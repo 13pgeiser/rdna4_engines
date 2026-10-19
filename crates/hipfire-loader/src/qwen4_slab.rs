@@ -81,8 +81,7 @@ mod tests {
     use hipfire_arch_qwen4::expert_arena::ExpertArenaPlan;
     use hipfire_arch_qwen4::expert_slab_table::build_expert_slab_table;
     use hipfire_arch_qwen4::expert_slabs::{
-        expert_entry_name, ExpertFormat, ExpertProj, ExpertSlabsV1, EXPERTS_PER_LAYER,
-        TRUNK_LAYERS,
+        expert_entry_name, ExpertFormat, ExpertProj, ExpertSlabsV1, EXPERTS_PER_LAYER, TRUNK_LAYERS,
     };
     use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqFile, HfqMemTensor, HfqTensorInfo};
     use hipfire_runtime::weight_manifest::{ShardPolicy, WeightResidency};
@@ -176,7 +175,10 @@ mod tests {
     #[test]
     fn ordinary_entries_keep_the_by_name_size_under_every_recipe() {
         let plan = all_w3_plan();
-        let entry = ordinary_entry("model.language_model.layers.0.self_attn.q_proj.weight", Some(0));
+        let entry = ordinary_entry(
+            "model.language_model.layers.0.self_attn.q_proj.weight",
+            Some(0),
+        );
         for recipe in [slab_recipe(&plan), packed_recipe()] {
             assert_eq!(
                 qwen4_entry_bytes(&recipe, &entry, |e| {
@@ -194,7 +196,10 @@ mod tests {
         // A packed (non-slab) manifest declares no arenas: the name is just a
         // name, sized (or missing) exactly as before.
         let entry = arena_entry(0, 100, WeightResidency::Resident);
-        assert_eq!(qwen4_entry_bytes(&packed_recipe(), &entry, |_| Some(77)), Some(77));
+        assert_eq!(
+            qwen4_entry_bytes(&packed_recipe(), &entry, |_| Some(77)),
+            Some(77)
+        );
         assert_eq!(qwen4_entry_bytes(&packed_recipe(), &entry, |_| None), None);
     }
 
@@ -218,10 +223,8 @@ mod tests {
     /// A one-tensor HFQM container: enough source for the by-name path and a
     /// proof that arena entries never reach it.
     fn tiny_source(tag: &str) -> (HfqModelSource, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "hipfire-qwen4-slab-{}-{tag}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("hipfire-qwen4-slab-{}-{tag}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tiny.hfq");
         let tensors = [HfqMemTensor {

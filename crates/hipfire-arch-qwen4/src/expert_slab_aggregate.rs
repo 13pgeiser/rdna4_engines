@@ -52,7 +52,13 @@ pub fn slabs_from_aggregate_mq4(
     let (gate_up_qt, down_qt) = ExpertFormat::Mq4Xts.pair();
     let mut slabs = Vec::with_capacity(layers.len() * experts);
     for (layer, agg) in layers.iter().enumerate() {
-        let gate_up_stride = stride(layer, &agg.gate_up, gate_up_qt, &GATE_UP_SHAPE, GATE_UP_BYTES)?;
+        let gate_up_stride = stride(
+            layer,
+            &agg.gate_up,
+            gate_up_qt,
+            &GATE_UP_SHAPE,
+            GATE_UP_BYTES,
+        )?;
         let down_stride = stride(layer, &agg.down, down_qt, &DOWN_SHAPE, DOWN_BYTES)?;
         for expert in 0..experts {
             slabs.push(ExpertSlab {
@@ -178,7 +184,10 @@ mod tests {
                 assert_eq!(s.format, ExpertFormat::Mq4Xts);
                 assert_eq!(s.gate_up.len as u64, GU_STRIDE);
                 assert_eq!(s.down.len as u64, DN_STRIDE);
-                assert_eq!(s.gate_up.offset as u64, agg.gate_up.offset + e as u64 * GU_STRIDE);
+                assert_eq!(
+                    s.gate_up.offset as u64,
+                    agg.gate_up.offset + e as u64 * GU_STRIDE
+                );
                 assert_eq!(s.down.offset as u64, agg.down.offset + e as u64 * DN_STRIDE);
             }
         }

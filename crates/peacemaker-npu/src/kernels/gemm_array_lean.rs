@@ -172,7 +172,11 @@ struct Parity {
 
 /// One memtile channel reset + requeue.
 #[derive(Clone, Copy, Debug)]
-struct MemChannel { direction: dma::Direction, channel: u32, bd: u32 }
+struct MemChannel {
+    direction: dma::Direction,
+    channel: u32,
+    bd: u32,
+}
 
 /// Per-column memtile repairs (identical for every column).
 #[derive(Default, Debug)]
@@ -189,10 +193,16 @@ struct MemPlan {
 
 impl MemPlan {
     fn reset(&mut self, direction: dma::Direction, channel: u32, bd: u32) {
-        self.resets.push(MemChannel { direction, channel, bd });
+        self.resets.push(MemChannel {
+            direction,
+            channel,
+            bd,
+        });
     }
     fn lock(&mut self, id: u32) {
-        if !self.locks.contains(&id) { self.locks.push(id); }
+        if !self.locks.contains(&id) {
+            self.locks.push(id);
+        }
     }
 }
 
@@ -204,15 +214,24 @@ struct LeanPlan {
     mem: MemPlan,
 }
 
-
 impl ArrayDesign {
     fn lean_plan(&self) -> Result<LeanPlan, String> {
         let geo = &self.geo;
         let topo = geo.topo;
-        if !matches!(self.variant, Variant::V8 | Variant::V9 | Variant::V10 | Variant::G80 | Variant::Ief15) || !topo.is_pair() {
-            return Err(format!("lean submit is derived for the V8/V9/V10/G80/IEF15 pair designs only, not {}", self.variant));
+        if !matches!(
+            self.variant,
+            Variant::V8 | Variant::V9 | Variant::V10 | Variant::G80 | Variant::Ief15
+        ) || !topo.is_pair()
+        {
+            return Err(format!(
+                "lean submit is derived for the V8/V9/V10/G80/IEF15 pair designs only, not {}",
+                self.variant
+            ));
         }
-        let parity = Parity { chunks_odd: (geo.kc * geo.waves) % 2 == 1, waves_odd: geo.waves % 2 == 1 };
+        let parity = Parity {
+            chunks_odd: (geo.kc * geo.waves) % 2 == 1,
+            waves_odd: geo.waves % 2 == 1,
+        };
         let ((a_empty, _), (b_empty, _)) = ab_locks();
         let mut mem = MemPlan::default();
         match topo.resident() {
@@ -224,7 +243,13 @@ impl ArrayDesign {
                     mem.reset(Mm2s, A_MM2S_CH, A_MM2S_BD[0]);
                     mem.lock(a_empty[1]);
                 }
-                let task = |direction, channel, bd, repeat| Task { direction, channel, bd, repeat, issue_token: false };
+                let task = |direction, channel, bd, repeat| Task {
+                    direction,
+                    channel,
+                    bd,
+                    repeat,
+                    issue_token: false,
+                };
                 if topo.is_g80_n512() {
                     // N512: the B fill / guard groups (BD 4, 5 / 30, 31, `repeat = group length`) and the whole-panel BD 36.
                     let (requeues, currents) = gemm_g80_n512::lean_b_tasks(geo.kc, geo.waves);
@@ -233,30 +258,59 @@ impl ArrayDesign {
                 } else {
                     let (kc, whole) = (geo.kc as u32, (geo.waves - 1) as u32);
                     mem.requeues.push(task(S2mm, B_S2MM_CH, B_S2MM_BD[0], kc));
-                    for p in 0..2 { mem.requeues.push(task(Mm2s, gemm_g80::G80_B_MM2S_CH[p], gemm_g80::G80_B_GUARD_BD[p], kc)); }
+                    for p in 0..2 {
+                        mem.requeues.push(task(
+                            Mm2s,
+                            gemm_g80::G80_B_MM2S_CH[p],
+                            gemm_g80::G80_B_GUARD_BD[p],
+                            kc,
+                        ));
+                    }
                     if whole > 0 {
                         for p in 0..2 {
-                            mem.requeues.push(task(Mm2s, gemm_g80::G80_B_MM2S_CH[p], gemm_g80::G80_B_WHOLE_BD[p], whole));
+                            mem.requeues.push(task(
+                                Mm2s,
+                                gemm_g80::G80_B_MM2S_CH[p],
+                                gemm_g80::G80_B_WHOLE_BD[p],
+                                whole,
+                            ));
                         }
                     }
-                    mem.currents.extend([B_S2MM_BD[0], B_S2MM_BD[1], gemm_g80::G80_B_GUARD_BD[0], gemm_g80::G80_B_GUARD_BD[1]]);
+                    mem.currents.extend([
+                        B_S2MM_BD[0],
+                        B_S2MM_BD[1],
+                        gemm_g80::G80_B_GUARD_BD[0],
+                        gemm_g80::G80_B_GUARD_BD[1],
+                    ]);
                 }
                 // G80 I32: the C producers (two-stripe chain per row) and the C drains (four-stripe chain per drain channel) are
                 // finite and run `mw` passes, like the B tasks: after a completed submit they are idle with empty queues and
                 // every C lock is back at its initial value (no lookahead, single slot), for every wave parity. Requeue them.
                 if topo.is_g80_i32() || topo.is_g80_bf16() {
-                    for r in 0..ROWS { mem.requeues.push(task(S2mm, r as u32, C_S2MM_BD[r][0], geo.waves as u32)); }
-                    for g in 0..2 { mem.requeues.push(task(Mm2s, PAIR_C_MM2S_CH[g], PAIR_C_MM2S_BD0[g], geo.waves as u32)); }
+                    for r in 0..ROWS {
+                        mem.requeues
+                            .push(task(S2mm, r as u32, C_S2MM_BD[r][0], geo.waves as u32));
+                    }
+                    for g in 0..2 {
+                        mem.requeues.push(task(
+                            Mm2s,
+                            PAIR_C_MM2S_CH[g],
+                            PAIR_C_MM2S_BD0[g],
+                            geo.waves as u32,
+                        ));
+                    }
                 }
             }
-            None => if parity.chunks_odd {
-                mem.reset(S2mm, B_S2MM_CH, B_S2MM_BD[0]);
-                mem.reset(S2mm, A_S2MM_CH, A_S2MM_BD[0]);
-                mem.reset(Mm2s, B_MM2S_CH, B_MM2S_BD[0]);
-                mem.reset(Mm2s, A_MM2S_CH, A_MM2S_BD[0]);
-                mem.lock(b_empty[1]);
-                mem.lock(a_empty[1]);
-            },
+            None => {
+                if parity.chunks_odd {
+                    mem.reset(S2mm, B_S2MM_CH, B_S2MM_BD[0]);
+                    mem.reset(S2mm, A_S2MM_CH, A_S2MM_BD[0]);
+                    mem.reset(Mm2s, B_MM2S_CH, B_MM2S_BD[0]);
+                    mem.reset(Mm2s, A_MM2S_CH, A_MM2S_BD[0]);
+                    mem.lock(b_empty[1]);
+                    mem.lock(a_empty[1]);
+                }
+            }
             Some(res) => match res.mode {
                 ResidentMode::NwOuter => {
                     if parity.chunks_odd {
@@ -274,34 +328,56 @@ impl ArrayDesign {
                 ResidentMode::MwOuter => {
                     if res.b_prefix {
                         // Same finite B tasks as ring_tasks, without building unrelated core / A / C tasks.
-                        let task = |direction, channel, bd, repeat| Task { direction, channel, bd, repeat,
-                            issue_token: false };
+                        let task = |direction, channel, bd, repeat| Task {
+                            direction,
+                            channel,
+                            bd,
+                            repeat,
+                            issue_token: false,
+                        };
                         for (g, (_, len)) in res.b_prefix_groups().enumerate() {
-                            mem.requeues.push(task(S2mm, B_S2MM_CH, B_S2MM_BD[g], len as u32));
+                            mem.requeues
+                                .push(task(S2mm, B_S2MM_CH, B_S2MM_BD[g], len as u32));
                             mem.currents.extend([B_S2MM_BD[g], B_MM2S_BD[g]]);
                         }
                         for (g, (_, len)) in res.b_prefix_groups().enumerate() {
-                            mem.requeues.push(task(Mm2s, B_MM2S_CH, B_MM2S_BD[g], len as u32));
+                            mem.requeues
+                                .push(task(Mm2s, B_MM2S_CH, B_MM2S_BD[g], len as u32));
                         }
                         if res.mw > 1 {
-                            mem.requeues.push(task(Mm2s, B_MM2S_CH, V10_B_LOCKFREE_BD, (res.mw - 1) as u32));
+                            mem.requeues.push(task(
+                                Mm2s,
+                                B_MM2S_CH,
+                                V10_B_LOCKFREE_BD,
+                                (res.mw - 1) as u32,
+                            ));
                         }
                     } else {
-                        mem.requeues.push(Task { direction: S2mm, channel: B_S2MM_CH, bd: B_S2MM_BD[0],
-                            repeat: 1, issue_token: false });
+                        mem.requeues.push(Task {
+                            direction: S2mm,
+                            channel: B_S2MM_CH,
+                            bd: B_S2MM_BD[0],
+                            repeat: 1,
+                            issue_token: false,
+                        });
                     }
                     if res.mw % 2 == 1 {
                         mem.reset(S2mm, A_S2MM_CH, A_S2MM_BD[0]);
                         mem.lock(a_empty[0]);
                         mem.reset(Mm2s, A_MM2S_CH, V10_A_CHAIN_BD0);
-                        mem.currents.extend((0..res.nw as u32).map(|i| V10_A_CHAIN_BD0 + i));
+                        mem.currents
+                            .extend((0..res.nw as u32).map(|i| V10_A_CHAIN_BD0 + i));
                     }
                 }
             },
         }
         if parity.waves_odd && !topo.is_g80_i32() && !topo.is_g80_bf16() {
-            for r in 0..ROWS { mem.reset(S2mm, r as u32, C_S2MM_BD[r][0]); }
-            for g in 0..2 { mem.reset(Mm2s, PAIR_C_MM2S_CH[g], PAIR_C_MM2S_BD0[g]); }
+            for r in 0..ROWS {
+                mem.reset(S2mm, r as u32, C_S2MM_BD[r][0]);
+            }
+            for g in 0..2 {
+                mem.reset(Mm2s, PAIR_C_MM2S_CH[g], PAIR_C_MM2S_BD0[g]);
+            }
             for r in 0..ROWS {
                 // Rings (V8 all rows, V9/V10 rows 0,2): the dropped lookahead credit is the slot-1 empty lock.
                 // V9/V10 rows 1,3 share one pair lock between both slots (credit returned to slot-0 empty).
@@ -309,16 +385,30 @@ impl ArrayDesign {
                 mem.lock(c_lock(if shared_pair { 0 } else { 1 }, r));
             }
         }
-        Ok(LeanPlan { core_ab: parity.chunks_odd, mem })
+        Ok(LeanPlan {
+            core_ab: parity.chunks_odd,
+            mem,
+        })
     }
 
     /// Memtile channel `(direction, channel)` of a column forced through reset + requeue although the plan of the design
     /// does not repair it at this parity (see "Forced channel repair" in the module documentation): the first BD of the
     /// channel and the lock that held the dropped lookahead credit while the channel was parked at that BD.
-    fn forced_channel(&self, direction: dma::Direction, channel: u32) -> Result<(u32, Option<u32>), String> {
+    fn forced_channel(
+        &self,
+        direction: dma::Direction,
+        channel: u32,
+    ) -> Result<(u32, Option<u32>), String> {
         let topo = self.geo.topo;
-        if !matches!(self.variant, Variant::V8 | Variant::V9 | Variant::V10 | Variant::G80 | Variant::Ief15) || !topo.is_pair() {
-            return Err(format!("lean submit is derived for the V8/V9/V10/G80/IEF15 pair designs only, not {}", self.variant));
+        if !matches!(
+            self.variant,
+            Variant::V8 | Variant::V9 | Variant::V10 | Variant::G80 | Variant::Ief15
+        ) || !topo.is_pair()
+        {
+            return Err(format!(
+                "lean submit is derived for the V8/V9/V10/G80/IEF15 pair designs only, not {}",
+                self.variant
+            ));
         }
         let (_, (b_empty, _)) = ab_locks();
         match (direction, channel) {
@@ -338,14 +428,19 @@ impl ArrayDesign {
     /// Lean persistent TXN: see the module documentation (`gemm_array_lean.rs`). Valid only directly after a
     /// completed submit of this design (full or lean); the first submit after the PDI must use [`ArrayDesign::insts`].
     /// Err for any design other than V8 / V9 / V10 / G80.
-    pub fn lean_insts(&self) -> Result<Vec<u8>, String> { self.lean_insts_requeue(&[]) }
+    pub fn lean_insts(&self) -> Result<Vec<u8>, String> {
+        self.lean_insts_requeue(&[])
+    }
 
     /// [`ArrayDesign::lean_insts`] plus a forced reset + requeue of each `(column, direction, memtile channel)` of
     /// `extra` (module documentation, "Forced channel repair"). Use it when something other than the design's own run
     /// has clobbered those channels since the last completed run (the persistent ring's poll / done tasks). Channels the
     /// plan already repairs at this shape are not emitted twice. Supported channels: memtile B fill S2MM4 and the C
     /// drains MM2S0 / MM2S3; any other channel, or a column outside the topology, is an Err.
-    pub fn lean_insts_requeue(&self, extra: &[(u32, dma::Direction, u32)]) -> Result<Vec<u8>, String> {
+    pub fn lean_insts_requeue(
+        &self,
+        extra: &[(u32, dma::Direction, u32)],
+    ) -> Result<Vec<u8>, String> {
         let mut txn = Txn::aie2p_8col();
         self.append_lean_run_body(&mut txn, [0; 3], extra)?;
         Ok(txn.to_bytes())
@@ -354,18 +449,24 @@ impl ArrayDesign {
     /// Append one lean body (ends with the C token SYNCs) to `txn`, every shim DDR patch advanced by `arena_base[arg]`
     /// (args 0..=2) as [`ArrayDesign::append_run_body`] does for the full body. `extra` as in
     /// [`ArrayDesign::lean_insts_requeue`]. On Err `txn` is unchanged.
-    pub fn append_lean_run_body(&self, txn: &mut Txn, arena_base: [u64; 3], extra: &[(u32, dma::Direction, u32)])
-        -> Result<(), String>
-    {
+    pub fn append_lean_run_body(
+        &self,
+        txn: &mut Txn,
+        arena_base: [u64; 3],
+        extra: &[(u32, dma::Direction, u32)],
+    ) -> Result<(), String> {
         self.lean_body(txn, arena_base, extra, true, false)
     }
 
     /// [`ArrayDesign::append_lean_run_body`] that does not rewrite the shim BD words / S2MM controller ids (only DDR
     /// patches and tasks). Valid ONLY when the previous body executed on this hardware context was a body of this SAME
     /// design (not merely the same PDI: e.g. [`ArrayDesign::with_a_repeat`] shares the PDI but not the shim BDs).
-    pub fn append_lean_run_body_same_design(&self, txn: &mut Txn, arena_base: [u64; 3], extra: &[(u32, dma::Direction, u32)])
-        -> Result<(), String>
-    {
+    pub fn append_lean_run_body_same_design(
+        &self,
+        txn: &mut Txn,
+        arena_base: [u64; 3],
+        extra: &[(u32, dma::Direction, u32)],
+    ) -> Result<(), String> {
         self.lean_body(txn, arena_base, extra, false, false)
     }
 
@@ -373,41 +474,78 @@ impl ArrayDesign {
     /// memtile for a submit): no shim B stream, no memtile B fill; the B ready locks are set to the `kc` credits the
     /// fill would have released. Valid ONLY when the previous body on this hardware context was a body of this same
     /// design whose B argument held the same bytes (the memtile B regions still hold them); `arena_base[1]` is unused.
-    pub fn append_lean_run_body_b_resident(&self, txn: &mut Txn, arena_base: [u64; 3], extra: &[(u32, dma::Direction, u32)])
-        -> Result<(), String>
-    {
+    pub fn append_lean_run_body_b_resident(
+        &self,
+        txn: &mut Txn,
+        arena_base: [u64; 3],
+        extra: &[(u32, dma::Direction, u32)],
+    ) -> Result<(), String> {
         if self.variant != Variant::G80 || self.geo.topo.is_g80_n512() {
-            return Err(format!("B-resident lean body is derived for G80 only, not {}", self.variant));
+            return Err(format!(
+                "B-resident lean body is derived for G80 only, not {}",
+                self.variant
+            ));
         }
         self.lean_body(txn, arena_base, extra, false, true)
     }
 
-    fn lean_body(&self, txn: &mut Txn, arena_base: [u64; 3], extra: &[(u32, dma::Direction, u32)], shim_bd_words: bool,
-        b_resident: bool) -> Result<(), String>
-    {
+    fn lean_body(
+        &self,
+        txn: &mut Txn,
+        arena_base: [u64; 3],
+        extra: &[(u32, dma::Direction, u32)],
+        shim_bd_words: bool,
+        b_resident: bool,
+    ) -> Result<(), String> {
         let mut plan = self.lean_plan()?;
         // B resident: the fill task is not requeued (nothing streams B in); the guards get the fill's credits instead.
-        if b_resident { plan.mem.requeues.retain(|t| !(t.direction == S2mm && t.channel == B_S2MM_CH)); }
+        if b_resident {
+            plan.mem
+                .requeues
+                .retain(|t| !(t.direction == S2mm && t.channel == B_S2MM_CH));
+        }
         let geo = &self.geo;
         let topo = geo.topo;
         let cores: Vec<Location> = topo.cores().collect();
-        let core_task = |direction, channel, bd| Task { direction, channel, bd, repeat: 1, issue_token: false };
-        let core_chans = [core_task(S2mm, gemm_core::A_CHANNEL, gemm_core::A_BD[0]),
-            core_task(S2mm, gemm_core::B_CHANNEL, gemm_core::B_BD[0])];
-        let mem_task = |c: &MemChannel| Task { direction: c.direction, channel: c.channel, bd: c.bd, repeat: 1, issue_token: false };
+        let core_task = |direction, channel, bd| Task {
+            direction,
+            channel,
+            bd,
+            repeat: 1,
+            issue_token: false,
+        };
+        let core_chans = [
+            core_task(S2mm, gemm_core::A_CHANNEL, gemm_core::A_BD[0]),
+            core_task(S2mm, gemm_core::B_CHANNEL, gemm_core::B_BD[0]),
+        ];
+        let mem_task = |c: &MemChannel| Task {
+            direction: c.direction,
+            channel: c.channel,
+            bd: c.bd,
+            repeat: 1,
+            issue_token: false,
+        };
         // G80 injects A in columns 0..4 only: the A channels / locks of the other columns do not exist and are never repaired.
         let ((a_empty, a_full), _) = ab_locks();
-        let skip_chan = |col: u32, t: &Task| !topo.has_a(col)
-            && ((t.direction == S2mm && t.channel == A_S2MM_CH) || (t.direction == Mm2s && t.channel == A_MM2S_CH));
-        let skip_lock = |col: u32, id: u32| !topo.has_a(col) && (a_empty.contains(&id) || a_full.contains(&id));
+        let skip_chan = |col: u32, t: &Task| {
+            !topo.has_a(col)
+                && ((t.direction == S2mm && t.channel == A_S2MM_CH)
+                    || (t.direction == Mm2s && t.channel == A_MM2S_CH))
+        };
+        let skip_lock =
+            |col: u32, id: u32| !topo.has_a(col) && (a_empty.contains(&id) || a_full.contains(&id));
         let mut mem_resets: Vec<(Location, Task)> = Vec::new();
         let mut mem_requeues: Vec<(Location, Task)> = Vec::new();
         for col in 0..topo.cols as u32 {
             for c in &plan.mem.resets {
                 let t = mem_task(c);
-                if !skip_chan(col, &t) { mem_resets.push((mem_loc(col), t)); }
+                if !skip_chan(col, &t) {
+                    mem_resets.push((mem_loc(col), t));
+                }
             }
-            for &t in &plan.mem.requeues { mem_requeues.push((mem_loc(col), t)); }
+            for &t in &plan.mem.requeues {
+                mem_requeues.push((mem_loc(col), t));
+            }
         }
         // Forced channels, validated before the first op is appended. A channel the plan already resets (same column,
         // direction, channel) keeps its parity-derived repair and is skipped. Finite tasks retain ALL their repeats and
@@ -416,32 +554,62 @@ impl ArrayDesign {
         let mut extra_resets: Vec<(Location, Task)> = Vec::new();
         for &(col, direction, channel) in extra {
             if col as usize >= topo.cols {
-                return Err(format!("forced lean repair: column {col} outside the {} active columns", topo.cols));
+                return Err(format!(
+                    "forced lean repair: column {col} outside the {} active columns",
+                    topo.cols
+                ));
             }
             let (bd, lock) = self.forced_channel(direction, channel)?;
             let loc = mem_loc(col);
-            let same = |&(l, t): &(Location, Task)| l == loc && t.direction == direction && t.channel == channel;
-            if mem_resets.iter().chain(&extra_resets).any(same) { continue; }
+            let same = |&(l, t): &(Location, Task)| {
+                l == loc && t.direction == direction && t.channel == channel
+            };
+            if mem_resets.iter().chain(&extra_resets).any(same) {
+                continue;
+            }
             // Non-prefix V10 has one repeat of BD 4: promote it as before, preserving the existing TXN order.
             // Prefix tasks must remain intact instead of being replaced by the single reset-channel task.
-            if !topo.is_g80() && !topo.resident().is_some_and(|r| r.b_prefix) { mem_requeues.retain(|e| !same(e)); }
-            extra_resets.push((loc, Task { direction, channel, bd, repeat: 1, issue_token: false }));
+            if !topo.is_g80() && !topo.resident().is_some_and(|r| r.b_prefix) {
+                mem_requeues.retain(|e| !same(e));
+            }
+            extra_resets.push((
+                loc,
+                Task {
+                    direction,
+                    channel,
+                    bd,
+                    repeat: 1,
+                    issue_token: false,
+                },
+            ));
             if let Some(id) = lock {
-                if !plan.mem.locks.contains(&id) && !extra_locks.contains(&(col, id)) { extra_locks.push((col, id)); }
+                if !plan.mem.locks.contains(&id) && !extra_locks.contains(&(col, id)) {
+                    extra_locks.push((col, id));
+                }
             }
         }
         mem_resets.extend(extra_resets);
 
         // 1. halt + reset every core (clears DONE / status; the program restarts its phase at 0).
-        for &tile in &cores { txn.mask_write(tile.address(regs::core::CORE_CONTROL), 2, 3); }
+        for &tile in &cores {
+            txn.mask_write(tile.address(regs::core::CORE_CONTROL), 2, 3);
+        }
         // 2. channel reset, only the channels whose parked BD / latched descriptor is not the canonical start.
         let mut resets: Vec<(Location, Task)> = Vec::new();
         if plan.core_ab {
-            for &tile in &cores { for t in core_chans { resets.push((tile, t)); } }
+            for &tile in &cores {
+                for t in core_chans {
+                    resets.push((tile, t));
+                }
+            }
         }
         resets.extend(mem_resets.iter().copied());
-        for &(loc, t) in &resets { txn.mask_write(channel_ctrl(loc, t.direction, t.channel), 2, 2); }
-        for &(loc, t) in &resets { txn.mask_write(channel_ctrl(loc, t.direction, t.channel), 0, 2); }
+        for &(loc, t) in &resets {
+            txn.mask_write(channel_ctrl(loc, t.direction, t.channel), 2, 2);
+        }
+        for &(loc, t) in &resets {
+            txn.mask_write(channel_ctrl(loc, t.direction, t.channel), 0, 2);
+        }
         // 3. iteration `current := 0` (memtile BD word 6 bits 23..28); includes every prefix group on every submit.
         for col in 0..topo.cols as u32 {
             for &bd in &plan.mem.currents {
@@ -460,12 +628,17 @@ impl ArrayDesign {
         }
         let mut initial_mem_locks = [0u32; 64];
         if !plan.mem.locks.is_empty() || !extra_locks.is_empty() {
-            for (id, value) in memtile_locks(topo, 0) { initial_mem_locks[id as usize] = value; }
+            for (id, value) in memtile_locks(topo, 0) {
+                initial_mem_locks[id as usize] = value;
+            }
         }
         for col in 0..topo.cols as u32 {
             for &id in &plan.mem.locks {
-                if skip_lock(col, id) { continue; }
-                let (addr, value) = dma::lock_write(mem_loc(col), id, initial_mem_locks[id as usize]);
+                if skip_lock(col, id) {
+                    continue;
+                }
+                let (addr, value) =
+                    dma::lock_write(mem_loc(col), id, initial_mem_locks[id as usize]);
                 txn.write32(addr, value);
             }
         }
@@ -489,21 +662,33 @@ impl ArrayDesign {
         // 6. requeue the reset channels (+ ENABLE on compute tiles) and the completed finite memtile tasks.
         if plan.core_ab {
             for &tile in &cores {
-                for t in core_chans { t.emit_txn(tile, txn); t.enable_txn(tile, txn); }
+                for t in core_chans {
+                    t.emit_txn(tile, txn);
+                    t.enable_txn(tile, txn);
+                }
             }
         }
         for &(loc, t) in &mem_resets {
             // B resident: a reset B fill channel stays idle (requeueing it would park a fill waiting for data).
-            if b_resident && t.direction == S2mm && t.channel == B_S2MM_CH { continue; }
-            if !mem_requeues.iter().any(|&(l, q)| l == loc && q.direction == t.direction && q.channel == t.channel) {
+            if b_resident && t.direction == S2mm && t.channel == B_S2MM_CH {
+                continue;
+            }
+            if !mem_requeues
+                .iter()
+                .any(|&(l, q)| l == loc && q.direction == t.direction && q.channel == t.channel)
+            {
                 t.emit_txn(loc, txn);
             }
         }
-        for &(loc, t) in &mem_requeues { t.emit_txn(loc, txn); }
+        for &(loc, t) in &mem_requeues {
+            t.emit_txn(loc, txn);
+        }
         // 7. shim BDs / DDR patches / tokens / tasks.
         emit_shim_at(txn, geo, arena_base, shim_bd_words, b_resident);
         // 8. cores last, then wait for the C tokens.
-        for &tile in &cores { txn.mask_write(tile.address(regs::core::CORE_CONTROL), 1, 1); }
+        for &tile in &cores {
+            txn.mask_write(tile.address(regs::core::CORE_CONTROL), 1, 1);
+        }
         emit_output_tail(txn, geo, false, arena_base[2]);
         Ok(())
     }

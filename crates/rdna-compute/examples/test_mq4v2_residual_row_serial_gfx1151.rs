@@ -43,10 +43,8 @@ const GUARD: usize = 32;
 /// Distinct NaN sentinel for guards (never a legal output).
 const SENTINEL: u32 = 0x7FC0_00FF;
 
-const CACHE_POLICY_SRC: &str =
-    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc");
-const RESIDUAL_BODY_SRC: &str =
-    include_str!("../../../kernels/src/gemv_mq4g256v2_residual.hip");
+const CACHE_POLICY_SRC: &str = include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc");
+const RESIDUAL_BODY_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g256v2_residual.hip");
 
 const LEGACY_ENTRY: &str = "gemv_mq4g256v2_residual_legacy_gfx1151";
 const CAND_ENTRY: &str = "gemv_mq4g256v2_residual_row_serial_gfx1151";
@@ -181,10 +179,7 @@ fn variance(v: &[f32]) -> f64 {
         return 0.0;
     }
     let mean = v.iter().map(|x| *x as f64).sum::<f64>() / v.len() as f64;
-    v.iter()
-        .map(|x| (*x as f64 - mean).powi(2))
-        .sum::<f64>()
-        / v.len() as f64
+    v.iter().map(|x| (*x as f64 - mean).powi(2)).sum::<f64>() / v.len() as f64
 }
 
 fn htod(gpu: &Gpu, dst: &rdna_compute::GpuTensor, host_bytes: &[u8], what: &str) {
@@ -365,7 +360,12 @@ fn main() {
     gpu.ensure_kernel_public(MEMCMP_ENTRY, MEMCMP_SRC, MEMCMP_ENTRY)
         .expect("compile memcmp module");
 
-    let shapes = [(5120usize, 5120usize), (5120, 6144), (5120, 17408), (5119, 5120)];
+    let shapes = [
+        (5120usize, 5120usize),
+        (5120, 6144),
+        (5120, 17408),
+        (5119, 5120),
+    ];
     let mut all_ok = true;
     for (m, k) in shapes {
         if !run_shape(&mut gpu, m, k) {

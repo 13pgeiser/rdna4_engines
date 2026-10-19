@@ -202,10 +202,15 @@ mod tests {
 
     #[test]
     fn architecture_match_is_exact() {
-        for arch in ["", "gfx1100x", "gfx110", "gfx1101", "gfx1200", "gfx12010", "GFX1201", "gfx1201 "] {
+        for arch in [
+            "", "gfx1100x", "gfx110", "gfx1101", "gfx1200", "gfx12010", "GFX1201", "gfx1201 ",
+        ] {
             for landed in [false, true] {
                 for codec in 0..=3u8 {
-                    assert!(!qwen4_slab_codec_admitted_with(arch, codec, landed), "{arch:?} codec {codec}");
+                    assert!(
+                        !qwen4_slab_codec_admitted_with(arch, codec, landed),
+                        "{arch:?} codec {codec}"
+                    );
                 }
             }
         }
@@ -282,9 +287,18 @@ mod tests {
         // gfx1151 with the E8P receipts not landed (`false`, the refused state) serves MQ4 and W3: uniform MQ4 has no
         // cold bucket, W3 is the cold codec whether uniform or mixed with MQ4, and E8P is
         // refused in every position.
-        assert_eq!(qwen4_slab_layer_cold_codec_with("gfx1151", &[mq4, mq4], false), Ok(mq4));
-        assert_eq!(qwen4_slab_layer_cold_codec_with("gfx1151", &[w3, w3], false), Ok(w3));
-        assert_eq!(qwen4_slab_layer_cold_codec_with("gfx1151", &[mq4, w3, mq4, w3], false), Ok(w3));
+        assert_eq!(
+            qwen4_slab_layer_cold_codec_with("gfx1151", &[mq4, mq4], false),
+            Ok(mq4)
+        );
+        assert_eq!(
+            qwen4_slab_layer_cold_codec_with("gfx1151", &[w3, w3], false),
+            Ok(w3)
+        );
+        assert_eq!(
+            qwen4_slab_layer_cold_codec_with("gfx1151", &[mq4, w3, mq4, w3], false),
+            Ok(w3)
+        );
         assert_eq!(
             qwen4_slab_layer_cold_codec_with("gfx1151", &[mq4, e8p], false),
             Err(SlabLayerCodecError::NotAdmitted { codec: e8p })
@@ -303,10 +317,22 @@ mod tests {
         );
         // gfx1151 with the receipts landed: E8P is a cold codec next to MQ4 (either order) or
         // alone; W3 + E8P in one layer is the two-cold-codecs refusal; W2 stays refused.
-        assert_eq!(qwen4_slab_layer_cold_codec_with("gfx1151", &[mq4, e8p, mq4], true), Ok(e8p));
-        assert_eq!(qwen4_slab_layer_cold_codec_with("gfx1151", &[e8p, mq4], true), Ok(e8p));
-        assert_eq!(qwen4_slab_layer_cold_codec_with("gfx1151", &[e8p, e8p], true), Ok(e8p));
-        assert_eq!(qwen4_slab_layer_cold_codec_with("gfx1151", &[mq4, w3, mq4], true), Ok(w3));
+        assert_eq!(
+            qwen4_slab_layer_cold_codec_with("gfx1151", &[mq4, e8p, mq4], true),
+            Ok(e8p)
+        );
+        assert_eq!(
+            qwen4_slab_layer_cold_codec_with("gfx1151", &[e8p, mq4], true),
+            Ok(e8p)
+        );
+        assert_eq!(
+            qwen4_slab_layer_cold_codec_with("gfx1151", &[e8p, e8p], true),
+            Ok(e8p)
+        );
+        assert_eq!(
+            qwen4_slab_layer_cold_codec_with("gfx1151", &[mq4, w3, mq4], true),
+            Ok(w3)
+        );
         for codecs in [[mq4, w3, e8p], [e8p, w3, mq4], [w3, e8p, w3]] {
             assert!(matches!(
                 qwen4_slab_layer_cold_codec_with("gfx1151", &codecs, true),
@@ -339,16 +365,33 @@ mod tests {
                         "{arch} codec {codec} landed={landed}"
                     );
                 }
-                assert!(!qwen4_slab_codec_admitted_with(arch, w2, landed), "{arch} W2");
+                assert!(
+                    !qwen4_slab_codec_admitted_with(arch, w2, landed),
+                    "{arch} W2"
+                );
                 // cold0 means no cold bucket on every admitted arch, Halo included.
-                assert_eq!(qwen4_slab_default_cold_codec(arch), Some(SLAB_CODEC_MQ4), "{arch}");
-                assert_eq!(qwen4_slab_layer_cold_codec_with(arch, &[mq4, mq4], landed), Ok(mq4), "{arch}");
+                assert_eq!(
+                    qwen4_slab_default_cold_codec(arch),
+                    Some(SLAB_CODEC_MQ4),
+                    "{arch}"
+                );
+                assert_eq!(
+                    qwen4_slab_layer_cold_codec_with(arch, &[mq4, mq4], landed),
+                    Ok(mq4),
+                    "{arch}"
+                );
             }
         }
         // Refused: gfx1151 serves W3 only as its cold codec and E8P is a NotAdmitted refusal in
         // every position, W3 + E8P included.
-        assert_eq!(qwen4_slab_layer_cold_codec_with("gfx1151", &[w3, w3], false), Ok(w3));
-        assert_eq!(qwen4_slab_layer_cold_codec_with("gfx1151", &[mq4, w3, mq4], false), Ok(w3));
+        assert_eq!(
+            qwen4_slab_layer_cold_codec_with("gfx1151", &[w3, w3], false),
+            Ok(w3)
+        );
+        assert_eq!(
+            qwen4_slab_layer_cold_codec_with("gfx1151", &[mq4, w3, mq4], false),
+            Ok(w3)
+        );
         assert_eq!(
             qwen4_slab_layer_cold_codec_with("gfx1151", &[mq4, e8p], false),
             Err(SlabLayerCodecError::NotAdmitted { codec: e8p })
@@ -358,10 +401,16 @@ mod tests {
             Err(SlabLayerCodecError::NotAdmitted { codec: e8p })
         );
         // Landed: E8P is gfx1151's second cold codec; a layer still holds ONE cold codec.
-        assert_eq!(qwen4_slab_layer_cold_codec_with("gfx1151", &[mq4, e8p], true), Ok(e8p));
+        assert_eq!(
+            qwen4_slab_layer_cold_codec_with("gfx1151", &[mq4, e8p], true),
+            Ok(e8p)
+        );
         assert_eq!(
             qwen4_slab_layer_cold_codec_with("gfx1151", &[w3, e8p], true),
-            Err(SlabLayerCodecError::MixedCold { first: w3, second: e8p })
+            Err(SlabLayerCodecError::MixedCold {
+                first: w3,
+                second: e8p
+            })
         );
         // Multiple cold codecs: refused where both are admitted, NotAdmitted on the rest.
         assert_eq!(
@@ -382,9 +431,15 @@ mod tests {
         ] {
             for landed in [false, true] {
                 for codec in [0u8, 1, 2, 3, 255] {
-                    assert!(!qwen4_slab_codec_admitted_with(arch, codec, landed), "{arch:?} codec {codec}");
+                    assert!(
+                        !qwen4_slab_codec_admitted_with(arch, codec, landed),
+                        "{arch:?} codec {codec}"
+                    );
                 }
-                assert!(qwen4_slab_layer_cold_codec_with(arch, &[mq4], landed).is_err(), "{arch:?}");
+                assert!(
+                    qwen4_slab_layer_cold_codec_with(arch, &[mq4], landed).is_err(),
+                    "{arch:?}"
+                );
             }
             assert_eq!(qwen4_slab_default_cold_codec(arch), None, "{arch:?}");
         }

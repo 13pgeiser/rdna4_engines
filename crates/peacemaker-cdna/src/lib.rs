@@ -58,23 +58,23 @@ macro_rules! op_table {
 }
 
 pub mod arch;
-pub mod operand;
 pub mod inst;
+pub mod operand;
 pub mod enc {
     //! One module per CDNA microcode format family (CDNA3 ISA §13).
-    pub mod sop;
-    pub mod smem;
-    pub mod vop;
-    pub mod vop3;
-    pub mod vop3p;
     pub mod ds;
     pub mod flat;
     pub mod mubuf;
+    pub mod smem;
+    pub mod sop;
+    pub mod vop;
+    pub mod vop3;
+    pub mod vop3p;
 }
 pub mod float;
 pub mod kd;
-pub mod sim;
 pub mod oracle;
+pub mod sim;
 
 pub use arch::{Arch, Caps};
 pub use inst::{decode_all, encode_all, Format, Inst};

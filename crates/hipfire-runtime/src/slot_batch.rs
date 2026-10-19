@@ -255,7 +255,11 @@ impl BatchPlanner {
             .count();
         let prefill_reserve = (0..n)
             .filter(|&i| admitted[i] && is_runnable_prefill(&work[i], vl_seq))
-            .map(|i| prefill_min_tokens.max(1).min(work[i].remaining_prompt.len()))
+            .map(|i| {
+                prefill_min_tokens
+                    .max(1)
+                    .min(work[i].remaining_prompt.len())
+            })
             .max()
             .unwrap_or(0);
         let verify_cap = row_budget.saturating_sub(ar_lanes + prefill_reserve);
@@ -303,7 +307,11 @@ impl BatchPlanner {
             let pf: Vec<usize> = (0..n)
                 .filter(|&i| admitted[i] && is_runnable_prefill(&work[i], vl_seq))
                 .collect();
-            let start = if pf.is_empty() { 0 } else { self.scheduler.prefill_cursor % pf.len() };
+            let start = if pf.is_empty() {
+                0
+            } else {
+                self.scheduler.prefill_cursor % pf.len()
+            };
             for k in 0..pf.len() {
                 let i = pf[(start + k) % pf.len()];
                 let want = match self.forced_prefill_len.get(i).copied().flatten() {
@@ -315,8 +323,8 @@ impl BatchPlanner {
                     avail -= want;
                 }
             }
-            alloc.next_prefill_cursor = (!pf.is_empty())
-                .then(|| (self.scheduler.prefill_cursor + 1) % pf.len());
+            alloc.next_prefill_cursor =
+                (!pf.is_empty()).then(|| (self.scheduler.prefill_cursor + 1) % pf.len());
         }
         let any_pos3 = self.scheduler.any_pos3(work);
         let mut plan = BatchStepPlan::default();
@@ -425,7 +433,10 @@ impl BatchPlanner {
                     let left = work[i].remaining_prompt.len();
                     let completes = left == rr.rows.len;
                     if left < rr.rows.len || n_adv > usize::from(completes) {
-                        return Err(format!("publish: invalid prefill commit for {:?}", rr.epoch));
+                        return Err(format!(
+                            "publish: invalid prefill commit for {:?}",
+                            rr.epoch
+                        ));
                     }
                     if let Some(a) = advances.iter().find(|a| a.epoch == rr.epoch) {
                         if a.committed_position != work[i].next_pos + rr.rows.len {
@@ -448,7 +459,10 @@ impl BatchPlanner {
             .iter()
             .find(|a| !plan.requests.iter().any(|r| r.epoch == a.epoch))
         {
-            return Err(format!("publish: advance for unplanned epoch {:?}", a.epoch));
+            return Err(format!(
+                "publish: advance for unplanned epoch {:?}",
+                a.epoch
+            ));
         }
         for rr in &plan.requests {
             let i = work_epochs
@@ -576,7 +590,13 @@ mod tests {
         assert_eq!(b.positions[b.positions.len() - 1], 77);
     }
 
-    fn pw(slot: usize, prompt: Vec<u32>, next_pos: usize, decoding: bool, spec: SpecKind) -> PendingWork {
+    fn pw(
+        slot: usize,
+        prompt: Vec<u32>,
+        next_pos: usize,
+        decoding: bool,
+        spec: SpecKind,
+    ) -> PendingWork {
         PendingWork {
             slot: SlotId(slot),
             remaining_prompt: prompt,
@@ -592,12 +612,19 @@ mod tests {
     }
 
     fn ep(tag: u64) -> RequestEpoch {
-        RequestEpoch { request_tag: tag, owner_generation: 1 }
+        RequestEpoch {
+            request_tag: tag,
+            owner_generation: 1,
+        }
     }
 
     fn planner() -> BatchPlanner {
         BatchPlanner::new(
-            Scheduler { chunk_size: 64, vl_sequential: false, prefill_cursor: 0 },
+            Scheduler {
+                chunk_size: 64,
+                vl_sequential: false,
+                prefill_cursor: 0,
+            },
             3,
             15,
         )
@@ -616,7 +643,10 @@ mod tests {
         assert_eq!(plan.verify_rows, 4);
         assert_eq!(plan.decode_rows, 1);
         assert_eq!(plan.prefill_rows, 40);
-        assert_eq!(plan.requests[0].kind, RequestStepKind::Verify { draft_len: 3 });
+        assert_eq!(
+            plan.requests[0].kind,
+            RequestStepKind::Verify { draft_len: 3 }
+        );
         assert_eq!(plan.requests[0].rows, RowRange { begin: 0, len: 4 });
         assert_eq!(&plan.batch.positions[..4], &[100, 101, 102, 103]);
         assert_eq!(plan.requests[2].rows, RowRange { begin: 5, len: 40 });
@@ -633,7 +663,9 @@ mod tests {
         ];
         let mut p = planner();
         // 16 verify rows + 8 quantum > 20 budget: verify lane waits.
-        let plan = p.plan_step(&work, &[ep(1), ep(2)], &[true; 2], 20, 8).unwrap();
+        let plan = p
+            .plan_step(&work, &[ep(1), ep(2)], &[true; 2], 20, 8)
+            .unwrap();
         assert_eq!(plan.verify_rows, 0);
         assert_eq!(plan.prefill_rows, 20);
     }
@@ -642,7 +674,10 @@ mod tests {
     fn unadmitted_epochs_contribute_no_rows() {
         let work = vec![pw(0, vec![1], 0, true, SpecKind::None)];
         let mut p = planner();
-        let e = RequestEpoch { request_tag: 1, owner_generation: 0 };
+        let e = RequestEpoch {
+            request_tag: 1,
+            owner_generation: 0,
+        };
         let plan = p.plan_step(&work, &[e], &[true], 8, 1).unwrap();
         assert!(plan.requests.is_empty());
     }
@@ -664,7 +699,13 @@ mod tests {
             verified_rows: 1,
             finish: None,
         };
-        let stale = [RequestEpoch { request_tag: 1, owner_generation: 2 }, ep(2)];
+        let stale = [
+            RequestEpoch {
+                request_tag: 1,
+                owner_generation: 2,
+            },
+            ep(2),
+        ];
         assert!(p.publish(&mut work, &stale, &plan, &[adv.clone()]).is_err());
         p.publish(&mut work, &epochs, &plan, &[adv]).unwrap();
         assert_eq!(work[0].remaining_prompt, vec![42]);
@@ -687,7 +728,9 @@ mod tests {
             verified_rows: 0,
             finish: None,
         };
-        assert!(p.publish(&mut work, &epochs, &plan, &[adv.clone()]).is_err());
+        assert!(p
+            .publish(&mut work, &epochs, &plan, &[adv.clone()])
+            .is_err());
         assert_eq!(work[0].remaining_prompt.len(), 10);
         adv.committed_position = 10;
         p.publish(&mut work, &epochs, &plan, &[adv]).unwrap();

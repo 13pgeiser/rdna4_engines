@@ -84,7 +84,11 @@ impl Lcg {
 
 /// Exact f16 -> f32 for the normal numbers this fixture generates.
 fn f16_normal_to_f32(h: u16) -> f32 {
-    let (sign, exp, mant) = ((h >> 15) as u32, ((h >> 10) & 0x1F) as u32, (h & 0x3FF) as u32);
+    let (sign, exp, mant) = (
+        (h >> 15) as u32,
+        ((h >> 10) & 0x1F) as u32,
+        (h & 0x3FF) as u32,
+    );
     assert!(exp != 0 && exp != 0x1F, "fixture emits normal f16 only");
     f32::from_bits((sign << 31) | ((exp + 112) << 23) | (mant << 13))
 }
@@ -165,14 +169,18 @@ fn row_dot(packed: &[u8], row: usize, groups: usize, x: &[f32], d1_first: bool) 
 }
 
 fn upload_u8(gpu: &mut Gpu, data: &[u8]) -> GpuTensor {
-    let t = gpu.alloc_tensor(&[data.len()], DType::Raw).expect("alloc u8");
+    let t = gpu
+        .alloc_tensor(&[data.len()], DType::Raw)
+        .expect("alloc u8");
     gpu.hip.memcpy_htod(&t.buf, data).expect("htod u8");
     t
 }
 fn upload_f32(gpu: &mut Gpu, data: &[f32]) -> GpuTensor {
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
-    let t = gpu.alloc_tensor(&[data.len()], DType::F32).expect("alloc f32");
+    let t = gpu
+        .alloc_tensor(&[data.len()], DType::F32)
+        .expect("alloc f32");
     gpu.hip.memcpy_htod(&t.buf, bytes).expect("htod f32");
     t
 }

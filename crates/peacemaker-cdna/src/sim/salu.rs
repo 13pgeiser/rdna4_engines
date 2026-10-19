@@ -40,18 +40,40 @@ pub fn exec(w: &mut Wave, inst: &Inst) -> SimResult<Flow> {
 }
 
 /// 32-bit scalar source.
-fn r32(w: &Wave, s: Src) -> SimResult<u32> { w.read_s(s, Ty::B32) }
+fn r32(w: &Wave, s: Src) -> SimResult<u32> {
+    w.read_s(s, Ty::B32)
+}
 /// 64-bit scalar source.
-fn r64(w: &Wave, s: Src) -> SimResult<u64> { w.read_s64(s, Ty::B64) }
+fn r64(w: &Wave, s: Src) -> SimResult<u64> {
+    w.read_s64(s, Ty::B64)
+}
 
 /// `(1 << width) - 1` with `width` already clamped to 0..=32.
-fn mask32(width: u32) -> u32 { if width >= 32 { u32::MAX } else { (1u32 << width) - 1 } }
+fn mask32(width: u32) -> u32 {
+    if width >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << width) - 1
+    }
+}
 /// `(1 << width) - 1` with `width` already clamped to 0..=64.
-fn mask64(width: u32) -> u64 { if width >= 64 { u64::MAX } else { (1u64 << width) - 1 } }
+fn mask64(width: u32) -> u64 {
+    if width >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << width) - 1
+    }
+}
 
 /// `signext_from_bit(x, width)`: sign-extend `x` from bit `width - 1`; width 0 gives 0.
 fn sext_from_bit32(x: u32, width: u32) -> u32 {
-    if width == 0 { 0 } else if width >= 32 { x } else { (((x << (32 - width)) as i32) >> (32 - width)) as u32 }
+    if width == 0 {
+        0
+    } else if width >= 32 {
+        x
+    } else {
+        (((x << (32 - width)) as i32) >> (32 - width)) as u32
+    }
 }
 
 fn sop2(w: &mut Wave, op: Sop2Op, d: Src, s0: Src, s1: Src) -> SimResult<()> {
@@ -92,8 +114,16 @@ fn sop2(w: &mut Wave, op: Sop2Op, d: Src, s0: Src, s1: Src) -> SimResult<()> {
         MinI32 | MaxI32 | MinU32 | MaxU32 => {
             let (a, b) = (r32(w, s0)?, r32(w, s1)?);
             let signed = matches!(op, MinI32 | MaxI32);
-            let (ord_lt, ord_ge) = if signed { ((a as i32) < (b as i32), (a as i32) >= (b as i32)) } else { (a < b, a >= b) };
-            let pick0 = if matches!(op, MinI32 | MinU32) { ord_lt } else { ord_ge };
+            let (ord_lt, ord_ge) = if signed {
+                ((a as i32) < (b as i32), (a as i32) >= (b as i32))
+            } else {
+                (a < b, a >= b)
+            };
+            let pick0 = if matches!(op, MinI32 | MinU32) {
+                ord_lt
+            } else {
+                ord_ge
+            };
             w.scc = pick0;
             w.write_s(d, if pick0 { a } else { b })?;
         }
@@ -109,27 +139,47 @@ fn sop2(w: &mut Wave, op: Sop2Op, d: Src, s0: Src, s1: Src) -> SimResult<()> {
         // S_AND/OR/XOR/ANDN2/ORN2_B32 p.99-101: SCC = result != 0.
         AndB32 | OrB32 | XorB32 | Andn2B32 | Orn2B32 => {
             let (a, b) = (r32(w, s0)?, r32(w, s1)?);
-            let r = match op { AndB32 => a & b, OrB32 => a | b, XorB32 => a ^ b, Andn2B32 => a & !b, _ => a | !b };
+            let r = match op {
+                AndB32 => a & b,
+                OrB32 => a | b,
+                XorB32 => a ^ b,
+                Andn2B32 => a & !b,
+                _ => a | !b,
+            };
             w.write_s(d, r)?;
             w.scc = r != 0;
         }
         AndB64 | OrB64 | XorB64 | Andn2B64 | Orn2B64 => {
             let (a, b) = (r64(w, s0)?, r64(w, s1)?);
-            let r = match op { AndB64 => a & b, OrB64 => a | b, XorB64 => a ^ b, Andn2B64 => a & !b, _ => a | !b };
+            let r = match op {
+                AndB64 => a & b,
+                OrB64 => a | b,
+                XorB64 => a ^ b,
+                Andn2B64 => a & !b,
+                _ => a | !b,
+            };
             w.write_s64(d, r)?;
             w.scc = r != 0;
         }
         // S_LSHL/LSHR/ASHR_B32/I32 p.103-104: the count is S1[4:0]; SCC = result != 0.
         LshlB32 | LshrB32 | AshrI32 => {
             let (a, b) = (r32(w, s0)?, r32(w, s1)? & 31);
-            let r = match op { LshlB32 => a << b, LshrB32 => a >> b, _ => ((a as i32) >> b) as u32 };
+            let r = match op {
+                LshlB32 => a << b,
+                LshrB32 => a >> b,
+                _ => ((a as i32) >> b) as u32,
+            };
             w.write_s(d, r)?;
             w.scc = r != 0;
         }
         // 64-bit forms: the count is S1[5:0] (S1 is a 32-bit operand).
         LshlB64 | LshrB64 | AshrI64 => {
             let (a, b) = (r64(w, s0)?, r32(w, s1)? & 63);
-            let r = match op { LshlB64 => a << b, LshrB64 => a >> b, _ => ((a as i64) >> b) as u64 };
+            let r = match op {
+                LshlB64 => a << b,
+                LshrB64 => a >> b,
+                _ => ((a as i64) >> b) as u64,
+            };
             w.write_s64(d, r)?;
             w.scc = r != 0;
         }
@@ -167,7 +217,9 @@ fn sop2(w: &mut Wave, op: Sop2Op, d: Src, s0: Src, s1: Src) -> SimResult<()> {
         AbsdiffI32 => {
             let (a, b) = (r32(w, s0)?, r32(w, s1)?);
             let mut r = a.wrapping_sub(b) as i32;
-            if r < 0 { r = r.wrapping_neg() }
+            if r < 0 {
+                r = r.wrapping_neg()
+            }
             w.write_s(d, r as u32)?;
             w.scc = r != 0;
         }
@@ -178,11 +230,19 @@ fn sop2(w: &mut Wave, op: Sop2Op, d: Src, s0: Src, s1: Src) -> SimResult<()> {
         }
         MulHiI32 => {
             let (a, b) = (r32(w, s0)?, r32(w, s1)?);
-            w.write_s(d, ((i64::from(a as i32) * i64::from(b as i32)) >> 32) as u32)?;
+            w.write_s(
+                d,
+                ((i64::from(a as i32) * i64::from(b as i32)) >> 32) as u32,
+            )?;
         }
         // S_LSHL{1..4}_ADD_U32 p.107-108: SCC = unsigned overflow of the sum.
         Lshl1AddU32 | Lshl2AddU32 | Lshl3AddU32 | Lshl4AddU32 => {
-            let sh = match op { Lshl1AddU32 => 1, Lshl2AddU32 => 2, Lshl3AddU32 => 3, _ => 4 };
+            let sh = match op {
+                Lshl1AddU32 => 1,
+                Lshl2AddU32 => 2,
+                Lshl3AddU32 => 3,
+                _ => 4,
+            };
             let (a, b) = (r32(w, s0)?, r32(w, s1)?);
             let t = (u64::from(a) << sh) + u64::from(b);
             w.write_s(d, t as u32)?;
@@ -191,8 +251,16 @@ fn sop2(w: &mut Wave, op: Sop2Op, d: Src, s0: Src, s1: Src) -> SimResult<()> {
         // S_PACK_{LL,LH,HH}_B32_B16 p.108: D = { S1.half, S0.half }; SCC unchanged.
         PackLlB32B16 | PackLhB32B16 | PackHhB32B16 => {
             let (a, b) = (r32(w, s0)?, r32(w, s1)?);
-            let lo = if op == PackHhB32B16 { a >> 16 } else { a & 0xffff };
-            let hi = if op == PackLlB32B16 { b & 0xffff } else { b >> 16 };
+            let lo = if op == PackHhB32B16 {
+                a >> 16
+            } else {
+                a & 0xffff
+            };
+            let hi = if op == PackLlB32B16 {
+                b & 0xffff
+            } else {
+                b >> 16
+            };
             w.write_s(d, (hi << 16) | lo)?;
         }
     }
@@ -202,31 +270,85 @@ fn sop2(w: &mut Wave, op: Sop2Op, d: Src, s0: Src, s1: Src) -> SimResult<()> {
 fn sop1(w: &mut Wave, op: Sop1Op, d: Option<Src>, s0: Option<Src>) -> SimResult<()> {
     use Sop1Op::*;
     let name = format!("{op:?}");
-    let src = || s0.ok_or_else(|| super::SimError::Fault(format!("{name}: missing source operand")));
-    let dst = || d.ok_or_else(|| super::SimError::Fault(format!("{name}: missing destination operand")));
+    let src =
+        || s0.ok_or_else(|| super::SimError::Fault(format!("{name}: missing source operand")));
+    let dst =
+        || d.ok_or_else(|| super::SimError::Fault(format!("{name}: missing destination operand")));
     match op {
         // S_MOV_B32/B64 p.107 ff.
-        MovB32 => { let a = r32(w, src()?)?; w.write_s(dst()?, a)?; }
-        MovB64 => { let a = r64(w, src()?)?; w.write_s64(dst()?, a)?; }
+        MovB32 => {
+            let a = r32(w, src()?)?;
+            w.write_s(dst()?, a)?;
+        }
+        MovB64 => {
+            let a = r64(w, src()?)?;
+            w.write_s64(dst()?, a)?;
+        }
         // S_CMOV_B32/B64: only when SCC is set (the source is still read).
-        CmovB32 => { let a = r32(w, src()?)?; let d = dst()?; if w.scc { w.write_s(d, a)? } }
-        CmovB64 => { let a = r64(w, src()?)?; let d = dst()?; if w.scc { w.write_s64(d, a)? } }
+        CmovB32 => {
+            let a = r32(w, src()?)?;
+            let d = dst()?;
+            if w.scc {
+                w.write_s(d, a)?
+            }
+        }
+        CmovB64 => {
+            let a = r64(w, src()?)?;
+            let d = dst()?;
+            if w.scc {
+                w.write_s64(d, a)?
+            }
+        }
         // S_NOT_B32/B64: SCC = result != 0.
-        NotB32 => { let r = !r32(w, src()?)?; w.write_s(dst()?, r)?; w.scc = r != 0; }
-        NotB64 => { let r = !r64(w, src()?)?; w.write_s64(dst()?, r)?; w.scc = r != 0; }
+        NotB32 => {
+            let r = !r32(w, src()?)?;
+            w.write_s(dst()?, r)?;
+            w.scc = r != 0;
+        }
+        NotB64 => {
+            let r = !r64(w, src()?)?;
+            w.write_s64(dst()?, r)?;
+            w.scc = r != 0;
+        }
         // S_BREV_B32: bit reversal; SCC unchanged.
-        BrevB32 => { let a = r32(w, src()?)?; w.write_s(dst()?, a.reverse_bits())?; }
+        BrevB32 => {
+            let a = r32(w, src()?)?;
+            w.write_s(dst()?, a.reverse_bits())?;
+        }
         // S_BCNT1_I32_B32/B64: SCC = count != 0 (equivalently S0 != 0).
-        Bcnt1I32B32 => { let n = r32(w, src()?)?.count_ones(); w.write_s(dst()?, n)?; w.scc = n != 0; }
-        Bcnt1I32B64 => { let n = r64(w, src()?)?.count_ones(); w.write_s(dst()?, n)?; w.scc = n != 0; }
+        Bcnt1I32B32 => {
+            let n = r32(w, src()?)?.count_ones();
+            w.write_s(dst()?, n)?;
+            w.scc = n != 0;
+        }
+        Bcnt1I32B64 => {
+            let n = r64(w, src()?)?.count_ones();
+            w.write_s(dst()?, n)?;
+            w.scc = n != 0;
+        }
         // S_FF1_I32_B32/B64: index of the lowest set bit, -1 if none; SCC unchanged.
-        Ff1I32B32 => { let a = r32(w, src()?)?; w.write_s(dst()?, if a == 0 { u32::MAX } else { a.trailing_zeros() })?; }
-        Ff1I32B64 => { let a = r64(w, src()?)?; w.write_s(dst()?, if a == 0 { u32::MAX } else { a.trailing_zeros() })?; }
+        Ff1I32B32 => {
+            let a = r32(w, src()?)?;
+            w.write_s(dst()?, if a == 0 { u32::MAX } else { a.trailing_zeros() })?;
+        }
+        Ff1I32B64 => {
+            let a = r64(w, src()?)?;
+            w.write_s(dst()?, if a == 0 { u32::MAX } else { a.trailing_zeros() })?;
+        }
         // S_FLBIT_I32_B32: leading zeros before the first one, -1 if none.
-        FlbitI32B32 => { let a = r32(w, src()?)?; w.write_s(dst()?, if a == 0 { u32::MAX } else { a.leading_zeros() })?; }
+        FlbitI32B32 => {
+            let a = r32(w, src()?)?;
+            w.write_s(dst()?, if a == 0 { u32::MAX } else { a.leading_zeros() })?;
+        }
         // S_SEXT_I32_I8 / I16.
-        SextI32I8 => { let a = r32(w, src()?)?; w.write_s(dst()?, i32::from(a as u8 as i8) as u32)?; }
-        SextI32I16 => { let a = r32(w, src()?)?; w.write_s(dst()?, i32::from(a as u16 as i16) as u32)?; }
+        SextI32I8 => {
+            let a = r32(w, src()?)?;
+            w.write_s(dst()?, i32::from(a as u8 as i8) as u32)?;
+        }
+        SextI32I16 => {
+            let a = r32(w, src()?)?;
+            w.write_s(dst()?, i32::from(a as u16 as i16) as u32)?;
+        }
         // S_{AND,OR,XOR,ANDN2}_SAVEEXEC_B64 p.119 ff.: D = EXEC (saved first),
         // EXEC = S0 <op> EXEC (ANDN2: S0 & ~EXEC, as the ISA text gives it),
         // SCC = new EXEC != 0. [UNVERIFIED: confirm on MI300X: the ANDN2 operand
@@ -235,7 +357,12 @@ fn sop1(w: &mut Wave, op: Sop1Op, d: Option<Src>, s0: Option<Src>) -> SimResult<
             let a = r64(w, src()?)?;
             let d = dst()?;
             let saved = r64(w, Src::ExecLo)?;
-            let new = match op { AndSaveexecB64 => a & saved, OrSaveexecB64 => a | saved, XorSaveexecB64 => a ^ saved, _ => a & !saved };
+            let new = match op {
+                AndSaveexecB64 => a & saved,
+                OrSaveexecB64 => a | saved,
+                XorSaveexecB64 => a ^ saved,
+                _ => a & !saved,
+            };
             w.write_s64(d, saved)?;
             w.write_s64(Src::ExecLo, new)?;
             w.scc = new != 0;
@@ -252,11 +379,20 @@ fn sop1(w: &mut Wave, op: Sop1Op, d: Option<Src>, s0: Option<Src>) -> SimResult<
             let bit = r32(w, src()?)? & 31;
             let d = dst()?;
             let cur = r32(w, d)?;
-            w.write_s(d, if op == Bitset0B32 { cur & !(1 << bit) } else { cur | (1 << bit) })?;
+            w.write_s(
+                d,
+                if op == Bitset0B32 {
+                    cur & !(1 << bit)
+                } else {
+                    cur | (1 << bit)
+                },
+            )?;
         }
         // The wave carries an instruction index, not a byte PC: no real byte
         // address exists to return or to jump to.
-        GetpcB64 | SetpcB64 => return unsupported(format!("{name}: the wave has no byte-addressed PC")),
+        GetpcB64 | SetpcB64 => {
+            return unsupported(format!("{name}: the wave has no byte-addressed PC"))
+        }
     }
     Ok(())
 }
@@ -266,8 +402,13 @@ fn sop1(w: &mut Wave, op: Sop1Op, d: Option<Src>, s0: Option<Src>) -> SimResult<
 const MODE_MODELLED: u32 = 0x0000_03ff | (1 << 23);
 
 fn mode_bits(m: &Mode) -> u32 {
-    u32::from(m.round32 & 3) | u32::from(m.round16_64 & 3) << 2 | u32::from(m.denorm32 & 3) << 4 | u32::from(m.denorm16_64 & 3) << 6
-        | u32::from(m.dx10_clamp) << 8 | u32::from(m.ieee) << 9 | u32::from(m.fp16_ovfl) << 23
+    u32::from(m.round32 & 3)
+        | u32::from(m.round16_64 & 3) << 2
+        | u32::from(m.denorm32 & 3) << 4
+        | u32::from(m.denorm16_64 & 3) << 6
+        | u32::from(m.dx10_clamp) << 8
+        | u32::from(m.ieee) << 9
+        | u32::from(m.fp16_ovfl) << 23
 }
 
 fn set_mode_bits(m: &mut Mode, v: u32) {
@@ -286,10 +427,14 @@ fn hwreg(simm16: u16, name: &str) -> SimResult<(u32, u32, u32)> {
     let id = u32::from(simm16 & 0x3f);
     let off = u32::from(simm16 >> 6 & 0x1f);
     let size = u32::from(simm16 >> 11) + 1;
-    if id != 1 { return unsupported(format!("{name}: hardware register id {id} (only MODE, id 1, is modelled)")) }
+    if id != 1 {
+        return unsupported(format!(
+            "{name}: hardware register id {id} (only MODE, id 1, is modelled)"
+        ));
+    }
     let mask = mask32(size) << off;
     if mask & !MODE_MODELLED != 0 {
-        return unsupported(format!("{name}: MODE bits {:#x} are outside the modelled FP_ROUND/FP_DENORM/DX10_CLAMP/IEEE/FP16_OVFL fields", mask & !MODE_MODELLED))
+        return unsupported(format!("{name}: MODE bits {:#x} are outside the modelled FP_ROUND/FP_DENORM/DX10_CLAMP/IEEE/FP16_OVFL fields", mask & !MODE_MODELLED));
     }
     Ok((id, off, size))
 }
@@ -301,17 +446,35 @@ fn sopk(w: &mut Wave, op: SopkOp, d: Src, simm16: u16) -> SimResult<()> {
     match op {
         // S_MOVK_I32 / S_CMOVK_I32 p.109: D = signext(simm16) (CMOVK iff SCC).
         MovkI32 => w.write_s(d, sx)?,
-        CmovkI32 => { if w.scc { w.write_s(d, sx)? } }
+        CmovkI32 => {
+            if w.scc {
+                w.write_s(d, sx)?
+            }
+        }
         // S_CMPK_*_I32 p.109-110: signed compare with signext(simm16).
         CmpkEqI32 | CmpkLgI32 | CmpkGtI32 | CmpkGeI32 | CmpkLtI32 | CmpkLeI32 => {
             let a = r32(w, d)? as i32;
             let b = sx as i32;
-            w.scc = match op { CmpkEqI32 => a == b, CmpkLgI32 => a != b, CmpkGtI32 => a > b, CmpkGeI32 => a >= b, CmpkLtI32 => a < b, _ => a <= b };
+            w.scc = match op {
+                CmpkEqI32 => a == b,
+                CmpkLgI32 => a != b,
+                CmpkGtI32 => a > b,
+                CmpkGeI32 => a >= b,
+                CmpkLtI32 => a < b,
+                _ => a <= b,
+            };
         }
         // S_CMPK_*_U32 p.110-111: unsigned compare with zext(simm16).
         CmpkEqU32 | CmpkLgU32 | CmpkGtU32 | CmpkGeU32 | CmpkLtU32 | CmpkLeU32 => {
             let a = r32(w, d)?;
-            w.scc = match op { CmpkEqU32 => a == zx, CmpkLgU32 => a != zx, CmpkGtU32 => a > zx, CmpkGeU32 => a >= zx, CmpkLtU32 => a < zx, _ => a <= zx };
+            w.scc = match op {
+                CmpkEqU32 => a == zx,
+                CmpkLgU32 => a != zx,
+                CmpkGtU32 => a > zx,
+                CmpkGeU32 => a >= zx,
+                CmpkLtU32 => a < zx,
+                _ => a <= zx,
+            };
         }
         // S_ADDK_I32 p.111: D += signext(simm16), SCC = signed overflow.
         AddkI32 => {
@@ -321,7 +484,10 @@ fn sopk(w: &mut Wave, op: SopkOp, d: Src, simm16: u16) -> SimResult<()> {
             w.scc = (a >> 31 == sx >> 31) && (a >> 31 != r >> 31);
         }
         // S_MULK_I32 p.111: low 32 bits of D * signext(simm16).
-        MulkI32 => { let a = r32(w, d)?; w.write_s(d, a.wrapping_mul(sx))?; }
+        MulkI32 => {
+            let a = r32(w, d)?;
+            w.write_s(d, a.wrapping_mul(sx))?;
+        }
         // S_GETREG_B32 p.112: D = (MODE >> offset) & ((1 << size) - 1).
         GetregB32 => {
             let (_, off, size) = hwreg(simm16, "s_getreg_b32")?;
@@ -348,22 +514,44 @@ fn sopc(w: &mut Wave, op: SopcOp, s0: Src, s1: Src) -> SimResult<()> {
         // S_CMP_*_I32 / _U32 p.124-127.
         CmpEqI32 | CmpLgI32 | CmpGtI32 | CmpGeI32 | CmpLtI32 | CmpLeI32 => {
             let (a, b) = (r32(w, s0)? as i32, r32(w, s1)? as i32);
-            match op { CmpEqI32 => a == b, CmpLgI32 => a != b, CmpGtI32 => a > b, CmpGeI32 => a >= b, CmpLtI32 => a < b, _ => a <= b }
+            match op {
+                CmpEqI32 => a == b,
+                CmpLgI32 => a != b,
+                CmpGtI32 => a > b,
+                CmpGeI32 => a >= b,
+                CmpLtI32 => a < b,
+                _ => a <= b,
+            }
         }
         CmpEqU32 | CmpLgU32 | CmpGtU32 | CmpGeU32 | CmpLtU32 | CmpLeU32 => {
             let (a, b) = (r32(w, s0)?, r32(w, s1)?);
-            match op { CmpEqU32 => a == b, CmpLgU32 => a != b, CmpGtU32 => a > b, CmpGeU32 => a >= b, CmpLtU32 => a < b, _ => a <= b }
+            match op {
+                CmpEqU32 => a == b,
+                CmpLgU32 => a != b,
+                CmpGtU32 => a > b,
+                CmpGeU32 => a >= b,
+                CmpLtU32 => a < b,
+                _ => a <= b,
+            }
         }
         // S_BITCMP0/1_B32 p.127: SCC = S0[S1[4:0]] == 0 / 1.
         Bitcmp0B32 | Bitcmp1B32 => {
             let (a, b) = (r32(w, s0)?, r32(w, s1)? & 31);
             let bit = a >> b & 1 != 0;
-            if op == Bitcmp1B32 { bit } else { !bit }
+            if op == Bitcmp1B32 {
+                bit
+            } else {
+                !bit
+            }
         }
         // S_CMP_EQ_U64 / S_CMP_LG_U64 p.128.
         CmpEqU64 | CmpLgU64 => {
             let (a, b) = (r64(w, s0)?, r64(w, s1)?);
-            if op == CmpEqU64 { a == b } else { a != b }
+            if op == CmpEqU64 {
+                a == b
+            } else {
+                a != b
+            }
         }
     };
     Ok(())
@@ -371,7 +559,13 @@ fn sopc(w: &mut Wave, op: SopcOp, s0: Src, s1: Src) -> SimResult<()> {
 
 fn sopp(w: &mut Wave, op: SoppOp, simm16: u16) -> SimResult<Flow> {
     use SoppOp::*;
-    let taken = |c: bool| if c { Flow::Branch(simm16 as i16) } else { Flow::Next };
+    let taken = |c: bool| {
+        if c {
+            Flow::Branch(simm16 as i16)
+        } else {
+            Flow::Next
+        }
+    };
     Ok(match op {
         // S_NOP p.130, S_SLEEP, S_SETPRIO, S_ICACHE_INV: no architectural
         // effect in a functional model (wait states and hazards are not
@@ -386,7 +580,13 @@ fn sopp(w: &mut Wave, op: SoppOp, simm16: u16) -> SimResult<Flow> {
         CbranchVccnz => taken(w.vcc != 0),
         CbranchExecz => taken(w.exec == 0),
         CbranchExecnz => taken(w.exec != 0),
-        Sendmsg | Trap => return unsupported(format!("{op:?}: messages and the trap handler are not modelled")),
-        Waitcnt | Barrier | Endpgm => return fault(format!("{op:?} is handled by exec_one, not the scalar ALU")),
+        Sendmsg | Trap => {
+            return unsupported(format!(
+                "{op:?}: messages and the trap handler are not modelled"
+            ))
+        }
+        Waitcnt | Barrier | Endpgm => {
+            return fault(format!("{op:?} is handled by exec_one, not the scalar ALU"))
+        }
     })
 }

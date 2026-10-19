@@ -24,11 +24,11 @@
 //! or a batched-prefill-ineligible row count) runs the singleton verify.
 
 use super::*;
+use crate::qwen35::prefill::fp8_verify_open;
 use crate::qwen35::prefill::multi::{
     forward_prefill_batch_multi, MultiChunkRequest, MultiChunkScratch, MULTI_CHUNK_MAX_LANE_ROWS,
     MULTI_CHUNK_PRODUCT_MAX_ROWS,
 };
-use crate::qwen35::prefill::fp8_verify_open;
 
 /// Rows one MTP CB trunk chunk packs: the product cap. The wide 64..=128-row
 /// verify route is DFlash-only until a wide MTP state-oracle receipt exists,
@@ -68,7 +68,16 @@ impl MtpCbScratch {
         let sampled_probs = alloc(gpu, max_rows * config.vocab_size)?;
         let sampled_tau = alloc(gpu, max_rows)?;
         let sampled_z = alloc(gpu, max_rows)?;
-        Ok(Self { max_rows, trunk, hidden, rot, logits, sampled_probs, sampled_tau, sampled_z })
+        Ok(Self {
+            max_rows,
+            trunk,
+            hidden,
+            rot,
+            logits,
+            sampled_probs,
+            sampled_tau,
+            sampled_z,
+        })
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) -> HipResult<()> {
@@ -95,7 +104,12 @@ pub struct MtpCbDraftLane<'a> {
 /// Does this lane's singleton draft take the greedy full-vocab
 /// device-token-chain loop (no proposal graph) whose head the batched
 /// drafter shares?
-fn draft_batchable(gpu: &Gpu, weights: &Qwen35Weights, head: &Qwen35MtpHead, lane: &MtpCbDraftLane<'_>) -> bool {
+fn draft_batchable(
+    gpu: &Gpu,
+    weights: &Qwen35Weights,
+    head: &Qwen35MtpHead,
+    lane: &MtpCbDraftLane<'_>,
+) -> bool {
     let st = &*lane.state;
     lane.k.min(st.max_n) > 0
         && head.weights.lm_head_draft.is_none()
@@ -173,16 +187,23 @@ pub fn mtp_cb_draft_batched(
     }
     let dim = config.dim;
     let vocab = config.vocab_size;
-    let batched: Vec<bool> = lanes.iter().map(|l| draft_batchable(gpu, weights, head, l)).collect();
+    let batched: Vec<bool> = lanes
+        .iter()
+        .map(|l| draft_batchable(gpu, weights, head, l))
+        .collect();
     let group: Vec<usize> = (0..lanes.len()).filter(|&i| batched[i]).collect();
     let mut out: Vec<Option<MtpDraftOutput>> = (0..lanes.len()).map(|_| None).collect();
     if group.len() >= 2 && group.len() <= cb.max_rows {
-        let n_k: Vec<usize> = group.iter().map(|&i| lanes[i].k.min(lanes[i].state.max_n)).collect();
+        let n_k: Vec<usize> = group
+            .iter()
+            .map(|&i| lanes[i].k.min(lanes[i].state.max_n))
+            .collect();
         for &i in &group {
             let l = &mut lanes[i];
             l.state.penalty.begin_window(l.emitted);
             let seed = l.last_committed as i32;
-            gpu.hip.memcpy_htod(&l.state.mtp_token_chain.buf, &seed.to_ne_bytes())?;
+            gpu.hip
+                .memcpy_htod(&l.state.mtp_token_chain.buf, &seed.to_ne_bytes())?;
         }
         let out_w = &weights.output;
         let k_max = n_k.iter().copied().max().unwrap_or(0);
@@ -193,7 +214,11 @@ pub fn mtp_cb_draft_batched(
                 let st = &mut *lanes[group[g]].state;
                 let token_slot = st.mtp_token_chain.sub_offset(k, 1);
                 embed_device_token_into(gpu, weights, &st.mtp_token_embed, &token_slot, dim)?;
-                let prev = if k == 0 { st.prev_hidden.sub_offset(0, dim) } else { st.mtp_t_outs.sub_offset((k - 1) * dim, dim) };
+                let prev = if k == 0 {
+                    st.prev_hidden.sub_offset(0, dim)
+                } else {
+                    st.mtp_t_outs.sub_offset((k - 1) * dim, dim)
+                };
                 mtp_head::mtp_head_forward_block_only(
                     gpu,
                     head,
@@ -205,7 +230,12 @@ pub fn mtp_cb_draft_batched(
                     cur_pos + k,
                     weights,
                 )?;
-                gpu.rmsnorm_f32(&st.mtp_scratch.t_mtp_out, &head.weights.shared_head_norm, &st.mtp_scratch.tmp, head.config.rms_norm_eps)?;
+                gpu.rmsnorm_f32(
+                    &st.mtp_scratch.t_mtp_out,
+                    &head.weights.shared_head_norm,
+                    &st.mtp_scratch.tmp,
+                    head.config.rms_norm_eps,
+                )?;
                 // weight_gemv's MQ4 input rotate, into this lane's column.
                 let col_x = cb.rot.sub_offset(col * dim, dim);
                 llama::rotate_x_mq_for(gpu, out_w, &st.mtp_scratch.tmp, &col_x, out_w.k)?;
@@ -228,9 +258,22 @@ pub fn mtp_cb_draft_batched(
                 let st = &mut *lanes[group[g]].state;
                 let argmax_view = st.mtp_lm_argmax.sub_offset(0, 1);
                 let logits = cb.logits.sub_offset(col * vocab, vocab);
-                gpu.argmax_token_chain_f32(&logits, &argmax_view, &st.mtp_token_chain, None, vocab, k + 1)?;
+                gpu.argmax_token_chain_f32(
+                    &logits,
+                    &argmax_view,
+                    &st.mtp_token_chain,
+                    None,
+                    vocab,
+                    k + 1,
+                )?;
                 if k + 1 < n_k[g] {
-                    gpu.memcpy_dtod_at_auto(&st.mtp_t_outs.buf, k * dim * 4, &st.mtp_scratch.t_mtp_out.buf, 0, dim * 4)?;
+                    gpu.memcpy_dtod_at_auto(
+                        &st.mtp_t_outs.buf,
+                        k * dim * 4,
+                        &st.mtp_scratch.t_mtp_out.buf,
+                        0,
+                        dim * 4,
+                    )?;
                 }
             }
         }
@@ -239,8 +282,10 @@ pub fn mtp_cb_draft_batched(
             let n = n_k[g];
             let mut host = vec![0i32; n];
             {
-                let bytes: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut u8, n * 4) };
-                gpu.hip.memcpy_dtoh(bytes, &l.state.mtp_token_chain.sub_offset(1, n).buf)?;
+                let bytes: &mut [u8] =
+                    unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut u8, n * 4) };
+                gpu.hip
+                    .memcpy_dtoh(bytes, &l.state.mtp_token_chain.sub_offset(1, n).buf)?;
             }
             out[i] = Some(MtpDraftOutput {
                 candidates: host.into_iter().map(|t| t as u32).collect(),
@@ -278,7 +323,10 @@ pub fn mtp_cb_draft_batched(
                 && s.min_p.to_bits() == t.min_p.to_bits()
                 && s.top_k == t.top_k
         };
-        match cohorts.iter_mut().find(|c| c.len() < cb.max_rows && same(c[0])) {
+        match cohorts
+            .iter_mut()
+            .find(|c| c.len() < cb.max_rows && same(c[0]))
+        {
             Some(c) => c.push(i),
             None => cohorts.push(vec![i]),
         }
@@ -286,7 +334,12 @@ pub fn mtp_cb_draft_batched(
     // Host staging for the three dense D2H copies per depth: allocated ONCE
     // per call for the largest cohort that will batch, reused across depths
     // and cohorts (`download_f32_into` resizes within this capacity).
-    let stage_rows = cohorts.iter().map(Vec::len).filter(|&n| n >= 2).max().unwrap_or(0);
+    let stage_rows = cohorts
+        .iter()
+        .map(Vec::len)
+        .filter(|&n| n >= 2)
+        .max()
+        .unwrap_or(0);
     let mut probs_host: Vec<f32> = Vec::with_capacity(stage_rows * vocab);
     let mut tau_host: Vec<f32> = Vec::with_capacity(stage_rows);
     let mut z_host: Vec<f32> = Vec::with_capacity(stage_rows);
@@ -294,7 +347,10 @@ pub fn mtp_cb_draft_batched(
     for group in cohorts.iter().filter(|c| c.len() >= 2) {
         let samp = lanes[group[0]].state.sampling;
         let out_w = &weights.output;
-        let n_k: Vec<usize> = group.iter().map(|&i| lanes[i].k.min(lanes[i].state.max_n)).collect();
+        let n_k: Vec<usize> = group
+            .iter()
+            .map(|&i| lanes[i].k.min(lanes[i].state.max_n))
+            .collect();
         let mut outs: Vec<MtpDraftOutput> = Vec::with_capacity(group.len());
         for (g, &i) in group.iter().enumerate() {
             let l = &mut lanes[i];
@@ -322,7 +378,11 @@ pub fn mtp_cb_draft_batched(
             for (col, &g) in act.iter().enumerate() {
                 let cur_pos = lanes[group[g]].cur_pos;
                 let st = &mut *lanes[group[g]].state;
-                let next_tok = if k == 0 { outs[g].last_committed } else { outs[g].candidates[k - 1] };
+                let next_tok = if k == 0 {
+                    outs[g].last_committed
+                } else {
+                    outs[g].candidates[k - 1]
+                };
                 if k == 0 {
                     mtp_head::mtp_head_forward_block_only(
                         gpu,
@@ -349,7 +409,12 @@ pub fn mtp_cb_draft_batched(
                         weights,
                     )?;
                 }
-                gpu.rmsnorm_f32(&st.mtp_scratch.t_mtp_out, &head.weights.shared_head_norm, &st.mtp_scratch.tmp, head.config.rms_norm_eps)?;
+                gpu.rmsnorm_f32(
+                    &st.mtp_scratch.t_mtp_out,
+                    &head.weights.shared_head_norm,
+                    &st.mtp_scratch.tmp,
+                    head.config.rms_norm_eps,
+                )?;
                 let col_x = cb.rot.sub_offset(col * dim, dim);
                 llama::rotate_x_mq_for(gpu, out_w, &st.mtp_scratch.tmp, &col_x, out_w.k)?;
             }
@@ -419,11 +484,18 @@ pub fn mtp_cb_draft_batched(
                 // The retained q row outlives the staging buffer: copy it.
                 let mut probs = probs_host[col * vocab..(col + 1) * vocab].to_vec();
                 // Raw (untruncated) top prob, read only for the p_min cutoff.
-                let top_prob = if st.p_min > 0.0 { probs.iter().cloned().fold(0.0f32, f32::max) } else { 0.0 };
+                let top_prob = if st.p_min > 0.0 {
+                    probs.iter().cloned().fold(0.0f32, f32::max)
+                } else {
+                    0.0
+                };
                 apply_topp_trunc(&mut probs, tau_host[col], z_host[col]);
                 let u = st.rng.next_uniform_f32();
                 let draft_idx = sample_categorical(&probs, u) as usize;
-                assert!(draft_idx < vocab, "draft sample {draft_idx} out of draft vocab {vocab}");
+                assert!(
+                    draft_idx < vocab,
+                    "draft sample {draft_idx} out of draft vocab {vocab}"
+                );
                 let o = &mut outs[g];
                 o.draft_probs.push(probs[draft_idx]);
                 o.candidates.push(draft_idx as u32);
@@ -432,7 +504,12 @@ pub fn mtp_cb_draft_batched(
                     // pick (even one that truncates the chain below), never a
                     // future candidate.
                     let t0 = MtpPenaltyTiming::start();
-                    mtp_penalty_append_draft(gpu, &mut st.penalty, &st.mtp_sample_repeat_buf, draft_idx as u32)?;
+                    mtp_penalty_append_draft(
+                        gpu,
+                        &mut st.penalty,
+                        &st.mtp_sample_repeat_buf,
+                        draft_idx as u32,
+                    )?;
                     st.penalty_timing.finish(t0, 1, 0);
                 }
                 o.draft_softmaxes.push(probs);
@@ -444,7 +521,13 @@ pub fn mtp_cb_draft_batched(
                     continue;
                 }
                 if k + 1 < n_k[g] {
-                    gpu.memcpy_dtod_at_auto(&st.mtp_t_outs.buf, k * dim * 4, &st.mtp_scratch.t_mtp_out.buf, 0, dim * 4)?;
+                    gpu.memcpy_dtod_at_auto(
+                        &st.mtp_t_outs.buf,
+                        k * dim * 4,
+                        &st.mtp_scratch.t_mtp_out.buf,
+                        0,
+                        dim * 4,
+                    )?;
                 }
             }
         }
@@ -454,10 +537,23 @@ pub fn mtp_cb_draft_batched(
     }
     for (i, l) in lanes.iter_mut().enumerate() {
         if out[i].is_none() {
-            out[i] = Some(mtp_cb_draft(gpu, weights, config, head, l.state, l.cur_pos, l.last_committed, l.emitted, l.k)?);
+            out[i] = Some(mtp_cb_draft(
+                gpu,
+                weights,
+                config,
+                head,
+                l.state,
+                l.cur_pos,
+                l.last_committed,
+                l.emitted,
+                l.k,
+            )?);
         }
     }
-    Ok(out.into_iter().map(|d| d.expect("every lane drafted")).collect())
+    Ok(out
+        .into_iter()
+        .map(|d| d.expect("every lane drafted"))
+        .collect())
 }
 
 /// One request's window in a CB cycle: its trunk owners, its MTP drafter
@@ -507,7 +603,17 @@ pub fn mtp_cb_draft(
         gpu.active_stream = Some(gpu.hip.stream_create()?);
     }
     state.penalty.begin_window(emitted);
-    mtp_draft_phase_inner(gpu, weights, config, head, state, cur_pos, last_committed, k, false)
+    mtp_draft_phase_inner(
+        gpu,
+        weights,
+        config,
+        head,
+        state,
+        cur_pos,
+        last_committed,
+        k,
+        false,
+    )
 }
 
 /// One drafted lane between verify and accept.
@@ -533,12 +639,25 @@ pub enum MtpCbVerified {
 /// verifies it on the batched-prefill body with a rollback tape)? `pack_cap`
 /// is the chunk's packing cap (`<= 63`); a window never exceeds one
 /// request's 63 rows.
-fn shared_verify_ok(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwen35Config, pack_cap: usize, lane: &MtpCbVerifyLane<'_>) -> bool {
+fn shared_verify_ok(
+    gpu: &Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    pack_cap: usize,
+    lane: &MtpCbVerifyLane<'_>,
+) -> bool {
     let n = lane.draft.n_verify();
     n >= 2
         && n <= pack_cap.min(MULTI_CHUNK_MAX_LANE_ROWS)
         && n <= lane.state.trunk_gdn_tape.max_n
-        && qwen35::prefill_batch_pbs_eligible(weights, config, lane.dn_state, n, gpu.arch.as_str(), true)
+        && qwen35::prefill_batch_pbs_eligible(
+            weights,
+            config,
+            lane.dn_state,
+            n,
+            gpu.arch.as_str(),
+            true,
+        )
 }
 
 /// Verify phase over drafted lanes: DeltaNet snapshot, ONE shared trunk
@@ -558,7 +677,10 @@ pub fn mtp_cb_verify(
         gpu.active_stream = Some(gpu.hip.stream_create()?);
     }
     let pack_cap = cb.max_rows.min(MTP_CB_MAX_ROWS);
-    let shared: Vec<bool> = lanes.iter().map(|l| shared_verify_ok(gpu, weights, config, pack_cap, l)).collect();
+    let shared: Vec<bool> = lanes
+        .iter()
+        .map(|l| shared_verify_ok(gpu, weights, config, pack_cap, l))
+        .collect();
     let mut out: Vec<MtpCbVerified> = (0..lanes.len()).map(|_| MtpCbVerified::Pending).collect();
     let dim = config.dim;
     let vocab = config.vocab_size;
@@ -571,7 +693,10 @@ pub fn mtp_cb_verify(
             take += 1;
         }
         let chunk: Vec<usize> = idx.drain(..take).collect();
-        let verify_tokens: Vec<Vec<u32>> = chunk.iter().map(|&i| lanes[i].draft.verify_tokens()).collect();
+        let verify_tokens: Vec<Vec<u32>> = chunk
+            .iter()
+            .map(|&i| lanes[i].draft.verify_tokens())
+            .collect();
         for &i in &chunk {
             let lane = &mut lanes[i];
             lane.state.trunk_snap.save_from(lane.dn_state, gpu)?;
@@ -601,11 +726,28 @@ pub fn mtp_cb_verify(
                     dn_state_src: None,
                 });
             }
-            forward_prefill_batch_multi(gpu, weights, config, scratch, &cb.trunk, &mut reqs, Some(&cb.hidden))
+            forward_prefill_batch_multi(
+                gpu,
+                weights,
+                config,
+                scratch,
+                &cb.trunk,
+                &mut reqs,
+                Some(&cb.hidden),
+            )
         };
         let logits = cb.logits.sub_offset(0, rows * vocab);
         let head = fwd.and_then(|()| {
-            mtp_trunk_verify_lm_head(gpu, &weights.output, &cb.hidden, &cb.rot, &logits, rows, dim, vocab)
+            mtp_trunk_verify_lm_head(
+                gpu,
+                &weights.output,
+                &cb.hidden,
+                &cb.rot,
+                &logits,
+                rows,
+                dim,
+                vocab,
+            )
         });
         gpu.fp8_verify_exit(prev);
         head?;
@@ -613,8 +755,20 @@ pub fn mtp_cb_verify(
         for &i in &chunk {
             let n = lanes[i].draft.n_verify();
             let st = &mut *lanes[i].state;
-            gpu.memcpy_dtod_at_auto(&st.verify_hidden.buf, 0, &cb.hidden.buf, row * dim * 4, n * dim * 4)?;
-            gpu.memcpy_dtod_at_auto(&st.verify_logits.buf, 0, &cb.logits.buf, row * vocab * 4, n * vocab * 4)?;
+            gpu.memcpy_dtod_at_auto(
+                &st.verify_hidden.buf,
+                0,
+                &cb.hidden.buf,
+                row * dim * 4,
+                n * dim * 4,
+            )?;
+            gpu.memcpy_dtod_at_auto(
+                &st.verify_logits.buf,
+                0,
+                &cb.logits.buf,
+                row * vocab * 4,
+                n * vocab * 4,
+            )?;
             row += n;
         }
     }

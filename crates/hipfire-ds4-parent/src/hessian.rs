@@ -143,7 +143,9 @@ impl ParentHessianAccum {
     ) -> Result<(), String> {
         self.backend.ensure_device(gpu)?;
         if name.is_empty() {
-            return Err("deepseek4 parent: hessian accumulate requires a non-empty tensor name".into());
+            return Err(
+                "deepseek4 parent: hessian accumulate requires a non-empty tensor name".into(),
+            );
         }
         if rows == 0 {
             return Ok(());
@@ -191,9 +193,7 @@ impl ParentHessianAccum {
                 let host = download_bf16_prefix_as_f32(gpu, x, need_elems)?;
                 let t = gpu
                     .upload_f32(&host, &[rows, k])
-                    .map_err(|e| {
-                        format!("deepseek4 parent: hessian {name}: F32 upload: {e:?}")
-                    })?;
+                    .map_err(|e| format!("deepseek4 parent: hessian {name}: F32 upload: {e:?}"))?;
                 Some(t)
             }
             _ => unreachable!("dtype gated above"),
@@ -206,9 +206,7 @@ impl ParentHessianAccum {
         if let Some(dir) = self.acts_dump_dir.clone() {
             let host = gpu
                 .download_f32(x_f32)
-                .map_err(|e| {
-                    format!("deepseek4 parent: hessian {name}: acts download: {e:?}")
-                })?;
+                .map_err(|e| format!("deepseek4 parent: hessian {name}: acts download: {e:?}"))?;
             if host.len() < need_elems {
                 return Err(format!(
                     "deepseek4 parent: hessian {name}: acts download short ({} < {need_elems})",
@@ -303,15 +301,13 @@ impl ParentHessianAccum {
                 )
             }
             .map_err(|e| {
-                format!(
-                    "deepseek4 parent: hessian {name}: rocBLAS Gram block {block}: {e}"
-                )
+                format!("deepseek4 parent: hessian {name}: rocBLAS Gram block {block}: {e}")
             })?;
         }
         if let Some(stream) = gpu.active_stream.as_ref() {
-            gpu.hip.stream_synchronize(stream).map_err(|e| {
-                format!("deepseek4 parent: hessian {name}: stream sync: {e:?}")
-            })?;
+            gpu.hip
+                .stream_synchronize(stream)
+                .map_err(|e| format!("deepseek4 parent: hessian {name}: stream sync: {e:?}"))?;
         } else {
             // Null stream: device-wide sync via a zero-size event is not
             // exposed; rocBLAS on the default stream is ordered with later
@@ -354,11 +350,7 @@ impl ParentHessianAccum {
 
     /// Write every accumulated Hessian as `E8H1` `.hblk` into `dir`, exactly
     /// matching what `hipfire-quantize --hessian-dir` consumes.
-    pub fn write_hblk_dir(
-        &self,
-        gpu: &mut Gpu,
-        dir: &Path,
-    ) -> Result<ParentHessianReport, String> {
+    pub fn write_hblk_dir(&self, gpu: &mut Gpu, dir: &Path) -> Result<ParentHessianReport, String> {
         self.backend.ensure_device(gpu)?;
         if self.entries.is_empty() {
             return Err("deepseek4 parent: write_hblk_dir: no tensors accumulated".into());
@@ -386,9 +378,9 @@ impl ParentHessianAccum {
                     "deepseek4 parent: hessian {name}: zero rows accumulated — refusing empty H"
                 ));
             }
-            let mut blocks = gpu.download_f32(&st.h_dev).map_err(|e| {
-                format!("deepseek4 parent: hessian {name}: download H: {e:?}")
-            })?;
+            let mut blocks = gpu
+                .download_f32(&st.h_dev)
+                .map_err(|e| format!("deepseek4 parent: hessian {name}: download H: {e:?}"))?;
             let expect = st.n_blocks * HESSIAN_BLOCK * HESSIAN_BLOCK;
             if blocks.len() < expect {
                 return Err(format!(
@@ -406,9 +398,8 @@ impl ParentHessianAccum {
             }
 
             let input_asym = symmetrize_blocks(&mut bytes, st.n_blocks);
-            let stats = validate_blocks(&bytes, st.n_blocks).map_err(|e| {
-                format!("deepseek4 parent: hessian {name}: {e}")
-            })?;
+            let stats = validate_blocks(&bytes, st.n_blocks)
+                .map_err(|e| format!("deepseek4 parent: hessian {name}: {e}"))?;
 
             write_hblk_file(dir, name, st.k, &bytes)?;
 
@@ -465,9 +456,7 @@ impl ParentHessianAccum {
                 .and_then(|_| w.file.write_all(&w.rows.to_le_bytes()))
                 .and_then(|_| w.file.write_all(&(w.k as u32).to_le_bytes()))
                 .and_then(|_| w.file.flush())
-                .map_err(|e| {
-                    format!("deepseek4 parent: finalize acts dump {name}: {e}")
-                })?;
+                .map_err(|e| format!("deepseek4 parent: finalize acts dump {name}: {e}"))?;
             total_rows += w.rows as u64;
         }
         self.acts_writers.clear();
@@ -482,12 +471,8 @@ impl ParentHessianAccum {
         dir: &Path,
     ) -> Result<(), String> {
         use std::io::Write;
-        std::fs::create_dir_all(dir).map_err(|e| {
-            format!(
-                "deepseek4 parent: create acts dir {}: {e}",
-                dir.display()
-            )
-        })?;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("deepseek4 parent: create acts dir {}: {e}", dir.display()))?;
         if !self.acts_writers.contains_key(name) {
             let key = hessian_key(name);
             let path = dir.join(format!("{key}.acts"));
@@ -495,12 +480,7 @@ impl ParentHessianAccum {
                 .write(true)
                 .create_new(true)
                 .open(&path)
-                .map_err(|e| {
-                    format!(
-                        "deepseek4 parent: create acts {}: {e}",
-                        path.display()
-                    )
-                })?;
+                .map_err(|e| format!("deepseek4 parent: create acts {}: {e}", path.display()))?;
             let mut writer = std::io::BufWriter::new(file);
             writer
                 .write_all(&0u32.to_le_bytes())
@@ -599,14 +579,8 @@ pub fn check_p3_tensor_names(cfg: &ParentQuantConfig, captured: &[String]) -> P3
     let expected_list = p3_tensor_names(cfg);
     let expected: BTreeSet<&str> = expected_list.iter().map(String::as_str).collect();
     let got: BTreeSet<&str> = captured.iter().map(String::as_str).collect();
-    let missing: Vec<String> = expected
-        .difference(&got)
-        .map(|s| (*s).to_owned())
-        .collect();
-    let extra: Vec<String> = got
-        .difference(&expected)
-        .map(|s| (*s).to_owned())
-        .collect();
+    let missing: Vec<String> = expected.difference(&got).map(|s| (*s).to_owned()).collect();
+    let extra: Vec<String> = got.difference(&expected).map(|s| (*s).to_owned()).collect();
     P3NameCheck {
         expected: expected_list.len(),
         captured: captured.len(),
@@ -671,9 +645,8 @@ pub fn project_p3_hblk_bytes(cfg: &ParentQuantConfig) -> Result<(usize, u64), St
     let names = p3_tensor_names(cfg);
     let mut total = 0u64;
     for name in &names {
-        let k = expected_k_for_p3_name(name).ok_or_else(|| {
-            format!("deepseek4 parent: no expected K for P3 name {name}")
-        })?;
+        let k = expected_k_for_p3_name(name)
+            .ok_or_else(|| format!("deepseek4 parent: no expected K for P3 name {name}"))?;
         total = total
             .checked_add(hblk_bytes_for_k(k)?)
             .ok_or_else(|| "deepseek4 parent: projected hblk bytes overflow".to_owned())?;
@@ -829,12 +802,8 @@ pub fn write_hblk_file(
             blocks.len()
         ));
     }
-    std::fs::create_dir_all(out_dir).map_err(|e| {
-        format!(
-            "deepseek4 parent: create {}: {e}",
-            out_dir.display()
-        )
-    })?;
+    std::fs::create_dir_all(out_dir)
+        .map_err(|e| format!("deepseek4 parent: create {}: {e}", out_dir.display()))?;
     let path = out_dir.join(format!("{}.hblk", hessian_key(tensor_name)));
     let mut file = OpenOptions::new()
         .write(true)
@@ -953,10 +922,18 @@ mod tests {
         assert_eq!(set.len(), names.len(), "duplicate P3 names");
         // Spot-check ratio gates: layer 0 ratio 0 → no compressor; layer 2
         // ratio 4 → indexer; layer 3 ratio 128 → compressor only.
-        assert!(!names.iter().any(|n| n == "layers.0.attn.compressor.wkv.weight"));
-        assert!(names.iter().any(|n| n == "layers.2.attn.indexer.wq_b.weight"));
-        assert!(names.iter().any(|n| n == "layers.3.attn.compressor.wkv.weight"));
-        assert!(!names.iter().any(|n| n == "layers.3.attn.indexer.wq_b.weight"));
+        assert!(!names
+            .iter()
+            .any(|n| n == "layers.0.attn.compressor.wkv.weight"));
+        assert!(names
+            .iter()
+            .any(|n| n == "layers.2.attn.indexer.wq_b.weight"));
+        assert!(names
+            .iter()
+            .any(|n| n == "layers.3.attn.compressor.wkv.weight"));
+        assert!(!names
+            .iter()
+            .any(|n| n == "layers.3.attn.indexer.wq_b.weight"));
         // MTP must never appear.
         assert!(!names.iter().any(|n| n.starts_with("mtp.")));
     }
@@ -970,7 +947,11 @@ mod tests {
         let check = check_p3_tensor_names(&cfg, &names);
         assert!(!check.ok());
         assert_eq!(check.expected, 554);
-        assert!(check.missing.iter().any(|n| n == &removed), "{:?}", check.missing);
+        assert!(
+            check.missing.iter().any(|n| n == &removed),
+            "{:?}",
+            check.missing
+        );
         assert_eq!(check.extra, vec!["not.a.p3.tensor.weight".to_owned()]);
     }
 
@@ -994,10 +975,8 @@ mod tests {
         assert_eq!(stats.max_asymmetry, 0.0);
         assert!(stats.min_diag >= 0.0);
 
-        let dir = std::env::temp_dir().join(format!(
-            "hipfire_parent_hblk_layout_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("hipfire_parent_hblk_layout_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = write_hblk_file(&dir, "layers.0.test.weight", k, &body).unwrap();
@@ -1121,9 +1100,7 @@ mod tests {
             })
             .collect();
 
-        let x = gpu
-            .upload_f32(&values, &[rows, k])
-            .expect("upload X");
+        let x = gpu.upload_f32(&values, &[rows, k]).expect("upload X");
 
         // Feed twice to exercise beta=1 accumulation (matches collector test).
         acc.accumulate(&mut gpu, "layers.0.test.weight", &x, rows, k)
@@ -1132,10 +1109,8 @@ mod tests {
             .expect("accumulate 2");
         assert_eq!(acc.rows_seen("layers.0.test.weight"), 2 * rows);
 
-        let dir = std::env::temp_dir().join(format!(
-            "hipfire_parent_hess_gpu_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("hipfire_parent_hess_gpu_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let report = acc.write_hblk_dir(&mut gpu, &dir).expect("write_hblk_dir");
         assert_eq!(report.tensors, 1);

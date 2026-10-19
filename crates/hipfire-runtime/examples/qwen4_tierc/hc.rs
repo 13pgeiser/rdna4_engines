@@ -44,9 +44,9 @@ use hipfire_dispatch::pipeline::{
     HyperWriteOp, Step,
 };
 use rdna_compute::tensor_ops::{
-    bf16_roundtrip_f32, hc_activation_fused_f32, hyper_norm, hyper_read_projected,
-    hyper_write, hyper_write_norm, scale_f32, Bf16Roundtrip, HcActivationFused, HyperNextGates,
-    HyperNorm, HyperReadProjected, HyperWrite, ScaleF32,
+    bf16_roundtrip_f32, hc_activation_fused_f32, hyper_norm, hyper_read_projected, hyper_write,
+    hyper_write_norm, scale_f32, Bf16Roundtrip, HcActivationFused, HyperNextGates, HyperNorm,
+    HyperReadProjected, HyperWrite, ScaleF32,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -64,18 +64,66 @@ const DECODE_ROWS: [usize; 9] = [1, 7, 8, 9, 15, 16, 17, 31, 32];
 const EPS: f32 = 1.0e-6;
 
 pub const CASES: &[Q4Case] = &[
-    Q4Case { name: "qwen4_hc_streams_init_from_embed_batched", timeout_s: 90, run: case_streams_init },
-    Q4Case { name: "qwen4_hyper_norm_f32", timeout_s: 90, run: case_hyper_norm },
-    Q4Case { name: "qwen4_hc_read_activation_chain_bf16_roundtrip_scale_silu", timeout_s: 90, run: case_activation_chain },
-    Q4Case { name: "qwen4_hc_activation_fused_f32_mtp_only", timeout_s: 90, run: case_activation_fused },
-    Q4Case { name: "qwen4_hyper_read_projected_f32", timeout_s: 90, run: case_read_projected },
-    Q4Case { name: "qwen4_hyper_read_projected_rotate_f32", timeout_s: 90, run: case_read_projected_rotate },
-    Q4Case { name: "qwen4_hyper_write_f32", timeout_s: 90, run: case_hyper_write },
-    Q4Case { name: "qwen4_hyper_write_norm_f32", timeout_s: 120, run: case_hyper_write_norm },
-    Q4Case { name: "qwen4_hc_read_route_execute_hyper_read", timeout_s: 180, run: case_route_read },
-    Q4Case { name: "qwen4_hc_final_read_route_execute_final_hyper", timeout_s: 180, run: case_route_final_read },
-    Q4Case { name: "qwen4_hc_write_route_execute_hyper_write", timeout_s: 180, run: case_route_write },
-    Q4Case { name: "qwen4_hc_step_program_write_read_pairs", timeout_s: 240, run: case_step_program },
+    Q4Case {
+        name: "qwen4_hc_streams_init_from_embed_batched",
+        timeout_s: 90,
+        run: case_streams_init,
+    },
+    Q4Case {
+        name: "qwen4_hyper_norm_f32",
+        timeout_s: 90,
+        run: case_hyper_norm,
+    },
+    Q4Case {
+        name: "qwen4_hc_read_activation_chain_bf16_roundtrip_scale_silu",
+        timeout_s: 90,
+        run: case_activation_chain,
+    },
+    Q4Case {
+        name: "qwen4_hc_activation_fused_f32_mtp_only",
+        timeout_s: 90,
+        run: case_activation_fused,
+    },
+    Q4Case {
+        name: "qwen4_hyper_read_projected_f32",
+        timeout_s: 90,
+        run: case_read_projected,
+    },
+    Q4Case {
+        name: "qwen4_hyper_read_projected_rotate_f32",
+        timeout_s: 90,
+        run: case_read_projected_rotate,
+    },
+    Q4Case {
+        name: "qwen4_hyper_write_f32",
+        timeout_s: 90,
+        run: case_hyper_write,
+    },
+    Q4Case {
+        name: "qwen4_hyper_write_norm_f32",
+        timeout_s: 120,
+        run: case_hyper_write_norm,
+    },
+    Q4Case {
+        name: "qwen4_hc_read_route_execute_hyper_read",
+        timeout_s: 180,
+        run: case_route_read,
+    },
+    Q4Case {
+        name: "qwen4_hc_final_read_route_execute_final_hyper",
+        timeout_s: 180,
+        run: case_route_final_read,
+    },
+    Q4Case {
+        name: "qwen4_hc_write_route_execute_hyper_write",
+        timeout_s: 180,
+        run: case_route_write,
+    },
+    Q4Case {
+        name: "qwen4_hc_step_program_write_read_pairs",
+        timeout_s: 240,
+        run: case_step_program,
+    },
 ];
 
 // ── CPU twins ─────────────────────────────────────────────────────────────────
@@ -123,7 +171,11 @@ fn cpu_norm_rows(x: &[f32], w: &[f32], rows: usize) -> Vec<f32> {
     for r in 0..rows {
         for b in 0..HC_STREAMS {
             let o = r * HC_WIDE + b * HIDDEN;
-            cpu_norm_branch(&x[o..o + HIDDEN], &w[b * HIDDEN..(b + 1) * HIDDEN], &mut out[o..o + HIDDEN]);
+            cpu_norm_branch(
+                &x[o..o + HIDDEN],
+                &w[b * HIDDEN..(b + 1) * HIDDEN],
+                &mut out[o..o + HIDDEN],
+            );
         }
     }
     out
@@ -177,7 +229,10 @@ fn cpu_hc_act(v: f32) -> f32 {
 }
 
 fn dot64(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(&x, &y)| x as f64 * y as f64).sum::<f64>() as f32
+    a.iter()
+        .zip(b)
+        .map(|(&x, &y)| x as f64 * y as f64)
+        .sum::<f64>() as f32
 }
 
 /// Whole HC read for `rows` rows (weights `down [320, wide]`, `up [wide, 320]`).
@@ -294,8 +349,14 @@ fn case_streams_init(gpu: &mut Gpu) -> Result<String, String> {
         let emb = rng.vec(rows * HIDDEN, -4.0, 4.0);
         let et = up_f32(gpu, &emb)?;
         let st = sentinel_f32(gpu, rows * HC_WIDE)?;
-        gpu.hc_streams_init_from_embed_batched(&et, &st, HIDDEN as i32, HC_STREAMS as i32, rows as i32)
-            .map_err(e)?;
+        gpu.hc_streams_init_from_embed_batched(
+            &et,
+            &st,
+            HIDDEN as i32,
+            HC_STREAMS as i32,
+            rows as i32,
+        )
+        .map_err(e)?;
         let got = down_f32(gpu, &st)?;
         let mut want = vec![0.0f32; rows * HC_WIDE];
         for r in 0..rows {
@@ -360,17 +421,37 @@ fn case_activation_chain(gpu: &mut Gpu) -> Result<String, String> {
         let roundtrip = |gpu: &mut Gpu| -> Result<(), String> {
             bf16_roundtrip_f32(
                 gpu,
-                &Bf16Roundtrip { input: &low, scratch: &staging, output: &low, elements: rows * HC_LOW },
+                &Bf16Roundtrip {
+                    input: &low,
+                    scratch: &staging,
+                    output: &low,
+                    elements: rows * HC_LOW,
+                },
             )
             .map_err(e)
         };
         roundtrip(gpu)?;
         let s1: Vec<f32> = v.iter().map(|&x| bf(x)).collect();
-        out.push(exact_f32(&format!("roundtrip#1 rows={rows}"), &down_f32(gpu, &low)?, &s1));
-        scale_f32(gpu, &ScaleF32 { values: &low, scale: 1.0 / HC_STREAMS as f32 }).map_err(e)?;
+        out.push(exact_f32(
+            &format!("roundtrip#1 rows={rows}"),
+            &down_f32(gpu, &low)?,
+            &s1,
+        ));
+        scale_f32(
+            gpu,
+            &ScaleF32 {
+                values: &low,
+                scale: 1.0 / HC_STREAMS as f32,
+            },
+        )
+        .map_err(e)?;
         roundtrip(gpu)?;
         let s2: Vec<f32> = s1.iter().map(|&x| bf(x * 0.25)).collect();
-        out.push(exact_f32(&format!("scale+roundtrip#2 rows={rows}"), &down_f32(gpu, &low)?, &s2));
+        out.push(exact_f32(
+            &format!("scale+roundtrip#2 rows={rows}"),
+            &down_f32(gpu, &low)?,
+            &s2,
+        ));
         gpu.silu_f32(&low, &low).map_err(e)?;
         roundtrip(gpu)?;
         let s3: Vec<f32> = s2.iter().map(|&x| bf(x / (1.0 + (-x).exp()))).collect();
@@ -395,8 +476,15 @@ fn case_activation_fused(gpu: &mut Gpu) -> Result<String, String> {
         let v = rng.vec(rows * HC_LOW, -6.0, 6.0);
         let want: Vec<f32> = v.iter().map(|&x| cpu_hc_act(x)).collect();
         let low = up_f32(gpu, &v)?;
-        hc_activation_fused_f32(gpu, &HcActivationFused { values: &low, scale: 0.25, bf16_out: None })
-            .map_err(e)?;
+        hc_activation_fused_f32(
+            gpu,
+            &HcActivationFused {
+                values: &low,
+                scale: 0.25,
+                bf16_out: None,
+            },
+        )
+        .map_err(e)?;
         out.push(close_f32(
             &format!("activation_fused f32 rows={rows}"),
             &down_f32(gpu, &low)?,
@@ -405,9 +493,19 @@ fn case_activation_fused(gpu: &mut Gpu) -> Result<String, String> {
         ));
         let low2 = up_f32(gpu, &v)?;
         let packed = up_bf16(gpu, &vec![0.0f32; rows * HC_LOW])?;
-        hc_activation_fused_f32(gpu, &HcActivationFused { values: &low2, scale: 0.25, bf16_out: Some(&packed) })
-            .map_err(e)?;
-        let got: Vec<f32> = down_bf16(gpu, &packed)?.into_iter().map(bf16_bits_to_f32).collect();
+        hc_activation_fused_f32(
+            gpu,
+            &HcActivationFused {
+                values: &low2,
+                scale: 0.25,
+                bf16_out: Some(&packed),
+            },
+        )
+        .map_err(e)?;
+        let got: Vec<f32> = down_bf16(gpu, &packed)?
+            .into_iter()
+            .map(bf16_bits_to_f32)
+            .collect();
         out.push(close_f32(
             &format!("activation_fused bf16_out rows={rows}"),
             &got,
@@ -435,7 +533,11 @@ fn case_read_projected(gpu: &mut Gpu) -> Result<String, String> {
         let x = rng.vec(rows * HC_WIDE, -2.0, 2.0);
         let normalized = rng.vec_bf16_exact(rows * HC_WIDE, -3.0, 3.0);
         let up = rng.vec(rows * HC_WIDE, -5.0, 5.0);
-        let (xt, nt, ut) = (up_f32(gpu, &x)?, up_f32(gpu, &normalized)?, up_f32(gpu, &up)?);
+        let (xt, nt, ut) = (
+            up_f32(gpu, &x)?,
+            up_f32(gpu, &normalized)?,
+            up_f32(gpu, &up)?,
+        );
         let mt = sentinel_f32(gpu, rows * HIDDEN)?;
         hyper_read_projected(
             gpu,
@@ -472,8 +574,14 @@ fn case_read_projected(gpu: &mut Gpu) -> Result<String, String> {
 fn case_read_projected_rotate(gpu: &mut Gpu) -> Result<String, String> {
     let mut rng = Rng::new(0x4843_5001);
     gpu.ensure_mq_signs().map_err(e)?;
-    let s1 = down_f32(gpu, gpu.scratch.mq_signs1.as_ref().ok_or("mq_signs1 missing")?)?;
-    let s2 = down_f32(gpu, gpu.scratch.mq_signs2.as_ref().ok_or("mq_signs2 missing")?)?;
+    let s1 = down_f32(
+        gpu,
+        gpu.scratch.mq_signs1.as_ref().ok_or("mq_signs1 missing")?,
+    )?;
+    let s2 = down_f32(
+        gpu,
+        gpu.scratch.mq_signs2.as_ref().ok_or("mq_signs2 missing")?,
+    )?;
     let mut out = Vec::new();
     for &rows in &ROW_COUNTS {
         let normalized = rng.vec_bf16_exact(rows * HC_WIDE, -3.0, 3.0);
@@ -481,7 +589,8 @@ fn case_read_projected_rotate(gpu: &mut Gpu) -> Result<String, String> {
         let (nt, ut) = (up_f32(gpu, &normalized)?, up_f32(gpu, &up)?);
         let mt = sentinel_f32(gpu, rows * HIDDEN)?;
         let rt = sentinel_f32(gpu, rows * HIDDEN)?;
-        gpu.hyper_read_projected_rotate(&nt, &ut, &mt, &rt, HIDDEN, rows).map_err(e)?;
+        gpu.hyper_read_projected_rotate(&nt, &ut, &mt, &rt, HIDDEN, rows)
+            .map_err(e)?;
         gpu.scratch.prerotated = None;
         let got_mixed = down_f32(gpu, &mt)?;
         out.push(close_f32(
@@ -492,7 +601,11 @@ fn case_read_projected_rotate(gpu: &mut Gpu) -> Result<String, String> {
         ));
         let mut want_rot = Vec::with_capacity(rows * HIDDEN);
         for g in 0..rows * HIDDEN / 256 {
-            want_rot.extend(cpu_rotate_group(&got_mixed[g * 256..(g + 1) * 256], &s1, &s2));
+            want_rot.extend(cpu_rotate_group(
+                &got_mixed[g * 256..(g + 1) * 256],
+                &s1,
+                &s2,
+            ));
         }
         out.push(exact_f32(
             &format!("read_projected_rotate rotated rows={rows}"),
@@ -566,7 +679,11 @@ fn case_hyper_write_norm(gpu: &mut Gpu) -> Result<String, String> {
         let nt = sentinel_f32(gpu, rows * HC_WIDE)?;
         let qt = sentinel_f32(gpu, 16 * rows)?;
         let clr = up_f32(gpu, &vec![7.0f32; CLEAR_N])?;
-        let next = HyperNextGates { norm_weight: &nnt, inject: &injt, quarters: &qt };
+        let next = HyperNextGates {
+            norm_weight: &nnt,
+            inject: &injt,
+            quarters: &qt,
+        };
         hyper_write_norm(
             gpu,
             &HyperWrite {
@@ -672,7 +789,10 @@ fn case_hyper_write_norm(gpu: &mut Gpu) -> Result<String, String> {
             &cpu_norm_rows(&want_s2, &wn, rows),
             BF16_INPUT_F32_ACCUM,
         ));
-        free_all(gpu, vec![wnt, nnt, injt, st, mt, gt, nt, qt, clr, st2, mt2, gt2, nt2])?;
+        free_all(
+            gpu,
+            vec![wnt, nnt, injt, st, mt, gt, nt, qt, clr, st2, mt2, gt2, nt2],
+        )?;
     }
     all(out)
 }
@@ -686,7 +806,11 @@ fn run_route_read(gpu: &mut Gpu, final_read: bool) -> Result<String, String> {
     let wn = rng.vec_bf16_exact(HC_WIDE, -0.5, 0.5);
     let down = rng.vec_bf16_exact(HC_LOW * HC_WIDE, -0.02, 0.02);
     let upw = rng.vec_bf16_exact(HC_WIDE * HC_LOW, -0.1, 0.1);
-    let (wnt, downt, upt) = (up_bf16(gpu, &wn)?, up_bf16(gpu, &down)?, up_bf16(gpu, &upw)?);
+    let (wnt, downt, upt) = (
+        up_bf16(gpu, &wn)?,
+        up_bf16(gpu, &down)?,
+        up_bf16(gpu, &upw)?,
+    );
     let mut out = Vec::new();
     for &rows in &ROW_COUNTS {
         let x = rng.vec(rows * HC_WIDE, -2.0, 2.0);
@@ -827,7 +951,14 @@ fn case_step_program(gpu: &mut Gpu) -> Result<String, String> {
     // (rows, prefill_invariant_scope): gfx942 prefill pins the invariant scope
     // (`gpu_forward.rs trunk_prefill_invariant_scope`), so `route_rows` is 8192
     // and the write+read pair is never fused there; decode (scope off) fuses at <= 8 rows.
-    for &(rows, invariant) in &[(1usize, false), (7, false), (8, false), (1, true), (7, true), (33, true)] {
+    for &(rows, invariant) in &[
+        (1usize, false),
+        (7, false),
+        (8, false),
+        (1, true),
+        (7, true),
+        (33, true),
+    ] {
         let s0 = rng.vec(rows * HC_WIDE, -2.0, 2.0);
         let mix_a = rng.vec(rows * HIDDEN, -1.0, 1.0);
         let mix_b = rng.vec(rows * HIDDEN, -1.0, 1.0);
@@ -892,11 +1023,32 @@ fn case_step_program(gpu: &mut Gpu) -> Result<String, String> {
         let g_b = cpu_gates(&inj_b, &cpu_norm_rows(&s1, &wn_b, rows), rows);
         let s2 = cpu_write(&s1, &mix_b, &g_b, rows);
         let (_, m_b) = cpu_read(&s2, &rn_b, &down, &upw, rows);
-        out.push(close_f32(&format!("program read A mixed rows={rows} invariant={invariant}"), &down_f32(gpu, &out_a)?, &m_a, BF16_INPUT_F32_ACCUM));
-        out.push(close_f32(&format!("program final streams rows={rows} invariant={invariant}"), &down_f32(gpu, &st)?, &s2, BF16_INPUT_F32_ACCUM));
-        out.push(close_f32(&format!("program read B mixed rows={rows} invariant={invariant}"), &down_f32(gpu, &out_b)?, &m_b, BF16_INPUT_F32_ACCUM));
-        free_all(gpu, vec![st, mat, mbt, gat, gbt, nt, lowt, uot, out_a, out_b, rot])?;
+        out.push(close_f32(
+            &format!("program read A mixed rows={rows} invariant={invariant}"),
+            &down_f32(gpu, &out_a)?,
+            &m_a,
+            BF16_INPUT_F32_ACCUM,
+        ));
+        out.push(close_f32(
+            &format!("program final streams rows={rows} invariant={invariant}"),
+            &down_f32(gpu, &st)?,
+            &s2,
+            BF16_INPUT_F32_ACCUM,
+        ));
+        out.push(close_f32(
+            &format!("program read B mixed rows={rows} invariant={invariant}"),
+            &down_f32(gpu, &out_b)?,
+            &m_b,
+            BF16_INPUT_F32_ACCUM,
+        ));
+        free_all(
+            gpu,
+            vec![st, mat, mbt, gat, gbt, nt, lowt, uot, out_a, out_b, rot],
+        )?;
     }
-    free_all(gpu, vec![wn_at, wn_bt, rn_at, rn_bt, inj_at, inj_bt, downt, upt])?;
+    free_all(
+        gpu,
+        vec![wn_at, wn_bt, rn_at, rn_bt, inj_at, inj_bt, downt, upt],
+    )?;
     all(out)
 }

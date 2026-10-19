@@ -149,9 +149,8 @@ impl ParentManifest {
             return Err("deepseek4 parent: gpu_arch must be non-empty".into());
         }
 
-        let exe = std::env::current_exe().map_err(|e| {
-            format!("deepseek4 parent: cannot resolve current executable: {e}")
-        })?;
+        let exe = std::env::current_exe()
+            .map_err(|e| format!("deepseek4 parent: cannot resolve current executable: {e}"))?;
         let binary = exe
             .to_str()
             .ok_or_else(|| {
@@ -195,9 +194,8 @@ impl ParentManifest {
     }
 
     pub fn write_to(&self, path: &Path) -> Result<(), String> {
-        let json = serde_json::to_string_pretty(self).map_err(|e| {
-            format!("deepseek4 parent: failed to serialize manifest: {e}")
-        })?;
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("deepseek4 parent: failed to serialize manifest: {e}"))?;
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent).map_err(|e| {
@@ -304,21 +302,15 @@ impl ParentManifest {
                 ));
             }
             if t.k == 0 {
-                return Err(format!(
-                    "deepseek4 parent: capture.tensors[{i}].k is zero"
-                ));
+                return Err(format!("deepseek4 parent: capture.tensors[{i}].k is zero"));
             }
         }
         for (i, out) in self.outputs.iter().enumerate() {
             if out.sha256.trim().is_empty() {
-                return Err(format!(
-                    "deepseek4 parent: outputs[{i}].sha256 is empty"
-                ));
+                return Err(format!("deepseek4 parent: outputs[{i}].sha256 is empty"));
             }
             if out.bytes == 0 {
-                return Err(format!(
-                    "deepseek4 parent: outputs[{i}].bytes is zero"
-                ));
+                return Err(format!("deepseek4 parent: outputs[{i}].bytes is zero"));
             }
         }
         Ok(())
@@ -361,10 +353,12 @@ pub fn sha256_bytes(bytes: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 
 fn git_stdout(args: &[&str]) -> Result<String, String> {
-    let out = Command::new("git")
-        .args(args)
-        .output()
-        .map_err(|e| format!("deepseek4 parent: failed to spawn git {}: {e}", args.join(" ")))?;
+    let out = Command::new("git").args(args).output().map_err(|e| {
+        format!(
+            "deepseek4 parent: failed to spawn git {}: {e}",
+            args.join(" ")
+        )
+    })?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(format!(
@@ -383,10 +377,12 @@ fn git_stdout(args: &[&str]) -> Result<String, String> {
 }
 
 fn git_stdout_bytes(args: &[&str]) -> Result<Vec<u8>, String> {
-    let out = Command::new("git")
-        .args(args)
-        .output()
-        .map_err(|e| format!("deepseek4 parent: failed to spawn git {}: {e}", args.join(" ")))?;
+    let out = Command::new("git").args(args).output().map_err(|e| {
+        format!(
+            "deepseek4 parent: failed to spawn git {}: {e}",
+            args.join(" ")
+        )
+    })?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(format!(
@@ -432,11 +428,7 @@ fn resolve_rocm_root() -> Option<PathBuf> {
             }
         }
     }
-    for candidate in [
-        "/opt/rocm/core",
-        "/opt/rocm/core-7.14",
-        "/opt/rocm",
-    ] {
+    for candidate in ["/opt/rocm/core", "/opt/rocm/core-7.14", "/opt/rocm"] {
         let p = PathBuf::from(candidate);
         if p.is_dir() && p.join(".info").join("version").is_file() {
             return Some(canonicalize_or_self(p));
@@ -895,7 +887,10 @@ mod tests {
         let mut m = sample_manifest();
         m.source.shards.clear();
         let err = m.validate().unwrap_err();
-        assert!(err.contains("source.shards is empty"), "unexpected err: {err}");
+        assert!(
+            err.contains("source.shards is empty"),
+            "unexpected err: {err}"
+        );
     }
 
     #[test]

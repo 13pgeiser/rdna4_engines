@@ -3864,7 +3864,12 @@ fn run_quality_candidate(
     let mut hfq = HfqFile::open(model_path)
         .map_err(|error| format!("open HFQM {}: {error}", model_path.display()))?;
     let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
-    hipfire_runtime::ple_sidecar::attach_validation_ple_rows(&mut hfq, model_path, hipfire_config::memory::ple_format(), &gpu.arch)
+    hipfire_runtime::ple_sidecar::attach_validation_ple_rows(
+        &mut hfq,
+        model_path,
+        hipfire_config::memory::ple_format(),
+        &gpu.arch,
+    )
     .map_err(|error| format!("qwen4 PLE rows: {error}"))?;
     // Admission is GPU-arch aware: an expert-slab artifact admits only on a
     // supported arch. Initialising the GPU allocates no model memory.

@@ -37,7 +37,10 @@ pub enum Item {
     Label(String),
     /// `s_branch` / `s_cbranch_*` to a label; the offset is resolved after
     /// hazard NOP insertion.
-    Branch { op: SoppOp, target: String },
+    Branch {
+        op: SoppOp,
+        target: String,
+    },
 }
 
 /// What the descriptor and metadata need to know about a kernel.
@@ -75,7 +78,12 @@ pub enum KernArgKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct KernArg { pub name: String, pub offset: u32, pub size: u32, pub kind: KernArgKind }
+pub struct KernArg {
+    pub name: String,
+    pub offset: u32,
+    pub size: u32,
+    pub kind: KernArgKind,
+}
 
 /// A finished, certified kernel.
 #[derive(Clone, Debug)]

@@ -2009,12 +2009,19 @@ mod test {
                 for (i, &value) in got.iter().enumerate() {
                     let coord = POINTS[(i / 8) % POINTS.len()].1[i % 8];
                     let want = (row_scale * block_scale * 0.88) * coord;
-                    assert_eq!(value.to_bits(), want.to_bits(), "header={bits:04x} scale={code:02x} coordinate={i}");
+                    assert_eq!(
+                        value.to_bits(),
+                        want.to_bits(),
+                        "header={bits:04x} scale={code:02x} coordinate={i}"
+                    );
                 }
             }
         }
         for k in [256, 512, 4096] {
-            assert_eq!(crate::gemv::row_bytes(CpuQuant::Mfp4G32E8, k), 16 + (k / 32) * 17);
+            assert_eq!(
+                crate::gemv::row_bytes(CpuQuant::Mfp4G32E8, k),
+                16 + (k / 32) * 17
+            );
         }
     }
 
@@ -2101,8 +2108,8 @@ mod test {
         //   38/39 MQ{2,3}G256GL — MoE-indexed only, no dense GEMV kernel exists
         //   22    TidI32 — a routing table, not a weight
         for qt in [
-            0u8, 4, 5, 14, 21, 22, 23, 24, 25, 26, 27, 28, 29, 32, 33, 35, 36, 37, 38, 39, 43,
-            46, 255,
+            0u8, 4, 5, 14, 21, 22, 23, 24, 25, 26, 27, 28, 29, 32, 33, 35, 36, 37, 38, 39, 43, 46,
+            255,
         ] {
             assert_eq!(CpuQuant::from_quant_type(qt), None, "qt {qt}");
         }

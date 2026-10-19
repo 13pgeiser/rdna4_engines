@@ -71,7 +71,11 @@ impl NpuTrunkMode {
 
     /// Resolve auto before any arch-specific work, logging or allocation.
     pub fn resolve(self, arch: &str) -> Self {
-        if self == Self::Auto && arch != "gfx1151" { Self::Off } else { self }
+        if self == Self::Auto && arch != "gfx1151" {
+            Self::Off
+        } else {
+            self
+        }
     }
 }
 
@@ -82,9 +86,13 @@ impl FromStr for NpuTrunkMode {
     fn from_str(s: &str) -> Result<Self, String> {
         let t = s.trim();
         for mode in Self::ALL {
-            if t.eq_ignore_ascii_case(mode.as_str()) { return Ok(mode); }
+            if t.eq_ignore_ascii_case(mode.as_str()) {
+                return Ok(mode);
+            }
         }
-        Err(format!("invalid npu trunk mode {s:?} (expected off, auto, on or emulate)"))
+        Err(format!(
+            "invalid npu trunk mode {s:?} (expected off, auto, on or emulate)"
+        ))
     }
 }
 
@@ -132,7 +140,9 @@ mod tests {
 
     #[test]
     fn parse_rejects_unknown_and_empty() {
-        for bad in ["", " ", "1", "0", "true", "yes", "enable", "emulated", "of f"] {
+        for bad in [
+            "", " ", "1", "0", "true", "yes", "enable", "emulated", "of f",
+        ] {
             let err = bad.parse::<NpuTrunkMode>().unwrap_err();
             assert!(err.contains("invalid npu trunk mode"), "{bad:?}: {err}");
         }
@@ -152,12 +162,20 @@ mod tests {
     fn env_key_is_the_documented_developer_key() {
         assert_eq!(NPU_TRUNK_ENV, "HIPFIRE_QWEN4_NPU_TRUNK");
         assert_eq!(NPU_TRUNK_DAEMON_KEY, "npu_trunk");
-        let field = hipfire_config::field(NPU_TRUNK_DAEMON_KEY).expect("registered npu_trunk schema");
+        let field =
+            hipfire_config::field(NPU_TRUNK_DAEMON_KEY).expect("registered npu_trunk schema");
         assert_eq!(field.env_compat, Some(NPU_TRUNK_ENV));
-        assert!(matches!(field.default, hipfire_config::DefaultValue::String("auto")));
+        assert!(matches!(
+            field.default,
+            hipfire_config::DefaultValue::String("auto")
+        ));
         for mode in NpuTrunkMode::ALL {
-            assert!(field.validate(&hipfire_config::ConfigValue::String(mode.to_string())).is_ok());
+            assert!(field
+                .validate(&hipfire_config::ConfigValue::String(mode.to_string()))
+                .is_ok());
         }
-        assert!(field.validate(&hipfire_config::ConfigValue::String("invalid".into())).is_err());
+        assert!(field
+            .validate(&hipfire_config::ConfigValue::String("invalid".into()))
+            .is_err());
     }
 }

@@ -222,7 +222,12 @@ impl Kind {
             Self::GateUp => "qwen4_moe_gate_up_silu_iu4_sym",
             Self::Down => "qwen4_moe_down_iu4_sym",
         };
-        format!("{base}{}_pm_{}{}", codec.infix(), arch_name(), if acc { "_acc" } else { "" })
+        format!(
+            "{base}{}_pm_{}{}",
+            codec.infix(),
+            arch_name(),
+            if acc { "_acc" } else { "" }
+        )
     }
 }
 

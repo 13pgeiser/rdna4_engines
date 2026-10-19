@@ -27,9 +27,9 @@
 //!   gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_a0_prod
 //!   gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_a0_noload
 //!   gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_a0_nofold
- //!
- //! Resource ceilings (plan §4): probes ≤192 VGPR, mode a/b LDS 0, mode c
- //! exactly 2048 B; twins ≤192 VGPR, dynamic LDS 30720 B; spill/scratch 0.
+//!
+//! Resource ceilings (plan §4): probes ≤192 VGPR, mode a/b LDS 0, mode c
+//! exactly 2048 B; twins ≤192 VGPR, dynamic LDS 30720 B; spill/scratch 0.
 //! Peak probes: iu4 4-chain 2048 B, iu4 8-chain 2048 B, iu8 4096 B,
 //! f16 8192 B dynamic LDS; same VGPR/spill expectations.
 
@@ -782,7 +782,8 @@ fn pack_mq4g256v2(m: usize, k: usize, salt: u32) -> Vec<u8> {
             // Nonzero dual headers: sc=0.05, zp=-0.4-ish per half (distinct).
             let sc0 = f16_bits(0.05 + (prng_u32((r * gpr + g) as u64, salt) % 20) as f32 * 0.001);
             let zp0 = f16_bits(-0.35);
-            let sc1 = f16_bits(0.07 + (prng_u32((r * gpr + g) as u64, salt ^ 1) % 20) as f32 * 0.001);
+            let sc1 =
+                f16_bits(0.07 + (prng_u32((r * gpr + g) as u64, salt ^ 1) % 20) as f32 * 0.001);
             let zp1 = f16_bits(-0.45);
             blob[dst..dst + 2].copy_from_slice(&sc0.to_le_bytes());
             blob[dst + 2..dst + 4].copy_from_slice(&zp0.to_le_bytes());
@@ -959,7 +960,6 @@ fn ensure_probes(gpu: &mut Gpu) {
         eprintln!("A0 meta: compiled probe symbol {sym} (module {MOD})");
     }
 }
-
 
 fn ensure_peak(gpu: &mut Gpu) {
     const MOD: &str = "halo_iu4_a0_probes";
@@ -1209,10 +1209,34 @@ fn run_peak(gpu: &mut Gpu) {
     let (iu8a, iu8b) = pack_probe_ops_iu8();
     let (f16a, f16b) = pack_probe_ops_f16();
     let probes = [
-        PeakProbe { name: "iu4_probe_independent_lds", lds: PROBE_LDS_BYTES, chains: 4.0, a: iu4a, b: iu4b },
-        PeakProbe { name: "iu4_probe_independent8_lds", lds: PROBE_LDS_BYTES, chains: 8.0, a: iu4c, b: iu4d },
-        PeakProbe { name: "iu8_probe_independent_lds", lds: IU8_PEAK_LDS, chains: 4.0, a: iu8a, b: iu8b },
-        PeakProbe { name: "f16_probe_independent_lds", lds: F16_PEAK_LDS, chains: 4.0, a: f16a, b: f16b },
+        PeakProbe {
+            name: "iu4_probe_independent_lds",
+            lds: PROBE_LDS_BYTES,
+            chains: 4.0,
+            a: iu4a,
+            b: iu4b,
+        },
+        PeakProbe {
+            name: "iu4_probe_independent8_lds",
+            lds: PROBE_LDS_BYTES,
+            chains: 8.0,
+            a: iu4c,
+            b: iu4d,
+        },
+        PeakProbe {
+            name: "iu8_probe_independent_lds",
+            lds: IU8_PEAK_LDS,
+            chains: 4.0,
+            a: iu8a,
+            b: iu8b,
+        },
+        PeakProbe {
+            name: "f16_probe_independent_lds",
+            lds: F16_PEAK_LDS,
+            chains: 4.0,
+            a: f16a,
+            b: f16b,
+        },
     ];
 
     let max_grid = *PEAK_GRIDS.iter().max().unwrap();
@@ -1235,7 +1259,17 @@ fn run_peak(gpu: &mut Gpu) {
 
     // Warmup each symbol once at the smallest peak grid.
     for (i, p) in probes.iter().enumerate() {
-        let _ = launch_probe(gpu, p.name, PEAK_GRIDS[0], PEAK_LOOPS, &bufs[i].0, &bufs[i].1, &d_cs, &d_ticks, p.lds);
+        let _ = launch_probe(
+            gpu,
+            p.name,
+            PEAK_GRIDS[0],
+            PEAK_LOOPS,
+            &bufs[i].0,
+            &bufs[i].1,
+            &d_cs,
+            &d_ticks,
+            p.lds,
+        );
     }
 
     let mut rows: Vec<PeakRow> = Vec::new();
@@ -1250,8 +1284,9 @@ fn run_peak(gpu: &mut Gpu) {
             // 3 samples; take median event time.
             let mut us_samples = Vec::with_capacity(3);
             for _ in 0..3 {
-                let (us, _, _) =
-                    launch_probe(gpu, p.name, g, PEAK_LOOPS, &bufs[i].0, &bufs[i].1, &d_cs, &d_ticks, p.lds);
+                let (us, _, _) = launch_probe(
+                    gpu, p.name, g, PEAK_LOOPS, &bufs[i].0, &bufs[i].1, &d_cs, &d_ticks, p.lds,
+                );
                 us_samples.push(us);
             }
             let event_us = median_f64(&mut us_samples);
@@ -1271,7 +1306,14 @@ fn run_peak(gpu: &mut Gpu) {
                 "{:<28} {:>5} {:>10.2} {:>14.3} {:>10.2} {:>10}",
                 p.name, g, event_us, rate, tops, cs_or
             );
-            rows.push(PeakRow { name: p.name, grid: g, event_us, wmma_per_us_cu: rate, tops, checksum_or: cs_or });
+            rows.push(PeakRow {
+                name: p.name,
+                grid: g,
+                event_us,
+                wmma_per_us_cu: rate,
+                tops,
+                checksum_or: cs_or,
+            });
         }
     }
 
@@ -1286,7 +1328,13 @@ fn run_peak(gpu: &mut Gpu) {
             let d = pct_diff(w[0].tops, w[1].tops);
             let ok = d < 3.0;
             all_plateau &= ok;
-            steps.push(format!("{}->{} {:.2}% {}", w[0].grid, w[1].grid, d, if ok { "ok" } else { "NO" }));
+            steps.push(format!(
+                "{}->{} {:.2}% {}",
+                w[0].grid,
+                w[1].grid,
+                d,
+                if ok { "ok" } else { "NO" }
+            ));
         }
         eprintln!(
             "{}: {}  => {}",
@@ -1378,10 +1426,7 @@ fn run_attribution(gpu: &mut Gpu) {
         for i in 0..3 {
             med[i] = median_f64(&mut samples[i]);
             let mn = samples[i].iter().cloned().fold(f64::INFINITY, f64::min);
-            let mx = samples[i]
-                .iter()
-                .cloned()
-                .fold(f64::NEG_INFINITY, f64::max);
+            let mx = samples[i].iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             eprintln!(
                 "  {:<64} median_us={:.2}  min={:.2} max={:.2}",
                 syms[i], med[i], mn, mx
@@ -1398,7 +1443,9 @@ fn run_attribution(gpu: &mut Gpu) {
             fold_frac * 100.0
         );
         if e >= 0.25 {
-            eprintln!("  W2 eligibility screen on this shape: E≥25% PASS (still needs object budgets)");
+            eprintln!(
+                "  W2 eligibility screen on this shape: E≥25% PASS (still needs object budgets)"
+            );
         } else {
             eprintln!("  W2 eligibility screen on this shape: E≥25% FAIL");
         }

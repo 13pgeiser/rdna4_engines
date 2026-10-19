@@ -46,10 +46,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let find = |frag: &str| {
         hfq.tensor_infos()
             .iter()
-            .find(|t| t.quant_type == 44 && t.shape.len() == 2 && t.name.contains(want) && t.name.contains(frag))
+            .find(|t| {
+                t.quant_type == 44
+                    && t.shape.len() == 2
+                    && t.name.contains(want)
+                    && t.name.contains(frag)
+            })
             .or_else(|| {
                 hfq.tensor_infos().iter().find(|t| {
-                    t.quant_type == 44 && t.name.contains(".mlp.experts.0.") && t.name.contains(frag)
+                    t.quant_type == 44
+                        && t.name.contains(".mlp.experts.0.")
+                        && t.name.contains(frag)
                 })
             })
             .unwrap_or_else(|| panic!("no qt44 {frag} tensor matching {want}"))
@@ -122,7 +129,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 gpu.download_raw_bytes(&dn.buf)?,
             ),
             MemoryTarget::HostMapped => (
-                gpu.host_bytes(&gu.buf).expect("host gate_up bytes").to_vec(),
+                gpu.host_bytes(&gu.buf)
+                    .expect("host gate_up bytes")
+                    .to_vec(),
                 gpu.host_bytes(&dn.buf).expect("host down bytes").to_vec(),
             ),
         };
@@ -130,10 +139,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // loader builds them (blob + slot*stride with slot 0).
         let gu_view = gu.buf.sub_offset(0, gu.buf.byte_size());
         let dn_view = dn.buf.sub_offset(0, dn.buf.byte_size());
-        let gu_ptrs =
-            gpu.upload_raw(&(gu_view.buf.as_ptr() as u64).to_ne_bytes(), &[8])?;
-        let dn_ptrs =
-            gpu.upload_raw(&(dn_view.buf.as_ptr() as u64).to_ne_bytes(), &[8])?;
+        let gu_ptrs = gpu.upload_raw(&(gu_view.buf.as_ptr() as u64).to_ne_bytes(), &[8])?;
+        let dn_ptrs = gpu.upload_raw(&(dn_view.buf.as_ptr() as u64).to_ne_bytes(), &[8])?;
         // k8-specialized kernel: grid.y is always 8 ranks. topk must hold 8
         // entries and y_gate/y_up [8 x mi] each; rank 0 is the comparison.
         // (A 1-entry topk + [mi] outputs overflows rank 1..7 into adjacent
@@ -216,7 +223,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "qt44 MoE down kernel [{label}] disagrees with CPU: {worst:.6e} rel {:.3e}",
             worst / scale
         );
-        println!("MQ4V2_MOE_KERNEL_PARITY PASS (qt44 [{label}], gate_up {gu_m}x{m} + down {m}x{k})");
+        println!(
+            "MQ4V2_MOE_KERNEL_PARITY PASS (qt44 [{label}], gate_up {gu_m}x{m} + down {m}x{k})"
+        );
     }
     Ok(())
 }

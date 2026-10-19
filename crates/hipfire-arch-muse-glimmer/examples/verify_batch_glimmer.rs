@@ -12,18 +12,16 @@ use hipfire_runtime::hfq::HfqFile;
 use rdna_compute::Gpu;
 
 fn main() {
-    let model = std::env::args().nth(1).expect("model path: verify_batch_glimmer <model.mq4>");
+    let model = std::env::args()
+        .nth(1)
+        .expect("model path: verify_batch_glimmer <model.mq4>");
     let mut gpu = Gpu::init().expect("gpu init");
     let hfq = HfqFile::open(std::path::Path::new(&model)).expect("open");
     let cfg = GlimmerConfig::from_hfq(&hfq).expect("cfg");
     let weights = GlimmerWeights::load(&hfq, &cfg, &mut gpu).expect("weights");
     eprintln!(
         "glimmer dim={} layers={} vocab={} window={} lm_head_dtype={:?}",
-        cfg.dim,
-        cfg.n_layers,
-        cfg.vocab_size,
-        cfg.sliding_window,
-        weights.lm_head.gpu_dtype
+        cfg.dim, cfg.n_layers, cfg.vocab_size, cfg.sliding_window, weights.lm_head.gpu_dtype
     );
     // Deterministic token ids (avoid tokenizer dependency). First is BOS.
     let prompt_tokens: Vec<u32> = {
@@ -39,24 +37,82 @@ fn main() {
         }
         let start_pos = 10;
         let block: Vec<u32> = prompt_tokens[10..10 + b].to_vec();
-        let seq_picks = verify_block(&cfg, &weights, &mut state_seq, &mut gpu, &block, start_pos as u32, None).expect("seq verify");
+        let seq_picks = verify_block(
+            &cfg,
+            &weights,
+            &mut state_seq,
+            &mut gpu,
+            &block,
+            start_pos as u32,
+            None,
+        )
+        .expect("seq verify");
 
         let mut state_bat = GlimmerState::new(&mut gpu, &cfg).expect("state");
         for (i, &tok) in prompt_tokens[..10].iter().enumerate() {
             decode_step(&cfg, &weights, &mut state_bat, &mut gpu, tok, i as u32).expect("decode");
         }
         let mut hidden_out = Vec::new();
-        let bat_picks = verify_block_with_capture(&cfg, &weights, &mut state_bat, &mut gpu, &block, start_pos as u32, &[], &mut hidden_out, None).expect("bat verify");
-        assert_eq!(seq_picks, bat_picks, "B={}: picks mismatch seq {:?} bat {:?}", b, seq_picks, bat_picks);
-        eprintln!(" B={}: picks MATCH {:?}", b, &seq_picks[..seq_picks.len().min(4)]);
+        let bat_picks = verify_block_with_capture(
+            &cfg,
+            &weights,
+            &mut state_bat,
+            &mut gpu,
+            &block,
+            start_pos as u32,
+            &[],
+            &mut hidden_out,
+            None,
+        )
+        .expect("bat verify");
+        assert_eq!(
+            seq_picks, bat_picks,
+            "B={}: picks mismatch seq {:?} bat {:?}",
+            b, seq_picks, bat_picks
+        );
+        eprintln!(
+            " B={}: picks MATCH {:?}",
+            b,
+            &seq_picks[..seq_picks.len().min(4)]
+        );
 
         // KV parity: decode one more token and check next-token argmax matches.
         let next_tok = 9999u32;
-        let seq_next = decode_step(&cfg, &weights, &mut state_seq, &mut gpu, next_tok, (start_pos + b) as u32).expect("seq next");
-        let seq_pick = seq_next.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i as u32).unwrap();
-        let bat_next = decode_step(&cfg, &weights, &mut state_bat, &mut gpu, next_tok, (start_pos + b) as u32).expect("bat next");
-        let bat_pick = bat_next.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i as u32).unwrap();
-        assert_eq!(seq_pick, bat_pick, "B={}: post-batch next-token mismatch seq {} bat {}", b, seq_pick, bat_pick);
+        let seq_next = decode_step(
+            &cfg,
+            &weights,
+            &mut state_seq,
+            &mut gpu,
+            next_tok,
+            (start_pos + b) as u32,
+        )
+        .expect("seq next");
+        let seq_pick = seq_next
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i as u32)
+            .unwrap();
+        let bat_next = decode_step(
+            &cfg,
+            &weights,
+            &mut state_bat,
+            &mut gpu,
+            next_tok,
+            (start_pos + b) as u32,
+        )
+        .expect("bat next");
+        let bat_pick = bat_next
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i as u32)
+            .unwrap();
+        assert_eq!(
+            seq_pick, bat_pick,
+            "B={}: post-batch next-token mismatch seq {} bat {}",
+            b, seq_pick, bat_pick
+        );
         eprintln!("  post-batch next token MATCH {}", seq_pick);
 
         state_seq.free_gpu(&mut gpu);

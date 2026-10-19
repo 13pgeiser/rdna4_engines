@@ -39,12 +39,17 @@ const FMTS: [(&str, Fp8Encoding, F8); 4] = [
 /// and string scalars, written one value per quoted token).
 fn strings(key: &str) -> Vec<&'static str> {
     let open = format!("\"{key}\": [");
-    let start = FIXTURE.find(&open).unwrap_or_else(|| panic!("fixture lacks {key}")) + open.len();
+    let start = FIXTURE
+        .find(&open)
+        .unwrap_or_else(|| panic!("fixture lacks {key}"))
+        + open.len();
     let end = start + FIXTURE[start..].find(']').expect("unterminated array");
     FIXTURE[start..end].split('"').skip(1).step_by(2).collect()
 }
 
-fn hex32(s: &str) -> u32 { u32::from_str_radix(s, 16).unwrap() }
+fn hex32(s: &str) -> u32 {
+    u32::from_str_radix(s, 16).unwrap()
+}
 
 /// `(x bits, [codes; 8])` rows of `f8_rne`: four formats with FP16_OVFL=0,
 /// then the same four with FP16_OVFL=1.
@@ -83,7 +88,12 @@ fn rne_sweep_bit_exact() {
             let (name, enc, kind) = FMTS[slot % 4];
             let ovfl = slot >= 4;
             let got = f32_to_f8_rne(enc, kind, f32::from_bits(x), ovfl);
-            assert_eq!(got, *w, "{name} fp16_ovfl={ovfl} x={x:#010x} ({})", f32::from_bits(x));
+            assert_eq!(
+                got,
+                *w,
+                "{name} fp16_ovfl={ovfl} x={x:#010x} ({})",
+                f32::from_bits(x)
+            );
         }
     }
 }
@@ -112,9 +122,17 @@ fn every_finite_code_round_trips() {
                 continue;
             }
             for ovfl in [false, true] {
-                assert_eq!(f32_to_f8_rne(enc, kind, v, ovfl), code, "{name} {code:#04x}");
+                assert_eq!(
+                    f32_to_f8_rne(enc, kind, v, ovfl),
+                    code,
+                    "{name} {code:#04x}"
+                );
                 for rnd in [0, 0x8000_0000, u32::MAX] {
-                    assert_eq!(f32_to_f8_sr(enc, kind, v, rnd, ovfl), code, "{name} sr {code:#04x}");
+                    assert_eq!(
+                        f32_to_f8_sr(enc, kind, v, rnd, ovfl),
+                        code,
+                        "{name} sr {code:#04x}"
+                    );
                 }
             }
         }
@@ -161,9 +179,13 @@ fn fp16_ovfl_table() {
         assert_eq!(f32_to_f8_rne(Ocp, F8::Bf8, s * 60000.0, true), neg | 0x7b);
         for (_, enc, kind) in FMTS {
             for ovfl in [false, true] {
-                let nan = f32::from_bits(f32::NAN.to_bits() | if s < 0.0 { 0x8000_0000 } else { 0 });
+                let nan =
+                    f32::from_bits(f32::NAN.to_bits() | if s < 0.0 { 0x8000_0000 } else { 0 });
                 let got = f32_to_f8_rne(enc, kind, nan, ovfl);
-                assert!(f8_to_f32(enc, kind, got).is_nan(), "{enc:?} {kind:?} NaN → {got:#04x}");
+                assert!(
+                    f8_to_f32(enc, kind, got).is_nan(),
+                    "{enc:?} {kind:?} NaN → {got:#04x}"
+                );
             }
         }
     }
@@ -179,7 +201,11 @@ fn fold_theorem_decode() {
             None => assert!(ocp.is_nan(), "{c:#04x}"),
             Some(h) => {
                 assert!(!ocp.is_nan());
-                assert_eq!(2.0 * f8_to_f32(Fnuz, F8::Fp8, h), ocp, "{c:#04x} → {h:#04x}");
+                assert_eq!(
+                    2.0 * f8_to_f32(Fnuz, F8::Fp8, h),
+                    ocp,
+                    "{c:#04x} → {h:#04x}"
+                );
                 assert_eq!(h, if c == 0x80 { 0x00 } else { c });
             }
         }
@@ -194,7 +220,12 @@ fn fold_theorem_rne_commutes_with_halving() {
         for ovfl in [false, true] {
             let ocp = f32_to_f8_rne(Ocp, F8::Fp8, x, ovfl);
             let image = ocp_e4m3_to_fnuz_half(ocp).expect("in-range OCP RNE is finite");
-            assert_eq!(f32_to_f8_rne(Fnuz, F8::Fp8, x * 0.5, ovfl), image, "x={x} ({:#010x})", x.to_bits());
+            assert_eq!(
+                f32_to_f8_rne(Fnuz, F8::Fp8, x * 0.5, ovfl),
+                image,
+                "x={x} ({:#010x})",
+                x.to_bits()
+            );
         }
     };
     let mut n = 0usize;
@@ -242,20 +273,29 @@ fn f16_round_trip_and_rounding_structure() {
             let sg = |v: f32| if s != 0 { -v } else { v };
             assert_eq!(f32_to_f16_rne(sg(mid)), s | even, "{h:#06x}");
             assert_eq!(f32_to_f16_rne(sg(f32::from_bits(mid.to_bits() - 1))), s | h);
-            assert_eq!(f32_to_f16_rne(sg(f32::from_bits(mid.to_bits() + 1))), s | (h + 1));
+            assert_eq!(
+                f32_to_f16_rne(sg(f32::from_bits(mid.to_bits() + 1))),
+                s | (h + 1)
+            );
             assert_eq!(f32_to_f16_rtz(sg(mid)), s | h);
             assert_eq!(f32_to_f16_rtz(sg(f32::from_bits(b.to_bits() - 1))), s | h);
         }
     }
     // Overflow: 65520 is the tie between 65504 and 2^16.
     assert_eq!(f32_to_f16_rne(65520.0), 0x7c00);
-    assert_eq!(f32_to_f16_rne(f32::from_bits(65520.0f32.to_bits() - 1)), 0x7bff);
+    assert_eq!(
+        f32_to_f16_rne(f32::from_bits(65520.0f32.to_bits() - 1)),
+        0x7bff
+    );
     assert_eq!(f32_to_f16_rtz(1e30), 0x7bff);
     assert_eq!(f32_to_f16_rtz(-f32::INFINITY), 0xfc00);
     assert_eq!(f32_to_f16_rne(-0.0), 0x8000);
     // Below half the smallest subnormal → ±0; just above → smallest subnormal.
     assert_eq!(f32_to_f16_rne(2f32.powi(-25)), 0x0000);
-    assert_eq!(f32_to_f16_rne(f32::from_bits(2f32.powi(-25).to_bits() + 1)), 0x0001);
+    assert_eq!(
+        f32_to_f16_rne(f32::from_bits(2f32.powi(-25).to_bits() + 1)),
+        0x0001
+    );
 }
 
 #[test]
@@ -276,7 +316,10 @@ fn bf16_round_trip_and_rounding_structure() {
             let s16 = (s >> 16) as u16;
             assert_eq!(f32_to_bf16_rne(f32::from_bits(s | mid)), s16 | even);
             assert_eq!(f32_to_bf16_rne(f32::from_bits(s | (mid - 1))), s16 | h);
-            assert_eq!(f32_to_bf16_rne(f32::from_bits(s | (mid + 1))), s16 | (h + 1));
+            assert_eq!(
+                f32_to_bf16_rne(f32::from_bits(s | (mid + 1))),
+                s16 | (h + 1)
+            );
         }
     }
     // Largest finite + half ulp ties to even → Inf.
@@ -291,7 +334,12 @@ fn bf16_round_trip_and_rounding_structure() {
 #[test]
 fn stochastic_rounding_model() {
     // FP8: 20 random bits rnd[31:12]; BF8: 21 bits rnd[31:11].
-    for (enc, kind, bits) in [(Fnuz, F8::Fp8, 20u32), (Fnuz, F8::Bf8, 21), (Ocp, F8::Fp8, 20), (Ocp, F8::Bf8, 21)] {
+    for (enc, kind, bits) in [
+        (Fnuz, F8::Fp8, 20u32),
+        (Fnuz, F8::Bf8, 21),
+        (Ocp, F8::Fp8, 20),
+        (Ocp, F8::Bf8, 21),
+    ] {
         let lo_code = 0x38u8; // a normal code in every format
         let lo = f8_to_f32(enc, kind, lo_code);
         let hi = f8_to_f32(enc, kind, lo_code + 1);
@@ -306,7 +354,10 @@ fn stochastic_rounding_model() {
                 .count();
             assert_eq!(up as u32, d, "{enc:?} {kind:?} d={d}");
             // Bits below the used field are ignored.
-            assert_eq!(f32_to_f8_sr(enc, kind, x, (1 << (32 - bits)) - 1, false), lo_code);
+            assert_eq!(
+                f32_to_f8_sr(enc, kind, x, (1 << (32 - bits)) - 1, false),
+                lo_code
+            );
             let neg = f32_to_f8_sr(enc, kind, -x, u32::MAX, false);
             assert_eq!(neg, 0x80 | (lo_code + 1));
         }
@@ -328,7 +379,10 @@ fn stochastic_rounding_model() {
         for ovfl in [false, true] {
             for x in [f32::NAN, f32::INFINITY, -f32::INFINITY, 1e9, -1e9] {
                 for rnd in [0, 0x1234_5678, u32::MAX] {
-                    assert_eq!(f32_to_f8_sr(enc, kind, x, rnd, ovfl), f32_to_f8_rne(enc, kind, x, ovfl));
+                    assert_eq!(
+                        f32_to_f8_sr(enc, kind, x, rnd, ovfl),
+                        f32_to_f8_rne(enc, kind, x, ovfl)
+                    );
                 }
             }
         }

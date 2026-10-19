@@ -495,7 +495,10 @@ impl LabWindow {
                 residual,
             },
         };
-        let q_token = q.iter().find(|&&(t, _)| t == draft).map_or(0.0, |&(_, p)| p);
+        let q_token = q
+            .iter()
+            .find(|&&(t, _)| t == draft)
+            .map_or(0.0, |&(_, p)| p);
         match self.proposals.last_mut() {
             Some(last) if !point_mass && last.token == draft && last.verdict.is_none() => {
                 last.verdict = Some(verdict);
@@ -739,19 +742,31 @@ mod tests {
         assert_eq!(
             window.proposals[0].verdict,
             Some(LabVerdict::Accept {
-                draw: LabDraw { index: 0, u: tape[0] }
+                draw: LabDraw {
+                    index: 0,
+                    u: tape[0]
+                }
             })
         );
         assert_eq!(
             window.proposals[1].verdict,
             Some(LabVerdict::Reject {
-                draw: LabDraw { index: 1, u: tape[1] },
-                residual_draw: LabDraw { index: 2, u: tape[2] },
+                draw: LabDraw {
+                    index: 1,
+                    u: tape[1]
+                },
+                residual_draw: LabDraw {
+                    index: 2,
+                    u: tape[2]
+                },
                 residual: 8,
             })
         );
         assert_eq!(window.proposals[1].p_token, Some(0.2));
-        assert_eq!(window.proposals[2].verdict, None, "past the first rejection");
+        assert_eq!(
+            window.proposals[2].verdict, None,
+            "past the first rejection"
+        );
         assert!(window.point_mass);
     }
 
@@ -768,14 +783,26 @@ mod tests {
             window.bonus,
             Some(LabBonus {
                 row: 2,
-                draw: LabDraw { index: 2, u: tape[2] },
+                draw: LabDraw {
+                    index: 2,
+                    u: tape[2]
+                },
                 token: 9
             })
         );
         // An accepted EOS draft stops the window with no terminal; the verify
         // keeps one row fewer (`target_commit_accept_len`).
         let mut eos = started(start);
-        eos.note_batched(&drafts, &qs, true, &[4, 5], 2, true, &start, Some([2, u32::MAX]));
+        eos.note_batched(
+            &drafts,
+            &qs,
+            true,
+            &[4, 5],
+            2,
+            true,
+            &start,
+            Some([2, u32::MAX]),
+        );
         assert_eq!(eos.keep, 2);
         assert_eq!(eos.bonus, None);
         assert_eq!(eos.device_words, vec![[2, u32::MAX]]);

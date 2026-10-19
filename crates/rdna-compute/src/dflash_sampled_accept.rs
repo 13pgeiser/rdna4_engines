@@ -70,7 +70,10 @@ enum AcceptKernel {
 const FLT_MIN: f32 = f32::MIN_POSITIVE;
 
 fn err(msg: impl AsRef<str>) -> HipError {
-    HipError::new(0, &format!("dflash_sampled_accept_sparse_q_f32: {}", msg.as_ref()))
+    HipError::new(
+        0,
+        &format!("dflash_sampled_accept_sparse_q_f32: {}", msg.as_ref()),
+    )
 }
 
 /// Decision of one window: the first `accept_len` proposed tokens are
@@ -151,7 +154,11 @@ pub fn dflash_accept_pack_payload(
 /// Check `payload` is a well-formed window of `n` rows over `vocab` ids.
 fn validate_payload(payload: &[u32], n: usize, vocab: usize) -> Result<(), String> {
     if payload.len() < 4 * n + 3 {
-        return Err(format!("payload has {} words, header alone needs {}", payload.len(), 4 * n + 3));
+        return Err(format!(
+            "payload has {} words, header alone needs {}",
+            payload.len(),
+            4 * n + 3
+        ));
     }
     let off = &payload[3 * n + 2..4 * n + 3];
     let nnz = off[n] as usize;
@@ -172,7 +179,9 @@ fn validate_payload(payload: &[u32], n: usize, vocab: usize) -> Result<(), Strin
     for r in 0..n {
         let row = &ids[off[r] as usize..off[r + 1] as usize];
         if row.iter().any(|&i| i as usize >= vocab) || row.windows(2).any(|w| w[0] >= w[1]) {
-            return Err(format!("q row {r} ids are not strictly ascending and < vocab"));
+            return Err(format!(
+                "q row {r} ids are not strictly ascending and < vocab"
+            ));
         }
     }
     Ok(())
@@ -326,9 +335,17 @@ pub fn dflash_sampled_accept_reference(
     }
     let bonus = bonus.unwrap_or_else(|| {
         fallback = 2;
-        (0..T).rev().find_map(|t| (seg_last[t] >= 0).then(|| seg_last[t] as usize)).unwrap_or(vocab - 1)
+        (0..T)
+            .rev()
+            .find_map(|t| (seg_last[t] >= 0).then(|| seg_last[t] as usize))
+            .unwrap_or(vocab - 1)
     });
-    DflashDeviceDecision { accept_len: row, bonus: bonus as u32, rejected, fallback }
+    DflashDeviceDecision {
+        accept_len: row,
+        bonus: bonus as u32,
+        rejected,
+        fallback,
+    }
 }
 
 /// Reusable device buffers of the window accept: the verify rows' softmax
@@ -495,7 +512,16 @@ impl Gpu {
         n: usize,
         vocab: usize,
     ) -> HipResult<DflashDeviceDecision> {
-        self.dflash_sampled_accept_run(AcceptKernel::HipOracle, scratch, probs, tau, z, payload, n, vocab)
+        self.dflash_sampled_accept_run(
+            AcceptKernel::HipOracle,
+            scratch,
+            probs,
+            tau,
+            z,
+            payload,
+            n,
+            vocab,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -574,7 +600,15 @@ impl Gpu {
             )));
         }
         let result = self.dflash_sampled_accept_enqueue(
-            symbol, probs, tau, z, payload, &scratch.payload, &scratch.out, n, vocab,
+            symbol,
+            probs,
+            tau,
+            z,
+            payload,
+            &scratch.payload,
+            &scratch.out,
+            n,
+            vocab,
         );
         if result.is_err() {
             // An async copy of `payload` may still be queued: drain it before
@@ -598,12 +632,15 @@ impl Gpu {
         vocab: usize,
     ) -> HipResult<DflashDeviceDecision> {
         // SAFETY: `payload` is a live `&[u32]`; any bytes view of it is valid.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(payload.as_ptr() as *const u8, payload.len() * 4)
-        };
+        let bytes =
+            unsafe { std::slice::from_raw_parts(payload.as_ptr() as *const u8, payload.len() * 4) };
         match self.active_stream.as_ref() {
-            Some(stream) => self.hip.memcpy_htod_async(&payload_dev.buf, bytes, stream)?,
-            None => self.hip.memcpy_htod_async_default(&payload_dev.buf, bytes)?,
+            Some(stream) => self
+                .hip
+                .memcpy_htod_async(&payload_dev.buf, bytes, stream)?,
+            None => self
+                .hip
+                .memcpy_htod_async_default(&payload_dev.buf, bytes)?,
         }
         let pp = probs.buf.as_ptr();
         let tp = tau.buf.as_ptr();
@@ -654,7 +691,9 @@ impl Gpu {
         let dst = unsafe { std::slice::from_raw_parts_mut(raw.as_mut_ptr() as *mut u8, 16) };
         self.memcpy_dtoh_auto(dst, &out_dev.buf)?;
         if raw[0] < 0 || raw[0] as usize > n || raw[1] < 0 || raw[1] as usize >= vocab {
-            return Err(err(format!("device result out of range: {raw:?} (n {n}, vocab {vocab})")));
+            return Err(err(format!(
+                "device result out of range: {raw:?} (n {n}, vocab {vocab})"
+            )));
         }
         Ok(DflashDeviceDecision {
             accept_len: raw[0] as usize,
@@ -670,12 +709,19 @@ mod tests {
     use super::*;
 
     fn lcg(s: &mut u64) -> f32 {
-        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((*s >> 40) as f32) / (1u64 << 24) as f32
     }
 
     /// `rows` softmax-like rows with a top-`keep` nucleus: raw probs, tau, z.
-    fn rows(vocab: usize, n_rows: usize, keep: usize, seed: &mut u64) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    fn rows(
+        vocab: usize,
+        n_rows: usize,
+        keep: usize,
+        seed: &mut u64,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let mut probs = Vec::new();
         let (mut tau, mut z) = (Vec::new(), Vec::new());
         for _ in 0..n_rows {
@@ -685,7 +731,11 @@ mod tests {
             let mut sorted = r.clone();
             sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
             let t = if keep == 0 { 0.0 } else { sorted[keep - 1] };
-            let zz: f32 = if keep == 0 { 1.0 } else { r.iter().filter(|&&p| p >= t).sum() };
+            let zz: f32 = if keep == 0 {
+                1.0
+            } else {
+                r.iter().filter(|&&p| p >= t).sum()
+            };
             probs.extend(r);
             tau.push(t);
             z.push(zz);
@@ -711,8 +761,10 @@ mod tests {
             off.push(ids.len() as u32);
         }
         let mut out = Vec::new();
-        dflash_accept_pack_payload(&mut out, tokens, us, u_fin, max_accept, selq, &off, &ids, &vals)
-            .unwrap();
+        dflash_accept_pack_payload(
+            &mut out, tokens, us, u_fin, max_accept, selq, &off, &ids, &vals,
+        )
+        .unwrap();
         out
     }
 
@@ -732,7 +784,10 @@ mod tests {
         let n = tokens.len();
         let trunc = |r: usize| -> Vec<f32> {
             let inv = 1.0f32 / z[r].max(FLT_MIN);
-            probs[r * vocab..(r + 1) * vocab].iter().map(|&p| eff(p, tau[r], inv)).collect()
+            probs[r * vocab..(r + 1) * vocab]
+                .iter()
+                .map(|&p| eff(p, tau[r], inv))
+                .collect()
         };
         for i in 0..n.min(max_accept) {
             let p = trunc(i);
@@ -777,14 +832,46 @@ mod tests {
 
     #[test]
     fn payload_round_trips_and_validates() {
-        let p = pack(&[3, 5], &[0.25, 0.5], 0.75, 7, &[0.5, 1.0], &[vec![(1, 0.5), (3, 0.5)], vec![(5, 1.0)]]);
+        let p = pack(
+            &[3, 5],
+            &[0.25, 0.5],
+            0.75,
+            7,
+            &[0.5, 1.0],
+            &[vec![(1, 0.5), (3, 0.5)], vec![(5, 1.0)]],
+        );
         assert_eq!(p.len(), dflash_accept_payload_words(2, 3));
         assert_eq!(p[2 * 2 + 1], 2, "max_accept is clamped to n");
         validate_payload(&p, 2, 8).unwrap();
-        assert!(validate_payload(&p, 2, 5).is_err(), "token 5 is outside vocab 5");
+        assert!(
+            validate_payload(&p, 2, 5).is_err(),
+            "token 5 is outside vocab 5"
+        );
         let mut out = Vec::new();
-        assert!(dflash_accept_pack_payload(&mut out, &[1], &[0.1, 0.2], 0.5, 1, &[1.0], &[0, 0], &[], &[]).is_err());
-        assert!(dflash_accept_pack_payload(&mut out, &[1], &[0.1], 0.5, 1, &[1.0], &[0, 2], &[1], &[1.0]).is_err());
+        assert!(dflash_accept_pack_payload(
+            &mut out,
+            &[1],
+            &[0.1, 0.2],
+            0.5,
+            1,
+            &[1.0],
+            &[0, 0],
+            &[],
+            &[]
+        )
+        .is_err());
+        assert!(dflash_accept_pack_payload(
+            &mut out,
+            &[1],
+            &[0.1],
+            0.5,
+            1,
+            &[1.0],
+            &[0, 2],
+            &[1],
+            &[1.0]
+        )
+        .is_err());
         // Unsorted q ids are refused by the launcher's validation.
         let bad = pack(&[0], &[0.1], 0.5, 1, &[1.0], &[vec![(4, 0.5), (2, 0.5)]]);
         assert!(validate_payload(&bad, 1, 8).is_err());
@@ -802,13 +889,17 @@ mod tests {
         for keep in [0usize, 1, 3, 20, 64] {
             let (probs, tau, z) = rows(vocab, n + 1, keep, &mut seed);
             for _ in 0..800 {
-                let tokens: Vec<u32> = (0..n).map(|_| (lcg(&mut seed) * vocab as f32) as u32 % vocab as u32).collect();
+                let tokens: Vec<u32> = (0..n)
+                    .map(|_| (lcg(&mut seed) * vocab as f32) as u32 % vocab as u32)
+                    .collect();
                 let us: Vec<f32> = (0..n).map(|_| lcg(&mut seed)).collect();
                 let u_fin = lcg(&mut seed);
                 // q: a small support containing the proposed token (last write wins).
                 let q: Vec<Vec<(u32, f32)>> = (0..n)
                     .map(|i| {
-                        let mut ids: Vec<u32> = (0..6).map(|_| (lcg(&mut seed) * vocab as f32) as u32 % vocab as u32).collect();
+                        let mut ids: Vec<u32> = (0..6)
+                            .map(|_| (lcg(&mut seed) * vocab as f32) as u32 % vocab as u32)
+                            .collect();
                         ids.push(tokens[i]);
                         ids.sort_unstable();
                         ids.dedup();
@@ -822,7 +913,9 @@ mod tests {
                 let max_accept = [n, n, 2, 0][(lcg(&mut seed) * 4.0) as usize % 4];
                 let p = pack(&tokens, &us, u_fin, max_accept, &selq, &q);
                 let r = dflash_sampled_accept_reference(&probs, &tau, &z, &p, n, vocab);
-                let (acc, bonus) = legacy(&probs, &tau, &z, &tokens, &us, u_fin, max_accept, &selq, &q, vocab);
+                let (acc, bonus) = legacy(
+                    &probs, &tau, &z, &tokens, &us, u_fin, max_accept, &selq, &q, vocab,
+                );
                 checked += 1;
                 if (r.accept_len, r.bonus) != (acc, bonus) {
                     mismatched += 1;
@@ -831,7 +924,10 @@ mod tests {
                 assert_eq!(r.rejected, r.accept_len < max_accept.min(n));
             }
         }
-        assert!(mismatched * 200 <= checked, "{mismatched}/{checked} windows differ from the ordered loop");
+        assert!(
+            mismatched * 200 <= checked,
+            "{mismatched}/{checked} windows differ from the ordered loop"
+        );
     }
 
     /// Point-mass q (PLD): rejecting `t` draws from p with `t` removed.
@@ -849,7 +945,10 @@ mod tests {
                 assert_ne!(r.bonus, t, "k={k}");
                 assert_eq!(r.fallback, 0);
                 let row = &probs[..vocab];
-                assert!(row[r.bonus as usize] >= tau[0], "residual leaves the kept set");
+                assert!(
+                    row[r.bonus as usize] >= tau[0],
+                    "residual leaves the kept set"
+                );
             }
         }
     }
@@ -866,7 +965,15 @@ mod tests {
         let p = pack(&[3], &[0.9], 0.3, 1, &[2.0], &[vec![(3, 2.0)]]);
         let r = dflash_sampled_accept_reference(&probs, &tau, &z, &p, 1, vocab);
         // u * 2 = 1.8 > 1 rejects; residual 1 - 2 < 0 elsewhere 0: degenerate.
-        assert_eq!(r, DflashDeviceDecision { accept_len: 0, bonus: 3, rejected: true, fallback: 1 });
+        assert_eq!(
+            r,
+            DflashDeviceDecision {
+                accept_len: 0,
+                bonus: 3,
+                rejected: true,
+                fallback: 1
+            }
+        );
     }
 
     #[test]
@@ -877,11 +984,21 @@ mod tests {
         for k in 0..500 {
             let u_fin = lcg(&mut seed);
             // Every proposal accepted (u = 0, q = 1) but only 2 rows allowed.
-            let p = pack(&[1, 2, 3], &[0.0; 3], u_fin, 2, &[1.0; 3], &[vec![(1, 1.0)], vec![(2, 1.0)], vec![(3, 1.0)]]);
+            let p = pack(
+                &[1, 2, 3],
+                &[0.0; 3],
+                u_fin,
+                2,
+                &[1.0; 3],
+                &[vec![(1, 1.0)], vec![(2, 1.0)], vec![(3, 1.0)]],
+            );
             let r = dflash_sampled_accept_reference(&probs, &tau, &z, &p, 3, vocab);
             // Token probabilities are > 0 only if kept; u = 0 accepts anything with p_t >= 0.
             assert_eq!((r.accept_len, r.rejected), (2, false), "k={k}");
-            assert!(probs[2 * vocab + r.bonus as usize] >= tau[2], "bonus outside kept set");
+            assert!(
+                probs[2 * vocab + r.bonus as usize] >= tau[2],
+                "bonus outside kept set"
+            );
         }
     }
 
@@ -893,10 +1010,18 @@ mod tests {
         let mut seed = 99;
         let (probs, tau, z) = rows(vocab, 2, 8, &mut seed);
         let inv = 1.0f32 / z[0].max(FLT_MIN);
-        let target: Vec<f32> = probs[..vocab].iter().map(|&p| eff(p, tau[0], inv)).collect();
+        let target: Vec<f32> = probs[..vocab]
+            .iter()
+            .map(|&p| eff(p, tau[0], inv))
+            .collect();
         // q: uniform over 12 ids chosen to overlap and miss the nucleus.
         let mut qids: Vec<u32> = (0..12).map(|i| (i * 23 + 4) % vocab as u32).collect();
-        let top = target.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
+        let top = target
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap()
+            .0 as u32;
         qids.push(top);
         qids.sort_unstable();
         qids.dedup();

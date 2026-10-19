@@ -80,7 +80,6 @@ impl Architecture for Toy {
     // suppression). Override only what diverges for your arch.
     // See `hipfire_runtime::arch` for full field-level docs.
 
-
     /// EOS-filter overrides: per-arch end-of-turn markers and visible-
     /// stream policy. Example for Gemma's `<end_of_turn>`:
     /// `EosFilterOverrides {

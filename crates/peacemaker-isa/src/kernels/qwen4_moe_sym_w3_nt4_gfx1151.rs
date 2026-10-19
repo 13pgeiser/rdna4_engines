@@ -56,13 +56,13 @@ const MAGIC8: u8 = 40;
 const CACC: u8 = 48;
 const TPROD: u8 = 56;
 const SCF: u8 = 64;
-const SUM0: u8 = 72;   // + 8j
-const SETS: u8 = 104;  // physical weight set s at SETS + 16 s: 16 code dwords (unpacked in place)
-const WH0: u8 = 136;   // + s: scale pair
-const D0: u8 = 138;    // + j: activation scale of tile j
-const X0: u8 = 144;    // + 16 j: activation nibbles of tile j
-const TMPN: u8 = 142;  // 2: unpack temporaries (the two registers between `d` and X)
-// Epilogue aliases (dead K-loop ranges).
+const SUM0: u8 = 72; // + 8j
+const SETS: u8 = 104; // physical weight set s at SETS + 16 s: 16 code dwords (unpacked in place)
+const WH0: u8 = 136; // + s: scale pair
+const D0: u8 = 138; // + j: activation scale of tile j
+const X0: u8 = 144; // + 16 j: activation nibbles of tile j
+const TMPN: u8 = 142; // 2: unpack temporaries (the two registers between `d` and X)
+                      // Epilogue aliases (dead K-loop ranges).
 const SILU_TMP: u8 = 40; // 24: magic, cacc, fold products
 const RT_TMP: u8 = 64; // 8: row scales
 
@@ -340,7 +340,9 @@ impl G {
             }
             p.v::<1>("scale_pair", WH0 + set as u8, kernel())?;
         }
-        for i in 0..2u8 { p.v::<1>("unpack_tmp", TMPN + i, kernel())?; }
+        for i in 0..2u8 {
+            p.v::<1>("unpack_tmp", TMPN + i, kernel())?;
+        }
         for b in 0..rr {
             for i in 0..8u8 {
                 p.v::<1>("rt_tmp", RT_TMP + i, epi(b))?;
@@ -854,8 +856,24 @@ fn prologue(wg: &mut Wg<Gfx1151>, g: &G, end: &End) -> R {
         load_x(b, g, j, SRD_X[0])?;
     }
     let b = wg.isa();
-    for j in 0..8u8 { op(b, format!("v_mov_b32_e32 v{}, {}", MAGIC8 + j, lit(MAGIC)), &[v(MAGIC8 + j)], &[])?; }
-    for t in 0..NT { for j in 0..8u8 { op(b, format!("v_mov_b32_e32 v{}, 0", g.sum(t) + j), &[v(g.sum(t) + j)], &[])?; } }
+    for j in 0..8u8 {
+        op(
+            b,
+            format!("v_mov_b32_e32 v{}, {}", MAGIC8 + j, lit(MAGIC)),
+            &[v(MAGIC8 + j)],
+            &[],
+        )?;
+    }
+    for t in 0..NT {
+        for j in 0..8u8 {
+            op(
+                b,
+                format!("v_mov_b32_e32 v{}, 0", g.sum(t) + j),
+                &[v(g.sum(t) + j)],
+                &[],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -902,16 +920,40 @@ fn load_x(b: &mut Builder, g: &G, j: u8, srd: u8) -> R {
 /// dst ^= 0x88888888                                signed nibble `2c - 7`
 /// ```
 fn unpack(b: &mut Builder, dst: u8, code: u8, y: u8) -> R {
-    let bfi = |b: &mut Builder, d: u8, mask: u32, p: u8, q: u8| op(b, format!("v_bfi_b32 v{d}, {}, v{p}, v{q}", lit(mask)), &[v(d)], &[v(p), v(q)]);
-    let shl = |b: &mut Builder, d: u8, n: u8, sr: u8| op(b, format!("v_lshlrev_b32_e32 v{d}, {n}, v{sr}"), &[v(d)], &[v(sr)]);
+    let bfi = |b: &mut Builder, d: u8, mask: u32, p: u8, q: u8| {
+        op(
+            b,
+            format!("v_bfi_b32 v{d}, {}, v{p}, v{q}", lit(mask)),
+            &[v(d)],
+            &[v(p), v(q)],
+        )
+    };
+    let shl = |b: &mut Builder, d: u8, n: u8, sr: u8| {
+        op(
+            b,
+            format!("v_lshlrev_b32_e32 v{d}, {n}, v{sr}"),
+            &[v(d)],
+            &[v(sr)],
+        )
+    };
     shl(b, y, 4, code)?;
     bfi(b, y, 0xfff, code, y)?;
     shl(b, dst, 2, y)?;
     bfi(b, y, 0x003f_003f, y, dst)?;
     shl(b, dst, 1, y)?;
-    op(b, format!("v_lshl_or_b32 v{y}, v{y}, 2, 0x11111111"), &[v(y)], &[v(y)])?;
+    op(
+        b,
+        format!("v_lshl_or_b32 v{y}, v{y}, 2, 0x11111111"),
+        &[v(y)],
+        &[v(y)],
+    )?;
     bfi(b, dst, 0x0e0e_0e0e, dst, y)?;
-    op(b, format!("v_xor_b32_e32 v{dst}, {}, v{dst}", lit(REBIAS)), &[v(dst)], &[v(dst)])
+    op(
+        b,
+        format!("v_xor_b32_e32 v{dst}, {}, v{dst}", lit(REBIAS)),
+        &[v(dst)],
+        &[v(dst)],
+    )
 }
 
 /// Fold weight set `p` (one K128 epoch) into every live tile's sums, the weights dequantized once;

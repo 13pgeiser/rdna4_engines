@@ -46,35 +46,136 @@ use crate::Result;
 use std::fmt;
 
 op_table!(Vop1Op {
-    Nop, MovB32, ReadfirstlaneB32,
-    CvtF32I32, CvtF32U32, CvtU32F32, CvtI32F32, CvtF16F32, CvtF32F16, CvtRpiI32F32, CvtFlrI32F32,
-    CvtF32Ubyte0, CvtF32Ubyte1, CvtF32Ubyte2, CvtF32Ubyte3,
-    FractF32, TruncF32, CeilF32, RndneF32, FloorF32, ExpF32, LogF32, RcpF32, RcpIflagF32, RsqF32, SqrtF32,
-    NotB32, BfrevB32, FfbhU32, FfblB32, FfbhI32, FrexpExpI32F32, FrexpMantF32,
-    MovB64, AccvgprMovB32,
-    CvtF32Fp8, CvtF32Bf8, CvtPkF32Fp8, CvtPkF32Bf8,
-    SwapB32, CvtF64F32, CvtF32F64,
+    Nop,
+    MovB32,
+    ReadfirstlaneB32,
+    CvtF32I32,
+    CvtF32U32,
+    CvtU32F32,
+    CvtI32F32,
+    CvtF16F32,
+    CvtF32F16,
+    CvtRpiI32F32,
+    CvtFlrI32F32,
+    CvtF32Ubyte0,
+    CvtF32Ubyte1,
+    CvtF32Ubyte2,
+    CvtF32Ubyte3,
+    FractF32,
+    TruncF32,
+    CeilF32,
+    RndneF32,
+    FloorF32,
+    ExpF32,
+    LogF32,
+    RcpF32,
+    RcpIflagF32,
+    RsqF32,
+    SqrtF32,
+    NotB32,
+    BfrevB32,
+    FfbhU32,
+    FfblB32,
+    FfbhI32,
+    FrexpExpI32F32,
+    FrexpMantF32,
+    MovB64,
+    AccvgprMovB32,
+    CvtF32Fp8,
+    CvtF32Bf8,
+    CvtPkF32Fp8,
+    CvtPkF32Bf8,
+    SwapB32,
+    CvtF64F32,
+    CvtF32F64,
 });
 
 op_table!(Vop2Op {
-    CndmaskB32, AddF32, SubF32, SubrevF32, MulF32, MulI32I24, MulHiI32I24, MulU32U24, MulHiU32U24,
-    MinF32, MaxF32, MinI32, MaxI32, MinU32, MaxU32,
-    LshrrevB32, AshrrevI32, LshlrevB32, AndB32, OrB32, XorB32, XnorB32, FmacF32,
-    AddCoU32, SubCoU32, SubrevCoU32, AddcCoU32, SubbCoU32, SubbrevCoU32,
-    AddU32, SubU32, SubrevU32,
-    AddF16, SubF16, MulF16, MaxF16, MinF16, AddU16, SubU16, LshlrevB16, MulLoU16,
+    CndmaskB32,
+    AddF32,
+    SubF32,
+    SubrevF32,
+    MulF32,
+    MulI32I24,
+    MulHiI32I24,
+    MulU32U24,
+    MulHiU32U24,
+    MinF32,
+    MaxF32,
+    MinI32,
+    MaxI32,
+    MinU32,
+    MaxU32,
+    LshrrevB32,
+    AshrrevI32,
+    LshlrevB32,
+    AndB32,
+    OrB32,
+    XorB32,
+    XnorB32,
+    FmacF32,
+    AddCoU32,
+    SubCoU32,
+    SubrevCoU32,
+    AddcCoU32,
+    SubbCoU32,
+    SubbrevCoU32,
+    AddU32,
+    SubU32,
+    SubrevU32,
+    AddF16,
+    SubF16,
+    MulF16,
+    MaxF16,
+    MinF16,
+    AddU16,
+    SubU16,
+    LshlrevB16,
+    MulLoU16,
 });
 
 op_table!(VopcOp {
-    CmpClassF32, CmpLtF32, CmpEqF32, CmpLeF32, CmpGtF32, CmpLgF32, CmpGeF32, CmpOF32, CmpUF32, CmpNeqF32,
-    CmpLtI32, CmpEqI32, CmpLeI32, CmpGtI32, CmpNeI32, CmpGeI32,
-    CmpLtU32, CmpEqU32, CmpLeU32, CmpGtU32, CmpNeU32, CmpGeU32,
-    CmpxEqU32, CmpxNeU32, CmpxGtU32, CmpxLtU32, CmpxGtI32, CmpxLtI32, CmpxGtF32, CmpxLtF32,
-    CmpEqU64, CmpNeU64,
+    CmpClassF32,
+    CmpLtF32,
+    CmpEqF32,
+    CmpLeF32,
+    CmpGtF32,
+    CmpLgF32,
+    CmpGeF32,
+    CmpOF32,
+    CmpUF32,
+    CmpNeqF32,
+    CmpLtI32,
+    CmpEqI32,
+    CmpLeI32,
+    CmpGtI32,
+    CmpNeI32,
+    CmpGeI32,
+    CmpLtU32,
+    CmpEqU32,
+    CmpLeU32,
+    CmpGtU32,
+    CmpNeU32,
+    CmpGeU32,
+    CmpxEqU32,
+    CmpxNeU32,
+    CmpxGtU32,
+    CmpxLtU32,
+    CmpxGtI32,
+    CmpxLtI32,
+    CmpxGtF32,
+    CmpxLtF32,
+    CmpEqU64,
+    CmpNeU64,
 });
 
 impl Vop1Op {
-    pub fn from_opcode(arch: Arch, opcode: u8) -> Option<Self> { Self::ALL.iter().copied().find(|op| op.opcode(arch) == Some(opcode)) }
+    pub fn from_opcode(arch: Arch, opcode: u8) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|op| op.opcode(arch) == Some(opcode))
+    }
     /// Dword widths of (vdst, src0); 0 where absent (`v_nop`).
     pub fn widths(self) -> (u8, u8) {
         match self {
@@ -87,26 +188,65 @@ impl Vop1Op {
     }
 }
 impl Vop2Op {
-    pub fn from_opcode(arch: Arch, opcode: u8) -> Option<Self> { Self::ALL.iter().copied().find(|op| op.opcode(arch) == Some(opcode)) }
+    pub fn from_opcode(arch: Arch, opcode: u8) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|op| op.opcode(arch) == Some(opcode))
+    }
     /// Reads VCC as carry-in / select (`v_cndmask_b32`, `v_addc_co_u32`, ...).
-    pub fn reads_vcc(self) -> bool { matches!(self, Self::CndmaskB32 | Self::AddcCoU32 | Self::SubbCoU32 | Self::SubbrevCoU32) }
+    pub fn reads_vcc(self) -> bool {
+        matches!(
+            self,
+            Self::CndmaskB32 | Self::AddcCoU32 | Self::SubbCoU32 | Self::SubbrevCoU32
+        )
+    }
     /// Writes VCC as carry-out in the e32 form (`v_add_co_u32`, ...)
     /// (CDNA3 ISA §6.2.2 p.33: "write their result to VCC when used in the
     /// VOP2 form"); the DPP and SDWA forms of gfx9 write VCC as well.
     pub fn writes_vcc(self) -> bool {
-        matches!(self, Self::AddCoU32 | Self::SubCoU32 | Self::SubrevCoU32 | Self::AddcCoU32 | Self::SubbCoU32 | Self::SubbrevCoU32)
+        matches!(
+            self,
+            Self::AddCoU32
+                | Self::SubCoU32
+                | Self::SubrevCoU32
+                | Self::AddcCoU32
+                | Self::SubbCoU32
+                | Self::SubbrevCoU32
+        )
     }
 }
 impl VopcOp {
-    pub fn from_opcode(arch: Arch, opcode: u8) -> Option<Self> { Self::ALL.iter().copied().find(|op| op.opcode(arch) == Some(opcode)) }
+    pub fn from_opcode(arch: Arch, opcode: u8) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|op| op.opcode(arch) == Some(opcode))
+    }
     /// Source dword width (2 for the `_u64` compares).
-    pub fn src_dwords(self) -> u8 { if matches!(self, Self::CmpEqU64 | Self::CmpNeU64) { 2 } else { 1 } }
+    pub fn src_dwords(self) -> u8 {
+        if matches!(self, Self::CmpEqU64 | Self::CmpNeU64) {
+            2
+        } else {
+            1
+        }
+    }
     /// `v_cmpx_*`: writes EXEC as well as VCC (e32) or the SDWA SDST
     /// (CDNA3 ISA §6.2.2 p.33: "All V_CMPX instructions write the result of
     /// their comparison ... to both an SGPR (or VCC) and the EXEC mask";
     /// Table 25 p.36 "Write VCC and exec").
     pub fn is_cmpx(self) -> bool {
-        matches!(self, Self::CmpxEqU32 | Self::CmpxNeU32 | Self::CmpxGtU32 | Self::CmpxLtU32 | Self::CmpxGtI32 | Self::CmpxLtI32 | Self::CmpxGtF32 | Self::CmpxLtF32)
+        matches!(
+            self,
+            Self::CmpxEqU32
+                | Self::CmpxNeU32
+                | Self::CmpxGtU32
+                | Self::CmpxLtU32
+                | Self::CmpxGtI32
+                | Self::CmpxLtI32
+                | Self::CmpxGtF32
+                | Self::CmpxLtF32
+        )
     }
 }
 
@@ -116,10 +256,17 @@ pub enum DppCtrl {
     /// `quad_perm:[a,b,c,d]`, each 0..=3.
     QuadPerm([u8; 4]),
     /// `row_shl:n`, `row_shr:n`, `row_ror:n`, n in 1..=15.
-    RowShl(u8), RowShr(u8), RowRor(u8),
-    WaveShl1, WaveRol1, WaveShr1, WaveRor1,
-    RowMirror, RowHalfMirror,
-    RowBcast15, RowBcast31,
+    RowShl(u8),
+    RowShr(u8),
+    RowRor(u8),
+    WaveShl1,
+    WaveRol1,
+    WaveShr1,
+    WaveRor1,
+    RowMirror,
+    RowHalfMirror,
+    RowBcast15,
+    RowBcast31,
 }
 
 /// The DPP dword: `src0` of the owning instruction is the DPP source VGPR
@@ -132,15 +279,30 @@ pub struct Dpp {
     /// BOUND_CTRL bit 51 (gfx942 llvm prints `bound_ctrl:1` when set and
     /// accepts `bound_ctrl:0` as a legacy spelling of the same bit).
     pub bound_ctrl: bool,
-    pub src0_neg: bool, pub src0_abs: bool, pub src1_neg: bool, pub src1_abs: bool,
+    pub src0_neg: bool,
+    pub src0_abs: bool,
+    pub src1_neg: bool,
+    pub src1_abs: bool,
 }
 
 /// SDWA operand / destination select.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum SdwaSel { Byte0, Byte1, Byte2, Byte3, Word0, Word1, Dword }
+pub enum SdwaSel {
+    Byte0,
+    Byte1,
+    Byte2,
+    Byte3,
+    Word0,
+    Word1,
+    Dword,
+}
 /// SDWA DST_UNUSED.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum SdwaUnused { Pad, Sext, Preserve }
+pub enum SdwaUnused {
+    Pad,
+    Sext,
+    Preserve,
+}
 
 /// The SDWA dword (src0 field holds 249 = SDWA). `src0`/`src1` of the owning
 /// instruction may be SGPRs (the S0/S1 bits). VOPC: `sdst` is the SDWA SD
@@ -151,24 +313,50 @@ pub struct Sdwa {
     pub dst_unused: SdwaUnused,
     pub clamp: bool,
     pub omod: u8,
-    pub src0_sel: SdwaSel, pub src0_sext: bool, pub src0_neg: bool, pub src0_abs: bool,
-    pub src1_sel: SdwaSel, pub src1_sext: bool, pub src1_neg: bool, pub src1_abs: bool,
+    pub src0_sel: SdwaSel,
+    pub src0_sext: bool,
+    pub src0_neg: bool,
+    pub src0_abs: bool,
+    pub src1_sel: SdwaSel,
+    pub src1_sext: bool,
+    pub src1_neg: bool,
+    pub src1_abs: bool,
     pub sdst: Option<Src>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum VopExt { None, Dpp(Dpp), Sdwa(Sdwa) }
+pub enum VopExt {
+    None,
+    Dpp(Dpp),
+    Sdwa(Sdwa),
+}
 
 /// `vdst = op(src0)`. `v_readfirstlane_b32`: `vdst` is an SGPR. `v_nop`:
 /// `vdst = Vgpr(0)`, `src0 = Sgpr(0)` (zero fields).
 #[derive(Clone, Debug, PartialEq)]
-pub struct Vop1 { pub op: Vop1Op, pub vdst: Src, pub src0: Src, pub ext: VopExt }
+pub struct Vop1 {
+    pub op: Vop1Op,
+    pub vdst: Src,
+    pub src0: Src,
+    pub ext: VopExt,
+}
 /// `vdst = op(src0, src1)`; `src1` is a VGPR except under SDWA (S1 bit).
 #[derive(Clone, Debug, PartialEq)]
-pub struct Vop2 { pub op: Vop2Op, pub vdst: Src, pub src0: Src, pub src1: Src, pub ext: VopExt }
+pub struct Vop2 {
+    pub op: Vop2Op,
+    pub vdst: Src,
+    pub src0: Src,
+    pub src1: Src,
+    pub ext: VopExt,
+}
 /// `VCC = op(src0, src1)` (EXEC too for `v_cmpx_*`).
 #[derive(Clone, Debug, PartialEq)]
-pub struct Vopc { pub op: VopcOp, pub src0: Src, pub src1: Src, pub ext: VopExt }
+pub struct Vopc {
+    pub op: VopcOp,
+    pub src0: Src,
+    pub src1: Src,
+    pub ext: VopExt,
+}
 
 /// SRC0 field values that select the second dword (§13.3.1-13.3.3).
 const SRC_SDWA: u32 = 249;
@@ -201,10 +389,19 @@ impl LitTy {
     fn inline_equivalent(self, v: u32) -> bool {
         let int = v <= 64;
         match self {
-            Self::B32 => int || v >= 0xffff_fff0 || InlineFloat::ALL.iter().any(|f| f.f32_bits() == v),
-            Self::F16 => int || (0xfff0..=0xffff).contains(&v) || InlineFloat::ALL.iter().any(|f| u32::from(f.f16_bits()) == v),
+            Self::B32 => {
+                int || v >= 0xffff_fff0 || InlineFloat::ALL.iter().any(|f| f.f32_bits() == v)
+            }
+            Self::F16 => {
+                int || (0xfff0..=0xffff).contains(&v)
+                    || InlineFloat::ALL
+                        .iter()
+                        .any(|f| u32::from(f.f16_bits()) == v)
+            }
             Self::I16 | Self::I64 => int,
-            Self::F64 => InlineFloat::ALL.iter().any(|f| f.f64_bits() as u32 == 0 && (f.f64_bits() >> 32) as u32 == v),
+            Self::F64 => InlineFloat::ALL
+                .iter()
+                .any(|f| f.f64_bits() as u32 == 0 && (f.f64_bits() >> 32) as u32 == v),
         }
     }
     fn check(self, name: &str, v: u32) -> Result<()> {
@@ -216,7 +413,13 @@ impl LitTy {
             _ => Ok(()),
         }
     }
-    fn text(self, v: u32) -> String { if self.inline_equivalent(v) { format!("lit({v:#x})") } else { format!("{v:#x}") } }
+    fn text(self, v: u32) -> String {
+        if self.inline_equivalent(v) {
+            format!("lit({v:#x})")
+        } else {
+            format!("{v:#x}")
+        }
+    }
 }
 
 /// Source modifiers a DPP / SDWA source takes.
@@ -241,10 +444,27 @@ impl Vop1Op {
     }
     fn mods(self) -> Mods {
         match self {
-            Self::CvtU32F32 | Self::CvtI32F32 | Self::CvtF16F32 | Self::CvtF32F16 | Self::CvtRpiI32F32 | Self::CvtFlrI32F32
-            | Self::FractF32 | Self::TruncF32 | Self::CeilF32 | Self::RndneF32 | Self::FloorF32 | Self::ExpF32 | Self::LogF32
-            | Self::RcpF32 | Self::RcpIflagF32 | Self::RsqF32 | Self::SqrtF32 | Self::FrexpExpI32F32 | Self::FrexpMantF32
-            | Self::CvtF64F32 | Self::CvtF32F64 => Mods::Float,
+            Self::CvtU32F32
+            | Self::CvtI32F32
+            | Self::CvtF16F32
+            | Self::CvtF32F16
+            | Self::CvtRpiI32F32
+            | Self::CvtFlrI32F32
+            | Self::FractF32
+            | Self::TruncF32
+            | Self::CeilF32
+            | Self::RndneF32
+            | Self::FloorF32
+            | Self::ExpF32
+            | Self::LogF32
+            | Self::RcpF32
+            | Self::RcpIflagF32
+            | Self::RsqF32
+            | Self::SqrtF32
+            | Self::FrexpExpI32F32
+            | Self::FrexpMantF32
+            | Self::CvtF64F32
+            | Self::CvtF32F64 => Mods::Float,
             Self::CvtF32Fp8 | Self::CvtF32Bf8 | Self::CvtPkF32Fp8 | Self::CvtPkF32Bf8 => Mods::None,
             _ => Mods::Int,
         }
@@ -252,62 +472,152 @@ impl Vop1Op {
     /// The FP8/BF8 converts: their SDWA form takes only `src0_sel` (a byte for
     /// `v_cvt_f32_*8`, a word for `v_cvt_pk_f32_*8`; CDNA3 ISA §12.8
     /// V_CVT_F32_FP8 / V_CVT_PK_F32_FP8 p.203-204).
-    fn fp8(self) -> bool { matches!(self, Self::CvtF32Fp8 | Self::CvtF32Bf8 | Self::CvtPkF32Fp8 | Self::CvtPkF32Bf8) }
+    fn fp8(self) -> bool {
+        matches!(
+            self,
+            Self::CvtF32Fp8 | Self::CvtF32Bf8 | Self::CvtPkF32Fp8 | Self::CvtPkF32Bf8
+        )
+    }
     /// SDWA form exists. `v_accvgpr_mov_b32` is listed with DPP/SDWA in the
     /// machine-readable ISA but llvm has neither; rejected
     /// [UNVERIFIED: confirm on MI300X].
     fn has_sdwa(self) -> bool {
-        !matches!(self, Self::Nop | Self::ReadfirstlaneB32 | Self::MovB64 | Self::AccvgprMovB32 | Self::SwapB32 | Self::CvtF64F32 | Self::CvtF32F64)
+        !matches!(
+            self,
+            Self::Nop
+                | Self::ReadfirstlaneB32
+                | Self::MovB64
+                | Self::AccvgprMovB32
+                | Self::SwapB32
+                | Self::CvtF64F32
+                | Self::CvtF32F64
+        )
     }
     /// DPP form exists (64-bit operands would need `row_newbcast`).
-    fn has_dpp(self) -> bool { self.has_sdwa() && !matches!(self, Self::CvtPkF32Fp8 | Self::CvtPkF32Bf8) }
+    fn has_dpp(self) -> bool {
+        self.has_sdwa() && !matches!(self, Self::CvtPkF32Fp8 | Self::CvtPkF32Bf8)
+    }
     /// SDWA OMOD allowed (float result).
     fn has_omod(self) -> bool {
         self.fp8()
-            || matches!(self, Self::CvtF32I32 | Self::CvtF32U32 | Self::CvtF16F32 | Self::CvtF32F16
-                | Self::CvtF32Ubyte0 | Self::CvtF32Ubyte1 | Self::CvtF32Ubyte2 | Self::CvtF32Ubyte3
-                | Self::FractF32 | Self::TruncF32 | Self::CeilF32 | Self::RndneF32 | Self::FloorF32 | Self::ExpF32 | Self::LogF32
-                | Self::RcpF32 | Self::RcpIflagF32 | Self::RsqF32 | Self::SqrtF32 | Self::FrexpMantF32)
+            || matches!(
+                self,
+                Self::CvtF32I32
+                    | Self::CvtF32U32
+                    | Self::CvtF16F32
+                    | Self::CvtF32F16
+                    | Self::CvtF32Ubyte0
+                    | Self::CvtF32Ubyte1
+                    | Self::CvtF32Ubyte2
+                    | Self::CvtF32Ubyte3
+                    | Self::FractF32
+                    | Self::TruncF32
+                    | Self::CeilF32
+                    | Self::RndneF32
+                    | Self::FloorF32
+                    | Self::ExpF32
+                    | Self::LogF32
+                    | Self::RcpF32
+                    | Self::RcpIflagF32
+                    | Self::RsqF32
+                    | Self::SqrtF32
+                    | Self::FrexpMantF32
+            )
     }
     /// llvm prints the e32 form without `_e32`.
-    fn bare(self) -> bool { matches!(self, Self::Nop | Self::ReadfirstlaneB32 | Self::AccvgprMovB32 | Self::SwapB32) }
+    fn bare(self) -> bool {
+        matches!(
+            self,
+            Self::Nop | Self::ReadfirstlaneB32 | Self::AccvgprMovB32 | Self::SwapB32
+        )
+    }
 }
 
 impl Vop2Op {
-    fn f16(self) -> bool { matches!(self, Self::AddF16 | Self::SubF16 | Self::MulF16 | Self::MaxF16 | Self::MinF16) }
+    fn f16(self) -> bool {
+        matches!(
+            self,
+            Self::AddF16 | Self::SubF16 | Self::MulF16 | Self::MaxF16 | Self::MinF16
+        )
+    }
     fn lit_ty(self) -> LitTy {
         if self.f16() {
             LitTy::F16
-        } else if matches!(self, Self::AddU16 | Self::SubU16 | Self::LshlrevB16 | Self::MulLoU16) {
+        } else if matches!(
+            self,
+            Self::AddU16 | Self::SubU16 | Self::LshlrevB16 | Self::MulLoU16
+        ) {
             LitTy::I16
         } else {
             LitTy::B32
         }
     }
     fn mods(self) -> Mods {
-        let float = matches!(self, Self::CndmaskB32 | Self::AddF32 | Self::SubF32 | Self::SubrevF32 | Self::MulF32 | Self::MinF32 | Self::MaxF32 | Self::FmacF32);
-        if float || self.f16() { Mods::Float } else { Mods::Int }
+        let float = matches!(
+            self,
+            Self::CndmaskB32
+                | Self::AddF32
+                | Self::SubF32
+                | Self::SubrevF32
+                | Self::MulF32
+                | Self::MinF32
+                | Self::MaxF32
+                | Self::FmacF32
+        );
+        if float || self.f16() {
+            Mods::Float
+        } else {
+            Mods::Int
+        }
     }
     fn has_omod(self) -> bool {
-        self.f16() || matches!(self, Self::AddF32 | Self::SubF32 | Self::SubrevF32 | Self::MulF32 | Self::MinF32 | Self::MaxF32)
+        self.f16()
+            || matches!(
+                self,
+                Self::AddF32
+                    | Self::SubF32
+                    | Self::SubrevF32
+                    | Self::MulF32
+                    | Self::MinF32
+                    | Self::MaxF32
+            )
     }
     /// `v_fmac_f32` has no SDWA form (machine-readable ISA and llvm).
-    fn has_sdwa(self) -> bool { self != Self::FmacF32 }
+    fn has_sdwa(self) -> bool {
+        self != Self::FmacF32
+    }
 }
 
 impl VopcOp {
-    fn lit_ty(self) -> LitTy { if self.src_dwords() == 2 { LitTy::I64 } else { LitTy::B32 } }
+    fn lit_ty(self) -> LitTy {
+        if self.src_dwords() == 2 {
+            LitTy::I64
+        } else {
+            LitTy::B32
+        }
+    }
     /// (src0, src1) modifier classes; `v_cmp_class_f32`'s src1 is the class mask.
     fn mods(self) -> (Mods, Mods) {
         match self {
             Self::CmpClassF32 => (Mods::Float, Mods::Int),
-            Self::CmpLtF32 | Self::CmpEqF32 | Self::CmpLeF32 | Self::CmpGtF32 | Self::CmpLgF32 | Self::CmpGeF32 | Self::CmpOF32
-            | Self::CmpUF32 | Self::CmpNeqF32 | Self::CmpxGtF32 | Self::CmpxLtF32 => (Mods::Float, Mods::Float),
+            Self::CmpLtF32
+            | Self::CmpEqF32
+            | Self::CmpLeF32
+            | Self::CmpGtF32
+            | Self::CmpLgF32
+            | Self::CmpGeF32
+            | Self::CmpOF32
+            | Self::CmpUF32
+            | Self::CmpNeqF32
+            | Self::CmpxGtF32
+            | Self::CmpxLtF32 => (Mods::Float, Mods::Float),
             _ => (Mods::Int, Mods::Int),
         }
     }
     /// The 64-bit compares have no SDWA form.
-    fn has_sdwa(self) -> bool { self.src_dwords() == 1 }
+    fn has_sdwa(self) -> bool {
+        self.src_dwords() == 1
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -318,7 +628,9 @@ fn in_range(name: &str, s: Src) -> Result<()> {
     match s {
         Src::Sgpr(n) if n > 101 => Err(format!("{name}: s{n} is beyond s101")),
         Src::Ttmp(n) if n > 15 => Err(format!("{name}: ttmp{n} is beyond ttmp15")),
-        Src::Int(i) if !(-16..=64).contains(&i) => Err(format!("{name}: {i} is not an inline integer (-16..=64)")),
+        Src::Int(i) if !(-16..=64).contains(&i) => {
+            Err(format!("{name}: {i} is not an inline integer (-16..=64)"))
+        }
         _ => Ok(()),
     }
 }
@@ -327,14 +639,20 @@ fn in_range(name: &str, s: Src) -> Result<()> {
 /// SGPR / TTMP / VGPR / AGPR or a `*_lo` special register, never M0.
 fn check_width(name: &str, what: &str, s: Src, dwords: u8) -> Result<()> {
     in_range(name, s)?;
-    if dwords < 2 { return Ok(()) }
+    if dwords < 2 {
+        return Ok(());
+    }
     let bad = match s {
         Src::Sgpr(n) => n % 2 != 0 || n > 100,
         Src::Ttmp(n) | Src::Vgpr(n) | Src::Agpr(n) => n % 2 != 0,
         Src::VccHi | Src::ExecHi | Src::FlatScratchHi | Src::XnackMaskHi | Src::M0 => true,
         _ => false,
     };
-    if bad { Err(format!("{name}: {what} {s:?} cannot start a {dwords}-dword operand (even register or a *_lo pair)")) } else { Ok(()) }
+    if bad {
+        Err(format!("{name}: {what} {s:?} cannot start a {dwords}-dword operand (even register or a *_lo pair)"))
+    } else {
+        Ok(())
+    }
 }
 
 fn vgpr(name: &str, what: &str, s: Src, dwords: u8) -> Result<u32> {
@@ -353,7 +671,9 @@ fn agpr(name: &str, what: &str, s: Src) -> Result<u32> {
 
 /// The e32 SRC0 field and the literal dword it implies.
 fn e32_src0(name: &str, s: Src, dwords: u8, lit: LitTy) -> Result<(u32, Option<u32>)> {
-    if s.is_agpr() { return Err(format!("{name}: src0 cannot be an AGPR")) }
+    if s.is_agpr() {
+        return Err(format!("{name}: src0 cannot be an AGPR"));
+    }
     check_width(name, "src0", s, dwords)?;
     match s {
         Src::Lit(v) => lit.check(name, v).map(|()| (u32::from(LITERAL), Some(v))),
@@ -363,7 +683,9 @@ fn e32_src0(name: &str, s: Src, dwords: u8, lit: LitTy) -> Result<(u32, Option<u
 
 /// The operand reads a scalar value over the constant bus (§6.2.1 p.32);
 /// inline constants do not.
-fn on_bus(s: Src) -> bool { !matches!(s, Src::Vgpr(_) | Src::Agpr(_) | Src::Int(_) | Src::Float(_)) }
+fn on_bus(s: Src) -> bool {
+    !matches!(s, Src::Vgpr(_) | Src::Agpr(_) | Src::Int(_) | Src::Float(_))
+}
 
 /// At most one scalar value per instruction (§6.2.1 p.32: one SGPR, usable
 /// by several operands; ADDC/SUBB/CNDMASK already read VCC).
@@ -386,7 +708,11 @@ fn check_mods(name: &str, what: &str, kind: Mods, sext: bool, neg: bool, abs: bo
         Mods::Int => (!neg && !abs, "sext only (SDWA), none under DPP"),
         Mods::None => (!sext && !neg && !abs, "no modifier"),
     };
-    if ok { Ok(()) } else { Err(format!("{name}: {what} takes {allowed}")) }
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("{name}: {what} takes {allowed}"))
+    }
 }
 
 /// Check the decoded instruction re-encodes to exactly the input words.
@@ -395,28 +721,64 @@ fn canonical(enc: Result<([u32; 2], usize)>, words: &[u32], name: &str) -> Resul
     if words.get(..n) == Some(&enc[..n]) {
         Ok(n)
     } else {
-        Err(format!("{name}: non-canonical encoding {:#010x?} (canonical {:#010x?})", &words[..n.min(words.len())], &enc[..n]))
+        Err(format!(
+            "{name}: non-canonical encoding {:#010x?} (canonical {:#010x?})",
+            &words[..n.min(words.len())],
+            &enc[..n]
+        ))
     }
 }
 
-fn second(words: &[u32], name: &str) -> Result<u32> { words.get(1).copied().ok_or_else(|| format!("{name}: missing second dword")) }
+fn second(words: &[u32], name: &str) -> Result<u32> {
+    words
+        .get(1)
+        .copied()
+        .ok_or_else(|| format!("{name}: missing second dword"))
+}
 
 // ---------------------------------------------------------------------------
 // SDWA / SDWAB (§13.3.7-13.3.8 p.542-543).
 
-const SELS: [SdwaSel; 7] = [SdwaSel::Byte0, SdwaSel::Byte1, SdwaSel::Byte2, SdwaSel::Byte3, SdwaSel::Word0, SdwaSel::Word1, SdwaSel::Dword];
+const SELS: [SdwaSel; 7] = [
+    SdwaSel::Byte0,
+    SdwaSel::Byte1,
+    SdwaSel::Byte2,
+    SdwaSel::Byte3,
+    SdwaSel::Word0,
+    SdwaSel::Word1,
+    SdwaSel::Dword,
+];
 const UNUSED: [SdwaUnused; 3] = [SdwaUnused::Pad, SdwaUnused::Sext, SdwaUnused::Preserve];
 
 impl SdwaSel {
-    fn bits(self) -> u32 { self as u32 }
-    fn from_bits(b: u32) -> Result<Self> { SELS.get(b as usize).copied().ok_or_else(|| format!("reserved SDWA select {b}")) }
-    fn text(self) -> &'static str { ["BYTE_0", "BYTE_1", "BYTE_2", "BYTE_3", "WORD_0", "WORD_1", "DWORD"][self as usize] }
+    fn bits(self) -> u32 {
+        self as u32
+    }
+    fn from_bits(b: u32) -> Result<Self> {
+        SELS.get(b as usize)
+            .copied()
+            .ok_or_else(|| format!("reserved SDWA select {b}"))
+    }
+    fn text(self) -> &'static str {
+        [
+            "BYTE_0", "BYTE_1", "BYTE_2", "BYTE_3", "WORD_0", "WORD_1", "DWORD",
+        ][self as usize]
+    }
 }
 
 impl SdwaUnused {
-    fn bits(self) -> u32 { self as u32 }
-    fn from_bits(b: u32) -> Result<Self> { UNUSED.get(b as usize).copied().ok_or_else(|| format!("reserved SDWA DST_UNUSED {b}")) }
-    fn text(self) -> &'static str { ["UNUSED_PAD", "UNUSED_SEXT", "UNUSED_PRESERVE"][self as usize] }
+    fn bits(self) -> u32 {
+        self as u32
+    }
+    fn from_bits(b: u32) -> Result<Self> {
+        UNUSED
+            .get(b as usize)
+            .copied()
+            .ok_or_else(|| format!("reserved SDWA DST_UNUSED {b}"))
+    }
+    fn text(self) -> &'static str {
+        ["UNUSED_PAD", "UNUSED_SEXT", "UNUSED_PRESERVE"][self as usize]
+    }
 }
 
 /// An SDWA source: 8-bit field and S bit (VGPR number, or scalar code with S).
@@ -431,17 +793,32 @@ fn sdwa_src(name: &str, what: &str, s: Src) -> Result<(u32, bool)> {
 }
 
 fn sdwa_src_decode((field, scalar): (u32, bool)) -> Result<Src> {
-    if scalar { Src::from_code(field as u16, None) } else { Ok(Src::Vgpr(field as u8)) }
+    if scalar {
+        Src::from_code(field as u16, None)
+    } else {
+        Ok(Src::Vgpr(field as u8))
+    }
 }
 
 /// VOP1/VOP2 SDWA bits [15:8]: DST_SEL, DST_U, CLMP, OMOD.
-fn sdwa_dst_byte(s: &Sdwa) -> u32 { s.dst_sel.bits() | s.dst_unused.bits() << 3 | u32::from(s.clamp) << 5 | u32::from(s.omod) << 6 }
+fn sdwa_dst_byte(s: &Sdwa) -> u32 {
+    s.dst_sel.bits() | s.dst_unused.bits() << 3 | u32::from(s.clamp) << 5 | u32::from(s.omod) << 6
+}
 
 fn sdwa_word(s: &Sdwa, src0: (u32, bool), src1: Option<(u32, bool)>, dst_byte: u32) -> u32 {
-    let mut w = src0.0 | dst_byte << 8 | s.src0_sel.bits() << 16 | u32::from(s.src0_sext) << 19 | u32::from(s.src0_neg) << 20
-        | u32::from(s.src0_abs) << 21 | u32::from(src0.1) << 23;
+    let mut w = src0.0
+        | dst_byte << 8
+        | s.src0_sel.bits() << 16
+        | u32::from(s.src0_sext) << 19
+        | u32::from(s.src0_neg) << 20
+        | u32::from(s.src0_abs) << 21
+        | u32::from(src0.1) << 23;
     if let Some((_, scalar)) = src1 {
-        w |= s.src1_sel.bits() << 24 | u32::from(s.src1_sext) << 27 | u32::from(s.src1_neg) << 28 | u32::from(s.src1_abs) << 29 | u32::from(scalar) << 31;
+        w |= s.src1_sel.bits() << 24
+            | u32::from(s.src1_sext) << 27
+            | u32::from(s.src1_neg) << 28
+            | u32::from(s.src1_abs) << 29
+            | u32::from(scalar) << 31;
     }
     w
 }
@@ -451,17 +828,39 @@ fn sdwa_word(s: &Sdwa, src0: (u32, bool), src1: Option<(u32, bool)>, dst_byte: u
 fn sdwa_parse(w: u32, vopc: bool, vop1: bool) -> Result<(Sdwa, (u32, bool), bool)> {
     let bit = |n: u32| w >> n & 1 != 0;
     let (dst_sel, dst_unused, clamp, omod, sdst) = if vopc {
-        let sdst = if bit(15) { Some(Src::from_code((w >> 8 & 0x7f) as u16, None)?) } else { None };
+        let sdst = if bit(15) {
+            Some(Src::from_code((w >> 8 & 0x7f) as u16, None)?)
+        } else {
+            None
+        };
         (SdwaSel::Dword, SdwaUnused::Pad, false, 0, sdst)
     } else {
-        (SdwaSel::from_bits(w >> 8 & 7)?, SdwaUnused::from_bits(w >> 11 & 3)?, bit(13), (w >> 14 & 3) as u8, None)
+        (
+            SdwaSel::from_bits(w >> 8 & 7)?,
+            SdwaUnused::from_bits(w >> 11 & 3)?,
+            bit(13),
+            (w >> 14 & 3) as u8,
+            None,
+        )
     };
-    let (src1_sel, src1_sext, src1_neg, src1_abs) =
-        if vop1 { (SdwaSel::Dword, false, false, false) } else { (SdwaSel::from_bits(w >> 24 & 7)?, bit(27), bit(28), bit(29)) };
+    let (src1_sel, src1_sext, src1_neg, src1_abs) = if vop1 {
+        (SdwaSel::Dword, false, false, false)
+    } else {
+        (SdwaSel::from_bits(w >> 24 & 7)?, bit(27), bit(28), bit(29))
+    };
     let s = Sdwa {
-        dst_sel, dst_unused, clamp, omod,
-        src0_sel: SdwaSel::from_bits(w >> 16 & 7)?, src0_sext: bit(19), src0_neg: bit(20), src0_abs: bit(21),
-        src1_sel, src1_sext, src1_neg, src1_abs,
+        dst_sel,
+        dst_unused,
+        clamp,
+        omod,
+        src0_sel: SdwaSel::from_bits(w >> 16 & 7)?,
+        src0_sext: bit(19),
+        src0_neg: bit(20),
+        src0_abs: bit(21),
+        src1_sel,
+        src1_sext,
+        src1_neg,
+        src1_abs,
         sdst,
     };
     Ok((s, (w & 0xff, bit(23)), bit(31)))
@@ -469,19 +868,33 @@ fn sdwa_parse(w: u32, vopc: bool, vop1: bool) -> Result<(Sdwa, (u32, bool), bool
 
 /// VOP1/VOP2 output-modifier checks.
 fn sdwa_out_check(name: &str, s: &Sdwa, omod_ok: bool) -> Result<()> {
-    if s.omod > 3 { return Err(format!("{name}: SDWA omod {} outside 0..=3", s.omod)) }
-    if s.omod != 0 && !omod_ok { return Err(format!("{name}: no SDWA output modifier (integer result)")) }
-    if s.sdst.is_some() { return Err(format!("{name}: sdst exists only in the VOPC SDWA form")) }
+    if s.omod > 3 {
+        return Err(format!("{name}: SDWA omod {} outside 0..=3", s.omod));
+    }
+    if s.omod != 0 && !omod_ok {
+        return Err(format!("{name}: no SDWA output modifier (integer result)"));
+    }
+    if s.sdst.is_some() {
+        return Err(format!("{name}: sdst exists only in the VOPC SDWA form"));
+    }
     Ok(())
 }
 
 /// The bits of `v` that read the old destination (DST_UNUSED = preserve).
-fn preserves(s: &Sdwa) -> bool { s.dst_unused == SdwaUnused::Preserve && s.dst_sel != SdwaSel::Dword }
+fn preserves(s: &Sdwa) -> bool {
+    s.dst_unused == SdwaUnused::Preserve && s.dst_sel != SdwaSel::Dword
+}
 
 fn out_mods(s: &Sdwa) -> &'static str {
     match (s.clamp, s.omod) {
-        (false, 0) => "", (false, 1) => " mul:2", (false, 2) => " mul:4", (false, _) => " div:2",
-        (true, 0) => " clamp", (true, 1) => " clamp mul:2", (true, 2) => " clamp mul:4", (true, _) => " clamp div:2",
+        (false, 0) => "",
+        (false, 1) => " mul:2",
+        (false, 2) => " mul:4",
+        (false, _) => " div:2",
+        (true, 0) => " clamp",
+        (true, 1) => " clamp mul:2",
+        (true, 2) => " clamp mul:4",
+        (true, _) => " clamp div:2",
     }
 }
 
@@ -493,13 +906,28 @@ impl DppCtrl {
     /// the variant's caps say so (gfx9 DPP).
     fn bits(self, name: &str, arch: Arch) -> Result<u32> {
         let row = |base: u32, n: u8, what: &str| {
-            if (1..=15).contains(&n) { Ok(base | u32::from(n)) } else { Err(format!("{name}: {what}:{n} outside 1..=15")) }
+            if (1..=15).contains(&n) {
+                Ok(base | u32::from(n))
+            } else {
+                Err(format!("{name}: {what}:{n} outside 1..=15"))
+            }
         };
-        let wave = |b: u32| if arch.caps().dpp_wave_ops { Ok(b) } else { Err(format!("{name}: DPP {self:?} does not exist on {arch}")) };
+        let wave = |b: u32| {
+            if arch.caps().dpp_wave_ops {
+                Ok(b)
+            } else {
+                Err(format!("{name}: DPP {self:?} does not exist on {arch}"))
+            }
+        };
         match self {
             Self::QuadPerm(p) => {
-                if p.iter().any(|&x| x > 3) { return Err(format!("{name}: quad_perm {p:?} element > 3")) }
-                Ok(u32::from(p[0]) | u32::from(p[1]) << 2 | u32::from(p[2]) << 4 | u32::from(p[3]) << 6)
+                if p.iter().any(|&x| x > 3) {
+                    return Err(format!("{name}: quad_perm {p:?} element > 3"));
+                }
+                Ok(u32::from(p[0])
+                    | u32::from(p[1]) << 2
+                    | u32::from(p[2]) << 4
+                    | u32::from(p[3]) << 6)
             }
             Self::RowShl(n) => row(0x100, n, "row_shl"),
             Self::RowShr(n) => row(0x110, n, "row_shr"),
@@ -516,7 +944,12 @@ impl DppCtrl {
     }
     fn from_bits(b: u32) -> Result<Self> {
         Ok(match b {
-            0..=0xff => Self::QuadPerm([(b & 3) as u8, (b >> 2 & 3) as u8, (b >> 4 & 3) as u8, (b >> 6 & 3) as u8]),
+            0..=0xff => Self::QuadPerm([
+                (b & 3) as u8,
+                (b >> 2 & 3) as u8,
+                (b >> 4 & 3) as u8,
+                (b >> 6 & 3) as u8,
+            ]),
             0x101..=0x10f => Self::RowShl((b & 0xf) as u8),
             0x111..=0x11f => Self::RowShr((b & 0xf) as u8),
             0x121..=0x12f => Self::RowRor((b & 0xf) as u8),
@@ -528,7 +961,11 @@ impl DppCtrl {
             0x141 => Self::RowHalfMirror,
             0x142 => Self::RowBcast15,
             0x143 => Self::RowBcast31,
-            0x150..=0x15f => return Err(format!("DPP_CTRL {b:#x} (row_newbcast, 64-bit DPP) is not modelled")),
+            0x150..=0x15f => {
+                return Err(format!(
+                    "DPP_CTRL {b:#x} (row_newbcast, 64-bit DPP) is not modelled"
+                ))
+            }
             _ => return Err(format!("reserved DPP_CTRL {b:#x}")),
         })
     }
@@ -552,10 +989,20 @@ impl DppCtrl {
 
 fn dpp_word(name: &str, arch: Arch, d: &Dpp, src0: u32) -> Result<u32> {
     if d.row_mask > 0xf || d.bank_mask > 0xf {
-        return Err(format!("{name}: DPP row_mask {:#x} / bank_mask {:#x} exceed 4 bits", d.row_mask, d.bank_mask));
+        return Err(format!(
+            "{name}: DPP row_mask {:#x} / bank_mask {:#x} exceed 4 bits",
+            d.row_mask, d.bank_mask
+        ));
     }
-    Ok(src0 | d.ctrl.bits(name, arch)? << 8 | u32::from(d.bound_ctrl) << 19 | u32::from(d.src0_neg) << 20 | u32::from(d.src0_abs) << 21
-        | u32::from(d.src1_neg) << 22 | u32::from(d.src1_abs) << 23 | u32::from(d.bank_mask) << 24 | u32::from(d.row_mask) << 28)
+    Ok(src0
+        | d.ctrl.bits(name, arch)? << 8
+        | u32::from(d.bound_ctrl) << 19
+        | u32::from(d.src0_neg) << 20
+        | u32::from(d.src0_abs) << 21
+        | u32::from(d.src1_neg) << 22
+        | u32::from(d.src1_abs) << 23
+        | u32::from(d.bank_mask) << 24
+        | u32::from(d.row_mask) << 28)
 }
 
 /// Parse a DPP dword into its fields and the src0 VGPR number. Reserved bits
@@ -567,13 +1014,22 @@ fn dpp_parse(w: u32) -> Result<(Dpp, u8)> {
         row_mask: (w >> 28) as u8,
         bank_mask: (w >> 24 & 0xf) as u8,
         bound_ctrl: bit(19),
-        src0_neg: bit(20), src0_abs: bit(21), src1_neg: bit(22), src1_abs: bit(23),
+        src0_neg: bit(20),
+        src0_abs: bit(21),
+        src1_neg: bit(22),
+        src1_abs: bit(23),
     };
     Ok((d, (w & 0xff) as u8))
 }
 
 fn dpp_text(d: &Dpp) -> String {
-    format!(" {} row_mask:{:#x} bank_mask:{:#x}{}", d.ctrl.text(), d.row_mask, d.bank_mask, if d.bound_ctrl { " bound_ctrl:1" } else { "" })
+    format!(
+        " {} row_mask:{:#x} bank_mask:{:#x}{}",
+        d.ctrl.text(),
+        d.row_mask,
+        d.bank_mask,
+        if d.bound_ctrl { " bound_ctrl:1" } else { "" }
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -591,7 +1047,9 @@ fn e32_text(s: Src, dwords: u8, lit: LitTy) -> String {
 /// `|x|`, `-x`, `-|x|`, and `neg(c)` for a negated constant without ABS.
 fn modded(s: Src, sext: bool, neg: bool, abs: bool) -> String {
     let t = s.fmt(1);
-    if sext { return format!("sext({t})") }
+    if sext {
+        return format!("sext({t})");
+    }
     let t = if abs { format!("|{t}|") } else { t };
     if !neg {
         t
@@ -610,9 +1068,18 @@ impl Vop1 {
     fn words(&self, arch: Arch) -> Result<([u32; 2], usize)> {
         let op = self.op;
         let name = op.name();
-        let opcode = op.opcode(arch).ok_or_else(|| format!("{name} does not exist on {arch}"))?;
-        let base = |vdst: u32, src0: u32| 0b011_1111 << 25 | vdst << 17 | u32::from(opcode) << 9 | src0;
-        let plain = || if self.ext == VopExt::None { Ok(()) } else { Err(format!("{name} has no DPP/SDWA form on {arch}")) };
+        let opcode = op
+            .opcode(arch)
+            .ok_or_else(|| format!("{name} does not exist on {arch}"))?;
+        let base =
+            |vdst: u32, src0: u32| 0b011_1111 << 25 | vdst << 17 | u32::from(opcode) << 9 | src0;
+        let plain = || {
+            if self.ext == VopExt::None {
+                Ok(())
+            } else {
+                Err(format!("{name} has no DPP/SDWA form on {arch}"))
+            }
+        };
         match op {
             Vop1Op::Nop => {
                 plain()?;
@@ -629,7 +1096,10 @@ impl Vop1 {
                 plain()?;
                 in_range(name, self.vdst)?;
                 if !self.vdst.is_sreg() || self.vdst == Src::M0 {
-                    return Err(format!("{name}: vdst must be a scalar register other than M0, got {:?}", self.vdst));
+                    return Err(format!(
+                        "{name}: vdst must be a scalar register other than M0, got {:?}",
+                        self.vdst
+                    ));
                 }
                 let src0 = vgpr(name, "src0", self.src0, 1)?;
                 return Ok(([base(u32::from(self.vdst.code()), 256 + src0), 0], 1));
@@ -639,12 +1109,18 @@ impl Vop1 {
             // `a1, a2` as VDST 1, SRC0 258).
             Vop1Op::AccvgprMovB32 => {
                 plain()?;
-                let (vdst, src0) = (agpr(name, "vdst", self.vdst)?, agpr(name, "src0", self.src0)?);
+                let (vdst, src0) = (
+                    agpr(name, "vdst", self.vdst)?,
+                    agpr(name, "src0", self.src0)?,
+                );
                 return Ok(([base(vdst, 256 + src0), 0], 1));
             }
             Vop1Op::SwapB32 => {
                 plain()?;
-                let (vdst, src0) = (vgpr(name, "vdst", self.vdst, 1)?, vgpr(name, "src0", self.src0, 1)?);
+                let (vdst, src0) = (
+                    vgpr(name, "vdst", self.vdst, 1)?,
+                    vgpr(name, "src0", self.src0, 1)?,
+                );
                 return Ok(([base(vdst, 256 + src0), 0], 1));
             }
             _ => {}
@@ -654,27 +1130,46 @@ impl Vop1 {
         match self.ext {
             VopExt::None => {
                 let (src0, lit) = e32_src0(name, self.src0, sw, op.lit_ty())?;
-                Ok(([base(vdst, src0), lit.unwrap_or(0)], 1 + usize::from(lit.is_some())))
+                Ok((
+                    [base(vdst, src0), lit.unwrap_or(0)],
+                    1 + usize::from(lit.is_some()),
+                ))
             }
             VopExt::Dpp(d) => {
-                if !op.has_dpp() { return Err(format!("{name} has no DPP form on {arch}")) }
+                if !op.has_dpp() {
+                    return Err(format!("{name} has no DPP form on {arch}"));
+                }
                 let src0 = vgpr(name, "DPP src0", self.src0, 1)?;
                 check_mods(name, "src0", op.mods(), false, d.src0_neg, d.src0_abs)?;
-                if d.src1_neg || d.src1_abs { return Err(format!("{name}: VOP1 has no src1 modifiers")) }
+                if d.src1_neg || d.src1_abs {
+                    return Err(format!("{name}: VOP1 has no src1 modifiers"));
+                }
                 Ok(([base(vdst, SRC_DPP), dpp_word(name, arch, &d, src0)?], 2))
             }
             VopExt::Sdwa(s) => {
-                if !op.has_sdwa() { return Err(format!("{name} has no SDWA form on {arch}")) }
+                if !op.has_sdwa() {
+                    return Err(format!("{name} has no SDWA form on {arch}"));
+                }
                 let src0 = sdwa_src(name, "src0", self.src0)?;
                 check_mods(name, "src0", op.mods(), s.src0_sext, s.src0_neg, s.src0_abs)?;
-                if (s.src1_sel, s.src1_sext, s.src1_neg, s.src1_abs) != (SdwaSel::Dword, false, false, false) {
-                    return Err(format!("{name}: VOP1 SDWA has no src1 (src1_sel must be Dword, no src1 modifiers)"));
+                if (s.src1_sel, s.src1_sext, s.src1_neg, s.src1_abs)
+                    != (SdwaSel::Dword, false, false, false)
+                {
+                    return Err(format!(
+                        "{name}: VOP1 SDWA has no src1 (src1_sel must be Dword, no src1 modifiers)"
+                    ));
                 }
                 if op.fp8() && (s.dst_sel, s.dst_unused) != (SdwaSel::Dword, SdwaUnused::Pad) {
                     return Err(format!("{name}: the FP8/BF8 convert SDWA form selects src0 only (dst_sel Dword, dst_unused Pad)"));
                 }
                 sdwa_out_check(name, &s, op.has_omod())?;
-                Ok(([base(vdst, SRC_SDWA), sdwa_word(&s, src0, None, sdwa_dst_byte(&s))], 2))
+                Ok((
+                    [
+                        base(vdst, SRC_SDWA),
+                        sdwa_word(&s, src0, None, sdwa_dst_byte(&s)),
+                    ],
+                    2,
+                ))
             }
         }
     }
@@ -689,33 +1184,75 @@ impl Vop1 {
     /// Decode the VOP1 instruction at `words[0]`; non-canonical encodings
     /// (reserved fields set, forms the encoder rejects) are errors.
     pub fn decode(arch: Arch, words: &[u32]) -> Result<(Self, usize)> {
-        let w = *words.first().ok_or("VOP1 decode past the end of the code")?;
-        if w >> 25 != 0b011_1111 { return Err(format!("{w:#010x} is not a VOP1 encoding")) }
+        let w = *words
+            .first()
+            .ok_or("VOP1 decode past the end of the code")?;
+        if w >> 25 != 0b011_1111 {
+            return Err(format!("{w:#010x} is not a VOP1 encoding"));
+        }
         let opcode = (w >> 9 & 0xff) as u8;
-        let op = Vop1Op::from_opcode(arch, opcode).ok_or_else(|| format!("VOP1 opcode {opcode} is outside the PeaceMaker CDNA table on {arch}"))?;
+        let op = Vop1Op::from_opcode(arch, opcode).ok_or_else(|| {
+            format!("VOP1 opcode {opcode} is outside the PeaceMaker CDNA table on {arch}")
+        })?;
         let name = op.name();
         let (vdst, src0) = (w >> 17 & 0xff, w & 0x1ff);
         let inst = match op {
-            Vop1Op::Nop => Vop1 { op, vdst: Src::Vgpr(0), src0: Src::Sgpr(0), ext: VopExt::None },
-            Vop1Op::ReadfirstlaneB32 => Vop1 { op, vdst: Src::from_code(vdst as u16, None)?, src0: Src::from_code(src0 as u16, None)?, ext: VopExt::None },
+            Vop1Op::Nop => Vop1 {
+                op,
+                vdst: Src::Vgpr(0),
+                src0: Src::Sgpr(0),
+                ext: VopExt::None,
+            },
+            Vop1Op::ReadfirstlaneB32 => Vop1 {
+                op,
+                vdst: Src::from_code(vdst as u16, None)?,
+                src0: Src::from_code(src0 as u16, None)?,
+                ext: VopExt::None,
+            },
             Vop1Op::AccvgprMovB32 => {
-                if src0 < 256 { return Err(format!("{name}: src0 code {src0} is not an AccVGPR")) }
-                Vop1 { op, vdst: Src::Agpr(vdst as u8), src0: Src::Agpr((src0 - 256) as u8), ext: VopExt::None }
+                if src0 < 256 {
+                    return Err(format!("{name}: src0 code {src0} is not an AccVGPR"));
+                }
+                Vop1 {
+                    op,
+                    vdst: Src::Agpr(vdst as u8),
+                    src0: Src::Agpr((src0 - 256) as u8),
+                    ext: VopExt::None,
+                }
             }
             _ => {
                 let vdst = Src::Vgpr(vdst as u8);
                 match src0 {
                     SRC_SDWA => {
                         let (s, s0, _) = sdwa_parse(second(words, name)?, false, true)?;
-                        Vop1 { op, vdst, src0: sdwa_src_decode(s0)?, ext: VopExt::Sdwa(s) }
+                        Vop1 {
+                            op,
+                            vdst,
+                            src0: sdwa_src_decode(s0)?,
+                            ext: VopExt::Sdwa(s),
+                        }
                     }
                     SRC_DPP => {
                         let (d, s0) = dpp_parse(second(words, name)?)?;
-                        Vop1 { op, vdst, src0: Src::Vgpr(s0), ext: VopExt::Dpp(d) }
+                        Vop1 {
+                            op,
+                            vdst,
+                            src0: Src::Vgpr(s0),
+                            ext: VopExt::Dpp(d),
+                        }
                     }
                     c => {
-                        let lit = if c == u32::from(LITERAL) { Some(second(words, name)?) } else { None };
-                        Vop1 { op, vdst, src0: Src::from_code(c as u16, lit)?, ext: VopExt::None }
+                        let lit = if c == u32::from(LITERAL) {
+                            Some(second(words, name)?)
+                        } else {
+                            None
+                        };
+                        Vop1 {
+                            op,
+                            vdst,
+                            src0: Src::from_code(c as u16, lit)?,
+                            ext: VopExt::None,
+                        }
                     }
                 }
             }
@@ -729,7 +1266,9 @@ impl Vop1 {
     /// touches nothing.
     pub fn footprint(&self) -> Footprint {
         let mut f = Footprint::default();
-        if self.op == Vop1Op::Nop { return f }
+        if self.op == Vop1Op::Nop {
+            return f;
+        }
         let (dw, sw) = self.op.widths();
         f.read_file(RegFile::Exec, 0, 2);
         f.read(self.src0, sw);
@@ -739,7 +1278,9 @@ impl Vop1 {
             f.write(self.src0, 1);
         }
         if let VopExt::Sdwa(s) = &self.ext {
-            if preserves(s) { f.read(self.vdst, dw) }
+            if preserves(s) {
+                f.read(self.vdst, dw)
+            }
         }
         f
     }
@@ -750,18 +1291,41 @@ impl fmt::Display for Vop1 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let op = self.op;
         let name = op.name();
-        if op == Vop1Op::Nop { return f.write_str(name) }
+        if op == Vop1Op::Nop {
+            return f.write_str(name);
+        }
         let (dw, sw) = op.widths();
         let vdst = self.vdst.fmt(dw);
         match &self.ext {
             VopExt::None => {
                 let suffix = if op.bare() { "" } else { "_e32" };
-                write!(f, "{name}{suffix} {vdst}, {}", e32_text(self.src0, sw, op.lit_ty()))
+                write!(
+                    f,
+                    "{name}{suffix} {vdst}, {}",
+                    e32_text(self.src0, sw, op.lit_ty())
+                )
             }
-            VopExt::Dpp(d) => write!(f, "{name}_dpp {vdst}, {}{}", modded(self.src0, false, d.src0_neg, d.src0_abs), dpp_text(d)),
+            VopExt::Dpp(d) => write!(
+                f,
+                "{name}_dpp {vdst}, {}{}",
+                modded(self.src0, false, d.src0_neg, d.src0_abs),
+                dpp_text(d)
+            ),
             VopExt::Sdwa(s) => {
-                write!(f, "{name}_sdwa {vdst}, {}{}", modded(self.src0, s.src0_sext, s.src0_neg, s.src0_abs), out_mods(s))?;
-                if !op.fp8() { write!(f, " dst_sel:{} dst_unused:{}", s.dst_sel.text(), s.dst_unused.text())? }
+                write!(
+                    f,
+                    "{name}_sdwa {vdst}, {}{}",
+                    modded(self.src0, s.src0_sext, s.src0_neg, s.src0_abs),
+                    out_mods(s)
+                )?;
+                if !op.fp8() {
+                    write!(
+                        f,
+                        " dst_sel:{} dst_unused:{}",
+                        s.dst_sel.text(),
+                        s.dst_unused.text()
+                    )?
+                }
                 write!(f, " src0_sel:{}", s.src0_sel.text())
             }
         }
@@ -775,10 +1339,18 @@ impl Vop2 {
     fn words(&self, arch: Arch) -> Result<([u32; 2], usize)> {
         let op = self.op;
         let name = op.name();
-        let opcode = op.opcode(arch).ok_or_else(|| format!("{name} does not exist on {arch}"))?;
+        let opcode = op
+            .opcode(arch)
+            .ok_or_else(|| format!("{name} does not exist on {arch}"))?;
         // Opcodes 62/63 would read as VOPC/VOP1 (`inst::classify`).
-        if opcode >= 0b11_1110 { return Err(format!("{name}: VOP2 opcode {opcode} collides with the VOPC/VOP1 encodings")) }
-        let base = |vdst: u32, src1: u32, src0: u32| u32::from(opcode) << 25 | vdst << 17 | src1 << 9 | src0;
+        if opcode >= 0b11_1110 {
+            return Err(format!(
+                "{name}: VOP2 opcode {opcode} collides with the VOPC/VOP1 encodings"
+            ));
+        }
+        let base = |vdst: u32, src1: u32, src0: u32| {
+            u32::from(opcode) << 25 | vdst << 17 | src1 << 9 | src0
+        };
         let vdst = vgpr(name, "vdst", self.vdst, 1)?;
         match self.ext {
             VopExt::None => {
@@ -787,22 +1359,42 @@ impl Vop2 {
                 if op.reads_vcc() && on_bus(self.src0) {
                     return Err(format!("{name}: src0 {:?} and the implicit VCC exceed the one scalar value per instruction (CDNA3 ISA §6.2.1 p.32)", self.src0));
                 }
-                Ok(([base(vdst, src1, src0), lit.unwrap_or(0)], 1 + usize::from(lit.is_some())))
+                Ok((
+                    [base(vdst, src1, src0), lit.unwrap_or(0)],
+                    1 + usize::from(lit.is_some()),
+                ))
             }
             VopExt::Dpp(d) => {
-                let (src0, src1) = (vgpr(name, "DPP src0", self.src0, 1)?, vgpr(name, "src1", self.src1, 1)?);
+                let (src0, src1) = (
+                    vgpr(name, "DPP src0", self.src0, 1)?,
+                    vgpr(name, "src1", self.src1, 1)?,
+                );
                 check_mods(name, "src0", op.mods(), false, d.src0_neg, d.src0_abs)?;
                 check_mods(name, "src1", op.mods(), false, d.src1_neg, d.src1_abs)?;
-                Ok(([base(vdst, src1, SRC_DPP), dpp_word(name, arch, &d, src0)?], 2))
+                Ok((
+                    [base(vdst, src1, SRC_DPP), dpp_word(name, arch, &d, src0)?],
+                    2,
+                ))
             }
             VopExt::Sdwa(s) => {
-                if !op.has_sdwa() { return Err(format!("{name} has no SDWA form on {arch}")) }
-                let (src0, src1) = (sdwa_src(name, "src0", self.src0)?, sdwa_src(name, "src1", self.src1)?);
+                if !op.has_sdwa() {
+                    return Err(format!("{name} has no SDWA form on {arch}"));
+                }
+                let (src0, src1) = (
+                    sdwa_src(name, "src0", self.src0)?,
+                    sdwa_src(name, "src1", self.src1)?,
+                );
                 check_mods(name, "src0", op.mods(), s.src0_sext, s.src0_neg, s.src0_abs)?;
                 check_mods(name, "src1", op.mods(), s.src1_sext, s.src1_neg, s.src1_abs)?;
                 bus_check(name, self.src0, self.src1, op.reads_vcc())?;
                 sdwa_out_check(name, &s, op.has_omod())?;
-                Ok(([base(vdst, src1.0, SRC_SDWA), sdwa_word(&s, src0, Some(src1), sdwa_dst_byte(&s))], 2))
+                Ok((
+                    [
+                        base(vdst, src1.0, SRC_SDWA),
+                        sdwa_word(&s, src0, Some(src1), sdwa_dst_byte(&s)),
+                    ],
+                    2,
+                ))
             }
         }
     }
@@ -816,24 +1408,52 @@ impl Vop2 {
 
     /// Decode the VOP2 instruction at `words[0]`; non-canonical encodings are errors.
     pub fn decode(arch: Arch, words: &[u32]) -> Result<(Self, usize)> {
-        let w = *words.first().ok_or("VOP2 decode past the end of the code")?;
-        if w >> 31 != 0 || w >> 25 >= 0b011_1110 { return Err(format!("{w:#010x} is not a VOP2 encoding")) }
+        let w = *words
+            .first()
+            .ok_or("VOP2 decode past the end of the code")?;
+        if w >> 31 != 0 || w >> 25 >= 0b011_1110 {
+            return Err(format!("{w:#010x} is not a VOP2 encoding"));
+        }
         let opcode = (w >> 25) as u8;
-        let op = Vop2Op::from_opcode(arch, opcode).ok_or_else(|| format!("VOP2 opcode {opcode} is outside the PeaceMaker CDNA table on {arch}"))?;
+        let op = Vop2Op::from_opcode(arch, opcode).ok_or_else(|| {
+            format!("VOP2 opcode {opcode} is outside the PeaceMaker CDNA table on {arch}")
+        })?;
         let name = op.name();
         let (vdst, src1, src0) = (Src::Vgpr((w >> 17 & 0xff) as u8), w >> 9 & 0xff, w & 0x1ff);
         let inst = match src0 {
             SRC_SDWA => {
                 let (s, s0, s1) = sdwa_parse(second(words, name)?, false, false)?;
-                Vop2 { op, vdst, src0: sdwa_src_decode(s0)?, src1: sdwa_src_decode((src1, s1))?, ext: VopExt::Sdwa(s) }
+                Vop2 {
+                    op,
+                    vdst,
+                    src0: sdwa_src_decode(s0)?,
+                    src1: sdwa_src_decode((src1, s1))?,
+                    ext: VopExt::Sdwa(s),
+                }
             }
             SRC_DPP => {
                 let (d, s0) = dpp_parse(second(words, name)?)?;
-                Vop2 { op, vdst, src0: Src::Vgpr(s0), src1: Src::Vgpr(src1 as u8), ext: VopExt::Dpp(d) }
+                Vop2 {
+                    op,
+                    vdst,
+                    src0: Src::Vgpr(s0),
+                    src1: Src::Vgpr(src1 as u8),
+                    ext: VopExt::Dpp(d),
+                }
             }
             c => {
-                let lit = if c == u32::from(LITERAL) { Some(second(words, name)?) } else { None };
-                Vop2 { op, vdst, src0: Src::from_code(c as u16, lit)?, src1: Src::Vgpr(src1 as u8), ext: VopExt::None }
+                let lit = if c == u32::from(LITERAL) {
+                    Some(second(words, name)?)
+                } else {
+                    None
+                };
+                Vop2 {
+                    op,
+                    vdst,
+                    src0: Src::from_code(c as u16, lit)?,
+                    src1: Src::Vgpr(src1 as u8),
+                    ext: VopExt::None,
+                }
             }
         };
         let n = canonical(inst.words(arch), words, name)?;
@@ -850,12 +1470,20 @@ impl Vop2 {
         f.read(self.src0, 1);
         f.read(self.src1, 1);
         f.write(self.vdst, 1);
-        if self.op == Vop2Op::FmacF32 { f.read(self.vdst, 1) }
-        if let VopExt::Sdwa(s) = &self.ext {
-            if preserves(s) { f.read(self.vdst, 1) }
+        if self.op == Vop2Op::FmacF32 {
+            f.read(self.vdst, 1)
         }
-        if self.op.reads_vcc() { f.read_file(RegFile::Vcc, 0, 2) }
-        if self.op.writes_vcc() { f.write_file(RegFile::Vcc, 0, 2) }
+        if let VopExt::Sdwa(s) = &self.ext {
+            if preserves(s) {
+                f.read(self.vdst, 1)
+            }
+        }
+        if self.op.reads_vcc() {
+            f.read_file(RegFile::Vcc, 0, 2)
+        }
+        if self.op.writes_vcc() {
+            f.write_file(RegFile::Vcc, 0, 2)
+        }
         f
     }
 }
@@ -865,13 +1493,30 @@ impl fmt::Display for Vop2 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let op = self.op;
         let (src0, src1, suffix, tail) = match &self.ext {
-            VopExt::None => (e32_text(self.src0, 1, op.lit_ty()), self.src1.fmt(1), "_e32", String::new()),
-            VopExt::Dpp(d) => (modded(self.src0, false, d.src0_neg, d.src0_abs), modded(self.src1, false, d.src1_neg, d.src1_abs), "_dpp", dpp_text(d)),
+            VopExt::None => (
+                e32_text(self.src0, 1, op.lit_ty()),
+                self.src1.fmt(1),
+                "_e32",
+                String::new(),
+            ),
+            VopExt::Dpp(d) => (
+                modded(self.src0, false, d.src0_neg, d.src0_abs),
+                modded(self.src1, false, d.src1_neg, d.src1_abs),
+                "_dpp",
+                dpp_text(d),
+            ),
             VopExt::Sdwa(s) => (
                 modded(self.src0, s.src0_sext, s.src0_neg, s.src0_abs),
                 modded(self.src1, s.src1_sext, s.src1_neg, s.src1_abs),
                 "_sdwa",
-                format!("{} dst_sel:{} dst_unused:{} src0_sel:{} src1_sel:{}", out_mods(s), s.dst_sel.text(), s.dst_unused.text(), s.src0_sel.text(), s.src1_sel.text()),
+                format!(
+                    "{} dst_sel:{} dst_unused:{} src0_sel:{} src1_sel:{}",
+                    out_mods(s),
+                    s.dst_sel.text(),
+                    s.dst_unused.text(),
+                    s.src0_sel.text(),
+                    s.src1_sel.text()
+                ),
             ),
         };
         let vdst = self.vdst.fmt(1);
@@ -896,39 +1541,69 @@ impl Vopc {
     fn words(&self, arch: Arch) -> Result<([u32; 2], usize)> {
         let op = self.op;
         let name = op.name();
-        let opcode = op.opcode(arch).ok_or_else(|| format!("{name} does not exist on {arch}"))?;
-        let base = |src1: u32, src0: u32| 0b011_1110 << 25 | u32::from(opcode) << 17 | src1 << 9 | src0;
+        let opcode = op
+            .opcode(arch)
+            .ok_or_else(|| format!("{name} does not exist on {arch}"))?;
+        let base =
+            |src1: u32, src0: u32| 0b011_1110 << 25 | u32::from(opcode) << 17 | src1 << 9 | src0;
         let dw = op.src_dwords();
         match self.ext {
             VopExt::None => {
                 let src1 = vgpr(name, "src1 (VSRC1)", self.src1, dw)?;
                 let (src0, lit) = e32_src0(name, self.src0, dw, op.lit_ty())?;
-                Ok(([base(src1, src0), lit.unwrap_or(0)], 1 + usize::from(lit.is_some())))
+                Ok((
+                    [base(src1, src0), lit.unwrap_or(0)],
+                    1 + usize::from(lit.is_some()),
+                ))
             }
             // §13.3.9 p.544 lists DPP after VOPC, but the CDNA3 machine-readable
             // ISA has no VOPC DPP encoding and llvm rejects it for gfx942.
             // [UNVERIFIED: confirm on MI300X]
             VopExt::Dpp(_) => Err(format!("{name}: VOPC has no DPP form on {arch}")),
             VopExt::Sdwa(s) => {
-                if !op.has_sdwa() { return Err(format!("{name} has no SDWA form on {arch}")) }
+                if !op.has_sdwa() {
+                    return Err(format!("{name} has no SDWA form on {arch}"));
+                }
                 let (m0, m1) = op.mods();
-                let (src0, src1) = (sdwa_src(name, "src0", self.src0)?, sdwa_src(name, "src1", self.src1)?);
+                let (src0, src1) = (
+                    sdwa_src(name, "src0", self.src0)?,
+                    sdwa_src(name, "src1", self.src1)?,
+                );
                 check_mods(name, "src0", m0, s.src0_sext, s.src0_neg, s.src0_abs)?;
                 check_mods(name, "src1", m1, s.src1_sext, s.src1_neg, s.src1_abs)?;
                 bus_check(name, self.src0, self.src1, false)?;
-                if (s.dst_sel, s.dst_unused, s.clamp, s.omod) != (SdwaSel::Dword, SdwaUnused::Pad, false, 0) {
-                    return Err(format!("{name}: SDWAB has no dst_sel/dst_unused/clamp/omod (Dword, Pad, false, 0)"));
+                if (s.dst_sel, s.dst_unused, s.clamp, s.omod)
+                    != (SdwaSel::Dword, SdwaUnused::Pad, false, 0)
+                {
+                    return Err(format!(
+                        "{name}: SDWAB has no dst_sel/dst_unused/clamp/omod (Dword, Pad, false, 0)"
+                    ));
                 }
                 let sd = match s.sdst {
                     None => 0,
-                    Some(Src::VccLo) => return Err(format!("{name}: SDWA sdst VCC is `None` (SD = 0)")),
-                    Some(d @ (Src::Sgpr(_) | Src::Ttmp(_) | Src::ExecLo | Src::FlatScratchLo | Src::XnackMaskLo)) => {
+                    Some(Src::VccLo) => {
+                        return Err(format!("{name}: SDWA sdst VCC is `None` (SD = 0)"))
+                    }
+                    Some(
+                        d @ (Src::Sgpr(_)
+                        | Src::Ttmp(_)
+                        | Src::ExecLo
+                        | Src::FlatScratchLo
+                        | Src::XnackMaskLo),
+                    ) => {
                         check_width(name, "sdst", d, 2)?;
                         0x80 | u32::from(d.code())
                     }
-                    Some(d) => return Err(format!("{name}: SDWA sdst must be a 64-bit scalar register pair, got {d:?}")),
+                    Some(d) => {
+                        return Err(format!(
+                            "{name}: SDWA sdst must be a 64-bit scalar register pair, got {d:?}"
+                        ))
+                    }
                 };
-                Ok(([base(src1.0, SRC_SDWA), sdwa_word(&s, src0, Some(src1), sd)], 2))
+                Ok((
+                    [base(src1.0, SRC_SDWA), sdwa_word(&s, src0, Some(src1), sd)],
+                    2,
+                ))
             }
         }
     }
@@ -942,21 +1617,41 @@ impl Vopc {
 
     /// Decode the VOPC instruction at `words[0]`; non-canonical encodings are errors.
     pub fn decode(arch: Arch, words: &[u32]) -> Result<(Self, usize)> {
-        let w = *words.first().ok_or("VOPC decode past the end of the code")?;
-        if w >> 25 != 0b011_1110 { return Err(format!("{w:#010x} is not a VOPC encoding")) }
+        let w = *words
+            .first()
+            .ok_or("VOPC decode past the end of the code")?;
+        if w >> 25 != 0b011_1110 {
+            return Err(format!("{w:#010x} is not a VOPC encoding"));
+        }
         let opcode = (w >> 17 & 0xff) as u8;
-        let op = VopcOp::from_opcode(arch, opcode).ok_or_else(|| format!("VOPC opcode {opcode} is outside the PeaceMaker CDNA table on {arch}"))?;
+        let op = VopcOp::from_opcode(arch, opcode).ok_or_else(|| {
+            format!("VOPC opcode {opcode} is outside the PeaceMaker CDNA table on {arch}")
+        })?;
         let name = op.name();
         let (src1, src0) = (w >> 9 & 0xff, w & 0x1ff);
         let inst = match src0 {
             SRC_SDWA => {
                 let (s, s0, s1) = sdwa_parse(second(words, name)?, true, false)?;
-                Vopc { op, src0: sdwa_src_decode(s0)?, src1: sdwa_src_decode((src1, s1))?, ext: VopExt::Sdwa(s) }
+                Vopc {
+                    op,
+                    src0: sdwa_src_decode(s0)?,
+                    src1: sdwa_src_decode((src1, s1))?,
+                    ext: VopExt::Sdwa(s),
+                }
             }
             SRC_DPP => return Err(format!("{name}: VOPC DPP is not a gfx942 encoding")),
             c => {
-                let lit = if c == u32::from(LITERAL) { Some(second(words, name)?) } else { None };
-                Vopc { op, src0: Src::from_code(c as u16, lit)?, src1: Src::Vgpr(src1 as u8), ext: VopExt::None }
+                let lit = if c == u32::from(LITERAL) {
+                    Some(second(words, name)?)
+                } else {
+                    None
+                };
+                Vopc {
+                    op,
+                    src0: Src::from_code(c as u16, lit)?,
+                    src1: Src::Vgpr(src1 as u8),
+                    ext: VopExt::None,
+                }
             }
         };
         let n = canonical(inst.words(arch), words, name)?;
@@ -975,7 +1670,9 @@ impl Vopc {
             VopExt::Sdwa(Sdwa { sdst: Some(d), .. }) => f.write(*d, 2),
             _ => f.write_file(RegFile::Vcc, 0, 2),
         }
-        if self.op.is_cmpx() { f.write_file(RegFile::Exec, 0, 2) }
+        if self.op.is_cmpx() {
+            f.write_file(RegFile::Exec, 0, 2)
+        }
         f
     }
 }
@@ -987,17 +1684,27 @@ impl fmt::Display for Vopc {
         let name = op.name();
         let dw = op.src_dwords();
         match &self.ext {
-            VopExt::None => write!(f, "{name}_e32 vcc, {}, {}", e32_text(self.src0, dw, op.lit_ty()), self.src1.fmt(dw)),
+            VopExt::None => write!(
+                f,
+                "{name}_e32 vcc, {}, {}",
+                e32_text(self.src0, dw, op.lit_ty()),
+                self.src1.fmt(dw)
+            ),
             VopExt::Dpp(d) => write!(
-                f, "{name}_dpp vcc, {}, {}{}",
-                modded(self.src0, false, d.src0_neg, d.src0_abs), modded(self.src1, false, d.src1_neg, d.src1_abs), dpp_text(d)
+                f,
+                "{name}_dpp vcc, {}, {}{}",
+                modded(self.src0, false, d.src0_neg, d.src0_abs),
+                modded(self.src1, false, d.src1_neg, d.src1_abs),
+                dpp_text(d)
             ),
             VopExt::Sdwa(s) => write!(
-                f, "{name}_sdwa {}, {}, {} src0_sel:{} src1_sel:{}",
+                f,
+                "{name}_sdwa {}, {}, {} src0_sel:{} src1_sel:{}",
                 s.sdst.map_or_else(|| "vcc".to_string(), |d| d.fmt(2)),
                 modded(self.src0, s.src0_sext, s.src0_neg, s.src0_abs),
                 modded(self.src1, s.src1_sext, s.src1_neg, s.src1_abs),
-                s.src0_sel.text(), s.src1_sel.text()
+                s.src0_sel.text(),
+                s.src1_sel.text()
             ),
         }
     }

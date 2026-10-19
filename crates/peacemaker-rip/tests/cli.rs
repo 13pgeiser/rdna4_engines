@@ -79,8 +79,15 @@ fn legacy_form_writes_the_same_assembly_as_build() {
     let legacy_s = std::fs::read_to_string(&legacy_out).unwrap();
     assert!(legacy_s.contains("s_endpgm"), "{legacy_s}");
     assert_eq!(legacy_s, std::fs::read_to_string(&build_out).unwrap());
-    assert!(text(&a.stderr).contains("1 kernel(s) for gfx1201 ->"), "{}", text(&a.stderr));
-    assert_eq!(text(&a.stderr).replace(&legacy_out, "OUT"), text(&b.stderr).replace(&build_out, "OUT"));
+    assert!(
+        text(&a.stderr).contains("1 kernel(s) for gfx1201 ->"),
+        "{}",
+        text(&a.stderr)
+    );
+    assert_eq!(
+        text(&a.stderr).replace(&legacy_out, "OUT"),
+        text(&b.stderr).replace(&build_out, "OUT")
+    );
 }
 
 #[test]
@@ -100,7 +107,11 @@ fn build_failure_renders_a_diagnostic_and_json_carries_the_code() {
     let out = dir.join("bad.s").display().to_string();
     let r = rip(&["build", &src, "gfx1151", "v", &out]);
     assert_eq!(r.status.code(), Some(1));
-    assert!(text(&r.stderr).contains("error[R0301]"), "{}", text(&r.stderr));
+    assert!(
+        text(&r.stderr).contains("error[R0301]"),
+        "{}",
+        text(&r.stderr)
+    );
     let j = rip(&["build", "--json", &src, "gfx1151", "v", &out]);
     assert_eq!(j.status.code(), Some(1));
     let doc: serde_json::Value = serde_json::from_slice(&j.stdout).expect("json on stdout");
@@ -115,8 +126,15 @@ fn build_renders_the_scripts_own_error_as_r0502() {
     let out = dir.join("o.s").display().to_string();
     let r = rip(&["build", &src, "gfx1201", "v", &out]);
     assert_eq!(r.status.code(), Some(1));
-    assert!(text(&r.stderr).contains("error[R0502]") && text(&r.stderr).contains("built for gfx1151 only"), "{}", text(&r.stderr));
-    let m = rip(&["build", "--json", "--module", &src, "gfx1201", "v", "m", &out]);
+    assert!(
+        text(&r.stderr).contains("error[R0502]")
+            && text(&r.stderr).contains("built for gfx1151 only"),
+        "{}",
+        text(&r.stderr)
+    );
+    let m = rip(&[
+        "build", "--json", "--module", &src, "gfx1201", "v", "m", &out,
+    ]);
     assert_eq!(m.status.code(), Some(1));
     let doc: serde_json::Value = serde_json::from_slice(&m.stdout).expect("json on stdout");
     assert_eq!(doc["diagnostics"][0]["code"], "R0502");
@@ -129,18 +147,37 @@ fn check_on_a_valid_kernel_exits_zero_with_a_summary_line_per_target() {
     let r = rip(&["check", &src, "--variant", "v"]);
     let err = text(&r.stderr);
     assert_eq!(r.status.code(), Some(0), "{err}");
-    assert!(err.contains("ok gfx1151/v: ") && err.contains("instructions") && err.contains("VGPRs") && err.contains("SGPRs") && err.contains("LDS"), "{err}");
+    assert!(
+        err.contains("ok gfx1151/v: ")
+            && err.contains("instructions")
+            && err.contains("VGPRs")
+            && err.contains("SGPRs")
+            && err.contains("LDS"),
+        "{err}"
+    );
     assert!(err.contains("ok gfx1201/v: "), "{err}");
     let all = rip(&["check", &src, "--variant", "v", "--arch", "all"]);
     assert_eq!(all.status.code(), Some(0));
-    assert!(text(&all.stderr).contains("ok gfx1100/v: "), "{}", text(&all.stderr));
+    assert!(
+        text(&all.stderr).contains("ok gfx1100/v: "),
+        "{}",
+        text(&all.stderr)
+    );
 }
 
 #[test]
 fn check_json_describes_every_target() {
     let dir = scratch("check_json");
     let src = write(&dir, "k.rip", &good());
-    let r = rip(&["check", &src, "--variant", "v", "--arch", "gfx1201", "--json"]);
+    let r = rip(&[
+        "check",
+        &src,
+        "--variant",
+        "v",
+        "--arch",
+        "gfx1201",
+        "--json",
+    ]);
     assert_eq!(r.status.code(), Some(0), "{}", text(&r.stderr));
     let doc: serde_json::Value = serde_json::from_slice(&r.stdout).expect("json on stdout");
     assert_eq!(doc["ok"], true);
@@ -159,8 +196,19 @@ fn check_on_a_broken_kernel_exits_one_and_json_has_code_and_span() {
     let r = rip(&["check", &src, "--variant", "v", "--arch", "gfx1151"]);
     let err = text(&r.stderr);
     assert_eq!(r.status.code(), Some(1), "{err}");
-    assert!(err.contains("error[R0301]") && err.contains("error gfx1151/v: 1 error"), "{err}");
-    let j = rip(&["check", &src, "--variant", "v", "--arch", "gfx1151", "--json"]);
+    assert!(
+        err.contains("error[R0301]") && err.contains("error gfx1151/v: 1 error"),
+        "{err}"
+    );
+    let j = rip(&[
+        "check",
+        &src,
+        "--variant",
+        "v",
+        "--arch",
+        "gfx1151",
+        "--json",
+    ]);
     assert_eq!(j.status.code(), Some(1));
     let doc: serde_json::Value = serde_json::from_slice(&j.stdout).expect("json on stdout");
     assert_eq!(doc["ok"], false);
@@ -170,7 +218,10 @@ fn check_on_a_broken_kernel_exits_one_and_json_has_code_and_span() {
     let d = &result["diagnostics"][0];
     assert_eq!(d["code"], "R0301");
     assert_eq!(d["severity"], "error");
-    assert!(d["span"]["line"].as_u64().unwrap() >= 1 && d["span"]["col"].as_u64().unwrap() >= 1, "{d}");
+    assert!(
+        d["span"]["line"].as_u64().unwrap() >= 1 && d["span"]["col"].as_u64().unwrap() >= 1,
+        "{d}"
+    );
 }
 
 #[test]
@@ -192,10 +243,18 @@ fn explain_prints_a_section_lists_codes_and_rejects_unknown_ones() {
     assert!(out.contains("R0301") && out.contains("barrier"), "{out}");
     let list = rip(&["explain", "--list"]);
     assert_eq!(list.status.code(), Some(0));
-    assert!(text(&list.stdout).lines().any(|l| l.starts_with("R0301  ")), "{}", text(&list.stdout));
+    assert!(
+        text(&list.stdout).lines().any(|l| l.starts_with("R0301  ")),
+        "{}",
+        text(&list.stdout)
+    );
     let bad = rip(&["explain", "R9999"]);
     assert_eq!(bad.status.code(), Some(1));
-    assert!(text(&bad.stderr).contains("--list"), "{}", text(&bad.stderr));
+    assert!(
+        text(&bad.stderr).contains("--list"),
+        "{}",
+        text(&bad.stderr)
+    );
 }
 
 #[test]

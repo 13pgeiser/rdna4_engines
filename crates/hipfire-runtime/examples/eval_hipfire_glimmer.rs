@@ -55,15 +55,30 @@ fn main() {
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
-            "--model" => { model = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--ref" => { ref_path = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--output" => { output = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--max-chunks" => { max_chunks = Some(argv[i + 1].parse().expect("--max-chunks int")); i += 2; }
+            "--model" => {
+                model = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--ref" => {
+                ref_path = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--output" => {
+                output = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--max-chunks" => {
+                max_chunks = Some(argv[i + 1].parse().expect("--max-chunks int"));
+                i += 2;
+            }
             "-h" | "--help" => {
                 eprintln!("Usage: eval_hipfire_glimmer --model <hfq> --ref <kldref.bin> --output <kldseq> [--max-chunks N]");
                 std::process::exit(0);
             }
-            other => { eprintln!("unknown arg: {other}"); std::process::exit(1); }
+            other => {
+                eprintln!("unknown arg: {other}");
+                std::process::exit(1);
+            }
         }
     }
     let model = model.expect("--model required");
@@ -95,7 +110,10 @@ fn main() {
     let mut magic = [0u8; 8];
     ref_in.read_exact(&mut magic).expect("read ref magic");
     if &magic != b"HFKLDR\0\0" {
-        eprintln!("bad ref magic: expected \"HFKLDR\\0\\0\" (bytes {:?}), found {:?}", b"HFKLDR\0\0", magic);
+        eprintln!(
+            "bad ref magic: expected \"HFKLDR\\0\\0\" (bytes {:?}), found {:?}",
+            b"HFKLDR\0\0", magic
+        );
         std::process::exit(2);
     }
     let mut hdr = [0u8; 24];
@@ -113,13 +131,20 @@ fn main() {
 
     // -------- load model --------
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
-    eprintln!("eval_hipfire_glimmer: arch={} model={}", gpu.arch, model.display());
+    eprintln!(
+        "eval_hipfire_glimmer: arch={} model={}",
+        gpu.arch,
+        model.display()
+    );
     let hfq = HfqFile::open(&model).expect("open model");
     let config = GlimmerConfig::from_hfq(&hfq).expect("read config");
     // Vocab cross-check BEFORE the weight upload — a mismatched reference is a
     // hard stop, so catching it here avoids uploading the whole model first.
     if ref_n_vocab != config.vocab_size {
-        eprintln!("vocab mismatch: ref says {ref_n_vocab}, model says {}", config.vocab_size);
+        eprintln!(
+            "vocab mismatch: ref says {ref_n_vocab}, model says {}",
+            config.vocab_size
+        );
         std::process::exit(2);
     }
     let weights = GlimmerWeights::load(&hfq, &config, &mut gpu).expect("load weights");
@@ -156,7 +181,8 @@ fn main() {
     // and KLD isolates weight precision. The VMM allocator is pinned to 1 above
     // so the two arms cannot silently differ via HIPFIRE_GLIMMER_KV_VMM.
     let kv_max = n_ctx + 16;
-    let mut state = GlimmerState::new_with_max_seq(&mut gpu, &config, kv_max).expect("GlimmerState");
+    let mut state =
+        GlimmerState::new_with_max_seq(&mut gpu, &config, kv_max).expect("GlimmerState");
 
     // -------- per-chunk loop --------
     let mut mean_kld_per_seq: Vec<f64> = Vec::with_capacity(effective_n_chunk);
@@ -180,8 +206,14 @@ fn main() {
 
         for pos in 0..(n_ctx - 1) {
             let cand_logits = decode_step(
-                &config, &weights, &mut state, &mut gpu, chunk_tokens[pos], pos as u32,
-            ).expect("decode_step");
+                &config,
+                &weights,
+                &mut state,
+                &mut gpu,
+                chunk_tokens[pos],
+                pos as u32,
+            )
+            .expect("decode_step");
             if pos < scoring_start {
                 continue;
             }
@@ -191,12 +223,16 @@ fn main() {
             let mut top_indices: Vec<u32> = Vec::with_capacity(top_k);
             let mut top_log_probs: Vec<f32> = Vec::with_capacity(top_k);
             for j in 0..top_k {
-                top_indices.push(u32::from_le_bytes(block_buf[j * 4..j * 4 + 4].try_into().unwrap()));
+                top_indices.push(u32::from_le_bytes(
+                    block_buf[j * 4..j * 4 + 4].try_into().unwrap(),
+                ));
             }
             let lp_off = top_k * 4;
             for j in 0..top_k {
                 top_log_probs.push(f32::from_le_bytes(
-                    block_buf[lp_off + j * 4..lp_off + j * 4 + 4].try_into().unwrap(),
+                    block_buf[lp_off + j * 4..lp_off + j * 4 + 4]
+                        .try_into()
+                        .unwrap(),
                 ));
             }
             let resid_off = top_k * 8;
@@ -209,7 +245,10 @@ fn main() {
             let mut max_logit = f32::NEG_INFINITY;
             let mut argmax = 0usize;
             for (idx, &v) in cand_logits.iter().enumerate() {
-                if v > max_logit { max_logit = v; argmax = idx; }
+                if v > max_logit {
+                    max_logit = v;
+                    argmax = idx;
+                }
             }
             let mut sum_exp = 0.0f64;
             for &v in cand_logits.iter() {
@@ -229,7 +268,9 @@ fn main() {
             let mut sum_p_cand_at_ref_top = 0.0f64;
             for j in 0..top_k {
                 let ref_idx = top_indices[j] as usize;
-                if ref_idx >= cand_logits.len() { continue; }
+                if ref_idx >= cand_logits.len() {
+                    continue;
+                }
                 let log_p_ref = top_log_probs[j] as f64;
                 let log_p_cand = (cand_logits[ref_idx] as f64) - log_z;
                 let p_ref = log_p_ref.exp();
@@ -240,8 +281,8 @@ fn main() {
             let sum_p_residual_ref = sum_p_residual as f64;
             let sum_p_residual_cand = (1.0 - sum_p_cand_at_ref_top).max(0.0);
             if sum_p_residual_ref > 1e-9 && sum_p_residual_cand > 1e-9 {
-                kld_token += sum_p_residual_ref
-                    * (sum_p_residual_ref.ln() - sum_p_residual_cand.ln());
+                kld_token +=
+                    sum_p_residual_ref * (sum_p_residual_ref.ln() - sum_p_residual_cand.ln());
             }
             debug_assert!(
                 kld_token >= -1e-9,
@@ -263,7 +304,12 @@ fn main() {
                 let rate = total_scored_done as f64 / elapsed.max(1e-9);
                 eprint!(
                     "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
-                    c + 1, effective_n_chunk, total_scored_done, total_scored, pct, rate
+                    c + 1,
+                    effective_n_chunk,
+                    total_scored_done,
+                    total_scored,
+                    pct,
+                    rate
                 );
             }
         }
@@ -282,7 +328,9 @@ fn main() {
         let p99 = sorted[p99_idx];
         let mean_nll = if chunk_nll_count > 0 {
             chunk_nll_sum / chunk_nll_count as f64
-        } else { f64::NAN };
+        } else {
+            f64::NAN
+        };
         mean_kld_per_seq.push(mean);
         p99_kld_per_seq.push(p99);
         mean_nll_per_seq.push(mean_nll);
@@ -304,9 +352,11 @@ fn main() {
     let mut out = BufWriter::new(out_file);
     out.write_all(b"HFKSEQ\0\0").unwrap();
     out.write_all(&2u32.to_le_bytes()).unwrap();
-    out.write_all(&(effective_n_chunk as u32).to_le_bytes()).unwrap();
+    out.write_all(&(effective_n_chunk as u32).to_le_bytes())
+        .unwrap();
     out.write_all(&0u32.to_le_bytes()).unwrap();
-    for ((m, p), n) in mean_kld_per_seq.iter()
+    for ((m, p), n) in mean_kld_per_seq
+        .iter()
         .zip(p99_kld_per_seq.iter())
         .zip(mean_nll_per_seq.iter())
     {
@@ -316,8 +366,13 @@ fn main() {
     }
     out.flush().unwrap();
 
-    let overall_mean: f64 = mean_kld_per_seq.iter().copied().sum::<f64>() / mean_kld_per_seq.len() as f64;
-    let nll_finite: Vec<f64> = mean_nll_per_seq.iter().copied().filter(|x| x.is_finite()).collect();
+    let overall_mean: f64 =
+        mean_kld_per_seq.iter().copied().sum::<f64>() / mean_kld_per_seq.len() as f64;
+    let nll_finite: Vec<f64> = mean_nll_per_seq
+        .iter()
+        .copied()
+        .filter(|x| x.is_finite())
+        .collect();
     let overall_nll: f64 = if nll_finite.is_empty() {
         f64::NAN
     } else {
@@ -326,7 +381,9 @@ fn main() {
     let overall_ppl = overall_nll.exp();
     let top1_pct = if top1_total > 0 {
         top1_agree as f64 * 100.0 / top1_total as f64
-    } else { f64::NAN };
+    } else {
+        f64::NAN
+    };
     eprintln!(
         "eval_hipfire_glimmer: slice-mean KLD = {:.6}  mean NLL = {:.6}  PPL = {:.4}  top1-agree = {:.2}% ({}/{})",
         overall_mean, overall_nll, overall_ppl, top1_pct, top1_agree, top1_total

@@ -28,20 +28,30 @@ pub fn native_mtp_refusal(
     arch: &str,
     fp16_disabled: bool,
 ) -> Option<&'static str> {
-    let dtypes = layers.iter().filter_map(|layer| match layer {
-        LayerWeights::DeltaNetMoe(layer) => Some(&layer.ffn),
-        LayerWeights::FullAttnMoe(layer) => Some(&layer.ffn),
-        _ => None,
-    }).flat_map(|ffn| {
-        // Prefer the loaded tensors. Paged/EP layers retain full-model dtype
-        // metadata in their immutable execution plan even without local tensors.
-        ffn.experts.iter()
-            .filter(move |_| ffn.global_expert_dtypes.is_none())
-            .map(|expert| (expert.gate_up.gpu_dtype, expert.down.gpu_dtype))
-            .chain(ffn.expert_execution_plan.experts().iter()
-                .filter(move |_| ffn.experts.is_empty() || ffn.global_expert_dtypes.is_some())
-                .map(|expert| (expert.gate.dtype, expert.down.dtype)))
-    });
+    let dtypes = layers
+        .iter()
+        .filter_map(|layer| match layer {
+            LayerWeights::DeltaNetMoe(layer) => Some(&layer.ffn),
+            LayerWeights::FullAttnMoe(layer) => Some(&layer.ffn),
+            _ => None,
+        })
+        .flat_map(|ffn| {
+            // Prefer the loaded tensors. Paged/EP layers retain full-model dtype
+            // metadata in their immutable execution plan even without local tensors.
+            ffn.experts
+                .iter()
+                .filter(move |_| ffn.global_expert_dtypes.is_none())
+                .map(|expert| (expert.gate_up.gpu_dtype, expert.down.gpu_dtype))
+                .chain(
+                    ffn.expert_execution_plan
+                        .experts()
+                        .iter()
+                        .filter(move |_| {
+                            ffn.experts.is_empty() || ffn.global_expert_dtypes.is_some()
+                        })
+                        .map(|expert| (expert.gate.dtype, expert.down.dtype)),
+                )
+        });
     native_mtp_uniform_mq6_refused(arch, fp16_disabled, dtypes).then_some(
         "native MTP refused: uniform MQ6/qt15 routed experts with gfx12 FP16 WMMA \
          corrupt verify windows; use --spec off / speculation.mtp=off or HIPFIRE_FP16=0",
@@ -78,13 +88,19 @@ mod native_mtp_refusal_tests {
             assert!(!native_mtp_uniform_mq6_refused(arch, true, [mq6]));
             assert!(!native_mtp_uniform_mq6_refused(arch, false, []));
             assert!(!native_mtp_uniform_mq6_refused(
-                arch, false, [mq6, (DType::MQ4G256, DType::MQ6G256)],
+                arch,
+                false,
+                [mq6, (DType::MQ4G256, DType::MQ6G256)],
             ));
             assert!(!native_mtp_uniform_mq6_refused(
-                arch, false, [(DType::MQ6G256, DType::MQ4G256)],
+                arch,
+                false,
+                [(DType::MQ6G256, DType::MQ4G256)],
             ));
             assert!(!native_mtp_uniform_mq6_refused(
-                arch, false, [(DType::MQ6G256V2, DType::MQ6G256V2)],
+                arch,
+                false,
+                [(DType::MQ6G256V2, DType::MQ6G256V2)],
             ));
             assert!(native_mtp_refusal(&[], arch, false).is_none());
         }
@@ -2446,7 +2462,10 @@ fn visit_weight(prefix: &str, w: &WeightTensor, f: DenseVisit<'_>) -> HipResult<
     if let Some(paro) = &w.paro {
         f(&format!("{prefix}.paro.pairs"), &paro.pairs)?;
         f(&format!("{prefix}.paro.theta"), &paro.theta)?;
-        f(&format!("{prefix}.paro.channel_scales"), &paro.channel_scales)?;
+        f(
+            &format!("{prefix}.paro.channel_scales"),
+            &paro.channel_scales,
+        )?;
     }
     Ok(())
 }
@@ -2459,7 +2478,10 @@ fn visit_weight_mut(prefix: &str, w: &mut WeightTensor, f: DenseVisitMut<'_>) ->
     if let Some(paro) = &mut w.paro {
         f(&format!("{prefix}.paro.pairs"), &mut paro.pairs)?;
         f(&format!("{prefix}.paro.theta"), &mut paro.theta)?;
-        f(&format!("{prefix}.paro.channel_scales"), &mut paro.channel_scales)?;
+        f(
+            &format!("{prefix}.paro.channel_scales"),
+            &mut paro.channel_scales,
+        )?;
     }
     Ok(())
 }
@@ -2521,7 +2543,11 @@ impl std::fmt::Debug for Qwen35DenseHydrateError {
             .field("error", &self.error)
             .field(
                 "acquired_roles",
-                &self.acquired.iter().map(|(r, _)| r.as_str()).collect::<Vec<_>>(),
+                &self
+                    .acquired
+                    .iter()
+                    .map(|(r, _)| r.as_str())
+                    .collect::<Vec<_>>(),
             )
             .finish()
     }
@@ -2790,8 +2816,9 @@ impl Qwen35Weights {
         seal: &Qwen35RankSeal,
         take: &mut dyn FnMut(&str, &GpuTensorDescriptor) -> HipResult<GpuTensor>,
     ) -> Result<Self, Qwen35DenseHydrateError> {
-        let fail = |error: HipError, acquired: Vec<(String, GpuTensor)>| {
-            Qwen35DenseHydrateError { error, acquired }
+        let fail = |error: HipError, acquired: Vec<(String, GpuTensor)>| Qwen35DenseHydrateError {
+            error,
+            acquired,
         };
         seal.validate_dense().map_err(|e| fail(e, Vec::new()))?;
         let mut layers = Vec::with_capacity(seal.layer_seals.len());
@@ -2893,7 +2920,8 @@ impl Qwen35Weights {
         if let Err(error) = supplied {
             return Err(fail(error, acquired));
         }
-        let mut table: std::collections::HashMap<String, GpuTensor> = acquired.into_iter().collect();
+        let mut table: std::collections::HashMap<String, GpuTensor> =
+            acquired.into_iter().collect();
         let assembled = weights.walk_dense_mut(&mut |role, slot| {
             if tied && role == "output.buf" {
                 return Ok(());
@@ -4191,7 +4219,10 @@ mod dense_shared_tests {
         weights.output.lloyd_lut_e4m3 = None;
         weights.output.lloyd_lut_f16 = None;
         weights.output.lloyd_lut_c16 = None;
-        assert!(weights.validate_dense().is_err(), "Lloyd dtype without LUTs");
+        assert!(
+            weights.validate_dense().is_err(),
+            "Lloyd dtype without LUTs"
+        );
 
         let mut weights = dense_fixture(false);
         weights.output_norm = weights.output_norm.shallow_clone();
@@ -4208,7 +4239,10 @@ mod dense_shared_tests {
 
         let mut weights = dense_fixture(true);
         weights.output.buf = weights.output_norm.shallow_clone();
-        assert!(weights.validate_dense().is_err(), "tied alias of wrong buffer");
+        assert!(
+            weights.validate_dense().is_err(),
+            "tied alias of wrong buffer"
+        );
 
         assert!(dense_fixture(false).validate_dense().is_ok());
         assert!(dense_fixture(true).validate_dense().is_ok());

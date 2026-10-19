@@ -10,7 +10,11 @@ use std::sync::LazyLock;
 
 /// Per-part output views of rows `first..first + n` (row stride `m`) of the
 /// four-part row launchers; an empty part (`m == 0`) views nothing.
-fn x4_group_ys(parts: &[(&GpuTensor, &GpuTensor, usize); 4], first: usize, n: usize) -> [GpuTensor; 4] {
+fn x4_group_ys(
+    parts: &[(&GpuTensor, &GpuTensor, usize); 4],
+    first: usize,
+    n: usize,
+) -> [GpuTensor; 4] {
     std::array::from_fn(|i| parts[i].1.sub_offset(first * parts[i].2, n * parts[i].2))
 }
 
@@ -23,7 +27,12 @@ fn x4_group_parts<'a>(
 }
 
 /// Whether F32 `x` holds `[rows, k]` and every part's F32 output `[rows, m]`.
-fn x4_rows_fit(parts: &[(&GpuTensor, &GpuTensor, usize); 4], x: &GpuTensor, k: usize, rows: usize) -> bool {
+fn x4_rows_fit(
+    parts: &[(&GpuTensor, &GpuTensor, usize); 4],
+    x: &GpuTensor,
+    k: usize,
+    rows: usize,
+) -> bool {
     x.buf.size() >= rows * k * 4 && parts.iter().all(|&(_, y, m)| y.buf.size() >= rows * m * 4)
 }
 
@@ -152,7 +161,8 @@ impl WideTwinFamily {
     /// Whether the family's switch is on (developer var, read once, default off).
     pub fn enabled(self) -> bool {
         static SWITCHES: LazyLock<[bool; 5]> = LazyLock::new(|| {
-            WideTwinFamily::ALL.map(|family| hipfire_config::developer_bool(family.env_var(), false))
+            WideTwinFamily::ALL
+                .map(|family| hipfire_config::developer_bool(family.env_var(), false))
         });
         SWITCHES[self as usize]
     }
@@ -222,7 +232,9 @@ static BF16_ROWS_WIDE_PM_VERIFIED: LazyLock<Result<(), String>> = LazyLock::new(
         .map(|b| format!("{b:02x}"))
         .collect();
     if got != want {
-        return Err(format!("{BF16_ROWS_WIDE_PM_MODULE}: embedded image sha256 {got} is not the pinned {want}"));
+        return Err(format!(
+            "{BF16_ROWS_WIDE_PM_MODULE}: embedded image sha256 {got} is not the pinned {want}"
+        ));
     }
     Ok(())
 });
@@ -19181,7 +19193,18 @@ impl Gpu {
                 // wide twin below serves gfx1201.
                 let func = BF16_K4_ROWS_WIDE_PM[usize::from(cap == 32)];
                 self.ensure_bf16_rows_wide_pm_entry(func)?;
-                return self.launch_hc_rows_wide(func, 256, false, weight, x, y, m, k, hc_act_scale, rows);
+                return self.launch_hc_rows_wide(
+                    func,
+                    256,
+                    false,
+                    weight,
+                    x,
+                    y,
+                    m,
+                    k,
+                    hc_act_scale,
+                    rows,
+                );
             }
             const WIDE: [&str; 2] = [
                 "gemv_bf16_xf32_k4_rows_wide_r16",
@@ -19194,7 +19217,18 @@ impl Gpu {
                 kernels::QWEN4_GEMV_BF16_XF32_SRC,
                 func,
             )?;
-            return self.launch_hc_rows_wide(func, 256, false, weight, x, y, m, k, hc_act_scale, rows);
+            return self.launch_hc_rows_wide(
+                func,
+                256,
+                false,
+                weight,
+                x,
+                y,
+                m,
+                k,
+                hc_act_scale,
+                rows,
+            );
         }
         if rows > FEW_ROW_ROUTE_ROWS {
             return self.gemv_bf16_xf32_k4_rows_tiled(weight, x, y, m, k, hc_act_scale, rows);
@@ -19399,16 +19433,35 @@ impl Gpu {
             if self.arch_caps.is_gfx1151() && crate::lane_rows_pm::q8_k8_wide_admits(m, k, rows) {
                 let func = crate::lane_rows_pm::Q8_K8_WIDE[ix];
                 self.ensure_lane_rows_pm(func, func)?;
-                return self.launch_hc_rows_wide(func, 512, true, weight, x, y, m, k, hc_act_scale, rows);
+                return self.launch_hc_rows_wide(
+                    func,
+                    512,
+                    true,
+                    weight,
+                    x,
+                    y,
+                    m,
+                    k,
+                    hc_act_scale,
+                    rows,
+                );
             }
-            const WIDE: [&str; 2] = [
-                "gemv_q8_0_k8_rows_wide_r16",
-                "gemv_q8_0_k8_rows_wide_r32",
-            ];
+            const WIDE: [&str; 2] = ["gemv_q8_0_k8_rows_wide_r16", "gemv_q8_0_k8_rows_wide_r32"];
             let func = WIDE[ix];
             self.bind_thread()?;
             self.ensure_kernel("qwen4_gemv_q8_0", kernels::QWEN4_GEMV_Q8_0_SRC, func)?;
-            return self.launch_hc_rows_wide(func, 512, false, weight, x, y, m, k, hc_act_scale, rows);
+            return self.launch_hc_rows_wide(
+                func,
+                512,
+                false,
+                weight,
+                x,
+                y,
+                m,
+                k,
+                hc_act_scale,
+                rows,
+            );
         }
         if rows > FEW_ROW_ROUTE_ROWS {
             for (first, n) in few_row_groups(rows) {
@@ -20338,11 +20391,20 @@ impl Gpu {
     /// oracles can launch the exports directly.
     pub fn ensure_bf16_rows_wide_pm_entry(&mut self, symbol: &str) -> HipResult<()> {
         if !self.arch_caps.is_gfx1151() {
-            return Err(hip_bridge::HipError::new(1, "the BF16 wide PM kernels are exact gfx1151 only"));
+            return Err(hip_bridge::HipError::new(
+                1,
+                "the BF16 wide PM kernels are exact gfx1151 only",
+            ));
         }
-        BF16_ROWS_WIDE_PM_VERIFIED.clone().map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
+        BF16_ROWS_WIDE_PM_VERIFIED
+            .clone()
+            .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
         self.bind_thread()?;
-        self.ensure_embedded_kernel(BF16_ROWS_WIDE_PM_MODULE, kernels::BF16_ROWS_WIDE_PM_GFX1151, symbol)
+        self.ensure_embedded_kernel(
+            BF16_ROWS_WIDE_PM_MODULE,
+            kernels::BF16_ROWS_WIDE_PM_GFX1151,
+            symbol,
+        )
     }
 
     /// One launch of an HC wide twin `(W, X, Y, M, K, scale, hc_act, R)`
@@ -20792,7 +20854,11 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let bad = |msg: &str| Err(hip_bridge::HipError::new(1, msg));
-        if !(1..=WIDE_VERIFY_MAX_ROWS).contains(&rows) || k == 0 || !k.is_multiple_of(256) || k > i32::MAX as usize {
+        if !(1..=WIDE_VERIFY_MAX_ROWS).contains(&rows)
+            || k == 0
+            || !k.is_multiple_of(256)
+            || k > i32::MAX as usize
+        {
             return bad("MQ4 rows x4 needs 1..=32 rows, K > 0, K % 256 == 0");
         }
         let fits = |n: Option<usize>| n.is_some_and(|n| n <= u32::MAX as usize);

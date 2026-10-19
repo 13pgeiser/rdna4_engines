@@ -108,9 +108,9 @@
 //!  * Registers: VGPR high water `40 + accumulators` (one chain / HC: 56 /
 //!    72 of 80; four chains: 104 of 128 / 168 of 192), SGPR 49 of 56.
 use crate::insn::{Instruction, MemoryClass};
-use crate::ledger::Counter;
 use crate::kernels::common::{lit, mem, op, s, smem, sop, sr, v, vr};
 use crate::lds::Transition;
+use crate::ledger::Counter;
 use crate::plan::Access;
 use crate::reg::{Kind, Live, RegRef};
 use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan};
@@ -141,7 +141,8 @@ fn declare(p: &mut RegPlan, name: &str, kind: Kind, base: u8, len: u8) -> R {
     let mut at = 0u8;
     while at < len {
         let rest = len - at;
-        let piece = [8u8, 4, 2, 1].into_iter()
+        let piece = [8u8, 4, 2, 1]
+            .into_iter()
             .find(|w| *w <= rest && (kind == Kind::V || (base + at) % *w == 0))
             .ok_or("unalignable register range")?;
         p.add_range(&format!("{name}{at}"), kind, base + at, piece, Live::Whole)?;
@@ -158,25 +159,64 @@ fn vop(b: &mut Builder, text: impl Into<String>, defs: &[u8], uses: &[u8], suses
     op(b, text, &d, &u)
 }
 
-fn off(imm: u32) -> String { if imm == 0 { String::new() } else { format!(" offset:{imm}") } }
+fn off(imm: u32) -> String {
+    if imm == 0 {
+        String::new()
+    } else {
+        format!(" offset:{imm}")
+    }
+}
 
 /// `global_load_*` of one dword-or-narrower value at `s[base:base+1] + v{voff} + imm`.
 fn gload(b: &mut Builder, mnemonic: &str, dst: u8, voff: u8, base: u8, imm: u32) -> R {
-    mem(b, format!("{mnemonic} v{dst}, v{voff}, s[{base}:{}]{}", base + 1, off(imm)),
-        &[v(dst)], &[v(voff), sr(base, 2)], MemoryClass::VmemLoad)
+    mem(
+        b,
+        format!(
+            "{mnemonic} v{dst}, v{voff}, s[{base}:{}]{}",
+            base + 1,
+            off(imm)
+        ),
+        &[v(dst)],
+        &[v(voff), sr(base, 2)],
+        MemoryClass::VmemLoad,
+    )
 }
 
 fn ds_st(b: &mut Builder, slot: usize, addr: u8, data: u8, imm: u32) -> R {
-    b.ds_store(slot, Instruction::new(format!("ds_store_b32 v{addr}, v{data}{}", off(imm)), vec![], vec![v(addr), v(data)])
-        .memory(MemoryClass::DsStore))
+    b.ds_store(
+        slot,
+        Instruction::new(
+            format!("ds_store_b32 v{addr}, v{data}{}", off(imm)),
+            vec![],
+            vec![v(addr), v(data)],
+        )
+        .memory(MemoryClass::DsStore),
+    )
 }
 
 /// `ds_load_u16_d16` (low half, high half kept) and `ds_load_i8` (sign extended).
-fn ds_ld(b: &mut Builder, slot: usize, mnemonic: &str, dst: u8, addr: u8, imm: u32, keeps_dst: bool) -> R {
+fn ds_ld(
+    b: &mut Builder,
+    slot: usize,
+    mnemonic: &str,
+    dst: u8,
+    addr: u8,
+    imm: u32,
+    keeps_dst: bool,
+) -> R {
     let mut uses = vec![v(addr)];
-    if keeps_dst { uses.push(v(dst)); }
-    b.ds_load(slot, Instruction::new(format!("{mnemonic} v{dst}, v{addr}{}", off(imm)), vec![v(dst)], uses)
-        .memory(MemoryClass::DsLoad))
+    if keeps_dst {
+        uses.push(v(dst));
+    }
+    b.ds_load(
+        slot,
+        Instruction::new(
+            format!("{mnemonic} v{dst}, v{addr}{}", off(imm)),
+            vec![v(dst)],
+            uses,
+        )
+        .memory(MemoryClass::DsLoad),
+    )
 }
 
 /// The wave-wide lane reduction of every value in `values` (VGPRs), batched
@@ -187,22 +227,40 @@ fn lane_tree(b: &mut Builder, values: &[u8], tmp: u8, addr: u8) -> R {
     let add = |b: &mut Builder, chunk: &[u8]| -> R {
         for (i, &val) in chunk.iter().enumerate() {
             let t = tmp + i as u8;
-            vop(b, format!("v_add_f32_e32 v{val}, v{val}, v{t}"), &[val], &[val, t], &[])?;
+            vop(
+                b,
+                format!("v_add_f32_e32 v{val}, v{val}, v{t}"),
+                &[val],
+                &[val, t],
+                &[],
+            )?;
         }
         Ok(())
     };
     for chunk in values.chunks(TREE_CHUNK) {
         for (i, &val) in chunk.iter().enumerate() {
             let t = tmp + i as u8;
-            b.ds_crosslane(Instruction::new(format!("ds_swizzle_b32 v{t}, v{val} offset:swizzle(BITMASK_PERM,\"1pppp\")"),
-                vec![v(t)], vec![v(val)]).memory(MemoryClass::DsLoad))?;
+            b.ds_crosslane(
+                Instruction::new(
+                    format!("ds_swizzle_b32 v{t}, v{val} offset:swizzle(BITMASK_PERM,\"1pppp\")"),
+                    vec![v(t)],
+                    vec![v(val)],
+                )
+                .memory(MemoryClass::DsLoad),
+            )?;
         }
         add(b, chunk)?;
         for level in 0..4u8 {
             for (i, &val) in chunk.iter().enumerate() {
                 let t = tmp + i as u8;
-                b.ds_crosslane(Instruction::new(format!("ds_bpermute_b32 v{t}, v{}, v{val}", addr + level),
-                    vec![v(t)], vec![v(addr + level), v(val)]).memory(MemoryClass::DsLoad))?;
+                b.ds_crosslane(
+                    Instruction::new(
+                        format!("ds_bpermute_b32 v{t}, v{}, v{val}", addr + level),
+                        vec![v(t)],
+                        vec![v(addr + level), v(val)],
+                    )
+                    .memory(MemoryClass::DsLoad),
+                )?;
             }
             add(b, chunk)?;
         }
@@ -215,9 +273,27 @@ fn lane_tree(b: &mut Builder, values: &[u8], tmp: u8, addr: u8) -> R {
 fn bpermute_addresses(b: &mut Builder, addr: u8, lane: u8) -> R {
     for (i, o) in [8u32, 4, 2, 1].into_iter().enumerate() {
         let a = addr + i as u8;
-        vop(b, format!("v_cmp_gt_u32_e32 vcc_lo, {}, v{lane}", 32 - o), &[], &[lane], &[])?;
-        vop(b, format!("v_cndmask_b32_e64 v{a}, 0, {o}, vcc_lo"), &[a], &[], &[])?;
-        vop(b, format!("v_add_lshl_u32 v{a}, v{a}, v{lane}, 2"), &[a], &[a, lane], &[])?;
+        vop(
+            b,
+            format!("v_cmp_gt_u32_e32 vcc_lo, {}, v{lane}", 32 - o),
+            &[],
+            &[lane],
+            &[],
+        )?;
+        vop(
+            b,
+            format!("v_cndmask_b32_e64 v{a}, 0, {o}, vcc_lo"),
+            &[a],
+            &[],
+            &[],
+        )?;
+        vop(
+            b,
+            format!("v_add_lshl_u32 v{a}, v{a}, v{lane}, 2"),
+            &[a],
+            &[a, lane],
+            &[],
+        )?;
     }
     Ok(())
 }
@@ -229,16 +305,76 @@ fn bpermute_addresses(b: &mut Builder, addr: u8, lane: u8) -> R {
 /// by `v_cndmask` instead of the HIP object's exec-masked branches. `t` are
 /// four scratch VGPRs.
 fn bf16_round(b: &mut Builder, x: u8, t: [u8; 4]) -> R {
-    vop(b, format!("v_and_b32_e32 v{}, 0x7f800000, v{x}", t[0]), &[t[0]], &[x], &[])?;
-    vop(b, format!("v_bfe_u32 v{}, v{x}, 16, 1", t[1]), &[t[1]], &[x], &[])?;
-    vop(b, format!("v_add3_u32 v{0}, v{x}, v{0}, 0x7fff", t[1]), &[t[1]], &[x, t[1]], &[])?;
-    vop(b, format!("v_and_b32_e32 v{}, 0xffff, v{x}", t[2]), &[t[2]], &[x], &[])?;
-    vop(b, format!("v_or_b32_e32 v{}, 0x10000, v{x}", t[3]), &[t[3]], &[x], &[])?;
-    vop(b, format!("v_cmp_eq_u32_e32 vcc_lo, 0, v{}", t[2]), &[], &[t[2]], &[])?;
-    vop(b, format!("v_cndmask_b32_e32 v{0}, v{1}, v{x}, vcc_lo", t[2], t[3]), &[t[2]], &[t[3], x], &[])?;
-    vop(b, format!("v_cmp_ne_u32_e32 vcc_lo, 0x7f800000, v{}", t[0]), &[], &[t[0]], &[])?;
-    vop(b, format!("v_cndmask_b32_e32 v{0}, v{1}, v{0}, vcc_lo", t[1], t[2]), &[t[1]], &[t[2], t[1]], &[])?;
-    vop(b, format!("v_and_b32_e32 v{x}, 0xffff0000, v{}", t[1]), &[x], &[t[1]], &[])
+    vop(
+        b,
+        format!("v_and_b32_e32 v{}, 0x7f800000, v{x}", t[0]),
+        &[t[0]],
+        &[x],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_bfe_u32 v{}, v{x}, 16, 1", t[1]),
+        &[t[1]],
+        &[x],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_add3_u32 v{0}, v{x}, v{0}, 0x7fff", t[1]),
+        &[t[1]],
+        &[x, t[1]],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_and_b32_e32 v{}, 0xffff, v{x}", t[2]),
+        &[t[2]],
+        &[x],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_or_b32_e32 v{}, 0x10000, v{x}", t[3]),
+        &[t[3]],
+        &[x],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_cmp_eq_u32_e32 vcc_lo, 0, v{}", t[2]),
+        &[],
+        &[t[2]],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_cndmask_b32_e32 v{0}, v{1}, v{x}, vcc_lo", t[2], t[3]),
+        &[t[2]],
+        &[t[3], x],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_cmp_ne_u32_e32 vcc_lo, 0x7f800000, v{}", t[0]),
+        &[],
+        &[t[0]],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_cndmask_b32_e32 v{0}, v{1}, v{0}, vcc_lo", t[1], t[2]),
+        &[t[1]],
+        &[t[2], t[1]],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_and_b32_e32 v{x}, 0xffff0000, v{}", t[1]),
+        &[x],
+        &[t[1]],
+        &[],
+    )
 }
 
 /// SiLU of `x` in place: the r8 incumbent's expansion of `x / (1 + expf(-x))`
@@ -246,38 +382,182 @@ fn bf16_round(b: &mut Builder, x: u8, t: [u8; 4]) -> R {
 /// `t[0..6]` standing for the listing's v2..v7 and `x` for v1.
 fn silu(b: &mut Builder, x: u8, t: [u8; 6]) -> R {
     let [t0, t1, t2, t3, t4, t5] = t;
-    vop(b, format!("v_mul_f32_e32 v{t0}, 0xbfb8aa3b, v{x}"), &[t0], &[x], &[])?;
-    vop(b, format!("v_fma_f32 v{t1}, 0xbfb8aa3b, v{x}, -v{t0}"), &[t1], &[x, t0], &[])?;
-    vop(b, format!("v_rndne_f32_e32 v{t2}, v{t0}"), &[t2], &[t0], &[])?;
-    vop(b, format!("v_sub_f32_e32 v{t0}, v{t0}, v{t2}"), &[t0], &[t0, t2], &[])?;
-    vop(b, format!("v_cmp_nlt_f32_e32 vcc_lo, 0x42ce8ed0, v{x}"), &[], &[x], &[])?;
-    vop(b, format!("v_fmamk_f32 v{t1}, v{x}, 0xb2a5705f, v{t1}"), &[t1], &[x, t1], &[])?;
-    vop(b, format!("v_add_f32_e32 v{t0}, v{t0}, v{t1}"), &[t0], &[t0, t1], &[])?;
-    vop(b, format!("v_cvt_i32_f32_e32 v{t1}, v{t2}"), &[t1], &[t2], &[])?;
+    vop(
+        b,
+        format!("v_mul_f32_e32 v{t0}, 0xbfb8aa3b, v{x}"),
+        &[t0],
+        &[x],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_fma_f32 v{t1}, 0xbfb8aa3b, v{x}, -v{t0}"),
+        &[t1],
+        &[x, t0],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_rndne_f32_e32 v{t2}, v{t0}"),
+        &[t2],
+        &[t0],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_sub_f32_e32 v{t0}, v{t0}, v{t2}"),
+        &[t0],
+        &[t0, t2],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_cmp_nlt_f32_e32 vcc_lo, 0x42ce8ed0, v{x}"),
+        &[],
+        &[x],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_fmamk_f32 v{t1}, v{x}, 0xb2a5705f, v{t1}"),
+        &[t1],
+        &[x, t1],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_add_f32_e32 v{t0}, v{t0}, v{t1}"),
+        &[t0],
+        &[t0, t1],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_cvt_i32_f32_e32 v{t1}, v{t2}"),
+        &[t1],
+        &[t2],
+        &[],
+    )?;
     vop(b, format!("v_exp_f32_e32 v{t0}, v{t0}"), &[t0], &[t0], &[])?;
-    vop(b, format!("v_ldexp_f32 v{t0}, v{t0}, v{t1}"), &[t0], &[t0, t1], &[])?;
-    vop(b, format!("v_cndmask_b32_e32 v{t0}, 0, v{t0}, vcc_lo"), &[t0], &[t0], &[])?;
-    vop(b, format!("v_cmp_ngt_f32_e32 vcc_lo, 0xc2b17218, v{x}"), &[], &[x], &[])?;
-    vop(b, format!("v_cndmask_b32_e32 v{t0}, 0x7f800000, v{t0}, vcc_lo"), &[t0], &[t0], &[])?;
-    vop(b, format!("v_add_f32_e32 v{t0}, 1.0, v{t0}"), &[t0], &[t0], &[])?;
-    vop(b, format!("v_div_scale_f32 v{t1}, null, v{t0}, v{t0}, v{x}"), &[t1], &[t0, x], &[])?;
+    vop(
+        b,
+        format!("v_ldexp_f32 v{t0}, v{t0}, v{t1}"),
+        &[t0],
+        &[t0, t1],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_cndmask_b32_e32 v{t0}, 0, v{t0}, vcc_lo"),
+        &[t0],
+        &[t0],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_cmp_ngt_f32_e32 vcc_lo, 0xc2b17218, v{x}"),
+        &[],
+        &[x],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_cndmask_b32_e32 v{t0}, 0x7f800000, v{t0}, vcc_lo"),
+        &[t0],
+        &[t0],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_add_f32_e32 v{t0}, 1.0, v{t0}"),
+        &[t0],
+        &[t0],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_div_scale_f32 v{t1}, null, v{t0}, v{t0}, v{x}"),
+        &[t1],
+        &[t0, x],
+        &[],
+    )?;
     vop(b, format!("v_rcp_f32_e32 v{t2}, v{t1}"), &[t2], &[t1], &[])?;
-    vop(b, format!("v_fma_f32 v{t3}, -v{t1}, v{t2}, 1.0"), &[t3], &[t1, t2], &[])?;
-    vop(b, format!("v_fmac_f32_e32 v{t2}, v{t3}, v{t2}"), &[t2], &[t2, t3], &[])?;
-    vop(b, format!("v_div_scale_f32 v{t3}, vcc_lo, v{x}, v{t0}, v{x}"), &[t3], &[x, t0], &[])?;
-    vop(b, format!("v_mul_f32_e32 v{t4}, v{t3}, v{t2}"), &[t4], &[t3, t2], &[])?;
-    vop(b, format!("v_fma_f32 v{t5}, -v{t1}, v{t4}, v{t3}"), &[t5], &[t1, t4, t3], &[])?;
-    vop(b, format!("v_fmac_f32_e32 v{t4}, v{t5}, v{t2}"), &[t4], &[t4, t5, t2], &[])?;
-    vop(b, format!("v_fma_f32 v{t1}, -v{t1}, v{t4}, v{t3}"), &[t1], &[t1, t4, t3], &[])?;
-    vop(b, format!("v_div_fmas_f32 v{t1}, v{t1}, v{t2}, v{t4}"), &[t1], &[t1, t2, t4], &[])?;
-    vop(b, format!("v_div_fixup_f32 v{x}, v{t1}, v{t0}, v{x}"), &[x], &[t1, t0, x], &[])
+    vop(
+        b,
+        format!("v_fma_f32 v{t3}, -v{t1}, v{t2}, 1.0"),
+        &[t3],
+        &[t1, t2],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_fmac_f32_e32 v{t2}, v{t3}, v{t2}"),
+        &[t2],
+        &[t2, t3],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_div_scale_f32 v{t3}, vcc_lo, v{x}, v{t0}, v{x}"),
+        &[t3],
+        &[x, t0],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_mul_f32_e32 v{t4}, v{t3}, v{t2}"),
+        &[t4],
+        &[t3, t2],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_fma_f32 v{t5}, -v{t1}, v{t4}, v{t3}"),
+        &[t5],
+        &[t1, t4, t3],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_fmac_f32_e32 v{t4}, v{t5}, v{t2}"),
+        &[t4],
+        &[t4, t5, t2],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_fma_f32 v{t1}, -v{t1}, v{t4}, v{t3}"),
+        &[t1],
+        &[t1, t4, t3],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_div_fmas_f32 v{t1}, v{t1}, v{t2}, v{t4}"),
+        &[t1],
+        &[t1, t2, t4],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_div_fixup_f32 v{x}, v{t1}, v{t0}, v{x}"),
+        &[x],
+        &[t1, t0, x],
+        &[],
+    )
 }
 
 /// `dq = fma_mix(d_f16, q, -0.0)` in place over the block's `d` register and
 /// `q = f32(int8)` in place (`DAG.md` §2: `neg(0) op_sel_hi:[1,0,0]`).
 fn dequant(b: &mut Builder, d: u8, q: u8) -> R {
     vop(b, format!("v_cvt_f32_i32_e32 v{q}, v{q}"), &[q], &[q], &[])?;
-    vop(b, format!("v_fma_mix_f32 v{d}, v{d}, v{q}, neg(0) op_sel_hi:[1,0,0]"), &[d], &[d, q], &[])
+    vop(
+        b,
+        format!("v_fma_mix_f32 v{d}, v{d}, v{q}, neg(0) op_sel_hi:[1,0,0]"),
+        &[d],
+        &[d, q],
+        &[],
+    )
 }
 
 // ===================================================================== k8
@@ -344,36 +624,76 @@ const S_LANE0: u8 = 30;
 const K8_WSTEP: u32 = 8 * 34;
 const K8_XSTEP: u32 = 8 * 128;
 
-fn k8_q(slot: u8, r: u8) -> u8 { V_SLOT + 16 * slot + r }
-fn k8_d(slot: u8, r: u8) -> u8 { V_SLOT + 16 * slot + 4 + r }
-fn k8_x(slot: u8, c: u8) -> u8 { V_SLOT + 16 * slot + 8 + c }
-fn k8_sum(r: u8, c: u8) -> u8 { V_SUM + 8 * r + c }
+fn k8_q(slot: u8, r: u8) -> u8 {
+    V_SLOT + 16 * slot + r
+}
+fn k8_d(slot: u8, r: u8) -> u8 {
+    V_SLOT + 16 * slot + 4 + r
+}
+fn k8_x(slot: u8, c: u8) -> u8 {
+    V_SLOT + 16 * slot + 8 + c
+}
+fn k8_sum(r: u8, c: u8) -> u8 {
+    V_SUM + 8 * r + c
+}
 
 fn k8_plan() -> Result<RegPlan, String> {
     let mut p = RegPlan::new(K8_VGPRS, 40)?;
     for (name, base, len) in [
-        ("kernarg_ptr", S_KARG, 2), ("wg_x", S_WG, 1), ("a_x_ptrs", S_A, 4), ("y_ptr", S_Y, 2),
-        ("m_k", S_M, 2), ("b_scale", S_B, 2), ("hc_act", S_HC, 1),
-    ] { declare(&mut p, name, Kind::S, base, len)?; }
-    for n in S_WAVE..=S_LANE0 { declare(&mut p, "scalar", Kind::S, n, 1)?; }
+        ("kernarg_ptr", S_KARG, 2),
+        ("wg_x", S_WG, 1),
+        ("a_x_ptrs", S_A, 4),
+        ("y_ptr", S_Y, 2),
+        ("m_k", S_M, 2),
+        ("b_scale", S_B, 2),
+        ("hc_act", S_HC, 1),
+    ] {
+        declare(&mut p, name, Kind::S, base, len)?;
+    }
+    for n in S_WAVE..=S_LANE0 {
+        declare(&mut p, "scalar", Kind::S, n, 1)?;
+    }
     for (name, base, len) in [
-        ("tid", V_TID, 1), ("lane", V_LANE, 1), ("wave4", V_WAVE4, 1), ("bpermute_addr", V_ADDR, 4),
-        ("x_offset", V_XOFF, 8), ("w_offset_d", V_WOFFD, 4), ("w_offset_q", V_WOFFQ, 4),
-        ("block_slots", V_SLOT, 64), ("sums", V_SUM, 32), ("tree_tmp", V_TMP, 8),
-        ("partials", V_PART, 8), ("epilogue_tmp", V_EP, 8), ("epilogue_index", V_IR, 5),
-    ] { declare(&mut p, name, Kind::V, base, len)?; }
+        ("tid", V_TID, 1),
+        ("lane", V_LANE, 1),
+        ("wave4", V_WAVE4, 1),
+        ("bpermute_addr", V_ADDR, 4),
+        ("x_offset", V_XOFF, 8),
+        ("w_offset_d", V_WOFFD, 4),
+        ("w_offset_q", V_WOFFQ, 4),
+        ("block_slots", V_SLOT, 64),
+        ("sums", V_SUM, 32),
+        ("tree_tmp", V_TMP, 8),
+        ("partials", V_PART, 8),
+        ("epilogue_tmp", V_EP, 8),
+        ("epilogue_index", V_IR, 5),
+    ] {
+        declare(&mut p, name, Kind::V, base, len)?;
+    }
     Ok(p)
 }
 
 fn k8_spec() -> KernelSpec {
     KernelSpec {
-        kernel_id: "qwen4_lane_rows_q8".into(), variant: "k8_xbatch".into(), arch: Arch::Gfx1151, symbol: K8_SYMBOL.into(),
-        kernargs: KernargLayout::new(44).pointer_access("A", 0, Access::ReadOnly)
-            .pointer_access("x", 8, Access::ReadOnly).pointer_access("y", 16, Access::WriteOnly)
-            .hidden("M", 24, 4, "by_value").hidden("K", 28, 4, "by_value").hidden("B", 32, 4, "by_value")
-            .hidden("scale", 36, 4, "by_value").hidden("hc_act", 40, 4, "by_value"),
-        user_sgpr_count: 2, system_sgpr_workgroup_id_y: false, workgroup_size: 256,
-        group_segment_fixed_size: K8_LDS_BYTES, wave32: true, cu_mode: false,
+        kernel_id: "qwen4_lane_rows_q8".into(),
+        variant: "k8_xbatch".into(),
+        arch: Arch::Gfx1151,
+        symbol: K8_SYMBOL.into(),
+        kernargs: KernargLayout::new(44)
+            .pointer_access("A", 0, Access::ReadOnly)
+            .pointer_access("x", 8, Access::ReadOnly)
+            .pointer_access("y", 16, Access::WriteOnly)
+            .hidden("M", 24, 4, "by_value")
+            .hidden("K", 28, 4, "by_value")
+            .hidden("B", 32, 4, "by_value")
+            .hidden("scale", 36, 4, "by_value")
+            .hidden("hc_act", 40, 4, "by_value"),
+        user_sgpr_count: 2,
+        system_sgpr_workgroup_id_y: false,
+        workgroup_size: 256,
+        group_segment_fixed_size: K8_LDS_BYTES,
+        wave32: true,
+        cu_mode: false,
     }
 }
 
@@ -387,7 +707,9 @@ fn k8() -> Result<Emitted, String> {
         op(&mut b, format!("s_cbranch_scc1 .Lq8k8_b{nb}"), &[], &[])?;
     }
     op(&mut b, "s_branch .Lq8k8_end", &[], &[])?;
-    for nb in 1..=MAX_COLUMNS { k8_section(&mut b, nb, slot)?; }
+    for nb in 1..=MAX_COLUMNS {
+        k8_section(&mut b, nb, slot)?;
+    }
     b.label(".Lq8k8_end")?;
     op(&mut b, "s_endpgm", &[], &[])?;
     b.finish()
@@ -401,38 +723,164 @@ fn k8_prologue(b: &mut Builder) -> R {
     smem(b, S_M, 2, S_KARG, 0x18)?;
     smem(b, S_B, 2, S_KARG, 0x20)?;
     smem(b, S_HC, 1, S_KARG, 0x28)?;
-    vop(b, format!("v_and_b32_e32 v{V_LANE}, 31, v{V_TID}"), &[V_LANE], &[V_TID], &[])?;
-    vop(b, format!("v_lshrrev_b32_e32 v{V_WAVE4}, 5, v{V_TID}"), &[V_WAVE4], &[V_TID], &[])?;
-    op(b, format!("v_readfirstlane_b32 s{S_WAVE}, v{V_WAVE4}"), &[s(S_WAVE)], &[v(V_WAVE4)])?;
-    vop(b, format!("v_lshlrev_b32_e32 v{V_WAVE4}, 2, v{V_WAVE4}"), &[V_WAVE4], &[V_WAVE4], &[])?;
+    vop(
+        b,
+        format!("v_and_b32_e32 v{V_LANE}, 31, v{V_TID}"),
+        &[V_LANE],
+        &[V_TID],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_lshrrev_b32_e32 v{V_WAVE4}, 5, v{V_TID}"),
+        &[V_WAVE4],
+        &[V_TID],
+        &[],
+    )?;
+    op(
+        b,
+        format!("v_readfirstlane_b32 s{S_WAVE}, v{V_WAVE4}"),
+        &[s(S_WAVE)],
+        &[v(V_WAVE4)],
+    )?;
+    vop(
+        b,
+        format!("v_lshlrev_b32_e32 v{V_WAVE4}, 2, v{V_WAVE4}"),
+        &[V_WAVE4],
+        &[V_WAVE4],
+        &[],
+    )?;
     bpermute_addresses(b, V_ADDR, V_LANE)?;
-    vop(b, format!("v_cmp_eq_u32_e32 vcc_lo, 0, v{V_LANE}"), &[], &[V_LANE], &[])?;
-    op(b, format!("s_mov_b32 s{S_LANE0}, vcc_lo"), &[s(S_LANE0)], &[])?;
+    vop(
+        b,
+        format!("v_cmp_eq_u32_e32 vcc_lo, 0, v{V_LANE}"),
+        &[],
+        &[V_LANE],
+        &[],
+    )?;
+    op(
+        b,
+        format!("s_mov_b32 s{S_LANE0}, vcc_lo"),
+        &[s(S_LANE0)],
+        &[],
+    )?;
     b.wait_all()?;
-    sop(b, format!("s_lshl_b32 s{S_ROW0}, s{S_WG}, 2"), &[S_ROW0], &[S_WG])?;
-    sop(b, format!("s_cmp_ge_i32 s{S_ROW0}, s{S_M}"), &[], &[S_ROW0, S_M])?;
+    sop(
+        b,
+        format!("s_lshl_b32 s{S_ROW0}, s{S_WG}, 2"),
+        &[S_ROW0],
+        &[S_WG],
+    )?;
+    sop(
+        b,
+        format!("s_cmp_ge_i32 s{S_ROW0}, s{S_M}"),
+        &[],
+        &[S_ROW0, S_M],
+    )?;
     op(b, "s_cbranch_scc1 .Lq8k8_end", &[], &[])?;
-    sop(b, format!("s_lshr_b32 s{S_ITERS}, s{S_K}, 11"), &[S_ITERS], &[S_K])?;
+    sop(
+        b,
+        format!("s_lshr_b32 s{S_ITERS}, s{S_K}, 11"),
+        &[S_ITERS],
+        &[S_K],
+    )?;
     sop(b, format!("s_cmp_eq_u32 s{S_ITERS}, 0"), &[], &[S_ITERS])?;
     op(b, "s_cbranch_scc1 .Lq8k8_end", &[], &[])?;
     // rowbytes = (K/32)*34; slice = wave*(K/256)*34; xwave = wave*K/2 (activation bytes); K*4.
-    sop(b, format!("s_lshr_b32 s{S_ROWBYTES}, s{S_K}, 5"), &[S_ROWBYTES], &[S_K])?;
-    sop(b, format!("s_mul_i32 s{S_ROWBYTES}, s{S_ROWBYTES}, 34"), &[S_ROWBYTES], &[S_ROWBYTES])?;
-    sop(b, format!("s_lshr_b32 s{S_SLICE}, s{S_K}, 8"), &[S_SLICE], &[S_K])?;
-    sop(b, format!("s_mul_i32 s{S_SLICE}, s{S_SLICE}, 34"), &[S_SLICE], &[S_SLICE])?;
-    sop(b, format!("s_mul_i32 s{S_SLICE}, s{S_SLICE}, s{S_WAVE}"), &[S_SLICE], &[S_SLICE, S_WAVE])?;
-    sop(b, format!("s_lshr_b32 s{S_XWAVE}, s{S_K}, 1"), &[S_XWAVE], &[S_K])?;
-    sop(b, format!("s_mul_i32 s{S_XWAVE}, s{S_XWAVE}, s{S_WAVE}"), &[S_XWAVE], &[S_XWAVE, S_WAVE])?;
-    sop(b, format!("s_lshl_b32 s{S_KX4}, s{S_K}, 2"), &[S_KX4], &[S_K])?;
-    sop(b, format!("s_add_i32 s{S_MM1}, s{S_M}, -1"), &[S_MM1], &[S_M])?;
+    sop(
+        b,
+        format!("s_lshr_b32 s{S_ROWBYTES}, s{S_K}, 5"),
+        &[S_ROWBYTES],
+        &[S_K],
+    )?;
+    sop(
+        b,
+        format!("s_mul_i32 s{S_ROWBYTES}, s{S_ROWBYTES}, 34"),
+        &[S_ROWBYTES],
+        &[S_ROWBYTES],
+    )?;
+    sop(
+        b,
+        format!("s_lshr_b32 s{S_SLICE}, s{S_K}, 8"),
+        &[S_SLICE],
+        &[S_K],
+    )?;
+    sop(
+        b,
+        format!("s_mul_i32 s{S_SLICE}, s{S_SLICE}, 34"),
+        &[S_SLICE],
+        &[S_SLICE],
+    )?;
+    sop(
+        b,
+        format!("s_mul_i32 s{S_SLICE}, s{S_SLICE}, s{S_WAVE}"),
+        &[S_SLICE],
+        &[S_SLICE, S_WAVE],
+    )?;
+    sop(
+        b,
+        format!("s_lshr_b32 s{S_XWAVE}, s{S_K}, 1"),
+        &[S_XWAVE],
+        &[S_K],
+    )?;
+    sop(
+        b,
+        format!("s_mul_i32 s{S_XWAVE}, s{S_XWAVE}, s{S_WAVE}"),
+        &[S_XWAVE],
+        &[S_XWAVE, S_WAVE],
+    )?;
+    sop(
+        b,
+        format!("s_lshl_b32 s{S_KX4}, s{S_K}, 2"),
+        &[S_KX4],
+        &[S_K],
+    )?;
+    sop(
+        b,
+        format!("s_add_i32 s{S_MM1}, s{S_M}, -1"),
+        &[S_MM1],
+        &[S_M],
+    )?;
     for r in 0..4u8 {
         let ro = S_ROWOFF + r;
-        sop(b, format!("s_add_i32 s{S_T0}, s{S_ROW0}, {r}"), &[S_T0], &[S_ROW0])?;
-        sop(b, format!("s_min_i32 s{S_T0}, s{S_T0}, s{S_MM1}"), &[S_T0], &[S_T0, S_MM1])?;
-        sop(b, format!("s_mul_i32 s{ro}, s{S_T0}, s{S_ROWBYTES}"), &[ro], &[S_T0, S_ROWBYTES])?;
-        sop(b, format!("s_add_i32 s{ro}, s{ro}, s{S_SLICE}"), &[ro], &[ro, S_SLICE])?;
-        vop(b, format!("v_mov_b32_e32 v{}, s{ro}", V_WOFFD + r), &[V_WOFFD + r], &[], &[ro])?;
-        vop(b, format!("v_add_nc_u32_e32 v{}, s{ro}, v{V_LANE}", V_WOFFQ + r), &[V_WOFFQ + r], &[V_LANE], &[ro])?;
+        sop(
+            b,
+            format!("s_add_i32 s{S_T0}, s{S_ROW0}, {r}"),
+            &[S_T0],
+            &[S_ROW0],
+        )?;
+        sop(
+            b,
+            format!("s_min_i32 s{S_T0}, s{S_T0}, s{S_MM1}"),
+            &[S_T0],
+            &[S_T0, S_MM1],
+        )?;
+        sop(
+            b,
+            format!("s_mul_i32 s{ro}, s{S_T0}, s{S_ROWBYTES}"),
+            &[ro],
+            &[S_T0, S_ROWBYTES],
+        )?;
+        sop(
+            b,
+            format!("s_add_i32 s{ro}, s{ro}, s{S_SLICE}"),
+            &[ro],
+            &[ro, S_SLICE],
+        )?;
+        vop(
+            b,
+            format!("v_mov_b32_e32 v{}, s{ro}", V_WOFFD + r),
+            &[V_WOFFD + r],
+            &[],
+            &[ro],
+        )?;
+        vop(
+            b,
+            format!("v_add_nc_u32_e32 v{}, s{ro}, v{V_LANE}", V_WOFFQ + r),
+            &[V_WOFFQ + r],
+            &[V_LANE],
+            &[ro],
+        )?;
     }
     Ok(())
 }
@@ -440,9 +888,36 @@ fn k8_prologue(b: &mut Builder) -> R {
 /// Loads of block `jb` (0..8 of the current base) into ring slot `slot`:
 /// the four rows' int8 `q` and f16 `d`, then the columns' activations.
 fn k8_issue(b: &mut Builder, nb: u8, slot: u8, jb: u32) -> R {
-    for r in 0..4u8 { gload(b, "global_load_i8", k8_q(slot, r), V_WOFFQ + r, S_A, 34 * jb + 2)?; }
-    for r in 0..4u8 { gload(b, "global_load_u16", k8_d(slot, r), V_WOFFD + r, S_A, 34 * jb)?; }
-    for c in 0..nb { gload(b, "global_load_b32", k8_x(slot, c), V_XOFF + c, S_X, 128 * jb)?; }
+    for r in 0..4u8 {
+        gload(
+            b,
+            "global_load_i8",
+            k8_q(slot, r),
+            V_WOFFQ + r,
+            S_A,
+            34 * jb + 2,
+        )?;
+    }
+    for r in 0..4u8 {
+        gload(
+            b,
+            "global_load_u16",
+            k8_d(slot, r),
+            V_WOFFD + r,
+            S_A,
+            34 * jb,
+        )?;
+    }
+    for c in 0..nb {
+        gload(
+            b,
+            "global_load_b32",
+            k8_x(slot, c),
+            V_XOFF + c,
+            S_X,
+            128 * jb,
+        )?;
+    }
     Ok(())
 }
 
@@ -452,16 +927,38 @@ fn k8_compute(b: &mut Builder, nb: u8, slot: u8) -> R {
     // At nb = 8 a slot's first int8 load has 63 younger loads in flight (three
     // 16-load blocks plus 15 of its own), which `vmcnt` (6 bits) cannot
     // express; drain the oldest two so the slot's waits fit the counter.
-    if nb == 8 { b.wait(Counter::Vm, 62)?; }
-    for r in 0..4u8 { vop(b, format!("v_cvt_f32_i32_e32 v{0}, v{0}", k8_q(slot, r)), &[k8_q(slot, r)], &[k8_q(slot, r)], &[])?; }
+    if nb == 8 {
+        b.wait(Counter::Vm, 62)?;
+    }
+    for r in 0..4u8 {
+        vop(
+            b,
+            format!("v_cvt_f32_i32_e32 v{0}, v{0}", k8_q(slot, r)),
+            &[k8_q(slot, r)],
+            &[k8_q(slot, r)],
+            &[],
+        )?;
+    }
     for r in 0..4u8 {
         let (d, q) = (k8_d(slot, r), k8_q(slot, r));
-        vop(b, format!("v_fma_mix_f32 v{d}, v{d}, v{q}, neg(0) op_sel_hi:[1,0,0]"), &[d], &[d, q], &[])?;
+        vop(
+            b,
+            format!("v_fma_mix_f32 v{d}, v{d}, v{q}, neg(0) op_sel_hi:[1,0,0]"),
+            &[d],
+            &[d, q],
+            &[],
+        )?;
     }
     for c in 0..nb {
         for r in 0..4u8 {
             let (sum, x, d) = (k8_sum(r, c), k8_x(slot, c), k8_d(slot, r));
-            vop(b, format!("v_fmac_f32_e32 v{sum}, v{x}, v{d}"), &[sum], &[sum, x, d], &[])?;
+            vop(
+                b,
+                format!("v_fmac_f32_e32 v{sum}, v{x}, v{d}"),
+                &[sum],
+                &[sum, x, d],
+                &[],
+            )?;
         }
     }
     Ok(())
@@ -471,19 +968,56 @@ fn k8_section(b: &mut Builder, nb: u8, slot: usize) -> R {
     let tag = format!(".Lq8k8_b{nb}");
     b.label(&tag)?;
     for c in 0..nb {
-        sop(b, format!("s_mul_i32 s{S_T0}, s{S_KX4}, {c}"), &[S_T0], &[S_KX4])?;
-        sop(b, format!("s_add_i32 s{S_T0}, s{S_T0}, s{S_XWAVE}"), &[S_T0], &[S_T0, S_XWAVE])?;
-        op(b, format!("v_lshl_add_u32 v{}, v{V_LANE}, 2, s{S_T0}", V_XOFF + c), &[v(V_XOFF + c)], &[v(V_LANE), s(S_T0)])?;
+        sop(
+            b,
+            format!("s_mul_i32 s{S_T0}, s{S_KX4}, {c}"),
+            &[S_T0],
+            &[S_KX4],
+        )?;
+        sop(
+            b,
+            format!("s_add_i32 s{S_T0}, s{S_T0}, s{S_XWAVE}"),
+            &[S_T0],
+            &[S_T0, S_XWAVE],
+        )?;
+        op(
+            b,
+            format!("v_lshl_add_u32 v{}, v{V_LANE}, 2, s{S_T0}", V_XOFF + c),
+            &[v(V_XOFF + c)],
+            &[v(V_LANE), s(S_T0)],
+        )?;
     }
-    for r in 0..4u8 { for c in 0..nb { vop(b, format!("v_mov_b32_e32 v{}, 0", k8_sum(r, c)), &[k8_sum(r, c)], &[], &[])?; } }
-    for slot_i in 0..4u8 { k8_issue(b, nb, slot_i, u32::from(slot_i))?; }
+    for r in 0..4u8 {
+        for c in 0..nb {
+            vop(
+                b,
+                format!("v_mov_b32_e32 v{}, 0", k8_sum(r, c)),
+                &[k8_sum(r, c)],
+                &[],
+                &[],
+            )?;
+        }
+    }
+    for slot_i in 0..4u8 {
+        k8_issue(b, nb, slot_i, u32::from(slot_i))?;
+    }
     let head = format!("{tag}_loop");
     b.loop_(&head, |b| {
         // The loads of the next iteration's first four blocks advance by a full
         // iteration; in the last iteration they re-read the current blocks.
         sop(b, format!("s_cmp_gt_u32 s{S_ITERS}, 1"), &[], &[S_ITERS])?;
-        sop(b, format!("s_cselect_b32 s{S_WSTEP}, {}, 0", lit(K8_WSTEP)), &[S_WSTEP], &[])?;
-        sop(b, format!("s_cselect_b32 s{S_XSTEP}, {}, 0", lit(K8_XSTEP)), &[S_XSTEP], &[])?;
+        sop(
+            b,
+            format!("s_cselect_b32 s{S_WSTEP}, {}, 0", lit(K8_WSTEP)),
+            &[S_WSTEP],
+            &[],
+        )?;
+        sop(
+            b,
+            format!("s_cselect_b32 s{S_XSTEP}, {}, 0", lit(K8_XSTEP)),
+            &[S_XSTEP],
+            &[],
+        )?;
         for j in 0..8u8 {
             let ring = j % 4;
             k8_compute(b, nb, ring)?;
@@ -491,50 +1025,164 @@ fn k8_section(b: &mut Builder, nb: u8, slot: usize) -> R {
                 k8_issue(b, nb, ring, u32::from(j) + 4)?;
                 if j == 3 {
                     for r in 0..4u8 {
-                        vop(b, format!("v_add_nc_u32_e32 v{0}, s{S_WSTEP}, v{0}", V_WOFFD + r), &[V_WOFFD + r], &[V_WOFFD + r], &[S_WSTEP])?;
-                        vop(b, format!("v_add_nc_u32_e32 v{0}, s{S_WSTEP}, v{0}", V_WOFFQ + r), &[V_WOFFQ + r], &[V_WOFFQ + r], &[S_WSTEP])?;
+                        vop(
+                            b,
+                            format!("v_add_nc_u32_e32 v{0}, s{S_WSTEP}, v{0}", V_WOFFD + r),
+                            &[V_WOFFD + r],
+                            &[V_WOFFD + r],
+                            &[S_WSTEP],
+                        )?;
+                        vop(
+                            b,
+                            format!("v_add_nc_u32_e32 v{0}, s{S_WSTEP}, v{0}", V_WOFFQ + r),
+                            &[V_WOFFQ + r],
+                            &[V_WOFFQ + r],
+                            &[S_WSTEP],
+                        )?;
                     }
                     for c in 0..nb {
-                        vop(b, format!("v_add_nc_u32_e32 v{0}, s{S_XSTEP}, v{0}", V_XOFF + c), &[V_XOFF + c], &[V_XOFF + c], &[S_XSTEP])?;
+                        vop(
+                            b,
+                            format!("v_add_nc_u32_e32 v{0}, s{S_XSTEP}, v{0}", V_XOFF + c),
+                            &[V_XOFF + c],
+                            &[V_XOFF + c],
+                            &[S_XSTEP],
+                        )?;
                     }
                 }
             } else {
                 k8_issue(b, nb, ring, u32::from(j) - 4)?;
             }
         }
-        sop(b, format!("s_add_i32 s{S_ITERS}, s{S_ITERS}, -1"), &[S_ITERS], &[S_ITERS])?;
+        sop(
+            b,
+            format!("s_add_i32 s{S_ITERS}, s{S_ITERS}, -1"),
+            &[S_ITERS],
+            &[S_ITERS],
+        )?;
         sop(b, format!("s_cmp_lg_u32 s{S_ITERS}, 0"), &[], &[S_ITERS])?;
         op(b, format!("s_cbranch_scc1 {head}"), &[], &[])
     })?;
     b.wait_all()?;
     // Wave reduction of every (row, column) value, then lane 0 parks the wave's
     // partial: part[(row*8 + col)*8 + wave].
-    let values: Vec<u8> = (0..4u8).flat_map(|r| (0..nb).map(move |c| k8_sum(r, c))).collect();
+    let values: Vec<u8> = (0..4u8)
+        .flat_map(|r| (0..nb).map(move |c| k8_sum(r, c)))
+        .collect();
     lane_tree(b, &values, V_TMP, V_ADDR)?;
-    op(b, format!("s_mov_b32 exec_lo, s{S_LANE0}"), &[], &[s(S_LANE0)])?;
+    op(
+        b,
+        format!("s_mov_b32 exec_lo, s{S_LANE0}"),
+        &[],
+        &[s(S_LANE0)],
+    )?;
     for r in 0..4u8 {
-        for c in 0..nb { ds_st(b, slot, V_WAVE4, k8_sum(r, c), (u32::from(r) * 8 + u32::from(c)) * 32)?; }
+        for c in 0..nb {
+            ds_st(
+                b,
+                slot,
+                V_WAVE4,
+                k8_sum(r, c),
+                (u32::from(r) * 8 + u32::from(c)) * 32,
+            )?;
+        }
     }
     op(b, "s_mov_b32 exec_lo, -1", &[], &[])?;
     // Thread t (< 4*nb) folds (row t / nb, column t % nb): the quotient is
     // (t * ceil(2^16 / nb)) >> 16, exact for t < 32.
     let magic = (65536 + u32::from(nb) - 1) / u32::from(nb);
-    vop(b, format!("v_mul_u32_u24_e32 v{V_IR}, {}, v{V_TID}", lit(magic)), &[V_IR], &[V_TID], &[])?;
-    vop(b, format!("v_lshrrev_b32_e32 v{V_IR}, 16, v{V_IR}"), &[V_IR], &[V_IR], &[])?;
-    vop(b, format!("v_mul_u32_u24_e32 v{V_IC}, {nb}, v{V_IR}"), &[V_IC], &[V_IR], &[])?;
-    vop(b, format!("v_sub_nc_u32_e32 v{V_IC}, v{V_TID}, v{V_IC}"), &[V_IC], &[V_TID, V_IC], &[])?;
-    vop(b, format!("v_lshl_add_u32 v{V_ILDS}, v{V_IR}, 3, v{V_IC}"), &[V_ILDS], &[V_IR, V_IC], &[])?;
-    vop(b, format!("v_lshlrev_b32_e32 v{V_ILDS}, 5, v{V_ILDS}"), &[V_ILDS], &[V_ILDS], &[])?;
-    vop(b, format!("v_add_nc_u32_e32 v{V_IROW}, s{S_ROW0}, v{V_IR}"), &[V_IROW], &[V_IR], &[S_ROW0])?;
-    op(b, format!("v_mul_lo_u32 v{V_IY}, v{V_IC}, s{S_M}"), &[v(V_IY)], &[v(V_IC), s(S_M)])?;
-    vop(b, format!("v_add_nc_u32_e32 v{V_IY}, v{V_IROW}, v{V_IY}"), &[V_IY], &[V_IROW, V_IY], &[])?;
-    vop(b, format!("v_lshlrev_b32_e32 v{V_IY}, 2, v{V_IY}"), &[V_IY], &[V_IY], &[])?;
+    vop(
+        b,
+        format!("v_mul_u32_u24_e32 v{V_IR}, {}, v{V_TID}", lit(magic)),
+        &[V_IR],
+        &[V_TID],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_lshrrev_b32_e32 v{V_IR}, 16, v{V_IR}"),
+        &[V_IR],
+        &[V_IR],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_mul_u32_u24_e32 v{V_IC}, {nb}, v{V_IR}"),
+        &[V_IC],
+        &[V_IR],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_sub_nc_u32_e32 v{V_IC}, v{V_TID}, v{V_IC}"),
+        &[V_IC],
+        &[V_TID, V_IC],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_lshl_add_u32 v{V_ILDS}, v{V_IR}, 3, v{V_IC}"),
+        &[V_ILDS],
+        &[V_IR, V_IC],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_lshlrev_b32_e32 v{V_ILDS}, 5, v{V_ILDS}"),
+        &[V_ILDS],
+        &[V_ILDS],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_add_nc_u32_e32 v{V_IROW}, s{S_ROW0}, v{V_IR}"),
+        &[V_IROW],
+        &[V_IR],
+        &[S_ROW0],
+    )?;
+    op(
+        b,
+        format!("v_mul_lo_u32 v{V_IY}, v{V_IC}, s{S_M}"),
+        &[v(V_IY)],
+        &[v(V_IC), s(S_M)],
+    )?;
+    vop(
+        b,
+        format!("v_add_nc_u32_e32 v{V_IY}, v{V_IROW}, v{V_IY}"),
+        &[V_IY],
+        &[V_IROW, V_IY],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_lshlrev_b32_e32 v{V_IY}, 2, v{V_IY}"),
+        &[V_IY],
+        &[V_IY],
+        &[],
+    )?;
     b.barrier(&[Transition::Ready(slot)])?;
-    vop(b, format!("v_cmp_gt_u32_e32 vcc_lo, {}, v{V_TID}", 4 * u32::from(nb)), &[], &[V_TID], &[])?;
+    vop(
+        b,
+        format!("v_cmp_gt_u32_e32 vcc_lo, {}, v{V_TID}", 4 * u32::from(nb)),
+        &[],
+        &[V_TID],
+        &[],
+    )?;
     op(b, "s_mov_b32 exec_lo, vcc_lo", &[], &[])?;
     for half in 0..2u8 {
-        b.ds_load(slot, Instruction::new(format!("ds_load_b128 {}, v{V_ILDS}{}", vrange(V_PART + 4 * half, 4), off(16 * u32::from(half))),
-            vec![vr(V_PART + 4 * half, 4)], vec![v(V_ILDS)]).memory(MemoryClass::DsLoad))?;
+        b.ds_load(
+            slot,
+            Instruction::new(
+                format!(
+                    "ds_load_b128 {}, v{V_ILDS}{}",
+                    vrange(V_PART + 4 * half, 4),
+                    off(16 * u32::from(half))
+                ),
+                vec![vr(V_PART + 4 * half, 4)],
+                vec![v(V_ILDS)],
+            )
+            .memory(MemoryClass::DsLoad),
+        )?;
     }
     b.wait_all()?;
     b.barrier(&[Transition::Retire(slot)])?;
@@ -542,8 +1190,22 @@ fn k8_section(b: &mut Builder, nb: u8, slot: usize) -> R {
     op(b, "s_cbranch_execz .Lq8k8_end", &[], &[])?;
     let p = |n: u8| V_PART + n;
     // ((p0 + p1) + (p2 + p3)) + ((p4 + p5) + (p6 + p7))
-    for (dst, a, c) in [(0u8, 0u8, 1u8), (2, 2, 3), (4, 4, 5), (6, 6, 7), (0, 0, 2), (4, 4, 6), (0, 0, 4)] {
-        vop(b, format!("v_add_f32_e32 v{}, v{}, v{}", p(dst), p(a), p(c)), &[p(dst)], &[p(a), p(c)], &[])?;
+    for (dst, a, c) in [
+        (0u8, 0u8, 1u8),
+        (2, 2, 3),
+        (4, 4, 5),
+        (6, 6, 7),
+        (0, 0, 2),
+        (4, 4, 6),
+        (0, 0, 4),
+    ] {
+        vop(
+            b,
+            format!("v_add_f32_e32 v{}, v{}, v{}", p(dst), p(a), p(c)),
+            &[p(dst)],
+            &[p(a), p(c)],
+            &[],
+        )?;
     }
     let x = p(0);
     let store = format!("{tag}_store");
@@ -551,19 +1213,39 @@ fn k8_section(b: &mut Builder, nb: u8, slot: usize) -> R {
     op(b, format!("s_cbranch_scc1 {store}"), &[], &[])?;
     let e = |n: u8| V_EP + n;
     bf16_round(b, x, [e(0), e(1), e(2), e(3)])?;
-    vop(b, format!("v_mul_f32_e32 v{x}, s{S_SCALE}, v{x}"), &[x], &[x], &[S_SCALE])?;
+    vop(
+        b,
+        format!("v_mul_f32_e32 v{x}, s{S_SCALE}, v{x}"),
+        &[x],
+        &[x],
+        &[S_SCALE],
+    )?;
     bf16_round(b, x, [e(0), e(1), e(2), e(3)])?;
     silu(b, x, [e(0), e(1), e(2), e(3), e(4), e(5)])?;
     bf16_round(b, x, [e(0), e(1), e(2), e(3)])?;
     b.label(&store)?;
-    vop(b, format!("v_cmp_gt_i32_e32 vcc_lo, s{S_M}, v{V_IROW}"), &[], &[V_IROW], &[S_M])?;
+    vop(
+        b,
+        format!("v_cmp_gt_i32_e32 vcc_lo, s{S_M}, v{V_IROW}"),
+        &[],
+        &[V_IROW],
+        &[S_M],
+    )?;
     op(b, "s_and_b32 exec_lo, exec_lo, vcc_lo", &[], &[])?;
-    mem(b, format!("global_store_b32 v{V_IY}, v{x}, s[{S_Y}:{}]", S_Y + 1), &[], &[v(V_IY), v(x), sr(S_Y, 2)], MemoryClass::VmemStore)?;
+    mem(
+        b,
+        format!("global_store_b32 v{V_IY}, v{x}, s[{S_Y}:{}]", S_Y + 1),
+        &[],
+        &[v(V_IY), v(x), sr(S_Y, 2)],
+        MemoryClass::VmemStore,
+    )?;
     b.wait_all()?;
     op(b, "s_branch .Lq8k8_end", &[], &[])
 }
 
-fn vrange(base: u8, len: u8) -> String { format!("v[{base}:{}]", u16::from(base) + u16::from(len) - 1) }
+fn vrange(base: u8, len: u8) -> String {
+    format!("v[{base}:{}]", u16::from(base) + u16::from(len) - 1)
+}
 
 // ================================================================== k320
 // VGPRs.
@@ -604,48 +1286,89 @@ const T_LANE0: u8 = 16;
 /// `rowoff[q] = min(row0 + q, M-1) * 340` of the wave's eight rows.
 const T_ROWOFF: u8 = 17;
 
-fn k320_x(blk: u8, c: u8) -> u8 { W_X + 8 * blk + c }
-fn k320_sum(set: u8, c: u8) -> u8 { W_SUM + 8 * set + c }
+fn k320_x(blk: u8, c: u8) -> u8 {
+    W_X + 8 * blk + c
+}
+fn k320_sum(set: u8, c: u8) -> u8 {
+    W_SUM + 8 * set + c
+}
 
 fn k320_plan() -> Result<RegPlan, String> {
     let mut p = RegPlan::new(K320_VGPRS, 40)?;
     for (name, base, len) in [
-        ("kernarg_ptr", S_KARG, 2), ("wg_x", S_WG, 1), ("a_x_ptrs", S_A, 4), ("y_ptr", S_Y, 2), ("m_b", T_M, 2),
-    ] { declare(&mut p, name, Kind::S, base, len)?; }
-    for n in T_WAVE..T_ROWOFF + 8 { declare(&mut p, "scalar", Kind::S, n, 1)?; }
+        ("kernarg_ptr", S_KARG, 2),
+        ("wg_x", S_WG, 1),
+        ("a_x_ptrs", S_A, 4),
+        ("y_ptr", S_Y, 2),
+        ("m_b", T_M, 2),
+    ] {
+        declare(&mut p, name, Kind::S, base, len)?;
+    }
+    for n in T_WAVE..T_ROWOFF + 8 {
+        declare(&mut p, "scalar", Kind::S, n, 1)?;
+    }
     for (name, base, len) in [
-        ("tid", V_TID, 1), ("lane", V_LANE, 1), ("lds_base_d", W_BASED, 1), ("lds_base_q", W_BASEQ, 1),
-        ("lds_stage_addr", W_STA, 1), ("lane4", W_LANE4, 1), ("lane4_clamped", W_LANE4C, 1),
-        ("bpermute_addr", W_ADDR, 4), ("x_offset", W_XOFF, 8), ("y_offset", W_YOFF, 8),
-        ("row_ring", W_G, 12), ("row_offset_a", W_OFFA, 1), ("row_offset_b", W_OFFB, 1),
-        ("scales", W_D, 10), ("weights", W_Q, 10), ("tree_tmp", W_TMP, 8), ("sums", W_SUM, 32),
+        ("tid", V_TID, 1),
+        ("lane", V_LANE, 1),
+        ("lds_base_d", W_BASED, 1),
+        ("lds_base_q", W_BASEQ, 1),
+        ("lds_stage_addr", W_STA, 1),
+        ("lane4", W_LANE4, 1),
+        ("lane4_clamped", W_LANE4C, 1),
+        ("bpermute_addr", W_ADDR, 4),
+        ("x_offset", W_XOFF, 8),
+        ("y_offset", W_YOFF, 8),
+        ("row_ring", W_G, 12),
+        ("row_offset_a", W_OFFA, 1),
+        ("row_offset_b", W_OFFB, 1),
+        ("scales", W_D, 10),
+        ("weights", W_Q, 10),
+        ("tree_tmp", W_TMP, 8),
+        ("sums", W_SUM, 32),
         ("activations", W_X, 80),
-    ] { declare(&mut p, name, Kind::V, base, len)?; }
+    ] {
+        declare(&mut p, name, Kind::V, base, len)?;
+    }
     Ok(p)
 }
 
 fn k320_spec() -> KernelSpec {
     KernelSpec {
-        kernel_id: "qwen4_lane_rows_q8".into(), variant: "k320_xbatch".into(), arch: Arch::Gfx1151, symbol: K320_SYMBOL.into(),
-        kernargs: KernargLayout::new(32).pointer_access("A", 0, Access::ReadOnly)
-            .pointer_access("x", 8, Access::ReadOnly).pointer_access("y", 16, Access::WriteOnly)
-            .hidden("M", 24, 4, "by_value").hidden("B", 28, 4, "by_value"),
-        user_sgpr_count: 2, system_sgpr_workgroup_id_y: false, workgroup_size: 64,
-        group_segment_fixed_size: K320_LDS_BYTES, wave32: true, cu_mode: false,
+        kernel_id: "qwen4_lane_rows_q8".into(),
+        variant: "k320_xbatch".into(),
+        arch: Arch::Gfx1151,
+        symbol: K320_SYMBOL.into(),
+        kernargs: KernargLayout::new(32)
+            .pointer_access("A", 0, Access::ReadOnly)
+            .pointer_access("x", 8, Access::ReadOnly)
+            .pointer_access("y", 16, Access::WriteOnly)
+            .hidden("M", 24, 4, "by_value")
+            .hidden("B", 28, 4, "by_value"),
+        user_sgpr_count: 2,
+        system_sgpr_workgroup_id_y: false,
+        workgroup_size: 64,
+        group_segment_fixed_size: K320_LDS_BYTES,
+        wave32: true,
+        cu_mode: false,
     }
 }
 
 fn k320() -> Result<Emitted, String> {
     let mut b = Builder::new(k320_spec(), k320_plan()?);
     b.enable_delay_alu();
-    let slots = [b.lds_slot("rows0", 0, K320_SLOT)?, b.lds_slot("rows1", K320_SLOT, K320_SLOT)?];
+    let slots = [
+        b.lds_slot("rows0", 0, K320_SLOT)?,
+        b.lds_slot("rows1", K320_SLOT, K320_SLOT)?,
+    ];
     k320_prologue(&mut b)?;
     for nb in 1..=MAX_COLUMNS {
         sop(&mut b, format!("s_cmp_eq_u32 s{T_B}, {nb}"), &[], &[T_B])?;
         op(&mut b, format!("s_cbranch_scc1 .Lq8k320_b{nb}"), &[], &[])?;
     }
     op(&mut b, "s_branch .Lq8k320_end", &[], &[])?;
-    for nb in 1..=MAX_COLUMNS { k320_section(&mut b, nb, slots)?; }
+    for nb in 1..=MAX_COLUMNS {
+        k320_section(&mut b, nb, slots)?;
+    }
     b.label(".Lq8k320_end")?;
     op(&mut b, "s_endpgm", &[], &[])?;
     b.finish()
@@ -655,33 +1378,148 @@ fn k320_prologue(b: &mut Builder) -> R {
     smem(b, S_A, 4, S_KARG, 0)?;
     smem(b, S_Y, 2, S_KARG, 0x10)?;
     smem(b, T_M, 2, S_KARG, 0x18)?;
-    vop(b, format!("v_and_b32_e32 v{V_LANE}, 31, v{V_TID}"), &[V_LANE], &[V_TID], &[])?;
-    vop(b, format!("v_lshrrev_b32_e32 v{W_BASED}, 5, v{V_TID}"), &[W_BASED], &[V_TID], &[])?;
-    op(b, format!("v_readfirstlane_b32 s{T_WAVE}, v{W_BASED}"), &[s(T_WAVE)], &[v(W_BASED)])?;
-    vop(b, format!("v_mul_u32_u24_e32 v{W_BASED}, {}, v{W_BASED}", lit(K320_WAVE_REGION)), &[W_BASED], &[W_BASED], &[])?;
-    vop(b, format!("v_add_nc_u32_e32 v{W_BASEQ}, v{W_BASED}, v{V_LANE}"), &[W_BASEQ], &[W_BASED, V_LANE], &[])?;
-    vop(b, format!("v_lshlrev_b32_e32 v{W_LANE4}, 2, v{V_LANE}"), &[W_LANE4], &[V_LANE], &[])?;
-    vop(b, format!("v_add_nc_u32_e32 v{W_STA}, v{W_BASED}, v{W_LANE4}"), &[W_STA], &[W_BASED, W_LANE4], &[])?;
-    vop(b, format!("v_min_u32_e32 v{W_LANE4C}, 20, v{V_LANE}"), &[W_LANE4C], &[V_LANE], &[])?;
-    vop(b, format!("v_lshlrev_b32_e32 v{W_LANE4C}, 2, v{W_LANE4C}"), &[W_LANE4C], &[W_LANE4C], &[])?;
+    vop(
+        b,
+        format!("v_and_b32_e32 v{V_LANE}, 31, v{V_TID}"),
+        &[V_LANE],
+        &[V_TID],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_lshrrev_b32_e32 v{W_BASED}, 5, v{V_TID}"),
+        &[W_BASED],
+        &[V_TID],
+        &[],
+    )?;
+    op(
+        b,
+        format!("v_readfirstlane_b32 s{T_WAVE}, v{W_BASED}"),
+        &[s(T_WAVE)],
+        &[v(W_BASED)],
+    )?;
+    vop(
+        b,
+        format!(
+            "v_mul_u32_u24_e32 v{W_BASED}, {}, v{W_BASED}",
+            lit(K320_WAVE_REGION)
+        ),
+        &[W_BASED],
+        &[W_BASED],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_add_nc_u32_e32 v{W_BASEQ}, v{W_BASED}, v{V_LANE}"),
+        &[W_BASEQ],
+        &[W_BASED, V_LANE],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_lshlrev_b32_e32 v{W_LANE4}, 2, v{V_LANE}"),
+        &[W_LANE4],
+        &[V_LANE],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_add_nc_u32_e32 v{W_STA}, v{W_BASED}, v{W_LANE4}"),
+        &[W_STA],
+        &[W_BASED, W_LANE4],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_min_u32_e32 v{W_LANE4C}, 20, v{V_LANE}"),
+        &[W_LANE4C],
+        &[V_LANE],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_lshlrev_b32_e32 v{W_LANE4C}, 2, v{W_LANE4C}"),
+        &[W_LANE4C],
+        &[W_LANE4C],
+        &[],
+    )?;
     bpermute_addresses(b, W_ADDR, V_LANE)?;
-    vop(b, format!("v_cmp_eq_u32_e32 vcc_lo, 0, v{V_LANE}"), &[], &[V_LANE], &[])?;
-    op(b, format!("s_mov_b32 s{T_LANE0}, vcc_lo"), &[s(T_LANE0)], &[])?;
+    vop(
+        b,
+        format!("v_cmp_eq_u32_e32 vcc_lo, 0, v{V_LANE}"),
+        &[],
+        &[V_LANE],
+        &[],
+    )?;
+    op(
+        b,
+        format!("s_mov_b32 s{T_LANE0}, vcc_lo"),
+        &[s(T_LANE0)],
+        &[],
+    )?;
     // `ds_load_u16_d16` keeps the high half of its destination.
-    for blk in 0..10u8 { vop(b, format!("v_mov_b32_e32 v{}, 0", W_D + blk), &[W_D + blk], &[], &[])?; }
+    for blk in 0..10u8 {
+        vop(
+            b,
+            format!("v_mov_b32_e32 v{}, 0", W_D + blk),
+            &[W_D + blk],
+            &[],
+            &[],
+        )?;
+    }
     b.wait_all()?;
     // The workgroup's first row must exist.
-    sop(b, format!("s_lshl_b32 s{T_T0}, s{S_WG}, 4"), &[T_T0], &[S_WG])?;
-    sop(b, format!("s_cmp_ge_i32 s{T_T0}, s{T_M}"), &[], &[T_T0, T_M])?;
+    sop(
+        b,
+        format!("s_lshl_b32 s{T_T0}, s{S_WG}, 4"),
+        &[T_T0],
+        &[S_WG],
+    )?;
+    sop(
+        b,
+        format!("s_cmp_ge_i32 s{T_T0}, s{T_M}"),
+        &[],
+        &[T_T0, T_M],
+    )?;
     op(b, "s_cbranch_scc1 .Lq8k320_end", &[], &[])?;
-    sop(b, format!("s_lshl_b32 s{T_ROW0}, s{T_WAVE}, 3"), &[T_ROW0], &[T_WAVE])?;
-    sop(b, format!("s_add_i32 s{T_ROW0}, s{T_ROW0}, s{T_T0}"), &[T_ROW0], &[T_ROW0, T_T0])?;
-    sop(b, format!("s_add_i32 s{T_MM1}, s{T_M}, -1"), &[T_MM1], &[T_M])?;
+    sop(
+        b,
+        format!("s_lshl_b32 s{T_ROW0}, s{T_WAVE}, 3"),
+        &[T_ROW0],
+        &[T_WAVE],
+    )?;
+    sop(
+        b,
+        format!("s_add_i32 s{T_ROW0}, s{T_ROW0}, s{T_T0}"),
+        &[T_ROW0],
+        &[T_ROW0, T_T0],
+    )?;
+    sop(
+        b,
+        format!("s_add_i32 s{T_MM1}, s{T_M}, -1"),
+        &[T_MM1],
+        &[T_M],
+    )?;
     for q in 0..8u8 {
         let ro = T_ROWOFF + q;
-        sop(b, format!("s_add_i32 s{ro}, s{T_ROW0}, {q}"), &[ro], &[T_ROW0])?;
-        sop(b, format!("s_min_i32 s{ro}, s{ro}, s{T_MM1}"), &[ro], &[ro, T_MM1])?;
-        sop(b, format!("s_mul_i32 s{ro}, s{ro}, {}", lit(340)), &[ro], &[ro])?;
+        sop(
+            b,
+            format!("s_add_i32 s{ro}, s{T_ROW0}, {q}"),
+            &[ro],
+            &[T_ROW0],
+        )?;
+        sop(
+            b,
+            format!("s_min_i32 s{ro}, s{ro}, s{T_MM1}"),
+            &[ro],
+            &[ro, T_MM1],
+        )?;
+        sop(
+            b,
+            format!("s_mul_i32 s{ro}, s{ro}, {}", lit(340)),
+            &[ro],
+            &[ro],
+        )?;
     }
     Ok(())
 }
@@ -691,8 +1529,20 @@ fn k320_prologue(b: &mut Builder) -> R {
 fn k320_row_load(b: &mut Builder, q: u8) -> R {
     let g = W_G + 3 * (q % 4);
     let ro = T_ROWOFF + q;
-    vop(b, format!("v_add_nc_u32_e32 v{W_OFFA}, s{ro}, v{W_LANE4}"), &[W_OFFA], &[W_LANE4], &[ro])?;
-    vop(b, format!("v_add_nc_u32_e32 v{W_OFFB}, s{ro}, v{W_LANE4C}"), &[W_OFFB], &[W_LANE4C], &[ro])?;
+    vop(
+        b,
+        format!("v_add_nc_u32_e32 v{W_OFFA}, s{ro}, v{W_LANE4}"),
+        &[W_OFFA],
+        &[W_LANE4],
+        &[ro],
+    )?;
+    vop(
+        b,
+        format!("v_add_nc_u32_e32 v{W_OFFB}, s{ro}, v{W_LANE4C}"),
+        &[W_OFFB],
+        &[W_LANE4C],
+        &[ro],
+    )?;
     gload(b, "global_load_b32", g, W_OFFA, S_A, 0)?;
     gload(b, "global_load_b32", g + 1, W_OFFA, S_A, 128)?;
     gload(b, "global_load_b32", g + 2, W_OFFB, S_A, 256)
@@ -702,7 +1552,15 @@ fn k320_row_load(b: &mut Builder, q: u8) -> R {
 fn k320_stage(b: &mut Builder, slots: [usize; 2], q: u8) -> R {
     let g = W_G + 3 * (q % 4);
     let base = u32::from(q % 2) * K320_SLOT;
-    for dword in 0..3u8 { ds_st(b, slots[usize::from(q % 2)], W_STA, g + dword, base + 128 * u32::from(dword))?; }
+    for dword in 0..3u8 {
+        ds_st(
+            b,
+            slots[usize::from(q % 2)],
+            W_STA,
+            g + dword,
+            base + 128 * u32::from(dword),
+        )?;
+    }
     Ok(())
 }
 
@@ -712,17 +1570,45 @@ fn k320_row(b: &mut Builder, nb: u8, slot: usize, r: u8) -> R {
     let base = u32::from(r % 2) * K320_SLOT;
     let set = r % 4;
     for blk in 0..10u8 {
-        ds_ld(b, slot, "ds_load_u16_d16", W_D + blk, W_BASED, base + 34 * u32::from(blk), true)?;
-        ds_ld(b, slot, "ds_load_i8", W_Q + blk, W_BASEQ, base + 34 * u32::from(blk) + 2, false)?;
+        ds_ld(
+            b,
+            slot,
+            "ds_load_u16_d16",
+            W_D + blk,
+            W_BASED,
+            base + 34 * u32::from(blk),
+            true,
+        )?;
+        ds_ld(
+            b,
+            slot,
+            "ds_load_i8",
+            W_Q + blk,
+            W_BASEQ,
+            base + 34 * u32::from(blk) + 2,
+            false,
+        )?;
     }
     for blk in 0..10u8 {
         dequant(b, W_D + blk, W_Q + blk)?;
         for c in 0..nb {
             let (sum, x, d) = (k320_sum(set, c), k320_x(blk, c), W_D + blk);
             if blk == 0 {
-                vop(b, format!("v_fma_f32 v{sum}, v{x}, v{d}, 0"), &[sum], &[x, d], &[])?;
+                vop(
+                    b,
+                    format!("v_fma_f32 v{sum}, v{x}, v{d}, 0"),
+                    &[sum],
+                    &[x, d],
+                    &[],
+                )?;
             } else {
-                vop(b, format!("v_fmac_f32_e32 v{sum}, v{x}, v{d}"), &[sum], &[sum, x, d], &[])?;
+                vop(
+                    b,
+                    format!("v_fmac_f32_e32 v{sum}, v{x}, v{d}"),
+                    &[sum],
+                    &[sum, x, d],
+                    &[],
+                )?;
             }
         }
     }
@@ -734,45 +1620,127 @@ fn k320_section(b: &mut Builder, nb: u8, slots: [usize; 2]) -> R {
     b.label(&tag)?;
     for c in 0..nb {
         if c == 0 {
-            vop(b, format!("v_mov_b32_e32 v{W_XOFF}, v{W_LANE4}"), &[W_XOFF], &[W_LANE4], &[])?;
+            vop(
+                b,
+                format!("v_mov_b32_e32 v{W_XOFF}, v{W_LANE4}"),
+                &[W_XOFF],
+                &[W_LANE4],
+                &[],
+            )?;
         } else {
-            vop(b, format!("v_add_nc_u32_e32 v{}, {}, v{W_LANE4}", W_XOFF + c, lit(1280 * u32::from(c))), &[W_XOFF + c], &[W_LANE4], &[])?;
+            vop(
+                b,
+                format!(
+                    "v_add_nc_u32_e32 v{}, {}, v{W_LANE4}",
+                    W_XOFF + c,
+                    lit(1280 * u32::from(c))
+                ),
+                &[W_XOFF + c],
+                &[W_LANE4],
+                &[],
+            )?;
         }
         // y byte offset of (column c, this wave's first row).
-        sop(b, format!("s_mul_i32 s{T_T0}, s{T_M}, {c}"), &[T_T0], &[T_M])?;
-        sop(b, format!("s_add_i32 s{T_T0}, s{T_T0}, s{T_ROW0}"), &[T_T0], &[T_T0, T_ROW0])?;
-        sop(b, format!("s_lshl_b32 s{T_T0}, s{T_T0}, 2"), &[T_T0], &[T_T0])?;
-        vop(b, format!("v_mov_b32_e32 v{}, s{T_T0}", W_YOFF + c), &[W_YOFF + c], &[], &[T_T0])?;
+        sop(
+            b,
+            format!("s_mul_i32 s{T_T0}, s{T_M}, {c}"),
+            &[T_T0],
+            &[T_M],
+        )?;
+        sop(
+            b,
+            format!("s_add_i32 s{T_T0}, s{T_T0}, s{T_ROW0}"),
+            &[T_T0],
+            &[T_T0, T_ROW0],
+        )?;
+        sop(
+            b,
+            format!("s_lshl_b32 s{T_T0}, s{T_T0}, 2"),
+            &[T_T0],
+            &[T_T0],
+        )?;
+        vop(
+            b,
+            format!("v_mov_b32_e32 v{}, s{T_T0}", W_YOFF + c),
+            &[W_YOFF + c],
+            &[],
+            &[T_T0],
+        )?;
     }
-    for q in 0..4u8 { k320_row_load(b, q)?; }
+    for q in 0..4u8 {
+        k320_row_load(b, q)?;
+    }
     for blk in 0..10u8 {
-        for c in 0..nb { gload(b, "global_load_b32", k320_x(blk, c), W_XOFF + c, S_X, 128 * u32::from(blk))?; }
+        for c in 0..nb {
+            gload(
+                b,
+                "global_load_b32",
+                k320_x(blk, c),
+                W_XOFF + c,
+                S_X,
+                128 * u32::from(blk),
+            )?;
+        }
     }
     k320_stage(b, slots, 0)?;
     b.barrier(&[Transition::Ready(slots[0])])?;
     for r in 0..8u8 {
         let par = usize::from(r % 2);
-        if r + 1 < 8 { k320_stage(b, slots, r + 1)?; }
-        if r + 4 < 8 { k320_row_load(b, r + 4)?; }
+        if r + 1 < 8 {
+            k320_stage(b, slots, r + 1)?;
+        }
+        if r + 4 < 8 {
+            k320_row_load(b, r + 4)?;
+        }
         // Row r reuses the sum set that row r-4 stored. Those stores may be
         // skipped (row >= M) and retire out of order, so only vscnt(0)
         // releases their sources; four rows later they have long retired.
-        if r >= 4 { b.wait(Counter::Vs, 0)?; }
+        if r >= 4 {
+            b.wait(Counter::Vs, 0)?;
+        }
         k320_row(b, nb, slots[par], r)?;
         let mut transitions = vec![Transition::Retire(slots[par])];
-        if r + 1 < 8 { transitions.push(Transition::Ready(slots[1 - par])); }
+        if r + 1 < 8 {
+            transitions.push(Transition::Ready(slots[1 - par]));
+        }
         b.barrier(&transitions)?;
         let set = r % 4;
         let values: Vec<u8> = (0..nb).map(|c| k320_sum(set, c)).collect();
         lane_tree(b, &values, W_TMP, W_ADDR)?;
         let skip = format!("{tag}_r{r}_skip");
-        sop(b, format!("s_add_i32 s{T_T0}, s{T_ROW0}, {r}"), &[T_T0], &[T_ROW0])?;
-        sop(b, format!("s_cmp_ge_i32 s{T_T0}, s{T_M}"), &[], &[T_T0, T_M])?;
+        sop(
+            b,
+            format!("s_add_i32 s{T_T0}, s{T_ROW0}, {r}"),
+            &[T_T0],
+            &[T_ROW0],
+        )?;
+        sop(
+            b,
+            format!("s_cmp_ge_i32 s{T_T0}, s{T_M}"),
+            &[],
+            &[T_T0, T_M],
+        )?;
         op(b, format!("s_cbranch_scc1 {skip}"), &[], &[])?;
-        op(b, format!("s_mov_b32 exec_lo, s{T_LANE0}"), &[], &[s(T_LANE0)])?;
+        op(
+            b,
+            format!("s_mov_b32 exec_lo, s{T_LANE0}"),
+            &[],
+            &[s(T_LANE0)],
+        )?;
         for c in 0..nb {
-            mem(b, format!("global_store_b32 v{}, v{}, s[{S_Y}:{}]{}", W_YOFF + c, k320_sum(set, c), S_Y + 1, off(4 * u32::from(r))),
-                &[], &[v(W_YOFF + c), v(k320_sum(set, c)), sr(S_Y, 2)], MemoryClass::VmemStore)?;
+            mem(
+                b,
+                format!(
+                    "global_store_b32 v{}, v{}, s[{S_Y}:{}]{}",
+                    W_YOFF + c,
+                    k320_sum(set, c),
+                    S_Y + 1,
+                    off(4 * u32::from(r))
+                ),
+                &[],
+                &[v(W_YOFF + c), v(k320_sum(set, c)), sr(S_Y, 2)],
+                MemoryClass::VmemStore,
+            )?;
         }
         op(b, "s_mov_b32 exec_lo, -1", &[], &[])?;
         b.label(&skip)?;
@@ -818,39 +1786,133 @@ pub enum WideKind {
 
 /// One wide entry: recipe and compiled row capacity (16 or 32).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WideSpec { pub kind: WideKind, pub cap: u8 }
+pub struct WideSpec {
+    pub kind: WideKind,
+    pub cap: u8,
+}
 
 impl WideSpec {
     fn tag(&self) -> &'static str {
-        match self.kind { WideKind::K8 => "k8", WideKind::K320 => "k320", WideKind::K2560 => "k2560", WideKind::K2560X2 => "k2560_x2", WideKind::Wide => "wide" }
+        match self.kind {
+            WideKind::K8 => "k8",
+            WideKind::K320 => "k320",
+            WideKind::K2560 => "k2560",
+            WideKind::K2560X2 => "k2560_x2",
+            WideKind::Wide => "wide",
+        }
     }
-    pub fn symbol(&self) -> String { format!("gemv_q8_0_{}_xbatch_wide_r{}_pm", self.tag(), self.cap) }
-    fn hc(&self) -> bool { self.kind == WideKind::K8 }
-    fn four(&self) -> bool { self.kind == WideKind::Wide }
-    fn x2(&self) -> bool { self.kind == WideKind::K2560X2 }
-    pub fn kernarg_bytes(&self) -> u32 { match self.kind { WideKind::K8 => 44, WideKind::K2560X2 => 56, _ => 36 } }
-    pub fn workgroup_size(&self) -> u16 { if self.hc() { 512 } else { 256 } }
-    pub fn lds_bytes(&self) -> u32 { if self.hc() { WIDE_K8_LDS_BYTES } else { WIDE_LDS_BYTES } }
+    pub fn symbol(&self) -> String {
+        format!("gemv_q8_0_{}_xbatch_wide_r{}_pm", self.tag(), self.cap)
+    }
+    fn hc(&self) -> bool {
+        self.kind == WideKind::K8
+    }
+    fn four(&self) -> bool {
+        self.kind == WideKind::Wide
+    }
+    fn x2(&self) -> bool {
+        self.kind == WideKind::K2560X2
+    }
+    pub fn kernarg_bytes(&self) -> u32 {
+        match self.kind {
+            WideKind::K8 => 44,
+            WideKind::K2560X2 => 56,
+            _ => 36,
+        }
+    }
+    pub fn workgroup_size(&self) -> u16 {
+        if self.hc() {
+            512
+        } else {
+            256
+        }
+    }
+    pub fn lds_bytes(&self) -> u32 {
+        if self.hc() {
+            WIDE_K8_LDS_BYTES
+        } else {
+            WIDE_LDS_BYTES
+        }
+    }
     /// Declared VGPR budget (design ceilings): 80 for one chain per row
     /// (ordinary and HC), 128 / 192 for four chains per row.
-    pub fn vgpr_budget(&self) -> u16 { if self.four() { if self.cap == 16 { 128 } else { 192 } } else { 80 } }
+    pub fn vgpr_budget(&self) -> u16 {
+        if self.four() {
+            if self.cap == 16 {
+                128
+            } else {
+                192
+            }
+        } else {
+            80
+        }
+    }
     /// Persistent accumulator VGPRs per lane.
-    pub fn accumulators(&self) -> usize { usize::from(self.cap) * if self.four() { 4 } else { 1 } }
+    pub fn accumulators(&self) -> usize {
+        usize::from(self.cap) * if self.four() { 4 } else { 1 }
+    }
     /// VGPR high water (`WV_ACC + accumulators`), in usize arithmetic.
-    pub fn vgpr_high_water(&self) -> usize { usize::from(WV_ACC) + self.accumulators() }
+    pub fn vgpr_high_water(&self) -> usize {
+        usize::from(WV_ACC) + self.accumulators()
+    }
     /// Activation rows per X stage.
-    fn rows_per_tile(&self) -> u32 { if self.hc() { 2 } else { 8 } }
-    fn tiles(&self) -> u32 { u32::from(self.cap) / self.rows_per_tile() }
-    fn label(&self) -> String { format!(".Lq8w_{}r{}", self.tag(), self.cap) }
+    fn rows_per_tile(&self) -> u32 {
+        if self.hc() {
+            2
+        } else {
+            8
+        }
+    }
+    fn tiles(&self) -> u32 {
+        u32::from(self.cap) / self.rows_per_tile()
+    }
+    fn label(&self) -> String {
+        format!(".Lq8w_{}r{}", self.tag(), self.cap)
+    }
 }
 
 /// The wide exports, in frozen return order of [`build_wide_gfx1151`].
 pub const WIDE_EXPORTS: [WideSpec; 10] = [
-    WideSpec { kind: WideKind::K8, cap: 16 }, WideSpec { kind: WideKind::K8, cap: 32 },
-    WideSpec { kind: WideKind::K320, cap: 16 }, WideSpec { kind: WideKind::K320, cap: 32 },
-    WideSpec { kind: WideKind::K2560, cap: 16 }, WideSpec { kind: WideKind::K2560, cap: 32 },
-    WideSpec { kind: WideKind::K2560X2, cap: 16 }, WideSpec { kind: WideKind::K2560X2, cap: 32 },
-    WideSpec { kind: WideKind::Wide, cap: 16 }, WideSpec { kind: WideKind::Wide, cap: 32 },
+    WideSpec {
+        kind: WideKind::K8,
+        cap: 16,
+    },
+    WideSpec {
+        kind: WideKind::K8,
+        cap: 32,
+    },
+    WideSpec {
+        kind: WideKind::K320,
+        cap: 16,
+    },
+    WideSpec {
+        kind: WideKind::K320,
+        cap: 32,
+    },
+    WideSpec {
+        kind: WideKind::K2560,
+        cap: 16,
+    },
+    WideSpec {
+        kind: WideKind::K2560,
+        cap: 32,
+    },
+    WideSpec {
+        kind: WideKind::K2560X2,
+        cap: 16,
+    },
+    WideSpec {
+        kind: WideKind::K2560X2,
+        cap: 32,
+    },
+    WideSpec {
+        kind: WideKind::Wide,
+        cap: 16,
+    },
+    WideSpec {
+        kind: WideKind::Wide,
+        cap: 32,
+    },
 ];
 
 /// Operand spelling of the four-chain recipe, pinned to the decode object
@@ -940,17 +2002,38 @@ const WV_ACC: u8 = 40;
 
 /// Accumulator of activation row `row`, chain `chain` (`0` for one chain).
 fn wacc(w: WideSpec, row: u32, chain: u8) -> u8 {
-    let n = usize::from(WV_ACC) + if w.four() { 4 * row as usize + usize::from(chain) } else { row as usize };
+    let n = usize::from(WV_ACC)
+        + if w.four() {
+            4 * row as usize + usize::from(chain)
+        } else {
+            row as usize
+        };
     u8::try_from(n).expect("accumulator index validated by wide_plan")
 }
 
 fn wide_plan(w: WideSpec) -> Result<RegPlan, String> {
-    if !WIDE_CAPS.contains(&w.cap) { return Err(format!("q8 wide capacity {} is not 16 or 32", w.cap)) }
+    if !WIDE_CAPS.contains(&w.cap) {
+        return Err(format!("q8 wide capacity {} is not 16 or 32", w.cap));
+    }
     let hw = w.vgpr_high_water();
-    if hw > 256 { return Err(format!("{} needs {hw} VGPRs (> 256)", w.symbol())) }
-    if hw > usize::from(w.vgpr_budget()) { return Err(format!("{} needs {hw} VGPRs (> budget {})", w.symbol(), w.vgpr_budget())) }
+    if hw > 256 {
+        return Err(format!("{} needs {hw} VGPRs (> 256)", w.symbol()));
+    }
+    if hw > usize::from(w.vgpr_budget()) {
+        return Err(format!(
+            "{} needs {hw} VGPRs (> budget {})",
+            w.symbol(),
+            w.vgpr_budget()
+        ));
+    }
     let mut p = RegPlan::new(w.vgpr_budget(), WIDE_SGPRS)?;
-    for (name, base, len) in [("kernarg_ptr", S_KARG, 2), ("wg_x", S_WG, 1), ("a_x_ptrs", WS_A, 4), ("y_ptr", WS_Y, 2), ("m_k", WS_M, 2)] {
+    for (name, base, len) in [
+        ("kernarg_ptr", S_KARG, 2),
+        ("wg_x", S_WG, 1),
+        ("a_x_ptrs", WS_A, 4),
+        ("y_ptr", WS_Y, 2),
+        ("m_k", WS_M, 2),
+    ] {
         declare(&mut p, name, Kind::S, base, len)?;
     }
     if w.hc() {
@@ -959,42 +2042,90 @@ fn wide_plan(w: WideSpec) -> Result<RegPlan, String> {
     } else {
         declare(&mut p, "r", Kind::S, WS_R, 1)?;
     }
-    for n in WS_WAVE..=WS_IT { declare(&mut p, "scalar", Kind::S, n, 1)?; }
+    for n in WS_WAVE..=WS_IT {
+        declare(&mut p, "scalar", Kind::S, n, 1)?;
+    }
     if w.x2() {
-        for (name, base, len) in [("x2_a", WS_RA, 4), ("x2_x_y0", WS_RXY, 4), ("x2_y1", WS_RY1, 2), ("x2_m", WS_RM, 2), ("x2_k_r", WS_RKR, 2)] {
+        for (name, base, len) in [
+            ("x2_a", WS_RA, 4),
+            ("x2_x_y0", WS_RXY, 4),
+            ("x2_y1", WS_RY1, 2),
+            ("x2_m", WS_RM, 2),
+            ("x2_k_r", WS_RKR, 2),
+        ] {
             declare(&mut p, name, Kind::S, base, len)?;
         }
     }
-    for n in WS_T0..=WS_ROWOFF { declare(&mut p, "scalar", Kind::S, n, 1)?; }
-    let acc = u8::try_from(w.accumulators()).map_err(|_| "accumulator count past 255".to_string())?;
+    for n in WS_T0..=WS_ROWOFF {
+        declare(&mut p, "scalar", Kind::S, n, 1)?;
+    }
+    let acc =
+        u8::try_from(w.accumulators()).map_err(|_| "accumulator count past 255".to_string())?;
     for (name, base, len) in [
-        ("tid", V_TID, 1), ("lane", V_LANE, 1), ("bpermute_addr", WV_ADDR, 4), ("lds_store", WV_LDST, 1), ("lds_read", WV_LDRD, 1),
-        ("x_offset", WV_XOFF, 1), ("x_addr", WV_XADDR, 1), ("w_offset_d", WV_WOFFD, 1), ("w_offset_q", WV_WOFFQ, 1),
-        ("product", WV_TMP, 1), ("temp", WV_VT, 1), ("partial_store", WV_PST, 1), ("y_offset", WV_EY, 1),
-        ("dq", WV_DQ, 8), ("q", WV_Q, 8), ("x_slots", WV_XS, 8), ("accumulators", WV_ACC, acc),
-    ] { declare(&mut p, name, Kind::V, base, len)?; }
+        ("tid", V_TID, 1),
+        ("lane", V_LANE, 1),
+        ("bpermute_addr", WV_ADDR, 4),
+        ("lds_store", WV_LDST, 1),
+        ("lds_read", WV_LDRD, 1),
+        ("x_offset", WV_XOFF, 1),
+        ("x_addr", WV_XADDR, 1),
+        ("w_offset_d", WV_WOFFD, 1),
+        ("w_offset_q", WV_WOFFQ, 1),
+        ("product", WV_TMP, 1),
+        ("temp", WV_VT, 1),
+        ("partial_store", WV_PST, 1),
+        ("y_offset", WV_EY, 1),
+        ("dq", WV_DQ, 8),
+        ("q", WV_Q, 8),
+        ("x_slots", WV_XS, 8),
+        ("accumulators", WV_ACC, acc),
+    ] {
+        declare(&mut p, name, Kind::V, base, len)?;
+    }
     Ok(p)
 }
 
 fn wide_kspec(w: WideSpec) -> KernelSpec {
     let kernargs = match w.kind {
-        WideKind::K8 => KernargLayout::new(44).pointer_access("A", 0, Access::ReadOnly)
-            .pointer_access("x", 8, Access::ReadOnly).pointer_access("y", 16, Access::WriteOnly)
-            .hidden("M", 24, 4, "by_value").hidden("K", 28, 4, "by_value").hidden("B", 32, 4, "by_value")
-            .hidden("scale", 36, 4, "by_value").hidden("hc_act", 40, 4, "by_value"),
-        WideKind::K2560X2 => KernargLayout::new(56).pointer_access("A0", 0, Access::ReadOnly)
-            .pointer_access("A1", 8, Access::ReadOnly).pointer_access("x", 16, Access::ReadOnly)
-            .pointer_access("y0", 24, Access::WriteOnly).pointer_access("y1", 32, Access::WriteOnly)
-            .hidden("M0", 40, 4, "by_value").hidden("M1", 44, 4, "by_value")
-            .hidden("K", 48, 4, "by_value").hidden("R", 52, 4, "by_value"),
-        _ => KernargLayout::new(36).pointer_access("A", 0, Access::ReadOnly)
-            .pointer_access("x", 8, Access::ReadOnly).pointer_access("y", 16, Access::WriteOnly)
-            .hidden("M", 24, 4, "by_value").hidden("K", 28, 4, "by_value").hidden("R", 32, 4, "by_value"),
+        WideKind::K8 => KernargLayout::new(44)
+            .pointer_access("A", 0, Access::ReadOnly)
+            .pointer_access("x", 8, Access::ReadOnly)
+            .pointer_access("y", 16, Access::WriteOnly)
+            .hidden("M", 24, 4, "by_value")
+            .hidden("K", 28, 4, "by_value")
+            .hidden("B", 32, 4, "by_value")
+            .hidden("scale", 36, 4, "by_value")
+            .hidden("hc_act", 40, 4, "by_value"),
+        WideKind::K2560X2 => KernargLayout::new(56)
+            .pointer_access("A0", 0, Access::ReadOnly)
+            .pointer_access("A1", 8, Access::ReadOnly)
+            .pointer_access("x", 16, Access::ReadOnly)
+            .pointer_access("y0", 24, Access::WriteOnly)
+            .pointer_access("y1", 32, Access::WriteOnly)
+            .hidden("M0", 40, 4, "by_value")
+            .hidden("M1", 44, 4, "by_value")
+            .hidden("K", 48, 4, "by_value")
+            .hidden("R", 52, 4, "by_value"),
+        _ => KernargLayout::new(36)
+            .pointer_access("A", 0, Access::ReadOnly)
+            .pointer_access("x", 8, Access::ReadOnly)
+            .pointer_access("y", 16, Access::WriteOnly)
+            .hidden("M", 24, 4, "by_value")
+            .hidden("K", 28, 4, "by_value")
+            .hidden("R", 32, 4, "by_value"),
     };
     KernelSpec {
-        kernel_id: "qwen4_lane_rows_q8".into(), variant: format!("wide_{}_r{}", w.tag(), w.cap), arch: Arch::Gfx1151, symbol: w.symbol(),
-        kernargs, user_sgpr_count: 2, system_sgpr_workgroup_id_y: false, workgroup_size: w.workgroup_size(),
-        group_segment_fixed_size: w.lds_bytes(), wave32: true, cu_mode: false,
+        kernel_id: "qwen4_lane_rows_q8".into(),
+        variant: format!("wide_{}_r{}", w.tag(), w.cap),
+        arch: Arch::Gfx1151,
+        symbol: w.symbol(),
+        kernargs,
+        user_sgpr_count: 2,
+        system_sgpr_workgroup_id_y: false,
+        workgroup_size: w.workgroup_size(),
+        group_segment_fixed_size: w.lds_bytes(),
+        wave32: true,
+        cu_mode: false,
     }
 }
 
@@ -1014,7 +2145,12 @@ fn wide(w: WideSpec) -> Result<Emitted, String> {
     match w.kind {
         WideKind::Wide => {
             let k640 = format!("{lbl}_k640");
-            sop(&mut b, format!("s_cmp_eq_u32 s{WS_K}, {}", lit(640)), &[], &[WS_K])?;
+            sop(
+                &mut b,
+                format!("s_cmp_eq_u32 s{WS_K}, {}", lit(640)),
+                &[],
+                &[WS_K],
+            )?;
             op(&mut b, format!("s_cbranch_scc1 {k640}"), &[], &[])?;
             let g = format!("{lbl}_g");
             wide_traverse(&mut b, w, slot, Order::Generic, &tails, &g)?;
@@ -1066,117 +2202,444 @@ fn wide_prologue(b: &mut Builder, w: WideSpec, end: &str) -> R {
             smem(b, WS_R, 1, S_KARG, 0x20)?;
         }
     }
-    vop(b, format!("v_and_b32_e32 v{V_LANE}, 31, v{V_TID}"), &[V_LANE], &[V_TID], &[])?;
-    vop(b, format!("v_lshrrev_b32_e32 v{WV_VT}, 5, v{V_TID}"), &[WV_VT], &[V_TID], &[])?;
-    op(b, format!("v_readfirstlane_b32 s{WS_WAVE}, v{WV_VT}"), &[s(WS_WAVE)], &[v(WV_VT)])?;
+    vop(
+        b,
+        format!("v_and_b32_e32 v{V_LANE}, 31, v{V_TID}"),
+        &[V_LANE],
+        &[V_TID],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_lshrrev_b32_e32 v{WV_VT}, 5, v{V_TID}"),
+        &[WV_VT],
+        &[V_TID],
+        &[],
+    )?;
+    op(
+        b,
+        format!("v_readfirstlane_b32 s{WS_WAVE}, v{WV_VT}"),
+        &[s(WS_WAVE)],
+        &[v(WV_VT)],
+    )?;
     bpermute_addresses(b, WV_ADDR, V_LANE)?;
-    vop(b, format!("v_cmp_eq_u32_e32 vcc_lo, 0, v{V_LANE}"), &[], &[V_LANE], &[])?;
-    op(b, format!("s_mov_b32 s{WS_LANE0}, vcc_lo"), &[s(WS_LANE0)], &[])?;
+    vop(
+        b,
+        format!("v_cmp_eq_u32_e32 vcc_lo, 0, v{V_LANE}"),
+        &[],
+        &[V_LANE],
+        &[],
+    )?;
+    op(
+        b,
+        format!("s_mov_b32 s{WS_LANE0}, vcc_lo"),
+        &[s(WS_LANE0)],
+        &[],
+    )?;
     b.wait_all()?;
     let wg = if w.x2() {
         // Blocks [0, ceil(M0/8)) run matrix 0, the rest matrix 1 with the
         // matrix-local block index; M0 = 0 routes every block to matrix 1.
-        sop(b, format!("s_add_i32 s{WS_T1}, s{WS_RM}, 7"), &[WS_T1], &[WS_RM])?;
-        sop(b, format!("s_lshr_b32 s{WS_T1}, s{WS_T1}, 3"), &[WS_T1], &[WS_T1])?;
-        sop(b, format!("s_cmp_ge_u32 s{S_WG}, s{WS_T1}"), &[], &[S_WG, WS_T1])?;
-        op(b, format!("s_cselect_b64 s[{WS_A}:{}], s[{}:{}], s[{WS_RA}:{}]", WS_A + 1, WS_RA + 2, WS_RA + 3, WS_RA + 1),
-            &[sr(WS_A, 2)], &[sr(WS_RA + 2, 2), sr(WS_RA, 2)])?;
-        op(b, format!("s_cselect_b64 s[{WS_Y}:{}], s[{WS_RY1}:{}], s[{}:{}]", WS_Y + 1, WS_RY1 + 1, WS_RXY + 2, WS_RXY + 3),
-            &[sr(WS_Y, 2)], &[sr(WS_RY1, 2), sr(WS_RXY + 2, 2)])?;
-        sop(b, format!("s_cselect_b32 s{WS_M}, s{}, s{WS_RM}", WS_RM + 1), &[WS_M], &[WS_RM + 1, WS_RM])?;
-        sop(b, format!("s_cselect_b32 s{WS_T1}, s{WS_T1}, 0"), &[WS_T1], &[WS_T1])?;
-        sop(b, format!("s_sub_i32 s{WS_T0}, s{S_WG}, s{WS_T1}"), &[WS_T0], &[S_WG, WS_T1])?;
-        op(b, format!("s_mov_b64 s[{WS_X}:{}], s[{WS_RXY}:{}]", WS_X + 1, WS_RXY + 1), &[sr(WS_X, 2)], &[sr(WS_RXY, 2)])?;
-        sop(b, format!("s_mov_b32 s{WS_K}, s{WS_RKR}"), &[WS_K], &[WS_RKR])?;
-        sop(b, format!("s_mov_b32 s{WS_R}, s{}", WS_RKR + 1), &[WS_R], &[WS_RKR + 1])?;
+        sop(
+            b,
+            format!("s_add_i32 s{WS_T1}, s{WS_RM}, 7"),
+            &[WS_T1],
+            &[WS_RM],
+        )?;
+        sop(
+            b,
+            format!("s_lshr_b32 s{WS_T1}, s{WS_T1}, 3"),
+            &[WS_T1],
+            &[WS_T1],
+        )?;
+        sop(
+            b,
+            format!("s_cmp_ge_u32 s{S_WG}, s{WS_T1}"),
+            &[],
+            &[S_WG, WS_T1],
+        )?;
+        op(
+            b,
+            format!(
+                "s_cselect_b64 s[{WS_A}:{}], s[{}:{}], s[{WS_RA}:{}]",
+                WS_A + 1,
+                WS_RA + 2,
+                WS_RA + 3,
+                WS_RA + 1
+            ),
+            &[sr(WS_A, 2)],
+            &[sr(WS_RA + 2, 2), sr(WS_RA, 2)],
+        )?;
+        op(
+            b,
+            format!(
+                "s_cselect_b64 s[{WS_Y}:{}], s[{WS_RY1}:{}], s[{}:{}]",
+                WS_Y + 1,
+                WS_RY1 + 1,
+                WS_RXY + 2,
+                WS_RXY + 3
+            ),
+            &[sr(WS_Y, 2)],
+            &[sr(WS_RY1, 2), sr(WS_RXY + 2, 2)],
+        )?;
+        sop(
+            b,
+            format!("s_cselect_b32 s{WS_M}, s{}, s{WS_RM}", WS_RM + 1),
+            &[WS_M],
+            &[WS_RM + 1, WS_RM],
+        )?;
+        sop(
+            b,
+            format!("s_cselect_b32 s{WS_T1}, s{WS_T1}, 0"),
+            &[WS_T1],
+            &[WS_T1],
+        )?;
+        sop(
+            b,
+            format!("s_sub_i32 s{WS_T0}, s{S_WG}, s{WS_T1}"),
+            &[WS_T0],
+            &[S_WG, WS_T1],
+        )?;
+        op(
+            b,
+            format!(
+                "s_mov_b64 s[{WS_X}:{}], s[{WS_RXY}:{}]",
+                WS_X + 1,
+                WS_RXY + 1
+            ),
+            &[sr(WS_X, 2)],
+            &[sr(WS_RXY, 2)],
+        )?;
+        sop(
+            b,
+            format!("s_mov_b32 s{WS_K}, s{WS_RKR}"),
+            &[WS_K],
+            &[WS_RKR],
+        )?;
+        sop(
+            b,
+            format!("s_mov_b32 s{WS_R}, s{}", WS_RKR + 1),
+            &[WS_R],
+            &[WS_RKR + 1],
+        )?;
         WS_T0
-    } else { S_WG };
+    } else {
+        S_WG
+    };
     // Uniform refusals (no store): R outside 1..=cap, K outside the domain
     // (ordinary K % 32, HC K % 256 and K > 0), a workgroup without columns.
     sop(b, format!("s_cmp_eq_u32 s{WS_R}, 0"), &[], &[WS_R])?;
     op(b, format!("s_cbranch_scc1 {end}"), &[], &[])?;
     sop(b, format!("s_cmp_gt_u32 s{WS_R}, {}", w.cap), &[], &[WS_R])?;
     op(b, format!("s_cbranch_scc1 {end}"), &[], &[])?;
-    sop(b, format!("s_and_b32 s{WS_T1}, s{WS_K}, {}", lit(if w.hc() { 255 } else { 31 })), &[WS_T1], &[WS_K])?;
+    sop(
+        b,
+        format!(
+            "s_and_b32 s{WS_T1}, s{WS_K}, {}",
+            lit(if w.hc() { 255 } else { 31 })
+        ),
+        &[WS_T1],
+        &[WS_K],
+    )?;
     sop(b, format!("s_cmp_lg_u32 s{WS_T1}, 0"), &[], &[WS_T1])?;
     op(b, format!("s_cbranch_scc1 {end}"), &[], &[])?;
     if w.hc() {
         sop(b, format!("s_cmp_eq_u32 s{WS_K}, 0"), &[], &[WS_K])?;
         op(b, format!("s_cbranch_scc1 {end}"), &[], &[])?;
     }
-    sop(b, format!("s_lshl_b32 s{WS_MBASE}, s{wg}, {}", if w.hc() { 1 } else { 3 }), &[WS_MBASE], &[wg])?;
-    sop(b, format!("s_cmp_ge_i32 s{WS_MBASE}, s{WS_M}"), &[], &[WS_MBASE, WS_M])?;
+    sop(
+        b,
+        format!(
+            "s_lshl_b32 s{WS_MBASE}, s{wg}, {}",
+            if w.hc() { 1 } else { 3 }
+        ),
+        &[WS_MBASE],
+        &[wg],
+    )?;
+    sop(
+        b,
+        format!("s_cmp_ge_i32 s{WS_MBASE}, s{WS_M}"),
+        &[],
+        &[WS_MBASE, WS_M],
+    )?;
     op(b, format!("s_cbranch_scc1 {end}"), &[], &[])?;
     // Column, liveness, weight row (HC: row-major partitions `(m*8 + part)`).
     if w.hc() {
-        sop(b, format!("s_lshr_b32 s{WS_PROW}, s{WS_WAVE}, 3"), &[WS_PROW], &[WS_WAVE])?;
-        sop(b, format!("s_and_b32 s{WS_PART}, s{WS_WAVE}, 7"), &[WS_PART], &[WS_WAVE])?;
+        sop(
+            b,
+            format!("s_lshr_b32 s{WS_PROW}, s{WS_WAVE}, 3"),
+            &[WS_PROW],
+            &[WS_WAVE],
+        )?;
+        sop(
+            b,
+            format!("s_and_b32 s{WS_PART}, s{WS_WAVE}, 7"),
+            &[WS_PART],
+            &[WS_WAVE],
+        )?;
     } else {
-        sop(b, format!("s_mov_b32 s{WS_PROW}, s{WS_WAVE}"), &[WS_PROW], &[WS_WAVE])?;
+        sop(
+            b,
+            format!("s_mov_b32 s{WS_PROW}, s{WS_WAVE}"),
+            &[WS_PROW],
+            &[WS_WAVE],
+        )?;
     }
-    sop(b, format!("s_add_i32 s{WS_COL}, s{WS_MBASE}, s{WS_PROW}"), &[WS_COL], &[WS_MBASE, WS_PROW])?;
-    sop(b, format!("s_cmp_lt_i32 s{WS_COL}, s{WS_M}"), &[], &[WS_COL, WS_M])?;
-    sop(b, format!("s_cselect_b32 s{WS_LIVE}, 1, 0"), &[WS_LIVE], &[])?;
-    sop(b, format!("s_lshr_b32 s{WS_NBLK}, s{WS_K}, {}", if w.hc() { 8 } else { 5 }), &[WS_NBLK], &[WS_K])?;
-    sop(b, format!("s_mul_i32 s{WS_ROWB}, s{WS_NBLK}, 34"), &[WS_ROWB], &[WS_NBLK])?;
+    sop(
+        b,
+        format!("s_add_i32 s{WS_COL}, s{WS_MBASE}, s{WS_PROW}"),
+        &[WS_COL],
+        &[WS_MBASE, WS_PROW],
+    )?;
+    sop(
+        b,
+        format!("s_cmp_lt_i32 s{WS_COL}, s{WS_M}"),
+        &[],
+        &[WS_COL, WS_M],
+    )?;
+    sop(
+        b,
+        format!("s_cselect_b32 s{WS_LIVE}, 1, 0"),
+        &[WS_LIVE],
+        &[],
+    )?;
+    sop(
+        b,
+        format!(
+            "s_lshr_b32 s{WS_NBLK}, s{WS_K}, {}",
+            if w.hc() { 8 } else { 5 }
+        ),
+        &[WS_NBLK],
+        &[WS_K],
+    )?;
+    sop(
+        b,
+        format!("s_mul_i32 s{WS_ROWB}, s{WS_NBLK}, 34"),
+        &[WS_ROWB],
+        &[WS_NBLK],
+    )?;
     if w.hc() {
-        sop(b, format!("s_lshl_b32 s{WS_ROWOFF}, s{WS_COL}, 3"), &[WS_ROWOFF], &[WS_COL])?;
-        sop(b, format!("s_add_i32 s{WS_ROWOFF}, s{WS_ROWOFF}, s{WS_PART}"), &[WS_ROWOFF], &[WS_ROWOFF, WS_PART])?;
-        sop(b, format!("s_mul_i32 s{WS_ROWOFF}, s{WS_ROWOFF}, s{WS_ROWB}"), &[WS_ROWOFF], &[WS_ROWOFF, WS_ROWB])?;
+        sop(
+            b,
+            format!("s_lshl_b32 s{WS_ROWOFF}, s{WS_COL}, 3"),
+            &[WS_ROWOFF],
+            &[WS_COL],
+        )?;
+        sop(
+            b,
+            format!("s_add_i32 s{WS_ROWOFF}, s{WS_ROWOFF}, s{WS_PART}"),
+            &[WS_ROWOFF],
+            &[WS_ROWOFF, WS_PART],
+        )?;
+        sop(
+            b,
+            format!("s_mul_i32 s{WS_ROWOFF}, s{WS_ROWOFF}, s{WS_ROWB}"),
+            &[WS_ROWOFF],
+            &[WS_ROWOFF, WS_ROWB],
+        )?;
     } else {
-        sop(b, format!("s_mul_i32 s{WS_ROWOFF}, s{WS_COL}, s{WS_ROWB}"), &[WS_ROWOFF], &[WS_COL, WS_ROWB])?;
+        sop(
+            b,
+            format!("s_mul_i32 s{WS_ROWOFF}, s{WS_COL}, s{WS_ROWB}"),
+            &[WS_ROWOFF],
+            &[WS_COL, WS_ROWB],
+        )?;
     }
-    vop(b, format!("v_mov_b32_e32 v{WV_WOFFD}, s{WS_ROWOFF}"), &[WV_WOFFD], &[], &[WS_ROWOFF])?;
-    vop(b, format!("v_add_nc_u32_e32 v{WV_WOFFQ}, s{WS_ROWOFF}, v{V_LANE}"), &[WV_WOFFQ], &[V_LANE], &[WS_ROWOFF])?;
+    vop(
+        b,
+        format!("v_mov_b32_e32 v{WV_WOFFD}, s{WS_ROWOFF}"),
+        &[WV_WOFFD],
+        &[],
+        &[WS_ROWOFF],
+    )?;
+    vop(
+        b,
+        format!("v_add_nc_u32_e32 v{WV_WOFFQ}, s{WS_ROWOFF}, v{V_LANE}"),
+        &[WV_WOFFQ],
+        &[V_LANE],
+        &[WS_ROWOFF],
+    )?;
     // Producer row of tile 0: x row `PROW` (HC: plus partition `part*K/8`).
-    sop(b, format!("s_lshl_b32 s{WS_KX4}, s{WS_K}, 2"), &[WS_KX4], &[WS_K])?;
-    sop(b, format!("s_mul_i32 s{WS_XTB}, s{WS_PROW}, s{WS_KX4}"), &[WS_XTB], &[WS_PROW, WS_KX4])?;
+    sop(
+        b,
+        format!("s_lshl_b32 s{WS_KX4}, s{WS_K}, 2"),
+        &[WS_KX4],
+        &[WS_K],
+    )?;
+    sop(
+        b,
+        format!("s_mul_i32 s{WS_XTB}, s{WS_PROW}, s{WS_KX4}"),
+        &[WS_XTB],
+        &[WS_PROW, WS_KX4],
+    )?;
     if w.hc() {
-        sop(b, format!("s_lshr_b32 s{WS_T1}, s{WS_K}, 1"), &[WS_T1], &[WS_K])?;
-        sop(b, format!("s_mul_i32 s{WS_T1}, s{WS_T1}, s{WS_PART}"), &[WS_T1], &[WS_T1, WS_PART])?;
-        sop(b, format!("s_add_i32 s{WS_XTB}, s{WS_XTB}, s{WS_T1}"), &[WS_XTB], &[WS_XTB, WS_T1])?;
+        sop(
+            b,
+            format!("s_lshr_b32 s{WS_T1}, s{WS_K}, 1"),
+            &[WS_T1],
+            &[WS_K],
+        )?;
+        sop(
+            b,
+            format!("s_mul_i32 s{WS_T1}, s{WS_T1}, s{WS_PART}"),
+            &[WS_T1],
+            &[WS_T1, WS_PART],
+        )?;
+        sop(
+            b,
+            format!("s_add_i32 s{WS_XTB}, s{WS_XTB}, s{WS_T1}"),
+            &[WS_XTB],
+            &[WS_XTB, WS_T1],
+        )?;
     }
-    sop(b, format!("s_lshr_b32 s{WS_NFULL}, s{WS_NBLK}, 3"), &[WS_NFULL], &[WS_NBLK])?;
-    sop(b, format!("s_and_b32 s{WS_TAIL}, s{WS_NBLK}, 7"), &[WS_TAIL], &[WS_NBLK])?;
+    sop(
+        b,
+        format!("s_lshr_b32 s{WS_NFULL}, s{WS_NBLK}, 3"),
+        &[WS_NFULL],
+        &[WS_NBLK],
+    )?;
+    sop(
+        b,
+        format!("s_and_b32 s{WS_TAIL}, s{WS_NBLK}, 7"),
+        &[WS_TAIL],
+        &[WS_NBLK],
+    )?;
     // LDS word (stage row v, block j, lane l) = (v*8 + j)*32 + l; the
     // producer wave (HC: (ml, part) = wave) owns stage row `wave`.
-    vop(b, format!("v_lshlrev_b32_e32 v{WV_XOFF}, 2, v{V_LANE}"), &[WV_XOFF], &[V_LANE], &[])?;
-    sop(b, format!("s_lshl_b32 s{WS_T1}, s{WS_WAVE}, 10"), &[WS_T1], &[WS_WAVE])?;
-    vop(b, format!("v_add_nc_u32_e32 v{WV_LDST}, s{WS_T1}, v{WV_XOFF}"), &[WV_LDST], &[WV_XOFF], &[WS_T1])?;
+    vop(
+        b,
+        format!("v_lshlrev_b32_e32 v{WV_XOFF}, 2, v{V_LANE}"),
+        &[WV_XOFF],
+        &[V_LANE],
+        &[],
+    )?;
+    sop(
+        b,
+        format!("s_lshl_b32 s{WS_T1}, s{WS_WAVE}, 10"),
+        &[WS_T1],
+        &[WS_WAVE],
+    )?;
+    vop(
+        b,
+        format!("v_add_nc_u32_e32 v{WV_LDST}, s{WS_T1}, v{WV_XOFF}"),
+        &[WV_LDST],
+        &[WV_XOFF],
+        &[WS_T1],
+    )?;
     if w.hc() {
         // Consumer (ml, part) reads stage rows (r2, part), r2 = 0, 1; lane 0
         // parks partial[ml][r][part] at ((ml*cap + r)*8 + part)*4.
-        sop(b, format!("s_lshl_b32 s{WS_T1}, s{WS_PART}, 10"), &[WS_T1], &[WS_PART])?;
-        vop(b, format!("v_add_nc_u32_e32 v{WV_LDRD}, s{WS_T1}, v{WV_XOFF}"), &[WV_LDRD], &[WV_XOFF], &[WS_T1])?;
-        sop(b, format!("s_mul_i32 s{WS_T1}, s{WS_PROW}, {}", lit(32 * u32::from(w.cap))), &[WS_T1], &[WS_PROW])?;
-        sop(b, format!("s_lshl_b32 s{WS_T0}, s{WS_PART}, 2"), &[WS_T0], &[WS_PART])?;
-        sop(b, format!("s_add_i32 s{WS_T1}, s{WS_T1}, s{WS_T0}"), &[WS_T1], &[WS_T1, WS_T0])?;
-        vop(b, format!("v_mov_b32_e32 v{WV_PST}, s{WS_T1}"), &[WV_PST], &[], &[WS_T1])
+        sop(
+            b,
+            format!("s_lshl_b32 s{WS_T1}, s{WS_PART}, 10"),
+            &[WS_T1],
+            &[WS_PART],
+        )?;
+        vop(
+            b,
+            format!("v_add_nc_u32_e32 v{WV_LDRD}, s{WS_T1}, v{WV_XOFF}"),
+            &[WV_LDRD],
+            &[WV_XOFF],
+            &[WS_T1],
+        )?;
+        sop(
+            b,
+            format!(
+                "s_mul_i32 s{WS_T1}, s{WS_PROW}, {}",
+                lit(32 * u32::from(w.cap))
+            ),
+            &[WS_T1],
+            &[WS_PROW],
+        )?;
+        sop(
+            b,
+            format!("s_lshl_b32 s{WS_T0}, s{WS_PART}, 2"),
+            &[WS_T0],
+            &[WS_PART],
+        )?;
+        sop(
+            b,
+            format!("s_add_i32 s{WS_T1}, s{WS_T1}, s{WS_T0}"),
+            &[WS_T1],
+            &[WS_T1, WS_T0],
+        )?;
+        vop(
+            b,
+            format!("v_mov_b32_e32 v{WV_PST}, s{WS_T1}"),
+            &[WV_PST],
+            &[],
+            &[WS_T1],
+        )
     } else {
-        vop(b, format!("v_mov_b32_e32 v{WV_LDRD}, v{WV_XOFF}"), &[WV_LDRD], &[WV_XOFF], &[])?;
-        sop(b, format!("s_lshl_b32 s{WS_MB}, s{WS_M}, 2"), &[WS_MB], &[WS_M])?;
-        sop(b, format!("s_lshl_b32 s{WS_COL4}, s{WS_COL}, 2"), &[WS_COL4], &[WS_COL])
+        vop(
+            b,
+            format!("v_mov_b32_e32 v{WV_LDRD}, v{WV_XOFF}"),
+            &[WV_LDRD],
+            &[WV_XOFF],
+            &[],
+        )?;
+        sop(
+            b,
+            format!("s_lshl_b32 s{WS_MB}, s{WS_M}, 2"),
+            &[WS_MB],
+            &[WS_M],
+        )?;
+        sop(
+            b,
+            format!("s_lshl_b32 s{WS_COL4}, s{WS_COL}, 2"),
+            &[WS_COL4],
+            &[WS_COL],
+        )
     }
 }
 
 /// The whole K sweep: the full 8-block tiles in a loop, then the tail tile
 /// of `TAIL` (1..=7) blocks through a compile-time variant per listed
 /// count, so no block past the row (partition) is loaded or consumed.
-fn wide_traverse(b: &mut Builder, w: WideSpec, slot: usize, order: Order, tails: &[u8], lbl: &str) -> R {
+fn wide_traverse(
+    b: &mut Builder,
+    w: WideSpec,
+    slot: usize,
+    order: Order,
+    tails: &[u8],
+    lbl: &str,
+) -> R {
     let tail_lbl = format!("{lbl}_tails");
     let kdone = format!("{lbl}_kdone");
-    sop(b, format!("s_mov_b32 s{WS_IT}, s{WS_NFULL}"), &[WS_IT], &[WS_NFULL])?;
+    sop(
+        b,
+        format!("s_mov_b32 s{WS_IT}, s{WS_NFULL}"),
+        &[WS_IT],
+        &[WS_NFULL],
+    )?;
     sop(b, format!("s_cmp_eq_u32 s{WS_IT}, 0"), &[], &[WS_IT])?;
     op(b, format!("s_cbranch_scc1 {tail_lbl}"), &[], &[])?;
     let head = format!("{lbl}_kloop");
     let full = format!("{lbl}_full");
     b.loop_(&head, |b| {
         wide_pass(b, w, slot, order, 8, &full)?;
-        vop(b, format!("v_add_nc_u32_e32 v{WV_XOFF}, {}, v{WV_XOFF}", lit(8 * 128)), &[WV_XOFF], &[WV_XOFF], &[])?;
+        vop(
+            b,
+            format!("v_add_nc_u32_e32 v{WV_XOFF}, {}, v{WV_XOFF}", lit(8 * 128)),
+            &[WV_XOFF],
+            &[WV_XOFF],
+            &[],
+        )?;
         for r in [WV_WOFFD, WV_WOFFQ] {
-            vop(b, format!("v_add_nc_u32_e32 v{r}, {}, v{r}", lit(8 * 34)), &[r], &[r], &[])?;
+            vop(
+                b,
+                format!("v_add_nc_u32_e32 v{r}, {}, v{r}", lit(8 * 34)),
+                &[r],
+                &[r],
+                &[],
+            )?;
         }
-        sop(b, format!("s_add_i32 s{WS_IT}, s{WS_IT}, -1"), &[WS_IT], &[WS_IT])?;
+        sop(
+            b,
+            format!("s_add_i32 s{WS_IT}, s{WS_IT}, -1"),
+            &[WS_IT],
+            &[WS_IT],
+        )?;
         sop(b, format!("s_cmp_lg_u32 s{WS_IT}, 0"), &[], &[WS_IT])?;
         op(b, format!("s_cbranch_scc1 {head}"), &[], &[])
     })?;
@@ -1199,7 +2662,9 @@ fn wide_traverse(b: &mut Builder, w: WideSpec, slot: usize, order: Order, tails:
 fn wide_pass(b: &mut Builder, w: WideSpec, slot: usize, order: Order, nb: u8, lbl: &str) -> R {
     let lbl = format!("{lbl}{nb}");
     wide_weights(b, nb, &lbl)?;
-    for t in 0..w.tiles() { wide_tile(b, w, slot, order, nb, t, &lbl)?; }
+    for t in 0..w.tiles() {
+        wide_tile(b, w, slot, order, nb, t, &lbl)?;
+    }
     Ok(())
 }
 
@@ -1210,17 +2675,41 @@ fn wide_weights(b: &mut Builder, nb: u8, lbl: &str) -> R {
     sop(b, format!("s_cmp_eq_u32 s{WS_LIVE}, 0"), &[], &[WS_LIVE])?;
     op(b, format!("s_cbranch_scc1 {done}"), &[], &[])?;
     for j in 0..nb {
-        gload(b, "global_load_i8", WV_Q + j, WV_WOFFQ, WS_A, 34 * u32::from(j) + 2)?;
-        gload(b, "global_load_u16", WV_DQ + j, WV_WOFFD, WS_A, 34 * u32::from(j))?;
+        gload(
+            b,
+            "global_load_i8",
+            WV_Q + j,
+            WV_WOFFQ,
+            WS_A,
+            34 * u32::from(j) + 2,
+        )?;
+        gload(
+            b,
+            "global_load_u16",
+            WV_DQ + j,
+            WV_WOFFD,
+            WS_A,
+            34 * u32::from(j),
+        )?;
     }
-    for j in 0..nb { dequant(b, WV_DQ + j, WV_Q + j)?; }
+    for j in 0..nb {
+        dequant(b, WV_DQ + j, WV_Q + j)?;
+    }
     b.label(&done)
 }
 
 /// Row tile `t` of one K tile: producer fill, barrier, every live wave
 /// consumes the tile's rows `< R`, barrier. Rows past `R` are neither loaded
 /// nor consumed; dead waves produce and keep every barrier.
-fn wide_tile(b: &mut Builder, w: WideSpec, slot: usize, order: Order, nb: u8, t: u32, lbl: &str) -> R {
+fn wide_tile(
+    b: &mut Builder,
+    w: WideSpec,
+    slot: usize,
+    order: Order,
+    nb: u8,
+    t: u32,
+    lbl: &str,
+) -> R {
     let rows = w.rows_per_tile();
     let rb = rows * t;
     let tag = format!("{lbl}_t{t}");
@@ -1231,21 +2720,69 @@ fn wide_tile(b: &mut Builder, w: WideSpec, slot: usize, order: Order, nb: u8, t:
     }
     let nofill = format!("{tag}_nofill");
     if t == 0 {
-        sop(b, format!("s_cmp_ge_u32 s{WS_PROW}, s{WS_R}"), &[], &[WS_PROW, WS_R])?;
+        sop(
+            b,
+            format!("s_cmp_ge_u32 s{WS_PROW}, s{WS_R}"),
+            &[],
+            &[WS_PROW, WS_R],
+        )?;
     } else {
-        sop(b, format!("s_add_i32 s{WS_T0}, s{WS_PROW}, {rb}"), &[WS_T0], &[WS_PROW])?;
-        sop(b, format!("s_cmp_ge_u32 s{WS_T0}, s{WS_R}"), &[], &[WS_T0, WS_R])?;
+        sop(
+            b,
+            format!("s_add_i32 s{WS_T0}, s{WS_PROW}, {rb}"),
+            &[WS_T0],
+            &[WS_PROW],
+        )?;
+        sop(
+            b,
+            format!("s_cmp_ge_u32 s{WS_T0}, s{WS_R}"),
+            &[],
+            &[WS_T0, WS_R],
+        )?;
     }
     op(b, format!("s_cbranch_scc1 {nofill}"), &[], &[])?;
     if t == 0 {
-        vop(b, format!("v_add_nc_u32_e32 v{WV_XADDR}, s{WS_XTB}, v{WV_XOFF}"), &[WV_XADDR], &[WV_XOFF], &[WS_XTB])?;
+        vop(
+            b,
+            format!("v_add_nc_u32_e32 v{WV_XADDR}, s{WS_XTB}, v{WV_XOFF}"),
+            &[WV_XADDR],
+            &[WV_XOFF],
+            &[WS_XTB],
+        )?;
     } else {
-        sop(b, format!("s_mul_i32 s{WS_T0}, s{WS_KX4}, {}", lit(rb)), &[WS_T0], &[WS_KX4])?;
-        sop(b, format!("s_add_i32 s{WS_T0}, s{WS_T0}, s{WS_XTB}"), &[WS_T0], &[WS_T0, WS_XTB])?;
-        vop(b, format!("v_add_nc_u32_e32 v{WV_XADDR}, s{WS_T0}, v{WV_XOFF}"), &[WV_XADDR], &[WV_XOFF], &[WS_T0])?;
+        sop(
+            b,
+            format!("s_mul_i32 s{WS_T0}, s{WS_KX4}, {}", lit(rb)),
+            &[WS_T0],
+            &[WS_KX4],
+        )?;
+        sop(
+            b,
+            format!("s_add_i32 s{WS_T0}, s{WS_T0}, s{WS_XTB}"),
+            &[WS_T0],
+            &[WS_T0, WS_XTB],
+        )?;
+        vop(
+            b,
+            format!("v_add_nc_u32_e32 v{WV_XADDR}, s{WS_T0}, v{WV_XOFF}"),
+            &[WV_XADDR],
+            &[WV_XOFF],
+            &[WS_T0],
+        )?;
     }
-    for j in 0..nb { gload(b, "global_load_b32", WV_XS + j, WV_XADDR, WS_X, 128 * u32::from(j))?; }
-    for j in 0..nb { ds_st(b, slot, WV_LDST, WV_XS + j, 128 * u32::from(j))?; }
+    for j in 0..nb {
+        gload(
+            b,
+            "global_load_b32",
+            WV_XS + j,
+            WV_XADDR,
+            WS_X,
+            128 * u32::from(j),
+        )?;
+    }
+    for j in 0..nb {
+        ds_st(b, slot, WV_LDST, WV_XS + j, 128 * u32::from(j))?;
+    }
     b.label(&nofill)?;
     b.barrier(&[Transition::Ready(slot)])?;
     let cdone = format!("{tag}_cdone");
@@ -1269,24 +2806,69 @@ fn wide_tile(b: &mut Builder, w: WideSpec, slot: usize, order: Order, nb: u8, t:
 /// `8k + j`, chain `j & 3`) is a quad block when `j < 4*floor(nb/4)` (the
 /// whole tile when `nb = 8`): `Order` spelling of the fused update; else
 /// a remainder block: `p = RN(x * dq)`, `acc = acc + p`.
-fn wide_consume(b: &mut Builder, w: WideSpec, slot: usize, order: Order, nb: u8, r_local: u32, row: u32) -> R {
+fn wide_consume(
+    b: &mut Builder,
+    w: WideSpec,
+    slot: usize,
+    order: Order,
+    nb: u8,
+    r_local: u32,
+    row: u32,
+) -> R {
     let base = r_local * if w.hc() { 8 * 1024 } else { 1024 };
-    for j in 0..nb { ds_ld(b, slot, "ds_load_b32", WV_XS + j, WV_LDRD, base + 128 * u32::from(j), false)?; }
+    for j in 0..nb {
+        ds_ld(
+            b,
+            slot,
+            "ds_load_b32",
+            WV_XS + j,
+            WV_LDRD,
+            base + 128 * u32::from(j),
+            false,
+        )?;
+    }
     let quad_left = if nb == 8 { 8 } else { nb & !3 };
     for j in 0..nb {
         let (x, d) = (WV_XS + j, WV_DQ + j);
         if !w.four() {
             let a = wacc(w, row, 0);
-            vop(b, format!("v_fmac_f32_e32 v{a}, v{x}, v{d}"), &[a], &[a, x, d], &[])?;
+            vop(
+                b,
+                format!("v_fmac_f32_e32 v{a}, v{x}, v{d}"),
+                &[a],
+                &[a, x, d],
+                &[],
+            )?;
             continue;
         }
         let a = wacc(w, row, j & 3);
         if j < quad_left {
-            let (s0, s1) = match order { Order::Generic => (d, x), Order::K640 => (x, d) };
-            vop(b, format!("v_fmac_f32_e32 v{a}, v{s0}, v{s1}"), &[a], &[a, s0, s1], &[])?;
+            let (s0, s1) = match order {
+                Order::Generic => (d, x),
+                Order::K640 => (x, d),
+            };
+            vop(
+                b,
+                format!("v_fmac_f32_e32 v{a}, v{s0}, v{s1}"),
+                &[a],
+                &[a, s0, s1],
+                &[],
+            )?;
         } else {
-            vop(b, format!("v_mul_f32_e32 v{WV_TMP}, v{x}, v{d}"), &[WV_TMP], &[x, d], &[])?;
-            vop(b, format!("v_add_f32_e32 v{a}, v{a}, v{WV_TMP}"), &[a], &[a, WV_TMP], &[])?;
+            vop(
+                b,
+                format!("v_mul_f32_e32 v{WV_TMP}, v{x}, v{d}"),
+                &[WV_TMP],
+                &[x, d],
+                &[],
+            )?;
+            vop(
+                b,
+                format!("v_add_f32_e32 v{a}, v{a}, v{WV_TMP}"),
+                &[a],
+                &[a, WV_TMP],
+                &[],
+            )?;
         }
     }
     Ok(())
@@ -1299,7 +2881,15 @@ fn wide_fold(b: &mut Builder, w: WideSpec, order: Order, row: u32) -> R {
         Order::Generic => [(a(1), a(1), a(0)), (a(3), a(3), a(2)), (a(0), a(3), a(1))],
         Order::K640 => [(a(0), a(0), a(1)), (a(2), a(2), a(3)), (a(0), a(0), a(2))],
     };
-    for (d, x, y) in steps { vop(b, format!("v_add_f32_e32 v{d}, v{x}, v{y}"), &[d], &[x, y], &[])?; }
+    for (d, x, y) in steps {
+        vop(
+            b,
+            format!("v_add_f32_e32 v{d}, v{x}, v{y}"),
+            &[d],
+            &[x, y],
+            &[],
+        )?;
+    }
     Ok(())
 }
 
@@ -1316,20 +2906,51 @@ fn wide_epilogue(b: &mut Builder, w: WideSpec, order: Order, lbl: &str, end: &st
             op(b, format!("s_cbranch_scc1 {end}"), &[], &[])?;
         }
         let rows: Vec<u32> = (r0..r0 + 8).collect();
-        if w.four() { for &r in &rows { wide_fold(b, w, order, r)?; } }
+        if w.four() {
+            for &r in &rows {
+                wide_fold(b, w, order, r)?;
+            }
+        }
         let values: Vec<u8> = rows.iter().map(|&r| wacc(w, r, 0)).collect();
         lane_tree(b, &values, WV_XS, WV_ADDR)?;
         for (i, &r) in rows.iter().enumerate() {
             let a = WV_Q + i as u8;
             if r == 0 {
-                vop(b, format!("v_mov_b32_e32 v{a}, s{WS_COL4}"), &[a], &[], &[WS_COL4])?;
+                vop(
+                    b,
+                    format!("v_mov_b32_e32 v{a}, s{WS_COL4}"),
+                    &[a],
+                    &[],
+                    &[WS_COL4],
+                )?;
             } else {
-                sop(b, format!("s_mul_i32 s{WS_T0}, s{WS_MB}, {r}"), &[WS_T0], &[WS_MB])?;
-                sop(b, format!("s_add_i32 s{WS_T0}, s{WS_T0}, s{WS_COL4}"), &[WS_T0], &[WS_T0, WS_COL4])?;
-                vop(b, format!("v_mov_b32_e32 v{a}, s{WS_T0}"), &[a], &[], &[WS_T0])?;
+                sop(
+                    b,
+                    format!("s_mul_i32 s{WS_T0}, s{WS_MB}, {r}"),
+                    &[WS_T0],
+                    &[WS_MB],
+                )?;
+                sop(
+                    b,
+                    format!("s_add_i32 s{WS_T0}, s{WS_T0}, s{WS_COL4}"),
+                    &[WS_T0],
+                    &[WS_T0, WS_COL4],
+                )?;
+                vop(
+                    b,
+                    format!("v_mov_b32_e32 v{a}, s{WS_T0}"),
+                    &[a],
+                    &[],
+                    &[WS_T0],
+                )?;
             }
         }
-        op(b, format!("s_mov_b32 exec_lo, s{WS_LANE0}"), &[], &[s(WS_LANE0)])?;
+        op(
+            b,
+            format!("s_mov_b32 exec_lo, s{WS_LANE0}"),
+            &[],
+            &[s(WS_LANE0)],
+        )?;
         let stored = format!("{lbl}_stored{batch}");
         for (i, &r) in rows.iter().enumerate() {
             if i > 0 {
@@ -1337,7 +2958,13 @@ fn wide_epilogue(b: &mut Builder, w: WideSpec, order: Order, lbl: &str, end: &st
                 op(b, format!("s_cbranch_scc1 {stored}"), &[], &[])?;
             }
             let (a, val) = (WV_Q + i as u8, wacc(w, r, 0));
-            mem(b, format!("global_store_b32 v{a}, v{val}, s[{WS_Y}:{}]", WS_Y + 1), &[], &[v(a), v(val), sr(WS_Y, 2)], MemoryClass::VmemStore)?;
+            mem(
+                b,
+                format!("global_store_b32 v{a}, v{val}, s[{WS_Y}:{}]", WS_Y + 1),
+                &[],
+                &[v(a), v(val), sr(WS_Y, 2)],
+                MemoryClass::VmemStore,
+            )?;
         }
         b.label(&stored)?;
         op(b, "s_mov_b32 exec_lo, -1", &[], &[])?;
@@ -1366,35 +2993,144 @@ fn wide_hc_epilogue(b: &mut Builder, w: WideSpec, lbl: &str, end: &str) -> R {
         }
         let values: Vec<u8> = (r0..r0 + 8).map(|r| wacc(w, r, 0)).collect();
         lane_tree(b, &values, WV_XS, WV_ADDR)?;
-        op(b, format!("s_mov_b32 exec_lo, s{WS_LANE0}"), &[], &[s(WS_LANE0)])?;
-        for r in r0..r0 + 8 { ds_st(b, pslot, WV_PST, wacc(w, r, 0), 32 * r)?; }
+        op(
+            b,
+            format!("s_mov_b32 exec_lo, s{WS_LANE0}"),
+            &[],
+            &[s(WS_LANE0)],
+        )?;
+        for r in r0..r0 + 8 {
+            ds_st(b, pslot, WV_PST, wacc(w, r, 0), 32 * r)?;
+        }
         op(b, "s_mov_b32 exec_lo, -1", &[], &[])?;
     }
     b.label(&parked)?;
     let (e_addr, e_r, e_m2) = (WV_XADDR, WV_TMP, WV_VT);
-    vop(b, format!("v_and_b32_e32 v{e_r}, {}, v{V_TID}", cap - 1), &[e_r], &[V_TID], &[])?;
-    vop(b, format!("v_lshrrev_b32_e32 v{e_m2}, {}, v{V_TID}", cap.trailing_zeros()), &[e_m2], &[V_TID], &[])?;
-    vop(b, format!("v_add_nc_u32_e32 v{e_m2}, s{WS_MBASE}, v{e_m2}"), &[e_m2], &[e_m2], &[WS_MBASE])?;
-    vop(b, format!("v_lshlrev_b32_e32 v{e_addr}, 5, v{V_TID}"), &[e_addr], &[V_TID], &[])?;
-    op(b, format!("v_mul_lo_u32 v{WV_EY}, v{e_r}, s{WS_M}"), &[v(WV_EY)], &[v(e_r), s(WS_M)])?;
-    vop(b, format!("v_add_nc_u32_e32 v{WV_EY}, v{e_m2}, v{WV_EY}"), &[WV_EY], &[e_m2, WV_EY], &[])?;
-    vop(b, format!("v_lshlrev_b32_e32 v{WV_EY}, 2, v{WV_EY}"), &[WV_EY], &[WV_EY], &[])?;
+    vop(
+        b,
+        format!("v_and_b32_e32 v{e_r}, {}, v{V_TID}", cap - 1),
+        &[e_r],
+        &[V_TID],
+        &[],
+    )?;
+    vop(
+        b,
+        format!(
+            "v_lshrrev_b32_e32 v{e_m2}, {}, v{V_TID}",
+            cap.trailing_zeros()
+        ),
+        &[e_m2],
+        &[V_TID],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_add_nc_u32_e32 v{e_m2}, s{WS_MBASE}, v{e_m2}"),
+        &[e_m2],
+        &[e_m2],
+        &[WS_MBASE],
+    )?;
+    vop(
+        b,
+        format!("v_lshlrev_b32_e32 v{e_addr}, 5, v{V_TID}"),
+        &[e_addr],
+        &[V_TID],
+        &[],
+    )?;
+    op(
+        b,
+        format!("v_mul_lo_u32 v{WV_EY}, v{e_r}, s{WS_M}"),
+        &[v(WV_EY)],
+        &[v(e_r), s(WS_M)],
+    )?;
+    vop(
+        b,
+        format!("v_add_nc_u32_e32 v{WV_EY}, v{e_m2}, v{WV_EY}"),
+        &[WV_EY],
+        &[e_m2, WV_EY],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_lshlrev_b32_e32 v{WV_EY}, 2, v{WV_EY}"),
+        &[WV_EY],
+        &[WV_EY],
+        &[],
+    )?;
     b.barrier(&[Transition::Ready(pslot)])?;
-    vop(b, format!("v_cmp_gt_u32_e32 vcc_lo, {}, v{V_TID}", 2 * cap), &[], &[V_TID], &[])?;
-    op(b, format!("s_mov_b32 s{WS_MASK}, vcc_lo"), &[s(WS_MASK)], &[])?;
-    vop(b, format!("v_cmp_gt_u32_e32 vcc_lo, s{WS_R}, v{e_r}"), &[], &[e_r], &[WS_R])?;
-    sop(b, format!("s_and_b32 s{WS_MASK}, s{WS_MASK}, vcc_lo"), &[WS_MASK], &[WS_MASK])?;
-    vop(b, format!("v_cmp_gt_i32_e32 vcc_lo, s{WS_M}, v{e_m2}"), &[], &[e_m2], &[WS_M])?;
-    op(b, format!("s_and_b32 exec_lo, s{WS_MASK}, vcc_lo"), &[], &[s(WS_MASK)])?;
+    vop(
+        b,
+        format!("v_cmp_gt_u32_e32 vcc_lo, {}, v{V_TID}", 2 * cap),
+        &[],
+        &[V_TID],
+        &[],
+    )?;
+    op(
+        b,
+        format!("s_mov_b32 s{WS_MASK}, vcc_lo"),
+        &[s(WS_MASK)],
+        &[],
+    )?;
+    vop(
+        b,
+        format!("v_cmp_gt_u32_e32 vcc_lo, s{WS_R}, v{e_r}"),
+        &[],
+        &[e_r],
+        &[WS_R],
+    )?;
+    sop(
+        b,
+        format!("s_and_b32 s{WS_MASK}, s{WS_MASK}, vcc_lo"),
+        &[WS_MASK],
+        &[WS_MASK],
+    )?;
+    vop(
+        b,
+        format!("v_cmp_gt_i32_e32 vcc_lo, s{WS_M}, v{e_m2}"),
+        &[],
+        &[e_m2],
+        &[WS_M],
+    )?;
+    op(
+        b,
+        format!("s_and_b32 exec_lo, s{WS_MASK}, vcc_lo"),
+        &[],
+        &[s(WS_MASK)],
+    )?;
     op(b, format!("s_cbranch_execz {end}"), &[], &[])?;
     for half in 0..2u8 {
-        b.ds_load(pslot, Instruction::new(format!("ds_load_b128 {}, v{e_addr}{}", vrange(WV_DQ + 4 * half, 4), off(16 * u32::from(half))),
-            vec![vr(WV_DQ + 4 * half, 4)], vec![v(e_addr)]).memory(MemoryClass::DsLoad))?;
+        b.ds_load(
+            pslot,
+            Instruction::new(
+                format!(
+                    "ds_load_b128 {}, v{e_addr}{}",
+                    vrange(WV_DQ + 4 * half, 4),
+                    off(16 * u32::from(half))
+                ),
+                vec![vr(WV_DQ + 4 * half, 4)],
+                vec![v(e_addr)],
+            )
+            .memory(MemoryClass::DsLoad),
+        )?;
     }
     let p = |n: u8| WV_DQ + n;
     // ((p0 + p1) + (p2 + p3)) + ((p4 + p5) + (p6 + p7)), the narrow k8 spelling.
-    for (dst, a, c) in [(0u8, 0u8, 1u8), (2, 2, 3), (4, 4, 5), (6, 6, 7), (0, 0, 2), (4, 4, 6), (0, 0, 4)] {
-        vop(b, format!("v_add_f32_e32 v{}, v{}, v{}", p(dst), p(a), p(c)), &[p(dst)], &[p(a), p(c)], &[])?;
+    for (dst, a, c) in [
+        (0u8, 0u8, 1u8),
+        (2, 2, 3),
+        (4, 4, 5),
+        (6, 6, 7),
+        (0, 0, 2),
+        (4, 4, 6),
+        (0, 0, 4),
+    ] {
+        vop(
+            b,
+            format!("v_add_f32_e32 v{}, v{}, v{}", p(dst), p(a), p(c)),
+            &[p(dst)],
+            &[p(a), p(c)],
+            &[],
+        )?;
     }
     let x = p(0);
     let store = format!("{lbl}_store");
@@ -1402,12 +3138,24 @@ fn wide_hc_epilogue(b: &mut Builder, w: WideSpec, lbl: &str, end: &str) -> R {
     op(b, format!("s_cbranch_scc1 {store}"), &[], &[])?;
     let e = |n: u8| WV_Q + n;
     bf16_round(b, x, [e(0), e(1), e(2), e(3)])?;
-    vop(b, format!("v_mul_f32_e32 v{x}, s{WS_SCALE}, v{x}"), &[x], &[x], &[WS_SCALE])?;
+    vop(
+        b,
+        format!("v_mul_f32_e32 v{x}, s{WS_SCALE}, v{x}"),
+        &[x],
+        &[x],
+        &[WS_SCALE],
+    )?;
     bf16_round(b, x, [e(0), e(1), e(2), e(3)])?;
     silu(b, x, [e(0), e(1), e(2), e(3), e(4), e(5)])?;
     bf16_round(b, x, [e(0), e(1), e(2), e(3)])?;
     b.label(&store)?;
-    mem(b, format!("global_store_b32 v{WV_EY}, v{x}, s[{WS_Y}:{}]", WS_Y + 1), &[], &[v(WV_EY), v(x), sr(WS_Y, 2)], MemoryClass::VmemStore)?;
+    mem(
+        b,
+        format!("global_store_b32 v{WV_EY}, v{x}, s[{WS_Y}:{}]", WS_Y + 1),
+        &[],
+        &[v(WV_EY), v(x), sr(WS_Y, 2)],
+        MemoryClass::VmemStore,
+    )?;
     b.wait_all()
 }
 
@@ -1415,7 +3163,10 @@ fn wide_hc_epilogue(b: &mut Builder, w: WideSpec, lbl: &str, end: &str) -> R {
 /// k2560 r16/r32, k2560_x2 r16/r32, wide (four-chain) r16/r32. Callable
 /// separately from [`build_gfx1151`], whose exports and text are unchanged.
 pub fn build_wide_gfx1151() -> Result<Vec<Emitted>, String> {
-    WIDE_EXPORTS.iter().map(|&w| wide(w).map_err(|e| format!("{}: {e}", w.symbol()))).collect()
+    WIDE_EXPORTS
+        .iter()
+        .map(|&w| wide(w).map_err(|e| format!("{}: {e}", w.symbol())))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1451,20 +3202,30 @@ mod tests {
         assert_eq!(k8.shape.next_free_vgpr, K8_VGPRS);
         assert_eq!(k320.shape.next_free_vgpr, K320_VGPRS);
         assert!(k8.shape.next_free_sgpr <= 40 && k320.shape.next_free_sgpr <= 40);
-        assert!(k8.s_text.contains(&format!(".amdhsa_group_segment_fixed_size {K8_LDS_BYTES}")));
-        assert!(k320.s_text.contains(&format!(".amdhsa_group_segment_fixed_size {K320_LDS_BYTES}")));
+        assert!(k8
+            .s_text
+            .contains(&format!(".amdhsa_group_segment_fixed_size {K8_LDS_BYTES}")));
+        assert!(k320.s_text.contains(&format!(
+            ".amdhsa_group_segment_fixed_size {K320_LDS_BYTES}"
+        )));
         assert_eq!(k8.proof.lds_slots.len(), 1);
         assert_eq!(k320.proof.lds_slots.len(), 2);
         for (e, symbol) in [(k8, K8_SYMBOL), (k320, K320_SYMBOL)] {
             assert!(e.s_text.contains(&format!("{symbol}:")));
             // The DAG nodes: dq = fma_mix(d, q, -0.0); sum = fma(x, dq, sum); the lane tree.
-            assert!(e.s_text.contains("v_fma_mix_f32") && e.s_text.contains("neg(0) op_sel_hi:[1,0,0]"));
+            assert!(
+                e.s_text.contains("v_fma_mix_f32") && e.s_text.contains("neg(0) op_sel_hi:[1,0,0]")
+            );
             assert!(e.s_text.contains("v_fmac_f32_e32") && e.s_text.contains("v_cvt_f32_i32_e32"));
             assert!(e.s_text.contains("ds_swizzle_b32") && e.s_text.contains("ds_bpermute_b32"));
             assert!(e.s_text.contains("s_barrier"));
         }
         // Only k8 carries the epilogue.
-        assert!(k8.s_text.contains("v_div_fixup_f32") && k8.s_text.contains("v_div_fmas_f32") && k8.s_text.contains("v_exp_f32_e32"));
+        assert!(
+            k8.s_text.contains("v_div_fixup_f32")
+                && k8.s_text.contains("v_div_fmas_f32")
+                && k8.s_text.contains("v_exp_f32_e32")
+        );
         assert!(!k320.s_text.contains("v_div_fixup_f32"));
         assert_eq!(k8.proof.loop_fixpoints.len(), usize::from(MAX_COLUMNS));
         assert!(k320.proof.loop_fixpoints.is_empty());
@@ -1474,28 +3235,58 @@ mod tests {
     fn wide_exports_build_in_frozen_order_with_declared_budgets() {
         let emitted = build_wide_gfx1151().expect("q8 wide");
         let symbols: Vec<String> = WIDE_EXPORTS.iter().map(|w| w.symbol()).collect();
-        assert_eq!(symbols, [
-            "gemv_q8_0_k8_xbatch_wide_r16_pm", "gemv_q8_0_k8_xbatch_wide_r32_pm",
-            "gemv_q8_0_k320_xbatch_wide_r16_pm", "gemv_q8_0_k320_xbatch_wide_r32_pm",
-            "gemv_q8_0_k2560_xbatch_wide_r16_pm", "gemv_q8_0_k2560_xbatch_wide_r32_pm",
-            "gemv_q8_0_k2560_x2_xbatch_wide_r16_pm", "gemv_q8_0_k2560_x2_xbatch_wide_r32_pm",
-            "gemv_q8_0_wide_xbatch_wide_r16_pm", "gemv_q8_0_wide_xbatch_wide_r32_pm",
-        ]);
+        assert_eq!(
+            symbols,
+            [
+                "gemv_q8_0_k8_xbatch_wide_r16_pm",
+                "gemv_q8_0_k8_xbatch_wide_r32_pm",
+                "gemv_q8_0_k320_xbatch_wide_r16_pm",
+                "gemv_q8_0_k320_xbatch_wide_r32_pm",
+                "gemv_q8_0_k2560_xbatch_wide_r16_pm",
+                "gemv_q8_0_k2560_xbatch_wide_r32_pm",
+                "gemv_q8_0_k2560_x2_xbatch_wide_r16_pm",
+                "gemv_q8_0_k2560_x2_xbatch_wide_r32_pm",
+                "gemv_q8_0_wide_xbatch_wide_r16_pm",
+                "gemv_q8_0_wide_xbatch_wide_r32_pm",
+            ]
+        );
         assert_eq!(emitted.len(), WIDE_EXPORTS.len());
-        let high_water: Vec<u16> = WIDE_EXPORTS.iter().map(|w| w.vgpr_high_water() as u16).collect();
+        let high_water: Vec<u16> = WIDE_EXPORTS
+            .iter()
+            .map(|w| w.vgpr_high_water() as u16)
+            .collect();
         assert_eq!(high_water, [56, 72, 56, 72, 56, 72, 56, 72, 104, 168]);
         for (e, w) in emitted.iter().zip(WIDE_EXPORTS) {
             let symbol = w.symbol();
-            assert!(e.s_text.contains(&format!(".amdhsa_kernel {symbol}")), "{symbol}");
-            assert_eq!(e.shape.next_free_vgpr, w.vgpr_high_water() as u16, "{symbol}");
+            assert!(
+                e.s_text.contains(&format!(".amdhsa_kernel {symbol}")),
+                "{symbol}"
+            );
+            assert_eq!(
+                e.shape.next_free_vgpr,
+                w.vgpr_high_water() as u16,
+                "{symbol}"
+            );
             assert!(e.shape.next_free_vgpr <= w.vgpr_budget(), "{symbol}");
             assert!(e.shape.next_free_sgpr <= WIDE_SGPRS, "{symbol}");
-            assert!(e.s_text.contains(&format!(".amdhsa_group_segment_fixed_size {}", w.lds_bytes())), "{symbol}");
+            assert!(
+                e.s_text.contains(&format!(
+                    ".amdhsa_group_segment_fixed_size {}",
+                    w.lds_bytes()
+                )),
+                "{symbol}"
+            );
             assert!(!e.s_text.contains("scratch_"), "{symbol}");
             assert!(e.s_text.contains("s_barrier"), "{symbol}");
             // dq = fma_mix(d, q, -0.0) once per block; the swizzle/bpermute tree.
-            assert!(e.s_text.contains("v_fma_mix_f32") && e.s_text.contains("neg(0) op_sel_hi:[1,0,0]"), "{symbol}");
-            assert!(e.s_text.contains("ds_swizzle_b32") && e.s_text.contains("ds_bpermute_b32"), "{symbol}");
+            assert!(
+                e.s_text.contains("v_fma_mix_f32") && e.s_text.contains("neg(0) op_sel_hi:[1,0,0]"),
+                "{symbol}"
+            );
+            assert!(
+                e.s_text.contains("ds_swizzle_b32") && e.s_text.contains("ds_bpermute_b32"),
+                "{symbol}"
+            );
             // The full-tile K loop converged.
             assert!(!e.proof.loop_fixpoints.is_empty(), "{symbol}");
         }
@@ -1514,14 +3305,29 @@ mod tests {
     #[test]
     fn wide_weight_loads_do_not_scale_with_rows() {
         let emitted = build_wide_gfx1151().expect("q8 wide");
-        let count = |e: &Emitted, m: &str| e.s_text.lines().filter(|l| l.trim_start().starts_with(m)).count();
+        let count = |e: &Emitted, m: &str| {
+            e.s_text
+                .lines()
+                .filter(|l| l.trim_start().starts_with(m))
+                .count()
+        };
         for pair in emitted.chunks(2) {
-            assert_eq!(count(&pair[0], "global_load_i8 "), count(&pair[1], "global_load_i8 "));
-            assert_eq!(count(&pair[0], "global_load_u16 "), count(&pair[1], "global_load_u16 "));
+            assert_eq!(
+                count(&pair[0], "global_load_i8 "),
+                count(&pair[1], "global_load_i8 ")
+            );
+            assert_eq!(
+                count(&pair[0], "global_load_u16 "),
+                count(&pair[1], "global_load_u16 ")
+            );
         }
         // 8 (full tile) + 1 + .. + 7 (tail variants); four chains add the K = 640 path (8 + 4).
         for (e, w) in emitted.iter().zip(WIDE_EXPORTS) {
-            let want = if w.kind == WideKind::Wide { 36 + 12 } else { 36 };
+            let want = if w.kind == WideKind::Wide {
+                36 + 12
+            } else {
+                36
+            };
             assert_eq!(count(e, "global_load_i8 "), want, "{}", w.symbol());
         }
     }
@@ -1544,9 +3350,14 @@ mod tests {
                 assert!(t.contains(&format!("v_add_f32_e32 v{acc0}, v{acc0}, v{WV_TMP}")));
                 // Folds: generic (a3 + a2) + (a1 + a0); K = 640 (a0 + a1) + (a2 + a3).
                 let a = |c: u8| acc0 + c;
-                for line in [format!("v_add_f32_e32 v{}, v{}, v{}", a(1), a(1), a(0)), format!("v_add_f32_e32 v{}, v{}, v{}", a(3), a(3), a(2)),
-                    format!("v_add_f32_e32 v{}, v{}, v{}", a(0), a(3), a(1)), format!("v_add_f32_e32 v{}, v{}, v{}", a(0), a(0), a(1)),
-                    format!("v_add_f32_e32 v{}, v{}, v{}", a(2), a(2), a(3)), format!("v_add_f32_e32 v{}, v{}, v{}", a(0), a(0), a(2))] {
+                for line in [
+                    format!("v_add_f32_e32 v{}, v{}, v{}", a(1), a(1), a(0)),
+                    format!("v_add_f32_e32 v{}, v{}, v{}", a(3), a(3), a(2)),
+                    format!("v_add_f32_e32 v{}, v{}, v{}", a(0), a(3), a(1)),
+                    format!("v_add_f32_e32 v{}, v{}, v{}", a(0), a(0), a(1)),
+                    format!("v_add_f32_e32 v{}, v{}, v{}", a(2), a(2), a(3)),
+                    format!("v_add_f32_e32 v{}, v{}, v{}", a(0), a(0), a(2)),
+                ] {
                     assert!(t.contains(&line), "{line}");
                 }
                 assert!(t.contains("s_cmp_eq_u32 s11, 0x280"));
@@ -1557,7 +3368,11 @@ mod tests {
                 assert!(!t.contains(&format!("v_mul_f32_e32 v{WV_TMP},")));
             }
             if w.hc() {
-                assert!(t.contains("v_div_fixup_f32") && t.contains("v_div_fmas_f32") && t.contains("v_exp_f32_e32"));
+                assert!(
+                    t.contains("v_div_fixup_f32")
+                        && t.contains("v_div_fmas_f32")
+                        && t.contains("v_exp_f32_e32")
+                );
                 assert!(t.contains(&format!("v_mul_f32_e32 v{dq0}, s{WS_SCALE}, v{dq0}")));
             } else {
                 assert!(!t.contains("v_div_fixup_f32"));
@@ -1568,10 +3383,18 @@ mod tests {
     #[cfg(feature = "toolchain")]
     #[test]
     fn q8_lane_rows_m7() {
-        let dir = std::env::temp_dir().join(format!("peacemaker-isa-lane-rows-q8-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "peacemaker-isa-lane-rows-q8-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
-        for (emitted, symbol) in build_gfx1151().expect("q8 lane rows").into_iter().zip([K8_SYMBOL, K320_SYMBOL]) {
-            let elf = crate::native::assemble(&emitted.s_text, Arch::Gfx1151).expect("native assemble");
+        for (emitted, symbol) in build_gfx1151()
+            .expect("q8 lane rows")
+            .into_iter()
+            .zip([K8_SYMBOL, K320_SYMBOL])
+        {
+            let elf =
+                crate::native::assemble(&emitted.s_text, Arch::Gfx1151).expect("native assemble");
             std::fs::write(dir.join(format!("{symbol}.test.s")), &emitted.s_text).unwrap();
             let co = dir.join(format!("{symbol}.test.co"));
             std::fs::write(&co, &elf).unwrap();
@@ -1585,11 +3408,19 @@ mod tests {
     #[cfg(feature = "toolchain")]
     #[test]
     fn q8_lane_rows_wide_m7() {
-        let dir = std::env::temp_dir().join(format!("peacemaker-isa-lane-rows-q8-wide-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "peacemaker-isa-lane-rows-q8-wide-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
-        for (emitted, w) in build_wide_gfx1151().expect("q8 wide").into_iter().zip(WIDE_EXPORTS) {
+        for (emitted, w) in build_wide_gfx1151()
+            .expect("q8 wide")
+            .into_iter()
+            .zip(WIDE_EXPORTS)
+        {
             let symbol = w.symbol();
-            let elf = crate::native::assemble(&emitted.s_text, Arch::Gfx1151).expect("native assemble");
+            let elf =
+                crate::native::assemble(&emitted.s_text, Arch::Gfx1151).expect("native assemble");
             std::fs::write(dir.join(format!("{symbol}.test.s")), &emitted.s_text).unwrap();
             let co = dir.join(format!("{symbol}.test.co"));
             std::fs::write(&co, &elf).unwrap();

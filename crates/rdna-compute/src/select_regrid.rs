@@ -61,7 +61,10 @@ impl Gpu {
         b: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!((1..=16).contains(&k), "topk_batched: K={k} must be in [1,16]");
+        assert!(
+            (1..=16).contains(&k),
+            "topk_batched: K={k} must be in [1,16]"
+        );
         if (self.arch_caps.is_gfx1201() || self.arch_caps.is_gfx1151())
             && !self.flags.select_regrid_off
             && !self.replay.is_recording()

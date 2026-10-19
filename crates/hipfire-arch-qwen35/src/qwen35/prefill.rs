@@ -26,13 +26,13 @@ use super::forward::Qwen35Scratch;
 use super::weights::DeltaNetLayerWeights;
 use super::weights::DeltaNetMoeLayerWeights;
 use super::weights::DeltaNetState;
+use super::weights::DeltaNetStateGeometry;
 use super::weights::FullAttnLayerWeights;
 use super::weights::FullAttnMoeLayerWeights;
 use super::weights::LayerWeights;
 use super::weights::MoeFfnWeights;
 use super::weights::Qwen35Weights;
 use super::weights::StateQuant;
-use super::weights::DeltaNetStateGeometry;
 use crate::speculative::HiddenStateRingBuffer;
 use hip_bridge::HipError;
 use hip_bridge::HipResult;
@@ -48,7 +48,7 @@ use hipfire_dispatch::families::attention::Gfx1100SplitVerifyRoute;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::families::kv_tier::KvTierInputs;
 use hipfire_dispatch::families::kv_tier::KvTierPlan;
-use hipfire_dispatch::families::moe::{NARROW_VERIFY_MAX_ROWS, codebook_batched_admit_enabled};
+use hipfire_dispatch::families::moe::{codebook_batched_admit_enabled, NARROW_VERIFY_MAX_ROWS};
 #[cfg(test)]
 use hipfire_dispatch::families::moe::{
     codebook_batched_admit_enabled_from_env, mq6_batched_admit_enabled_from_env,
@@ -624,9 +624,7 @@ fn fp8_stream_consumer_takes_fp8(
     }
     match consumer {
         Fp8StreamConsumer::Qkvza => flags.gfx12_mq4v2_fp8_qkvza,
-        Fp8StreamConsumer::GateUp => {
-            flags.gfx12_mq4v2_fp8_gateup && !flags.hfq4g256_ldsstage_wmma
-        }
+        Fp8StreamConsumer::GateUp => flags.gfx12_mq4v2_fp8_gateup && !flags.hfq4g256_ldsstage_wmma,
         Fp8StreamConsumer::Qkv => flags.gfx12_mq4v2_fp8_qkv,
         Fp8StreamConsumer::Residual => flags.gfx12_mq4v2_fp8_resid,
     }
@@ -1223,7 +1221,9 @@ fn require_iu4_verify_prep(math: DenseBatchMath, site: &str, produced: bool) -> 
     if math == DenseBatchMath::Iu4Verify && !produced {
         return Err(HipError::new(
             0,
-            &format!("{site}: IU4 verify math requires the gfx1201 A4 producer, which was not admitted"),
+            &format!(
+                "{site}: IU4 verify math requires the gfx1201 A4 producer, which was not admitted"
+            ),
         ));
     }
     Ok(())
@@ -1268,7 +1268,8 @@ pub(crate) fn fp8_verify_target(
     config: &Qwen35Config,
     kv: &llama::KvCache,
 ) -> Fp8VerifyTarget {
-    let kv_batched = kv.quant_fp8 || kv.quant_q8 || kv.quant_asym4 || kv.quant_asym3 || kv.quant_asym2;
+    let kv_batched =
+        kv.quant_fp8 || kv.quant_q8 || kv.quant_asym4 || kv.quant_asym3 || kv.quant_asym2;
     if kv_batched && multi::multi_chunk_dense_mq4v2_target(weights, config) {
         Fp8VerifyTarget::Eligible
     } else {
@@ -1873,8 +1874,8 @@ pub(crate) fn implicit_reuse_pbs_plan(
     explicit_max_batch: Option<usize>,
     fp8_chunk512: bool,
 ) -> (usize, bool) {
-    let configured = explicit_max_batch
-        .unwrap_or_else(|| prefill_max_batch_for_arch(arch, fp8_chunk512));
+    let configured =
+        explicit_max_batch.unwrap_or_else(|| prefill_max_batch_for_arch(arch, fp8_chunk512));
     if arch == "gfx1201" {
         (configured.min(512), false)
     } else if arch == "gfx1151" {
@@ -2356,8 +2357,7 @@ fn resident_moe_static_decision(f: &ResidentMoeStaticFacts) -> Option<usize> {
     if !f.batch_pbs_eligible {
         return None;
     }
-    f.layers_resident_capable
-        .then_some(RESIDENT_MOE_CHUNK_ROWS)
+    f.layers_resident_capable.then_some(RESIDENT_MOE_CHUNK_ROWS)
 }
 ///
 /// Gather [`ResidentMoeStaticFacts`] from the loaded model. The gates are read
@@ -2711,10 +2711,12 @@ fn ordinary_wrapper_pbs_prepare(
     let fp8_chunk512 = fp8_chunk512_for_gpu(gpu);
     let default_moe_fits = gate.needs_default_fit(dense_widened) && {
         let moe = resident_moe_static_facts(gpu, weights, config, dn_state);
-        let target =
-            implicit_reuse_pbs_plan(gpu.arch.as_str(), Some(RESIDENT_MOE_CHUNK_ROWS), fp8_chunk512);
-        let credit_bytes =
-            wrapper_virtual_credit_bytes(config, physical, existing_virtual, target);
+        let target = implicit_reuse_pbs_plan(
+            gpu.arch.as_str(),
+            Some(RESIDENT_MOE_CHUNK_ROWS),
+            fp8_chunk512,
+        );
+        let credit_bytes = wrapper_virtual_credit_bytes(config, physical, existing_virtual, target);
         resident_moe_default_fits(
             &moe,
             config,
@@ -3028,11 +3030,7 @@ impl KvTierFlags {
 
     /// Batched flash attention is selectable for the tier.
     fn batched_flash(self) -> bool {
-        self.quant_q8
-            || self.quant_asym4
-            || self.quant_asym3
-            || self.quant_asym2
-            || self.quant_fp8
+        self.quant_q8 || self.quant_asym4 || self.quant_asym3 || self.quant_asym2 || self.quant_fp8
     }
 }
 ///
@@ -3094,7 +3092,10 @@ fn resident_moe_memory_admits(
         return false;
     };
     let owner_bytes = resident_moe_owner_bytes(config, owner.rows, owner.tape);
-    let pbs_bytes = match (resident_moe_pbs_bytes(config, RESIDENT_MOE_CHUNK_ROWS), owner_bytes) {
+    let pbs_bytes = match (
+        resident_moe_pbs_bytes(config, RESIDENT_MOE_CHUNK_ROWS),
+        owner_bytes,
+    ) {
         (Some(rung), Some(own)) => Some(rung.max(own)),
         _ => None,
     };
@@ -3102,18 +3103,13 @@ fn resident_moe_memory_admits(
         free_bytes,
         free_deduction,
         pbs_bytes,
-        cached_credit: resident_moe_cache_credit(config, cached)
-            .saturating_add(owner.credit_bytes),
+        cached_credit: resident_moe_cache_credit(config, cached).saturating_add(owner.credit_bytes),
         projection_deficit: resident_moe_projection_deficit(
             config,
             RESIDENT_MOE_CHUNK_ROWS,
             &mem.live,
         ),
-        q16_missing: resident_moe_q16_missing(
-            config,
-            RESIDENT_MOE_CHUNK_ROWS,
-            mem.live_q16_bytes,
-        ),
+        q16_missing: resident_moe_q16_missing(config, RESIDENT_MOE_CHUNK_ROWS, mem.live_q16_bytes),
     })
 }
 ///
@@ -3274,9 +3270,7 @@ fn plan_ordinary_prefill<E>(
     let pbs_rows = match req.call.caller_pbs_rows {
         Some(rows) => rows,
         None if wide => widened_owned_rows(limit, req.n),
-        None => {
-            owned_prefill_scratch_plan(req.n, req.max_batch.min(limit), req.call.tree_verify).0
-        }
+        None => owned_prefill_scratch_plan(req.n, req.max_batch.min(limit), req.call.tree_verify).0,
     };
     Ok(OrdinaryPrefillPlan {
         limit,
@@ -3833,7 +3827,16 @@ fn ordinary_prefill_chunk_limit_with_cache(
 ) -> HipResult<usize> {
     let moe = resident_moe_static_facts(gpu, weights, config, dn_state);
     ordinary_prefill_chunk_limit_with_facts(
-        gpu, weights, config, dn_state, kv_cache, pbs, cached, reuse_rows, free_deduction, &moe,
+        gpu,
+        weights,
+        config,
+        dn_state,
+        kv_cache,
+        pbs,
+        cached,
+        reuse_rows,
+        free_deduction,
+        &moe,
     )
 }
 
@@ -3873,7 +3876,14 @@ fn ordinary_prefill_chunk_limit_with_facts(
     }
     let lean = lean_pbs_requested() && lean_pbs_route(gpu, weights, config, perf);
     let mut admitted = memory_admitted_rung(
-        gpu, config, kv_cache, perf, lean, native_mq4_widened_route(gpu, weights), cached, free_deduction,
+        gpu,
+        config,
+        kv_cache,
+        perf,
+        lean,
+        native_mq4_widened_route(gpu, weights),
+        cached,
+        free_deduction,
     )?;
     if let Some(p) = pbs {
         admitted = admitted.min(p.max_batch);
@@ -4330,7 +4340,15 @@ pub fn forward_prefill_batch(
         false,
     );
     let wrapper = ordinary_wrapper_pbs_prepare(
-        gpu, weights, config, dn_state, kv_cache, scratch, start_pos, tokens.len(), call,
+        gpu,
+        weights,
+        config,
+        dn_state,
+        kv_cache,
+        scratch,
+        start_pos,
+        tokens.len(),
+        call,
     )?;
     let virtual_owner = scratch.reuse_virtual_pbs.borrow();
     let pbs_for_call = wrapper.pbs(scratch.prefill_batch.as_ref(), virtual_owner.as_ref());
@@ -4384,7 +4402,15 @@ pub fn forward_prefill_batch_capture_hidden(
     // Same wrapper PBS plan as `forward_prefill_batch`.
     let call = ordinary_call_facts(gpu, None, None, false, false, None, true, false, false);
     let wrapper = ordinary_wrapper_pbs_prepare(
-        gpu, weights, config, dn_state, kv_cache, scratch, start_pos, tokens.len(), call,
+        gpu,
+        weights,
+        config,
+        dn_state,
+        kv_cache,
+        scratch,
+        start_pos,
+        tokens.len(),
+        call,
     )?;
     let virtual_owner = scratch.reuse_virtual_pbs.borrow();
     let pbs_for_call = wrapper.pbs(scratch.prefill_batch.as_ref(), virtual_owner.as_ref());
@@ -5020,12 +5046,12 @@ fn forward_prefill_batch_with_pbs_opts_inner(
             // Widened grouping keeps an odd tail attached to the largest
             // admitted chunk so its GEMMs use the padded multi-row route.
             let chunk_n = next_ordinary_chunk_len(wide, packed_mq4, remaining, chunk_batch)
-            .ok_or_else(|| {
-                hip_bridge::HipError::new(
-                    0,
-                    "forward_prefill_batch: chunk plan cannot satisfy the two-token minimum",
-                )
-            })?;
+                .ok_or_else(|| {
+                    hip_bridge::HipError::new(
+                        0,
+                        "forward_prefill_batch: chunk plan cannot satisfy the two-token minimum",
+                    )
+                })?;
             if pbs.lean {
                 if !matches!(fusion, DflashFusionCtx::Off) || tree_verify.is_some() {
                     return Err(hip_bridge::HipError::new(
@@ -5882,9 +5908,8 @@ fn prefill_batch_scalar_eligible(
     has_dn: bool,
 ) -> bool {
     let is_rdna3_decouple = arch.starts_with("gfx11");
-    let verify_decouple = n <= 32
-        && decouple_env != Some("0")
-        && (is_rdna3_decouple || decouple_env == Some("1"));
+    let verify_decouple =
+        n <= 32 && decouple_env != Some("0") && (is_rdna3_decouple || decouple_env == Some("1"));
     let force_fallback = !verify_decouple && !prefill_batched;
     !force_fallback && n >= MIN_BATCH && has_dn
 }
@@ -6704,7 +6729,16 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route<'a>(
     route: PrefillRouteMode<'a>,
 ) -> HipResult<()> {
     prefill_moe_ffn_body_batched_with_route_layered(
-        gpu, ffn, ffn_norm, config, pbs, n, ctx, model_has_mq6_moe, routed_out, route,
+        gpu,
+        ffn,
+        ffn_norm,
+        config,
+        pbs,
+        n,
+        ctx,
+        model_has_mq6_moe,
+        routed_out,
+        route,
         ffn.layer_idx as usize,
     )
 }
@@ -7419,7 +7453,11 @@ fn batch_chunk_delta_net_input_projection(
     let math = math.resolve(gpu, "batch_chunk_delta_net_input_projection")?;
     // IU4 verify keeps the plain SET consumers: the fused QKVZ + GDN-prep
     // epilogue was not row-count checked, and the caller runs the prep.
-    let gdn = if math == DenseBatchMath::Iu4Verify { None } else { gdn };
+    let gdn = if math == DenseBatchMath::Iu4Verify {
+        None
+    } else {
+        gdn
+    };
     if math == DenseBatchMath::SingletonWmma {
         require_singleton_wmma_mq4v2(
             "batch_chunk_delta_net_input_projection",
@@ -7664,7 +7702,11 @@ fn batch_chunk_delta_net_input_projection(
         )?;
     }
 
-    require_iu4_verify_prep(math, "batch_chunk_delta_net_input_projection", iu4_prep.is_some())?;
+    require_iu4_verify_prep(
+        math,
+        "batch_chunk_delta_net_input_projection",
+        iu4_prep.is_some(),
+    )?;
     // Batched 4-way LA projection (wqkv + wz + w_beta + w_alpha).
     if let Some(prep) = &a8_prep {
         let xq = gpu.int8_mmq_prepared_ptr(prep, layer.wqkv.k, n)?;
@@ -8110,9 +8152,27 @@ fn gdn_tape_copy_descriptors(
     let copy_qkv = n * qkv_row_bytes;
     let copy_a = n * alpha_row_bytes;
     [
-        TapeCopy::new(&tape.qkv_bufs[delta_layer_idx].buf, off_qkv, &pbs.dn_qkv_batch.buf, 0, copy_qkv),
-        TapeCopy::new(&tape.alpha_bufs[delta_layer_idx].buf, off_a, &pbs.dn_alpha_batch.buf, 0, copy_a),
-        TapeCopy::new(&tape.beta_bufs[delta_layer_idx].buf, off_a, &pbs.dn_beta_batch.buf, 0, copy_a),
+        TapeCopy::new(
+            &tape.qkv_bufs[delta_layer_idx].buf,
+            off_qkv,
+            &pbs.dn_qkv_batch.buf,
+            0,
+            copy_qkv,
+        ),
+        TapeCopy::new(
+            &tape.alpha_bufs[delta_layer_idx].buf,
+            off_a,
+            &pbs.dn_alpha_batch.buf,
+            0,
+            copy_a,
+        ),
+        TapeCopy::new(
+            &tape.beta_bufs[delta_layer_idx].buf,
+            off_a,
+            &pbs.dn_beta_batch.buf,
+            0,
+            copy_a,
+        ),
     ]
 }
 
@@ -8128,7 +8188,14 @@ pub(crate) fn push_gdn_tape_copies(
     n: usize,
     delta_layer_idx: usize,
 ) {
-    sink.extend(gdn_tape_copy_descriptors(tape, pbs, n_v_heads, tape_offset, n, delta_layer_idx));
+    sink.extend(gdn_tape_copy_descriptors(
+        tape,
+        pbs,
+        n_v_heads,
+        tape_offset,
+        n,
+        delta_layer_idx,
+    ));
 }
 
 /// The pre-GDN fused sigmoid(beta) + alpha gate over rows `[0, n)` of `pbs`
@@ -8141,7 +8208,14 @@ pub(crate) fn gdn_sigmoid_alpha_gate(
     n_v_heads: usize,
     n: usize,
 ) -> HipResult<()> {
-    gpu.fused_sigmoid_alpha_gate_f32_batched(&pbs.dn_beta_batch, &pbs.dn_alpha_batch, &layer.dt_bias, &layer.a_log, n_v_heads, n)
+    gpu.fused_sigmoid_alpha_gate_f32_batched(
+        &pbs.dn_beta_batch,
+        &pbs.dn_alpha_batch,
+        &layer.dt_bias,
+        &layer.a_log,
+        n_v_heads,
+        n,
+    )
 }
 
 /// The GQA (`n_key_heads < n_v_heads`) fused L2-norm(Q) + scale + L2-norm(K)
@@ -8318,7 +8392,8 @@ fn batch_chunk_delta_net_pre_gdn<'a>(
         {
             // Singleton chain verify: one batched launch for the same three
             // descriptors, issued at the original copy point (before conv).
-            let copies = gdn_tape_copy_descriptors(tape, pbs, n_v_heads, tape_offset, n, delta_layer_idx);
+            let copies =
+                gdn_tape_copy_descriptors(tape, pbs, n_v_heads, tape_offset, n, delta_layer_idx);
             gpu.tape_copy_batched(&copies)?;
         } else {
             let qkv_row_bytes = tape.qkv_dim * 4;
@@ -9532,7 +9607,11 @@ fn batch_chunk_delta_net_ffn_gate_up(
         )?;
     }
 
-    require_iu4_verify_prep(math, "batch_chunk_delta_net_ffn_gate_up", iu4_prep.is_some())?;
+    require_iu4_verify_prep(
+        math,
+        "batch_chunk_delta_net_ffn_gate_up",
+        iu4_prep.is_some(),
+    )?;
     // Batched gate+up projection.
     // #397 Ship 5.2 slice 2: fused gate+up dtypes → FusedQkvFamily
     // (batched-prefill gate+up variant) via run_fused_gate_up_key.
@@ -10346,7 +10425,11 @@ fn batch_chunk_full_attn_input_projection(
         )?;
     }
 
-    require_iu4_verify_prep(math, "batch_chunk_full_attn_input_projection", iu4_prep.is_some())?;
+    require_iu4_verify_prep(
+        math,
+        "batch_chunk_full_attn_input_projection",
+        iu4_prep.is_some(),
+    )?;
     // 2. Batched 3-way QKV projection (wq+wk+wv).
     if let Some(prep) = &a8_prep {
         let xq = gpu.int8_mmq_prepared_ptr(prep, layer.wq.k, n)?;
@@ -10870,7 +10953,14 @@ fn batch_chunk_full_attn_prepare(
         } else {
             &pbs.positions
         };
-        fa_prep_unfused_rope(gpu, config, pbs, rope_pos_buf, n, kv_cache.compact_offset as i32)?;
+        fa_prep_unfused_rope(
+            gpu,
+            config,
+            pbs,
+            rope_pos_buf,
+            n,
+            kv_cache.compact_offset as i32,
+        )?;
     }
 
     // 6–7. (F2 split: the KV write + flash attention dispatch now lives in
@@ -11961,8 +12051,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
     // Only the new ragged shape is admitted outside the incumbent n/commit
     // predicate. It keeps the F32 attention output (no A4 attention epilogue:
     // the A4 attend step cannot express the two-plane range launches).
-    let newly_admitted_ragged =
-        gfx12_fa_prep_fp8q && !fa_fp8q_incumbent_shape(n, commit_stride);
+    let newly_admitted_ragged = gfx12_fa_prep_fp8q && !fa_fp8q_incumbent_shape(n, commit_stride);
     let pair_q8_writes = dflash_fa_batch_fusion_admitted(gpu, config, fusion, n);
     // The fp8q prep can leave the sigmoid gate in `fa_q_full_batch` (no
     // 4·n·q_dim-byte copy, and its gate half is never read by the prep) when
@@ -12303,7 +12392,11 @@ fn batch_chunk_full_attn_ffn_gate_up(
             config.norm_eps,
         )?;
     }
-    require_iu4_verify_prep(math, "batch_chunk_full_attn_ffn_gate_up", iu4_prep.is_some())?;
+    require_iu4_verify_prep(
+        math,
+        "batch_chunk_full_attn_ffn_gate_up",
+        iu4_prep.is_some(),
+    )?;
     // #397 Ship 5.2 slice 2: FA-FFN fused gate+up → FusedQkvFamily
     // (batched-prefill gate+up variant), mirroring the LA-FFN block
     // above. Q8-non-WMMA stays as two plain GEMMs; HFQ3 WMMA-vs-base
@@ -15697,7 +15790,6 @@ pub(crate) fn forward_batch_chunk_impl(
     let hd = config.linear_key_head_dim;
     let dim_row_bytes = dim * 4;
 
-
     let do_embed = band.map(|b| b.is_first_band).unwrap_or(true);
     let layer_start = band.map(|b| b.layer_start).unwrap_or(0);
     let layer_end = band
@@ -15823,10 +15915,12 @@ pub(crate) fn forward_batch_chunk_impl(
     // fallback arms never reach a `*VerifyExact` key).
     if gpu.fp8_verify_scope
         && (!fa_batched_ok
-            || weights
-                .layers
-                .iter()
-                .any(|l| matches!(l, LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_))))
+            || weights.layers.iter().any(|l| {
+                matches!(
+                    l,
+                    LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_)
+                )
+            }))
     {
         return Err(HipError::new(
             0,
@@ -16779,16 +16873,27 @@ mod tests {
         on.gfx12_mq4v2_fp8_qkv = true;
         on.gfx12_mq4v2_fp8_resid = true;
         for (consumer, dtypes) in families {
-            assert!(fp8_stream_consumer_takes_fp8(&on, consumer, dtypes), "{consumer:?}");
+            assert!(
+                fp8_stream_consumer_takes_fp8(&on, consumer, dtypes),
+                "{consumer:?}"
+            );
         }
         // gate/up under the LDS-stage WMMA has no FP8 prepared consumer.
         on.hfq4g256_ldsstage_wmma = true;
         assert!(!fp8_stream_consumer_takes_fp8(&on, GateUp, &[U, U]));
         assert!(fp8_stream_consumer_takes_fp8(&on, Residual, &[U]));
         // Mixed, non-MQ4v2, or empty weight sets never admit a producer.
-        assert!(!fp8_stream_consumer_takes_fp8(&on, Qkvza, &[U, U, U, DType::Q8_0]));
+        assert!(!fp8_stream_consumer_takes_fp8(
+            &on,
+            Qkvza,
+            &[U, U, U, DType::Q8_0]
+        ));
         assert!(!fp8_stream_consumer_takes_fp8(&on, GateUp, &[U, L]));
-        assert!(!fp8_stream_consumer_takes_fp8(&on, Residual, &[DType::MQ4G256]));
+        assert!(!fp8_stream_consumer_takes_fp8(
+            &on,
+            Residual,
+            &[DType::MQ4G256]
+        ));
         assert!(!fp8_stream_consumer_takes_fp8(&on, Residual, &[]));
     }
 
@@ -18958,7 +19063,8 @@ mod tests {
         let q = (c.n_heads * c.head_dim) as u128;
         let kvd = (c.n_kv_heads * c.head_dim) as u128;
         let p = n.div_ceil(64) * 64;
-        let base = 4 * (n * (3 * d + 3 * h + 9 * v + 3 * k + 2 * hh + 6 * q + 2 * kvd + 263) + p * k)
+        let base = 4
+            * (n * (3 * d + 3 * h + 9 * v + 3 * k + 2 * hh + 6 * q + 2 * kvd + 263) + p * k)
             + 2 * n * (d + v + h + q)
             + 8 * n
             + 256;
@@ -19071,8 +19177,22 @@ mod tests {
             live_q16_bytes: 0,
         };
         let widened = ResidentMoeOwner::WIDENED;
-        assert!(resident_moe_memory_admits(&moe, kv, &mem(need), None, widened, 0));
-        assert!(!resident_moe_memory_admits(&moe, kv, &mem(need - 1), None, widened, 0));
+        assert!(resident_moe_memory_admits(
+            &moe,
+            kv,
+            &mem(need),
+            None,
+            widened,
+            0
+        ));
+        assert!(!resident_moe_memory_admits(
+            &moe,
+            kv,
+            &mem(need - 1),
+            None,
+            widened,
+            0
+        ));
     }
 
     #[test]
@@ -19104,10 +19224,7 @@ mod tests {
             fp8_half_sums: usize::MAX,
             fp8_row_scales: usize::MAX,
         };
-        assert_eq!(
-            resident_moe_projection_deficit(&moe, 4096, &full),
-            Some(0)
-        );
+        assert_eq!(resident_moe_projection_deficit(&moe, 4096, &full), Some(0));
         assert_eq!(
             resident_moe_projection_deficit(&moe, usize::MAX, &none),
             None
@@ -19175,7 +19292,10 @@ mod tests {
         assert!(admits(mem(need, 0)));
         assert!(!admits(mem(need - 1, 0)));
         // Remaining free bytes after the full growth are at least the headroom.
-        assert_eq!(need - (pbs + projection + q16_full), WIDENED_VRAM_HEADROOM_BYTES);
+        assert_eq!(
+            need - (pbs + projection + q16_full),
+            WIDENED_VRAM_HEADROOM_BYTES
+        );
         // The 512-row Q16 budget would have admitted this much free memory.
         let old_need = need - (q16_full - q16_512);
         assert!(!admits(mem(old_need, 0)));
@@ -19199,8 +19319,22 @@ mod tests {
         ));
         // Pending allocations are deducted before the headroom test.
         let widened = ResidentMoeOwner::WIDENED;
-        assert!(resident_moe_memory_admits(&moe, kv, &mem(need + 4096, 0), None, widened, 4096));
-        assert!(!resident_moe_memory_admits(&moe, kv, &mem(need + 4096, 0), None, widened, 4097));
+        assert!(resident_moe_memory_admits(
+            &moe,
+            kv,
+            &mem(need + 4096, 0),
+            None,
+            widened,
+            4096
+        ));
+        assert!(!resident_moe_memory_admits(
+            &moe,
+            kv,
+            &mem(need + 4096, 0),
+            None,
+            widened,
+            4097
+        ));
         // A taped explicit-equivalent owner is charged its own (larger) bytes,
         // and an existing owner credits exactly its bytes.
         let taped = ResidentMoeOwner {
@@ -19211,22 +19345,64 @@ mod tests {
         let taped_bytes = resident_moe_owner_bytes(&moe, taped.rows, true).unwrap();
         assert!(taped_bytes > pbs);
         let taped_need = need - pbs + taped_bytes;
-        assert!(resident_moe_memory_admits(&moe, kv, &mem(taped_need, 0), None, taped, 0));
-        assert!(!resident_moe_memory_admits(&moe, kv, &mem(taped_need - 1, 0), None, taped, 0));
+        assert!(resident_moe_memory_admits(
+            &moe,
+            kv,
+            &mem(taped_need, 0),
+            None,
+            taped,
+            0
+        ));
+        assert!(!resident_moe_memory_admits(
+            &moe,
+            kv,
+            &mem(taped_need - 1, 0),
+            None,
+            taped,
+            0
+        ));
         // An owner smaller than the rung never lowers the 4096-row charge.
         let small = ResidentMoeOwner {
             rows: WIDENED_COMMIT_ROWS,
             tape: false,
             credit_bytes: 0,
         };
-        assert!(!resident_moe_memory_admits(&moe, kv, &mem(need - 1, 0), None, small, 0));
-        assert!(resident_moe_memory_admits(&moe, kv, &mem(need, 0), None, small, 0));
+        assert!(!resident_moe_memory_admits(
+            &moe,
+            kv,
+            &mem(need - 1, 0),
+            None,
+            small,
+            0
+        ));
+        assert!(resident_moe_memory_admits(
+            &moe,
+            kv,
+            &mem(need, 0),
+            None,
+            small,
+            0
+        ));
         let credited = ResidentMoeOwner {
             credit_bytes: taped_bytes,
             ..taped
         };
-        assert!(resident_moe_memory_admits(&moe, kv, &mem(need - pbs, 0), None, credited, 0));
-        assert!(!resident_moe_memory_admits(&moe, kv, &mem(need - pbs - 1, 0), None, credited, 0));
+        assert!(resident_moe_memory_admits(
+            &moe,
+            kv,
+            &mem(need - pbs, 0),
+            None,
+            credited,
+            0
+        ));
+        assert!(!resident_moe_memory_admits(
+            &moe,
+            kv,
+            &mem(need - pbs - 1, 0),
+            None,
+            credited,
+            0
+        ));
     }
 
     #[test]
@@ -19309,7 +19485,10 @@ mod tests {
         assert_eq!(limit(None, 4096, need - 1), incumbent);
         // Same-shape owner reused in place: positive credit, exact boundary.
         let same = Some((4096, false));
-        assert_eq!(limit(same, 4096, need - bytes(4096)), RESIDENT_MOE_CHUNK_ROWS);
+        assert_eq!(
+            limit(same, 4096, need - bytes(4096)),
+            RESIDENT_MOE_CHUNK_ROWS
+        );
         assert_eq!(limit(same, 4096, need - bytes(4096) - 1), incumbent);
         // Short owner at 4096 needed rows must be replaced: growth rejects the
         // budget the speculative credit would admit, and charges the full rung.
@@ -19319,11 +19498,17 @@ mod tests {
         assert_eq!(limit(short, 4096, need - 1), incumbent);
         // The same short owner is reused (and credited) when the call needs no
         // more rows than it holds; one row more is a replacement.
-        assert_eq!(limit(short, 2048, need - bytes(2048)), RESIDENT_MOE_CHUNK_ROWS);
+        assert_eq!(
+            limit(short, 2048, need - bytes(2048)),
+            RESIDENT_MOE_CHUNK_ROWS
+        );
         assert_eq!(limit(short, 2048, need - bytes(2048) - 1), incumbent);
         assert_eq!(limit(short, 2049, need - bytes(2048)), incumbent);
         // Lean owner: never credited.
-        assert_eq!(limit(Some((2048, true)), 100, need - bytes(2048)), incumbent);
+        assert_eq!(
+            limit(Some((2048, true)), 100, need - bytes(2048)),
+            incumbent
+        );
         // An oversized lean owner still earns no credit. Its payload can exceed
         // the full-rung need, so use the uncredited boundary without subtraction.
         assert_eq!(limit(Some((8192, true)), 100, need - 1), incumbent);
@@ -19638,8 +19823,7 @@ mod tests {
             false,
             false,
         );
-        let policy =
-            kv_mode::qwen35_policy_for_native(&kv_mode::QWEN35_HFQ_POLICY, "auto", native);
+        let policy = kv_mode::qwen35_policy_for_native(&kv_mode::QWEN35_HFQ_POLICY, "auto", native);
         let pair = kv_mode::resolve_kv_pair("auto", None, None, &policy, arch, true)
             .expect("default kv pair");
         kv_tier_flags_for_pair(pair)
@@ -19669,8 +19853,7 @@ mod tests {
         owner: (usize, bool),
     ) -> usize {
         let rung = resident_moe_pbs_bytes(config, RESIDENT_MOE_CHUNK_ROWS).unwrap();
-        resident_moe_need_bytes(config, live_q16) - rung
-            + rung.max(owner_bytes_of(config, owner))
+        resident_moe_need_bytes(config, live_q16) - rung + rung.max(owner_bytes_of(config, owner))
     }
 
     /// Every input of one modelled ordinary prefill call. Each field is a REAL
@@ -19794,10 +19977,8 @@ mod tests {
     }
 
     fn sc_static_facts(moe: &InstalledMoe, sc: &Sc) -> ResidentMoeStaticFacts {
-        let caps = rdna_compute::arch_caps::ArchCaps::new(
-            sc.arch,
-            std::sync::Arc::new(sc.flags.clone()),
-        );
+        let caps =
+            rdna_compute::arch_caps::ArchCaps::new(sc.arch, std::sync::Arc::new(sc.flags.clone()));
         let explicit_max = sc.explicit.then_some(4096usize);
         let plan = DeltaNetStatePlan::new(&moe.config, sc.dn_quant, sc.dn_batch, sc.dn_ef);
         ResidentMoeStaticFacts {
@@ -19808,11 +19989,7 @@ mod tests {
             ep_shard: sc.ep_shard,
             moe_has_mq6: sc.mq6_weights,
             layers_present: !sc.layers.is_empty(),
-            dn_state_admitted: ordinary_dn_state_admitted(
-                &moe.config,
-                &plan,
-                sc.per_token_requant,
-            ),
+            dn_state_admitted: ordinary_dn_state_admitted(&moe.config, &plan, sc.per_token_requant),
             // The static facts' probe is the 512-row seam, exactly as
             // `resident_moe_static_facts` evaluates it.
             batch_pbs_eligible: sc_batched_eligible(moe, sc, WIDENED_COMMIT_ROWS),
@@ -19902,7 +20079,13 @@ mod tests {
                     credit_bytes,
                 },
             );
-        let plan = gate.plan(arch, fp8, dense_widened, sc.existing_virtual, default_moe_fits);
+        let plan = gate.plan(
+            arch,
+            fp8,
+            dense_widened,
+            sc.existing_virtual,
+            default_moe_fits,
+        );
         (plan, gate.maps_kv(), queried.get())
     }
 
@@ -19929,7 +20112,10 @@ mod tests {
             "{}: a MoE shape has no dense widened ceiling",
             moe.name
         );
-        assert!(sc.n >= MIN_BATCH, "run() needs n >= 2 (n = 1: use wrapper_run)");
+        assert!(
+            sc.n >= MIN_BATCH,
+            "run() needs n >= 2 (n = 1: use wrapper_run)"
+        );
         let facts = sc_static_facts(moe, sc);
         let mem = sc_memory_facts(sc);
         let physical = sc
@@ -20035,7 +20221,10 @@ mod tests {
                 "{what}: no virtual-explicit override"
             );
             assert_eq!(r.plan.limit, r.incumbent, "{what}: incumbent ceiling");
-            assert!(r.chunks.is_empty(), "{what}: AR fallback runs no chunk plan");
+            assert!(
+                r.chunks.is_empty(),
+                "{what}: AR fallback runs no chunk plan"
+            );
             return;
         }
         assert_eq!(
@@ -20083,7 +20272,8 @@ mod tests {
                     .map(|home| std::path::Path::new(&home).join(".hipfire/models"))
             })
             .expect("HOME or HIPFIRE_MODELS_DIR");
-        let require = hipfire_config::developer_var_os("HIPFIRE_REQUIRE_INSTALLED_A3B_HFQ").is_some();
+        let require =
+            hipfire_config::developer_var_os("HIPFIRE_REQUIRE_INSTALLED_A3B_HFQ").is_some();
         let mut checked = 0;
         for name in ["qwen3.6-35b-a3b.mq4r", "ornith-1.5-35b-a3b.mq4r"] {
             let path = models.join(name);
@@ -20093,14 +20283,20 @@ mod tests {
                     "resident_moe artifact test: required {} is absent",
                     path.display()
                 );
-                eprintln!("resident_moe artifact test: {} absent, skipped", path.display());
+                eprintln!(
+                    "resident_moe artifact test: {} absent, skipped",
+                    path.display()
+                );
                 continue;
             }
             let hfq = HfqFile::open(&path).expect("open installed hfq");
             for arch in ["gfx1201", "gfx1100"] {
                 let moe = load_installed_moe(name, &hfq, arch);
                 assert!(!moe.moe_has_mq6, "{name}: moe_has_mq6 must be false");
-                assert!(moe.batch_pbs_eligible, "{name}: batched layer dtype admission");
+                assert!(
+                    moe.batch_pbs_eligible,
+                    "{name}: batched layer dtype admission"
+                );
                 let line = |r: &Run| r.plan.receipt.to_string();
                 // Census of the actual HFQ shape against the independent
                 // constructor closed form (not the projected mirror).
@@ -20113,7 +20309,10 @@ mod tests {
                         );
                     }
                 }
-                assert_eq!(resident_moe_owner_bytes(&moe.config, usize::MAX, false), None);
+                assert_eq!(
+                    resident_moe_owner_bytes(&moe.config, usize::MAX, false),
+                    None
+                );
 
                 // --- reuse PBS off: default vs beta explicit 4096 -------------
                 for n in [4096usize, 8192, 3855, 16384, 4097, 513, 100] {
@@ -20190,7 +20389,8 @@ mod tests {
                         f
                     };
                     let fp8_now = fp8_chunk512_for_flags(arch, &flags_now);
-                    let target = implicit_reuse_pbs_plan(arch, Some(RESIDENT_MOE_CHUNK_ROWS), fp8_now);
+                    let target =
+                        implicit_reuse_pbs_plan(arch, Some(RESIDENT_MOE_CHUNK_ROWS), fp8_now);
                     let default_physical = implicit_reuse_pbs_plan(arch, None, fp8_now);
                     let need_owner = resident_moe_need_owner_bytes(&moe.config, 0, target);
                     for n in [4096usize, 8192, 513, 100] {
@@ -20206,7 +20406,11 @@ mod tests {
                         assert_eq!(e.wrapper.max_batch_override, None);
                         assert_eq!(e.owner, Some(target));
                         assert!(!d.plan.wide && !e.plan.wide, "{name} {arch} n={n}");
-                        assert!(d.chunks.iter().chain(e.chunks.iter()).all(|c| c.1.is_none()));
+                        assert!(d
+                            .chunks
+                            .iter()
+                            .chain(e.chunks.iter())
+                            .all(|c| c.1.is_none()));
                         assert_eq!(d.plan.limit, RESIDENT_MOE_CHUNK_ROWS);
                         // Default (fresh owner): EXACT beta explicit parameters.
                         assert_eq!(
@@ -20229,7 +20433,11 @@ mod tests {
                         }
                         // Existing owner kept from an earlier admitted request: the
                         // same effective parameters, allocated only when it differs.
-                        for existing in [Some(target), Some((1024, false)), Some((target.0, !target.1))] {
+                        for existing in [
+                            Some(target),
+                            Some((1024, false)),
+                            Some((target.0, !target.1)),
+                        ] {
                             let mut s2 = sd.clone();
                             s2.existing_virtual = existing;
                             let d2 = run(&moe, &s2);
@@ -20253,7 +20461,10 @@ mod tests {
                         assert!(!l.plan.wide);
                         assert_eq!(l.plan.limit, l.max_batch);
                         assert_ne!(l.max_batch, RESIDENT_MOE_CHUNK_ROWS);
-                        assert_eq!(l.plan.chunk_batch(None), l.max_batch.min(default_physical.0));
+                        assert_eq!(
+                            l.plan.chunk_batch(None),
+                            l.max_batch.min(default_physical.0)
+                        );
                         // A virtual owner kept from an earlier admitted request is
                         // released when a later request no longer fits even with
                         // the owner's own bytes credited; only a SAME-TARGET owner
@@ -20337,7 +20548,9 @@ mod tests {
                     }
                     let call_flips: [(&str, CallFlip); 10] = [
                         ("caller PBS smaller", |c| c.caller_pbs_rows = Some(512)),
-                        ("caller PBS covering the rung", |c| c.caller_pbs_rows = Some(8192)),
+                        ("caller PBS covering the rung", |c| {
+                            c.caller_pbs_rows = Some(8192)
+                        }),
                         ("max_batch_cap", |c| c.max_batch_cap = Some(256)),
                         ("tree verify", |c| c.tree_verify = true),
                         ("gdn tape", |c| c.gdn_tape = true),
@@ -20407,7 +20620,9 @@ mod tests {
                         ("pager", |s| s.pager = true),
                         ("ep shard", |s| s.ep_shard = true),
                         ("mq6 weights", |s| s.mq6_weights = true),
-                        ("batch pbs dtype ineligible", |s| s.batch_pbs_eligible = false),
+                        ("batch pbs dtype ineligible", |s| {
+                            s.batch_pbs_eligible = false
+                        }),
                         ("prefill_batched off", |s| s.prefill_batched = false),
                         ("no layers", |s| s.layers.clear()),
                     ];
@@ -20460,7 +20675,10 @@ mod tests {
                 let need = resident_moe_need_bytes(&moe.config, 0);
                 let mut sc = base.clone();
                 sc.free_bytes = Some(need);
-                assert!(run(&moe, &sc).plan.wide, "{name} {arch}: free == need admits");
+                assert!(
+                    run(&moe, &sc).plan.wide,
+                    "{name} {arch}: free == need admits"
+                );
                 sc.free_bytes = Some(need - 1);
                 deny("free < need", &sc);
                 let fallback = run(&moe, &sc);
@@ -20516,13 +20734,17 @@ mod tests {
                     &with_cached(8192, Some((2048, false)), need - short),
                 );
                 assert!(
-                    run(&moe, &with_cached(8192, Some((2048, false)), need)).plan.wide,
+                    run(&moe, &with_cached(8192, Some((2048, false)), need))
+                        .plan
+                        .wide,
                     "{name} {arch}: short cached owner, full rung charged exactly"
                 );
                 // Same-shape owner reused in place: positive credit, exact boundary.
                 let same = pbs_rows_bytes(4096);
                 assert!(
-                    run(&moe, &with_cached(8192, Some((4096, false)), need - same)).plan.wide,
+                    run(&moe, &with_cached(8192, Some((4096, false)), need - same))
+                        .plan
+                        .wide,
                     "{name} {arch}: reused owner credit"
                 );
                 deny(
@@ -20531,7 +20753,9 @@ mod tests {
                 );
                 // A call needing only the owner's rows reuses a smaller owner.
                 assert!(
-                    run(&moe, &with_cached(100, Some((2048, false)), need - short)).plan.wide,
+                    run(&moe, &with_cached(100, Some((2048, false)), need - short))
+                        .plan
+                        .wide,
                     "{name} {arch}: n=100 reuses a 2048-row owner"
                 );
                 deny(
@@ -20541,7 +20765,9 @@ mod tests {
                 // Exact reuse boundary: rows == needed rows credits, one row more
                 // needed replaces the owner.
                 assert!(
-                    run(&moe, &with_cached(2048, Some((2048, false)), need - short)).plan.wide,
+                    run(&moe, &with_cached(2048, Some((2048, false)), need - short))
+                        .plan
+                        .wide,
                     "{name} {arch}: owner rows == needed rows"
                 );
                 deny(
@@ -20590,64 +20816,179 @@ mod tests {
             call_eligible: true,
         };
         let none = |p: WrapperPbsPlan| {
-            p.owner == WrapperOwner::None
-                && p.max_batch_override.is_none()
-                && !p.alloc_virtual
+            p.owner == WrapperOwner::None && p.max_batch_override.is_none() && !p.alloc_virtual
         };
         // Dense widened route and reuse off never hand a cache; an old virtual
         // owner is released.
-        assert!(none(plan_wrapper_pbs(&inputs("gfx1100", false, true, Some((512, true)), None, true))));
-        assert!(none(plan_wrapper_pbs(&inputs("gfx1100", false, false, None, None, true))));
-        assert!(plan_wrapper_pbs(&inputs("gfx1100", false, false, None, Some((4096, true)), true)).free_virtual);
+        assert!(none(plan_wrapper_pbs(&inputs(
+            "gfx1100",
+            false,
+            true,
+            Some((512, true)),
+            None,
+            true
+        ))));
+        assert!(none(plan_wrapper_pbs(&inputs(
+            "gfx1100", false, false, None, None, true
+        ))));
+        assert!(
+            plan_wrapper_pbs(&inputs(
+                "gfx1100",
+                false,
+                false,
+                None,
+                Some((4096, true)),
+                true
+            ))
+            .free_virtual
+        );
         // Not fitting: the implicit cache, no override; an existing owner is released.
-        let p = plan_wrapper_pbs(&inputs("gfx1100", false, false, Some((512, true)), Some((4096, true)), false));
-        assert_eq!((p.owner, p.max_batch_override, p.free_virtual, p.alloc_virtual), (WrapperOwner::Physical, None, true, false));
+        let p = plan_wrapper_pbs(&inputs(
+            "gfx1100",
+            false,
+            false,
+            Some((512, true)),
+            Some((4096, true)),
+            false,
+        ));
+        assert_eq!(
+            (
+                p.owner,
+                p.max_batch_override,
+                p.free_virtual,
+                p.alloc_virtual
+            ),
+            (WrapperOwner::Physical, None, true, false)
+        );
         // Fitting default on gfx1100: the explicit-4096 owner (4096 rows, tape) from the
         // existing explicit sizing function, ceiling 4096.
         let target = implicit_reuse_pbs_plan("gfx1100", Some(RESIDENT_MOE_CHUNK_ROWS), false);
         assert_eq!(target, (4096, true));
-        let p = plan_wrapper_pbs(&inputs("gfx1100", false, false, Some((512, true)), None, true));
+        let p = plan_wrapper_pbs(&inputs(
+            "gfx1100",
+            false,
+            false,
+            Some((512, true)),
+            None,
+            true,
+        ));
         assert_eq!(
-            (p.owner, p.max_batch_override, p.free_virtual, p.alloc_virtual),
-            (WrapperOwner::Virtual { rows: 4096, tape: true }, Some(4096), false, true)
+            (
+                p.owner,
+                p.max_batch_override,
+                p.free_virtual,
+                p.alloc_virtual
+            ),
+            (
+                WrapperOwner::Virtual {
+                    rows: 4096,
+                    tape: true
+                },
+                Some(4096),
+                false,
+                true
+            )
         );
         // An existing owner of the same shape is reused; a different one is replaced.
-        let p = plan_wrapper_pbs(&inputs("gfx1100", false, false, Some((512, true)), Some(target), true));
+        let p = plan_wrapper_pbs(&inputs(
+            "gfx1100",
+            false,
+            false,
+            Some((512, true)),
+            Some(target),
+            true,
+        ));
         assert_eq!((p.free_virtual, p.alloc_virtual), (false, false));
-        let p = plan_wrapper_pbs(&inputs("gfx1100", false, false, Some((512, true)), Some((1024, false)), true));
+        let p = plan_wrapper_pbs(&inputs(
+            "gfx1100",
+            false,
+            false,
+            Some((512, true)),
+            Some((1024, false)),
+            true,
+        ));
         assert_eq!((p.free_virtual, p.alloc_virtual), (true, true));
         // A denying call (capture/tree/tape/ring/cap/state) never promotes, whatever
         // fits, and leaves existing owners untouched.
-        let mut denied = inputs("gfx1100", false, false, Some((512, true)), Some((4096, true)), true);
+        let mut denied = inputs(
+            "gfx1100",
+            false,
+            false,
+            Some((512, true)),
+            Some((4096, true)),
+            true,
+        );
         denied.call_eligible = false;
         let p = plan_wrapper_pbs(&denied);
         assert_eq!(
-            (p.owner, p.max_batch_override, p.free_virtual, p.alloc_virtual),
+            (
+                p.owner,
+                p.max_batch_override,
+                p.free_virtual,
+                p.alloc_virtual
+            ),
             (WrapperOwner::Physical, None, false, false)
         );
         // The shared scalar gate: prefill_batched off denies (outside the verify-decouple window).
-        assert!(prefill_batch_scalar_eligible(512, "gfx1201", None, true, true));
-        assert!(!prefill_batch_scalar_eligible(512, "gfx1201", None, false, true));
-        assert!(!prefill_batch_scalar_eligible(512, "gfx1100", Some("0"), false, true));
-        assert!(prefill_batch_scalar_eligible(16, "gfx1100", None, false, true));
-        assert!(!prefill_batch_scalar_eligible(1, "gfx1201", None, true, true));
-        assert!(!prefill_batch_scalar_eligible(512, "gfx1201", None, true, false));
+        assert!(prefill_batch_scalar_eligible(
+            512, "gfx1201", None, true, true
+        ));
+        assert!(!prefill_batch_scalar_eligible(
+            512, "gfx1201", None, false, true
+        ));
+        assert!(!prefill_batch_scalar_eligible(
+            512,
+            "gfx1100",
+            Some("0"),
+            false,
+            true
+        ));
+        assert!(prefill_batch_scalar_eligible(
+            16, "gfx1100", None, false, true
+        ));
+        assert!(!prefill_batch_scalar_eligible(
+            1, "gfx1201", None, true, true
+        ));
+        assert!(!prefill_batch_scalar_eligible(
+            512, "gfx1201", None, true, false
+        ));
         // The shared ceiling resolver: the cap applies to the override too.
         assert_eq!(resolve_ordinary_max_batch(512, None, Some(256)), 256);
         assert_eq!(resolve_ordinary_max_batch(512, Some(4096), Some(256)), 256);
         assert_eq!(resolve_ordinary_max_batch(512, Some(4096), None), 4096);
         assert_eq!(resolve_ordinary_max_batch(384, None, None), 384);
         // gfx1201 with the FP8 path: the implicit cache already is the explicit-4096 shape.
-        let p = plan_wrapper_pbs(&inputs("gfx1201", true, false, Some((512, false)), None, true));
+        let p = plan_wrapper_pbs(&inputs(
+            "gfx1201",
+            true,
+            false,
+            Some((512, false)),
+            None,
+            true,
+        ));
         assert_eq!(
             (p.owner, p.max_batch_override, p.alloc_virtual),
             (WrapperOwner::Physical, Some(4096), false)
         );
         // gfx1201 without it: 384-row cache -> the 512-row tape-free explicit owner.
-        let p = plan_wrapper_pbs(&inputs("gfx1201", false, false, Some((384, false)), None, true));
+        let p = plan_wrapper_pbs(&inputs(
+            "gfx1201",
+            false,
+            false,
+            Some((384, false)),
+            None,
+            true,
+        ));
         assert_eq!(
             (p.owner, p.max_batch_override, p.alloc_virtual),
-            (WrapperOwner::Virtual { rows: 512, tape: false }, Some(4096), true)
+            (
+                WrapperOwner::Virtual {
+                    rows: 512,
+                    tape: false
+                },
+                Some(4096),
+                true
+            )
         );
         let open = OrdinaryCallFacts::default();
         assert!(open.wide_candidate());
@@ -20669,10 +21010,19 @@ mod tests {
         }
         // Implicit cache sizing per arch, default and explicit.
         assert_eq!(implicit_reuse_pbs_plan("gfx1201", None, true), (512, false));
-        assert_eq!(implicit_reuse_pbs_plan("gfx1201", None, false), (384, false));
-        assert_eq!(implicit_reuse_pbs_plan("gfx1201", Some(4096), false), (512, false));
+        assert_eq!(
+            implicit_reuse_pbs_plan("gfx1201", None, false),
+            (384, false)
+        );
+        assert_eq!(
+            implicit_reuse_pbs_plan("gfx1201", Some(4096), false),
+            (512, false)
+        );
         assert_eq!(implicit_reuse_pbs_plan("gfx1100", None, false), (512, true));
-        assert_eq!(implicit_reuse_pbs_plan("gfx1100", Some(4096), false), (4096, true));
+        assert_eq!(
+            implicit_reuse_pbs_plan("gfx1100", Some(4096), false),
+            (4096, true)
+        );
         assert_eq!(implicit_reuse_pbs_plan("gfx1151", None, false), (512, true));
         // State gate over the allocator's own scalar plan.
         let moe = resident_moe_test_config();
@@ -20760,7 +21110,11 @@ mod tests {
                 let efs: Vec<usize> = plan.ef_numel().collect();
                 assert_eq!(
                     efs,
-                    if ef { vec![s_size(batch); n_la] } else { Vec::new() }
+                    if ef {
+                        vec![s_size(batch); n_la]
+                    } else {
+                        Vec::new()
+                    }
                 );
                 assert_eq!(plan.s_numel().len(), n_la);
                 assert_eq!(plan.ef_numel().len(), if ef { n_la } else { 0 });
@@ -20775,7 +21129,8 @@ mod tests {
     fn dn_state_admission_checks_every_owner() {
         let moe = resident_moe_test_config();
         let n_la = 48usize;
-        let single = moe.linear_num_value_heads * moe.linear_value_head_dim * moe.linear_value_head_dim;
+        let single =
+            moe.linear_num_value_heads * moe.linear_value_head_dim * moe.linear_value_head_dim;
         let valid = || SliceGeometry {
             quant: StateQuant::Q8,
             s: vec![single; n_la],
@@ -20806,10 +21161,16 @@ mod tests {
             // EF owners are required non-empty per layer (any nonzero count).
             let mut g = valid();
             g.ef[i] = 0;
-            assert!(!ordinary_dn_state_admitted(&moe, &g, false), "EF owner {i} empty");
+            assert!(
+                !ordinary_dn_state_admitted(&moe, &g, false),
+                "EF owner {i} empty"
+            );
             let mut g = valid();
             g.ef[i] = single * 3;
-            assert!(ordinary_dn_state_admitted(&moe, &g, false), "EF owner {i} nonzero");
+            assert!(
+                ordinary_dn_state_admitted(&moe, &g, false),
+                "EF owner {i} nonzero"
+            );
         }
         // Missing / extra owners (count mismatch) anywhere in the list.
         for list in 0..2 {
@@ -20876,14 +21237,21 @@ mod tests {
         // n = 1 falls to the per-token AR loop: closed, reuse on and off.
         for physical in [phys, None] {
             assert_closed(&gate("gfx1100", None, true, 1, &open, physical), "n=1");
-            assert_closed(&gate("gfx1201", None, true, 1, &open, physical), "n=1 gfx1201");
+            assert_closed(
+                &gate("gfx1201", None, true, 1, &open, physical),
+                "n=1 gfx1201",
+            );
         }
         // prefill_batched off: the verify-decouple window admits small n on
         // gfx11 (actual n allowed) but the 512-row seam is not: closed. Above
         // the window both are closed. gfx1201 needs the env opt-in for the
         // window and is still closed at the seam.
-        assert!(prefill_batch_scalar_eligible(16, "gfx1100", None, false, true));
-        assert!(!prefill_batch_scalar_eligible(512, "gfx1100", None, false, true));
+        assert!(prefill_batch_scalar_eligible(
+            16, "gfx1100", None, false, true
+        ));
+        assert!(!prefill_batch_scalar_eligible(
+            512, "gfx1100", None, false, true
+        ));
         for physical in [phys, None] {
             for n in [2usize, 16, 32, 33, 40, 600] {
                 assert_closed(
@@ -20891,8 +21259,17 @@ mod tests {
                     "gfx1100 prefill_batched off",
                 );
             }
-            assert_closed(&gate("gfx1201", None, false, 16, &open, physical), "gfx1201 off");
-            assert!(prefill_batch_scalar_eligible(16, "gfx1201", Some("1"), false, true));
+            assert_closed(
+                &gate("gfx1201", None, false, 16, &open, physical),
+                "gfx1201 off",
+            );
+            assert!(prefill_batch_scalar_eligible(
+                16,
+                "gfx1201",
+                Some("1"),
+                false,
+                true
+            ));
             assert_closed(
                 &gate("gfx1201", Some("1"), false, 16, &open, physical),
                 "gfx1201 decouple=1, off",
@@ -20906,8 +21283,14 @@ mod tests {
         // memory fit is queried; reuse off maps nothing.
         for n in [2usize, 3, 16, 33, 100, 4096, 8192] {
             let g = gate("gfx1100", None, true, n, &open, phys);
-            assert!(g.call_eligible && g.maps_kv() && g.needs_default_fit(false), "n={n}");
-            assert!(!g.needs_default_fit(true), "dense widened never queries the MoE fit");
+            assert!(
+                g.call_eligible && g.maps_kv() && g.needs_default_fit(false),
+                "n={n}"
+            );
+            assert!(
+                !g.needs_default_fit(true),
+                "dense widened never queries the MoE fit"
+            );
             let p = g.plan("gfx1100", false, false, None, true);
             assert_eq!(
                 (p.owner, p.max_batch_override, p.alloc_virtual),
@@ -20925,7 +21308,10 @@ mod tests {
             let off = gate("gfx1100", None, true, n, &open, None);
             assert!(off.call_eligible && !off.maps_kv() && !off.needs_default_fit(false));
             let p = off.plan("gfx1100", false, false, Some(target), true);
-            assert_eq!((p.owner, p.max_batch_override, p.alloc_virtual), (WrapperOwner::None, None, false));
+            assert_eq!(
+                (p.owner, p.max_batch_override, p.alloc_virtual),
+                (WrapperOwner::None, None, false)
+            );
             assert!(p.free_virtual);
         }
         // Every caller/capture fact closes the gate at a valid n.
@@ -20969,8 +21355,14 @@ mod tests {
         let target = (4096usize, true);
         let bytes = resident_moe_owner_bytes(&moe, target.0, target.1).unwrap();
         let physical = Some((512usize, true));
-        assert_eq!(wrapper_virtual_credit_bytes(&moe, physical, Some(target), target), bytes);
-        assert_eq!(wrapper_virtual_credit_bytes(&moe, physical, None, target), 0);
+        assert_eq!(
+            wrapper_virtual_credit_bytes(&moe, physical, Some(target), target),
+            bytes
+        );
+        assert_eq!(
+            wrapper_virtual_credit_bytes(&moe, physical, None, target),
+            0
+        );
         for stale in [(1024usize, true), (4096, false), (8192, true), (512, false)] {
             assert_eq!(
                 wrapper_virtual_credit_bytes(&moe, physical, Some(stale), target),
@@ -20979,7 +21371,10 @@ mod tests {
             );
         }
         // The implicit cache already is the target: no virtual owner is kept.
-        assert_eq!(wrapper_virtual_credit_bytes(&moe, Some(target), Some(target), target), 0);
+        assert_eq!(
+            wrapper_virtual_credit_bytes(&moe, Some(target), Some(target), target),
+            0
+        );
         // The plan keeps exactly the credited owner (no free, no alloc).
         let p = plan_wrapper_pbs(&WrapperPbsInputs {
             arch: "gfx1100",
@@ -21052,8 +21447,14 @@ mod tests {
                     eff(&e),
                     "{name} {arch} reuse={reuse} n={n}: default vs explicit 4096"
                 );
-                assert_eq!(d.maps_kv, reuse, "{name} {arch} n={n}: KV mapped iff cache present");
-                assert!(!e.mem_queried, "explicit knob never queries the default fit");
+                assert_eq!(
+                    d.maps_kv, reuse,
+                    "{name} {arch} n={n}: KV mapped iff cache present"
+                );
+                assert!(
+                    !e.mem_queried,
+                    "explicit knob never queries the default fit"
+                );
                 if reuse {
                     assert_eq!(d.wrapper.max_batch_override, Some(RESIDENT_MOE_CHUNK_ROWS));
                     assert!(d.mem_queried);
@@ -21066,7 +21467,10 @@ mod tests {
             let (plan, maps_kv, queried) = wrapper_run(moe, sc, &facts);
             assert!(!maps_kv, "{name} {arch} {what}: no KV mapping");
             assert!(!queried, "{name} {arch} {what}: no memory query");
-            assert_eq!(plan.max_batch_override, None, "{name} {arch} {what}: no override");
+            assert_eq!(
+                plan.max_batch_override, None,
+                "{name} {arch} {what}: no override"
+            );
             assert!(!plan.alloc_virtual, "{name} {arch} {what}: no allocation");
             if sc.reuse_pbs {
                 assert_eq!(plan.owner, WrapperOwner::Physical, "{what}");
@@ -21083,7 +21487,10 @@ mod tests {
                 let mut sc = base(false, reuse, 1);
                 sc.existing_virtual = existing;
                 let facts = sc_static_facts(moe, &sc);
-                assert!(resident_moe_static_decision(&facts).is_some(), "{name} {arch}");
+                assert!(
+                    resident_moe_static_decision(&facts).is_some(),
+                    "{name} {arch}"
+                );
                 assert!(!sc_batched_eligible(moe, &sc, 1));
                 assert_denied(&sc, "n=1");
                 // Explicit knob: also the incumbent.
@@ -21094,7 +21501,8 @@ mod tests {
         }
         // prefill_batched off at the verify-decouple boundary and above: the
         // actual n may be admitted (gfx11 window) while the 512 seam is not.
-        let decouple_env_unset = hipfire_config::developer_var_os("HIPFIRE_MTP_VERIFY_DECOUPLE").is_none();
+        let decouple_env_unset =
+            hipfire_config::developer_var_os("HIPFIRE_MTP_VERIFY_DECOUPLE").is_none();
         for reuse in [false, true] {
             for existing in [None, Some(target)] {
                 for n in [2usize, 16, 32, 33, 40, 600] {
@@ -22456,15 +22864,27 @@ mod tests {
         const S: Option<usize> = Some(WIDENED_COMMIT_ROWS);
         let cap = 262_144;
         // New shape: prefix of whole 512-row runs + 64..=511 tail.
-        assert_eq!(fa_ragged_packet_split(1088, S, 0, 1088, cap), Some((1024, 64)));
-        assert_eq!(fa_ragged_packet_split(1023, S, 4096, 5119, cap), Some((512, 511)));
-        assert_eq!(fa_ragged_packet_split(32768 - 448, S, 7, 32768 - 441, cap), Some((32256, 64)));
+        assert_eq!(
+            fa_ragged_packet_split(1088, S, 0, 1088, cap),
+            Some((1024, 64))
+        );
+        assert_eq!(
+            fa_ragged_packet_split(1023, S, 4096, 5119, cap),
+            Some((512, 511))
+        );
+        assert_eq!(
+            fa_ragged_packet_split(32768 - 448, S, 7, 32768 - 441, cap),
+            Some((32256, 64))
+        );
         // Tail boundaries, aligned, small, and oversized chunks.
         assert_eq!(fa_ragged_packet_split(1087, S, 0, 1087, cap), None);
         assert_eq!(fa_ragged_packet_split(1024, S, 0, 1024, cap), None);
         assert_eq!(fa_ragged_packet_split(511, S, 0, 511, cap), None);
         assert_eq!(fa_ragged_packet_split(576, S, 0, 576, cap), Some((512, 64)));
-        assert_eq!(fa_ragged_packet_split(32768 + 64, S, 0, 32768 + 64, cap), None);
+        assert_eq!(
+            fa_ragged_packet_split(32768 + 64, S, 0, 32768 + 64, cap),
+            None
+        );
         // Authority: only ordinary widened prefill (`Some(512)`).
         assert_eq!(fa_ragged_packet_split(1088, None, 0, 1088, cap), None);
         assert_eq!(fa_ragged_packet_split(1088, Some(256), 0, 1088, cap), None);
@@ -22472,7 +22892,10 @@ mod tests {
         assert_eq!(fa_ragged_packet_split(1088, S, 10, 1088, cap), None);
         assert_eq!(fa_ragged_packet_split(1088, S, 10, 1099, cap), None);
         assert_eq!(fa_ragged_packet_split(1088, S, 1000, 2088, 2087), None);
-        assert_eq!(fa_ragged_packet_split(1088, S, usize::MAX, usize::MAX, usize::MAX), None);
+        assert_eq!(
+            fa_ragged_packet_split(1088, S, usize::MAX, usize::MAX, usize::MAX),
+            None
+        );
 
         // Incumbent predicate is unchanged and never admits the ragged shape.
         assert!(fa_fp8q_incumbent_shape(512, None));

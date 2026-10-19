@@ -27,7 +27,13 @@ use peacemaker_isa::{native, Arch};
 const TRANS_WAIT: &str = "s_waitcnt_depctr depctr_va_vdst(0)";
 
 fn spec(arch: Arch, codec: Codec, kind: Kind, acc: bool, negative: Negative) -> Spec {
-    Spec { arch, codec, kind, acc, negative }
+    Spec {
+        arch,
+        codec,
+        kind,
+        acc,
+        negative,
+    }
 }
 
 fn s1151(codec: Codec, kind: Kind, acc: bool, negative: Negative) -> Spec {
@@ -36,26 +42,62 @@ fn s1151(codec: Codec, kind: Kind, acc: bool, negative: Negative) -> Spec {
 
 #[test]
 fn e8p_gfx1151_names_and_abi() {
-    assert_eq!(Codec::E8p.module(Arch::Gfx1151), "qwen4_moe_iu4_sym_e8p_pm_gfx1151");
-    assert_eq!(s1151(Codec::E8p, Kind::GateUp, false, Negative::None).symbol(), "qwen4_moe_gate_up_silu_iu4_sym_e8p_pm_gfx1151");
-    assert_eq!(s1151(Codec::E8p, Kind::Down, false, Negative::None).symbol(), "qwen4_moe_down_iu4_sym_e8p_pm_gfx1151");
-    assert_eq!(s1151(Codec::E8p, Kind::GateUp, true, Negative::None).symbol(), "qwen4_moe_gate_up_silu_iu4_sym_e8p_pm_gfx1151_acc");
-    assert_eq!(s1151(Codec::E8p, Kind::Down, true, Negative::None).symbol(), "qwen4_moe_down_iu4_sym_e8p_pm_gfx1151_acc");
-    assert_eq!(s1151(Codec::E8p, Kind::Down, true, Negative::None).variant(), "down_e8p_acc");
+    assert_eq!(
+        Codec::E8p.module(Arch::Gfx1151),
+        "qwen4_moe_iu4_sym_e8p_pm_gfx1151"
+    );
+    assert_eq!(
+        s1151(Codec::E8p, Kind::GateUp, false, Negative::None).symbol(),
+        "qwen4_moe_gate_up_silu_iu4_sym_e8p_pm_gfx1151"
+    );
+    assert_eq!(
+        s1151(Codec::E8p, Kind::Down, false, Negative::None).symbol(),
+        "qwen4_moe_down_iu4_sym_e8p_pm_gfx1151"
+    );
+    assert_eq!(
+        s1151(Codec::E8p, Kind::GateUp, true, Negative::None).symbol(),
+        "qwen4_moe_gate_up_silu_iu4_sym_e8p_pm_gfx1151_acc"
+    );
+    assert_eq!(
+        s1151(Codec::E8p, Kind::Down, true, Negative::None).symbol(),
+        "qwen4_moe_down_iu4_sym_e8p_pm_gfx1151_acc"
+    );
+    assert_eq!(
+        s1151(Codec::E8p, Kind::Down, true, Negative::None).variant(),
+        "down_e8p_acc"
+    );
     assert_eq!(gfx11::ARCHES, [Arch::Gfx1100, Arch::Gfx1151]);
     assert_eq!(gfx11::KERNARG_BYTES, 64);
     let layout = s1151(Codec::E8p, Kind::Down, false, Negative::None).kernargs();
     assert_eq!(layout.size, 64);
     assert_eq!(
-        layout.args.last().map(|a| (a.name.as_str(), a.offset, a.size)),
+        layout
+            .args
+            .last()
+            .map(|a| (a.name.as_str(), a.offset, a.size)),
         Some(("n_experts", 60, 4))
     );
     assert_eq!(Codec::ALL.len(), 3, "the legacy module set is unchanged");
-    assert_eq!(Negative::ALL.len(), 4, "the legacy negative set is unchanged");
+    assert_eq!(
+        Negative::ALL.len(),
+        4,
+        "the legacy negative set is unchanged"
+    );
     for kind in Kind::ALL {
-        let (a, b) = (spec(Arch::Gfx1100, Codec::E8p, kind, false, Negative::None), s1151(Codec::E8p, kind, false, Negative::None));
-        assert_eq!(serde_json::to_value(a.kernargs()).unwrap(), serde_json::to_value(b.kernargs()).unwrap(), "{kind:?}: kernarg ABI");
-        assert_eq!((a.threads(), a.lds_bytes(), a.grid(2560, 1536)), (b.threads(), b.lds_bytes(), b.grid(2560, 1536)), "{kind:?}: launch geometry");
+        let (a, b) = (
+            spec(Arch::Gfx1100, Codec::E8p, kind, false, Negative::None),
+            s1151(Codec::E8p, kind, false, Negative::None),
+        );
+        assert_eq!(
+            serde_json::to_value(a.kernargs()).unwrap(),
+            serde_json::to_value(b.kernargs()).unwrap(),
+            "{kind:?}: kernarg ABI"
+        );
+        assert_eq!(
+            (a.threads(), a.lds_bytes(), a.grid(2560, 1536)),
+            (b.threads(), b.lds_bytes(), b.grid(2560, 1536)),
+            "{kind:?}: launch geometry"
+        );
     }
 }
 
@@ -65,21 +107,46 @@ fn only_gfx11_targets_are_admitted() {
         for kind in Kind::ALL {
             let s = spec(arch, Codec::E8p, kind, false, Negative::None);
             assert!(gfx11::emit(s).is_err(), "{arch:?} {kind:?}");
-            assert!(gfx11::validate_launch(s, 2560, 2560, 1, 1536, 1536).is_err(), "{arch:?} {kind:?}");
+            assert!(
+                gfx11::validate_launch(s, 2560, 2560, 1, 1536, 1536).is_err(),
+                "{arch:?} {kind:?}"
+            );
         }
     }
 }
 
 #[test]
 fn launch_admission_is_arch_independent() {
-    let launches = [(2560u32, 2560u32, 1u32, 1536u32, 1536u32), (2560, 640, 10, 32, 17), (2560, 2560, 1, 0, 1536), (100, 2560, 1, 1536, 1536), (2560, 2559, 1, 1536, 1536)];
+    let launches = [
+        (2560u32, 2560u32, 1u32, 1536u32, 1536u32),
+        (2560, 640, 10, 32, 17),
+        (2560, 2560, 1, 0, 1536),
+        (100, 2560, 1, 1536, 1536),
+        (2560, 2559, 1, 1536, 1536),
+    ];
     for kind in Kind::ALL {
         for acc in [false, true] {
             for (m, k, x_row_div, m_total, x_src_rows) in launches {
-                let r = |arch| gfx11::validate_launch(spec(arch, Codec::E8p, kind, acc, Negative::None), m, k, x_row_div, m_total, x_src_rows);
+                let r = |arch| {
+                    gfx11::validate_launch(
+                        spec(arch, Codec::E8p, kind, acc, Negative::None),
+                        m,
+                        k,
+                        x_row_div,
+                        m_total,
+                        x_src_rows,
+                    )
+                };
                 let (a, b) = (r(Arch::Gfx1100), r(Arch::Gfx1151));
-                assert_eq!(a.is_ok(), b.is_ok(), "{kind:?} acc {acc} {:?}", (m, k, x_row_div, m_total, x_src_rows));
-                if let (Err(a), Err(b)) = (a, b) { assert_eq!(a.replace("gfx1100", "gfx1151"), b) }
+                assert_eq!(
+                    a.is_ok(),
+                    b.is_ok(),
+                    "{kind:?} acc {acc} {:?}",
+                    (m, k, x_row_div, m_total, x_src_rows)
+                );
+                if let (Err(a), Err(b)) = (a, b) {
+                    assert_eq!(a.replace("gfx1100", "gfx1151"), b)
+                }
             }
         }
     }
@@ -93,11 +160,23 @@ fn e8p_gfx1151_entries_and_mutations_build_with_the_lds_stage() {
                 let s = s1151(Codec::E8p, kind, acc, negative);
                 let e = gfx11::emit(s).unwrap_or_else(|err| panic!("{s:?}: {err}"));
                 assert_eq!(e.proof.arch, Arch::Gfx1151, "{s:?}");
-                assert!(e.s_text.contains(".group_segment_fixed_size: 1536"), "{s:?}: missing the 1,536 B static LDS");
-                assert!(e.s_text.contains("s_barrier"), "{s:?}: missing the table publication barrier");
+                assert!(
+                    e.s_text.contains(".group_segment_fixed_size: 1536"),
+                    "{s:?}: missing the 1,536 B static LDS"
+                );
+                assert!(
+                    e.s_text.contains("s_barrier"),
+                    "{s:?}: missing the table publication barrier"
+                );
                 assert!(e.s_text.contains("ds_load_b32"), "{s:?}: no LDS table read");
-                assert!(e.s_text.contains(&s.symbol()), "{s:?}: symbol missing from the source");
-                assert!(!e.s_text.contains("gfx1100"), "{s:?}: a gfx1100 name leaked into the gfx1151 source");
+                assert!(
+                    e.s_text.contains(&s.symbol()),
+                    "{s:?}: symbol missing from the source"
+                );
+                assert!(
+                    !e.s_text.contains("gfx1100"),
+                    "{s:?}: a gfx1100 name leaked into the gfx1151 source"
+                );
             }
         }
     }
@@ -109,7 +188,8 @@ fn e8p_gfx1151_entries_and_mutations_build_with_the_lds_stage() {
 /// `s_mov_b32 s4, 0`) pointer index, the expert-pointer load, the first buffer load and the table barrier. The
 /// instruction sequence of the guard is the gfx1100 one (the builder's only gfx1151 delta is the trans-use wait).
 #[test]
-fn expert_guard_is_one_unsigned_compare_before_pointer_load_barrier_and_loads_on_every_gfx11_arch() {
+fn expert_guard_is_one_unsigned_compare_before_pointer_load_barrier_and_loads_on_every_gfx11_arch()
+{
     for arch in gfx11::ARCHES {
         for codec in [Codec::Mq4, Codec::E8p] {
             let negatives: Vec<Negative> = std::iter::once(Negative::None)
@@ -134,26 +214,44 @@ fn expert_guard_is_one_unsigned_compare_before_pointer_load_barrier_and_loads_on
                         let e = gfx11::emit(s).unwrap_or_else(|err| panic!("{s:?}: {err}"));
                         let lines: Vec<&str> = e.s_text.lines().map(str::trim).collect();
                         let at = |p: &str| lines.iter().position(|l| l.starts_with(p));
-                        assert!(e.s_text.contains(".kernarg_segment_size: 64"), "{s:?}: kernarg segment");
+                        assert!(
+                            e.s_text.contains(".kernarg_segment_size: 64"),
+                            "{s:?}: kernarg segment"
+                        );
                         assert_eq!(
-                            lines.iter().filter(|l| l.starts_with("s_cmp_ge_u32 s23, s5")).count(),
+                            lines
+                                .iter()
+                                .filter(|l| l.starts_with("s_cmp_ge_u32 s23, s5"))
+                                .count(),
                             1,
                             "{s:?}: one unsigned guard"
                         );
-                        assert!(!lines.iter().any(|l| l.starts_with("s_cmp_lt_i32 s23, 0")), "{s:?}: old signed compare");
-                        let load = at("s_load_b32 s5, s[0:1], 0x3c").unwrap_or_else(|| panic!("{s:?}: no n_experts load"));
+                        assert!(
+                            !lines.iter().any(|l| l.starts_with("s_cmp_lt_i32 s23, 0")),
+                            "{s:?}: old signed compare"
+                        );
+                        let load = at("s_load_b32 s5, s[0:1], 0x3c")
+                            .unwrap_or_else(|| panic!("{s:?}: no n_experts load"));
                         let cmp = at("s_cmp_ge_u32 s23, s5").unwrap();
                         assert!(load < cmp, "{s:?}: n_experts is loaded before the guard");
-                        assert!(lines[cmp + 1].starts_with("s_cbranch_scc1"), "{s:?}: the guard branches to the exit");
+                        assert!(
+                            lines[cmp + 1].starts_with("s_cbranch_scc1"),
+                            "{s:?}: the guard branches to the exit"
+                        );
                         let pointer_index = if negative == Negative::WrongExpertPointer {
                             at("s_mov_b32 s4, 0")
                         } else {
                             at("s_lshl_b32 s4, s23, 3")
                         }
                         .expect("expert pointer index");
-                        let pointer_load = at("s_load_b64 s[58:59], s[6:7], null").expect("expert pointer load");
+                        let pointer_load =
+                            at("s_load_b64 s[58:59], s[6:7], null").expect("expert pointer load");
                         let first_buffer = at("buffer_load").expect("first buffer load");
-                        for (what, i) in [("pointer index", pointer_index), ("pointer load", pointer_load), ("buffer load", first_buffer)] {
+                        for (what, i) in [
+                            ("pointer index", pointer_index),
+                            ("pointer load", pointer_load),
+                            ("buffer load", first_buffer),
+                        ] {
                             assert!(cmp < i, "{s:?}: guard must precede the {what}");
                         }
                         if codec == Codec::E8p {
@@ -215,17 +313,29 @@ fn expert_guard_cpu_model_rejects_minus_one_min_n_and_n_plus_one_and_passes_n_mi
                         .iter()
                         .position(|l| l.starts_with("s_cmp_ge_u32 s23, s5"))
                         .unwrap_or_else(|| panic!("{s:?}: no guard compare"));
-                    assert!(lines[cmp + 1].starts_with("s_cbranch_scc1"), "{s:?}: SCC set (id >= n) exits");
+                    assert!(
+                        lines[cmp + 1].starts_with("s_cbranch_scc1"),
+                        "{s:?}: SCC set (id >= n) exits"
+                    );
                     for n in [1u32, 2, 5, 512, i32::MAX as u32] {
                         for id in [u32::MAX, i32::MIN as u32, n, n + 1] {
-                            assert!(scalar_compare(lines[cmp], id, n), "{s:?}: id {id:#x} against n_experts {n} must exit");
+                            assert!(
+                                scalar_compare(lines[cmp], id, n),
+                                "{s:?}: id {id:#x} against n_experts {n} must exit"
+                            );
                         }
                         for id in [n - 1, 0] {
-                            assert!(!scalar_compare(lines[cmp], id, n), "{s:?}: id {id:#x} against n_experts {n} must not exit");
+                            assert!(
+                                !scalar_compare(lines[cmp], id, n),
+                                "{s:?}: id {id:#x} against n_experts {n} must not exit"
+                            );
                         }
                     }
                     for id in [0u32, 1, u32::MAX, i32::MIN as u32] {
-                        assert!(scalar_compare(lines[cmp], id, 0), "{s:?}: n = 0, id {id:#x}");
+                        assert!(
+                            scalar_compare(lines[cmp], id, 0),
+                            "{s:?}: n = 0, id {id:#x}"
+                        );
                     }
                     assert!(
                         lines[..cmp]
@@ -243,11 +353,25 @@ fn expert_guard_cpu_model_rejects_minus_one_min_n_and_n_plus_one_and_passes_n_mi
 fn legacy_gfx1151_entries_stay_lds_free_and_mutations_are_codec_scoped() {
     for codec in Codec::ALL {
         for kind in Kind::ALL {
-            let e = gfx11::emit(s1151(codec, kind, false, Negative::None)).expect("legacy entry builds");
-            assert!(e.s_text.contains(".group_segment_fixed_size: 0"), "{codec:?} {kind:?}");
-            assert!(!e.s_text.contains("s_barrier") && !e.s_text.contains("ds_load_b32"), "{codec:?} {kind:?}");
-            for bad in [Negative::WrongLut, Negative::WrongSignMask, Negative::WrongFoldEpoch] {
-                assert!(gfx11::emit(s1151(codec, kind, false, bad)).is_err(), "{codec:?} accepted {bad:?}");
+            let e = gfx11::emit(s1151(codec, kind, false, Negative::None))
+                .expect("legacy entry builds");
+            assert!(
+                e.s_text.contains(".group_segment_fixed_size: 0"),
+                "{codec:?} {kind:?}"
+            );
+            assert!(
+                !e.s_text.contains("s_barrier") && !e.s_text.contains("ds_load_b32"),
+                "{codec:?} {kind:?}"
+            );
+            for bad in [
+                Negative::WrongLut,
+                Negative::WrongSignMask,
+                Negative::WrongFoldEpoch,
+            ] {
+                assert!(
+                    gfx11::emit(s1151(codec, kind, false, bad)).is_err(),
+                    "{codec:?} accepted {bad:?}"
+                );
             }
         }
     }
@@ -259,10 +383,17 @@ fn legacy_gfx1151_entries_stay_lds_free_and_mutations_are_codec_scoped() {
 #[test]
 fn e8p_gfx1151_mutations_change_the_source() {
     for kind in Kind::ALL {
-        let base = gfx11::emit(s1151(Codec::E8p, kind, false, Negative::None)).unwrap().s_text;
+        let base = gfx11::emit(s1151(Codec::E8p, kind, false, Negative::None))
+            .unwrap()
+            .s_text;
         for negative in Negative::E8P {
-            let mutated = gfx11::emit(s1151(Codec::E8p, kind, false, negative)).unwrap().s_text;
-            assert_ne!(base, mutated, "{kind:?} {negative:?} left the source unchanged");
+            let mutated = gfx11::emit(s1151(Codec::E8p, kind, false, negative))
+                .unwrap()
+                .s_text;
+            assert_ne!(
+                base, mutated,
+                "{kind:?} {negative:?} left the source unchanged"
+            );
         }
     }
 }
@@ -271,20 +402,40 @@ fn e8p_gfx1151_mutations_change_the_source() {
 fn wrong_fold_epoch_gfx1151_drops_only_the_activation_sum() {
     for kind in Kind::ALL {
         for acc in [false, true] {
-            let base = gfx11::emit(s1151(Codec::E8p, kind, acc, Negative::None)).unwrap().s_text;
-            let bad = gfx11::emit(s1151(Codec::E8p, kind, acc, Negative::WrongFoldEpoch)).unwrap().s_text;
+            let base = gfx11::emit(s1151(Codec::E8p, kind, acc, Negative::None))
+                .unwrap()
+                .s_text;
+            let bad = gfx11::emit(s1151(Codec::E8p, kind, acc, Negative::WrongFoldEpoch))
+                .unwrap()
+                .s_text;
             let adds = |t: &str| t.matches("v_add_nc_u32_e32").count();
             let movs = |t: &str| t.matches("v_mov_b32_e32").count();
-            assert_eq!(adds(&base), adds(&bad) + 1, "{kind:?} acc {acc}: exactly one `s - MAGIC` add is replaced");
-            assert_eq!(movs(&bad), movs(&base) + 1, "{kind:?} acc {acc}: by exactly one `-MAGIC` move");
-            assert_eq!(base.lines().count(), bad.lines().count(), "{kind:?} acc {acc}: instruction count unchanged");
+            assert_eq!(
+                adds(&base),
+                adds(&bad) + 1,
+                "{kind:?} acc {acc}: exactly one `s - MAGIC` add is replaced"
+            );
+            assert_eq!(
+                movs(&bad),
+                movs(&base) + 1,
+                "{kind:?} acc {acc}: by exactly one `-MAGIC` move"
+            );
+            assert_eq!(
+                base.lines().count(),
+                bad.lines().count(),
+                "{kind:?} acc {acc}: instruction count unchanged"
+            );
         }
     }
 }
 
 /// The gfx1100 source with its arch name swapped and its gfx1100-only trans-use waits removed.
 fn arch_neutral(text: &str, arch: Arch) -> String {
-    text.replace(arch.name(), "ARCH").lines().filter(|l| l.trim() != TRANS_WAIT).collect::<Vec<_>>().join("\n")
+    text.replace(arch.name(), "ARCH")
+        .lines()
+        .filter(|l| l.trim() != TRANS_WAIT)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Every codec/kind/acc/mutation entry: gfx1151 differs from gfx1100 only by the arch name and by the
@@ -294,18 +445,49 @@ fn gfx1151_source_is_the_gfx1100_source_minus_arch_forced_deltas() {
     let mut dropped = 0usize;
     let mut entries = 0usize;
     for codec in Codec::ALL.into_iter().chain([Codec::E8p]) {
-        let negatives: Vec<Negative> = if codec == Codec::E8p { std::iter::once(Negative::None).chain(Negative::E8P).collect() } else { vec![Negative::None] };
+        let negatives: Vec<Negative> = if codec == Codec::E8p {
+            std::iter::once(Negative::None)
+                .chain(Negative::E8P)
+                .collect()
+        } else {
+            vec![Negative::None]
+        };
         for negative in negatives {
             for kind in Kind::ALL {
                 for acc in [false, true] {
                     let a = gfx11::emit(spec(Arch::Gfx1100, codec, kind, acc, negative)).unwrap();
                     let b = gfx11::emit(s1151(codec, kind, acc, negative)).unwrap();
                     let id = format!("{codec:?} {kind:?} acc {acc} {negative:?}");
-                    let (wa, wb) = (a.s_text.matches(TRANS_WAIT).count(), b.s_text.matches(TRANS_WAIT).count());
+                    let (wa, wb) = (
+                        a.s_text.matches(TRANS_WAIT).count(),
+                        b.s_text.matches(TRANS_WAIT).count(),
+                    );
                     assert_eq!(wb, 0, "{id}: gfx1151 has no VALUTransUseHazard wait");
-                    assert_eq!(arch_neutral(&a.s_text, Arch::Gfx1100), arch_neutral(&b.s_text, Arch::Gfx1151), "{id}: unexpected delta beyond the trans-use waits");
-                    assert_eq!(a.s_text.lines().count(), b.s_text.lines().count() + wa, "{id}");
-                    assert_eq!((a.shape.next_free_vgpr, a.shape.next_free_sgpr, a.shape.wmma, a.shape.vmem), (b.shape.next_free_vgpr, b.shape.next_free_sgpr, b.shape.wmma, b.shape.vmem), "{id}: register plan and operation census");
+                    assert_eq!(
+                        arch_neutral(&a.s_text, Arch::Gfx1100),
+                        arch_neutral(&b.s_text, Arch::Gfx1151),
+                        "{id}: unexpected delta beyond the trans-use waits"
+                    );
+                    assert_eq!(
+                        a.s_text.lines().count(),
+                        b.s_text.lines().count() + wa,
+                        "{id}"
+                    );
+                    assert_eq!(
+                        (
+                            a.shape.next_free_vgpr,
+                            a.shape.next_free_sgpr,
+                            a.shape.wmma,
+                            a.shape.vmem
+                        ),
+                        (
+                            b.shape.next_free_vgpr,
+                            b.shape.next_free_sgpr,
+                            b.shape.wmma,
+                            b.shape.vmem
+                        ),
+                        "{id}: register plan and operation census"
+                    );
                     assert_eq!(a.shape.barriers, b.shape.barriers, "{id}");
                     dropped += wa;
                     entries += 1;
@@ -314,7 +496,10 @@ fn gfx1151_source_is_the_gfx1100_source_minus_arch_forced_deltas() {
         }
     }
     // 3 legacy codecs x 4 entries + E8P (candidate + 6 mutations) x 4 entries.
-    assert!(entries == 12 + 28 && dropped > 0, "{entries} entries, {dropped} dropped trans-use waits");
+    assert!(
+        entries == 12 + 28 && dropped > 0,
+        "{entries} entries, {dropped} dropped trans-use waits"
+    );
 }
 
 /// The module of one codec/negative on `arch`, in the committed order (BF16 gate/up, BF16 down, `_acc` pair).
@@ -343,12 +528,25 @@ fn committed_e8p_images_are_byte_identical_to_the_emission() {
         let want = image(arch, &module_source(arch, Codec::E8p, Negative::None));
         let file = dir.join(format!("{module}.hxaco"));
         let committed = std::fs::read(&file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
-        assert!(committed == want, "{} differs from the emitted bundle", file.display());
+        assert!(
+            committed == want,
+            "{} differs from the emitted bundle",
+            file.display()
+        );
         for negative in Negative::E8P {
-            let file = dir.join(format!("qwen4_moe_{}_negative/{}/{module}.hxaco", arch.name(), negative.tag()));
-            let committed = std::fs::read(&file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+            let file = dir.join(format!(
+                "qwen4_moe_{}_negative/{}/{module}.hxaco",
+                arch.name(),
+                negative.tag()
+            ));
+            let committed =
+                std::fs::read(&file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
             let want = image(arch, &module_source(arch, Codec::E8p, negative));
-            assert!(committed == want, "{} differs from the emitted bundle", file.display());
+            assert!(
+                committed == want,
+                "{} differs from the emitted bundle",
+                file.display()
+            );
         }
     }
 }
@@ -359,8 +557,15 @@ fn e8p_images_end_with_the_code_end_guard() {
     for arch in gfx11::ARCHES {
         let elf = native::assemble(&module_source(arch, Codec::E8p, Negative::None), arch).unwrap();
         let text = text_section(&elf);
-        assert_eq!(text.len() % 128, 0, "{arch:?}: .text not a whole instruction-cache line count");
-        let guard = text.rchunks(4).take_while(|w| *w == 0xbf9f_0000u32.to_le_bytes()).count();
+        assert_eq!(
+            text.len() % 128,
+            0,
+            "{arch:?}: .text not a whole instruction-cache line count"
+        );
+        let guard = text
+            .rchunks(4)
+            .take_while(|w| *w == 0xbf9f_0000u32.to_le_bytes())
+            .count();
         assert!(guard >= 96, "{arch:?}: {guard} trailing s_code_end dwords");
     }
 }

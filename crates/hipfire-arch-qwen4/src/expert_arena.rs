@@ -97,13 +97,22 @@ impl ExpertArenaLayer {
     /// `arch` does not serve and a layer holding two different cold codecs.
     /// Absent (pruned, zero-byte) experts count as MQ4 and never name a cold codec.
     pub fn cold_codec(&self, arch: &str) -> Result<u8, ExpertArenaError> {
-        self.cold_codec_with(arch, rdna_compute::slab_admission::SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED)
+        self.cold_codec_with(
+            arch,
+            rdna_compute::slab_admission::SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED,
+        )
     }
 
     /// [`Self::cold_codec`] with the gfx1151 E8P receipts decision given explicitly (the pure
     /// matrix, see [`rdna_compute::slab_admission::qwen4_slab_codec_admitted_with`]).
-    pub fn cold_codec_with(&self, arch: &str, gfx1151_e8p_landed: bool) -> Result<u8, ExpertArenaError> {
-        use rdna_compute::slab_admission::{qwen4_slab_codec_admitted_with, qwen4_slab_layer_cold_codec_with};
+    pub fn cold_codec_with(
+        &self,
+        arch: &str,
+        gfx1151_e8p_landed: bool,
+    ) -> Result<u8, ExpertArenaError> {
+        use rdna_compute::slab_admission::{
+            qwen4_slab_codec_admitted_with, qwen4_slab_layer_cold_codec_with,
+        };
         let codecs = self.codec_table()?;
         for expert in &self.experts {
             if !qwen4_slab_codec_admitted_with(arch, expert.codec()?, gfx1151_e8p_landed) {
@@ -113,16 +122,18 @@ impl ExpertArenaLayer {
                 });
             }
         }
-        qwen4_slab_layer_cold_codec_with(arch, &codecs, gfx1151_e8p_landed).map_err(|error| match error {
-            rdna_compute::SlabLayerCodecError::MixedCold { first, second } => {
-                ExpertArenaError::MixedCold { first, second }
-            }
-            // Every expert was admitted above: only an unknown architecture
-            // with no experts reaches here.
-            rdna_compute::SlabLayerCodecError::NotAdmitted { .. } => {
-                ExpertArenaError::ArchRefused {
-                    format: ExpertFormat::Mq4Xts,
-                    arch: arch.to_string(),
+        qwen4_slab_layer_cold_codec_with(arch, &codecs, gfx1151_e8p_landed).map_err(|error| {
+            match error {
+                rdna_compute::SlabLayerCodecError::MixedCold { first, second } => {
+                    ExpertArenaError::MixedCold { first, second }
+                }
+                // Every expert was admitted above: only an unknown architecture
+                // with no experts reaches here.
+                rdna_compute::SlabLayerCodecError::NotAdmitted { .. } => {
+                    ExpertArenaError::ArchRefused {
+                        format: ExpertFormat::Mq4Xts,
+                        arch: arch.to_string(),
+                    }
                 }
             }
         })
@@ -264,12 +275,19 @@ impl ExpertArenaPlan {
     /// ([`rdna_compute::qwen4_slab_codec_admitted`]), or one layer holding two
     /// different cold codecs (W3 and E8P share a layer's single cold bucket).
     pub fn check_executable(&self, arch: &str) -> Result<(), ExpertArenaError> {
-        self.check_executable_with(arch, rdna_compute::slab_admission::SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED)
+        self.check_executable_with(
+            arch,
+            rdna_compute::slab_admission::SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED,
+        )
     }
 
     /// [`Self::check_executable`] with the gfx1151 E8P receipts decision given explicitly (the
     /// pure matrix, see [`rdna_compute::slab_admission::qwen4_slab_codec_admitted_with`]).
-    pub fn check_executable_with(&self, arch: &str, gfx1151_e8p_landed: bool) -> Result<(), ExpertArenaError> {
+    pub fn check_executable_with(
+        &self,
+        arch: &str,
+        gfx1151_e8p_landed: bool,
+    ) -> Result<(), ExpertArenaError> {
         for layer in &self.layers {
             layer.cold_codec_with(arch, gfx1151_e8p_landed)?;
         }
@@ -473,13 +491,19 @@ mod tests {
         assert_eq!(w3.check_executable_with("gfx1151", true), Ok(()));
         assert_eq!(
             e8p.check_executable_with("gfx1151", false),
-            Err(ExpertArenaError::ArchRefused { format: ExpertFormat::E8pI4, arch: "gfx1151".into() })
+            Err(ExpertArenaError::ArchRefused {
+                format: ExpertFormat::E8pI4,
+                arch: "gfx1151".into()
+            })
         );
         assert_eq!(e8p.check_executable_with("gfx1151", true), Ok(()));
         // The public entry reads the one receipts constant.
         assert_eq!(
             e8p.check_executable("gfx1151"),
-            e8p.check_executable_with("gfx1151", rdna_compute::slab_admission::SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED)
+            e8p.check_executable_with(
+                "gfx1151",
+                rdna_compute::slab_admission::SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED
+            )
         );
         // The receipts switch never changes another arch.
         for landed in [false, true] {
@@ -510,9 +534,15 @@ mod tests {
         assert_eq!(cold(&w3, "gfx1151"), Ok(CODEC_W3));
         assert_eq!(
             e8p.layers()[0].cold_codec_with("gfx1151", false),
-            Err(ExpertArenaError::ArchRefused { format: ExpertFormat::E8pI4, arch: "gfx1151".into() })
+            Err(ExpertArenaError::ArchRefused {
+                format: ExpertFormat::E8pI4,
+                arch: "gfx1151".into()
+            })
         );
-        assert_eq!(e8p.layers()[0].cold_codec_with("gfx1151", true), Ok(CODEC_E8P));
+        assert_eq!(
+            e8p.layers()[0].cold_codec_with("gfx1151", true),
+            Ok(CODEC_E8P)
+        );
     }
 
     /// One layer holding both W3 and E8P has two cold codecs for its one cold
@@ -552,13 +582,19 @@ mod tests {
         // expert is the arch refusal.
         assert_eq!(
             both.cold_codec_with("gfx1151", false),
-            Err(ExpertArenaError::ArchRefused { format: ExpertFormat::E8pI4, arch: "gfx1151".into() })
+            Err(ExpertArenaError::ArchRefused {
+                format: ExpertFormat::E8pI4,
+                arch: "gfx1151".into()
+            })
         );
         // With the receipts landed gfx1151 serves both codecs, so a W3 + E8P layer is the
         // two-cold-codecs refusal like gfx1201.
         assert_eq!(
             both.cold_codec_with("gfx1151", true),
-            Err(ExpertArenaError::MixedCold { first: CODEC_W3, second: CODEC_E8P })
+            Err(ExpertArenaError::MixedCold {
+                first: CODEC_W3,
+                second: CODEC_E8P
+            })
         );
         let w3 = layer(0, &[ExpertFormat::Mq4Xts, ExpertFormat::Mq3I4]);
         let e8p = layer(0, &[ExpertFormat::Mq4Xts, ExpertFormat::E8pI4]);

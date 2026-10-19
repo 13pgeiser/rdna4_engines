@@ -220,7 +220,6 @@ fn run() -> Result<(), String> {
         }
     }
 
-
     // MoE forward
     let fwd_t0 = Instant::now();
     let decode_calls = parent_moe_forward_counted(
@@ -243,9 +242,8 @@ fn run() -> Result<(), String> {
     // Download output
     let y = {
         let mut data = vec![0.0f32; ROWS * PARENT_DIM];
-        let bytes = unsafe {
-            std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, data.len() * 4)
-        };
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, data.len() * 4) };
         gpu.hip
             .memcpy_dtoh(bytes, &out.buf)
             .map_err(|e| format!("deepseek4 parent: download out: {e:?}"))?;

@@ -18,10 +18,9 @@
 //! The panel byte layout is owned by `peacemaker-npu` `Geometry::pack_b` and is not re-derived here; panel
 //! tests check structure, determinism and the `ws` vector only.
 
-
 use hipfire_arch_qwen4::npu_trunk::{
-    pack_matrix, pack_shape, pack_shape_with_contract, pack_trunk, pack_trunk_with_contract, EpilogueContract, Family,
-    FamilyMask, LayerTrunkRefs, MatrixRef, Shape, PANEL_COLS, TRUNK_K,
+    pack_matrix, pack_shape, pack_shape_with_contract, pack_trunk, pack_trunk_with_contract,
+    EpilogueContract, Family, FamilyMask, LayerTrunkRefs, MatrixRef, Shape, PANEL_COLS, TRUNK_K,
 };
 
 mod oracle {
@@ -105,7 +104,12 @@ mod oracle {
     pub fn pack_group(codes: &[u8; 256], payload: &mut [u8]) {
         for i in (0..256).step_by(4) {
             let bo = (i / 4) * 3;
-            let (q0, q1, q2, q3) = (codes[i] & 63, codes[i + 1] & 63, codes[i + 2] & 63, codes[i + 3] & 63);
+            let (q0, q1, q2, q3) = (
+                codes[i] & 63,
+                codes[i + 1] & 63,
+                codes[i + 2] & 63,
+                codes[i + 3] & 63,
+            );
             payload[bo] = q0 | (q1 << 6);
             payload[bo + 1] = (q1 >> 2) | (q2 << 4);
             payload[bo + 2] = (q2 >> 4) | (q3 << 2);
@@ -144,7 +148,11 @@ mod oracle {
     pub fn decode_mq6(blob: &[u8], m: usize, k: usize) -> DecodedWeights {
         assert_eq!(blob.len(), m * (k / 256) * GROUP_BYTES);
         let epochs = k / 128;
-        let mut out = DecodedWeights { codes: vec![0; m * k], s: vec![0.0; m * epochs], z: vec![0.0; m * epochs] };
+        let mut out = DecodedWeights {
+            codes: vec![0; m * k],
+            s: vec![0.0; m * epochs],
+            z: vec![0.0; m * epochs],
+        };
         let mut q = [0u8; 256];
         let mut q2 = [0u8; 256];
         for (gi, g) in blob.chunks_exact(GROUP_BYTES).enumerate() {
@@ -172,7 +180,9 @@ mod oracle {
         let mut w8 = vec![0i8; m * k];
         let mut ws = vec![0f32; m];
         for n in 0..m {
-            let wf = |i: usize| (w.codes[n * k + i] as f32) * w.s[n * epochs + i / 128] + w.z[n * epochs + i / 128];
+            let wf = |i: usize| {
+                (w.codes[n * k + i] as f32) * w.s[n * epochs + i / 128] + w.z[n * epochs + i / 128]
+            };
             let absmax = (0..k).map(|i| wf(i).abs()).fold(0.0f32, f32::max);
             let wsn = (absmax as f64 / 127.0) as f32;
             ws[n] = wsn;
@@ -268,7 +278,11 @@ fn realistic_group(rng: &mut Rng, rot: usize) -> Group {
         hdr[2 * h] = sc16;
         hdr[2 * h + 1] = z16;
     }
-    let codes = if rot == usize::MAX { random_codes(rng) } else { all_codes(rot) };
+    let codes = if rot == usize::MAX {
+        random_codes(rng)
+    } else {
+        all_codes(rot)
+    };
     Group { hdr, codes }
 }
 
@@ -295,11 +309,20 @@ fn check_against_oracle(label: &str, blob: &[u8], m: usize, k: usize) -> (Vec<i8
         let (a, b) = (&w8[n * k..(n + 1) * k], &w8_ref[n * k..(n + 1) * k]);
         if a != b {
             let i = (0..k).find(|&i| a[i] != b[i]).unwrap();
-            panic!("{label}: w8[{n}][{i}] = {}, oracle {} (ws {:e})", a[i], b[i], ws_ref[n]);
+            panic!(
+                "{label}: w8[{n}][{i}] = {}, oracle {} (ws {:e})",
+                a[i], b[i], ws_ref[n]
+            );
         }
-        assert!(a.iter().all(|&v| v != i8::MIN), "{label}: -128 code in row {n}");
+        assert!(
+            a.iter().all(|&v| v != i8::MIN),
+            "{label}: -128 code in row {n}"
+        );
         if ws[n] == 0.0 {
-            assert!(a.iter().all(|&v| v == 0), "{label}: ws==0 row {n} must have zero codes");
+            assert!(
+                a.iter().all(|&v| v == 0),
+                "{label}: ws==0 row {n} must have zero codes"
+            );
         }
     }
     (w8, ws)
@@ -312,22 +335,41 @@ fn check_against_oracle(label: &str, blob: &[u8], m: usize, k: usize) -> (Vec<i8
 #[test]
 fn oracle_self_check_roundtrips_generated_codes() {
     let mut rng = Rng::new(0x5eed);
-    let groups: Vec<Group> = (0..16).map(|i| realistic_group(&mut rng, if i % 2 == 0 { i } else { usize::MAX })).collect();
+    let groups: Vec<Group> = (0..16)
+        .map(|i| realistic_group(&mut rng, if i % 2 == 0 { i } else { usize::MAX }))
+        .collect();
     let blob = blob_of(&groups);
     let dec = decode_mq6(&blob, 4, 1024);
     for (gi, g) in groups.iter().enumerate() {
-        assert_eq!(dec.codes[gi * 256..(gi + 1) * 256], g.codes[..], "group {gi}");
+        assert_eq!(
+            dec.codes[gi * 256..(gi + 1) * 256],
+            g.codes[..],
+            "group {gi}"
+        );
         assert_eq!(dec.s[gi * 2].to_bits(), f16_bits_to_f32(g.hdr[0]).to_bits());
-        assert_eq!(dec.z[gi * 2 + 1].to_bits(), f16_bits_to_f32(g.hdr[3]).to_bits());
+        assert_eq!(
+            dec.z[gi * 2 + 1].to_bits(),
+            f16_bits_to_f32(g.hdr[3]).to_bits()
+        );
     }
 }
 
 #[test]
 fn random_finite_headers_all_f16_magnitudes() {
-    for (seed, (m, k)) in [(1u64, (48usize, TRUNK_K)), (2, (17, 256)), (3, (9, 768)), (4, (1, TRUNK_K))] {
+    for (seed, (m, k)) in [
+        (1u64, (48usize, TRUNK_K)),
+        (2, (17, 256)),
+        (3, (9, 768)),
+        (4, (1, TRUNK_K)),
+    ] {
         let mut rng = Rng::new(0xa11c0de ^ seed);
         let blob = random_blob_fast(&mut rng, m, k);
-        check_against_oracle(&format!("random_finite seed={seed} m={m} k={k}"), &blob, m, k);
+        check_against_oracle(
+            &format!("random_finite seed={seed} m={m} k={k}"),
+            &blob,
+            m,
+            k,
+        );
     }
 }
 
@@ -370,7 +412,14 @@ fn zero_rows_and_degenerate_scales() {
     let mut groups = Vec::new();
     let mk_row = |rng: &mut Rng, hdr: [u16; 4], random: bool| -> Vec<Group> {
         (0..ngroups)
-            .map(|i| Group { hdr, codes: if random { random_codes(rng) } else { all_codes(i) } })
+            .map(|i| Group {
+                hdr,
+                codes: if random {
+                    random_codes(rng)
+                } else {
+                    all_codes(i)
+                },
+            })
             .collect()
     };
     // 0: +0 scales/zeros, random codes. 1: -0 headers. 2: s=0 but z nonzero (constant row).
@@ -378,10 +427,17 @@ fn zero_rows_and_degenerate_scales() {
     groups.extend(mk_row(&mut rng, [0, 0, 0, 0], true));
     groups.extend(mk_row(&mut rng, [0x8000, 0x8000, 0x8000, 0x8000], true));
     groups.extend(mk_row(&mut rng, [0, f16(0.75), 0, f16(-0.75)], true));
-    groups.extend((0..ngroups).map(|_| Group { hdr: [f16(1.5), 0, f16(-2.0), 0], codes: [0; 256] }));
+    groups.extend((0..ngroups).map(|_| Group {
+        hdr: [f16(1.5), 0, f16(-2.0), 0],
+        codes: [0; 256],
+    }));
     groups.extend(mk_row(&mut rng, [0x0001, 0x0001, 0x8001, 0x0003], true));
     groups.extend(mk_row(&mut rng, [0, 0x8001, 0, 0x8001], false));
-    groups.extend(mk_row(&mut rng, [f16(0.125), f16(-1.0), f16(0.25), f16(-2.0)], true));
+    groups.extend(mk_row(
+        &mut rng,
+        [f16(0.125), f16(-1.0), f16(0.25), f16(-2.0)],
+        true,
+    ));
     // Zero row between two nonzero rows with all-zero scale on one half only.
     groups.extend(mk_row(&mut rng, [0, 0, f16(1.0), f16(-1.0)], true));
     let m = groups.len() / ngroups;
@@ -400,9 +456,18 @@ fn huge_outlier_rows() {
     let tiny = [f16(2f32.powi(-14)), 0, f16(2f32.powi(-14)), 0];
     let mut groups = Vec::new();
     // Rows: (group, position, positive?) of one outlier amid tiny weights.
-    for &(og, pos, neg) in &[(0usize, 0usize, false), (3, 127, true), (4, 128, false), (ngroups - 1, 255, true), (5, 77, false)] {
+    for &(og, pos, neg) in &[
+        (0usize, 0usize, false),
+        (3, 127, true),
+        (4, 128, false),
+        (ngroups - 1, 255, true),
+        (5, 77, false),
+    ] {
         for gi in 0..ngroups {
-            let mut g = Group { hdr: tiny, codes: random_codes(&mut Rng::new(0x1234 + gi as u64 + pos as u64)) };
+            let mut g = Group {
+                hdr: tiny,
+                codes: random_codes(&mut Rng::new(0x1234 + gi as u64 + pos as u64)),
+            };
             if gi == og {
                 let half = pos / 128;
                 let big = if neg { 0xfbff } else { 0x7bff }; // +-65504 = f16 max finite
@@ -417,7 +482,10 @@ fn huge_outlier_rows() {
     }
     // Largest possible |w| = 63*65504 + 65504 with the offset sharing the sign: same-sign outlier z.
     for gi in 0..ngroups {
-        let mut g = Group { hdr: tiny, codes: random_codes(&mut Rng::new(0x99 + gi as u64)) };
+        let mut g = Group {
+            hdr: tiny,
+            codes: random_codes(&mut Rng::new(0x99 + gi as u64)),
+        };
         if gi == 2 {
             g.hdr[0] = 0x7bff;
             g.hdr[1] = 0x7bff;
@@ -430,7 +498,11 @@ fn huge_outlier_rows() {
     // The outlier saturates at +-127.
     for n in 0..m {
         let row = &w8[n * k..(n + 1) * k];
-        assert_eq!(row.iter().map(|&v| (v as i32).abs()).max(), Some(127), "row {n}");
+        assert_eq!(
+            row.iter().map(|&v| (v as i32).abs()).max(),
+            Some(127),
+            "row {n}"
+        );
         assert!(ws[n] > 100.0);
     }
 }
@@ -449,7 +521,12 @@ fn exact_round_ties_even_rows() {
             let sg = if neg { -1.0 } else { 1.0 };
             for gi in 0..ngroups {
                 // Same header in every group: half 0 w = (q + 0.5) u, half 1 w = (2q + 1) u, |w|max = 127 u.
-                let hdr = [f16(sg * u), f16(sg * 0.5 * u), f16(sg * 2.0 * u), f16(sg * u)];
+                let hdr = [
+                    f16(sg * u),
+                    f16(sg * 0.5 * u),
+                    f16(sg * 2.0 * u),
+                    f16(sg * u),
+                ];
                 let mut codes = all_codes(gi);
                 if gi == 0 {
                     codes[128 + 5] = 63;
@@ -468,9 +545,17 @@ fn exact_round_ties_even_rows() {
         for q in 0..64usize {
             // Group 0, half 0, position j has code (j % 64): j = q.
             let expect = (q as f32 + 0.5).round_ties_even() as i8;
-            assert_eq!(row[q], if neg { -expect } else { expect }, "row {n} (e={e}, neg={neg}) code {q}: tie to even");
+            assert_eq!(
+                row[q],
+                if neg { -expect } else { expect },
+                "row {n} (e={e}, neg={neg}) code {q}: tie to even"
+            );
         }
-        assert_eq!(&row[0..4], if neg { &[0, -2, -2, -4] } else { &[0, 2, 2, 4] }, "row {n}");
+        assert_eq!(
+            &row[0..4],
+            if neg { &[0, -2, -2, -4] } else { &[0, 2, 2, 4] },
+            "row {n}"
+        );
         assert_eq!(row[128 + 5], if neg { -127 } else { 127 });
     }
 }
@@ -483,8 +568,14 @@ fn edge_shapes_and_invalid_arguments() {
     let mut rng = Rng::new(7);
     let good = random_blob_fast(&mut rng, 2, 256);
     let short = good[..good.len() - 1].to_vec();
-    assert!(std::panic::catch_unwind(|| pack_matrix(&short, 2, 256)).is_err(), "short blob must panic");
-    assert!(std::panic::catch_unwind(|| pack_matrix(&good, 2, 255)).is_err(), "k not a multiple of 256 must panic");
+    assert!(
+        std::panic::catch_unwind(|| pack_matrix(&short, 2, 256)).is_err(),
+        "short blob must panic"
+    );
+    assert!(
+        std::panic::catch_unwind(|| pack_matrix(&good, 2, 255)).is_err(),
+        "k not a multiple of 256 must panic"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -509,7 +600,15 @@ fn shape_data(shape: Shape, seed: u64) -> ShapeData {
 }
 
 fn refs(d: &ShapeData) -> Vec<MatrixRef<'_>> {
-    d.blobs.iter().map(|(f, m, b)| MatrixRef { family: *f, mq6: b, m: *m, k: TRUNK_K }).collect()
+    d.blobs
+        .iter()
+        .map(|(f, m, b)| MatrixRef {
+            family: *f,
+            mq6: b,
+            m: *m,
+            k: TRUNK_K,
+        })
+        .collect()
 }
 
 fn parts_of(map: &hipfire_arch_qwen4::npu_trunk::ColumnMap) -> Vec<(u32, u32)> {
@@ -525,7 +624,13 @@ fn grid_ws(raw: f32) -> f32 {
 fn expected_ws(blobs: &[(Family, usize, Vec<u8>)]) -> Vec<Vec<f32>> {
     blobs
         .iter()
-        .map(|(_, m, b)| wprep_w8(&decode_mq6(b, *m, TRUNK_K), *m, TRUNK_K).1.into_iter().map(grid_ws).collect())
+        .map(|(_, m, b)| {
+            wprep_w8(&decode_mq6(b, *m, TRUNK_K), *m, TRUNK_K)
+                .1
+                .into_iter()
+                .map(grid_ws)
+                .collect()
+        })
         .collect()
 }
 
@@ -546,16 +651,31 @@ fn pack_shape_full_mask_matches_oracle_ws_and_structure() {
         assert!(map.padded_cols() >= useful && map.padded_cols() % PANEL_COLS == 0);
         assert_eq!(packed.panels.len(), map.panel_count());
         assert_eq!(packed.panels.len() * PANEL_COLS, map.padded_cols());
-        assert!(packed.panels.iter().all(|p| p.len() == packed.panels[0].len() && !p.is_empty()));
-        assert_eq!(packed.ws.len(), map.padded_cols(), "ws is padded to the panel multiple");
+        assert!(packed
+            .panels
+            .iter()
+            .all(|p| p.len() == packed.panels[0].len() && !p.is_empty()));
+        assert_eq!(
+            packed.ws.len(),
+            map.padded_cols(),
+            "ws is padded to the panel multiple"
+        );
         let mut col = 0;
         for (ws_ref, (_, m, _)) in expected_ws(&d.blobs).iter().zip(&d.blobs) {
             for n in 0..*m {
-                assert_eq!(packed.ws[col + n].to_bits(), ws_ref[n].to_bits(), "{shape:?} fused col {}", col + n);
+                assert_eq!(
+                    packed.ws[col + n].to_bits(),
+                    ws_ref[n].to_bits(),
+                    "{shape:?} fused col {}",
+                    col + n
+                );
             }
             col += m;
         }
-        assert!(packed.ws[useful..].iter().all(|&w| w == 0.0), "{shape:?}: padded ws must be zero");
+        assert!(
+            packed.ws[useful..].iter().all(|&w| w == 0.0),
+            "{shape:?}: padded ws must be zero"
+        );
         // locate() agrees with the family boundaries.
         let mut c0 = 0;
         for &(f, m, _) in &d.blobs {
@@ -564,17 +684,27 @@ fn pack_shape_full_mask_matches_oracle_ws_and_structure() {
             let _ = f;
             c0 += m;
         }
-        assert!(map.locate(map.useful_cols()).is_none(), "padding columns belong to no projection");
+        assert!(
+            map.locate(map.useful_cols()).is_none(),
+            "padding columns belong to no projection"
+        );
         // Deterministic.
         let again = pack_shape(shape, &mats, mask).ok().expect("repack");
-        assert!(again.panels == packed.panels && again.ws == packed.ws, "{shape:?}: nondeterministic");
+        assert!(
+            again.panels == packed.panels && again.ws == packed.ws,
+            "{shape:?}: nondeterministic"
+        );
         // The explicit contract is the default; scales are the grid15-up decomposition of `ws`.
-        let direct = pack_shape_with_contract(EpilogueContract::Bf16Direct, shape, &mats, mask).unwrap();
+        let direct =
+            pack_shape_with_contract(EpilogueContract::Bf16Direct, shape, &mats, mask).unwrap();
         assert!(direct.panels == packed.panels && direct.ws == packed.ws);
         assert_eq!(direct.scales.len(), map.padded_cols());
         for (&rounded, &(sm, se)) in direct.ws.iter().zip(&direct.scales) {
             assert_eq!(rounded, (f64::from(sm) * 2f64.powi(i32::from(se))) as f32);
-            assert_eq!((sm, se), peacemaker_npu::kernels::w8a8_epi::grid15_up(rounded));
+            assert_eq!(
+                (sm, se),
+                peacemaker_npu::kernels::w8a8_epi::grid15_up(rounded)
+            );
         }
     }
 }
@@ -588,7 +718,12 @@ fn pack_shape_single_family_masks_and_validation() {
         for (fi, &(f, m, _)) in d.blobs.iter().enumerate() {
             let mask = FamilyMask::from(f);
             // Unselected entries may be omitted.
-            let only = vec![MatrixRef { family: all[fi].family, mq6: all[fi].mq6, m: all[fi].m, k: all[fi].k }];
+            let only = vec![MatrixRef {
+                family: all[fi].family,
+                mq6: all[fi].mq6,
+                m: all[fi].m,
+                k: all[fi].k,
+            }];
             let packed = match pack_shape(shape, &only, mask) {
                 Ok(p) => p,
                 Err(e) => panic!("{shape:?} family #{fi}: {e}"),
@@ -598,42 +733,79 @@ fn pack_shape_single_family_masks_and_validation() {
             assert_eq!(packed.panels.len(), map.panel_count());
             assert_eq!(packed.ws.len(), map.padded_cols());
             // The selected columns' ws sit at the column map's own offsets.
-            let (c0, n) = map.parts.iter().map(|&(_, c, n)| (c as usize, n as usize)).next().unwrap();
+            let (c0, n) = map
+                .parts
+                .iter()
+                .map(|&(_, c, n)| (c as usize, n as usize))
+                .next()
+                .unwrap();
             assert_eq!(n, m);
             for r in 0..m {
-                assert_eq!(packed.ws[c0 + r].to_bits(), ws_all[fi][r].to_bits(), "{shape:?} fam #{fi} row {r}");
+                assert_eq!(
+                    packed.ws[c0 + r].to_bits(),
+                    ws_all[fi][r].to_bits(),
+                    "{shape:?} fam #{fi} row {r}"
+                );
             }
             // Full set given but only one selected: also accepted, same result.
             let with_all = pack_shape(shape, &all, mask).ok().expect("superset refs");
             assert!(with_all.panels == packed.panels && with_all.ws == packed.ws);
             // Selected family missing => error.
-            assert!(pack_shape(shape, &[], mask).is_err(), "{shape:?} #{fi}: missing selected family");
+            assert!(
+                pack_shape(shape, &[], mask).is_err(),
+                "{shape:?} #{fi}: missing selected family"
+            );
         }
         // Zero selected columns => zero panels.
-        let none = pack_shape(shape, &[], FamilyMask::NONE).ok().expect("empty mask");
+        let none = pack_shape(shape, &[], FamilyMask::NONE)
+            .ok()
+            .expect("empty mask");
         assert!(none.panels.is_empty());
 
         // Validation of the full mask.
         let mask = FamilyMask::ALL;
         let mut dup = refs(&d);
-        dup.push(MatrixRef { family: all[0].family, mq6: all[0].mq6, m: all[0].m, k: all[0].k });
-        assert!(pack_shape(shape, &dup, mask).is_err(), "{shape:?}: duplicate family");
+        dup.push(MatrixRef {
+            family: all[0].family,
+            mq6: all[0].mq6,
+            m: all[0].m,
+            k: all[0].k,
+        });
+        assert!(
+            pack_shape(shape, &dup, mask).is_err(),
+            "{shape:?}: duplicate family"
+        );
         let mut swapped = refs(&d);
         swapped.swap(0, 1);
-        assert!(pack_shape(shape, &swapped, mask).is_err(), "{shape:?}: out-of-fused-order");
+        assert!(
+            pack_shape(shape, &swapped, mask).is_err(),
+            "{shape:?}: out-of-fused-order"
+        );
         let mut missing = refs(&d);
         missing.pop();
-        assert!(pack_shape(shape, &missing, mask).is_err(), "{shape:?}: missing selected family");
+        assert!(
+            pack_shape(shape, &missing, mask).is_err(),
+            "{shape:?}: missing selected family"
+        );
         let mut bad_m = refs(&d);
         bad_m[0].m -= 1;
         bad_m[0].mq6 = &d.blobs[0].2[..d.blobs[0].2.len() - (TRUNK_K / 256) * GROUP_BYTES];
-        assert!(pack_shape(shape, &bad_m, mask).is_err(), "{shape:?}: wrong family rows");
+        assert!(
+            pack_shape(shape, &bad_m, mask).is_err(),
+            "{shape:?}: wrong family rows"
+        );
         let mut bad_k = refs(&d);
         bad_k[0].k = 2048;
-        assert!(pack_shape(shape, &bad_k, mask).is_err(), "{shape:?}: K must be 2560");
+        assert!(
+            pack_shape(shape, &bad_k, mask).is_err(),
+            "{shape:?}: K must be 2560"
+        );
         let mut short = refs(&d);
         short[0].mq6 = &d.blobs[0].2[..d.blobs[0].2.len() - 1];
-        assert!(pack_shape(shape, &short, mask).is_err(), "{shape:?}: truncated blob");
+        assert!(
+            pack_shape(shape, &short, mask).is_err(),
+            "{shape:?}: truncated blob"
+        );
     }
 }
 
@@ -642,9 +814,18 @@ fn pack_trunk_layers_share_shape_map_and_ws() {
     let gdn = shape_data(Shape::GdnIn, 0x6d5);
     let qsa = shape_data(Shape::QsaIn, 0x95a);
     let layers = vec![
-        LayerTrunkRefs { shape: Shape::GdnIn, matrices: refs(&gdn) },
-        LayerTrunkRefs { shape: Shape::QsaIn, matrices: refs(&qsa) },
-        LayerTrunkRefs { shape: Shape::GdnIn, matrices: refs(&gdn) },
+        LayerTrunkRefs {
+            shape: Shape::GdnIn,
+            matrices: refs(&gdn),
+        },
+        LayerTrunkRefs {
+            shape: Shape::QsaIn,
+            matrices: refs(&qsa),
+        },
+        LayerTrunkRefs {
+            shape: Shape::GdnIn,
+            matrices: refs(&gdn),
+        },
     ];
     let mask = FamilyMask::ALL;
     let trunk = match pack_trunk(&layers, mask) {
@@ -656,14 +837,31 @@ fn pack_trunk_layers_share_shape_map_and_ws() {
     for (l, shape) in [(0, Shape::GdnIn), (1, Shape::QsaIn), (2, Shape::GdnIn)] {
         let (s, packed) = trunk.per_layer[l].as_ref().expect("layer selected by ALL");
         assert!(*s == shape);
-        let direct = pack_shape(shape, &layers[l].matrices, mask).ok().expect("pack_shape");
-        assert!(packed.panels == direct.panels && packed.ws == direct.ws, "layer {l}");
-        assert!(trunk.ws[l] == packed.ws, "layer {l}: PackedTrunk.ws mirrors the packed ws");
-        assert_eq!(parts_of(&trunk.map[shape.index()]), parts_of(&shape.column_map(mask)));
+        let direct = pack_shape(shape, &layers[l].matrices, mask)
+            .ok()
+            .expect("pack_shape");
+        assert!(
+            packed.panels == direct.panels && packed.ws == direct.ws,
+            "layer {l}"
+        );
+        assert!(
+            trunk.ws[l] == packed.ws,
+            "layer {l}: PackedTrunk.ws mirrors the packed ws"
+        );
+        assert_eq!(
+            parts_of(&trunk.map[shape.index()]),
+            parts_of(&shape.column_map(mask))
+        );
     }
-    assert!(trunk.per_layer[0].as_ref().unwrap().1.panels == trunk.per_layer[2].as_ref().unwrap().1.panels);
+    assert!(
+        trunk.per_layer[0].as_ref().unwrap().1.panels
+            == trunk.per_layer[2].as_ref().unwrap().1.panels
+    );
     let direct = pack_trunk_with_contract(EpilogueContract::Bf16Direct, &layers, mask).unwrap();
     assert_eq!(direct.per_layer.len(), layers.len());
-    assert_eq!(direct.per_layer[0].as_ref().unwrap().1.scales, direct.per_layer[2].as_ref().unwrap().1.scales);
+    assert_eq!(
+        direct.per_layer[0].as_ref().unwrap().1.scales,
+        direct.per_layer[2].as_ref().unwrap().1.scales
+    );
     assert!(pack_trunk_with_contract(EpilogueContract::Bf16Direct, &layers, mask).is_ok());
 }

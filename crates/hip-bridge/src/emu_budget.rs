@@ -431,9 +431,14 @@ mod tests {
         let table = TokenTable::<FakeToken>::new();
         charged_alloc_keyed::<_, usize>(&ledger, &table, Class::Device, 101, |h| *h, || Ok(1))
             .unwrap_err();
-        charged_alloc_keyed::<_, usize>(&ledger, &table, Class::Device, 50, |h| *h, || {
-            Err(raw_err())
-        })
+        charged_alloc_keyed::<_, usize>(
+            &ledger,
+            &table,
+            Class::Device,
+            50,
+            |h| *h,
+            || Err(raw_err()),
+        )
         .unwrap_err();
         assert_eq!((USED.get(), PENDING.get(), table.len()), (0, 0, 0));
     }

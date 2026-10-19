@@ -269,7 +269,10 @@ mod tests {
         assert_eq!(actual, expected);
         assert_eq!(routed.snapshots, off.snapshots);
         assert!(routed.request_gpu);
-        assert_eq!(routed.npu_pairs_attempted, 0, "a GPU-routed request plans no pair");
+        assert_eq!(
+            routed.npu_pairs_attempted, 0,
+            "a GPU-routed request plans no pair"
+        );
         assert_eq!(routed.attempts, 1);
         assert!(!routed.latch.tripped() && routed.latch.reason().is_none());
         assert!(!routed.latch.take_request_fault());
@@ -298,7 +301,10 @@ mod tests {
             let before = toy.npu_pairs_attempted;
             let actual = toy.request(&request, 0).unwrap();
             let expected = off.request(&request, 0).unwrap();
-            assert_eq!(toy.request_gpu, gpu, "the route is captured at the request's begin");
+            assert_eq!(
+                toy.request_gpu, gpu,
+                "the route is captured at the request's begin"
+            );
             assert_eq!(toy.npu_pairs_attempted - before, pairs);
             if gpu {
                 assert_eq!(actual, expected);
@@ -322,11 +328,18 @@ mod tests {
         let mut toy = Toy::new(true, Some(0));
         toy.gpu_route = true;
         assert_eq!(toy.request(&request, 0).unwrap(), expected);
-        assert_eq!(toy.npu_pairs_attempted, 0, "the GPU route never reaches the first pair");
+        assert_eq!(
+            toy.npu_pairs_attempted, 0,
+            "the GPU route never reaches the first pair"
+        );
         assert!(!toy.latch.tripped() && !toy.latch.take_request_fault());
         // Back on auto the first pair faults exactly as if the GPU request had not happened.
         toy.gpu_route = false;
-        assert_eq!(toy.request(&request, 0).unwrap(), expected, "the faulted rerun is GPU-only");
+        assert_eq!(
+            toy.request(&request, 0).unwrap(),
+            expected,
+            "the faulted rerun is GPU-only"
+        );
         assert_eq!(toy.npu_pairs_attempted, 1);
         assert_eq!(toy.latch.reason(), Some(FAULT));
         // A later GPU request leaves the tripped latch and its reason as they were.
@@ -355,7 +368,10 @@ mod tests {
                 assert_eq!(toy.attempts, attempts + 1, "no fault, no rerun");
                 assert!(toy.latch.tripped());
                 assert_eq!(toy.latch.reason(), Some(FAULT));
-                assert!(!toy.latch.take_request_fault(), "the request fault mark is not set");
+                assert!(
+                    !toy.latch.take_request_fault(),
+                    "the request fault mark is not set"
+                );
                 assert_eq!(toy.npu_pairs_attempted, 1);
             }
             // Switching back to auto does not clear the latch: still no pair.
@@ -392,7 +408,11 @@ mod tests {
         let mut pos = start;
         while pos < end {
             let mut segment = SCHEDULE_CHUNK.min(end - pos);
-            if let Some(cut) = cuts.iter().copied().find(|&cut| cut > pos && cut < pos + segment) {
+            if let Some(cut) = cuts
+                .iter()
+                .copied()
+                .find(|&cut| cut > pos && cut < pos + segment)
+            {
                 segment = cut - pos;
             }
             rows.push(segment);
@@ -426,7 +446,10 @@ mod tests {
             assert_eq!(segments(start, 40000, cuts, diagnostic.planned()), expected);
             assert_eq!(segments(start, 40000, cuts, tripped.planned()), expected);
             let paired = segments(start, 40000, cuts, auto.planned());
-            assert_ne!(paired, expected, "auto groups rows into pairs, so the schedules differ");
+            assert_ne!(
+                paired, expected,
+                "auto groups rows into pairs, so the schedules differ"
+            );
             assert!(paired.iter().any(|&rows| rows > SCHEDULE_CHUNK));
             assert_eq!(paired.iter().sum::<usize>(), expected.iter().sum::<usize>());
         }

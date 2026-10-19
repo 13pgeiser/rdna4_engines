@@ -199,10 +199,7 @@ impl XdnaProfile {
             }
         }
         if self.row_count > self.m {
-            return Err(format!(
-                "row_count {} exceeds M {}",
-                self.row_count, self.m
-            ));
+            return Err(format!("row_count {} exceeds M {}", self.row_count, self.m));
         }
         validate_archive_name(&self.pdi, "pdi")?;
         validate_archive_name(&self.insts, "insts")?;
@@ -216,9 +213,9 @@ impl XdnaProfile {
             if arg.size == 0 {
                 return Err(format!("arg_layout '{}' has zero size", arg.name));
             }
-            arg.offset.checked_add(arg.size).ok_or_else(|| {
-                format!("arg_layout '{}' offset+size overflows", arg.name)
-            })?;
+            arg.offset
+                .checked_add(arg.size)
+                .ok_or_else(|| format!("arg_layout '{}' offset+size overflows", arg.name))?;
         }
         validate_hex_digest(&self.sha256_pdi, "sha256_pdi")?;
         validate_hex_digest(&self.sha256_insts, "sha256_insts")?;
@@ -232,12 +229,11 @@ impl XdnaSidecarDescriptor {
     pub fn load_verified(path: &Path) -> Result<Self> {
         let read = |entry: &str| read_stored_entry(path, entry);
         let manifest_bytes = read(XDNA_MANIFEST_NAME)?;
-        let manifest: XdnaManifest = serde_json::from_slice(&manifest_bytes).map_err(|error| {
-            XdnaError::Invalid {
+        let manifest: XdnaManifest =
+            serde_json::from_slice(&manifest_bytes).map_err(|error| XdnaError::Invalid {
                 path: path.to_owned(),
                 message: format!("{XDNA_MANIFEST_NAME}: {error}"),
-            }
-        })?;
+            })?;
         manifest.validate().map_err(|message| XdnaError::Invalid {
             path: path.to_owned(),
             message,
@@ -325,7 +321,11 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn hex(nibble: u8) -> char {
-    (if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 }) as char
+    (if nibble < 10 {
+        b'0' + nibble
+    } else {
+        b'a' + nibble - 10
+    }) as char
 }
 
 /// Read one stored entry from the archive.
@@ -373,7 +373,10 @@ fn read_stored_entries(path: &Path, want: &BTreeSet<String>) -> Result<BTreeMap<
     let central_count = u16_at(eocd, 10) as u64;
     let central_size = u32_at(eocd, 12) as u64;
     let central_offset = u32_at(eocd, 16) as u64;
-    if central_offset.checked_add(central_size).is_none_or(|end| end > file_len) {
+    if central_offset
+        .checked_add(central_size)
+        .is_none_or(|end| end > file_len)
+    {
         return Err(zip("central directory runs past end of file".into()));
     }
     // Walk the central directory, collecting the wanted stored entries.
@@ -384,7 +387,9 @@ fn read_stored_entries(path: &Path, want: &BTreeSet<String>) -> Result<BTreeMap<
     // (name, local-header offset, size)
     let mut hits: Vec<(String, u64, u64)> = Vec::new();
     for _ in 0..central_count {
-        let rest = central.get(cursor..).ok_or_else(|| zip("truncated central directory".into()))?;
+        let rest = central
+            .get(cursor..)
+            .ok_or_else(|| zip("truncated central directory".into()))?;
         if rest.len() < 46 || &rest[0..4] != b"PK\x01\x02" {
             return Err(zip("bad central-directory entry signature".into()));
         }
@@ -602,7 +607,13 @@ mod tests {
         let pdi = b"fake-pdi-bytes";
         let insts = b"fake-insts-bytes";
         // Manifest binds the ORIGINAL bytes; the archive carries a corrupt PDI.
-        let path = write_sidecar(&dir, "m.xdna.zip", &manifest_json(pdi, insts), b"corrupt!", insts);
+        let path = write_sidecar(
+            &dir,
+            "m.xdna.zip",
+            &manifest_json(pdi, insts),
+            b"corrupt!",
+            insts,
+        );
         let error = XdnaSidecarDescriptor::load_verified(&path).expect_err("tamper must fail");
         let message = format!("{error}");
         assert!(message.contains("hash mismatch"), "{message}");

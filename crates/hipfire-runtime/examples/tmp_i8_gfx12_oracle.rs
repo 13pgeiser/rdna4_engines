@@ -88,7 +88,10 @@ const MODEL_PREFIX: &str = "model.language_model.layers.";
 type Matrix = (usize, usize, Vec<u8>);
 
 fn rand(i: usize, salt: u32) -> f32 {
-    let mut x = (i as u32).wrapping_mul(0x9e3779b1).wrapping_add(salt).wrapping_mul(0x85ebca6b);
+    let mut x = (i as u32)
+        .wrapping_mul(0x9e3779b1)
+        .wrapping_add(salt)
+        .wrapping_mul(0x85ebca6b);
     x ^= x >> 16;
     x = x.wrapping_mul(0xc2b2ae35);
     x ^= x >> 16;
@@ -101,13 +104,21 @@ fn weight(hfq: &HfqFile, layer: usize, suffixes: &[&str]) -> Matrix {
     let mut k = 0;
     for suffix in suffixes {
         let name = format!("{MODEL_PREFIX}{layer}.{suffix}.weight");
-        let (info, data) = hfq.tensor_data_vec(&name).unwrap_or_else(|| panic!("missing {name}"));
+        let (info, data) = hfq
+            .tensor_data_vec(&name)
+            .unwrap_or_else(|| panic!("missing {name}"));
         assert_eq!(info.quant_type, 44, "{name}: not qt44");
         assert_eq!(info.shape.len(), 2);
         let (rows, cols) = (info.shape[0] as usize, info.shape[1] as usize);
         assert_eq!(cols % 256, 0);
-        assert_eq!(data.len(), rows * (cols / 256) * 136, "{name}: weight layout");
-        if m != 0 { assert_eq!(k, cols, "{name}: incompatible K"); }
+        assert_eq!(
+            data.len(),
+            rows * (cols / 256) * 136,
+            "{name}: weight layout"
+        );
+        if m != 0 {
+            assert_eq!(k, cols, "{name}: incompatible K");
+        }
         m += rows;
         k = cols;
         bytes.extend_from_slice(&data);
@@ -119,13 +130,19 @@ fn weight(hfq: &HfqFile, layer: usize, suffixes: &[&str]) -> Matrix {
 /// scale, sparse x40 outliers, and one all-zero K128 block every 29 tokens.
 fn activation(n: usize, k: usize, salt: u32) -> Vec<f32> {
     let kbn = k / 128;
-    (0..n * k).map(|i| {
-        let (t, c) = (i / k, i % k);
-        if t % 29 == 3 && c / 128 == t % kbn { return 0.0; }
-        let mut v = rand(i, salt) * (0.75 + (t % 5) as f32 * 0.15);
-        if (t * 131 + c) % 997 == 0 { v *= 40.0; }
-        v
-    }).collect()
+    (0..n * k)
+        .map(|i| {
+            let (t, c) = (i / k, i % k);
+            if t % 29 == 3 && c / 128 == t % kbn {
+                return 0.0;
+            }
+            let mut v = rand(i, salt) * (0.75 + (t % 5) as f32 * 0.15);
+            if (t * 131 + c) % 997 == 0 {
+                v *= 40.0;
+            }
+            v
+        })
+        .collect()
 }
 
 /// CPU quantizer (the shared contract): amax, d = RN(amax/127),
@@ -145,7 +162,11 @@ fn quantize_cpu(x: &[f32], n: usize, k: usize) -> (Vec<u8>, Vec<i8>, Vec<f32>) {
             let mut s = 0i32;
             let q = &mut x8[t * k + kb * 128..t * k + kb * 128 + 128];
             for (e, &v) in src.iter().enumerate() {
-                let qi = if amax == 0.0 { 0 } else { (v / d).round_ties_even().clamp(-127.0, 127.0) as i32 };
+                let qi = if amax == 0.0 {
+                    0
+                } else {
+                    (v / d).round_ties_even().clamp(-127.0, 127.0) as i32
+                };
                 q[e] = qi as i8;
                 s += qi;
             }
@@ -165,7 +186,12 @@ fn quantize_cpu(x: &[f32], n: usize, k: usize) -> (Vec<u8>, Vec<i8>, Vec<f32>) {
 }
 
 /// Symmetric MQ4V2 rows as signed codes (q - 8) [M][K] and per-128 f32 sc.
-struct Wprep { m: usize, k: usize, w8: Vec<i8>, sc: Vec<f32> }
+struct Wprep {
+    m: usize,
+    k: usize,
+    w8: Vec<i8>,
+    sc: Vec<f32>,
+}
 
 fn prep(a: &Matrix) -> Wprep {
     let (m, k, bytes) = a;
@@ -209,37 +235,53 @@ fn gemm_cpu(w: &Wprep, x8: &[i8], ds: &[f32], n: usize) -> Vec<f32> {
     let (m, k) = (w.m, w.k);
     let kbn = k / 128;
     let mut out = vec![0f32; n * m];
-    out.par_chunks_mut(TILE * m).enumerate().for_each(|(ti, chunk)| {
-        let n0 = ti * TILE;
-        let nt = chunk.len() / m;
-        let mut acc = [0f32; TILE];
-        for row in 0..m {
-            acc[..nt].fill(0.0);
-            for kb in 0..kbn {
-                let wr: &[i8; 128] = w.w8[row * k + kb * 128..row * k + kb * 128 + 128].try_into().unwrap();
-                let sc = w.sc[row * kbn + kb];
+    out.par_chunks_mut(TILE * m)
+        .enumerate()
+        .for_each(|(ti, chunk)| {
+            let n0 = ti * TILE;
+            let nt = chunk.len() / m;
+            let mut acc = [0f32; TILE];
+            for row in 0..m {
+                acc[..nt].fill(0.0);
+                for kb in 0..kbn {
+                    let wr: &[i8; 128] = w.w8[row * k + kb * 128..row * k + kb * 128 + 128]
+                        .try_into()
+                        .unwrap();
+                    let sc = w.sc[row * kbn + kb];
+                    for t in 0..nt {
+                        let tok = n0 + t;
+                        let xr: &[i8; 128] = x8[tok * k + kb * 128..tok * k + kb * 128 + 128]
+                            .try_into()
+                            .unwrap();
+                        let c = dot128(wr, xr);
+                        let t1 = sc * ds[kb * n + tok];
+                        acc[t] = if split {
+                            t1 * c as f32 + acc[t]
+                        } else {
+                            t1.mul_add(c as f32, acc[t])
+                        };
+                    }
+                }
                 for t in 0..nt {
-                    let tok = n0 + t;
-                    let xr: &[i8; 128] = x8[tok * k + kb * 128..tok * k + kb * 128 + 128].try_into().unwrap();
-                    let c = dot128(wr, xr);
-                    let t1 = sc * ds[kb * n + tok];
-                    acc[t] = if split { t1 * c as f32 + acc[t] } else { t1.mul_add(c as f32, acc[t]) };
+                    chunk[t * m + row] = acc[t];
                 }
             }
-            for t in 0..nt {
-                chunk[t * m + row] = acc[t];
-            }
-        }
-    });
+        });
     out
 }
 
 fn download_bytes(gpu: &Gpu, t: &GpuTensor) -> Vec<u8> {
-    gpu.download_f32(t).expect("download").iter().flat_map(|v| v.to_bits().to_le_bytes()).collect()
+    gpu.download_f32(t)
+        .expect("download")
+        .iter()
+        .flat_map(|v| v.to_bits().to_le_bytes())
+        .collect()
 }
 
 fn quantize_gpu(gpu: &mut Gpu, d_x: &GpuTensor, n: usize, k: usize) -> GpuTensor {
-    let out = gpu.zeros(&[(k / 128) * n * BLOCK_BYTES / 4], DType::F32).expect("alloc Xq");
+    let out = gpu
+        .zeros(&[(k / 128) * n * BLOCK_BYTES / 4], DType::F32)
+        .expect("alloc Xq");
     let mut b = KernargBlob::new();
     b.push_ptr(d_x.buf.as_ptr() as *const c_void);
     b.push_ptr(out.buf.as_ptr() as *const c_void);
@@ -247,8 +289,14 @@ fn quantize_gpu(gpu: &mut Gpu, d_x: &GpuTensor, n: usize, k: usize) -> GpuTensor
     b.push_i32(n as i32);
     let mut blob = b.into_vec();
     // Folded 1-D grid: token = blockIdx.x / blocks_per_row.
-    gpu.launch_kernel_blob(QUANT, [(k.div_ceil(1024) * n) as u32, 1, 1], [256, 1, 1], 0, &mut blob)
-        .expect("launch quantizer");
+    gpu.launch_kernel_blob(
+        QUANT,
+        [(k.div_ceil(1024) * n) as u32, 1, 1],
+        [256, 1, 1],
+        0,
+        &mut blob,
+    )
+    .expect("launch quantizer");
     out
 }
 
@@ -269,22 +317,42 @@ fn v3_symbol(fused: bool, add: bool) -> &'static str {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch(gpu: &mut Gpu, sym: &str, lds: u32, a: *const c_void, u: Option<*const c_void>,
-          xq: *const c_void, y: *const c_void, m: usize, k: usize, n: usize, add: bool) {
+fn launch(
+    gpu: &mut Gpu,
+    sym: &str,
+    lds: u32,
+    a: *const c_void,
+    u: Option<*const c_void>,
+    xq: *const c_void,
+    y: *const c_void,
+    m: usize,
+    k: usize,
+    n: usize,
+    add: bool,
+) {
     let mut b = KernargBlob::new();
     b.push_ptr(a);
-    if let Some(u) = u { b.push_ptr(u); }
+    if let Some(u) = u {
+        b.push_ptr(u);
+    }
     b.push_ptr(xq);
     b.push_ptr(y);
     b.push_i32(m as i32);
     b.push_i32(k as i32);
     b.push_i32(n as i32);
-    if u.is_none() { b.push_i32(i32::from(add)); }
+    if u.is_none() {
+        b.push_i32(i32::from(add));
+    }
     let mut blob = b.into_vec();
     let rows = if u.is_some() { 2 * m } else { m };
-    gpu.launch_kernel_blob(sym, [rows.div_ceil(128) as u32, n.div_ceil(128) as u32, 1],
-                           [256, 1, 1], lds, &mut blob)
-        .unwrap_or_else(|e| panic!("launch {sym}: {e}"));
+    gpu.launch_kernel_blob(
+        sym,
+        [rows.div_ceil(128) as u32, n.div_ceil(128) as u32, 1],
+        [256, 1, 1],
+        lds,
+        &mut blob,
+    )
+    .unwrap_or_else(|e| panic!("launch {sym}: {e}"));
 }
 
 fn compare(label: &str, reference: &[f32], candidate: &[f32], m: usize) -> usize {
@@ -293,8 +361,13 @@ fn compare(label: &str, reference: &[f32], candidate: &[f32], m: usize) -> usize
     for (i, (&a, &b)) in reference.iter().zip(candidate).enumerate() {
         if a.to_bits() != b.to_bits() {
             if diffs < 8 {
-                eprintln!("DIFF {label} n={} row={} ref={:08x} gpu={:08x} ({a:?} {b:?})",
-                          i / m, i % m, a.to_bits(), b.to_bits());
+                eprintln!(
+                    "DIFF {label} n={} row={} ref={:08x} gpu={:08x} ({a:?} {b:?})",
+                    i / m,
+                    i % m,
+                    a.to_bits(),
+                    b.to_bits()
+                );
             }
             diffs += 1;
         }
@@ -312,33 +385,69 @@ fn silu_gpu(gpu: &mut Gpu, g: &[f32], u: &[f32]) -> Vec<f32> {
     b.push_ptr(dh.buf.as_ptr() as *const c_void);
     b.push_i32(g.len() as i32);
     let mut blob = b.into_vec();
-    gpu.launch_kernel_blob("i8_oracle_silu_mul", [g.len().div_ceil(256) as u32, 1, 1], [256, 1, 1], 0, &mut blob)
-        .expect("launch silu ref");
+    gpu.launch_kernel_blob(
+        "i8_oracle_silu_mul",
+        [g.len().div_ceil(256) as u32, 1, 1],
+        [256, 1, 1],
+        0,
+        &mut blob,
+    )
+    .expect("launch silu ref");
     gpu.hip.device_synchronize().expect("sync silu");
     let h = gpu.download_f32(&dh).expect("download h");
-    for t in [dg, du, dh] { gpu.free_tensor(t).expect("free silu"); }
+    for t in [dg, du, dh] {
+        gpu.free_tensor(t).expect("free silu");
+    }
     h
 }
 
-struct Tally { cases: usize, outputs: usize, gemm_diffs: usize, repeat_diffs: usize, quant_diffs: usize,
-               silu_host_max_ulp: u32 }
+struct Tally {
+    cases: usize,
+    outputs: usize,
+    gemm_diffs: usize,
+    repeat_diffs: usize,
+    quant_diffs: usize,
+    silu_host_max_ulp: u32,
+}
 
 #[allow(clippy::too_many_arguments)]
-fn check(gpu: &mut Gpu, tally: &mut Tally, label: &str, a: &Matrix, u: Option<&Matrix>, n: usize,
-         add: bool, salt: u32) {
+fn check(
+    gpu: &mut Gpu,
+    tally: &mut Tally,
+    label: &str,
+    a: &Matrix,
+    u: Option<&Matrix>,
+    n: usize,
+    add: bool,
+    salt: u32,
+) {
     let (m, k, bytes) = a;
     let (m, k) = (*m, *k);
-    if let Some((um, uk, _)) = u { assert_eq!((m, k), (*um, *uk)); }
+    if let Some((um, uk, _)) = u {
+        assert_eq!((m, k), (*um, *uk));
+    }
     let x = activation(n, k, salt);
     let (blocks_cpu, x8, ds) = quantize_cpu(&x, n, k);
     let d_x = gpu.upload_f32(&x, &[n, k]).expect("upload X");
     let d_xq = quantize_gpu(gpu, &d_x, n, k);
     gpu.hip.device_synchronize().expect("sync quant");
     let blocks_gpu = download_bytes(gpu, &d_xq);
-    let qd = blocks_cpu.iter().zip(&blocks_gpu).filter(|(a, b)| a != b).count();
+    let qd = blocks_cpu
+        .iter()
+        .zip(&blocks_gpu)
+        .filter(|(a, b)| a != b)
+        .count();
     if qd != 0 {
-        let first = blocks_cpu.iter().zip(&blocks_gpu).position(|(a, b)| a != b).unwrap();
-        eprintln!("QDIFF {label} N={n} bytes={qd} first block={} byte={}", first / BLOCK_BYTES, first % BLOCK_BYTES);
+        let first = blocks_cpu
+            .iter()
+            .zip(&blocks_gpu)
+            .position(|(a, b)| a != b)
+            .unwrap();
+        eprintln!(
+            "QDIFF {label} N={n} bytes={qd} first block={} byte={}",
+            first / BLOCK_BYTES,
+            first % BLOCK_BYTES
+        );
     }
     // CPU reference.
     let reference: Vec<f32> = if let Some(up) = u {
@@ -346,19 +455,35 @@ fn check(gpu: &mut Gpu, tally: &mut Tally, label: &str, a: &Matrix, u: Option<&M
         let uu = gemm_cpu(&prep(up), &x8, &ds, n);
         let h = silu_gpu(gpu, &g, &uu);
         // Host sanity for the GPU-evaluated SiLU (not the bit gate).
-        let worst = h.iter().zip(g.iter().zip(&uu)).map(|(&hv, (&gv, &uv))| {
-            let host = gv / (1.0 + (-gv).exp()) * uv;
-            (hv.to_bits() as i64 - host.to_bits() as i64).unsigned_abs() as u32
-        }).max().unwrap_or(0);
+        let worst = h
+            .iter()
+            .zip(g.iter().zip(&uu))
+            .map(|(&hv, (&gv, &uv))| {
+                let host = gv / (1.0 + (-gv).exp()) * uv;
+                (hv.to_bits() as i64 - host.to_bits() as i64).unsigned_abs() as u32
+            })
+            .max()
+            .unwrap_or(0);
         tally.silu_host_max_ulp = tally.silu_host_max_ulp.max(worst);
         h
     } else {
         gemm_cpu(&prep(a), &x8, &ds, n)
     };
-    let y0: Vec<f32> = if add { (0..n * m).map(|i| rand(i, salt ^ 0xADD0_BEEF) * 0.37 + 0.11).collect() }
-                        else { vec![0.0; n * m] };
-    let reference: Vec<f32> = if add { reference.iter().zip(&y0).map(|(r, o)| o + r).collect() } else { reference };
-    let d_a = gpu.upload_raw(bytes, &[bytes.len()]).expect("upload weights");
+    let y0: Vec<f32> = if add {
+        (0..n * m)
+            .map(|i| rand(i, salt ^ 0xADD0_BEEF) * 0.37 + 0.11)
+            .collect()
+    } else {
+        vec![0.0; n * m]
+    };
+    let reference: Vec<f32> = if add {
+        reference.iter().zip(&y0).map(|(r, o)| o + r).collect()
+    } else {
+        reference
+    };
+    let d_a = gpu
+        .upload_raw(bytes, &[bytes.len()])
+        .expect("upload weights");
     let d_u = u.map(|(_, _, b)| gpu.upload_raw(b, &[b.len()]).expect("upload up"));
     let ynew = gpu.upload_f32(&y0, &[n, m]).expect("new Y");
     let yrep = gpu.upload_f32(&y0, &[n, m]).expect("repeat Y");
@@ -366,8 +491,32 @@ fn check(gpu: &mut Gpu, tally: &mut Tally, label: &str, a: &Matrix, u: Option<&M
     let up = d_u.as_ref().map(|t| t.buf.as_ptr() as *const c_void);
     let xq = d_xq.buf.as_ptr() as *const c_void;
     let sym = i8_symbol(u.is_some(), add);
-    launch(gpu, sym, I8_LDS, ap, up, xq, ynew.buf.as_ptr() as *const c_void, m, k, n, add);
-    launch(gpu, sym, I8_LDS, ap, up, xq, yrep.buf.as_ptr() as *const c_void, m, k, n, add);
+    launch(
+        gpu,
+        sym,
+        I8_LDS,
+        ap,
+        up,
+        xq,
+        ynew.buf.as_ptr() as *const c_void,
+        m,
+        k,
+        n,
+        add,
+    );
+    launch(
+        gpu,
+        sym,
+        I8_LDS,
+        ap,
+        up,
+        xq,
+        yrep.buf.as_ptr() as *const c_void,
+        m,
+        k,
+        n,
+        add,
+    );
     gpu.hip.device_synchronize().expect("sync G1");
     let candidate = gpu.download_f32(&ynew).expect("download");
     let repeat = gpu.download_f32(&yrep).expect("download repeat");
@@ -381,8 +530,12 @@ fn check(gpu: &mut Gpu, tally: &mut Tally, label: &str, a: &Matrix, u: Option<&M
     tally.gemm_diffs += differing;
     tally.repeat_diffs += repeated;
     tally.quant_diffs += qd;
-    for t in [ynew, yrep, d_x, d_xq, d_a] { gpu.free_tensor(t).expect("free"); }
-    if let Some(t) = d_u { gpu.free_tensor(t).expect("free U"); }
+    for t in [ynew, yrep, d_x, d_xq, d_a] {
+        gpu.free_tensor(t).expect("free");
+    }
+    if let Some(t) = d_u {
+        gpu.free_tensor(t).expect("free U");
+    }
 }
 
 fn median(xs: &mut [f64]) -> f64 {
@@ -392,14 +545,28 @@ fn median(xs: &mut [f64]) -> f64 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn timed(gpu: &mut Gpu, out: &str, idx: usize, arm: &str, shape: &str, a: &Matrix, u: Option<&Matrix>,
-         n: usize, add: bool) -> f64 {
+fn timed(
+    gpu: &mut Gpu,
+    out: &str,
+    idx: usize,
+    arm: &str,
+    shape: &str,
+    a: &Matrix,
+    u: Option<&Matrix>,
+    n: usize,
+    add: bool,
+) -> f64 {
     let (m, k, bytes) = a;
     let x: Vec<f32> = (0..n * k).map(|i| rand(i, 0x71e0)).collect();
     let d_x = gpu.upload_f32(&x, &[n, *k]).expect("upload X");
     let (xq, d_xq, sym, lds) = if arm == "a8" {
         let t = quantize_gpu(gpu, &d_x, n, *k);
-        (t.buf.as_ptr() as *const c_void, Some(t), i8_symbol(u.is_some(), add), I8_LDS)
+        (
+            t.buf.as_ptr() as *const c_void,
+            Some(t),
+            i8_symbol(u.is_some(), add),
+            I8_LDS,
+        )
     } else {
         let p = gpu.ensure_int4_mmq_x(&d_x, n, *k).expect("quantize X") as *const c_void;
         (p, None, v3_symbol(u.is_some(), add), V3_LDS)
@@ -411,18 +578,27 @@ fn timed(gpu: &mut Gpu, out: &str, idx: usize, arm: &str, shape: &str, a: &Matri
     let y0: Vec<f32> = (0..n * m).map(|i| rand(i, 0x5eed) * 0.25).collect();
     let y = gpu.upload_f32(&y0, &[n, *m]).expect("upload Y");
     let yp = y.buf.as_ptr() as *const c_void;
-    for _ in 0..16 { launch(gpu, sym, lds, ap, up, xq, yp, *m, *k, n, add); }
+    for _ in 0..16 {
+        launch(gpu, sym, lds, ap, up, xq, yp, *m, *k, n, add);
+    }
     gpu.hip.device_synchronize().expect("warmup sync");
     let csv = format!("{out}/{idx:02}-{arm}-{shape}-{n}-telemetry.csv");
-    let mut child = Command::new("python3").args(["-u", "-c", TELEMETRY, &csv, CARD_BDF])
-        .stdout(Stdio::piped()).spawn().expect("start AMD-SMI sampler");
+    let mut child = Command::new("python3")
+        .args(["-u", "-c", TELEMETRY, &csv, CARD_BDF])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("start AMD-SMI sampler");
     let mut ready = String::new();
-    BufReader::new(child.stdout.take().expect("sampler stdout")).read_line(&mut ready).expect("sampler ready");
+    BufReader::new(child.stdout.take().expect("sampler stdout"))
+        .read_line(&mut ready)
+        .expect("sampler ready");
     assert_eq!(ready.trim(), "READY", "AMD-SMI sampler failed");
     let start = Instant::now();
     let mut calls = 0;
     while start.elapsed() < Duration::from_secs(10) {
-        for _ in 0..16 { launch(gpu, sym, lds, ap, up, xq, yp, *m, *k, n, add); }
+        for _ in 0..16 {
+            launch(gpu, sym, lds, ap, up, xq, yp, *m, *k, n, add);
+        }
         gpu.hip.device_synchronize().expect("timed sync");
         calls += 16;
     }
@@ -430,7 +606,8 @@ fn timed(gpu: &mut Gpu, out: &str, idx: usize, arm: &str, shape: &str, a: &Matri
     child.kill().expect("stop sampler");
     child.wait().expect("reap sampler");
     let data = std::fs::read_to_string(&csv).expect("read telemetry");
-    let (mut watts, mut clocks, mut busy, mut times) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut watts, mut clocks, mut busy, mut times) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for row in data.lines().skip(1) {
         let f: Vec<_> = row.splitn(5, ',').collect();
         assert_eq!(f.len(), 5, "telemetry row");
@@ -441,51 +618,89 @@ fn timed(gpu: &mut Gpu, out: &str, idx: usize, arm: &str, shape: &str, a: &Matri
         busy.push(f[3].parse::<f64>().expect("busy"));
     }
     assert!(times.len() >= 180, "too few 20-Hz samples: {}", times.len());
-    let mut gaps: Vec<f64> = times.windows(2).map(|w| (w[1] - w[0]) as f64 / 1e6).collect();
+    let mut gaps: Vec<f64> = times
+        .windows(2)
+        .map(|w| (w[1] - w[0]) as f64 / 1e6)
+        .collect();
     let spacing = median(&mut gaps);
-    assert!((40.0..=60.0).contains(&spacing), "telemetry spacing {spacing} ms");
+    assert!(
+        (40.0..=60.0).contains(&spacing),
+        "telemetry spacing {spacing} ms"
+    );
     let us = elapsed * 1e6 / calls as f64;
     let mats = if u.is_some() { 2.0 } else { 1.0 };
     let tops = 2.0 * mats * (*m as f64) * (*k as f64) * n as f64 / (us * 1e6);
     eprintln!("G2 idx={idx} arm={arm} shape={shape} sym={sym} N={n} M={m} K={k} calls={calls} seconds={elapsed:.3} us_per_call={us:.3} TOPS={tops:.3} sclk_mhz={:.1} watts={:.1} busy_pct={:.1} samples={} spacing_ms={spacing:.1} csv={csv}",
               median(&mut clocks), median(&mut watts), median(&mut busy), times.len());
-    for t in [d_x, d_a, y] { gpu.free_tensor(t).expect("free"); }
-    if let Some(t) = d_xq { gpu.free_tensor(t).expect("free Xq"); }
-    if let Some(t) = d_u { gpu.free_tensor(t).expect("free U"); }
+    for t in [d_x, d_a, y] {
+        gpu.free_tensor(t).expect("free");
+    }
+    if let Some(t) = d_xq {
+        gpu.free_tensor(t).expect("free Xq");
+    }
+    if let Some(t) = d_u {
+        gpu.free_tensor(t).expect("free U");
+    }
     tops
 }
 
 fn main() {
-    let model = std::env::args().nth(1).expect("usage: tmp_i8_gfx12_oracle <model.hfq> [--compile-only]");
+    let model = std::env::args()
+        .nth(1)
+        .expect("usage: tmp_i8_gfx12_oracle <model.hfq> [--compile-only]");
     for key in ["HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"] {
-        assert_eq!(std::env::var(key).as_deref(), Ok(CARD_UUID), "{key} must pin card E by UUID");
+        assert_eq!(
+            std::env::var(key).as_deref(),
+            Ok(CARD_UUID),
+            "{key} must pin card E by UUID"
+        );
     }
     let mut src = String::new();
     if let Ok(defs) = std::env::var("I8_DEFINES") {
         for d in defs.split(',').filter(|d| !d.is_empty()) {
-            let (name, value) = d.split_once('=').expect("I8_DEFINES entries are NAME=VALUE");
+            let (name, value) = d
+                .split_once('=')
+                .expect("I8_DEFINES entries are NAME=VALUE");
             src.push_str(&format!("#define {name} {value}\n"));
         }
     }
     src.push_str(I8_SRC);
     let mut gpu = Gpu::init().expect("initialize GPU");
     assert_eq!(gpu.arch, "gfx1201");
-    for sym in [QUANT, i8_symbol(true, false), i8_symbol(false, true), i8_symbol(false, false)] {
-        gpu.ensure_kernel_public(I8_MODULE, &src, sym).unwrap_or_else(|e| panic!("compile {sym}: {e}"));
+    for sym in [
+        QUANT,
+        i8_symbol(true, false),
+        i8_symbol(false, true),
+        i8_symbol(false, false),
+    ] {
+        gpu.ensure_kernel_public(I8_MODULE, &src, sym)
+            .unwrap_or_else(|e| panic!("compile {sym}: {e}"));
         eprintln!("JIT OK {sym}");
     }
-    for sym in [v3_symbol(true, false), v3_symbol(false, true), v3_symbol(false, false)] {
-        gpu.ensure_kernel_public(V3_MODULE, V3_SRC, sym).unwrap_or_else(|e| panic!("compile {sym}: {e}"));
+    for sym in [
+        v3_symbol(true, false),
+        v3_symbol(false, true),
+        v3_symbol(false, false),
+    ] {
+        gpu.ensure_kernel_public(V3_MODULE, V3_SRC, sym)
+            .unwrap_or_else(|e| panic!("compile {sym}: {e}"));
         eprintln!("JIT OK {sym}");
     }
-    gpu.ensure_kernel_public(SILU_MODULE, SILU_SRC, "i8_oracle_silu_mul").expect("compile silu ref");
-    if std::env::args().any(|a| a == "--compile-only") { return; }
+    gpu.ensure_kernel_public(SILU_MODULE, SILU_SRC, "i8_oracle_silu_mul")
+        .expect("compile silu ref");
+    if std::env::args().any(|a| a == "--compile-only") {
+        return;
+    }
     let hfq = HfqFile::open(Path::new(&model)).expect("open HFQ");
     assert!(hfq.mq4v2_symmetric(), "A8 requires symmetric qt44");
 
     if let Ok(seq) = std::env::var("TIME") {
-        let n: usize = std::env::var("TIME_N").ok().map(|v| v.parse().expect("TIME_N")).unwrap_or(8192);
-        let out = std::env::var("TIME_OUT").unwrap_or_else(|_| "/home/kaden/qcal/perf/fp8-4k5/a8/g2".into());
+        let n: usize = std::env::var("TIME_N")
+            .ok()
+            .map(|v| v.parse().expect("TIME_N"))
+            .unwrap_or(8192);
+        let out = std::env::var("TIME_OUT")
+            .unwrap_or_else(|_| "/home/kaden/qcal/perf/fp8-4k5/a8/g2".into());
         std::fs::create_dir_all(&out).expect("create telemetry directory");
         let gate = weight(&hfq, 0, &["mlp.gate_proj"]);
         let up = weight(&hfq, 0, &["mlp.up_proj"]);
@@ -504,33 +719,124 @@ fn main() {
         return;
     }
 
-    let mut tally = Tally { cases: 0, outputs: 0, gemm_diffs: 0, repeat_diffs: 0, quant_diffs: 0, silu_host_max_ulp: 0 };
+    let mut tally = Tally {
+        cases: 0,
+        outputs: 0,
+        gemm_diffs: 0,
+        repeat_diffs: 0,
+        quant_diffs: 0,
+        silu_host_max_ulp: 0,
+    };
     let quick = std::env::var("QUICK").ok().as_deref() == Some("1");
-    let ns: &[usize] = if quick { &[48, 512] } else { &[48, 80, 512, 8192] };
+    let ns: &[usize] = if quick {
+        &[48, 512]
+    } else {
+        &[48, 80, 512, 8192]
+    };
     let layers: &[usize] = if quick { &[0] } else { &[0, 31, 63] };
     for &layer in layers {
         let gate = weight(&hfq, layer, &["mlp.gate_proj"]);
         let up = weight(&hfq, layer, &["mlp.up_proj"]);
         for &n in ns {
-            check(&mut gpu, &mut tally, &format!("gate-up/layer{layer}"), &gate, Some(&up), n, false, 0x7000 + layer as u32 + n as u32);
+            check(
+                &mut gpu,
+                &mut tally,
+                &format!("gate-up/layer{layer}"),
+                &gate,
+                Some(&up),
+                n,
+                false,
+                0x7000 + layer as u32 + n as u32,
+            );
         }
     }
     let down = weight(&hfq, 0, &["mlp.down_proj"]);
-    let qkvza = weight(&hfq, 0, &["linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.in_proj_a", "linear_attn.in_proj_b"]);
-    let qkv = weight(&hfq, 31, &["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"]);
+    let qkvza = weight(
+        &hfq,
+        0,
+        &[
+            "linear_attn.in_proj_qkv",
+            "linear_attn.in_proj_z",
+            "linear_attn.in_proj_a",
+            "linear_attn.in_proj_b",
+        ],
+    );
+    let qkv = weight(
+        &hfq,
+        31,
+        &["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"],
+    );
     let tail48 = weight(&hfq, 0, &["linear_attn.in_proj_a"]);
-    let tail100 = (100, tail48.1, [tail48.2.as_slice(), &weight(&hfq, 0, &["linear_attn.in_proj_b"]).2, &tail48.2[..4 * (tail48.1 / 256) * 136]].concat());
+    let tail100 = (
+        100,
+        tail48.1,
+        [
+            tail48.2.as_slice(),
+            &weight(&hfq, 0, &["linear_attn.in_proj_b"]).2,
+            &tail48.2[..4 * (tail48.1 / 256) * 136],
+        ]
+        .concat(),
+    );
     for &n in ns {
-        check(&mut gpu, &mut tally, "down/set", &down, None, n, false, 0xD000 + n as u32);
-        check(&mut gpu, &mut tally, "down/add", &down, None, n, true, 0xD100 + n as u32);
+        check(
+            &mut gpu,
+            &mut tally,
+            "down/set",
+            &down,
+            None,
+            n,
+            false,
+            0xD000 + n as u32,
+        );
+        check(
+            &mut gpu,
+            &mut tally,
+            "down/add",
+            &down,
+            None,
+            n,
+            true,
+            0xD100 + n as u32,
+        );
         if !quick {
-            check(&mut gpu, &mut tally, "qkvza/set", &qkvza, None, n, false, 0xA000 + n as u32);
-            check(&mut gpu, &mut tally, "qkv/set", &qkv, None, n, false, 0xB000 + n as u32);
+            check(
+                &mut gpu,
+                &mut tally,
+                "qkvza/set",
+                &qkvza,
+                None,
+                n,
+                false,
+                0xA000 + n as u32,
+            );
+            check(
+                &mut gpu,
+                &mut tally,
+                "qkv/set",
+                &qkv,
+                None,
+                n,
+                false,
+                0xB000 + n as u32,
+            );
         }
     }
     for (label, matrix) in [("m48tail/set", &tail48), ("m100tail/set", &tail100)] {
-        for &n in if quick { &[48usize][..] } else { &[48usize, 80, 512][..] } {
-            check(&mut gpu, &mut tally, label, matrix, None, n, false, 0xE000 + n as u32);
+        for &n in if quick {
+            &[48usize][..]
+        } else {
+            &[48usize, 80, 512][..]
+        } {
+            check(
+                &mut gpu,
+                &mut tally,
+                label,
+                matrix,
+                None,
+                n,
+                false,
+                0xE000 + n as u32,
+            );
         }
     }
     eprintln!("SUMMARY cases={} outputs_compared={} gemm_differing={} repeat_differing={} quant_bytes_differing={} silu_gpu_vs_host_max_ulp={}",

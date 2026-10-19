@@ -48,7 +48,9 @@ fn build_e8_soa(m: usize, k: usize, seed: u64) -> Vec<u8> {
 }
 
 fn upload_weight(gpu: &Gpu, packed: &[u8], m: usize, k: usize) -> GpuTensor {
-    let mut weight = gpu.upload_raw(packed, &[packed.len()]).expect("upload weight");
+    let mut weight = gpu
+        .upload_raw(packed, &[packed.len()])
+        .expect("upload weight");
     weight.shape = vec![m, k];
     weight.dtype = DType::MFP4G32E8SOA;
     weight
@@ -184,14 +186,24 @@ fn time_rocblas(
     for _ in 0..3 {
         let start = gpu.hip.event_create().map_err(|e| e.to_string())?;
         let stop = gpu.hip.event_create().map_err(|e| e.to_string())?;
-        gpu.hip.event_record(&start, None).map_err(|e| e.to_string())?;
+        gpu.hip
+            .event_record(&start, None)
+            .map_err(|e| e.to_string())?;
         for _ in 0..repeats {
-            rocblas_call(rb, shadow, x_f16, y, m, k, solution)
-                .map_err(|e| e.to_string())?;
+            rocblas_call(rb, shadow, x_f16, y, m, k, solution).map_err(|e| e.to_string())?;
         }
-        gpu.hip.event_record(&stop, None).map_err(|e| e.to_string())?;
-        gpu.hip.event_synchronize(&stop).map_err(|e| e.to_string())?;
-        trials.push(gpu.hip.event_elapsed_ms(&start, &stop).map_err(|e| e.to_string())? as f64 / repeats as f64);
+        gpu.hip
+            .event_record(&stop, None)
+            .map_err(|e| e.to_string())?;
+        gpu.hip
+            .event_synchronize(&stop)
+            .map_err(|e| e.to_string())?;
+        trials.push(
+            gpu.hip
+                .event_elapsed_ms(&start, &stop)
+                .map_err(|e| e.to_string())? as f64
+                / repeats as f64,
+        );
         gpu.hip.event_destroy(start).map_err(|e| e.to_string())?;
         gpu.hip.event_destroy(stop).map_err(|e| e.to_string())?;
     }
@@ -207,7 +219,8 @@ fn time_compressed(
     k: usize,
     repeats: usize,
 ) -> f64 {
-    gpu.gemv_mfp4g32_e8_soa(weight, x, y, m, k).expect("warm compressed");
+    gpu.gemv_mfp4g32_e8_soa(weight, x, y, m, k)
+        .expect("warm compressed");
     gpu.hip.device_synchronize().expect("warm sync");
     let mut trials = Vec::with_capacity(3);
     for _ in 0..3 {
@@ -215,7 +228,8 @@ fn time_compressed(
         let stop = gpu.hip.event_create().unwrap();
         gpu.hip.event_record(&start, None).unwrap();
         for _ in 0..repeats {
-            gpu.gemv_mfp4g32_e8_soa(weight, x, y, m, k).expect("compressed");
+            gpu.gemv_mfp4g32_e8_soa(weight, x, y, m, k)
+                .expect("compressed");
         }
         gpu.hip.event_record(&stop, None).unwrap();
         gpu.hip.event_synchronize(&stop).unwrap();
@@ -244,7 +258,9 @@ fn validate(candidate: &[f32], reference: &[f32], guard: &[f32]) -> Result<(f64,
     }
     let rel_l2 = (err2 / ref2.max(1.0e-30)).sqrt();
     if max_abs > 0.1 || rel_l2 > 1.0e-3 {
-        return Err(format!("numerics max_abs={max_abs:.6e} rel_l2={rel_l2:.6e}"));
+        return Err(format!(
+            "numerics max_abs={max_abs:.6e} rel_l2={rel_l2:.6e}"
+        ));
     }
     Ok((max_abs, rel_l2))
 }
@@ -258,15 +274,19 @@ fn run_shape(gpu: &mut Gpu, m: usize, k: usize, seed: u64) {
     let x_host = make_x(k, seed ^ 0xa5a5);
     let x = gpu.upload_f32(&x_host, &[k]).expect("x");
     let x_f16 = gpu.alloc_tensor(&[k], DType::F16).expect("x f16");
-    gpu.deepseek4_convert_f32_to_f16(&x, &x_f16, k as i64).expect("x f16 convert");
+    gpu.deepseek4_convert_f32_to_f16(&x, &x_f16, k as i64)
+        .expect("x f16 convert");
     let reference = gpu.zeros(&[m], DType::F32).expect("reference");
-    gpu.gemv_mfp4g32_e8_soa(&weight, &x, &reference, m, k).expect("reference");
+    gpu.gemv_mfp4g32_e8_soa(&weight, &x, &reference, m, k)
+        .expect("reference");
     gpu.hip.device_synchronize().expect("reference sync");
     let reference_host = gpu.download_f32(&reference).expect("reference download");
 
     let poison = f32::from_bits(POISON_BITS);
     let poison_host = vec![poison; m + GUARD];
-    let backing = gpu.upload_f32(&poison_host, &[m + GUARD]).expect("guarded output");
+    let backing = gpu
+        .upload_f32(&poison_host, &[m + GUARD])
+        .expect("guarded output");
     let y = backing.sub_offset(0, m);
     let ids = enumerate(gpu.rocblas.as_ref().unwrap(), &shadow, &x_f16, &y, m, k);
     println!("ENUM M={m} K={k} count={} ids={ids:?}", ids.len());
@@ -278,12 +298,29 @@ fn run_shape(gpu: &mut Gpu, m: usize, k: usize, seed: u64) {
 
     let mut choices = Vec::new();
     choices.push(("default".to_string(), None));
-    choices.extend(ids.into_iter().filter(|id| *id > 0).map(|id| (format!("solution:{id}"), Some(id))));
+    choices.extend(
+        ids.into_iter()
+            .filter(|id| *id > 0)
+            .map(|id| (format!("solution:{id}"), Some(id))),
+    );
     for (label, solution) in choices {
-        gpu.hip.memcpy_htod(&backing.buf, bytes_of_f32(&poison_host)).expect("reset guard");
-        let call = rocblas_call(gpu.rocblas.as_ref().unwrap(), &shadow, &x_f16, &y, m, k, solution);
+        gpu.hip
+            .memcpy_htod(&backing.buf, bytes_of_f32(&poison_host))
+            .expect("reset guard");
+        let call = rocblas_call(
+            gpu.rocblas.as_ref().unwrap(),
+            &shadow,
+            &x_f16,
+            &y,
+            m,
+            k,
+            solution,
+        );
         if let Err(error) = call {
-            println!("REJECT M={m} K={k} route={label} reason=launch status={} context={:?}", error.status, error.context);
+            println!(
+                "REJECT M={m} K={k} route={label} reason=launch status={} context={:?}",
+                error.status, error.context
+            );
             continue;
         }
         gpu.hip.device_synchronize().expect("candidate sync");
@@ -301,7 +338,12 @@ fn run_shape(gpu: &mut Gpu, m: usize, k: usize, seed: u64) {
 fn main() {
     let mut gpu = Gpu::init().expect("Gpu::init");
     assert_eq!(gpu.arch, "gfx942", "exact-gfx942 channel only");
-    assert!(gpu.rocblas.as_ref().is_some_and(Rocblas::has_gemm_ex_solution_enumeration), "ROCm rocBLAS solution enumeration required");
+    assert!(
+        gpu.rocblas
+            .as_ref()
+            .is_some_and(Rocblas::has_gemm_ex_solution_enumeration),
+        "ROCm rocBLAS solution enumeration required"
+    );
     run_shape(&mut gpu, 1024, 4096, 0x9421);
     run_shape(&mut gpu, 32768, 1024, 0x9422);
 }

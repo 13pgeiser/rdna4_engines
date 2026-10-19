@@ -73,7 +73,11 @@ macro_rules! twin {
             source_sha256: hex32($src),
             image_sha256: hex32($img),
             accepted_elf_sha256: hex32($elf),
-            image: include_bytes!(concat!("../../../kernels/pm-decode/gfx1201/", $file, ".hxaco")),
+            image: include_bytes!(concat!(
+                "../../../kernels/pm-decode/gfx1201/",
+                $file,
+                ".hxaco"
+            )),
             radiowave_json: include_str!(concat!(
                 "../../../kernels/pm-decode/gfx1201/",
                 $file,
@@ -214,7 +218,8 @@ mod tests {
     /// The gfx1201 code object inside a clang offload bundle (the bytes HIP
     /// loads), independent of any loose `.co` file next to it.
     fn gfx1201_payload(bundle: &[u8]) -> &[u8] {
-        let u64_at = |at: usize| u64::from_le_bytes(bundle[at..at + 8].try_into().unwrap()) as usize;
+        let u64_at =
+            |at: usize| u64::from_le_bytes(bundle[at..at + 8].try_into().unwrap()) as usize;
         assert_eq!(&bundle[..24], b"__CLANG_OFFLOAD_BUNDLE__");
         let mut cursor = 32;
         let mut found = None;
@@ -223,7 +228,10 @@ mod tests {
             let triple = &bundle[cursor + 24..cursor + 24 + len];
             cursor += 24 + len;
             if triple == b"hipv4-amdgcn-amd-amdhsa--gfx1201" {
-                assert!(found.replace(&bundle[offset..offset + size]).is_none(), "two gfx1201 entries");
+                assert!(
+                    found.replace(&bundle[offset..offset + size]).is_none(),
+                    "two gfx1201 entries"
+                );
             }
         }
         found.expect("bundle has no gfx1201 entry")
@@ -236,12 +244,18 @@ mod tests {
             twin.verify_image().unwrap();
             let elf = gfx1201_payload(twin.image);
             let elf_sha: [u8; 32] = Sha256::digest(elf).into();
-            assert_eq!(elf_sha, twin.accepted_elf_sha256, "{}: bundle does not carry the accepted ELF", twin.module);
+            assert_eq!(
+                elf_sha, twin.accepted_elf_sha256,
+                "{}: bundle does not carry the accepted ELF",
+                twin.module
+            );
             radiowave::CodeObjectCertification::from_json(twin.image, twin.radiowave_json)
                 .unwrap_or_else(|e| panic!("{}: {e}", twin.module));
             for &symbol in twin.symbols {
                 assert!(
-                    twin.image.windows(symbol.len()).any(|w| w == symbol.as_bytes()),
+                    twin.image
+                        .windows(symbol.len())
+                        .any(|w| w == symbol.as_bytes()),
                     "{}: export {symbol} missing",
                     twin.module
                 );
@@ -255,7 +269,14 @@ mod tests {
         let s = "fused_qkvza_mq4g256v2";
         assert!(select_pm_decode_twin("gfx1201", true, m, s).is_some());
         assert!(select_pm_decode_twin("gfx1201", false, m, s).is_none());
-        for arch in ["gfx1200", "gfx12", "gfx1151", "gfx1100", "gfx942", "gfx1201:xnack-"] {
+        for arch in [
+            "gfx1200",
+            "gfx12",
+            "gfx1151",
+            "gfx1100",
+            "gfx942",
+            "gfx1201:xnack-",
+        ] {
             assert!(select_pm_decode_twin(arch, true, m, s).is_none(), "{arch}");
         }
         assert!(select_pm_decode_twin("gfx1201", true, m, "other").is_none());
@@ -276,9 +297,13 @@ mod tests {
         };
         let err = tampered.verify_image().unwrap_err();
         assert!(err.contains("embedded image sha256"), "{err}");
-        let err = twin.verify("// not the incumbent", twin.symbols[0]).unwrap_err();
+        let err = twin
+            .verify("// not the incumbent", twin.symbols[0])
+            .unwrap_err();
         assert!(err.contains("incumbent source sha256"), "{err}");
-        let err = tampered.verify("// not the incumbent", twin.symbols[0]).unwrap_err();
+        let err = tampered
+            .verify("// not the incumbent", twin.symbols[0])
+            .unwrap_err();
         assert!(err.contains("embedded image sha256"), "{err}");
     }
 }

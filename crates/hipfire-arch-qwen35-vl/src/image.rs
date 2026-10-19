@@ -599,8 +599,8 @@ pub fn vcn_to_patches(
     // Geometry scalars outlive the frame borrow; the log below runs after
     // the lease drops.
     let (src_w, src_h) = (frame.width, frame.height);
-    let map_err = |op: &'static str| move |e: hip_bridge::HipError| {
-        VcnPreprocessError::Recoverable(format!("vcn {op}: {e}"))
+    let map_err = |op: &'static str| {
+        move |e: hip_bridge::HipError| VcnPreprocessError::Recoverable(format!("vcn {op}: {e}"))
     };
     gpu.ensure_kernel_public("vl_yuv_preprocess", VL_YUV_PREPROCESS_SRC, VL_RGB_KERNEL)
         .map_err(map_err("ensure rgb kernel"))?;

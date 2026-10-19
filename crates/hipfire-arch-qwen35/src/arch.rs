@@ -96,9 +96,7 @@ impl Architecture for Qwen35 {
         // load rather than replay a route with stale activations.
         // The `None` route is the pre-placement one — no placement was resolved,
         // so nothing is spilled and the gate starts off.
-        let host_weights = placement.map_or(0, |p| {
-            p.host_layers() + p.host_expert_layers()
-        });
+        let host_weights = placement.map_or(0, |p| p.host_layers() + p.host_expert_layers());
         // Any host-mapped weight the CPU may multiply is a host sync point: a
         // whole-layer spill's own weights through the step seam, and a routed
         // expert's down projection through the MoE CPU splice (default-on

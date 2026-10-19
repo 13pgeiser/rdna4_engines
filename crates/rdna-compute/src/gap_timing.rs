@@ -26,7 +26,14 @@ pub enum Slot {
 
 const SLOTS: usize = 8;
 const NAMES: [&str; SLOTS] = [
-    "embed", "pos_copy", "patch", "submit_wait", "gpu_span", "graph_launch", "forward", "between",
+    "embed",
+    "pos_copy",
+    "patch",
+    "submit_wait",
+    "gpu_span",
+    "graph_launch",
+    "forward",
+    "between",
 ];
 const WINDOW: usize = 128;
 
@@ -141,7 +148,11 @@ fn flush(state: &mut State) {
         values.sort_unstable();
         let mean = values.iter().sum::<u64>() as f64 / values.len() as f64;
         let median = values[values.len() / 2];
-        line.push_str(&format!(" {name}_us={:.2}/{:.2}", mean / 1e3, median as f64 / 1e3));
+        line.push_str(&format!(
+            " {name}_us={:.2}/{:.2}",
+            mean / 1e3,
+            median as f64 / 1e3
+        ));
     }
     eprintln!("{line} (mean/median)");
 }

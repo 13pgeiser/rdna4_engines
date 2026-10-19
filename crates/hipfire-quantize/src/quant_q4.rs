@@ -3,7 +3,6 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-
 use hipfire_quantize::float16::{f16_to_f32, f32_to_f16};
 
 // ─── Q4_F16_G64 Quantization ────────────────────────────────────────────────

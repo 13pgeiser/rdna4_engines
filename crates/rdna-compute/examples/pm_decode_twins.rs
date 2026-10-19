@@ -52,7 +52,10 @@ fn err<E: std::fmt::Display>(e: E) -> String {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -63,7 +66,10 @@ fn unhex(s: &str) -> Result<Vec<u8>> {
     if s.len() % 2 != 0 {
         return Err("odd hex length".into());
     }
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(err)).collect()
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(err))
+        .collect()
 }
 
 fn abs_path(s: &str, what: &str) -> Result<PathBuf> {
@@ -205,7 +211,11 @@ const MODULES: &[ModuleSpec] = &[
         module: "gemv_hfq4g256_residual_mq4v2",
         symbol: "gemv_mq4g256v2_residual",
         k: 28,
-        args: &[Arg::Weight { ptr: 0, m: 24 }, Arg::X { ptr: 8 }, Arg::Y { ptr: 16, m: 24 }],
+        args: &[
+            Arg::Weight { ptr: 0, m: 24 },
+            Arg::X { ptr: 8 },
+            Arg::Y { ptr: 16, m: 24 },
+        ],
         rename: Rename::Macro("HIPFIRE_RESIDUAL_KERNEL"),
         pre_after: "    float bcc = (bcc0 + bcc1) + (bcc2 + bcc3);\n",
         post_before: "    if (tid == 0) {\n        if (have_row1) {",
@@ -217,7 +227,11 @@ const MODULES: &[ModuleSpec] = &[
         module: "gemv_hfq4g256_multirow_default_mq4v2",
         symbol: "gemv_mq4g256v2_multirow_r2",
         k: 28,
-        args: &[Arg::Weight { ptr: 0, m: 24 }, Arg::X { ptr: 8 }, Arg::Y { ptr: 16, m: 24 }],
+        args: &[
+            Arg::Weight { ptr: 0, m: 24 },
+            Arg::X { ptr: 8 },
+            Arg::Y { ptr: 16, m: 24 },
+        ],
         rename: Rename::Literal("gemv_mq4g256v2_multirow_r2"),
         pre_after: "    float s1 = (b0 + b1) + (b2 + b3);\n",
         post_before: "    if (tid == 0) {\n        y[row0] = s0;",
@@ -231,7 +245,11 @@ fn spec(module: &str) -> Result<&'static ModuleSpec> {
     MODULES.iter().find(|m| m.module == module).ok_or_else(|| {
         format!(
             "unknown module {module}; known: {}",
-            MODULES.iter().map(|m| m.module).collect::<Vec<_>>().join(", ")
+            MODULES
+                .iter()
+                .map(|m| m.module)
+                .collect::<Vec<_>>()
+                .join(", ")
         )
     })
 }
@@ -248,14 +266,17 @@ struct Incumbent {
 }
 
 fn incumbent(inventory: &Path, s: &ModuleSpec) -> Result<Incumbent> {
-    let inv: Value = serde_json::from_slice(&std::fs::read(inventory).map_err(err)?).map_err(err)?;
+    let inv: Value =
+        serde_json::from_slice(&std::fs::read(inventory).map_err(err)?).map_err(err)?;
     let m = inv["modules"]
         .as_array()
         .ok_or("inventory.modules missing")?
         .iter()
         .find(|m| m["module"] == s.module)
         .ok_or_else(|| format!("{} not in inventory", s.module))?;
-    let snap = m["source_snapshot"].as_str().ok_or("source_snapshot missing")?;
+    let snap = m["source_snapshot"]
+        .as_str()
+        .ok_or("source_snapshot missing")?;
     let source = std::fs::read_to_string(snap).map_err(err)?;
     let want = m["source_sha256"].as_str().ok_or("source_sha256 missing")?;
     let got = sha256_hex(source.as_bytes());
@@ -283,7 +304,10 @@ fn incumbent(inventory: &Path, s: &ModuleSpec) -> Result<Incumbent> {
         source,
         source_sha256: got,
         object_path: PathBuf::from(m["object_path"].as_str().ok_or("object_path missing")?),
-        object_sha256: m["object_sha256"].as_str().ok_or("object_sha256 missing")?.to_owned(),
+        object_sha256: m["object_sha256"]
+            .as_str()
+            .ok_or("object_sha256 missing")?
+            .to_owned(),
         kernarg_size,
     })
 }
@@ -297,7 +321,10 @@ fn variant_source(s: &ModuleSpec, inc: &Incumbent, stage: Stage, name: &str) -> 
     };
     let hits = src.matches(anchor).count();
     if hits != 1 {
-        return Err(format!("{}: {stage:?} anchor occurs {hits} times", s.module));
+        return Err(format!(
+            "{}: {stage:?} anchor occurs {hits} times",
+            s.module
+        ));
     }
     let at = src.find(anchor).unwrap() + if after { anchor.len() } else { 0 };
     let mut out = String::with_capacity(src.len() + 256);
@@ -311,7 +338,10 @@ fn variant_source(s: &ModuleSpec, inc: &Incumbent, stage: Stage, name: &str) -> 
         Rename::Literal(sym) => {
             let decl = format!("void {sym}(");
             if src.matches(&decl).count() != 1 {
-                return Err(format!("{}: literal symbol declaration not unique", s.module));
+                return Err(format!(
+                    "{}: literal symbol declaration not unique",
+                    s.module
+                ));
             }
             let body = format!("{}{}{}", &src[..at], insert, &src[at..]);
             out.push_str(&body.replacen(&decl, &format!("void {name}("), 1));
@@ -356,7 +386,9 @@ impl Capture {
     fn arg(&self, off: usize, tag: &str) -> Result<Vec<u8>> {
         let name = format!("arg{off}.{tag}.bin");
         let b = std::fs::read(self.dir.join(&name)).map_err(err)?;
-        let want = self.meta["files"][&name]["sha256"].as_str().ok_or(format!("no hash for {name}"))?;
+        let want = self.meta["files"][&name]["sha256"]
+            .as_str()
+            .ok_or(format!("no hash for {name}"))?;
         if sha256_hex(&b) != want {
             return Err(format!("{name}: sha256 mismatch"));
         }
@@ -373,7 +405,9 @@ struct Dev {
 
 impl Dev {
     fn new(gpu: &Gpu, bytes: usize) -> Result<Self> {
-        Ok(Dev { buf: gpu.hip.malloc(bytes.max(16)).map_err(err)? })
+        Ok(Dev {
+            buf: gpu.hip.malloc(bytes.max(16)).map_err(err)?,
+        })
     }
     fn upload(gpu: &Gpu, bytes: &[u8]) -> Result<Self> {
         let d = Self::new(gpu, bytes.len())?;
@@ -414,13 +448,29 @@ fn load_candidate(gpu: &Gpu, path: &Path, symbol: &str) -> Result<Candidate> {
     let bytes = std::fs::read(path).map_err(err)?;
     let module = gpu.hip.module_load_data(&bytes).map_err(err)?;
     let func = gpu.hip.module_get_function(&module, symbol).map_err(err)?;
-    Ok(Candidate { _module: module, func, path: path.to_owned(), sha256: sha256_hex(&bytes) })
+    Ok(Candidate {
+        _module: module,
+        func,
+        path: path.to_owned(),
+        sha256: sha256_hex(&bytes),
+    })
 }
 
-fn launch_candidate(gpu: &Gpu, c: &Candidate, grid: [u32; 3], block: [u32; 3], lds: u32, kernarg: &mut [u8]) -> Result<()> {
+fn launch_candidate(
+    gpu: &Gpu,
+    c: &Candidate,
+    grid: [u32; 3],
+    block: [u32; 3],
+    lds: u32,
+    kernarg: &mut [u8],
+) -> Result<()> {
     // SAFETY: the kernarg bytes follow the candidate's declared ABI and every
     // pointer addresses a live allocation owned by this process.
-    unsafe { gpu.hip.launch_kernel_blob(&c.func, grid, block, lds, None, kernarg) }.map_err(err)
+    unsafe {
+        gpu.hip
+            .launch_kernel_blob(&c.func, grid, block, lds, None, kernarg)
+    }
+    .map_err(err)
 }
 
 // ---------------------------------------------------------------------------
@@ -434,7 +484,10 @@ struct Cmp {
 }
 
 fn compare(a: &[u8], b: &[u8]) -> Cmp {
-    let mut c = Cmp { bytes: a.len().max(b.len()), ..Default::default() };
+    let mut c = Cmp {
+        bytes: a.len().max(b.len()),
+        ..Default::default()
+    };
     for i in 0..c.bytes {
         if a.get(i) != b.get(i) {
             c.mismatches += 1;
@@ -478,7 +531,9 @@ fn shfl_down_tree(lanes: &[f32; 32]) -> f32 {
 }
 
 fn f32s(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -508,13 +563,22 @@ struct Launch {
     lds: u32,
 }
 
-fn build_arm(gpu: &Gpu, s: &ModuleSpec, l: &Launch, perturb: Option<(usize, usize)>) -> Result<Arm> {
+fn build_arm(
+    gpu: &Gpu,
+    s: &ModuleSpec,
+    l: &Launch,
+    perturb: Option<(usize, usize)>,
+) -> Result<Arm> {
     let mut kernarg = l.kernarg.clone();
     let mut bufs = Vec::new();
     for (a, pre) in &l.args {
         let len = arg_len(s, &l.kernarg, *a);
         if pre.len() != len {
-            return Err(format!("arg{}: {} bytes, expected {len}", a.ptr(), pre.len()));
+            return Err(format!(
+                "arg{}: {} bytes, expected {len}",
+                a.ptr(),
+                pre.len()
+            ));
         }
         let mut framed = vec![GUARD_BYTE; GUARD + len + GUARD];
         framed[GUARD..GUARD + len].copy_from_slice(pre);
@@ -527,16 +591,27 @@ fn build_arm(gpu: &Gpu, s: &ModuleSpec, l: &Launch, perturb: Option<(usize, usiz
         wr_u64(&mut kernarg, a.ptr(), d.va(GUARD));
         bufs.push((*a, len, d));
     }
-    Ok(Arm { bufs, kernarg: pad16(kernarg) })
+    Ok(Arm {
+        bufs,
+        kernarg: pad16(kernarg),
+    })
 }
 
 /// Launch incumbent and candidate on identical copies; returns (mismatch
 /// bytes, per-buffer json, incumbent post bytes per arg).
-fn launch_pair(gpu: &mut Gpu, s: &ModuleSpec, cand: &Candidate, l: &Launch, perturb: Option<(usize, usize)>, flip_output: bool) -> Result<(usize, Vec<Value>, Vec<Vec<u8>>)> {
+fn launch_pair(
+    gpu: &mut Gpu,
+    s: &ModuleSpec,
+    cand: &Candidate,
+    l: &Launch,
+    perturb: Option<(usize, usize)>,
+    flip_output: bool,
+) -> Result<(usize, Vec<Value>, Vec<Vec<u8>>)> {
     let mut hip = build_arm(gpu, s, l, None)?;
     let mut pm = build_arm(gpu, s, l, perturb)?;
     gpu.hip.device_synchronize().map_err(err)?;
-    gpu.launch_kernel_blob(s.symbol, l.grid, l.block, l.lds, &mut hip.kernarg).map_err(err)?;
+    gpu.launch_kernel_blob(s.symbol, l.grid, l.block, l.lds, &mut hip.kernarg)
+        .map_err(err)?;
     gpu.hip.device_synchronize().map_err(err)?;
     launch_candidate(gpu, cand, l.grid, l.block, l.lds, &mut pm.kernarg)?;
     gpu.hip.device_synchronize().map_err(err)?;
@@ -554,7 +629,11 @@ fn launch_pair(gpu: &mut Gpu, s: &ModuleSpec, cand: &Candidate, l: &Launch, pert
         let (n, v) = cmp_json(&format!("arg{}+guards", a.ptr()), &fh, &fp, ("hipcc", "pm"));
         total += n;
         rows.push(v);
-        if !fh[..GUARD].iter().chain(&fh[GUARD + len..]).all(|&b| b == GUARD_BYTE) {
+        if !fh[..GUARD]
+            .iter()
+            .chain(&fh[GUARD + len..])
+            .all(|&b| b == GUARD_BYTE)
+        {
             return Err(format!("incumbent wrote outside arg{} extent", a.ptr()));
         }
         posts.push(fh[GUARD..GUARD + len].to_vec());
@@ -564,13 +643,34 @@ fn launch_pair(gpu: &mut Gpu, s: &ModuleSpec, cand: &Candidate, l: &Launch, pert
 
 fn captured_launch(s: &ModuleSpec, cap: &Capture, kernarg_size: usize) -> Result<Launch> {
     if cap.kernarg.len() < kernarg_size {
-        return Err(format!("captured kernarg {} < segment {kernarg_size}", cap.kernarg.len()));
+        return Err(format!(
+            "captured kernarg {} < segment {kernarg_size}",
+            cap.kernarg.len()
+        ));
     }
-    let args = s.args.iter().map(|&a| cap.arg(a.ptr(), "pre").map(|b| (a, b))).collect::<Result<_>>()?;
-    Ok(Launch { kernarg: cap.kernarg.clone(), args, grid: cap.grid, block: cap.block, lds: cap.lds })
+    let args = s
+        .args
+        .iter()
+        .map(|&a| cap.arg(a.ptr(), "pre").map(|b| (a, b)))
+        .collect::<Result<_>>()?;
+    Ok(Launch {
+        kernarg: cap.kernarg.clone(),
+        args,
+        grid: cap.grid,
+        block: cap.block,
+        lds: cap.lds,
+    })
 }
 
-fn run_full(gpu: &mut Gpu, s: &ModuleSpec, inc: &Incumbent, cap: &Capture, cand: &Candidate, perturb: Option<(usize, usize)>, flip_output: bool) -> Result<(usize, Value)> {
+fn run_full(
+    gpu: &mut Gpu,
+    s: &ModuleSpec,
+    inc: &Incumbent,
+    cap: &Capture,
+    cand: &Candidate,
+    perturb: Option<(usize, usize)>,
+    flip_output: bool,
+) -> Result<(usize, Value)> {
     let l = captured_launch(s, cap, inc.kernarg_size)?;
     let (total, rows, posts) = launch_pair(gpu, s, cand, &l, perturb, flip_output)?;
     let mut callsite_mismatch = 0;
@@ -604,7 +704,12 @@ fn edge_grid(s: &ModuleSpec, ms: &[usize]) -> [u32; 3] {
 /// Admitted edge shapes derived from the real tensors: group counts covering
 /// quads 0/1/2+ with tail 0/1/2/3 plus the real K-1 group / K, and row counts
 /// 1, 2/3 (odd row-pair tails), 31/32/33 and per-matrix routing.
-fn run_edges(gpu: &mut Gpu, s: &ModuleSpec, cap: &Capture, cand: &Candidate) -> Result<(usize, Value)> {
+fn run_edges(
+    gpu: &mut Gpu,
+    s: &ModuleSpec,
+    cap: &Capture,
+    cand: &Candidate,
+) -> Result<(usize, Value)> {
     let real_groups = rd_i32(&cap.kernarg, s.k) as usize / 256;
     let mut gs: Vec<usize> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, real_groups - 1, real_groups];
     gs.retain(|&g| g >= 1 && g <= real_groups);
@@ -613,30 +718,62 @@ fn run_edges(gpu: &mut Gpu, s: &ModuleSpec, cap: &Capture, cand: &Candidate) -> 
     let weights: Vec<(Arg, usize)> = s
         .args
         .iter()
-        .filter_map(|&a| if let Arg::Weight { m, .. } = a { Some((a, m)) } else { None })
+        .filter_map(|&a| {
+            if let Arg::Weight { m, .. } = a {
+                Some((a, m))
+            } else {
+                None
+            }
+        })
         .collect();
-    let real_rows: Vec<usize> = weights.iter().map(|&(_, m)| rd_i32(&cap.kernarg, m) as usize).collect();
+    let real_rows: Vec<usize> = weights
+        .iter()
+        .map(|&(_, m)| rd_i32(&cap.kernarg, m) as usize)
+        .collect();
     let nw = weights.len();
     let patterns: Vec<Vec<usize>> = if nw == 1 {
         [1, 2, 3, 31, 32, 33, 65].iter().map(|&m| vec![m]).collect()
     } else {
         let base: &[[usize; 4]] = &[
-            [1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1],
-            [1, 1, 1, 1], [31, 32, 33, 1], [33, 1, 2, 31], [3, 0, 5, 0], [32, 32, 32, 32],
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+            [1, 1, 1, 1],
+            [31, 32, 33, 1],
+            [33, 1, 2, 31],
+            [3, 0, 5, 0],
+            [32, 32, 32, 32],
         ];
-        let mut v: Vec<Vec<usize>> = base.iter().map(|p| p[..nw].to_vec()).filter(|p| p.iter().any(|&m| m > 0)).collect();
+        let mut v: Vec<Vec<usize>> = base
+            .iter()
+            .map(|p| p[..nw].to_vec())
+            .filter(|p| p.iter().any(|&m| m > 0))
+            .collect();
         v.sort();
         v.dedup();
         v
     };
-    let wbytes: Vec<Vec<u8>> = weights.iter().map(|(a, _)| cap.arg(a.ptr(), "pre")).collect::<Result<_>>()?;
-    let xa = s.args.iter().copied().find(|a| matches!(a, Arg::X { .. })).unwrap();
+    let wbytes: Vec<Vec<u8>> = weights
+        .iter()
+        .map(|(a, _)| cap.arg(a.ptr(), "pre"))
+        .collect::<Result<_>>()?;
+    let xa = s
+        .args
+        .iter()
+        .copied()
+        .find(|a| matches!(a, Arg::X { .. }))
+        .unwrap();
     let x = cap.arg(xa.ptr(), "pre")?;
     let mut total = 0;
     let mut shapes = Vec::new();
     for &g in &gs {
         for pat in &patterns {
-            let ms: Vec<usize> = pat.iter().zip(&real_rows).map(|(&m, &r)| m.min(r)).collect();
+            let ms: Vec<usize> = pat
+                .iter()
+                .zip(&real_rows)
+                .map(|(&m, &r)| m.min(r))
+                .collect();
             if ms.iter().all(|&m| m == 0) {
                 continue;
             }
@@ -667,17 +804,27 @@ fn run_edges(gpu: &mut Gpu, s: &ModuleSpec, cap: &Capture, cand: &Candidate) -> 
                 };
                 args.push((a, bytes));
             }
-            let l = Launch { kernarg, args, grid: edge_grid(s, &ms), block: cap.block, lds: cap.lds };
+            let l = Launch {
+                kernarg,
+                args,
+                grid: edge_grid(s, &ms),
+                block: cap.block,
+                lds: cap.lds,
+            };
             let (n, rows, _) = launch_pair(gpu, s, cand, &l, None, false)?;
             total += n;
-            let mut shape = json!({"groups": g, "K": g * 256, "rows": ms, "grid": l.grid, "mismatch_bytes": n});
+            let mut shape =
+                json!({"groups": g, "K": g * 256, "rows": ms, "grid": l.grid, "mismatch_bytes": n});
             if n > 0 {
                 shape["buffers"] = json!(rows);
             }
             shapes.push(shape);
         }
     }
-    Ok((total, json!({"mode": "edges", "shapes": shapes.len(), "mismatch_bytes": total, "results": shapes})))
+    Ok((
+        total,
+        json!({"mode": "edges", "shapes": shapes.len(), "mismatch_bytes": total, "results": shapes}),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -699,10 +846,26 @@ struct RegionArms {
 const LANE_OUT: usize = 128;
 
 #[allow(clippy::too_many_arguments)]
-fn region(gpu: &mut Gpu, s: &ModuleSpec, inc: &Incumbent, cap: &Capture, cand: &Candidate, stage: Stage, row_stride: usize, report: &Path) -> Result<(usize, Value)> {
+fn region(
+    gpu: &mut Gpu,
+    s: &ModuleSpec,
+    inc: &Incumbent,
+    cap: &Capture,
+    cand: &Candidate,
+    stage: Stage,
+    row_stride: usize,
+    report: &Path,
+) -> Result<(usize, Value)> {
     let k_total = rd_i32(&cap.kernarg, s.k) as usize;
     let groups = k_total / 256;
-    let x = cap.arg(s.args.iter().find(|a| matches!(a, Arg::X { .. })).unwrap().ptr(), "pre")?;
+    let x = cap.arg(
+        s.args
+            .iter()
+            .find(|a| matches!(a, Arg::X { .. }))
+            .unwrap()
+            .ptr(),
+        "pre",
+    )?;
     let weights: Vec<(Arg, usize, Vec<u8>)> = s
         .args
         .iter()
@@ -728,7 +891,11 @@ fn region(gpu: &mut Gpu, s: &ModuleSpec, inc: &Incumbent, cap: &Capture, cand: &
         for row in picked {
             let mut g = 0;
             while g + span <= groups {
-                cases.push(Case { matrix: mi, row, group: g });
+                cases.push(Case {
+                    matrix: mi,
+                    row,
+                    group: g,
+                });
                 g += span;
             }
         }
@@ -740,7 +907,10 @@ fn region(gpu: &mut Gpu, s: &ModuleSpec, inc: &Incumbent, cap: &Capture, cand: &
     // Device inputs: full matrices + x once; per-case synthetic blocks only where the ABI needs them.
     let xd = Dev::upload(gpu, &x)?;
     let zero_x = Dev::zeroed(gpu, 1024 * 4)?;
-    let wd: Vec<Dev> = weights.iter().map(|(_, _, b)| Dev::upload(gpu, b)).collect::<Result<_>>()?;
+    let wd: Vec<Dev> = weights
+        .iter()
+        .map(|(_, _, b)| Dev::upload(gpu, b))
+        .collect::<Result<_>>()?;
     let out_bytes = match s.region {
         RegionAbi::MultirowPair | RegionAbi::ResidualRecords => 2 * LANE_OUT,
         _ => LANE_OUT,
@@ -795,7 +965,12 @@ fn region(gpu: &mut Gpu, s: &ModuleSpec, inc: &Incumbent, cap: &Capture, cand: &
     let out_r = Dev::zeroed(gpu, cases.len() * out_bytes)?;
     let out_i = Dev::zeroed(gpu, cases.len() * out_bytes)?;
 
-    let mut arms = RegionArms { cand_kernargs: Vec::new(), ref_kernargs: Vec::new(), inc_kernargs: Vec::new(), out_bytes };
+    let mut arms = RegionArms {
+        cand_kernargs: Vec::new(),
+        ref_kernargs: Vec::new(),
+        inc_kernargs: Vec::new(),
+        out_bytes,
+    };
     for (i, c) in cases.iter().enumerate() {
         let wva = wd[c.matrix].va(c.row * row_bytes + c.group * 136);
         let xva = xd.va(c.group * 1024);
@@ -817,7 +992,14 @@ fn region(gpu: &mut Gpu, s: &ModuleSpec, inc: &Incumbent, cap: &Capture, cand: &
                     first = false;
                 }
             }
-            wr_i32(&mut ka, s.k, (256 * match s.region { RegionAbi::QkvzaQuad => 4, _ => 1 }) as i32);
+            wr_i32(
+                &mut ka,
+                s.k,
+                (256 * match s.region {
+                    RegionAbi::QkvzaQuad => 4,
+                    _ => 1,
+                }) as i32,
+            );
             pad16(ka)
         };
         match s.region {
@@ -871,20 +1053,31 @@ fn region(gpu: &mut Gpu, s: &ModuleSpec, inc: &Incumbent, cap: &Capture, cand: &
     }
     let _ = &zero_x;
 
-    let ref_name = format!("pmdt_ref_{}_{}", if stage == Stage::Pre { "pre" } else { "post" }, s.symbol);
-    let ref_module = format!("pmdt_ref_{}_{}", if stage == Stage::Pre { "pre" } else { "post" }, s.module);
+    let ref_name = format!(
+        "pmdt_ref_{}_{}",
+        if stage == Stage::Pre { "pre" } else { "post" },
+        s.symbol
+    );
+    let ref_module = format!(
+        "pmdt_ref_{}_{}",
+        if stage == Stage::Pre { "pre" } else { "post" },
+        s.module
+    );
     let src = variant_source(s, inc, stage, &ref_name)?;
-    gpu.ensure_kernel_public(&ref_module, &src, &ref_name).map_err(err)?;
+    gpu.ensure_kernel_public(&ref_module, &src, &ref_name)
+        .map_err(err)?;
     let one = [1u32, 1, 1];
     let blk = [32u32, 1, 1];
     for ka in arms.cand_kernargs.iter_mut() {
         launch_candidate(gpu, cand, one, blk, 0, ka)?;
     }
     for ka in arms.ref_kernargs.iter_mut() {
-        gpu.launch_kernel_blob(&ref_name, one, blk, 0, ka).map_err(err)?;
+        gpu.launch_kernel_blob(&ref_name, one, blk, 0, ka)
+            .map_err(err)?;
     }
     for ka in arms.inc_kernargs.iter_mut() {
-        gpu.launch_kernel_blob(s.symbol, one, blk, 0, ka).map_err(err)?;
+        gpu.launch_kernel_blob(s.symbol, one, blk, 0, ka)
+            .map_err(err)?;
     }
     gpu.hip.device_synchronize().map_err(err)?;
     let n = cases.len() * arms.out_bytes;
@@ -899,18 +1092,28 @@ fn region(gpu: &mut Gpu, s: &ModuleSpec, inc: &Incumbent, cap: &Capture, cand: &
         let r = f32s(&hr[i * out_bytes..(i + 1) * out_bytes]);
         let inc_out = f32s(&hi[i * out_bytes..(i + 1) * out_bytes]);
         let (expect, got): (Vec<f32>, Vec<f32>) = match (s.region, stage) {
-            (RegionAbi::MultirowPair, Stage::Post) => (vec![r[0], r[32]], vec![inc_out[0], inc_out[1]]),
+            (RegionAbi::MultirowPair, Stage::Post) => {
+                (vec![r[0], r[32]], vec![inc_out[0], inc_out[1]])
+            }
             (RegionAbi::MultirowPair, Stage::Pre) => {
                 let a: [f32; 32] = r[..32].try_into().unwrap();
                 let b: [f32; 32] = r[32..64].try_into().unwrap();
-                (vec![shfl_down_tree(&a), shfl_down_tree(&b)], vec![inc_out[0], inc_out[1]])
+                (
+                    vec![shfl_down_tree(&a), shfl_down_tree(&b)],
+                    vec![inc_out[0], inc_out[1]],
+                )
             }
             // Residual incumbent is RMW on zeroed y: y = 0 + lane0.
-            (RegionAbi::ResidualRecords, Stage::Post) => (vec![0.0 + r[0], 0.0 + r[1]], vec![inc_out[0], inc_out[1]]),
+            (RegionAbi::ResidualRecords, Stage::Post) => {
+                (vec![0.0 + r[0], 0.0 + r[1]], vec![inc_out[0], inc_out[1]])
+            }
             (RegionAbi::ResidualRecords, Stage::Pre) => {
                 let a: [f32; 32] = std::array::from_fn(|l| r[l * 2]);
                 let b: [f32; 32] = std::array::from_fn(|l| r[l * 2 + 1]);
-                (vec![0.0 + shfl_down_tree(&a), 0.0 + shfl_down_tree(&b)], vec![inc_out[0], inc_out[1]])
+                (
+                    vec![0.0 + shfl_down_tree(&a), 0.0 + shfl_down_tree(&b)],
+                    vec![inc_out[0], inc_out[1]],
+                )
             }
             (_, Stage::Post) => (vec![r[0]], vec![inc_out[0]]),
             (_, Stage::Pre) => {
@@ -951,7 +1154,11 @@ fn region(gpu: &mut Gpu, s: &ModuleSpec, inc: &Incumbent, cap: &Capture, cand: &
     if let Some(i) = cmp.first {
         let ci = i / out_bytes;
         let c = &cases[ci];
-        let lane_bytes = if matches!(s.region, RegionAbi::ResidualRecords) { 8 } else { 4 };
+        let lane_bytes = if matches!(s.region, RegionAbi::ResidualRecords) {
+            8
+        } else {
+            4
+        };
         v["first_index"] = json!(i);
         v["first_case"] = json!({"case": ci, "matrix_arg": weights[c.matrix].0.ptr(), "row": c.row, "group": c.group,
                                  "byte_in_case": i - ci * out_bytes, "lane": (i - ci * out_bytes) % LANE_OUT / lane_bytes});
@@ -965,7 +1172,11 @@ fn region(gpu: &mut Gpu, s: &ModuleSpec, inc: &Incumbent, cap: &Capture, cand: &
             wdump.extend_from_slice(&w[(c.row + r) * row_bytes + c.group * 136..][..span * 136]);
         }
         std::fs::write(report.join("first_case_weights.bin"), &wdump).map_err(err)?;
-        std::fs::write(report.join("first_case_x.bin"), &x[c.group * 1024..][..span * 1024]).map_err(err)?;
+        std::fs::write(
+            report.join("first_case_x.bin"),
+            &x[c.group * 1024..][..span * 1024],
+        )
+        .map_err(err)?;
     }
     Ok((cmp.mismatches + tie_mismatch, v))
 }
@@ -1051,8 +1262,13 @@ fn run() -> Result<usize> {
     if gpu.arch != "gfx1201" {
         return Err(format!("gfx1201 only, got {}", gpu.arch));
     }
-    gpu.ensure_kernel_public(s.module, &inc.source, s.symbol).map_err(err)?;
-    let label = if o.label.is_empty() { o.cmd.clone() } else { o.label.clone() };
+    gpu.ensure_kernel_public(s.module, &inc.source, s.symbol)
+        .map_err(err)?;
+    let label = if o.label.is_empty() {
+        o.cmd.clone()
+    } else {
+        o.label.clone()
+    };
     let report_dir = Path::new(RESULTS).join(s.module).join(&label);
     std::fs::create_dir_all(&report_dir).map_err(err)?;
     let argv: Vec<String> = std::env::args().collect();
@@ -1085,7 +1301,16 @@ fn run() -> Result<usize> {
                 }
             } else {
                 let stage = o.stage.unwrap_or(s.default_stage);
-                region(&mut gpu, s, &inc, &cap, &cand, stage, o.row_stride, &report_dir)?
+                region(
+                    &mut gpu,
+                    s,
+                    &inc,
+                    &cap,
+                    &cand,
+                    stage,
+                    o.row_stride,
+                    &report_dir,
+                )?
             };
             report["result"] = v;
             n
@@ -1093,7 +1318,10 @@ fn run() -> Result<usize> {
         "selftest" => {
             let obj = std::fs::read(&inc.object_path).map_err(err)?;
             if sha256_hex(&obj) != inc.object_sha256 {
-                return Err(format!("{}: object sha256 mismatch", inc.object_path.display()));
+                return Err(format!(
+                    "{}: object sha256 mismatch",
+                    inc.object_path.display()
+                ));
             }
             let cand = load_candidate(&gpu, &inc.object_path, s.symbol)?;
             report["candidate"] = json!({"path": cand.path.display().to_string(), "sha256": cand.sha256, "symbol": s.symbol, "kind": "inventory hipcc object"});
@@ -1108,7 +1336,10 @@ fn run() -> Result<usize> {
                 "flipped_output_byte": {"detected": flipped == 1, "result": v2},
                 "hipcc_vs_hipcc_edges": v3,
             });
-            usize::from(clean != 0) + usize::from(perturbed == 0) + usize::from(flipped != 1) + usize::from(edge_diff != 0)
+            usize::from(clean != 0)
+                + usize::from(perturbed == 0)
+                + usize::from(flipped != 1)
+                + usize::from(edge_diff != 0)
         }
         other => return Err(format!("unknown command {other}")),
     };
@@ -1116,6 +1347,11 @@ fn run() -> Result<usize> {
     let text = serde_json::to_string_pretty(&report).map_err(err)?;
     std::fs::write(report_dir.join("report.json"), &text).map_err(err)?;
     println!("{text}");
-    println!("{}: {} -> {}", if failures == 0 { "PASS" } else { "FAIL" }, s.module, report_dir.join("report.json").display());
+    println!(
+        "{}: {} -> {}",
+        if failures == 0 { "PASS" } else { "FAIL" },
+        s.module,
+        report_dir.join("report.json").display()
+    );
     Ok(failures)
 }

@@ -64,13 +64,18 @@ impl CheckMode {
             return Ok(Self::Always);
         }
         if let Some(n) = v.strip_prefix("sample(").and_then(|r| r.strip_suffix(')')) {
-            let n: u64 = n.trim().parse().map_err(|_| format!("railgun.check: bad sample period in {v:?}"))?;
+            let n: u64 = n
+                .trim()
+                .parse()
+                .map_err(|_| format!("railgun.check: bad sample period in {v:?}"))?;
             if n == 0 {
                 return Err("railgun.check: sample(0)".into());
             }
             return Ok(Self::Sample(n));
         }
-        Err(format!("railgun.check: expected off | sample(N) | always, got {v:?}"))
+        Err(format!(
+            "railgun.check: expected off | sample(N) | always, got {v:?}"
+        ))
     }
 
     fn name(self) -> String {
@@ -100,7 +105,11 @@ pub struct CheckState {
 
 impl CheckState {
     pub fn from_config() -> Option<Self> {
-        let var = |name: &str| hipfire_config::developer_var(name).ok().filter(|v| !v.is_empty());
+        let var = |name: &str| {
+            hipfire_config::developer_var(name)
+                .ok()
+                .filter(|v| !v.is_empty())
+        };
         let mode = match var("HIPFIRE_RAILGUN_CHECK").map(|v| CheckMode::parse(&v)) {
             None => CheckMode::Off,
             Some(Ok(mode)) => mode,
@@ -110,7 +119,8 @@ impl CheckState {
         if mode == CheckMode::Off && !digest {
             return None;
         }
-        let flip_byte = mode != CheckMode::Off && var("HIPFIRE_RAILGUN_NEGATIVE_CONTROL").as_deref() == Some("flip_byte");
+        let flip_byte = mode != CheckMode::Off
+            && var("HIPFIRE_RAILGUN_NEGATIVE_CONTROL").as_deref() == Some("flip_byte");
         let out = var("HIPFIRE_RAILGUN_CHECK_OUT").map(|path| {
             std::fs::OpenOptions::new()
                 .create(true)
@@ -158,7 +168,11 @@ impl CheckState {
             // SAFETY: forwarded from the model owner.
             unsafe { gpu.replay.replay_pm4(pos) }?;
             let pm4_ms = ms(started);
-            let digest = if self.digest { Some(self.digest_surfaces(gpu)?) } else { None };
+            let digest = if self.digest {
+                Some(self.digest_surfaces(gpu)?)
+            } else {
+                None
+            };
             self.emit(json!({"step": index, "pos": pos, "checked": false, "ms": {"pm4": pm4_ms}, "digest": digest}));
             return Ok(());
         }
@@ -174,19 +188,26 @@ impl CheckState {
         let surfaces = self.surfaces(gpu)?;
         let total_bytes: usize = surfaces.iter().map(|s| s.bytes).sum();
         let program = gpu.replay.prepared_pm4_generation();
-        let weights_before = if self.mode == CheckMode::Always && self.weights_program != Some(program) {
-            Some(weights_digest(gpu)?)
-        } else {
-            None
-        };
+        let weights_before =
+            if self.mode == CheckMode::Always && self.weights_program != Some(program) {
+                Some(weights_digest(gpu)?)
+            } else {
+                None
+            };
         let weights_before_ms = ms(t_start);
 
         // 1. pre-image
         let t = Instant::now();
         {
             let _internal = registry::role_scope(AllocationRole::Internal);
-            let live: std::collections::HashSet<(usize, usize)> = surfaces.iter().map(|s| (s.base, s.bytes)).collect();
-            let stale: Vec<_> = self.snapshots.keys().copied().filter(|k| !live.contains(k)).collect();
+            let live: std::collections::HashSet<(usize, usize)> =
+                surfaces.iter().map(|s| (s.base, s.bytes)).collect();
+            let stale: Vec<_> = self
+                .snapshots
+                .keys()
+                .copied()
+                .filter(|k| !live.contains(k))
+                .collect();
             for key in stale {
                 if let Some(buf) = self.snapshots.remove(&key) {
                     let _ = gpu.hip.free(buf);
@@ -194,7 +215,10 @@ impl CheckState {
             }
             for s in &surfaces {
                 if !self.snapshots.contains_key(&(s.base, s.bytes)) {
-                    let buf = gpu.hip.malloc(s.bytes).map_err(|e| format!("check snapshot {} bytes: {e}", s.bytes))?;
+                    let buf = gpu
+                        .hip
+                        .malloc(s.bytes)
+                        .map_err(|e| format!("check snapshot {} bytes: {e}", s.bytes))?;
                     self.snapshots.insert((s.base, s.bytes), buf);
                 }
             }
@@ -203,7 +227,9 @@ impl CheckState {
             let snap = &self.snapshots[&(s.base, s.bytes)];
             // SAFETY: registry entries are live device allocations.
             let live = unsafe { DeviceBuffer::from_raw(s.base as *mut _, s.bytes) };
-            gpu.hip.memcpy_dtod(snap, &live, s.bytes).map_err(|e| format!("check snapshot: {e}"))?;
+            gpu.hip
+                .memcpy_dtod(snap, &live, s.bytes)
+                .map_err(|e| format!("check snapshot: {e}"))?;
         }
         sync(gpu)?;
         let snapshot_ms = ms(t);
@@ -213,7 +239,11 @@ impl CheckState {
         // SAFETY: forwarded from the model owner.
         unsafe { gpu.replay.replay_pm4(pos) }?;
         let pm4_ms = ms(t);
-        let flipped = if self.flip_byte { Some(flip_one_byte(gpu, &surfaces)?) } else { None };
+        let flipped = if self.flip_byte {
+            Some(flip_one_byte(gpu, &surfaces)?)
+        } else {
+            None
+        };
         let t = Instant::now();
         read_back(gpu, &surfaces, &mut self.after_pm4)?;
         let readback_pm4_ms = ms(t);
@@ -224,7 +254,9 @@ impl CheckState {
             let snap = &self.snapshots[&(s.base, s.bytes)];
             // SAFETY: as above.
             let live = unsafe { DeviceBuffer::from_raw(s.base as *mut _, s.bytes) };
-            gpu.hip.memcpy_dtod(&live, snap, s.bytes).map_err(|e| format!("check restore: {e}"))?;
+            gpu.hip
+                .memcpy_dtod(&live, snap, s.bytes)
+                .map_err(|e| format!("check restore: {e}"))?;
         }
         sync(gpu)?;
         let restore_ms = ms(t);
@@ -242,7 +274,11 @@ impl CheckState {
         for (k, s) in surfaces.iter().enumerate() {
             let (a, b) = (&self.after_pm4[k], &self.after_twin[k]);
             if a != b {
-                let first = a.iter().zip(b.iter()).position(|(x, y)| x != y).unwrap_or(0);
+                let first = a
+                    .iter()
+                    .zip(b.iter())
+                    .position(|(x, y)| x != y)
+                    .unwrap_or(0);
                 let differing = a.iter().zip(b.iter()).filter(|(x, y)| x != y).count();
                 flip_seen |= flipped == Some((s.seq, first)) && differing == 1;
                 mismatches.push(json!({"seq": s.seq, "base": format!("{:#x}", s.base), "bytes": s.bytes,
@@ -263,12 +299,22 @@ impl CheckState {
                 }
                 self.weights_program = Some(program);
                 let bytes: usize = after.iter().map(|w| w.1).sum();
-                Some(json!({"program": program, "allocations": after.len(), "bytes": bytes, "equal": true}))
+                Some(
+                    json!({"program": program, "allocations": after.len(), "bytes": bytes, "equal": true}),
+                )
             }
         };
-        let weights_ms = if weights.is_some() { weights_before_ms + ms(t) } else { 0.0 };
+        let weights_ms = if weights.is_some() {
+            weights_before_ms + ms(t)
+        } else {
+            0.0
+        };
 
-        let digest = if self.digest { Some(digest_of(&surfaces, &self.after_twin)) } else { None };
+        let digest = if self.digest {
+            Some(digest_of(&surfaces, &self.after_twin))
+        } else {
+            None
+        };
         self.checked += 1;
         let equal = mismatches.is_empty();
         if !equal {
@@ -288,7 +334,9 @@ impl CheckState {
         });
         self.emit(line);
         if !equal {
-            let reason = format!("railgun check: PM4 lowering and HIP twin differ at step {index} (pos {pos})");
+            let reason = format!(
+                "railgun check: PM4 lowering and HIP twin differ at step {index} (pos {pos})"
+            );
             eprintln!("[railgun] {reason}; route poisoned, the twin's result stands");
             gpu.replay.poison(reason);
         }
@@ -300,18 +348,23 @@ impl CheckState {
         match self.mode {
             CheckMode::Always | CheckMode::Off => Ok(state),
             CheckMode::Sample(_) => {
-                let program = gpu
-                    .replay
-                    .railgun_program_surfaces()
-                    .ok_or("railgun.check=sample needs the railgun program (HIPFIRE_RAILGUN_SHADOW)")?;
+                let program = gpu.replay.railgun_program_surfaces().ok_or(
+                    "railgun.check=sample needs the railgun program (HIPFIRE_RAILGUN_SHADOW)",
+                )?;
                 if program.non_pm4_nodes != 0 {
-                    return Err(format!("railgun.check=sample refused: {} non-PM4 nodes", program.non_pm4_nodes));
+                    return Err(format!(
+                        "railgun.check=sample refused: {} non-PM4 nodes",
+                        program.non_pm4_nodes
+                    ));
                 }
                 Ok(state
                     .into_iter()
                     .filter(|a| {
                         let (lo, hi) = (a.base as u64, (a.base + a.bytes) as u64);
-                        program.written.iter().any(|w| w.base < hi && lo < w.base + w.bytes)
+                        program
+                            .written
+                            .iter()
+                            .any(|w| w.base < hi && lo < w.base + w.bytes)
                     })
                     .collect())
             }
@@ -330,17 +383,25 @@ fn ms(t: Instant) -> f64 {
 }
 
 fn sync(gpu: &Gpu) -> Result<(), String> {
-    gpu.hip.device_synchronize().map_err(|e| format!("check sync: {e}"))
+    gpu.hip
+        .device_synchronize()
+        .map_err(|e| format!("check sync: {e}"))
 }
 
-fn read_back(gpu: &Gpu, surfaces: &[LiveAllocation], into: &mut Vec<Vec<u8>>) -> Result<(), String> {
+fn read_back(
+    gpu: &Gpu,
+    surfaces: &[LiveAllocation],
+    into: &mut Vec<Vec<u8>>,
+) -> Result<(), String> {
     sync(gpu)?;
     into.resize_with(surfaces.len(), Vec::new);
     for (k, s) in surfaces.iter().enumerate() {
         into[k].resize(s.bytes, 0);
         // SAFETY: registry entries are live device allocations.
         let live = unsafe { DeviceBuffer::from_raw(s.base as *mut _, s.bytes) };
-        gpu.hip.memcpy_dtoh(&mut into[k], &live).map_err(|e| format!("check read-back: {e}"))?;
+        gpu.hip
+            .memcpy_dtoh(&mut into[k], &live)
+            .map_err(|e| format!("check read-back: {e}"))?;
     }
     Ok(())
 }
@@ -354,7 +415,9 @@ fn weights_digest(gpu: &Gpu) -> Result<Vec<(u64, usize, u64)>, String> {
     const BATCH: usize = 1 << 30;
     const SLICE: usize = 16 << 20;
     let weights = registry::live_allocations_with_role(AllocationRole::Weights);
-    let threads = std::thread::available_parallelism().map_or(8, |n| n.get()).min(32);
+    let threads = std::thread::available_parallelism()
+        .map_or(8, |n| n.get())
+        .min(32);
     let mut host = Vec::new();
     let mut digests = Vec::with_capacity(weights.len());
     let mut first = 0;
@@ -371,7 +434,9 @@ fn weights_digest(gpu: &Gpu) -> Result<Vec<(u64, usize, u64)>, String> {
         for w in batch {
             // SAFETY: registry entries are live device allocations.
             let live = unsafe { DeviceBuffer::from_raw(w.base as *mut _, w.bytes) };
-            gpu.hip.memcpy_dtoh(&mut host[at..at + w.bytes], &live).map_err(|e| format!("weights read-back: {e}"))?;
+            gpu.hip
+                .memcpy_dtoh(&mut host[at..at + w.bytes], &live)
+                .map_err(|e| format!("weights read-back: {e}"))?;
             at += w.bytes;
         }
         // Slices never straddle two allocations; `owner[i]` is the batch
@@ -398,8 +463,12 @@ fn weights_digest(gpu: &Gpu) -> Result<Vec<(u64, usize, u64)>, String> {
             }
         });
         for (k, w) in batch.iter().enumerate() {
-            let combined: Vec<u8> =
-                hashes.iter().zip(&owner).filter(|(_, o)| **o == k).flat_map(|(h, _)| h.to_le_bytes()).collect();
+            let combined: Vec<u8> = hashes
+                .iter()
+                .zip(&owner)
+                .filter(|(_, o)| **o == k)
+                .flat_map(|(h, _)| h.to_le_bytes())
+                .collect();
             digests.push((w.seq, w.bytes, fast_hash(&combined)));
         }
         first = end;
@@ -410,22 +479,35 @@ fn weights_digest(gpu: &Gpu) -> Result<Vec<(u64, usize, u64)>, String> {
 /// Negative control: XOR 0xff into the middle byte of the middle surface.
 /// Returns `(seq, offset)`.
 fn flip_one_byte(gpu: &Gpu, surfaces: &[LiveAllocation]) -> Result<(u64, usize), String> {
-    let s = surfaces.get(surfaces.len() / 2).ok_or("negative control: no surfaces")?;
+    let s = surfaces
+        .get(surfaces.len() / 2)
+        .ok_or("negative control: no surfaces")?;
     let offset = s.bytes / 2;
     // SAFETY: one byte inside a live registry allocation.
     let cell = unsafe { DeviceBuffer::from_raw((s.base + offset) as *mut _, 1) };
     let mut byte = [0u8];
-    gpu.hip.memcpy_dtoh(&mut byte, &cell).map_err(|e| format!("negative control read: {e}"))?;
+    gpu.hip
+        .memcpy_dtoh(&mut byte, &cell)
+        .map_err(|e| format!("negative control read: {e}"))?;
     byte[0] ^= 0xff;
-    gpu.hip.memcpy_htod(&cell, &byte).map_err(|e| format!("negative control write: {e}"))?;
+    gpu.hip
+        .memcpy_htod(&cell, &byte)
+        .map_err(|e| format!("negative control write: {e}"))?;
     sync(gpu)?;
-    eprintln!("[railgun] NEGATIVE CONTROL: flipped byte {offset} of surface seq {}", s.seq);
+    eprintln!(
+        "[railgun] NEGATIVE CONTROL: flipped byte {offset} of surface seq {}",
+        s.seq
+    );
     Ok((s.seq, offset))
 }
 
 /// Per-surface `[seq, bytes, hash]` plus one combined hash.
 fn digest_of(surfaces: &[LiveAllocation], bytes: &[Vec<u8>]) -> serde_json::Value {
-    let rows: Vec<(u64, usize, u64)> = surfaces.iter().zip(bytes).map(|(s, b)| (s.seq, s.bytes, fast_hash(b))).collect();
+    let rows: Vec<(u64, usize, u64)> = surfaces
+        .iter()
+        .zip(bytes)
+        .map(|(s, b)| (s.seq, s.bytes, fast_hash(b)))
+        .collect();
     let mut all = Vec::with_capacity(rows.len() * 24);
     for (seq, n, h) in &rows {
         all.extend_from_slice(&seq.to_le_bytes());
@@ -456,19 +538,37 @@ fn fast_hash(bytes: &[u8]) -> u64 {
 /// kernarg bytes the PM4 lowering submitted (explicit prefix only; HIP
 /// supplies its own hidden arguments). Returns the launch count.
 unsafe fn run_twin(gpu: &mut Gpu) -> Result<usize, String> {
-    let images = gpu.replay.prepared_pm4_submitted_kernargs().map_err(|e| format!("HIP twin refused: {e}"))?;
+    let images = gpu
+        .replay
+        .prepared_pm4_submitted_kernargs()
+        .map_err(|e| format!("HIP twin refused: {e}"))?;
     let launches: Vec<(String, [u32; 3], [u32; 3], u32, Vec<u8>)> = gpu
         .replay
         .recorded_launches()
         .iter()
         .take(images.len())
-        .map(|l| (l.kernel.clone(), l.grid, l.block, l.shared_mem, l.kernarg.clone()))
+        .map(|l| {
+            (
+                l.kernel.clone(),
+                l.grid,
+                l.block,
+                l.shared_mem,
+                l.kernarg.clone(),
+            )
+        })
         .collect();
     if launches.len() != images.len() {
-        return Err(format!("HIP twin: {} prepared dispatches, {} recorded launches", images.len(), launches.len()));
+        return Err(format!(
+            "HIP twin: {} prepared dispatches, {} recorded launches",
+            images.len(),
+            launches.len()
+        ));
     }
     for (k, (name, grid, block, shared, recorded)) in launches.iter().enumerate() {
-        let func = gpu.functions.get(name).ok_or_else(|| format!("HIP twin: no HIP function {name}"))?;
+        let func = gpu
+            .functions
+            .get(name)
+            .ok_or_else(|| format!("HIP twin: no HIP function {name}"))?;
         // The recorded blob is the explicit segment padded to 16 bytes; the
         // loader segment may end before that padding (no hidden arguments).
         // Every byte the loader segment covers comes from the submitted image.
@@ -478,10 +578,21 @@ unsafe fn run_twin(gpu: &mut Gpu) -> Result<usize, String> {
         // SAFETY: the blob is the recorded launch's explicit kernarg segment
         // with this position's bindings applied; every pointer is a live
         // model allocation (the same contract as the PM4 replay).
-        unsafe { gpu.hip.launch_kernel_blob(func, *grid, *block, *shared, gpu.active_stream.as_ref(), &mut blob) }
-            .map_err(|e| format!("HIP twin launch {k} {name}: {e}"))?;
+        unsafe {
+            gpu.hip.launch_kernel_blob(
+                func,
+                *grid,
+                *block,
+                *shared,
+                gpu.active_stream.as_ref(),
+                &mut blob,
+            )
+        }
+        .map_err(|e| format!("HIP twin launch {k} {name}: {e}"))?;
     }
-    gpu.hip.device_synchronize().map_err(|e| format!("HIP twin sync: {e}"))?;
+    gpu.hip
+        .device_synchronize()
+        .map_err(|e| format!("HIP twin sync: {e}"))?;
     Ok(launches.len())
 }
 

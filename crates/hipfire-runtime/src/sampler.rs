@@ -447,7 +447,11 @@ impl PenaltyTable {
 
     /// Apply row `row` to a host logit row: the device kernel's arithmetic.
     pub fn apply_row_cpu(&self, row: usize, logits: &mut [f32]) {
-        let begin = if row == 0 { 0 } else { self.row_ends[row - 1] as usize };
+        let begin = if row == 0 {
+            0
+        } else {
+            self.row_ends[row - 1] as usize
+        };
         for entry in self.entries[3 * begin..3 * self.row_ends[row] as usize].chunks_exact(3) {
             let Some(value) = logits.get_mut(entry[0] as usize) else {
                 continue;
@@ -723,19 +727,110 @@ mod tests {
     }
 
     const POLICY_CASES: &[PolicyCase] = &[
-        PolicyCase { name: "window0_everything_set", repeat_penalty: 1.1, repeat_window: 0, presence: 1.5, frequency: 0.5, blocked: &[] },
-        PolicyCase { name: "neutral", repeat_penalty: 1.0, repeat_window: 64, presence: 0.0, frequency: 0.0, blocked: &[] },
-        PolicyCase { name: "repeat_1_1_w16", repeat_penalty: 1.1, repeat_window: 16, presence: 0.0, frequency: 0.0, blocked: &[] },
-        PolicyCase { name: "repeat_1_1_w1", repeat_penalty: 1.1, repeat_window: 1, presence: 0.0, frequency: 0.0, blocked: &[] },
-        PolicyCase { name: "repeat_1_1_w1000_short_history", repeat_penalty: 1.1, repeat_window: 1000, presence: 0.0, frequency: 0.0, blocked: &[] },
-        PolicyCase { name: "repeat_lt_1", repeat_penalty: 0.9, repeat_window: 16, presence: 0.0, frequency: 0.0, blocked: &[] },
-        PolicyCase { name: "repeat_capped", repeat_penalty: 2.0, repeat_window: 24, presence: 0.0, frequency: 0.0, blocked: &[] },
-        PolicyCase { name: "presence_only_repeat_1", repeat_penalty: 1.0, repeat_window: 16, presence: 1.5, frequency: 0.0, blocked: &[] },
-        PolicyCase { name: "frequency_only", repeat_penalty: 1.0, repeat_window: 16, presence: 0.0, frequency: 0.5, blocked: &[] },
-        PolicyCase { name: "presence_frequency_w1", repeat_penalty: 1.0, repeat_window: 1, presence: 1.5, frequency: 0.5, blocked: &[] },
-        PolicyCase { name: "combined", repeat_penalty: 1.1, repeat_window: 32, presence: 1.5, frequency: 0.5, blocked: &[] },
-        PolicyCase { name: "blocked_only", repeat_penalty: 1.0, repeat_window: 0, presence: 0.0, frequency: 0.0, blocked: &[3, 7, 17, 5000] },
-        PolicyCase { name: "blocked_with_combined", repeat_penalty: 1.1, repeat_window: 32, presence: 1.5, frequency: 0.5, blocked: &[3, 7, 17, 5000] },
+        PolicyCase {
+            name: "window0_everything_set",
+            repeat_penalty: 1.1,
+            repeat_window: 0,
+            presence: 1.5,
+            frequency: 0.5,
+            blocked: &[],
+        },
+        PolicyCase {
+            name: "neutral",
+            repeat_penalty: 1.0,
+            repeat_window: 64,
+            presence: 0.0,
+            frequency: 0.0,
+            blocked: &[],
+        },
+        PolicyCase {
+            name: "repeat_1_1_w16",
+            repeat_penalty: 1.1,
+            repeat_window: 16,
+            presence: 0.0,
+            frequency: 0.0,
+            blocked: &[],
+        },
+        PolicyCase {
+            name: "repeat_1_1_w1",
+            repeat_penalty: 1.1,
+            repeat_window: 1,
+            presence: 0.0,
+            frequency: 0.0,
+            blocked: &[],
+        },
+        PolicyCase {
+            name: "repeat_1_1_w1000_short_history",
+            repeat_penalty: 1.1,
+            repeat_window: 1000,
+            presence: 0.0,
+            frequency: 0.0,
+            blocked: &[],
+        },
+        PolicyCase {
+            name: "repeat_lt_1",
+            repeat_penalty: 0.9,
+            repeat_window: 16,
+            presence: 0.0,
+            frequency: 0.0,
+            blocked: &[],
+        },
+        PolicyCase {
+            name: "repeat_capped",
+            repeat_penalty: 2.0,
+            repeat_window: 24,
+            presence: 0.0,
+            frequency: 0.0,
+            blocked: &[],
+        },
+        PolicyCase {
+            name: "presence_only_repeat_1",
+            repeat_penalty: 1.0,
+            repeat_window: 16,
+            presence: 1.5,
+            frequency: 0.0,
+            blocked: &[],
+        },
+        PolicyCase {
+            name: "frequency_only",
+            repeat_penalty: 1.0,
+            repeat_window: 16,
+            presence: 0.0,
+            frequency: 0.5,
+            blocked: &[],
+        },
+        PolicyCase {
+            name: "presence_frequency_w1",
+            repeat_penalty: 1.0,
+            repeat_window: 1,
+            presence: 1.5,
+            frequency: 0.5,
+            blocked: &[],
+        },
+        PolicyCase {
+            name: "combined",
+            repeat_penalty: 1.1,
+            repeat_window: 32,
+            presence: 1.5,
+            frequency: 0.5,
+            blocked: &[],
+        },
+        PolicyCase {
+            name: "blocked_only",
+            repeat_penalty: 1.0,
+            repeat_window: 0,
+            presence: 0.0,
+            frequency: 0.0,
+            blocked: &[3, 7, 17, 5000],
+        },
+        PolicyCase {
+            name: "blocked_with_combined",
+            repeat_penalty: 1.1,
+            repeat_window: 32,
+            presence: 1.5,
+            frequency: 0.5,
+            blocked: &[3, 7, 17, 5000],
+        },
     ];
 
     /// Dense logits with positive, negative, +0.0 and -0.0 entries.
@@ -818,12 +913,10 @@ mod tests {
                     let blocked_in = |i: usize| case.blocked.contains(&(i as u32));
                     let start = hist.len().saturating_sub(case.repeat_window);
                     let touched = hist[start..].iter().any(|&t| {
-                        (t as usize) < vocab
-                            && !blocked_in(t as usize)
-                            && orig[t as usize] != 0.0
+                        (t as usize) < vocab && !blocked_in(t as usize) && orig[t as usize] != 0.0
                     });
-                    let changed = (0..vocab)
-                        .any(|i| !blocked_in(i) && got[i].to_bits() != orig[i].to_bits());
+                    let changed =
+                        (0..vocab).any(|i| !blocked_in(i) && got[i].to_bits() != orig[i].to_bits());
                     if case.active() && touched {
                         assert!(changed, "{what}: active policy changed nothing");
                     }
@@ -866,7 +959,10 @@ mod tests {
                     let mut ids: Vec<u32> = (0..40).map(|_| rng.below(vocab as u32)).collect();
                     ids.extend(hist.iter().rev().copied().filter(|&t| (t as usize) < vocab));
                     ids.extend(
-                        case.blocked.iter().copied().filter(|&b| (b as usize) < vocab),
+                        case.blocked
+                            .iter()
+                            .copied()
+                            .filter(|&b| (b as usize) < vocab),
                     );
                     let dup: Vec<u32> = ids.iter().take(6).copied().collect();
                     ids.extend(dup);
@@ -930,7 +1026,11 @@ mod tests {
                     let mut got = orig.clone();
                     table.apply_row_cpu(row, &mut got);
                     apply_logit_policy_cpu(&mut got, hist, &rest);
-                    let what = format!("{} vocab={vocab} row={row} hist_len={}", case.name, hist.len());
+                    let what = format!(
+                        "{} vocab={vocab} row={row} hist_len={}",
+                        case.name,
+                        hist.len()
+                    );
                     assert_bits_eq(&got, &want, &what);
                     assert_bits_eq(&policy, &want, &what);
                 }
@@ -1048,12 +1148,54 @@ mod tests {
         }
         let by_name = |n: &str| POLICY_CASES.iter().find(|c| c.name == n).unwrap();
         let configs = [
-            Cfg { name: "neutral_default_draw", temperature: 0.7, top_p: 0.95, top_k: None, min_p: None, policy: by_name("neutral") },
-            Cfg { name: "neutral_top_k_min_p", temperature: 0.9, top_p: 0.9, top_k: Some(5), min_p: Some(0.05), policy: by_name("neutral") },
-            Cfg { name: "repeat", temperature: 0.7, top_p: 0.95, top_k: None, min_p: None, policy: by_name("repeat_1_1_w16") },
-            Cfg { name: "combined", temperature: 0.8, top_p: 0.92, top_k: None, min_p: None, policy: by_name("combined") },
-            Cfg { name: "combined_blocked_top_k", temperature: 1.0, top_p: 1.0, top_k: Some(8), min_p: None, policy: by_name("blocked_with_combined") },
-            Cfg { name: "presence_w1", temperature: 0.6, top_p: 0.9, top_k: None, min_p: Some(0.02), policy: by_name("presence_frequency_w1") },
+            Cfg {
+                name: "neutral_default_draw",
+                temperature: 0.7,
+                top_p: 0.95,
+                top_k: None,
+                min_p: None,
+                policy: by_name("neutral"),
+            },
+            Cfg {
+                name: "neutral_top_k_min_p",
+                temperature: 0.9,
+                top_p: 0.9,
+                top_k: Some(5),
+                min_p: Some(0.05),
+                policy: by_name("neutral"),
+            },
+            Cfg {
+                name: "repeat",
+                temperature: 0.7,
+                top_p: 0.95,
+                top_k: None,
+                min_p: None,
+                policy: by_name("repeat_1_1_w16"),
+            },
+            Cfg {
+                name: "combined",
+                temperature: 0.8,
+                top_p: 0.92,
+                top_k: None,
+                min_p: None,
+                policy: by_name("combined"),
+            },
+            Cfg {
+                name: "combined_blocked_top_k",
+                temperature: 1.0,
+                top_p: 1.0,
+                top_k: Some(8),
+                min_p: None,
+                policy: by_name("blocked_with_combined"),
+            },
+            Cfg {
+                name: "presence_w1",
+                temperature: 0.6,
+                top_p: 0.9,
+                top_k: None,
+                min_p: Some(0.02),
+                policy: by_name("presence_frequency_w1"),
+            },
         ];
 
         for c in &configs {

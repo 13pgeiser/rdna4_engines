@@ -50,7 +50,12 @@ fn header(dir: &str, name: &str) -> Header {
                 (
                     t["name"].as_str().unwrap().to_owned(),
                     dtype(t["quant_tag"].as_u64().unwrap()),
-                    t["shape"].as_array().unwrap().iter().map(|d| d.as_u64().unwrap() as usize).collect(),
+                    t["shape"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|d| d.as_u64().unwrap() as usize)
+                        .collect(),
                 )
             })
             .collect(),
@@ -61,7 +66,11 @@ fn metas<'a>(headers: &[&'a Header]) -> Vec<KernelTensorMeta<'a>> {
     headers
         .iter()
         .flat_map(|h| h.tensors.iter())
-        .map(|(name, dtype, shape)| KernelTensorMeta { name, dtype: *dtype, shape })
+        .map(|(name, dtype, shape)| KernelTensorMeta {
+            name,
+            dtype: *dtype,
+            shape,
+        })
         .collect()
 }
 
@@ -108,7 +117,9 @@ fn sha256(bytes: &[u8]) -> String {
 }
 
 /// `module -> (kind, image/source sha256, flags, profile, symbols)`.
-fn manifest(plan: &RouteKernelPlan) -> BTreeMap<String, (String, String, Value, Value, BTreeSet<String>)> {
+fn manifest(
+    plan: &RouteKernelPlan,
+) -> BTreeMap<String, (String, String, Value, Value, BTreeSet<String>)> {
     let mut out = BTreeMap::new();
     for entry in &plan.entries {
         let symbols = entry.symbols().iter().map(|s| s.to_string()).collect();
@@ -120,11 +131,19 @@ fn manifest(plan: &RouteKernelPlan) -> BTreeMap<String, (String, String, Value, 
                 serde_json::json!(e.scheduler_profile),
                 symbols,
             ),
-            PlannedKernel::Embedded { image, .. } => {
-                ("embedded".to_owned(), sha256(image), Value::Null, Value::Null, symbols)
-            }
+            PlannedKernel::Embedded { image, .. } => (
+                "embedded".to_owned(),
+                sha256(image),
+                Value::Null,
+                Value::Null,
+                symbols,
+            ),
         };
-        assert!(out.insert(entry.module().to_owned(), row).is_none(), "duplicate module {}", entry.module());
+        assert!(
+            out.insert(entry.module().to_owned(), row).is_none(),
+            "duplicate module {}",
+            entry.module()
+        );
     }
     out
 }
@@ -158,7 +177,10 @@ fn plan_27b(
 /// the `kernel.pm_decode=false` opt-out. The default (twins on) closure is
 /// derived from it exactly in [`pm_decode_twins_replace_their_hip_route_entries`].
 fn route_27b(spec: KernelSpecRoute) -> (Value, RouteKernelPlan) {
-    (fixture(A3, "27b-xts-gfx1201.a3.json"), plan_27b(spec, false, |_| true))
+    (
+        fixture(A3, "27b-xts-gfx1201.a3.json"),
+        plan_27b(spec, false, |_| true),
+    )
 }
 
 fn route_key(spec: KernelSpecRoute) -> &'static str {
@@ -173,16 +195,29 @@ fn route_key(spec: KernelSpecRoute) -> &'static str {
 fn qwen36_27b_gfx1201_plans_are_exact_frozen_manifests() {
     for spec in [KernelSpecRoute::Ar, KernelSpecRoute::NativeMtp] {
         let (fixture, plan) = route_27b(spec);
-        assert_eq!(fixture["hipcc_extra_flags"], builtin_flags("gfx1201").hipcc_extra_flags.as_str());
+        assert_eq!(
+            fixture["hipcc_extra_flags"],
+            builtin_flags("gfx1201").hipcc_extra_flags.as_str()
+        );
         let route = &fixture["routes"][route_key(spec)];
         let got = manifest(&plan);
         let mut want = BTreeMap::new();
         for e in route["entries"].as_array().unwrap() {
-            let symbols = e["symbols"].as_array().unwrap().iter().map(|s| s.as_str().unwrap().to_owned()).collect();
+            let symbols = e["symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s.as_str().unwrap().to_owned())
+                .collect();
             want.insert(
                 e["module"].as_str().unwrap().to_owned(),
-                (e["kind"].as_str().unwrap().to_owned(), e["sha256"].as_str().unwrap().to_owned(),
-                 e["flags"].clone(), e["scheduler_profile"].clone(), symbols),
+                (
+                    e["kind"].as_str().unwrap().to_owned(),
+                    e["sha256"].as_str().unwrap().to_owned(),
+                    e["flags"].clone(),
+                    e["scheduler_profile"].clone(),
+                    symbols,
+                ),
             );
         }
         assert_eq!(got, want, "{spec:?} plan drifted from its frozen manifest");
@@ -201,11 +236,19 @@ fn every_observed_route_symbol_is_planned_with_its_observed_identity() {
         for o in observed {
             let module = o["module"].as_str().unwrap();
             let symbol = o["symbol"].as_str().unwrap();
-            let (kind, digest, flags, profile, symbols) =
-                got.get(module).unwrap_or_else(|| panic!("{spec:?}: observed module {module} not planned"));
-            assert!(symbols.contains(symbol), "{spec:?}: observed {module}:{symbol} not planned");
+            let (kind, digest, flags, profile, symbols) = got
+                .get(module)
+                .unwrap_or_else(|| panic!("{spec:?}: observed module {module} not planned"));
+            assert!(
+                symbols.contains(symbol),
+                "{spec:?}: observed {module}:{symbol} not planned"
+            );
             assert_eq!(kind, o["kind"].as_str().unwrap(), "{module}");
-            assert_eq!(digest, o["sha256"].as_str().unwrap(), "{module}: observed image differs");
+            assert_eq!(
+                digest,
+                o["sha256"].as_str().unwrap(),
+                "{module}: observed image differs"
+            );
             if kind == "hip" {
                 assert_eq!(flags, &o["flags"], "{module}: observed recipe flags differ");
                 assert_eq!(profile, &o["scheduler_profile"], "{module}");
@@ -220,12 +263,32 @@ fn ar_plan_carries_no_native_mtp_head_or_unrelated_model_recipe() {
     let (fixture, mtp) = route_27b(KernelSpecRoute::NativeMtp);
     let ar = manifest(&ar);
     let mtp = manifest(&mtp);
-    assert!(ar.keys().all(|m| mtp.contains_key(m)), "MTP route must keep the AR fallback closure");
-    for m in fixture["routes"]["native_mtp"]["mtp_only_modules"].as_array().unwrap() {
-        assert!(!ar.contains_key(m.as_str().unwrap()), "AR plan carries MTP-only {m}");
+    assert!(
+        ar.keys().all(|m| mtp.contains_key(m)),
+        "MTP route must keep the AR fallback closure"
+    );
+    for m in fixture["routes"]["native_mtp"]["mtp_only_modules"]
+        .as_array()
+        .unwrap()
+    {
+        assert!(
+            !ar.contains_key(m.as_str().unwrap()),
+            "AR plan carries MTP-only {m}"
+        );
     }
     for module in mtp.keys() {
-        for foreign in ["qwen4", "deepseek4", "gemma4", "glimmer", "minimax", "qsa_", "ddtree", "dspark", "_gfx1151", "eagle"] {
+        for foreign in [
+            "qwen4",
+            "deepseek4",
+            "gemma4",
+            "glimmer",
+            "minimax",
+            "qsa_",
+            "ddtree",
+            "dspark",
+            "_gfx1151",
+            "eagle",
+        ] {
             assert!(!module.contains(foreign), "unrelated recipe {module}");
         }
     }
@@ -240,26 +303,50 @@ fn ar_plan_carries_no_native_mtp_head_or_unrelated_model_recipe() {
 fn no_awq_27b_plan_closes_the_plain_rotate_producers() {
     const PLAIN: [(&str, &str); 12] = [
         ("fused_rmsnorm_mq_rotate", "fused_rmsnorm_mq_rotate"),
-        ("fused_rmsnorm_mq_rotate_i4_gfx12_v2", "fused_rmsnorm_mq_rotate_i4_gfx12_v2"),
+        (
+            "fused_rmsnorm_mq_rotate_i4_gfx12_v2",
+            "fused_rmsnorm_mq_rotate_i4_gfx12_v2",
+        ),
         ("fused_silu_mul_mq_rotate", "fused_silu_mul_mq_rotate"),
-        ("fused_silu_mul_mq_rotate_i4_gfx12", "fused_silu_mul_mq_rotate_i4_gfx12"),
-        ("gated_norm_mq_rotate_k6144_gfx1201", "gated_norm_mq_rotate_k6144_gfx1201"),
-        ("gated_norm_mq_rotate_i4_gfx12_v2", "gated_norm_mq_rotate_i4_gfx12_v2"),
-        ("gated_norm_mq_rotate_i4_gfx12_v2_xbf16", "gated_norm_mq_rotate_i4_gfx12_v2_xbf16"),
+        (
+            "fused_silu_mul_mq_rotate_i4_gfx12",
+            "fused_silu_mul_mq_rotate_i4_gfx12",
+        ),
+        (
+            "gated_norm_mq_rotate_k6144_gfx1201",
+            "gated_norm_mq_rotate_k6144_gfx1201",
+        ),
+        (
+            "gated_norm_mq_rotate_i4_gfx12_v2",
+            "gated_norm_mq_rotate_i4_gfx12_v2",
+        ),
+        (
+            "gated_norm_mq_rotate_i4_gfx12_v2_xbf16",
+            "gated_norm_mq_rotate_i4_gfx12_v2_xbf16",
+        ),
         ("mq_rotate_x", "mq_rotate_x"),
         ("mq_rotate_x_i4_gfx12", "mq_rotate_x_i4_gfx12"),
-        ("gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1", "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1"),
-        ("gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1", "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1"),
-        ("gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1", "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1"),
+        (
+            "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1",
+            "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1",
+        ),
+        (
+            "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1",
+            "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1",
+        ),
+        (
+            "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1",
+            "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1",
+        ),
     ];
     for spec in [KernelSpecRoute::Ar, KernelSpecRoute::NativeMtp] {
         for pm_decode in [false, true] {
             let plan = plan_27b(spec, pm_decode, |name| !name.ends_with(".awq_scale.weight"));
             let got = manifest(&plan);
             for (module, symbol) in PLAIN {
-                let (_, _, _, _, symbols) = got
-                    .get(module)
-                    .unwrap_or_else(|| panic!("{spec:?} pm_decode={pm_decode}: no-AWQ plan lacks module {module}"));
+                let (_, _, _, _, symbols) = got.get(module).unwrap_or_else(|| {
+                    panic!("{spec:?} pm_decode={pm_decode}: no-AWQ plan lacks module {module}")
+                });
                 assert!(
                     symbols.contains(symbol),
                     "{spec:?} pm_decode={pm_decode}: no-AWQ plan lacks {module}:{symbol}"
@@ -272,8 +359,20 @@ fn no_awq_27b_plan_closes_the_plain_rotate_producers() {
 /// Plain-only modules of the 27B route by producer family; `mq_rotate_x` is
 /// already in the AWQ closure and not listed.
 const PLAIN_FAMILIES: [(&str, &[&str]); 4] = [
-    ("rmsnorm", &["fused_rmsnorm_mq_rotate", "fused_rmsnorm_mq_rotate_i4_gfx12_v2"]),
-    ("silu", &["fused_silu_mul_mq_rotate", "fused_silu_mul_mq_rotate_i4_gfx12"]),
+    (
+        "rmsnorm",
+        &[
+            "fused_rmsnorm_mq_rotate",
+            "fused_rmsnorm_mq_rotate_i4_gfx12_v2",
+        ],
+    ),
+    (
+        "silu",
+        &[
+            "fused_silu_mul_mq_rotate",
+            "fused_silu_mul_mq_rotate_i4_gfx12",
+        ],
+    ),
     (
         "gated_norm",
         &[
@@ -292,8 +391,13 @@ type Manifest = BTreeMap<String, (String, String, Value, Value, BTreeSet<String>
 /// The plan manifest with the sidecars of the given weight stems
 /// (e.g. `.mlp.down_proj`) removed from the canonical AWQ header.
 fn manifest_without_sidecars(spec: KernelSpecRoute, pm_decode: bool, stems: &[&str]) -> Manifest {
-    let dropped: Vec<String> = stems.iter().map(|s| format!("{s}.awq_scale.weight")).collect();
-    manifest(&plan_27b(spec, pm_decode, |name| !dropped.iter().any(|d| name.ends_with(d.as_str()))))
+    let dropped: Vec<String> = stems
+        .iter()
+        .map(|s| format!("{s}.awq_scale.weight"))
+        .collect();
+    manifest(&plan_27b(spec, pm_decode, |name| {
+        !dropped.iter().any(|d| name.ends_with(d.as_str()))
+    }))
 }
 
 /// The AWQ closure is untouched: the full-sidecar plan plans no plain-only
@@ -306,16 +410,31 @@ fn awq_27b_plan_is_unchanged_by_the_plain_closure() {
             let awq = manifest_without_sidecars(spec, pm_decode, &[]);
             for (family, modules) in PLAIN_FAMILIES {
                 for module in modules {
-                    assert!(!awq.contains_key(*module), "{spec:?} pm_decode={pm_decode}: AWQ plan carries {family} module {module}");
+                    assert!(
+                        !awq.contains_key(*module),
+                        "{spec:?} pm_decode={pm_decode}: AWQ plan carries {family} module {module}"
+                    );
                 }
             }
-            assert!(!awq.contains_key(PLAIN_B1), "{spec:?} pm_decode={pm_decode}: AWQ plan carries the non-slab _b1 bundle");
+            assert!(
+                !awq.contains_key(PLAIN_B1),
+                "{spec:?} pm_decode={pm_decode}: AWQ plan carries the non-slab _b1 bundle"
+            );
             let unrelated = manifest_without_sidecars(
                 spec,
                 pm_decode,
-                &[".self_attn.k_proj", ".self_attn.v_proj", ".linear_attn.in_proj_a", ".linear_attn.in_proj_b", ".mlp.up_proj"],
+                &[
+                    ".self_attn.k_proj",
+                    ".self_attn.v_proj",
+                    ".linear_attn.in_proj_a",
+                    ".linear_attn.in_proj_b",
+                    ".mlp.up_proj",
+                ],
             );
-            assert_eq!(awq, unrelated, "{spec:?} pm_decode={pm_decode}: sidecars no producer reads changed the plan");
+            assert_eq!(
+                awq, unrelated,
+                "{spec:?} pm_decode={pm_decode}: sidecars no producer reads changed the plan"
+            );
         }
     }
 }
@@ -345,9 +464,9 @@ fn partial_sidecars_plan_only_their_plain_families() {
                         );
                     }
                 }
-                let (_, _, _, _, symbols) = got
-                    .get(PLAIN_B1)
-                    .unwrap_or_else(|| panic!("{spec:?} pm_decode={pm_decode} without {stems:?}: no _b1 bundle"));
+                let (_, _, _, _, symbols) = got.get(PLAIN_B1).unwrap_or_else(|| {
+                    panic!("{spec:?} pm_decode={pm_decode} without {stems:?}: no _b1 bundle")
+                });
                 assert!(symbols.contains("gemm_mq4g256v2_residual_mmq_iu4_full_add_b1"));
                 assert_eq!(
                     symbols.contains(PLAIN_B1_SILU_SYMBOL),
@@ -369,7 +488,9 @@ fn cross_layer_partial_sidecars_keep_the_f1lite_b1_symbol() {
     const DOWN1: &str = "model.language_model.layers.1.mlp.down_proj.awq_scale.weight";
     for spec in [KernelSpecRoute::Ar, KernelSpecRoute::NativeMtp] {
         for pm_decode in [false, true] {
-            let got = manifest(&plan_27b(spec, pm_decode, |name| name != GATE0 && name != DOWN1));
+            let got = manifest(&plan_27b(spec, pm_decode, |name| {
+                name != GATE0 && name != DOWN1
+            }));
             for (family, modules) in PLAIN_FAMILIES {
                 for module in modules {
                     assert_eq!(
@@ -405,28 +526,66 @@ fn explicit_drafter_and_unclosed_routes_refuse() {
         flags: &flags,
     };
     let refused = |load: &Load<'_>| matches!(plan(load), Err(RegistryError::UnsupportedRoute(_)));
-    for spec in [KernelSpecRoute::DFlash, KernelSpecRoute::DDTree, KernelSpecRoute::DSpark] {
+    for spec in [
+        KernelSpecRoute::DFlash,
+        KernelSpecRoute::DDTree,
+        KernelSpecRoute::DSpark,
+    ] {
         assert!(refused(&Load { spec, ..base }), "{spec:?} must refuse");
     }
-    assert!(refused(&Load { spec: KernelSpecRoute::NativeMtp, tensors: &trunk_only, ..base }));
-    assert!(plan(&Load { tensors: &trunk_only, ..base }).is_ok(), "AR needs no sidecar head");
-    assert!(refused(&Load { kv: ("q8", "q8"), ..base }));
-    assert!(refused(&Load { kv: ("fp8", "q8"), ..base }));
+    assert!(refused(&Load {
+        spec: KernelSpecRoute::NativeMtp,
+        tensors: &trunk_only,
+        ..base
+    }));
+    assert!(
+        plan(&Load {
+            tensors: &trunk_only,
+            ..base
+        })
+        .is_ok(),
+        "AR needs no sidecar head"
+    );
+    assert!(refused(&Load {
+        kv: ("q8", "q8"),
+        ..base
+    }));
+    assert!(refused(&Load {
+        kv: ("fp8", "q8"),
+        ..base
+    }));
     for arch in ["gfx1151", "gfx1100"] {
         let arch_flags = builtin_flags(arch);
-        assert!(refused(&Load { arch, flags: &arch_flags, ..base }), "{arch} 27B is not closed");
+        assert!(
+            refused(&Load {
+                arch,
+                flags: &arch_flags,
+                ..base
+            }),
+            "{arch} 27B is not closed"
+        );
     }
     let fn_header = header(G0, "header-flash-next.json");
     let fn_tensors = metas(&[&fn_header]);
-    assert!(refused(&Load { model_arch: fn_header.arch_id, tensors: &fn_tensors, ..base }));
+    assert!(refused(&Load {
+        model_arch: fn_header.arch_id,
+        tensors: &fn_tensors,
+        ..base
+    }));
     // Same model id and heads, different tensors: not this route.
     let mut renamed = with_head.clone();
     renamed.retain(|t| !t.name.ends_with("mlp.gate_proj.weight"));
-    assert!(refused(&Load { tensors: &renamed, ..base }));
+    assert!(refused(&Load {
+        tensors: &renamed,
+        ..base
+    }));
     // Any non-default feature flag is outside the walked closure.
     let mut changed = flags.clone();
     changed.hipcc_extra_flags.push_str(" -DA3_TEST=1");
-    assert!(refused(&Load { flags: &changed, ..base }));
+    assert!(refused(&Load {
+        flags: &changed,
+        ..base
+    }));
 }
 
 #[test]
@@ -453,25 +612,48 @@ fn conflicting_public_entry_plans_refuse() {
     };
     // Two modules exporting one public entry name.
     let two_images = RouteKernelPlan {
-        entries: vec![clone("rmsnorm_f32_rowsplit", hip.source()), clone("rmsnorm_alt", hip.source())],
+        entries: vec![
+            clone("rmsnorm_f32_rowsplit", hip.source()),
+            clone("rmsnorm_alt", hip.source()),
+        ],
     };
-    assert!(matches!(validate_route_plan(&two_images), Err(RegistryError::ConflictingPlan(_))));
+    assert!(matches!(
+        validate_route_plan(&two_images),
+        Err(RegistryError::ConflictingPlan(_))
+    ));
     // One module name, two recipes.
     let two_recipes = RouteKernelPlan {
-        entries: vec![clone("rmsnorm_f32_rowsplit", hip.source()), clone("rmsnorm_f32_rowsplit", "changed")],
+        entries: vec![
+            clone("rmsnorm_f32_rowsplit", hip.source()),
+            clone("rmsnorm_f32_rowsplit", "changed"),
+        ],
     };
-    assert!(matches!(validate_route_plan(&two_recipes), Err(RegistryError::ConflictingPlan(_))));
+    assert!(matches!(
+        validate_route_plan(&two_recipes),
+        Err(RegistryError::ConflictingPlan(_))
+    ));
     // An embedded image and a HIP module both claiming an entry.
     let mixed = RouteKernelPlan {
         entries: vec![
             clone("rmsnorm_f32_rowsplit", hip.source()),
-            PlannedKernel::Embedded { module: "pm_twin", image: b"x", radiowave_json: None, symbols: hip.symbols },
+            PlannedKernel::Embedded {
+                module: "pm_twin",
+                image: b"x",
+                radiowave_json: None,
+                symbols: hip.symbols,
+            },
         ],
     };
-    assert!(matches!(validate_route_plan(&mixed), Err(RegistryError::ConflictingPlan(_))));
+    assert!(matches!(
+        validate_route_plan(&mixed),
+        Err(RegistryError::ConflictingPlan(_))
+    ));
     // Identical recipes under one module name union, they do not conflict.
     let same = RouteKernelPlan {
-        entries: vec![clone("rmsnorm_f32_rowsplit", hip.source()), clone("rmsnorm_f32_rowsplit", hip.source())],
+        entries: vec![
+            clone("rmsnorm_f32_rowsplit", hip.source()),
+            clone("rmsnorm_f32_rowsplit", hip.source()),
+        ],
     };
     validate_route_plan(&same).unwrap();
 }
@@ -479,9 +661,21 @@ fn conflicting_public_entry_plans_refuse() {
 /// The accepted PM multi-column objects (`pm_xbatch.rs`): `(module, image
 /// sha256, symbol)`.
 const PM_XBATCH_OBJECTS: [(&str, &str, &str); 3] = [
-    ("gemv_hfq4g256_xbatch_mq4v2_pm", "97c2872246c123a03bbb4751fed75b2f7235654482c96b007eb69c2ffbb41b59", "gemv_mq4g256v2_xbatch_pm"),
-    ("gemv_hfq4g256_residual_xbatch_mq4v2_pm", "7ad33f79e552f550a46a96c0863760bb3ac31ac8d7223e256a59ade20eb4ade1", "gemv_mq4g256v2_residual_xbatch"),
-    ("gemv_hfq4g256_multirow_xbatch_mq4v2_pm", "fadb665f00c35bea787fda7c6956d9af61f5f6d1e60f759c2c7f2c23a1ddd9bf", "gemv_mq4g256v2_multirow_r2_xbatch_pm"),
+    (
+        "gemv_hfq4g256_xbatch_mq4v2_pm",
+        "97c2872246c123a03bbb4751fed75b2f7235654482c96b007eb69c2ffbb41b59",
+        "gemv_mq4g256v2_xbatch_pm",
+    ),
+    (
+        "gemv_hfq4g256_residual_xbatch_mq4v2_pm",
+        "7ad33f79e552f550a46a96c0863760bb3ac31ac8d7223e256a59ade20eb4ade1",
+        "gemv_mq4g256v2_residual_xbatch",
+    ),
+    (
+        "gemv_hfq4g256_multirow_xbatch_mq4v2_pm",
+        "fadb665f00c35bea787fda7c6956d9af61f5f6d1e60f759c2c7f2c23a1ddd9bf",
+        "gemv_mq4g256v2_multirow_r2_xbatch_pm",
+    ),
 ];
 
 /// Default `kernel.pm_decode` on exact gfx1201: every accepted twin replaces its HIP
@@ -498,7 +692,10 @@ fn pm_decode_twins_replace_their_hip_route_entries() {
     let tensors = metas(&[&trunk, &head]);
     for spec in [KernelSpecRoute::Ar, KernelSpecRoute::NativeMtp] {
         let on_flags = builtin_flags("gfx1201");
-        assert!(on_flags.pm_decode, "pm_decode must default on for exact gfx1201");
+        assert!(
+            on_flags.pm_decode,
+            "pm_decode must default on for exact gfx1201"
+        );
         let mut off_flags = on_flags.clone();
         off_flags.pm_decode = false;
         let load = |flags| Load {
@@ -516,22 +713,42 @@ fn pm_decode_twins_replace_their_hip_route_entries() {
         let mut off = manifest(&off_plan);
         let mut on = manifest(&on_plan);
         for twin in GFX1201_TWINS {
-            let hip = off.remove(twin.module).unwrap_or_else(|| panic!("{} not in HIP route", twin.module));
+            let hip = off
+                .remove(twin.module)
+                .unwrap_or_else(|| panic!("{} not in HIP route", twin.module));
             assert_eq!(hip.0, "hip");
-            let source_hex: String = twin.source_sha256.iter().map(|b| format!("{b:02x}")).collect();
-            assert_eq!(hip.1, source_hex, "{}: route HIP source is not the oracle's incumbent", twin.module);
+            let source_hex: String = twin
+                .source_sha256
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            assert_eq!(
+                hip.1, source_hex,
+                "{}: route HIP source is not the oracle's incumbent",
+                twin.module
+            );
             let pm = on.remove(twin.module).unwrap();
             assert_eq!(pm.0, "embedded", "{}", twin.module);
             assert_eq!(pm.1, sha256(twin.image), "{}", twin.module);
             assert_eq!(pm.4, hip.4, "{}: symbols changed", twin.module);
         }
-        let xbatch = off.remove("gemv_mq4g256v2_xbatch").expect("hipcc x-batch fallback not in the pm_decode=false route");
+        let xbatch = off
+            .remove("gemv_mq4g256v2_xbatch")
+            .expect("hipcc x-batch fallback not in the pm_decode=false route");
         assert_eq!(xbatch.0, "hip");
-        assert!(!on.contains_key("gemv_mq4g256v2_xbatch"), "pm_decode route keeps the hipcc x-batch fallback");
+        assert!(
+            !on.contains_key("gemv_mq4g256v2_xbatch"),
+            "pm_decode route keeps the hipcc x-batch fallback"
+        );
         for (module, digest, symbol) in PM_XBATCH_OBJECTS {
-            let pm = on.remove(module).unwrap_or_else(|| panic!("{module} not in the pm_decode route"));
+            let pm = on
+                .remove(module)
+                .unwrap_or_else(|| panic!("{module} not in the pm_decode route"));
             assert_eq!(pm.0, "embedded", "{module}");
-            assert_eq!(pm.1, digest, "{module}: embedded image is not the accepted object");
+            assert_eq!(
+                pm.1, digest,
+                "{module}: embedded image is not the accepted object"
+            );
             assert_eq!(pm.4, BTreeSet::from([symbol.to_owned()]), "{module}");
         }
         assert_eq!(off, on, "{spec:?}: pm_decode changed a non-twin entry");

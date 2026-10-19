@@ -117,8 +117,7 @@ fn run() -> Result<(), String> {
     let mut gpu = Gpu::init().map_err(|e| format!("deepseek4 parent: Gpu::init: {e:?}"))?;
     if gpu.try_gfx942().is_none() {
         return Err(
-            "deepseek4 parent: gfx942 required (parent calibration is fail-closed)"
-                .to_owned(),
+            "deepseek4 parent: gfx942 required (parent calibration is fail-closed)".to_owned(),
         );
     }
     println!("gpu: gfx942");
@@ -376,7 +375,10 @@ fn run() -> Result<(), String> {
     let attn_neg = attn_norm_w.iter().filter(|&&v| v < 0.0).count();
     let ffn_neg = ffn_norm_w.iter().filter(|&&v| v < 0.0).count();
     let attn_w_min = attn_norm_w.iter().cloned().fold(f32::INFINITY, f32::min);
-    let attn_w_max = attn_norm_w.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let attn_w_max = attn_norm_w
+        .iter()
+        .cloned()
+        .fold(f32::NEG_INFINITY, f32::max);
     let ffn_w_min = ffn_norm_w.iter().cloned().fold(f32::INFINITY, f32::min);
     let ffn_w_max = ffn_norm_w.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     println!(
@@ -433,10 +435,8 @@ fn run() -> Result<(), String> {
                 "pred={attn_pred:.4} meas={attn_meas:.4} mean|w|={attn_w_mean:.5} n_neg={attn_neg}"
             ),
         });
-        let ffn_pass = ffn_rel <= RMSNORM_PRED_TOL
-            && ffn_neg == 0
-            && ffn_w_min > 0.0
-            && ffn_meas.is_finite();
+        let ffn_pass =
+            ffn_rel <= RMSNORM_PRED_TOL && ffn_neg == 0 && ffn_w_min > 0.0 && ffn_meas.is_finite();
         checks.push(CheckRow {
             name: "ffn_norm_closed_form".into(),
             max_abs: (ffn_meas - ffn_pred).abs(),
@@ -537,11 +537,7 @@ fn run() -> Result<(), String> {
         let stream_normed = download_f32(&gpu, scratch.stream_normed(), rows * PARENT_DIM)?;
         let stream_block = download_f32(&gpu, scratch.stream_block(), rows * PARENT_DIM)?;
         let post = download_f32(&gpu, scratch.post(), rows * PARENT_HC_MULT)?;
-        let comb = download_f32(
-            &gpu,
-            scratch.comb(),
-            rows * PARENT_HC_MULT * PARENT_HC_MULT,
-        )?;
+        let comb = download_f32(&gpu, scratch.comb(), rows * PARENT_HC_MULT * PARENT_HC_MULT)?;
 
         // residual_hc is the attn-half hc_post output = FFN hc_pre input.
         let (y_ref, post_ref, comb_ref) = hc_pre_ref(
@@ -692,14 +688,7 @@ fn run() -> Result<(), String> {
                     .map_err(|e| format!("deepseek4 parent: swiglu act1 htod: {e:?}"))?;
                 t
             };
-            parent_linear_dense(
-                &mut gpu,
-                backend,
-                &layer.shared_w1,
-                &act1,
-                rows,
-                &gate_t,
-            )?;
+            parent_linear_dense(&mut gpu, backend, &layer.shared_w1, &act1, rows, &gate_t)?;
             let act2 = {
                 let t = gpu
                     .alloc_tensor(&[rows, PARENT_DIM], DType::BF16)
@@ -709,14 +698,7 @@ fn run() -> Result<(), String> {
                     .map_err(|e| format!("deepseek4 parent: swiglu act2 htod: {e:?}"))?;
                 t
             };
-            parent_linear_dense(
-                &mut gpu,
-                backend,
-                &layer.shared_w3,
-                &act2,
-                rows,
-                &up_t,
-            )?;
+            parent_linear_dense(&mut gpu, backend, &layer.shared_w3, &act2, rows, &up_t)?;
             let gate = download_f32(&gpu, &gate_t, rows * PARENT_MOE_INTER)?;
             let up = download_f32(&gpu, &up_t, rows * PARENT_MOE_INTER)?;
             let swiglu = expert_swiglu_ref(
@@ -934,8 +916,8 @@ fn run() -> Result<(), String> {
     if !degen_pass {
         all_pass = false;
     }
-    let trace_out_err = ((trace.hc_post_ffn as f64) - (out_l2 as f64)).abs()
-        / (out_l2 as f64).max(1e-12);
+    let trace_out_err =
+        ((trace.hc_post_ffn as f64) - (out_l2 as f64)).abs() / (out_l2 as f64).max(1e-12);
     let trace_pass = trace_out_err < 1e-5 && stage_norms.iter().all(|n| n.is_finite());
     println!(
         "{:<28} {:>12.3e} {:>12} {:>12} {:>6}  |trace.hc_post_ffn - ||out|||/||out||",
@@ -1209,8 +1191,7 @@ fn download_f32(gpu: &Gpu, t: &GpuTensor, nelems: usize) -> Result<Vec<f32>, Str
         ));
     }
     let mut data = vec![0.0f32; nelems];
-    let bytes =
-        unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, nbytes) };
+    let bytes = unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, nbytes) };
     gpu.hip
         .memcpy_dtoh(bytes, &t.buf)
         .map_err(|e| format!("deepseek4 parent: download_f32: {e:?}"))?;

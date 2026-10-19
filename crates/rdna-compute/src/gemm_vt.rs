@@ -164,7 +164,10 @@ const VERIFY_RESIDUAL: VerifyOpInfo = VerifyOpInfo {
 #[derive(Clone, Copy)]
 enum VerifyImage {
     /// A hipcc module (`ensure_kernel`).
-    Hip { module: &'static str, source: &'static str },
+    Hip {
+        module: &'static str,
+        source: &'static str,
+    },
     /// The embedded PeaceMaker wide bundle (`ensure_embedded_kernel`).
     Pm,
 }
@@ -182,7 +185,11 @@ struct VerifyPlan {
 /// to 128; the w4/w8 choice keeps the VT row-tile threshold.
 fn verify_wide_geometry(n: usize, total_m: usize) -> (usize, usize) {
     let bt = if n <= 64 { 4 } else { 8 };
-    let waves = if (total_m + 15) / 16 >= VT_WIDE_MIN_ROW_TILES { 8 } else { 4 };
+    let waves = if (total_m + 15) / 16 >= VT_WIDE_MIN_ROW_TILES {
+        8
+    } else {
+        4
+    };
     (bt, waves)
 }
 
@@ -349,7 +356,13 @@ impl Gpu {
                 y_k.buf.as_ptr(),
                 y_v.buf.as_ptr(),
             ],
-            vec![q_m as i32, k_m as i32, v_m as i32, k as i32, batch_size as i32],
+            vec![
+                q_m as i32,
+                k_m as i32,
+                v_m as i32,
+                k as i32,
+                batch_size as i32,
+            ],
             bytes,
         )
     }
@@ -518,7 +531,10 @@ impl Gpu {
         if self.arch != "gfx1201" {
             return Err(hip_bridge::HipError::new(
                 1,
-                &format!("{what}: exact MQ4V2 verify GEMMs exist only on gfx1201, not {}", self.arch),
+                &format!(
+                    "{what}: exact MQ4V2 verify GEMMs exist only on gfx1201, not {}",
+                    self.arch
+                ),
             ));
         }
         if k == 0 || k % 256 != 0 || total_m == 0 {
@@ -537,7 +553,10 @@ impl Gpu {
         if n <= 16 || (n < VERIFY_WIDE_MIN_ROWS && !vt) {
             return Ok(VerifyPlan {
                 func_name: info.one_tile_symbol,
-                image: VerifyImage::Hip { module: info.one_tile_module, source: info.one_tile_source },
+                image: VerifyImage::Hip {
+                    module: info.one_tile_module,
+                    source: info.one_tile_source,
+                },
                 grid: [((total_m + 15) / 16) as u32, ((n + 15) / 16) as u32, 1],
                 block: [32, 1, 1],
             });
@@ -548,7 +567,10 @@ impl Gpu {
             let waves = if wide { 8 } else { 4 };
             return Ok(VerifyPlan {
                 func_name: info.vt[bt - 2][wide as usize],
-                image: VerifyImage::Hip { module: info.vt_module, source: info.vt_source },
+                image: VerifyImage::Hip {
+                    module: info.vt_module,
+                    source: info.vt_source,
+                },
                 grid: [
                     ((total_m + 16 * waves - 1) / (16 * waves)) as u32,
                     ((n + 16 * bt - 1) / (16 * bt)) as u32,
@@ -571,7 +593,10 @@ impl Gpu {
         } else {
             (
                 info.k32[slot][wide],
-                VerifyImage::Hip { module: info.vt_module, source: info.vt_source },
+                VerifyImage::Hip {
+                    module: info.vt_module,
+                    source: info.vt_source,
+                },
             )
         };
         Ok(VerifyPlan {
@@ -589,7 +614,9 @@ impl Gpu {
     /// Load the plan's code object. A missing PM bundle or symbol is an error.
     fn load_verify_plan(&mut self, plan: &VerifyPlan) -> HipResult<()> {
         match plan.image {
-            VerifyImage::Hip { module, source } => self.ensure_kernel(module, source, plan.func_name),
+            VerifyImage::Hip { module, source } => {
+                self.ensure_kernel(module, source, plan.func_name)
+            }
             VerifyImage::Pm => self.ensure_embedded_kernel(
                 VERIFY_PM_MODULE,
                 kernels::MQ4_VERIFY_PM_GFX1201,
@@ -663,12 +690,19 @@ impl Gpu {
     ) -> HipResult<()> {
         if self.fp8_verify_scope {
             return self.gemm_qkvza_mq4g256v2_verify_fp8(
-                a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, n,
+                a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
+                alpha_m, k, n,
             );
         }
         let total_m = qkv_m + z_m + beta_m + alpha_m;
         self.iu4_verify_note_f16();
-        let plan = self.verify_exact_plan(&VERIFY_QKVZA, "gemm_qkvza_mq4g256v2_verify_exact", total_m, k, n)?;
+        let plan = self.verify_exact_plan(
+            &VERIFY_QKVZA,
+            "gemm_qkvza_mq4g256v2_verify_exact",
+            total_m,
+            k,
+            n,
+        )?;
         self.bind_thread()?;
         self.load_verify_plan(&plan)?;
         let x_f16 = self.ensure_fp16_x(x, n * k)?;
@@ -691,7 +725,14 @@ impl Gpu {
                 y_beta.buf.as_ptr(),
                 y_alpha.buf.as_ptr(),
             ],
-            [qkv_m as i32, z_m as i32, beta_m as i32, alpha_m as i32, k as i32, n as i32],
+            [
+                qkv_m as i32,
+                z_m as i32,
+                beta_m as i32,
+                alpha_m as i32,
+                k as i32,
+                n as i32,
+            ],
             bytes,
         )
     }
@@ -715,11 +756,19 @@ impl Gpu {
         n: usize,
     ) -> HipResult<()> {
         if self.fp8_verify_scope {
-            return self.gemm_qkv_mq4g256v2_verify_fp8(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, n);
+            return self.gemm_qkv_mq4g256v2_verify_fp8(
+                a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, n,
+            );
         }
         let total_m = q_m + k_m + v_m;
         self.iu4_verify_note_f16();
-        let plan = self.verify_exact_plan(&VERIFY_QKV, "gemm_qkv_mq4g256v2_verify_exact", total_m, k, n)?;
+        let plan = self.verify_exact_plan(
+            &VERIFY_QKV,
+            "gemm_qkv_mq4g256v2_verify_exact",
+            total_m,
+            k,
+            n,
+        )?;
         self.bind_thread()?;
         self.load_verify_plan(&plan)?;
         let x_f16 = self.ensure_fp16_x(x, n * k)?;
@@ -760,11 +809,19 @@ impl Gpu {
         n: usize,
     ) -> HipResult<()> {
         if self.fp8_verify_scope {
-            return self.gemm_gate_up_mq4g256v2_verify_fp8(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, n);
+            return self.gemm_gate_up_mq4g256v2_verify_fp8(
+                a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, n,
+            );
         }
         let total_m = gate_m + up_m;
         self.iu4_verify_note_f16();
-        let plan = self.verify_exact_plan(&VERIFY_GATE_UP, "gemm_gate_up_mq4g256v2_verify_exact", total_m, k, n)?;
+        let plan = self.verify_exact_plan(
+            &VERIFY_GATE_UP,
+            "gemm_gate_up_mq4g256v2_verify_exact",
+            total_m,
+            k,
+            n,
+        )?;
         self.bind_thread()?;
         self.load_verify_plan(&plan)?;
         let x_f16 = self.ensure_fp16_x(x, n * k)?;
@@ -774,7 +831,13 @@ impl Gpu {
             + n * total_m * 4 * 2;
         self.launch_verify_plan(
             plan,
-            [a_gate.buf.as_ptr(), a_up.buf.as_ptr(), x_f16, y_gate.buf.as_ptr(), y_up.buf.as_ptr()],
+            [
+                a_gate.buf.as_ptr(),
+                a_up.buf.as_ptr(),
+                x_f16,
+                y_gate.buf.as_ptr(),
+                y_up.buf.as_ptr(),
+            ],
             [gate_m as i32, up_m as i32, k as i32, n as i32],
             bytes,
         )
@@ -795,12 +858,23 @@ impl Gpu {
             return self.gemm_mq4g256v2_residual_verify_fp8(a, x, y, m, k, n);
         }
         self.iu4_verify_note_f16();
-        let plan = self.verify_exact_plan(&VERIFY_RESIDUAL, "gemm_mq4g256v2_residual_verify_exact", m, k, n)?;
+        let plan = self.verify_exact_plan(
+            &VERIFY_RESIDUAL,
+            "gemm_mq4g256v2_residual_verify_exact",
+            m,
+            k,
+            n,
+        )?;
         self.bind_thread()?;
         self.load_verify_plan(&plan)?;
         let x_f16 = self.ensure_fp16_x(x, n * k)?;
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + n * k * 2 + n * m * 4 * 2;
-        self.launch_verify_plan(plan, [a.buf.as_ptr(), x_f16, y.buf.as_ptr()], [m as i32, k as i32, n as i32], bytes)
+        self.launch_verify_plan(
+            plan,
+            [a.buf.as_ptr(), x_f16, y.buf.as_ptr()],
+            [m as i32, k as i32, n as i32],
+            bytes,
+        )
     }
 
     /// Exact verify lm_head: +0 byte memset of `y`, then the exact residual
@@ -821,7 +895,13 @@ impl Gpu {
         }
         // Resolve and load before the memset so a refused or unloadable
         // launch leaves `y` untouched.
-        let plan = self.verify_exact_plan(&VERIFY_RESIDUAL, "gemm_mq4g256v2_lmhead_verify_exact", m, k, n)?;
+        let plan = self.verify_exact_plan(
+            &VERIFY_RESIDUAL,
+            "gemm_mq4g256v2_lmhead_verify_exact",
+            m,
+            k,
+            n,
+        )?;
         self.bind_thread()?;
         self.load_verify_plan(&plan)?;
         // The fp16 activation cache is keyed by source pointer: stomp it so
@@ -870,8 +950,14 @@ mod tests {
         assert_eq!(
             VERIFY_RESIDUAL.pm,
             [
-                ["mq4_verify_residual_pm_gfx1201_bt4w4", "mq4_verify_residual_pm_gfx1201_bt4w8"],
-                ["mq4_verify_residual_pm_gfx1201_bt8w4", "mq4_verify_residual_pm_gfx1201_bt8w8"],
+                [
+                    "mq4_verify_residual_pm_gfx1201_bt4w4",
+                    "mq4_verify_residual_pm_gfx1201_bt4w8"
+                ],
+                [
+                    "mq4_verify_residual_pm_gfx1201_bt8w4",
+                    "mq4_verify_residual_pm_gfx1201_bt8w8"
+                ],
             ]
         );
     }

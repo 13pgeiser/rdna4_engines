@@ -49,13 +49,19 @@ fn every_known_model_type_resolves_identically_through_all_three_consumers() {
         if *expected_arch == 5 {
             // dense qwen3.5 family without experts -> 5
             let id_dense = derive_arch_id(&json!({ "model_type": *model_type }));
-            assert_eq!(id_dense, 5, "derive_arch_id dense {model_type} -> {id_dense} != 5");
+            assert_eq!(
+                id_dense, 5,
+                "derive_arch_id dense {model_type} -> {id_dense} != 5"
+            );
             // with experts -> 6 (MoE when has_experts)
             let id_moe = derive_arch_id(&json!({
                 "model_type": *model_type,
                 "num_experts": 8
             }));
-            assert_eq!(id_moe, 6, "derive_arch_id moe {model_type} -> {id_moe} != 6");
+            assert_eq!(
+                id_moe, 6,
+                "derive_arch_id moe {model_type} -> {id_moe} != 6"
+            );
         } else {
             let id = derive_arch_id(&json!({ "model_type": *model_type }));
             assert_eq!(
@@ -107,7 +113,12 @@ fn qwen2_maps_to_7_not_llama_0() {
 #[test]
 fn gemma4_variants_route_correctly_and_gemma4_unified_assistant_is_22() {
     // Gemma4 unified dense/MoE -> 13, the EAGLE drafter -> 22.
-    for mt in ["gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text"] {
+    for mt in [
+        "gemma4",
+        "gemma4_text",
+        "gemma4_unified",
+        "gemma4_unified_text",
+    ] {
         assert_eq!(lookup_model_type(mt), Some(13), "{mt} -> 13");
         assert_eq!(
             derive_arch_id(&json!({ "model_type": mt })),
@@ -186,10 +197,7 @@ fn unknown_model_type_fails_closed_in_all_three() {
     );
     // The supported list must be the same set as the canonical table (no drift).
     for (k, _) in MODEL_TYPE_TO_ARCH_ID {
-        assert!(
-            supported.contains(*k),
-            "supported display missing {k}"
-        );
+        assert!(supported.contains(*k), "supported display missing {k}");
     }
 }
 
@@ -200,7 +208,10 @@ fn supported_list_is_sorted_and_deduped() {
     let mut sorted = parts.clone();
     sorted.sort_unstable();
     sorted.dedup();
-    assert_eq!(parts, sorted, "supported display should be sorted & deduped");
+    assert_eq!(
+        parts, sorted,
+        "supported display should be sorted & deduped"
+    );
 }
 
 #[test]

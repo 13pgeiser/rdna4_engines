@@ -1248,8 +1248,13 @@ mod tests {
             inputs.draft_bytes,
             inputs.slack,
         );
-        let (expected_placement, _) =
-            plan(&layers, budgets, &expected_capacity, Orientation::SuffixResident).unwrap();
+        let (expected_placement, _) = plan(
+            &layers,
+            budgets,
+            &expected_capacity,
+            Orientation::SuffixResident,
+        )
+        .unwrap();
         let expected_host = layers.host_bytes(&expected_placement);
         let placement =
             resolve_placement(&layers, &inputs, budgets, Orientation::SuffixResident).unwrap();
@@ -1285,7 +1290,10 @@ mod tests {
             ),
         );
         assert!(sized_line.contains("pbs floor 1 MiB"), "{sized_line}");
-        assert!(!sized_line.contains("no MoE prefill sizing"), "{sized_line}");
+        assert!(
+            !sized_line.contains("no MoE prefill sizing"),
+            "{sized_line}"
+        );
     }
 
     #[test]
@@ -1332,8 +1340,7 @@ mod tests {
         );
         assert_eq!(cap_seq, cap_slots);
         let (p_seq, _) = plan(&layers, budgets, &cap_seq, Orientation::SuffixResident).unwrap();
-        let (p_slots, _) =
-            plan(&layers, budgets, &cap_slots, Orientation::SuffixResident).unwrap();
+        let (p_slots, _) = plan(&layers, budgets, &cap_slots, Orientation::SuffixResident).unwrap();
         assert_eq!(p_seq, p_slots);
         assert!(!p_seq.is_fully_resident());
     }

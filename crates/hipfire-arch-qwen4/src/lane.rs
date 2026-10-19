@@ -37,7 +37,8 @@ use crate::lane_exec::LanePhase;
 use crate::mtp_gpu::{MtpAppendScratch, MtpGpuState, MTP_FILL_ROWS};
 use crate::mtp_lanes::{LaneCostModel, LaneSpecPolicy, PendingWindow};
 use crate::mtp_spec::{
-    mtp_fill_scratch_requested, mtp_fill_scratch_wanted, native_mtp_row_capture, Qwen4PromotionParts,
+    mtp_fill_scratch_requested, mtp_fill_scratch_wanted, native_mtp_row_capture,
+    Qwen4PromotionParts,
 };
 use crate::state::{Qwen4State, Qwen4StateFormat};
 use hipfire_dispatch::pipeline::DraftHeadRequestState;
@@ -198,11 +199,7 @@ impl LaneSpec {
             .map_err(|e| format!("lane head reset: {e}"))?;
         self.draft = DraftHeadRequestState::default();
         gpu.hip
-            .memset(
-                &self.pending_hidden.buf,
-                0,
-                self.pending_hidden.buf.size(),
-            )
+            .memset(&self.pending_hidden.buf, 0, self.pending_hidden.buf.size())
             .map_err(|e| format!("lane pending hidden reset: {e}"))?;
         self.policy = LaneSpecPolicy::new(k);
         self.window = None;
@@ -326,7 +323,8 @@ impl<C: LaneCell> LaneTable<C> {
     }
 
     fn get(&self, epoch: &RequestEpoch) -> Option<&C> {
-        self.slot_of(epoch).and_then(|slot| self.cells[slot].as_ref())
+        self.slot_of(epoch)
+            .and_then(|slot| self.cells[slot].as_ref())
     }
 
     fn get_mut(&mut self, epoch: &RequestEpoch) -> Option<&mut C> {
@@ -419,8 +417,9 @@ impl<C: LaneCell> LaneTable<C> {
                 *cell.host_mut() = host;
             }
             None => {
-                let payload = prepare(slot, None)?
-                    .ok_or_else(|| "admit: prepare returned no payload for a new cell".to_string())?;
+                let payload = prepare(slot, None)?.ok_or_else(|| {
+                    "admit: prepare returned no payload for a new cell".to_string()
+                })?;
                 self.cells[slot] = Some(C::assemble(host, payload));
             }
         }
@@ -435,7 +434,10 @@ impl<C: LaneCell> LaneTable<C> {
             .slot_of(epoch)
             .ok_or_else(|| format!("release: unknown or stale epoch {epoch:?}"))?;
         self.live[slot] = false;
-        let host = self.cells[slot].as_mut().expect("live slot has a cell").host_mut();
+        let host = self.cells[slot]
+            .as_mut()
+            .expect("live slot has a cell")
+            .host_mut();
         host.prompt = Vec::new();
         host.generated = Vec::new();
         host.pending_seed = None;
@@ -456,7 +458,10 @@ impl<C: LaneCell> LaneTable<C> {
             .ok_or_else(|| format!("force_seed: unknown or stale epoch {epoch:?}"))?
             .host_mut();
         if host.status != LaneStatus::Decoding {
-            return Err(format!("force_seed: lane {:?} is {:?}, not Decoding", epoch, host.status));
+            return Err(format!(
+                "force_seed: lane {:?} is {:?}, not Decoding",
+                epoch, host.status
+            ));
         }
         host.pending_seed = Some(token);
         Ok(())
@@ -542,24 +547,23 @@ impl SpecStore {
                 return Err(format!("lane store: draft top-1: {error}"));
             }
         };
-        let append_scratch = if mtp_fill_scratch_wanted(gpu)
-            && bundle.mtp_append_rows_supported(gpu)
-        {
-            let rows = MTP_FILL_ROWS.min(bundle.spec_chunk_rows().unwrap_or(1).max(1));
-            // Prompt-id rows = append rows: a tile of at most `rows` rows
-            // uploads its ids once; a longer one uploads per sub-chunk
-            // (`append_rows`' own upload, the same bytes).
-            match MtpAppendScratch::new(gpu, &bundle.config, rows, rows) {
-                Ok(scratch) => Some(scratch),
-                Err(error) => {
-                    let _ = gpu.free_tensor(hidden);
-                    let _ = gpu.free_tensor(draft_top1);
-                    return Err(format!("lane store: append scratch: {error}"));
+        let append_scratch =
+            if mtp_fill_scratch_wanted(gpu) && bundle.mtp_append_rows_supported(gpu) {
+                let rows = MTP_FILL_ROWS.min(bundle.spec_chunk_rows().unwrap_or(1).max(1));
+                // Prompt-id rows = append rows: a tile of at most `rows` rows
+                // uploads its ids once; a longer one uploads per sub-chunk
+                // (`append_rows`' own upload, the same bytes).
+                match MtpAppendScratch::new(gpu, &bundle.config, rows, rows) {
+                    Ok(scratch) => Some(scratch),
+                    Err(error) => {
+                        let _ = gpu.free_tensor(hidden);
+                        let _ = gpu.free_tensor(draft_top1);
+                        return Err(format!("lane store: append scratch: {error}"));
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         Ok(Self {
             config,
             head_max_seq,
@@ -636,7 +640,9 @@ impl Qwen4LaneStore {
             ));
         }
         if max_lanes == 0 || max_lanes > MAX_LANES {
-            return Err(format!("lane store: max_lanes {max_lanes} outside 1..={MAX_LANES}"));
+            return Err(format!(
+                "lane store: max_lanes {max_lanes} outside 1..={MAX_LANES}"
+            ));
         }
         if row_budget == 0 {
             return Err("lane store: row_budget must be at least 1".to_string());
@@ -775,27 +781,28 @@ impl Qwen4LaneStore {
             .spec
             .as_ref()
             .map(|s| (s.config, s.head_max_seq, s.backend));
-        self.table.admit(epoch, prompt, |slot, existing| match existing {
-            Some(cell) => {
-                cell.state
-                    .reset(gpu)
-                    .map_err(|e| format!("admit: reset lane {slot}: {e}"))?;
-                cell.state.row_capture_armed = false;
-                match (spec_cfg, cell.spec.as_mut()) {
-                    (Some((config, _, _)), Some(spec)) => spec
-                        .reset(gpu, config.k)
-                        .map_err(|e| format!("admit: reset lane {slot}: {e}"))?,
-                    (None, None) => {}
-                    _ => {
-                        return Err(format!(
-                            "admit: lane {slot} spec state does not match the store"
-                        ));
+        self.table
+            .admit(epoch, prompt, |slot, existing| match existing {
+                Some(cell) => {
+                    cell.state
+                        .reset(gpu)
+                        .map_err(|e| format!("admit: reset lane {slot}: {e}"))?;
+                    cell.state.row_capture_armed = false;
+                    match (spec_cfg, cell.spec.as_mut()) {
+                        (Some((config, _, _)), Some(spec)) => spec
+                            .reset(gpu, config.k)
+                            .map_err(|e| format!("admit: reset lane {slot}: {e}"))?,
+                        (None, None) => {}
+                        _ => {
+                            return Err(format!(
+                                "admit: lane {slot} spec state does not match the store"
+                            ));
+                        }
                     }
+                    Ok(None)
                 }
-                Ok(None)
-            }
-            None => new_payload(gpu, bundle, slot, spec_cfg).map(Some),
-        })
+                None => new_payload(gpu, bundle, slot, spec_cfg).map(Some),
+            })
     }
 
     /// Admit `epoch` straight into Decoding (a promoted singleton): `prompt`
@@ -825,7 +832,9 @@ impl Qwen4LaneStore {
             .map(|s| (s.config, s.head_max_seq, s.backend));
         match (spec_cfg.is_some(), parts.is_some()) {
             (true, false) => {
-                return Err("admit_promoted: an MTP lane store needs the drafter's parts".to_string());
+                return Err(
+                    "admit_promoted: an MTP lane store needs the drafter's parts".to_string(),
+                );
             }
             (false, true) => {
                 return Err("admit_promoted: an AR lane store takes no drafter parts".to_string());
@@ -833,41 +842,47 @@ impl Qwen4LaneStore {
             _ => {}
         }
         self.table
-            .admit_decoding(epoch, prompt, generated, pending_seed, |slot, existing| match existing {
-                Some(cell) => {
-                    match (spec_cfg, cell.spec.as_mut(), parts.as_ref()) {
-                        (Some((config, _, _)), Some(spec), Some(parts)) => spec
-                            .promote(gpu, config.k, parts)
-                            .map_err(|e| format!("admit_promoted: lane {slot}: {e}"))?,
-                        (None, None, None) => {}
-                        _ => {
-                            return Err(format!(
+            .admit_decoding(
+                epoch,
+                prompt,
+                generated,
+                pending_seed,
+                |slot, existing| match existing {
+                    Some(cell) => {
+                        match (spec_cfg, cell.spec.as_mut(), parts.as_ref()) {
+                            (Some((config, _, _)), Some(spec), Some(parts)) => spec
+                                .promote(gpu, config.k, parts)
+                                .map_err(|e| format!("admit_promoted: lane {slot}: {e}"))?,
+                            (None, None, None) => {}
+                            _ => {
+                                return Err(format!(
                                 "admit_promoted: lane {slot} spec state does not match the store"
                             ));
+                            }
                         }
+                        cell.state.row_capture_armed = false;
+                        Ok(None)
                     }
-                    cell.state.row_capture_armed = false;
-                    Ok(None)
-                }
-                None => {
-                    let (state, mut spec) = new_payload(gpu, bundle, slot, spec_cfg)?;
-                    let seeded = match (spec_cfg, spec.as_mut(), parts.as_ref()) {
-                        (Some((config, _, _)), Some(spec), Some(parts)) => {
-                            spec.promote(gpu, config.k, parts)
+                    None => {
+                        let (state, mut spec) = new_payload(gpu, bundle, slot, spec_cfg)?;
+                        let seeded = match (spec_cfg, spec.as_mut(), parts.as_ref()) {
+                            (Some((config, _, _)), Some(spec), Some(parts)) => {
+                                spec.promote(gpu, config.k, parts)
+                            }
+                            _ => Ok(()),
+                        };
+                        if let Err(error) = seeded {
+                            let _ = state.free_gpu(gpu);
+                            if let Some(spec) = spec {
+                                let _ = spec.head.free_gpu(gpu);
+                                let _ = gpu.free_tensor(spec.pending_hidden);
+                            }
+                            return Err(format!("admit_promoted: lane {slot}: {error}"));
                         }
-                        _ => Ok(()),
-                    };
-                    if let Err(error) = seeded {
-                        let _ = state.free_gpu(gpu);
-                        if let Some(spec) = spec {
-                            let _ = spec.head.free_gpu(gpu);
-                            let _ = gpu.free_tensor(spec.pending_hidden);
-                        }
-                        return Err(format!("admit_promoted: lane {slot}: {error}"));
+                        Ok(Some((state, spec)))
                     }
-                    Ok(Some((state, spec)))
-                }
-            })
+                },
+            )
     }
 
     /// Free `epoch`'s lane (its device state stays allocated for reuse).
@@ -1208,7 +1223,10 @@ mod tests {
         assert_eq!(table.active(), 3);
         let host = &table.get(&epoch(4, 1)).unwrap().host;
         assert_eq!(host.status, LaneStatus::Prefilling);
-        assert_eq!((host.prefilled, host.generated.len(), host.pending_seed), (0, 0, None));
+        assert_eq!(
+            (host.prefilled, host.generated.len(), host.pending_seed),
+            (0, 0, None)
+        );
         assert_eq!(host.stamp, 3);
         assert_eq!(table.epochs(), vec![epoch(1, 1), epoch(4, 1), epoch(3, 1)]);
     }
@@ -1243,8 +1261,12 @@ mod tests {
         prompt: &[u32],
         made: &mut usize,
     ) -> Result<usize, String> {
-        table.admit_decoding(epoch, prompt.to_vec(), vec![4, 5], 6, |slot, existing| {
-            match existing {
+        table.admit_decoding(
+            epoch,
+            prompt.to_vec(),
+            vec![4, 5],
+            6,
+            |slot, existing| match existing {
                 Some(cell) => {
                     cell.payload += 100;
                     Ok(None)
@@ -1253,15 +1275,18 @@ mod tests {
                     *made += 1;
                     Ok(Some(slot as u32))
                 }
-            }
-        })
+            },
+        )
     }
 
     #[test]
     fn promoted_admission_publishes_a_decoding_lane() {
         let mut table = LaneTable::<TestCell>::new(2);
         let mut made = 0;
-        assert_eq!(admit_decoding(&mut table, epoch(1, 1), &[7, 8, 9], &mut made), Ok(0));
+        assert_eq!(
+            admit_decoding(&mut table, epoch(1, 1), &[7, 8, 9], &mut made),
+            Ok(0)
+        );
         let host = &table.get(&epoch(1, 1)).unwrap().host;
         assert_eq!(host.status, LaneStatus::Decoding);
         assert_eq!(host.prompt, vec![7, 8, 9]);
@@ -1272,12 +1297,18 @@ mod tests {
         assert_eq!(table.active(), 1);
         // A plain admission still starts Prefilling next to it, in order.
         assert_eq!(admit(&mut table, epoch(2, 1), &[7], &mut made), Ok(1));
-        assert_eq!(table.get(&epoch(2, 1)).unwrap().host.status, LaneStatus::Prefilling);
+        assert_eq!(
+            table.get(&epoch(2, 1)).unwrap().host.status,
+            LaneStatus::Prefilling
+        );
         assert_eq!(table.get(&epoch(2, 1)).unwrap().host.stamp, 1);
         // The slot's payload is kept across a release and reused by a
         // promoted admission without remaking it.
         table.release(&epoch(1, 1)).unwrap();
-        assert_eq!(admit_decoding(&mut table, epoch(3, 1), &[9, 9], &mut made), Ok(0));
+        assert_eq!(
+            admit_decoding(&mut table, epoch(3, 1), &[9, 9], &mut made),
+            Ok(0)
+        );
         assert_eq!(made, 2);
         let cell = table.get(&epoch(3, 1)).unwrap();
         assert_eq!(cell.payload, 100);
@@ -1313,7 +1344,9 @@ mod tests {
         // A failed prepare leaves no half-published lane.
         table.release(&epoch(2, 1)).unwrap();
         let error = table
-            .admit_decoding(epoch(4, 1), vec![7], vec![1], 2, |_, _| Err("no memory".to_string()))
+            .admit_decoding(epoch(4, 1), vec![7], vec![1], 2, |_, _| {
+                Err("no memory".to_string())
+            })
             .unwrap_err();
         assert_eq!(error, "no memory");
         assert!(table.get(&epoch(4, 1)).is_none());
@@ -1384,10 +1417,19 @@ mod tests {
         admit(&mut table, epoch(2, 1), &[7], &mut made).unwrap();
         table.poison(&epoch(1, 2));
         table.poison(&epoch(9, 1));
-        assert_eq!(table.get(&epoch(1, 1)).unwrap().host.status, LaneStatus::Prefilling);
+        assert_eq!(
+            table.get(&epoch(1, 1)).unwrap().host.status,
+            LaneStatus::Prefilling
+        );
         table.poison(&epoch(1, 1));
-        assert_eq!(table.get(&epoch(1, 1)).unwrap().host.status, LaneStatus::Poisoned);
-        assert_eq!(table.get(&epoch(2, 1)).unwrap().host.status, LaneStatus::Prefilling);
+        assert_eq!(
+            table.get(&epoch(1, 1)).unwrap().host.status,
+            LaneStatus::Poisoned
+        );
+        assert_eq!(
+            table.get(&epoch(2, 1)).unwrap().host.status,
+            LaneStatus::Prefilling
+        );
     }
 
     #[test]
@@ -1420,10 +1462,11 @@ mod tests {
         for tag in 1..=3 {
             admit(&mut table, epoch(tag, 1), &[7], &mut made).unwrap();
         }
-        let picked = table
-            .pick_mut(&[epoch(3, 1), epoch(1, 1)])
-            .unwrap();
-        assert_eq!(picked.iter().map(|c| c.host.slot).collect::<Vec<_>>(), vec![2, 0]);
+        let picked = table.pick_mut(&[epoch(3, 1), epoch(1, 1)]).unwrap();
+        assert_eq!(
+            picked.iter().map(|c| c.host.slot).collect::<Vec<_>>(),
+            vec![2, 0]
+        );
         assert!(table.pick_mut(&[epoch(1, 1), epoch(1, 1)]).is_err());
         assert!(table.pick_mut(&[epoch(1, 9)]).is_err());
     }

@@ -111,7 +111,11 @@ fn no_unchunked_production_caller_of_the_bare_q8_kernel() {
     assert!(files.len() > 100, "crate scan found {} files", files.len());
     let mut offenders = Vec::new();
     for f in files {
-        let rel = f.strip_prefix(&crates).unwrap().to_string_lossy().replace('\\', "/");
+        let rel = f
+            .strip_prefix(&crates)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
         if allowed.contains(&rel.as_str()) {
             continue;
         }
@@ -155,8 +159,10 @@ fn bare_kernel_users_split_with_the_shared_plan() {
         std::fs::read_to_string(crates.join("hipfire-arch-qwen35/src/qwen35/batch.rs")).unwrap();
     let lm = batch.split("fn lm_head_batched").nth(1).unwrap();
     let lm = lm.split("DType::HFQ4G256").next().unwrap();
-    assert!(lm.contains("gemm_q8_0_batched_f32_chunked"), "qwen35 lm_head_batched");
-    let gemma =
-        std::fs::read_to_string(crates.join("hipfire-arch-gemma4/src/forward.rs")).unwrap();
+    assert!(
+        lm.contains("gemm_q8_0_batched_f32_chunked"),
+        "qwen35 lm_head_batched"
+    );
+    let gemma = std::fs::read_to_string(crates.join("hipfire-arch-gemma4/src/forward.rs")).unwrap();
     assert!(gemma.contains("let lm_result = gpu.gemm_q8_0_batched_f32_chunked("));
 }

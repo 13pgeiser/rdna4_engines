@@ -13,16 +13,16 @@
 //! Keeping the range reserved (see [`retired_va_bytes`]) means no later
 //! reservation or `hipMalloc` can land on a VA the GPU has translated before.
 
+use crate::ffi::{HipMemLocation, HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM};
 use crate::{
     DeviceBuffer, HipError, HipMemAccessDesc, HipMemAllocationProp, HipMemGenericAllocationHandle,
     HipResult, HipRuntime, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
 };
-use crate::ffi::{HipMemLocation, HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM};
-#[cfg(unix)]
-use std::os::fd::{BorrowedFd, OwnedFd};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ffi::c_void;
+#[cfg(unix)]
+use std::os::fd::{BorrowedFd, OwnedFd};
 use std::sync::Mutex;
 
 /// Retired VA a process may accumulate before new reservations are refused.
@@ -251,9 +251,7 @@ impl GranuleTable {
 static GRANULES: Mutex<GranuleTable> = Mutex::new(GranuleTable::new());
 
 fn granule_table() -> std::sync::MutexGuard<'static, GranuleTable> {
-    GRANULES
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
+    GRANULES.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
 /// Process-wide bytes of physical VMM granules that still hold at least one
@@ -511,11 +509,7 @@ impl VmmArena {
     /// device access only; a second mapping is refused), fills it while the
     /// arena is read-write, synchronizes, calls [`Self::publish_read_only`],
     /// then [`Self::export_posix`]. Retirement/release behave like [`Self::reserve`].
-    pub fn reserve_exportable(
-        hip: &HipRuntime,
-        device: i32,
-        bytes: usize,
-    ) -> HipResult<Self> {
+    pub fn reserve_exportable(hip: &HipRuntime, device: i32, bytes: usize) -> HipResult<Self> {
         Self::reserve_kind(hip, device, bytes, VmmArenaKind::ExportBuilding, false)
     }
 
@@ -640,9 +634,7 @@ impl VmmArena {
             None => err,
             Some(cleanup) => HipError::new(
                 0,
-                &format!(
-                    "{err}; imported VMM cleanup also failed: {cleanup}; reservation retired"
-                ),
+                &format!("{err}; imported VMM cleanup also failed: {cleanup}; reservation retired"),
             ),
         }
     }
@@ -771,7 +763,10 @@ impl VmmArena {
                         "exportable VMM arena holds exactly one physical allocation",
                     ));
                 }
-                if access_devices.iter().any(|&device| device != self.owner_device) {
+                if access_devices
+                    .iter()
+                    .any(|&device| device != self.owner_device)
+                {
                     return Err(HipError::new(
                         0,
                         "exportable VMM arena grants access to its owner device only",
@@ -1582,9 +1577,7 @@ fn teardown_segments(
             // order); handle is owned and no mapped range should still reference it.
             unsafe { hip.mem_release(handle) }
         },
-        |id| {
-            granule_table().drop_lease(id, &mut |handle| release_granule_handle(hip, handle))
-        },
+        |id| granule_table().drop_lease(id, &mut |handle| release_granule_handle(hip, handle)),
     )
 }
 
@@ -1655,9 +1648,8 @@ fn cleanup_segments(
             }
         }
     }
-    segments.retain(|segment| {
-        segment.mapped || segment.handle.is_some() || segment.granule.is_some()
-    });
+    segments
+        .retain(|segment| segment.mapped || segment.handle.is_some() || segment.granule.is_some());
     match first_error {
         Some(err) => Err(err),
         None => Ok(()),
@@ -1689,7 +1681,11 @@ mod tests {
     }
 
     fn host_arena(segments: Vec<VmmSegment>) -> VmmArena {
-        let mapped_bytes = segments.iter().map(|s| s.offset + s.size).max().unwrap_or(0);
+        let mapped_bytes = segments
+            .iter()
+            .map(|s| s.offset + s.size)
+            .max()
+            .unwrap_or(0);
         VmmArena {
             base: 0x1000_0000usize as *mut c_void,
             owner_device: 0,
@@ -1978,14 +1974,21 @@ mod tests {
             &mut segments,
             |_, _| Ok(()),
             |_| panic!("granule segments never use the exclusive handle"),
-            |id| table.drop_lease(id, &mut |_| Err(HipError::new(3, "injected release failure"))),
+            |id| {
+                table.drop_lease(id, &mut |_| {
+                    Err(HipError::new(3, "injected release failure"))
+                })
+            },
         )
         .unwrap_err();
         assert!(err.to_string().contains("injected release failure"));
         assert!(segments.is_empty(), "the mapping lease is consumed");
         assert_eq!(table.live_bytes(), 4096, "a pending release is still live");
         assert_eq!(table.leases(id), Some(0));
-        assert!(table.add_lease(id).is_err(), "a pending granule is not leasable");
+        assert!(
+            table.add_lease(id).is_err(),
+            "a pending granule is not leasable"
+        );
 
         let (released, error) =
             table.retry_pending(&mut |_| Err(HipError::new(4, "still failing")));
@@ -2037,7 +2040,10 @@ mod tests {
         assert!(err.to_string().contains("granule boundary"), "{err}");
         let err = arena.share_prefix(4 * G).unwrap_err();
         assert!(err.to_string().contains("granule prefix"), "{err}");
-        assert!(ids.iter().all(|&id| leases(id) == Some(1)), "failed shares take no lease");
+        assert!(
+            ids.iter().all(|&id| leases(id) == Some(1)),
+            "failed shares take no lease"
+        );
 
         let prefix = arena.share_prefix(2 * G).unwrap();
         assert_eq!(prefix.bytes(), 2 * G);
@@ -2076,7 +2082,10 @@ mod tests {
     #[test]
     fn physical_granules_and_sealed_bytes_follow_leases() {
         let (arena, ids) = three_granule_arena();
-        assert_eq!(arena.physical_granules(), vec![(ids[0], G), (ids[1], G), (ids[2], G)]);
+        assert_eq!(
+            arena.physical_granules(),
+            vec![(ids[0], G), (ids[1], G), (ids[2], G)]
+        );
         assert_eq!(arena.sealed_bytes(), 0);
         granule_table().add_lease(ids[1]).unwrap();
         assert_eq!(arena.sealed_bytes(), 2 * G);
@@ -2120,9 +2129,15 @@ mod tests {
         clear_vmm_faults();
         inject_vmm_fault(VmmFaultKind::Map, 1);
         inject_vmm_fault(VmmFaultKind::Create, 2);
-        assert!(take_fault(VmmFaultKind::Map).unwrap().to_string().contains("map"));
+        assert!(take_fault(VmmFaultKind::Map)
+            .unwrap()
+            .to_string()
+            .contains("map"));
         assert!(take_fault(VmmFaultKind::Map).is_none());
-        assert!(take_fault(VmmFaultKind::Create).unwrap().to_string().contains("create"));
+        assert!(take_fault(VmmFaultKind::Create)
+            .unwrap()
+            .to_string()
+            .contains("create"));
         assert!(take_fault(VmmFaultKind::Create).is_some());
         assert!(take_fault(VmmFaultKind::Create).is_none());
         inject_vmm_fault(VmmFaultKind::Map, 3);
@@ -2148,14 +2163,19 @@ mod tests {
 
         let mut a = VmmArena::reserve(&hip, device, 64 << 20).expect("reserve A");
         let g = a.granule_bytes();
-        assert!(4 * g <= a.reserved_bytes(), "reserve too small for 4 granules of {g} bytes");
-        a.map_next_granules(&hip, 3 * g, &access).expect("map 3 granules in A");
+        assert!(
+            4 * g <= a.reserved_bytes(),
+            "reserve too small for 4 granules of {g} bytes"
+        );
+        a.map_next_granules(&hip, 3 * g, &access)
+            .expect("map 3 granules in A");
         assert_eq!(a.mapped_bytes(), 3 * g);
         assert_eq!(a.granule_prefix_bytes(), 3 * g);
         assert_eq!(a.sealed_bytes(), 0);
         assert!(a.primary_handle().is_some());
         let pattern = gpu_pattern(3 * g, 31, 7);
-        hip.memcpy_htod(&a.buffer(3 * g).unwrap(), &pattern).expect("write A");
+        hip.memcpy_htod(&a.buffer(3 * g).unwrap(), &pattern)
+            .expect("write A");
 
         let shared = a.share_prefix(2 * g).expect("share 2 granules");
         assert_eq!(shared.bytes(), 2 * g);
@@ -2164,40 +2184,61 @@ mod tests {
 
         let mut b = VmmArena::reserve(&hip, device, 64 << 20).expect("reserve B");
         assert_ne!(a.base_address(), b.base_address());
-        b.map_shared_prefix(&hip, &shared, &access).expect("map shared prefix in B");
+        b.map_shared_prefix(&hip, &shared, &access)
+            .expect("map shared prefix in B");
         assert_eq!(b.mapped_bytes(), 2 * g);
-        b.map_next_granules(&hip, g, &access).expect("map private granule in B");
+        b.map_next_granules(&hip, g, &access)
+            .expect("map private granule in B");
         assert_eq!(b.mapped_bytes(), 3 * g);
         assert_eq!(b.sealed_bytes(), 2 * g);
         let physical_b = b.physical_granules();
         assert_eq!(&physical_b[..2], shared.granules());
         assert_eq!(&physical_b[..2], &a.physical_granules()[..2]);
         assert_ne!(physical_b[2].0, a.physical_granules()[2].0);
-        assert!(b.map_shared_prefix(&hip, &shared, &access).is_err(), "B was already mapped");
+        assert!(
+            b.map_shared_prefix(&hip, &shared, &access).is_err(),
+            "B was already mapped"
+        );
 
         let buf_a = a.buffer(3 * g).unwrap();
         let buf_b = b.buffer(3 * g).unwrap();
         let mut read = vec![0u8; 2 * g];
-        hip.memcpy_dtoh_at(&mut read, &buf_b, 0).expect("read B alias");
+        hip.memcpy_dtoh_at(&mut read, &buf_b, 0)
+            .expect("read B alias");
         assert_eq!(read, pattern[..2 * g]);
 
         let private = gpu_pattern(g, 13, 99);
-        hip.memcpy_htod_offset(&buf_b, 2 * g, &private).expect("write B private granule");
+        hip.memcpy_htod_offset(&buf_b, 2 * g, &private)
+            .expect("write B private granule");
         let mut a_third = vec![0u8; g];
-        hip.memcpy_dtoh_at(&mut a_third, &buf_a, 2 * g).expect("read A third granule");
-        assert_eq!(a_third, pattern[2 * g..3 * g], "A's private granule must be unchanged");
+        hip.memcpy_dtoh_at(&mut a_third, &buf_a, 2 * g)
+            .expect("read A third granule");
+        assert_eq!(
+            a_third,
+            pattern[2 * g..3 * g],
+            "A's private granule must be unchanged"
+        );
         let mut b_third = vec![0u8; g];
-        hip.memcpy_dtoh_at(&mut b_third, &buf_b, 2 * g).expect("read B third granule");
+        hip.memcpy_dtoh_at(&mut b_third, &buf_b, 2 * g)
+            .expect("read B third granule");
         assert_eq!(b_third, private);
 
         a.release(&hip).expect("release A");
         assert!(a.is_released());
-        hip.memcpy_dtoh_at(&mut read, &buf_b, 0).expect("read B after A release");
-        assert_eq!(read, pattern[..2 * g], "B must keep the aliased bytes after A is released");
+        hip.memcpy_dtoh_at(&mut read, &buf_b, 0)
+            .expect("read B after A release");
+        assert_eq!(
+            read,
+            pattern[..2 * g],
+            "B must keep the aliased bytes after A is released"
+        );
 
         b.release(&hip).expect("release B");
         shared.release(&hip).expect("release shared prefix");
         assert_eq!(vmm_live_granule_bytes(), live_before);
-        assert_eq!(retry_pending_granule_releases(&hip).expect("retry pending"), 0);
+        assert_eq!(
+            retry_pending_granule_releases(&hip).expect("retry pending"),
+            0
+        );
     }
 }

@@ -784,7 +784,10 @@ fn qwen35_tp2_vs_single_oracle() {
         // gfx1201, `HIPFIRE_TP_FULL_GRAPH`) prepares its signal tape before peer
         // enable. `Ok(false)` touches nothing when it is not admitted.
         let whole_token_graph = gpus
-            .prepare_tp2_whole_token_graph(global.n_layers * 2, global.dim * std::mem::size_of::<f32>())
+            .prepare_tp2_whole_token_graph(
+                global.n_layers * 2,
+                global.dim * std::mem::size_of::<f32>(),
+            )
             .expect("tp prepare_tp2_whole_token_graph");
         eprintln!("{TEST}: tp2 whole-token graph prepared={whole_token_graph}");
         assert!(

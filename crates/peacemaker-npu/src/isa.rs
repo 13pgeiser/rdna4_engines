@@ -118,16 +118,17 @@ impl Inst {
     /// Stand-alone bundle bytes (little-endian).
     pub fn encode(self) -> Vec<u8> {
         // 32-bit: Inst = {instr32(28), 0b1000}
-        let f32 = |inner28: u64| -> Vec<u8> { (((inner28 << 4) | 0b1000) as u32).to_le_bytes().to_vec() };
+        let f32 =
+            |inner28: u64| -> Vec<u8> { (((inner28 << 4) | 0b1000) as u32).to_le_bytes().to_vec() };
         match self {
             // instr16 = {nop(1), dontcare(11), 0b0000}
             Inst::Nop16 => vec![0, 0],
-            Inst::Lda(s) => f32((s << 3) | 0b001),                    // {00000, lda, 001}
+            Inst::Lda(s) => f32((s << 3) | 0b001), // {00000, lda, 001}
             Inst::Ldb(s) => f32((0b00111 << 23) | (s << 6) | 0b000001), // {00111, ldb, 000001}
-            Inst::Alu(s) => f32((0b00010 << 23) | (s << 3) | 0b001),  // {00010, alu, 001}
-            Inst::Mv(s) => f32((0b00011 << 23) | (s << 1) | 0b1),     // {00011, mv, 1}
-            Inst::St(s) => f32((0b00001 << 23) | (s << 3) | 0b001),   // {00001, st, 001}
-            Inst::Vec(s) => f32(s << 2),                              // {vec, 00}
+            Inst::Alu(s) => f32((0b00010 << 23) | (s << 3) | 0b001), // {00010, alu, 001}
+            Inst::Mv(s) => f32((0b00011 << 23) | (s << 1) | 0b1), // {00011, mv, 1}
+            Inst::St(s) => f32((0b00001 << 23) | (s << 3) | 0b001), // {00001, st, 001}
+            Inst::Vec(s) => f32(s << 2),           // {vec, 00}
             // 48-bit: Inst = {instr48(45), 0b100}; instr48 = {lng(42), 0, 00}
             Inst::Lng(s) => (((s << 3) << 3) | 0b100).to_le_bytes()[..6].to_vec(),
         }
@@ -164,7 +165,9 @@ pub fn mova(dst: Reg, i: i64) -> Inst {
 /// `lda dst, [ptr, #imm]` (LDA_dms_lda_idx_imm): {ptr(3), imm/4(4), 01, dst(7), 1101}
 pub fn lda_idx_imm(dst: Reg, ptr: Reg, imm: i64) -> Inst {
     assert!(imm % 4 == 0);
-    Inst::Lda((e_p(ptr) << 17) | (simm(imm / 4, 4) << 13) | (0b01 << 11) | (scl_st(dst) << 4) | 0b1101)
+    Inst::Lda(
+        (e_p(ptr) << 17) | (simm(imm / 4, 4) << 13) | (0b01 << 11) | (scl_st(dst) << 4) | 0b1101,
+    )
 }
 /// `nopa`: {dc(10), 1011001111}
 pub fn nopa() -> Inst {
@@ -175,12 +178,16 @@ pub fn nopa() -> Inst {
 /// `st src, [ptr, #imm]` (ST_dms_sts_idx_imm): {ptr(3), imm/4(4), 01, src(7), 0011}
 pub fn st_idx_imm(src: Reg, ptr: Reg, imm: i64) -> Inst {
     assert!(imm % 4 == 0);
-    Inst::St((e_p(ptr) << 17) | (simm(imm / 4, 4) << 13) | (0b01 << 11) | (scl_st(src) << 4) | 0b0011)
+    Inst::St(
+        (e_p(ptr) << 17) | (simm(imm / 4, 4) << 13) | (0b01 << 11) | (scl_st(src) << 4) | 0b0011,
+    )
 }
 /// `st src, [ptr], #imm` post-modify (ST_dms_sts_pstm_nrm_imm): {ptr(3), imm/4(4), 11, src(7), 0011}
 pub fn st_post_imm(src: Reg, ptr: Reg, imm: i64) -> Inst {
     assert!(imm % 4 == 0);
-    Inst::St((e_p(ptr) << 17) | (simm(imm / 4, 4) << 13) | (0b11 << 11) | (scl_st(src) << 4) | 0b0011)
+    Inst::St(
+        (e_p(ptr) << 17) | (simm(imm / 4, 4) << 13) | (0b11 << 11) | (scl_st(src) << 4) | 0b0011,
+    )
 }
 /// `nops`: {dc(10), 1010110110}
 pub fn nops() -> Inst {
@@ -239,14 +246,20 @@ impl Program {
         Ok(self.bytes)
     }
     /// [`Program::try_finish`]; a rule violation is a generator bug and panics with the rule and pc.
-    pub fn finish(self) -> Vec<u8> { self.try_finish().unwrap_or_else(|v| panic!("{v}")) }
+    pub fn finish(self) -> Vec<u8> {
+        self.try_finish().unwrap_or_else(|v| panic!("{v}"))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     fn hex(i: Inst) -> String {
-        i.encode().iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+        i.encode()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
     /// Oracle bytes: stand-alone bundles found in a vendor-built AIE2P core ELF (add_one, mlir-aie
     /// npu2), as listed by llvm-objdump --triple=aie2p. Used only to check our TableGen transcription.

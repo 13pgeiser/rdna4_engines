@@ -92,7 +92,10 @@ fn err<E: std::fmt::Display>(e: E) -> String {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -103,7 +106,10 @@ fn unhex(s: &str) -> Result<Vec<u8>> {
     if s.len() % 2 != 0 {
         return Err("odd hex length".into());
     }
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(err)).collect()
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(err))
+        .collect()
 }
 
 fn abs_path(s: &str, what: &str) -> Result<PathBuf> {
@@ -127,7 +133,9 @@ fn wr_u64(b: &mut [u8], off: usize, v: u64) {
 }
 
 fn f32s(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -136,7 +144,9 @@ fn f32s(b: &[u8]) -> Vec<f32> {
 fn jget<'a>(v: &'a Value, path: &str) -> Result<&'a Value> {
     let mut cur = v;
     for part in path.split('.') {
-        cur = cur.get(part).ok_or_else(|| format!("required field `{path}` is absent"))?;
+        cur = cur
+            .get(part)
+            .ok_or_else(|| format!("required field `{path}` is absent"))?;
     }
     Ok(cur)
 }
@@ -150,24 +160,36 @@ fn jstr(v: &Value, path: &str) -> Result<String> {
 
 fn jhex64(v: &Value, path: &str) -> Result<String> {
     let s = jstr(v, path)?;
-    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
-        return Err(format!("field `{path}` must be lowercase 64-hex sha256: {s}"));
+    if s.len() != 64
+        || !s
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(format!(
+            "field `{path}` must be lowercase 64-hex sha256: {s}"
+        ));
     }
     Ok(s)
 }
 
 fn ju64(v: &Value, path: &str) -> Result<u64> {
-    jget(v, path)?.as_u64().ok_or_else(|| format!("field `{path}` must be an unsigned integer"))
+    jget(v, path)?
+        .as_u64()
+        .ok_or_else(|| format!("field `{path}` must be an unsigned integer"))
 }
 
 fn jarr3(v: &Value, path: &str) -> Result<[u32; 3]> {
-    let a = jget(v, path)?.as_array().ok_or_else(|| format!("field `{path}` must be an array"))?;
+    let a = jget(v, path)?
+        .as_array()
+        .ok_or_else(|| format!("field `{path}` must be an array"))?;
     if a.len() != 3 {
         return Err(format!("field `{path}` must have 3 entries"));
     }
     let mut out = [0u32; 3];
     for (i, e) in a.iter().enumerate() {
-        out[i] = e.as_u64().ok_or_else(|| format!("field `{path}`[{i}] not an integer"))? as u32;
+        out[i] = e
+            .as_u64()
+            .ok_or_else(|| format!("field `{path}`[{i}] not an integer"))? as u32;
     }
     Ok(out)
 }
@@ -198,11 +220,16 @@ struct Capture {
 
 fn read_hashed(dir: &Path, meta: &Value, name: &str) -> Result<Vec<u8>> {
     let b = std::fs::read(dir.join(name)).map_err(|e| format!("{name}: {e}"))?;
-    let want = meta["files"][name]["sha256"].as_str().ok_or(format!("{name}: no hash in meta"))?.to_owned();
+    let want = meta["files"][name]["sha256"]
+        .as_str()
+        .ok_or(format!("{name}: no hash in meta"))?
+        .to_owned();
     if sha256_hex(&b) != want {
         return Err(format!("{name}: sha256 mismatch against capture meta"));
     }
-    let bytes = meta["files"][name]["bytes"].as_u64().ok_or(format!("{name}: no byte count in meta"))?;
+    let bytes = meta["files"][name]["bytes"]
+        .as_u64()
+        .ok_or(format!("{name}: no byte count in meta"))?;
     if bytes as usize != b.len() {
         return Err(format!("{name}: {} bytes, meta says {bytes}", b.len()));
     }
@@ -212,7 +239,11 @@ fn read_hashed(dir: &Path, meta: &Value, name: &str) -> Result<Vec<u8>> {
 fn load_capture(dir: &Path) -> Result<Capture> {
     let meta_bytes = std::fs::read(dir.join("meta.json")).map_err(|e| format!("meta.json: {e}"))?;
     let meta: Value = serde_json::from_slice(&meta_bytes).map_err(err)?;
-    must_eq("capture schema", jstr(&meta, "schema")?, "pmdt-capture-v1".to_owned())?;
+    must_eq(
+        "capture schema",
+        jstr(&meta, "schema")?,
+        "pmdt-capture-v1".to_owned(),
+    )?;
     must_eq("capture symbol", jstr(&meta, "symbol")?, SYMBOL.to_owned())?;
     must_eq("capture arch", jstr(&meta, "arch")?, "gfx1201".to_owned())?;
     let kernarg = unhex(&jstr(&meta, "kernarg_hex")?)?;
@@ -227,8 +258,16 @@ fn load_capture(dir: &Path) -> Result<Capture> {
     let post = [read(0, "post")?, read(8, "post")?, read(16, "post")?];
     let lens = [m * (k / 256) * GROUP_BYTES, k * 4, m * 4];
     for i in 0..3 {
-        must_eq(&format!("arg{} pre length", PTR_OFF[i]), pre[i].len(), lens[i])?;
-        must_eq(&format!("arg{} post length", PTR_OFF[i]), post[i].len(), lens[i])?;
+        must_eq(
+            &format!("arg{} pre length", PTR_OFF[i]),
+            pre[i].len(),
+            lens[i],
+        )?;
+        must_eq(
+            &format!("arg{} post length", PTR_OFF[i]),
+            post[i].len(),
+            lens[i],
+        )?;
     }
     Ok(Capture {
         dir: dir.to_owned(),
@@ -261,7 +300,11 @@ fn fixture_quality(c: &Capture) -> Result<Value> {
     let y_post_finite = y1.iter().all(|v| v.is_finite());
     let y_pre_distinct = y0.iter().map(|v| v.to_bits()).collect::<HashSet<_>>().len();
     let y_pre_nonzero = y0.iter().filter(|v| v.to_bits() != 0).count();
-    let y_rows_changed = y0.iter().zip(&y1).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+    let y_rows_changed = y0
+        .iter()
+        .zip(&y1)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
     let a_unchanged = c.pre[0] == c.post[0];
     let x_unchanged = c.pre[1] == c.post[1];
     let v = json!({
@@ -289,7 +332,9 @@ fn fixture_quality(c: &Capture) -> Result<Value> {
         && a_unchanged
         && x_unchanged;
     if !ok {
-        return Err(format!("fixture is degenerate or not a pure A/x-read RMW-y callsite: {v}"));
+        return Err(format!(
+            "fixture is degenerate or not a pure A/x-read RMW-y callsite: {v}"
+        ));
     }
     Ok(v)
 }
@@ -324,7 +369,11 @@ enum VkScope {
 
 impl Shape {
     fn lens(&self) -> [usize; 3] {
-        [self.m * (self.k / 256) * GROUP_BYTES, self.k * 4, self.m * 4]
+        [
+            self.m * (self.k / 256) * GROUP_BYTES,
+            self.k * 4,
+            self.m * 4,
+        ]
     }
     fn masked_kernarg(&self) -> Vec<u8> {
         let mut k = self.kernarg.clone();
@@ -357,7 +406,9 @@ fn fixture_shape(c: &Capture) -> Shape {
 fn derived_shape(c: &Capture, m: usize, groups: usize, minimal_grid: bool) -> Result<Shape> {
     let g_full = c.k / 256;
     if m == 0 || m > c.m || groups == 0 || groups > g_full {
-        return Err(format!("derived shape M={m} groups={groups} outside the fixture"));
+        return Err(format!(
+            "derived shape M={m} groups={groups} outside the fixture"
+        ));
     }
     if !minimal_grid && c.grid != [c.m as u32, 1, 1] {
         return Err(format!(
@@ -377,10 +428,21 @@ fn derived_shape(c: &Capture, m: usize, groups: usize, minimal_grid: bool) -> Re
     PTR_OFF.iter().for_each(|&o| wr_u64(&mut kernarg, o, 0));
     wr_u32(&mut kernarg, OFF_M, m as u32);
     wr_u32(&mut kernarg, OFF_K, (groups * 256) as u32);
-    let grid_x = if minimal_grid { m.div_ceil(2) as u32 } else { m as u32 };
+    let grid_x = if minimal_grid {
+        m.div_ceil(2) as u32
+    } else {
+        m as u32
+    };
     let key = format!("odd_tail_m{m}_k{}", groups * 256);
     Ok(Shape {
-        name: format!("{key}.{}", if minimal_grid { "minimal_grid" } else { "captured_grid" }),
+        name: format!(
+            "{key}.{}",
+            if minimal_grid {
+                "minimal_grid"
+            } else {
+                "captured_grid"
+            }
+        ),
         m,
         k: groups * 256,
         grid: [grid_x, 1, 1],
@@ -389,7 +451,11 @@ fn derived_shape(c: &Capture, m: usize, groups: usize, minimal_grid: bool) -> Re
         kernarg,
         pre: [a, x, y],
         callsite_post: None,
-        vk: if minimal_grid { VkScope::NotRun } else { VkScope::Derived(key) },
+        vk: if minimal_grid {
+            VkScope::NotRun
+        } else {
+            VkScope::Derived(key)
+        },
         derived: true,
     })
 }
@@ -422,14 +488,17 @@ struct Incumbent {
 }
 
 fn incumbent(inventory: &Path) -> Result<Incumbent> {
-    let inv: Value = serde_json::from_slice(&std::fs::read(inventory).map_err(err)?).map_err(err)?;
+    let inv: Value =
+        serde_json::from_slice(&std::fs::read(inventory).map_err(err)?).map_err(err)?;
     let m = inv["modules"]
         .as_array()
         .ok_or("inventory.modules missing")?
         .iter()
         .find(|m| m["module"] == MODULE)
         .ok_or_else(|| format!("{MODULE} not in inventory"))?;
-    let snap = m["source_snapshot"].as_str().ok_or("source_snapshot missing")?;
+    let snap = m["source_snapshot"]
+        .as_str()
+        .ok_or("source_snapshot missing")?;
     let source = std::fs::read_to_string(snap).map_err(err)?;
     let want = m["source_sha256"].as_str().ok_or("source_sha256 missing")?;
     let got = sha256_hex(source.as_bytes());
@@ -457,7 +526,10 @@ fn incumbent(inventory: &Path) -> Result<Incumbent> {
         source,
         source_sha256: got,
         object_path: PathBuf::from(m["object_path"].as_str().ok_or("object_path missing")?),
-        object_sha256: m["object_sha256"].as_str().ok_or("object_sha256 missing")?.to_owned(),
+        object_sha256: m["object_sha256"]
+            .as_str()
+            .ok_or("object_sha256 missing")?
+            .to_owned(),
         flags,
     })
 }
@@ -476,9 +548,23 @@ struct Arm {
     extra: Value,
 }
 
-fn load_arm(gpu: &Gpu, label: &'static str, kind: &str, image: &[u8], symbol: &str, path: Option<&Path>, extra: Value) -> Result<Arm> {
-    let module = gpu.hip.module_load_data(image).map_err(|e| format!("{label}: module_load_data: {e}"))?;
-    let func = gpu.hip.module_get_function(&module, symbol).map_err(|e| format!("{label}: symbol {symbol}: {e}"))?;
+fn load_arm(
+    gpu: &Gpu,
+    label: &'static str,
+    kind: &str,
+    image: &[u8],
+    symbol: &str,
+    path: Option<&Path>,
+    extra: Value,
+) -> Result<Arm> {
+    let module = gpu
+        .hip
+        .module_load_data(image)
+        .map_err(|e| format!("{label}: module_load_data: {e}"))?;
+    let func = gpu
+        .hip
+        .module_get_function(&module, symbol)
+        .map_err(|e| format!("{label}: symbol {symbol}: {e}"))?;
     Ok(Arm {
         label,
         kind: kind.to_owned(),
@@ -503,9 +589,13 @@ fn arm_identity(a: &Arm, sh: &Shape) -> Value {
 }
 
 fn load_hipcc(gpu: &Gpu, inc: &Incumbent) -> Result<Arm> {
-    let obj = std::fs::read(&inc.object_path).map_err(|e| format!("{}: {e}", inc.object_path.display()))?;
+    let obj = std::fs::read(&inc.object_path)
+        .map_err(|e| format!("{}: {e}", inc.object_path.display()))?;
     if sha256_hex(&obj) != inc.object_sha256 {
-        return Err(format!("{}: object sha256 mismatch against inventory", inc.object_path.display()));
+        return Err(format!(
+            "{}: object sha256 mismatch against inventory",
+            inc.object_path.display()
+        ));
     }
     load_arm(
         gpu,
@@ -555,23 +645,52 @@ struct Manifest {
     aco_sidecar_sha256: String,
 }
 
-fn load_manifest(path: &Path, cand_sha: &str, symbol: &str, cap: &Capture, kernarg_abi_sha256: &str) -> Result<Manifest> {
-    let bytes = std::fs::read(path).map_err(|e| format!("candidate manifest {}: {e}", path.display()))?;
-    let j: Value = serde_json::from_slice(&bytes).map_err(|e| format!("candidate manifest: {e}"))?;
+fn load_manifest(
+    path: &Path,
+    cand_sha: &str,
+    symbol: &str,
+    cap: &Capture,
+    kernarg_abi_sha256: &str,
+) -> Result<Manifest> {
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("candidate manifest {}: {e}", path.display()))?;
+    let j: Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("candidate manifest: {e}"))?;
     let ctx = |e: String| format!("candidate manifest {}: {e}", path.display());
     let pre = || -> Result<()> {
         must_eq("schema", jstr(&j, "schema")?, MANIFEST_SCHEMA.to_owned())?;
         must_eq("symbol", jstr(&j, "symbol")?, symbol.to_owned())?;
-        must_eq("object_sha256 vs --candidate bytes", jhex64(&j, "object_sha256")?, cand_sha.to_owned())?;
-        for f in ["spirv_sha256", "aco_binary_sha256", "aco_sidecar_sha256", "body_sha256"] {
+        must_eq(
+            "object_sha256 vs --candidate bytes",
+            jhex64(&j, "object_sha256")?,
+            cand_sha.to_owned(),
+        )?;
+        for f in [
+            "spirv_sha256",
+            "aco_binary_sha256",
+            "aco_sidecar_sha256",
+            "body_sha256",
+        ] {
             jhex64(&j, f)?;
         }
         jstr(&j, "adapter_version")?;
         must_eq("wave_size", ju64(&j, "wave_size")?, 32)?;
         must_eq("block", jarr3(&j, "block")?, cap.block)?;
-        must_eq("kernarg_size", ju64(&j, "kernarg_size")? as usize, KERNARG_LEN)?;
-        must_eq("kernarg_abi_sha256", jhex64(&j, "kernarg_abi_sha256")?, kernarg_abi_sha256.to_owned())?;
-        must_eq("shape_support.fixture", jget(&j, "shape_support.fixture")?.as_bool(), Some(true))?;
+        must_eq(
+            "kernarg_size",
+            ju64(&j, "kernarg_size")? as usize,
+            KERNARG_LEN,
+        )?;
+        must_eq(
+            "kernarg_abi_sha256",
+            jhex64(&j, "kernarg_abi_sha256")?,
+            kernarg_abi_sha256.to_owned(),
+        )?;
+        must_eq(
+            "shape_support.fixture",
+            jget(&j, "shape_support.fixture")?.as_bool(),
+            Some(true),
+        )?;
         jget(&j, "shape_support.odd_tail")?
             .as_bool()
             .ok_or_else(|| "field `shape_support.odd_tail` must be a boolean".to_owned())?;
@@ -608,10 +727,19 @@ fn vk_buffers(bucket: &Value, base: &Path, sh: &Shape) -> Result<[Vec<u8>; 3]> {
         let ctx = |e: String| format!("vulkan receipt, shape {}: {key}: {e}", sh.name);
         let want_pre = jhex64(bucket, &format!("{key}.pre_framed_sha256")).map_err(ctx)?;
         let got_pre = sha256_hex(&framed(&sh.pre[i]));
-        must_eq("pre_framed_sha256 vs oracle framing of the fixture bytes", want_pre, got_pre).map_err(ctx)?;
+        must_eq(
+            "pre_framed_sha256 vs oracle framing of the fixture bytes",
+            want_pre,
+            got_pre,
+        )
+        .map_err(ctx)?;
         let file = jstr(bucket, &format!("{key}.post_framed_file")).map_err(ctx)?;
         let want_post = jhex64(bucket, &format!("{key}.post_framed_sha256")).map_err(ctx)?;
-        let p = if Path::new(&file).is_absolute() { PathBuf::from(&file) } else { base.join(&file) };
+        let p = if Path::new(&file).is_absolute() {
+            PathBuf::from(&file)
+        } else {
+            base.join(&file)
+        };
         let b = std::fs::read(&p).map_err(|e| ctx(format!("{}: {e}", p.display())))?;
         must_eq("post file length", b.len(), GUARD + lens[i] + GUARD).map_err(ctx)?;
         must_eq("post file sha256 vs receipt", sha256_hex(&b), want_post).map_err(ctx)?;
@@ -620,8 +748,15 @@ fn vk_buffers(bucket: &Value, base: &Path, sh: &Shape) -> Result<[Vec<u8>; 3]> {
     Ok(out)
 }
 
-fn load_vulkan(path: &Path, cap: &Capture, man: &Manifest, shapes: &[Shape], pins: &Pins) -> Result<VkRef> {
-    let bytes = std::fs::read(path).map_err(|e| format!("vulkan receipt {}: {e}", path.display()))?;
+fn load_vulkan(
+    path: &Path,
+    cap: &Capture,
+    man: &Manifest,
+    shapes: &[Shape],
+    pins: &Pins,
+) -> Result<VkRef> {
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("vulkan receipt {}: {e}", path.display()))?;
     let j: Value = serde_json::from_slice(&bytes).map_err(|e| format!("vulkan receipt: {e}"))?;
     let base = path.parent().ok_or("receipt has no parent directory")?;
     let ctx = |e: String| format!("vulkan receipt {}: {e}", path.display());
@@ -629,25 +764,57 @@ fn load_vulkan(path: &Path, cap: &Capture, man: &Manifest, shapes: &[Shape], pin
         must_eq("schema", jstr(&j, "schema")?, VK_SCHEMA.to_owned())?;
         must_eq("symbol", jstr(&j, "symbol")?, SYMBOL.to_owned())?;
         let spirv = jhex64(&j, "spirv.sha256")?;
-        must_eq("spirv.sha256 vs candidate manifest", spirv.clone(), man.spirv_sha256.clone())?;
+        must_eq(
+            "spirv.sha256 vs candidate manifest",
+            spirv.clone(),
+            man.spirv_sha256.clone(),
+        )?;
         if let Some(p) = &pins.spirv {
             must_eq("spirv.sha256 vs --expect-spirv-sha256", spirv, p.clone())?;
         }
         let bin = jhex64(&j, "aco_binary.sha256")?;
-        must_eq("aco_binary.sha256 vs candidate manifest", bin.clone(), man.aco_binary_sha256.clone())?;
+        must_eq(
+            "aco_binary.sha256 vs candidate manifest",
+            bin.clone(),
+            man.aco_binary_sha256.clone(),
+        )?;
         if let Some(p) = &pins.aco_binary {
-            must_eq("aco_binary.sha256 vs --expect-aco-binary-sha256", bin, p.clone())?;
+            must_eq(
+                "aco_binary.sha256 vs --expect-aco-binary-sha256",
+                bin,
+                p.clone(),
+            )?;
         }
-        must_eq("aco_binary.sidecar_sha256 vs candidate manifest", jhex64(&j, "aco_binary.sidecar_sha256")?, man.aco_sidecar_sha256.clone())?;
+        must_eq(
+            "aco_binary.sidecar_sha256 vs candidate manifest",
+            jhex64(&j, "aco_binary.sidecar_sha256")?,
+            man.aco_sidecar_sha256.clone(),
+        )?;
         must_eq("config.wave_size", ju64(&j, "config.wave_size")?, 32)?;
-        must_eq("config.local_size vs capture block", jarr3(&j, "config.local_size")?, cap.block)?;
-        must_eq("config.workgroups vs capture grid", jarr3(&j, "config.workgroups")?, cap.grid)?;
+        must_eq(
+            "config.local_size vs capture block",
+            jarr3(&j, "config.local_size")?,
+            cap.block,
+        )?;
+        must_eq(
+            "config.workgroups vs capture grid",
+            jarr3(&j, "config.workgroups")?,
+            cap.grid,
+        )?;
         must_eq("config.M vs capture", ju64(&j, "config.M")? as usize, cap.m)?;
         must_eq("config.K vs capture", ju64(&j, "config.K")? as usize, cap.k)?;
         jhex64(&j, "config.specialization_sha256")?;
         jhex64(&j, "config.layout_sha256")?;
-        must_eq("fixture.meta_sha256 vs capture meta.json", jhex64(&j, "fixture.meta_sha256")?, cap.meta_sha256.clone())?;
-        for f in ["driver.mesa_version", "driver.device_name", "driver.driver_id"] {
+        must_eq(
+            "fixture.meta_sha256 vs capture meta.json",
+            jhex64(&j, "fixture.meta_sha256")?,
+            cap.meta_sha256.clone(),
+        )?;
+        for f in [
+            "driver.mesa_version",
+            "driver.device_name",
+            "driver.driver_id",
+        ] {
             jstr(&j, f)?;
         }
         for f in ["driver.vendor_id", "driver.device_id"] {
@@ -655,8 +822,16 @@ fn load_vulkan(path: &Path, cap: &Capture, man: &Manifest, shapes: &[Shape], pin
                 return Err(format!("field `{f}` is null"));
             }
         }
-        must_eq("framing.guard_bytes", ju64(&j, "framing.guard_bytes")? as usize, GUARD)?;
-        must_eq("framing.guard_byte", jstr(&j, "framing.guard_byte")?, format!("{GUARD_BYTE:02x}"))?;
+        must_eq(
+            "framing.guard_bytes",
+            ju64(&j, "framing.guard_bytes")? as usize,
+            GUARD,
+        )?;
+        must_eq(
+            "framing.guard_byte",
+            jstr(&j, "framing.guard_byte")?,
+            format!("{GUARD_BYTE:02x}"),
+        )?;
         Ok(())
     };
     top().map_err(ctx)?;
@@ -673,9 +848,24 @@ fn load_vulkan(path: &Path, cap: &Capture, man: &Manifest, shapes: &[Shape], pin
                     ctx(format!("candidate claims shape_support.odd_tail but receipt has no `derived.{key}` bucket"))
                 })?;
                 let c2 = |e: String| format!("vulkan receipt derived.{key}: {e}");
-                must_eq("config.M", ju64(bucket, "config.M").map_err(c2)? as usize, sh.m).map_err(c2)?;
-                must_eq("config.K", ju64(bucket, "config.K").map_err(c2)? as usize, sh.k).map_err(c2)?;
-                must_eq("config.workgroups", jarr3(bucket, "config.workgroups").map_err(c2)?, sh.grid).map_err(c2)?;
+                must_eq(
+                    "config.M",
+                    ju64(bucket, "config.M").map_err(c2)? as usize,
+                    sh.m,
+                )
+                .map_err(c2)?;
+                must_eq(
+                    "config.K",
+                    ju64(bucket, "config.K").map_err(c2)? as usize,
+                    sh.k,
+                )
+                .map_err(c2)?;
+                must_eq(
+                    "config.workgroups",
+                    jarr3(bucket, "config.workgroups").map_err(c2)?,
+                    sh.grid,
+                )
+                .map_err(c2)?;
                 posts.push((sh.name.clone(), vk_buffers(bucket, base, sh)?));
             }
         }
@@ -719,7 +909,9 @@ fn mapped_frame(pre: &[u8], mapped: usize) -> Vec<u8> {
 
 fn upload_frames(gpu: &Gpu, b: &Bufs, pre: &[Vec<u8>; 3]) -> Result<()> {
     for (f, p) in b.frames.iter().zip(pre) {
-        gpu.hip.memcpy_htod(&f.t.buf, &mapped_frame(p, f.mapped)).map_err(err)?;
+        gpu.hip
+            .memcpy_htod(&f.t.buf, &mapped_frame(p, f.mapped))
+            .map_err(err)?;
     }
     Ok(())
 }
@@ -732,12 +924,25 @@ fn alloc_bufs(gpu: &mut Gpu, cx: &Ctx, sh: &Shape, pre: &[Vec<u8>; 3]) -> Result
         let mapped = (GUARD + p.len() + GUARD).next_multiple_of(cx.gran);
         // SAFETY: the tensor is mapped at its full shape; every access below
         // stays inside `mapped` bytes.
-        let t = unsafe { gpu.alloc_vmm_tensor(&[mapped], DType::Raw, mapped, &access) }.map_err(err)?;
+        let t =
+            unsafe { gpu.alloc_vmm_tensor(&[mapped], DType::Raw, mapped, &access) }.map_err(err)?;
         if t.buf.size() < mapped || !t.buf.is_vmm_owner() {
-            return Err(format!("arg{}: VMM allocation of {mapped} bytes not owner-mapped (size {})", PTR_OFF[i], t.buf.size()));
+            return Err(format!(
+                "arg{}: VMM allocation of {mapped} bytes not owner-mapped (size {})",
+                PTR_OFF[i],
+                t.buf.size()
+            ));
         }
-        wr_u64(&mut kernarg, PTR_OFF[i], t.buf.as_ptr() as u64 + GUARD as u64);
-        frames.push(Frame { t, len: p.len(), mapped });
+        wr_u64(
+            &mut kernarg,
+            PTR_OFF[i],
+            t.buf.as_ptr() as u64 + GUARD as u64,
+        );
+        frames.push(Frame {
+            t,
+            len: p.len(),
+            mapped,
+        });
     }
     kernarg.resize(kernarg.len().next_multiple_of(16), 0);
     let b = Bufs { frames, kernarg };
@@ -770,7 +975,10 @@ fn read_out(gpu: &Gpu, b: &Bufs) -> Result<([Vec<u8>; 3], bool, bool)> {
         gpu.hip.memcpy_dtoh(&mut v, &f.t.buf).map_err(err)?;
         let end = GUARD + f.len + GUARD;
         tail &= v[end..].iter().all(|&x| x == GUARD_BYTE);
-        guards &= v[..GUARD].iter().chain(&v[GUARD + f.len..end]).all(|&x| x == GUARD_BYTE);
+        guards &= v[..GUARD]
+            .iter()
+            .chain(&v[GUARD + f.len..end])
+            .all(|&x| x == GUARD_BYTE);
         v.truncate(end);
         core[i] = v;
     }
@@ -780,8 +988,17 @@ fn read_out(gpu: &Gpu, b: &Bufs) -> Result<([Vec<u8>; 3], bool, bool)> {
 fn launch(gpu: &Gpu, a: &Arm, cx: &Ctx, sh: &Shape, kernarg: &mut [u8]) -> Result<()> {
     // SAFETY: the kernarg bytes follow the original 32-byte ABI and every
     // pointer addresses a live VMM allocation owned by this process.
-    unsafe { gpu.hip.launch_kernel_blob(&a.func, sh.grid, sh.block, sh.lds, Some(&cx.stream), kernarg) }
-        .map_err(|e| format!("{}: launch {}: {e}", a.label, sh.name))
+    unsafe {
+        gpu.hip.launch_kernel_blob(
+            &a.func,
+            sh.grid,
+            sh.block,
+            sh.lds,
+            Some(&cx.stream),
+            kernarg,
+        )
+    }
+    .map_err(|e| format!("{}: launch {}: {e}", a.label, sh.name))
 }
 
 fn sync(gpu: &Gpu, cx: &Ctx) -> Result<()> {
@@ -796,7 +1013,12 @@ fn run_eager(gpu: &mut Gpu, cx: &Ctx, a: &Arm, sh: &Shape, pre: &[Vec<u8>; 3]) -
     sync(gpu, cx)?;
     let (core, tail_clean, guards_intact) = read_out(gpu, &b)?;
     free_bufs(gpu, b)?;
-    Ok(RunOut { core, tail_clean, guards_intact, replay_identical: None })
+    Ok(RunOut {
+        core,
+        tail_clean,
+        guards_intact,
+        replay_identical: None,
+    })
 }
 
 /// Capture the launch into a hipGraph on the oracle stream (the kernarg blob
@@ -806,27 +1028,40 @@ fn run_graph(gpu: &mut Gpu, cx: &Ctx, a: &Arm, sh: &Shape, pre: &[Vec<u8>; 3]) -
     let mut b = alloc_bufs(gpu, cx, sh, pre)?;
     sync(gpu, cx)?;
     let dev = gpu.device_id;
-    gpu.graphs.begin_graph_capture(&gpu.hip, dev, &cx.stream).map_err(err)?;
+    gpu.graphs
+        .begin_graph_capture(&gpu.hip, dev, &cx.stream)
+        .map_err(err)?;
     if let Err(e) = launch(gpu, a, cx, sh, &mut b.kernarg) {
         gpu.graphs.abort_graph_capture(&gpu.hip, dev, &cx.stream);
         return Err(e);
     }
-    gpu.graphs.end_graph_capture(&gpu.hip, dev, &cx.stream).map_err(err)?;
+    gpu.graphs
+        .end_graph_capture(&gpu.hip, dev, &cx.stream)
+        .map_err(err)?;
     // Capture does not execute; reset anyway so replay starts from the pre bytes.
     sync(gpu, cx)?;
     upload_frames(gpu, &b, pre)?;
     sync(gpu, cx)?;
-    gpu.graphs.graph_launch(&gpu.hip, dev, &cx.stream).map_err(err)?;
+    gpu.graphs
+        .graph_launch(&gpu.hip, dev, &cx.stream)
+        .map_err(err)?;
     sync(gpu, cx)?;
     let (core1, tail1, guards1) = read_out(gpu, &b)?;
     upload_frames(gpu, &b, pre)?;
     sync(gpu, cx)?;
-    gpu.graphs.graph_launch(&gpu.hip, dev, &cx.stream).map_err(err)?;
+    gpu.graphs
+        .graph_launch(&gpu.hip, dev, &cx.stream)
+        .map_err(err)?;
     sync(gpu, cx)?;
     let (core2, tail2, guards2) = read_out(gpu, &b)?;
     gpu.graphs.drop_captured_graph(&gpu.hip, dev);
     free_bufs(gpu, b)?;
-    Ok(RunOut { replay_identical: Some(core1 == core2), core: core1, tail_clean: tail1 && tail2, guards_intact: guards1 && guards2 })
+    Ok(RunOut {
+        replay_identical: Some(core1 == core2),
+        core: core1,
+        tail_clean: tail1 && tail2,
+        guards_intact: guards1 && guards2,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -839,7 +1074,11 @@ struct Cmp {
 }
 
 fn compare(a: &[u8], b: &[u8]) -> Cmp {
-    let mut c = Cmp { bytes: a.len().max(b.len()), mismatches: 0, first: None };
+    let mut c = Cmp {
+        bytes: a.len().max(b.len()),
+        mismatches: 0,
+        first: None,
+    };
     for i in 0..c.bytes {
         if a.get(i) != b.get(i) {
             c.mismatches += 1;
@@ -882,25 +1121,38 @@ struct Matrix {
 
 impl Matrix {
     fn new() -> Self {
-        Matrix { failures: 0, entries: Vec::new() }
+        Matrix {
+            failures: 0,
+            entries: Vec::new(),
+        }
     }
 
     /// Whole-buffer byte identity (expected: zero differing bytes).
     fn eq(&mut self, name: &str, a: &[Vec<u8>; 3], b: &[Vec<u8>; 3], labels: (&str, &str)) {
         let (n, rows) = cmp_bufs(a, b, labels);
         self.failures += n;
-        self.entries.push(json!({"check": name, "kind": "identical", "mismatch_bytes": n, "buffers": rows}));
+        self.entries.push(
+            json!({"check": name, "kind": "identical", "mismatch_bytes": n, "buffers": rows}),
+        );
     }
 
     fn flag(&mut self, name: &str, ok: bool, detail: Value) {
         if !ok {
             self.failures += 1;
         }
-        self.entries.push(json!({"check": name, "kind": "flag", "ok": ok, "detail": detail}));
+        self.entries
+            .push(json!({"check": name, "kind": "flag", "ok": ok, "detail": detail}));
     }
 
     /// Negative control: the compared buffers MUST differ.
-    fn detect(&mut self, name: &str, a: &[Vec<u8>; 3], b: &[Vec<u8>; 3], labels: (&str, &str), require_y: bool) {
+    fn detect(
+        &mut self,
+        name: &str,
+        a: &[Vec<u8>; 3],
+        b: &[Vec<u8>; 3],
+        labels: (&str, &str),
+        require_y: bool,
+    ) {
         let (n, rows) = cmp_bufs(a, b, labels);
         let y_diff = rows[2]["mismatch_bytes"].as_u64().unwrap_or(0);
         let ok = n > 0 && (!require_y || y_diff > 0);
@@ -927,10 +1179,22 @@ fn xor_edit(pre: &[Vec<u8>; 3], edits: &[(usize, usize, u8)]) -> [Vec<u8>; 3] {
 fn run_check(m: &mut Matrix, name: &str, r: &Result<RunOut>) -> bool {
     match r {
         Ok(o) => {
-            m.flag(&format!("{name}: guards intact (pre/post guard bytes untouched)"), o.guards_intact, json!(null));
-            m.flag(&format!("{name}: VMM mapping tail beyond the frame untouched"), o.tail_clean, json!(null));
+            m.flag(
+                &format!("{name}: guards intact (pre/post guard bytes untouched)"),
+                o.guards_intact,
+                json!(null),
+            );
+            m.flag(
+                &format!("{name}: VMM mapping tail beyond the frame untouched"),
+                o.tail_clean,
+                json!(null),
+            );
             if let Some(same) = o.replay_identical {
-                m.flag(&format!("{name}: graph replay #2 from reset buffers == replay #1"), same, json!(null));
+                m.flag(
+                    &format!("{name}: graph replay #2 from reset buffers == replay #1"),
+                    same,
+                    json!(null),
+                );
             }
             true
         }
@@ -964,12 +1228,18 @@ fn parity(gpu: &mut Gpu, cx: &Ctx, s: &Setup) -> Result<(usize, Value)> {
         let ref_run = run_eager(gpu, cx, &s.hipcc, sh, &sh.pre);
         if !run_check(&mut m, "hipcc eager", &ref_run) {
             total_failures += m.failures;
-            shape_reports.push(json!({"shape": sh.name, "matrix": m.entries, "failures": m.failures}));
+            shape_reports
+                .push(json!({"shape": sh.name, "matrix": m.entries, "failures": m.failures}));
             continue;
         }
         let ref_run = ref_run.unwrap();
         if let Some(exp) = expected_callsite(sh) {
-            m.eq("hipcc eager vs captured real callsite (A/x pre==post, y post)", &ref_run.core, &exp, ("hipcc", "captured"));
+            m.eq(
+                "hipcc eager vs captured real callsite (A/x pre==post, y post)",
+                &ref_run.core,
+                &exp,
+                ("hipcc", "captured"),
+            );
         }
         let mut runs: Vec<(&Arm, &str, Result<RunOut>)> = Vec::new();
         let arms: [&Arm; 3] = [&s.hipcc, &s.twin, &s.cand];
@@ -991,23 +1261,40 @@ fn parity(gpu: &mut Gpu, cx: &Ctx, s: &Setup) -> Result<(usize, Value)> {
         if sh.derived && s.cand_odd_tail {
             odd_tail_claim = "claimed_and_checked".to_owned();
         }
-        let vk_post = s.vk.and_then(|v| v.posts.iter().find(|(n, _)| *n == sh.name)).map(|(_, p)| p);
+        let vk_post =
+            s.vk.and_then(|v| v.posts.iter().find(|(n, _)| *n == sh.name))
+                .map(|(_, p)| p);
         for (a, mode, r) in &runs {
             let name = format!("{} {mode}", a.label);
             if !run_check(&mut m, &name, r) {
                 continue;
             }
             let r = r.as_ref().unwrap();
-            m.eq(&format!("{name} vs hipcc eager"), &r.core, &ref_run.core, (a.label, "hipcc"));
+            m.eq(
+                &format!("{name} vs hipcc eager"),
+                &r.core,
+                &ref_run.core,
+                (a.label, "hipcc"),
+            );
             if a.label == "candidate" {
                 if let Some(vp) = vk_post {
-                    m.eq(&format!("{name} vs original RADV/Vulkan reference"), &r.core, vp, (a.label, "vulkan"));
+                    m.eq(
+                        &format!("{name} vs original RADV/Vulkan reference"),
+                        &r.core,
+                        vp,
+                        (a.label, "vulkan"),
+                    );
                 }
             }
             arms_run.push(json!({"arm": a.label, "mode": mode, "identity": arm_identity(a, sh)}));
         }
         if let Some(vp) = vk_post {
-            m.eq("original RADV/Vulkan reference vs hipcc eager", vp, &ref_run.core, ("vulkan", "hipcc"));
+            m.eq(
+                "original RADV/Vulkan reference vs hipcc eager",
+                vp,
+                &ref_run.core,
+                ("vulkan", "hipcc"),
+            );
         }
         if !sh.derived {
             // Negative controls on the real fixture (candidate arm, eager).
@@ -1015,24 +1302,51 @@ fn parity(gpu: &mut Gpu, cx: &Ctx, s: &Setup) -> Result<(usize, Value)> {
                 let g = s.cap.k / 256;
                 let row_bytes = g * GROUP_BYTES;
                 let invert = |row: usize, group: usize| -> Vec<(usize, usize, u8)> {
-                    (0..128).map(|i| (0, row * row_bytes + group * GROUP_BYTES + 8 + i, 0xFFu8)).collect()
+                    (0..128)
+                        .map(|i| (0, row * row_bytes + group * GROUP_BYTES + 8 + i, 0xFFu8))
+                        .collect()
                 };
                 let w_edits: Vec<(&str, Vec<(usize, usize, u8)>)> = vec![
                     ("wrong weight: byte 8 of A xor 0x10", vec![(0, 8, 0x10)]),
-                    ("wrong weight: all nibbles of row 0 group 0 inverted", invert(0, 0)),
-                    ("wrong weight: all nibbles of mid row/group inverted", invert(s.cap.m / 2, g / 2)),
-                    ("wrong weight: all nibbles of last row/last group inverted", invert(s.cap.m - 1, g - 1)),
+                    (
+                        "wrong weight: all nibbles of row 0 group 0 inverted",
+                        invert(0, 0),
+                    ),
+                    (
+                        "wrong weight: all nibbles of mid row/group inverted",
+                        invert(s.cap.m / 2, g / 2),
+                    ),
+                    (
+                        "wrong weight: all nibbles of last row/last group inverted",
+                        invert(s.cap.m - 1, g - 1),
+                    ),
                     ("wrong input x: byte 0 xor 0x10", vec![(1, 0, 0x10)]),
-                    ("wrong input x: last byte xor 0x10", vec![(1, s.cap.k * 4 - 1, 0x10)]),
+                    (
+                        "wrong input x: last byte xor 0x10",
+                        vec![(1, s.cap.k * 4 - 1, 0x10)],
+                    ),
                 ];
                 let vk_ref = vk_post;
                 for (label, edits) in w_edits {
                     let pre = xor_edit(&sh.pre, &edits);
                     match run_eager(gpu, cx, &s.cand, sh, &pre) {
                         Ok(r) => {
-                            m.detect(&format!("control {label}: candidate vs hipcc"), &r.core, &ref_run.core, ("candidate", "hipcc"), label.starts_with("wrong weight: all") || label.contains("last byte"));
+                            m.detect(
+                                &format!("control {label}: candidate vs hipcc"),
+                                &r.core,
+                                &ref_run.core,
+                                ("candidate", "hipcc"),
+                                label.starts_with("wrong weight: all")
+                                    || label.contains("last byte"),
+                            );
                             if let Some(vp) = vk_ref {
-                                m.detect(&format!("control {label}: candidate vs Vulkan"), &r.core, vp, ("candidate", "vulkan"), false);
+                                m.detect(
+                                    &format!("control {label}: candidate vs Vulkan"),
+                                    &r.core,
+                                    vp,
+                                    ("candidate", "vulkan"),
+                                    false,
+                                );
                             }
                         }
                         Err(e) => m.flag(&format!("control {label}: run"), false, json!(e)),
@@ -1069,15 +1383,33 @@ fn parity(gpu: &mut Gpu, cx: &Ctx, s: &Setup) -> Result<(usize, Value)> {
                             ("corrupted y pre-guard byte", &guard_pre),
                             ("corrupted A post-guard byte", &guard_post),
                         ] {
-                            m.detect(&format!("control {label}: vs hipcc"), t, &ref_run.core, ("tampered", "hipcc"), false);
+                            m.detect(
+                                &format!("control {label}: vs hipcc"),
+                                t,
+                                &ref_run.core,
+                                ("tampered", "hipcc"),
+                                false,
+                            );
                             if let Some(vp) = vk_ref {
-                                m.detect(&format!("control {label}: vs Vulkan"), t, vp, ("tampered", "vulkan"), false);
+                                m.detect(
+                                    &format!("control {label}: vs Vulkan"),
+                                    t,
+                                    vp,
+                                    ("tampered", "vulkan"),
+                                    false,
+                                );
                             }
                         }
                         if let Some(vp) = vk_ref {
                             let mut tv = vp.clone();
                             tv[2][GUARD + 4] ^= 0x01;
-                            m.detect("control tampered Vulkan reference y[1] vs candidate", &tv, &r.core, ("vulkan_tampered", "candidate"), false);
+                            m.detect(
+                                "control tampered Vulkan reference y[1] vs candidate",
+                                &tv,
+                                &r.core,
+                                ("vulkan_tampered", "candidate"),
+                                false,
+                            );
                         }
                     }
                     Err(e) => m.flag("control wrong-output base run", false, json!(e)),
@@ -1123,13 +1455,23 @@ struct TimeCfg {
     cold: bool,
 }
 
-fn time_sample(gpu: &mut Gpu, cx: &Ctx, a: &Arm, sh: &Shape, kernarg: &mut [u8], flush: Option<&GpuTensor>, cfg: &TimeCfg) -> Result<f64> {
+fn time_sample(
+    gpu: &mut Gpu,
+    cx: &Ctx,
+    a: &Arm,
+    sh: &Shape,
+    kernarg: &mut [u8],
+    flush: Option<&GpuTensor>,
+    cfg: &TimeCfg,
+) -> Result<f64> {
     let t0 = gpu.hip.event_create().map_err(err)?;
     let t1 = gpu.hip.event_create().map_err(err)?;
     let ms = if let Some(fl) = flush {
         let mut pairs = Vec::new();
         for i in 0..cfg.iters {
-            gpu.hip.memset_async(&fl.buf, (i & 0x7f) as i32, fl.buf.size(), &cx.stream).map_err(err)?;
+            gpu.hip
+                .memset_async(&fl.buf, (i & 0x7f) as i32, fl.buf.size(), &cx.stream)
+                .map_err(err)?;
             let s = gpu.hip.event_create().map_err(err)?;
             let e = gpu.hip.event_create().map_err(err)?;
             gpu.hip.event_record(&s, Some(&cx.stream)).map_err(err)?;
@@ -1161,7 +1503,11 @@ fn time_sample(gpu: &mut Gpu, cx: &Ctx, a: &Arm, sh: &Shape, kernarg: &mut [u8],
 
 fn md5_of(path: &Path) -> Value {
     match std::process::Command::new("md5sum").arg(path).output() {
-        Ok(o) if o.status.success() => json!(String::from_utf8_lossy(&o.stdout).split_whitespace().next().unwrap_or("").to_owned()),
+        Ok(o) if o.status.success() => json!(String::from_utf8_lossy(&o.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_owned()),
         _ => json!("unavailable: md5sum failed"),
     }
 }
@@ -1169,7 +1515,14 @@ fn md5_of(path: &Path) -> Value {
 /// Rep-major timing of `arms` on one shape; every arm gets its own freshly allocated pre-image
 /// frames. With `alternate`, odd reps run the arms in reverse order. Returns per-arm samples
 /// (indexed like `arms`) and the executed arm order of every rep.
-fn time_arms(gpu: &mut Gpu, cx: &Ctx, arms: &[&Arm], sh: &Shape, cfg: &TimeCfg, alternate: bool) -> Result<(Vec<Vec<f64>>, Vec<Vec<&'static str>>)> {
+fn time_arms(
+    gpu: &mut Gpu,
+    cx: &Ctx,
+    arms: &[&Arm],
+    sh: &Shape,
+    cfg: &TimeCfg,
+    alternate: bool,
+) -> Result<(Vec<Vec<f64>>, Vec<Vec<&'static str>>)> {
     let mut bufs: Vec<Bufs> = Vec::new();
     for _ in arms {
         bufs.push(alloc_bufs(gpu, cx, sh, &sh.pre)?);
@@ -1197,7 +1550,15 @@ fn time_arms(gpu: &mut Gpu, cx: &Ctx, arms: &[&Arm], sh: &Shape, cfg: &TimeCfg, 
             idx.reverse();
         }
         for &i in &idx {
-            let ms = time_sample(gpu, cx, arms[i], sh, &mut bufs[i].kernarg, flush.as_ref(), cfg)?;
+            let ms = time_sample(
+                gpu,
+                cx,
+                arms[i],
+                sh,
+                &mut bufs[i].kernarg,
+                flush.as_ref(),
+                cfg,
+            )?;
             full[i].push(ms);
         }
         order.push(idx.iter().map(|&i| arms[i].label).collect());
@@ -1229,7 +1590,10 @@ fn run_time(gpu: &mut Gpu, cx: &Ctx, s: &Setup, cfg: &TimeCfg) -> Result<Value> 
     };
     let mut per_arm = serde_json::Map::new();
     for (i, a) in arms.iter().enumerate() {
-        per_arm.insert(a.label.to_owned(), json!({"identity": arm_identity(a, &sh), "launch": stats(&full[i])}));
+        per_arm.insert(
+            a.label.to_owned(),
+            json!({"identity": arm_identity(a, &sh), "launch": stats(&full[i])}),
+        );
     }
     let ratio = |a: usize, b: usize| med(&full[a]) / med(&full[b]);
     Ok(json!({
@@ -1253,33 +1617,65 @@ fn run_time(gpu: &mut Gpu, cx: &Ctx, s: &Setup, cfg: &TimeCfg) -> Result<Value> 
 /// Whole-buffer + guard parity of hipcc and twin on the captured fixture, eager and hipGraph,
 /// each against the captured real post bytes and twin-vs-hipcc. Six byte comparisons are
 /// REQUIRED to have run over a nonzero number of bytes.
-fn twin_parity(gpu: &mut Gpu, cx: &Ctx, hipcc: &Arm, twin: &Arm, sh: &Shape) -> Result<(usize, Value)> {
+fn twin_parity(
+    gpu: &mut Gpu,
+    cx: &Ctx,
+    hipcc: &Arm,
+    twin: &Arm,
+    sh: &Shape,
+) -> Result<(usize, Value)> {
     let exp = expected_callsite(sh).ok_or("fixture has no captured callsite post buffers")?;
     let mut m = Matrix::new();
     let mut runs: Vec<(&Arm, &str, RunOut)> = Vec::new();
     for a in [hipcc, twin] {
         for mode in ["eager", "graph"] {
-            let r = if mode == "eager" { run_eager(gpu, cx, a, sh, &sh.pre) } else { run_graph(gpu, cx, a, sh, &sh.pre) };
+            let r = if mode == "eager" {
+                run_eager(gpu, cx, a, sh, &sh.pre)
+            } else {
+                run_graph(gpu, cx, a, sh, &sh.pre)
+            };
             let name = format!("{} {mode}", a.label);
             if run_check(&mut m, &name, &r) {
                 let r = r.unwrap();
-                m.eq(&format!("{name} vs captured real callsite (A/x pre==post, y post)"), &r.core, &exp, (a.label, "captured"));
+                m.eq(
+                    &format!("{name} vs captured real callsite (A/x pre==post, y post)"),
+                    &r.core,
+                    &exp,
+                    (a.label, "captured"),
+                );
                 runs.push((a, mode, r));
             }
         }
     }
-    let find = |label: &str, mode: &str| runs.iter().find(|(a, md, _)| a.label == label && *md == mode).map(|(_, _, r)| r);
+    let find = |label: &str, mode: &str| {
+        runs.iter()
+            .find(|(a, md, _)| a.label == label && *md == mode)
+            .map(|(_, _, r)| r)
+    };
     for mode in ["eager", "graph"] {
         match (find("twin", mode), find("hipcc", mode)) {
-            (Some(t), Some(h)) => m.eq(&format!("twin {mode} vs hipcc {mode}"), &t.core, &h.core, ("twin", "hipcc")),
-            _ => m.flag(&format!("twin {mode} vs hipcc {mode}: both runs available"), false, json!(null)),
+            (Some(t), Some(h)) => m.eq(
+                &format!("twin {mode} vs hipcc {mode}"),
+                &t.core,
+                &h.core,
+                ("twin", "hipcc"),
+            ),
+            _ => m.flag(
+                &format!("twin {mode} vs hipcc {mode}: both runs available"),
+                false,
+                json!(null),
+            ),
         }
     }
     let (mut n, mut compared, mut differing) = (0usize, 0u64, 0u64);
     for e in m.entries.iter().filter(|e| e["kind"] == "identical") {
         n += 1;
         differing += e["mismatch_bytes"].as_u64().unwrap_or(u64::MAX);
-        compared += e["buffers"].as_array().map_or(0, |b| b.iter().map(|x| x["bytes"].as_u64().unwrap_or(0)).sum::<u64>());
+        compared += e["buffers"].as_array().map_or(0, |b| {
+            b.iter()
+                .map(|x| x["bytes"].as_u64().unwrap_or(0))
+                .sum::<u64>()
+        });
     }
     m.flag(
         "six whole-buffer comparisons ran over nonzero bytes",
@@ -1295,7 +1691,14 @@ fn twin_parity(gpu: &mut Gpu, cx: &Ctx, hipcc: &Arm, twin: &Arm, sh: &Shape) -> 
     ))
 }
 
-fn run_twin_time(gpu: &mut Gpu, cx: &Ctx, hipcc: &Arm, twin: &Arm, cap: &Capture, cfg: &TimeCfg) -> Result<(usize, Value)> {
+fn run_twin_time(
+    gpu: &mut Gpu,
+    cx: &Ctx,
+    hipcc: &Arm,
+    twin: &Arm,
+    cap: &Capture,
+    cfg: &TimeCfg,
+) -> Result<(usize, Value)> {
     let sh = fixture_shape(cap);
     let geometry = json!({
         "name": sh.name, "M": sh.m, "K": sh.k, "grid": sh.grid, "block": sh.block, "dynamic_lds": sh.lds,
@@ -1303,13 +1706,19 @@ fn run_twin_time(gpu: &mut Gpu, cx: &Ctx, hipcc: &Arm, twin: &Arm, cap: &Capture
     });
     let (failures, parity) = twin_parity(gpu, cx, hipcc, twin, &sh)?;
     if failures != 0 {
-        return Ok((failures, json!({"geometry": geometry, "parity": parity, "timing": "NOT RUN: hipcc/twin parity failed closed"})));
+        return Ok((
+            failures,
+            json!({"geometry": geometry, "parity": parity, "timing": "NOT RUN: hipcc/twin parity failed closed"}),
+        ));
     }
     let arms = [hipcc, twin];
     let (full, order) = time_arms(gpu, cx, &arms, &sh, cfg, true)?;
     let mut per_arm = serde_json::Map::new();
     for (i, a) in arms.iter().enumerate() {
-        per_arm.insert(a.label.to_owned(), json!({"identity": arm_identity(a, &sh), "launch": stats(&full[i])}));
+        per_arm.insert(
+            a.label.to_owned(),
+            json!({"identity": arm_identity(a, &sh), "launch": stats(&full[i])}),
+        );
     }
     let paired: Vec<f64> = full[1].iter().zip(&full[0]).map(|(t, h)| t / h).collect();
     let med = |v: &Vec<f64>| {
@@ -1376,7 +1785,10 @@ fn parse() -> Result<Opts> {
         inventory: PathBuf::from(INVENTORY),
         out: None,
         label: String::new(),
-        pins: Pins { spirv: None, aco_binary: None },
+        pins: Pins {
+            spirv: None,
+            aco_binary: None,
+        },
         iters: 200,
         reps: 5,
         warmup: 20,
@@ -1435,7 +1847,13 @@ fn kernarg_abi_sha256(cap: &Capture) -> String {
     sha256_hex(&fixture_shape(cap).masked_kernarg())
 }
 
-fn require_passing_parity(path: &Path, cand_sha: &str, cap: &Capture, twin_image: &str, man: &Manifest) -> Result<Value> {
+fn require_passing_parity(
+    path: &Path,
+    cand_sha: &str,
+    cap: &Capture,
+    twin_image: &str,
+    man: &Manifest,
+) -> Result<Value> {
     let b = std::fs::read(path).map_err(|e| format!("--parity-report {}: {e}", path.display()))?;
     let r: Value = serde_json::from_slice(&b).map_err(err)?;
     let ctx = |e: String| format!("--parity-report {}: {e}", path.display());
@@ -1443,10 +1861,26 @@ fn require_passing_parity(path: &Path, cand_sha: &str, cap: &Capture, twin_image
         must_eq("schema", jstr(&r, "schema")?, "pm-aco-oracle-v1".to_owned())?;
         must_eq("mode", jstr(&r, "mode")?, "full".to_owned())?;
         must_eq("pass", jget(&r, "pass")?.as_bool(), Some(true))?;
-        must_eq("candidate.image_sha256", jstr(&r, "identity.candidate.image_sha256")?, cand_sha.to_owned())?;
-        must_eq("candidate manifest sha256", jstr(&r, "identity.candidate_manifest.sha256")?, man.sha256.clone())?;
-        must_eq("capture meta_sha256", jstr(&r, "fixture.meta_sha256")?, cap.meta_sha256.clone())?;
-        must_eq("twin image_sha256", jstr(&r, "identity.twin.detail.image_sha256")?, twin_image.to_owned())?;
+        must_eq(
+            "candidate.image_sha256",
+            jstr(&r, "identity.candidate.image_sha256")?,
+            cand_sha.to_owned(),
+        )?;
+        must_eq(
+            "candidate manifest sha256",
+            jstr(&r, "identity.candidate_manifest.sha256")?,
+            man.sha256.clone(),
+        )?;
+        must_eq(
+            "capture meta_sha256",
+            jstr(&r, "fixture.meta_sha256")?,
+            cap.meta_sha256.clone(),
+        )?;
+        must_eq(
+            "twin image_sha256",
+            jstr(&r, "identity.twin.detail.image_sha256")?,
+            twin_image.to_owned(),
+        )?;
         jstr(&r, "identity.vulkan.receipt_sha256")?;
         Ok(())
     };
@@ -1460,9 +1894,20 @@ fn run() -> Result<usize> {
     let quality = fixture_quality(&cap)?;
     let inc = incumbent(&o.inventory)?;
     let shapes = shapes_for(&cap)?;
-    let occ_name = o.capture.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let label = if o.label.is_empty() { format!("{}-{occ_name}", o.cmd) } else { o.label.clone() };
-    let out_dir = o.out.clone().unwrap_or_else(|| Path::new(RESULTS).join(&label));
+    let occ_name = o
+        .capture
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let label = if o.label.is_empty() {
+        format!("{}-{occ_name}", o.cmd)
+    } else {
+        o.label.clone()
+    };
+    let out_dir = o
+        .out
+        .clone()
+        .unwrap_or_else(|| Path::new(RESULTS).join(&label));
     let argv: Vec<String> = std::env::args().collect();
 
     if o.cmd == "prepare" {
@@ -1501,7 +1946,10 @@ fn run() -> Result<usize> {
     let cx = Ctx { stream, gran };
     let hipcc = load_hipcc(&gpu, &inc)?;
     let twin = load_twin(&gpu, &inc)?;
-    let twin_image = twin.extra["image_sha256"].as_str().unwrap_or_default().to_owned();
+    let twin_image = twin.extra["image_sha256"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
     std::fs::create_dir_all(&out_dir).map_err(err)?;
 
     let mut report = json!({
@@ -1522,22 +1970,47 @@ fn run() -> Result<usize> {
             // hipcc object as the "candidate": the pipeline, graph path and all
             // negative controls must behave on a known-identical arm.
             let obj = std::fs::read(&inc.object_path).map_err(err)?;
-            let cand = load_arm(&gpu, "candidate", "selftest: hipcc inventory object", &obj, SYMBOL, Some(&inc.object_path), json!({}))?;
+            let cand = load_arm(
+                &gpu,
+                "candidate",
+                "selftest: hipcc inventory object",
+                &obj,
+                SYMBOL,
+                Some(&inc.object_path),
+                json!({}),
+            )?;
             report["identity"] = json!({
                 "hipcc": arm_identity(&hipcc, shape0), "twin": arm_identity(&twin, shape0),
                 "candidate": arm_identity(&cand, shape0), "vulkan": "not applicable (selftest)",
             });
-            let setup = Setup { cap: &cap, hipcc, twin, cand, vk: None, cand_odd_tail: true };
+            let setup = Setup {
+                cap: &cap,
+                hipcc,
+                twin,
+                cand,
+                vk: None,
+                cand_odd_tail: true,
+            };
             let (n, v) = parity(&mut gpu, &cx, &setup)?;
             report["result"] = v;
             n
         }
         "full" | "time" => {
             let path = o.candidate.as_ref().ok_or("--candidate required")?;
-            let mpath = o.manifest.as_ref().ok_or("--candidate-manifest required (refusing to infer candidate identity)")?;
+            let mpath = o
+                .manifest
+                .as_ref()
+                .ok_or("--candidate-manifest required (refusing to infer candidate identity)")?;
             must_eq("--symbol", o.symbol.clone(), SYMBOL.to_owned())?;
-            let bytes = std::fs::read(path).map_err(|e| format!("--candidate {}: {e}", path.display()))?;
-            let man = load_manifest(mpath, &sha256_hex(&bytes), &o.symbol, &cap, &kernarg_abi_sha256(&cap))?;
+            let bytes =
+                std::fs::read(path).map_err(|e| format!("--candidate {}: {e}", path.display()))?;
+            let man = load_manifest(
+                mpath,
+                &sha256_hex(&bytes),
+                &o.symbol,
+                &cap,
+                &kernarg_abi_sha256(&cap),
+            )?;
             let cand = load_arm(
                 &gpu,
                 "candidate",
@@ -1559,16 +2032,38 @@ fn run() -> Result<usize> {
                 let vk = load_vulkan(rpath, &cap, &man, &shapes, &o.pins)?;
                 ident["vulkan"] = vk.identity.clone();
                 report["identity"] = ident;
-                let setup = Setup { cap: &cap, hipcc, twin, cand, vk: Some(&vk), cand_odd_tail: man.odd_tail };
+                let setup = Setup {
+                    cap: &cap,
+                    hipcc,
+                    twin,
+                    cand,
+                    vk: Some(&vk),
+                    cand_odd_tail: man.odd_tail,
+                };
                 let (n, v) = parity(&mut gpu, &cx, &setup)?;
                 report["result"] = v;
                 n
             } else {
-                let prev = o.parity_report.as_ref().ok_or("time requires --parity-report of a passing `full` run for this candidate")?;
-                report["parity_report"] = require_passing_parity(prev, &cand.image_sha256, &cap, &twin_image, &man)?;
+                let prev = o.parity_report.as_ref().ok_or(
+                    "time requires --parity-report of a passing `full` run for this candidate",
+                )?;
+                report["parity_report"] =
+                    require_passing_parity(prev, &cand.image_sha256, &cap, &twin_image, &man)?;
                 report["identity"] = ident;
-                let setup = Setup { cap: &cap, hipcc, twin, cand, vk: None, cand_odd_tail: man.odd_tail };
-                let cfg = TimeCfg { iters: o.iters, reps: o.reps, warmup: o.warmup, cold: o.cold };
+                let setup = Setup {
+                    cap: &cap,
+                    hipcc,
+                    twin,
+                    cand,
+                    vk: None,
+                    cand_odd_tail: man.odd_tail,
+                };
+                let cfg = TimeCfg {
+                    iters: o.iters,
+                    reps: o.reps,
+                    warmup: o.warmup,
+                    cold: o.cold,
+                };
                 report["result"] = run_time(&mut gpu, &cx, &setup, &cfg)?;
                 0
             }
@@ -1607,7 +2102,12 @@ fn run() -> Result<usize> {
                     "kernarg_hex": hex(&cap.kernarg), "files": cap.meta["files"],
                 },
             });
-            let cfg = TimeCfg { iters: o.iters, reps: o.reps, warmup: o.warmup, cold: o.cold };
+            let cfg = TimeCfg {
+                iters: o.iters,
+                reps: o.reps,
+                warmup: o.warmup,
+                cold: o.cold,
+            };
             let (n, v) = run_twin_time(&mut gpu, &cx, &hipcc, &twin, &cap, &cfg)?;
             report["result"] = v;
             n
@@ -1618,7 +2118,8 @@ fn run() -> Result<usize> {
     if o.cmd == "full" {
         report["claim_scope"] = json!(match report["result"]["odd_tail_claim"].as_str() {
             Some("claimed_and_checked") => "fixture + odd/tail shapes",
-            Some("refused_unsupported") => "fixture only; odd/tail shapes explicitly UNSUPPORTED by the candidate",
+            Some("refused_unsupported") =>
+                "fixture only; odd/tail shapes explicitly UNSUPPORTED by the candidate",
             _ => "fixture",
         });
     }
@@ -1633,6 +2134,12 @@ fn run() -> Result<usize> {
     };
     std::fs::write(out_dir.join(file), &text).map_err(err)?;
     println!("{text}");
-    println!("{}: {} {} -> {}", if failures == 0 { "PASS" } else { "FAIL" }, o.cmd, MODULE, out_dir.join(file).display());
+    println!(
+        "{}: {} {} -> {}",
+        if failures == 0 { "PASS" } else { "FAIL" },
+        o.cmd,
+        MODULE,
+        out_dir.join(file).display()
+    );
     Ok(failures)
 }

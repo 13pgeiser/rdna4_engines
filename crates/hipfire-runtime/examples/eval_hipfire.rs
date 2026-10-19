@@ -989,7 +989,10 @@ fn main() {
             Gemma4State::new_with_max_seq(&mut gpu, &cfg, kv_max).expect("gemma4 state");
 
         for c in 0..effective_n_chunk {
-            state.kv_sliding.clear_gpu(&mut gpu).expect("kv sliding clear");
+            state
+                .kv_sliding
+                .clear_gpu(&mut gpu)
+                .expect("kv sliding clear");
             state.kv_full.clear_gpu(&mut gpu).expect("kv full clear");
             let chunk_tokens = &tokens[c * n_ctx..(c + 1) * n_ctx];
             let mut chunk_klds: Vec<f64> = Vec::with_capacity(scored_per_chunk);

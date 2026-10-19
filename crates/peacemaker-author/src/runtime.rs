@@ -135,7 +135,9 @@ impl Transition {
     fn place(self) -> Place {
         match self {
             Transition::Ready(r) | Transition::Retire(r) => Place::Region(r),
-            Transition::Rotate(g) | Transition::Prime(g) | Transition::RetireCur(g) => Place::Ring(g),
+            Transition::Rotate(g) | Transition::Prime(g) | Transition::RetireCur(g) => {
+                Place::Ring(g)
+            }
         }
     }
 }
@@ -273,7 +275,14 @@ fn desc(phase: Phase, undrained: bool, hold: Hold) -> String {
     match hold {
         Hold::Gone => "consumed".into(),
         Hold::Barrier => "held by a split barrier".into(),
-        Hold::Live => format!("{phase:?}{}", if undrained { " with an undrained store" } else { "" }),
+        Hold::Live => format!(
+            "{phase:?}{}",
+            if undrained {
+                " with an undrained store"
+            } else {
+                ""
+            }
+        ),
     }
 }
 
@@ -287,9 +296,15 @@ fn shape_diff(a: &St, b: &St) -> Option<String> {
         return Some("a split barrier is in flight on one path only".into());
     }
     for (x, y) in a.regions.iter().zip(&b.regions) {
-        let (dx, dy) = (desc(x.phase, x.stores.undrained(), x.hold), desc(y.phase, y.stores.undrained(), y.hold));
+        let (dx, dy) = (
+            desc(x.phase, x.stores.undrained(), x.hold),
+            desc(y.phase, y.stores.undrained(), y.hold),
+        );
         if dx != dy {
-            return Some(format!("{} is {dx} on one path and {dy} on the other", x.name));
+            return Some(format!(
+                "{} is {dx} on one path and {dy} on the other",
+                x.name
+            ));
         }
     }
     for (x, y) in a.rings.iter().zip(&b.rings) {
@@ -298,8 +313,19 @@ fn shape_diff(a: &St, b: &St) -> Option<String> {
             && x.next == y.next
             && x.stores.undrained() == y.stores.undrained();
         if !same {
-            let d = |r: &RingBuf| format!("cur {:?}, next {}", r.cur_phase, desc(r.next, r.stores.undrained(), r.hold));
-            return Some(format!("ring {} is [{}] on one path and [{}] on the other", x.name, d(x), d(y)));
+            let d = |r: &RingBuf| {
+                format!(
+                    "cur {:?}, next {}",
+                    r.cur_phase,
+                    desc(r.next, r.stores.undrained(), r.hold)
+                )
+            };
+            return Some(format!(
+                "ring {} is [{}] on one path and [{}] on the other",
+                x.name,
+                d(x),
+                d(y)
+            ));
         }
     }
     None
@@ -361,16 +387,27 @@ pub struct Forward<B: Backend> {
 impl<B: Backend> Forward<B> {
     fn open(&mut self, label: &str) -> Result<usize, String> {
         match self.targets.iter().position(|d| d.label == label) {
-            Some(i) if self.targets[i].placed => Err(format!("branch to {label} after it was placed: branches only go forward")),
+            Some(i) if self.targets[i].placed => Err(format!(
+                "branch to {label} after it was placed: branches only go forward"
+            )),
             Some(i) => Ok(i),
             None => {
-                self.targets.push(Dest { label: label.into(), forks: Vec::new(), placed: false });
+                self.targets.push(Dest {
+                    label: label.into(),
+                    forks: Vec::new(),
+                    placed: false,
+                });
                 Ok(self.targets.len() - 1)
             }
         }
     }
     /// `s_cbranch_scc1 label`: when `cond` holds, continue at `label`.
-    pub fn branch_if<T: Target>(&mut self, w: &mut Driver<'_, T, B>, cond: Cond, label: &str) -> Result<(), String> {
+    pub fn branch_if<T: Target>(
+        &mut self,
+        w: &mut Driver<'_, T, B>,
+        cond: Cond,
+        label: &str,
+    ) -> Result<(), String> {
         w.fresh(cond.owner, cond.at)?;
         let i = self.open(label)?;
         w.b.branch_scc1(&w.auth, label)?;
@@ -378,7 +415,12 @@ impl<B: Backend> Forward<B> {
         Ok(())
     }
     /// `s_cbranch_scc0 label`: when `cond` does not hold, continue at `label`.
-    pub fn branch_unless<T: Target>(&mut self, w: &mut Driver<'_, T, B>, cond: Cond, label: &str) -> Result<(), String> {
+    pub fn branch_unless<T: Target>(
+        &mut self,
+        w: &mut Driver<'_, T, B>,
+        cond: Cond,
+        label: &str,
+    ) -> Result<(), String> {
         w.fresh(cond.owner, cond.at)?;
         let i = self.open(label)?;
         w.b.branch_scc0(&w.auth, label)?;
@@ -395,15 +437,25 @@ impl<B: Backend> Forward<B> {
     }
     /// Place `label`: its state joins every branch to it with the code
     /// falling through (if any).
-    pub fn place<T: Target>(&mut self, w: &mut Driver<'_, T, B>, label: &str) -> Result<(), String> {
-        let d = self.targets.iter_mut().find(|d| d.label == label).ok_or_else(|| format!("{label} is not the target of a branch in this block"))?;
+    pub fn place<T: Target>(
+        &mut self,
+        w: &mut Driver<'_, T, B>,
+        label: &str,
+    ) -> Result<(), String> {
+        let d = self
+            .targets
+            .iter_mut()
+            .find(|d| d.label == label)
+            .ok_or_else(|| format!("{label} is not the target of a branch in this block"))?;
         if d.placed {
             return Err(format!("{label} is already placed"));
         }
         d.placed = true;
         for (fork, st) in d.forks.drain(..) {
-            w.b.join(&w.auth, fork).map_err(|e| format!("the paths cannot join at {label}: {e}"))?;
-            w.join_state(st).map_err(|e| format!("the paths cannot join at {label}: {e}"))?;
+            w.b.join(&w.auth, fork)
+                .map_err(|e| format!("the paths cannot join at {label}: {e}"))?;
+            w.join_state(st)
+                .map_err(|e| format!("the paths cannot join at {label}: {e}"))?;
         }
         w.b.label(&w.auth, label)
     }
@@ -415,12 +467,29 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
     /// refuse from here on, and so does a second `Driver`/`Workgroup` over it.
     pub fn new(b: &'b mut B) -> Result<Self, String> {
         if b.arch_name() != T::NAME {
-            return Err(format!("backend targets {}, kernel is typed for {}", b.arch_name(), T::NAME));
+            return Err(format!(
+                "backend targets {}, kernel is typed for {}",
+                b.arch_name(),
+                T::NAME
+            ));
         }
         let auth = Auth::mint();
         b.seal(&auth)?;
-        let st = St { regions: Vec::new(), rings: Vec::new(), in_flight: None, reachable: true, wave_exit: false };
-        Ok(Self { b, auth, owner: NEXT_OWNER.fetch_add(1, Ordering::Relaxed), st, wave_scope: 0, _t: PhantomData })
+        let st = St {
+            regions: Vec::new(),
+            rings: Vec::new(),
+            in_flight: None,
+            reachable: true,
+            wave_exit: false,
+        };
+        Ok(Self {
+            b,
+            auth,
+            owner: NEXT_OWNER.fetch_add(1, Ordering::Relaxed),
+            st,
+            wave_scope: 0,
+            _t: PhantomData,
+        })
     }
 
     // ---- raw access ---------------------------------------------------
@@ -449,8 +518,14 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         let r = self.st.regions.get(id.idx).ok_or("unknown LDS region")?;
         match r.hold {
             Hold::Live => Ok(id.idx),
-            Hold::Barrier => Err(format!("{} is held by a split barrier in flight until wait_arrived", r.name)),
-            Hold::Gone => Err(format!("{} was consumed (joined, split, made a ring buffer or re-laid out)", r.name)),
+            Hold::Barrier => Err(format!(
+                "{} is held by a split barrier in flight until wait_arrived",
+                r.name
+            )),
+            Hold::Gone => Err(format!(
+                "{} was consumed (joined, split, made a ring buffer or re-laid out)",
+                r.name
+            )),
         }
     }
     fn ring_ix(&self, id: RingId) -> Result<usize, String> {
@@ -460,7 +535,10 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         let r = self.st.rings.get(id.idx).ok_or("unknown LDS ring")?;
         match r.hold {
             Hold::Live => Ok(id.idx),
-            Hold::Barrier => Err(format!("ring {} is held by a split barrier in flight until wait_arrived", r.name)),
+            Hold::Barrier => Err(format!(
+                "ring {} is held by a split barrier in flight until wait_arrived",
+                r.name
+            )),
             Hold::Gone => Err(format!("ring {} was re-laid out", r.name)),
         }
     }
@@ -504,12 +582,18 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
 
     fn wg(&self, what: &str) -> Result<(), String> {
         if self.wave_scope > 0 {
-            return Err(format!("{what} is workgroup scope: it cannot run under wave- or lane-dependent control"));
+            return Err(format!(
+                "{what} is workgroup scope: it cannot run under wave- or lane-dependent control"
+            ));
         }
         Ok(())
     }
     fn check_barrier_scope(&self) -> Result<(), String> {
-        if self.st.wave_exit { Err("workgroup barrier after a wave-uniform kernel exit".into()) } else { Ok(()) }
+        if self.st.wave_exit {
+            Err("workgroup barrier after a wave-uniform kernel exit".into())
+        } else {
+            Ok(())
+        }
     }
     fn scoped<R>(&mut self, f: impl FnOnce(&mut Self) -> Result<R, String>) -> Result<R, String> {
         self.wave_scope += 1;
@@ -522,13 +606,18 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
             return Err("condition from another Driver".into());
         }
         if self.b.position() != at {
-            return Err("SCC was redefined between its compare and the branch that consumes it".into());
+            return Err(
+                "SCC was redefined between its compare and the branch that consumes it".into(),
+            );
         }
         Ok(())
     }
     fn own_exit(&self, end: &Exit) -> Result<(), String> {
         if end.owner != self.owner {
-            return Err(format!("kernel exit {} belongs to another Driver", end.label));
+            return Err(format!(
+                "kernel exit {} belongs to another Driver",
+                end.label
+            ));
         }
         Ok(())
     }
@@ -554,11 +643,24 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
     pub fn lds(&mut self, name: &str, base: u32, len: u32) -> Result<RegionId, String> {
         self.wg("lds")?;
         if base.checked_add(len).is_none_or(|end| end > T::LDS_BYTES) {
-            return Err(format!("LDS region {name} [{base}, +{len}) exceeds {} bytes on {}", T::LDS_BYTES, T::NAME));
+            return Err(format!(
+                "LDS region {name} [{base}, +{len}) exceeds {} bytes on {}",
+                T::LDS_BYTES,
+                T::NAME
+            ));
         }
         let slot = self.b.lds_slot(&self.auth, name, base, len)?;
-        self.st.regions.push(Region { name: name.into(), slots: vec![slot], phase: Phase::RtFree, stores: Stores::default(), hold: Hold::Live });
-        Ok(RegionId { owner: self.owner, idx: self.st.regions.len() - 1 })
+        self.st.regions.push(Region {
+            name: name.into(),
+            slots: vec![slot],
+            phase: Phase::RtFree,
+            stores: Stores::default(),
+            hold: Hold::Live,
+        });
+        Ok(RegionId {
+            owner: self.owner,
+            idx: self.st.regions.len() - 1,
+        })
     }
     /// End the slot layout so a later phase can carve its own. Every region
     /// and ring must be `Free`; all ids are invalid afterwards.
@@ -566,12 +668,19 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         self.wg("relayout")?;
         for r in self.st.regions.iter().filter(|r| r.hold != Hold::Gone) {
             if r.hold != Hold::Live || r.phase != Phase::RtFree {
-                return Err(format!("{} is {} at relayout: a barrier must retire every reader first", r.name, desc(r.phase, r.stores.undrained(), r.hold)));
+                return Err(format!(
+                    "{} is {} at relayout: a barrier must retire every reader first",
+                    r.name,
+                    desc(r.phase, r.stores.undrained(), r.hold)
+                ));
             }
         }
         for g in self.st.rings.iter().filter(|g| g.hold != Hold::Gone) {
             if g.hold != Hold::Live || g.cur_phase != Phase::RtFree || g.next != Phase::RtFree {
-                return Err(format!("ring {} is not Free at relayout: a barrier must retire every reader first", g.name));
+                return Err(format!(
+                    "ring {} is not Free at relayout: a barrier must retire every reader first",
+                    g.name
+                ));
             }
         }
         self.b.lds_relayout(&self.auth)?;
@@ -602,13 +711,24 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
             name.push_str(&r.name);
         }
         if slots.len() > MAX_JOIN_SLOTS {
-            return Err(format!("a joined LDS region holds at most {MAX_JOIN_SLOTS} slots"));
+            return Err(format!(
+                "a joined LDS region holds at most {MAX_JOIN_SLOTS} slots"
+            ));
         }
         for &p in parts {
             self.st.regions[p.idx].hold = Hold::Gone;
         }
-        self.st.regions.push(Region { name, slots, phase: Phase::RtFree, stores: Stores::default(), hold: Hold::Live });
-        Ok(RegionId { owner: self.owner, idx: self.st.regions.len() - 1 })
+        self.st.regions.push(Region {
+            name,
+            slots,
+            phase: Phase::RtFree,
+            stores: Stores::default(),
+            hold: Hold::Live,
+        });
+        Ok(RegionId {
+            owner: self.owner,
+            idx: self.st.regions.len() - 1,
+        })
     }
     /// Undo a `join`: the first `first` slots become one region, the rest another.
     pub fn split(&mut self, r: RegionId, first: usize) -> Result<(RegionId, RegionId), String> {
@@ -618,18 +738,50 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
             return Err(format!("cannot split {}: it is {:?}", g.name, g.phase));
         }
         if first == 0 || first >= g.slots.len() {
-            return Err(format!("cannot split a {}-slot region after {first} slots", g.slots.len()));
+            return Err(format!(
+                "cannot split a {}-slot region after {first} slots",
+                g.slots.len()
+            ));
         }
         let (a, b) = g.slots.split_at(first);
-        let (a, b) = (Region { name: format!("{}.0", g.name), slots: a.to_vec(), phase: Phase::RtFree, stores: Stores::default(), hold: Hold::Live }, Region { name: format!("{}.1", g.name), slots: b.to_vec(), phase: Phase::RtFree, stores: Stores::default(), hold: Hold::Live });
+        let (a, b) = (
+            Region {
+                name: format!("{}.0", g.name),
+                slots: a.to_vec(),
+                phase: Phase::RtFree,
+                stores: Stores::default(),
+                hold: Hold::Live,
+            },
+            Region {
+                name: format!("{}.1", g.name),
+                slots: b.to_vec(),
+                phase: Phase::RtFree,
+                stores: Stores::default(),
+                hold: Hold::Live,
+            },
+        );
         self.st.regions[i].hold = Hold::Gone;
         self.st.regions.push(a);
         self.st.regions.push(b);
         let n = self.st.regions.len();
-        Ok((RegionId { owner: self.owner, idx: n - 2 }, RegionId { owner: self.owner, idx: n - 1 }))
+        Ok((
+            RegionId {
+                owner: self.owner,
+                idx: n - 2,
+            },
+            RegionId {
+                owner: self.owner,
+                idx: n - 1,
+            },
+        ))
     }
     /// A two-buffer ring over two `Free` regions; `first` is written first.
-    pub fn ring(&mut self, name: &str, first: RegionId, second: RegionId) -> Result<RingId, String> {
+    pub fn ring(
+        &mut self,
+        name: &str,
+        first: RegionId,
+        second: RegionId,
+    ) -> Result<RingId, String> {
         if first == second {
             return Err("a ring needs two distinct regions".into());
         }
@@ -637,14 +789,32 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         for k in [i, j] {
             let r = &self.st.regions[k];
             if r.phase != Phase::RtFree {
-                return Err(format!("ring {name}: {} is {:?}, a ring is built over Free regions", r.name, r.phase));
+                return Err(format!(
+                    "ring {name}: {} is {:?}, a ring is built over Free regions",
+                    r.name, r.phase
+                ));
             }
         }
-        let bufs = [self.st.regions[i].slots.clone(), self.st.regions[j].slots.clone()];
+        let bufs = [
+            self.st.regions[i].slots.clone(),
+            self.st.regions[j].slots.clone(),
+        ];
         self.st.regions[i].hold = Hold::Gone;
         self.st.regions[j].hold = Hold::Gone;
-        self.st.rings.push(RingBuf { name: name.into(), bufs, cur: 1, cur_live: false, cur_phase: Phase::RtFree, next: Phase::RtFree, stores: Stores::default(), hold: Hold::Live });
-        Ok(RingId { owner: self.owner, idx: self.st.rings.len() - 1 })
+        self.st.rings.push(RingBuf {
+            name: name.into(),
+            bufs,
+            cur: 1,
+            cur_live: false,
+            cur_phase: Phase::RtFree,
+            next: Phase::RtFree,
+            stores: Stores::default(),
+            hold: Hold::Live,
+        });
+        Ok(RingId {
+            owner: self.owner,
+            idx: self.st.rings.len() - 1,
+        })
     }
     /// Enter steady-state role typing before a loop whose head barrier
     /// rotates: the vacant current buffer is not retired by the first
@@ -653,7 +823,10 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         let i = self.ring_ix(g)?;
         let r = &mut self.st.rings[i];
         if r.cur_phase != Phase::RtFree || r.cur_live {
-            return Err(format!("ring {}: only a ring whose current buffer is Free and vacant can become steady", r.name));
+            return Err(format!(
+                "ring {}: only a ring whose current buffer is Free and vacant can become steady",
+                r.name
+            ));
         }
         r.cur_phase = Phase::RtPublished;
         Ok(())
@@ -697,7 +870,9 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
             }
             _ => {
                 let (name, phase) = self.name_phase(l);
-                return Err(format!("begin_write of {name}: it is {phase:?}, only a Free place can start writing"));
+                return Err(format!(
+                    "begin_write of {name}: it is {phase:?}, only a Free place can start writing"
+                ));
             }
         }
         Ok(())
@@ -707,12 +882,19 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
     pub fn ds_store(&mut self, to: impl Into<Place>, insn: B::Insn) -> Result<(), String> {
         let l = self.loc(to.into())?;
         self.storable(l)?;
-        let e = self.b.ds_store(&self.auth, Self::slots_of(&self.st, l), insn)?;
+        let e = self
+            .b
+            .ds_store(&self.auth, Self::slots_of(&self.st, l), insn)?;
         self.note_store(l, e);
         Ok(())
     }
     /// One LDS store covering two places (one instruction, both slot lists).
-    pub fn ds_store2(&mut self, x: impl Into<Place>, y: impl Into<Place>, insn: B::Insn) -> Result<(), String> {
+    pub fn ds_store2(
+        &mut self,
+        x: impl Into<Place>,
+        y: impl Into<Place>,
+        insn: B::Insn,
+    ) -> Result<(), String> {
         let (px, py) = (x.into(), y.into());
         if px == py {
             return Err("a store cannot cover the same place twice".into());
@@ -744,7 +926,10 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         let i = self.ring_ix(g)?;
         let r = &self.st.rings[i];
         if r.cur_phase != Phase::RtPublished {
-            return Err(format!("ring {}: current buffer is {:?}, not published", r.name, r.cur_phase));
+            return Err(format!(
+                "ring {}: current buffer is {:?}, not published",
+                r.name, r.cur_phase
+            ));
         }
         if !r.cur_live {
             return Err("read of a ring buffer no barrier has published".into());
@@ -764,7 +949,9 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
             let l = self.loc(p)?;
             let (name, phase) = self.name_phase(l);
             if phase != Phase::RtWriting {
-                return Err(format!("wait on {name}: no store of this wave is in flight ({phase:?})"));
+                return Err(format!(
+                    "wait on {name}: no store of this wave is in flight ({phase:?})"
+                ));
             }
             locs.push(l);
         }
@@ -778,7 +965,8 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
             s.events.iter().any(|&e| b.lds_store_pending(e))
         });
         if pending {
-            self.b.drain_lds_stores(&self.auth, <T::Waits as WaitModel>::LDS)?;
+            self.b
+                .drain_lds_stores(&self.auth, <T::Waits as WaitModel>::LDS)?;
         }
         for l in locs {
             self.stores_mut(l).clear();
@@ -806,7 +994,10 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
                 Transition::Ready(r) => {
                     let g = &self.st.regions[self.region_ix(r)?];
                     if g.phase != Phase::RtWriting {
-                        return Err(format!("ready of {}: it is {:?}, only a Writing region can be published", g.name, g.phase));
+                        return Err(format!(
+                            "ready of {}: it is {:?}, only a Writing region can be published",
+                            g.name, g.phase
+                        ));
                     }
                     Self::covered(&g.name, &g.stores)?;
                     ready.extend(g.slots.iter().map(|&id| SlotTransition::Ready(id)));
@@ -814,7 +1005,10 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
                 Transition::Retire(r) => {
                     let g = &self.st.regions[self.region_ix(r)?];
                     if g.phase != Phase::RtPublished {
-                        return Err(format!("retire of {}: it is {:?}, only a Published region can be retired", g.name, g.phase));
+                        return Err(format!(
+                            "retire of {}: it is {:?}, only a Published region can be retired",
+                            g.name, g.phase
+                        ));
                     }
                     retire.extend(g.slots.iter().map(|&id| SlotTransition::Retire(id)));
                 }
@@ -827,7 +1021,11 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
                     if r.cur_live {
                         retire.extend(r.bufs[r.cur].iter().map(|&id| SlotTransition::Retire(id)));
                     }
-                    ready.extend(r.bufs[1 - r.cur].iter().map(|&id| SlotTransition::Ready(id)));
+                    ready.extend(
+                        r.bufs[1 - r.cur]
+                            .iter()
+                            .map(|&id| SlotTransition::Ready(id)),
+                    );
                 }
                 Transition::Prime(g) => {
                     let r = &self.st.rings[self.ring_ix(g)?];
@@ -835,7 +1033,11 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
                         return Err(format!("prime of ring {}: cur is {:?}, next is {:?}; it needs cur Free and next Writing", r.name, r.cur_phase, r.next));
                     }
                     Self::covered(&r.name, &r.stores)?;
-                    ready.extend(r.bufs[1 - r.cur].iter().map(|&id| SlotTransition::Ready(id)));
+                    ready.extend(
+                        r.bufs[1 - r.cur]
+                            .iter()
+                            .map(|&id| SlotTransition::Ready(id)),
+                    );
                 }
                 Transition::RetireCur(g) => {
                     let r = &self.st.rings[self.ring_ix(g)?];
@@ -849,7 +1051,9 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
             }
         }
         if retire.len() + ready.len() > MAX_BARRIER_TRANSITIONS {
-            return Err(format!("one barrier carries at most {MAX_BARRIER_TRANSITIONS} slot transitions"));
+            return Err(format!(
+                "one barrier carries at most {MAX_BARRIER_TRANSITIONS} slot transitions"
+            ));
         }
         retire.extend(ready);
         Ok(retire)
@@ -916,7 +1120,10 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         self.hold(ts, Hold::Barrier);
         let serial = NEXT_SIGNAL.fetch_add(1, Ordering::Relaxed);
         self.st.in_flight = Some((serial, ts.to_vec()));
-        Ok(Arrived { serial, ts: ts.to_vec() })
+        Ok(Arrived {
+            serial,
+            ts: ts.to_vec(),
+        })
     }
     /// Split barrier, second half.
     pub fn wait_arrived(&mut self, a: Arrived) -> Result<(), String>
@@ -940,7 +1147,10 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
     /// A scalar compare (`s_cmp*`, `s_bitcmp*`): SCC is wave-uniform.
     pub fn scmp(&mut self, insn: B::Insn) -> Result<Cond, String> {
         self.b.scalar_compare(&self.auth, insn)?;
-        Ok(Cond { owner: self.owner, at: self.b.position() })
+        Ok(Cond {
+            owner: self.owner,
+            at: self.b.position(),
+        })
     }
     /// A scalar compare whose operands the caller asserts are
     /// workgroup-uniform (kernel arguments, workgroup ids, constants and
@@ -948,13 +1158,24 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
     pub fn scmp_wg_uniform(&mut self, insn: B::Insn) -> Result<WgCond, String> {
         self.wg("scmp_wg_uniform")?;
         self.b.scalar_compare(&self.auth, insn)?;
-        Ok(WgCond { owner: self.owner, at: self.b.position() })
+        Ok(WgCond {
+            owner: self.owner,
+            at: self.b.position(),
+        })
     }
     /// A label in straight-line code (a register lifetime boundary).
     pub fn label(&mut self, name: &str) -> Result<(), String> {
         self.b.label(&self.auth, name)
     }
-    fn skip(&mut self, owner: u64, at: usize, target: &str, scc0: bool, wave: bool, body: impl FnOnce(&mut Self) -> Result<(), String>) -> Result<(), String> {
+    fn skip(
+        &mut self,
+        owner: u64,
+        at: usize,
+        target: &str,
+        scc0: bool,
+        wave: bool,
+        body: impl FnOnce(&mut Self) -> Result<(), String>,
+    ) -> Result<(), String> {
         self.fresh(owner, at)?;
         if scc0 {
             self.b.branch_scc0(&self.auth, target)?;
@@ -965,7 +1186,9 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         let before = self.st.clone();
         if wave { self.scoped(body) } else { body(self) }?;
         if let Some(d) = shape_diff(&before, &self.st) {
-            return Err(format!("the skipped path and the body disagree on LDS ownership at {target}: {d}"));
+            return Err(format!(
+                "the skipped path and the body disagree on LDS ownership at {target}: {d}"
+            ));
         }
         self.b.join(&self.auth, skipped)?;
         // The skipped path keeps the stores the body's path may have
@@ -975,21 +1198,40 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
     }
     /// Branch over `body` to `target` when `cond` holds. The body runs in
     /// wave scope (no barrier) and must leave LDS ownership as it found it.
-    pub fn skip_if(&mut self, cond: Cond, target: &str, body: impl FnOnce(&mut Self) -> Result<(), String>) -> Result<(), String> {
+    pub fn skip_if(
+        &mut self,
+        cond: Cond,
+        target: &str,
+        body: impl FnOnce(&mut Self) -> Result<(), String>,
+    ) -> Result<(), String> {
         self.skip(cond.owner, cond.at, target, false, true, body)
     }
     /// Skip `body` when `cond` does not hold.
-    pub fn skip_unless(&mut self, cond: Cond, target: &str, body: impl FnOnce(&mut Self) -> Result<(), String>) -> Result<(), String> {
+    pub fn skip_unless(
+        &mut self,
+        cond: Cond,
+        target: &str,
+        body: impl FnOnce(&mut Self) -> Result<(), String>,
+    ) -> Result<(), String> {
         self.skip(cond.owner, cond.at, target, true, true, body)
     }
     /// `skip_if` over a workgroup-uniform condition: `body` may hold barriers.
-    pub fn wg_skip_if(&mut self, cond: WgCond, target: &str, body: impl FnOnce(&mut Self) -> Result<(), String>) -> Result<(), String> {
+    pub fn wg_skip_if(
+        &mut self,
+        cond: WgCond,
+        target: &str,
+        body: impl FnOnce(&mut Self) -> Result<(), String>,
+    ) -> Result<(), String> {
         self.wg("wg_skip_if")?;
         self.skip(cond.owner, cond.at, target, false, false, body)
     }
     /// Run `body` with EXEC = all lanes if `cond`, else none, then restore
     /// EXEC. The body is wave scope.
-    pub fn exec_if<R>(&mut self, cond: Cond, body: impl FnOnce(&mut Self) -> Result<R, String>) -> Result<R, String> {
+    pub fn exec_if<R>(
+        &mut self,
+        cond: Cond,
+        body: impl FnOnce(&mut Self) -> Result<R, String>,
+    ) -> Result<R, String> {
         self.fresh(cond.owner, cond.at)?;
         self.b.exec_from_scc(&self.auth)?;
         let out = self.scoped(body)?;
@@ -998,8 +1240,13 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
     }
     /// A block of wave-uniform forward branches; every target it branches
     /// to must be placed inside it, after the branch. The body is wave scope.
-    pub fn forward<R>(&mut self, body: impl FnOnce(&mut Self, &mut Forward<B>) -> Result<R, String>) -> Result<R, String> {
-        let mut f = Forward { targets: Vec::new() };
+    pub fn forward<R>(
+        &mut self,
+        body: impl FnOnce(&mut Self, &mut Forward<B>) -> Result<R, String>,
+    ) -> Result<R, String> {
+        let mut f = Forward {
+            targets: Vec::new(),
+        };
         let out = self.scoped(|d| body(d, &mut f))?;
         if let Some(d) = f.targets.iter().find(|d| !d.placed) {
             return Err(format!("forward target {} is never placed", d.label));
@@ -1036,7 +1283,9 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         if let Some(d) = shape_diff(&saved, &self.st) {
             return Err(format!("the else arm changes LDS ownership: {d}"));
         }
-        self.b.join(&self.auth, then_end.0).map_err(|e| format!("the arms cannot join at {join}: {e}"))?;
+        self.b
+            .join(&self.auth, then_end.0)
+            .map_err(|e| format!("the arms cannot join at {join}: {e}"))?;
         merge(&mut self.st, &then_end.1).map_err(|e| format!("the arms cannot join at {join}: {e}"))
     }
     /// A loop at `head` whose back edge is `s_branch head`, left only by
@@ -1050,14 +1299,25 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         exit: &str,
         body: impl for<'x> Fn(&mut Driver<'x, T, B>, &Breaks<B>) -> Result<(), String>,
     ) -> Result<(), String> {
-        let x = Breaks { label: exit.into(), exits: RefCell::new(Vec::new()), recording: Cell::new(true) };
+        let x = Breaks {
+            label: exit.into(),
+            exits: RefCell::new(Vec::new()),
+            recording: Cell::new(true),
+        };
         let (entry, scope, owner) = (self.st.clone(), self.wave_scope + 1, self.owner);
         let carried = RefCell::new(entry.clone());
         let auth = &self.auth;
         let emit = |b: &mut B| -> Result<(), String> {
             x.exits.borrow_mut().clear();
             x.recording.set(true);
-            let mut d = Driver { b, auth: auth.reenter(), owner, st: carried.borrow().clone(), wave_scope: scope, _t: PhantomData };
+            let mut d = Driver {
+                b,
+                auth: auth.reenter(),
+                owner,
+                st: carried.borrow().clone(),
+                wave_scope: scope,
+                _t: PhantomData,
+            };
             body(&mut d, &x)?;
             x.recording.set(false);
             if let Some(diff) = shape_diff(&entry, &d.st) {
@@ -1071,7 +1331,9 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         self.b.loop_(&self.auth, head, &emit)?;
         let wave_exit = carried.into_inner().wave_exit;
         let mut exits = x.exits.into_inner().into_iter();
-        let (first, first_st) = exits.next().ok_or_else(|| format!("loop {head} has no break_if: it never reaches {exit}"))?;
+        let (first, first_st) = exits
+            .next()
+            .ok_or_else(|| format!("loop {head} has no break_if: it never reaches {exit}"))?;
         self.b.resume(&self.auth, first)?;
         self.restore(first_st);
         for (other, st) in exits {
@@ -1086,7 +1348,9 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         self.fresh(cond.owner, cond.at)?;
         self.b.branch_scc1(&self.auth, &exit.label)?;
         if exit.recording.get() {
-            exit.exits.borrow_mut().push((self.b.fork(), self.st.clone()));
+            exit.exits
+                .borrow_mut()
+                .push((self.b.fork(), self.st.clone()));
         }
         Ok(())
     }
@@ -1097,14 +1361,25 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
     /// reaches the loop head undrained, where a barrier needs it drained,
     /// is the Halo VerifyAttn race. The backend still checks the exact wait
     /// state reaches a fixed point.
-    pub fn loop_carried(&mut self, head: &str, body: impl for<'x> Fn(&mut Driver<'x, T, B>) -> Result<WgCond, String>) -> Result<(), String> {
+    pub fn loop_carried(
+        &mut self,
+        head: &str,
+        body: impl for<'x> Fn(&mut Driver<'x, T, B>) -> Result<WgCond, String>,
+    ) -> Result<(), String> {
         self.wg("loop_carried")?;
         let (entry, owner) = (self.st.clone(), self.owner);
         let carried = RefCell::new(entry.clone());
         let emitted = Cell::new(false);
         let auth = &self.auth;
         let emit = |b: &mut B| -> Result<(), String> {
-            let mut d = Driver { b, auth: auth.reenter(), owner, st: carried.borrow().clone(), wave_scope: 0, _t: PhantomData };
+            let mut d = Driver {
+                b,
+                auth: auth.reenter(),
+                owner,
+                st: carried.borrow().clone(),
+                wave_scope: 0,
+                _t: PhantomData,
+            };
             let back = body(&mut d)?;
             d.fresh(back.owner, back.at)?;
             if let Some(diff) = shape_diff(&entry, &d.st) {
@@ -1130,7 +1405,11 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
     pub fn exit(&mut self, label: &str) -> Result<Exit, String> {
         self.wg("exit")?;
         self.b.reserve_exit(&self.auth, label)?;
-        Ok(Exit { owner: self.owner, label: label.into(), branched: Rc::new(Cell::new(false)) })
+        Ok(Exit {
+            owner: self.owner,
+            label: label.into(),
+            branched: Rc::new(Cell::new(false)),
+        })
     }
     /// Leave the kernel when `cond` holds: skipping every later barrier is
     /// legal only for the whole workgroup, and only to the kernel's exit.
@@ -1181,14 +1460,21 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
     }
     /// Place the kernel exit, run `tail` in wave scope, then `s_endpgm`. An
     /// exit something branches to takes no tail.
-    pub fn end_with(&mut self, end: Exit, tail: impl FnOnce(&mut Self) -> Result<(), String>) -> Result<(), String> {
+    pub fn end_with(
+        &mut self,
+        end: Exit,
+        tail: impl FnOnce(&mut Self) -> Result<(), String>,
+    ) -> Result<(), String> {
         self.wg("end")?;
         self.own_exit(&end)?;
         self.b.place_exit(&self.auth, &end.label)?;
         let at = self.b.position();
         self.scoped(tail)?;
         if end.branched.get() && self.b.position() != at {
-            return Err(format!("kernel exit {} is a branch target: it takes no tail", end.label));
+            return Err(format!(
+                "kernel exit {} is a branch target: it takes no tail",
+                end.label
+            ));
         }
         self.b.end_program(&self.auth)
     }
@@ -1212,7 +1498,10 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         self.own_exit(&end)?;
         let i = self.region_ix(region)?;
         if self.st.regions[i].phase != Phase::RtFree {
-            return Err(format!("handoff of {}: it is {:?}, a handoff starts from a Free region", self.st.regions[i].name, self.st.regions[i].phase));
+            return Err(format!(
+                "handoff of {}: it is {:?}, a handoff starts from a Free region",
+                self.st.regions[i].name, self.st.regions[i].phase
+            ));
         }
         self.fresh(readers.owner, readers.at)?;
         self.b.branch_scc1(&self.auth, reader_label)?;
@@ -1220,7 +1509,10 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         let saved = self.st.clone();
         self.scoped(|d| write(d, region))?;
         if self.st.regions[i].phase != Phase::RtWriting {
-            return Err(format!("handoff writers left {} {:?}: they must write it", self.st.regions[i].name, self.st.regions[i].phase));
+            return Err(format!(
+                "handoff writers left {} {:?}: they must write it",
+                self.st.regions[i].name, self.st.regions[i].phase
+            ));
         }
         self.wait(region)?;
         self.barrier(&[Transition::Ready(region)])?;
@@ -1230,9 +1522,14 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         self.b.resume(&self.auth, at)?;
         self.restore(saved);
         self.b.label(&self.auth, reader_label)?;
-        self.b.lds_peer_stores(&self.auth, &self.st.regions[i].slots)?;
+        self.b
+            .lds_peer_stores(&self.auth, &self.st.regions[i].slots)?;
         self.check_barrier_scope()?;
-        let ts: Vec<SlotTransition> = self.st.regions[i].slots.iter().map(|&id| SlotTransition::Ready(id)).collect();
+        let ts: Vec<SlotTransition> = self.st.regions[i]
+            .slots
+            .iter()
+            .map(|&id| SlotTransition::Ready(id))
+            .collect();
         self.b.barrier(&self.auth, &ts)?;
         self.st.regions[i].phase = Phase::RtPublished;
         self.st.regions[i].stores.clear();

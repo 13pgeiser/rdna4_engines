@@ -11,21 +11,23 @@
 
 use peacemaker_ir::cfg::{Cond, Terminator};
 use peacemaker_ir::edit::entry_undefined;
+use peacemaker_ir::inst::Program;
 use peacemaker_ir::inst::{
-    Abi, Arch, Axis, EntryFact, EntryLoc, EntryValue, ExecExtent, FpState, Frontend, KernelOrigin, LocalIdField,
-    RawKernelSpec, RawResources, Relocation, Setting, SymbolId, Target, Wave,
+    Abi, Arch, Axis, EntryFact, EntryLoc, EntryValue, ExecExtent, FpState, Frontend, KernelOrigin,
+    LocalIdField, RawKernelSpec, RawResources, Relocation, Setting, SymbolId, Target, Wave,
 };
 use peacemaker_ir::operand::Special;
 use peacemaker_ir::reg::{Kind, RegRef};
 use peacemaker_ir::state::{Lifted, StreamProof};
-use peacemaker_ir::inst::Program;
 use peacemaker_lift::raw::{parse_spec_file, scan_stream, verify_sidecar};
 use peacemaker_lift::{emit, lift_raw, LiftError, Options, Rule};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
 const ARCH: Arch = Arch::Gfx1201;
-const ACO: Options = Options { frontend: Frontend::Aco };
+const ACO: Options = Options {
+    frontend: Frontend::Aco,
+};
 const SIDECAR: &[u8] = b"{\"schema\":\"pm-aco-abi-v1\"}";
 const HEADER: usize = 16;
 const TRAILER: usize = 8;
@@ -50,12 +52,22 @@ fn valid_words() -> Vec<u32> {
     words
 }
 
-fn sha(bytes: &[u8]) -> [u8; 32] { Sha256::digest(bytes).into() }
-fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }
-fn code_of(words: &[u32]) -> Vec<u8> { words.iter().flat_map(|w| w.to_le_bytes()).collect() }
+fn sha(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+fn code_of(words: &[u32]) -> Vec<u8> {
+    words.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
 
-fn reg(kind: Kind, base: u16, len: u8) -> EntryLoc { EntryLoc::Reg(RegRef { kind, base, len }) }
-fn fact(loc: EntryLoc, value: EntryValue) -> EntryFact { EntryFact { loc, value } }
+fn reg(kind: Kind, base: u16, len: u8) -> EntryLoc {
+    EntryLoc::Reg(RegRef { kind, base, len })
+}
+fn fact(loc: EntryLoc, value: EntryValue) -> EntryFact {
+    EntryFact { loc, value }
+}
 
 /// Exactly what `valid_words` reads: EXEC, SCC, v2..v3, v5..v6, plus the workgroup id and the
 /// packed local id the pilot ABI declares.
@@ -66,11 +78,22 @@ fn entry_facts() -> Vec<EntryFact> {
         fact(reg(Kind::V, 2, 2), EntryValue::Defined),
         fact(reg(Kind::V, 5, 2), EntryValue::Defined),
         fact(reg(Kind::Ttmp, 9, 1), EntryValue::WorkgroupId(Axis::X)),
-        fact(reg(Kind::V, 0, 1), EntryValue::LocalId(vec![LocalIdField { axis: Axis::X, shift: 0, bits: 10, max: 31 }])),
+        fact(
+            reg(Kind::V, 0, 1),
+            EntryValue::LocalId(vec![LocalIdField {
+                axis: Axis::X,
+                shift: 0,
+                bits: 10,
+                max: 31,
+            }]),
+        ),
     ]
 }
 
-struct Fixture { bytes: Vec<u8>, spec: RawKernelSpec }
+struct Fixture {
+    bytes: Vec<u8>,
+    spec: RawKernelSpec,
+}
 
 impl Fixture {
     fn new(words: &[u32]) -> Self {
@@ -79,13 +102,28 @@ impl Fixture {
         bytes.extend(&code);
         bytes.extend([0x5a; TRAILER]);
         let spec = RawKernelSpec {
-            target: Target { arch: ARCH, xnack: Setting::Any, sramecc: Setting::Any, abi_version: 0 },
+            target: Target {
+                arch: ARCH,
+                xnack: Setting::Any,
+                sramecc: Setting::Any,
+                abi_version: 0,
+            },
             symbol: SymbolId("aco_pilot".into()),
             wave: Wave::Wave32,
-            extent: ExecExtent { offset: HEADER as u64, len: code.len() as u64 },
+            extent: ExecExtent {
+                offset: HEADER as u64,
+                len: code.len() as u64,
+            },
             binary_sha256: sha(&bytes),
             exec_sha256: sha(&code),
-            resources: RawResources { lds_bytes: 0, scratch_bytes_per_lane: 0, vgprs_actual: 8, vgprs_allocated: 8, sgprs_actual: 0, sgprs_allocated: 8 },
+            resources: RawResources {
+                lds_bytes: 0,
+                scratch_bytes_per_lane: 0,
+                vgprs_actual: 8,
+                vgprs_allocated: 8,
+                sgprs_actual: 0,
+                sgprs_allocated: 8,
+            },
             fp: FpState::default(),
             relocations: vec![],
             entry: entry_facts(),
@@ -96,12 +134,26 @@ impl Fixture {
     fn code(&self) -> &[u8] {
         &self.bytes[HEADER..self.bytes.len() - TRAILER]
     }
-    fn lift(&self) -> Result<Lifted<Program>, LiftError> { lift_raw(&self.bytes, &self.spec, ACO) }
+    fn lift(&self) -> Result<Lifted<Program>, LiftError> {
+        lift_raw(&self.bytes, &self.spec, ACO)
+    }
 }
 
-fn rule(error: &LiftError) -> Rule { match error { LiftError::Rejected { rule, .. } => *rule } }
-fn reason(error: &LiftError) -> &str { match error { LiftError::Rejected { reason, .. } => reason } }
-fn offset(error: &LiftError) -> u64 { match error { LiftError::Rejected { offset, .. } => *offset } }
+fn rule(error: &LiftError) -> Rule {
+    match error {
+        LiftError::Rejected { rule, .. } => *rule,
+    }
+}
+fn reason(error: &LiftError) -> &str {
+    match error {
+        LiftError::Rejected { reason, .. } => reason,
+    }
+}
+fn offset(error: &LiftError) -> u64 {
+    match error {
+        LiftError::Rejected { offset, .. } => *offset,
+    }
+}
 
 fn expect_rejected(result: Result<Lifted<Program>, LiftError>, wanted: Rule) -> LiftError {
     match result {
@@ -119,17 +171,36 @@ fn every_word_round_trips_with_exact_cfg_and_entry_facts() {
     let lifted = fx.lift().unwrap_or_else(|e| panic!("{e}"));
     lifted.validate().unwrap();
     let program = &lifted.program;
-    assert!(program.source.is_none(), "a raw program has no fabricated HSA envelope");
-    assert!(matches!(emit::module(program), Err(emit::EmitError::NoEnvelope)));
+    assert!(
+        program.source.is_none(),
+        "a raw program has no fabricated HSA envelope"
+    );
+    assert!(matches!(
+        emit::module(program),
+        Err(emit::EmitError::NoEnvelope)
+    ));
     let kernel = &program.kernels[0];
     assert_eq!(kernel.symbol, fx.spec.symbol);
     assert_eq!(kernel.wave, Wave::Wave32);
     assert_eq!(kernel.abi, Abi::Raw(fx.spec.abi()));
-    assert_eq!(kernel.origin, KernelOrigin::Frontend {
-        kind: Frontend::Aco, object_sha256: fx.spec.binary_sha256, entry_va: HEADER as u64, size: fx.spec.extent.len,
-    });
+    assert_eq!(
+        kernel.origin,
+        KernelOrigin::Frontend {
+            kind: Frontend::Aco,
+            object_sha256: fx.spec.binary_sha256,
+            entry_va: HEADER as u64,
+            size: fx.spec.extent.len,
+        }
+    );
     assert_eq!(lifted.proof.input_sha256, sha(&fx.bytes));
-    assert_eq!(lifted.proof.streams, vec![StreamProof { entry: HEADER as u64, size: fx.spec.extent.len, stream_sha256: sha(fx.code()) }]);
+    assert_eq!(
+        lifted.proof.streams,
+        vec![StreamProof {
+            entry: HEADER as u64,
+            size: fx.spec.extent.len,
+            stream_sha256: sha(fx.code())
+        }]
+    );
     assert_eq!(lifted.proof.sidecar_sha256, Some(sha(SIDECAR)));
 
     // Exact CFG: [VOPD, s_cbranch_scc1] -> {[v_cvt], [VOPD+literal, s_endpgm]}; v_cvt falls into the join.
@@ -137,14 +208,26 @@ fn every_word_round_trips_with_exact_cfg_and_entry_facts() {
     assert_eq!(body.layout.len(), 5);
     let ranges: Vec<(usize, usize)> = body.blocks.iter().map(|b| b.range).collect();
     assert_eq!(ranges, vec![(0, 2), (2, 3), (3, 5)]);
-    assert!(matches!(body.blocks[0].term, Terminator::Branch { cond: Cond::Scc1, .. }));
+    assert!(matches!(
+        body.blocks[0].term,
+        Terminator::Branch {
+            cond: Cond::Scc1,
+            ..
+        }
+    ));
     assert_eq!(body.blocks[1].term, Terminator::FallThrough);
     assert_eq!(body.blocks[2].term, Terminator::EndPgm);
-    let succ = |block: usize| { let mut v: Vec<usize> = body.blocks[block].succs.iter().map(|b| b.0).collect(); v.sort(); v };
+    let succ = |block: usize| {
+        let mut v: Vec<usize> = body.blocks[block].succs.iter().map(|b| b.0).collect();
+        v.sort();
+        v
+    };
     assert_eq!((succ(0), succ(1), succ(2)), (vec![1, 2], vec![2], vec![]));
 
     // Entry facts are exact: nothing the code reads is left undefined.
-    assert!(entry_undefined(program, &fx.spec.symbol).unwrap().is_empty());
+    assert!(entry_undefined(program, &fx.spec.symbol)
+        .unwrap()
+        .is_empty());
 
     // Re-encoding reproduces the executable range from typed fields alone ...
     assert_eq!(emit::bytes(kernel, ARCH).unwrap(), fx.code());
@@ -154,29 +237,58 @@ fn every_word_round_trips_with_exact_cfg_and_entry_facts() {
     let ids = poisoned.kernels[0].body.layout.clone();
     for (n, id) in ids.into_iter().enumerate() {
         let inst = poisoned.kernels[0].body.insts.get_mut(id).unwrap();
-        inst.prov.bytes = if n % 2 == 0 { None } else { Some([0xdead_beef; 3]) };
+        inst.prov.bytes = if n % 2 == 0 {
+            None
+        } else {
+            Some([0xdead_beef; 3])
+        };
         inst.prov.pc = None;
     }
     assert_eq!(emit::bytes(&poisoned.kernels[0], ARCH).unwrap(), fx.code());
-    assert_eq!(emit::bytes(&poisoned.kernels[0], ARCH).unwrap(), emit::bytes(kernel, ARCH).unwrap());
+    assert_eq!(
+        emit::bytes(&poisoned.kernels[0], ARCH).unwrap(),
+        emit::bytes(kernel, ARCH).unwrap()
+    );
 }
 
 #[test]
 fn relocations_must_name_an_instruction_literal() {
     let mut fx = Fixture::new(&valid_words());
     // words: VOPD 0-1, s_cbranch 2, v_cvt 3, VOPD+literal 4-6 (literal at word 6), s_endpgm 7
-    fx.spec.relocations = vec![Relocation { offset: 24, r_type: 1, symbol: "rodata".into(), addend: 0 }];
+    fx.spec.relocations = vec![Relocation {
+        offset: 24,
+        r_type: 1,
+        symbol: "rodata".into(),
+        addend: 0,
+    }];
     let lifted = fx.lift().unwrap_or_else(|e| panic!("{e}"));
-    let Abi::Raw(raw) = &lifted.program.kernels[0].abi else { panic!("raw ABI") };
+    let Abi::Raw(raw) = &lifted.program.kernels[0].abi else {
+        panic!("raw ABI")
+    };
     assert_eq!(raw.relocations, fx.spec.relocations);
     for bad in [0u64, 16, 28] {
-        fx.spec.relocations = vec![Relocation { offset: bad, r_type: 1, symbol: "rodata".into(), addend: 0 }];
+        fx.spec.relocations = vec![Relocation {
+            offset: bad,
+            r_type: 1,
+            symbol: "rodata".into(),
+            addend: 0,
+        }];
         let e = expect_rejected(fx.lift(), Rule::Spec);
         assert!(reason(&e).contains("literal"), "{e}");
     }
-    fx.spec.relocations = vec![Relocation { offset: 2, r_type: 1, symbol: "rodata".into(), addend: 0 }];
+    fx.spec.relocations = vec![Relocation {
+        offset: 2,
+        r_type: 1,
+        symbol: "rodata".into(),
+        addend: 0,
+    }];
     expect_rejected(fx.lift(), Rule::Spec);
-    fx.spec.relocations = vec![Relocation { offset: 4096, r_type: 1, symbol: "rodata".into(), addend: 0 }];
+    fx.spec.relocations = vec![Relocation {
+        offset: 4096,
+        r_type: 1,
+        symbol: "rodata".into(),
+        addend: 0,
+    }];
     expect_rejected(fx.lift(), Rule::Spec);
 }
 
@@ -198,8 +310,13 @@ fn unknown_reserved_and_dangerous_bits_are_decode_rejections() {
     // The structured census names the same first failing word and does not hide it.
     let scan = scan_stream(&code_of(&[cmpx[0] ^ 1, cmpx[1], ENDPGM]), ARCH);
     let first = &scan.failures[0];
-    assert_eq!((first.offset, first.word, first.rule), (0, cmpx[0] ^ 1, Rule::Decode));
-    assert!(scan_stream(&code_of(&valid_words()), ARCH).failures.is_empty());
+    assert_eq!(
+        (first.offset, first.word, first.rule),
+        (0, cmpx[0] ^ 1, Rule::Decode)
+    );
+    assert!(scan_stream(&code_of(&valid_words()), ARCH)
+        .failures
+        .is_empty());
     assert_eq!(scan_stream(&code_of(&valid_words()), ARCH).decoded.len(), 5);
 }
 
@@ -214,7 +331,13 @@ fn an_instruction_overrunning_the_executable_range_is_rejected() {
 #[test]
 fn branches_must_land_on_instruction_starts_inside_the_stream() {
     // s_cbranch_scc1 +1 lands on the VOPD's literal word (middle of the instruction).
-    let into_middle = Fixture::new(&[CBRANCH_SCC1_PLUS1, VOPD_LITERAL[0], VOPD_LITERAL[1], VOPD_LITERAL[2], ENDPGM]);
+    let into_middle = Fixture::new(&[
+        CBRANCH_SCC1_PLUS1,
+        VOPD_LITERAL[0],
+        VOPD_LITERAL[1],
+        VOPD_LITERAL[2],
+        ENDPGM,
+    ]);
     expect_rejected(into_middle.lift(), Rule::BranchTarget);
     // s_branch +100 leaves the stream.
     let outside = Fixture::new(&[0xbfa0_0064, ENDPGM]);
@@ -231,7 +354,11 @@ fn target_wave_frontend_and_extent_mismatches_are_rejected() {
     let mut s_add_f32 = Fixture::new(&[0xa000_0201, ENDPGM]);
     s_add_f32.spec.target.arch = Arch::Gfx1151;
     s_add_f32.spec.entry = vec![fact(reg(Kind::S, 0, 4), EntryValue::Defined)];
-    s_add_f32.spec.resources = RawResources { sgprs_actual: 4, sgprs_allocated: 8, ..Default::default() };
+    s_add_f32.spec.resources = RawResources {
+        sgprs_actual: 4,
+        sgprs_allocated: 8,
+        ..Default::default()
+    };
     s_add_f32.lift().unwrap_or_else(|e| panic!("{e}"));
     s_add_f32.spec.target.arch = Arch::Gfx1100;
     expect_rejected(s_add_f32.lift(), Rule::Decode);
@@ -251,8 +378,16 @@ fn target_wave_frontend_and_extent_mismatches_are_rejected() {
 
     // Frontend: the raw importer is the ACO importer.
     let fx = Fixture::new(&valid_words());
-    for frontend in [Frontend::Hipcc, Frontend::Triton, Frontend::Builder, Frontend::Ctor] {
-        let e = expect_rejected(lift_raw(&fx.bytes, &fx.spec, Options { frontend }), Rule::Spec);
+    for frontend in [
+        Frontend::Hipcc,
+        Frontend::Triton,
+        Frontend::Builder,
+        Frontend::Ctor,
+    ] {
+        let e = expect_rejected(
+            lift_raw(&fx.bytes, &fx.spec, Options { frontend }),
+            Rule::Spec,
+        );
         assert!(reason(&e).contains("ACO"), "{e}");
     }
 
@@ -294,7 +429,10 @@ fn hash_and_sidecar_tampering_is_rejected() {
     other.spec.sidecar_sha256 = sha(b"another sidecar");
     let proof = other.lift().unwrap().proof;
     assert_eq!(proof.sidecar_sha256, Some(sha(b"another sidecar")));
-    assert_ne!(proof.sidecar_sha256, fx.lift().unwrap().proof.sidecar_sha256);
+    assert_ne!(
+        proof.sidecar_sha256,
+        fx.lift().unwrap().proof.sidecar_sha256
+    );
 }
 
 #[test]
@@ -333,29 +471,61 @@ fn sgpr_counts_use_the_physical_basis_and_s106_is_never_ordinary() {
     fx.spec.target.arch = Arch::Gfx1151;
     fx.spec.entry = vec![fact(reg(Kind::S, 0, 4), EntryValue::Defined)];
     // Driver counts that include VCC_LO/VCC_HI (106, 107) are kept verbatim.
-    fx.spec.resources = RawResources { sgprs_actual: 107, sgprs_allocated: 108, ..Default::default() };
+    fx.spec.resources = RawResources {
+        sgprs_actual: 107,
+        sgprs_allocated: 108,
+        ..Default::default()
+    };
     fx.spec.validate().unwrap();
     fx.lift().unwrap_or_else(|e| panic!("{e}"));
     let raw = fx.spec.abi();
-    assert_eq!((raw.resources.sgprs_actual, raw.resources.sgprs_allocated), (107, 108));
-    assert_eq!((raw.resources.ordinary_sgprs_actual(), raw.resources.ordinary_sgprs_allocated()), (106, 106));
+    assert_eq!(
+        (raw.resources.sgprs_actual, raw.resources.sgprs_allocated),
+        (107, 108)
+    );
+    assert_eq!(
+        (
+            raw.resources.ordinary_sgprs_actual(),
+            raw.resources.ordinary_sgprs_allocated()
+        ),
+        (106, 106)
+    );
     // The ordinary-only basis (VCC not counted) is equally valid and equally strict.
-    fx.spec.resources = RawResources { sgprs_actual: 4, sgprs_allocated: 106, ..Default::default() };
+    fx.spec.resources = RawResources {
+        sgprs_actual: 4,
+        sgprs_allocated: 106,
+        ..Default::default()
+    };
     fx.lift().unwrap_or_else(|e| panic!("{e}"));
-    fx.spec.resources = RawResources { sgprs_actual: 107, sgprs_allocated: 108, ..Default::default() };
+    fx.spec.resources = RawResources {
+        sgprs_actual: 107,
+        sgprs_allocated: 108,
+        ..Default::default()
+    };
     // The total never exceeds the physical limit.
     fx.spec.resources.sgprs_allocated = 109;
     expect_rejected(fx.lift(), Rule::Spec);
     // The ordinary part bounds the code: s0..s2 do not fit a count of 2.
-    fx.spec.resources = RawResources { sgprs_actual: 2, sgprs_allocated: 8, ..Default::default() };
+    fx.spec.resources = RawResources {
+        sgprs_actual: 2,
+        sgprs_allocated: 8,
+        ..Default::default()
+    };
     let e = expect_rejected(fx.lift(), Rule::Spec);
     assert!(reason(&e).contains("ordinary SGPRs"), "{e}");
     // An entry fact cannot name s106/s107 as ordinary registers, whatever the total says.
-    fx.spec.resources = RawResources { sgprs_actual: 107, sgprs_allocated: 108, ..Default::default() };
+    fx.spec.resources = RawResources {
+        sgprs_actual: 107,
+        sgprs_allocated: 108,
+        ..Default::default()
+    };
     fx.spec.entry = vec![fact(reg(Kind::S, 106, 1), EntryValue::Defined)];
     expect_rejected(fx.lift(), Rule::Spec);
     // VCC is a special: declare it through `Special`, not as s106.
-    fx.spec.entry = vec![fact(reg(Kind::S, 0, 4), EntryValue::Defined), fact(EntryLoc::Special(Special::VccLo), EntryValue::Defined)];
+    fx.spec.entry = vec![
+        fact(reg(Kind::S, 0, 4), EntryValue::Defined),
+        fact(EntryLoc::Special(Special::VccLo), EntryValue::Defined),
+    ];
     fx.lift().unwrap_or_else(|e| panic!("{e}"));
 }
 
@@ -364,7 +534,9 @@ fn wg_round_robin_is_a_gfx12_only_declaration() {
     let mut fx = Fixture::new(&valid_words());
     fx.spec.fp.wg_round_robin = true;
     let lifted = fx.lift().unwrap_or_else(|e| panic!("{e}"));
-    let Abi::Raw(raw) = &lifted.program.kernels[0].abi else { panic!("raw ABI") };
+    let Abi::Raw(raw) = &lifted.program.kernels[0].abi else {
+        panic!("raw ABI")
+    };
     assert!(raw.fp.wg_round_robin);
     let mut gfx11 = Fixture::new(&[ENDPGM]);
     gfx11.spec.target.arch = Arch::Gfx1100;
@@ -379,15 +551,24 @@ fn wg_round_robin_is_a_gfx12_only_declaration() {
 #[test]
 fn malformed_declarations_and_register_overruns_are_rejected() {
     let mut overlap = Fixture::new(&valid_words());
-    overlap.spec.entry.push(fact(reg(Kind::V, 3, 1), EntryValue::Defined));
+    overlap
+        .spec
+        .entry
+        .push(fact(reg(Kind::V, 3, 1), EntryValue::Defined));
     expect_rejected(overlap.lift(), Rule::Spec);
 
     let mut outside_allocation = Fixture::new(&valid_words());
-    outside_allocation.spec.entry.push(fact(reg(Kind::V, 8, 1), EntryValue::Defined));
+    outside_allocation
+        .spec
+        .entry
+        .push(fact(reg(Kind::V, 8, 1), EntryValue::Defined));
     expect_rejected(outside_allocation.lift(), Rule::Spec);
 
     let mut exact_pair = Fixture::new(&valid_words());
-    exact_pair.spec.entry.push(fact(reg(Kind::S, 0, 2), EntryValue::Exact(0)));
+    exact_pair
+        .spec
+        .entry
+        .push(fact(reg(Kind::S, 0, 2), EntryValue::Exact(0)));
     expect_rejected(exact_pair.lift(), Rule::Spec);
 
     // The code touches v6; declaring 4 actual VGPRs is a false declaration.
@@ -422,15 +603,23 @@ fn spec_json_schema_parses_exactly_and_rejects_unknown_or_missing_keys() {
     });
     let parsed = parse_spec_file(&doc).unwrap();
     assert_eq!(parsed.spec, fx.spec);
-    assert_eq!((parsed.binary.as_str(), parsed.sidecar.as_str()), ("shader.bin", "shader.abi.json"));
+    assert_eq!(
+        (parsed.binary.as_str(), parsed.sidecar.as_str()),
+        ("shader.bin", "shader.abi.json")
+    );
     lift_raw(&fx.bytes, &parsed.spec, ACO).unwrap_or_else(|e| panic!("{e}"));
 
     let mut extra = doc.clone();
     extra["fp"]["flush_denorms"] = json!(true);
     assert!(parse_spec_file(&extra).unwrap_err().contains("unknown key"));
     let mut missing = doc.clone();
-    missing["resources"].as_object_mut().unwrap().remove("scratch_bytes_per_lane");
-    assert!(parse_spec_file(&missing).unwrap_err().contains("missing key"));
+    missing["resources"]
+        .as_object_mut()
+        .unwrap()
+        .remove("scratch_bytes_per_lane");
+    assert!(parse_spec_file(&missing)
+        .unwrap_err()
+        .contains("missing key"));
     let mut bad_kind = doc.clone();
     bad_kind["entry"][0]["value"] = json!({"kind": "guess"});
     assert!(parse_spec_file(&bad_kind).is_err());

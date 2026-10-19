@@ -6,10 +6,10 @@
 //! from `crates/hipfire-daemon/src/main.rs` (wave 5 / D3).
 //! See `lib.rs` for the layering rationale.
 
+use gemma4::emit::{GemmaEmit, GemmaThoughtRouter};
 use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_gemma4 as gemma4;
-use gemma4::emit::{GemmaEmit, GemmaThoughtRouter};
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_muse_glimmer as glimmer;
@@ -2273,11 +2273,7 @@ pub fn generate_gemma4(
         .as_mut()
         .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::Gemma4Bundle>())
     else {
-        emit_error_with_id(
-            stdout,
-            id,
-            "gemma4 bundle missing on arch_id=13 generate",
-        );
+        emit_error_with_id(stdout, id, "gemma4 bundle missing on arch_id=13 generate");
         return;
     };
 

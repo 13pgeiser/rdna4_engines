@@ -181,12 +181,7 @@ fn main() {
         let chunk = &tokens[c * n_ctx..(c + 1) * n_ctx];
         for pos in 0..(n_ctx - 1) {
             let cand_logits = forward::decode_step(
-                &config,
-                &weights,
-                &mut state,
-                &mut gpu,
-                chunk[pos],
-                pos as u32,
+                &config, &weights, &mut state, &mut gpu, chunk[pos], pos as u32,
             )
             .expect("decode_step");
             if pos < scoring_start {

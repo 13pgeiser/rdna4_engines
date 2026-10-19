@@ -16,7 +16,11 @@ pub const RECEIPT_SCHEMA_VERSION: u32 = 7;
 pub const RAILGUN_SECTION_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Tool { pub name: String, pub crate_version: String, pub git_sha: String }
+pub struct Tool {
+    pub name: String,
+    pub crate_version: String,
+    pub git_sha: String,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KernelIdentity {
@@ -29,7 +33,11 @@ pub struct KernelIdentity {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct Check { pub id: String, pub status: String, pub detail: String }
+pub struct Check {
+    pub id: String,
+    pub status: String,
+    pub detail: String,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Receipt {
@@ -60,10 +68,20 @@ pub struct RailgunSection {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct UnresolvedRecord { pub pc: Option<u32>, pub rule: String, pub detail: String }
+pub struct UnresolvedRecord {
+    pub pc: Option<u32>,
+    pub rule: String,
+    pub detail: String,
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct SideRecord { pub kernarg_segment: u32, pub module_global: u32, pub abi_packet: u32, pub local_flat: u32, pub scratch: u32 }
+pub struct SideRecord {
+    pub kernarg_segment: u32,
+    pub module_global: u32,
+    pub abi_packet: u32,
+    pub local_flat: u32,
+    pub scratch: u32,
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ImplicitRecord {
@@ -103,7 +121,11 @@ pub struct ArgRecord {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DwordRecord { pub offset: u32, pub loaded: bool, pub sinks: Vec<String> }
+pub struct DwordRecord {
+    pub offset: u32,
+    pub loaded: bool,
+    pub sinks: Vec<String>,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ArgCheck {

@@ -34,11 +34,10 @@
 //! fp8; the **current implementation uses bf16** — we follow the code.
 
 use crate::attention::{
-    apply_rope_interleaved_inplace, precompute_rope_freqs, PARENT_DIM, PARENT_Q_LORA, PARENT_ROPE_DIM,
+    apply_rope_interleaved_inplace, precompute_rope_freqs, PARENT_DIM, PARENT_Q_LORA,
+    PARENT_ROPE_DIM,
 };
-use crate::codec::{
-    act_quant_fp4_inplace_ref, hadamard_rotate_ref, round_to_bf16,
-};
+use crate::codec::{act_quant_fp4_inplace_ref, hadamard_rotate_ref, round_to_bf16};
 use crate::linear::parent_linear_dense;
 use crate::weights::{ParentCompressorWeights, ParentIndexerWeights};
 use crate::{Ds4ParentBackend, ParentQuantConfig};
@@ -134,19 +133,13 @@ impl ParentIndexerScratch {
     pub fn new(gpu: &mut Gpu, cfg: &ParentQuantConfig, max_rows: usize) -> Result<Self, String> {
         let _ = cfg;
         if max_rows == 0 {
-            return Err(
-                "deepseek4 parent: ParentIndexerScratch max_rows must be > 0".to_owned(),
-            );
+            return Err("deepseek4 parent: ParentIndexerScratch max_rows must be > 0".to_owned());
         }
-        let max_n_compressed = max_rows
-            .div_ceil(PARENT_INDEX_RATIO)
-            .max(PARENT_INDEX_TOPK);
+        let max_n_compressed = max_rows.div_ceil(PARENT_INDEX_RATIO).max(PARENT_INDEX_TOPK);
 
         // act width: max of dim (weights_proj / compressor x), q_lora (wq_b),
         // and index Q width (post-proj staging).
-        let act_k = PARENT_DIM
-            .max(PARENT_Q_LORA)
-            .max(PARENT_INDEX_Q_WIDTH);
+        let act_k = PARENT_DIM.max(PARENT_Q_LORA).max(PARENT_INDEX_Q_WIDTH);
 
         let act_bf16 = gpu
             .alloc_tensor(&[max_rows, act_k], DType::BF16)
@@ -158,14 +151,17 @@ impl ParentIndexerScratch {
                 return Err(format!("deepseek4 parent: indexer q_f32 alloc: {e:?}"));
             }
         };
-        let q_score_f32 = match gpu
-            .alloc_tensor(&[max_rows, PARENT_INDEX_N_HEADS, PARENT_INDEX_HEAD_DIM], DType::F32)
-        {
+        let q_score_f32 = match gpu.alloc_tensor(
+            &[max_rows, PARENT_INDEX_N_HEADS, PARENT_INDEX_HEAD_DIM],
+            DType::F32,
+        ) {
             Ok(t) => t,
             Err(e) => {
                 let _ = gpu.free_tensor(act_bf16);
                 let _ = gpu.free_tensor(q_f32);
-                return Err(format!("deepseek4 parent: indexer q_score_f32 alloc: {e:?}"));
+                return Err(format!(
+                    "deepseek4 parent: indexer q_score_f32 alloc: {e:?}"
+                ));
             }
         };
         let weights_f32 = match gpu.alloc_tensor(&[max_rows, PARENT_INDEX_N_HEADS], DType::F32) {
@@ -174,7 +170,9 @@ impl ParentIndexerScratch {
                 let _ = gpu.free_tensor(act_bf16);
                 let _ = gpu.free_tensor(q_f32);
                 let _ = gpu.free_tensor(q_score_f32);
-                return Err(format!("deepseek4 parent: indexer weights_f32 alloc: {e:?}"));
+                return Err(format!(
+                    "deepseek4 parent: indexer weights_f32 alloc: {e:?}"
+                ));
             }
         };
         let kv_cache_f32 =
@@ -190,18 +188,17 @@ impl ParentIndexerScratch {
                     ));
                 }
             };
-        let scores_f32 =
-            match gpu.alloc_tensor(&[max_rows, max_n_compressed], DType::F32) {
-                Ok(t) => t,
-                Err(e) => {
-                    let _ = gpu.free_tensor(act_bf16);
-                    let _ = gpu.free_tensor(q_f32);
-                    let _ = gpu.free_tensor(q_score_f32);
-                    let _ = gpu.free_tensor(weights_f32);
-                    let _ = gpu.free_tensor(kv_cache_f32);
-                    return Err(format!("deepseek4 parent: indexer scores_f32 alloc: {e:?}"));
-                }
-            };
+        let scores_f32 = match gpu.alloc_tensor(&[max_rows, max_n_compressed], DType::F32) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = gpu.free_tensor(act_bf16);
+                let _ = gpu.free_tensor(q_f32);
+                let _ = gpu.free_tensor(q_score_f32);
+                let _ = gpu.free_tensor(weights_f32);
+                let _ = gpu.free_tensor(kv_cache_f32);
+                return Err(format!("deepseek4 parent: indexer scores_f32 alloc: {e:?}"));
+            }
+        };
         let n_per_batch = match alloc_i32_buf(gpu, max_rows) {
             Ok(t) => t,
             Err(e) => {
@@ -437,9 +434,9 @@ pub fn indexer_score_row_f64(
 ///
 /// Returns `(scores_flat [rows * n_slots], topk_idx [rows * k_out])`.
 pub fn indexer_oracle_f64(
-    q: &[f64],         // [rows, H, D]
-    kv: &[f64],        // [n_slots, D]
-    weights: &[f64],   // [rows, H] already scaled
+    q: &[f64],       // [rows, H, D]
+    kv: &[f64],      // [n_slots, D]
+    weights: &[f64], // [rows, H] already scaled
     rows: usize,
     n_heads: usize,
     head_dim: usize,
@@ -468,14 +465,12 @@ pub fn indexer_oracle_f64(
                 f64::NEG_INFINITY
             };
         }
-        let k_take = k_out.min(n_slots).min(indexer_n_compressed(start_pos, rows, ratio).max(n_vis));
+        let k_take = k_out
+            .min(n_slots)
+            .min(indexer_n_compressed(start_pos, rows, ratio).max(n_vis));
         // Use per-row visible count as the effective N for top-k pool size
         // when start_pos==0; else the full committed set.
-        let pool_n = if start_pos == 0 {
-            n_vis
-        } else {
-            n_slots
-        };
+        let pool_n = if start_pos == 0 { n_vis } else { n_slots };
         let row_topk = indexer_topk_host(&masked[..pool_n.max(1).min(masked.len())], k_take.max(1));
         let dest = &mut topk[r * k_out..(r + 1) * k_out];
         for i in 0..k_out {
@@ -710,12 +705,10 @@ pub fn parent_indexer_forward(
     //
     // THIS IS THE FP4 GROUP-32 SITE (not FP8). Missing it makes the
     // reference more accurate than itself.
-    hadamard_rotate_ref(&mut q_host, PARENT_INDEX_HEAD_DIM).map_err(|e| {
-        format!("deepseek4 parent: indexer q hadamard: {e}")
-    })?;
-    act_quant_fp4_inplace_ref(&mut q_host, PARENT_INDEX_HEAD_DIM).map_err(|e| {
-        format!("deepseek4 parent: indexer q fp4_act_quant: {e}")
-    })?;
+    hadamard_rotate_ref(&mut q_host, PARENT_INDEX_HEAD_DIM)
+        .map_err(|e| format!("deepseek4 parent: indexer q hadamard: {e}"))?;
+    act_quant_fp4_inplace_ref(&mut q_host, PARENT_INDEX_HEAD_DIM)
+        .map_err(|e| format!("deepseek4 parent: indexer q fp4_act_quant: {e}"))?;
     upload_f32_prefix(
         gpu,
         &scratch.q_score_f32,
@@ -746,8 +739,7 @@ pub fn parent_indexer_forward(
     }
     // Apply softmax_scale * n_heads**-0.5 on host (tiny H=64).
     let scale = indexer_weights_scale_f32();
-    let mut w_host =
-        download_f32_prefix(gpu, &scratch.weights_f32, rows * PARENT_INDEX_N_HEADS)?;
+    let mut w_host = download_f32_prefix(gpu, &scratch.weights_f32, rows * PARENT_INDEX_N_HEADS)?;
     for v in w_host.iter_mut() {
         *v *= scale;
     }
@@ -895,9 +887,7 @@ pub fn parent_indexer_forward_with_kv(
         ));
     }
     if rows == 0 {
-        return Err(
-            "deepseek4 parent: parent_indexer_forward_with_kv rows must be > 0".to_owned(),
-        );
+        return Err("deepseek4 parent: parent_indexer_forward_with_kv rows must be > 0".to_owned());
     }
     if rows > scratch.max_rows {
         return Err(format!(
@@ -989,8 +979,7 @@ pub fn parent_indexer_forward_with_kv(
         .map_err(|e| format!("deepseek4 parent: indexer weights_proj BF16 GEMM: {e:?}"))?;
     }
     let scale = indexer_weights_scale_f32();
-    let mut w_host =
-        download_f32_prefix(gpu, &scratch.weights_f32, rows * PARENT_INDEX_N_HEADS)?;
+    let mut w_host = download_f32_prefix(gpu, &scratch.weights_f32, rows * PARENT_INDEX_N_HEADS)?;
     for v in w_host.iter_mut() {
         *v *= scale;
     }
@@ -1141,9 +1130,7 @@ fn run_indexer_compressor(
 // ── Staging / IO helpers ────────────────────────────────────────────────────
 
 fn act_view(scratch: &ParentIndexerScratch, rows: usize, k: usize) -> Result<GpuTensor, String> {
-    let act_k = PARENT_DIM
-        .max(PARENT_Q_LORA)
-        .max(PARENT_INDEX_Q_WIDTH);
+    let act_k = PARENT_DIM.max(PARENT_Q_LORA).max(PARENT_INDEX_Q_WIDTH);
     if k > act_k {
         return Err(format!(
             "deepseek4 parent: indexer act_view k={k} exceeds act_bf16 width {act_k}"
@@ -1337,16 +1324,10 @@ mod tests {
         // product = 1/sqrt(128*64) = 1/sqrt(8192)
         let got = indexer_weights_scale();
         let hand = 1.0 / (8192f64).sqrt();
-        assert!(
-            (got - hand).abs() < 1e-15,
-            "scale={got} hand={hand}"
-        );
+        assert!((got - hand).abs() < 1e-15, "scale={got} hand={hand}");
         // Numeric spot-check against a precomputed value.
         let expect = 0.011_048_543_456_039_806;
-        assert!(
-            (got - expect).abs() < 1e-15,
-            "scale={got} expect≈{expect}"
-        );
+        assert!((got - expect).abs() < 1e-15, "scale={got} expect≈{expect}");
         // f32 form must be the round-trip of the f64 value.
         let f = indexer_weights_scale_f32();
         assert!((f as f64 - got).abs() < 1e-7);

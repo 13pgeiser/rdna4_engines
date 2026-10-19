@@ -31,14 +31,17 @@ use std::time::Instant;
 use hip_bridge::HipRuntime;
 use railgun::kernel::{self as rk, DeclaredWord, LaunchRecord, Lowering, NodeFacts};
 use railgun::plan::{self as rp, CacheTable, Pm4Op, RowPolicy, Rung};
-use railgun::shadow::{self as rs, RailgunLowering, RedlineDecision, RedlineDispatch, RedlineTape, SegmentIb, SlotBinding};
+use railgun::shadow::{
+    self as rs, RailgunLowering, RedlineDecision, RedlineDispatch, RedlineTape, SegmentIb,
+    SlotBinding,
+};
 use railgun::Binding;
 use railgun_corpus::{sha256_hex, ArtifactKey, JitCorpus, Lookup, ProgramNode};
 use serde::Serialize;
 
 use super::{
-    Gfx11EntryAcquirePolicy, Gfx12DispatchPacing, KernargBuffer, KernargPool, Kernel, LaunchGeometry, Pm4Commands,
-    RecordedHipLaunch, ReplayGridBinding, ReplayKernargBinding,
+    Gfx11EntryAcquirePolicy, Gfx12DispatchPacing, KernargBuffer, KernargPool, Kernel,
+    LaunchGeometry, Pm4Commands, RecordedHipLaunch, ReplayGridBinding, ReplayKernargBinding,
 };
 use crate::code_object::CodeObjectId;
 use crate::compiler::KernelCompiler;
@@ -117,7 +120,11 @@ pub(super) struct Transport<'a> {
 
 impl RailgunShadow {
     pub(super) fn from_config() -> Option<Self> {
-        let var = |name: &str| hipfire_config::developer_var(name).ok().filter(|v| !v.is_empty());
+        let var = |name: &str| {
+            hipfire_config::developer_var(name)
+                .ok()
+                .filter(|v| !v.is_empty())
+        };
         let corpus = var("HIPFIRE_RAILGUN_SHADOW").filter(|v| v != "0")?;
         Some(Self {
             config: ShadowConfig {
@@ -170,7 +177,8 @@ impl RailgunShadow {
     ) {
         if let Some(compiler) = compiler {
             self.arch.get_or_insert_with(|| compiler.arch().to_owned());
-            self.toolchain_pin.get_or_insert_with(|| sha256_hex(compiler.toolchain_id().as_bytes()));
+            self.toolchain_pin
+                .get_or_insert_with(|| sha256_hex(compiler.toolchain_id().as_bytes()));
         }
         // The admitted image digest is the corpus key; no file is reopened.
         let sha = artifact.map(|id| id.to_hex());
@@ -206,7 +214,9 @@ impl RailgunShadow {
     fn open_corpus(&mut self) -> Result<Arc<JitCorpus>, String> {
         self.corpus
             .get_or_insert_with(|| {
-                JitCorpus::open(&self.config.corpus).map(Arc::new).map_err(|e| format!("railgun JIT corpus rejected: {e}"))
+                JitCorpus::open(&self.config.corpus)
+                    .map(Arc::new)
+                    .map_err(|e| format!("railgun JIT corpus rejected: {e}"))
             })
             .clone()
     }
@@ -218,14 +228,30 @@ impl RailgunShadow {
         }
         let result = (|| {
             let corpus = self.open_corpus()?;
-            let arch = self.arch.as_deref().ok_or("no compiler arch was observed")?;
-            let pin = self.toolchain_pin.as_deref().ok_or("no compiler toolchain was observed")?;
-            match corpus.lookup(&ArtifactKey { arch, toolchain_pin: pin, artifact_sha256: sha }) {
-                Ok(Lookup::Hit(hit)) => NodeFacts::from_hit(&hit.record, &hit.receipt, symbol).map(Arc::new),
+            let arch = self
+                .arch
+                .as_deref()
+                .ok_or("no compiler arch was observed")?;
+            let pin = self
+                .toolchain_pin
+                .as_deref()
+                .ok_or("no compiler toolchain was observed")?;
+            match corpus.lookup(&ArtifactKey {
+                arch,
+                toolchain_pin: pin,
+                artifact_sha256: sha,
+            }) {
+                Ok(Lookup::Hit(hit)) => {
+                    NodeFacts::from_hit(&hit.record, &hit.receipt, symbol).map(Arc::new)
+                }
                 Ok(Lookup::Missing) => Err(match corpus.rejection(arch, sha) {
                     Some(r) => format!("railgun-cert rejected {}: {}", &sha[..16], r.reason),
                     None if pin != corpus.toolchain_pin() => {
-                        format!("toolchain pin {} is not the corpus pin {}", &pin[..16], &corpus.toolchain_pin()[..16])
+                        format!(
+                            "toolchain pin {} is not the corpus pin {}",
+                            &pin[..16],
+                            &corpus.toolchain_pin()[..16]
+                        )
                     }
                     None => format!("no record for {arch} object {}", &sha[..16]),
                 }),
@@ -259,15 +285,30 @@ impl RailgunShadow {
             Ok(report) => (report.summary(), serde_json::to_value(&report)),
             Err(error) => (
                 format!("[railgun] shadow FAILED: {error}"),
-                serde_json::to_value(serde_json::json!({ "schema": "railgun-m1-shadow", "version": 1, "error": error })),
+                serde_json::to_value(
+                    serde_json::json!({ "schema": "railgun-m1-shadow", "version": 1, "error": error }),
+                ),
             ),
         };
-        let path = self.config.out.as_ref().map(|dir| dir.join(format!("railgun-shadow-{}-{}.json", std::process::id(), self.reports)));
+        let path = self.config.out.as_ref().map(|dir| {
+            dir.join(format!(
+                "railgun-shadow-{}-{}.json",
+                std::process::id(),
+                self.reports
+            ))
+        });
         let written = match (&path, value) {
-            (Some(path), Ok(value)) => std::fs::create_dir_all(path.parent().expect("file in a directory"))
-                .and_then(|_| std::fs::write(path, serde_json::to_vec_pretty(&value).expect("JSON value serialises")))
-                .map(|_| format!(" report={}", path.display()))
-                .unwrap_or_else(|e| format!(" report write failed: {e}")),
+            (Some(path), Ok(value)) => {
+                std::fs::create_dir_all(path.parent().expect("file in a directory"))
+                    .and_then(|_| {
+                        std::fs::write(
+                            path,
+                            serde_json::to_vec_pretty(&value).expect("JSON value serialises"),
+                        )
+                    })
+                    .map(|_| format!(" report={}", path.display()))
+                    .unwrap_or_else(|e| format!(" report write failed: {e}"))
+            }
             (Some(_), Err(e)) => format!(" report serialisation failed: {e}"),
             (None, _) => String::new(),
         };
@@ -277,7 +318,10 @@ impl RailgunShadow {
                 if let Some(s) = self.surfaces.as_mut() {
                     s.executing = true;
                 }
-                eprintln!("[railgun] backend=railgun: executing railgun's lowering ({} dwords)", commands.len_dwords());
+                eprintln!(
+                    "[railgun] backend=railgun: executing railgun's lowering ({} dwords)",
+                    commands.len_dwords()
+                );
             }
             Some(Err(reason)) => eprintln!("[railgun] backend=railgun refused: {reason}"),
             None => {}
@@ -294,22 +338,36 @@ impl RailgunShadow {
     ) -> Result<Report, String> {
         let n = redline.launches.len();
         if self.launches.len() != n {
-            return Err(format!("railgun observed {} launches, Redline prepared {n}", self.launches.len()));
+            return Err(format!(
+                "railgun observed {} launches, Redline prepared {n}",
+                self.launches.len()
+            ));
         }
         for (k, (ours, theirs)) in self.launches.iter().zip(redline.launches).enumerate() {
             if ours.symbol != theirs.kernel || ours.kernarg != theirs.kernarg {
-                return Err(format!("launch {k}: railgun observed {} but Redline recorded {}", ours.symbol, theirs.kernel));
+                return Err(format!(
+                    "launch {k}: railgun observed {} but Redline recorded {}",
+                    ours.symbol, theirs.kernel
+                ));
             }
         }
-        let arch = self.arch.clone().unwrap_or_else(|| redline.device_name.to_owned());
-        let mut table = CacheTable::for_arch(&arch).ok_or_else(|| format!("railgun M1 has no cache table for {arch}"))?;
+        let arch = self
+            .arch
+            .clone()
+            .unwrap_or_else(|| redline.device_name.to_owned());
+        let mut table = CacheTable::for_arch(&arch)
+            .ok_or_else(|| format!("railgun M1 has no cache table for {arch}"))?;
         let receipts = match &self.config.cache_table {
             Some(path) => {
                 let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-                let probe: rp::G4Table = serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+                let probe: rp::G4Table = serde_json::from_slice(&bytes)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
                 let source = format!("{} sha256={}", path.display(), sha256_hex(&bytes));
                 let attached = table.attach_receipts(&probe, &source, G4_MIN_TRIALS)?;
-                eprintln!("[railgun] G4 receipts: {attached}/{} {arch} rows backed by {source}", table.rows.len());
+                eprintln!(
+                    "[railgun] G4 receipts: {attached}/{} {arch} rows backed by {source}",
+                    table.rows.len()
+                );
                 attached
             }
             None => 0,
@@ -319,7 +377,8 @@ impl RailgunShadow {
         let plan = rp::plan(&program, &table, RowPolicy::TierD);
         let strict = rp::plan(&program, &table, RowPolicy::UnreceiptedSystem);
         let arch_lowering = arch_lowering(&arch);
-        let (lowering, _buffers) = lower(&program, &plan, arch_lowering, redline.kernels, transport)?;
+        let (lowering, _buffers) =
+            lower(&program, &plan, arch_lowering, redline.kernels, transport)?;
         let tape = redline_tape(redline);
         let diff = rs::diff(&program, &plan, &lowering, &tape);
         let mut written: Vec<Binding> = Vec::new();
@@ -333,11 +392,22 @@ impl RailgunShadow {
         }
         self.surfaces = Some(ProgramSurfaces {
             written,
-            non_pm4_nodes: program.nodes.iter().filter(|n| !n.lowering.is_pm4()).count(),
+            non_pm4_nodes: program
+                .nodes
+                .iter()
+                .filter(|n| !n.lowering.is_pm4())
+                .count(),
             executing: false,
         });
         if self.config.backend_railgun {
-            *executable = Some(lower_executable(&program, &plan, arch_lowering, &lowering, redline, transport));
+            *executable = Some(lower_executable(
+                &program,
+                &plan,
+                arch_lowering,
+                &lowering,
+                redline,
+                transport,
+            ));
         }
 
         let corpus = self.open_corpus().ok();
@@ -350,7 +420,13 @@ impl RailgunShadow {
                     .zip(&self.artifacts)
                     .filter_map(|(l, sha)| sha.clone().map(|sha| (l.symbol.clone(), sha)))
                     .collect();
-                let nodes: Vec<ProgramNode> = pairs.iter().map(|(s, a)| ProgramNode { symbol: s, artifact_sha256: a }).collect();
+                let nodes: Vec<ProgramNode> = pairs
+                    .iter()
+                    .map(|(s, a)| ProgramNode {
+                        symbol: s,
+                        artifact_sha256: a,
+                    })
+                    .collect();
                 match c.check_program(id, &arch, pin, &nodes) {
                     Ok(()) => "ok".to_owned(),
                     Err(e) => e.to_string(),
@@ -372,7 +448,12 @@ impl RailgunShadow {
             device: redline.device_name.to_owned(),
             tape: TapeSummary {
                 launches: n,
-                unique_kernels: redline.launches.iter().map(|l| l.kernel.as_str()).collect::<BTreeSet<_>>().len(),
+                unique_kernels: redline
+                    .launches
+                    .iter()
+                    .map(|l| l.kernel.as_str())
+                    .collect::<BTreeSet<_>>()
+                    .len(),
                 sequence_hash: format!("{tape_hash:016x}"),
             },
             corpus: corpus.as_deref().map(|c| CorpusSummary {
@@ -391,8 +472,17 @@ impl RailgunShadow {
                 words: program.words.clone(),
                 resources_overlapping,
             },
-            certificate: Certificate { tier: "D", obligations, rows_used: plan.rows_used.clone(), cache_table: table, lowering: arch_lowering },
-            plan: PlanSummary { tier_d: plan.counts(), unreceipted_system: strict.counts() },
+            certificate: Certificate {
+                tier: "D",
+                obligations,
+                rows_used: plan.rows_used.clone(),
+                cache_table: table,
+                lowering: arch_lowering,
+            },
+            plan: PlanSummary {
+                tier_d: plan.counts(),
+                unreceipted_system: strict.counts(),
+            },
             redline_effects,
             diff,
             elapsed_ms,
@@ -411,20 +501,37 @@ impl RailgunShadow {
             .programs
             .iter()
             .filter(|p| p.arch == arch)
-            .find(|p| p.nodes.iter().map(|n| (n.symbol.as_str(), n.artifact_sha256.as_str())).collect::<BTreeSet<_>>() == tape)
+            .find(|p| {
+                p.nodes
+                    .iter()
+                    .map(|n| (n.symbol.as_str(), n.artifact_sha256.as_str()))
+                    .collect::<BTreeSet<_>>()
+                    == tape
+            })
             .map(|p| p.id.clone())
     }
 
     fn inventory(&self, route: &str) -> InventoryEntry {
         let Some(path) = &self.config.inventory else {
-            return InventoryEntry { program: None, error: Some("HIPFIRE_RAILGUN_INVENTORY is not set".into()), ..InventoryEntry::default() };
+            return InventoryEntry {
+                program: None,
+                error: Some("HIPFIRE_RAILGUN_INVENTORY is not set".into()),
+                ..InventoryEntry::default()
+            };
         };
         let Some((_, program)) = INVENTORY_PROGRAM.iter().find(|(id, _)| *id == route) else {
-            return InventoryEntry { program: None, error: Some(format!("route {route} has no inventory program")), ..InventoryEntry::default() };
+            return InventoryEntry {
+                program: None,
+                error: Some(format!("route {route} has no inventory program")),
+                ..InventoryEntry::default()
+            };
         };
         let parsed = std::fs::read(path)
             .map_err(|e| format!("{}: {e}", path.display()))
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| format!("{}: {e}", path.display())));
+            .and_then(|bytes| {
+                serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .map_err(|e| format!("{}: {e}", path.display()))
+            });
         match parsed {
             Ok(value) => {
                 let entry = &value["programs"][*program];
@@ -432,17 +539,26 @@ impl RailgunShadow {
                     program: Some((*program).to_owned()),
                     recording_dependent_decisions: entry["recording_dependent_decisions"].clone(),
                     refused_as_default: entry["refused_as_default"].as_bool(),
-                    error: entry.is_null().then(|| format!("inventory has no program {program}")),
+                    error: entry
+                        .is_null()
+                        .then(|| format!("inventory has no program {program}")),
                 }
             }
-            Err(error) => InventoryEntry { program: Some((*program).to_owned()), error: Some(error), ..InventoryEntry::default() },
+            Err(error) => InventoryEntry {
+                program: Some((*program).to_owned()),
+                error: Some(error),
+                ..InventoryEntry::default()
+            },
         }
     }
 }
 
 fn probe(hip: &HipRuntime, value: u64) -> Result<Binding, String> {
     hip.mem_get_address_range(value as usize as *mut std::ffi::c_void)
-        .map(|(base, bytes)| Binding { base: base as usize as u64, bytes: bytes as u64 })
+        .map(|(base, bytes)| Binding {
+            base: base as usize as u64,
+            bytes: bytes as u64,
+        })
         .map_err(|e| e.to_string())
 }
 
@@ -508,27 +624,53 @@ fn lower(
                 }
                 Pm4Op::Dispatch(i) => {
                     let node = &program.nodes[i];
-                    let kernel = kernels.get(i).ok_or_else(|| format!("no loaded kernel for node {i}"))?;
+                    let kernel = kernels
+                        .get(i)
+                        .ok_or_else(|| format!("no loaded kernel for node {i}"))?;
                     let metadata = kernel.metadata();
-                    let image = program.kernarg_image(i, metadata.kernarg_segment_size as usize, &words)?;
-                    let mut buffer = transport.pool.allocate_for(metadata).map_err(|e| format!("{}: kernarg: {e}", node.symbol))?;
-                    buffer.write_exact(&image).map_err(|e| format!("{}: kernarg: {e}", node.symbol))?;
+                    let image =
+                        program.kernarg_image(i, metadata.kernarg_segment_size as usize, &words)?;
+                    let mut buffer = transport
+                        .pool
+                        .allocate_for(metadata)
+                        .map_err(|e| format!("{}: kernarg: {e}", node.symbol))?;
+                    buffer
+                        .write_exact(&image)
+                        .map_err(|e| format!("{}: kernarg: {e}", node.symbol))?;
                     let mut workgroup = [0u16; 3];
                     for axis in 0..3 {
-                        workgroup[axis] = u16::try_from(node.block[axis]).map_err(|_| format!("{}: block exceeds u16", node.symbol))?;
+                        workgroup[axis] = u16::try_from(node.block[axis])
+                            .map_err(|_| format!("{}: block exceeds u16", node.symbol))?;
                     }
-                    let geometry = LaunchGeometry::from_hip_workgroups(node.grid, workgroup).map_err(|e| format!("{}: {e}", node.symbol))?;
-                    commands.dispatch(kernel, geometry, node.dynamic_lds, buffer.address()).map_err(|e| format!("{}: {e}", node.symbol))?;
+                    let geometry = LaunchGeometry::from_hip_workgroups(node.grid, workgroup)
+                        .map_err(|e| format!("{}: {e}", node.symbol))?;
+                    commands
+                        .dispatch(kernel, geometry, node.dynamic_lds, buffer.address())
+                        .map_err(|e| format!("{}: {e}", node.symbol))?;
                     kernargs[i] = Some((image, buffer.address() as usize as u64));
                     buffers.push(buffer);
                 }
                 Pm4Op::Exit => commands.trailing_release()?,
             }
         }
-        let ib = commands.gfx12_dwords().ok_or("railgun M1 lowers gfx12 command buffers only")?.to_vec();
-        segments.push(SegmentIb { first: segment.first, end: segment.end, ib });
+        let ib = commands
+            .gfx12_dwords()
+            .ok_or("railgun M1 lowers gfx12 command buffers only")?
+            .to_vec();
+        segments.push(SegmentIb {
+            first: segment.first,
+            end: segment.end,
+            ib,
+        });
     }
-    Ok((RailgunLowering { segments, kernargs, post_dispatch_nop: arch_lowering.post_dispatch_nop }, buffers))
+    Ok((
+        RailgunLowering {
+            segments,
+            kernargs,
+            post_dispatch_nop: arch_lowering.post_dispatch_nop,
+        },
+        buffers,
+    ))
 }
 
 /// The executable railgun lowering (`HIPFIRE_RAILGUN_BACKEND=railgun`): one
@@ -552,20 +694,35 @@ fn lower_executable(
             return Err(format!(
                 "M2 executes single-segment programs only ({} segments, {} non-PM4 nodes)",
                 segments.len(),
-                program.nodes.iter().filter(|x| !x.lowering.is_pm4()).count()
+                program
+                    .nodes
+                    .iter()
+                    .filter(|x| !x.lowering.is_pm4())
+                    .count()
             ))
         }
     }
     for (i, (ours, theirs)) in lowering.kernargs.iter().zip(&redline.kernargs).enumerate() {
-        let Some((image, _)) = ours else { return Err(format!("node {i} has no railgun kernarg image")) };
+        let Some((image, _)) = ours else {
+            return Err(format!("node {i} has no railgun kernarg image"));
+        };
         if *image != theirs.0 {
-            let at = image.iter().zip(&theirs.0).position(|(a, b)| a != b).unwrap_or(image.len().min(theirs.0.len()));
-            return Err(format!("node {i} {}: railgun kernarg image differs from Redline's at byte {at}", program.nodes[i].symbol));
+            let at = image
+                .iter()
+                .zip(&theirs.0)
+                .position(|(a, b)| a != b)
+                .unwrap_or(image.len().min(theirs.0.len()));
+            return Err(format!(
+                "node {i} {}: railgun kernarg image differs from Redline's at byte {at}",
+                program.nodes[i].symbol
+            ));
         }
     }
     // Check-mode negative control (developer only): drop every mid-segment
     // boundary so dependent dispatches race; the HIP twin must then differ.
-    let drop_boundaries = hipfire_config::developer_var("HIPFIRE_RAILGUN_NEGATIVE_CONTROL").as_deref() == Ok("drop_boundaries");
+    let drop_boundaries = hipfire_config::developer_var("HIPFIRE_RAILGUN_NEGATIVE_CONTROL")
+        .as_deref()
+        == Ok("drop_boundaries");
     if drop_boundaries {
         eprintln!("[railgun] NEGATIVE CONTROL: executable lowering without mid-segment boundaries");
     }
@@ -589,22 +746,35 @@ fn lower_executable(
             }
             Pm4Op::Dispatch(i) => {
                 let node = &program.nodes[i];
-                let kernel = redline.kernels.get(i).ok_or_else(|| format!("no loaded kernel for node {i}"))?;
+                let kernel = redline
+                    .kernels
+                    .get(i)
+                    .ok_or_else(|| format!("no loaded kernel for node {i}"))?;
                 let mut workgroup = [0u16; 3];
                 for axis in 0..3 {
-                    workgroup[axis] = u16::try_from(node.block[axis]).map_err(|_| format!("{}: block exceeds u16", node.symbol))?;
+                    workgroup[axis] = u16::try_from(node.block[axis])
+                        .map_err(|_| format!("{}: block exceeds u16", node.symbol))?;
                 }
-                let geometry = LaunchGeometry::from_hip_workgroups(node.grid, workgroup).map_err(|e| format!("{}: {e}", node.symbol))?;
+                let geometry = LaunchGeometry::from_hip_workgroups(node.grid, workgroup)
+                    .map_err(|e| format!("{}: {e}", node.symbol))?;
                 let address = redline.kernargs[i].1 as usize as *mut std::ffi::c_void;
-                commands.dispatch(kernel, geometry, node.dynamic_lds, address).map_err(|e| format!("{}: {e}", node.symbol))?;
+                commands
+                    .dispatch(kernel, geometry, node.dynamic_lds, address)
+                    .map_err(|e| format!("{}: {e}", node.symbol))?;
             }
             Pm4Op::Exit => commands.trailing_release()?,
         }
     }
-    let ours = commands.gfx12_dwords().ok_or("railgun backend lowers gfx12 command buffers only")?;
+    let ours = commands
+        .gfx12_dwords()
+        .ok_or("railgun backend lowers gfx12 command buffers only")?;
     let shadow = &lowering.segments[0].ib;
     if ours.len() != shadow.len() && !drop_boundaries {
-        return Err(format!("executable lowering has {} dwords, the shadow lowering {}", ours.len(), shadow.len()));
+        return Err(format!(
+            "executable lowering has {} dwords, the shadow lowering {}",
+            ours.len(),
+            shadow.len()
+        ));
     }
     Ok(commands)
 }
@@ -624,12 +794,15 @@ fn redline_tape(redline: &RedlinePrepared<'_>) -> RedlineTape {
                 .iter()
                 .flat_map(|layout| &layout.slots)
                 .filter_map(|slot| {
-                    redline.resources.get(&slot.resource.index()).map(|&(base, bytes)| SlotBinding {
-                        offset: slot.offset as u32,
-                        base,
-                        bytes,
-                        interior: slot.interior_offset,
-                    })
+                    redline
+                        .resources
+                        .get(&slot.resource.index())
+                        .map(|&(base, bytes)| SlotBinding {
+                            offset: slot.offset as u32,
+                            base,
+                            bytes,
+                            interior: slot.interior_offset,
+                        })
                 })
                 .collect(),
             decision: decision.clone(),
@@ -639,38 +812,66 @@ fn redline_tape(redline: &RedlinePrepared<'_>) -> RedlineTape {
         .word_patches
         .iter()
         .map(|(dispatch, binding)| match binding {
-            ReplayKernargBinding::GdnFrameU32 { offset, frames } => {
-                rs::WordPatch { dispatch: *dispatch, offset: *offset as u32, kind: format!("gdn_frame(frames={frames})") }
-            }
-            ReplayKernargBinding::PositionPlusU32 { offset, addend } => {
-                rs::WordPatch { dispatch: *dispatch, offset: *offset as u32, kind: format!("position+{addend}") }
-            }
+            ReplayKernargBinding::GdnFrameU32 { offset, frames } => rs::WordPatch {
+                dispatch: *dispatch,
+                offset: *offset as u32,
+                kind: format!("gdn_frame(frames={frames})"),
+            },
+            ReplayKernargBinding::PositionPlusU32 { offset, addend } => rs::WordPatch {
+                dispatch: *dispatch,
+                offset: *offset as u32,
+                kind: format!("position+{addend}"),
+            },
             // Bindings beta added after railgun M1: no railgun word role
             // derives them yet, so the shadow reports them as Redline-only.
-            ReplayKernargBinding::PositionDivU32 { offset, addend, divisor } => rs::WordPatch {
+            ReplayKernargBinding::PositionDivU32 {
+                offset,
+                addend,
+                divisor,
+            } => rs::WordPatch {
                 dispatch: *dispatch,
                 offset: *offset as u32,
                 kind: format!("(position+{addend})/{divisor}"),
             },
-            ReplayKernargBinding::PositionModU32 { offset, addend, modulus } => rs::WordPatch {
+            ReplayKernargBinding::PositionModU32 {
+                offset,
+                addend,
+                modulus,
+            } => rs::WordPatch {
                 dispatch: *dispatch,
                 offset: *offset as u32,
                 kind: format!("(position+{addend})%{modulus}"),
             },
-            ReplayKernargBinding::PositionMulU32 { offset, factor } => {
-                rs::WordPatch { dispatch: *dispatch, offset: *offset as u32, kind: format!("position*{factor}") }
-            }
+            ReplayKernargBinding::PositionMulU32 { offset, factor } => rs::WordPatch {
+                dispatch: *dispatch,
+                offset: *offset as u32,
+                kind: format!("position*{factor}"),
+            },
         })
         .collect();
     let grid_patches = redline
         .grid_patches
         .iter()
         .map(|(dispatch, binding, _, _)| {
-            let ReplayGridBinding::PositionCeilDiv { axis, addend, divisor } = *binding;
-            rs::GridPatch { dispatch: *dispatch, axis, addend, divisor }
+            let ReplayGridBinding::PositionCeilDiv {
+                axis,
+                addend,
+                divisor,
+            } = *binding;
+            rs::GridPatch {
+                dispatch: *dispatch,
+                axis,
+                addend,
+                divisor,
+            }
         })
         .collect();
-    RedlineTape { ib: redline.ib.to_vec(), dispatches, word_patches, grid_patches }
+    RedlineTape {
+        ib: redline.ib.to_vec(),
+        dispatches,
+        word_patches,
+        grid_patches,
+    }
 }
 
 fn facts_summary(program: &rk::KernelProgram) -> FactsSummary {
@@ -688,33 +889,56 @@ fn facts_summary(program: &rk::KernelProgram) -> FactsSummary {
         if let Some(reason) = &reason {
             not_pm4.push(format!("{k} {}: {reason}", node.symbol));
         }
-        let row = per_kernel.entry((node.symbol.clone(), lowering.to_owned())).or_insert_with(|| KernelFactsRow {
-            symbol: node.symbol.clone(),
-            module: node.kref.as_ref().map(|r| r.module.clone()),
-            artifact_sha256: node.kref.as_ref().map(|r| r.artifact_sha256.clone()),
-            kd_sha256: node.kref.as_ref().map(|r| r.kd_sha256.clone()),
-            tier: node.kref.as_ref().map(|r| r.tier.clone()),
-            read_cache: node.read_cache,
-            lowering: lowering.to_owned(),
-            reason,
-            launches: 0,
-            pointer_args: node.args.iter().filter(|(_, a)| matches!(a, rk::Arg::Resource { .. })).count(),
-            effects: node.effects.len(),
-        });
+        let row = per_kernel
+            .entry((node.symbol.clone(), lowering.to_owned()))
+            .or_insert_with(|| KernelFactsRow {
+                symbol: node.symbol.clone(),
+                module: node.kref.as_ref().map(|r| r.module.clone()),
+                artifact_sha256: node.kref.as_ref().map(|r| r.artifact_sha256.clone()),
+                kd_sha256: node.kref.as_ref().map(|r| r.kd_sha256.clone()),
+                tier: node.kref.as_ref().map(|r| r.tier.clone()),
+                read_cache: node.read_cache,
+                lowering: lowering.to_owned(),
+                reason,
+                launches: 0,
+                pointer_args: node
+                    .args
+                    .iter()
+                    .filter(|(_, a)| matches!(a, rk::Arg::Resource { .. }))
+                    .count(),
+                effects: node.effects.len(),
+            });
         row.launches += 1;
     }
-    FactsSummary { launches: program.nodes.len(), fully_certified, per_kernel: per_kernel.into_values().collect(), not_pm4 }
+    FactsSummary {
+        launches: program.nodes.len(),
+        fully_certified,
+        per_kernel: per_kernel.into_values().collect(),
+        not_pm4,
+    }
 }
 
-fn obligations(program: &rk::KernelProgram, plan: &rp::Pm4Plan, table: &CacheTable) -> BTreeSet<String> {
-    let mut out: BTreeSet<String> = program.nodes.iter().filter_map(|n| n.kref.as_ref()).flat_map(|r| r.obligations.iter().cloned()).collect();
+fn obligations(
+    program: &rk::KernelProgram,
+    plan: &rp::Pm4Plan,
+    table: &CacheTable,
+) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> = program
+        .nodes
+        .iter()
+        .filter_map(|n| n.kref.as_ref())
+        .flat_map(|r| r.obligations.iter().cloned())
+        .collect();
     if program.nodes.iter().any(|n| !n.effects.is_empty()) {
         out.insert("InBoundsNoAlias".to_owned());
     }
     for (hazard, _) in &plan.rows_used {
         let row = table.row(*hazard);
         if row.g4_receipt.is_none() {
-            out.insert(format!("G4 {} {hazard:?} row (wait={}, acquire={:?})", table.arch, row.visibility.wait_idle, row.visibility.acquire));
+            out.insert(format!(
+                "G4 {} {hazard:?} row (wait={}, acquire={:?})",
+                table.arch, row.visibility.wait_idle, row.visibility.acquire
+            ));
         }
     }
     if !program.words.is_empty() {
@@ -729,7 +953,12 @@ fn overlapping(resources: &[Binding]) -> Vec<String> {
     sorted
         .windows(2)
         .filter(|w| w[0].base + w[0].bytes > w[1].base)
-        .map(|w| format!("{:#x}+{} overlaps {:#x}+{}", w[0].base, w[0].bytes, w[1].base, w[1].bytes))
+        .map(|w| {
+            format!(
+                "{:#x}+{} overlaps {:#x}+{}",
+                w[0].base, w[0].bytes, w[1].base, w[1].bytes
+            )
+        })
         .collect()
 }
 

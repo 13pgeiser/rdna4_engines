@@ -277,10 +277,7 @@ mod tests {
             quantize_arch_id("qwen3_5_moe", ["Qwen3_5MoeForCausalLM"]),
             Some(6)
         );
-        assert_eq!(
-            quantize_arch_id("qwen3_moe", ["Qwen3MoeForCausalLM"]),
-            None
-        );
+        assert_eq!(quantize_arch_id("qwen3_moe", ["Qwen3MoeForCausalLM"]), None);
         assert_eq!(
             quantize_arch_id("qwen3_next", ["Qwen3NextForCausalLM"]),
             None

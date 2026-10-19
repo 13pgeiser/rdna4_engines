@@ -125,9 +125,18 @@ const DEFAULT_CARD: &str = "xtx";
 const DEFAULT_CARD_GFX1151: &str = "halo";
 /// The artifacts a G1 can bind (`sample.json: artifact_sha256`): the two XTX `.hfq` exports and the Halo slab `mq2-xts` (shipped d2 base).
 static ARTIFACT_PINS: [(&str, &str); 3] = [
-    ("c24-e8p", "5f280cff75e1ae29e45bbbdcbeca31bec4eb026fb105d5c3bcd7c5238fe281db"),
-    ("c24h6306-e8p", "8d30e9d7df324e16f7aa811c114109ba3ad238e630134cdd4a282a7dcc4abc9f"),
-    ("c24h6306-d2-mq2-xts", "d3d536c040f834699b5a261a5122b67d076461a9493eca16669803757928a949"),
+    (
+        "c24-e8p",
+        "5f280cff75e1ae29e45bbbdcbeca31bec4eb026fb105d5c3bcd7c5238fe281db",
+    ),
+    (
+        "c24h6306-e8p",
+        "8d30e9d7df324e16f7aa811c114109ba3ad238e630134cdd4a282a7dcc4abc9f",
+    ),
+    (
+        "c24h6306-d2-mq2-xts",
+        "d3d536c040f834699b5a261a5122b67d076461a9493eca16669803757928a949",
+    ),
 ];
 const LINK_CAVEAT: &str = "The XTX endpoint is x16 but its upstream root port 0000:00:03.1 is PCIe 4.0 x4 \
 (16 GT/s, ~7.9 GB/s theoretical): host-mapped runs are exactness runs only, no latency/bandwidth claim.";
@@ -2824,8 +2833,12 @@ fn parse_args(argv: &[String]) -> Result<Cfg> {
         }
         i += 1;
     }
-    cfg.target = Target::of_name(&cfg.expect_arch)
-        .ok_or_else(|| format!("--expect-arch {:?}: this oracle serves gfx1100 and gfx1151\n{USAGE}", cfg.expect_arch))?;
+    cfg.target = Target::of_name(&cfg.expect_arch).ok_or_else(|| {
+        format!(
+            "--expect-arch {:?}: this oracle serves gfx1100 and gfx1151\n{USAGE}",
+            cfg.expect_arch
+        )
+    })?;
     match cfg.target {
         Target::Gfx1100 => {
             cfg.expect_uuid.get_or_insert_with(|| DEFAULT_UUID.into());
@@ -2851,7 +2864,10 @@ fn parse_args(argv: &[String]) -> Result<Cfg> {
         ));
     }
     if cfg.samples_dirs.len() > cfg.target.pins().len() {
-        return Err(format!("at most {} sample dirs (one per pinned artifact)", cfg.target.pins().len()));
+        return Err(format!(
+            "at most {} sample dirs (one per pinned artifact)",
+            cfg.target.pins().len()
+        ));
     }
     if !cfg.overwrite && Path::new(&cfg.out).exists() {
         return Err(format!("{} exists (use --overwrite)", cfg.out));
@@ -2877,7 +2893,10 @@ fn placements_for_synthetic(name: &str) -> Vec<Placement> {
 fn run(cfg: &Cfg, argv: &[String]) -> Result<(Value, bool)> {
     if !cfg.no_reclaim_arm {
         // Production Qwen4 host-mapped configuration; must precede the first HIP runtime call.
-        hip_bridge::keep_host_memory_out_of_reclaim(&format!("{} E8P G1 host-mapped weights", cfg.target.name()));
+        hip_bridge::keep_host_memory_out_of_reclaim(&format!(
+            "{} E8P G1 host-mapped weights",
+            cfg.target.name()
+        ));
     }
     let hip = HipRuntime::load().map_err(err)?;
     if let Some(d) = cfg.device {
@@ -2932,11 +2951,17 @@ fn run(cfg: &Cfg, argv: &[String]) -> Result<(Value, bool)> {
     let mut loads = Vec::new();
     for kind in Kind::ALL {
         let name = kind.symbol(cfg.target);
-        let f = hip.module_get_function(&module, &name).map_err(|e| format!("symbol {name}: {e}"))?;
+        let f = hip
+            .module_get_function(&module, &name)
+            .map_err(|e| format!("symbol {name}: {e}"))?;
         loads.push(name);
         funcs.push((kind, f));
     }
-    let ctx = Ctx { hip, funcs, target: cfg.target };
+    let ctx = Ctx {
+        hip,
+        funcs,
+        target: cfg.target,
+    };
     let mut totals = Totals::default();
     let mut cov = Coverage::new();
     let mut rows: Vec<Value> = Vec::new();
@@ -2974,7 +2999,13 @@ fn run(cfg: &Cfg, argv: &[String]) -> Result<(Value, bool)> {
         for dir in &cfg.samples_dirs {
             eprintln!("[g1] loading E8P samples from {dir}");
             let first = 4 * sets.len() as u32;
-            let s = load_sample_set(dir, first, cfg.verify_artifact, cfg.rehash_artifact, cfg.target.pins())?;
+            let s = load_sample_set(
+                dir,
+                first,
+                cfg.verify_artifact,
+                cfg.rehash_artifact,
+                cfg.target.pins(),
+            )?;
             if !bound.insert(s.sha) {
                 return Err(format!("{dir}: artifact {} bound twice", s.tag));
             }
@@ -3010,7 +3041,11 @@ fn run(cfg: &Cfg, argv: &[String]) -> Result<(Value, bool)> {
 
     let vram_after = ctx.hip.get_vram_info().ok();
     let full = cfg.only.is_empty();
-    let all_pinned_bound = cfg.target.required_pins().iter().all(|(_, s)| bound.contains(s));
+    let all_pinned_bound = cfg
+        .target
+        .required_pins()
+        .iter()
+        .all(|(_, s)| bound.contains(s));
     let missing_negatives: Vec<String> = NEGATIVES
         .iter()
         .flat_map(|n| {
@@ -3152,10 +3187,22 @@ mod tests {
     fn blob_sizes_match_the_extractor() {
         assert_eq!(Kind::GateUp.blob_bytes(), 870_400);
         assert_eq!(Kind::Down.blob_bytes(), 435_200);
-        assert_eq!(Kind::GateUp.symbol(Target::Gfx1100), "e8p_i4_moe_gemv_r256_gate_up_pm_gfx1100");
-        assert_eq!(Kind::Down.symbol(Target::Gfx1100), "e8p_i4_moe_gemv_r128_down_pm_gfx1100");
-        assert_eq!(Kind::GateUp.symbol(Target::Gfx1151), "e8p_i4_moe_gemv_r256_gate_up_pm_gfx1151");
-        assert_eq!(Kind::Down.symbol(Target::Gfx1151), "e8p_i4_moe_gemv_r128_down_pm_gfx1151");
+        assert_eq!(
+            Kind::GateUp.symbol(Target::Gfx1100),
+            "e8p_i4_moe_gemv_r256_gate_up_pm_gfx1100"
+        );
+        assert_eq!(
+            Kind::Down.symbol(Target::Gfx1100),
+            "e8p_i4_moe_gemv_r128_down_pm_gfx1100"
+        );
+        assert_eq!(
+            Kind::GateUp.symbol(Target::Gfx1151),
+            "e8p_i4_moe_gemv_r256_gate_up_pm_gfx1151"
+        );
+        assert_eq!(
+            Kind::Down.symbol(Target::Gfx1151),
+            "e8p_i4_moe_gemv_r128_down_pm_gfx1151"
+        );
     }
 
     #[test]
@@ -3257,12 +3304,23 @@ mod tests {
         assert_eq!(DEFAULT_ARCH, "gfx1100");
         let tags = |p: &[(&str, &str)]| p.iter().map(|(t, _)| t.to_string()).collect::<Vec<_>>();
         assert_eq!(tags(Target::Gfx1100.pins()), ["c24-e8p", "c24h6306-e8p"]);
-        assert_eq!(tags(Target::Gfx1100.required_pins()), ["c24-e8p", "c24h6306-e8p"]);
-        assert_eq!(tags(Target::Gfx1151.pins()), ["c24-e8p", "c24h6306-e8p", "c24h6306-d2-mq2-xts"]);
-        assert_eq!(tags(Target::Gfx1151.required_pins()), ["c24h6306-d2-mq2-xts"]);
+        assert_eq!(
+            tags(Target::Gfx1100.required_pins()),
+            ["c24-e8p", "c24h6306-e8p"]
+        );
+        assert_eq!(
+            tags(Target::Gfx1151.pins()),
+            ["c24-e8p", "c24h6306-e8p", "c24h6306-d2-mq2-xts"]
+        );
+        assert_eq!(
+            tags(Target::Gfx1151.required_pins()),
+            ["c24h6306-d2-mq2-xts"]
+        );
         for (_, sha) in ARTIFACT_PINS.iter() {
             assert_eq!(sha.len(), 64);
-            assert!(sha.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+            assert!(sha
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
         }
     }
 }

@@ -128,7 +128,7 @@ use peacemaker_cdna::enc::{
     smem::SmemOp,
     sop::{Sop1Op, Sop2Op},
     vop::{DppCtrl, Vop1Op, Vop2Op, VopcOp},
-    vop3::{Vop3Op, Vop3OnlyOp},
+    vop3::{Vop3OnlyOp, Vop3Op},
 };
 use peacemaker_cdna::operand::InlineFloat;
 use peacemaker_cdna::Src;
@@ -144,18 +144,32 @@ pub const ENCODE_LDS_BYTES: u32 = 64;
 
 /// Stored bytes of one K or V row: `kv_heads * 256` codes plus `kv_heads`
 /// little-endian F16 scales.
-pub fn row_bytes(kv_heads: usize) -> usize { kv_heads * (HEAD_DIM + 2) }
+pub fn row_bytes(kv_heads: usize) -> usize {
+    kv_heads * (HEAD_DIM + 2)
+}
 
 /// Symbol of the encoder for `kv_heads` KV heads.
-pub fn encode_symbol(kv_heads: usize) -> String { format!("qsa_kv_encode_fp8_h{kv_heads}_pm_gfx942") }
+pub fn encode_symbol(kv_heads: usize) -> String {
+    format!("qsa_kv_encode_fp8_h{kv_heads}_pm_gfx942")
+}
 /// Symbol of the decoder for `kv_heads` KV heads.
-pub fn decode_symbol(kv_heads: usize) -> String { format!("qsa_kv_decode_fp8_h{kv_heads}_pm_gfx942") }
+pub fn decode_symbol(kv_heads: usize) -> String {
+    format!("qsa_kv_decode_fp8_h{kv_heads}_pm_gfx942")
+}
 
 /// Launch grid for `rows` rows: `(kv_heads, rows, 1)` workgroups of [`BLOCK`] threads.
-pub fn grid(kv_heads: usize, rows: usize) -> [u32; 3] { [kv_heads as u32, rows as u32, 1] }
+pub fn grid(kv_heads: usize, rows: usize) -> [u32; 3] {
+    [kv_heads as u32, rows as u32, 1]
+}
 
 fn check_geometry(kv_heads: usize) -> R<()> {
-    if kv_heads == 2 || kv_heads == 4 { Ok(()) } else { Err(format!("qsa fp8 kv: kv_heads must be 2 or 4 (head_dim 256, even heads), got {kv_heads}")) }
+    if kv_heads == 2 || kv_heads == 4 {
+        Ok(())
+    } else {
+        Err(format!(
+            "qsa fp8 kv: kv_heads must be 2 or 4 (head_dim 256, even heads), got {kv_heads}"
+        ))
+    }
 }
 
 // ───────────────────────────── CPU reference ─────────────────────────────
@@ -217,7 +231,11 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
 /// zero becomes `0x0001`, and one conditional bump (cap `0x7bff`) makes
 /// `448 * f32(scale) >= amax`.
 pub fn reference_scale_bits(amax: f32) -> u16 {
-    let mut bits = if amax == 0.0 { 0x3c00 } else { f32_to_f16_bits(amax / 448.0) };
+    let mut bits = if amax == 0.0 {
+        0x3c00
+    } else {
+        f32_to_f16_bits(amax / 448.0)
+    };
     if amax > 0.0 && bits == 0 {
         bits = 0x0001;
     }
@@ -280,7 +298,11 @@ fn fnuz_e4m3_decode(code: u8) -> f32 {
     } else {
         (8.0 + man) * f32::from_bits(((127 + exp - 11) as u32) << 23)
     };
-    if code & 0x80 != 0 { -mag } else { mag }
+    if code & 0x80 != 0 {
+        -mag
+    } else {
+        mag
+    }
 }
 
 /// Encode one head: `src` is the head's 256 channels. Returns the OCP-valued
@@ -294,7 +316,9 @@ pub fn reference_encode_head(src: &[f32; HEAD_DIM]) -> R<([u8; HEAD_DIM], u16)> 
     let scale = reference_scale_bits(amax);
     let sf = f16_bits_to_f32(scale);
     if 448.0 * sf < amax {
-        return Err(format!("qsa fp8 kv encode: amax {amax} exceeds the scale ceiling 448*65504"));
+        return Err(format!(
+            "qsa fp8 kv encode: amax {amax} exceeds the scale ceiling 448*65504"
+        ));
     }
     let mut codes = [0u8; HEAD_DIM];
     for (code, &x) in codes.iter_mut().zip(src.iter()) {
@@ -320,7 +344,10 @@ pub fn reference_encode(kv_heads: usize, src: &[f32]) -> R<Vec<u8>> {
     check_geometry(kv_heads)?;
     let per_row = kv_heads * HEAD_DIM;
     if src.len() % per_row != 0 {
-        return Err(format!("qsa fp8 kv encode: {} values is not a whole number of {per_row}-value rows", src.len()));
+        return Err(format!(
+            "qsa fp8 kv encode: {} values is not a whole number of {per_row}-value rows",
+            src.len()
+        ));
     }
     let rows = src.len() / per_row;
     let rb = row_bytes(kv_heads);
@@ -328,7 +355,9 @@ pub fn reference_encode(kv_heads: usize, src: &[f32]) -> R<Vec<u8>> {
     for row in 0..rows {
         for head in 0..kv_heads {
             let at = row * per_row + head * HEAD_DIM;
-            let head_src: &[f32; HEAD_DIM] = src[at..at + HEAD_DIM].try_into().expect("slice of HEAD_DIM");
+            let head_src: &[f32; HEAD_DIM] = src[at..at + HEAD_DIM]
+                .try_into()
+                .expect("slice of HEAD_DIM");
             let (codes, scale) = reference_encode_head(head_src)?;
             let o = row * rb;
             out[o + head * HEAD_DIM..o + (head + 1) * HEAD_DIM].copy_from_slice(&codes);
@@ -345,14 +374,19 @@ pub fn reference_decode(kv_heads: usize, stored: &[u8]) -> R<Vec<f32>> {
     check_geometry(kv_heads)?;
     let rb = row_bytes(kv_heads);
     if stored.len() % rb != 0 {
-        return Err(format!("qsa fp8 kv decode: {} bytes is not a whole number of {rb}-byte rows", stored.len()));
+        return Err(format!(
+            "qsa fp8 kv decode: {} bytes is not a whole number of {rb}-byte rows",
+            stored.len()
+        ));
     }
     let rows = stored.len() / rb;
     let mut out = Vec::with_capacity(rows * kv_heads * HEAD_DIM);
     for row in 0..rows {
         let o = row * rb;
         for head in 0..kv_heads {
-            let codes: &[u8; HEAD_DIM] = stored[o + head * HEAD_DIM..o + (head + 1) * HEAD_DIM].try_into().expect("slice of HEAD_DIM");
+            let codes: &[u8; HEAD_DIM] = stored[o + head * HEAD_DIM..o + (head + 1) * HEAD_DIM]
+                .try_into()
+                .expect("slice of HEAD_DIM");
             let so = o + kv_heads * HEAD_DIM + 2 * head;
             let scale = u16::from_le_bytes([stored[so], stored[so + 1]]);
             out.extend_from_slice(&reference_decode_head(codes, scale));
@@ -380,17 +414,36 @@ fn vg(base: Src, k: u8) -> Src {
         other => panic!("vg: {other:?} is not a VGPR"),
     }
 }
-fn fma_neg0() -> Mods { Mods { neg: 0b001, ..Mods::default() } }
-fn fma() -> Vop3Op { Vop3Op::Only(Vop3OnlyOp::FmaF32) }
+fn fma_neg0() -> Mods {
+    Mods {
+        neg: 0b001,
+        ..Mods::default()
+    }
+}
+fn fma() -> Vop3Op {
+    Vop3Op::Only(Vop3OnlyOp::FmaF32)
+}
 
 /// `dst = base + off` (64-bit pointer plus 32-bit unsigned byte offset).
 fn ptr_add(b: &mut Builder, dst: Src, base: Src, off: Src) -> R<()> {
     b.push(ops::s2(Sop2Op::AddU32, dst, base, off))?;
-    b.push(ops::s2(Sop2Op::AddcU32, sg(dst, 1), sg(base, 1), Src::Int(0)))
+    b.push(ops::s2(
+        Sop2Op::AddcU32,
+        sg(dst, 1),
+        sg(base, 1),
+        Src::Int(0),
+    ))
 }
 
 /// Scratch registers of one IEEE F32 division.
-struct DivRegs { scaled_den: Src, recip: Src, scaled_num: Src, err: Src, quot: Src, dummy_sdst: Src }
+struct DivRegs {
+    scaled_den: Src,
+    recip: Src,
+    scaled_num: Src,
+    err: Src,
+    quot: Src,
+    dummy_sdst: Src,
+}
 
 /// `q = num / den` in IEEE F32, the sequence gfx942 clang emits for `fdiv`
 /// with F32 denormals preserved. `den` and `num` are VGPRs or one SGPR/inline
@@ -399,16 +452,55 @@ struct DivRegs { scaled_den: Src, recip: Src, scaled_num: Src, err: Src, quot: S
 /// `v_div_scale_f32`.
 fn emit_div(b: &mut Builder, q: Src, num: Src, den: Src, w: &DivRegs) -> R<()> {
     let one = Src::Float(InlineFloat::One);
-    b.push(ops::v3b(Vop3OnlyOp::DivScaleF32, w.scaled_den, w.dummy_sdst, &[den, den, num]))?;
+    b.push(ops::v3b(
+        Vop3OnlyOp::DivScaleF32,
+        w.scaled_den,
+        w.dummy_sdst,
+        &[den, den, num],
+    ))?;
     b.push(ops::v1(Vop1Op::RcpF32, w.recip, w.scaled_den))?;
-    b.push(ops::v3b(Vop3OnlyOp::DivScaleF32, w.scaled_num, Src::VccLo, &[num, den, num]))?;
-    b.push(ops::v3m(fma(), w.err, &[w.scaled_den, w.recip, one], fma_neg0()))?; //  e = fma(-d, r, 1)
-    b.push(ops::v3m(fma(), w.recip, &[w.err, w.recip, w.recip], Mods::default()))?; //  r = fma(e, r, r)
+    b.push(ops::v3b(
+        Vop3OnlyOp::DivScaleF32,
+        w.scaled_num,
+        Src::VccLo,
+        &[num, den, num],
+    ))?;
+    b.push(ops::v3m(
+        fma(),
+        w.err,
+        &[w.scaled_den, w.recip, one],
+        fma_neg0(),
+    ))?; //  e = fma(-d, r, 1)
+    b.push(ops::v3m(
+        fma(),
+        w.recip,
+        &[w.err, w.recip, w.recip],
+        Mods::default(),
+    ))?; //  r = fma(e, r, r)
     b.push(ops::v2(Vop2Op::MulF32, w.quot, w.scaled_num, w.recip))?; //  y = n * r
-    b.push(ops::v3m(fma(), w.err, &[w.scaled_den, w.quot, w.scaled_num], fma_neg0()))?; //  e = fma(-d, y, n)
-    b.push(ops::v3m(fma(), w.quot, &[w.err, w.recip, w.quot], Mods::default()))?; //  y = fma(e, r, y)
-    b.push(ops::v3m(fma(), w.err, &[w.scaled_den, w.quot, w.scaled_num], fma_neg0()))?; //  e = fma(-d, y, n)
-    b.push(ops::v3(Vop3OnlyOp::DivFmasF32, w.quot, &[w.err, w.recip, w.quot]))?;
+    b.push(ops::v3m(
+        fma(),
+        w.err,
+        &[w.scaled_den, w.quot, w.scaled_num],
+        fma_neg0(),
+    ))?; //  e = fma(-d, y, n)
+    b.push(ops::v3m(
+        fma(),
+        w.quot,
+        &[w.err, w.recip, w.quot],
+        Mods::default(),
+    ))?; //  y = fma(e, r, y)
+    b.push(ops::v3m(
+        fma(),
+        w.err,
+        &[w.scaled_den, w.quot, w.scaled_num],
+        fma_neg0(),
+    ))?; //  e = fma(-d, y, n)
+    b.push(ops::v3(
+        Vop3OnlyOp::DivFmasF32,
+        w.quot,
+        &[w.err, w.recip, w.quot],
+    ))?;
     b.push(ops::v3(Vop3OnlyOp::DivFixupF32, q, &[w.quot, den, num]))
 }
 
@@ -417,7 +509,8 @@ pub fn build_encode(arch: Arch, kv_heads: usize) -> R<Kernel> {
     check_geometry(kv_heads)?;
     let heads = kv_heads as u32;
     let rb = row_bytes(kv_heads) as u32;
-    let scale_imm = i16::try_from(kv_heads * HEAD_DIM).map_err(|_| "scale offset exceeds the immediate".to_string())?;
+    let scale_imm = i16::try_from(kv_heads * HEAD_DIM)
+        .map_err(|_| "scale offset exceeds the immediate".to_string())?;
     let mut b = Builder::new(arch, &encode_symbol(kv_heads), BLOCK)?;
     let a_dst = b.arg_ptr("dst", false)?;
     let a_src = b.arg_ptr("src", true)?;
@@ -425,7 +518,9 @@ pub fn build_encode(arch: Arch, kv_heads: usize) -> R<Kernel> {
     let wg_row = b.workgroup_id(1)?;
     let v0 = b.workitem_ids(1)?;
     let lds = b.lds(ENCODE_LDS_BYTES, 16)?;
-    let lds_off = |k: u32| u16::try_from(lds.offset + k).map_err(|_| "LDS offset exceeds the DS immediate".to_string());
+    let lds_off = |k: u32| {
+        u16::try_from(lds.offset + k).map_err(|_| "LDS offset exceeds the DS immediate".to_string())
+    };
 
     // SGPRs.
     let dstp = b.sgprs(2, 2)?;
@@ -493,15 +588,42 @@ pub fn build_encode(arch: Arch, kv_heads: usize) -> R<Kernel> {
 
     // x = src[head][tid]; amax of the head.
     b.push(ops::global_load(FlatOp::LoadDword, x, off4, Some(xptr), 0))?;
-    b.push(ops::v3m(Vop3Op::V2(Vop2Op::MaxF32), amax, &[x, x], Mods { abs: 0b011, ..Mods::default() }))?; //  |x|
-    for ctrl in [DppCtrl::QuadPerm([1, 0, 3, 2]), DppCtrl::QuadPerm([2, 3, 0, 1]), DppCtrl::RowHalfMirror, DppCtrl::RowMirror] {
-        b.push(ops::dpp2(Vop2Op::MaxF32, amax, amax, amax, ctrl, 0xf, 0xf, false))?;
+    b.push(ops::v3m(
+        Vop3Op::V2(Vop2Op::MaxF32),
+        amax,
+        &[x, x],
+        Mods {
+            abs: 0b011,
+            ..Mods::default()
+        },
+    ))?; //  |x|
+    for ctrl in [
+        DppCtrl::QuadPerm([1, 0, 3, 2]),
+        DppCtrl::QuadPerm([2, 3, 0, 1]),
+        DppCtrl::RowHalfMirror,
+        DppCtrl::RowMirror,
+    ] {
+        b.push(ops::dpp2(
+            Vop2Op::MaxF32,
+            amax,
+            amax,
+            amax,
+            ctrl,
+            0xf,
+            0xf,
+            false,
+        ))?;
     }
     // Each 16-lane row holds its maximum in every lane; lanes of a row write the same value to one slot.
     b.push(ops::ds_write(DsOp::WriteB32, slot, amax, lds_off(0)?))?;
     b.barrier()?;
     for i in 0..4u8 {
-        b.push(ops::ds_read(DsOp::ReadB128, vg(rows16, 4 * i), zero, lds_off(16 * u32::from(i))?))?;
+        b.push(ops::ds_read(
+            DsOp::ReadB128,
+            vg(rows16, 4 * i),
+            zero,
+            lds_off(16 * u32::from(i))?,
+        ))?;
     }
     b.push(ops::v2(Vop2Op::MaxF32, amax, rows16, vg(rows16, 1)))?;
     for i in 2..16u8 {
@@ -516,13 +638,25 @@ pub fn build_encode(arch: Arch, kv_heads: usize) -> R<Kernel> {
     b.push(ops::vc(VopcOp::CmpEqF32, m_eq, Src::Int(0), amax))?; //  amax == 0
     b.push(ops::vc(VopcOp::CmpEqU32, m_t0, Src::Int(0), bits))?; //  scale rounded to zero
     b.push(ops::s2(Sop2Op::AndB64, m_t0, m_t0, m_gt))?;
-    b.push(ops::v2ci(Vop2Op::CndmaskB32, bits, None, bits, Src::Int(1), m_t0))?; //  0 -> 0x0001 (amax > 0)
+    b.push(ops::v2ci(
+        Vop2Op::CndmaskB32,
+        bits,
+        None,
+        bits,
+        Src::Int(1),
+        m_t0,
+    ))?; //  0 -> 0x0001 (amax > 0)
     b.push(ops::v2ci(Vop2Op::CndmaskB32, bits, None, bits, one16, m_eq))?; //  amax == 0 -> F16(1)
     b.push(ops::v1(Vop1Op::CvtF32F16, sf, bits))?;
     b.push(ops::v2(Vop2Op::MulF32, prod, Src::Lit(F32_448), sf))?; //  448 * sf, exact
     b.push(ops::vc(VopcOp::CmpLtF32, m_t1, prod, amax))?;
     b.push(ops::s2(Sop2Op::AndB64, m_t1, m_t1, m_gt))?;
-    b.push(ops::v2(Vop2Op::MinU32, alt, Src::Lit(F16_MAX_BUMP_FROM), bits))?;
+    b.push(ops::v2(
+        Vop2Op::MinU32,
+        alt,
+        Src::Lit(F16_MAX_BUMP_FROM),
+        bits,
+    ))?;
     b.push(ops::v2(Vop2Op::AddU32, alt, Src::Int(1), alt))?; //  bits >= 0x7bff ? 0x7bff : bits + 1
     b.push(ops::v2ci(Vop2Op::CndmaskB32, bits, None, bits, alt, m_t1))?; //  single conditional ulp bump
     b.push(ops::v1(Vop1Op::CvtF32F16, sf, bits))?;
@@ -533,13 +667,32 @@ pub fn build_encode(arch: Arch, kv_heads: usize) -> R<Kernel> {
     b.push(ops::v1(Vop1Op::MovB32, word, Src::Int(0)))?;
     b.push(ops::v3(Vop3OnlyOp::CvtPkFp8F32, word, &[z, zero]))?; //  src1 must be a VGPR: byte 1 = fp8(0) = 0
     b.push(ops::vc(VopcOp::CmpEqU32, Src::VccLo, Src::Lit(0x80), word))?;
-    b.push(ops::v2ci(Vop2Op::CndmaskB32, word, None, word, zero, Src::VccLo))?;
-    b.push(ops::global_store(FlatOp::StoreByte, tid, word, Some(cptr), 0))?;
+    b.push(ops::v2ci(
+        Vop2Op::CndmaskB32,
+        word,
+        None,
+        word,
+        zero,
+        Src::VccLo,
+    ))?;
+    b.push(ops::global_store(
+        FlatOp::StoreByte,
+        tid,
+        word,
+        Some(cptr),
+        0,
+    ))?;
 
     // Thread 0 stores the scale (EXEC = lane 0 of wave 0; the kernel ends after the store).
     b.push(ops::vc(VopcOp::CmpEqU32, Src::VccLo, Src::Int(0), tid))?;
     b.push(ops::s1(Sop1Op::MovB64, Src::ExecLo, Src::VccLo))?;
-    b.push(ops::global_store(FlatOp::StoreShort, zero, bits, Some(sptr), scale_imm))?;
+    b.push(ops::global_store(
+        FlatOp::StoreShort,
+        zero,
+        bits,
+        Some(sptr),
+        scale_imm,
+    ))?;
     b.finish()
 }
 
@@ -548,7 +701,8 @@ pub fn build_decode(arch: Arch, kv_heads: usize) -> R<Kernel> {
     check_geometry(kv_heads)?;
     let heads = kv_heads as u32;
     let rb = row_bytes(kv_heads) as u32;
-    let scale_imm = i16::try_from(kv_heads * HEAD_DIM).map_err(|_| "scale offset exceeds the immediate".to_string())?;
+    let scale_imm = i16::try_from(kv_heads * HEAD_DIM)
+        .map_err(|_| "scale offset exceeds the immediate".to_string())?;
     let mut b = Builder::new(arch, &decode_symbol(kv_heads), BLOCK)?;
     let a_dst = b.arg_ptr("dst", false)?;
     let a_src = b.arg_ptr("src", true)?;
@@ -590,14 +744,35 @@ pub fn build_decode(arch: Arch, kv_heads: usize) -> R<Kernel> {
     b.push(ops::v2(Vop2Op::AndB32, tid, Src::Lit(0x3ff), v0))?;
     b.push(ops::v1(Vop1Op::MovB32, zero, Src::Int(0)))?;
     b.push(ops::v2(Vop2Op::LshlrevB32, off4, Src::Int(2), tid))?;
-    b.push(ops::global_load(FlatOp::LoadUbyte, code, tid, Some(cptr), 0))?;
-    b.push(ops::global_load(FlatOp::LoadUshort, sbits, zero, Some(sptr), scale_imm))?;
+    b.push(ops::global_load(
+        FlatOp::LoadUbyte,
+        code,
+        tid,
+        Some(cptr),
+        0,
+    ))?;
+    b.push(ops::global_load(
+        FlatOp::LoadUshort,
+        sbits,
+        zero,
+        Some(sptr),
+        scale_imm,
+    ))?;
     b.push(ops::v1(Vop1Op::CvtF32F16, sf, sbits))?;
-    b.push(ops::v2(Vop2Op::MulF32, s2, Src::Float(InlineFloat::Two), sf))?; //  2 * f32(s16), in F32
+    b.push(ops::v2(
+        Vop2Op::MulF32,
+        s2,
+        Src::Float(InlineFloat::Two),
+        sf,
+    ))?; //  2 * f32(s16), in F32
     b.push(ops::v1(Vop1Op::CvtF32Fp8, val, code))?; //  FNUZ decode of the OCP byte (= half its OCP value)
     b.push(ops::v2(Vop2Op::MulF32, out, s2, val))?;
-    b.push(ops::global_store(FlatOp::StoreDword, off4, out, Some(xptr), 0))?;
+    b.push(ops::global_store(
+        FlatOp::StoreDword,
+        off4,
+        out,
+        Some(xptr),
+        0,
+    ))?;
     b.finish()
 }
-
-

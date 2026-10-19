@@ -264,7 +264,9 @@ impl EpTileExchangeBuilder {
             )));
         }
         if self.regs[rank].is_some() {
-            return Err(err(format!("ep_tile_exchange: rank {rank} registered twice")));
+            return Err(err(format!(
+                "ep_tile_exchange: rank {rank} registered twice"
+            )));
         }
         let len = y_down_grouped.buf.size();
         let base = y_down_grouped.buf.as_ptr() as usize;
@@ -435,7 +437,9 @@ impl EpTileExchange {
                 Err(e) => return Err(e),
             }
         }
-        self.ranks[rank].peers_enabled.store(true, Ordering::Release);
+        self.ranks[rank]
+            .peers_enabled
+            .store(true, Ordering::Release);
         Ok(())
     }
 
@@ -611,7 +615,12 @@ impl Drop for EpTileExchange {
         let live = self
             .ranks
             .iter()
-            .filter(|r| r.ready.iter().chain(r.done.iter()).any(|e| lock(e).is_some()))
+            .filter(|r| {
+                r.ready
+                    .iter()
+                    .chain(r.done.iter())
+                    .any(|e| lock(e).is_some())
+            })
             .count();
         if live > 0 {
             eprintln!(
@@ -645,22 +654,53 @@ mod tests {
 
     #[test]
     fn supported_rank_counts_validate() {
-        assert!(EpTileExchangeSpec { ranks: 2, ..spec(8) }.validate().is_ok());
+        assert!(EpTileExchangeSpec {
+            ranks: 2,
+            ..spec(8)
+        }
+        .validate()
+        .is_ok());
         for ranks in 2..=MAX_RANKS {
-            assert!(EpTileExchangeSpec { ranks, ..spec(8) }.validate().is_ok(), "ranks={ranks}");
+            assert!(
+                EpTileExchangeSpec { ranks, ..spec(8) }.validate().is_ok(),
+                "ranks={ranks}"
+            );
         }
     }
 
     #[test]
     fn spec_validation_refuses_everything_else() {
         for ranks in [0, 1, 9, 16, usize::MAX] {
-            assert!(EpTileExchangeSpec { ranks, ..spec(8) }.validate().is_err(), "ranks={ranks}");
+            assert!(
+                EpTileExchangeSpec { ranks, ..spec(8) }.validate().is_err(),
+                "ranks={ranks}"
+            );
         }
-        assert!(EpTileExchangeSpec { experts: 0, ..spec(8) }.validate().is_err());
-        assert!(EpTileExchangeSpec { experts: usize::MAX, ..spec(8) }.validate().is_err());
-        assert!(EpTileExchangeSpec { row_u4: 0, ..spec(8) }.validate().is_err());
+        assert!(EpTileExchangeSpec {
+            experts: 0,
+            ..spec(8)
+        }
+        .validate()
+        .is_err());
+        assert!(EpTileExchangeSpec {
+            experts: usize::MAX,
+            ..spec(8)
+        }
+        .validate()
+        .is_err());
+        assert!(EpTileExchangeSpec {
+            row_u4: 0,
+            ..spec(8)
+        }
+        .validate()
+        .is_err());
         // 16 rows x 72 uint4 = 1152 uint4: not a multiple of 1024.
-        assert!(EpTileExchangeSpec { row_u4: 72, ..spec(8) }.validate().is_err());
+        assert!(EpTileExchangeSpec {
+            row_u4: 72,
+            ..spec(8)
+        }
+        .validate()
+        .is_err());
         assert!(spec(0).validate().is_err());
         // 60,000 tiles x 80 KiB exceeds 32 bits.
         assert!(spec(60_000).validate().is_err());
@@ -685,7 +725,10 @@ mod tests {
         assert_eq!(pending_done_parity(3), Some(0));
         assert_eq!(pending_done_parity(48), Some(1));
         assert_eq!(pending_done_parity(49), Some(0));
-        assert_eq!((parity(0), parity(1), parity(2), parity(47), parity(48)), (0, 1, 0, 1, 0));
+        assert_eq!(
+            (parity(0), parity(1), parity(2), parity(47), parity(48)),
+            (0, 1, 0, 1, 0)
+        );
     }
 
     #[test]
@@ -710,7 +753,10 @@ mod tests {
             assert!(b.regs.iter().all(Option::is_none));
         }
         // An unsupported spec never sizes a registration table past MAX_RANKS.
-        let b = EpTileExchange::builder(EpTileExchangeSpec { ranks: usize::MAX, ..spec(8) });
+        let b = EpTileExchange::builder(EpTileExchangeSpec {
+            ranks: usize::MAX,
+            ..spec(8)
+        });
         assert!(b.regs.len() <= MAX_RANKS);
     }
 
@@ -741,7 +787,10 @@ mod tests {
     /// stays valid), unused slots zero, fixed-size (no per-exchange allocation).
     #[test]
     fn pull_sources_layout() {
-        assert_eq!(pull_sources([0x1000, 0x2000].into_iter()), [0x1000, 0x2000, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            pull_sources([0x1000, 0x2000].into_iter()),
+            [0x1000, 0x2000, 0, 0, 0, 0, 0, 0]
+        );
         assert_eq!(
             pull_sources([0x1000, 0x2000, 0x3000, 0x4000].into_iter()),
             [0x1000, 0x2000, 0x3000, 0x4000, 0, 0, 0, 0]

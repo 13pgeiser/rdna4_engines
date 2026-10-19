@@ -73,7 +73,8 @@ pub const E8P_I4_MOE_GEMV_MODULE: &str = "e8p_i4_moe_gemv_pm_gfx1201";
 
 /// `[gate_up (R256), down (R128)]` entry symbols of the gfx1201 module (per arch:
 /// [`E8pArch::symbols`]).
-pub const E8P_I4_MOE_GEMV_SYMBOLS: [&str; 2] = ["e8p_i4_moe_gemv_r256_gate_up", "e8p_i4_moe_gemv_r128_down"];
+pub const E8P_I4_MOE_GEMV_SYMBOLS: [&str; 2] =
+    ["e8p_i4_moe_gemv_r256_gate_up", "e8p_i4_moe_gemv_r128_down"];
 
 /// Module key of the emitted gfx1151 K-E2 image (the gfx1100 arm with only arch-forced deltas).
 pub const E8P_I4_MOE_GEMV_GFX1151_MODULE: &str = "e8p_i4_moe_gemv_pm_gfx1151";
@@ -254,7 +255,10 @@ pub enum E8pMoeError {
     /// Distinct-expert count outside `1..=min(10 C, 512)`.
     InvalidUnion { u: usize, c: usize },
     /// An operand is null, misaligned, too small, overflowing or aliases another one.
-    Operand { name: &'static str, reason: &'static str },
+    Operand {
+        name: &'static str,
+        reason: &'static str,
+    },
     /// The device is not exactly gfx1201 or gfx1151.
     Arch(String),
     /// The launch cannot be issued in this execution mode.
@@ -273,7 +277,10 @@ impl fmt::Display for E8pMoeError {
                 max_union(*c)
             ),
             Self::Operand { name, reason } => write!(f, "operand {name}: {reason}"),
-            Self::Arch(got) => write!(f, "e8p_i4_moe_gemv is exact gfx1201 or gfx1151 only, device is {got:?}"),
+            Self::Arch(got) => write!(
+                f,
+                "e8p_i4_moe_gemv is exact gfx1201 or gfx1151 only, device is {got:?}"
+            ),
             Self::Unavailable(why) => write!(f, "{why}"),
             Self::Layout(why) => write!(f, "union layout: {why}"),
         }
@@ -711,7 +718,11 @@ impl E8pMoeDecodeModule {
             gpu.hip.module_get_function(&module, symbols[0])?,
             gpu.hip.module_get_function(&module, symbols[1])?,
         ];
-        Ok(Self { _module: module, functions, arch })
+        Ok(Self {
+            _module: module,
+            functions,
+            arch,
+        })
     }
 
     /// The architecture whose symbols this module bound.
@@ -975,7 +986,9 @@ mod tests {
     fn arch_table_is_exactly_gfx1201_and_gfx1151_with_the_gfx1201_names_unchanged() {
         assert_eq!(E8pArch::of_name("gfx1201"), Some(E8pArch::Gfx1201));
         assert_eq!(E8pArch::of_name("gfx1151"), Some(E8pArch::Gfx1151));
-        for other in ["gfx1100", "gfx1101", "gfx1152", "gfx1200", "gfx942", "GFX1151", "gfx1151x", ""] {
+        for other in [
+            "gfx1100", "gfx1101", "gfx1152", "gfx1200", "gfx942", "GFX1151", "gfx1151x", "",
+        ] {
             assert_eq!(E8pArch::of_name(other), None, "{other:?}");
         }
         for arch in E8pArch::ALL {
@@ -985,27 +998,49 @@ mod tests {
         assert_eq!(E8pArch::Gfx1201.module(), E8P_I4_MOE_GEMV_MODULE);
         assert_eq!(E8pArch::Gfx1201.module(), "e8p_i4_moe_gemv_pm_gfx1201");
         assert_eq!(E8pArch::Gfx1201.symbols(), E8P_I4_MOE_GEMV_SYMBOLS);
-        assert_eq!(E8pArch::Gfx1201.image(), crate::kernels::E8P_I4_MOE_GEMV_PM_GFX1201);
+        assert_eq!(
+            E8pArch::Gfx1201.image(),
+            crate::kernels::E8P_I4_MOE_GEMV_PM_GFX1201
+        );
         // gfx1151: its own module, the `_pm_gfx1151` symbols and its own image.
         assert_eq!(E8pArch::Gfx1151.module(), "e8p_i4_moe_gemv_pm_gfx1151");
         assert_eq!(
             E8pArch::Gfx1151.symbols(),
-            ["e8p_i4_moe_gemv_r256_gate_up_pm_gfx1151", "e8p_i4_moe_gemv_r128_down_pm_gfx1151"]
+            [
+                "e8p_i4_moe_gemv_r256_gate_up_pm_gfx1151",
+                "e8p_i4_moe_gemv_r128_down_pm_gfx1151"
+            ]
         );
-        assert_eq!(E8pArch::Gfx1151.image(), crate::kernels::E8P_I4_MOE_GEMV_PM_GFX1151);
+        assert_eq!(
+            E8pArch::Gfx1151.image(),
+            crate::kernels::E8P_I4_MOE_GEMV_PM_GFX1151
+        );
         for kind in E8pKind::ALL {
             assert_eq!(kind.symbol(), kind.symbol_on(E8pArch::Gfx1201));
-            assert_eq!(kind.symbol_on(E8pArch::Gfx1151), E8pArch::Gfx1151.symbols()[kind.index()]);
-            assert_eq!(kind.symbol_on(E8pArch::Gfx1151), format!("{}_pm_gfx1151", kind.symbol()));
+            assert_eq!(
+                kind.symbol_on(E8pArch::Gfx1151),
+                E8pArch::Gfx1151.symbols()[kind.index()]
+            );
+            assert_eq!(
+                kind.symbol_on(E8pArch::Gfx1151),
+                format!("{}_pm_gfx1151", kind.symbol())
+            );
         }
         for arch in E8pArch::ALL {
             for symbol in arch.symbols() {
-                assert!(contains_bytes(arch.image(), format!("{symbol}.kd").as_bytes()), "{} {symbol}.kd", arch.name());
+                assert!(
+                    contains_bytes(arch.image(), format!("{symbol}.kd").as_bytes()),
+                    "{} {symbol}.kd",
+                    arch.name()
+                );
             }
         }
         // Each image carries its own symbols only.
         for symbol in E8pArch::Gfx1151.symbols() {
-            assert!(!contains_bytes(E8pArch::Gfx1201.image(), symbol.as_bytes()), "{symbol} in the gfx1201 image");
+            assert!(
+                !contains_bytes(E8pArch::Gfx1201.image(), symbol.as_bytes()),
+                "{symbol} in the gfx1201 image"
+            );
         }
         assert_ne!(E8pArch::Gfx1201.image(), E8pArch::Gfx1151.image());
     }
@@ -1020,7 +1055,10 @@ mod tests {
                 assert_eq!(base.symbol, kind.symbol());
                 let halo = plan_launch_on(E8pArch::Gfx1151, &req).unwrap();
                 assert_eq!(halo.symbol, kind.symbol_on(E8pArch::Gfx1151));
-                assert_eq!((halo.kind, halo.grid, halo.block, halo.kernargs), (base.kind, base.grid, base.block, base.kernargs));
+                assert_eq!(
+                    (halo.kind, halo.grid, halo.block, halo.kernargs),
+                    (base.kind, base.grid, base.block, base.kernargs)
+                );
             }
         }
     }

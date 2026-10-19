@@ -50,9 +50,7 @@
 //!
 //! Exit code 0 only if every meaningful case PASSes (INCONCLUSIVE is allowed).
 
-use hipfire_ds4_parent::codec::{
-    e2m1_to_f32, e4m3_to_f32, round_to_bf16, ue8m0_to_f32,
-};
+use hipfire_ds4_parent::codec::{e2m1_to_f32, e4m3_to_f32, round_to_bf16, ue8m0_to_f32};
 use hipfire_ds4_parent::gemm_ref::{
     act_quant_fp8_codes, linear_fp4_ref, linear_fp8_ref, AccumMode,
 };
@@ -146,10 +144,7 @@ fn run() -> Result<(), String> {
 
     // ── GPU + admit ──────────────────────────────────────────────────────
     let mut gpu = Gpu::init().map_err(|e| format!("deepseek4 parent: Gpu::init failed: {e:?}"))?;
-    let gfx = gpu
-        .try_gfx942()
-        .map(|_| "gfx942")
-        .unwrap_or("not-gfx942");
+    let gfx = gpu.try_gfx942().map(|_| "gfx942").unwrap_or("not-gfx942");
     println!("gpu: {gfx}");
     if gfx != "gfx942" {
         return Err(format!(
@@ -337,7 +332,12 @@ fn run() -> Result<(), String> {
         if let Some(e) = &c.error {
             println!("  {}: ERROR — {e}", c.name);
         } else {
-            println!("  [{}] {}: {}", c.verdict.as_str(), c.name, c.interpretation);
+            println!(
+                "  [{}] {}: {}",
+                c.verdict.as_str(),
+                c.name,
+                c.interpretation
+            );
         }
     }
     println!();
@@ -399,12 +399,8 @@ fn run() -> Result<(), String> {
     if let Some(path) = args.manifest.as_ref() {
         manifest.write_to(path)?;
         println!("wrote {}", path.display());
-        let written = fs::read_to_string(path).map_err(|e| {
-            format!(
-                "deepseek4 parent: re-read manifest {}: {e}",
-                path.display()
-            )
-        })?;
+        let written = fs::read_to_string(path)
+            .map_err(|e| format!("deepseek4 parent: re-read manifest {}: {e}", path.display()))?;
         println!("--- manifest.json begin ---");
         print!("{written}");
         if !written.ends_with('\n') {
@@ -572,9 +568,7 @@ fn run_real_expert(
     }
     let n = ws[0];
     let k = ws[1] * 2; // packed along K
-    println!(
-        "    weight I8 {ws:?} logical [{n},{k}]  scale F8_E8M0 {ss:?}  act batch m={m}"
-    );
+    println!("    weight I8 {ws:?} logical [{n},{k}]  scale F8_E8M0 {ss:?}  act batch m={m}");
     let x = gen_acts_bf16(rng, m * k, ScaleMode::Wide);
     run_expert_case(gpu, backend, &x, &wbytes, &sbytes, m, n, k, name)
 }
@@ -827,11 +821,7 @@ fn linear_fp4_sequential(
                 let av = e4m3_to_f32(a[mi * k + kk]);
                 // Packed E2M1: low nibble = even k, high nibble = odd k.
                 let byte = b[ni * (k / 2) + kk / 2];
-                let nibble = if kk & 1 == 0 {
-                    byte & 0x0f
-                } else {
-                    byte >> 4
-                };
+                let nibble = if kk & 1 == 0 { byte & 0x0f } else { byte >> 4 };
                 let bv = e2m1_to_f32(nibble);
                 acc += (sa * sb) * (av * bv);
             }
@@ -1003,25 +993,11 @@ fn score_case(
     let (_, _, _, _) = (mean_signed, std_signed, bias_noise_floor, count); // kept for reports
     let (bias_z_ref, mean_ref) = {
         let (_, _, mean, std) = residual_stats(reference, exact);
-        (
-            if std > 0.0 {
-                mean.abs() / std
-            } else {
-                0.0
-            },
-            mean,
-        )
+        (if std > 0.0 { mean.abs() / std } else { 0.0 }, mean)
     };
     let (bias_z_seq, mean_seq) = {
         let (_, _, mean, std) = residual_stats(sequential, exact);
-        (
-            if std > 0.0 {
-                mean.abs() / std
-            } else {
-                0.0
-            },
-            mean,
-        )
+        (if std > 0.0 { mean.abs() / std } else { 0.0 }, mean)
     };
     // Absolute material threshold OR GPU much more biased than both CPU trees.
     let cpu_bias_ceiling = bias_z_ref.max(bias_z_seq).max(bias_noise_floor) * 3.0 + 0.05;
@@ -1041,9 +1017,8 @@ fn score_case(
         );
     } else if ratio_ref <= RATIO_HARD {
         // Must match sequential-f32 magnitude to claim "deeper tree, same op".
-        let seq_ok = err_seq > ERR_REF_FLOOR
-            && ratio_seq <= SEQ_MATCH
-            && ratio_seq >= 1.0 / SEQ_MATCH;
+        let seq_ok =
+            err_seq > ERR_REF_FLOOR && ratio_seq <= SEQ_MATCH && ratio_seq >= 1.0 / SEQ_MATCH;
         mag_ok = seq_ok;
         if seq_ok {
             mag_note = format!(
@@ -1059,9 +1034,8 @@ fn score_case(
         }
     } else {
         mag_ok = false;
-        mag_note = format!(
-            "ratio_ref={ratio_ref:.2} > {RATIO_HARD}× hard ceiling vs ReferenceOrder"
-        );
+        mag_note =
+            format!("ratio_ref={ratio_ref:.2} > {RATIO_HARD}× hard ceiling vs ReferenceOrder");
     }
 
     let verdict = if bias_ok && mag_ok {
@@ -1318,8 +1292,7 @@ fn upload_bf16(gpu: &mut Gpu, bytes: &[u8], shape: &[usize]) -> Result<GpuTensor
 
 fn download_f32(gpu: &Gpu, t: &GpuTensor, n: usize) -> Result<Vec<f32>, String> {
     let mut data = vec![0f32; n];
-    let bytes =
-        unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, n * 4) };
+    let bytes = unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, n * 4) };
     gpu.hip
         .memcpy_dtoh(bytes, &t.buf)
         .map_err(|e| format!("deepseek4 parent: download f32: {e:?}"))?;
@@ -1334,12 +1307,8 @@ fn load_from_shard(
     shard_path: &Path,
     tensor_name: &str,
 ) -> Result<(String, Vec<usize>, Vec<u8>), String> {
-    let data = fs::read(shard_path).map_err(|e| {
-        format!(
-            "deepseek4 parent: read shard {}: {e}",
-            shard_path.display()
-        )
-    })?;
+    let data = fs::read(shard_path)
+        .map_err(|e| format!("deepseek4 parent: read shard {}: {e}", shard_path.display()))?;
     if data.len() < 8 {
         return Err("deepseek4 parent: shard too small".into());
     }
@@ -1421,11 +1390,9 @@ fn parse_args() -> Result<Args, String> {
                     .next()
                     .ok_or_else(|| "flag --seed missing value".to_string())?;
                 seed = if let Some(hex) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
-                    u64::from_str_radix(hex, 16)
-                        .map_err(|e| format!("--seed hex parse: {e}"))?
+                    u64::from_str_radix(hex, 16).map_err(|e| format!("--seed hex parse: {e}"))?
                 } else {
-                    v.parse::<u64>()
-                        .map_err(|e| format!("--seed parse: {e}"))?
+                    v.parse::<u64>().map_err(|e| format!("--seed parse: {e}"))?
                 };
             }
             "-h" | "--help" => {
@@ -1494,12 +1461,8 @@ fn build_source_info(root: &Path, skip_shard_hashes: bool) -> Result<SourceInfo,
     let hash_t0 = Instant::now();
     let mut shards = Vec::with_capacity(shard_paths.len());
     for (i, p) in shard_paths.iter().enumerate() {
-        let meta = fs::metadata(p).map_err(|e| {
-            format!(
-                "deepseek4 parent: metadata {}: {e}",
-                p.display()
-            )
-        })?;
+        let meta = fs::metadata(p)
+            .map_err(|e| format!("deepseek4 parent: metadata {}: {e}", p.display()))?;
         let bytes = meta.len();
         let file = p
             .file_name()

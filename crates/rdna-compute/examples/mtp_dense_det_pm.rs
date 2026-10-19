@@ -119,12 +119,20 @@ fn f32_to_f16_rne(f: f32) -> u16 {
         let half = m >> shift;
         let rem = m & ((1u32 << shift) - 1);
         let mid = 1u32 << (shift - 1);
-        let r = if rem > mid || (rem == mid && half & 1 == 1) { half + 1 } else { half };
+        let r = if rem > mid || (rem == mid && half & 1 == 1) {
+            half + 1
+        } else {
+            half
+        };
         return s | r as u16;
     }
     let half = ((ne as u32) << 10) | (m >> 13);
     let rem = m & 0x1fff;
-    let r = if rem > 0x1000 || (rem == 0x1000 && half & 1 == 1) { half + 1 } else { half };
+    let r = if rem > 0x1000 || (rem == 0x1000 && half & 1 == 1) {
+        half + 1
+    } else {
+        half
+    };
     s | r as u16
 }
 
@@ -139,12 +147,16 @@ impl Guarded {
     fn new(gpu: &mut Gpu, elems: usize) -> Res<Self> {
         let total = elems + 2 * GUARD / 4;
         let store = gpu.alloc_tensor(&[total], DType::F32)?;
-        let g = Self { store, payload_elems: elems };
+        let g = Self {
+            store,
+            payload_elems: elems,
+        };
         g.poison(gpu)?;
         Ok(g)
     }
     fn poison(&self, gpu: &Gpu) -> Res<()> {
-        gpu.hip.memset(&self.store.buf, i32::from(POISON), self.store.byte_size())?;
+        gpu.hip
+            .memset(&self.store.buf, i32::from(POISON), self.store.byte_size())?;
         Ok(())
     }
     fn view(&self) -> GpuTensor {
@@ -173,7 +185,9 @@ fn region_ok(buf: &[u8], written: usize) -> bool {
 
 /// F32 words of the payload that are still the poison pattern.
 fn poison_left(p: &[u8]) -> usize {
-    p.chunks_exact(4).filter(|c| c.iter().all(|&b| b == POISON)).count()
+    p.chunks_exact(4)
+        .filter(|c| c.iter().all(|&b| b == POISON))
+        .count()
 }
 
 fn first_diff(a: &[u8], b: &[u8]) -> (usize, Option<usize>) {
@@ -185,11 +199,15 @@ fn first_diff(a: &[u8], b: &[u8]) -> (usize, Option<usize>) {
             first.get_or_insert(i);
         }
     }
-    (n + a.len().abs_diff(b.len()), first.or((a.len() != b.len()).then_some(a.len().min(b.len()))))
+    (
+        n + a.len().abs_diff(b.len()),
+        first.or((a.len() != b.len()).then_some(a.len().min(b.len()))),
+    )
 }
 
 fn f32s(b: &[u8]) -> impl Iterator<Item = f32> + '_ {
-    b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -198,7 +216,11 @@ fn median(mut v: Vec<f64>) -> f64 {
     if n == 0 {
         return f64::NAN;
     }
-    if n % 2 == 1 { v[n / 2] } else { 0.5 * (v[n / 2 - 1] + v[n / 2]) }
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        0.5 * (v[n / 2 - 1] + v[n / 2])
+    }
 }
 
 struct ErrStats {
@@ -215,7 +237,10 @@ struct ErrStats {
 /// `max(|ref|, 1e-3 * rms_ref)`.
 fn err_stats(cand: &[u8], reference: &[u8]) -> ErrStats {
     let count = cand.len() / 4;
-    let ss: f64 = f32s(reference).filter(|v| v.is_finite()).map(|v| f64::from(v) * f64::from(v)).sum();
+    let ss: f64 = f32s(reference)
+        .filter(|v| v.is_finite())
+        .map(|v| f64::from(v) * f64::from(v))
+        .sum();
     let rms_ref = (ss / count.max(1) as f64).sqrt();
     let floor = 1e-3 * rms_ref.max(f64::MIN_POSITIVE);
     let (mut max_abs, mut max_abs_at, mut max_rel, mut sq) = (0f64, 0usize, 0f64, 0f64);
@@ -238,15 +263,29 @@ fn err_stats(cand: &[u8], reference: &[u8]) -> ErrStats {
         }
         max_rel = max_rel.max(d / f64::from(r).abs().max(floor));
     }
-    ErrStats { max_abs, max_abs_at, max_rel, rms: (sq / count.max(1) as f64).sqrt(), rms_ref, nonfinite_cand: nf_c, nonfinite_ref: nf_r }
+    ErrStats {
+        max_abs,
+        max_abs_at,
+        max_rel,
+        rms: (sq / count.max(1) as f64).sqrt(),
+        rms_ref,
+        nonfinite_cand: nf_c,
+        nonfinite_ref: nf_r,
+    }
 }
 
 fn arg(args: &[String], k: &str, d: &str) -> String {
-    args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned().unwrap_or_else(|| d.to_string())
+    args.iter()
+        .position(|a| a == k)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| d.to_string())
 }
 
 fn usage(msg: &str) -> ! {
-    eprintln!("{msg}\nusage: mtp_dense_det_pm [--m 2560] [--k 2560] [--n 4096] [--reps 20] [--seed 184]");
+    eprintln!(
+        "{msg}\nusage: mtp_dense_det_pm [--m 2560] [--k 2560] [--n 4096] [--reps 20] [--seed 184]"
+    );
     std::process::exit(2);
 }
 
@@ -270,18 +309,47 @@ fn fixtures(n: usize) -> Vec<Fixture> {
     dup.extend(std::iter::repeat(Some(n / 3)).take(129));
     dup.extend(std::iter::repeat(Some(n - 1)).take(100));
     dup.extend(std::iter::repeat(Some(0)).take(28));
-    let scattered: Vec<Option<usize>> = (0..INV_MAX_ROWS).map(|i| Some((i * 131 + 17) % n)).collect();
-    let padded: Vec<Option<usize>> =
-        (0..300).map(|j| if j % 2 == 0 { Some((j * 37 + 5) % n) } else { None }).collect();
+    let scattered: Vec<Option<usize>> = (0..INV_MAX_ROWS)
+        .map(|i| Some((i * 131 + 17) % n))
+        .collect();
+    let padded: Vec<Option<usize>> = (0..300)
+        .map(|j| {
+            if j % 2 == 0 {
+                Some((j * 37 + 5) % n)
+            } else {
+                None
+            }
+        })
+        .collect();
     vec![
-        Fixture { name: "reordered", rows: reorder },
-        Fixture { name: "duplicated", rows: dup },
-        Fixture { name: "scattered", rows: scattered },
-        Fixture { name: "zero_padded", rows: padded },
+        Fixture {
+            name: "reordered",
+            rows: reorder,
+        },
+        Fixture {
+            name: "duplicated",
+            rows: dup,
+        },
+        Fixture {
+            name: "scattered",
+            rows: scattered,
+        },
+        Fixture {
+            name: "zero_padded",
+            rows: padded,
+        },
     ]
 }
 
-fn run(gpu: &mut Gpu, m: usize, k: usize, n: usize, reps: usize, seed: u64, fails: &mut Vec<String>) -> Res<Value> {
+fn run(
+    gpu: &mut Gpu,
+    m: usize,
+    k: usize,
+    n: usize,
+    reps: usize,
+    seed: u64,
+    fails: &mut Vec<String>,
+) -> Res<Value> {
     // ---- operands
     let mut w_bytes = Vec::with_capacity(m * k * 2);
     for r in 0..m as u64 {
@@ -289,7 +357,9 @@ fn run(gpu: &mut Gpu, m: usize, k: usize, n: usize, reps: usize, seed: u64, fail
             w_bytes.extend(gen_w(r, c, k as u64, seed ^ 0x57A11).to_le_bytes());
         }
     }
-    let x: Vec<f32> = (0..(n * k) as u64).map(|e| gen_x(e, seed ^ 0xC0FFEE)).collect();
+    let x: Vec<f32> = (0..(n * k) as u64)
+        .map(|e| gen_x(e, seed ^ 0xC0FFEE))
+        .collect();
     let w = upload_dtype(gpu, &w_bytes, DType::BF16, m * k)?;
     let x32 = gpu.upload_f32(&x, &[n * k])?;
 
@@ -308,18 +378,28 @@ fn run(gpu: &mut Gpu, m: usize, k: usize, n: usize, reps: usize, seed: u64, fail
     let shadow_bytes = gpu.download_raw_bytes(&shadow)?;
     let shadow_expect: Vec<u8> = w_bytes
         .chunks_exact(2)
-        .flat_map(|c| f32_to_f16_rne(f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16)).to_le_bytes())
+        .flat_map(|c| {
+            f32_to_f16_rne(f32::from_bits(
+                u32::from(u16::from_le_bytes([c[0], c[1]])) << 16,
+            ))
+            .to_le_bytes()
+        })
         .collect();
     let (shadow_diff, _) = first_diff(&shadow_bytes, &shadow_expect);
     let x16_view = gpu.qwen4_convert_f16_x(&x32, n * k)?;
     let x16_bytes = gpu.download_raw_bytes(&x16_view)?;
-    let x16_expect: Vec<u8> = x.iter().flat_map(|v| f32_to_f16_rne(*v).to_le_bytes()).collect();
+    let x16_expect: Vec<u8> = x
+        .iter()
+        .flat_map(|v| f32_to_f16_rne(*v).to_le_bytes())
+        .collect();
     let (x16_diff, _) = first_diff(&x16_bytes, &x16_expect);
     let x16 = upload_dtype(gpu, &x16_bytes, DType::F16, n * k)?;
     drop((shadow_expect, x16_expect, x16_bytes));
     let conv_ok = shadow_diff == 0 && x16_diff == 0;
     if !conv_ok {
-        fails.push(format!("conversion differs from host RNE (shadow {shadow_diff} bytes, x16 {x16_diff} bytes)"));
+        fails.push(format!(
+            "conversion differs from host RNE (shadow {shadow_diff} bytes, x16 {x16_diff} bytes)"
+        ));
     }
 
     // ---- buffers + arms
@@ -330,10 +410,17 @@ fn run(gpu: &mut Gpu, m: usize, k: usize, n: usize, reps: usize, seed: u64, fail
     let (yb, yo, yn, yl) = (y_base.view(), y_orc.view(), y_nat.view(), y_lo.view());
     let pay = n * m * 4;
 
-    let base = |gpu: &mut Gpu| -> Res<()> { Ok(gpu.gemm_bf16_xf32_multirow_r16w4_forced(&w, &x32, &yb, m, k, n)?) };
-    let oracle = |gpu: &mut Gpu| -> Res<()> { Ok(gpu.gemm_f16_x_f16_wmma_lds_tiled(&shadow, &x16, &yo, None, m, k, n, ORACLE_TILE)?) };
-    let nat = |gpu: &mut Gpu| -> Res<()> { Ok(gpu.gemm_bf16_xf32_mtp_dense_det_pm(&w, &x32, &yn, m, k, n)?) };
-    let launch = |gpu: &mut Gpu| -> Res<()> { Ok(gpu.mtp_dense_det_pm_launch(&w, &x16, &yl, m, k, n)?) };
+    let base = |gpu: &mut Gpu| -> Res<()> {
+        Ok(gpu.gemm_bf16_xf32_multirow_r16w4_forced(&w, &x32, &yb, m, k, n)?)
+    };
+    let oracle = |gpu: &mut Gpu| -> Res<()> {
+        Ok(gpu.gemm_f16_x_f16_wmma_lds_tiled(&shadow, &x16, &yo, None, m, k, n, ORACLE_TILE)?)
+    };
+    let nat = |gpu: &mut Gpu| -> Res<()> {
+        Ok(gpu.gemm_bf16_xf32_mtp_dense_det_pm(&w, &x32, &yn, m, k, n)?)
+    };
+    let launch =
+        |gpu: &mut Gpu| -> Res<()> { Ok(gpu.mtp_dense_det_pm_launch(&w, &x16, &yl, m, k, n)?) };
 
     // ---- first run of every arm
     base(gpu)?;
@@ -341,12 +428,20 @@ fn run(gpu: &mut Gpu, m: usize, k: usize, n: usize, reps: usize, seed: u64, fail
     nat(gpu)?;
     launch(gpu)?;
     gpu.hip.device_synchronize()?;
-    let (b1, o1, n1, l1) = (y_base.fetch(gpu)?, y_orc.fetch(gpu)?, y_nat.fetch(gpu)?, y_lo.fetch(gpu)?);
+    let (b1, o1, n1, l1) = (
+        y_base.fetch(gpu)?,
+        y_orc.fetch(gpu)?,
+        y_nat.fetch(gpu)?,
+        y_lo.fetch(gpu)?,
+    );
     let first = check_outputs("first", &b1, &o1, &n1, &l1, pay, fails);
     let err_nat = err_stats(payload(&n1, pay), payload(&b1, pay));
     let err_orc = err_stats(payload(&o1, pay), payload(&b1, pay));
     if err_nat.nonfinite_cand != 0 || err_nat.nonfinite_ref != 0 {
-        fails.push(format!("non-finite outputs (native {}, incumbent {})", err_nat.nonfinite_cand, err_nat.nonfinite_ref));
+        fails.push(format!(
+            "non-finite outputs (native {}, incumbent {})",
+            err_nat.nonfinite_cand, err_nat.nonfinite_ref
+        ));
     }
 
     // ---- timing: WARM warm rounds, then `reps` interleaved rounds of baseline / native incl. / native launch-only
@@ -387,10 +482,17 @@ fn run(gpu: &mut Gpu, m: usize, k: usize, n: usize, reps: usize, seed: u64, fail
     // ---- post-timing: the last timed outputs, then a fresh poisoned re-run of the oracle / native arms
     gpu.hip.device_synchronize()?;
     let (b2, n2, l2) = (y_base.fetch(gpu)?, y_nat.fetch(gpu)?, y_lo.fetch(gpu)?);
-    let timed_same = payload(&b2, pay) == payload(&b1, pay) && payload(&n2, pay) == payload(&n1, pay) && payload(&l2, pay) == payload(&l1, pay)
-        && region_ok(&b2, pay) && region_ok(&n2, pay) && region_ok(&l2, pay);
+    let timed_same = payload(&b2, pay) == payload(&b1, pay)
+        && payload(&n2, pay) == payload(&n1, pay)
+        && payload(&l2, pay) == payload(&l1, pay)
+        && region_ok(&b2, pay)
+        && region_ok(&n2, pay)
+        && region_ok(&l2, pay);
     if !timed_same {
-        fails.push("outputs after the timed loops differ from the first run (or a guard was written)".into());
+        fails.push(
+            "outputs after the timed loops differ from the first run (or a guard was written)"
+                .into(),
+        );
     }
     y_orc.poison(gpu)?;
     y_nat.poison(gpu)?;
@@ -401,7 +503,8 @@ fn run(gpu: &mut Gpu, m: usize, k: usize, n: usize, reps: usize, seed: u64, fail
     gpu.hip.device_synchronize()?;
     let (o3, n3, l3) = (y_orc.fetch(gpu)?, y_nat.fetch(gpu)?, y_lo.fetch(gpu)?);
     let post = check_outputs("post", &b2, &o3, &n3, &l3, pay, fails);
-    let post_same_as_first = payload(&o3, pay) == payload(&o1, pay) && payload(&n3, pay) == payload(&n1, pay);
+    let post_same_as_first =
+        payload(&o3, pay) == payload(&o1, pay) && payload(&n3, pay) == payload(&n1, pay);
     if !post_same_as_first {
         fails.push("fresh post-timing re-run differs from the first run".into());
     }
@@ -428,7 +531,10 @@ fn run(gpu: &mut Gpu, m: usize, k: usize, n: usize, reps: usize, seed: u64, fail
             gpu.hip.device_synchronize()?;
             let got = part.fetch(gpu)?;
             let written = s * row_bytes;
-            let (d, _) = first_diff(payload(&got, written), &ref_nat[start * row_bytes..(start + s) * row_bytes]);
+            let (d, _) = first_diff(
+                payload(&got, written),
+                &ref_nat[start * row_bytes..(start + s) * row_bytes],
+            );
             let ok = d == 0 && region_ok(&got, written);
             inv_ok &= ok;
             partitions.push(json!({"rows": s, "start": start, "diff_bytes": d, "guards_ok": region_ok(&got, written), "ok": ok}));
@@ -506,19 +612,43 @@ fn err_json(e: &ErrStats, m: usize) -> Value {
 
 /// Native (conversion-inclusive and launch-only) against the oracle over the whole buffers,
 /// guards and un-overwritten poison of every arm.
-fn check_outputs(stage: &str, b: &[u8], o: &[u8], n: &[u8], l: &[u8], pay: usize, fails: &mut Vec<String>) -> Value {
+fn check_outputs(
+    stage: &str,
+    b: &[u8],
+    o: &[u8],
+    n: &[u8],
+    l: &[u8],
+    pay: usize,
+    fails: &mut Vec<String>,
+) -> Value {
     let (nd, nf) = first_diff(n, o);
     let (ld, lf) = first_diff(l, o);
-    let guards = [region_ok(b, pay), region_ok(o, pay), region_ok(n, pay), region_ok(l, pay)];
-    let left = [poison_left(payload(b, pay)), poison_left(payload(o, pay)), poison_left(payload(n, pay)), poison_left(payload(l, pay))];
+    let guards = [
+        region_ok(b, pay),
+        region_ok(o, pay),
+        region_ok(n, pay),
+        region_ok(l, pay),
+    ];
+    let left = [
+        poison_left(payload(b, pay)),
+        poison_left(payload(o, pay)),
+        poison_left(payload(n, pay)),
+        poison_left(payload(l, pay)),
+    ];
     if nd != 0 {
-        fails.push(format!("{stage}: native conversion-inclusive differs from the oracle ({nd} bytes)"));
+        fails.push(format!(
+            "{stage}: native conversion-inclusive differs from the oracle ({nd} bytes)"
+        ));
     }
     if ld != 0 {
-        fails.push(format!("{stage}: native launch-only differs from the oracle ({ld} bytes)"));
+        fails.push(format!(
+            "{stage}: native launch-only differs from the oracle ({ld} bytes)"
+        ));
     }
     if guards.iter().any(|g| !g) {
-        fails.push(format!("{stage}: a guard was written {guards:?} (baseline, oracle, native, launch-only)"));
+        fails.push(format!(
+            "{stage}: a guard was written {guards:?} (baseline, oracle, native, launch-only)"
+        ));
     }
     if left.iter().any(|&p| p != 0) {
         fails.push(format!("{stage}: poison words left in an output {left:?} (baseline, oracle, native, launch-only)"));
@@ -533,7 +663,10 @@ fn check_outputs(stage: &str, b: &[u8], o: &[u8], n: &[u8], l: &[u8], pay: usize
 }
 
 fn verdict_fail(reason: String, code: i32) -> ! {
-    println!("{}", json!({"event": "kill_verdict", "kill_pass": false, "reason": reason}));
+    println!(
+        "{}",
+        json!({"event": "kill_verdict", "kill_pass": false, "reason": reason})
+    );
     println!("KILL FAIL");
     std::process::exit(code);
 }
@@ -555,10 +688,23 @@ fn main() {
         Ok(g) => g,
         Err(e) => verdict_fail(format!("gpu init: {e}"), 3),
     };
-    let pci = gpu.hip.device_pci_bus_id(gpu.device_id).unwrap_or_default().to_ascii_lowercase();
-    println!("{}", json!({"event": "start", "arch": gpu.arch, "pci_bus_id": pci, "device_id": gpu.device_id, "shape": {"M": m, "K": k, "N": n}, "seed": seed, "reps": reps}));
+    let pci = gpu
+        .hip
+        .device_pci_bus_id(gpu.device_id)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    println!(
+        "{}",
+        json!({"event": "start", "arch": gpu.arch, "pci_bus_id": pci, "device_id": gpu.device_id, "shape": {"M": m, "K": k, "N": n}, "seed": seed, "reps": reps})
+    );
     if gpu.arch != "gfx1151" || pci != REQUIRED_PCI {
-        verdict_fail(format!("device is {} at {pci:?}; the admitted device is gfx1151 at {REQUIRED_PCI}", gpu.arch), 3);
+        verdict_fail(
+            format!(
+                "device is {} at {pci:?}; the admitted device is gfx1151 at {REQUIRED_PCI}",
+                gpu.arch
+            ),
+            3,
+        );
     }
     let mut fails: Vec<String> = Vec::new();
     let receipt = match run(&mut gpu, m, k, n, reps, seed, &mut fails) {

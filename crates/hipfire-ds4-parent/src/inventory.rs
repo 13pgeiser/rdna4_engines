@@ -131,12 +131,7 @@ impl ParentInventory {
             match dtype.as_str() {
                 "F8_E4M3" => {
                     let entry = classify_dense_fp8(&name, &shape, &infos, &mut scale_claimed)?;
-                    bump_class(
-                        &mut totals,
-                        ParentTensorClass::DenseFp8,
-                        is_mtp,
-                        nbytes,
-                    );
+                    bump_class(&mut totals, ParentTensorClass::DenseFp8, is_mtp, nbytes);
                     if is_mtp {
                         excluded_mtp.push(name);
                     } else {
@@ -145,12 +140,7 @@ impl ParentInventory {
                 }
                 "I8" => {
                     let entry = classify_expert_fp4(&name, &shape, &infos, &mut scale_claimed)?;
-                    bump_class(
-                        &mut totals,
-                        ParentTensorClass::ExpertFp4,
-                        is_mtp,
-                        nbytes,
-                    );
+                    bump_class(&mut totals, ParentTensorClass::ExpertFp4, is_mtp, nbytes);
                     if is_mtp {
                         excluded_mtp.push(name);
                     } else {
@@ -752,8 +742,7 @@ mod tests {
         let src = FixtureSource::new(pairs);
         let err = ParentInventory::build(&src, &test_cfg()).expect_err("non-expert I8");
         assert!(
-            err.contains("not a routed-expert weight")
-                && err.contains("shared_experts.w1.weight"),
+            err.contains("not a routed-expert weight") && err.contains("shared_experts.w1.weight"),
             "unexpected err: {err}"
         );
     }
@@ -765,8 +754,7 @@ mod tests {
         let src = FixtureSource::new(pairs);
         let err = ParentInventory::build(&src, &test_cfg()).expect_err("missing expert scale");
         assert!(
-            err.contains("missing required scale companion")
-                && err.contains("experts.0.w1.weight"),
+            err.contains("missing required scale companion") && err.contains("experts.0.w1.weight"),
             "unexpected err: {err}"
         );
     }

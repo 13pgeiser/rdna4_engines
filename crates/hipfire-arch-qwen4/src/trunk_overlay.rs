@@ -57,7 +57,11 @@ impl TrunkOverlayPolicy {
 
     /// The policy from the process configuration.
     pub fn from_env() -> Result<Self, String> {
-        Self::parse(hipfire_config::developer_var(TRUNK_OVERLAY_ENV).ok().as_deref())
+        Self::parse(
+            hipfire_config::developer_var(TRUNK_OVERLAY_ENV)
+                .ok()
+                .as_deref(),
+        )
     }
 }
 
@@ -248,13 +252,22 @@ mod tests {
 
     #[test]
     fn policy_parses_the_documented_values() {
-        assert_eq!(TrunkOverlayPolicy::parse(None), Ok(TrunkOverlayPolicy::Auto));
+        assert_eq!(
+            TrunkOverlayPolicy::parse(None),
+            Ok(TrunkOverlayPolicy::Auto)
+        );
         assert_eq!(
             TrunkOverlayPolicy::parse(Some("auto")),
             Ok(TrunkOverlayPolicy::Auto)
         );
-        assert_eq!(TrunkOverlayPolicy::parse(Some("0")), Ok(TrunkOverlayPolicy::Off));
-        assert_eq!(TrunkOverlayPolicy::parse(Some("1")), Ok(TrunkOverlayPolicy::On));
+        assert_eq!(
+            TrunkOverlayPolicy::parse(Some("0")),
+            Ok(TrunkOverlayPolicy::Off)
+        );
+        assert_eq!(
+            TrunkOverlayPolicy::parse(Some("1")),
+            Ok(TrunkOverlayPolicy::On)
+        );
         for bad in ["", "2", "on", "AUTO", "true", " 1"] {
             let error = TrunkOverlayPolicy::parse(Some(bad)).unwrap_err();
             assert!(error.contains("HIPFIRE_QWEN4_TRUNK_OVERLAY"), "{error}");
@@ -318,8 +331,7 @@ mod tests {
                     Some(TrunkIu4Default::Gfx1151ZabV1)
                 ),
                 OverlayDecision::Refuse(
-                    "base already carries the trunk default marker \"gfx1151-zab-v1\""
-                        .to_string()
+                    "base already carries the trunk default marker \"gfx1151-zab-v1\"".to_string()
                 )
             );
         }

@@ -80,8 +80,7 @@ const SRC_INCUMBENT: &str = concat!(
     include_str!("../../../kernels/src/rope_yarn.h"),
     include_str!("../../../kernels/src/tensor_ops.hip")
 );
-const SRC_TWIN: &str =
-    include_str!("../../../kernels/src/indexed_attention_hg12_den1.gfx1151.hip");
+const SRC_TWIN: &str = include_str!("../../../kernels/src/indexed_attention_hg12_den1.gfx1151.hip");
 const MODULE_INCUMBENT: &str = "tensor_ops";
 const MODULE_TWIN: &str = "indexed_attention_hg12_den1";
 
@@ -222,11 +221,19 @@ fn f32_bytes(v: &[f32]) -> &[u8] {
 fn median(v: &mut [f64]) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = v.len();
-    if n % 2 == 1 { v[n / 2] } else { 0.5 * (v[n / 2 - 1] + v[n / 2]) }
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        0.5 * (v[n / 2 - 1] + v[n / 2])
+    }
 }
 
 fn sha_prefix(s: &str) -> String {
-    Sha256::digest(s.as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(s.as_bytes())
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// The kernel's own selected_len formula.
@@ -368,22 +375,35 @@ struct CaseOutcome {
 
 fn run_case(gpu: &mut Gpu, spec: &Spec, kv: &Kv) -> CaseOutcome {
     let rows = spec.rows;
-    let mut rng = Rng(
-        SEED ^ ((rows as u64) << 32) ^ ((spec.position_start as u64) << 8) ^ (spec.salt << 4)
-            ^ 0xA5A5,
+    let mut rng = Rng(SEED
+        ^ ((rows as u64) << 32)
+        ^ ((spec.position_start as u64) << 8)
+        ^ (spec.salt << 4)
+        ^ 0xA5A5);
+    assert!(
+        spec.position_start + rows <= FULL_CAPACITY,
+        "case exceeds full_capacity"
     );
-    assert!(spec.position_start + rows <= FULL_CAPACITY, "case exceeds full_capacity");
-    let lens: Vec<usize> = (0..rows).map(|r| selected_len(spec.position_start, r)).collect();
+    let lens: Vec<usize> = (0..rows)
+        .map(|r| selected_len(spec.position_start, r))
+        .collect();
     let sel_min = *lens.iter().min().unwrap();
     let sel_max = *lens.iter().max().unwrap();
-    assert!(sel_max <= HG12_MAX_SELECTED && sel_max <= CAPACITY, "selected_len above hg12 bound");
+    assert!(
+        sel_max <= HG12_MAX_SELECTED && sel_max <= CAPACITY,
+        "selected_len above hg12 bound"
+    );
 
     let mut selected = build_selected(&mut rng, rows, spec.position_start);
-    let inject = spec.invalid.then(|| inject_invalid(&mut selected, rows, spec.position_start));
+    let inject = spec
+        .invalid
+        .then(|| inject_invalid(&mut selected, rows, spec.position_start));
 
     let q: Vec<f32> = (0..rows * Q_ROW).map(|_| rng.sym()).collect();
     let q_t = gpu.upload_f32(&q, &[q.len()]).expect("q upload");
-    let sel_t = gpu.upload_raw(&i32_bytes(&selected), &[selected.len() * 4]).expect("selected");
+    let sel_t = gpu
+        .upload_raw(&i32_bytes(&selected), &[selected.len() * 4])
+        .expect("selected");
 
     // Output with a guard band; every variant starts from the NaN-payload sentinel.
     let main_cells = rows * OUT_ROW;
@@ -396,7 +416,10 @@ fn run_case(gpu: &mut Gpu, spec: &Spec, kv: &Kv) -> CaseOutcome {
         .enumerate()
         .map(|(r, row)| {
             let visible = (spec.position_start + r + 1) as i64;
-            row[..lens[r]].iter().filter(|&&t| t >= 0 && (t as i64) < visible).count()
+            row[..lens[r]]
+                .iter()
+                .filter(|&&t| t >= 0 && (t as i64) < visible)
+                .count()
         })
         .sum();
     println!(
@@ -425,8 +448,15 @@ fn run_case(gpu: &mut Gpu, spec: &Spec, kv: &Kv) -> CaseOutcome {
         }
         b.push_i32(rows as i32);
         b.push_i32(spec.position_start as i32);
-        for v in [N_HEADS, N_KV_HEADS, HEAD_DIM, BUDGET_BLOCKS, COMPRESS, CAPACITY, FULL_CAPACITY]
-        {
+        for v in [
+            N_HEADS,
+            N_KV_HEADS,
+            HEAD_DIM,
+            BUDGET_BLOCKS,
+            COMPRESS,
+            CAPACITY,
+            FULL_CAPACITY,
+        ] {
             b.push_i32(v as i32);
         }
         b.pad_to(16);
@@ -441,13 +471,21 @@ fn run_case(gpu: &mut Gpu, spec: &Spec, kv: &Kv) -> CaseOutcome {
     let mut ok = true;
     let mut reference: Vec<f32> = Vec::new();
     for (vi, v) in VARIANTS.iter().enumerate() {
-        gpu.hip.memcpy_htod(&y_t.buf, f32_bytes(&sentinel)).expect("reset y");
-        gpu.launch_kernel_blob(v.func, grid, block, 0, &mut blobs[vi]).expect("launch");
+        gpu.hip
+            .memcpy_htod(&y_t.buf, f32_bytes(&sentinel))
+            .expect("reset y");
+        gpu.launch_kernel_blob(v.func, grid, block, 0, &mut blobs[vi])
+            .expect("launch");
         gpu.hip.device_synchronize().expect("sync");
         let out = gpu.download_f32(&y_t).expect("download y");
-        let unwritten =
-            out[..main_cells].iter().filter(|x| x.to_bits() == SENTINEL_BITS).count();
-        let guard_bad = out[main_cells..].iter().filter(|x| x.to_bits() != SENTINEL_BITS).count();
+        let unwritten = out[..main_cells]
+            .iter()
+            .filter(|x| x.to_bits() == SENTINEL_BITS)
+            .count();
+        let guard_bad = out[main_cells..]
+            .iter()
+            .filter(|x| x.to_bits() != SENTINEL_BITS)
+            .count();
         let nonfinite = out[..main_cells]
             .iter()
             .filter(|x| !x.is_finite() && x.to_bits() != SENTINEL_BITS)
@@ -467,7 +505,11 @@ fn run_case(gpu: &mut Gpu, spec: &Spec, kv: &Kv) -> CaseOutcome {
                 v_ok = false;
                 line.push_str(" ALL-ZERO");
             }
-            line.push_str(if v_ok { " (reference sane)" } else { " REFERENCE-BAD" });
+            line.push_str(if v_ok {
+                " (reference sane)"
+            } else {
+                " REFERENCE-BAD"
+            });
             reference = out;
         } else {
             let mut count = 0usize;
@@ -508,7 +550,8 @@ fn run_case(gpu: &mut Gpu, spec: &Spec, kv: &Kv) -> CaseOutcome {
     let time_one = |gpu: &mut Gpu, vi: usize, blobs: &mut Vec<Vec<u8>>| -> f64 {
         let v = &VARIANTS[vi];
         gpu.hip.event_record(&ev0, None).expect("rec");
-        gpu.launch_kernel_blob(v.func, grid, block, 0, &mut blobs[vi]).expect("launch");
+        gpu.launch_kernel_blob(v.func, grid, block, 0, &mut blobs[vi])
+            .expect("launch");
         gpu.hip.event_record(&ev1, None).expect("rec");
         gpu.hip.event_synchronize(&ev1).expect("evsync");
         gpu.hip.event_elapsed_ms(&ev0, &ev1).expect("elapsed") as f64 * 1000.0
@@ -547,7 +590,11 @@ fn run_case(gpu: &mut Gpu, spec: &Spec, kv: &Kv) -> CaseOutcome {
             median_us[0] / med
         );
     }
-    println!("  VERDICT {}: {}", spec.name, if ok { "PASS (bitwise)" } else { "FAIL" });
+    println!(
+        "  VERDICT {}: {}",
+        spec.name,
+        if ok { "PASS (bitwise)" } else { "FAIL" }
+    );
 
     for t in [q_t, sel_t, y_t] {
         gpu.free_tensor(t).expect("free");
@@ -574,9 +621,16 @@ fn main() {
         if let Some(list) = a.strip_prefix("--rows=") {
             let v: Vec<usize> = list
                 .split(',')
-                .map(|s| s.trim().parse().unwrap_or_else(|_| panic!("bad --rows entry {s:?}")))
+                .map(|s| {
+                    s.trim()
+                        .parse()
+                        .unwrap_or_else(|_| panic!("bad --rows entry {s:?}"))
+                })
                 .collect();
-            assert!(!v.is_empty() && v.iter().all(|&r| r > 0), "--rows needs positive counts");
+            assert!(
+                !v.is_empty() && v.iter().all(|&r| r > 0),
+                "--rows needs positive counts"
+            );
             rows_override = Some(v);
         } else if a == "--precheck" {
             precheck = true;
@@ -602,7 +656,10 @@ fn main() {
         std::process::exit(2);
     }
     if !gfx1151 {
-        println!("NOTE: {} correctness pre-check; timings below are NOT gfx1151 numbers", gpu.arch);
+        println!(
+            "NOTE: {} correctness pre-check; timings below are NOT gfx1151 numbers",
+            gpu.arch
+        );
     }
 
     println!(
@@ -614,7 +671,10 @@ fn main() {
     for v in &VARIANTS {
         gpu.ensure_kernel_public(v.module, v.src, v.func)
             .unwrap_or_else(|e| panic!("compile {}: {e:?}", v.func));
-        println!("  loaded {:<9} {} (block 256, grid [{N_KV_HEADS},1,rows])", v.label, v.func);
+        println!(
+            "  loaded {:<9} {} (block 256, grid [{N_KV_HEADS},1,rows])",
+            v.label, v.func
+        );
     }
 
     let all_specs = specs(rows_override.as_deref());
@@ -659,7 +719,11 @@ fn main() {
             o.median_us[0]
         );
         for i in 1..VARIANTS.len() {
-            print!(" | {:>9.2} {:>6.3}", o.median_us[i], o.median_us[0] / o.median_us[i]);
+            print!(
+                " | {:>9.2} {:>6.3}",
+                o.median_us[i],
+                o.median_us[0] / o.median_us[i]
+            );
         }
         println!();
     }
@@ -673,12 +737,21 @@ fn main() {
             geo.len()
         );
         for i in 1..VARIANTS.len() {
-            let ln: f64 =
-                geo.iter().map(|o| (o.median_us[0] / o.median_us[i]).ln()).sum::<f64>()
-                    / geo.len() as f64;
+            let ln: f64 = geo
+                .iter()
+                .map(|o| (o.median_us[0] / o.median_us[i]).ln())
+                .sum::<f64>()
+                / geo.len() as f64;
             println!("  {:<9} {:.4}x", VARIANTS[i].label, ln.exp());
         }
     }
-    println!("OVERALL: {}", if all_ok { "PASS (all bitwise identical)" } else { "FAIL" });
+    println!(
+        "OVERALL: {}",
+        if all_ok {
+            "PASS (all bitwise identical)"
+        } else {
+            "FAIL"
+        }
+    );
     std::process::exit(if all_ok { 0 } else { 1 });
 }

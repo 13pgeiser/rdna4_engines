@@ -139,7 +139,15 @@ const SCHEMA_GFX1151: &str = "consumer24.gfx1151.g1-oracle.v1";
 const XTX_UUID: &str = "GPU-43390a851e296ee5";
 const XTX_BDF: &str = "0000:67:00.0";
 /// Every negative-control name any codec accepts; `Codec::negative_names` is the per-codec required subset.
-const NEG_NAMES: [&str; 7] = ["wrong-scale-row", "reversed-epoch", "wrong-pack-selector", "wrong-expert-pointer", "wrong-lut", "wrong-sign-mask", "wrong-fold-epoch"];
+const NEG_NAMES: [&str; 7] = [
+    "wrong-scale-row",
+    "reversed-epoch",
+    "wrong-pack-selector",
+    "wrong-expert-pointer",
+    "wrong-lut",
+    "wrong-sign-mask",
+    "wrong-fold-epoch",
+];
 
 /// `--expect-arch`: gfx1100 (the default; the xtx) or gfx1151 (Strix Halo, fabric label `halo`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -202,13 +210,24 @@ impl Ident {
 }
 impl Args {
     fn target_or_default(&self) -> Target {
-        self.expect_arch.as_deref().and_then(Target::of_name).unwrap_or(Target::Gfx1100)
+        self.expect_arch
+            .as_deref()
+            .and_then(Target::of_name)
+            .unwrap_or(Target::Gfx1100)
     }
     /// Identity expected of the qualification tables (CPU modes included): the xtx for gfx1100, the optional flags for gfx1151.
     fn table_ident(&self) -> Ident {
         match self.target_or_default() {
-            Target::Gfx1100 => Ident { target: Target::Gfx1100, uuid: Some(XTX_UUID.into()), bdf: Some(XTX_BDF.into()) },
-            Target::Gfx1151 => Ident { target: Target::Gfx1151, uuid: self.expect_uuid.clone(), bdf: self.expect_bdf.clone() },
+            Target::Gfx1100 => Ident {
+                target: Target::Gfx1100,
+                uuid: Some(XTX_UUID.into()),
+                bdf: Some(XTX_BDF.into()),
+            },
+            Target::Gfx1151 => Ident {
+                target: Target::Gfx1151,
+                uuid: self.expect_uuid.clone(),
+                bdf: self.expect_bdf.clone(),
+            },
         }
     }
 }
@@ -401,7 +420,9 @@ fn parse_args() -> Res<Args> {
     }
     let target = match a.expect_arch.as_deref() {
         None => Target::Gfx1100,
-        Some(n) => Target::of_name(n).ok_or_else(|| format!("--expect-arch {n:?}: this oracle serves gfx1100 and gfx1151\n{USAGE}"))?,
+        Some(n) => Target::of_name(n).ok_or_else(|| {
+            format!("--expect-arch {n:?}: this oracle serves gfx1100 and gfx1151\n{USAGE}")
+        })?,
     };
     model::set_arch(target.name());
     Ok(a)
@@ -570,7 +591,10 @@ fn load_table(a: &Args) -> Res<(QualifiedHooks, Value, Vec<String>)> {
     if let Some(dp) = &a.divide_table {
         let (db, dd) = file_json(dp)?;
         if dd["selfcheck"]["ok"] != json!(true) || !id.matches(&dd["device"]) {
-            problems.push(format!("supplementary divide table lacks a passing {} qualification", id.arch()));
+            problems.push(format!(
+                "supplementary divide table lacks a passing {} qualification",
+                id.arch()
+            ));
         }
         let added = hooks.merge_divide_extras(&dd)?;
         divide_meta = json!({"path": dp, "sha256": sha256_hex(&db), "new_divide_keys": added});
@@ -586,7 +610,12 @@ fn load_table(a: &Args) -> Res<(QualifiedHooks, Value, Vec<String>)> {
                 "--intrinsic-table {ip} repeats an earlier table (sha256 {sha})"
             ));
         }
-        for p in probe_table::intrinsic_qualification(&idoc, id.arch(), id.uuid.as_deref(), id.bdf.as_deref()) {
+        for p in probe_table::intrinsic_qualification(
+            &idoc,
+            id.arch(),
+            id.uuid.as_deref(),
+            id.bdf.as_deref(),
+        ) {
             problems.push(format!("intrinsic table {ip}: {p}"));
         }
         let merged = hooks
@@ -611,7 +640,11 @@ fn load_table(a: &Args) -> Res<(QualifiedHooks, Value, Vec<String>)> {
         problems.push("probe table lacks a passing independent selfcheck".into());
     }
     if !id.matches(&top["device"]) {
-        problems.push(format!("probe table was not qualified on the expected {} {}", id.arch(), id.target.card()));
+        problems.push(format!(
+            "probe table was not qualified on the expected {} {}",
+            id.arch(),
+            id.target.card()
+        ));
     }
     let observed: std::collections::BTreeSet<u32> = hooks
         .entries
@@ -923,7 +956,10 @@ fn run_self_check(a: &Args) -> Res<bool> {
         "mixed_scenarios": st.tally.mixed_total, "chain_down_scenarios": st.tally.chain_down_total, "negative_controls_all_detected": neg_ok});
     doc["pass"] = json!(pass);
     write_json(out, &doc)?;
-    println!("{}", json!({"schema": schema_of(a), "mode": "self-check", "out": out, "pass": pass, "summary": doc["summary"], "problems": doc["problems"]}));
+    println!(
+        "{}",
+        json!({"schema": schema_of(a), "mode": "self-check", "out": out, "pass": pass, "summary": doc["summary"], "problems": doc["problems"]})
+    );
     Ok(pass)
 }
 
@@ -1619,9 +1655,26 @@ fn run_fixture(hip: &HipRuntime, co: &[u8], hooks: &QualifiedHooks, seed: u32) -
     let mut neg_bad = [0u64; 2];
     let neg_names = ["wrongsel_gate_up", "wrongsel_down"];
     for (ki, kind) in [Kind::GateUp, Kind::Down].into_iter().enumerate() {
-        let tag = if kind == Kind::GateUp { "gate_up" } else { "down" };
-        let f = hip.module_get_function(&module, &format!("qwen4_moe_epilogue_fixture_{tag}_{}", model::arch_name())).map_err(err)?;
-        let fneg = hip.module_get_function(&module, &format!("qwen4_moe_epilogue_fixture_{tag}_wrongsel_{}", model::arch_name())).map_err(err)?;
+        let tag = if kind == Kind::GateUp {
+            "gate_up"
+        } else {
+            "down"
+        };
+        let f = hip
+            .module_get_function(
+                &module,
+                &format!("qwen4_moe_epilogue_fixture_{tag}_{}", model::arch_name()),
+            )
+            .map_err(err)?;
+        let fneg = hip
+            .module_get_function(
+                &module,
+                &format!(
+                    "qwen4_moe_epilogue_fixture_{tag}_wrongsel_{}",
+                    model::arch_name()
+                ),
+            )
+            .map_err(err)?;
         let (m, oc) = (kind.m(), kind.out_cols());
         let p_rows = fixture_p_rows(kind);
         for (pi, pass_name) in FIXTURE_PASSES.iter().enumerate() {
@@ -1974,14 +2027,22 @@ fn run_device(a: &Args) -> Res<bool> {
             let expect_uuid = a.expect_uuid.clone().ok_or("--expect-uuid is required")?;
             let expect_bdf = a.expect_bdf.clone().ok_or("--expect-bdf is required")?;
             if expect_uuid != XTX_UUID || expect_bdf != XTX_BDF {
-                return Err(format!("xtx identity is {XTX_UUID} / {XTX_BDF}; got {expect_uuid} / {expect_bdf}"));
+                return Err(format!(
+                    "xtx identity is {XTX_UUID} / {XTX_BDF}; got {expect_uuid} / {expect_bdf}"
+                ));
             }
-            Ident { target, uuid: Some(expect_uuid), bdf: Some(expect_bdf) }
+            Ident {
+                target,
+                uuid: Some(expect_uuid),
+                bdf: Some(expect_bdf),
+            }
         }
         Target::Gfx1151 => Ident {
             target,
             uuid: a.expect_uuid.clone(),
-            bdf: Some(a.expect_bdf.clone().ok_or("gfx1151 has no ROCr UUID: --expect-bdf is required (--expect-uuid is optional)")?),
+            bdf: Some(a.expect_bdf.clone().ok_or(
+                "gfx1151 has no ROCr UUID: --expect-bdf is required (--expect-uuid is optional)",
+            )?),
         },
     };
     if !mixed && matches!(codec, Codec::W2 | Codec::W3) && a.anchor.is_none() {
@@ -2012,7 +2073,10 @@ fn run_device(a: &Args) -> Res<bool> {
     let bdf = hip.device_pci_bus_id(id).map_err(err)?.to_ascii_lowercase();
     let arch = hip.get_arch(id).map_err(err)?;
     let identity_match = arch == ident.arch()
-        && ident.uuid.as_deref().is_none_or(|u| uuid.eq_ignore_ascii_case(u))
+        && ident
+            .uuid
+            .as_deref()
+            .is_none_or(|u| uuid.eq_ignore_ascii_case(u))
         && ident.bdf.as_deref().is_none_or(|b| bdf == b);
     let device = json!({"card": card, "uuid": uuid, "bdf": bdf, "arch": arch, "expected_arch": ident.arch(), "expected_uuid": ident.uuid, "expected_bdf": ident.bdf,
         "uuid_authoritative": target == Target::Gfx1100,
@@ -2110,11 +2174,21 @@ fn run_device(a: &Args) -> Res<bool> {
     if let Some(d) = table_meta.get("device") {
         if !d.is_null() {
             if d.get("arch").and_then(Value::as_str) != Some(ident.arch()) {
-                problems.push(format!("probe table arch {:?} is not {}", d.get("arch"), ident.arch()));
+                problems.push(format!(
+                    "probe table arch {:?} is not {}",
+                    d.get("arch"),
+                    ident.arch()
+                ));
             }
             if let Some(eu) = &ident.uuid {
-                if d.get("uuid").and_then(Value::as_str).is_some_and(|u| !u.eq_ignore_ascii_case(eu)) {
-                    problems.push(format!("probe table was observed on {:?}, not {eu}", d.get("uuid")));
+                if d.get("uuid")
+                    .and_then(Value::as_str)
+                    .is_some_and(|u| !u.eq_ignore_ascii_case(eu))
+                {
+                    problems.push(format!(
+                        "probe table was observed on {:?}, not {eu}",
+                        d.get("uuid")
+                    ));
                 }
             }
             if d.get("identity_match").and_then(Value::as_bool) == Some(false) {
@@ -2225,8 +2299,14 @@ fn run_device(a: &Args) -> Res<bool> {
     if let Some((_, b)) = &fixture_bytes {
         let mut v = Vec::new();
         for t in ["gate_up", "down"] {
-            v.push(format!("qwen4_moe_epilogue_fixture_{t}_{}", model::arch_name()));
-            v.push(format!("qwen4_moe_epilogue_fixture_{t}_wrongsel_{}", model::arch_name()));
+            v.push(format!(
+                "qwen4_moe_epilogue_fixture_{t}_{}",
+                model::arch_name()
+            ));
+            v.push(format!(
+                "qwen4_moe_epilogue_fixture_{t}_wrongsel_{}",
+                model::arch_name()
+            ));
         }
         audit_in.push(("epilogue_fixture", b.as_slice(), v));
     }
@@ -2356,7 +2436,9 @@ fn run_device(a: &Args) -> Res<bool> {
     ctx.flush("complete")?;
     let d = ctx.doc("complete");
     let _ = std::fs::remove_file(format!("{out}.progress"));
-    println!("{}", json!({"schema": schema_of(a), "mode": "device", "out": out, "scope": scope, "mixed_codec_run": mixed, "pass": d["pass"], "g1c_verdict": d["g1c"]["verdict"],
+    println!(
+        "{}",
+        json!({"schema": schema_of(a), "mode": "device", "out": out, "scope": scope, "mixed_codec_run": mixed, "pass": d["pass"], "g1c_verdict": d["g1c"]["verdict"],
         "g1c_measured_pass": d["g1c"]["measured_pass"], "g1c_closed": d["g1c"]["closed"], "artifact_binding": d["g1c"]["artifact_binding"]["status"],
         "g1c_blockers": d["g1c"]["blockers"], "summary": d["summary"], "denorm_ok": d["denorm"]["ok"],
         "negative_controls": d["negative_controls"], "coverage_gaps": d["coverage_gaps"], "epilogue_fixture_pass": d.get("epilogue_fixture").map(|f| f["pass"].clone())})

@@ -52,14 +52,26 @@ fn gfx12_reads_the_architected_ttmps() {
 
 #[test]
 fn gfx12_x_needs_no_y_flag_and_no_system_sgpr_ownership() {
-    let s = compile(&kernel(false, false, "    workgroup_id(wg.isa(), 0, 4)?;"), Arch::Gfx1201).unwrap();
+    let s = compile(
+        &kernel(false, false, "    workgroup_id(wg.isa(), 0, 4)?;"),
+        Arch::Gfx1201,
+    )
+    .unwrap();
     assert!(s.contains("s_mov_b32 s4, ttmp9"), "{s}");
 }
 
 #[test]
 fn gfx11_reads_the_system_sgprs_after_the_user_sgprs() {
     for arch in [Arch::Gfx1151, Arch::Gfx1100] {
-        let s = compile(&kernel(true, true, "    workgroup_id(wg.isa(), 0, 4)?;\n    workgroup_id(wg.isa(), 1, 5)?;"), arch).unwrap();
+        let s = compile(
+            &kernel(
+                true,
+                true,
+                "    workgroup_id(wg.isa(), 0, 4)?;\n    workgroup_id(wg.isa(), 1, 5)?;",
+            ),
+            arch,
+        )
+        .unwrap();
         assert!(s.contains("s_mov_b32 s4, s2"), "{arch:?}: {s}");
         assert!(s.contains("s_mov_b32 s5, s3"), "{arch:?}: {s}");
         assert!(!s.contains("ttmp"), "{arch:?}: {s}");
@@ -70,10 +82,18 @@ fn gfx11_reads_the_system_sgprs_after_the_user_sgprs() {
 fn an_invalid_axis_names_the_three_axes() {
     for arch in [Arch::Gfx1151, Arch::Gfx1201] {
         for axis in ["3", "255", "-1"] {
-            let src = kernel(true, true, &format!("    workgroup_id(wg.isa(), {axis}, 4)?;"));
+            let src = kernel(
+                true,
+                true,
+                &format!("    workgroup_id(wg.isa(), {axis}, 4)?;"),
+            );
             let e = compile(&src, arch).err().expect("must be refused");
             assert!(e.starts_with("wg.rip:"), "{e}");
-            assert!(e.contains("workgroup_id: axis must be 0 (x), 1 (y) or 2 (z)") && e.contains(&format!("got {axis}")), "{arch:?}: {e}");
+            assert!(
+                e.contains("workgroup_id: axis must be 0 (x), 1 (y) or 2 (z)")
+                    && e.contains(&format!("got {axis}")),
+                "{arch:?}: {e}"
+            );
         }
     }
 }
@@ -83,8 +103,14 @@ fn y_without_the_spec_flag_is_refused_with_the_fix() {
     for arch in [Arch::Gfx1151, Arch::Gfx1201] {
         let src = kernel(false, true, "    workgroup_id(wg.isa(), 1, 5)?;");
         let e = compile(&src, arch).err().expect("must be refused");
-        assert!(e.contains("workgroup_id: axis 1 (y) needs the Y work-group id enabled"), "{arch:?}: {e}");
-        assert!(e.contains("system_sgpr_workgroup_id_y: true"), "{arch:?}: {e}");
+        assert!(
+            e.contains("workgroup_id: axis 1 (y) needs the Y work-group id enabled"),
+            "{arch:?}: {e}"
+        );
+        assert!(
+            e.contains("system_sgpr_workgroup_id_y: true"),
+            "{arch:?}: {e}"
+        );
     }
 }
 
@@ -95,7 +121,12 @@ fn z_is_refused_on_every_arch_even_with_the_y_flag() {
             let src = kernel(y, true, "    workgroup_id(wg.isa(), 2, 6)?;");
             let e = compile(&src, arch).err().expect("must be refused");
             assert!(e.starts_with("wg.rip:"), "{e}");
-            assert!(e.ends_with("workgroup id z is not enabled: KernelSpec has no z flag; fold z into x or y"), "{arch:?} y={y}: {e}");
+            assert!(
+                e.ends_with(
+                    "workgroup id z is not enabled: KernelSpec has no z flag; fold z into x or y"
+                ),
+                "{arch:?} y={y}: {e}"
+            );
         }
     }
 }
@@ -104,11 +135,18 @@ fn z_is_refused_on_every_arch_even_with_the_y_flag() {
 fn an_unowned_gfx11_source_is_r0401() {
     let src = kernel(false, false, "    workgroup_id(wg.isa(), 0, 4)?;");
     let e = compile(&src, Arch::Gfx1151).err().expect("must be refused");
-    assert!(e.contains("s2 at ") && e.ends_with(" has no unique live owner"), "{e}");
+    assert!(
+        e.contains("s2 at ") && e.ends_with(" has no unique live owner"),
+        "{e}"
+    );
 
     let checked = peacemaker_rip::check(&src, "wg.rip", Arch::Gfx1151, "v");
     assert!(checked.emitted.is_none());
-    let errors: Vec<_> = checked.diagnostics.iter().filter(|d| d.severity == Severity::Error).collect();
+    let errors: Vec<_> = checked
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .collect();
     assert_eq!(errors.len(), 1, "{:?}", checked.diagnostics);
     assert_eq!(errors[0].code, "R0401", "{:?}", errors[0]);
 
@@ -119,9 +157,17 @@ fn an_unowned_gfx11_source_is_r0401() {
 #[test]
 fn a_valid_kernel_checks_clean_on_both_architectures() {
     for (arch, own_ids) in [(Arch::Gfx1151, true), (Arch::Gfx1201, false)] {
-        let src = kernel(true, own_ids, "    workgroup_id(wg.isa(), 0, 4)?;\n    workgroup_id(wg.isa(), 1, 5)?;");
+        let src = kernel(
+            true,
+            own_ids,
+            "    workgroup_id(wg.isa(), 0, 4)?;\n    workgroup_id(wg.isa(), 1, 5)?;",
+        );
         let checked = peacemaker_rip::check(&src, "wg.rip", arch, "v");
-        assert!(checked.diagnostics.is_empty(), "{arch:?}: {:?}", checked.diagnostics);
+        assert!(
+            checked.diagnostics.is_empty(),
+            "{arch:?}: {:?}",
+            checked.diagnostics
+        );
         assert!(checked.emitted.is_some());
     }
 }

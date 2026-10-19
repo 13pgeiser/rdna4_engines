@@ -53,7 +53,10 @@ struct PmObject {
 
 impl PmObject {
     fn verify(&self) -> Result<(), String> {
-        let got: String = Sha256::digest(self.image).iter().map(|b| format!("{b:02x}")).collect();
+        let got: String = Sha256::digest(self.image)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         if got != self.sha256 {
             return Err(format!(
                 "{}: embedded object sha256 {got} is not the accepted {}",
@@ -86,7 +89,9 @@ static PLAIN: PmObject = PmObject {
 static RESIDUAL: PmObject = PmObject {
     module: "gemv_hfq4g256_residual_xbatch_mq4v2_pm",
     symbol: "gemv_mq4g256v2_residual_xbatch",
-    image: include_bytes!("../../../kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_xbatch_mq4v2.co"),
+    image: include_bytes!(
+        "../../../kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_xbatch_mq4v2.co"
+    ),
     sha256: "7ad33f79e552f550a46a96c0863760bb3ac31ac8d7223e256a59ade20eb4ade1",
     rows_per_workgroup: Some(4),
 };
@@ -99,7 +104,9 @@ static RESIDUAL_VERIFIED: LazyLock<Result<(), String>> = LazyLock::new(|| RESIDU
 static MULTIROW: PmObject = PmObject {
     module: "gemv_hfq4g256_multirow_xbatch_mq4v2_pm",
     symbol: "gemv_mq4g256v2_multirow_r2_xbatch_pm",
-    image: include_bytes!("../../../kernels/pm-decode/gfx1201/gemv_hfq4g256_multirow_xbatch_mq4v2.co"),
+    image: include_bytes!(
+        "../../../kernels/pm-decode/gfx1201/gemv_hfq4g256_multirow_xbatch_mq4v2.co"
+    ),
     sha256: "fadb665f00c35bea787fda7c6956d9af61f5f6d1e60f759c2c7f2c23a1ddd9bf",
     rows_per_workgroup: Some(2),
 };
@@ -139,7 +146,9 @@ impl Gpu {
         k: usize,
         batch: usize,
     ) -> HipResult<()> {
-        verified.clone().map_err(|reason| HipError::new(0, &reason))?;
+        verified
+            .clone()
+            .map_err(|reason| HipError::new(0, &reason))?;
         self.bind_thread()?;
         self.ensure_embedded_kernel(obj.module, obj.image, obj.symbol)?;
         let a_ptr = a_raw.buf.as_ptr();
@@ -154,16 +163,23 @@ impl Gpu {
             &k_val as *const _ as *mut c_void,
             &b_val as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(obj.symbol, [obj.grid(m), 1, 1], [32, 1, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(a_ptr);
-            b.push_ptr(x_ptr);
-            b.push_ptr(y_ptr);
-            b.push_i32(m_val);
-            b.push_i32(k_val);
-            b.push_i32(b_val);
-            b
-        })
+        self.launch_maybe_blob(
+            obj.symbol,
+            [obj.grid(m), 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(b_val);
+                b
+            },
+        )
     }
 
     fn check_xbatch_shape(name: &str, m: usize, k: usize, batch: usize) -> HipResult<()> {
@@ -216,8 +232,14 @@ impl Gpu {
     ) -> HipResult<()> {
         Self::check_xbatch_shape("gemv_mq4g256v2_multirow_r2_xbatch_pm", m, k, batch)?;
         let fits = |n: Option<usize>| n.is_some_and(|n| n <= u32::MAX as usize);
-        if !fits(m.checked_mul(batch * 4)) || !fits(k.checked_mul(batch * 4)) || !fits((k / 256).checked_mul(m * 136)) {
-            return Err(HipError::new(0, "gemv_mq4g256v2_multirow_r2_xbatch_pm: 32-bit byte offsets required"));
+        if !fits(m.checked_mul(batch * 4))
+            || !fits(k.checked_mul(batch * 4))
+            || !fits((k / 256).checked_mul(m * 136))
+        {
+            return Err(HipError::new(
+                0,
+                "gemv_mq4g256v2_multirow_r2_xbatch_pm: 32-bit byte offsets required",
+            ));
         }
         if self.pm_xbatch_enabled() {
             return self.launch_pm_xbatch(&MULTIROW, &MULTIROW_VERIFIED, a_raw, x, y, m, k, batch);

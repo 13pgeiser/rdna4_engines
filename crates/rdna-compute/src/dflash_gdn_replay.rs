@@ -305,7 +305,11 @@ impl Gpu {
     /// returns to the pool once no tape holds it and no replay graph can
     /// reference it; otherwise it stays at its address until unload. A
     /// holder whose entry was already drained (unload) is a no-op.
-    pub fn dflash_gdn_replay_scratch_release(&mut self, shape: GdnReplayScratchShape, base: *mut c_void) {
+    pub fn dflash_gdn_replay_scratch_release(
+        &mut self,
+        shape: GdnReplayScratchShape,
+        base: *mut c_void,
+    ) {
         // bind_thread: skip — bookkeeping; the buffer goes to the pool, no device call.
         let Some(s) = self.dflash_gdn_replay_scratch.get_mut(&shape) else {
             return;
@@ -333,7 +337,10 @@ impl Gpu {
         base: *mut c_void,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let stream = self.active_stream.as_ref().map_or(0, |s| s.as_raw() as usize);
+        let stream = self
+            .active_stream
+            .as_ref()
+            .map_or(0, |s| s.as_raw() as usize);
         let capturing = self.graphs.capture_mode;
         let last = match self.dflash_gdn_replay_scratch.get(&shape) {
             Some(s) if s.buf.as_ptr() == base => s.last_stream,
@@ -365,8 +372,11 @@ impl Gpu {
     /// via `invalidate_weight_caches`). Tapes still holding one fail loudly
     /// at their next replay.
     pub(crate) fn drain_dflash_gdn_replay_scratch(&mut self) {
-        let entries: Vec<GdnReplaySharedScratch> =
-            self.dflash_gdn_replay_scratch.drain().map(|(_, s)| s).collect();
+        let entries: Vec<GdnReplaySharedScratch> = self
+            .dflash_gdn_replay_scratch
+            .drain()
+            .map(|(_, s)| s)
+            .collect();
         for s in entries {
             self.pool.free(s.buf);
         }

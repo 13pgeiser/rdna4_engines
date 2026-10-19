@@ -165,9 +165,15 @@ pub struct NodeRecord {
 #[derive(Debug, thiserror::Error)]
 pub enum CorpusError {
     #[error("{}: {source}", path.display())]
-    Io { path: PathBuf, source: std::io::Error },
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("{}: {source}", path.display())]
-    Json { path: PathBuf, source: serde_json::Error },
+    Json {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
     #[error("{}: {detail}", path.display())]
     Invalid { path: PathBuf, detail: String },
 }
@@ -225,16 +231,24 @@ fn short(sha: &str) -> &str {
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn is_sha256(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// A path inside the corpus: relative, no `..`, no root.
 fn contained(rel: &str) -> bool {
-    !rel.is_empty() && Path::new(rel).components().all(|c| matches!(c, Component::Normal(_)))
+    !rel.is_empty()
+        && Path::new(rel)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
 }
 
 /// An opened corpus directory. Opening validates the whole index; receipts
@@ -250,22 +264,45 @@ impl JitCorpus {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, CorpusError> {
         let root = root.as_ref().to_path_buf();
         let path = root.join(CORPUS_INDEX);
-        let bytes = std::fs::read(&path).map_err(|source| CorpusError::Io { path: path.clone(), source })?;
-        let index: CorpusIndex = serde_json::from_slice(&bytes).map_err(|source| CorpusError::Json { path: path.clone(), source })?;
-        let invalid = |detail: String| CorpusError::Invalid { path: path.clone(), detail };
+        let bytes = std::fs::read(&path).map_err(|source| CorpusError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let index: CorpusIndex =
+            serde_json::from_slice(&bytes).map_err(|source| CorpusError::Json {
+                path: path.clone(),
+                source,
+            })?;
+        let invalid = |detail: String| CorpusError::Invalid {
+            path: path.clone(),
+            detail,
+        };
         if index.schema != CORPUS_SCHEMA || index.version != CORPUS_VERSION {
-            return Err(invalid(format!("schema {} v{} is not {CORPUS_SCHEMA} v{CORPUS_VERSION}", index.schema, index.version)));
+            return Err(invalid(format!(
+                "schema {} v{} is not {CORPUS_SCHEMA} v{CORPUS_VERSION}",
+                index.schema, index.version
+            )));
         }
-        if !is_sha256(&index.toolchain.pin) || index.toolchain.pin != sha256_hex(index.toolchain.id.as_bytes()) {
-            return Err(invalid("toolchain pin is not the SHA-256 of the toolchain id".into()));
+        if !is_sha256(&index.toolchain.pin)
+            || index.toolchain.pin != sha256_hex(index.toolchain.id.as_bytes())
+        {
+            return Err(invalid(
+                "toolchain pin is not the SHA-256 of the toolchain id".into(),
+            ));
         }
         let mut by_artifact = HashMap::new();
         for (i, r) in index.records.iter().enumerate() {
             if !is_sha256(&r.artifact_sha256) || !is_sha256(&r.receipt_sha256) {
-                return Err(invalid(format!("record {} {}: malformed digest", r.arch, r.module)));
+                return Err(invalid(format!(
+                    "record {} {}: malformed digest",
+                    r.arch, r.module
+                )));
             }
             if !contained(&r.object) || !contained(&r.receipt) {
-                return Err(invalid(format!("record {} {}: path escapes the corpus", r.arch, r.module)));
+                return Err(invalid(format!(
+                    "record {} {}: path escapes the corpus",
+                    r.arch, r.module
+                )));
             }
             // Two registry modules with the same source compile to the same
             // object (beta's `gemv_mq4g256` / `mq_rotate_x`). One object has one
@@ -277,32 +314,55 @@ impl JitCorpus {
                 }
                 std::collections::hash_map::Entry::Occupied(o) => {
                     if index.records[*o.get()].receipt_sha256 != r.receipt_sha256 {
-                        return Err(invalid(format!("duplicate record {} {} with a different receipt", r.arch, r.artifact_sha256)));
+                        return Err(invalid(format!(
+                            "duplicate record {} {} with a different receipt",
+                            r.arch, r.artifact_sha256
+                        )));
                     }
                 }
             }
         }
         for r in &index.rejected {
-            if !is_sha256(&r.artifact_sha256) || !contained(&r.object) || by_artifact.contains_key(&(r.arch.clone(), r.artifact_sha256.clone())) {
-                return Err(invalid(format!("rejected object {} {} is malformed or also a record", r.arch, r.module)));
+            if !is_sha256(&r.artifact_sha256)
+                || !contained(&r.object)
+                || by_artifact.contains_key(&(r.arch.clone(), r.artifact_sha256.clone()))
+            {
+                return Err(invalid(format!(
+                    "rejected object {} {} is malformed or also a record",
+                    r.arch, r.module
+                )));
             }
         }
         for program in &index.programs {
             for node in &program.nodes {
-                let exports = match by_artifact.get(&(program.arch.clone(), node.artifact_sha256.clone())) {
-                    Some(&i) => &index.records[i].symbols,
-                    None => match index.rejected.iter().find(|r| r.arch == program.arch && r.artifact_sha256 == node.artifact_sha256) {
-                        Some(r) => &r.symbols,
-                        None => return Err(invalid(format!("program {} node {} names artifact {} with no record",
-                            program.id, node.symbol, node.artifact_sha256))),
-                    },
-                };
+                let exports =
+                    match by_artifact.get(&(program.arch.clone(), node.artifact_sha256.clone())) {
+                        Some(&i) => &index.records[i].symbols,
+                        None => match index.rejected.iter().find(|r| {
+                            r.arch == program.arch && r.artifact_sha256 == node.artifact_sha256
+                        }) {
+                            Some(r) => &r.symbols,
+                            None => {
+                                return Err(invalid(format!(
+                                    "program {} node {} names artifact {} with no record",
+                                    program.id, node.symbol, node.artifact_sha256
+                                )))
+                            }
+                        },
+                    };
                 if !exports.iter().any(|s| s == &node.symbol) {
-                    return Err(invalid(format!("program {} node {}: its object does not export it", program.id, node.symbol)));
+                    return Err(invalid(format!(
+                        "program {} node {}: its object does not export it",
+                        program.id, node.symbol
+                    )));
                 }
             }
         }
-        Ok(Self { root, index, by_artifact })
+        Ok(Self {
+            root,
+            index,
+            by_artifact,
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -322,59 +382,107 @@ impl JitCorpus {
         if key.toolchain_pin != self.index.toolchain.pin {
             return None;
         }
-        self.by_artifact.get(&(key.arch.to_owned(), key.artifact_sha256.to_owned())).map(|&i| &self.index.records[i])
+        self.by_artifact
+            .get(&(key.arch.to_owned(), key.artifact_sha256.to_owned()))
+            .map(|&i| &self.index.records[i])
     }
 
     /// Why `(arch, artifact_sha256)` has no record, when the certifier
     /// rejected that object.
     pub fn rejection(&self, arch: &str, artifact_sha256: &str) -> Option<&RejectedObject> {
-        self.index.rejected.iter().find(|r| r.arch == arch && r.artifact_sha256 == artifact_sha256)
+        self.index
+            .rejected
+            .iter()
+            .find(|r| r.arch == arch && r.artifact_sha256 == artifact_sha256)
     }
 
     /// The first hipcc-built record for `(arch, module, packaging_key)`: the
     /// runtime's toolchain-free JIT cache key for the module's generated source.
     /// Native ([`ObjectOrigin::PmNative`]) records have no packaging key and are
     /// never matched here; they are found by image digest through [`Self::record`].
-    pub fn record_for_module(&self, arch: &str, module: &str, packaging_key: &str) -> Option<&CorpusRecord> {
-        self.index.records.iter().find(|r| r.origin == ObjectOrigin::Hipcc && r.arch == arch && r.module == module && r.packaging_key == packaging_key)
+    pub fn record_for_module(
+        &self,
+        arch: &str,
+        module: &str,
+        packaging_key: &str,
+    ) -> Option<&CorpusRecord> {
+        self.index.records.iter().find(|r| {
+            r.origin == ObjectOrigin::Hipcc
+                && r.arch == arch
+                && r.module == module
+                && r.packaging_key == packaging_key
+        })
     }
 
     /// Look an artifact up and return its verified receipt. A receipt that is
     /// absent, altered, or names other bytes is an error, not a miss.
     pub fn lookup(&self, key: &ArtifactKey) -> Result<Lookup, CorpusError> {
-        let Some(record) = self.record(key) else { return Ok(Lookup::Missing) };
+        let Some(record) = self.record(key) else {
+            return Ok(Lookup::Missing);
+        };
         let path = self.root.join(&record.receipt);
-        let bytes = std::fs::read(&path).map_err(|source| CorpusError::Io { path: path.clone(), source })?;
-        let invalid = |detail: String| CorpusError::Invalid { path: path.clone(), detail };
+        let bytes = std::fs::read(&path).map_err(|source| CorpusError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let invalid = |detail: String| CorpusError::Invalid {
+            path: path.clone(),
+            detail,
+        };
         if sha256_hex(&bytes) != record.receipt_sha256 {
-            return Err(invalid("receipt SHA-256 does not match the corpus index".into()));
+            return Err(invalid(
+                "receipt SHA-256 does not match the corpus index".into(),
+            ));
         }
-        let receipt: Receipt = serde_json::from_slice(&bytes).map_err(|source| CorpusError::Json { path: path.clone(), source })?;
-        if receipt.schema != RECEIPT_SCHEMA || receipt.schema_version != RECEIPT_SCHEMA_VERSION
+        let receipt: Receipt =
+            serde_json::from_slice(&bytes).map_err(|source| CorpusError::Json {
+                path: path.clone(),
+                source,
+            })?;
+        if receipt.schema != RECEIPT_SCHEMA
+            || receipt.schema_version != RECEIPT_SCHEMA_VERSION
             || receipt.railgun.section_version != RAILGUN_SECTION_VERSION
         {
             return Err(invalid(format!("receipt schema {} v{} section v{} is not {RECEIPT_SCHEMA} v{RECEIPT_SCHEMA_VERSION} section v{RAILGUN_SECTION_VERSION}",
                 receipt.schema, receipt.schema_version, receipt.railgun.section_version)));
         }
         if receipt.object_sha256 != key.artifact_sha256 || receipt.arch != key.arch {
-            return Err(invalid(format!("receipt certifies {} {}, not {} {}", receipt.arch, receipt.object_sha256, key.arch, key.artifact_sha256)));
+            return Err(invalid(format!(
+                "receipt certifies {} {}, not {} {}",
+                receipt.arch, receipt.object_sha256, key.arch, key.artifact_sha256
+            )));
         }
-        Ok(Lookup::Hit(Box::new(Hit { record: record.clone(), receipt })))
+        Ok(Lookup::Hit(Box::new(Hit {
+            record: record.clone(),
+            receipt,
+        })))
     }
 
     /// Every node of `program` must resolve to a verified receipt that
     /// carries a record for the node's symbol.
-    pub fn check_program(&self, program: &str, arch: &str, toolchain_pin: &str, nodes: &[ProgramNode]) -> Result<(), ProgramCheckError> {
+    pub fn check_program(
+        &self,
+        program: &str,
+        arch: &str,
+        toolchain_pin: &str,
+        nodes: &[ProgramNode],
+    ) -> Result<(), ProgramCheckError> {
         let mut receipts: BTreeMap<&str, Result<Receipt, String>> = BTreeMap::new();
         let mut missing = Vec::new();
         for node in nodes {
             let receipt = receipts.entry(node.artifact_sha256).or_insert_with(|| {
-                let key = ArtifactKey { arch, toolchain_pin, artifact_sha256: node.artifact_sha256 };
+                let key = ArtifactKey {
+                    arch,
+                    toolchain_pin,
+                    artifact_sha256: node.artifact_sha256,
+                };
                 match self.lookup(&key) {
                     Ok(Lookup::Hit(hit)) => Ok(hit.receipt),
-                    Ok(Lookup::Missing) if toolchain_pin != self.toolchain_pin() => {
-                        Err(format!("corpus toolchain pin {} is not {}", short(self.toolchain_pin()), short(toolchain_pin)))
-                    }
+                    Ok(Lookup::Missing) if toolchain_pin != self.toolchain_pin() => Err(format!(
+                        "corpus toolchain pin {} is not {}",
+                        short(self.toolchain_pin()),
+                        short(toolchain_pin)
+                    )),
                     Ok(Lookup::Missing) => Err(match self.rejection(arch, node.artifact_sha256) {
                         Some(r) => format!("railgun-cert rejected the object: {}", r.reason),
                         None => "no record".into(),
@@ -387,12 +495,20 @@ impl JitCorpus {
                 Ok(_) => format!("receipt has no kernel {}", node.symbol),
                 Err(e) => e.clone(),
             };
-            missing.push(MissingNode { symbol: node.symbol.to_owned(), artifact_sha256: node.artifact_sha256.to_owned(), reason });
+            missing.push(MissingNode {
+                symbol: node.symbol.to_owned(),
+                artifact_sha256: node.artifact_sha256.to_owned(),
+                reason,
+            });
         }
         if missing.is_empty() {
             Ok(())
         } else {
-            Err(ProgramCheckError { program: program.to_owned(), arch: arch.to_owned(), missing })
+            Err(ProgramCheckError {
+                program: program.to_owned(),
+                arch: arch.to_owned(),
+                missing,
+            })
         }
     }
 }

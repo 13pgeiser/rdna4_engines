@@ -35,8 +35,8 @@ use hipfire_runtime::llama::{self, KvCache};
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::tokenizer::{Tokenizer, TokenizerError};
 use hipfire_runtime::tp_shard::ShardConfig;
-use rdna_compute::dflash_state_copy::{DflashStateCopyDesc, DFLASH_STATE_BULK_COPY_MAX_ITEMS};
 use rdna_compute::dflash_sampled_accept::DflashAcceptScratch;
+use rdna_compute::dflash_state_copy::{DflashStateCopyDesc, DFLASH_STATE_BULK_COPY_MAX_ITEMS};
 use rdna_compute::{DType, Fp8VerifyTarget, Gpu, GpuTensor};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -532,7 +532,15 @@ pub fn dflash_finish_retained_lm_head_argmax(
 ) -> HipResult<Vec<u32>> {
     if dflash_batched_lm_head_supported(w_out.gpu_dtype) {
         let math = verify_dense_math(gpu);
-        dflash_enqueue_verify_lm_head_argmax(gpu, w_out, final_hidden, verify_scratch, b, vocab, math)?;
+        dflash_enqueue_verify_lm_head_argmax(
+            gpu,
+            w_out,
+            final_hidden,
+            verify_scratch,
+            b,
+            vocab,
+            math,
+        )?;
         return dflash_download_verify_argmax(gpu, verify_scratch, b);
     }
 
@@ -570,9 +578,7 @@ fn selector_candidates_shape(proposal: &dflash::DflashCandidateProposal) -> HipR
 
 /// The temperature>0 selector inputs: flattened normalized q (`[rows*top_k]`)
 /// and the per-row selected probability (`[rows]`), shape-checked.
-fn selector_temp_inputs(
-    proposal: &dflash::DflashCandidateProposal,
-) -> HipResult<(&[f32], &[f32])> {
+fn selector_temp_inputs(proposal: &dflash::DflashCandidateProposal) -> HipResult<(&[f32], &[f32])> {
     let rows = proposal.tokens.len();
     let top_k = proposal.top_k;
     let probs = proposal.probabilities.as_ref().ok_or_else(|| {
@@ -1349,7 +1355,10 @@ impl DnCbExtents {
     /// `None` unless the geometry is the one the exact save-free kernels
     /// cover: 128-wide heads and conv kernel dimension 4 (3 ring slots).
     fn for_config(config: &Qwen35Config) -> Option<Self> {
-        if config.conv_kernel_dim != 4 || config.linear_key_head_dim != 128 || config.linear_value_head_dim != 128 {
+        if config.conv_kernel_dim != 4
+            || config.linear_key_head_dim != 128
+            || config.linear_value_head_dim != 128
+        {
             return None;
         }
         let hv = config.linear_num_value_heads;
@@ -1696,7 +1705,11 @@ impl DeltaNetSnapshot {
     ///
     /// Cross-lane pointer distinctness is the caller's whole-chunk check
     /// ([`Self::push_owner_ptrs`]).
-    pub(crate) fn cb_verify_owned_exact(&self, state: &DeltaNetState, config: &Qwen35Config) -> bool {
+    pub(crate) fn cb_verify_owned_exact(
+        &self,
+        state: &DeltaNetState,
+        config: &Qwen35Config,
+    ) -> bool {
         let Some(ext) = DnCbExtents::for_config(config) else {
             return false;
         };
@@ -1708,7 +1721,13 @@ impl DeltaNetSnapshot {
     fn exact_extents(&self, state: &DeltaNetState, ext: &DnCbExtents) -> bool {
         /// Equal live/backup size per layer, each at least `logical`
         /// (`exact`: exactly `logical`).
-        fn fam_ok(live: &[GpuTensor], back: &[DeviceBuffer], n: usize, logical: usize, exact: bool) -> bool {
+        fn fam_ok(
+            live: &[GpuTensor],
+            back: &[DeviceBuffer],
+            n: usize,
+            logical: usize,
+            exact: bool,
+        ) -> bool {
             live.len() == n
                 && back.len() == n
                 && live.iter().zip(back).all(|(l, b)| {
@@ -1721,8 +1740,20 @@ impl DeltaNetSnapshot {
             && state.quant == qwen35::StateQuant::Q8
             && fam_ok(&state.s_matrices, &self.s_matrix_bufs, n, ext.s, true)
             && fam_ok(&state.s_scales, &self.s_scale_bufs, n, ext.scales, false)
-            && fam_ok(&state.conv_states, &self.conv_state_bufs, n, ext.conv, false)
-            && fam_ok(&state.s_ef_residual, &self.s_ef_residual_bufs, n, ext.ef, false)
+            && fam_ok(
+                &state.conv_states,
+                &self.conv_state_bufs,
+                n,
+                ext.conv,
+                false,
+            )
+            && fam_ok(
+                &state.s_ef_residual,
+                &self.s_ef_residual_bufs,
+                n,
+                ext.ef,
+                false,
+            )
     }
 
     /// Every buffer of `state` and of this snapshot is a HIP-owned allocation.
@@ -1834,20 +1865,24 @@ impl DeltaNetSnapshot {
         // and pool rounding only pads, so the common extent covers every
         // element and never overruns either side.
         for (dst, src) in self.s_matrix_bufs.iter().zip(state.s_matrices.iter()) {
-            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
+            gpu.hip
+                .memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
         }
         for (dst, src) in self.s_scale_bufs.iter().zip(state.s_scales.iter()) {
-            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
+            gpu.hip
+                .memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
         }
         for (dst, src) in self.conv_state_bufs.iter().zip(state.conv_states.iter()) {
-            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
+            gpu.hip
+                .memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
         }
         for (dst, src) in self
             .s_ef_residual_bufs
             .iter()
             .zip(state.s_ef_residual.iter())
         {
-            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
+            gpu.hip
+                .memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
         }
         Ok(())
     }
@@ -1910,20 +1945,24 @@ impl DeltaNetSnapshot {
         }
         // Common extent (see `save_from`).
         for (src, dst) in self.s_matrix_bufs.iter().zip(state.s_matrices.iter()) {
-            gpu.hip.memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
+            gpu.hip
+                .memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
         }
         for (src, dst) in self.s_scale_bufs.iter().zip(state.s_scales.iter()) {
-            gpu.hip.memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
+            gpu.hip
+                .memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
         }
         for (src, dst) in self.conv_state_bufs.iter().zip(state.conv_states.iter()) {
-            gpu.hip.memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
+            gpu.hip
+                .memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
         }
         for (src, dst) in self
             .s_ef_residual_bufs
             .iter()
             .zip(state.s_ef_residual.iter())
         {
-            gpu.hip.memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
+            gpu.hip
+                .memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
         }
         Ok(())
     }
@@ -2493,23 +2532,27 @@ impl GdnTape {
                 let pre: Vec<_> = pre
                     .into_iter()
                     .enumerate()
-                    .map(|(la, base)| rdna_compute::dflash_gdn_replay::DflashReplayPreLayerFrom {
-                        base,
-                        conv_state_src: snap.conv_state_bufs[la].as_ptr() as u64,
-                    })
+                    .map(
+                        |(la, base)| rdna_compute::dflash_gdn_replay::DflashReplayPreLayerFrom {
+                            base,
+                            conv_state_src: snap.conv_state_bufs[la].as_ptr() as u64,
+                        },
+                    )
                     .collect();
                 let gdn: Vec<_> = gdn
                     .into_iter()
                     .enumerate()
-                    .map(|(la, base)| rdna_compute::dflash_gdn_replay::GdnLayerTableFrom {
-                        base,
-                        s_q8_src: snap.s_matrix_bufs[la].as_ptr() as u64,
-                        s_scales_src: snap.s_scale_bufs[la].as_ptr() as u64,
-                        ef_src: snap
-                            .s_ef_residual_bufs
-                            .get(la)
-                            .map_or(0, |b| b.as_ptr() as u64),
-                    })
+                    .map(
+                        |(la, base)| rdna_compute::dflash_gdn_replay::GdnLayerTableFrom {
+                            base,
+                            s_q8_src: snap.s_matrix_bufs[la].as_ptr() as u64,
+                            s_scales_src: snap.s_scale_bufs[la].as_ptr() as u64,
+                            ef_src: snap
+                                .s_ef_residual_bufs
+                                .get(la)
+                                .map_or(0, |b| b.as_ptr() as u64),
+                        },
+                    )
                     .collect();
                 let Some(from) = ml.from.as_mut() else {
                     unreachable!("armed at construction")
@@ -2594,7 +2637,12 @@ impl GdnTape {
         let can_graph = graph_enabled && gpu.active_stream.is_some();
 
         if can_graph && gpu.graphs.replay_has_graph(n_steps) {
-            if let Some(ml) = self.replay_ml.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            if let Some(ml) = self
+                .replay_ml
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+            {
                 ml.order(gpu)?;
             }
             return gpu.graphs.replay_graph_launch(
@@ -2940,8 +2988,8 @@ impl GdnReplayMlFrom {
     /// failure frees what was allocated and returns the error.
     fn arm(gpu: &mut Gpu, n_la: usize) -> HipResult<Self> {
         gpu.ensure_dflash_gdn_replay_ml_from()?;
-        let pre_bytes = n_la
-            * std::mem::size_of::<rdna_compute::dflash_gdn_replay::DflashReplayPreLayerFrom>();
+        let pre_bytes =
+            n_la * std::mem::size_of::<rdna_compute::dflash_gdn_replay::DflashReplayPreLayerFrom>();
         let gdn_bytes =
             n_la * std::mem::size_of::<rdna_compute::dflash_gdn_replay::GdnLayerTableFrom>();
         let alloc_pair = |gpu: &mut Gpu| -> HipResult<(DeviceBuffer, DeviceBuffer)> {
@@ -3249,7 +3297,11 @@ impl VerifyScratch {
         if let Some(pbs) = self.prefill_batch {
             pbs.free_gpu(gpu);
         }
-        if let Some(acc) = self.device_accept.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        if let Some(acc) = self
+            .device_accept
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner())
+        {
             acc.free(gpu);
         }
     }
@@ -4030,7 +4082,11 @@ pub enum TargetRowRef<'a> {
     Dense { raw: &'a [f32], tau: f32, z: f32 },
     /// The kept set `p >= tau` (`tau > 0`): ascending ids and RAW probs. The
     /// truncated value of id `idx[k]` is `val[k] * inv_z`, every other id 0.
-    Sparse { idx: &'a [u32], val: &'a [f32], inv_z: f32 },
+    Sparse {
+        idx: &'a [u32],
+        val: &'a [f32],
+        inv_z: f32,
+    },
 }
 
 /// FAST_SAMPLE target rows of a sampled DFlash window, downloaded from the
@@ -4060,7 +4116,12 @@ pub struct FastTargetRows {
 impl FastTargetRows {
     /// Dense-mode rows.
     pub fn dense(probs: Vec<f32>, tau: Vec<f32>, z: Vec<f32>) -> Self {
-        Self { probs, tau, z, ..Self::default() }
+        Self {
+            probs,
+            tau,
+            z,
+            ..Self::default()
+        }
     }
 
     pub fn rows(&self) -> usize {
@@ -4126,7 +4187,10 @@ impl FastTargetRows {
             || self.idx.len() != rows * cap
             || self.val.len() != rows * cap
         {
-            return Err(HipError::new(0, "sparse target rows: inconsistent compact arrays"));
+            return Err(HipError::new(
+                0,
+                "sparse target rows: inconsistent compact arrays",
+            ));
         }
         self.dense_slot.clear();
         let mut n_dense = 0usize;
@@ -4140,10 +4204,13 @@ impl FastTargetRows {
                 continue;
             }
             let ids = &self.idx[r * cap..r * cap + c];
-            let ok = ids.iter().all(|&i| (i as usize) < vocab)
-                && ids.windows(2).all(|w| w[0] < w[1]);
+            let ok =
+                ids.iter().all(|&i| (i as usize) < vocab) && ids.windows(2).all(|w| w[0] < w[1]);
             if !ok {
-                return Err(HipError::new(0, "sparse target rows: compact ids not ascending/in range"));
+                return Err(HipError::new(
+                    0,
+                    "sparse target rows: compact ids not ascending/in range",
+                ));
             }
             self.dense_slot.push(SPARSE_NONE);
         }
@@ -4252,11 +4319,25 @@ impl TargetRowsScratch {
             return Err(HipError::new(0, "sparse target run: not a sparse run"));
         }
         self.ensure_sparse(gpu, run_rows, vocab)?;
-        dflash_target_rows_core(gpu, logits, &self.bufs, run_rows, vocab, cfg, &mut self.host)
+        dflash_target_rows_core(
+            gpu,
+            logits,
+            &self.bufs,
+            run_rows,
+            vocab,
+            cfg,
+            &mut self.host,
+        )
     }
 
     /// Lane-owned copy of rows `r0..r0 + b` of the last [`Self::run_sparse`].
-    pub fn split_lane_into(&self, r0: usize, b: usize, vocab: usize, out: &mut FastTargetRows) -> HipResult<()> {
+    pub fn split_lane_into(
+        &self,
+        r0: usize,
+        b: usize,
+        vocab: usize,
+        out: &mut FastTargetRows,
+    ) -> HipResult<()> {
         self.host.split_lane_into(r0, b, vocab, out)
     }
 }
@@ -4265,7 +4346,13 @@ impl FastTargetRows {
     /// Sparse mode: the `b` rows `r0..r0 + b` of this run as a lane-owned
     /// `FastTargetRows`, identical to what the per-lane download of those
     /// rows produces (including its validation and dense-row slots).
-    fn split_lane_into(&self, r0: usize, b: usize, vocab: usize, out: &mut FastTargetRows) -> HipResult<()> {
+    fn split_lane_into(
+        &self,
+        r0: usize,
+        b: usize,
+        vocab: usize,
+        out: &mut FastTargetRows,
+    ) -> HipResult<()> {
         let cap = self.capacity;
         if cap == 0 || r0 + b > self.tau.len() || self.dense_slot.len() != self.tau.len() {
             return Err(HipError::new(0, "sparse target run: inconsistent run rows"));
@@ -4279,9 +4366,11 @@ impl FastTargetRows {
         out.counts.clear();
         out.counts.extend_from_slice(&self.counts[r0..r0 + b]);
         out.idx.clear();
-        out.idx.extend_from_slice(&self.idx[r0 * cap..(r0 + b) * cap]);
+        out.idx
+            .extend_from_slice(&self.idx[r0 * cap..(r0 + b) * cap]);
         out.val.clear();
-        out.val.extend_from_slice(&self.val[r0 * cap..(r0 + b) * cap]);
+        out.val
+            .extend_from_slice(&self.val[r0 * cap..(r0 + b) * cap]);
         let n_dense = out.plan_dense_rows(vocab)?;
         out.dense_rows.clear();
         if n_dense == 0 {
@@ -4295,7 +4384,10 @@ impl FastTargetRows {
             }
             let src = self.dense_slot[r0 + i];
             if src == SPARSE_NONE {
-                return Err(HipError::new(0, "sparse target run: dense row classification mismatch"));
+                return Err(HipError::new(
+                    0,
+                    "sparse target run: dense row classification mismatch",
+                ));
             }
             let (s, src) = (slot as usize, src as usize);
             out.dense_rows[s * vocab..(s + 1) * vocab]
@@ -4345,16 +4437,7 @@ fn dflash_target_rows_core(
     let sparse = bufs.len() == 6;
     let (probs_gpu, tau_gpu, z_gpu) = (&bufs[0], &bufs[1], &bufs[2]);
     gpu.softmax_temp_topp_batched_into_f32(
-        logits,
-        probs_gpu,
-        tau_gpu,
-        z_gpu,
-        vocab,
-        b,
-        cfg.temp,
-        cfg.top_p,
-        cfg.top_k,
-        0.0,
+        logits, probs_gpu, tau_gpu, z_gpu, vocab, b, cfg.temp, cfg.top_p, cfg.top_k, 0.0,
     )?;
     // Exact-row views: a persistent scratch may be larger than this pass.
     gpu.download_f32_into(&tau_gpu.sub_offset(0, b), &mut out.tau)?;
@@ -4475,7 +4558,10 @@ pub fn dflash_sampled_accept_device(
 ) -> HipResult<SampledWindowDecision> {
     let b = block.len();
     if !dflash_device_accept_eligible(true, &cfg, q, b) {
-        return Err(HipError::new(0, "device sampled accept: ineligible window (cactus / dense q / receipt shape)"));
+        return Err(HipError::new(
+            0,
+            "device sampled accept: ineligible window (cactus / dense q / receipt shape)",
+        ));
     }
     let n = b - 1;
     let nnz = q.sparse_q.offsets()[n] as usize;
@@ -4483,7 +4569,8 @@ pub fn dflash_sampled_accept_device(
     DflashAcceptScratch::ensure(scratch, gpu, b, vocab, payload_words)?;
     let s = scratch.as_mut().expect("scratch ensured above");
     s.host_uniforms.clear();
-    s.host_uniforms.extend((0..n).map(|_| xorshift_next_unit(rng)));
+    s.host_uniforms
+        .extend((0..n).map(|_| xorshift_next_unit(rng)));
     let u_fin = xorshift_next_unit(rng);
     rdna_compute::dflash_sampled_accept::dflash_accept_pack_payload(
         &mut s.host_payload,
@@ -4502,10 +4589,25 @@ pub fn dflash_sampled_accept_device(
     // The scratch tensors may be larger than this window: kernels size by the
     // explicit (rows, vocab) arguments, never by the tensor.
     gpu.softmax_temp_topp_batched_into_f32(
-        &logits_batch, &s.probs, &s.tau, &s.z, vocab, b, cfg.temp, cfg.top_p, cfg.top_k, 0.0,
+        &logits_batch,
+        &s.probs,
+        &s.tau,
+        &s.z,
+        vocab,
+        b,
+        cfg.temp,
+        cfg.top_p,
+        cfg.top_k,
+        0.0,
     )?;
     let d = gpu.dflash_sampled_accept_sparse_q_f32(
-        s, &s.probs, &s.tau, &s.z, &s.host_payload, n, vocab,
+        s,
+        &s.probs,
+        &s.tau,
+        &s.z,
+        &s.host_payload,
+        n,
+        vocab,
     )?;
     Ok(SampledWindowDecision {
         accepted_drafts: d.accept_len,
@@ -4562,8 +4664,16 @@ pub fn dflash_sampled_accept_rows(
         QRows::Dense(&q.dense_q)
     };
     dflash_sampled_accept_q_rows(
-        block, &q.selected_q, q_rows, fast, logits, vocab, cfg,
-        max_accept, rng, scratch,
+        block,
+        &q.selected_q,
+        q_rows,
+        fast,
+        logits,
+        vocab,
+        cfg,
+        max_accept,
+        rng,
+        scratch,
     )
 }
 
@@ -4592,7 +4702,11 @@ fn dflash_sampled_accept_q_rows(
         let p_d = selected_q[i].max(f32::MIN_POSITIVE);
         if !use_cactus {
             if let (
-                Some(TargetRowRef::Sparse { idx: tidx, val: tval, inv_z }),
+                Some(TargetRowRef::Sparse {
+                    idx: tidx,
+                    val: tval,
+                    inv_z,
+                }),
                 QRows::Sparse(qs),
             ) = (fast.map(|f| f.row(i, vocab)), q)
             {
@@ -4779,7 +4893,11 @@ pub(crate) fn sample_residual_point_mass(p_target: &[f32], excluded: u32, u: f32
     let ex = excluded as usize;
     let mut sum = 0.0f32;
     for i in 0..p_target.len() {
-        let d = if i == ex { p_target[i] - 1.0 } else { p_target[i] };
+        let d = if i == ex {
+            p_target[i] - 1.0
+        } else {
+            p_target[i]
+        };
         if d > 0.0 {
             sum += d;
         }
@@ -4790,7 +4908,11 @@ pub(crate) fn sample_residual_point_mass(p_target: &[f32], excluded: u32, u: f32
     let u_scaled = u * sum;
     let mut acc = 0.0f32;
     for i in 0..p_target.len() {
-        let d = if i == ex { p_target[i] - 1.0 } else { p_target[i] };
+        let d = if i == ex {
+            p_target[i] - 1.0
+        } else {
+            p_target[i]
+        };
         if d > 0.0 {
             acc += d;
             if u_scaled < acc {
@@ -5422,7 +5544,8 @@ fn dflash_commit_decision_borrowed(
         // so the rewritten KV/DeltaNet rows are the verify's FP8 / IU4 rows
         // (n >= 2; the per-token n == 1 fallback inside is the decode GEMV).
         let fp8 = fp8_verify_target(target.weights, target.config, target.kv_cache);
-        let iu4 = qwen35::prefill::multi::dflash_iu4_verify_admitted(gpu, target.weights, target.config);
+        let iu4 =
+            qwen35::prefill::multi::dflash_iu4_verify_admitted(gpu, target.weights, target.config);
         fp8_verify_scoped(gpu, fp8, |gpu| {
             iu4_verify_scoped(gpu, iu4, |gpu| {
                 qwen35::forward_prefill_batch(
@@ -5584,7 +5707,6 @@ pub fn dflash_greedy_accept_commit_parts(
     )
 }
 
-
 /// Run the target on `draft_tokens` (length B) positions starting at
 /// `start_pos`. Advances `target.kv_cache` and `target.dn_state` by B
 /// positions. Writes B hidden-state rows into `hidden_rb` (ring head
@@ -5735,7 +5857,9 @@ fn verify_dflash_block_inner(
     // A retained route that stands down (`HipAuto`, e.g. PM4 disabled) runs
     // the ordinary HIP body; prime/capture/PM4 windows are never IU4-scoped.
     let iu4 = tree_verify.is_none()
-        && retained.as_ref().is_none_or(|c| c.selected == DflashVerifyRoute::HipAuto)
+        && retained
+            .as_ref()
+            .is_none_or(|c| c.selected == DflashVerifyRoute::HipAuto)
         && qwen35::prefill::multi::dflash_iu4_verify_admitted(gpu, &target.weights, &target.config);
     let prev = gpu.fp8_verify_enter(fp8)?;
     let prev_iu4 = gpu.iu4_verify_enter(iu4);
@@ -6305,15 +6429,7 @@ pub(crate) fn dflash_verify_head(
         // MQ4/HFQ4/HFQ6/MQ6 kernels have no 64-row cap and take the
         // single-shot path.
         let math = verify_dense_math(gpu);
-        dflash_enqueue_verify_lm_head(
-            gpu,
-            w_out,
-            final_hidden,
-            verify_scratch,
-            b,
-            vocab,
-            math,
-        )?;
+        dflash_enqueue_verify_lm_head(gpu, w_out, final_hidden, verify_scratch, b, vocab, math)?;
         if want_full_logits {
             // Rejection-sampling path needs full target distribution.
             // Cost: B × vocab × 4 bytes D2H per verify (~15 MB at B=16 × 248K).
@@ -6816,12 +6932,21 @@ pub fn scatter_hidden_prefill_to_interleaved(
     });
     if !*FAST {
         return scatter_hidden_block_to_interleaved(
-            gpu, hidden_rb, dst, dst_row_offset, block_size, n_rows, dst_modulus,
+            gpu,
+            hidden_rb,
+            dst,
+            dst_row_offset,
+            block_size,
+            n_rows,
+            dst_modulus,
         );
     }
     assert!(n_rows <= block_size, "scatter: n_rows > block_size");
     let max_pos = hidden_rb.max_positions;
-    assert!(block_size <= hidden_rb.written.max(max_pos), "scatter: block_size > written");
+    assert!(
+        block_size <= hidden_rb.written.max(max_pos),
+        "scatter: block_size > written"
+    );
     let num_extract = hidden_rb.extract_layers.len();
     let row_bytes = hidden_rb.hidden_dim * 4;
     let r_skip = block_size.saturating_sub(max_pos);
@@ -7147,10 +7272,24 @@ pub fn dflash_sampled_selector_draft_into(
     out: &mut DflashSampledDraft,
 ) -> HipResult<()> {
     dflash_sampled_selector_draft_parts_into(
-        gpu, weights, &df.draft_weights, &df.draft_config,
-        &mut df.draft_scratch, &df.verify_scratch, &[],
+        gpu,
+        weights,
+        &df.draft_weights,
+        &df.draft_config,
+        &mut df.draft_scratch,
+        &df.verify_scratch,
+        &[],
         &df.verify_scratch.logits.sub_offset(0, vocab),
-        position, compact_offset, seed, b, vocab, None, false, cfg, rng, out,
+        position,
+        compact_offset,
+        seed,
+        b,
+        vocab,
+        None,
+        false,
+        cfg,
+        rng,
+        out,
     )
 }
 
@@ -7176,7 +7315,10 @@ fn dflash_sampled_selector_draft_parts_into(
     out: &mut DflashSampledDraft,
 ) -> HipResult<()> {
     if b < 2 || cfg.temp <= 0.0 || !draft_weights.has_candidate_selector() {
-        return Err(HipError::new(0, "sampled DFlash draft requires b>=2, temp>0 and selector"));
+        return Err(HipError::new(
+            0,
+            "sampled DFlash draft requires b>=2, temp>0 and selector",
+        ));
     }
     if gpu.active_stream.is_none() {
         gpu.active_stream = Some(gpu.hip.stream_create()?);
@@ -7185,9 +7327,17 @@ fn dflash_sampled_selector_draft_parts_into(
     out.block.resize(b, draft_cfg.mask_token_id);
     out.block[0] = seed;
     draft_dflash_forward_rank(
-        gpu, weights, draft_weights, draft_cfg, draft_scratch,
-        target_hidden_host, &out.block, position, compact_offset,
-        ctx_slice, draft_ffn_graph,
+        gpu,
+        weights,
+        draft_weights,
+        draft_cfg,
+        draft_scratch,
+        target_hidden_host,
+        &out.block,
+        position,
+        compact_offset,
+        ctx_slice,
+        draft_ffn_graph,
     )?;
     let batch = b - 1;
     let h = draft_cfg.hidden;
@@ -7197,16 +7347,31 @@ fn dflash_sampled_selector_draft_parts_into(
         assert!(
             batch <= verify_scratch.max_n,
             "verify_scratch max_n {} < draft batch {}",
-            verify_scratch.max_n, batch,
+            verify_scratch.max_n,
+            batch,
         );
         dflash_enqueue_verify_lm_head(
-            gpu, &weights.output, &hidden_rows, verify_scratch,
-            batch, vocab, DenseBatchMath::Product,
+            gpu,
+            &weights.output,
+            &hidden_rows,
+            verify_scratch,
+            batch,
+            vocab,
+            DenseBatchMath::Product,
         )?;
         let logits_batch = verify_scratch.logits.sub_offset(0, batch * vocab);
         return dflash_sampled_selector_rows_into(
-            gpu, draft_weights, draft_scratch, &hidden_rows, &logits_batch,
-            seed, batch, vocab, cfg, rng, out,
+            gpu,
+            draft_weights,
+            draft_scratch,
+            &hidden_rows,
+            &logits_batch,
+            seed,
+            batch,
+            vocab,
+            cfg,
+            rng,
+            out,
         );
     } else {
         let mut host_logits = Vec::with_capacity(batch * vocab);
@@ -7217,10 +7382,18 @@ fn dflash_sampled_selector_draft_parts_into(
             debug_assert_eq!(logits.len(), vocab);
             host_logits.extend_from_slice(&logits);
         }
-        out.uniforms.extend((0..batch).map(|_| xorshift_next_unit(rng)));
+        out.uniforms
+            .extend((0..batch).map(|_| xorshift_next_unit(rng)));
         dflash::propose_candidates_host(
-            gpu, draft_weights, draft_scratch, &hidden_rows,
-            &host_logits, batch, seed, cfg.temp, Some(&out.uniforms),
+            gpu,
+            draft_weights,
+            draft_scratch,
+            &hidden_rows,
+            &host_logits,
+            batch,
+            seed,
+            cfg.temp,
+            Some(&out.uniforms),
         )?
     };
     dflash_sampled_apply_proposal_into(proposal, vocab, cfg, out)
@@ -7241,10 +7414,18 @@ fn dflash_sampled_selector_rows_into(
     out: &mut DflashSampledDraft,
 ) -> HipResult<()> {
     out.uniforms.clear();
-    out.uniforms.extend((0..rows).map(|_| xorshift_next_unit(rng)));
+    out.uniforms
+        .extend((0..rows).map(|_| xorshift_next_unit(rng)));
     let proposal = dflash::propose_candidates_device(
-        gpu, draft_weights, draft_scratch, hidden_rows, logits_rows,
-        rows, seed, cfg.temp, Some(&out.uniforms),
+        gpu,
+        draft_weights,
+        draft_scratch,
+        hidden_rows,
+        logits_rows,
+        rows,
+        seed,
+        cfg.temp,
+        Some(&out.uniforms),
     )?;
     dflash_sampled_apply_proposal_into(proposal, vocab, cfg, out)
 }
@@ -7262,12 +7443,19 @@ fn dflash_sampled_apply_proposal_into(
     if out.sparse {
         out.sparse_q.clear();
         apply_dflash2_selector_proposal_sparse(
-            &proposal, vocab, &mut out.block, &mut out.sparse_q,
+            &proposal,
+            vocab,
+            &mut out.block,
+            &mut out.sparse_q,
             &mut out.selected_q,
         )?;
     } else {
         apply_dflash2_selector_proposal(
-            &proposal, vocab, true, &mut out.block, &mut out.dense_q,
+            &proposal,
+            vocab,
+            true,
+            &mut out.block,
+            &mut out.dense_q,
             &mut out.selected_q,
         )?;
     }
@@ -7676,7 +7864,8 @@ fn selector_lanes_batched(gpu: &Gpu, shared: &DflashScratch) -> bool {
 /// (64 launches at C8) instead of one `embedding_lookup_q8_batched` launch.
 /// Default on; every row byte is identical either way.
 static DRAFT_NOISE_EMBED_BATCH_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_DRAFT_NOISE_EMBED_BATCH").map_or(true, |v| v.trim() != "0")
+    hipfire_config::developer_var("HIPFIRE_DRAFT_NOISE_EMBED_BATCH")
+        .map_or(true, |v| v.trim() != "0")
 });
 
 /// Whether the batched draft's noise rows come from one batched Q8_0
@@ -7687,7 +7876,12 @@ static DRAFT_NOISE_EMBED_BATCH_ON: std::sync::LazyLock<bool> = std::sync::LazyLo
 /// `(float)half(d) * (float)int8(q)` with the same 256-thread element
 /// striding — one block per row instead of one launch per row — so each
 /// row's bytes cannot differ.
-fn noise_embed_batch_admitted(gpu: &Gpu, target_weights: &Qwen35Weights, shared: &DflashScratch, rows: usize) -> bool {
+fn noise_embed_batch_admitted(
+    gpu: &Gpu,
+    target_weights: &Qwen35Weights,
+    shared: &DflashScratch,
+    rows: usize,
+) -> bool {
     *DRAFT_NOISE_EMBED_BATCH_ON
         && gpu.arch == "gfx1201"
         && matches!(target_weights.embd_format, llama::EmbeddingFormat::Q8_0)
@@ -7760,24 +7954,29 @@ pub fn draft_dflash_sampled_blocks_batched(
     lanes: &mut [DflashSampledDraftLane<'_>],
 ) -> HipResult<Vec<Vec<u32>>> {
     for (i, lane) in lanes.iter().enumerate() {
-        if lane.draft.b < 3 || lane.cfg.temp <= 0.0
+        if lane.draft.b < 3
+            || lane.cfg.temp <= 0.0
             || !lane.draft.df.draft_weights.has_candidate_selector()
         {
-            return Err(HipError::new(0, &format!(
+            return Err(HipError::new(
+                0,
+                &format!(
                 "draft_dflash_sampled_blocks_batched: lane {i} requires b>=3, temp>0 and selector"
-            )));
+            ),
+            ));
         }
     }
     {
-        let mut drafts: Vec<DflashDraftLane<'_>> = lanes.iter_mut().map(|lane| {
-            DflashDraftLane {
+        let mut drafts: Vec<DflashDraftLane<'_>> = lanes
+            .iter_mut()
+            .map(|lane| DflashDraftLane {
                 df: &mut *lane.draft.df,
                 position: lane.draft.position,
                 seed: lane.draft.seed,
                 b: lane.draft.b,
                 compact_offset: lane.draft.compact_offset,
-            }
-        }).collect();
+            })
+            .collect();
         draft_dflash_forward_head_batched(gpu, target_weights, vocab, shared, head, &mut drafts)?;
     }
     let mut blocks = Vec::with_capacity(lanes.len());
@@ -7792,8 +7991,10 @@ pub fn draft_dflash_sampled_blocks_batched(
         let lent = scratch.mq_x_rot.is_none();
         if lent {
             if shared.mq_x_rot.is_none() || shared.mq_x_rot_f16.is_none() {
-                return Err(HipError::new(0,
-                    "the shared draft scratch has no FWHT rotation buffers for the lane selector"));
+                return Err(HipError::new(
+                    0,
+                    "the shared draft scratch has no FWHT rotation buffers for the lane selector",
+                ));
             }
             scratch.mq_x_rot = shared.mq_x_rot.take();
             scratch.mq_x_rot_f16 = shared.mq_x_rot_f16.take();
@@ -7801,8 +8002,17 @@ pub fn draft_dflash_sampled_blocks_batched(
         lane.out.block.clear();
         lane.out.block.push(draft.seed);
         let result = dflash_sampled_selector_rows_into(
-            gpu, &draft.df.draft_weights, scratch, &hidden_rows, &logits_rows,
-            draft.seed, rows, vocab, lane.cfg, lane.rng, lane.out,
+            gpu,
+            &draft.df.draft_weights,
+            scratch,
+            &hidden_rows,
+            &logits_rows,
+            draft.seed,
+            rows,
+            vocab,
+            lane.cfg,
+            lane.rng,
+            lane.out,
         );
         // Restore the shared buffers even when projection/scoring failed.
         if lent {
@@ -7828,8 +8038,11 @@ pub fn dflash_draft_batch_eligible(
     config: &Qwen35Config,
     draft_weights: &DflashWeights,
 ) -> bool {
-    use rdna_compute::DType::{MQ4G256V2, F16, F32};
-    if config.num_experts > 0 || gpu.draft_collapse_fused_enabled() || !gpu.arch.starts_with("gfx12") {
+    use rdna_compute::DType::{F16, F32, MQ4G256V2};
+    if config.num_experts > 0
+        || gpu.draft_collapse_fused_enabled()
+        || !gpu.arch.starts_with("gfx12")
+    {
         return false;
     }
     if target_weights.output.gpu_dtype != MQ4G256V2 {
@@ -7860,7 +8073,12 @@ fn draft_dflash_forward_head_batched(
     head: &VerifyScratch,
     lanes: &mut [DflashDraftLane<'_>],
 ) -> HipResult<bool> {
-    let err = |m: String| Err(HipError::new(0, &format!("draft_dflash_blocks_batched: {m}")));
+    let err = |m: String| {
+        Err(HipError::new(
+            0,
+            &format!("draft_dflash_blocks_batched: {m}"),
+        ))
+    };
     if lanes.is_empty() {
         return Ok(false);
     }
@@ -7901,11 +8119,18 @@ fn draft_dflash_forward_head_batched(
         let mut ids: Vec<i32> = Vec::with_capacity(rows);
         for l in lanes.iter() {
             for i in 0..l.b {
-                ids.push((if i == 0 { l.seed } else { draft_cfg.mask_token_id }) as i32);
+                ids.push(
+                    (if i == 0 {
+                        l.seed
+                    } else {
+                        draft_cfg.mask_token_id
+                    }) as i32,
+                );
             }
         }
         let id_view = shared.noise_tokens.sub_offset(0, rows);
-        let id_bytes: &[u8] = unsafe { std::slice::from_raw_parts(ids.as_ptr() as *const u8, rows * 4) };
+        let id_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(ids.as_ptr() as *const u8, rows * 4) };
         gpu.hip.memcpy_htod(&id_view.buf, id_bytes)?;
         let out_view = shared.x.sub_offset(0, rows * h);
         gpu.embedding_lookup_q8_batched(&target_weights.token_embd, &out_view, &id_view, rows, h)?;
@@ -7913,7 +8138,11 @@ fn draft_dflash_forward_head_batched(
         let mut off = 0usize;
         for l in lanes.iter() {
             for i in 0..l.b {
-                let tok = if i == 0 { l.seed } else { draft_cfg.mask_token_id };
+                let tok = if i == 0 {
+                    l.seed
+                } else {
+                    draft_cfg.mask_token_id
+                };
                 let dst = shared.x.sub_offset((off + i) * h, h);
                 match target_weights.embd_format {
                     llama::EmbeddingFormat::HFQ4G256 => {
@@ -7922,8 +8151,12 @@ fn draft_dflash_forward_head_batched(
                     llama::EmbeddingFormat::HFQ4G128 => {
                         gpu.embedding_lookup_hfq4g128(&target_weights.token_embd, &dst, tok, h)?
                     }
-                    llama::EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&target_weights.token_embd, &dst, tok, h)?,
-                    llama::EmbeddingFormat::F32 => gpu.embedding_lookup(&target_weights.token_embd, &dst, tok, h)?,
+                    llama::EmbeddingFormat::Q8_0 => {
+                        gpu.embedding_lookup_q8(&target_weights.token_embd, &dst, tok, h)?
+                    }
+                    llama::EmbeddingFormat::F32 => {
+                        gpu.embedding_lookup(&target_weights.token_embd, &dst, tok, h)?
+                    }
                     _ => return err("unsupported target embedding format for noise lookup".into()),
                 }
             }
@@ -7940,9 +8173,15 @@ fn draft_dflash_forward_head_batched(
     let geos: Vec<Geo> = lanes
         .iter()
         .map(|l| {
-            let ctx = l.df.draft_scratch.thlog.abs_positions().len().min(l.position);
+            let ctx =
+                l.df.draft_scratch
+                    .thlog
+                    .abs_positions()
+                    .len()
+                    .min(l.position);
             let co = l.compact_offset;
-            let pos_q: Vec<i32> = ((l.position as i32 + co)..(l.position as i32 + l.b as i32 + co)).collect();
+            let pos_q: Vec<i32> =
+                ((l.position as i32 + co)..(l.position as i32 + l.b as i32 + co)).collect();
             let mut pos_k = Vec::with_capacity(ctx + l.b);
             let th_abs = l.df.draft_scratch.thlog.abs_positions();
             pos_k.extend_from_slice(&th_abs[th_abs.len().saturating_sub(ctx)..]);
@@ -7984,7 +8223,16 @@ fn draft_dflash_forward_head_batched(
             dflash::draft_forward_lanes(gpu, &draft_weights, &draft_cfg, shared, &mut dl)?;
         }
         llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_all, &rotated, h, rows)?;
-        gemm_mq_batched_lmhead_draft(gpu, w_out.gpu_dtype, &w_out.buf, &rotated, &logits_all, w_out.m, w_out.k, rows)
+        gemm_mq_batched_lmhead_draft(
+            gpu,
+            w_out.gpu_dtype,
+            &w_out.buf,
+            &rotated,
+            &logits_all,
+            w_out.m,
+            w_out.k,
+            rows,
+        )
     })();
     gpu.draft_rows64_exit(prev);
     scoped?;
@@ -8012,8 +8260,14 @@ pub fn draft_dflash_blocks_batched(
     if lanes.is_empty() {
         return Ok(Vec::new());
     }
-    let rows64 = draft_dflash_forward_head_batched(gpu, target_weights, vocab, shared, head, lanes)?;
-    let err = |m: String| Err(HipError::new(0, &format!("draft_dflash_blocks_batched: {m}")));
+    let rows64 =
+        draft_dflash_forward_head_batched(gpu, target_weights, vocab, shared, head, lanes)?;
+    let err = |m: String| {
+        Err(HipError::new(
+            0,
+            &format!("draft_dflash_blocks_batched: {m}"),
+        ))
+    };
     let rows: usize = lanes.iter().map(|l| l.b).sum();
     let draft_weights = std::sync::Arc::clone(&lanes[0].df.draft_weights);
     let h = lanes[0].df.draft_config.hidden;
@@ -8037,7 +8291,11 @@ pub fn draft_dflash_blocks_batched(
         let mut sel: Vec<dflash::SelectorLane> = Vec::with_capacity(lanes.len());
         let mut off = 0usize;
         for l in lanes.iter() {
-            sel.push(dflash::SelectorLane { first_row: off + 1, rows: l.b - 1, anchor: l.seed });
+            sel.push(dflash::SelectorLane {
+                first_row: off + 1,
+                rows: l.b - 1,
+                anchor: l.seed,
+            });
             off += l.b;
         }
         let proposals = dflash::propose_candidates_lanes_device(
@@ -8114,8 +8372,9 @@ pub fn draft_dflash_blocks_batched(
         gpu.argmax_f32_batched(&logits_all, &argmax_buf, vocab, rows)?;
         let mut host_idx = vec![0i32; rows];
         {
-            let bytes: &mut [u8] =
-                unsafe { std::slice::from_raw_parts_mut(host_idx.as_mut_ptr() as *mut u8, rows * 4) };
+            let bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(host_idx.as_mut_ptr() as *mut u8, rows * 4)
+            };
             gpu.hip.memcpy_dtoh(bytes, &argmax_buf.buf)?;
         }
         let mut off = 0usize;
@@ -8387,7 +8646,12 @@ pub fn spec_step_dflash(
             drafted.push(pld[i]);
         }
         if use_temp_sampling {
-            let sample_cfg = DflashSampleCfg { temp, top_p, top_k, cactus_delta };
+            let sample_cfg = DflashSampleCfg {
+                temp,
+                top_p,
+                top_k,
+                cactus_delta,
+            };
             if dflash_sparse_target_enabled(&sample_cfg) {
                 // q = point mass at the PLD token: a one-entry sparse row,
                 // identical arithmetic to the one-hot vocab row below.
@@ -8414,12 +8678,29 @@ pub fn spec_step_dflash(
     } else if use_temp_sampling && selector_mode {
         let mut receipt = DflashSampledDraft::default();
         dflash_sampled_selector_draft_parts_into(
-            gpu, &target.weights, draft_weights, draft_cfg, draft_scratch,
-            verify_scratch, target_hidden_host, &target.scratch.logits,
-            position, target.kv_cache.compact_offset as i32, seed_token,
-            b, vocab, ctx_slice, draft_ffn_graph,
-            DflashSampleCfg { temp, top_p, top_k, cactus_delta },
-            rng_state, &mut receipt,
+            gpu,
+            &target.weights,
+            draft_weights,
+            draft_cfg,
+            draft_scratch,
+            verify_scratch,
+            target_hidden_host,
+            &target.scratch.logits,
+            position,
+            target.kv_cache.compact_offset as i32,
+            seed_token,
+            b,
+            vocab,
+            ctx_slice,
+            draft_ffn_graph,
+            DflashSampleCfg {
+                temp,
+                top_p,
+                top_k,
+                cactus_delta,
+            },
+            rng_state,
+            &mut receipt,
         )?;
         drafted = std::mem::take(&mut receipt.block);
         q_receipt = Some(receipt);
@@ -9043,7 +9324,12 @@ pub fn spec_step_dflash(
                     && fast_sample_active
                     && dflash_device_accept_eligible(
                         dflash_device_accept_enabled() && gpu.dflash_device_accept_supported(),
-                        &DflashSampleCfg { temp, top_p, top_k, cactus_delta },
+                        &DflashSampleCfg {
+                            temp,
+                            top_p,
+                            top_k,
+                            cactus_delta,
+                        },
                         r,
                         b,
                     ) =>
@@ -9054,7 +9340,12 @@ pub fn spec_step_dflash(
                     &block,
                     r,
                     vocab,
-                    DflashSampleCfg { temp, top_p, top_k, cactus_delta },
+                    DflashSampleCfg {
+                        temp,
+                        top_p,
+                        top_k,
+                        cactus_delta,
+                    },
                     max_accept.unwrap_or(usize::MAX),
                     rng_state,
                     &mut *verify_scratch
@@ -9152,8 +9443,16 @@ pub fn spec_step_dflash(
                 let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
                 let mut rows = FastTargetRows::default();
                 dflash_target_rows_into(
-                    gpu, &logits_batch, b, vocab,
-                    DflashSampleCfg { temp, top_p, top_k, cactus_delta },
+                    gpu,
+                    &logits_batch,
+                    b,
+                    vocab,
+                    DflashSampleCfg {
+                        temp,
+                        top_p,
+                        top_k,
+                        cactus_delta,
+                    },
                     &mut rows,
                 )?;
                 Some(rows)
@@ -9171,9 +9470,20 @@ pub fn spec_step_dflash(
             };
             let mut target_probs = Vec::with_capacity(vocab);
             let decision = dflash_sampled_accept_rows(
-                &block, &q, fast_tgt.as_ref(), &verify_out.logits_per_pos,
-                vocab, DflashSampleCfg { temp, top_p, top_k, cactus_delta },
-                max_accept.unwrap_or(usize::MAX), rng_state, &mut target_probs,
+                &block,
+                &q,
+                fast_tgt.as_ref(),
+                &verify_out.logits_per_pos,
+                vocab,
+                DflashSampleCfg {
+                    temp,
+                    top_p,
+                    top_k,
+                    cactus_delta,
+                },
+                max_accept.unwrap_or(usize::MAX),
+                rng_state,
+                &mut target_probs,
             );
             accept_len = decision.accepted_drafts;
             bonus_token = decision.bonus_token;
@@ -9382,7 +9692,10 @@ pub fn spec_step_dflash(
         let us_draft = t_draft_end.duration_since(t_spec_start).as_micros();
         let us_ngram = t_verify_start.duration_since(t_draft_end).as_micros();
         let us_verify = t_verify_end.duration_since(t_verify_start).as_micros();
-        let us_accept = commit_times.accept_end.duration_since(t_verify_end).as_micros();
+        let us_accept = commit_times
+            .accept_end
+            .duration_since(t_verify_end)
+            .as_micros();
         let us_scatter = commit_times
             .scatter_end
             .duration_since(commit_times.accept_end)
@@ -9408,12 +9721,7 @@ pub fn spec_step_dflash(
             us_total,
         );
     }
-    let _ = (
-        t_phase,
-        t_draft_end,
-        t_verify_start,
-        t_verify_end,
-    );
+    let _ = (t_phase, t_draft_end, t_verify_start, t_verify_end);
 
     Ok(SpecStepResult {
         accepted: accept_len,
@@ -12024,7 +12332,12 @@ fn dflash_seed_outer_chunk_len(remaining: usize, ceiling: usize) -> usize {
 /// checkpoint plus `interval`, and at `cap` recycles the oldest, so the ring
 /// length never exceeds `cap`. (A failed snapshot allocation only lowers the
 /// real count.)
-pub fn dflash_seed_checkpoint_count(prompt_len: usize, ceiling: usize, interval: usize, cap: usize) -> usize {
+pub fn dflash_seed_checkpoint_count(
+    prompt_len: usize,
+    ceiling: usize,
+    interval: usize,
+    cap: usize,
+) -> usize {
     if cap == 0 {
         return 0;
     }
@@ -12049,7 +12362,12 @@ pub fn dflash_seed_checkpoint_count(prompt_len: usize, ceiling: usize, interval:
 /// with a free-byte deduction that covers everything allocated before the
 /// seed's own query (admission is monotone in free bytes, and a ceiling that
 /// does not depend on memory equals `min_ceiling`).
-pub fn dflash_seed_checkpoint_bound(prompt_len: usize, min_ceiling: usize, interval: usize, cap: usize) -> usize {
+pub fn dflash_seed_checkpoint_bound(
+    prompt_len: usize,
+    min_ceiling: usize,
+    interval: usize,
+    cap: usize,
+) -> usize {
     qwen35::prefill::WIDENED_RUNGS
         .iter()
         .copied()
@@ -12207,7 +12525,12 @@ impl SeedPrefill {
         }
         if self.pbs.is_none() {
             let rows = self.ceiling.min(total).max(2);
-            self.pbs = Some(qwen35::PrefillBatchScratch::new_opt(gpu, target.config, rows, false)?);
+            self.pbs = Some(qwen35::PrefillBatchScratch::new_opt(
+                gpu,
+                target.config,
+                rows,
+                false,
+            )?);
         }
         qwen35::forward_prefill_batch_with_pbs(
             gpu,
@@ -12612,7 +12935,8 @@ mod sparse_target_tests {
     fn sparse_accept_matches_dense_10k_cases() {
         let mut rng = Lcg(0x5EED_0001);
         let (mut full, mut zero, mut budget, mut rejected) = (0usize, 0usize, 0usize, 0usize);
-        let (mut dense_rows_seen, mut overflow_seen, mut sparse_rows_seen) = (0usize, 0usize, 0usize);
+        let (mut dense_rows_seen, mut overflow_seen, mut sparse_rows_seen) =
+            (0usize, 0usize, 0usize);
         let mut empty_q_rows = 0usize;
         for case in 0..10_000usize {
             let vocab = 2 + rng.below(if case % 50 == 0 { 400 } else { 40 });
@@ -12653,8 +12977,26 @@ mod sparse_target_tests {
                 }
                 // Rebuilt legacy rows are bit-identical to the dense rows.
                 let (mut a, mut c) = (Vec::new(), Vec::new());
-                sampled_target_row_into(&mut a, r, vocab, Some(&dense_fast), &[], temp, top_k, top_p);
-                sampled_target_row_into(&mut c, r, vocab, Some(&sparse_fast), &[], temp, top_k, top_p);
+                sampled_target_row_into(
+                    &mut a,
+                    r,
+                    vocab,
+                    Some(&dense_fast),
+                    &[],
+                    temp,
+                    top_k,
+                    top_p,
+                );
+                sampled_target_row_into(
+                    &mut c,
+                    r,
+                    vocab,
+                    Some(&sparse_fast),
+                    &[],
+                    temp,
+                    top_k,
+                    top_p,
+                );
                 assert_eq!(a, c, "case {case} row {r}");
             }
 
@@ -12716,7 +13058,11 @@ mod sparse_target_tests {
                 top_k,
                 cactus_delta: if rng.below(8) == 0 { 0.1 } else { 0.0 },
             };
-            let max_accept = if rng.below(10) < 7 { usize::MAX } else { rng.below(b + 1) };
+            let max_accept = if rng.below(10) < 7 {
+                usize::MAX
+            } else {
+                rng.below(b + 1)
+            };
             let seed = rng.next_u64() | 1;
             let q_dense = DflashSampledDraft {
                 selected_q: selected.clone(),
@@ -12732,7 +13078,15 @@ mod sparse_target_tests {
             let run = |fast: &FastTargetRows, q: &DflashSampledDraft, scratch: &mut Vec<f32>| {
                 let mut s = seed;
                 let d = dflash_sampled_accept_rows(
-                    &block, q, Some(fast), &[], vocab, cfg, max_accept, &mut s, scratch,
+                    &block,
+                    q,
+                    Some(fast),
+                    &[],
+                    vocab,
+                    cfg,
+                    max_accept,
+                    &mut s,
+                    scratch,
                 );
                 (d.accepted_drafts, d.bonus_token, d.committed_len, s)
             };
@@ -12760,12 +13114,22 @@ mod sparse_target_tests {
                 assert_eq!(got, reference, "case {case} {name}");
                 let all_sparse = sparse_fast.dense_slot.iter().all(|&s| s == SPARSE_NONE);
                 if name == "sparse/sparse" && all_sparse && cfg.cactus_delta <= 0.0 {
-                    assert_eq!(s.capacity(), 0, "case {case}: sparse path built a vocab row");
+                    assert_eq!(
+                        s.capacity(),
+                        0,
+                        "case {case}: sparse path built a vocab row"
+                    );
                 }
             }
         }
-        assert!(full > 0 && zero > 0 && budget > 0 && rejected > 0, "coverage {full} {zero} {budget} {rejected}");
-        assert!(dense_rows_seen > 0 && overflow_seen > 0 && sparse_rows_seen > 0, "rows {dense_rows_seen} {overflow_seen} {sparse_rows_seen}");
+        assert!(
+            full > 0 && zero > 0 && budget > 0 && rejected > 0,
+            "coverage {full} {zero} {budget} {rejected}"
+        );
+        assert!(
+            dense_rows_seen > 0 && overflow_seen > 0 && sparse_rows_seen > 0,
+            "rows {dense_rows_seen} {overflow_seen} {sparse_rows_seen}"
+        );
         assert!(empty_q_rows > 0);
     }
 
@@ -12781,7 +13145,11 @@ mod sparse_target_tests {
             for j in 0..vocab {
                 if rng.below(dens) == 0 && rng.below(8) != 0 {
                     tidx.push(j as u32);
-                    tval.push(if tied { (1 + rng.below(3)) as f32 * 0.07 } else { 0.01 + rng.unit() * 0.4 });
+                    tval.push(if tied {
+                        (1 + rng.below(3)) as f32 * 0.07
+                    } else {
+                        0.01 + rng.unit() * 0.4
+                    });
                 }
             }
             let (mut qidx, mut qval) = (Vec::new(), Vec::new());
@@ -12866,7 +13234,11 @@ mod sparse_target_tests {
                     "case {case} u {u} categorical"
                 );
             }
-            assert_eq!(argmax_u32(&p), argmax_sparse(&tidx, &tval, inv_z, vocab), "case {case} argmax");
+            assert_eq!(
+                argmax_u32(&p),
+                argmax_sparse(&tidx, &tval, inv_z, vocab),
+                "case {case} argmax"
+            );
         }
     }
 
@@ -12879,7 +13251,11 @@ mod sparse_target_tests {
             let mut p = vec![0.0f32; vocab];
             for j in 0..vocab {
                 if rng.below(3) == 0 {
-                    let v = if rng.below(4) == 0 { 1.0 } else { rng.unit() * 0.6 };
+                    let v = if rng.below(4) == 0 {
+                        1.0
+                    } else {
+                        rng.unit() * 0.6
+                    };
                     idx.push(j as u32);
                     val.push(v);
                     p[j] = v;
@@ -12900,7 +13276,8 @@ mod sparse_target_tests {
     fn sparse_q_rows_reproduce_last_write_and_reject_bad_ids() {
         let mut q = SparseQRows::default();
         q.clear();
-        q.push_row(&[5, 3, 5, 9, 3], &[0.1, 0.2, 0.3, 0.4, 0.5], 16).unwrap();
+        q.push_row(&[5, 3, 5, 9, 3], &[0.1, 0.2, 0.3, 0.4, 0.5], 16)
+            .unwrap();
         q.push_row(&[], &[], 16).unwrap();
         q.push_row(&[7, 7], &[0.25, 0.0], 16).unwrap();
         assert_eq!(q.rows(), 3);
@@ -12946,7 +13323,12 @@ mod sparse_target_tests {
 
     #[test]
     fn cactus_disables_the_sparse_representation() {
-        let cfg = DflashSampleCfg { temp: 0.8, top_p: 0.9, top_k: 20, cactus_delta: 0.1 };
+        let cfg = DflashSampleCfg {
+            temp: 0.8,
+            top_p: 0.9,
+            top_k: 20,
+            cactus_delta: 0.1,
+        };
         assert!(!dflash_sparse_target_enabled(&cfg));
     }
 }
@@ -13071,7 +13453,11 @@ mod tests {
                     .map(|_| {
                         let x = xorshift_next_unit(&mut rng);
                         // Sparse-ish rows: many exact zeros like a nucleus.
-                        if x < 0.5 { 0.0 } else { x }
+                        if x < 0.5 {
+                            0.0
+                        } else {
+                            x
+                        }
                     })
                     .collect();
                 let s: f32 = r.iter().sum();
@@ -13655,7 +14041,13 @@ mod tests {
 mod dn_exchange_tests {
     use super::*;
 
-    const EXT: DnCbExtents = DnCbExtents { n_layers: 2, s: 64, scales: 16, conv: 24, ef: 128 };
+    const EXT: DnCbExtents = DnCbExtents {
+        n_layers: 2,
+        s: 64,
+        scales: 16,
+        conv: 24,
+        ef: 128,
+    };
     const LIVE: usize = 0x10_0000;
     const SNAP: usize = 0x20_0000;
     const FWD0: usize = 0xF0_0000;
@@ -13686,7 +14078,11 @@ mod dn_exchange_tests {
     fn state(base: usize) -> DeltaNetState {
         let fam = |f: usize| -> Vec<GpuTensor> {
             (0..EXT.n_layers)
-                .map(|l| GpuTensor { buf: buf(addr(base, f, l), fam_bytes(f)), shape: vec![fam_bytes(f)], dtype: fam_dtype(f) })
+                .map(|l| GpuTensor {
+                    buf: buf(addr(base, f, l), fam_bytes(f)),
+                    shape: vec![fam_bytes(f)],
+                    dtype: fam_dtype(f),
+                })
                 .collect()
         };
         DeltaNetState {
@@ -13700,7 +14096,9 @@ mod dn_exchange_tests {
 
     fn snapshot(base: usize, live: &DeltaNetState) -> DeltaNetSnapshot {
         let fam = |f: usize| -> Vec<DeviceBuffer> {
-            (0..EXT.n_layers).map(|l| buf(addr(base, f, l), fam_bytes(f))).collect()
+            (0..EXT.n_layers)
+                .map(|l| buf(addr(base, f, l), fam_bytes(f)))
+                .collect()
         };
         DeltaNetSnapshot {
             s_matrix_bufs: fam(0),
@@ -13733,12 +14131,25 @@ mod dn_exchange_tests {
         let mut sn = snapshot(SNAP, &st);
         sn.exchange_buffers(&mut st);
         for l in 0..EXT.n_layers {
-            assert_eq!(live_ptrs(&st, l), expect(SNAP, l), "live now owns the old snapshot bank");
-            assert_eq!(sn.layer_state_ptrs(l), expect(LIVE, l), "snapshot now owns the old live bank");
+            assert_eq!(
+                live_ptrs(&st, l),
+                expect(SNAP, l),
+                "live now owns the old snapshot bank"
+            );
+            assert_eq!(
+                sn.layer_state_ptrs(l),
+                expect(LIVE, l),
+                "snapshot now owns the old live bank"
+            );
         }
         // Handle sizes, tensor shape/dtype and quant mode are untouched.
         for f in 0..4 {
-            let fam = [&st.s_matrices, &st.s_scales, &st.conv_states, &st.s_ef_residual][f];
+            let fam = [
+                &st.s_matrices,
+                &st.s_scales,
+                &st.conv_states,
+                &st.s_ef_residual,
+            ][f];
             for t in fam.iter() {
                 assert_eq!(t.buf.size(), fam_bytes(f));
                 assert_eq!(t.shape, vec![fam_bytes(f)]);
@@ -13746,7 +14157,10 @@ mod dn_exchange_tests {
             }
         }
         assert_eq!(st.quant, qwen35::StateQuant::Q8);
-        assert!(sn.exact_extents(&st, &EXT), "still an exact pair after the exchange");
+        assert!(
+            sn.exact_extents(&st, &EXT),
+            "still an exact pair after the exchange"
+        );
     }
 
     #[test]
@@ -13761,8 +14175,14 @@ mod dn_exchange_tests {
             assert_eq!(sn.layer_state_ptrs(l), expect(SNAP, l));
         }
         assert_eq!(sn.bulk_fingerprint, fp0);
-        assert_eq!(sn.bulk_fwd.as_ref().map(|b| b.as_ptr() as usize), Some(FWD0));
-        assert_eq!(sn.bulk_rev.as_ref().map(|b| b.as_ptr() as usize), Some(REV0));
+        assert_eq!(
+            sn.bulk_fwd.as_ref().map(|b| b.as_ptr() as usize),
+            Some(FWD0)
+        );
+        assert_eq!(
+            sn.bulk_rev.as_ref().map(|b| b.as_ptr() as usize),
+            Some(REV0)
+        );
         assert_eq!(sn.bulk_n_items, 3);
     }
 
@@ -13773,10 +14193,20 @@ mod dn_exchange_tests {
         sn.exchange_buffers(&mut st);
         // Old reverse (backup -> live) is the new forward SAVE; old forward is
         // the new RESTORE.
-        assert_eq!(sn.bulk_fwd.as_ref().map(|b| b.as_ptr() as usize), Some(REV0));
-        assert_eq!(sn.bulk_rev.as_ref().map(|b| b.as_ptr() as usize), Some(FWD0));
+        assert_eq!(
+            sn.bulk_fwd.as_ref().map(|b| b.as_ptr() as usize),
+            Some(REV0)
+        );
+        assert_eq!(
+            sn.bulk_rev.as_ref().map(|b| b.as_ptr() as usize),
+            Some(FWD0)
+        );
         assert_eq!(sn.bulk_n_items, 3);
-        assert_eq!(sn.bulk_fingerprint, DeltaNetSnapshot::bulk_fingerprint(&st), "valid for the new live owners");
+        assert_eq!(
+            sn.bulk_fingerprint,
+            DeltaNetSnapshot::bulk_fingerprint(&st),
+            "valid for the new live owners"
+        );
     }
 
     #[test]
@@ -13785,10 +14215,19 @@ mod dn_exchange_tests {
         let mut sn = snapshot(SNAP, &st);
         sn.bulk_fingerprint ^= 1; // built against some other live state
         sn.exchange_buffers(&mut st);
-        assert_eq!(sn.bulk_n_items, 0, "stale tables must not be re-fingerprinted into validity");
+        assert_eq!(
+            sn.bulk_n_items, 0,
+            "stale tables must not be re-fingerprinted into validity"
+        );
         // Allocations stay owned (freed by `free_gpu`), directions not swapped.
-        assert_eq!(sn.bulk_fwd.as_ref().map(|b| b.as_ptr() as usize), Some(FWD0));
-        assert_eq!(sn.bulk_rev.as_ref().map(|b| b.as_ptr() as usize), Some(REV0));
+        assert_eq!(
+            sn.bulk_fwd.as_ref().map(|b| b.as_ptr() as usize),
+            Some(FWD0)
+        );
+        assert_eq!(
+            sn.bulk_rev.as_ref().map(|b| b.as_ptr() as usize),
+            Some(REV0)
+        );
         // The exchange itself still happened.
         assert_eq!(live_ptrs(&st, 0), expect(SNAP, 0));
         // Disarmed stays disarmed across a second exchange.
@@ -13804,13 +14243,19 @@ mod dn_exchange_tests {
 
         let mut bad = state(LIVE);
         bad.conv_states[1].buf = buf(addr(LIVE, 2, 1), EXT.conv + 4096);
-        assert!(!sn.exact_extents(&bad, &EXT), "live conv ring rounded but the snapshot's is not (unequal banks)");
+        assert!(
+            !sn.exact_extents(&bad, &EXT),
+            "live conv ring rounded but the snapshot's is not (unequal banks)"
+        );
 
         let mut bad = state(LIVE);
         bad.s_scales[0].buf = buf(addr(LIVE, 1, 0), EXT.scales - 4);
         let mut bad_snap = snapshot(SNAP, &st);
         bad_snap.s_scale_bufs[0] = buf(addr(SNAP, 1, 0), EXT.scales - 4);
-        assert!(!bad_snap.exact_extents(&bad, &EXT), "equal banks below the logical scales extent");
+        assert!(
+            !bad_snap.exact_extents(&bad, &EXT),
+            "equal banks below the logical scales extent"
+        );
 
         let mut bad = state(LIVE);
         bad.s_matrices[0].buf = buf(addr(LIVE, 0, 0), EXT.s + 4096);
@@ -13825,7 +14270,10 @@ mod dn_exchange_tests {
         ok.s_ef_residual[0].buf = buf(addr(LIVE, 3, 0), EXT.ef + 4096);
         let mut ok_snap = snapshot(SNAP, &st);
         ok_snap.s_ef_residual_bufs[0] = buf(addr(SNAP, 3, 0), EXT.ef + 4096);
-        assert!(ok_snap.exact_extents(&ok, &EXT), "equal pool-rounded EF banks are admitted");
+        assert!(
+            ok_snap.exact_extents(&ok, &EXT),
+            "equal pool-rounded EF banks are admitted"
+        );
         let mut bad = state(LIVE);
         bad.s_ef_residual[0].buf = buf(addr(LIVE, 3, 0), EXT.ef + 4096);
         assert!(!sn.exact_extents(&bad, &EXT), "unequal EF banks");
@@ -13848,10 +14296,16 @@ mod dn_exchange_tests {
 
         let mut bad_snap = snapshot(SNAP, &st);
         bad_snap.s_scale_bufs.pop();
-        assert!(!bad_snap.exact_extents(&st, &EXT), "snapshot scales family short");
+        assert!(
+            !bad_snap.exact_extents(&st, &EXT),
+            "snapshot scales family short"
+        );
 
         let other = DnCbExtents { n_layers: 3, ..EXT };
-        assert!(!sn.exact_extents(&st, &other), "layer count differs from the config's");
+        assert!(
+            !sn.exact_extents(&st, &other),
+            "layer count differs from the config's"
+        );
         let none = DnCbExtents { n_layers: 0, ..EXT };
         assert!(!sn.exact_extents(&st, &none));
     }
@@ -13870,7 +14324,10 @@ mod dn_exchange_tests {
         }
         assert!(sn.exact_extents(&st, &EXT));
         sn.exchange_buffers(&mut st);
-        assert!(sn.exact_extents(&st, &EXT), "equal sizes: an exchange keeps every owner's capacity");
+        assert!(
+            sn.exact_extents(&st, &EXT),
+            "equal sizes: an exchange keeps every owner's capacity"
+        );
         assert_eq!(st.conv_states[0].buf.size(), EXT.conv + 8192);
         assert_eq!(sn.conv_state_bufs[0].size(), EXT.conv + 8192);
     }
@@ -13939,13 +14396,21 @@ mod device_accept_tests {
 
     #[test]
     fn admission_follows_switch_cactus_and_q_representation() {
-        let cfg = DflashSampleCfg { temp: 0.7, top_p: 0.9, top_k: 20, cactus_delta: 0.0 };
+        let cfg = DflashSampleCfg {
+            temp: 0.7,
+            top_p: 0.9,
+            top_k: 20,
+            cactus_delta: 0.0,
+        };
         let d = sparse_draft(5);
         assert!(dflash_device_accept_eligible(true, &cfg, &d, 5));
         // Kill switch.
         assert!(!dflash_device_accept_eligible(false, &cfg, &d, 5));
         // CACTUS keeps the dense host arithmetic.
-        let cactus = DflashSampleCfg { cactus_delta: 0.05, ..cfg };
+        let cactus = DflashSampleCfg {
+            cactus_delta: 0.05,
+            ..cfg
+        };
         assert!(!dflash_device_accept_eligible(true, &cactus, &d, 5));
         // Dense q (HIPFIRE_DFLASH_SPARSE_TARGET=0) keeps the host loop.
         let mut dense = sparse_draft(5);
@@ -13954,21 +14419,40 @@ mod device_accept_tests {
         // Receipt not covering the window.
         assert!(!dflash_device_accept_eligible(true, &cfg, &d, 6));
         assert!(!dflash_device_accept_eligible(true, &cfg, &d, 1));
-        assert!(!dflash_device_accept_eligible(true, &cfg, &DflashSampledDraft::default(), 5));
+        assert!(!dflash_device_accept_eligible(
+            true,
+            &cfg,
+            &DflashSampledDraft::default(),
+            5
+        ));
     }
 
     /// Duplicate selector candidate ids: the payload carries the last write.
     #[test]
     fn payload_carries_the_last_write_sparse_rows() {
         let mut q = SparseQRows::with_capacity(1, 8);
-        q.push_row(&[9, 4, 9, 2], &[0.1, 0.2, 0.3, 0.4], 16).unwrap();
-        let mut payload = Vec::new();
-        dflash_accept_pack_payload(&mut payload, &[4], &[0.5], 0.25, 1, &[0.2], q.offsets(), &q.idx, &q.val)
+        q.push_row(&[9, 4, 9, 2], &[0.1, 0.2, 0.3, 0.4], 16)
             .unwrap();
+        let mut payload = Vec::new();
+        dflash_accept_pack_payload(
+            &mut payload,
+            &[4],
+            &[0.5],
+            0.25,
+            1,
+            &[0.2],
+            q.offsets(),
+            &q.idx,
+            &q.val,
+        )
+        .unwrap();
         // 4n+3 header words, then ids [2, 4, 9] and values [0.4, 0.2, 0.3].
         let n = 1;
         let ids = &payload[4 * n + 3..4 * n + 6];
-        let vals: Vec<f32> = payload[4 * n + 6..].iter().map(|&w| f32::from_bits(w)).collect();
+        let vals: Vec<f32> = payload[4 * n + 6..]
+            .iter()
+            .map(|&w| f32::from_bits(w))
+            .collect();
         assert_eq!(ids, &[2, 4, 9]);
         assert_eq!(vals, vec![0.4, 0.2, 0.3]);
     }
@@ -14010,7 +14494,9 @@ mod device_accept_tests {
                 // the proposed token is one of the candidates; its q is the row's value.
                 let pick = cands[rng.below(6)];
                 let (ids, vals) = draft.sparse_q.row(draft.sparse_q.rows() - 1);
-                draft.selected_q.push(vals[ids.iter().position(|&i| i == pick).unwrap()]);
+                draft
+                    .selected_q
+                    .push(vals[ids.iter().position(|&i| i == pick).unwrap()]);
                 draft.block.push(pick);
             }
             let max_accept = [n, n, n, 2][round % 4];
@@ -14018,8 +14504,15 @@ mod device_accept_tests {
             let u_fin = rng.unit();
             let mut payload = Vec::new();
             dflash_accept_pack_payload(
-                &mut payload, &draft.block[1..], &uniforms, u_fin, max_accept, &draft.selected_q,
-                draft.sparse_q.offsets(), &draft.sparse_q.idx, &draft.sparse_q.val,
+                &mut payload,
+                &draft.block[1..],
+                &uniforms,
+                u_fin,
+                max_accept,
+                &draft.selected_q,
+                draft.sparse_q.offsets(),
+                &draft.sparse_q.idx,
+                &draft.sparse_q.val,
             )
             .unwrap();
             let dev = dflash_sampled_accept_reference(&probs, &tau, &z, &payload, n, vocab);
@@ -14043,7 +14536,12 @@ mod device_accept_tests {
                     counts[r] = c as u32;
                 }
                 let mut f = FastTargetRows {
-                    tau: tau.clone(), z: z.clone(), capacity: cap, counts, idx, val,
+                    tau: tau.clone(),
+                    z: z.clone(),
+                    capacity: cap,
+                    counts,
+                    idx,
+                    val,
                     ..FastTargetRows::default()
                 };
                 let nd = f.plan_dense_rows(vocab).unwrap();
@@ -14053,18 +14551,24 @@ mod device_accept_tests {
             let mut accept = 0usize;
             let mut host_bonus = None;
             for i in 0..n.min(max_accept) {
-                let TargetRowRef::Sparse { idx, val, inv_z } = fast.row(i, vocab) else { unreachable!() };
+                let TargetRowRef::Sparse { idx, val, inv_z } = fast.row(i, vocab) else {
+                    unreachable!()
+                };
                 let p_t = sparse_row_prob(idx, val, inv_z, draft.block[i + 1]);
                 if uniforms[i] * draft.selected_q[i].max(f32::MIN_POSITIVE) <= p_t {
                     accept += 1;
                 } else {
                     let (qi, qv) = draft.sparse_q.row(i);
-                    host_bonus = Some(sample_residual_sparse(idx, val, inv_z, qi, qv, vocab, u_fin));
+                    host_bonus = Some(sample_residual_sparse(
+                        idx, val, inv_z, qi, qv, vocab, u_fin,
+                    ));
                     break;
                 }
             }
             let host_bonus = host_bonus.unwrap_or_else(|| {
-                let TargetRowRef::Sparse { idx, val, inv_z } = fast.row(accept, vocab) else { unreachable!() };
+                let TargetRowRef::Sparse { idx, val, inv_z } = fast.row(accept, vocab) else {
+                    unreachable!()
+                };
                 sample_categorical_sparse(idx, val, inv_z, vocab, u_fin)
             });
             assert_eq!(dev.accept_len, accept, "round {round}");
@@ -14073,6 +14577,9 @@ mod device_accept_tests {
                 bonus_mismatch += 1;
             }
         }
-        assert!(bonus_mismatch * 100 <= checked, "{bonus_mismatch}/{checked} bonus draws differ");
+        assert!(
+            bonus_mismatch * 100 <= checked,
+            "{bonus_mismatch}/{checked} bonus draws differ"
+        );
     }
 }

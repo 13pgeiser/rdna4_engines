@@ -642,7 +642,9 @@ mod tests {
         let caps = make_caps("gfx1151");
         assert!(caps.supports_dflash_hidden_scatter_fusion());
         assert!(!caps.supports_dflash_f16_residual_fusions());
-        for arch in ["gfx1030", "gfx1101", "gfx1150", "gfx1152", "gfx1200", "gfx942"] {
+        for arch in [
+            "gfx1030", "gfx1101", "gfx1150", "gfx1152", "gfx1200", "gfx942",
+        ] {
             let caps = make_caps(arch);
             assert!(!caps.supports_dflash_hidden_scatter_fusion(), "{arch}");
             assert!(!caps.supports_dflash_f16_residual_fusions(), "{arch}");
@@ -855,7 +857,10 @@ mod tests {
         assert!(!gfx942.has_wmma());
         for arch in &["gfx1151", "gfx1201"] {
             let caps = make_caps(arch);
-            assert!(caps.has_gfx11_plus_simt() && caps.has_qwen4_parallel_qsa_gdn(), "{arch}");
+            assert!(
+                caps.has_gfx11_plus_simt() && caps.has_qwen4_parallel_qsa_gdn(),
+                "{arch}"
+            );
         }
     }
 

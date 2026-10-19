@@ -259,7 +259,8 @@ pub fn dequant_b128_block(
     rows: usize,
     k: usize,
 ) -> Result<Vec<u16>, Fp8Error> {
-    if Some(codes.len()) != b128_code_bytes(rows, k) || Some(s_inv.len()) != b128_scale_count(rows, k)
+    if Some(codes.len()) != b128_code_bytes(rows, k)
+        || Some(s_inv.len()) != b128_scale_count(rows, k)
     {
         return Err(Fp8Error::Shape);
     }
@@ -283,10 +284,17 @@ pub fn dequant_b128_block(
 
 /// Decode one qt=55 expert block laid out as in the payload (`codes ‖ s_inv LE ‖
 /// zero pad`). `block` must be at least `rows*k + 2*scales` bytes.
-pub fn dequant_b128_expert_bytes(block: &[u8], rows: usize, k: usize) -> Result<Vec<u16>, Fp8Error> {
+pub fn dequant_b128_expert_bytes(
+    block: &[u8],
+    rows: usize,
+    k: usize,
+) -> Result<Vec<u16>, Fp8Error> {
     let nc = b128_code_bytes(rows, k).ok_or(Fp8Error::Shape)?;
     let ns = b128_scale_count(rows, k).ok_or(Fp8Error::Shape)?;
-    let end = ns.checked_mul(2).and_then(|b| b.checked_add(nc)).ok_or(Fp8Error::Shape)?;
+    let end = ns
+        .checked_mul(2)
+        .and_then(|b| b.checked_add(nc))
+        .ok_or(Fp8Error::Shape)?;
     let body = block.get(..end).ok_or(Fp8Error::Shape)?;
     let s_inv: Vec<u16> = body[nc..]
         .chunks_exact(2)
@@ -360,7 +368,10 @@ mod tests {
     const REC: usize = 2 + 254 * 2;
 
     fn finite_codes() -> Vec<u8> {
-        (0u16..256).map(|b| b as u8).filter(|&b| !is_nan_code(b)).collect()
+        (0u16..256)
+            .map(|b| b as u8)
+            .filter(|&b| !is_nan_code(b))
+            .collect()
     }
 
     fn records() -> Vec<(u16, Vec<u16>)> {
@@ -369,7 +380,10 @@ mod tests {
             .chunks_exact(REC)
             .map(|r| {
                 let s = u16::from_le_bytes([r[0], r[1]]);
-                let v = r[2..].chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
+                let v = r[2..]
+                    .chunks_exact(2)
+                    .map(|p| u16::from_le_bytes([p[0], p[1]]))
+                    .collect();
                 (s, v)
             })
             .collect()
@@ -381,7 +395,10 @@ mod tests {
         assert!(recs.len() >= 40, "fixture has {} scales", recs.len());
         let scales: Vec<u16> = recs.iter().map(|r| r.0).collect();
         for want in [1.0f32, 2f32.powi(-20), 2f32.powi(-9), 0.0017, 2f32.powi(10)] {
-            assert!(scales.contains(&bf16_rne(want)), "fixture missing scale {want}");
+            assert!(
+                scales.contains(&bf16_rne(want)),
+                "fixture missing scale {want}"
+            );
         }
     }
 
@@ -405,7 +422,11 @@ mod tests {
             }
             let fnv = e4m3fn_to_f32(b).unwrap();
             let fz = e4m3fnuz_to_f32(b).unwrap();
-            assert_eq!(fz.to_bits() << 1, (fnv * 0.5).to_bits() << 1, "byte {b:#04x}");
+            assert_eq!(
+                fz.to_bits() << 1,
+                (fnv * 0.5).to_bits() << 1,
+                "byte {b:#04x}"
+            );
             assert_eq!(fz, fnv * 0.5, "byte {b:#04x}");
         }
         assert_eq!(e4m3fnuz_to_f32(0x80), None);
@@ -480,10 +501,19 @@ mod tests {
                 Err(Fp8Error::NanCode { index: 1 })
             );
             let mut out = [0u16; 1];
-            assert_eq!(dequant_row_pt(&[b], one, &mut out), Err(Fp8Error::NanCode { index: 0 }));
+            assert_eq!(
+                dequant_row_pt(&[b], one, &mut out),
+                Err(Fp8Error::NanCode { index: 0 })
+            );
             assert_eq!(e4m3fn_to_f32(b), None);
         }
-        assert_eq!(scan_codes(&[0x7F, 0xFF, 0x80, 0x80, 0x80, 0x00, 0x38]), CodeScan { nan: 2, neg_zero: 3 });
+        assert_eq!(
+            scan_codes(&[0x7F, 0xFF, 0x80, 0x80, 0x80, 0x00, 0x38]),
+            CodeScan {
+                nan: 2,
+                neg_zero: 3
+            }
+        );
     }
 
     #[test]
@@ -504,7 +534,10 @@ mod tests {
         assert_eq!(b128_block_stride(2560, 640), Some(1_638_656));
         assert_eq!(b128_scale_dims(1280, 2560), (10, 20));
         assert_eq!(b128_tensor_bytes(3, 1280, 2560), Some(3 * 3_277_312));
-        assert_eq!(b128_scales_offset(2, 1280, 2560), Some(2 * 3_277_312 + 1280 * 2560));
+        assert_eq!(
+            b128_scales_offset(2, 1280, 2560),
+            Some(2 * 3_277_312 + 1280 * 2560)
+        );
         // ragged geometry: 130 x 130 -> 2x2 scales, 16900 + 8 = 16908 -> 17152.
         assert_eq!(b128_block_stride(130, 130), Some(17_152));
         assert_eq!(b128_block_stride(1, 1), Some(256));
@@ -524,7 +557,9 @@ mod tests {
     fn fp8_expert_bytes_roundtrip_ragged_blocks() {
         // 130 x 131: 2x2 scale grid with distinct scales; payload padded to stride.
         let (rows, k) = (130usize, 131usize);
-        let codes: Vec<u8> = (0..rows * k).map(|i| finite_codes()[(i * 7) % 254]).collect();
+        let codes: Vec<u8> = (0..rows * k)
+            .map(|i| finite_codes()[(i * 7) % 254])
+            .collect();
         let s_inv: Vec<u16> = vec![0x3F80, 0x3E80, 0x4000, 0x3C00];
         let stride = b128_block_stride(rows, k).unwrap();
         let mut blob = vec![0u8; stride];
@@ -536,8 +571,14 @@ mod tests {
         assert_eq!(dequant_b128_expert_bytes(&blob, rows, k).unwrap(), want);
         // block boundaries pick the right scale: row 129 col 130 uses s_inv[3].
         let idx = 129 * k + 130;
-        assert_eq!(want[idx], decode_elem(codes[idx], bf16_to_f32(s_inv[3]), idx).unwrap());
+        assert_eq!(
+            want[idx],
+            decode_elem(codes[idx], bf16_to_f32(s_inv[3]), idx).unwrap()
+        );
         assert_eq!(want[idx], fnuz_fold_decode(codes[idx], s_inv[3]).unwrap());
-        assert_eq!(dequant_b128_block(&codes, &s_inv[..3], rows, k), Err(Fp8Error::Shape));
+        assert_eq!(
+            dequant_b128_block(&codes, &s_inv[..3], rows, k),
+            Err(Fp8Error::Shape)
+        );
     }
 }

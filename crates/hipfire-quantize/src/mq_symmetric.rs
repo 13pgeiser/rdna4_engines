@@ -19,18 +19,16 @@ use crate::float16::{f16_to_f32, f32_to_f16};
 /// `max_code`-interval midpoint grid) are scored by MSE including the fp16
 /// round-trip of both scale and zero. Returns `(scale_bits, zero_bits)` and
 /// fills `codes` (len 128).
-pub fn quantize_symmetric_half(
-    values: &[f32],
-    max_code: u8,
-    codes: &mut [u8],
-) -> (u16, u16) {
+pub fn quantize_symmetric_half(values: &[f32], max_code: u8, codes: &mut [u8]) -> (u16, u16) {
     debug_assert!(max_code == 15 || max_code == 7);
     debug_assert_eq!(values.len(), 128);
     debug_assert_eq!(codes.len(), 128);
     let mid = (max_code as f32 + 1.0) * 0.5;
     let max_code_f = max_code as f32;
 
-    let amax = values.iter().fold(0.0f32, |acc, &value| acc.max(value.abs()));
+    let amax = values
+        .iter()
+        .fold(0.0f32, |acc, &value| acc.max(value.abs()));
     if amax == 0.0 {
         codes.fill(mid as u8);
         return (0, f32_to_f16(-0.0));
@@ -57,7 +55,9 @@ pub fn quantize_symmetric_half(
         let inverse = 1.0 / scale;
         let mut mse = 0.0f64;
         for &value in values {
-            let code = ((value - zero) * inverse + 0.5).floor().clamp(0.0, max_code_f);
+            let code = ((value - zero) * inverse + 0.5)
+                .floor()
+                .clamp(0.0, max_code_f);
             let error = value - code.mul_add(scale, zero);
             mse += (error as f64) * (error as f64);
         }
@@ -78,7 +78,9 @@ pub fn quantize_symmetric_half(
     let zero = f16_to_f32(zero_bits_best);
     let inverse = 1.0 / scale;
     for (code, &value) in codes.iter_mut().zip(values) {
-        *code = ((value - zero) * inverse + 0.5).floor().clamp(0.0, max_code_f) as u8;
+        *code = ((value - zero) * inverse + 0.5)
+            .floor()
+            .clamp(0.0, max_code_f) as u8;
     }
     (scale_bits_best, zero_bits_best)
 }
@@ -98,7 +100,9 @@ mod tests {
     ) -> (u16, u16) {
         let mid = (max_code as f32 + 1.0) * 0.5;
         let max_code_f = max_code as f32;
-        let amax = values.iter().fold(0.0f32, |acc, &value| acc.max(value.abs()));
+        let amax = values
+            .iter()
+            .fold(0.0f32, |acc, &value| acc.max(value.abs()));
         if amax == 0.0 {
             codes.fill(mid as u8);
             return (0, f32_to_f16(-0.0));
@@ -124,7 +128,9 @@ mod tests {
             let inverse = 1.0 / scale;
             let mut mse = 0.0f64;
             for &value in values {
-                let code = ((value - zero) * inverse + 0.5).floor().clamp(0.0, max_code_f);
+                let code = ((value - zero) * inverse + 0.5)
+                    .floor()
+                    .clamp(0.0, max_code_f);
                 let error = value - code.mul_add(scale, zero);
                 mse += (error as f64) * (error as f64);
             }
@@ -138,7 +144,9 @@ mod tests {
         let zero = f16_to_f32(zero_bits_best);
         let inverse = 1.0 / scale;
         for (code, &value) in codes.iter_mut().zip(values) {
-            *code = ((value - zero) * inverse + 0.5).floor().clamp(0.0, max_code_f) as u8;
+            *code = ((value - zero) * inverse + 0.5)
+                .floor()
+                .clamp(0.0, max_code_f) as u8;
         }
         (scale_bits_best, zero_bits_best)
     }
@@ -164,7 +172,10 @@ mod tests {
             let mut codes = [0xffu8; 128];
             let header = quantize_symmetric_half(&values, max_code, &mut codes);
             assert_eq!(header, (0, 0x8000), "max_code={max_code}");
-            assert!(codes.iter().all(|&code| code == mid_code), "max_code={max_code}");
+            assert!(
+                codes.iter().all(|&code| code == mid_code),
+                "max_code={max_code}"
+            );
         }
     }
 
@@ -177,7 +188,10 @@ mod tests {
             let mut codes = [0xffu8; 128];
             let header = quantize_symmetric_half(&values, max_code, &mut codes);
             assert_eq!(header, (0, 0x8000), "max_code={max_code}");
-            assert!(codes.iter().all(|&code| code == mid_code), "max_code={max_code}");
+            assert!(
+                codes.iter().all(|&code| code == mid_code),
+                "max_code={max_code}"
+            );
         }
     }
 

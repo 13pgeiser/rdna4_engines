@@ -113,7 +113,11 @@ impl Builder {
 
     fn experts(&mut self, prefix: &str) {
         for expert in 0..EXPERTS {
-            for (proj, rows, cols) in [("gate_proj", RG, K), ("up_proj", RG, K), ("down_proj", K, RG)] {
+            for (proj, rows, cols) in [
+                ("gate_proj", RG, K),
+                ("up_proj", RG, K),
+                ("down_proj", K, RG),
+            ] {
                 let base = format!("{prefix}.mlp.experts.{expert}.{proj}");
                 self.f8(&format!("{base}.weight"), &[rows, cols]);
                 self.scale(
@@ -135,7 +139,10 @@ fn fixture_bag(ple_scale_shape: &[u64]) -> Bag {
     }
     b.experts("mtp.layers.0");
     for shard in 0..2 {
-        b.f8(&format!("{PLE_TABLE}.shard_{shard}.weight"), &[PLE_ROWS, 160]);
+        b.f8(
+            &format!("{PLE_TABLE}.shard_{shard}.weight"),
+            &[PLE_ROWS, 160],
+        );
     }
     b.scale(&format!("{PLE_TABLE}.weight_scale"), ple_scale_shape);
     b.bf16("model.language_model.embed_tokens.weight", &[4, 8]);
@@ -262,7 +269,9 @@ fn expected_gate_up(fixture: &Fixture, prefix: &str) -> Vec<u8> {
     let mut out = Vec::new();
     for e in 0..EXPERTS {
         let at = |proj: &str, suffix: &str| {
-            fixture.data(&format!("{prefix}.mlp.experts.{e}.{proj}.{suffix}")).to_vec()
+            fixture
+                .data(&format!("{prefix}.mlp.experts.{e}.{proj}.{suffix}"))
+                .to_vec()
         };
         out.extend(at("gate_proj", "weight"));
         out.extend(at("up_proj", "weight"));
@@ -359,7 +368,10 @@ fn fixture_payload_receipt_and_metadata_are_exact() {
         assert_eq!(entry.shape, vec![PLE_ROWS as u32, 160]);
         let body = payload(&name);
         assert_eq!(body.len(), 16 + PLE_ROWS as usize * 160);
-        assert_eq!(&body[..2], fixture.data(&format!("{PLE_TABLE}.weight_scale")));
+        assert_eq!(
+            &body[..2],
+            fixture.data(&format!("{PLE_TABLE}.weight_scale"))
+        );
         assert!(body[2..16].iter().all(|&b| b == 0));
         assert_eq!(&body[16..], fixture.data(&name));
     }
@@ -372,7 +384,11 @@ fn fixture_payload_receipt_and_metadata_are_exact() {
         assert_eq!(payload(name), fixture.data(name));
     }
     let root = "model.language_model.layers.1.ple.ple_embedding";
-    for suffix in ["layer_multipliers", "ngram_heads_vocab_sizes", "ngram_heads_offsets"] {
+    for suffix in [
+        "layer_multipliers",
+        "ngram_heads_vocab_sizes",
+        "ngram_heads_offsets",
+    ] {
         let name = format!("{root}.{suffix}");
         assert_eq!(by_name[name.as_str()].quant_type, QWEN4_I64_QUANT_TYPE);
         assert_eq!(payload(&name), fixture.data(&name));
@@ -413,7 +429,10 @@ fn fixture_payload_receipt_and_metadata_are_exact() {
         .filter(|n| n.starts_with("mtp."))
         .map(|n| count80(fixture.data(n)))
         .sum();
-    assert!(total80 > 0 && omitted80 > 0, "fixture must contain 0x80 codes");
+    assert!(
+        total80 > 0 && omitted80 > 0,
+        "fixture must contain 0x80 codes"
+    );
     assert_eq!(fp8["count_0x80"]["total"], total80);
     assert_eq!(fp8["count_0x80"]["omitted"], omitted80);
     assert_eq!(fp8["count_0x80"]["emitted"], total80 - omitted80);
@@ -435,7 +454,8 @@ fn fixture_payload_receipt_and_metadata_are_exact() {
         for source in record["sources"].as_array().unwrap() {
             let name = source["name"].as_str().unwrap();
             assert_eq!(source["sha256"], sha_hex(fixture.data(name)), "{name}");
-            let shard = fs::read(fixture.src.path().join(source["file"].as_str().unwrap())).unwrap();
+            let shard =
+                fs::read(fixture.src.path().join(source["file"].as_str().unwrap())).unwrap();
             let (start, end) = (
                 source["start"].as_u64().unwrap() as usize,
                 source["end"].as_u64().unwrap() as usize,
@@ -469,10 +489,19 @@ fn ple_scale_shapes_scalar_and_one_by_one_are_accepted() {
 fn nan_codes_are_refused_everywhere_including_omitted_mtp() {
     let cases = [
         // Emitted routed expert, both NaN codes.
-        ("model.language_model.layers.1.mlp.experts.1.down_proj.weight", 0x7F),
-        ("model.language_model.layers.0.mlp.experts.0.gate_proj.weight", 0xFF),
+        (
+            "model.language_model.layers.1.mlp.experts.1.down_proj.weight",
+            0x7F,
+        ),
+        (
+            "model.language_model.layers.0.mlp.experts.0.gate_proj.weight",
+            0xFF,
+        ),
         // Emitted PLE shard.
-        ("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_1.weight", 0x7F),
+        (
+            "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_1.weight",
+            0x7F,
+        ),
         // Omitted MTP experts: scanned although never copied.
         ("mtp.layers.0.mlp.experts.1.up_proj.weight", 0x7F),
         ("mtp.layers.0.mlp.experts.0.down_proj.weight", 0xFF),
@@ -482,7 +511,10 @@ fn nan_codes_are_refused_everywhere_including_omitted_mtp() {
         let error = fixture.compact(None).unwrap_err().to_string();
         assert!(error.contains(name), "{name}: {error}");
         assert!(error.contains(&format!("0x{byte:02X}")), "{name}: {error}");
-        assert!(fixture.out_is_empty(), "{name}: no output or temp file may remain");
+        assert!(
+            fixture.out_is_empty(),
+            "{name}: no output or temp file may remain"
+        );
     }
 }
 
@@ -507,7 +539,10 @@ fn unexpected_fp8_and_missing_expert_parts_are_refused() {
     let fixture = Fixture::with(bag);
     let error = fixture.compact(None).unwrap_err().to_string();
     assert!(error.contains("missing"), "{error}");
-    assert!(error.contains("layers.1.mlp.experts.1.up_proj.weight_scale_inv"), "{error}");
+    assert!(
+        error.contains("layers.1.mlp.experts.1.up_proj.weight_scale_inv"),
+        "{error}"
+    );
     assert!(fixture.out_is_empty());
 }
 
@@ -579,7 +614,11 @@ fn a_pinned_manifest_must_agree_with_shards_and_sidecars() {
     // config.json changed after the manifest was made.
     let fixture = Fixture::new();
     let pin = fixture.write_manifest(None);
-    fs::write(fixture.src.path().join("config.json"), r#"{"model_type":"other"}"#).unwrap();
+    fs::write(
+        fixture.src.path().join("config.json"),
+        r#"{"model_type":"other"}"#,
+    )
+    .unwrap();
     let error = fixture.compact(Some(&pin)).unwrap_err().to_string();
     assert!(error.contains("does not match"), "{error}");
     assert!(fixture.out_is_empty());

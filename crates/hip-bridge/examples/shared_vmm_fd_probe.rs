@@ -315,7 +315,13 @@ struct Spec {
 impl Spec {
     fn new(seed: u64, id: u32, requested: u64, bytes: u64) -> Spec {
         let sm = seedmix(seed, id);
-        Spec { id, requested, bytes, sm, expect_sum: expected_sum(bytes / 8, sm) }
+        Spec {
+            id,
+            requested,
+            bytes,
+            sm,
+            expect_sum: expected_sum(bytes / 8, sm),
+        }
     }
 
     fn words(&self) -> u64 {
@@ -445,7 +451,9 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn parse_num<T: std::str::FromStr>(s: &str, what: &str) -> Result<T, String> {
-    s.trim().parse::<T>().map_err(|_| format!("{what}: invalid number {s:?}"))
+    s.trim()
+        .parse::<T>()
+        .map_err(|_| format!("{what}: invalid number {s:?}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -479,7 +487,11 @@ fn hip_err<E: std::fmt::Display>(what: &str) -> impl FnOnce(E) -> String + '_ {
 // Bounded SCM_RIGHTS socket I/O
 // ---------------------------------------------------------------------------
 fn wait_ready(fd: RawFd, events: i16, timeout_ms: i32, what: &str) -> Result<(), String> {
-    let mut p = sys::PollFd { fd, events, revents: 0 };
+    let mut p = sys::PollFd {
+        fd,
+        events,
+        revents: 0,
+    };
     // SAFETY: `p` is a live stack PollFd and nfds == 1.
     let r = unsafe { sys::poll(&mut p, 1, timeout_ms) };
     match r {
@@ -506,7 +518,16 @@ fn decode(buf: &[u8; FRAME_BYTES]) -> Frame {
 }
 
 fn mk_frame(kind: u64, index: u64, count: u64, bytes: u64, requested: u64, extra: u64) -> Frame {
-    [MAGIC, WIRE_VERSION, kind, index, count, bytes, requested, extra]
+    [
+        MAGIC,
+        WIRE_VERSION,
+        kind,
+        index,
+        count,
+        bytes,
+        requested,
+        extra,
+    ]
 }
 
 #[repr(C, align(8))]
@@ -521,7 +542,10 @@ fn send_frame(
     what: &str,
 ) -> Result<(), String> {
     let mut bytes = encode(frame);
-    let mut iov = sys::IoVec { base: bytes.as_mut_ptr().cast(), len: FRAME_BYTES };
+    let mut iov = sys::IoVec {
+        base: bytes.as_mut_ptr().cast(),
+        len: FRAME_BYTES,
+    };
     let mut ctl = Ctl([0u8; 64]);
     let mut hdr = sys::MsgHdr {
         name: std::ptr::null_mut(),
@@ -548,7 +572,11 @@ fn send_frame(
     if n != FRAME_BYTES as isize {
         return Err(format!(
             "{what}: sendmsg: {}",
-            if n < 0 { std::io::Error::last_os_error().to_string() } else { format!("short send {n}") }
+            if n < 0 {
+                std::io::Error::last_os_error().to_string()
+            } else {
+                format!("short send {n}")
+            }
         ));
     }
     Ok(())
@@ -559,7 +587,10 @@ fn send_frame(
 fn recv_frame(sock: RawFd, timeout_ms: i32, what: &str) -> Result<(Frame, Vec<OwnedFd>), String> {
     wait_ready(sock, sys::POLLIN, timeout_ms, what)?;
     let mut bytes = [0u8; FRAME_BYTES];
-    let mut iov = sys::IoVec { base: bytes.as_mut_ptr().cast(), len: FRAME_BYTES };
+    let mut iov = sys::IoVec {
+        base: bytes.as_mut_ptr().cast(),
+        len: FRAME_BYTES,
+    };
     let mut ctl = Ctl([0u8; 64]);
     let mut hdr = sys::MsgHdr {
         name: std::ptr::null_mut(),
@@ -601,11 +632,16 @@ fn recv_frame(sock: RawFd, timeout_ms: i32, what: &str) -> Result<(Frame, Vec<Ow
         return Err(format!("{what}: peer closed the connection"));
     }
     if n as usize != FRAME_BYTES || hdr.flags & (sys::MSG_TRUNC | sys::MSG_CTRUNC) != 0 {
-        return Err(format!("{what}: short/truncated frame or control data (n={n})"));
+        return Err(format!(
+            "{what}: short/truncated frame or control data (n={n})"
+        ));
     }
     let frame = decode(&bytes);
     if frame[0] != MAGIC || frame[1] != WIRE_VERSION {
-        return Err(format!("{what}: bad magic/version {:#x}/{}", frame[0], frame[1]));
+        return Err(format!(
+            "{what}: bad magic/version {:#x}/{}",
+            frame[0], frame[1]
+        ));
     }
     Ok((frame, fds))
 }
@@ -635,7 +671,8 @@ fn fd_identity(fd: RawFd) -> Result<(u64, u64), String> {
 /// Count process FDs that still name one of `idents` (dev, inode).
 fn count_fds_with_identity(idents: &[(u64, u64)]) -> Result<usize, String> {
     let mut hits = 0usize;
-    let rd = std::fs::read_dir("/proc/self/fd").map_err(|e| format!("read_dir /proc/self/fd: {e}"))?;
+    let rd =
+        std::fs::read_dir("/proc/self/fd").map_err(|e| format!("read_dir /proc/self/fd: {e}"))?;
     for entry in rd.flatten() {
         if let Ok(md) = std::fs::metadata(entry.path()) {
             if idents.contains(&(md.dev(), md.ino())) {
@@ -666,10 +703,19 @@ impl Gpu {
         let hip = HipRuntime::load().map_err(hip_err("load HIP runtime"))?;
         hip.set_device(device).map_err(hip_err("hipSetDevice"))?;
         let module = hip.module_load(hsaco).map_err(hip_err("hipModuleLoad"))?;
-        let fill = hip.module_get_function(&module, "fill_kernel").map_err(hip_err("fill_kernel"))?;
-        let verify =
-            hip.module_get_function(&module, "verify_kernel").map_err(hip_err("verify_kernel"))?;
-        Ok(Gpu { hip, device, _module: module, fill, verify })
+        let fill = hip
+            .module_get_function(&module, "fill_kernel")
+            .map_err(hip_err("fill_kernel"))?;
+        let verify = hip
+            .module_get_function(&module, "verify_kernel")
+            .map_err(hip_err("verify_kernel"))?;
+        Ok(Gpu {
+            hip,
+            device,
+            _module: module,
+            fill,
+            verify,
+        })
     }
 
     fn launch(
@@ -712,7 +758,9 @@ impl Gpu {
     }
 
     fn sync(&self) -> Result<(), String> {
-        self.hip.device_synchronize().map_err(hip_err("hipDeviceSynchronize"))
+        self.hip
+            .device_synchronize()
+            .map_err(hip_err("hipDeviceSynchronize"))
     }
 }
 
@@ -726,7 +774,10 @@ fn views(set: &[Mapped]) -> Result<Vec<View>, String> {
         .map(|m| {
             Ok(View {
                 spec: m.spec,
-                buf: m.arena.buffer(m.spec.bytes as usize).map_err(hip_err("arena.buffer"))?,
+                buf: m
+                    .arena
+                    .buffer(m.spec.bytes as usize)
+                    .map_err(hip_err("arena.buffer"))?,
             })
         })
         .collect()
@@ -765,19 +816,36 @@ struct VerifyStats {
 
 /// Eager GPU verification (real kernel reads of the mapping) and optional full
 /// host readback of every byte.
-fn verify_eager(gpu: &Gpu, set: &[Mapped], ctx: &str, readback: bool) -> Result<VerifyStats, String> {
+fn verify_eager(
+    gpu: &Gpu,
+    set: &[Mapped],
+    ctx: &str,
+    readback: bool,
+) -> Result<VerifyStats, String> {
     let vs = views(set)?;
-    let res = gpu.hip.malloc(vs.len() * 16).map_err(hip_err("malloc result slots"))?;
-    gpu.hip.memset(&res, 0, vs.len() * 16).map_err(hip_err("memset result slots"))?;
+    let res = gpu
+        .hip
+        .malloc(vs.len() * 16)
+        .map_err(hip_err("malloc result slots"))?;
+    gpu.hip
+        .memset(&res, 0, vs.len() * 16)
+        .map_err(hip_err("memset result slots"))?;
     let mut stats = VerifyStats::default();
     for (i, v) in vs.iter().enumerate() {
-        let mut blob = Gpu::verify_blob(v.buf.as_ptr(), v.spec.words(), v.spec.sm, res_slot(res.as_ptr(), i));
+        let mut blob = Gpu::verify_blob(
+            v.buf.as_ptr(),
+            v.spec.words(),
+            v.spec.sm,
+            res_slot(res.as_ptr(), i),
+        );
         gpu.launch(&gpu.verify, v.spec.words(), &mut blob, None)?;
         stats.gpu_words += v.spec.words();
     }
     gpu.sync()?;
     let mut host = vec![0u8; vs.len() * 16];
-    gpu.hip.memcpy_dtoh(&mut host, &res).map_err(hip_err("D2H result slots"))?;
+    gpu.hip
+        .memcpy_dtoh(&mut host, &res)
+        .map_err(hip_err("D2H result slots"))?;
     gpu.hip.free(res).map_err(hip_err("free result slots"))?;
     check_res(&host, &vs, ctx)?;
     if readback {
@@ -785,7 +853,9 @@ fn verify_eager(gpu: &Gpu, set: &[Mapped], ctx: &str, readback: bool) -> Result<
         let mut bytes = vec![0u8; max];
         for v in &vs {
             let n = v.spec.bytes as usize;
-            gpu.hip.memcpy_dtoh(&mut bytes[..n], &v.buf).map_err(hip_err("D2H readback"))?;
+            gpu.hip
+                .memcpy_dtoh(&mut bytes[..n], &v.buf)
+                .map_err(hip_err("D2H readback"))?;
             for (i, w) in bytes[..n].chunks_exact(8).enumerate() {
                 let got = u64::from_le_bytes(w.try_into().expect("8"));
                 if got != pat(i as u64, v.spec.sm) {
@@ -806,14 +876,24 @@ fn verify_eager(gpu: &Gpu, set: &[Mapped], ctx: &str, readback: bool) -> Result<
 /// and require mismatches.
 fn negative_control(gpu: &Gpu, set: &[Mapped]) -> Result<u64, String> {
     let m = set.last().ok_or("negative control: empty set")?;
-    let buf = m.arena.buffer(m.spec.bytes as usize).map_err(hip_err("arena.buffer"))?;
+    let buf = m
+        .arena
+        .buffer(m.spec.bytes as usize)
+        .map_err(hip_err("arena.buffer"))?;
     let res = gpu.hip.malloc(16).map_err(hip_err("malloc"))?;
     gpu.hip.memset(&res, 0, 16).map_err(hip_err("memset"))?;
-    let mut blob = Gpu::verify_blob(buf.as_ptr(), m.spec.words(), m.spec.sm ^ 0xDEAD_BEEF, res.as_ptr());
+    let mut blob = Gpu::verify_blob(
+        buf.as_ptr(),
+        m.spec.words(),
+        m.spec.sm ^ 0xDEAD_BEEF,
+        res.as_ptr(),
+    );
     gpu.launch(&gpu.verify, m.spec.words(), &mut blob, None)?;
     gpu.sync()?;
     let mut host = [0u8; 16];
-    gpu.hip.memcpy_dtoh(&mut host, &res).map_err(hip_err("D2H"))?;
+    gpu.hip
+        .memcpy_dtoh(&mut host, &res)
+        .map_err(hip_err("D2H"))?;
     gpu.hip.free(res).map_err(hip_err("free"))?;
     let (mm, _) = parse_res(&host, 0);
     if mm < m.spec.words() / 2 {
@@ -842,17 +922,34 @@ impl GraphState {
     fn capture(gpu: &Gpu, set: &[Mapped]) -> Result<GraphState, String> {
         let vs = views(set)?;
         let slots = vs.len() * 16;
-        let res = gpu.hip.malloc(slots).map_err(hip_err("malloc graph result slots"))?;
-        let host = gpu.hip.host_malloc(slots, 0).map_err(hip_err("hipHostMalloc"))?;
-        let stream = gpu.hip.stream_create_non_blocking().map_err(hip_err("stream_create"))?;
+        let res = gpu
+            .hip
+            .malloc(slots)
+            .map_err(hip_err("malloc graph result slots"))?;
+        let host = gpu
+            .hip
+            .host_malloc(slots, 0)
+            .map_err(hip_err("hipHostMalloc"))?;
+        let stream = gpu
+            .hip
+            .stream_create_non_blocking()
+            .map_err(hip_err("stream_create"))?;
         let mut blobs: Vec<KernargBlob> = Vec::with_capacity(vs.len());
         let captured = (|| -> Result<(), String> {
             // Mode 1 = hipStreamCaptureModeThreadLocal (rdna-compute convention).
-            gpu.hip.stream_begin_capture(&stream, 1).map_err(hip_err("hipStreamBeginCapture"))?;
-            gpu.hip.memset_async(&res, 0, slots, &stream).map_err(hip_err("memset_async"))?;
+            gpu.hip
+                .stream_begin_capture(&stream, 1)
+                .map_err(hip_err("hipStreamBeginCapture"))?;
+            gpu.hip
+                .memset_async(&res, 0, slots, &stream)
+                .map_err(hip_err("memset_async"))?;
             for (i, v) in vs.iter().enumerate() {
-                let mut blob =
-                    Gpu::verify_blob(v.buf.as_ptr(), v.spec.words(), v.spec.sm, res_slot(res.as_ptr(), i));
+                let mut blob = Gpu::verify_blob(
+                    v.buf.as_ptr(),
+                    v.spec.words(),
+                    v.spec.sm,
+                    res_slot(res.as_ptr(), i),
+                );
                 gpu.launch(&gpu.verify, v.spec.words(), &mut blob, Some(&stream))?;
                 blobs.push(blob);
             }
@@ -869,7 +966,10 @@ impl GraphState {
             return Err(format!("graph capture: {e}"));
         }
         let graph = ended.map_err(hip_err("hipStreamEndCapture"))?;
-        let exec = gpu.hip.graph_instantiate(&graph).map_err(hip_err("hipGraphInstantiate"))?;
+        let exec = gpu
+            .hip
+            .graph_instantiate(&graph)
+            .map_err(hip_err("hipGraphInstantiate"))?;
         Ok(GraphState {
             stream,
             graph,
@@ -888,10 +988,15 @@ impl GraphState {
         for r in 0..n {
             // SAFETY: host is a live pinned allocation of host_len bytes; the
             // stream is idle (synchronized) between replays.
-            let host = unsafe { std::slice::from_raw_parts_mut(self.host.cast::<u8>(), self.host_len) };
+            let host =
+                unsafe { std::slice::from_raw_parts_mut(self.host.cast::<u8>(), self.host_len) };
             host.fill(0xFF);
-            gpu.hip.graph_launch(&self.exec, &self.stream).map_err(hip_err("hipGraphLaunch"))?;
-            gpu.hip.stream_synchronize(&self.stream).map_err(hip_err("hipStreamSynchronize"))?;
+            gpu.hip
+                .graph_launch(&self.exec, &self.stream)
+                .map_err(hip_err("hipGraphLaunch"))?;
+            gpu.hip
+                .stream_synchronize(&self.stream)
+                .map_err(hip_err("hipStreamSynchronize"))?;
             for (i, spec) in self.specs.iter().enumerate() {
                 let (mm, sum) = parse_res(host, i);
                 if mm != 0 || sum != spec.expect_sum {
@@ -906,12 +1011,22 @@ impl GraphState {
     }
 
     fn destroy(self, gpu: &Gpu) -> Result<(), String> {
-        gpu.hip.stream_synchronize(&self.stream).map_err(hip_err("stream sync"))?;
-        gpu.hip.graph_exec_destroy(self.exec).map_err(hip_err("graph_exec_destroy"))?;
-        gpu.hip.graph_destroy(self.graph).map_err(hip_err("graph_destroy"))?;
-        gpu.hip.stream_destroy(self.stream).map_err(hip_err("stream_destroy"))?;
+        gpu.hip
+            .stream_synchronize(&self.stream)
+            .map_err(hip_err("stream sync"))?;
+        gpu.hip
+            .graph_exec_destroy(self.exec)
+            .map_err(hip_err("graph_exec_destroy"))?;
+        gpu.hip
+            .graph_destroy(self.graph)
+            .map_err(hip_err("graph_destroy"))?;
+        gpu.hip
+            .stream_destroy(self.stream)
+            .map_err(hip_err("stream_destroy"))?;
         gpu.hip.host_free(self.host).map_err(hip_err("host_free"))?;
-        gpu.hip.free(self.res).map_err(hip_err("free graph result slots"))?;
+        gpu.hip
+            .free(self.res)
+            .map_err(hip_err("free graph result slots"))?;
         Ok(())
     }
 }
@@ -953,7 +1068,9 @@ fn inherited_sock(fd: RawFd) -> Result<OwnedFd, String> {
 }
 
 fn hsaco_arg(a: &Args) -> Result<&str, String> {
-    a.hsaco.as_deref().ok_or_else(|| "--hsaco is required for this role".to_string())
+    a.hsaco
+        .as_deref()
+        .ok_or_else(|| "--hsaco is required for this role".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -964,8 +1081,12 @@ fn role_identity(a: &Args) -> Result<(), String> {
     hip.set_device(a.device).map_err(hip_err("hipSetDevice"))?;
     let (maj, min) = hip.runtime_version().unwrap_or((0, 0));
     let arch = hip.get_arch(a.device).map_err(hip_err("get_arch"))?;
-    let bdf = hip.device_pci_bus_id(a.device).map_err(hip_err("pci bus id"))?;
-    let uuid = hip.device_uuid(a.device).unwrap_or_else(|_| "unknown".into());
+    let bdf = hip
+        .device_pci_bus_id(a.device)
+        .map_err(hip_err("pci bus id"))?;
+    let uuid = hip
+        .device_uuid(a.device)
+        .unwrap_or_else(|_| "unknown".into());
     emit(
         "identity",
         &[
@@ -973,7 +1094,12 @@ fn role_identity(a: &Args) -> Result<(), String> {
             ("bdf", bdf.to_lowercase()),
             ("uuid", uuid.replace(' ', "_")),
             ("hip_runtime", format!("{maj}.{min}")),
-            ("devices", hip.device_count().map(|c| c.to_string()).unwrap_or_default()),
+            (
+                "devices",
+                hip.device_count()
+                    .map(|c| c.to_string())
+                    .unwrap_or_default(),
+            ),
         ],
     );
     Ok(())
@@ -986,12 +1112,18 @@ fn role_exporter(a: &Args) -> Result<(), String> {
     if a.fds.is_empty() {
         return Err("exporter needs --fds <socket,...>".into());
     }
-    let socks: Vec<OwnedFd> = a.fds.iter().map(|&f| inherited_sock(f)).collect::<Result<_, _>>()?;
+    let socks: Vec<OwnedFd> = a
+        .fds
+        .iter()
+        .map(|&f| inherited_sock(f))
+        .collect::<Result<_, _>>()?;
     let gpu = Gpu::init(a.device, hsaco_arg(a)?)?;
     let hip = &gpu.hip;
     let granularity_note = {
         let arch = hip.get_arch(a.device).unwrap_or_default();
-        let bdf = hip.device_pci_bus_id(a.device).map_err(hip_err("pci bus id"))?;
+        let bdf = hip
+            .device_pci_bus_id(a.device)
+            .map_err(hip_err("pci bus id"))?;
         (arch, bdf.to_lowercase())
     };
 
@@ -1002,7 +1134,9 @@ fn role_exporter(a: &Args) -> Result<(), String> {
             let mut arena = VmmArena::reserve_exportable(hip, a.device, req as usize)
                 .map_err(hip_err("reserve_exportable"))?;
             let reserved = arena.reserved_bytes();
-            let mapped = arena.map_next(hip, reserved, &[]).map_err(hip_err("map_next"));
+            let mapped = arena
+                .map_next(hip, reserved, &[])
+                .map_err(hip_err("map_next"));
             if let Err(e) = mapped {
                 let _ = arena.release(hip);
                 return Err(e);
@@ -1011,11 +1145,19 @@ fn role_exporter(a: &Args) -> Result<(), String> {
             let spec = Spec::new(a.seed, id as u32, req, bytes);
             set.push(Mapped { spec, arena });
             let m = set.last().expect("pushed");
-            let flags = m.arena.owner_access_flags(hip).map_err(hip_err("hipMemGetAccess"))?;
+            let flags = m
+                .arena
+                .owner_access_flags(hip)
+                .map_err(hip_err("hipMemGetAccess"))?;
             if flags != ACCESS_RW {
-                return Err(format!("alloc {id}: pre-publish access {flags}, expected RW={ACCESS_RW}"));
+                return Err(format!(
+                    "alloc {id}: pre-publish access {flags}, expected RW={ACCESS_RW}"
+                ));
             }
-            let buf = m.arena.buffer(bytes as usize).map_err(hip_err("arena.buffer"))?;
+            let buf = m
+                .arena
+                .buffer(bytes as usize)
+                .map_err(hip_err("arena.buffer"))?;
             gpu.fill(buf.as_ptr(), spec.words(), spec.sm)?;
         }
         gpu.sync()
@@ -1030,10 +1172,18 @@ fn role_exporter(a: &Args) -> Result<(), String> {
         let pre = verify_eager(&gpu, &set, "exporter RW", true)?;
         let neg = negative_control(&gpu, &set)?;
         for m in set.iter_mut() {
-            m.arena.publish_read_only(hip).map_err(hip_err("publish_read_only"))?;
-            let flags = m.arena.owner_access_flags(hip).map_err(hip_err("hipMemGetAccess"))?;
+            m.arena
+                .publish_read_only(hip)
+                .map_err(hip_err("publish_read_only"))?;
+            let flags = m
+                .arena
+                .owner_access_flags(hip)
+                .map_err(hip_err("hipMemGetAccess"))?;
             if flags != ACCESS_RO || !m.arena.is_read_only() {
-                return Err(format!("alloc {}: post-publish access {flags}, expected RO={ACCESS_RO}", m.spec.id));
+                return Err(format!(
+                    "alloc {}: post-publish access {flags}, expected RO={ACCESS_RO}",
+                    m.spec.id
+                ));
             }
         }
         let post = verify_eager(&gpu, &set, "exporter RO", true)?;
@@ -1049,13 +1199,25 @@ fn role_exporter(a: &Args) -> Result<(), String> {
                 ("physical_bytes", total.to_string()),
                 ("rw_pre_publish", ACCESS_RW.to_string()),
                 ("ro_post_publish", ACCESS_RO.to_string()),
-                ("gpu_words_verified", (pre.gpu_words + post.gpu_words).to_string()),
-                ("readback_bytes", (pre.readback_bytes + post.readback_bytes).to_string()),
+                (
+                    "gpu_words_verified",
+                    (pre.gpu_words + post.gpu_words).to_string(),
+                ),
+                (
+                    "readback_bytes",
+                    (pre.readback_bytes + post.readback_bytes).to_string(),
+                ),
                 ("negative_control_mismatches", neg.to_string()),
                 ("export_fds_cloexec", cloexec.to_string()),
                 ("arch", granularity_note.0.clone()),
                 ("bdf", granularity_note.1.clone()),
-                ("sizes", set.iter().map(|m| format!("{}>{}", m.spec.requested, m.spec.bytes)).collect::<Vec<_>>().join(",")),
+                (
+                    "sizes",
+                    set.iter()
+                        .map(|m| format!("{}>{}", m.spec.requested, m.spec.bytes))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
             ],
         );
         exporter_loop(a, &gpu, &mut set, &socks, &mut fds)
@@ -1093,7 +1255,14 @@ fn exporter_loop(
                     for (i, m) in set.iter().enumerate() {
                         send_frame(
                             raw,
-                            &mk_frame(KIND_ALLOC, i as u64, set.len() as u64, m.spec.bytes, m.spec.requested, 0),
+                            &mk_frame(
+                                KIND_ALLOC,
+                                i as u64,
+                                set.len() as u64,
+                                m.spec.bytes,
+                                m.spec.requested,
+                                0,
+                            ),
                             Some(fds[i].as_fd_borrowed()),
                             to,
                             &format!("send ALLOC {i} to importer {si}"),
@@ -1101,24 +1270,47 @@ fn exporter_loop(
                     }
                 }
                 for (si, sock) in socks.iter().enumerate() {
-                    let (f, extra_fds) =
-                        recv_frame(sock.as_raw_fd(), a.ipc_timeout_ms, &format!("recv ACK from importer {si}"))?;
+                    let (f, extra_fds) = recv_frame(
+                        sock.as_raw_fd(),
+                        a.ipc_timeout_ms,
+                        &format!("recv ACK from importer {si}"),
+                    )?;
                     if !extra_fds.is_empty() {
-                        return Err(format!("importer {si} ACK carried {} unexpected FDs", extra_fds.len()));
+                        return Err(format!(
+                            "importer {si} ACK carried {} unexpected FDs",
+                            extra_fds.len()
+                        ));
                     }
                     if f[2] != KIND_ACK || f[4] != set.len() as u64 || f[5] != total {
-                        return Err(format!("importer {si}: bad ACK {f:?} (want count={} bytes={total})", set.len()));
+                        return Err(format!(
+                            "importer {si}: bad ACK {f:?} (want count={} bytes={total})",
+                            set.len()
+                        ));
                     }
                 }
                 let n = fds.len();
                 for fd in fds.drain(..) {
                     close_checked(fd)?;
                 }
-                emit("served", &[("importers", socks.len().to_string()), ("acks", socks.len().to_string()), ("fds_sent_each", n.to_string()), ("exporter_fds_closed", n.to_string())]);
+                emit(
+                    "served",
+                    &[
+                        ("importers", socks.len().to_string()),
+                        ("acks", socks.len().to_string()),
+                        ("fds_sent_each", n.to_string()),
+                        ("exporter_fds_closed", n.to_string()),
+                    ],
+                );
             }
             "VERIFY" => {
                 let s = verify_eager(gpu, set, "exporter after FD close", true)?;
-                emit("verified", &[("gpu_words", s.gpu_words.to_string()), ("readback_bytes", s.readback_bytes.to_string())]);
+                emit(
+                    "verified",
+                    &[
+                        ("gpu_words", s.gpu_words.to_string()),
+                        ("readback_bytes", s.readback_bytes.to_string()),
+                    ],
+                );
             }
             "EXIT_CLEAN" => {
                 release_all(gpu, set)?;
@@ -1162,7 +1354,12 @@ struct Importer {
 fn import_all(gpu: &Gpu, specs: &[Spec], fds: &[OwnedFd]) -> Result<Vec<Mapped>, String> {
     let mut set: Vec<Mapped> = Vec::new();
     for (spec, fd) in specs.iter().zip(fds) {
-        match VmmArena::import_posix(&gpu.hip, gpu.device, fd.as_fd_borrowed(), spec.bytes as usize) {
+        match VmmArena::import_posix(
+            &gpu.hip,
+            gpu.device,
+            fd.as_fd_borrowed(),
+            spec.bytes as usize,
+        ) {
             Ok(arena) => set.push(Mapped { spec: *spec, arena }),
             Err(e) => {
                 let _ = release_all(gpu, &mut set);
@@ -1170,15 +1367,24 @@ fn import_all(gpu: &Gpu, specs: &[Spec], fds: &[OwnedFd]) -> Result<Vec<Mapped>,
             }
         }
         let m = set.last().expect("pushed");
-        let flags = m.arena.owner_access_flags(&gpu.hip).map_err(hip_err("hipMemGetAccess"))?;
+        let flags = m
+            .arena
+            .owner_access_flags(&gpu.hip)
+            .map_err(hip_err("hipMemGetAccess"))?;
         if flags != ACCESS_RO || !m.arena.is_read_only() {
             let _ = release_all(gpu, &mut set);
-            return Err(format!("alloc {}: imported access {flags}, expected RO={ACCESS_RO}", spec.id));
+            return Err(format!(
+                "alloc {}: imported access {flags}, expected RO={ACCESS_RO}",
+                spec.id
+            ));
         }
         if m.arena.mapped_bytes() as u64 != spec.bytes {
             let got = m.arena.mapped_bytes();
             let _ = release_all(gpu, &mut set);
-            return Err(format!("alloc {}: imported {got} B, manifest says {}", spec.id, spec.bytes));
+            return Err(format!(
+                "alloc {}: imported {got} B, manifest says {}",
+                spec.id, spec.bytes
+            ));
         }
     }
     Ok(set)
@@ -1195,12 +1401,20 @@ fn role_importer(a: &Args) -> Result<(), String> {
     // physical copy" accounting window opens.
     {
         let words = 1u64 << 18;
-        let buf = gpu.hip.malloc((words * 8) as usize).map_err(hip_err("warmup malloc"))?;
+        let buf = gpu
+            .hip
+            .malloc((words * 8) as usize)
+            .map_err(hip_err("warmup malloc"))?;
         gpu.fill(buf.as_ptr(), words, 7)?;
         gpu.sync()?;
         gpu.hip.free(buf).map_err(hip_err("warmup free"))?;
-        let s = gpu.hip.stream_create_non_blocking().map_err(hip_err("warmup stream"))?;
-        gpu.hip.stream_destroy(s).map_err(hip_err("warmup stream destroy"))?;
+        let s = gpu
+            .hip
+            .stream_create_non_blocking()
+            .map_err(hip_err("warmup stream"))?;
+        gpu.hip
+            .stream_destroy(s)
+            .map_err(hip_err("warmup stream destroy"))?;
     }
     let mut imp = Importer {
         gpu,
@@ -1224,10 +1438,19 @@ fn role_importer(a: &Args) -> Result<(), String> {
                     return Err("VERIFY before IMPORT".into());
                 }
                 let neg = negative_control(&imp.gpu, &imp.set)?;
-                let s = verify_eager(&imp.gpu, &imp.set, &format!("importer {} eager", a.name), true)?;
+                let s = verify_eager(
+                    &imp.gpu,
+                    &imp.set,
+                    &format!("importer {} eager", a.name),
+                    true,
+                )?;
                 emit(
                     "verified",
-                    &[("gpu_words", s.gpu_words.to_string()), ("readback_bytes", s.readback_bytes.to_string()), ("negative_control_mismatches", neg.to_string())],
+                    &[
+                        ("gpu_words", s.gpu_words.to_string()),
+                        ("readback_bytes", s.readback_bytes.to_string()),
+                        ("negative_control_mismatches", neg.to_string()),
+                    ],
                 );
             }
             "CYCLES" => importer_cycles(a, &mut imp, arg.unwrap_or(u64::from(a.cycles)) as u32)?,
@@ -1237,14 +1460,31 @@ fn role_importer(a: &Args) -> Result<(), String> {
                     old.destroy(&imp.gpu)?;
                 }
                 let g = GraphState::capture(&imp.gpu, &imp.set)?;
-                g.replay(&imp.gpu, n, &format!("importer {} {}", a.name, cmd.to_lowercase()))?;
+                g.replay(
+                    &imp.gpu,
+                    n,
+                    &format!("importer {} {}", a.name, cmd.to_lowercase()),
+                )?;
                 imp.graph = Some(g);
-                emit(&cmd.to_lowercase(), &[("replays", n.to_string()), ("allocs", imp.set.len().to_string())]);
+                emit(
+                    &cmd.to_lowercase(),
+                    &[
+                        ("replays", n.to_string()),
+                        ("allocs", imp.set.len().to_string()),
+                    ],
+                );
             }
             "REPLAY" => {
                 let n = arg.unwrap_or(u64::from(a.replays)) as u32;
-                let g = imp.graph.as_ref().ok_or("REPLAY without a captured graph")?;
-                g.replay(&imp.gpu, n, &format!("importer {} replay of earlier graph", a.name))?;
+                let g = imp
+                    .graph
+                    .as_ref()
+                    .ok_or("REPLAY without a captured graph")?;
+                g.replay(
+                    &imp.gpu,
+                    n,
+                    &format!("importer {} replay of earlier graph", a.name),
+                )?;
                 emit("replay", &[("replays", n.to_string())]);
             }
             "CLOSE_FDS" => {
@@ -1253,14 +1493,23 @@ fn role_importer(a: &Args) -> Result<(), String> {
                     close_checked(fd)?;
                 }
                 let residual = count_fds_with_identity(&imp.idents)?;
-                emit("closed_fds", &[("closed", n.to_string()), ("residual_same_inode_fds", residual.to_string())]);
+                emit(
+                    "closed_fds",
+                    &[
+                        ("closed", n.to_string()),
+                        ("residual_same_inode_fds", residual.to_string()),
+                    ],
+                );
             }
             "EXIT" => {
                 if let Some(g) = imp.graph.take() {
                     g.destroy(&imp.gpu)?;
                 }
                 release_all(&imp.gpu, &mut imp.set)?;
-                emit("exiting", &[("retired_va_bytes", retired_va_bytes().to_string())]);
+                emit(
+                    "exiting",
+                    &[("retired_va_bytes", retired_va_bytes().to_string())],
+                );
                 std::process::exit(0);
             }
             other => return Err(format!("importer: unknown command {other:?}")),
@@ -1296,15 +1545,22 @@ fn importer_import(a: &Args, imp: &mut Importer, sock: &OwnedFd) -> Result<(), S
             return Err(format!("ALLOC {i}: bad frame {f:?}"));
         }
         if got.len() != 1 {
-            return Err(format!("ALLOC {i}: expected exactly 1 FD, got {}", got.len()));
+            return Err(format!(
+                "ALLOC {i}: expected exactly 1 FD, got {}",
+                got.len()
+            ));
         }
         let fd = got.pop().expect("one fd");
         if !fd_is_cloexec(fd.as_raw_fd()) {
-            return Err(format!("ALLOC {i}: received FD lacks FD_CLOEXEC (MSG_CMSG_CLOEXEC ignored?)"));
+            return Err(format!(
+                "ALLOC {i}: received FD lacks FD_CLOEXEC (MSG_CMSG_CLOEXEC ignored?)"
+            ));
         }
         let (bytes, requested) = (f[5], f[6]);
         if bytes == 0 || bytes % 8 != 0 || bytes < requested {
-            return Err(format!("ALLOC {i}: implausible sizes bytes={bytes} requested={requested}"));
+            return Err(format!(
+                "ALLOC {i}: implausible sizes bytes={bytes} requested={requested}"
+            ));
         }
         sum = sum.checked_add(bytes).ok_or("byte total overflow")?;
         specs.push(Spec::new(seed, i as u32, requested, bytes));
@@ -1312,16 +1568,25 @@ fn importer_import(a: &Args, imp: &mut Importer, sock: &OwnedFd) -> Result<(), S
         fds.push(fd);
     }
     if sum != total {
-        return Err(format!("manifest total {total} != sum of allocations {sum}"));
+        return Err(format!(
+            "manifest total {total} != sum of allocations {sum}"
+        ));
     }
     let set = import_all(&imp.gpu, &specs, &fds)?;
     for m in &set {
-        imp.ranges.push((m.arena.base_address(), m.arena.reserved_bytes()));
+        imp.ranges
+            .push((m.arena.base_address(), m.arena.reserved_bytes()));
     }
     imp.set = set;
     imp.specs = specs;
     imp.fds = fds;
-    send_frame(raw, &mk_frame(KIND_ACK, 0, count, total, 0, 0), None, to, "send ACK")?;
+    send_frame(
+        raw,
+        &mk_frame(KIND_ACK, 0, count, total, 0, 0),
+        None,
+        to,
+        "send ACK",
+    )?;
     emit(
         "imported",
         &[
@@ -1353,14 +1618,22 @@ fn importer_cycles(a: &Args, imp: &mut Importer, cycles: u32) -> Result<(), Stri
             imp.ranges.push((lo, len));
         }
         let reserved: usize = set.iter().map(|m| m.arena.reserved_bytes()).sum();
-        let verified = verify_eager(&imp.gpu, &set, &format!("importer {} cycle {k}", a.name), true);
+        let verified = verify_eager(
+            &imp.gpu,
+            &set,
+            &format!("importer {} cycle {k}", a.name),
+            true,
+        );
         let rv0 = retired_va_bytes();
         let released = release_all(&imp.gpu, &mut set);
         verified?;
         released?;
         let rv1 = retired_va_bytes();
         if rv1 < rv0 + reserved {
-            return Err(format!("cycle {k}: retired VA grew {} B, expected at least {reserved} B", rv1.saturating_sub(rv0)));
+            return Err(format!(
+                "cycle {k}: retired VA grew {} B, expected at least {reserved} B",
+                rv1.saturating_sub(rv0)
+            ));
         }
         retired_total += reserved;
     }
@@ -1371,7 +1644,10 @@ fn importer_cycles(a: &Args, imp: &mut Importer, cycles: u32) -> Result<(), Stri
             ("retired_ranges_recorded", imp.ranges.len().to_string()),
             ("va_retired_by_cycles", retired_total.to_string()),
             ("retired_va_bytes", retired_va_bytes().to_string()),
-            ("retired_va_growth", retired_va_bytes().saturating_sub(rv_start).to_string()),
+            (
+                "retired_va_growth",
+                retired_va_bytes().saturating_sub(rv_start).to_string(),
+            ),
         ],
     );
     Ok(())
@@ -1416,7 +1692,11 @@ impl Role {
         inherit: &[RawFd],
     ) -> Result<Role, String> {
         let mut cmd = Command::new(exe);
-        cmd.arg("--role").arg(role).arg("--name").arg(name).args(args);
+        cmd.arg("--role")
+            .arg(role)
+            .arg("--name")
+            .arg(name)
+            .args(args);
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
         let fds = inherit.to_vec();
         // SAFETY: only async-signal-safe fcntl calls run between fork and exec.
@@ -1431,7 +1711,9 @@ impl Role {
                 Ok(())
             });
         }
-        let mut child: Child = cmd.spawn().map_err(|e| format!("spawn {name} ({role}): {e}"))?;
+        let mut child: Child = cmd
+            .spawn()
+            .map_err(|e| format!("spawn {name} ({role}): {e}"))?;
         let pid = child.id() as i32;
         let start_ticks = read_start_ticks(pid).unwrap_or(0);
         let stdin = child.stdin.take();
@@ -1456,7 +1738,15 @@ impl Role {
             }
         });
         println!("SPAWN {name} role={role} pid={pid} starttime={start_ticks}");
-        Ok(Role { name, pid, start_ticks, stdin, events, exit, exited: None })
+        Ok(Role {
+            name,
+            pid,
+            start_ticks,
+            stdin,
+            events,
+            exit,
+            exited: None,
+        })
     }
 
     fn poll_exit(&mut self) -> Option<ExitStatus> {
@@ -1480,7 +1770,10 @@ impl Role {
     }
 
     fn send(&mut self, cmd: &str) -> Result<(), String> {
-        let stdin = self.stdin.as_mut().ok_or_else(|| format!("{}: stdin closed", self.name))?;
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| format!("{}: stdin closed", self.name))?;
         writeln!(stdin, "{cmd}")
             .and_then(|_| stdin.flush())
             .map_err(|e| format!("{}: send {cmd}: {e}", self.name))
@@ -1500,7 +1793,10 @@ impl Role {
                     let mut parts = rest.split_whitespace();
                     let name = parts.next().unwrap_or("");
                     let kv: Evt = parts
-                        .filter_map(|p| p.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+                        .filter_map(|p| {
+                            p.split_once('=')
+                                .map(|(k, v)| (k.to_string(), v.to_string()))
+                        })
                         .collect();
                     if name != want {
                         return Err(format!("{}: expected event {want}, got {name}", self.name));
@@ -1508,14 +1804,20 @@ impl Role {
                     return Ok(kv);
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    return Err(format!("{}: timed out after {timeout:?} waiting for {want}", self.name))
+                    return Err(format!(
+                        "{}: timed out after {timeout:?} waiting for {want}",
+                        self.name
+                    ))
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     let st = self
                         .wait_exit(Duration::from_secs(10))
                         .map(|s| describe(&s))
                         .unwrap_or_else(|e| e);
-                    return Err(format!("{}: output closed while waiting for {want} ({st})", self.name));
+                    return Err(format!(
+                        "{}: output closed while waiting for {want} ({st})",
+                        self.name
+                    ));
                 }
             }
         }
@@ -1530,12 +1832,22 @@ impl Role {
             Some(t) if t == self.start_ticks && self.start_ticks != 0 => {
                 // SAFETY: PID and start time match the process we spawned.
                 if unsafe { sys::kill(self.pid, sys::SIGTERM) } != 0 {
-                    return Err(format!("{}: kill(SIGTERM): {}", self.name, std::io::Error::last_os_error()));
+                    return Err(format!(
+                        "{}: kill(SIGTERM): {}",
+                        self.name,
+                        std::io::Error::last_os_error()
+                    ));
                 }
-                println!("SIGTERM {} pid={} starttime={} (recorded child; no SIGKILL)", self.name, self.pid, self.start_ticks);
+                println!(
+                    "SIGTERM {} pid={} starttime={} (recorded child; no SIGKILL)",
+                    self.name, self.pid, self.start_ticks
+                );
                 Ok(())
             }
-            Some(_) => Err(format!("{}: pid {} start time changed; refusing to signal", self.name, self.pid)),
+            Some(_) => Err(format!(
+                "{}: pid {} start time changed; refusing to signal",
+                self.name, self.pid
+            )),
             None => Ok(()),
         }
     }
@@ -1556,7 +1868,10 @@ impl Orch {
     }
 
     fn role(&mut self, name: &str) -> Result<&mut Role, String> {
-        self.roles.iter_mut().find(|r| r.name == name).ok_or_else(|| format!("no role {name}"))
+        self.roles
+            .iter_mut()
+            .find(|r| r.name == name)
+            .ok_or_else(|| format!("no role {name}"))
     }
 
     fn cmd(&mut self, role: &str, cmd: &str, want: &str, to: Duration) -> Result<Evt, String> {
@@ -1574,7 +1889,13 @@ impl Orch {
         Ok((b, c))
     }
 
-    fn expect_exit(&mut self, role: &str, to: Duration, want_code: Option<i32>, want_signal: Option<i32>) -> Result<String, String> {
+    fn expect_exit(
+        &mut self,
+        role: &str,
+        to: Duration,
+        want_code: Option<i32>,
+        want_signal: Option<i32>,
+    ) -> Result<String, String> {
         let r = self.role(role)?;
         let st = r.wait_exit(to)?;
         proc_absent(r.name, r.pid, r.start_ticks)?;
@@ -1602,7 +1923,10 @@ impl Orch {
             if r.exited.is_none() {
                 match r.wait_exit(Duration::from_secs(15)) {
                     Ok(st) => println!("CLEANUP {} {}", r.name, describe(&st)),
-                    Err(e) => eprintln!("cleanup: {e} (no SIGKILL sent; pid {} may still be running)", r.pid),
+                    Err(e) => eprintln!(
+                        "cleanup: {e} (no SIGKILL sent; pid {} may still be running)",
+                        r.pid
+                    ),
                 }
             }
         }
@@ -1613,17 +1937,28 @@ impl Orch {
 }
 
 fn get<'a>(e: &'a Evt, k: &str) -> Result<&'a str, String> {
-    e.get(k).map(String::as_str).ok_or_else(|| format!("event missing field {k}"))
+    e.get(k)
+        .map(String::as_str)
+        .ok_or_else(|| format!("event missing field {k}"))
 }
 
 fn get_u64(e: &Evt, k: &str) -> Result<u64, String> {
-    get(e, k)?.parse().map_err(|_| format!("event field {k} is not a number"))
+    get(e, k)?
+        .parse()
+        .map_err(|_| format!("event field {k} is not a number"))
 }
 
 fn socketpair_seqpacket() -> Result<(OwnedFd, OwnedFd), String> {
     let mut sv = [0i32; 2];
     // SAFETY: sv is a live 2-int array.
-    let rc = unsafe { sys::socketpair(sys::AF_UNIX, sys::SOCK_SEQPACKET | sys::SOCK_CLOEXEC, 0, sv.as_mut_ptr()) };
+    let rc = unsafe {
+        sys::socketpair(
+            sys::AF_UNIX,
+            sys::SOCK_SEQPACKET | sys::SOCK_CLOEXEC,
+            0,
+            sv.as_mut_ptr(),
+        )
+    };
     if rc != 0 {
         return Err(format!("socketpair: {}", std::io::Error::last_os_error()));
     }
@@ -1652,7 +1987,9 @@ fn compile_kernel(arch: &str, dir: &Path) -> Result<PathBuf, String> {
     if let Some(root) = hipfire_config::rocm::compiler_env_root(&hipcc) {
         cmd.env("ROCM_PATH", root);
     }
-    let out = cmd.output().map_err(|e| format!("run {}: {e}", hipcc.display()))?;
+    let out = cmd
+        .output()
+        .map_err(|e| format!("run {}: {e}", hipcc.display()))?;
     if !out.status.success() {
         return Err(format!(
             "{} failed ({}): {}",
@@ -1688,7 +2025,13 @@ impl Accounting {
                 }
             }
         };
-        Accounting { mode, path, baseline: None, bdf: bdf.to_string(), gpu_id }
+        Accounting {
+            mode,
+            path,
+            baseline: None,
+            bdf: bdf.to_string(),
+            gpu_id,
+        }
     }
 
     fn read(&self) -> Option<u64> {
@@ -1699,7 +2042,10 @@ impl Accounting {
     fn sample(&self, label: &str) -> Option<u64> {
         let v = self.read();
         match v {
-            Some(v) => println!("ACCT {label} vram_used={v} delta_baseline={}", v as i64 - self.baseline.unwrap_or(v) as i64),
+            Some(v) => println!(
+                "ACCT {label} vram_used={v} delta_baseline={}",
+                v as i64 - self.baseline.unwrap_or(v) as i64
+            ),
             None if self.mode != AcctMode::Off => println!("ACCT {label} unavailable"),
             None => {}
         }
@@ -1712,7 +2058,14 @@ impl Accounting {
 
     fn gate(&self, name: &str, ok: bool, detail: String) -> Result<(), String> {
         if !self.gating() {
-            println!("REPORT {name} {detail} ({})", if ok { "within gate" } else { "outside gate, not gating" });
+            println!(
+                "REPORT {name} {detail} ({})",
+                if ok {
+                    "within gate"
+                } else {
+                    "outside gate, not gating"
+                }
+            );
             return Ok(());
         }
         if ok {
@@ -1737,10 +2090,14 @@ fn proc_absent(name: &str, pid: i32, start_ticks: u64) -> Result<(), String> {
             Ok(())
         }
         Some(t) if t != start_ticks => {
-            println!("PROC_ABSENT {name} pid={pid} (pid reused by a different process, start differs)");
+            println!(
+                "PROC_ABSENT {name} pid={pid} (pid reused by a different process, start differs)"
+            );
             Ok(())
         }
-        Some(_) => Err(format!("{name}: /proc/{pid} still present with the recorded start time after wait")),
+        Some(_) => Err(format!(
+            "{name}: /proc/{pid} still present with the recorded start time after wait"
+        )),
     }
 }
 
@@ -1761,7 +2118,9 @@ fn kfd_gpu_id(bdf: &str) -> Result<String, String> {
     let nodes = "/sys/class/kfd/kfd/topology/nodes";
     let rd = std::fs::read_dir(nodes).map_err(|e| format!("read_dir {nodes}: {e}"))?;
     for entry in rd.flatten() {
-        let Ok(props) = std::fs::read_to_string(entry.path().join("properties")) else { continue };
+        let Ok(props) = std::fs::read_to_string(entry.path().join("properties")) else {
+            continue;
+        };
         let mut kv: HashMap<&str, &str> = HashMap::new();
         for line in props.lines() {
             let mut it = line.split_whitespace();
@@ -1777,7 +2136,9 @@ fn kfd_gpu_id(bdf: &str) -> Result<String, String> {
             return Ok(id.trim().to_string());
         }
     }
-    Err(format!("no KFD node for PCI {bdf} (domain {dom}, location_id {loc})"))
+    Err(format!(
+        "no KFD node for PCI {bdf} (domain {dom}, location_id {loc})"
+    ))
 }
 
 /// Per-PID KFD VRAM on the target GPU: `/sys/class/kfd/kfd/proc/<pid>/vram_<gpu_id>` (bytes).
@@ -1786,7 +2147,13 @@ fn kfd_vram_by_pid(gpu_id: &str) -> Result<Vec<(i32, u64)>, String> {
     let rd = std::fs::read_dir(dir).map_err(|e| format!("read_dir {dir}: {e}"))?;
     let mut out = Vec::new();
     for entry in rd.flatten() {
-        let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else { continue };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<i32>().ok())
+        else {
+            continue;
+        };
         let v = std::fs::read_to_string(entry.path().join(format!("vram_{gpu_id}")))
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok());
@@ -1804,9 +2171,17 @@ fn kfd_vram_by_pid(gpu_id: &str) -> Result<Vec<(i32, u64)>, String> {
 fn fdinfo_vram_by_pid(bdf: &str) -> (Vec<(i32, u64)>, usize) {
     let mut out = Vec::new();
     let mut denied = 0usize;
-    let Ok(rd) = std::fs::read_dir("/proc") else { return (out, denied) };
+    let Ok(rd) = std::fs::read_dir("/proc") else {
+        return (out, denied);
+    };
     for entry in rd.flatten() {
-        let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else { continue };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<i32>().ok())
+        else {
+            continue;
+        };
         let fdinfo = match std::fs::read_dir(entry.path().join("fdinfo")) {
             Ok(d) => d,
             Err(e) => {
@@ -1818,19 +2193,27 @@ fn fdinfo_vram_by_pid(bdf: &str) -> (Vec<(i32, u64)>, usize) {
         };
         let mut clients: HashMap<String, u64> = HashMap::new();
         for f in fdinfo.flatten() {
-            let Ok(txt) = std::fs::read_to_string(f.path()) else { continue };
+            let Ok(txt) = std::fs::read_to_string(f.path()) else {
+                continue;
+            };
             if !txt.contains("drm-pdev:") {
                 continue;
             }
             let (mut pdev, mut client, mut vram_kib) = (None, None, 0u64);
             for line in txt.lines() {
-                let Some((k, v)) = line.split_once(':') else { continue };
+                let Some((k, v)) = line.split_once(':') else {
+                    continue;
+                };
                 let v = v.trim();
                 match k.trim() {
                     "drm-pdev" => pdev = Some(v.to_lowercase()),
                     "drm-client-id" => client = Some(v.to_string()),
                     "drm-memory-vram" => {
-                        vram_kib = v.split_whitespace().next().and_then(|n| n.parse().ok()).unwrap_or(0)
+                        vram_kib = v
+                            .split_whitespace()
+                            .next()
+                            .and_then(|n| n.parse().ok())
+                            .unwrap_or(0)
                     }
                     _ => {}
                 }
@@ -1904,7 +2287,10 @@ fn diag(orch: &mut Orch, acct: &Accounting, label: &str) -> Option<(u64, u64)> {
             }
             Err(e) => println!("DIAG {label} src=kfd unavailable: {e}"),
         },
-        None => println!("DIAG {label} src=kfd unavailable (no KFD node for {})", acct.bdf),
+        None => println!(
+            "DIAG {label} src=kfd unavailable (no KFD node for {})",
+            acct.bdf
+        ),
     }
     let (list, denied) = fdinfo_vram_by_pid(&acct.bdf);
     let (mut own, mut others) = (0u64, 0u64);
@@ -1916,11 +2302,16 @@ fn diag(orch: &mut Orch, acct: &Accounting, label: &str) -> Option<(u64, u64)> {
             }
             None => {
                 others += v;
-                println!("DIAG {label} src=fdinfo who=OTHER pid={pid} comm={} drm_memory_vram_bytes={v}", proc_comm(pid));
+                println!(
+                    "DIAG {label} src=fdinfo who=OTHER pid={pid} comm={} drm_memory_vram_bytes={v}",
+                    proc_comm(pid)
+                );
             }
         }
     }
-    println!("DIAG {label} src=fdinfo own_sum={own} others_sum={others} processes_not_readable={denied}");
+    println!(
+        "DIAG {label} src=fdinfo own_sum={own} others_sum={others} processes_not_readable={denied}"
+    );
     kfd_result
 }
 
@@ -1961,7 +2352,11 @@ fn run(orch: &mut Orch, a: &Args) -> Result<(), String> {
     let bdf = get(&id_evt, "bdf")?.to_string();
     orch.pass(
         "IDENTITY",
-        &format!("arch={arch} bdf={bdf} uuid={} hip_runtime={}", get(&id_evt, "uuid")?, get(&id_evt, "hip_runtime")?),
+        &format!(
+            "arch={arch} bdf={bdf} uuid={} hip_runtime={}",
+            get(&id_evt, "uuid")?,
+            get(&id_evt, "hip_runtime")?
+        ),
     );
 
     // --- kernel code object -------------------------------------------------
@@ -1972,7 +2367,10 @@ fn run(orch: &mut Orch, a: &Args) -> Result<(), String> {
         Some(p) => PathBuf::from(p),
         None => compile_kernel(&arch, &dir)?,
     };
-    orch.pass("KERNEL_COMPILED", &format!("hsaco={} arch={arch}", hsaco.display()));
+    orch.pass(
+        "KERNEL_COMPILED",
+        &format!("hsaco={} arch={arch}", hsaco.display()),
+    );
 
     let mut acct = Accounting::new(a.acct, &bdf);
     acct.baseline = acct.read();
@@ -1988,7 +2386,13 @@ fn run(orch: &mut Orch, a: &Args) -> Result<(), String> {
     let mut a_args = common(Some(&hsaco));
     a_args.push("--fds".into());
     a_args.push(format!("{},{}", ab_a.as_raw_fd(), ac_a.as_raw_fd()));
-    let a_role = Role::spawn("A", &exe, "exporter", &a_args, &[ab_a.as_raw_fd(), ac_a.as_raw_fd()])?;
+    let a_role = Role::spawn(
+        "A",
+        &exe,
+        "exporter",
+        &a_args,
+        &[ab_a.as_raw_fd(), ac_a.as_raw_fd()],
+    )?;
     orch.roles.push(a_role);
     drop((ab_a, ac_a));
     let ready = orch.role("A")?.expect("ready", to)?;
@@ -2017,9 +2421,27 @@ fn run(orch: &mut Orch, a: &Args) -> Result<(), String> {
     }
 
     // --- importers -----------------------------------------------------------
-    let b_role = Role::spawn("B", &exe, "importer", &common(Some(&hsaco)).into_iter().chain(["--fd".into(), ab_b.as_raw_fd().to_string()]).collect::<Vec<_>>(), &[ab_b.as_raw_fd()])?;
+    let b_role = Role::spawn(
+        "B",
+        &exe,
+        "importer",
+        &common(Some(&hsaco))
+            .into_iter()
+            .chain(["--fd".into(), ab_b.as_raw_fd().to_string()])
+            .collect::<Vec<_>>(),
+        &[ab_b.as_raw_fd()],
+    )?;
     orch.roles.push(b_role);
-    let c_role = Role::spawn("C", &exe, "importer", &common(Some(&hsaco)).into_iter().chain(["--fd".into(), ac_c.as_raw_fd().to_string()]).collect::<Vec<_>>(), &[ac_c.as_raw_fd()])?;
+    let c_role = Role::spawn(
+        "C",
+        &exe,
+        "importer",
+        &common(Some(&hsaco))
+            .into_iter()
+            .chain(["--fd".into(), ac_c.as_raw_fd().to_string()])
+            .collect::<Vec<_>>(),
+        &[ac_c.as_raw_fd()],
+    )?;
     orch.roles.push(c_role);
     drop((ab_b, ac_c));
     orch.role("B")?.expect("warm", to)?;
@@ -2050,20 +2472,32 @@ fn run(orch: &mut Orch, a: &Args) -> Result<(), String> {
         acct.gate(
             "ACCT_IMPORT_NO_SECOND_W",
             (d as f64) < 0.25 * w as f64,
-            format!("delta_both_importers={d} limit={} (second W would be {w} each)", (0.25 * w as f64) as u64),
+            format!(
+                "delta_both_importers={d} limit={} (second W would be {w} each)",
+                (0.25 * w as f64) as u64
+            ),
         )?;
     }
 
     let ev = orch.cmd("A", "VERIFY", "verified", to)?;
-    orch.pass("EXPORTER_VERIFY_AFTER_FD_CLOSE", &format!("readback_bytes={}", get(&ev, "readback_bytes")?));
+    orch.pass(
+        "EXPORTER_VERIFY_AFTER_FD_CLOSE",
+        &format!("readback_bytes={}", get(&ev, "readback_bytes")?),
+    );
 
     // --- importer verification: eager, cycles, graph, FD close ---------------
     let (vb, vc) = orch.cmd_bc("VERIFY", "verified", to)?;
     orch.pass(
         "IMPORTERS_EAGER_GPU_AND_READBACK",
-        &format!("B_gpu_words={} C_gpu_words={} B_readback={} C_readback={} negctl_B={} negctl_C={}",
-            get(&vb, "gpu_words")?, get(&vc, "gpu_words")?, get(&vb, "readback_bytes")?, get(&vc, "readback_bytes")?,
-            get(&vb, "negative_control_mismatches")?, get(&vc, "negative_control_mismatches")?),
+        &format!(
+            "B_gpu_words={} C_gpu_words={} B_readback={} C_readback={} negctl_B={} negctl_C={}",
+            get(&vb, "gpu_words")?,
+            get(&vc, "gpu_words")?,
+            get(&vb, "readback_bytes")?,
+            get(&vc, "readback_bytes")?,
+            get(&vb, "negative_control_mismatches")?,
+            get(&vc, "negative_control_mismatches")?
+        ),
     );
     let (cb, cc) = orch.cmd_bc(&format!("CYCLES {}", a.cycles), "cycles", to)?;
     orch.pass(
@@ -2073,16 +2507,30 @@ fn run(orch: &mut Orch, a: &Args) -> Result<(), String> {
             get(&cb, "retired_ranges_recorded")?, get(&cc, "retired_ranges_recorded")?),
     );
     orch.cmd_bc(&format!("GRAPH {}", a.replays), "graph", to)?;
-    orch.pass("IMPORTERS_GRAPH_CAPTURE_REPLAY", &format!("replays={} each (host result buffer poisoned before every replay)", a.replays));
+    orch.pass(
+        "IMPORTERS_GRAPH_CAPTURE_REPLAY",
+        &format!(
+            "replays={} each (host result buffer poisoned before every replay)",
+            a.replays
+        ),
+    );
     let (xb, xc) = orch.cmd_bc("CLOSE_FDS", "closed_fds", to)?;
     orch.pass(
         "IMPORTERS_CLOSE_RECEIVED_FDS",
-        &format!("B_closed={} C_closed={} B_residual_same_inode_fds={} C_residual_same_inode_fds={}",
-            get(&xb, "closed")?, get(&xc, "closed")?, get(&xb, "residual_same_inode_fds")?, get(&xc, "residual_same_inode_fds")?),
+        &format!(
+            "B_closed={} C_closed={} B_residual_same_inode_fds={} C_residual_same_inode_fds={}",
+            get(&xb, "closed")?,
+            get(&xc, "closed")?,
+            get(&xb, "residual_same_inode_fds")?,
+            get(&xc, "residual_same_inode_fds")?
+        ),
     );
     orch.cmd_bc("VERIFY", "verified", to)?;
     orch.cmd_bc(&format!("REPLAY {}", a.replays), "replay", to)?;
-    orch.pass("IMPORTERS_VERIFY_AFTER_FD_CLOSE", "eager + graph replay on mappings whose FDs are closed");
+    orch.pass(
+        "IMPORTERS_VERIFY_AFTER_FD_CLOSE",
+        "eager + graph replay on mappings whose FDs are closed",
+    );
 
     // --- exporter exits -------------------------------------------------------
     let exit_desc = match a.exit_mode {
@@ -2099,37 +2547,60 @@ fn run(orch: &mut Orch, a: &Args) -> Result<(), String> {
             orch.expect_exit("A", to, None, Some(sys::SIGTERM))?
         }
     };
-    orch.pass("EXPORTER_EXIT", &format!("mode={} status={exit_desc}", a.exit_mode.as_str()));
+    orch.pass(
+        "EXPORTER_EXIT",
+        &format!("mode={} status={exit_desc}", a.exit_mode.as_str()),
+    );
     let after_a_exit = acct.sample("exporter_exited");
     diag(orch, &acct, "exporter_exited");
     if let (Some(b), Some(x)) = (baseline, after_a_exit) {
         acct.gate(
             "ACCT_EXPORTER_EXIT_W_RETAINED",
             (x as f64 - b as f64) >= 0.9 * w as f64,
-            format!("used_minus_baseline={} W={w} (importers still hold W)", x as i64 - b as i64),
+            format!(
+                "used_minus_baseline={} W={w} (importers still hold W)",
+                x as i64 - b as i64
+            ),
         )?;
     }
     orch.cmd_bc("VERIFY", "verified", to)?;
     orch.cmd_bc(&format!("REPLAY {}", a.replays), "replay", to)?;
     orch.cmd_bc(&format!("FRESH_GRAPH {}", a.replays), "fresh_graph", to)?;
-    orch.pass("POST_EXPORTER_EXIT_EAGER_GRAPH_REPLAY_FRESH_CAPTURE_BC", "B and C: eager+readback, replay of pre-exit graph, fresh capture+replay");
+    orch.pass(
+        "POST_EXPORTER_EXIT_EAGER_GRAPH_REPLAY_FRESH_CAPTURE_BC",
+        "B and C: eager+readback, replay of pre-exit graph, fresh capture+replay",
+    );
 
     // --- independent importer exit -------------------------------------------
     orch.cmd("B", "EXIT", "exiting", to)?;
     let bst = orch.expect_exit("B", to, Some(0), None)?;
     let after_b_exit = acct.sample("importer_B_exited");
     diag(orch, &acct, "importer_B_exited");
-    for cmd in ["VERIFY".to_string(), format!("REPLAY {}", a.replays), format!("FRESH_GRAPH {}", a.replays)] {
+    for cmd in [
+        "VERIFY".to_string(),
+        format!("REPLAY {}", a.replays),
+        format!("FRESH_GRAPH {}", a.replays),
+    ] {
         let want = cmd.split_whitespace().next().unwrap_or("").to_lowercase();
-        let want_evt = if want == "verify" { "verified" } else { want.as_str() };
+        let want_evt = if want == "verify" {
+            "verified"
+        } else {
+            want.as_str()
+        };
         orch.cmd("C", &cmd, want_evt, to)?;
     }
-    orch.pass("IMPORTER_B_EXIT_INDEPENDENT_C_VERIFIES", &format!("B {bst}; C eager+replay+fresh capture still pass"));
+    orch.pass(
+        "IMPORTER_B_EXIT_INDEPENDENT_C_VERIFIES",
+        &format!("B {bst}; C eager+replay+fresh capture still pass"),
+    );
     if let (Some(b), Some(x)) = (baseline, after_b_exit) {
         acct.gate(
             "ACCT_B_EXIT_W_RETAINED",
             (x as f64 - b as f64) >= 0.9 * w as f64,
-            format!("used_minus_baseline={} W={w} (C still holds W)", x as i64 - b as i64),
+            format!(
+                "used_minus_baseline={} W={w} (C still holds W)",
+                x as i64 - b as i64
+            ),
         )?;
     }
     orch.cmd("C", "EXIT", "exiting", to)?;
@@ -2149,7 +2620,9 @@ fn run(orch: &mut Orch, a: &Args) -> Result<(), String> {
             fd as i64 - b as i64,
             f != fd
         );
-        if let (Some((_, o0)), Some((own1, o1)), Some((own2, o2))) = (base_diag, fin_diag, fin_delayed_diag) {
+        if let (Some((_, o0)), Some((own1, o1)), Some((own2, o2))) =
+            (base_diag, fin_diag, fin_delayed_diag)
+        {
             println!(
                 "ATTRIBUTION kfd: others_sum baseline={o0} final={o1} delayed={o2}; others_delta_final={} others_delta_delayed={}; own_sum_at_final={own1} own_sum_at_delayed={own2}; final_minus_baseline_minus_others_delta={} (nonzero own_sum => our PID still listed)",
                 o1 as i64 - o0 as i64,
@@ -2200,7 +2673,12 @@ fn main() {
             }
         }
     }
-    let mut orch = Orch { roles: Vec::new(), steps: 0, tmp: None, extra: Vec::new() };
+    let mut orch = Orch {
+        roles: Vec::new(),
+        steps: 0,
+        tmp: None,
+        extra: Vec::new(),
+    };
     let result = run(&mut orch, &a);
     orch.cleanup();
     match result {
@@ -2211,7 +2689,10 @@ fn main() {
         ),
         Err(e) => {
             eprintln!("shared_vmm_fd_probe: FAIL {e}");
-            println!("shared_vmm_fd_probe: FAIL after {} passed steps: {e}", orch.steps);
+            println!(
+                "shared_vmm_fd_probe: FAIL after {} passed steps: {e}",
+                orch.steps
+            );
             std::process::exit(1);
         }
     }

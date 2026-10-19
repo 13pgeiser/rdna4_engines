@@ -609,7 +609,10 @@ fn stage_qwen4_lanes(
         if let Err(e) = gpu.abort_route_kernel_load() {
             return refuse(&format!("kernel route reset failed: {e}"));
         }
-        eprintln!("  kernels: {} [left the planned route: qwen4 fn-lanes]", crate::LAZY_KERNELS_NOTE);
+        eprintln!(
+            "  kernels: {} [left the planned route: qwen4 fn-lanes]",
+            crate::LAZY_KERNELS_NOTE
+        );
     }
     if let Err(e) = bundle.stage_lanes(gpu, requested, row_budget, spec) {
         return refuse(&format!("staging failed: {e}"));

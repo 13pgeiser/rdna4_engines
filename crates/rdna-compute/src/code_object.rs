@@ -240,7 +240,11 @@ mod tests {
     fn identity_is_sha256_of_the_exact_image() {
         let artifact = native("m", IMAGE_A);
         assert_eq!(artifact.id(), CodeObjectId(Sha256::digest(IMAGE_A).into()));
-        assert_eq!(artifact.image().as_bytes().as_ptr(), IMAGE_A.as_ptr(), "static image is not copied");
+        assert_eq!(
+            artifact.image().as_bytes().as_ptr(),
+            IMAGE_A.as_ptr(),
+            "static image is not copied"
+        );
         assert_eq!(artifact.origin(), &CodeObjectOrigin::NativeEmbedded("m"));
         let json = artifact.provenance_json();
         assert_eq!(json["origin"], "native_embedded");
@@ -253,13 +257,19 @@ mod tests {
         let mut registry = CodeObjectRegistry::default();
         let a = registry.admit_module("m", native("m", IMAGE_A)).unwrap();
         registry.bind_function("k", &a).unwrap();
-        let err = registry.admit_module("m", native("m", IMAGE_B)).unwrap_err();
+        let err = registry
+            .admit_module("m", native("m", IMAGE_B))
+            .unwrap_err();
         assert!(err.contains("cannot rebind"), "{err}");
-        let b = registry.admit_module("other", native("other", IMAGE_B)).unwrap();
+        let b = registry
+            .admit_module("other", native("other", IMAGE_B))
+            .unwrap();
         let err = registry.bind_function("k", &b).unwrap_err();
         assert!(err.contains("cannot rebind"), "{err}");
         assert!(registry.check_function_image("k", IMAGE_A).is_ok());
-        assert!(registry.check_function_image("k", IMAGE_A.to_vec().as_slice()).is_ok());
+        assert!(registry
+            .check_function_image("k", IMAGE_A.to_vec().as_slice())
+            .is_ok());
         assert!(registry.check_function_image("k", IMAGE_B).is_err());
         assert_eq!(registry.function("k").unwrap().id(), a.id());
     }
@@ -267,12 +277,16 @@ mod tests {
     #[test]
     fn multi_export_aliases_share_one_artifact() {
         let mut registry = CodeObjectRegistry::default();
-        let a = registry.admit_module("bundle", native("bundle", IMAGE_A)).unwrap();
+        let a = registry
+            .admit_module("bundle", native("bundle", IMAGE_A))
+            .unwrap();
         for symbol in ["k_b1s", "k_qkv_b1s", "k_gate_up_b1s"] {
             registry.bind_function(symbol, &a).unwrap();
         }
         // Re-admitting the same digest (reload) returns the same handle.
-        let again = registry.admit_module("bundle", native("bundle", IMAGE_A)).unwrap();
+        let again = registry
+            .admit_module("bundle", native("bundle", IMAGE_A))
+            .unwrap();
         assert!(Arc::ptr_eq(&a, &again));
         for symbol in ["k_b1s", "k_qkv_b1s", "k_gate_up_b1s"] {
             assert!(Arc::ptr_eq(registry.function(symbol).unwrap(), &a));

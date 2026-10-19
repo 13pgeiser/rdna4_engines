@@ -18307,10 +18307,8 @@ effort = "high"
         );
         assert_eq!(on["mtp_effective"], "auto");
         // An ack with no verdict is null, never a guess.
-        let none = bench_load_speculation_effective(
-            requested,
-            &serde_json::json!({ "type": "loaded" }),
-        );
+        let none =
+            bench_load_speculation_effective(requested, &serde_json::json!({ "type": "loaded" }));
         assert_eq!(none["mtp_effective"], serde_json::Value::Null);
     }
 

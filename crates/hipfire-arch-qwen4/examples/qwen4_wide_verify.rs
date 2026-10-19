@@ -252,18 +252,22 @@ fn parse_args_from(argv: &[String]) -> Result<Args, String> {
         match flag {
             "--model" => model = Some(PathBuf::from(value)),
             "--hot-budget-mib" => {
-                let mib: u64 = value.parse().map_err(|_| format!("bad --hot-budget-mib '{value}'"))?;
+                let mib: u64 = value
+                    .parse()
+                    .map_err(|_| format!("bad --hot-budget-mib '{value}'"))?;
                 if mib == 0 || mib.checked_mul(1 << 20).is_none() {
                     return Err("--hot-budget-mib must be nonzero and fit in bytes".into());
                 }
                 hot_budget_mib = Some(mib);
             }
             "--hotset" => hotset = Some(PathBuf::from(value)),
-            "--row-capture" => row_capture = match value {
-                "on" => true,
-                "off" => false,
-                _ => return Err("--row-capture takes on|off".into()),
-            },
+            "--row-capture" => {
+                row_capture = match value {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err("--row-capture takes on|off".into()),
+                }
+            }
             // `--prompt-file` is the single-element alias of `--prompt-files`.
             "--prompt-file" | "--prompt-files" => {
                 prompt_files = Some(
@@ -374,8 +378,14 @@ mod pinned_control_tests {
 
     fn cli(extra: &[&str]) -> Result<Args, String> {
         let argv: Vec<String> = [
-            "--model", "model.hfq", "--prompt-file", "prompt.txt",
-            "--rows", "1,2,4,8", "--out", "receipt.json",
+            "--model",
+            "model.hfq",
+            "--prompt-file",
+            "prompt.txt",
+            "--rows",
+            "1,2,4,8",
+            "--out",
+            "receipt.json",
         ]
         .into_iter()
         .chain(extra.iter().copied())
@@ -393,10 +403,17 @@ mod pinned_control_tests {
         }
         assert!(cli(&["--hot-budget-mib"]).is_err());
         let args = cli(&[
-            "--hot-budget-mib", "4096", "--hotset", "bound.expert-hotset",
-        ]).unwrap();
+            "--hot-budget-mib",
+            "4096",
+            "--hotset",
+            "bound.expert-hotset",
+        ])
+        .unwrap();
         assert_eq!(args.hot_budget_mib, Some(4096));
-        assert_eq!(args.hotset.as_deref(), Some(Path::new("bound.expert-hotset")));
+        assert_eq!(
+            args.hotset.as_deref(),
+            Some(Path::new("bound.expert-hotset"))
+        );
     }
 
     #[test]
@@ -485,7 +502,12 @@ impl Model {
     /// the loader's forward scratch plan, UMA mmap drop, optional
     /// `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`, `attach_forward`. No MTP head, no
     /// session cache.
-    fn load(path: &Path, n_ctx: usize, hot_budget_mib: Option<u64>, hotset: Option<&Path>) -> Result<Self, String> {
+    fn load(
+        path: &Path,
+        n_ctx: usize,
+        hot_budget_mib: Option<u64>,
+        hotset: Option<&Path>,
+    ) -> Result<Self, String> {
         let model_bytes = std::fs::metadata(path)
             .map_err(|e| format!("stat {}: {e}", path.display()))?
             .len();
@@ -590,47 +612,80 @@ impl Model {
                 expert_parallel: false,
                 explicit_vram_layers: false,
                 source: match &receipt.manifest.identity.recipe {
-                    hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextPacked { .. } => hotsets::HotsetSource::Aggregate,
-                    hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextSlab { .. } => hotsets::HotsetSource::SlabArena,
-                    hipfire_arch_qwen4::weights::Qwen4TierRecipe::StockFp8 => hotsets::HotsetSource::StockFp8,
-                    _ => hotsets::HotsetSource::Nonaggregate("not an aggregate MQ4 artifact".into()),
+                    hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextPacked { .. } => {
+                        hotsets::HotsetSource::Aggregate
+                    }
+                    hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextSlab { .. } => {
+                        hotsets::HotsetSource::SlabArena
+                    }
+                    hipfire_arch_qwen4::weights::Qwen4TierRecipe::StockFp8 => {
+                        hotsets::HotsetSource::StockFp8
+                    }
+                    _ => {
+                        hotsets::HotsetSource::Nonaggregate("not an aggregate MQ4 artifact".into())
+                    }
                 },
             };
-            let sidecar_path = hotsets::preflight(&policy, path, &env)
-                .map_err(|skip| skip.log_line(&policy.sidecar_path(path)).unwrap_or_else(|| skip.to_string()))?;
+            let sidecar_path = hotsets::preflight(&policy, path, &env).map_err(|skip| {
+                skip.log_line(&policy.sidecar_path(path))
+                    .unwrap_or_else(|| skip.to_string())
+            })?;
             let base = hotsets::HotsetBase::from_hfq(&hfq)?;
             let sidecar = hotsets::HotsetSidecar::load_bound(
-                &sidecar_path, receipt.config.num_hidden_layers,
-                receipt.config.num_experts, receipt.config.num_experts_per_tok, &base,
-            ).map_err(|skip| skip.to_string())?;
+                &sidecar_path,
+                receipt.config.num_hidden_layers,
+                receipt.config.num_experts,
+                receipt.config.num_experts_per_tok,
+                &base,
+            )
+            .map_err(|skip| skip.to_string())?;
             receipt.manifest.check_expert_tiers().map_err(es)?;
             let slabs = hipfire_arch_qwen4::artifact::hotset_aggregate_slabs(
-                &hfq, &receipt.config, &receipt.manifest,
+                &hfq,
+                &receipt.config,
+                &receipt.manifest,
             )?;
             let plan = hipfire_arch_qwen4::expert_tier_plan::plan_expert_tiers_from_slabs(
-                &slabs, sidecar.rank(), mib * (1 << 20),
-            ).map_err(es)?;
+                &slabs,
+                sidecar.rank(),
+                mib * (1 << 20),
+            )
+            .map_err(es)?;
             hotsets::require_experts(plan.device_experts()).map_err(|skip| skip.to_string())?;
             plan.check_executable(&gpu.arch).map_err(es)?;
             hipfire_arch_qwen4::expert_residency::place_routed_experts(
-                &mut receipt.manifest.weights, receipt.config.num_hidden_layers,
+                &mut receipt.manifest.weights,
+                receipt.config.num_hidden_layers,
             );
             receipt.manifest = receipt.manifest.with_expert_tiers().map_err(es)?;
             {
                 let keep: BTreeSet<_> = receipt.manifest.resident_keys().collect();
-                receipt.placements.retain(|p| keep.contains(&(p.name.as_str(), p.layer)));
+                receipt
+                    .placements
+                    .retain(|p| keep.contains(&(p.name.as_str(), p.layer)));
             }
             let lease = hipfire_arch_qwen4::expert_tier_owners::materialize(
-                &mut gpu, std::sync::Arc::new(plan), &|offset, len| {
-                    let offset = usize::try_from(offset).map_err(|_| "hotset source offset overflow".to_string())?;
-                    let len = usize::try_from(len).map_err(|_| "hotset source length overflow".to_string())?;
-                    hfq.data_range(offset, len)
-                        .ok_or_else(|| format!("source span {offset}+{len} is outside the artifact mapping"))
+                &mut gpu,
+                std::sync::Arc::new(plan),
+                &|offset, len| {
+                    let offset = usize::try_from(offset)
+                        .map_err(|_| "hotset source offset overflow".to_string())?;
+                    let len = usize::try_from(len)
+                        .map_err(|_| "hotset source length overflow".to_string())?;
+                    hfq.data_range(offset, len).ok_or_else(|| {
+                        format!("source span {offset}+{len} is outside the artifact mapping")
+                    })
                 },
-            ).map_err(|e| format!("expert tier materialize: {e}"))?;
-            lease.bind_hotset_sidecar_sha256(sidecar.sha256()).map_err(es)?;
-            eprintln!("qwen4_wide_verify: hotset {} sha256 {} fixed budget {mib} MiB",
-                sidecar_path.display(), sidecar.sha256());
+            )
+            .map_err(|e| format!("expert tier materialize: {e}"))?;
+            lease
+                .bind_hotset_sidecar_sha256(sidecar.sha256())
+                .map_err(es)?;
+            eprintln!(
+                "qwen4_wide_verify: hotset {} sha256 {} fixed budget {mib} MiB",
+                sidecar_path.display(),
+                sidecar.sha256()
+            );
             Some(lease)
         } else {
             None
@@ -753,7 +808,10 @@ impl Model {
         if let Some(digest) = &partition_digest {
             eprintln!("qwen4_wide_verify: partition_digest={digest}");
         }
-        eprintln!("qwen4_wide_verify: split_digest {:?}", bundle.split_digest());
+        eprintln!(
+            "qwen4_wide_verify: split_digest {:?}",
+            bundle.split_digest()
+        );
         eprintln!(
             "qwen4_wide_verify: loaded {} ({:.2} GB) on {} (vocab {vocab}), trunk overlay {}",
             path.display(),
@@ -1450,7 +1508,12 @@ fn run() -> Result<bool, String> {
         );
     }
 
-    let mut m = Model::load(&args.model, args.n_ctx, args.hot_budget_mib, args.hotset.as_deref())?;
+    let mut m = Model::load(
+        &args.model,
+        args.n_ctx,
+        args.hot_budget_mib,
+        args.hotset.as_deref(),
+    )?;
     let prompts: Vec<Vec<u32>> = prompt_texts.iter().map(|t| m.tokenizer.encode(t)).collect();
     for (path, prompt) in args.prompt_files.iter().zip(&prompts) {
         if prompt.is_empty() {

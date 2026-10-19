@@ -29,22 +29,45 @@ use crate::Result;
 use std::fmt;
 
 op_table!(MubufOp {
-    LoadUbyte, LoadSbyte, LoadUshort, LoadSshort, LoadDword, LoadDwordx2, LoadDwordx3, LoadDwordx4,
-    StoreByte, StoreShort, StoreDword, StoreDwordx2, StoreDwordx3, StoreDwordx4,
+    LoadUbyte,
+    LoadSbyte,
+    LoadUshort,
+    LoadSshort,
+    LoadDword,
+    LoadDwordx2,
+    LoadDwordx3,
+    LoadDwordx4,
+    StoreByte,
+    StoreShort,
+    StoreDword,
+    StoreDwordx2,
+    StoreDwordx3,
+    StoreDwordx4,
 });
 
 /// First-dword `[31:26]` of every MUBUF instruction.
 const ENCODING: u32 = 0b111000;
 
 impl MubufOp {
-    pub fn from_opcode(arch: Arch, opcode: u8) -> Option<Self> { Self::ALL.iter().copied().find(|op| op.opcode(arch) == Some(opcode)) }
+    pub fn from_opcode(arch: Arch, opcode: u8) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|op| op.opcode(arch) == Some(opcode))
+    }
 
     /// Dwords of VDATA moved per lane: 1 for the byte/short/dword forms,
     /// 2..=4 for `dwordx2..x4` (CDNA3 ISA §9.1.2 Table 39 p.64, §9.1.3 p.65).
     pub fn data_dwords(self) -> u8 {
         match self {
-            Self::LoadUbyte | Self::LoadSbyte | Self::LoadUshort | Self::LoadSshort | Self::LoadDword
-            | Self::StoreByte | Self::StoreShort | Self::StoreDword => 1,
+            Self::LoadUbyte
+            | Self::LoadSbyte
+            | Self::LoadUshort
+            | Self::LoadSshort
+            | Self::LoadDword
+            | Self::StoreByte
+            | Self::StoreShort
+            | Self::StoreDword => 1,
             Self::LoadDwordx2 | Self::StoreDwordx2 => 2,
             Self::LoadDwordx3 | Self::StoreDwordx3 => 3,
             Self::LoadDwordx4 | Self::StoreDwordx4 => 4,
@@ -53,7 +76,15 @@ impl MubufOp {
 
     /// `buffer_store_*`: VDATA is read; otherwise it is written.
     pub fn is_store(self) -> bool {
-        matches!(self, Self::StoreByte | Self::StoreShort | Self::StoreDword | Self::StoreDwordx2 | Self::StoreDwordx3 | Self::StoreDwordx4)
+        matches!(
+            self,
+            Self::StoreByte
+                | Self::StoreShort
+                | Self::StoreDword
+                | Self::StoreDwordx2
+                | Self::StoreDwordx3
+                | Self::StoreDwordx4
+        )
     }
 }
 
@@ -81,7 +112,10 @@ fn srsrc_field(srsrc: Src) -> Result<u32> {
     match srsrc {
         Src::Sgpr(n) if n % 4 == 0 && n <= 96 => Ok(u32::from(n / 4)),
         Src::Ttmp(n) if n % 4 == 0 && n <= 12 => Ok((108 + u32::from(n)) / 4),
-        other => Err(format!("buffer resource must start at a multiple-of-4 SGPR s0..s96 or ttmp0/4/8/12, got {}", other.fmt(4))),
+        other => Err(format!(
+            "buffer resource must start at a multiple-of-4 SGPR s0..s96 or ttmp0/4/8/12, got {}",
+            other.fmt(4)
+        )),
     }
 }
 
@@ -89,7 +123,9 @@ fn srsrc_from_field(field: u32) -> Result<Src> {
     match field {
         0..=24 => Ok(Src::Sgpr((field * 4) as u8)),
         27..=30 => Ok(Src::Ttmp(((field - 27) * 4) as u8)),
-        other => Err(format!("reserved SRSRC field {other} (s[100:103], xnack_mask/vcc range)")),
+        other => Err(format!(
+            "reserved SRSRC field {other} (s[100:103], xnack_mask/vcc range)"
+        )),
     }
 }
 
@@ -98,38 +134,80 @@ fn srsrc_from_field(field: u32) -> Result<Src> {
 fn soffset_field(soffset: Src) -> Result<u32> {
     let code = soffset.code();
     if code > 253 || Src::from_code(code, None).ok() != Some(soffset) {
-        return Err(format!("soffset must be an SGPR, special scalar register or inline constant, got {soffset:?}"));
+        return Err(format!(
+            "soffset must be an SGPR, special scalar register or inline constant, got {soffset:?}"
+        ));
     }
     Ok(u32::from(code))
 }
 
 impl Mubuf {
     /// Dwords of VADDR: a 64-bit `{index, offset}` pair with both modes.
-    fn vaddr_dwords(&self) -> u8 { if self.offen && self.idxen { 2 } else { 1 } }
+    fn vaddr_dwords(&self) -> u8 {
+        if self.offen && self.idxen {
+            2
+        } else {
+            1
+        }
+    }
 
     /// Every encodability rule, shared by `encode` and `decode`.
     fn check(&self, arch: Arch) -> Result<()> {
         let name = self.op.name();
-        if self.op.opcode(arch).is_none() { return Err(format!("{name} does not exist on {arch}")) }
-        if self.offset > 0xfff { return Err(format!("{name}: offset {} exceeds the 12-bit field", self.offset)) }
+        if self.op.opcode(arch).is_none() {
+            return Err(format!("{name} does not exist on {arch}"));
+        }
+        if self.offset > 0xfff {
+            return Err(format!(
+                "{name}: offset {} exceeds the 12-bit field",
+                self.offset
+            ));
+        }
         match (self.offen || self.idxen, self.vaddr) {
             (false, None) => {}
-            (false, Some(v)) => return Err(format!("{name}: vaddr {v:?} given but neither offen nor idxen is set")),
+            (false, Some(v)) => {
+                return Err(format!(
+                    "{name}: vaddr {v:?} given but neither offen nor idxen is set"
+                ))
+            }
             (true, None) => return Err(format!("{name}: offen/idxen require a vaddr")),
             (true, Some(Src::Vgpr(n))) => {
                 let w = self.vaddr_dwords();
-                if usize::from(n) + usize::from(w) > 256 { return Err(format!("{name}: vaddr v{n} (+{w} dwords) runs past v255")) }
-                if w == 2 && n % 2 != 0 { return Err(format!("{name}: idxen+offen vaddr pair v[{n}:{}] must be even-aligned", n + 1)) }
+                if usize::from(n) + usize::from(w) > 256 {
+                    return Err(format!("{name}: vaddr v{n} (+{w} dwords) runs past v255"));
+                }
+                if w == 2 && n % 2 != 0 {
+                    return Err(format!(
+                        "{name}: idxen+offen vaddr pair v[{n}:{}] must be even-aligned",
+                        n + 1
+                    ));
+                }
             }
-            (true, Some(other)) => return Err(format!("{name}: vaddr must be a VGPR, got {other:?}")),
+            (true, Some(other)) => {
+                return Err(format!("{name}: vaddr must be a VGPR, got {other:?}"))
+            }
         }
         let w = self.op.data_dwords();
         match self.vdata {
             Src::Vgpr(n) | Src::Agpr(n) => {
-                if usize::from(n) + usize::from(w) > 256 { return Err(format!("{name}: vdata {} runs past register 255", self.vdata.fmt(w))) }
-                if w > 1 && n % 2 != 0 { return Err(format!("{name}: {w}-dword vdata tuple {} must be even-aligned", self.vdata.fmt(w))) }
+                if usize::from(n) + usize::from(w) > 256 {
+                    return Err(format!(
+                        "{name}: vdata {} runs past register 255",
+                        self.vdata.fmt(w)
+                    ));
+                }
+                if w > 1 && n % 2 != 0 {
+                    return Err(format!(
+                        "{name}: {w}-dword vdata tuple {} must be even-aligned",
+                        self.vdata.fmt(w)
+                    ));
+                }
             }
-            other => return Err(format!("{name}: vdata must be a VGPR or AccVGPR, got {other:?}")),
+            other => {
+                return Err(format!(
+                    "{name}: vdata must be a VGPR or AccVGPR, got {other:?}"
+                ))
+            }
         }
         srsrc_field(self.srsrc).map_err(|e| format!("{name}: {e}"))?;
         soffset_field(self.soffset).map_err(|e| format!("{name}: {e}"))?;
@@ -139,8 +217,15 @@ impl Mubuf {
     pub fn encode(&self, arch: Arch, out: &mut Vec<u32>) -> Result<()> {
         self.check(arch)?;
         let opcode = u32::from(self.op.opcode(arch).expect("checked"));
-        let vaddr = match self.vaddr { Some(Src::Vgpr(n)) => u32::from(n), _ => 0 };
-        let (vdata, acc) = match self.vdata { Src::Agpr(n) => (u32::from(n), 1), Src::Vgpr(n) => (u32::from(n), 0), _ => unreachable!("checked") };
+        let vaddr = match self.vaddr {
+            Some(Src::Vgpr(n)) => u32::from(n),
+            _ => 0,
+        };
+        let (vdata, acc) = match self.vdata {
+            Src::Agpr(n) => (u32::from(n), 1),
+            Src::Vgpr(n) => (u32::from(n), 0),
+            _ => unreachable!("checked"),
+        };
         let w0 = u32::from(self.offset)
             | u32::from(self.offen) << 12
             | u32::from(self.idxen) << 13
@@ -149,20 +234,36 @@ impl Mubuf {
             | u32::from(self.nt) << 17
             | opcode << 18
             | ENCODING << 26;
-        let w1 = vaddr | vdata << 8 | srsrc_field(self.srsrc)? << 16 | acc << 23 | soffset_field(self.soffset)? << 24;
+        let w1 = vaddr
+            | vdata << 8
+            | srsrc_field(self.srsrc)? << 16
+            | acc << 23
+            | soffset_field(self.soffset)? << 24;
         out.push(w0);
         out.push(w1);
         Ok(())
     }
 
     pub fn decode(arch: Arch, words: &[u32]) -> Result<(Self, usize)> {
-        let [w0, w1] = match words { [a, b, ..] => [*a, *b], _ => return Err("MUBUF needs two dwords".into()) };
-        if w0 >> 26 != ENCODING { return Err(format!("{w0:#010x} is not a MUBUF instruction")) }
-        if w0 >> 25 & 1 != 0 { return Err(format!("MUBUF {w0:#010x}: reserved bit 25 set")) }
-        if w0 >> 16 & 1 != 0 { return Err(format!("MUBUF {w0:#010x}: LDS forms are not modeled")) }
-        if w1 >> 21 & 3 != 0 { return Err(format!("MUBUF {w1:#010x}: reserved bits [22:21] set")) }
+        let [w0, w1] = match words {
+            [a, b, ..] => [*a, *b],
+            _ => return Err("MUBUF needs two dwords".into()),
+        };
+        if w0 >> 26 != ENCODING {
+            return Err(format!("{w0:#010x} is not a MUBUF instruction"));
+        }
+        if w0 >> 25 & 1 != 0 {
+            return Err(format!("MUBUF {w0:#010x}: reserved bit 25 set"));
+        }
+        if w0 >> 16 & 1 != 0 {
+            return Err(format!("MUBUF {w0:#010x}: LDS forms are not modeled"));
+        }
+        if w1 >> 21 & 3 != 0 {
+            return Err(format!("MUBUF {w1:#010x}: reserved bits [22:21] set"));
+        }
         let opcode = (w0 >> 18 & 0x7f) as u8;
-        let op = MubufOp::from_opcode(arch, opcode).ok_or_else(|| format!("MUBUF opcode {opcode} is not in the {arch} table"))?;
+        let op = MubufOp::from_opcode(arch, opcode)
+            .ok_or_else(|| format!("MUBUF opcode {opcode} is not in the {arch} table"))?;
         let (offen, idxen) = (w0 >> 12 & 1 != 0, w0 >> 13 & 1 != 0);
         let vaddr_field = (w1 & 0xff) as u8;
         let vaddr = if offen || idxen {
@@ -170,16 +271,23 @@ impl Mubuf {
         } else if vaddr_field == 0 {
             None
         } else {
-            return Err(format!("MUBUF {w1:#010x}: VADDR {vaddr_field} set without offen/idxen"));
+            return Err(format!(
+                "MUBUF {w1:#010x}: VADDR {vaddr_field} set without offen/idxen"
+            ));
         };
         let vdata_field = (w1 >> 8 & 0xff) as u8;
-        let vdata = if w1 >> 23 & 1 != 0 { Src::Agpr(vdata_field) } else { Src::Vgpr(vdata_field) };
+        let vdata = if w1 >> 23 & 1 != 0 {
+            Src::Agpr(vdata_field)
+        } else {
+            Src::Vgpr(vdata_field)
+        };
         let inst = Self {
             op,
             vdata,
             vaddr,
             srsrc: srsrc_from_field(w1 >> 16 & 0x1f)?,
-            soffset: Src::from_code((w1 >> 24) as u16, None).map_err(|e| format!("MUBUF soffset: {e}"))?,
+            soffset: Src::from_code((w1 >> 24) as u16, None)
+                .map_err(|e| format!("MUBUF soffset: {e}"))?,
             offset: (w0 & 0xfff) as u16,
             offen,
             idxen,
@@ -198,30 +306,59 @@ impl Mubuf {
         fp.read_file(RegFile::Exec, 0, 2);
         fp.read(self.srsrc, 4);
         fp.read(self.soffset, 1);
-        if let Some(v) = self.vaddr { fp.read(v, self.vaddr_dwords()) }
-        if self.op.is_store() { fp.read(self.vdata, self.op.data_dwords()) } else { fp.write(self.vdata, self.op.data_dwords()) }
+        if let Some(v) = self.vaddr {
+            fp.read(v, self.vaddr_dwords())
+        }
+        if self.op.is_store() {
+            fp.read(self.vdata, self.op.data_dwords())
+        } else {
+            fp.write(self.vdata, self.op.data_dwords())
+        }
         fp
     }
 
-    pub fn mem_kind(&self) -> MemKind { if self.op.is_store() { MemKind::VmemStore } else { MemKind::VmemLoad } }
+    pub fn mem_kind(&self) -> MemKind {
+        if self.op.is_store() {
+            MemKind::VmemStore
+        } else {
+            MemKind::VmemLoad
+        }
+    }
 }
 
 impl fmt::Display for Mubuf {
     /// `llvm-objdump --mcpu=gfx942` text: `name vdata, vaddr|off, s[a:d], soffset
     /// [idxen] [offen] [offset:N] [sc0] [nt] [sc1]`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}, ", self.op.name(), self.vdata.fmt(self.op.data_dwords()))?;
+        write!(
+            f,
+            "{} {}, ",
+            self.op.name(),
+            self.vdata.fmt(self.op.data_dwords())
+        )?;
         match self.vaddr {
             Some(v) => write!(f, "{}", v.fmt(self.vaddr_dwords()))?,
             None => f.write_str("off")?,
         }
         write!(f, ", {}, {}", self.srsrc.fmt(4), self.soffset.fmt(1))?;
-        if self.idxen { f.write_str(" idxen")? }
-        if self.offen { f.write_str(" offen")? }
-        if self.offset != 0 { write!(f, " offset:{}", self.offset)? }
-        if self.sc0 { f.write_str(" sc0")? }
-        if self.nt { f.write_str(" nt")? }
-        if self.sc1 { f.write_str(" sc1")? }
+        if self.idxen {
+            f.write_str(" idxen")?
+        }
+        if self.offen {
+            f.write_str(" offen")?
+        }
+        if self.offset != 0 {
+            write!(f, " offset:{}", self.offset)?
+        }
+        if self.sc0 {
+            f.write_str(" sc0")?
+        }
+        if self.nt {
+            f.write_str(" nt")?
+        }
+        if self.sc1 {
+            f.write_str(" sc1")?
+        }
         Ok(())
     }
 }

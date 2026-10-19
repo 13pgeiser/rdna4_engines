@@ -536,7 +536,10 @@ pub fn validate_vmm_rows(
             .ok()
             .and_then(|s| descs.get(s))
             .ok_or_else(|| {
-                format!("VMM KV row {row} slot {slot} outside {} descriptors", descs.len())
+                format!(
+                    "VMM KV row {row} slot {slot} outside {} descriptors",
+                    descs.len()
+                )
             })?;
         if desc.owner_generation != generation {
             return Err(format!(
@@ -597,8 +600,7 @@ mod tests {
 
     /// hipx-shaped `/proc/meminfo`: `CmaTotal` is 0 and `CmaFree` is 0.45 GiB
     /// (page cache filled the KHO scratch) of the 66.8 GiB `MemAvailable`.
-    const HIPX_MEMINFO: &str =
-        "MemAvailable: 70000080 kB\nCmaTotal: 0 kB\nCmaFree: 470684 kB\n";
+    const HIPX_MEMINFO: &str = "MemAvailable: 70000080 kB\nCmaTotal: 0 kB\nCmaFree: 470684 kB\n";
 
     /// hipx `/proc/zoneinfo` `cma` lines: 3,465,216 pages = 13,536 MiB.
     const HIPX_ZONEINFO: &str = "Node 0, zone      DMA\n        cma      0\n      nr_free_cma  0\n\

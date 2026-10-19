@@ -27,8 +27,13 @@ const Q8_ROW_BYTES: usize = K / 32 * 34;
 
 /// (router rows, selector rows, shared gate/up rows): production, then shapes
 /// that put the BF16/Q8_0 and gate/up boundaries off every alignment.
-const SHAPES: [(usize, usize, usize); 5] =
-    [(512, 1, 640), (37, 3, 5), (1, 1, 1), (64, 1, 33), (3, 2, 64)];
+const SHAPES: [(usize, usize, usize); 5] = [
+    (512, 1, 640),
+    (37, 3, 5),
+    (1, 1, 1),
+    (64, 1, 33),
+    (3, 2, 64),
+];
 
 const SENTINEL: u32 = 0x7fc0_dead;
 
@@ -80,14 +85,22 @@ fn bits(gpu: &Gpu, t: &GpuTensor) -> Vec<u32> {
 }
 
 fn check_shape(gpu: &mut Gpu, (m_router, m_selector, m_shared): (usize, usize, usize), round: u64) {
-    let mut seed = 0x4ead_0000 + round * 7919 + (m_router * 131 + m_selector * 17 + m_shared) as u64;
+    let mut seed =
+        0x4ead_0000 + round * 7919 + (m_router * 131 + m_selector * 17 + m_shared) as u64;
     let x_data = fill(&mut seed, K, 2.0);
     let x = gpu.upload_f32(&x_data, &[K]).expect("upload x");
-    let w_router = gpu.upload_raw(&bf16_rows(&mut seed, m_router), &[m_router * K * 2]).unwrap();
-    let w_selector =
-        gpu.upload_raw(&bf16_rows(&mut seed, m_selector), &[m_selector * K * 2]).unwrap();
-    let w_gate = gpu.upload_raw(&q8_rows(&mut seed, m_shared), &[m_shared * Q8_ROW_BYTES]).unwrap();
-    let w_up = gpu.upload_raw(&q8_rows(&mut seed, m_shared), &[m_shared * Q8_ROW_BYTES]).unwrap();
+    let w_router = gpu
+        .upload_raw(&bf16_rows(&mut seed, m_router), &[m_router * K * 2])
+        .unwrap();
+    let w_selector = gpu
+        .upload_raw(&bf16_rows(&mut seed, m_selector), &[m_selector * K * 2])
+        .unwrap();
+    let w_gate = gpu
+        .upload_raw(&q8_rows(&mut seed, m_shared), &[m_shared * Q8_ROW_BYTES])
+        .unwrap();
+    let w_up = gpu
+        .upload_raw(&q8_rows(&mut seed, m_shared), &[m_shared * Q8_ROW_BYTES])
+        .unwrap();
 
     let outputs = |gpu: &mut Gpu| {
         [
@@ -119,7 +132,10 @@ fn check_shape(gpu: &mut Gpu, (m_router, m_selector, m_shared): (usize, usize, u
     for pass in 0..2 {
         let [router, selector, gate, up] = outputs(gpu);
         gpu.gemv_bf16_xf32_x2_q8_0_k2560_staged_pair(
-            [(&w_router, &router, m_router), (&w_selector, &selector, m_selector)],
+            [
+                (&w_router, &router, m_router),
+                (&w_selector, &selector, m_selector),
+            ],
             [(&w_gate, &gate), (&w_up, &up)],
             m_shared,
             &x,
@@ -137,8 +153,10 @@ fn check_shape(gpu: &mut Gpu, (m_router, m_selector, m_shared): (usize, usize, u
                 want.iter().all(|&b| b != SENTINEL),
                 "incumbent left {name} rows unwritten ({m_router}, {m_selector}, {m_shared})"
             );
-            let bad: Vec<usize> =
-                (0..got.len()).filter(|&i| got[i] != want[i]).take(8).collect();
+            let bad: Vec<usize> = (0..got.len())
+                .filter(|&i| got[i] != want[i])
+                .take(8)
+                .collect();
             assert!(
                 bad.is_empty(),
                 "{name} differs from the incumbent at rows {bad:?} (pass {pass}, shapes \
@@ -153,7 +171,10 @@ fn check_shape(gpu: &mut Gpu, (m_router, m_selector, m_shared): (usize, usize, u
 fn qwen4_decode_head_fuse_bitwise_incumbent() {
     let mut gpu = Gpu::init().expect("gpu init");
     if gpu.arch != "gfx1151" {
-        eprintln!("skip: the decode head fusion is exact gfx1151 only, got {}", gpu.arch);
+        eprintln!(
+            "skip: the decode head fusion is exact gfx1151 only, got {}",
+            gpu.arch
+        );
         return;
     }
     // The launcher refuses every other K.

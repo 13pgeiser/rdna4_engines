@@ -34,14 +34,23 @@ fn checkpoint(dir: &Path, config: serde_json::Value, names: &[&str]) -> PathBuf 
         .iter()
         .enumerate()
         .map(|(i, name)| {
-            let shape = if name.contains("norm") { vec![256] } else { vec![4, 256] };
+            let shape = if name.contains("norm") {
+                vec![256]
+            } else {
+                vec![4, 256]
+            };
             let n: usize = shape.iter().product();
             (name.to_string(), shape, bf16_bytes(n, i))
         })
         .collect();
     let views: HashMap<String, TensorView> = data
         .iter()
-        .map(|(n, s, b)| (n.clone(), TensorView::new(Dtype::BF16, s.clone(), b).unwrap()))
+        .map(|(n, s, b)| {
+            (
+                n.clone(),
+                TensorView::new(Dtype::BF16, s.clone(), b).unwrap(),
+            )
+        })
         .collect();
     safetensors::serialize_to_file(&views, None, &dir.join("model.safetensors")).unwrap();
     dir.to_path_buf()
@@ -51,7 +60,10 @@ fn llama(dir: &Path) -> PathBuf {
     checkpoint(
         dir,
         serde_json::json!({"model_type": "llama", "num_hidden_layers": 1}),
-        &["model.layers.0.self_attn.q_proj.weight", "model.norm.weight"],
+        &[
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.norm.weight",
+        ],
     )
 }
 
@@ -69,7 +81,11 @@ fn stderr(out: &Output) -> String {
 }
 
 fn qt(hfq: &Path, name: &str) -> u8 {
-    HfqFile::open(hfq).unwrap().find_tensor_info(name).unwrap().quant_type
+    HfqFile::open(hfq)
+        .unwrap()
+        .find_tensor_info(name)
+        .unwrap()
+        .quant_type
 }
 
 fn cohere(dir: &Path) -> PathBuf {
@@ -89,20 +105,47 @@ fn cohere2_expert_tier_follows_format() {
     let tmp = tempfile::tempdir().unwrap();
     let input = cohere(&tmp.path().join("ck"));
     let expert = "model.layers.0.mlp.experts.0.gate_proj.weight";
-    for (format, want) in [("mq4", MQ4G256), ("mq4v2", MQ4G256), ("mq4v1", MQ4G256), ("mq6", MQ6G256), ("q8", Q8F16)] {
+    for (format, want) in [
+        ("mq4", MQ4G256),
+        ("mq4v2", MQ4G256),
+        ("mq4v1", MQ4G256),
+        ("mq6", MQ6G256),
+        ("q8", Q8F16),
+    ] {
         let out_path = tmp.path().join(format!("{format}.hfq"));
         let out = quantize(
-            &["--input", input.to_str().unwrap(), "--output", out_path.to_str().unwrap(), "--format", format],
+            &[
+                "--input",
+                input.to_str().unwrap(),
+                "--output",
+                out_path.to_str().unwrap(),
+                "--format",
+                format,
+            ],
             &[],
         );
         assert!(out.status.success(), "{format}: {}", stderr(&out));
-        assert_eq!(qt(&out_path, expert), want, "--format {format} expert dtype");
-        assert_eq!(qt(&out_path, "model.layers.0.self_attn.q_proj.weight"), Q8F16);
+        assert_eq!(
+            qt(&out_path, expert),
+            want,
+            "--format {format} expert dtype"
+        );
+        assert_eq!(
+            qt(&out_path, "model.layers.0.self_attn.q_proj.weight"),
+            Q8F16
+        );
     }
     // A format the cohere2 handler has no tier for is an error, not Q8.
     let out_path = tmp.path().join("hfq4.hfq");
     let out = quantize(
-        &["--input", input.to_str().unwrap(), "--output", out_path.to_str().unwrap(), "--format", "hfq4"],
+        &[
+            "--input",
+            input.to_str().unwrap(),
+            "--output",
+            out_path.to_str().unwrap(),
+            "--format",
+            "hfq4",
+        ],
         &[],
     );
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
@@ -123,16 +166,21 @@ fn gemma4_unified_with_skipped_vision_does_not_claim_vision() {
     let out_path = tmp.path().join("g.hfq");
     let out = quantize(
         &[
-            "--input", input.to_str().unwrap(),
-            "--output", out_path.to_str().unwrap(),
-            "--format", "q8",
+            "--input",
+            input.to_str().unwrap(),
+            "--output",
+            out_path.to_str().unwrap(),
+            "--format",
+            "q8",
             "--include-vision",
         ],
         &[],
     );
     assert!(out.status.success(), "{}", stderr(&out));
     let hfq = HfqFile::open(&out_path).unwrap();
-    assert!(hfq.find_tensor_info("model.vision_tower.encoder.layers.0.mlp.fc1.weight").is_none());
+    assert!(hfq
+        .find_tensor_info("model.vision_tower.encoder.layers.0.mlp.fc1.weight")
+        .is_none());
     let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json).unwrap();
     assert_ne!(meta.get("has_vision"), Some(&serde_json::json!(true)));
 }
@@ -143,8 +191,18 @@ fn unusable_spill_dir_fails_without_output() {
     let input = llama(&tmp.path().join("ck"));
     let out_path = tmp.path().join("o.hfq");
     let out = quantize(
-        &["--input", input.to_str().unwrap(), "--output", out_path.to_str().unwrap(), "--format", "q8"],
-        &[("HIPFIRE_SPILL_DIR", tmp.path().join("missing/dir").to_str().unwrap())],
+        &[
+            "--input",
+            input.to_str().unwrap(),
+            "--output",
+            out_path.to_str().unwrap(),
+            "--format",
+            "q8",
+        ],
+        &[(
+            "HIPFIRE_SPILL_DIR",
+            tmp.path().join("missing/dir").to_str().unwrap(),
+        )],
     );
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
     assert!(stderr(&out).contains("error: cannot create tensor spill file"));
@@ -168,13 +226,24 @@ fn failed_write_leaves_existing_output_untouched() {
     let spill = tmp.path().join("spill");
     std::fs::create_dir(&spill).unwrap();
     let out = quantize(
-        &["--input", input.to_str().unwrap(), "--output", out_path.to_str().unwrap(), "--format", "q8"],
+        &[
+            "--input",
+            input.to_str().unwrap(),
+            "--output",
+            out_path.to_str().unwrap(),
+            "--format",
+            "q8",
+        ],
         &[("HIPFIRE_SPILL_DIR", spill.to_str().unwrap())],
     );
     std::fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
     assert_eq!(std::fs::read(&out_path).unwrap(), b"previous good artifact");
-    assert_eq!(std::fs::read_dir(&out_dir).unwrap().count(), 1, "temp file left behind");
+    assert_eq!(
+        std::fs::read_dir(&out_dir).unwrap().count(),
+        1,
+        "temp file left behind"
+    );
 }
 
 #[test]
@@ -184,7 +253,14 @@ fn unknown_format_is_an_error() {
     for format in ["mq4v3", "tq2"] {
         let out_path = tmp.path().join("o.hfq");
         let out = quantize(
-            &["--input", input.to_str().unwrap(), "--output", out_path.to_str().unwrap(), "--format", format],
+            &[
+                "--input",
+                input.to_str().unwrap(),
+                "--output",
+                out_path.to_str().unwrap(),
+                "--format",
+                format,
+            ],
             &[],
         );
         assert_eq!(out.status.code(), Some(2), "{format}: {}", stderr(&out));
@@ -204,7 +280,14 @@ fn documented_formats_are_accepted() {
     ] {
         let out_path = tmp.path().join(format!("{format}.hfq"));
         let out = quantize(
-            &["--input", input.to_str().unwrap(), "--output", out_path.to_str().unwrap(), "--format", format],
+            &[
+                "--input",
+                input.to_str().unwrap(),
+                "--output",
+                out_path.to_str().unwrap(),
+                "--format",
+                format,
+            ],
             &[],
         );
         assert!(out.status.success(), "--format {format}: {}", stderr(&out));
@@ -218,11 +301,16 @@ fn provenance_flags_are_recorded() {
     let out_path = tmp.path().join("o.hfq");
     let out = quantize(
         &[
-            "--input", input.to_str().unwrap(),
-            "--output", out_path.to_str().unwrap(),
-            "--format", "q8",
-            "--source-url", "https://huggingface.co/org/model",
-            "--license", "Apache-2.0",
+            "--input",
+            input.to_str().unwrap(),
+            "--output",
+            out_path.to_str().unwrap(),
+            "--format",
+            "q8",
+            "--source-url",
+            "https://huggingface.co/org/model",
+            "--license",
+            "Apache-2.0",
         ],
         &[],
     );
@@ -240,14 +328,41 @@ fn flags_a_route_never_reads_are_rejected() {
     let o = tmp.path().join("o.hfq");
     let o = o.to_str().unwrap();
     for argv in [
-        &["--qwen4-flash-next", "--input", "x", "--output", o, "--tier", "xt"][..],
-        &["--format", "maple", "--input", "x", "--output", o, "--mq4v2-symmetric"][..],
-        &["--flux-pipe", "p", "--output", o, "--fixed-tier", "lm_head:q8"][..],
+        &[
+            "--qwen4-flash-next",
+            "--input",
+            "x",
+            "--output",
+            o,
+            "--tier",
+            "xt",
+        ][..],
+        &[
+            "--format",
+            "maple",
+            "--input",
+            "x",
+            "--output",
+            o,
+            "--mq4v2-symmetric",
+        ][..],
+        &[
+            "--flux-pipe",
+            "p",
+            "--output",
+            o,
+            "--fixed-tier",
+            "lm_head:q8",
+        ][..],
         &["--input", "x", "--output", o, "--head-only"][..],
     ] {
         let out = quantize(argv, &[]);
         assert_eq!(out.status.code(), Some(2), "{argv:?}: {}", stderr(&out));
-        assert!(stderr(&out).contains("has no effect with"), "{argv:?}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("has no effect with"),
+            "{argv:?}: {}",
+            stderr(&out)
+        );
     }
     // Typos in --kmap-mode no longer fall back to `alternating`.
     let out = quantize(&["--input", "x", "--output", o, "--kmap-mode", "ful"], &[]);

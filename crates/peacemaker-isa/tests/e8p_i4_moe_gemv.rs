@@ -319,10 +319,7 @@ fn gfx1151_arm_is_the_gfx1100_arm_modulo_the_arch_forced_deltas() {
         "gfx1151 has no VALUTransUseHazard"
     );
     assert_eq!(
-        t1100
-            .lines()
-            .filter(|l| l.trim() == TRANS_USE_WAIT)
-            .count(),
+        t1100.lines().filter(|l| l.trim() == TRANS_USE_WAIT).count(),
         e1100.len(),
         "one trans-use wait per gfx1100 entry"
     );
@@ -402,11 +399,8 @@ fn committed_images_and_byproducts_are_byte_identical_to_the_emission() {
         let module = Spec::module(arch);
         let (emitted, text, proof) = e8p_i4_moe_gemv::emit_module(arch).unwrap();
         let elf = peacemaker_isa::native::assemble(&text, arch).unwrap();
-        let bundle = peacemaker_isa::native::bundle(
-            &elf,
-            arch,
-            peacemaker_isa::native::DEFAULT_HOST_TARGET,
-        );
+        let bundle =
+            peacemaker_isa::native::bundle(&elf, arch, peacemaker_isa::native::DEFAULT_HOST_TARGET);
         let committed = std::fs::read(dir.join(format!("{module}.hxaco")))
             .unwrap_or_else(|e| panic!("{module}.hxaco: {e}"));
         assert!(
@@ -772,7 +766,10 @@ fn n_experts_guard_cpu_model_rejects_minus_one_min_n_and_n_plus_one_and_passes_n
             }
             // n_experts == 0: every id, the sentinel included, exits.
             for id in [0u32, 1, u32::MAX, i32::MIN as u32] {
-                assert!(scalar_compare(lines[cmp], id, 0), "{symbol}: n = 0, id {id:#x}");
+                assert!(
+                    scalar_compare(lines[cmp], id, 0),
+                    "{symbol}: n = 0, id {id:#x}"
+                );
             }
             let forbidden = |m: &str| {
                 m.starts_with("global_")
@@ -806,7 +803,11 @@ fn cpu_guarded_launch(
     k: usize,
     m: usize,
 ) -> Vec<Vec<u32>> {
-    assert_eq!(table.len(), n as usize, "the table has exactly n_experts entries");
+    assert_eq!(
+        table.len(),
+        n as usize,
+        "the table has exactly n_experts entries"
+    );
     let mut y = vec![vec![0xa5a5_a5a5u32; m]; ids.len()];
     for (u, &id) in ids.iter().enumerate() {
         for row in 0..m {
@@ -816,8 +817,7 @@ fn cpu_guarded_launch(
             let (plane, scales) = table
                 .get(id as usize)
                 .expect("a passing expert id must index the n-entry table");
-            y[u][row] =
-                kernel_row(four_chain, k, plane, scales, row, &xs[u..u + 1])[0].to_bits();
+            y[u][row] = kernel_row(four_chain, k, plane, scales, row, &xs[u..u + 1])[0].to_bits();
         }
     }
     y
@@ -891,19 +891,30 @@ fn n_experts_nan_containment_cpu_fixture_on_every_arch() {
                 m,
             );
             for (u, b) in [(0usize, 0usize), (5, 1)] {
-                assert_eq!(y[u], baseline[b], "{symbol}: valid slot {u} changed by the invalid ones");
+                assert_eq!(
+                    y[u], baseline[b],
+                    "{symbol}: valid slot {u} changed by the invalid ones"
+                );
                 assert!(
-                    y[u].iter().all(|&w| f32::from_bits(w).is_finite() && w != 0xa5a5_a5a5),
+                    y[u].iter()
+                        .all(|&w| f32::from_bits(w).is_finite() && w != 0xa5a5_a5a5),
                     "{symbol}: valid slot {u} not a finite written word"
                 );
             }
             // Teeth: the unguarded model on a valid expert with a NaN row yields NaN.
             let (plane, scales) = &table[(n - 1) as usize];
             let poisoned = kernel_row(four_chain, k, plane, scales, 0, &[nan_row])[0];
-            assert!(poisoned.is_nan(), "{symbol}: a NaN activation must poison an unguarded row");
+            assert!(
+                poisoned.is_nan(),
+                "{symbol}: a NaN activation must poison an unguarded row"
+            );
             // n_experts == 0: the whole grid is dropped.
-            let none = cpu_guarded_launch(guard, 0, &[0, 1, u32::MAX], &[], &xs[..3], four_chain, k, m);
-            assert!(none.iter().flatten().all(|&w| w == 0xa5a5_a5a5), "{symbol}: n = 0 stored");
+            let none =
+                cpu_guarded_launch(guard, 0, &[0, 1, u32::MAX], &[], &xs[..3], four_chain, k, m);
+            assert!(
+                none.iter().flatten().all(|&w| w == 0xa5a5_a5a5),
+                "{symbol}: n = 0 stored"
+            );
         }
     }
 }

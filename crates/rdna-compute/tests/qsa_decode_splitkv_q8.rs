@@ -82,7 +82,6 @@ const SENTINEL: u32 = 0x7fc0_dead;
 /// Split counts under test (the kernels accept 1..=32).
 const SPLITS: [usize; 6] = [1, 2, 4, 8, 16, 32];
 
-
 // ---------------------------------------------------------------------------
 // Data generation
 // ---------------------------------------------------------------------------
@@ -156,7 +155,11 @@ fn f32_to_f16_bits(x: f32) -> u16 {
 /// all zero) so the scales are exercised.
 fn q8_row(rng: &mut Rng, out: &mut Vec<u8>) {
     for _ in 0..NKV * (HD / 32) {
-        let amp = if rng.below(64) == 0 { 0.0 } else { 0.8 + rng.value(0.7) };
+        let amp = if rng.below(64) == 0 {
+            0.0
+        } else {
+            0.8 + rng.value(0.7)
+        };
         let x: Vec<f32> = (0..32).map(|_| rng.value(amp)).collect();
         let amax = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         let d = amax / 127.0;
@@ -283,11 +286,19 @@ fn make_dev_q8(gpu: &mut Gpu, full_cap: usize, seed: u64) -> Dev {
             q8_row(&mut rng, &mut bytes);
         }
         assert_eq!(bytes.len(), full_cap * row_bytes);
-        tensors.push(gpu.upload_raw(&bytes, &[bytes.len()]).expect("upload q8 kv"));
+        tensors.push(
+            gpu.upload_raw(&bytes, &[bytes.len()])
+                .expect("upload q8 kv"),
+        );
     }
     let values = tensors.pop().unwrap();
     let keys = tensors.pop().unwrap();
-    Dev { format: QsaKvFormat::Q8, full_cap, keys, values }
+    Dev {
+        format: QsaKvFormat::Q8,
+        full_cap,
+        keys,
+        values,
+    }
 }
 
 fn sentinel(gpu: &mut Gpu, n: usize) -> GpuTensor {
@@ -300,8 +311,13 @@ fn upload_q(gpu: &mut Gpu, q: &[f32]) -> GpuTensor {
 }
 
 fn upload_selected(gpu: &Gpu, rows: &[Vec<i32>]) -> GpuTensor {
-    let bytes: Vec<u8> = rows.iter().flatten().flat_map(|t| t.to_le_bytes()).collect();
-    gpu.upload_raw(&bytes, &[bytes.len()]).expect("upload selected")
+    let bytes: Vec<u8> = rows
+        .iter()
+        .flatten()
+        .flat_map(|t| t.to_le_bytes())
+        .collect();
+    gpu.upload_raw(&bytes, &[bytes.len()])
+        .expect("upload selected")
 }
 
 fn download(gpu: &Gpu, t: &GpuTensor) -> Vec<f32> {
@@ -447,7 +463,11 @@ struct Stats {
 
 impl Stats {
     fn new(combos: usize) -> Self {
-        Stats { fails: Vec::new(), worst: vec![Worst::default(); combos], counts: Counts::default() }
+        Stats {
+            fails: Vec::new(),
+            worst: vec![Worst::default(); combos],
+            counts: Counts::default(),
+        }
     }
 
     fn fail(&mut self, msg: String) {
@@ -526,7 +546,14 @@ fn check(
     let sel_t = upload_selected(gpu, sel);
     let n_out = sh.rows * NH * HD;
     let sel_lens: Vec<usize> = (0..sh.rows)
-        .map(|r| selected_len(sh.position_start + r + 1, sh.budget, sh.compress, sh.capacity))
+        .map(|r| {
+            selected_len(
+                sh.position_start + r + 1,
+                sh.budget,
+                sh.compress,
+                sh.capacity,
+            )
+        })
         .collect();
     let valid: Vec<bool> = (0..sh.rows)
         .map(|r| {
@@ -548,13 +575,19 @@ fn check(
         let row = &want[r * row_len..(r + 1) * row_len];
         if row.iter().any(|x| !x.is_finite()) {
             stats.counts.reference_defects += 1;
-            stats.fail(format!("{label}: exact reference row {r} not finite/unwritten"));
+            stats.fail(format!(
+                "{label}: exact reference row {r} not finite/unwritten"
+            ));
         } else if valid[r] && row.iter().all(|&x| x == 0.0) {
             stats.counts.reference_defects += 1;
-            stats.fail(format!("{label}: exact reference row {r} is all zero despite valid tokens"));
+            stats.fail(format!(
+                "{label}: exact reference row {r} is all zero despite valid tokens"
+            ));
         } else if !valid[r] && row.iter().any(|x| x.to_bits() != 0) {
             stats.counts.reference_defects += 1;
-            stats.fail(format!("{label}: exact reference row {r} is not +0 without valid tokens"));
+            stats.fail(format!(
+                "{label}: exact reference row {r} is not +0 without valid tokens"
+            ));
         }
     }
 
@@ -614,7 +647,9 @@ fn check(
     let selected_before: Vec<u8> = sel.iter().flatten().flat_map(|t| t.to_le_bytes()).collect();
     if selected_after != selected_before {
         stats.counts.selected_modified += 1;
-        stats.fail(format!("{label}: a launch modified the selected input bytes"));
+        stats.fail(format!(
+            "{label}: a launch modified the selected input bytes"
+        ));
     }
     println!(
         "{label}: valid rows {}/{} worst maxdiff={:.3e} tol={:.3e} ratio={:.3}",
@@ -663,7 +698,13 @@ fn rows1_fixture(
     stats: &mut Stats,
 ) {
     let (compress, budget, capacity) = rows1_cfg(cfg, len);
-    let sh = Shape { rows: 1, position_start: len - 1, budget, compress, capacity };
+    let sh = Shape {
+        rows: 1,
+        position_start: len - 1,
+        budget,
+        compress,
+        capacity,
+    };
     let mut rng = Rng(0x1000_0000 + (len * 31 + cfg * 7) as u64 * 977 + mode as u64);
     let q = make_q(&mut rng, 1);
     let sel_len = selected_len(len, budget, compress, capacity);
@@ -693,7 +734,10 @@ fn rows1_sweep(gpu: &mut Gpu, dev: &Dev, title: &str) {
 #[ignore = "needs a HIP device"]
 fn qsa_splitk_q8_rows1_matches_exact() {
     let mut gpu = Gpu::init().expect("gpu init");
-    println!("arch={} default splits={}", gpu.arch, QSA_DECODE_SPLITK_SPLITS);
+    println!(
+        "arch={} default splits={}",
+        gpu.arch, QSA_DECODE_SPLITK_SPLITS
+    );
     let dev = make_dev_q8(&mut gpu, FULL_CAP, 0x5a5a_0008);
     rows1_sweep(&mut gpu, &dev, "q8 rows1 matches exact (8K cache)");
 }
@@ -714,15 +758,69 @@ struct BatchCfg {
 /// `selected_len`: S > len, budget at the block boundary (selected_len drops when a
 /// block completes), empty slices, capacity clamp, and the long contexts.
 const BATCH_CFGS: [BatchCfg; 9] = [
-    BatchCfg { name: "c8 b2 ps14 cap64", compress: 8, budget: 2, position_start: 14, capacity: 64 },
-    BatchCfg { name: "c8 b2 ps20 cap64 (drop at block 3)", compress: 8, budget: 2, position_start: 20, capacity: 64 },
-    BatchCfg { name: "c8 huge ps0 cap16 (S>len)", compress: 8, budget: HUGE, position_start: 0, capacity: 16 },
-    BatchCfg { name: "c8 b0 ps0 cap16 (empty slice)", compress: 8, budget: 0, position_start: 0, capacity: 16 },
-    BatchCfg { name: "c8 b0 ps6 cap16 (empty slice)", compress: 8, budget: 0, position_start: 6, capacity: 16 },
-    BatchCfg { name: "c1 b5 ps0 cap8", compress: 1, budget: 5, position_start: 0, capacity: 8 },
-    BatchCfg { name: "c8 b140 ps1124 cap1200", compress: 8, budget: 140, position_start: 1124, capacity: 1200 },
-    BatchCfg { name: "c8 huge ps8188 cap8200", compress: 8, budget: HUGE, position_start: 8188, capacity: 8200 },
-    BatchCfg { name: "c8 huge ps20 cap24 (clamp)", compress: 8, budget: HUGE, position_start: 20, capacity: 24 },
+    BatchCfg {
+        name: "c8 b2 ps14 cap64",
+        compress: 8,
+        budget: 2,
+        position_start: 14,
+        capacity: 64,
+    },
+    BatchCfg {
+        name: "c8 b2 ps20 cap64 (drop at block 3)",
+        compress: 8,
+        budget: 2,
+        position_start: 20,
+        capacity: 64,
+    },
+    BatchCfg {
+        name: "c8 huge ps0 cap16 (S>len)",
+        compress: 8,
+        budget: HUGE,
+        position_start: 0,
+        capacity: 16,
+    },
+    BatchCfg {
+        name: "c8 b0 ps0 cap16 (empty slice)",
+        compress: 8,
+        budget: 0,
+        position_start: 0,
+        capacity: 16,
+    },
+    BatchCfg {
+        name: "c8 b0 ps6 cap16 (empty slice)",
+        compress: 8,
+        budget: 0,
+        position_start: 6,
+        capacity: 16,
+    },
+    BatchCfg {
+        name: "c1 b5 ps0 cap8",
+        compress: 1,
+        budget: 5,
+        position_start: 0,
+        capacity: 8,
+    },
+    BatchCfg {
+        name: "c8 b140 ps1124 cap1200",
+        compress: 8,
+        budget: 140,
+        position_start: 1124,
+        capacity: 1200,
+    },
+    BatchCfg {
+        name: "c8 huge ps8188 cap8200",
+        compress: 8,
+        budget: HUGE,
+        position_start: 8188,
+        capacity: 8200,
+    },
+    BatchCfg {
+        name: "c8 huge ps20 cap24 (clamp)",
+        compress: 8,
+        budget: HUGE,
+        position_start: 20,
+        capacity: 24,
+    },
 ];
 
 /// Row `r` mode: row 1 is all invalid (so every batch of 2+ rows has one),
@@ -751,11 +849,9 @@ fn batch_host(
         "{}: {rows} rows must leave an in-bounds invalid token range below {full_cap}",
         cfg.name
     );
-    let mut rng = Rng(
-        0x2000_0000
-            + (cfg.position_start * 13 + cfg.compress) as u64 * 7919
-            + cfg.budget as u64 % 1009,
-    );
+    let mut rng = Rng(0x2000_0000
+        + (cfg.position_start * 13 + cfg.compress) as u64 * 7919
+        + cfg.budget as u64 % 1009);
     let q = make_q(&mut rng, rows);
     let mut sel = Vec::new();
     let mut lens = Vec::new();
@@ -763,7 +859,14 @@ fn batch_host(
         let visible = cfg.position_start + r + 1;
         let sel_len = selected_len(visible, cfg.budget, cfg.compress, cfg.capacity);
         lens.push(sel_len);
-        sel.push(gen_row(&mut rng, row_mode(r, force), visible, sel_len, cfg.capacity, full_cap));
+        sel.push(gen_row(
+            &mut rng,
+            row_mode(r, force),
+            visible,
+            sel_len,
+            cfg.capacity,
+            full_cap,
+        ));
     }
     (q, sel, lens)
 }
@@ -780,13 +883,23 @@ fn batch_shape(cfg: &BatchCfg, rows: usize) -> Shape {
 
 /// Batched launches of `row_counts` rows (each at most `host_rows`) against
 /// the single-row launches of the same rows.
-fn batched_bitwise_sweep(gpu: &mut Gpu, dev: &Dev, title: &str, host_rows: usize, row_counts: &[usize]) {
+fn batched_bitwise_sweep(
+    gpu: &mut Gpu,
+    dev: &Dev,
+    title: &str,
+    host_rows: usize,
+    row_counts: &[usize],
+) {
     assert!(row_counts.iter().all(|&n| (1..=host_rows).contains(&n)));
     let splits = splits();
     let mut stats = Stats::new(splits.len());
     for cfg in &BATCH_CFGS {
         let (q, sel, lens) = batch_host(cfg, None, dev.full_cap, host_rows);
-        println!("== {} {} selected_len per row {lens:?}", dev.format.name(), cfg.name);
+        println!(
+            "== {} {} selected_len per row {lens:?}",
+            dev.format.name(),
+            cfg.name
+        );
         assert!(
             lens.iter().any(|&l| l != lens[0]),
             "{}: selected_len must be heterogeneous: {lens:?}",
@@ -815,17 +928,33 @@ fn batched_bitwise_sweep(gpu: &mut Gpu, dev: &Dev, title: &str, host_rows: usize
             let row_len = NH * HD;
             for (c, &s) in splits.iter().enumerate() {
                 for r in 0..rows {
-                    let single = Shape { rows: 1, position_start: cfg.position_start + r, ..sh };
+                    let single = Shape {
+                        rows: 1,
+                        position_start: cfg.position_start + r,
+                        ..sh
+                    };
                     let out = sentinel(gpu, row_len);
-                    launch(gpu, Kind::Split(s), dev, &singles[r].0, &singles[r].1, &out, &single);
+                    launch(
+                        gpu,
+                        Kind::Split(s),
+                        dev,
+                        &singles[r].0,
+                        &singles[r].1,
+                        &out,
+                        &single,
+                    );
                     let alone = download(gpu, &out);
                     let batched = &outs[c][r * row_len..(r + 1) * row_len];
                     stats.counts.bitwise_rows += 1;
                     if alone.iter().any(|x| !x.is_finite()) {
                         stats.counts.bitwise_mismatches += 1;
-                        stats.fail(format!("{label} splits={s}: single-row launch {r} not finite"));
+                        stats.fail(format!(
+                            "{label} splits={s}: single-row launch {r} not finite"
+                        ));
                     }
-                    if let Some(i) = (0..row_len).find(|&i| alone[i].to_bits() != batched[i].to_bits()) {
+                    if let Some(i) =
+                        (0..row_len).find(|&i| alone[i].to_bits() != batched[i].to_bits())
+                    {
                         stats.counts.bitwise_mismatches += 1;
                         stats.fail(format!(
                             "{label} splits={s}: row {r} differs from its single-row launch at {i}: batched {:#010x} single {:#010x}",
@@ -852,8 +981,21 @@ fn all_invalid_sweep(gpu: &mut Gpu, dev: &Dev, title: &str) {
         let (q, sel, _) = batch_host(cfg, Some(Mode::AllInvalid), dev.full_cap, 8);
         for rows in 1..=8usize {
             let sh = batch_shape(cfg, rows);
-            let label = format!("{} all-invalid batched {} rows={rows}", dev.format.name(), cfg.name);
-            check(gpu, dev, &sh, &q[..rows * 2 * NH * HD], &sel[..rows], &splits, &label, &mut stats);
+            let label = format!(
+                "{} all-invalid batched {} rows={rows}",
+                dev.format.name(),
+                cfg.name
+            );
+            check(
+                gpu,
+                dev,
+                &sh,
+                &q[..rows * 2 * NH * HD],
+                &sel[..rows],
+                &splits,
+                &label,
+                &mut stats,
+            );
         }
     }
     stats.finish(title, &splits);
@@ -865,7 +1007,13 @@ fn qsa_splitk_q8_batched_rows_bitwise_individual() {
     let mut gpu = Gpu::init().expect("gpu init");
     let dev = make_dev_q8(&mut gpu, FULL_CAP, 0x5a5a_0008);
     let rows: Vec<usize> = (1..=8).collect();
-    batched_bitwise_sweep(&mut gpu, &dev, "q8 batched rows vs single-row launches (8K cache)", 8, &rows);
+    batched_bitwise_sweep(
+        &mut gpu,
+        &dev,
+        "q8 batched rows vs single-row launches (8K cache)",
+        8,
+        &rows,
+    );
 }
 
 /// The same batched-equals-individual check at the wide-verify width: windows
@@ -892,7 +1040,11 @@ fn qsa_splitk_q8_batched_rows_bitwise_individual_wide() {
 fn qsa_splitk_q8_all_invalid_zero() {
     let mut gpu = Gpu::init().expect("gpu init");
     let dev = make_dev_q8(&mut gpu, FULL_CAP, 0x5a5a_0008);
-    all_invalid_sweep(&mut gpu, &dev, "q8 all-invalid selections are +0 (8K cache)");
+    all_invalid_sweep(
+        &mut gpu,
+        &dev,
+        "q8 all-invalid selections are +0 (8K cache)",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -905,17 +1057,83 @@ fn qsa_splitk_q8_all_invalid_zero() {
 /// tail; the 256K configs draw tokens from the whole 2^18 range. A config runs
 /// on every cache with `position_start + 8 < full_cap`.
 const Q8_TILE_CFGS: [BatchCfg; 11] = [
-    BatchCfg { name: "c8 huge ps2050 cap2051 (clamp 2051)", compress: 8, budget: HUGE, position_start: 2050, capacity: 2051 },
-    BatchCfg { name: "c8 b256 ps4098 cap2200 (2048+3 = 2051..2058)", compress: 8, budget: 256, position_start: 4098, capacity: 2200 },
-    BatchCfg { name: "c1 huge ps2044 cap4096 (2045..2052)", compress: 1, budget: HUGE, position_start: 2044, capacity: 4096 },
-    BatchCfg { name: "c1 huge ps62 cap64 (63..70 clamp 64)", compress: 1, budget: HUGE, position_start: 62, capacity: 64 },
-    BatchCfg { name: "c8 b0 ps1000 cap16 (empty slice)", compress: 8, budget: 0, position_start: 1000, capacity: 16 },
-    BatchCfg { name: "c8 huge ps8180 cap8200 (8K tail)", compress: 8, budget: HUGE, position_start: 8180, capacity: 8200 },
-    BatchCfg { name: "c8 huge ps262000 cap2051 (256K clamp 2051)", compress: 8, budget: HUGE, position_start: 262000, capacity: 2051 },
-    BatchCfg { name: "c8 b256 ps262098 cap4096 (256K 2048+3)", compress: 8, budget: 256, position_start: 262098, capacity: 4096 },
-    BatchCfg { name: "c1 huge ps262130 cap2051 (256K c1)", compress: 1, budget: HUGE, position_start: 262130, capacity: 2051 },
-    BatchCfg { name: "c8 b0 ps262000 cap16 (256K empty slice)", compress: 8, budget: 0, position_start: 262000, capacity: 16 },
-    BatchCfg { name: "c1 b5 ps262000 cap8 (256K tiny)", compress: 1, budget: 5, position_start: 262000, capacity: 8 },
+    BatchCfg {
+        name: "c8 huge ps2050 cap2051 (clamp 2051)",
+        compress: 8,
+        budget: HUGE,
+        position_start: 2050,
+        capacity: 2051,
+    },
+    BatchCfg {
+        name: "c8 b256 ps4098 cap2200 (2048+3 = 2051..2058)",
+        compress: 8,
+        budget: 256,
+        position_start: 4098,
+        capacity: 2200,
+    },
+    BatchCfg {
+        name: "c1 huge ps2044 cap4096 (2045..2052)",
+        compress: 1,
+        budget: HUGE,
+        position_start: 2044,
+        capacity: 4096,
+    },
+    BatchCfg {
+        name: "c1 huge ps62 cap64 (63..70 clamp 64)",
+        compress: 1,
+        budget: HUGE,
+        position_start: 62,
+        capacity: 64,
+    },
+    BatchCfg {
+        name: "c8 b0 ps1000 cap16 (empty slice)",
+        compress: 8,
+        budget: 0,
+        position_start: 1000,
+        capacity: 16,
+    },
+    BatchCfg {
+        name: "c8 huge ps8180 cap8200 (8K tail)",
+        compress: 8,
+        budget: HUGE,
+        position_start: 8180,
+        capacity: 8200,
+    },
+    BatchCfg {
+        name: "c8 huge ps262000 cap2051 (256K clamp 2051)",
+        compress: 8,
+        budget: HUGE,
+        position_start: 262000,
+        capacity: 2051,
+    },
+    BatchCfg {
+        name: "c8 b256 ps262098 cap4096 (256K 2048+3)",
+        compress: 8,
+        budget: 256,
+        position_start: 262098,
+        capacity: 4096,
+    },
+    BatchCfg {
+        name: "c1 huge ps262130 cap2051 (256K c1)",
+        compress: 1,
+        budget: HUGE,
+        position_start: 262130,
+        capacity: 2051,
+    },
+    BatchCfg {
+        name: "c8 b0 ps262000 cap16 (256K empty slice)",
+        compress: 8,
+        budget: 0,
+        position_start: 262000,
+        capacity: 16,
+    },
+    BatchCfg {
+        name: "c1 b5 ps262000 cap8 (256K tiny)",
+        compress: 1,
+        budget: 5,
+        position_start: 262000,
+        capacity: 8,
+    },
 ];
 
 fn q8_selected_tiles(gpu: &mut Gpu, dev: &Dev, stats: &mut Stats) {
@@ -924,7 +1142,12 @@ fn q8_selected_tiles(gpu: &mut Gpu, dev: &Dev, stats: &mut Stats) {
         if cfg.position_start + 8 >= dev.full_cap {
             continue;
         }
-        for force in [None, Some(Mode::AllValid), Some(Mode::Mixed), Some(Mode::AllInvalid)] {
+        for force in [
+            None,
+            Some(Mode::AllValid),
+            Some(Mode::Mixed),
+            Some(Mode::AllInvalid),
+        ] {
             let (q, sel, lens) = batch_host(cfg, force, dev.full_cap, 8);
             for rows in [1usize, 2, 8] {
                 let sh = batch_shape(cfg, rows);
@@ -954,13 +1177,19 @@ fn q8_selected_tiles(gpu: &mut Gpu, dev: &Dev, stats: &mut Stats) {
 #[ignore = "needs a HIP device"]
 fn qsa_splitk_q8_selected_tiles_rows_1_2_8() {
     let mut gpu = Gpu::init().expect("gpu init");
-    println!("arch={} default splits={}", gpu.arch, QSA_DECODE_SPLITK_SPLITS);
+    println!(
+        "arch={} default splits={}",
+        gpu.arch, QSA_DECODE_SPLITK_SPLITS
+    );
     let splits = splits();
     let mut stats = Stats::new(splits.len());
     let dev_8k = make_dev_q8(&mut gpu, FULL_CAP, 0x5a5a_0108);
     q8_selected_tiles(&mut gpu, &dev_8k, &mut stats);
     let after_8k = (stats.counts.fixtures, stats.counts.rows_sel2051);
-    println!("8K cache: fixtures={} rows with selected_len 2051={}", after_8k.0, after_8k.1);
+    println!(
+        "8K cache: fixtures={} rows with selected_len 2051={}",
+        after_8k.0, after_8k.1
+    );
     let dev_256k = make_dev_q8(&mut gpu, FULL_CAP_256K, 0x5a5a_0256);
     q8_selected_tiles(&mut gpu, &dev_256k, &mut stats);
     println!(
@@ -973,5 +1202,8 @@ fn qsa_splitk_q8_selected_tiles_rows_1_2_8() {
         stats.counts.rows_sel2051 > after_8k.1,
         "256K cache: no row had selected_len 2051"
     );
-    stats.finish("q8 selected tiles rows 1/2/8 (8K and 256K-like caches)", &splits);
+    stats.finish(
+        "q8 selected tiles rows 1/2/8 (8K and 256K-like caches)",
+        &splits,
+    );
 }

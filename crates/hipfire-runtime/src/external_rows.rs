@@ -2181,8 +2181,7 @@ impl RowStoreInner {
             trace.mark_cache_scanned(pages.len() - missing.len(), missing.len(), groups.len());
         }
         let planned_reads = groups.len() + hot.runs.len();
-        let result = if self.inline_fetch && (1..=INLINE_FETCH_MAX_READS).contains(&planned_reads)
-        {
+        let result = if self.inline_fetch && (1..=INLINE_FETCH_MAX_READS).contains(&planned_reads) {
             let started = Instant::now();
             let result = self.fetch_inline(
                 &groups,
@@ -2878,7 +2877,9 @@ impl RowStoreInner {
                     std::thread::scope(|scope| -> Result<Vec<ReaderShare>, RowStoreError> {
                         let handles: Vec<_> = (0..readers)
                             .map(|_| {
-                                scope.spawn(move || self.run_reader(work, requested, shared, started))
+                                scope.spawn(move || {
+                                    self.run_reader(work, requested, shared, started)
+                                })
                             })
                             .collect();
                         handles
@@ -2947,7 +2948,11 @@ fn copy_requested_rows(
             output.len(),
             row,
         )?;
-        encoding.decode_row(shard_scale, &page_bytes[page_range], &mut output[output_range])?;
+        encoding.decode_row(
+            shard_scale,
+            &page_bytes[page_range],
+            &mut output[output_range],
+        )?;
     }
     Ok(())
 }
@@ -3727,7 +3732,10 @@ mod tests {
         std::thread::sleep(GAP);
         assert!(!activity.idle_for(QUIET));
         drop(serving);
-        assert!(!activity.idle_for(QUIET), "quiet period restarts at the end");
+        assert!(
+            !activity.idle_for(QUIET),
+            "quiet period restarts at the end"
+        );
         std::thread::sleep(GAP);
         assert!(activity.idle_for(QUIET));
     }
@@ -4643,8 +4651,12 @@ mod tests {
         let mut want = vec![0u8; ROW_BYTES];
         crate::ple_q4::decode_q4lm_row_bf16(row, &mut want).unwrap();
         assert_eq!(got, want);
-        assert!(RowEncoding::Q4Lm.decode_row(None, &row[..89], &mut got).is_err());
-        assert!(RowEncoding::Q4Lm.decode_row(None, row, &mut got[..318]).is_err());
+        assert!(RowEncoding::Q4Lm
+            .decode_row(None, &row[..89], &mut got)
+            .is_err());
+        assert!(RowEncoding::Q4Lm
+            .decode_row(None, row, &mut got[..318])
+            .is_err());
     }
 
     /// Deterministic xorshift for the FP8 row fixtures.
@@ -4691,7 +4703,9 @@ mod tests {
         let decode_ref = |codes: &[u8], scale: u16| {
             let mut bits = vec![0u16; codes.len()];
             rdna_compute::fp8_e4m3::dequant_row_pt(codes, scale, &mut bits).unwrap();
-            bits.iter().flat_map(|bits| bits.to_le_bytes()).collect::<Vec<u8>>()
+            bits.iter()
+                .flat_map(|bits| bits.to_le_bytes())
+                .collect::<Vec<u8>>()
         };
         let mut state = 0x9E37_79B9_7F4A_7C15u64;
         for _ in 0..512 {
@@ -4710,13 +4724,17 @@ mod tests {
             assert_eq!(got, decode_ref(&all, scale));
         }
         let mut zero = [0u8; 2];
-        encoding.decode_row(Some(0x3F80), &[0x80], &mut zero).unwrap();
+        encoding
+            .decode_row(Some(0x3F80), &[0x80], &mut zero)
+            .unwrap();
         assert_eq!(u16::from_le_bytes(zero), 0x8000);
 
         let mut got = vec![0u8; 2 * ROW_WIDTH];
         let mut codes = vec![0x38u8; ROW_WIDTH];
         assert!(encoding.decode_row(None, &codes, &mut got).is_err());
-        assert!(encoding.decode_row(Some(0x3F80), &codes[1..], &mut got).is_err());
+        assert!(encoding
+            .decode_row(Some(0x3F80), &codes[1..], &mut got)
+            .is_err());
         for nan in [0x7Fu8, 0xFF] {
             codes[17] = nan;
             assert!(encoding.decode_row(Some(0x3F80), &codes, &mut got).is_err());
@@ -4740,7 +4758,11 @@ mod tests {
         let mut state = 0x0123_4567_89AB_CDEFu64;
         let scales = [fp8_scale(&mut state), fp8_scale(&mut state)];
         let codes: Vec<Vec<u8>> = (0..2)
-            .map(|_| (0..rows_per_shard * ROW_WIDTH).map(|_| fp8_code(&mut state)).collect())
+            .map(|_| {
+                (0..rows_per_shard * ROW_WIDTH)
+                    .map(|_| fp8_code(&mut state))
+                    .collect()
+            })
             .collect();
         let shards: Vec<Vec<u8>> = scales
             .iter()
@@ -4759,7 +4781,9 @@ mod tests {
                 let row = &codes[shard][local * ROW_WIDTH..(local + 1) * ROW_WIDTH];
                 let mut bits = vec![0u16; ROW_WIDTH];
                 rdna_compute::fp8_e4m3::dequant_row_pt(row, scales[shard], &mut bits).unwrap();
-                bits.into_iter().flat_map(u16::to_le_bytes).collect::<Vec<u8>>()
+                bits.into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<u8>>()
             })
             .collect();
         assert_eq!(fetch(&rows, &ids), want);
@@ -4816,9 +4840,7 @@ mod tests {
                     dst.fill(0xA5);
                     Ok(NowaitRead::WouldBlock)
                 }
-                Some(_) => self
-                    .read_exact_at(offset, dst)
-                    .map(|()| NowaitRead::Done),
+                Some(_) => self.read_exact_at(offset, dst).map(|()| NowaitRead::Done),
                 None => crate::model_source::read_file_nowait_at(
                     &self.file,
                     &self.identity.files[0],
@@ -4911,7 +4933,8 @@ mod tests {
             file.extend_from_slice(shard);
         }
         std::fs::write(&path, &file).unwrap();
-        let descriptors = file_descriptors_with(&path, &ranges, dtype, rows_per_shard, width, cache);
+        let descriptors =
+            file_descriptors_with(&path, &ranges, dtype, rows_per_shard, width, cache);
         (dir, descriptors)
     }
 
@@ -6087,7 +6110,8 @@ mod tests {
 
     #[test]
     fn inline_fetch_cancel_before_the_first_read_reads_nothing() {
-        let (rows, memory, source, _, output, pending, result) = canceled_inline_fetch(usize::MAX, true);
+        let (rows, memory, source, _, output, pending, result) =
+            canceled_inline_fetch(usize::MAX, true);
         assert!(matches!(result, Err(RowStoreError::Canceled)), "{result:?}");
         assert_eq!(source.served.load(Ordering::Acquire), 0);
         assert_eq!(memory.reads.load(Ordering::Acquire), 0);
@@ -6160,11 +6184,9 @@ mod tests {
                     "mode {mode}"
                 );
                 match mode {
-                    CACHE_ALL => assert_eq!(
-                        (run_served, group_served),
-                        (runs, groups),
-                        "mode {mode}"
-                    ),
+                    CACHE_ALL => {
+                        assert_eq!((run_served, group_served), (runs, groups), "mode {mode}")
+                    }
                     CACHE_NONE => assert_eq!((run_served, group_served), (0, 0)),
                     _ => assert!(run_served > 0 && run_served < runs, "{run_served}/{runs}"),
                 }
@@ -6226,23 +6248,31 @@ mod tests {
         let shards = rows_source_q4(2, rows_per_shard);
         let ids = [0u64, 5, 63, 64, 100, 127, 64, 0, 3];
         let want = expected_q4_rows(&shards, &ids, rows_per_shard);
-        for mode in [Some(CACHE_ALL), Some(CACHE_NONE), Some(CACHE_ALTERNATE), None] {
+        for mode in [
+            Some(CACHE_ALL),
+            Some(CACHE_NONE),
+            Some(CACHE_ALTERNATE),
+            None,
+        ] {
             let cache = mode.map(CacheModel::new);
-            let (_dir, descriptors) = shard_descriptors_with(
-                &shards,
-                "Q4LM",
-                rows_per_shard,
-                ROW_WIDTH,
-                cache.clone(),
-            );
+            let (_dir, descriptors) =
+                shard_descriptors_with(&shards, "Q4LM", rows_per_shard, ROW_WIDTH, cache.clone());
             let descriptors: Arc<[SourceRangeDescriptor]> = descriptors.into();
             let layout = validate_descriptors(&descriptors, 128).unwrap();
             let source = Arc::new(DescriptorRowSource {
                 descriptors: descriptors.clone(),
                 data_offset: layout.encoding.shard_header_bytes() as u64,
             });
-            let rows = RowStore::spawn("descriptor-inline-test", source, descriptors, layout, 0, false, true)
-                .unwrap();
+            let rows = RowStore::spawn(
+                "descriptor-inline-test",
+                source,
+                descriptors,
+                layout,
+                0,
+                false,
+                true,
+            )
+            .unwrap();
             assert_eq!(fetch(&rows, &ids), want, "mode {mode:?}");
             let stats = rows.cache_stats();
             if let Some(cache) = cache {

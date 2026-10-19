@@ -27,11 +27,16 @@ pub use raw::lift_raw;
 use peacemaker_ir::cfg::{BlockId, Body};
 use peacemaker_ir::codec::{gfx11, gfx12};
 use peacemaker_ir::envelope::{Bundle, KernelSlot, Source};
-use peacemaker_ir::inst::{Abi, Arch, Frontend, Kernel, KernelOrigin, Program, Setting, SymbolId, Target, Wave};
+use peacemaker_ir::inst::{
+    Abi, Arch, Frontend, Kernel, KernelOrigin, Program, Setting, SymbolId, Target, Wave,
+};
 use peacemaker_ir::operand::Operand;
-use peacemaker_ir::passes::{cfg::{build_blocks, CfgError}, windows::{check_windows, WindowError}};
+use peacemaker_ir::passes::{
+    cfg::{build_blocks, CfgError},
+    windows::{check_windows, WindowError},
+};
 use peacemaker_ir::provenance::{ObjectSha, Provenance, Source as Origin, TextSha};
-use peacemaker_ir::state::{Lifted, LiftReport, RoundTripProof, StreamProof};
+use peacemaker_ir::state::{LiftReport, Lifted, RoundTripProof, StreamProof};
 use sha2::{Digest, Sha256};
 
 use crate::bundle::{BundleCodec, SourceCodec, COMPRESSED_MAGIC, HIP_DEVICE_TRIPLE_PREFIX};
@@ -82,11 +87,21 @@ pub enum LiftError {
     /// `offset` is the code-object virtual address of the offending instruction or
     /// descriptor for kernel-level rules, and 0 for module-level ones.
     #[error("{rule:?} at {offset:#x} ({}): {reason}", .kernel.as_deref().unwrap_or("module"))]
-    Rejected { kernel: Option<String>, offset: u64, rule: Rule, reason: String },
+    Rejected {
+        kernel: Option<String>,
+        offset: u64,
+        rule: Rule,
+        reason: String,
+    },
 }
 
 fn module_error(rule: Rule, reason: impl ToString) -> LiftError {
-    LiftError::Rejected { kernel: None, offset: 0, rule, reason: reason.to_string() }
+    LiftError::Rejected {
+        kernel: None,
+        offset: 0,
+        rule,
+        reason: reason.to_string(),
+    }
 }
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
@@ -129,20 +144,35 @@ fn arch_of_name(name: &str) -> Option<Arch> {
 fn input_arch(bytes: &[u8]) -> Result<Arch, LiftError> {
     if Bundle::is_bundle(bytes) || bytes.starts_with(COMPRESSED_MAGIC) {
         let (bundle, _) = Bundle::read(bytes).map_err(|e| module_error(Rule::Envelope, e))?;
-        let triples: Vec<&str> = bundle.entries.iter()
+        let triples: Vec<&str> = bundle
+            .entries
+            .iter()
             .filter_map(|entry| entry.triple.strip_prefix(HIP_DEVICE_TRIPLE_PREFIX))
             .collect();
         let [triple] = triples[..] else {
-            return Err(module_error(Rule::Envelope, format!("bundle has {} HIP device entries, not one", triples.len())));
+            return Err(module_error(
+                Rule::Envelope,
+                format!("bundle has {} HIP device entries, not one", triples.len()),
+            ));
         };
         let name = triple.split(':').next().unwrap_or(triple);
-        return arch_of_name(name).ok_or_else(|| module_error(Rule::UnsupportedArch, format!("bundle device target {name}")));
+        return arch_of_name(name).ok_or_else(|| {
+            module_error(
+                Rule::UnsupportedArch,
+                format!("bundle device target {name}"),
+            )
+        });
     }
-    let flags = bytes.get(E_FLAGS_OFFSET..E_FLAGS_OFFSET + 4)
+    let flags = bytes
+        .get(E_FLAGS_OFFSET..E_FLAGS_OFFSET + 4)
         .map(|b| u32::from_le_bytes(b.try_into().expect("four bytes")))
         .ok_or_else(|| module_error(Rule::Envelope, "input is shorter than an ELF64 header"))?;
-    arch_of_mach(flags & EF_MACH_MASK)
-        .ok_or_else(|| module_error(Rule::UnsupportedArch, format!("EF_AMDGPU_MACH {:#x}", flags & EF_MACH_MASK)))
+    arch_of_mach(flags & EF_MACH_MASK).ok_or_else(|| {
+        module_error(
+            Rule::UnsupportedArch,
+            format!("EF_AMDGPU_MACH {:#x}", flags & EF_MACH_MASK),
+        )
+    })
 }
 
 /// Feature setting from a code object v4+ two-bit field. `unsupported` (the target has
@@ -158,14 +188,29 @@ fn setting(bits: u32) -> Setting {
 fn target_of(source: &Source, arch: Arch) -> Result<Target, LiftError> {
     let header = &source.elf.header;
     if header.os_abi != ELFOSABI_AMDGPU_HSA {
-        return Err(module_error(Rule::UnsupportedArch, format!("EI_OSABI {} is not AMDGPU_HSA", header.os_abi)));
+        return Err(module_error(
+            Rule::UnsupportedArch,
+            format!("EI_OSABI {} is not AMDGPU_HSA", header.os_abi),
+        ));
     }
     if header.abi_version < ELFABIVERSION_AMDGPU_HSA_V4 {
-        return Err(module_error(Rule::UnsupportedArch, format!("EI_ABIVERSION {} is below code object v4", header.abi_version)));
+        return Err(module_error(
+            Rule::UnsupportedArch,
+            format!(
+                "EI_ABIVERSION {} is below code object v4",
+                header.abi_version
+            ),
+        ));
     }
     let declared = arch_of_mach(header.e_flags & EF_MACH_MASK);
     if declared != Some(arch) {
-        return Err(module_error(Rule::Envelope, format!("ELF EF_AMDGPU_MACH {:#x} disagrees with {arch:?}", header.e_flags & EF_MACH_MASK)));
+        return Err(module_error(
+            Rule::Envelope,
+            format!(
+                "ELF EF_AMDGPU_MACH {:#x} disagrees with {arch:?}",
+                header.e_flags & EF_MACH_MASK
+            ),
+        ));
     }
     Ok(Target {
         arch,
@@ -177,76 +222,158 @@ fn target_of(source: &Source, arch: Arch) -> Result<Target, LiftError> {
 
 /// The device ELF bytes of the input (the bundle's HIP payload, or the input itself).
 fn device_elf<'a>(bytes: &'a [u8], source: &Source, arch: Arch) -> Result<&'a [u8], LiftError> {
-    let Some(bundle) = &source.bundle else { return Ok(bytes) };
+    let Some(bundle) = &source.bundle else {
+        return Ok(bytes);
+    };
     let (_, payloads) = Bundle::read(bytes).map_err(|e| module_error(Rule::Envelope, e))?;
-    let index = bundle.device_entry(arch).map_err(|e| module_error(Rule::Envelope, e))?;
+    let index = bundle
+        .device_entry(arch)
+        .map_err(|e| module_error(Rule::Envelope, e))?;
     Ok(payloads[index])
 }
 
 /// Lift a code object (ELF or uncompressed HIP bundle) with a byte-exact proof.
 pub fn lift_object(bytes: &[u8], options: Options) -> Result<Lifted<Program>, LiftError> {
     let arch = input_arch(bytes)?;
-    let (source, images) = Source::read(bytes, arch).map_err(|e| module_error(Rule::Envelope, e))?;
+    let (source, images) =
+        Source::read(bytes, arch).map_err(|e| module_error(Rule::Envelope, e))?;
     let target = target_of(&source, arch)?;
     if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
-        return Err(module_error(Rule::UnsupportedArch, format!("{arch:?} has no opcode table")));
+        return Err(module_error(
+            Rule::UnsupportedArch,
+            format!("{arch:?} has no opcode table"),
+        ));
     }
     let object_sha = sha256(device_elf(bytes, &source, arch)?);
     if images.len() != source.elf.kernels.len() {
-        return Err(module_error(Rule::Envelope, "kernel images disagree with envelope slots"));
+        return Err(module_error(
+            Rule::Envelope,
+            "kernel images disagree with envelope slots",
+        ));
     }
     let mut kernels = Vec::with_capacity(images.len());
     let mut streams = Vec::with_capacity(images.len());
     for (image, slot) in images.iter().zip(&source.elf.kernels) {
         let kernel = lift_kernel(image, slot, arch, options.frontend, object_sha)?;
-        let code = emit::bytes(&kernel, arch).map_err(|e| kernel_error(image, image.entry_va, Rule::StreamIdentity, e))?;
+        let code = emit::bytes(&kernel, arch)
+            .map_err(|e| kernel_error(image, image.entry_va, Rule::StreamIdentity, e))?;
         if code != image.code {
-            let at = code.iter().zip(&image.code).position(|(a, b)| a != b).unwrap_or(code.len().min(image.code.len()));
-            return Err(kernel_error(image, image.entry_va + at as u64, Rule::StreamIdentity, "label-lowered stream differs from the input"));
+            let at = code
+                .iter()
+                .zip(&image.code)
+                .position(|(a, b)| a != b)
+                .unwrap_or(code.len().min(image.code.len()));
+            return Err(kernel_error(
+                image,
+                image.entry_va + at as u64,
+                Rule::StreamIdentity,
+                "label-lowered stream differs from the input",
+            ));
         }
-        streams.push(StreamProof { entry: slot.entry_va, size: slot.size, stream_sha256: sha256(&code) });
+        streams.push(StreamProof {
+            entry: slot.entry_va,
+            size: slot.size,
+            stream_sha256: sha256(&code),
+        });
         kernels.push(kernel);
     }
-    let program = Program { target, kernels, source: Some(source) };
-    program.validate().map_err(|e| module_error(Rule::Program, e))?;
+    let program = Program {
+        target,
+        kernels,
+        source: Some(source),
+    };
+    program
+        .validate()
+        .map_err(|e| module_error(Rule::Program, e))?;
     let emitted = emit::module(&program).map_err(|e| module_error(Rule::ModuleIdentity, e))?;
     if emitted != bytes {
-        let at = emitted.iter().zip(bytes).position(|(a, b)| a != b).unwrap_or(emitted.len().min(bytes.len()));
-        return Err(LiftError::Rejected { kernel: None, offset: at as u64, rule: Rule::ModuleIdentity, reason: "re-emitted module differs from the input".into() });
+        let at = emitted
+            .iter()
+            .zip(bytes)
+            .position(|(a, b)| a != b)
+            .unwrap_or(emitted.len().min(bytes.len()));
+        return Err(LiftError::Rejected {
+            kernel: None,
+            offset: at as u64,
+            rule: Rule::ModuleIdentity,
+            reason: "re-emitted module differs from the input".into(),
+        });
     }
     Ok(Lifted {
         program,
-        proof: RoundTripProof { input_sha256: sha256(bytes), tools: Vec::new(), streams, sidecar_sha256: None },
+        proof: RoundTripProof {
+            input_sha256: sha256(bytes),
+            tools: Vec::new(),
+            streams,
+            sidecar_sha256: None,
+        },
         report: LiftReport::default(),
     })
 }
 
 fn rejected(kernel: &str, offset: u64, rule: Rule, reason: impl ToString) -> LiftError {
-    LiftError::Rejected { kernel: Some(kernel.to_owned()), offset, rule, reason: reason.to_string() }
+    LiftError::Rejected {
+        kernel: Some(kernel.to_owned()),
+        offset,
+        rule,
+        reason: reason.to_string(),
+    }
 }
 
 fn kernel_error(image: &KernelImage, offset: u64, rule: Rule, reason: impl ToString) -> LiftError {
     rejected(&image.name, offset, rule, reason)
 }
 
-fn lift_kernel(image: &KernelImage, slot: &KernelSlot, arch: Arch, frontend: Frontend, object_sha: [u8; 32]) -> Result<Kernel, LiftError> {
-    if slot.name != image.name || slot.entry_va != image.entry_va || slot.size != image.code.len() as u64 {
-        return Err(kernel_error(image, image.entry_va, Rule::Envelope, "kernel image disagrees with its envelope slot"));
+fn lift_kernel(
+    image: &KernelImage,
+    slot: &KernelSlot,
+    arch: Arch,
+    frontend: Frontend,
+    object_sha: [u8; 32],
+) -> Result<Kernel, LiftError> {
+    if slot.name != image.name
+        || slot.entry_va != image.entry_va
+        || slot.size != image.code.len() as u64
+    {
+        return Err(kernel_error(
+            image,
+            image.entry_va,
+            Rule::Envelope,
+            "kernel image disagrees with its envelope slot",
+        ));
     }
     if image.code.len() % 4 != 0 {
-        return Err(kernel_error(image, image.entry_va, Rule::Decode, format!("symbol size {} is not a dword multiple", image.code.len())));
+        return Err(kernel_error(
+            image,
+            image.entry_va,
+            Rule::Decode,
+            format!("symbol size {} is not a dword multiple", image.code.len()),
+        ));
     }
     let body = decode_body(&image.name, &image.code, image.entry_va, arch, object_sha)?;
-    kd::validate(&image.descriptor, arch).map_err(|e| kernel_error(image, slot.kd_va, Rule::Descriptor, e))?;
+    kd::validate(&image.descriptor, arch)
+        .map_err(|e| kernel_error(image, slot.kd_va, Rule::Descriptor, e))?;
     metadata::check(&image.metadata.parsed, &image.name, &image.descriptor)
         .map_err(|e| kernel_error(image, slot.kd_va, Rule::Metadata, e))?;
-    let wave = if image.descriptor.kernel_code_properties.wave32() { Wave::Wave32 } else { Wave::Wave64 };
+    let wave = if image.descriptor.kernel_code_properties.wave32() {
+        Wave::Wave32
+    } else {
+        Wave::Wave64
+    };
     Ok(Kernel {
         symbol: SymbolId(image.name.clone()),
         wave,
-        abi: Abi::Hsa { descriptor: image.descriptor.clone(), metadata: image.metadata.clone() },
+        abi: Abi::Hsa {
+            descriptor: image.descriptor.clone(),
+            metadata: image.metadata.clone(),
+        },
         body,
-        origin: KernelOrigin::Frontend { kind: frontend, object_sha256: object_sha, entry_va: slot.entry_va, size: slot.size },
+        origin: KernelOrigin::Frontend {
+            kind: frontend,
+            object_sha256: object_sha,
+            entry_va: slot.entry_va,
+            size: slot.size,
+        },
     })
 }
 
@@ -254,24 +381,49 @@ fn lift_kernel(image: &KernelImage, slot: &KernelSlot, arch: Arch, frontend: Fro
 /// decoded by the target codec, re-encoded from its typed fields and compared word for word,
 /// the CFG is built from the encoded branch offsets and the clause/delay windows are checked.
 /// Shared by the HSA and the raw lifters; `prov.bytes` is recorded but never read back.
-fn decode_body(name: &str, code: &[u8], entry_va: u64, arch: Arch, object_sha: [u8; 32]) -> Result<Body, LiftError> {
-    let words: Vec<u32> = code.chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().expect("dword"))).collect();
+fn decode_body(
+    name: &str,
+    code: &[u8],
+    entry_va: u64,
+    arch: Arch,
+    object_sha: [u8; 32],
+) -> Result<Body, LiftError> {
+    let words: Vec<u32> = code
+        .chunks_exact(4)
+        .map(|w| u32::from_le_bytes(w.try_into().expect("dword")))
+        .collect();
     let mut body = Body::default();
     let mut vas = Vec::new();
     let mut at = 0;
     while at < words.len() {
         let va = entry_va + 4 * at as u64;
-        let (mut inst, n) = match arch { Arch::Gfx1100 | Arch::Gfx1151 => gfx11::decode(arch, &words[at..]),
-            _ => gfx12::decode(&words[at..]) }.map_err(|e| rejected(name, va, Rule::Decode, e))?;
+        let (mut inst, n) = match arch {
+            Arch::Gfx1100 | Arch::Gfx1151 => gfx11::decode(arch, &words[at..]),
+            _ => gfx12::decode(&words[at..]),
+        }
+        .map_err(|e| rejected(name, va, Rule::Decode, e))?;
         let original = &words[at..at + n];
-        let encoded = gfx12::encode_for(arch, &inst).map_err(|e| rejected(name, va, Rule::StreamIdentity, e))?;
+        let encoded = gfx12::encode_for(arch, &inst)
+            .map_err(|e| rejected(name, va, Rule::StreamIdentity, e))?;
         if encoded.as_slice() != original {
-            return Err(rejected(name, va, Rule::StreamIdentity, format!("re-encoded {encoded:08x?} != input {original:08x?}")));
+            return Err(rejected(
+                name,
+                va,
+                Rule::StreamIdentity,
+                format!("re-encoded {encoded:08x?} != input {original:08x?}"),
+            ));
         }
         let mut kept = [0u32; 3];
         kept[..n].copy_from_slice(original);
-        let pc = u32::try_from(va).map_err(|_| rejected(name, va, Rule::Envelope, "VA exceeds 32 bits"))?;
-        inst.prov = Provenance { source: Origin::Object(ObjectSha(object_sha)), pc: Some(pc), bytes: Some(kept), line: None, edit: None };
+        let pc = u32::try_from(va)
+            .map_err(|_| rejected(name, va, Rule::Envelope, "VA exceeds 32 bits"))?;
+        inst.prov = Provenance {
+            source: Origin::Object(ObjectSha(object_sha)),
+            pc: Some(pc),
+            bytes: Some(kept),
+            line: None,
+            edit: None,
+        };
         vas.push(va);
         let id = body.insts.insert(inst);
         body.layout.push(id);
@@ -280,19 +432,29 @@ fn decode_body(name: &str, code: &[u8], entry_va: u64, arch: Arch, object_sha: [
     let va_at = |index: usize| vas.get(index).copied().unwrap_or(entry_va);
     build_blocks(&mut body, arch).map_err(|e| {
         let (index, rule) = match e {
-            CfgError::TargetOutsideKernel { index, .. } | CfgError::TargetMidInstruction { index, .. } => (index, Rule::BranchTarget),
-            CfgError::MissingOffset { index } | CfgError::UnexpectedLabel { index } => (index, Rule::ControlFlow),
+            CfgError::TargetOutsideKernel { index, .. }
+            | CfgError::TargetMidInstruction { index, .. } => (index, Rule::BranchTarget),
+            CfgError::MissingOffset { index } | CfgError::UnexpectedLabel { index } => {
+                (index, Rule::ControlFlow)
+            }
             CfgError::MissingEndPgm => (vas.len().saturating_sub(1), Rule::ControlFlow),
-            CfgError::Empty | CfgError::AlreadyBuilt | CfgError::DanglingInst { .. } | CfgError::BlocksNotBuilt => (0, Rule::ControlFlow),
+            CfgError::Empty
+            | CfgError::AlreadyBuilt
+            | CfgError::DanglingInst { .. }
+            | CfgError::BlocksNotBuilt => (0, Rule::ControlFlow),
         };
         rejected(name, va_at(index), rule, e)
     })?;
     check_windows(&body).map_err(|e| {
         let index = match e {
-            WindowError::CrossesLeader { index, .. } | WindowError::ClauseLengthMissing { index }
-            | WindowError::NonMemoryMember { index, .. } | WindowError::MixedClass { index, .. }
-            | WindowError::WaitInsideClause { index, .. } | WindowError::EndPgmInsideClause { index }
-            | WindowError::HintMissing { index } | WindowError::DelayCrossesLeader { index } => index,
+            WindowError::CrossesLeader { index, .. }
+            | WindowError::ClauseLengthMissing { index }
+            | WindowError::NonMemoryMember { index, .. }
+            | WindowError::MixedClass { index, .. }
+            | WindowError::WaitInsideClause { index, .. }
+            | WindowError::EndPgmInsideClause { index }
+            | WindowError::HintMissing { index }
+            | WindowError::DelayCrossesLeader { index } => index,
             WindowError::BlocksNotBuilt => 0,
         };
         rejected(name, va_at(index), Rule::Window, e)
@@ -308,18 +470,41 @@ fn decode_body(name: &str, code: &[u8], entry_va: u64, arch: Arch, object_sha: [
 /// line parses to the decoded instruction (opcode, form, operands, modifiers, literal),
 /// and every label inside a kernel starts a block. Instructions then carry
 /// `Source::Text` provenance with their `.s` line; pc and words stay the object's.
-pub fn lift_text(source: &str, object: &[u8], options: Options) -> Result<Lifted<Program>, LiftError> {
+pub fn lift_text(
+    source: &str,
+    object: &[u8],
+    options: Options,
+) -> Result<Lifted<Program>, LiftError> {
     let mut lifted = lift_object(object, options)?;
     let file = parse_source(source).map_err(|e| module_error(Rule::Text, e))?;
     let text_sha = TextSha(sha256(source.as_bytes()));
     let arch = lifted.program.target.arch;
     // (1-based line number, text) of every instruction line, indexed by instruction ordinal.
-    let lines: Vec<(usize, &str)> = file.lines.iter()
-        .filter_map(|line| match &line.kind { SourceKind::Inst(text) => Some((line.line_no, text.as_str())), _ => None })
+    let lines: Vec<(usize, &str)> = file
+        .lines
+        .iter()
+        .filter_map(|line| match &line.kind {
+            SourceKind::Inst(text) => Some((line.line_no, text.as_str())),
+            _ => None,
+        })
         .collect();
-    let starts = lifted.program.kernels.iter().enumerate()
-        .map(|(k, kernel)| file.labels.iter().find(|(name, _)| *name == kernel.symbol.0).map(|(_, at)| (*at, k))
-            .ok_or_else(|| module_error(Rule::Text, format!("kernel {} is not a label in the source", kernel.symbol.0))))
+    let starts = lifted
+        .program
+        .kernels
+        .iter()
+        .enumerate()
+        .map(|(k, kernel)| {
+            file.labels
+                .iter()
+                .find(|(name, _)| *name == kernel.symbol.0)
+                .map(|(_, at)| (*at, k))
+                .ok_or_else(|| {
+                    module_error(
+                        Rule::Text,
+                        format!("kernel {} is not a label in the source", kernel.symbol.0),
+                    )
+                })
+        })
         .collect::<Result<Vec<(usize, usize)>, _>>()?;
     let mut bounds: Vec<usize> = starts.iter().map(|(at, _)| *at).collect();
     bounds.push(lines.len());
@@ -328,44 +513,105 @@ pub fn lift_text(source: &str, object: &[u8], options: Options) -> Result<Lifted
         let end = bounds[bounds.partition_point(|&b| b <= first)];
         let kernel = &mut lifted.program.kernels[k];
         let name = kernel.symbol.0.clone();
-        let fail = |offset: u64, reason: String| LiftError::Rejected { kernel: Some(name.clone()), offset, rule: Rule::Text, reason };
-        let entry = match kernel.origin { KernelOrigin::Frontend { entry_va, .. } => entry_va, KernelOrigin::Authored { .. } => 0 };
+        let fail = |offset: u64, reason: String| LiftError::Rejected {
+            kernel: Some(name.clone()),
+            offset,
+            rule: Rule::Text,
+            reason,
+        };
+        let entry = match kernel.origin {
+            KernelOrigin::Frontend { entry_va, .. } => entry_va,
+            KernelOrigin::Authored { .. } => 0,
+        };
         let body = &mut kernel.body;
         if end - first != body.layout.len() {
-            return Err(fail(entry, format!("{} source instruction lines, {} decoded instructions", end - first, body.layout.len())));
+            return Err(fail(
+                entry,
+                format!(
+                    "{} source instruction lines, {} decoded instructions",
+                    end - first,
+                    body.layout.len()
+                ),
+            ));
         }
-        let block_at = |ordinal: usize| body.blocks.iter().find(|b| b.range.0 == ordinal).map(|b| b.id);
-        let labels: Vec<(&str, usize)> = file.labels.iter()
+        let block_at = |ordinal: usize| {
+            body.blocks
+                .iter()
+                .find(|b| b.range.0 == ordinal)
+                .map(|b| b.id)
+        };
+        let labels: Vec<(&str, usize)> = file
+            .labels
+            .iter()
             .filter(|(_, at)| (first..end).contains(at))
             .map(|(name, at)| (name.as_str(), at - first))
             .collect();
         for (label, ordinal) in &labels {
             if block_at(*ordinal).is_none() {
-                return Err(fail(entry, format!("label {label} at instruction {ordinal} does not start a block")));
+                return Err(fail(
+                    entry,
+                    format!("label {label} at instruction {ordinal} does not start a block"),
+                ));
             }
         }
-        let starts_of: Vec<Option<BlockId>> = labels.iter().map(|(_, ordinal)| block_at(*ordinal)).collect();
+        let starts_of: Vec<Option<BlockId>> = labels
+            .iter()
+            .map(|(_, ordinal)| block_at(*ordinal))
+            .collect();
         for ordinal in 0..body.layout.len() {
             let (line_no, text) = lines[first + ordinal];
-            let inst = body.insts.get_mut(body.layout[ordinal]).expect("layout references live instructions");
+            let inst = body
+                .insts
+                .get_mut(body.layout[ordinal])
+                .expect("layout references live instructions");
             let va = inst.prov.pc.map_or(entry, u64::from);
-            let label_target = inst.operands.iter().find_map(|op| match op { Operand::Label(b) => Some(*b), _ => None });
+            let label_target = inst.operands.iter().find_map(|op| match op {
+                Operand::Label(b) => Some(*b),
+                _ => None,
+            });
             match label_target {
                 Some(target) => {
                     let mut parts = text.split_whitespace();
-                    let (mnemonic, operand) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+                    let (mnemonic, operand) =
+                        (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
                     if Some(mnemonic) != inst.op.name(arch) {
-                        return Err(fail(va, format!("line {line_no}: {text:?} is not {:?}", inst.op.name(arch))));
+                        return Err(fail(
+                            va,
+                            format!("line {line_no}: {text:?} is not {:?}", inst.op.name(arch)),
+                        ));
                     }
-                    let named = labels.iter().zip(&starts_of).find(|((label, _), _)| *label == operand).and_then(|(_, block)| *block);
+                    let named = labels
+                        .iter()
+                        .zip(&starts_of)
+                        .find(|((label, _), _)| *label == operand)
+                        .and_then(|(_, block)| *block);
                     if named != Some(target) {
-                        return Err(fail(va, format!("line {line_no}: {text:?} does not name the label of block {}", target.0)));
+                        return Err(fail(
+                            va,
+                            format!(
+                                "line {line_no}: {text:?} does not name the label of block {}",
+                                target.0
+                            ),
+                        ));
                     }
                 }
                 None => {
-                    let parsed = parse_line(text, arch).map_err(|e| fail(va, format!("line {line_no}: {text:?}: {e}")))?;
-                    if (parsed.op, parsed.form, &parsed.operands, &parsed.mods, parsed.literal) != (inst.op, inst.form, &inst.operands, &inst.mods, inst.literal) {
-                        return Err(fail(va, format!("line {line_no}: {text:?} disagrees with the object's instruction")));
+                    let parsed = parse_line(text, arch)
+                        .map_err(|e| fail(va, format!("line {line_no}: {text:?}: {e}")))?;
+                    if (
+                        parsed.op,
+                        parsed.form,
+                        &parsed.operands,
+                        &parsed.mods,
+                        parsed.literal,
+                    ) != (inst.op, inst.form, &inst.operands, &inst.mods, inst.literal)
+                    {
+                        return Err(fail(
+                            va,
+                            format!(
+                                "line {line_no}: {text:?} disagrees with the object's instruction"
+                            ),
+                        ));
                     }
                 }
             }
@@ -391,9 +637,17 @@ pub mod emit {
     #[derive(Debug, thiserror::Error)]
     pub enum EmitError {
         #[error("{kernel}: {error}")]
-        Lower { kernel: String, #[source] error: EditError },
+        Lower {
+            kernel: String,
+            #[source]
+            error: EditError,
+        },
         #[error("{kernel}: layout index {index}: {reason}")]
-        Encode { kernel: String, index: usize, reason: String },
+        Encode {
+            kernel: String,
+            index: usize,
+            reason: String,
+        },
         #[error("kernel {0} has a raw ABI and cannot be packaged without an adapter")]
         RawAbi(String),
         #[error("program has no source envelope to emit into")]
@@ -411,15 +665,21 @@ pub mod emit {
     /// The kernel's instructions in layout order with every `Label` lowered to its SOPP
     /// offset (signed dwords from the next PC) under the current layout.
     pub fn insts(kernel: &Kernel, arch: Arch) -> Result<Vec<Inst>, EmitError> {
-        lower_labels(&kernel.body, arch).map_err(|error| EmitError::Lower { kernel: kernel.symbol.0.clone(), error })
+        lower_labels(&kernel.body, arch).map_err(|error| EmitError::Lower {
+            kernel: kernel.symbol.0.clone(),
+            error,
+        })
     }
 
     /// Encoded words of the kernel stream.
     pub fn words(kernel: &Kernel, arch: Arch) -> Result<Vec<u32>, EmitError> {
         let mut out = Vec::with_capacity(kernel.body.layout.len() * 2);
         for (index, inst) in insts(kernel, arch)?.iter().enumerate() {
-            let encoded = gfx12::encode_for(arch, inst)
-                .map_err(|e| EmitError::Encode { kernel: kernel.symbol.0.clone(), index, reason: e.to_string() })?;
+            let encoded = gfx12::encode_for(arch, inst).map_err(|e| EmitError::Encode {
+                kernel: kernel.symbol.0.clone(),
+                index,
+                reason: e.to_string(),
+            })?;
             out.extend_from_slice(&encoded);
         }
         Ok(out)
@@ -427,7 +687,10 @@ pub mod emit {
 
     /// Little-endian bytes of the kernel stream.
     pub fn bytes(kernel: &Kernel, arch: Arch) -> Result<Vec<u8>, EmitError> {
-        Ok(words(kernel, arch)?.iter().flat_map(|w| w.to_le_bytes()).collect())
+        Ok(words(kernel, arch)?
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect())
     }
 
     /// Canonical (pinned `llvm-objdump`) text, one line per instruction; the input of
@@ -436,11 +699,26 @@ pub mod emit {
         Ok(kernel_lines(&insts(kernel, arch)?, arch)?)
     }
 
-    fn parts<'a>(program: &'a Program, codes: &'a [Vec<u8>]) -> Result<Vec<KernelParts<'a>>, EmitError> {
-        program.kernels.iter().zip(codes).map(|(kernel, code)| match &kernel.abi {
-            Abi::Hsa { descriptor, metadata } => Ok(KernelParts { code, descriptor, metadata }),
-            Abi::Raw { .. } => Err(EmitError::RawAbi(kernel.symbol.0.clone())),
-        }).collect()
+    fn parts<'a>(
+        program: &'a Program,
+        codes: &'a [Vec<u8>],
+    ) -> Result<Vec<KernelParts<'a>>, EmitError> {
+        program
+            .kernels
+            .iter()
+            .zip(codes)
+            .map(|(kernel, code)| match &kernel.abi {
+                Abi::Hsa {
+                    descriptor,
+                    metadata,
+                } => Ok(KernelParts {
+                    code,
+                    descriptor,
+                    metadata,
+                }),
+                Abi::Raw { .. } => Err(EmitError::RawAbi(kernel.symbol.0.clone())),
+            })
+            .collect()
     }
 
     /// The module: the retained envelope with every kernel's re-encoded stream and
@@ -448,32 +726,70 @@ pub mod emit {
     /// code, the metadata note or a kernel name no longer fits, `crate::layout`).
     pub fn module(program: &Program) -> Result<Vec<u8>, EmitError> {
         let source = program.source.as_ref().ok_or(EmitError::NoEnvelope)?;
-        let codes = program.kernels.iter().map(|kernel| bytes(kernel, program.target.arch)).collect::<Result<Vec<_>, _>>()?;
+        let codes = program
+            .kernels
+            .iter()
+            .map(|kernel| bytes(kernel, program.target.arch))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(source.write(&parts(program, &codes)?)?)
     }
 
     /// [`module`], then re-read: the bytes must lift (`lift_object`) to the same kernels
     /// in the same order — symbol, instruction stream, metadata, and the descriptor the
     /// layout derived (entry offset and `INST_PREF_SIZE` follow the new layout).
-    pub fn checked(program: &Program, options: crate::Options) -> Result<(Vec<u8>, Lifted<Program>), EmitError> {
+    pub fn checked(
+        program: &Program,
+        options: crate::Options,
+    ) -> Result<(Vec<u8>, Lifted<Program>), EmitError> {
         let source = program.source.as_ref().ok_or(EmitError::NoEnvelope)?;
-        let codes = program.kernels.iter().map(|kernel| bytes(kernel, program.target.arch)).collect::<Result<Vec<_>, _>>()?;
+        let codes = program
+            .kernels
+            .iter()
+            .map(|kernel| bytes(kernel, program.target.arch))
+            .collect::<Result<Vec<_>, _>>()?;
         let parts = parts(program, &codes)?;
         let layout = source.elf.layout(&parts).map_err(SourceError::from)?;
         let out = source.write(&parts)?;
-        let lifted = crate::lift_object(&out, options).map_err(|e| EmitError::Relift(e.to_string()))?;
+        let lifted =
+            crate::lift_object(&out, options).map_err(|e| EmitError::Relift(e.to_string()))?;
         if lifted.program.kernels.len() != program.kernels.len() {
-            return Err(EmitError::Mismatch { kernel: "module".into(), what: "kernel count".into() });
+            return Err(EmitError::Mismatch {
+                kernel: "module".into(),
+                what: "kernel count".into(),
+            });
         }
-        for ((kernel, back), descriptor) in program.kernels.iter().zip(&lifted.program.kernels).zip(&layout.descriptors) {
-            let differ = |what: &str| EmitError::Mismatch { kernel: kernel.symbol.0.clone(), what: what.into() };
-            if kernel.symbol != back.symbol { return Err(differ("symbol")); }
-            if words(kernel, program.target.arch)? != words(back, program.target.arch)? { return Err(differ("instruction stream")); }
-            let (Abi::Hsa { metadata, .. }, Abi::Hsa { descriptor: read, metadata: read_meta }) = (&kernel.abi, &back.abi) else {
+        for ((kernel, back), descriptor) in program
+            .kernels
+            .iter()
+            .zip(&lifted.program.kernels)
+            .zip(&layout.descriptors)
+        {
+            let differ = |what: &str| EmitError::Mismatch {
+                kernel: kernel.symbol.0.clone(),
+                what: what.into(),
+            };
+            if kernel.symbol != back.symbol {
+                return Err(differ("symbol"));
+            }
+            if words(kernel, program.target.arch)? != words(back, program.target.arch)? {
+                return Err(differ("instruction stream"));
+            }
+            let (
+                Abi::Hsa { metadata, .. },
+                Abi::Hsa {
+                    descriptor: read,
+                    metadata: read_meta,
+                },
+            ) = (&kernel.abi, &back.abi)
+            else {
                 return Err(differ("ABI"));
             };
-            if metadata.parsed != read_meta.parsed { return Err(differ("metadata")); }
-            if read != descriptor { return Err(differ("descriptor")); }
+            if metadata.parsed != read_meta.parsed {
+                return Err(differ("metadata"));
+            }
+            if read != descriptor {
+                return Err(differ("descriptor"));
+            }
         }
         Ok((out, lifted))
     }

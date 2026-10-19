@@ -4500,7 +4500,11 @@ const Q8EF_MIN_TRIALS: usize = 2000;
 /// later sampled windows; the four cold IDs of the AR comparison are not.
 const Q8EF_TOKENS: usize = 32;
 const Q8EF_ROUTE_ARMS: [&str; 3] = ["q8ef_batched", "q8ef_interleaved", "q8ef_adaptive"];
-const Q8EF_RESTORE_ARMS: [&str; 3] = ["q8ef_session_batched", "q8ef_prefix_batched", "q8ef_disk_batched"];
+const Q8EF_RESTORE_ARMS: [&str; 3] = [
+    "q8ef_session_batched",
+    "q8ef_prefix_batched",
+    "q8ef_disk_batched",
+];
 const Q8EF_DISK_ARM: &str = "q8ef_disk_batched";
 const Q8EF_STAGE_ENV: &str = "HIPFIRE_SAMPLED_MTP_Q8EF_STAGE";
 /// Harness-control variables of the q8_ef arms (identity excludes them).
@@ -4582,7 +4586,9 @@ fn q8ef_row_mass(entries: &[(u32, f32)]) -> Result<f64, String> {
     let mut mass = 0.0f64;
     for &(token, prob) in entries {
         if !prob.is_finite() || prob < 0.0 {
-            return Err(format!("target row has probability {prob} for token {token}"));
+            return Err(format!(
+                "target row has probability {prob} for token {token}"
+            ));
         }
         mass += f64::from(prob);
     }
@@ -4640,7 +4646,10 @@ fn q8ef_pit_uniform(pits: &[f64], bins: usize) -> Result<(f64, usize, f64), Stri
         }
         counts[q8ef_bin(x, bins)] += 1.0;
     }
-    let stat: f64 = counts.iter().map(|c| (c - expected).powi(2) / expected).sum();
+    let stat: f64 = counts
+        .iter()
+        .map(|c| (c - expected).powi(2) / expected)
+        .sum();
     let df = bins - 1;
     Ok((stat, df, gamma_q(df as f64 / 2.0, stat / 2.0)))
 }
@@ -4666,7 +4675,10 @@ fn q8ef_pit_joint(pairs: &[(f64, f64)], grid: usize) -> Result<(f64, usize, f64)
         }
         counts[q8ef_bin(a, grid) * grid + q8ef_bin(b, grid)] += 1.0;
     }
-    let stat: f64 = counts.iter().map(|c| (c - expected).powi(2) / expected).sum();
+    let stat: f64 = counts
+        .iter()
+        .map(|c| (c - expected).powi(2) / expected)
+        .sum();
     let df = cells - 1;
     Ok((stat, df, gamma_q(df as f64 / 2.0, stat / 2.0)))
 }
@@ -4740,7 +4752,9 @@ fn q8ef_category_chi_square(rows: &[(&[(u32, f32)], u32)]) -> Result<(f64, usize
         .collect();
     kept.sort_unstable();
     if kept.is_empty() {
-        return Err(format!("no token reaches {Q8EF_MIN_EXPECTED} expected draws"));
+        return Err(format!(
+            "no token reaches {Q8EF_MIN_EXPECTED} expected draws"
+        ));
     }
     let index: HashMap<u32, usize> = kept.iter().enumerate().map(|(i, &t)| (t, i)).collect();
     let rest_expected: f64 = expected
@@ -4956,7 +4970,10 @@ fn q8ef_replay(w: &Q8efWindow) -> Result<(Vec<u32>, usize, usize), String> {
     fn target_row(w: &Q8efWindow, j: usize) -> Result<&[(u32, f32)], String> {
         match w.target_rows.get(j) {
             Some(row) => Ok(row.as_slice()),
-            None => Err(format!("no recorded target row {j} ({} rows)", w.target_rows.len())),
+            None => Err(format!(
+                "no recorded target row {j} ({} rows)",
+                w.target_rows.len()
+            )),
         }
     }
     let mut at = 0usize;
@@ -5020,7 +5037,9 @@ fn q8ef_check_window(w: &Q8efWindow) -> Result<(), String> {
     for (j, (&draft, row)) in w.drafts.iter().zip(&w.q_rows).enumerate() {
         q8ef_row_mass(row).map_err(|e| format!("proposal row {j}: {e}"))?;
         if !(q8ef_prob(row, draft) > 0.0) {
-            return Err(format!("draft {j} ({draft}) lies outside its proposal's support"));
+            return Err(format!(
+                "draft {j} ({draft}) lies outside its proposal's support"
+            ));
         }
     }
     for (j, (p, q)) in w.target_rows.iter().zip(&w.q_rows).enumerate() {
@@ -5111,13 +5130,18 @@ impl Q8efEvidence {
     /// violation (a rejected window that kept the residual, or an accepted /
     /// target-only window that zeroed it) is an error.
     fn observe(&mut self, salt: u64, ctx: &mut Q8efTrial, w: &Q8efWindow) -> Result<(), String> {
-        let at = format!("trial {} window at stream index {}", ctx.trial, ctx.next_index);
+        let at = format!(
+            "trial {} window at stream index {}",
+            ctx.trial, ctx.next_index
+        );
         q8ef_check_window(w).map_err(|e| format!("{at}: {e}"))?;
         let keep = w.keep();
         let reset = w.reset_delta();
         match keep {
             Q8efKeep::Full | Q8efKeep::NoDrafts if reset != 0 => {
-                return Err(format!("{at}: {keep:?} window zeroed the residual ({reset} resets)"));
+                return Err(format!(
+                    "{at}: {keep:?} window zeroed the residual ({reset} resets)"
+                ));
             }
             Q8efKeep::Keep0 | Q8efKeep::Partial if reset == 0 => {
                 return Err(format!("{at}: {keep:?} window left the residual unzeroed"));
@@ -5172,8 +5196,12 @@ impl Q8efEvidence {
                 continue;
             }
             let row = &w.target_rows[j];
-            let pit = q8ef_pit(row, token, q8ef_pit_draw(Q8EF_PIT_SALT ^ salt, ctx.trial, index))
-                .map_err(|e| format!("{at}, committed token {j}: {e}"))?;
+            let pit = q8ef_pit(
+                row,
+                token,
+                q8ef_pit_draw(Q8EF_PIT_SALT ^ salt, ctx.trial, index),
+            )
+            .map_err(|e| format!("{at}, committed token {j}: {e}"))?;
             self.pits.entry(index).or_default().push((ctx.trial, pit));
             if Q8EF_MARGINALS.contains(&index) {
                 self.category
@@ -5331,8 +5359,10 @@ fn q8ef_judge(
                 Err(format!("{} observations for {need} trials", rows.len())),
             );
         } else {
-            let pairs: Vec<(&[(u32, f32)], u32)> =
-                rows.iter().map(|(row, token)| (row.as_slice(), *token)).collect();
+            let pairs: Vec<(&[(u32, f32)], u32)> = rows
+                .iter()
+                .map(|(row, token)| (row.as_slice(), *token))
+                .collect();
             verdict(
                 format!("category position {index}"),
                 q8ef_category_chi_square(&pairs),
@@ -5367,7 +5397,10 @@ fn q8ef_judge(
         if pairs.len() != need {
             verdict(
                 format!("joint PIT ({a},{b})"),
-                Err(format!("{} paired observations for {need} trials", pairs.len())),
+                Err(format!(
+                    "{} paired observations for {need} trials",
+                    pairs.len()
+                )),
             );
         } else {
             verdict(
@@ -5669,7 +5702,15 @@ fn q8ef_ensure_shards(
             // The publish process cold-prefills the restore prompt and
             // unloads, demoting its snapshots to this shard's disk dir; the
             // restore process then runs the shard's trials against it.
-            q8ef_spawn(arm, "leviathan", model, dir, gap, Some("publish"), &format!("{stem}.publish"))?;
+            q8ef_spawn(
+                arm,
+                "leviathan",
+                model,
+                dir,
+                gap,
+                Some("publish"),
+                &format!("{stem}.publish"),
+            )?;
             q8ef_spawn(arm, "leviathan", model, dir, gap, Some("restore"), &stem)?;
         } else {
             q8ef_spawn(arm, "leviathan", model, dir, gap, None, &stem)?;
@@ -5707,7 +5748,9 @@ mod q8ef_run {
     use hipfire_runtime::sampler::apply_logit_policy_cpu;
     use hipfire_runtime::serve_contract::CacheDomain;
     use hipfire_runtime::session_cache::{SessionCache, SessionRoute};
-    use hipfire_runtime::spec_sampling::{fill_penalty_history, naive_target_sampler, SampleSpec, SparseDist};
+    use hipfire_runtime::spec_sampling::{
+        fill_penalty_history, naive_target_sampler, SampleSpec, SparseDist,
+    };
 
     /// A recorded draw must be the stream uniform the window measured it at.
     fn draw_u(w: &LabWindow, draw: LabDraw) -> Result<f32, String> {
@@ -5738,21 +5781,29 @@ mod q8ef_run {
         let all: &[f32] = match f.logits.as_deref() {
             Some(all) => all,
             None => {
-                return Err("the verify forward's raw logits were not kept (keep_logits is off)".to_string());
+                return Err(
+                    "the verify forward's raw logits were not kept (keep_logits is off)"
+                        .to_string(),
+                );
             }
         };
         let (start, end) = (r * f.vocab, (r + 1) * f.vocab);
-        all.get(start..end).ok_or_else(|| {
-            format!("raw logits hold {} values, row {r} needs {end}", all.len())
-        })
+        all.get(start..end)
+            .ok_or_else(|| format!("raw logits hold {} values, row {r} needs {end}", all.len()))
     }
 
     /// The raw verify-forward logits of rows `0..rows` of the window's block
     /// `[seed] ++ drafts`: a batched window has one forward over the block,
     /// an interleaved or target-only window one single-row forward per row
     /// (in order). Replay forwards after a rollback are never matched.
-    fn raw_rows<'a>(w: &'a LabWindow, drafts: &[u32], rows: usize) -> Result<Vec<&'a [f32]>, String> {
-        let block: Vec<u32> = std::iter::once(w.seed_token).chain(drafts.iter().copied()).collect();
+    fn raw_rows<'a>(
+        w: &'a LabWindow,
+        drafts: &[u32],
+        rows: usize,
+    ) -> Result<Vec<&'a [f32]>, String> {
+        let block: Vec<u32> = std::iter::once(w.seed_token)
+            .chain(drafts.iter().copied())
+            .collect();
         if rows > block.len() {
             return Err(format!("{rows} rows read from a {}-row block", block.len()));
         }
@@ -5760,7 +5811,11 @@ mod q8ef_run {
             w.forwards.iter().find(|f| !f.prefill && f.tokens == block);
         if let Some(f) = batched {
             if f.rows != block.len() {
-                return Err(format!("the verify forward emitted {} rows for a {}-row block", f.rows, block.len()));
+                return Err(format!(
+                    "the verify forward emitted {} rows for a {}-row block",
+                    f.rows,
+                    block.len()
+                ));
             }
             let mut out: Vec<&'a [f32]> = Vec::with_capacity(rows);
             for r in 0..rows {
@@ -5821,7 +5876,11 @@ mod q8ef_run {
             dist.build_from_logits(&row, spec, &mut Vec::new())
                 .map_err(|e| format!("row {j}: {e}"))?;
             let want = dist.entries();
-            let from_device = w.rows.iter().find(|r| r.row == j).map_or(false, |r| r.from_device);
+            let from_device = w
+                .rows
+                .iter()
+                .find(|r| r.row == j)
+                .map_or(false, |r| r.from_device);
             let same = if from_device {
                 want.len() == got.len()
                     && want
@@ -5858,7 +5917,10 @@ mod q8ef_run {
         if !w.sampled || w.naive {
             return Err("not a sampled Leviathan window".into());
         }
-        if w.forwards.iter().any(|f| f.nonfinite.iter().any(|&n| n > 0)) {
+        if w.forwards
+            .iter()
+            .any(|f| f.nonfinite.iter().any(|&n| n > 0))
+        {
             return Err("non-finite logits in a verify forward of the window".into());
         }
         if w.proposals.len() < w.drafts_generated {
@@ -6036,7 +6098,8 @@ mod q8ef_run {
         disk: Option<&Path>,
     ) -> Result<(), String> {
         let hfq = HfqFile::open(model).map_err(|e| e.to_string())?;
-        let domain = CacheDomain::for_model(&hfq, &loaded.tokenizer, None, "qwen4", loaded.gpu.device_id);
+        let domain =
+            CacheDomain::for_model(&hfq, &loaded.tokenizer, None, "qwen4", loaded.gpu.device_id);
         let cache = SessionCache::new(domain, budget);
         loaded.bundle.set_turn_snapshots(false);
         loaded.bundle.attach_session_cache(match disk {
@@ -6055,7 +6118,15 @@ mod q8ef_run {
     ) -> Result<(), String> {
         drafter.configure_request(cfg);
         drafter
-            .mtp_prefill(&mut loaded.gpu, &mut loaded.bundle, prompt, prompt, 0, false, &|| false)?
+            .mtp_prefill(
+                &mut loaded.gpu,
+                &mut loaded.bundle,
+                prompt,
+                prompt,
+                0,
+                false,
+                &|| false,
+            )?
             .into_first_token()?;
         loaded.bundle.session_commit();
         Ok(())
@@ -6087,7 +6158,9 @@ mod q8ef_run {
         let salt = q8ef_salt(arm)?;
         let stage = std::env::var(Q8EF_STAGE_ENV).ok();
         if kind == Kind::Disk && !matches!(stage.as_deref(), Some("publish" | "restore")) {
-            return Err(format!("{arm}: {Q8EF_STAGE_ENV} must be publish or restore"));
+            return Err(format!(
+                "{arm}: {Q8EF_STAGE_ENV} must be publish or restore"
+            ));
         }
         let identity = own_identity(model, dir, &Q8EF_CONTROL_ENV)?;
         let config = q8ef_config(arm, &identity, &settings, total, range)?;
@@ -6098,7 +6171,9 @@ mod q8ef_run {
         let disk_dir = dir.join(format!("q8ef-disk-{}", range.0));
         let mut loaded = load_with_max_seq(model, Q8EF_MAX_SEQ)?;
         let route_prompt = loaded.render(&settings.fixture.text())?;
-        settings.fixture.check_prompt(route_prompt.len(), &settings.pen)?;
+        settings
+            .fixture
+            .check_prompt(route_prompt.len(), &settings.pen)?;
         let chunk = loaded
             .bundle
             .spec_chunk_rows()
@@ -6128,14 +6203,24 @@ mod q8ef_run {
         let mut drafter = new_drafter_with_max_seq(&mut loaded, None, false, Q8EF_MAX_SEQ)?;
         arm_taps(&mut loaded, &mut drafter);
         let prime_cfg = |seed: u64| -> SpecRequestConfig {
-            spec_request(settings.temp, settings.top_p, settings.top_k, settings.min_p, seed, &settings.pen)
+            spec_request(
+                settings.temp,
+                settings.top_p,
+                settings.top_k,
+                settings.min_p,
+                seed,
+                &settings.pen,
+            )
         };
         if kind == Kind::Disk && stage.as_deref() == Some("publish") {
             // Unloading demotes the snapshots of this cold prefill to the
             // disk tier; the restore process must start from them.
             prime(&mut loaded, &mut drafter, &disk_prompt, prime_cfg(1))?;
             Box::new(drafter).mtp_free(&mut loaded.gpu);
-            return loaded.bundle.free_gpu(&mut loaded.gpu).map_err(|e| e.to_string());
+            return loaded
+                .bundle
+                .free_gpu(&mut loaded.gpu)
+                .map_err(|e| e.to_string());
         }
         let a_slice: &[u32] = a.as_slice();
         let a2_slice: &[u32] = a2.as_slice();
@@ -6168,7 +6253,10 @@ mod q8ef_run {
                     if kind == Kind::Prefix {
                         // A reset outside the cache drops the resident
                         // snapshot, so the plan can only offer the pool.
-                        loaded.bundle.reset(&mut loaded.gpu).map_err(|e| e.to_string())?;
+                        loaded
+                            .bundle
+                            .reset(&mut loaded.gpu)
+                            .map_err(|e| e.to_string())?;
                     }
                     if kind == Kind::Disk {
                         // Demote every published snapshot to the disk tier
@@ -6191,7 +6279,16 @@ mod q8ef_run {
                     (target, reused)
                 }
             };
-            let (windows, produced) = request(&mut loaded, &mut drafter, prompt, reused, cfg, salt, trial, &mut ev)?;
+            let (windows, produced) = request(
+                &mut loaded,
+                &mut drafter,
+                prompt,
+                reused,
+                cfg,
+                salt,
+                trial,
+                &mut ev,
+            )?;
             loaded.bundle.session_commit();
             if kind == Kind::Disk {
                 let after = snap_files(&disk_dir);
@@ -6212,8 +6309,18 @@ mod q8ef_run {
             // adaptive route's choices depend on wall-clock prices.
             if forced && trial < REPLAYS {
                 let mut scratch = Q8efEvidence::default();
-                let (again, _) = request(&mut loaded, &mut drafter, prompt, 0, prime_cfg(seed), salt, trial, &mut scratch)?;
-                let keys = |ws: &[Q8efWindow]| ws.iter().map(Q8efWindow::replay_key).collect::<Vec<_>>();
+                let (again, _) = request(
+                    &mut loaded,
+                    &mut drafter,
+                    prompt,
+                    0,
+                    prime_cfg(seed),
+                    salt,
+                    trial,
+                    &mut scratch,
+                )?;
+                let keys =
+                    |ws: &[Q8efWindow]| ws.iter().map(Q8efWindow::replay_key).collect::<Vec<_>>();
                 if keys(&again) != keys(&windows) {
                     let first = keys(&again)
                         .iter()
@@ -6240,14 +6347,19 @@ mod q8ef_run {
         );
         fs::write(
             &path,
-            serde_json::to_vec(&json!({"arm": arm, "range": [range.0, range.1], "evidence": ev.to_json()?}))
-                .map_err(|e| e.to_string())?,
+            serde_json::to_vec(
+                &json!({"arm": arm, "range": [range.0, range.1], "evidence": ev.to_json()?}),
+            )
+            .map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
         write_config(&path, &config)?;
         write_receipt(&path, &hw_identity::receipt(&loaded.gpu, model))?;
         Box::new(drafter).mtp_free(&mut loaded.gpu);
-        loaded.bundle.free_gpu(&mut loaded.gpu).map_err(|e| e.to_string())
+        loaded
+            .bundle
+            .free_gpu(&mut loaded.gpu)
+            .map_err(|e| e.to_string())
     }
 
     /// The session arm alternates two prompts that share their first chunk,
@@ -6384,15 +6496,17 @@ fn sampled_mtp_q8ef_matches_verify_distribution_on_flash_next() {
         // restore, a tap gap, an infrastructure failure) has no verdict: it
         // is recorded and the run is INCOMPLETE, never a PASS.
         let collected = q8ef_ensure_shards(&model, &dir, arm, total, &settings, &identity)
-            .and_then(|shards: Vec<(usize, usize)>| -> Result<Q8efEvidence, String> {
-                let mut merged = Q8efEvidence::default();
-                for range in shards {
-                    let part = read_json(&late_file(&dir, arm, range, "q8ef.json"))
-                        .and_then(|v: Value| Q8efEvidence::from_json(&v["evidence"]))?;
-                    merged.merge(part);
-                }
-                Ok(merged)
-            });
+            .and_then(
+                |shards: Vec<(usize, usize)>| -> Result<Q8efEvidence, String> {
+                    let mut merged = Q8efEvidence::default();
+                    for range in shards {
+                        let part = read_json(&late_file(&dir, arm, range, "q8ef.json"))
+                            .and_then(|v: Value| Q8efEvidence::from_json(&v["evidence"]))?;
+                        merged.merge(part);
+                    }
+                    Ok(merged)
+                },
+            );
         arms.insert(
             arm.to_string(),
             collected.unwrap_or_else(|error| {
@@ -6420,7 +6534,15 @@ fn sampled_mtp_q8ef_matches_verify_distribution_on_flash_next() {
             ));
         }
     }
-    let receipt = q8ef_receipt(mode, &cohort, &arms, &cover, &report, &failures, &incomplete);
+    let receipt = q8ef_receipt(
+        mode,
+        &cohort,
+        &arms,
+        &cover,
+        &report,
+        &failures,
+        &incomplete,
+    );
     let path = dir.join(Q8EF_RECEIPT);
     write_json(&path, &receipt).unwrap_or_else(|e| panic!("{e}"));
     eprint!("{report}");
@@ -6531,7 +6653,10 @@ mod q8ef_law_logic {
             .collect();
         let (_, df, p) = q8ef_pit_uniform(&pits, Q8EF_PIT_BINS).unwrap();
         assert_eq!(df, Q8EF_PIT_BINS - 1);
-        assert!(p > 0.99, "stratified quantiles are uniform to the bin: p {p}");
+        assert!(
+            p > 0.99,
+            "stratified quantiles are uniform to the bin: p {p}"
+        );
         let pairs: Vec<(&[(u32, f32)], u32)> = rows
             .iter()
             .map(|(entries, token, _)| (entries.as_slice(), *token))
@@ -6555,7 +6680,8 @@ mod q8ef_law_logic {
             .collect();
         let (_, _, p) = q8ef_pit_uniform(&pits, Q8EF_PIT_BINS).unwrap();
         assert!(p < ALPHA, "pit p {p}");
-        let flats: Vec<Vec<(u32, f32)>> = rows.iter().map(|(entries, _, _)| flat(entries)).collect();
+        let flats: Vec<Vec<(u32, f32)>> =
+            rows.iter().map(|(entries, _, _)| flat(entries)).collect();
         let pairs: Vec<(&[(u32, f32)], u32)> = flats
             .iter()
             .zip(&rows)
@@ -6576,7 +6702,10 @@ mod q8ef_law_logic {
         let rows: Vec<(&[(u32, f32)], u32)> =
             tokens.iter().map(|&t| (entries.as_slice(), t)).collect();
         let (_, df, p) = q8ef_category_chi_square(&rows).unwrap();
-        assert_eq!(df, 3, "3 heavy cells + 1 pooled rest, minus the reference cell");
+        assert_eq!(
+            df, 3,
+            "3 heavy cells + 1 pooled rest, minus the reference cell"
+        );
         assert!(p > 0.5, "p {p}");
 
         // A tail too thin to stand alone merges into the heaviest cell.
@@ -6596,18 +6725,33 @@ mod q8ef_law_logic {
     fn q8ef_statistics_refuse_what_they_cannot_judge() {
         let entries = [(1u32, 0.5f32), (2, 0.5)];
         assert!(q8ef_pit(&entries, 3, 0.5).is_err(), "outside the support");
-        assert!(q8ef_pit(&[(1, 0.0), (2, 1.0)], 1, 0.5).is_err(), "zero probability");
+        assert!(
+            q8ef_pit(&[(1, 0.0), (2, 1.0)], 1, 0.5).is_err(),
+            "zero probability"
+        );
         assert!(q8ef_pit(&entries, 1, 1.0).is_err(), "u = 1");
         assert!(q8ef_pit(&entries, 1, -0.1).is_err(), "u < 0");
         assert!(q8ef_pit(&[(1, f32::NAN)], 1, 0.5).is_err(), "non-finite");
         assert!(q8ef_pit(&[(1, 0.0)], 1, 0.5).is_err(), "no mass");
         let pit = q8ef_pit(&entries, 2, 0.5).unwrap();
         assert!((pit - 0.75).abs() < 1e-12, "{pit}");
-        assert!(q8ef_pit_uniform(&[0.5; 99], Q8EF_PIT_BINS).is_err(), "too few values");
-        assert!(q8ef_pit_uniform(&[1.5; 400], Q8EF_PIT_BINS).is_err(), "out of range");
-        assert!(q8ef_pit_joint(&[(0.5, 0.5); 79], Q8EF_JOINT_GRID).is_err(), "too few pairs");
+        assert!(
+            q8ef_pit_uniform(&[0.5; 99], Q8EF_PIT_BINS).is_err(),
+            "too few values"
+        );
+        assert!(
+            q8ef_pit_uniform(&[1.5; 400], Q8EF_PIT_BINS).is_err(),
+            "out of range"
+        );
+        assert!(
+            q8ef_pit_joint(&[(0.5, 0.5); 79], Q8EF_JOINT_GRID).is_err(),
+            "too few pairs"
+        );
         let off_support: Vec<(&[(u32, f32)], u32)> = vec![(&entries[..], 9)];
-        assert!(q8ef_category_chi_square(&off_support).is_err(), "off-support token");
+        assert!(
+            q8ef_category_chi_square(&off_support).is_err(),
+            "off-support token"
+        );
         // A deterministic row has no sampling variance to test against.
         let point = [(7u32, 1.0f32)];
         let rows: Vec<(&[(u32, f32)], u32)> = (0..50).map(|_| (&point[..], 7)).collect();
@@ -6618,7 +6762,12 @@ mod q8ef_law_logic {
     fn q8ef_joint_grid_accepts_a_uniform_square_and_rejects_dependence() {
         // 60 x 60 cell centres: exactly uniform on every 4 x 4 cell.
         let square: Vec<(f64, f64)> = (0..3600)
-            .map(|i| ((i % 60) as f64 / 60.0 + 1.0 / 120.0, (i / 60) as f64 / 60.0 + 1.0 / 120.0))
+            .map(|i| {
+                (
+                    (i % 60) as f64 / 60.0 + 1.0 / 120.0,
+                    (i / 60) as f64 / 60.0 + 1.0 / 120.0,
+                )
+            })
             .collect();
         let (stat, df, p) = q8ef_pit_joint(&square, Q8EF_JOINT_GRID).unwrap();
         assert_eq!(df, Q8EF_JOINT_GRID * Q8EF_JOINT_GRID - 1);
@@ -6636,7 +6785,10 @@ mod q8ef_law_logic {
         assert!(q8ef_check_plan(1999, "q8_ef").unwrap_err().contains("2000"));
         for mode in ["q8", "fp32"] {
             let error = q8ef_check_plan(2000, mode).unwrap_err();
-            assert!(error.contains(hw_identity::GDN_TEST_STATE_QUANT_ENV), "{error}");
+            assert!(
+                error.contains(hw_identity::GDN_TEST_STATE_QUANT_ENV),
+                "{error}"
+            );
         }
     }
 }
@@ -6675,7 +6827,14 @@ mod q8ef_window_logic {
 
     /// p = q accepts every draft for any u < 1, then the bonus is p's draw.
     fn full() -> Q8efWindow {
-        window(&[1, 2], &[&P, &P, &P], &[&P, &P], &[0.9, 0.9, 0.5], &[1, 2, 1], 2)
+        window(
+            &[1, 2],
+            &[&P, &P, &P],
+            &[&P, &P],
+            &[0.9, 0.9, 0.5],
+            &[1, 2, 1],
+            2,
+        )
     }
 
     /// Draft 3 has p = 0: rejected, replacement from the residual (= p).
@@ -6725,22 +6884,32 @@ mod q8ef_window_logic {
     fn q8ef_check_window_refuses_a_production_verdict_the_law_does_not_give() {
         let mut wrong_token = keep0();
         wrong_token.committed = vec![1];
-        assert!(q8ef_check_window(&wrong_token).unwrap_err().contains("independent replay"));
+        assert!(q8ef_check_window(&wrong_token)
+            .unwrap_err()
+            .contains("independent replay"));
         let mut wrong_accept = full();
         wrong_accept.accepted = 1;
         assert!(q8ef_check_window(&wrong_accept).is_err());
         let mut spare_uniform = full();
         spare_uniform.uniforms.push(0.3);
-        assert!(q8ef_check_window(&spare_uniform).unwrap_err().contains("consumed 3"));
+        assert!(q8ef_check_window(&spare_uniform)
+            .unwrap_err()
+            .contains("consumed 3"));
         let mut short_tape = full();
         short_tape.uniforms.pop();
-        assert!(q8ef_check_window(&short_tape).unwrap_err().contains("more than"));
+        assert!(q8ef_check_window(&short_tape)
+            .unwrap_err()
+            .contains("more than"));
         let mut missing_row = full();
         missing_row.target_rows.pop();
-        assert!(q8ef_check_window(&missing_row).unwrap_err().contains("no recorded target row"));
+        assert!(q8ef_check_window(&missing_row)
+            .unwrap_err()
+            .contains("no recorded target row"));
         let mut off_support = keep0();
         off_support.drafts = vec![9];
-        assert!(q8ef_check_window(&off_support).unwrap_err().contains("support"));
+        assert!(q8ef_check_window(&off_support)
+            .unwrap_err()
+            .contains("support"));
         let mut bad_row = full();
         bad_row.target_rows[1] = vec![(1, f32::NAN)];
         assert!(q8ef_check_window(&bad_row).is_err());
@@ -6771,10 +6940,16 @@ mod q8ef_window_logic {
         // A rejected window that kept the residual, and an accepted one that zeroed it.
         let mut kept = keep0();
         kept.resets = (7, 7);
-        assert!(ev.observe(1, &mut ctx, &kept).unwrap_err().contains("unzeroed"));
+        assert!(ev
+            .observe(1, &mut ctx, &kept)
+            .unwrap_err()
+            .contains("unzeroed"));
         let mut zeroed = full();
         zeroed.resets = (7, 8);
-        assert!(ev.observe(1, &mut ctx, &zeroed).unwrap_err().contains("zeroed the residual"));
+        assert!(ev
+            .observe(1, &mut ctx, &zeroed)
+            .unwrap_err()
+            .contains("zeroed the residual"));
     }
 
     #[test]
@@ -6804,7 +6979,14 @@ mod q8ef_window_logic {
     fn q8ef_judge_is_incomplete_without_observations_and_a_failure_on_a_wrong_law() {
         let empty = Q8efEvidence::default();
         let (mut report, mut failures, mut incomplete) = (String::new(), Vec::new(), Vec::new());
-        q8ef_judge("batched", &empty, 2000, &mut report, &mut failures, &mut incomplete);
+        q8ef_judge(
+            "batched",
+            &empty,
+            2000,
+            &mut report,
+            &mut failures,
+            &mut incomplete,
+        );
         assert!(failures.is_empty());
         // The trial count, every marginal (category + PIT), every joint,
         // every draft slot and the stream uniforms.
@@ -6823,12 +7005,22 @@ mod q8ef_window_logic {
             ev.category.entry(1).or_default().push((P.to_vec(), 2));
         }
         let (mut report, mut failures, mut incomplete) = (String::new(), Vec::new(), Vec::new());
-        q8ef_judge("batched", &ev, 2000, &mut report, &mut failures, &mut incomplete);
+        q8ef_judge(
+            "batched",
+            &ev,
+            2000,
+            &mut report,
+            &mut failures,
+            &mut incomplete,
+        );
         assert!(
             failures.iter().any(|f| f.contains("category position 1")),
             "{failures:?}"
         );
-        assert!(failures.iter().any(|f| f.contains("PIT position 1")), "{failures:?}");
+        assert!(
+            failures.iter().any(|f| f.contains("PIT position 1")),
+            "{failures:?}"
+        );
         assert!(report.contains("category position 1"));
     }
 
@@ -6844,18 +7036,25 @@ mod q8ef_window_logic {
             ev.category.entry(1).or_default().push((P.to_vec(), 1));
         }
         let (mut report, mut failures, mut incomplete) = (String::new(), Vec::new(), Vec::new());
-        q8ef_judge("batched", &ev, 2000, &mut report, &mut failures, &mut incomplete);
+        q8ef_judge(
+            "batched",
+            &ev,
+            2000,
+            &mut report,
+            &mut failures,
+            &mut incomplete,
+        );
         assert!(failures.is_empty(), "{failures:?}");
         assert!(
-            incomplete
-                .iter()
-                .any(|m| m.contains("category position 1") && m.contains("1999 observations for 2000 trials")),
+            incomplete.iter().any(|m| m.contains("category position 1")
+                && m.contains("1999 observations for 2000 trials")),
             "{incomplete:?}"
         );
         assert!(
             incomplete
                 .iter()
-                .any(|m| m.contains("PIT position 1") && m.contains("1999 observations for 2000 trials")),
+                .any(|m| m.contains("PIT position 1")
+                    && m.contains("1999 observations for 2000 trials")),
             "{incomplete:?}"
         );
     }
@@ -6883,11 +7082,18 @@ mod q8ef_window_logic {
         ev.observe(1, &mut ctx, &full()).unwrap();
         assert_eq!(ev.draft_pits[&0].len(), 1);
         assert_eq!(ev.draft_pits[&1].len(), 1);
-        assert_eq!(ev.uniform_hist.iter().sum::<u64>(), 3, "one per stream uniform");
+        assert_eq!(
+            ev.uniform_hist.iter().sum::<u64>(),
+            3,
+            "one per stream uniform"
+        );
         assert_eq!(ev.routes["batched"], 1);
         let mut bad = full();
         bad.stream_uniforms = vec![1.5, 0.1, 0.1];
-        assert!(ev.observe(1, &mut ctx, &bad).unwrap_err().contains("outside [0, 1)"));
+        assert!(ev
+            .observe(1, &mut ctx, &bad)
+            .unwrap_err()
+            .contains("outside [0, 1)"));
     }
 
     #[test]
@@ -6916,7 +7122,11 @@ mod q8ef_window_logic {
         assert_eq!(merged.trials, 2);
         assert_eq!(merged.windows, 2);
         assert_eq!(merged.keep, [0, 1, 0, 1]);
-        assert_eq!(merged.pits[&1].len(), 2, "trial 0 and trial 1 both reached index 1");
+        assert_eq!(
+            merged.pits[&1].len(),
+            2,
+            "trial 0 and trial 1 both reached index 1"
+        );
         assert_eq!(merged.routes["batched"], 2);
     }
 
@@ -6931,13 +7141,15 @@ mod q8ef_window_logic {
         assert_ne!(a.replay_key(), b.replay_key());
         let mut c = keep0();
         c.resets = (4, 6);
-        assert_ne!(keep0().replay_key(), c.replay_key(), "a different reset delta differs");
+        assert_ne!(
+            keep0().replay_key(),
+            c.replay_key(),
+            "a different reset delta differs"
+        );
     }
 
     fn cohort() -> Q8efCohort {
-        Q8efCohort {
-            trials: 2000,
-        }
+        Q8efCohort { trials: 2000 }
     }
 
     #[test]
@@ -6993,7 +7205,11 @@ mod q8ef_window_logic {
             arms.insert(arm.to_string(), ev);
         }
         let all = q8ef_coverage(&arms, &c);
-        let short: Vec<&str> = all.iter().filter(|i| i.observed < i.required).map(|i| i.id).collect();
+        let short: Vec<&str> = all
+            .iter()
+            .filter(|i| i.observed < i.required)
+            .map(|i| i.id)
+            .collect();
         assert!(short.is_empty(), "{short:?}");
         // One missing restore, one missing half: exactly those items are short.
         arms.get_mut("q8ef_prefix_batched").unwrap().restored_trials = 1999;
@@ -7001,7 +7217,11 @@ mod q8ef_window_logic {
             ev.ring_half[1] = 0;
         }
         let all = q8ef_coverage(&arms, &c);
-        let short: Vec<&str> = all.iter().filter(|i| i.observed < i.required).map(|i| i.id).collect();
+        let short: Vec<&str> = all
+            .iter()
+            .filter(|i| i.observed < i.required)
+            .map(|i| i.id)
+            .collect();
         assert_eq!(short, ["prefix_restore_then_sample", "ring_half_1"]);
     }
 
@@ -7017,8 +7237,14 @@ mod q8ef_window_logic {
         let pass = q8ef_receipt("q8_ef", &c, &arms, &[], "", &[], &[]);
         assert_eq!(pass["verdict"], "PASS");
         assert!(pass["unobserved_by_design"].as_array().unwrap().len() == 3);
-        assert!(pass["scope"].as_str().unwrap().contains("stream indices >= 1"));
-        assert_eq!(incomplete["coverage"].as_array().unwrap().len(), cover.len());
+        assert!(pass["scope"]
+            .as_str()
+            .unwrap()
+            .contains("stream indices >= 1"));
+        assert_eq!(
+            incomplete["coverage"].as_array().unwrap().len(),
+            cover.len()
+        );
         let message = q8ef_failure_message(Path::new("d"), &["x\n".into()], &["y\n".into()]);
         assert!(message.contains("DISTRIBUTION FAILURE (law)") && message.contains("INCOMPLETE"));
     }

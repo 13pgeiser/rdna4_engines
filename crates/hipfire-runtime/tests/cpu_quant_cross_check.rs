@@ -289,8 +289,8 @@ fn synthetic_group(qt: u8) -> Vec<u8> {
 #[test]
 fn dequantize_v2_family_matches_cpu_transcription_on_synthetic_groups() {
     for qt in [44u8, 45, 47, 48, 49, 50] {
-        let q = CpuQuant::from_quant_type(qt)
-            .unwrap_or_else(|| panic!("qt {qt} unmapped in CpuQuant"));
+        let q =
+            CpuQuant::from_quant_type(qt).unwrap_or_else(|| panic!("qt {qt} unmapped in CpuQuant"));
         let group = synthetic_group(qt);
         assert_eq!(group.len(), q.group_bytes(), "qt {qt} group size");
 
@@ -306,7 +306,11 @@ fn dequantize_v2_family_matches_cpu_transcription_on_synthetic_groups() {
         let ge = q.group_elems();
         let mut got = vec![0.0f32; 512];
         for gidx in 0..2 {
-            dequant_group(q, &data[gidx * gb..(gidx + 1) * gb], &mut got[gidx * ge..(gidx + 1) * ge]);
+            dequant_group(
+                q,
+                &data[gidx * gb..(gidx + 1) * gb],
+                &mut got[gidx * ge..(gidx + 1) * ge],
+            );
         }
         for (i, (a, b)) in got.iter().zip(&want).enumerate() {
             assert_eq!(

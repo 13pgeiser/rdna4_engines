@@ -38,7 +38,9 @@ fn hash_file(path: &Path, ranges: &[(u64, u64)]) -> Result<(u64, String, Vec<Str
     let (mut whole, mut parts) = (Sha256::new(), vec![Sha256::new(); ranges.len()]);
     let mut pos = 0u64;
     loop {
-        let n = f.read(&mut buf).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
         if n == 0 {
             break;
         }
@@ -52,19 +54,28 @@ fn hash_file(path: &Path, ranges: &[(u64, u64)]) -> Result<(u64, String, Vec<Str
         }
         pos += n as u64;
     }
-    Ok((pos, hex(&whole.finalize()), parts.into_iter().map(|h| hex(&h.finalize())).collect()))
+    Ok((
+        pos,
+        hex(&whole.finalize()),
+        parts.into_iter().map(|h| hex(&h.finalize())).collect(),
+    ))
 }
 
 fn canon(p: &Path) -> String {
-    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()).display().to_string()
+    std::fs::canonicalize(p)
+        .unwrap_or_else(|_| p.to_path_buf())
+        .display()
+        .to_string()
 }
 
 /// Header summary plus streamed raw hashes of one sidecar.
 fn describe(path: &Path, base_len: u64, base_index: &str) -> Result<Value, String> {
     let rows = PleRowsFile::open(path)?;
     let (h, t) = (rows.header(), rows.table());
-    let (size, whole, parts) =
-        hash_file(path, &[(h.data_offset, h.data_bytes), (h.rank_offset, h.rank_bytes)])?;
+    let (size, whole, parts) = hash_file(
+        path,
+        &[(h.data_offset, h.data_bytes), (h.rank_offset, h.rank_bytes)],
+    )?;
     Ok(json!({
         "path": canon(path),
         "file_bytes": size,
@@ -92,7 +103,10 @@ fn describe(path: &Path, base_len: u64, base_index: &str) -> Result<Value, Strin
 }
 
 fn arg(args: &[String], flag: &str) -> Option<PathBuf> {
-    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).map(PathBuf::from)
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .map(PathBuf::from)
 }
 
 /// ple_convert's algorithm: per-shard sha256 of the raw shard bytes, then
@@ -131,7 +145,9 @@ fn verify_embedded(base: &HfqFile, rows: &PleRowsFile) -> Result<Value, String> 
         else {
             continue;
         };
-        let s: usize = num.parse().map_err(|_| format!("bad shard name {}", info.name))?;
+        let s: usize = num
+            .parse()
+            .map_err(|_| format!("bad shard name {}", info.name))?;
         if ple_shard_name(s) != info.name {
             return Err(format!("non-canonical shard name {}", info.name));
         }
@@ -155,8 +171,10 @@ fn verify_embedded(base: &HfqFile, rows: &PleRowsFile) -> Result<Value, String> 
     let shape_ok = found.iter().all(|(_, i)| {
         i.quant_type == 3 && i.shape == [rps as u32, width as u32] && i.data_size as u64 == want
     });
-    let ranges: Vec<(u64, u64)> =
-        found.iter().map(|(_, i)| (i.data_offset as u64, i.data_size as u64)).collect();
+    let ranges: Vec<(u64, u64)> = found
+        .iter()
+        .map(|(_, i)| (i.data_offset as u64, i.data_size as u64))
+        .collect();
     let actual = shard_merkle(base.path(), &ranges)?;
     Ok(json!({
         "path": canon(base.path()), "embedded_shards": found.len(),
@@ -181,7 +199,9 @@ fn run() -> Result<Value, String> {
 
     let mut base = HfqFile::open(&base_path).map_err(|e| format!("open base: {e}"))?;
     let base_len = base.file_len();
-    let base_index = hex(&base.index_sha256().map_err(|e| format!("base index sha256: {e}"))?);
+    let base_index = hex(&base
+        .index_sha256()
+        .map_err(|e| format!("base index sha256: {e}"))?);
 
     let sc = describe(&sidecar, base_len, &base_index)?;
     // Actual existing API; a rejection is the recorded result, not a failure.

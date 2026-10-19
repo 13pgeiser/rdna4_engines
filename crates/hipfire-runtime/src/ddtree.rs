@@ -1351,7 +1351,8 @@ mod tests {
         // Full accept: both drafts equal the argmax ⇒ accept 2, bonus = argmax at
         // the final row (pos 2) = 5.
         let drafts_full = [2u32, 4];
-        let (acc_f, bonus_f) = naive_sample_chain(&logits, &drafts_full, vocab, 0.0, 1.0, 0, &mut rng);
+        let (acc_f, bonus_f) =
+            naive_sample_chain(&logits, &drafts_full, vocab, 0.0, 1.0, 0, &mut rng);
         assert_eq!(acc_f, 2);
         assert_eq!(bonus_f, 5);
     }
@@ -1385,7 +1386,8 @@ mod tests {
             let mut hist = vec![0u64; vocab];
             let mut rng = 0xC0FFEE_1234_5678_u64 ^ ((temp.to_bits() as u64) << 8);
             for _ in 0..n_runs {
-                let (accepted, bonus) = naive_sample_chain(&full, &[draft], vocab, temp, 1.0, 0, &mut rng);
+                let (accepted, bonus) =
+                    naive_sample_chain(&full, &[draft], vocab, temp, 1.0, 0, &mut rng);
                 // Position-0 emitted token = accepted draft (if accept) else bonus.
                 let emitted = if accepted >= 1 { draft } else { bonus };
                 hist[emitted as usize] += 1;

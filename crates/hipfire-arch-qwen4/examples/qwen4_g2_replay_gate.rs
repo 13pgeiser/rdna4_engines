@@ -104,9 +104,7 @@ struct Args {
 }
 
 fn parse_count(flag: &str, value: &str) -> Result<usize, String> {
-    value
-        .parse::<usize>()
-        .map_err(|e| format!("{flag}: {e}"))
+    value.parse::<usize>().map_err(|e| format!("{flag}: {e}"))
 }
 
 fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Args, String> {
@@ -309,8 +307,7 @@ fn load_bundle(
     max_seq: usize,
     vram_layers: VramLayers,
 ) -> Result<(Qwen4Bundle, LoadFacts), String> {
-    let mut hfq =
-        HfqFile::open(path).map_err(|e| format!("open HFQM {}: {e}", path.display()))?;
+    let mut hfq = HfqFile::open(path).map_err(|e| format!("open HFQM {}: {e}", path.display()))?;
     // Never derives a missing q4 PLE table: derive it with
     // `hipfire ple derive` (or a serve load) first.
     let choice = attach_validation_ple_rows(
@@ -351,10 +348,8 @@ fn load_bundle(
             if gpu.is_uma() {
                 return Err("host-mapped experts are only for discrete GPUs".into());
             }
-            let moved = hipfire_arch_qwen4::expert_residency::place_routed_experts(
-                &mut weights,
-                layers,
-            );
+            let moved =
+                hipfire_arch_qwen4::expert_residency::place_routed_experts(&mut weights, layers);
             eprintln!(
                 "qwen4_g2_replay_gate: routed experts: layers 0..{layers} in VRAM, {moved} tensors host-mapped"
             );
@@ -523,7 +518,12 @@ fn snapshot(gpu: &Gpu, bundle: &Qwen4Bundle, logits: &GpuTensor) -> Result<Snaps
     let mut lengths = Vec::with_capacity(state.qsa.len());
     for (layer, qsa) in state.qsa.iter().enumerate() {
         let active = [
-            ("full_keys", &qsa.full_keys, qsa.full_len, qsa.full_row_units),
+            (
+                "full_keys",
+                &qsa.full_keys,
+                qsa.full_len,
+                qsa.full_row_units,
+            ),
             (
                 "full_values",
                 &qsa.full_values,
@@ -637,9 +637,10 @@ fn compare(candidate: &Snapshot, baseline: &Snapshot) -> Mismatch {
         ..Mismatch::default()
     };
     for index in 0..candidate.regions.len().max(baseline.regions.len()) {
-        let (name, mismatched) = match (candidate.regions.get(index), baseline.regions.get(index))
-        {
-            (Some((name, a)), Some((other, b))) if name == other => (name.as_str(), diff_bytes(a, b)),
+        let (name, mismatched) = match (candidate.regions.get(index), baseline.regions.get(index)) {
+            (Some((name, a)), Some((other, b))) if name == other => {
+                (name.as_str(), diff_bytes(a, b))
+            }
             // A region the other side lacks, or under another name, differs in
             // every byte (and at least once when empty).
             (Some((name, a)), _) => (name.as_str(), a.len().max(1) as u64),
@@ -724,9 +725,7 @@ fn run_arm(
             let before = launched();
             bundle
                 .forward_token(gpu, decode_token(i), &logits, None)
-                .map_err(|e| {
-                    format!("forward {i} at position {}: {e}", bundle.state.position)
-                })?;
+                .map_err(|e| format!("forward {i} at position {}: {e}", bundle.state.position))?;
             launches.push(launched().saturating_sub(before));
             gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
             snapshots.push(snapshot(gpu, bundle, &logits)?);
@@ -792,7 +791,10 @@ fn capture_phase(
     let closed = state == ReplayState::Ready && plan_ready(gpu);
     gate.push(
         "capture_executed",
-        closed && recorded > 0 && summary.launch_count == recorded && hip_launches >= recorded as u64,
+        closed
+            && recorded > 0
+            && summary.launch_count == recorded
+            && hip_launches >= recorded as u64,
         Some(
             u64::from(!closed)
                 + u64::from(recorded == 0)
@@ -943,7 +945,10 @@ fn positive_phase(
             m.logits + m.gdn + m.qsa + m.ple + m.lengths + m.position + m.argmax,
             m.json(),
         ),
-        None => gate.error("capture_forward_matches_hip_baseline", "missing capture snapshot"),
+        None => gate.error(
+            "capture_forward_matches_hip_baseline",
+            "missing capture snapshot",
+        ),
     }
 
     for executor in [Executor::Production, Executor::Plan, Executor::HipOracle] {
@@ -997,7 +1002,11 @@ fn positive_phase(
                 )
             }
         };
-        gate.count(&format!("positive_{name}_executed"), executed_mismatch, evidence);
+        gate.count(
+            &format!("positive_{name}_executed"),
+            executed_mismatch,
+            evidence,
+        );
         let stays_ready = arm.state_after == ReplayState::Ready;
         gate.push(
             &format!("positive_{name}_route_stays_ready"),
@@ -1020,10 +1029,9 @@ fn positive_phase(
             per_position.push(json!({"position": baseline.position, "mismatch": m.json()}));
             total.add(m);
         }
-        let compared: u64 = hip
-            .snapshots
-            .first()
-            .map_or(0, |s| s.regions.iter().map(|(_, b)| b.len() as u64).sum::<u64>() + s.logits.len() as u64);
+        let compared: u64 = hip.snapshots.first().map_or(0, |s| {
+            s.regions.iter().map(|(_, b)| b.len() as u64).sum::<u64>() + s.logits.len() as u64
+        });
         for (family, count) in [
             ("logits", total.logits),
             ("gdn", total.gdn),
@@ -1253,14 +1261,14 @@ fn run(args: &Args) -> Result<(Value, bool), String> {
     let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
     let arch = gpu.arch.to_string();
 
-    let (mut bundle, facts) = match load_bundle(&mut gpu, &args.model, args.max_seq, args.vram_layers)
-    {
-        Ok(loaded) => loaded,
-        Err(error) => {
-            gate.error("load_bundle", error);
-            return Ok((finish(&gate, &report, args, &arch, started), false));
-        }
-    };
+    let (mut bundle, facts) =
+        match load_bundle(&mut gpu, &args.model, args.max_seq, args.vram_layers) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                gate.error("load_bundle", error);
+                return Ok((finish(&gate, &report, args, &arch, started), false));
+            }
+        };
     // The gate is required only where the product takes the retained Redline
     // route by default, decided from the loaded model's facts by the daemon's
     // own admission. Elsewhere it does not force the route: no capture,
@@ -1509,7 +1517,10 @@ mod tests {
         ] {
             assert!(parse_args(argv(bad)).is_err(), "{bad}");
         }
-        assert_eq!(parse_args(argv("--model m --output -")).unwrap().output, None);
+        assert_eq!(
+            parse_args(argv("--model m --output -")).unwrap().output,
+            None
+        );
     }
 
     #[test]
@@ -1535,18 +1546,47 @@ mod tests {
 
     #[test]
     fn compare_groups_by_family() {
-        let base = snap(&[0; 8], &[("gdn.0.conv", &[1, 2]), ("qsa.0.selected", &[3]), ("ple.conv", &[4])]);
+        let base = snap(
+            &[0; 8],
+            &[
+                ("gdn.0.conv", &[1, 2]),
+                ("qsa.0.selected", &[3]),
+                ("ple.conv", &[4]),
+            ],
+        );
         assert_eq!(compare(&base, &base), Mismatch::default());
-        let mut other = snap(&[0, 0, 0, 0, 0, 0, 0, 1], &[("gdn.0.conv", &[9, 9]), ("qsa.0.selected", &[3]), ("ple.conv", &[5])]);
+        let mut other = snap(
+            &[0, 0, 0, 0, 0, 0, 0, 1],
+            &[
+                ("gdn.0.conv", &[9, 9]),
+                ("qsa.0.selected", &[3]),
+                ("ple.conv", &[5]),
+            ],
+        );
         other.position = 8;
         other.lengths = vec![(2, 1, 1, 1, 1)];
         other.argmax = 3;
         assert_eq!(
             compare(&other, &base),
-            Mismatch { logits: 1, gdn: 2, qsa: 0, ple: 1, lengths: 1, position: 1, argmax: 1 }
+            Mismatch {
+                logits: 1,
+                gdn: 2,
+                qsa: 0,
+                ple: 1,
+                lengths: 1,
+                position: 1,
+                argmax: 1
+            }
         );
         // A missing or renamed region is never equal.
-        let renamed = snap(&[0; 8], &[("gdn.1.conv", &[1, 2]), ("qsa.0.selected", &[3]), ("ple.conv", &[4])]);
+        let renamed = snap(
+            &[0; 8],
+            &[
+                ("gdn.1.conv", &[1, 2]),
+                ("qsa.0.selected", &[3]),
+                ("ple.conv", &[4]),
+            ],
+        );
         assert!(compare(&renamed, &base).gdn > 0);
     }
 
@@ -1558,8 +1598,12 @@ mod tests {
         assert!(is_binding_refusal(
             "Qwen4 retained replay refused: retained route identity for table 0x2a changed since capture: latched a, bound b"
         ));
-        assert!(!is_binding_refusal("Qwen4 retained replay failed: position 128 exceeds prepared max_position"));
-        assert!(!is_binding_refusal("Qwen4 retained replay refused: staging-stream sync before PM4 replay failed"));
+        assert!(!is_binding_refusal(
+            "Qwen4 retained replay failed: position 128 exceeds prepared max_position"
+        ));
+        assert!(!is_binding_refusal(
+            "Qwen4 retained replay refused: staging-stream sync before PM4 replay failed"
+        ));
         assert!(!is_binding_refusal("forward 0: some other error"));
     }
 
@@ -1596,7 +1640,11 @@ mod tests {
 
     #[test]
     fn model_arch_is_the_loader_label_for_qwen4() {
-        assert_eq!(hipfire_arch_qwen4::ARCH_ID, 16, "arch_label(16) == \"qwen4\"");
+        assert_eq!(
+            hipfire_arch_qwen4::ARCH_ID,
+            16,
+            "arch_label(16) == \"qwen4\""
+        );
         assert_eq!(MODEL_ARCH, "qwen4");
     }
 
@@ -1604,7 +1652,11 @@ mod tests {
     fn halo_mq3_is_not_the_default_route() {
         // Strix Halo (gfx1151) takes Redline by default only for `.mq4r`; the
         // gfx1201 Qwen4 exception does not apply to it.
-        for path in ["/m/flash-next-halo.mq3", "/m/flash-next-ctl3-hot.hfq", "/m/x.mq4"] {
+        for path in [
+            "/m/flash-next-halo.mq3",
+            "/m/flash-next-ctl3-hot.hfq",
+            "/m/x.mq4",
+        ] {
             for has_drafter in [false, true] {
                 assert!(
                     !route("gfx1151", path, has_drafter).default_route(),
@@ -1695,11 +1747,29 @@ mod tests {
         let args = parse_args(argv("--model /m/ctl3-hot.hfq")).unwrap();
         let mut gate = Gate::default();
         gate.count("replay_default_configured", 0, Value::Null);
-        let ok = finish(&gate, &serde_json::Map::new(), &args, "gfx1201", Instant::now());
-        assert_eq!((ok["ok"].clone(), ok["status"].clone()), (json!(true), json!("pass")));
+        let ok = finish(
+            &gate,
+            &serde_json::Map::new(),
+            &args,
+            "gfx1201",
+            Instant::now(),
+        );
+        assert_eq!(
+            (ok["ok"].clone(), ok["status"].clone()),
+            (json!(true), json!("pass"))
+        );
         assert!(ok.get("skipped").is_none() && ok.get("reason").is_none());
         gate.count("positive_production_logits_exact", 3, Value::Null);
-        let bad = finish(&gate, &serde_json::Map::new(), &args, "gfx1201", Instant::now());
-        assert_eq!((bad["ok"].clone(), bad["status"].clone()), (json!(false), json!("fail")));
+        let bad = finish(
+            &gate,
+            &serde_json::Map::new(),
+            &args,
+            "gfx1201",
+            Instant::now(),
+        );
+        assert_eq!(
+            (bad["ok"].clone(), bad["status"].clone()),
+            (json!(false), json!("fail"))
+        );
     }
 }

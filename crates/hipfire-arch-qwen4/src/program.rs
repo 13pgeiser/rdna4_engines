@@ -280,9 +280,7 @@ pub const QWEN4_CPU_SPLICE_MAX_ROWS: usize = NARROW_VERIFY_MAX_ROWS;
 // (AR decode, every admitted verify/replay width up to the cap), so the one
 // speculative cap (`QWEN4_CPU_SPLICE_MAX_ROWS`, `spec_verify_rows_cap`) covers
 // both CPU numerical modes.
-const _: () = assert!(
-    hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS == QWEN4_CPU_SPLICE_MAX_ROWS
-);
+const _: () = assert!(hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS == QWEN4_CPU_SPLICE_MAX_ROWS);
 
 /// MoE resources are source-bound once by the family and consumed by the
 /// shared prefill sealer/lowering. The dispatch layer owns all route policy.
@@ -548,7 +546,9 @@ fn lm_head_tile_rows(m: usize) -> Result<usize, DispatchError> {
     let row_bytes = m
         .checked_mul(DType::F32.size())
         .ok_or_else(|| DispatchError::Hip("Qwen4 LM-head logits row width overflows".into()))?;
-    let safe = LM_HEAD_OUTPUT_LIMIT_BYTES.checked_div(row_bytes).unwrap_or(0);
+    let safe = LM_HEAD_OUTPUT_LIMIT_BYTES
+        .checked_div(row_bytes)
+        .unwrap_or(0);
     if safe == 0 {
         return Err(DispatchError::Hip(format!(
             "Qwen4 LM-head logits row of {m} F32 values exceeds the {LM_HEAD_OUTPUT_LIMIT_BYTES}-byte projection output limit"
@@ -892,11 +892,8 @@ pub fn seal_moe_for_layer<'a>(
     // (the invariant prefill profile pins `route_rows` to the canonical chunk, so
     // a short prefill there keeps the PCIe grouped read) and which is at most
     // the narrow verify width; every wider window is unchanged.
-    let cpu_deferred = hipfire_dispatch::cpu_split::cpu_splice_window(
-        moe.cpu_deferred_experts,
-        rows,
-        route_rows,
-    );
+    let cpu_deferred =
+        hipfire_dispatch::cpu_split::cpu_splice_window(moe.cpu_deferred_experts, rows, route_rows);
     if cpu_deferred
         && (moe.route_policy.capability.is_fp8_grouped()
             || moe.row_gather.is_some()
@@ -948,12 +945,8 @@ fn validate_tier_moe_binding(
     moe: &Qwen4MoeBinding<'_>,
     num_experts: usize,
 ) -> Result<(), DispatchError> {
-    let refuse = |why: &str| {
-        DispatchError::Hip(format!(
-            "Qwen4 expert-tier layer {}: {why}",
-            moe.layer_idx
-        ))
-    };
+    let refuse =
+        |why: &str| DispatchError::Hip(format!("Qwen4 expert-tier layer {}: {why}", moe.layer_idx));
     if !matches!(
         moe.route_policy.capability,
         MoeRouteCapability::Qt44Qt53Grouped | MoeRouteCapability::Qt44Qt53GroupedSymmetric
@@ -1717,7 +1710,9 @@ mod lm_head_tile_tests {
 
     #[test]
     fn ragged_row_counts_are_covered_exactly() {
-        for rows in [1usize, 2, 255, 257, 2047, 2049, 4097, 4607, 6145, 8191, 8193, 10_000] {
+        for rows in [
+            1usize, 2, 255, 257, 2047, 2049, 4097, 4607, 6145, 8191, 8193, 10_000,
+        ] {
             assert_exact_safe(VOCAB, rows);
         }
     }

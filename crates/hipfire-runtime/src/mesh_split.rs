@@ -823,10 +823,7 @@ impl<'a> Walk<'a> {
             }
             match self.cur[ri] {
                 Some(ShardSpec::Owner { .. }) => {
-                    return Err(SplitError::LayoutMismatch {
-                        op: opid,
-                        resource,
-                    })
+                    return Err(SplitError::LayoutMismatch { op: opid, resource })
                 }
                 Some(ShardSpec::Partial { .. }) => self.reduce(opid, resource)?,
                 _ => {}
@@ -899,14 +896,8 @@ impl<'a> Walk<'a> {
             }
             Some(ShardSpec::Whole) => Ok(()),
             Some(ShardSpec::Owner { device }) if run == Run::One(device) => Ok(()),
-            Some(ShardSpec::Owner { .. }) => Err(SplitError::LayoutMismatch {
-                op: opid,
-                resource,
-            }),
-            Some(ShardSpec::Split { .. }) => Err(SplitError::NeedsGather {
-                op: opid,
-                resource,
-            }),
+            Some(ShardSpec::Owner { .. }) => Err(SplitError::LayoutMismatch { op: opid, resource }),
+            Some(ShardSpec::Split { .. }) => Err(SplitError::NeedsGather { op: opid, resource }),
             Some(ShardSpec::Partial { .. }) => Err(SplitError::UnreducedPartial { resource }),
         }
     }
@@ -935,10 +926,7 @@ impl<'a> Walk<'a> {
             }
             Some(spec) if spec == want => Ok(()),
             Some(ShardSpec::Partial { .. }) => Err(SplitError::UnreducedPartial { resource }),
-            Some(_) => Err(SplitError::LayoutMismatch {
-                op: opid,
-                resource,
-            }),
+            Some(_) => Err(SplitError::LayoutMismatch { op: opid, resource }),
         }
     }
 
@@ -961,12 +949,7 @@ impl<'a> Walk<'a> {
                     self.entry[ri] = Some(spec);
                 }
                 Some(c) if c == spec => {}
-                Some(_) => {
-                    return Err(SplitError::LayoutMismatch {
-                        op: opid,
-                        resource,
-                    })
-                }
+                Some(_) => return Err(SplitError::LayoutMismatch { op: opid, resource }),
             }
         } else {
             self.cur[ri] = Some(spec);
@@ -1022,9 +1005,7 @@ impl<'a> Walk<'a> {
                 self.write_res(opid, output, out, stage)?;
                 if matches!(out, ShardSpec::Partial { .. }) {
                     let sched = self.sched_entry(w);
-                    self.partial[output.0 as usize] = Some(PartialInfo {
-                        sched,
-                    });
+                    self.partial[output.0 as usize] = Some(PartialInfo { sched });
                 }
                 self.emit(opid, stage, run);
             }
@@ -1069,10 +1050,7 @@ impl<'a> Walk<'a> {
                         match layout {
                             None => layout = Some(c),
                             Some(l) if l != c => {
-                                return Err(SplitError::LayoutMismatch {
-                                    op: opid,
-                                    resource,
-                                })
+                                return Err(SplitError::LayoutMismatch { op: opid, resource })
                             }
                             _ => {}
                         }
@@ -1115,18 +1093,12 @@ impl<'a> Walk<'a> {
                         continue;
                     };
                     if c != ShardSpec::Whole && c != head {
-                        return Err(SplitError::LayoutMismatch {
-                            op: opid,
-                            resource,
-                        });
+                        return Err(SplitError::LayoutMismatch { op: opid, resource });
                     }
                     match layout {
                         None => layout = Some(c),
                         Some(l) if l != c => {
-                            return Err(SplitError::LayoutMismatch {
-                                op: opid,
-                                resource,
-                            })
+                            return Err(SplitError::LayoutMismatch { op: opid, resource })
                         }
                         _ => {}
                     }
@@ -1139,10 +1111,7 @@ impl<'a> Walk<'a> {
                     match self.cur[resource.0 as usize] {
                         None => self.adopt(resource, layout),
                         Some(c) if c != layout => {
-                            return Err(SplitError::LayoutMismatch {
-                                op: opid,
-                                resource,
-                            })
+                            return Err(SplitError::LayoutMismatch { op: opid, resource })
                         }
                         Some(_) => {}
                     }
@@ -2045,9 +2014,8 @@ mod tests {
         let mut b = B::new();
         let w = b.weight("w", 0, vec![8, 4], ShardPolicy::ColumnShard { axis: 0 });
         // 32 elements, 2 ranks -> 16-element blocks; [12, 20) straddles the boundary.
-        let view = b
-            .g
-            .add_resource(ResourceDecl {
+        let view =
+            b.g.add_resource(ResourceDecl {
                 class: ResourceClass::Activation,
                 shape: vec![8],
                 alias: Some(Alias { of: w, offset: 12 }),

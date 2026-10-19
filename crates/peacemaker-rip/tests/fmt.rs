@@ -3,22 +3,49 @@ use peacemaker_rip::srcfmt::{format_source, mask, unmask};
 use std::path::PathBuf;
 
 const KERNELS: [(&str, &str); 4] = [
-    ("qsa_gather", include_str!("../../peacemaker-isa/src/kernels/qsa_gather.rip")),
-    ("qsa_score", include_str!("../../peacemaker-isa/src/kernels/qsa_score.rip")),
-    ("qsa_score_bf16", include_str!("../../peacemaker-isa/src/kernels/qsa_score_bf16.rip")),
-    ("qsa_topk", include_str!("../../peacemaker-isa/src/kernels/qsa_topk.rip")),
+    (
+        "qsa_gather",
+        include_str!("../../peacemaker-isa/src/kernels/qsa_gather.rip"),
+    ),
+    (
+        "qsa_score",
+        include_str!("../../peacemaker-isa/src/kernels/qsa_score.rip"),
+    ),
+    (
+        "qsa_score_bf16",
+        include_str!("../../peacemaker-isa/src/kernels/qsa_score_bf16.rip"),
+    ),
+    (
+        "qsa_topk",
+        include_str!("../../peacemaker-isa/src/kernels/qsa_topk.rip"),
+    ),
 ];
 
 fn rustfmt_present() -> bool {
-    std::process::Command::new("rustfmt").arg("--version").output().is_ok()
+    std::process::Command::new("rustfmt")
+        .arg("--version")
+        .output()
+        .is_ok()
 }
 
 fn ui_sources() -> Vec<(String, String)> {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/ui");
-    let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|e| e == "rip")).collect();
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "rip"))
+        .collect();
     files.sort();
     assert_eq!(files.len(), 8, "tests/ui holds eight .rip files");
-    files.into_iter().map(|p| (p.file_name().unwrap().to_string_lossy().into_owned(), std::fs::read_to_string(&p).unwrap())).collect()
+    files
+        .into_iter()
+        .map(|p| {
+            (
+                p.file_name().unwrap().to_string_lossy().into_owned(),
+                std::fs::read_to_string(&p).unwrap(),
+            )
+        })
+        .collect()
 }
 
 /// Identifiers and literals in order. Layout may add, drop or move punctuation and delimiters
@@ -44,7 +71,11 @@ fn check_formats(name: &str, source: &str) {
     let twice = format_source(&once).unwrap_or_else(|e| panic!("{name} (second pass): {e}"));
     assert_eq!(once, twice, "{name}: formatting is not idempotent");
     // `format_source` already compares the full token streams modulo layout-only tokens.
-    assert_eq!(words(source), words(&once), "{name}: identifiers or literals changed");
+    assert_eq!(
+        words(source),
+        words(&once),
+        "{name}: identifiers or literals changed"
+    );
 }
 
 #[test]
@@ -72,7 +103,10 @@ fn body() { let chain = 1; let tile = chain; x.chain(tile); }
     assert!(masked.contains("__rip_region!(A, B);"), "{masked}");
     assert!(masked.contains("__rip_pub_region!(D);"), "{masked}");
     assert!(masked.contains("impl Ext { #[rip_chain] fn h("), "{masked}");
-    assert!(masked.contains("let chain = 1; let tile = chain; x.chain(tile);"), "bodies are untouched: {masked}");
+    assert!(
+        masked.contains("let chain = 1; let tile = chain; x.chain(tile);"),
+        "bodies are untouched: {masked}"
+    );
     assert_eq!(unmask(&masked).unwrap(), src);
 }
 

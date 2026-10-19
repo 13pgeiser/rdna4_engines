@@ -43,7 +43,10 @@ const EP_BARRIERS: usize = 4;
 const EP_REPLAYS: usize = 5;
 
 fn rank_stream(gpus: &Gpus, rank: usize) -> &hip_bridge::Stream {
-    gpus.devices[rank].active_stream.as_ref().expect("active stream")
+    gpus.devices[rank]
+        .active_stream
+        .as_ref()
+        .expect("active stream")
 }
 
 /// Launch the captured graphs of `ranks` and synchronize those ranks.
@@ -72,7 +75,8 @@ fn ep_path_screen(gpus: &mut Gpus) {
     let all: Vec<usize> = (0..n).collect();
     gpus.prepare_tp_graph_signals(EP_BARRIERS)
         .expect("prepare TP graph signals (allocates every rank's wait-error block)");
-    gpus.begin_tp_graph_signal_capture().expect("rewind barrier cursor");
+    gpus.begin_tp_graph_signal_capture()
+        .expect("rewind barrier cursor");
     for rank in 0..n {
         let gpu = &mut gpus.devices[rank];
         gpu.bind_thread().expect("bind capture begin");
@@ -124,7 +128,10 @@ fn ep_path_screen(gpus: &mut Gpus) {
     gpus.reset_tp_graph_signals().expect("reset signals");
     let ms = replay(gpus, &live);
     let skipped_block = gpus.devices[skipped].take_device_wait_timeout();
-    assert!(skipped_block.is_none(), "skipped rank recorded {skipped_block:?}");
+    assert!(
+        skipped_block.is_none(),
+        "skipped rank recorded {skipped_block:?}"
+    );
     // Exactly what ep.rs does after the DS4 TP graph sync.
     let reported = gpus
         .take_device_wait_errors()
@@ -140,10 +147,17 @@ fn ep_path_screen(gpus: &mut Gpus) {
         "forced skip: live ranks took {ms:.1} ms, expected ~500 ms"
     );
     for needle in [kernel, "epoch 1", "device wait timeout on GPU"] {
-        assert!(message.contains(needle), "forced skip report lacks {needle:?}: {message}");
+        assert!(
+            message.contains(needle),
+            "forced skip report lacks {needle:?}: {message}"
+        );
     }
     let reports = message.matches("device wait timeout on GPU").count();
-    assert_eq!(reports, live.len(), "every live rank must report: {message}");
+    assert_eq!(
+        reports,
+        live.len(),
+        "every live rank must report: {message}"
+    );
     let epochs = gpus.tp_graph_signal_epochs().expect("read signal epochs");
     assert!(
         epochs.iter().all(|&epoch| epoch == 0),

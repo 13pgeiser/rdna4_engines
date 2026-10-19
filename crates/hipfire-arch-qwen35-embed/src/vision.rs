@@ -365,7 +365,11 @@ pub fn encode_image(
     );
     let grid_h = img_h / vis.patch_size;
     let grid_w = img_w / vis.patch_size;
-    if hipfire_config::developer_var("HIPFIRE_EMBED_DEBUG").ok().as_deref() == Some("1") {
+    if hipfire_config::developer_var("HIPFIRE_EMBED_DEBUG")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         // Physical (raw hipMemGetInfo) diagnostic, never the emulated capacity.
         let (f, t) = gpu.hip.get_vram_info().unwrap_or((0, 0));
         eprintln!(

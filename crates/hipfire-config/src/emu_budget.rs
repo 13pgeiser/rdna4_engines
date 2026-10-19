@@ -108,7 +108,10 @@ pub enum BudgetError {
     /// The id is not the installed budget (or nothing is installed).
     UnknownBudget(BudgetId),
     /// Installed budget differs in device (BDF) or limits.
-    InstallConflict { installed_bdf: String, requested_bdf: String },
+    InstallConflict {
+        installed_bdf: String,
+        requested_bdf: String,
+    },
     /// A different install was requested after managed allocations exist.
     InstallAfterAllocations,
 }
@@ -123,7 +126,12 @@ impl BudgetError {
 impl fmt::Display for BudgetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BudgetError::OutOfMemory { dimension, requested, used, limit } => write!(
+            BudgetError::OutOfMemory {
+                dimension,
+                requested,
+                used,
+                limit,
+            } => write!(
                 f,
                 "emu budget out of memory: {dimension} request {requested} B with {used} B \
                  committed+pending exceeds limit {limit} B"
@@ -133,14 +141,17 @@ impl fmt::Display for BudgetError {
             BudgetError::UnknownBudget(id) => {
                 write!(f, "emu budget not initialized: unknown budget id {}", id.0)
             }
-            BudgetError::InstallConflict { installed_bdf, requested_bdf } => write!(
+            BudgetError::InstallConflict {
+                installed_bdf,
+                requested_bdf,
+            } => write!(
                 f,
                 "emu budget already installed for device {installed_bdf} with different \
                  device or limits (requested {requested_bdf}); installation is immutable"
             ),
-            BudgetError::InstallAfterAllocations => f.write_str(
-                "emu budget install refused: managed allocations already exist",
-            ),
+            BudgetError::InstallAfterAllocations => {
+                f.write_str("emu budget install refused: managed allocations already exist")
+            }
         }
     }
 }
@@ -212,10 +223,17 @@ fn check_dim(
     if add == 0 {
         return Ok(());
     }
-    let used = committed.checked_add(pending).ok_or(BudgetError::Overflow)?;
+    let used = committed
+        .checked_add(pending)
+        .ok_or(BudgetError::Overflow)?;
     let total = used.checked_add(add).ok_or(BudgetError::Overflow)?;
     if total > limit {
-        return Err(BudgetError::OutOfMemory { dimension, requested: add, used, limit });
+        return Err(BudgetError::OutOfMemory {
+            dimension,
+            requested: add,
+            used,
+            limit,
+        });
     }
     Ok(())
 }
@@ -314,7 +332,12 @@ impl Ledger {
             // check_charge proved the sums fit in u64.
             st.pending = add_usage(&st.pending, &charge).ok_or(BudgetError::Overflow)?;
         }
-        Ok(Reservation { ledger: Some(Arc::clone(self)), class, bytes, charge })
+        Ok(Reservation {
+            ledger: Some(Arc::clone(self)),
+            class,
+            bytes,
+            charge,
+        })
     }
 
     pub(crate) fn check_additional(
@@ -332,14 +355,23 @@ impl Ledger {
 
     pub(crate) fn snapshot(&self) -> BudgetSnapshot {
         let st = self.lock();
-        BudgetSnapshot { limits: self.limits, committed: st.committed, pending: st.pending }
+        BudgetSnapshot {
+            limits: self.limits,
+            committed: st.committed,
+            pending: st.pending,
+        }
     }
 
     fn rollback(&self, charge: &BudgetUsage) {
         sub_usage(&mut self.lock().pending, charge);
     }
 
-    fn commit(self: &Arc<Self>, class: AllocationClass, bytes: u64, charge: BudgetUsage) -> AllocationToken {
+    fn commit(
+        self: &Arc<Self>,
+        class: AllocationClass,
+        bytes: u64,
+        charge: BudgetUsage,
+    ) -> AllocationToken {
         {
             let mut st = self.lock();
             sub_usage(&mut st.pending, &charge);
@@ -347,7 +379,12 @@ impl Ledger {
             // the charge moved from pending to committed.
             st.committed = add_usage(&st.committed, &charge).unwrap_or(st.committed);
         }
-        AllocationToken { ledger: Arc::clone(self), class, bytes, charge }
+        AllocationToken {
+            ledger: Arc::clone(self),
+            class,
+            bytes,
+            charge,
+        }
     }
 
     fn release(&self, charge: &BudgetUsage) {
@@ -379,7 +416,10 @@ impl Reservation {
     /// Move the pending charge to committed. Call only after the raw
     /// allocation succeeded. The token does not release on Drop.
     pub fn commit(mut self) -> AllocationToken {
-        let ledger = self.ledger.take().expect("reservation holds its ledger until committed");
+        let ledger = self
+            .ledger
+            .take()
+            .expect("reservation holds its ledger until committed");
         ledger.commit(self.class, self.bytes, self.charge)
     }
 }
@@ -468,7 +508,11 @@ fn global(id: BudgetId) -> Result<&'static Arc<Ledger>, BudgetError> {
 }
 
 /// Atomically charge `bytes` as pending, or refuse (OOM-like for cap overruns).
-pub fn reserve(id: BudgetId, class: AllocationClass, bytes: u64) -> Result<Reservation, BudgetError> {
+pub fn reserve(
+    id: BudgetId,
+    class: AllocationClass,
+    bytes: u64,
+) -> Result<Reservation, BudgetError> {
     global(id)?.reserve(class, bytes)
 }
 
@@ -496,7 +540,11 @@ pub fn snapshot(id: BudgetId) -> BudgetSnapshot {
 }
 
 /// Non-mutating preflight: would `reserve` of the same request succeed now?
-pub fn check_additional(id: BudgetId, class: AllocationClass, bytes: u64) -> Result<(), BudgetError> {
+pub fn check_additional(
+    id: BudgetId,
+    class: AllocationClass,
+    bytes: u64,
+) -> Result<(), BudgetError> {
     global(id)?.check_additional(class, bytes)
 }
 
@@ -508,11 +556,21 @@ mod tests {
     const BDF: &str = "0000:03:00.0";
 
     fn discrete(device: u64) -> BudgetLimits {
-        BudgetLimits { device_bytes: device, gtt_bytes: None, shared_host_bytes: None, uma: false }
+        BudgetLimits {
+            device_bytes: device,
+            gtt_bytes: None,
+            shared_host_bytes: None,
+            uma: false,
+        }
     }
 
     fn uma(device: u64, gtt: Option<u64>, shared: Option<u64>) -> BudgetLimits {
-        BudgetLimits { device_bytes: device, gtt_bytes: gtt, shared_host_bytes: shared, uma: true }
+        BudgetLimits {
+            device_bytes: device,
+            gtt_bytes: gtt,
+            shared_host_bytes: shared,
+            uma: true,
+        }
     }
 
     #[test]
@@ -521,35 +579,68 @@ mod tests {
         let u = uma(100, Some(100), Some(100));
         assert_eq!(
             charge_vector(&d, AllocationClass::Device, 7),
-            BudgetUsage { device_bytes: 7, ..Default::default() }
+            BudgetUsage {
+                device_bytes: 7,
+                ..Default::default()
+            }
         );
         assert_eq!(
             charge_vector(&d, AllocationClass::HostPinnedGtt, 7),
-            BudgetUsage { host_bytes: 7, gtt_bytes: 7, ..Default::default() }
+            BudgetUsage {
+                host_bytes: 7,
+                gtt_bytes: 7,
+                ..Default::default()
+            }
         );
         assert_eq!(
             charge_vector(&d, AllocationClass::HostPinnedUserptr, 7),
-            BudgetUsage { host_bytes: 7, ..Default::default() }
+            BudgetUsage {
+                host_bytes: 7,
+                ..Default::default()
+            }
         );
         assert_eq!(
             charge_vector(&d, AllocationClass::HostApplication, 7),
-            BudgetUsage { host_bytes: 7, ..Default::default() }
+            BudgetUsage {
+                host_bytes: 7,
+                ..Default::default()
+            }
         );
         assert_eq!(
             charge_vector(&u, AllocationClass::Device, 7),
-            BudgetUsage { device_bytes: 7, host_bytes: 0, gtt_bytes: 7, shared_host_bytes: 7 }
+            BudgetUsage {
+                device_bytes: 7,
+                host_bytes: 0,
+                gtt_bytes: 7,
+                shared_host_bytes: 7
+            }
         );
         assert_eq!(
             charge_vector(&u, AllocationClass::HostPinnedGtt, 7),
-            BudgetUsage { device_bytes: 0, host_bytes: 7, gtt_bytes: 7, shared_host_bytes: 7 }
+            BudgetUsage {
+                device_bytes: 0,
+                host_bytes: 7,
+                gtt_bytes: 7,
+                shared_host_bytes: 7
+            }
         );
         assert_eq!(
             charge_vector(&u, AllocationClass::HostPinnedUserptr, 7),
-            BudgetUsage { device_bytes: 0, host_bytes: 7, gtt_bytes: 0, shared_host_bytes: 7 }
+            BudgetUsage {
+                device_bytes: 0,
+                host_bytes: 7,
+                gtt_bytes: 0,
+                shared_host_bytes: 7
+            }
         );
         assert_eq!(
             charge_vector(&u, AllocationClass::HostApplication, 7),
-            BudgetUsage { device_bytes: 0, host_bytes: 7, gtt_bytes: 0, shared_host_bytes: 7 }
+            BudgetUsage {
+                device_bytes: 0,
+                host_bytes: 7,
+                gtt_bytes: 0,
+                shared_host_bytes: 7
+            }
         );
     }
 
@@ -558,16 +649,31 @@ mod tests {
         let l = Ledger::new_isolated(BDF, discrete(100));
         let err = l.reserve(AllocationClass::Device, 101).unwrap_err();
         assert!(err.is_out_of_memory());
-        assert!(matches!(err, BudgetError::OutOfMemory { dimension: BudgetDimension::Device, .. }));
+        assert!(matches!(
+            err,
+            BudgetError::OutOfMemory {
+                dimension: BudgetDimension::Device,
+                ..
+            }
+        ));
         assert_eq!(l.snapshot().pending, BudgetUsage::default());
 
         let r = l.reserve(AllocationClass::Device, 100).unwrap();
         assert_eq!(l.snapshot().pending.device_bytes, 100);
         // Full: one more byte refused, preflight agrees.
-        assert!(l.reserve(AllocationClass::Device, 1).unwrap_err().is_out_of_memory());
-        assert!(l.check_additional(AllocationClass::Device, 1).unwrap_err().is_out_of_memory());
+        assert!(l
+            .reserve(AllocationClass::Device, 1)
+            .unwrap_err()
+            .is_out_of_memory());
+        assert!(l
+            .check_additional(AllocationClass::Device, 1)
+            .unwrap_err()
+            .is_out_of_memory());
         let _t = r.commit();
-        assert!(l.reserve(AllocationClass::Device, 1).unwrap_err().is_out_of_memory());
+        assert!(l
+            .reserve(AllocationClass::Device, 1)
+            .unwrap_err()
+            .is_out_of_memory());
     }
 
     #[test]
@@ -577,19 +683,34 @@ mod tests {
         assert_eq!(l.snapshot().pending, BudgetUsage::default());
         assert_eq!(l.snapshot().committed, BudgetUsage::default());
         assert!(l.check_additional(AllocationClass::Device, 101).is_err());
-        assert_eq!(l.check_additional(AllocationClass::Device, 0), Err(BudgetError::ZeroBytes));
+        assert_eq!(
+            l.check_additional(AllocationClass::Device, 0),
+            Err(BudgetError::ZeroBytes)
+        );
     }
 
     #[test]
     fn zero_and_overflow_refused() {
         let l = Ledger::new_isolated(BDF, discrete(u64::MAX));
-        assert_eq!(l.reserve(AllocationClass::Device, 0).unwrap_err(), BudgetError::ZeroBytes);
-        let _t = l.reserve(AllocationClass::Device, u64::MAX - 1).unwrap().commit();
+        assert_eq!(
+            l.reserve(AllocationClass::Device, 0).unwrap_err(),
+            BudgetError::ZeroBytes
+        );
+        let _t = l
+            .reserve(AllocationClass::Device, u64::MAX - 1)
+            .unwrap()
+            .commit();
         // used = MAX-1; +2 overflows u64 and is refused as Overflow, not wrapped.
-        assert_eq!(l.reserve(AllocationClass::Device, 2).unwrap_err(), BudgetError::Overflow);
+        assert_eq!(
+            l.reserve(AllocationClass::Device, 2).unwrap_err(),
+            BudgetError::Overflow
+        );
         assert_eq!(l.snapshot().pending, BudgetUsage::default());
         // Host dimension is unlimited but counter overflow still refuses.
-        let _h = l.reserve(AllocationClass::HostApplication, u64::MAX).unwrap().commit();
+        let _h = l
+            .reserve(AllocationClass::HostApplication, u64::MAX)
+            .unwrap()
+            .commit();
         assert_eq!(
             l.reserve(AllocationClass::HostApplication, 1).unwrap_err(),
             BudgetError::Overflow
@@ -641,7 +762,10 @@ mod tests {
         let t = l.reserve(AllocationClass::Device, 100).unwrap().commit();
         drop(t); // leak: no auto-release
         assert_eq!(l.snapshot().committed.device_bytes, 100);
-        assert!(l.reserve(AllocationClass::Device, 1).unwrap_err().is_out_of_memory());
+        assert!(l
+            .reserve(AllocationClass::Device, 1)
+            .unwrap_err()
+            .is_out_of_memory());
     }
 
     #[test]
@@ -654,9 +778,18 @@ mod tests {
     #[test]
     fn discrete_host_classes_do_not_consume_device_cap() {
         let l = Ledger::new_isolated(BDF, discrete(100));
-        let _a = l.reserve(AllocationClass::HostPinnedGtt, 1_000).unwrap().commit();
-        let _b = l.reserve(AllocationClass::HostPinnedUserptr, 1_000).unwrap().commit();
-        let _c = l.reserve(AllocationClass::HostApplication, 1_000).unwrap().commit();
+        let _a = l
+            .reserve(AllocationClass::HostPinnedGtt, 1_000)
+            .unwrap()
+            .commit();
+        let _b = l
+            .reserve(AllocationClass::HostPinnedUserptr, 1_000)
+            .unwrap()
+            .commit();
+        let _c = l
+            .reserve(AllocationClass::HostApplication, 1_000)
+            .unwrap()
+            .commit();
         let s = l.snapshot();
         assert_eq!(s.committed.device_bytes, 0);
         assert_eq!(s.committed.host_bytes, 3_000);
@@ -668,13 +801,30 @@ mod tests {
     fn discrete_gtt_limit_applies_to_gtt_host_only() {
         let l = Ledger::new_isolated(
             BDF,
-            BudgetLimits { device_bytes: 100, gtt_bytes: Some(50), shared_host_bytes: None, uma: false },
+            BudgetLimits {
+                device_bytes: 100,
+                gtt_bytes: Some(50),
+                shared_host_bytes: None,
+                uma: false,
+            },
         );
-        let t = l.reserve(AllocationClass::HostPinnedGtt, 50).unwrap().commit();
+        let t = l
+            .reserve(AllocationClass::HostPinnedGtt, 50)
+            .unwrap()
+            .commit();
         let err = l.reserve(AllocationClass::HostPinnedGtt, 1).unwrap_err();
-        assert!(matches!(err, BudgetError::OutOfMemory { dimension: BudgetDimension::Gtt, .. }));
+        assert!(matches!(
+            err,
+            BudgetError::OutOfMemory {
+                dimension: BudgetDimension::Gtt,
+                ..
+            }
+        ));
         // Userptr host and device are unaffected by the GTT cap.
-        let _u = l.reserve(AllocationClass::HostPinnedUserptr, 10_000).unwrap().commit();
+        let _u = l
+            .reserve(AllocationClass::HostPinnedUserptr, 10_000)
+            .unwrap()
+            .commit();
         let _d = l.reserve(AllocationClass::Device, 100).unwrap().commit();
         release(t);
         drop(l.reserve(AllocationClass::HostPinnedGtt, 50).unwrap());
@@ -690,34 +840,71 @@ mod tests {
         let s = l.snapshot();
         assert_eq!(
             s.committed,
-            BudgetUsage { device_bytes: 30, host_bytes: 0, gtt_bytes: 30, shared_host_bytes: 30 }
+            BudgetUsage {
+                device_bytes: 30,
+                host_bytes: 0,
+                gtt_bytes: 30,
+                shared_host_bytes: 30
+            }
         );
 
         // GTT dimension hit independently: gtt 30 used of 60.
-        let g = l.reserve(AllocationClass::HostPinnedGtt, 30).unwrap().commit();
+        let g = l
+            .reserve(AllocationClass::HostPinnedGtt, 30)
+            .unwrap()
+            .commit();
         assert_eq!(l.snapshot().committed.gtt_bytes, 60);
         let e = l.reserve(AllocationClass::Device, 1).unwrap_err();
-        assert!(matches!(e, BudgetError::OutOfMemory { dimension: BudgetDimension::Gtt, .. }));
+        assert!(matches!(
+            e,
+            BudgetError::OutOfMemory {
+                dimension: BudgetDimension::Gtt,
+                ..
+            }
+        ));
         let e = l.reserve(AllocationClass::HostPinnedGtt, 1).unwrap_err();
-        assert!(matches!(e, BudgetError::OutOfMemory { dimension: BudgetDimension::Gtt, .. }));
+        assert!(matches!(
+            e,
+            BudgetError::OutOfMemory {
+                dimension: BudgetDimension::Gtt,
+                ..
+            }
+        ));
 
         // Userptr/application never touch device or GTT but do hit shared:
         // shared used = 60 of 90.
-        let u = l.reserve(AllocationClass::HostPinnedUserptr, 20).unwrap().commit();
-        let a = l.reserve(AllocationClass::HostApplication, 10).unwrap().commit();
+        let u = l
+            .reserve(AllocationClass::HostPinnedUserptr, 20)
+            .unwrap()
+            .commit();
+        let a = l
+            .reserve(AllocationClass::HostApplication, 10)
+            .unwrap()
+            .commit();
         let s = l.snapshot();
         assert_eq!(s.committed.device_bytes, 30);
         assert_eq!(s.committed.gtt_bytes, 60);
         assert_eq!(s.committed.shared_host_bytes, 90);
         assert_eq!(s.committed.host_bytes, 60);
         let e = l.reserve(AllocationClass::HostApplication, 1).unwrap_err();
-        assert!(matches!(e, BudgetError::OutOfMemory { dimension: BudgetDimension::SharedHost, .. }));
-        assert!(l.check_additional(AllocationClass::HostPinnedUserptr, 1).is_err());
+        assert!(matches!(
+            e,
+            BudgetError::OutOfMemory {
+                dimension: BudgetDimension::SharedHost,
+                ..
+            }
+        ));
+        assert!(l
+            .check_additional(AllocationClass::HostPinnedUserptr, 1)
+            .is_err());
 
         // Releasing the GTT-pinned host buffer frees gtt and shared together.
         release(g);
         let s = l.snapshot();
-        assert_eq!((s.committed.gtt_bytes, s.committed.shared_host_bytes), (30, 60));
+        assert_eq!(
+            (s.committed.gtt_bytes, s.committed.shared_host_bytes),
+            (30, 60)
+        );
         drop(l.reserve(AllocationClass::HostPinnedGtt, 30).unwrap());
 
         release(d);
@@ -730,7 +917,13 @@ mod tests {
         let l = Ledger::new_isolated(BDF, uma(1_000, None, Some(40)));
         let _t = l.reserve(AllocationClass::Device, 40).unwrap().commit();
         let e = l.reserve(AllocationClass::Device, 1).unwrap_err();
-        assert!(matches!(e, BudgetError::OutOfMemory { dimension: BudgetDimension::SharedHost, .. }));
+        assert!(matches!(
+            e,
+            BudgetError::OutOfMemory {
+                dimension: BudgetDimension::SharedHost,
+                ..
+            }
+        ));
         // GTT is counted even when unlimited.
         assert_eq!(l.snapshot().committed.gtt_bytes, 40);
     }
@@ -800,7 +993,8 @@ mod tests {
                             assert!(s.committed.device_bytes + s.pending.device_bytes <= LIMIT);
                             assert!(s.committed.gtt_bytes + s.pending.gtt_bytes <= LIMIT);
                             assert!(
-                                s.committed.shared_host_bytes + s.pending.shared_host_bytes <= LIMIT
+                                s.committed.shared_host_bytes + s.pending.shared_host_bytes
+                                    <= LIMIT
                             );
                             match i % 3 {
                                 0 => tokens.push(r.commit()),
@@ -818,8 +1012,10 @@ mod tests {
                 })
             })
             .collect();
-        let tokens: Vec<AllocationToken> =
-            handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        let tokens: Vec<AllocationToken> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
         let s = l.snapshot();
         assert_eq!(s.pending, BudgetUsage::default());
         let expect = tokens
@@ -876,7 +1072,9 @@ mod tests {
         );
 
         // Free functions round-trip.
-        assert!(reserve(id, AllocationClass::Device, 101).unwrap_err().is_out_of_memory());
+        assert!(reserve(id, AllocationClass::Device, 101)
+            .unwrap_err()
+            .is_out_of_memory());
         check_additional(id, AllocationClass::Device, 100).unwrap();
         let t = reserve(id, AllocationClass::Device, 100).unwrap().commit();
         assert_eq!(t.budget_id(), id);
@@ -886,7 +1084,10 @@ mod tests {
         // Equal install stays idempotent after allocations; a different one is
         // refused specifically for existing allocations.
         assert_eq!(install(BDF, lim).unwrap(), id);
-        assert_eq!(install(BDF, discrete(200)).unwrap_err(), BudgetError::InstallAfterAllocations);
+        assert_eq!(
+            install(BDF, discrete(200)).unwrap_err(),
+            BudgetError::InstallAfterAllocations
+        );
         assert_eq!(
             install("0000:09:00.0", lim).unwrap_err(),
             BudgetError::InstallAfterAllocations
@@ -908,6 +1109,8 @@ mod tests {
         let s = e.to_string();
         assert!(s.contains("gtt") && s.contains("12"));
         let _: &dyn std::error::Error = &e;
-        assert!(BudgetError::UnknownBudget(BudgetId(3)).to_string().contains("not initialized"));
+        assert!(BudgetError::UnknownBudget(BudgetId(3))
+            .to_string()
+            .contains("not initialized"));
     }
 }

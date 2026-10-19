@@ -291,7 +291,8 @@ fn build_e8(m: usize, k: usize, x: &[f32], seed: u64, edge_rows: usize) -> Built
         let base = row * row_bytes;
 
         // 16-B row header: fp16 row scale @0, n_blocks:u16 @4, flags 0x05 @6.
-        let rs_f = 0.0625f32 + ((mix(seed ^ 0x51 ^ (row as u64) << 8) % 256) as f32) * (0.1875 / 256.0);
+        let rs_f =
+            0.0625f32 + ((mix(seed ^ 0x51 ^ (row as u64) << 8) % 256) as f32) * (0.1875 / 256.0);
         let rs_bits = f16_bits(rs_f);
         let row_scale = f16_to_f32(rs_bits) as f64;
         bytes[base..base + 2].copy_from_slice(&rs_bits.to_le_bytes());
@@ -312,9 +313,11 @@ fn build_e8(m: usize, k: usize, x: &[f32], seed: u64, edge_rows: usize) -> Built
             bytes[off] = sb;
 
             for cw in 0..4usize {
-                let w = gen_e8_word(mix(
-                    seed ^ 0xC0DE ^ ((row as u64) << 40) ^ ((b as u64) << 8) ^ cw as u64,
-                ));
+                let w = gen_e8_word(mix(seed
+                    ^ 0xC0DE
+                    ^ ((row as u64) << 40)
+                    ^ ((b as u64) << 8)
+                    ^ cw as u64));
                 bytes[off + 1 + cw * 4..off + 5 + cw * 4].copy_from_slice(&w.packed.to_le_bytes());
                 for i in 0..8usize {
                     // Format layout: block b holds weights [32b, 32b+32);
@@ -444,8 +447,9 @@ fn report(tag: &str, p: &Parity, got: &[f32], want: &[f64]) -> bool {
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 fn reseed(gpu: &Gpu, t: &GpuTensor, data: &[f32]) {
-    let raw =
-        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) };
+    let raw = unsafe {
+        std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data))
+    };
     gpu.hip.memcpy_htod(&t.buf, raw).expect("reseed y");
 }
 
@@ -555,7 +559,9 @@ fn main() {
     );
 
     let a_e8 = gpu.upload_raw(&e8.bytes, &[e8.bytes.len()]).unwrap();
-    let a_e8t = gpu.upload_raw(&e8_tail.bytes, &[e8_tail.bytes.len()]).unwrap();
+    let a_e8t = gpu
+        .upload_raw(&e8_tail.bytes, &[e8_tail.bytes.len()])
+        .unwrap();
     let a_mq3 = gpu.upload_raw(&mq3.bytes, &[mq3.bytes.len()]).unwrap();
     let x_t = gpu.upload_f32(&x, &[k]).unwrap();
     let y_e8 = gpu.upload_f32(&seed, &[m]).unwrap();
@@ -658,7 +664,10 @@ fn main() {
     let zero_ok = got1[0].to_bits() == seed[0].to_bits() && got2[0].to_bits() == seed[0].to_bits();
     println!(
         "  {:<28} row0 scale byte 0x00 → dot==0; y stayed {} (seed {}) → {}",
-        "zero-scale row bit-identity", got2[0], seed[0], if zero_ok { "PASS" } else { "*** FAIL ***" }
+        "zero-scale row bit-identity",
+        got2[0],
+        seed[0],
+        if zero_ok { "PASS" } else { "*** FAIL ***" }
     );
     all_ok &= zero_ok;
 
@@ -707,8 +716,13 @@ fn main() {
     let pad_ok = (0..PAD).all(|j| gotp[m_tail + j].to_bits() == seed_pad[m_tail + j].to_bits());
     println!(
         "  {:<28} {} pad slot(s) past M bit-identical → {}",
-        "row>=M guard", PAD,
-        if pad_ok { "PASS" } else { "*** FAIL (guard missing / OOB write) ***" }
+        "row>=M guard",
+        PAD,
+        if pad_ok {
+            "PASS"
+        } else {
+            "*** FAIL (guard missing / OOB write) ***"
+        }
     );
     all_ok &= pad_ok;
 
@@ -784,11 +798,16 @@ fn main() {
     );
     println!(
         "  per-rep us  E8 {:?}",
-        t_e8.iter().map(|v| (v * 100.0).round() / 100.0).collect::<Vec<_>>()
+        t_e8.iter()
+            .map(|v| (v * 100.0).round() / 100.0)
+            .collect::<Vec<_>>()
     );
     println!(
         "  per-rep us MQ3 {:?}",
-        t_mq3.iter().map(|v| (v * 100.0).round() / 100.0).collect::<Vec<_>>()
+        t_mq3
+            .iter()
+            .map(|v| (v * 100.0).round() / 100.0)
+            .collect::<Vec<_>>()
     );
     println!(
         "\n  MFP4-E8 is {:+.2}% on median time vs MQ3-Lloyd on the same M×K, moving {:+.1}% bytes.",

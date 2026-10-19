@@ -62,7 +62,8 @@ struct Block {
 
 impl Block {
     fn arches(&self) -> Vec<Arch> {
-        self.arch.map_or_else(|| vec![Arch::Gfx1151, Arch::Gfx1201], |a| vec![a])
+        self.arch
+            .map_or_else(|| vec![Arch::Gfx1151, Arch::Gfx1201], |a| vec![a])
     }
 }
 struct Section {
@@ -76,15 +77,24 @@ fn sections() -> Vec<Section> {
     let mut lines = DOC.lines();
     while let Some(line) = lines.next() {
         if let Some(heading) = line.strip_prefix("## ") {
-            let (code, title) = heading.split_once(": ").unwrap_or_else(|| panic!("heading `{heading}` is not `Rxxxx: title`"));
-            out.push(Section { code: code.into(), title: title.into(), blocks: Vec::new() });
+            let (code, title) = heading
+                .split_once(": ")
+                .unwrap_or_else(|| panic!("heading `{heading}` is not `Rxxxx: title`"));
+            out.push(Section {
+                code: code.into(),
+                title: title.into(),
+                blocks: Vec::new(),
+            });
         } else if let Some(info) = line.strip_prefix("```rip") {
             let (mut fails, mut arch, mut variant) = (None, None, "Default".to_string());
             for word in info.split_whitespace() {
                 if let Some(c) = word.strip_prefix("fails=") {
                     fails = Some(c.to_string());
                 } else if let Some(a) = word.strip_prefix("arch=") {
-                    arch = Some(a.parse::<Arch>().unwrap_or_else(|e| panic!("`{word}`: {e}")));
+                    arch = Some(
+                        a.parse::<Arch>()
+                            .unwrap_or_else(|e| panic!("`{word}`: {e}")),
+                    );
                 } else if let Some(v) = word.strip_prefix("variant=") {
                     variant = v.to_string();
                 } else {
@@ -99,7 +109,15 @@ fn sections() -> Vec<Section> {
                 source.push_str(l);
                 source.push('\n');
             }
-            out.last_mut().expect("a ```rip block outside any section").blocks.push(Block { fails, arch, variant, source });
+            out.last_mut()
+                .expect("a ```rip block outside any section")
+                .blocks
+                .push(Block {
+                    fails,
+                    arch,
+                    variant,
+                    source,
+                });
         }
     }
     out
@@ -110,7 +128,10 @@ fn run_block(b: &Block, arch: Arch) -> Checked {
 }
 
 fn errors(c: &Checked) -> Vec<&Diagnostic> {
-    c.diagnostics.iter().filter(|d| d.severity == Severity::Error).collect()
+    c.diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .collect()
 }
 
 fn word(severity: Severity) -> &'static str {
@@ -123,16 +144,28 @@ fn word(severity: Severity) -> &'static str {
 #[test]
 fn every_code_is_documented_in_order_with_its_exact_title() {
     let found: Vec<(String, String)> = sections().into_iter().map(|s| (s.code, s.title)).collect();
-    let want: Vec<(String, String)> = CODES.iter().map(|(c, t)| (c.to_string(), t.to_string())).collect();
+    let want: Vec<(String, String)> = CODES
+        .iter()
+        .map(|(c, t)| (c.to_string(), t.to_string()))
+        .collect();
     assert_eq!(found, want, "docs/ERRORS.md headings");
     // The library serves the same sections.
     let docs = diag::codes();
-    assert_eq!(docs.iter().map(|d| (d.code, d.title)).collect::<Vec<_>>(), CODES.to_vec());
+    assert_eq!(
+        docs.iter().map(|d| (d.code, d.title)).collect::<Vec<_>>(),
+        CODES.to_vec()
+    );
     for (code, title) in CODES {
         let doc = diag::explain(code).unwrap_or_else(|| panic!("explain({code})"));
         assert_eq!((doc.code, doc.title), (*code, *title));
-        assert!(doc.body.len() > 200, "{code}: the explanation is a paragraph, not a stub");
-        assert!(!doc.body.starts_with("##"), "{code}: the body does not repeat the heading");
+        assert!(
+            doc.body.len() > 200,
+            "{code}: the explanation is a paragraph, not a stub"
+        );
+        assert!(
+            !doc.body.starts_with("##"),
+            "{code}: the body does not repeat the heading"
+        );
     }
     assert!(diag::explain("R9999").is_none());
     assert!(diag::explain("").is_none());
@@ -145,17 +178,39 @@ fn every_section_carries_whole_failing_and_corrected_scripts_where_a_script_can_
         let fails: Vec<&Block> = s.blocks.iter().filter(|b| b.fails.is_some()).collect();
         let fixed: Vec<&Block> = s.blocks.iter().filter(|b| b.fails.is_none()).collect();
         if NO_SCRIPT.contains(&s.code.as_str()) {
-            assert!(s.blocks.is_empty(), "{}: environment-only codes carry no script example", s.code);
+            assert!(
+                s.blocks.is_empty(),
+                "{}: environment-only codes carry no script example",
+                s.code
+            );
             continue;
         }
         assert!(!fails.is_empty(), "{}: no failing script", s.code);
-        assert_eq!(fails.len(), fixed.len(), "{}: every failing script is followed by its corrected script", s.code);
+        assert_eq!(
+            fails.len(),
+            fixed.len(),
+            "{}: every failing script is followed by its corrected script",
+            s.code
+        );
         for b in &fails {
-            assert_eq!(b.fails.as_deref(), Some(s.code.as_str()), "{}: a failing block is marked with its own section's code", s.code);
+            assert_eq!(
+                b.fails.as_deref(),
+                Some(s.code.as_str()),
+                "{}: a failing block is marked with its own section's code",
+                s.code
+            );
         }
         for b in &s.blocks {
-            assert!(b.source.contains("fn emit(") || b.source.contains("fn build("), "{}: a whole kernel script, not a fragment", s.code);
-            assert!(b.source.contains("b.finish()") || s.code == "R0101", "{}: scripts finish the builder", s.code);
+            assert!(
+                b.source.contains("fn emit(") || b.source.contains("fn build("),
+                "{}: a whole kernel script, not a fragment",
+                s.code
+            );
+            assert!(
+                b.source.contains("b.finish()") || s.code == "R0101",
+                "{}: scripts finish the builder",
+                s.code
+            );
         }
     }
 }
@@ -166,27 +221,54 @@ fn every_failing_example_raises_exactly_its_code() {
         for b in s.blocks.iter().filter(|b| b.fails.is_some()) {
             let code = b.fails.as_deref().unwrap();
             let c = run_block(b, b.arch.unwrap_or(Arch::Gfx1201));
-            assert!(c.emitted.is_none() && c.resources.is_none(), "{code}: an error leaves nothing emitted");
+            assert!(
+                c.emitted.is_none() && c.resources.is_none(),
+                "{code}: an error leaves nothing emitted"
+            );
             let e = errors(&c);
             assert_eq!(e.len(), 1, "{code}: {:?}", c.diagnostics);
             let d: &Diagnostic = e[0];
             assert_eq!(d.code, code, "{}: {}", code, d.message);
             assert_eq!(d.severity, Severity::Error);
             assert_eq!(d.file, NAME, "{code}");
-            assert!(!d.message.starts_with(NAME) && !d.message.is_empty(), "{code}: the message carries no position prefix: {}", d.message);
-            assert!(d.help.as_deref().is_some_and(|h| !h.is_empty()), "{code}: every diagnostic has a fix-it");
+            assert!(
+                !d.message.starts_with(NAME) && !d.message.is_empty(),
+                "{code}: the message carries no position prefix: {}",
+                d.message
+            );
+            assert!(
+                d.help.as_deref().is_some_and(|h| !h.is_empty()),
+                "{code}: every diagnostic has a fix-it"
+            );
             if code != "R0501" && code != "R0502" {
-                assert!(d.span.is_some(), "{code}: located at the construct that failed: {d:?}");
+                assert!(
+                    d.span.is_some(),
+                    "{code}: located at the construct that failed: {d:?}"
+                );
             }
 
             // Rendering.
             let text = d.render(&b.source);
-            assert!(text.starts_with(&format!("{}[{code}]: {}\n", word(d.severity), d.message)), "{code}:\n{text}");
-            assert!(text.ends_with(&format!("  = note: details: peacemaker-rip explain {code}\n")), "{code}:\n{text}");
+            assert!(
+                text.starts_with(&format!("{}[{code}]: {}\n", word(d.severity), d.message)),
+                "{code}:\n{text}"
+            );
+            assert!(
+                text.ends_with(&format!(
+                    "  = note: details: peacemaker-rip explain {code}\n"
+                )),
+                "{code}:\n{text}"
+            );
             if let Some(sp) = d.span {
-                assert!(text.contains(&format!(" --> {NAME}:{}:{}\n", sp.line, sp.col)), "{code}:\n{text}");
+                assert!(
+                    text.contains(&format!(" --> {NAME}:{}:{}\n", sp.line, sp.col)),
+                    "{code}:\n{text}"
+                );
                 let line = b.source.lines().nth(sp.line - 1).unwrap();
-                assert!(text.contains(&format!(" | {line}\n")), "{code}: the failing line is shown\n{text}");
+                assert!(
+                    text.contains(&format!(" | {line}\n")),
+                    "{code}: the failing line is shown\n{text}"
+                );
                 assert!(text.contains('^'), "{code}:\n{text}");
             }
 
@@ -199,10 +281,17 @@ fn every_failing_example_raises_exactly_its_code() {
             assert_eq!(j["explain"], format!("peacemaker-rip explain {code}"));
             assert_eq!(j["help"], d.help.as_deref().unwrap());
             match d.span {
-                Some(sp) => assert_eq!(j["span"], json!({"line": sp.line, "col": sp.col, "end_line": sp.end_line, "end_col": sp.end_col})),
+                Some(sp) => assert_eq!(
+                    j["span"],
+                    json!({"line": sp.line, "col": sp.col, "end_line": sp.end_line, "end_col": sp.end_col})
+                ),
                 None => assert!(j["span"].is_null()),
             }
-            assert!(diag::explain(code).is_some_and(|doc| doc.body.contains(&format!("```rip fails={code}"))), "{code}: the explanation embeds its failing script");
+            assert!(
+                diag::explain(code)
+                    .is_some_and(|doc| doc.body.contains(&format!("```rip fails={code}"))),
+                "{code}: the explanation embeds its failing script"
+            );
         }
     }
 }
@@ -217,11 +306,18 @@ fn failing_examples_raise_the_same_code_on_gfx1151_unless_they_are_written_for_g
                 // `s2` is the workgroup id only on gfx11): the other target accepts it silently.
                 assert_eq!(b.arch, Some(Arch::Gfx1201), "{code}");
                 let c = run_block(b, Arch::Gfx1151);
-                assert!(c.diagnostics.is_empty() && c.emitted.is_some(), "{code} on gfx1151: {:?}", c.diagnostics);
+                assert!(
+                    c.diagnostics.is_empty() && c.emitted.is_some(),
+                    "{code} on gfx1151: {:?}",
+                    c.diagnostics
+                );
                 continue;
             }
             let c = run_block(b, Arch::Gfx1151);
-            let d = c.diagnostics.first().unwrap_or_else(|| panic!("{code}: no diagnostic on gfx1151"));
+            let d = c
+                .diagnostics
+                .first()
+                .unwrap_or_else(|| panic!("{code}: no diagnostic on gfx1151"));
             assert_eq!(d.code, code, "gfx1151 {}", d.message);
         }
     }
@@ -233,10 +329,22 @@ fn corrected_examples_compile_clean_on_both_targets() {
         for b in s.blocks.iter().filter(|b| b.fails.is_none()) {
             for arch in b.arches() {
                 let c = run_block(b, arch);
-                assert!(c.diagnostics.is_empty(), "{} on {arch:?}: {:?}", s.code, c.diagnostics);
-                let e = c.emitted.as_ref().unwrap_or_else(|| panic!("{} on {arch:?}: nothing emitted", s.code));
+                assert!(
+                    c.diagnostics.is_empty(),
+                    "{} on {arch:?}: {:?}",
+                    s.code,
+                    c.diagnostics
+                );
+                let e = c
+                    .emitted
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{} on {arch:?}: nothing emitted", s.code));
                 assert!(e.s_text.contains("s_endpgm"), "{}", s.code);
-                assert!(c.resources.is_some(), "{}: resources come from the emitted descriptor", s.code);
+                assert!(
+                    c.resources.is_some(),
+                    "{}: resources come from the emitted descriptor",
+                    s.code
+                );
             }
         }
     }
@@ -245,9 +353,18 @@ fn corrected_examples_compile_clean_on_both_targets() {
 #[test]
 fn the_overview_render_is_the_real_output_for_the_r0301_example() {
     let intro = DOC.split("\n## ").next().unwrap();
-    let start = intro.find("```text\nerror[R0301]").expect("the overview shows an R0301 rendering") + "```text\n".len();
+    let start = intro
+        .find("```text\nerror[R0301]")
+        .expect("the overview shows an R0301 rendering")
+        + "```text\n".len();
     let shown = &intro[start..start + intro[start..].find("```").unwrap()];
-    let source = sections().into_iter().find(|s| s.code == "R0301").unwrap().blocks.remove(0).source;
+    let source = sections()
+        .into_iter()
+        .find(|s| s.code == "R0301")
+        .unwrap()
+        .blocks
+        .remove(0)
+        .source;
     let c = check(&source, "kernel.rip", Arch::Gfx1201, "Default");
     assert_eq!(c.diagnostics.len(), 1, "{:?}", c.diagnostics);
     assert_eq!(c.diagnostics[0].render(&source), shown);
@@ -256,7 +373,9 @@ fn the_overview_render_is_the_real_output_for_the_r0301_example() {
 // ---- main-only scripts through eval ------------------------------------------------------
 
 fn eval_code(source: &str) -> Diagnostic {
-    let raw = peacemaker_rip::eval(source, "main").err().unwrap_or_else(|| panic!("the script must fail: {source}"));
+    let raw = peacemaker_rip::eval(source, "main")
+        .err()
+        .unwrap_or_else(|| panic!("the script must fail: {source}"));
     Diagnostic::from_raw(&raw, "rip", source, Severity::Error)
 }
 
@@ -265,13 +384,28 @@ fn evaluator_faults_of_main_only_scripts_are_classified_and_located() {
     let cases: &[(&str, &str)] = &[
         ("R0102", "fn main() -> u32 { weird!(1); 2 }"),
         ("R0201", "fn main() -> u32 { missing + 1 }"),
-        ("R0202", "fn main() -> u32 {\n    let a: u8 = 1;\n    a.nope()\n}"),
-        ("R0203", "fn f(x: u32) -> u32 { x } fn main() -> u32 { f(1, 2) }"),
+        (
+            "R0202",
+            "fn main() -> u32 {\n    let a: u8 = 1;\n    a.nope()\n}",
+        ),
+        (
+            "R0203",
+            "fn f(x: u32) -> u32 { x } fn main() -> u32 { f(1, 2) }",
+        ),
         ("R0204", "fn main() -> u8 { let a: u8 = 200; a + 56 }"),
         ("R0204", "fn main() -> u8 { let a: u8 = 0; a - 1 }"),
-        ("R0204", "fn main() -> u32 { let a: u8 = 1; let b: u32 = 2; a + b }"),
-        ("R0204", "fn f(x: u8) -> u8 { x } fn main() -> u8 { f(256) }"),
-        ("R0205", "fn main() -> u32 { let n: u32 = 1; if n { 1 } else { 2 } }"),
+        (
+            "R0204",
+            "fn main() -> u32 { let a: u8 = 1; let b: u32 = 2; a + b }",
+        ),
+        (
+            "R0204",
+            "fn f(x: u8) -> u8 { x } fn main() -> u8 { f(256) }",
+        ),
+        (
+            "R0205",
+            "fn main() -> u32 { let n: u32 = 1; if n { 1 } else { 2 } }",
+        ),
         ("R0205", "fn main() -> u32 { let n: u32 = 1; n? }"),
         ("R0206", "fn main() -> u32 { let _ = async { 1 }; 2 }"),
         ("R0207", "fn main() -> u32 { assert_eq!(1 + 1, 3); 0 }"),
@@ -281,12 +415,17 @@ fn evaluator_faults_of_main_only_scripts_are_classified_and_located() {
         let d = eval_code(src);
         assert_eq!(d.code, *code, "{src}: {}", d.message);
         assert_eq!(d.file, "rip");
-        assert!(d.span.is_some_and(|s| s.line >= 1 && s.col >= 1), "{src}: located: {d:?}");
+        assert!(
+            d.span.is_some_and(|s| s.line >= 1 && s.col >= 1),
+            "{src}: located: {d:?}"
+        );
         assert!(!d.message.starts_with("rip:"), "{src}: {}", d.message);
     }
     // A syntax error stops before anything runs, and is positioned too.
     let src = "fn main() -> u32 {\n    let x: u32 = ;\n    1\n}\n";
-    let raw = peacemaker_rip::parse(src, "t.rip").err().expect("syntax error");
+    let raw = peacemaker_rip::parse(src, "t.rip")
+        .err()
+        .expect("syntax error");
     let d = Diagnostic::from_raw(&raw, "t.rip", src, Severity::Error);
     assert_eq!((d.code, d.file.as_str()), ("R0101", "t.rip"), "{raw}");
     assert_eq!(d.span.map(|s| s.line), Some(2));
@@ -364,7 +503,10 @@ fn raw_messages_classify_to_their_codes() {
         let d = Diagnostic::from_raw(raw, "t.rip", source, Severity::Error);
         assert_eq!(d.code, *code, "{raw}");
         assert_eq!(d.severity, Severity::Error);
-        assert!(d.help.is_some(), "{code}: {raw}: every classification has a fix-it");
+        assert!(
+            d.help.is_some(),
+            "{code}: {raw}: every classification has a fix-it"
+        );
         assert!(diag::explain(d.code).is_some(), "{code}");
         assert_eq!(d.file, "t.rip");
         assert!(!d.message.starts_with("t.rip:"), "{raw} -> {}", d.message);
@@ -373,7 +515,10 @@ fn raw_messages_classify_to_their_codes() {
     // R0502 example above). Every other code is covered here.
     let covered: std::collections::BTreeSet<&str> = MESSAGES.iter().map(|(c, _)| *c).collect();
     for (code, _) in CODES {
-        assert!(covered.contains(code) || *code == "R0502", "{code} has no raw-message classification test");
+        assert!(
+            covered.contains(code) || *code == "R0502",
+            "{code} has no raw-message classification test"
+        );
     }
 }
 
@@ -382,7 +527,11 @@ fn warnings_keep_their_severity_and_carry_the_corrected_lists() {
     let raw = "t.rip:12:5: op declares defs [v2] and uses [v0] but `v_add_f32_e32 v2, v0, v1` also reads v1: write &[v(2)], &[v(0), v(1)]";
     let d = Diagnostic::from_raw(raw, "t.rip", "x\n", Severity::Warning);
     assert_eq!((d.code, d.severity), ("R0603", Severity::Warning));
-    assert!(d.help.as_deref().unwrap().contains("&[v(0), v(1)]"), "{:?}", d.help);
+    assert!(
+        d.help.as_deref().unwrap().contains("&[v(0), v(1)]"),
+        "{:?}",
+        d.help
+    );
     assert!(d.render("x\n").starts_with("warning[R0603]: "));
     assert_eq!(d.to_json()["severity"], "warning");
     let raw = "t.rip:3:5: register read before it is defined: s2 in `s_mov_b32 s20, s2`; nothing in the kernel writes it and the launch does not initialize it (gfx1201 entry state: s[0:1] kernarg pointer, ttmp9 workgroup id x, ttmp7 = y | z<<16, v0 thread id)";
@@ -393,30 +542,72 @@ fn warnings_keep_their_severity_and_carry_the_corrected_lists() {
 
 #[test]
 fn unpositioned_messages_have_no_span_and_a_positioned_prefix_is_split_off() {
-    let d = Diagnostic::from_raw("v40 at entry has no unique live owner", "k.rip", "fn emit() {}\n", Severity::Error);
-    assert_eq!((d.file.as_str(), d.span, d.message.as_str()), ("k.rip", None, "v40 at entry has no unique live owner"));
+    let d = Diagnostic::from_raw(
+        "v40 at entry has no unique live owner",
+        "k.rip",
+        "fn emit() {}\n",
+        Severity::Error,
+    );
+    assert_eq!(
+        (d.file.as_str(), d.span, d.message.as_str()),
+        ("k.rip", None, "v40 at entry has no unique live owner")
+    );
     let rendered = d.render("fn emit() {}\n");
     assert!(!rendered.contains("-->"), "{rendered}");
     assert!(rendered.contains("  = help: "), "{rendered}");
     // The prefix names the file; a path with directories is kept whole.
-    let d = Diagnostic::from_raw("kernels/a/k.rip:1:4: no method `x` on `u8`", "ignored.rip", "fn emit() {}\n", Severity::Error);
-    assert_eq!((d.file.as_str(), d.message.as_str()), ("kernels/a/k.rip", "no method `x` on `u8`"));
+    let d = Diagnostic::from_raw(
+        "kernels/a/k.rip:1:4: no method `x` on `u8`",
+        "ignored.rip",
+        "fn emit() {}\n",
+        Severity::Error,
+    );
+    assert_eq!(
+        (d.file.as_str(), d.message.as_str()),
+        ("kernels/a/k.rip", "no method `x` on `u8`")
+    );
     assert_eq!(d.span.map(|s| (s.line, s.col)), Some((1, 4)));
     // Messages that merely contain colons and digits are not positions.
-    let d = Diagnostic::from_raw("module: assemble/link: exit 1: failed", "k.rip", "", Severity::Error);
+    let d = Diagnostic::from_raw(
+        "module: assemble/link: exit 1: failed",
+        "k.rip",
+        "",
+        Severity::Error,
+    );
     assert_eq!((d.code, d.span, d.file.as_str()), ("R0701", None, "k.rip"));
 }
 
 #[test]
 fn name_errors_suggest_the_nearest_vocabulary_entry() {
     let src = "fn emit() {\n    srd_tial(wg.isa(), 12, None)?;\n    wg.barier(())?;\n}\n";
-    let d = Diagnostic::from_raw("t.rip:2:5: cannot find `srd_tial` in this scope", "t.rip", src, Severity::Error);
+    let d = Diagnostic::from_raw(
+        "t.rip:2:5: cannot find `srd_tial` in this scope",
+        "t.rip",
+        src,
+        Severity::Error,
+    );
     assert_eq!(d.code, "R0201");
-    assert!(d.help.as_deref().unwrap().contains("`srd_tail`"), "{:?}", d.help);
-    assert_eq!(d.suggestion.as_deref(), Some("srd_tail(wg.isa(), 12, None)"));
-    let d = Diagnostic::from_raw("t.rip:3:8: no method `barier` on `Workgroup`", "t.rip", src, Severity::Error);
+    assert!(
+        d.help.as_deref().unwrap().contains("`srd_tail`"),
+        "{:?}",
+        d.help
+    );
+    assert_eq!(
+        d.suggestion.as_deref(),
+        Some("srd_tail(wg.isa(), 12, None)")
+    );
+    let d = Diagnostic::from_raw(
+        "t.rip:3:8: no method `barier` on `Workgroup`",
+        "t.rip",
+        src,
+        Severity::Error,
+    );
     assert_eq!(d.code, "R0202");
-    assert!(d.help.as_deref().unwrap().contains("`barrier`"), "{:?}", d.help);
+    assert!(
+        d.help.as_deref().unwrap().contains("`barrier`"),
+        "{:?}",
+        d.help
+    );
     assert_eq!(d.suggestion.as_deref(), Some("barrier(())"));
     assert_eq!(d.to_json()["suggestion"], "barrier(())");
 }
@@ -430,24 +621,65 @@ fn fix_its_use_the_message_region_register_and_listed_vocabulary() {
     );
     assert_eq!(d.code, "R0301");
     let help = d.help.as_deref().unwrap();
-    assert!(help.contains("for t:") && help.contains("let drained = wg.wait(store)?;") && help.contains("ready(t, drained)"));
+    assert!(
+        help.contains("for t:")
+            && help.contains("let drained = wg.wait(store)?;")
+            && help.contains("ready(t, drained)")
+    );
     println!("{}", d.render(source));
 
     let source = "op(wg.isa(), \"v_mov_b32 v99, 0\", &[v(99)], &[])?;\n";
-    let d = Diagnostic::from_raw("kernel.rip:1:1: v99 at entry has no unique live owner", "kernel.rip", source, Severity::Error);
+    let d = Diagnostic::from_raw(
+        "kernel.rip:1:1: v99 at entry has no unique live owner",
+        "kernel.rip",
+        source,
+        Severity::Error,
+    );
     assert_eq!(d.code, "R0401");
-    assert!(d.help.as_deref().unwrap().contains("p.v::<1>(\"v99\", 99, Live::Whole)?;"));
+    assert!(d
+        .help
+        .as_deref()
+        .unwrap()
+        .contains("p.v::<1>(\"v99\", 99, Live::Whole)?;"));
     println!("{}", d.render(source));
-    let d = Diagnostic::from_raw("s[12:15] at entry has no unique live owner", "kernel.rip", "", Severity::Error);
-    assert!(d.help.as_deref().unwrap().contains("p.s::<4>(\"s12\", 12, Live::Whole)?;"));
+    let d = Diagnostic::from_raw(
+        "s[12:15] at entry has no unique live owner",
+        "kernel.rip",
+        "",
+        Severity::Error,
+    );
+    assert!(d
+        .help
+        .as_deref()
+        .unwrap()
+        .contains("p.s::<4>(\"s12\", 12, Live::Whole)?;"));
 
-    let d = Diagnostic::from_raw("no method `publsh` on `Mailbox` (methods: publish, release)", "kernel.rip", "", Severity::Error);
+    let d = Diagnostic::from_raw(
+        "no method `publsh` on `Mailbox` (methods: publish, release)",
+        "kernel.rip",
+        "",
+        Severity::Error,
+    );
     assert!(d.help.as_deref().unwrap().contains("`publish`"));
-    let d = Diagnostic::from_raw("cannot find `rgion` (available: region, lane)", "kernel.rip", "", Severity::Error);
+    let d = Diagnostic::from_raw(
+        "cannot find `rgion` (available: region, lane)",
+        "kernel.rip",
+        "",
+        Severity::Error,
+    );
     assert!(d.help.as_deref().unwrap().contains("`region`"));
-    let d = Diagnostic::from_raw("wg.isa() outside the Workgroup scope", "kernel.rip", "", Severity::Error);
+    let d = Diagnostic::from_raw(
+        "wg.isa() outside the Workgroup scope",
+        "kernel.rip",
+        "",
+        Severity::Error,
+    );
     let help = d.help.as_deref().unwrap();
-    assert!(help.contains("first later statement") && help.contains("let b = wg.isa();") && help.contains("fn author<T: Target>"));
+    assert!(
+        help.contains("first later statement")
+            && help.contains("let b = wg.isa();")
+            && help.contains("fn author<T: Target>")
+    );
 }
 
 #[test]
@@ -460,14 +692,33 @@ fn published_reuse_and_loop_ledger_refusals_have_specific_fix_its() {
     ] {
         let d = Diagnostic::from_raw(raw, "kernel.rip", "", Severity::Error);
         assert_eq!(d.code, "R0302", "{raw}");
-        assert!(d.help.as_deref().unwrap().contains("retire(mailbox)"), "{:?}", d.help);
+        assert!(
+            d.help.as_deref().unwrap().contains("retire(mailbox)"),
+            "{:?}",
+            d.help
+        );
     }
-    let d = Diagnostic::from_raw("cannot split mailbox: it is Writing", "kernel.rip", "", Severity::Error);
+    let d = Diagnostic::from_raw(
+        "cannot split mailbox: it is Writing",
+        "kernel.rip",
+        "",
+        Severity::Error,
+    );
     assert_eq!(d.code, "R0399");
-    let d = Diagnostic::from_raw("loop .Lloop: back-edge ledger must equal the entry ledger", "kernel.rip", "", Severity::Error);
+    let d = Diagnostic::from_raw(
+        "loop .Lloop: back-edge ledger must equal the entry ledger",
+        "kernel.rip",
+        "",
+        Severity::Error,
+    );
     assert_eq!(d.code, "R0404");
     let help = d.help.as_deref().unwrap();
-    assert!(help.contains(".Lloop") && help.contains("wg.wait(store)?") && help.contains("before the back edge"), "{help}");
+    assert!(
+        help.contains(".Lloop")
+            && help.contains("wg.wait(store)?")
+            && help.contains("before the back edge"),
+        "{help}"
+    );
 }
 
 #[test]
@@ -477,12 +728,18 @@ fn non_inline_operand_help_uses_the_number_from_the_message() {
         let d = Diagnostic::from_raw(&raw, "t.rip", "x\n", Severity::Error);
         assert_eq!(d.code, "R0602", "{raw}");
         let help = d.help.as_deref().unwrap();
-        assert!(help.contains(&format!("`{number}` is not an inline constant")), "{help}");
+        assert!(
+            help.contains(&format!("`{number}` is not an inline constant")),
+            "{help}"
+        );
         assert!(help.contains("-16..64"), "{help}");
         assert!(help.contains(&format!("lit({number})")), "{help}");
         assert!(help.contains("`0x..`"), "{help}");
         assert!(help.contains("one literal per instruction"), "{help}");
-        assert!(help.contains("src0") && help.contains("_e32") && help.contains("_e64"), "{help}");
+        assert!(
+            help.contains("src0") && help.contains("_e32") && help.contains("_e64"),
+            "{help}"
+        );
         assert!(!help.contains("operand order, register widths"), "{help}");
     }
 }
@@ -493,7 +750,10 @@ fn gfx1201_buffer_soffset_help_says_null_and_other_operand_errors_stay_generic()
     let d = Diagnostic::from_raw(raw, "t.rip", "x\n", Severity::Error);
     assert_eq!(d.code, "R0602");
     let help = d.help.as_deref().unwrap();
-    assert!(help.contains("On gfx12 a zero buffer soffset is spelled `null`, not `0`."), "{help}");
+    assert!(
+        help.contains("On gfx12 a zero buffer soffset is spelled `null`, not `0`."),
+        "{help}"
+    );
     assert!(!help.contains("lit("), "{help}");
 
     let generic = "Use the selected architecture's operand order, register widths and legal inline constants for this instruction.";
@@ -510,7 +770,15 @@ fn gfx1201_buffer_soffset_help_says_null_and_other_operand_errors_stay_generic()
 
 // ---- golden render and JSON ----------------------------------------------------------------
 
-fn diag(code: &'static str, severity: Severity, message: &str, span: Option<Span>, help: Option<&str>, suggestion: Option<&str>, notes: &[&str]) -> Diagnostic {
+fn diag(
+    code: &'static str,
+    severity: Severity,
+    message: &str,
+    span: Option<Span>,
+    help: Option<&str>,
+    suggestion: Option<&str>,
+    notes: &[&str],
+) -> Diagnostic {
     Diagnostic {
         code,
         severity,
@@ -530,7 +798,12 @@ fn render_single_line_span_golden() {
         "R0201",
         Severity::Error,
         "cannot find `missing_fn` in this scope",
-        Some(Span { line: 2, col: 13, end_line: 2, end_col: 34 }),
+        Some(Span {
+            line: 2,
+            col: 13,
+            end_line: 2,
+            end_col: 34,
+        }),
         Some("Declare `missing_fn` before use."),
         None,
         &["the call is in `main`"],
@@ -555,7 +828,20 @@ fn render_multi_line_span_golden_uses_a_two_digit_gutter() {
         source.push_str(&format!("// line {i}\n"));
     }
     source.push_str("    op(wg.isa(),\n       \"x\", &[], &[])?;\n");
-    let d = diag("R0203", Severity::Error, "`op` takes 4 arguments, got 3", Some(Span { line: 9, col: 5, end_line: 10, end_col: 22 }), None, None, &[]);
+    let d = diag(
+        "R0203",
+        Severity::Error,
+        "`op` takes 4 arguments, got 3",
+        Some(Span {
+            line: 9,
+            col: 5,
+            end_line: 10,
+            end_col: 22,
+        }),
+        None,
+        None,
+        &[],
+    );
     let want = "\
 error[R0203]: `op` takes 4 arguments, got 3
  --> t.rip:9:5
@@ -572,7 +858,20 @@ error[R0203]: `op` takes 4 arguments, got 3
 #[test]
 fn render_point_span_warning_and_unlocated_goldens() {
     let source = "x = ;\n";
-    let point = diag("R0101", Severity::Error, "expected an expression", Some(Span { line: 1, col: 5, end_line: 1, end_col: 6 }), Some("Repair the syntax."), None, &[]);
+    let point = diag(
+        "R0101",
+        Severity::Error,
+        "expected an expression",
+        Some(Span {
+            line: 1,
+            col: 5,
+            end_line: 1,
+            end_col: 6,
+        }),
+        Some("Repair the syntax."),
+        None,
+        &[],
+    );
     assert_eq!(
         point.render(source),
         "\
@@ -585,7 +884,20 @@ error[R0101]: expected an expression
   = note: details: peacemaker-rip explain R0101
 "
     );
-    let warn = diag("R0603", Severity::Warning, "op declares defs [v2]", Some(Span { line: 1, col: 1, end_line: 1, end_col: 2 }), None, Some("op(..)"), &[]);
+    let warn = diag(
+        "R0603",
+        Severity::Warning,
+        "op declares defs [v2]",
+        Some(Span {
+            line: 1,
+            col: 1,
+            end_line: 1,
+            end_col: 2,
+        }),
+        None,
+        Some("op(..)"),
+        &[],
+    );
     assert_eq!(
         warn.render(source),
         "\
@@ -597,7 +909,15 @@ warning[R0603]: op declares defs [v2]
   = note: details: peacemaker-rip explain R0603
 "
     );
-    let bare = diag("R0501", Severity::Error, "no `fn emit` entry point", None, Some("Define `fn emit`."), None, &[]);
+    let bare = diag(
+        "R0501",
+        Severity::Error,
+        "no `fn emit` entry point",
+        None,
+        Some("Define `fn emit`."),
+        None,
+        &[],
+    );
     assert_eq!(
         bare.render(source),
         "\
@@ -614,7 +934,12 @@ fn json_golden() {
         "R0201",
         Severity::Error,
         "cannot find `srd_tial` in this scope",
-        Some(Span { line: 2, col: 5, end_line: 2, end_col: 33 }),
+        Some(Span {
+            line: 2,
+            col: 5,
+            end_line: 2,
+            end_col: 33,
+        }),
         Some("Did you mean `srd_tail` instead of `srd_tial`?"),
         Some("srd_tail(wg.isa(), 12, None)"),
         &["first note"],
@@ -654,7 +979,9 @@ fn json_golden() {
 
 /// 1-based (line, column in chars) of `offset` chars into the first occurrence of `needle`.
 fn pos(source: &str, needle: &str, offset: usize) -> (usize, usize) {
-    let at = source.find(needle).unwrap_or_else(|| panic!("`{needle}` not in the source"));
+    let at = source
+        .find(needle)
+        .unwrap_or_else(|| panic!("`{needle}` not in the source"));
     let before = &source[..at];
     let line = before.matches('\n').count() + 1;
     let col = before.rsplit('\n').next().unwrap().chars().count() + 1;
@@ -668,7 +995,11 @@ fn slice(source: &str, s: Span) -> String {
     for n in s.line..=s.end_line {
         let chars: Vec<char> = lines[n - 1].chars().collect();
         let from = if n == s.line { s.col - 1 } else { 0 };
-        let to = if n == s.end_line { s.end_col - 1 } else { chars.len() };
+        let to = if n == s.end_line {
+            s.end_col - 1
+        } else {
+            chars.len()
+        };
         out.extend(&chars[from..to]);
         if n != s.end_line {
             out.push('\n');
@@ -679,53 +1010,125 @@ fn slice(source: &str, s: Span) -> String {
 
 /// The span the classifier gives a diagnostic reported at (line, col) of `source`.
 fn widened(source: &str, (line, col): (usize, usize)) -> Span {
-    Diagnostic::from_raw(&format!("t.rip:{line}:{col}: cannot find `x` in this scope"), "t.rip", source, Severity::Error)
-        .span
-        .expect("a positioned message has a span")
+    Diagnostic::from_raw(
+        &format!("t.rip:{line}:{col}: cannot find `x` in this scope"),
+        "t.rip",
+        source,
+        Severity::Error,
+    )
+    .span
+    .expect("a positioned message has a span")
 }
 
 fn covers(source: &str, needle: &str, offset: usize, want: &str) {
     let s = widened(source, pos(source, needle, offset));
-    assert_eq!(slice(source, s), want, "{source:?} at `{needle}`+{offset}: {s:?}");
+    assert_eq!(
+        slice(source, s),
+        want,
+        "{source:?} at `{needle}`+{offset}: {s:?}"
+    );
 }
 
 #[test]
 fn span_covers_an_identifier_and_extends_over_its_call() {
-    covers("fn emit() {\n    let n = lane_count + 1;\n}\n", "lane_count", 0, "lane_count");
-    covers("fn emit() {\n    let m = lane_count;\n}\n", "lane_count", 0, "lane_count");
-    covers("    srd_tial(wg.isa(), 12, None)?;\n", "srd_tial", 0, "srd_tial(wg.isa(), 12, None)");
+    covers(
+        "fn emit() {\n    let n = lane_count + 1;\n}\n",
+        "lane_count",
+        0,
+        "lane_count",
+    );
+    covers(
+        "fn emit() {\n    let m = lane_count;\n}\n",
+        "lane_count",
+        0,
+        "lane_count",
+    );
+    covers(
+        "    srd_tial(wg.isa(), 12, None)?;\n",
+        "srd_tial",
+        0,
+        "srd_tial(wg.isa(), 12, None)",
+    );
     // A method: the position is the method name; the receiver is not part of the span.
     covers("    wg.barier(())?;\n", "barier", 0, "barier(())");
     // Nested parentheses balance; the `?` after the call is not part of it.
-    covers("    foo(bar(1), (2, 3))?;\n", "foo", 0, "foo(bar(1), (2, 3))");
+    covers(
+        "    foo(bar(1), (2, 3))?;\n",
+        "foo",
+        0,
+        "foo(bar(1), (2, 3))",
+    );
     // The caller may point into the middle of the identifier: the span still starts at its beginning.
     let src = "    let n = lane_count + 1;\n";
     covers(src, "lane_count", 4, "lane_count");
-    assert_eq!(widened(src, pos(src, "lane_count", 4)).col, pos(src, "lane_count", 0).1);
+    assert_eq!(
+        widened(src, pos(src, "lane_count", 4)).col,
+        pos(src, "lane_count", 0).1
+    );
     // Whitespace between the name and its parenthesis does not break the call.
-    covers("    foo\n        (1, 2)?;\n", "foo", 0, "foo\n        (1, 2)");
+    covers(
+        "    foo\n        (1, 2)?;\n",
+        "foo",
+        0,
+        "foo\n        (1, 2)",
+    );
     // An unbalanced call keeps just the name.
     covers("    foo(1, 2\n", "foo", 0, "foo");
 }
 
 #[test]
 fn span_skips_a_turbofish_between_the_name_and_the_call() {
-    covers("    p.v::<8>(\"vectors\", 8 * i, Live::Whole)?;\n", "v::<8>", 0, "v::<8>(\"vectors\", 8 * i, Live::Whole)");
-    covers("    p.v :: < 8 > /* width */ (\"x\", 0, Live::Whole)?;\n", "v :: <", 0, "v :: < 8 > /* width */ (\"x\", 0, Live::Whole)");
+    covers(
+        "    p.v::<8>(\"vectors\", 8 * i, Live::Whole)?;\n",
+        "v::<8>",
+        0,
+        "v::<8>(\"vectors\", 8 * i, Live::Whole)",
+    );
+    covers(
+        "    p.v :: < 8 > /* width */ (\"x\", 0, Live::Whole)?;\n",
+        "v :: <",
+        0,
+        "v :: < 8 > /* width */ (\"x\", 0, Live::Whole)",
+    );
     // Nested generics, a grouped const expression and a function type arrow inside the turbofish.
-    covers("    wg.method::<Vec<u32>>(\"(\")?;\n", "method", 0, "method::<Vec<u32>>(\"(\")");
-    covers("    wg.method::<{ 1 > 0 }, fn() -> u32>(\"(\")?;\n", "method", 0, "method::<{ 1 > 0 }, fn() -> u32>(\"(\")");
+    covers(
+        "    wg.method::<Vec<u32>>(\"(\")?;\n",
+        "method",
+        0,
+        "method::<Vec<u32>>(\"(\")",
+    );
+    covers(
+        "    wg.method::<{ 1 > 0 }, fn() -> u32>(\"(\")?;\n",
+        "method",
+        0,
+        "method::<{ 1 > 0 }, fn() -> u32>(\"(\")",
+    );
     // A path that is not a turbofish stops at the identifier.
     covers("    let live = Live::Whole;\n", "Live", 0, "Live");
-    covers("    let mut wg = Workgroup::new(&mut b, arch)?;\n", "Workgroup", 0, "Workgroup");
+    covers(
+        "    let mut wg = Workgroup::new(&mut b, arch)?;\n",
+        "Workgroup",
+        0,
+        "Workgroup",
+    );
 }
 
 #[test]
 fn span_matching_call_skips_parentheses_in_literals_and_comments() {
     // A parenthesis and an escaped quote inside a string.
-    covers("    op(wg.isa(), \"mov (\\\")\", &[v(0)], &[])?;\n", "op(", 0, "op(wg.isa(), \"mov (\\\")\", &[v(0)], &[])");
+    covers(
+        "    op(wg.isa(), \"mov (\\\")\", &[v(0)], &[])?;\n",
+        "op(",
+        0,
+        "op(wg.isa(), \"mov (\\\")\", &[v(0)], &[])",
+    );
     // Character literals, including the escaped quote.
-    covers("    f(')', '(', '\\'', 1)?;\n", "f(", 0, "f(')', '(', '\\'', 1)");
+    covers(
+        "    f(')', '(', '\\'', 1)?;\n",
+        "f(",
+        0,
+        "f(')', '(', '\\'', 1)",
+    );
     // A raw string with a quote and a parenthesis inside.
     covers("    f(r#\"a)\"b\"#, 1)?;\n", "f(", 0, "f(r#\"a)\"b\"#, 1)");
     covers("    f(br\"x)\", 1)?;\n", "f(", 0, "f(br\"x)\", 1)");
@@ -737,7 +1140,12 @@ fn span_matching_call_skips_parentheses_in_literals_and_comments() {
         "op(wg.isa(), // )))\n       /* ( */ \"x\", &[], &[])",
     );
     // A nested block comment.
-    covers("    f(/* a /* ) */ ) */ 1)?;\n", "f(", 0, "f(/* a /* ) */ ) */ 1)");
+    covers(
+        "    f(/* a /* ) */ ) */ 1)?;\n",
+        "f(",
+        0,
+        "f(/* a /* ) */ ) */ 1)",
+    );
     // The span reports end line/col of a multi-line call.
     let src = "    op(wg.isa(),\n       \"x\", &[], &[])?;\n";
     let s = widened(src, pos(src, "op(", 0));

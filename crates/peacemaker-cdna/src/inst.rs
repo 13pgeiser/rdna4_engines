@@ -14,26 +14,61 @@
 //! `011_1110`, VOP3 `[31:26]=110100`, VOP3P `[31:23]=1_1010_0111` (MAI when
 //! the 7-bit opcode is >= 0x40), DS `110110`, FLAT/GLOBAL/SCRATCH `110111`,
 //! MUBUF `111000`, MTBUF `111010`, MIMG `111100`, EXP `110001`.
-use crate::enc::{
-    ds::Ds, flat::Flat, mubuf::Mubuf, smem::Smem,
-    sop::{Sop1, Sop2, Sopc, Sopk, Sopp},
-    vop::{Vop1, Vop2, Vopc}, vop3::Vop3, vop3p::{Mai, Vop3p},
-};
 use crate::arch::Arch;
+use crate::enc::{
+    ds::Ds,
+    flat::Flat,
+    mubuf::Mubuf,
+    smem::Smem,
+    sop::{Sop1, Sop2, Sopc, Sopk, Sopp},
+    vop::{Vop1, Vop2, Vopc},
+    vop3::Vop3,
+    vop3p::{Mai, Vop3p},
+};
 use crate::operand::Src;
 use crate::Result;
 use std::fmt;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Inst {
-    Sop1(Sop1), Sop2(Sop2), Sopk(Sopk), Sopc(Sopc), Sopp(Sopp),
+    Sop1(Sop1),
+    Sop2(Sop2),
+    Sopk(Sopk),
+    Sopc(Sopc),
+    Sopp(Sopp),
     Smem(Smem),
-    Vop1(Vop1), Vop2(Vop2), Vopc(Vopc), Vop3(Vop3), Vop3p(Vop3p), Mai(Mai),
-    Ds(Ds), Flat(Flat), Mubuf(Mubuf),
+    Vop1(Vop1),
+    Vop2(Vop2),
+    Vopc(Vopc),
+    Vop3(Vop3),
+    Vop3p(Vop3p),
+    Mai(Mai),
+    Ds(Ds),
+    Flat(Flat),
+    Mubuf(Mubuf),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Format { Sop1, Sop2, Sopk, Sopc, Sopp, Smem, Vop1, Vop2, Vopc, Vop3, Vop3p, Mai, Ds, Flat, Mubuf, Mtbuf, Mimg, Exp }
+pub enum Format {
+    Sop1,
+    Sop2,
+    Sopk,
+    Sopc,
+    Sopp,
+    Smem,
+    Vop1,
+    Vop2,
+    Vopc,
+    Vop3,
+    Vop3p,
+    Mai,
+    Ds,
+    Flat,
+    Mubuf,
+    Mtbuf,
+    Mimg,
+    Exp,
+}
 
 /// The format of the instruction whose first dword is `word`.
 pub fn classify(word: u32) -> Option<Format> {
@@ -54,7 +89,11 @@ pub fn classify(word: u32) -> Option<Format> {
         });
     }
     if word >> 23 == 0b1_1010_0111 {
-        return Some(if (word >> 16) & 0x7f >= 0x40 { Format::Mai } else { Format::Vop3p });
+        return Some(if (word >> 16) & 0x7f >= 0x40 {
+            Format::Mai
+        } else {
+            Format::Vop3p
+        });
     }
     Some(match word >> 26 {
         0b11_0000 => Format::Smem,
@@ -73,14 +112,31 @@ pub fn classify(word: u32) -> Option<Format> {
 /// EXEC, FLAT_SCRATCH and XNACK_MASK are two dwords each (`base` 0 = lo,
 /// 1 = hi); SCC and M0 are one unit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RegFile { Sgpr, Vgpr, Agpr, Ttmp, Vcc, Exec, M0, Scc, FlatScratch, XnackMask }
+pub enum RegFile {
+    Sgpr,
+    Vgpr,
+    Agpr,
+    Ttmp,
+    Vcc,
+    Exec,
+    M0,
+    Scc,
+    FlatScratch,
+    XnackMask,
+}
 
 /// `len` consecutive 32-bit registers of one file starting at `base`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct RegSpan { pub file: RegFile, pub base: u8, pub len: u8 }
+pub struct RegSpan {
+    pub file: RegFile,
+    pub base: u8,
+    pub len: u8,
+}
 
 impl RegSpan {
-    pub fn new(file: RegFile, base: u8, len: u8) -> Self { Self { file, base, len } }
+    pub fn new(file: RegFile, base: u8, len: u8) -> Self {
+        Self { file, base, len }
+    }
     /// The registers a `dwords`-wide operand starting at `src` names; `None`
     /// for constants, literals and the read-only `src_*` values (which are
     /// still state reads, see [`Footprint`] users: `Scc`, `Vccz` and `Execz`
@@ -119,23 +175,44 @@ impl RegSpan {
 /// for VOP2 carry ops / `v_cndmask_b32_e32` / VOPC, SCC for SOPC and the
 /// SCC-writing SALU ops, M0 where the ISA reads it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Footprint { pub defs: Vec<RegSpan>, pub uses: Vec<RegSpan> }
+pub struct Footprint {
+    pub defs: Vec<RegSpan>,
+    pub uses: Vec<RegSpan>,
+}
 
 impl Footprint {
     /// Record `src` (`dwords` wide) as a use; constants record nothing.
-    pub fn read(&mut self, src: Src, dwords: u8) { if let Some(r) = RegSpan::of(src, dwords) { self.uses.push(r) } }
+    pub fn read(&mut self, src: Src, dwords: u8) {
+        if let Some(r) = RegSpan::of(src, dwords) {
+            self.uses.push(r)
+        }
+    }
     /// Record `dst` (`dwords` wide) as a def.
-    pub fn write(&mut self, dst: Src, dwords: u8) { if let Some(r) = RegSpan::of(dst, dwords) { self.defs.push(r) } }
-    pub fn read_file(&mut self, file: RegFile, base: u8, len: u8) { self.uses.push(RegSpan::new(file, base, len)) }
-    pub fn write_file(&mut self, file: RegFile, base: u8, len: u8) { self.defs.push(RegSpan::new(file, base, len)) }
+    pub fn write(&mut self, dst: Src, dwords: u8) {
+        if let Some(r) = RegSpan::of(dst, dwords) {
+            self.defs.push(r)
+        }
+    }
+    pub fn read_file(&mut self, file: RegFile, base: u8, len: u8) {
+        self.uses.push(RegSpan::new(file, base, len))
+    }
+    pub fn write_file(&mut self, file: RegFile, base: u8, len: u8) {
+        self.defs.push(RegSpan::new(file, base, len))
+    }
 }
 
 /// What a memory instruction does to the wait counters (CDNA3 ISA §4.4
 /// p.19-20): VMEM (MUBUF/global) counts on VM_CNT, DS and SMEM on LGKM_CNT.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MemKind {
-    VmemLoad, VmemStore, VmemAtomic, VmemAtomicRtn,
-    DsLoad, DsStore, DsAtomic, DsAtomicRtn,
+    VmemLoad,
+    VmemStore,
+    VmemAtomic,
+    VmemAtomicRtn,
+    DsLoad,
+    DsStore,
+    DsAtomic,
+    DsAtomicRtn,
     /// `ds_swizzle_b32`, `ds_permute_b32`, `ds_bpermute_b32`: cross-lane
     /// moves through the LDS crossbar that touch no LDS memory but return
     /// data under LGKM_CNT.
@@ -146,26 +223,50 @@ pub enum MemKind {
 impl Inst {
     pub fn format(&self) -> Format {
         match self {
-            Self::Sop1(_) => Format::Sop1, Self::Sop2(_) => Format::Sop2, Self::Sopk(_) => Format::Sopk,
-            Self::Sopc(_) => Format::Sopc, Self::Sopp(_) => Format::Sopp, Self::Smem(_) => Format::Smem,
-            Self::Vop1(_) => Format::Vop1, Self::Vop2(_) => Format::Vop2, Self::Vopc(_) => Format::Vopc,
-            Self::Vop3(_) => Format::Vop3, Self::Vop3p(_) => Format::Vop3p, Self::Mai(_) => Format::Mai,
-            Self::Ds(_) => Format::Ds, Self::Flat(_) => Format::Flat, Self::Mubuf(_) => Format::Mubuf,
+            Self::Sop1(_) => Format::Sop1,
+            Self::Sop2(_) => Format::Sop2,
+            Self::Sopk(_) => Format::Sopk,
+            Self::Sopc(_) => Format::Sopc,
+            Self::Sopp(_) => Format::Sopp,
+            Self::Smem(_) => Format::Smem,
+            Self::Vop1(_) => Format::Vop1,
+            Self::Vop2(_) => Format::Vop2,
+            Self::Vopc(_) => Format::Vopc,
+            Self::Vop3(_) => Format::Vop3,
+            Self::Vop3p(_) => Format::Vop3p,
+            Self::Mai(_) => Format::Mai,
+            Self::Ds(_) => Format::Ds,
+            Self::Flat(_) => Format::Flat,
+            Self::Mubuf(_) => Format::Mubuf,
         }
     }
 
     /// Append the instruction's dwords (including a literal) to `out`.
     pub fn encode(&self, arch: Arch, out: &mut Vec<u32>) -> Result<()> {
         match self {
-            Self::Sop1(i) => i.encode(arch, out), Self::Sop2(i) => i.encode(arch, out), Self::Sopk(i) => i.encode(arch, out),
-            Self::Sopc(i) => i.encode(arch, out), Self::Sopp(i) => i.encode(arch, out), Self::Smem(i) => i.encode(arch, out),
-            Self::Vop1(i) => i.encode(arch, out), Self::Vop2(i) => i.encode(arch, out), Self::Vopc(i) => i.encode(arch, out),
-            Self::Vop3(i) => i.encode(arch, out), Self::Vop3p(i) => i.encode(arch, out), Self::Mai(i) => i.encode(arch, out),
-            Self::Ds(i) => i.encode(arch, out), Self::Flat(i) => i.encode(arch, out), Self::Mubuf(i) => i.encode(arch, out),
+            Self::Sop1(i) => i.encode(arch, out),
+            Self::Sop2(i) => i.encode(arch, out),
+            Self::Sopk(i) => i.encode(arch, out),
+            Self::Sopc(i) => i.encode(arch, out),
+            Self::Sopp(i) => i.encode(arch, out),
+            Self::Smem(i) => i.encode(arch, out),
+            Self::Vop1(i) => i.encode(arch, out),
+            Self::Vop2(i) => i.encode(arch, out),
+            Self::Vopc(i) => i.encode(arch, out),
+            Self::Vop3(i) => i.encode(arch, out),
+            Self::Vop3p(i) => i.encode(arch, out),
+            Self::Mai(i) => i.encode(arch, out),
+            Self::Ds(i) => i.encode(arch, out),
+            Self::Flat(i) => i.encode(arch, out),
+            Self::Mubuf(i) => i.encode(arch, out),
         }
     }
 
-    pub fn words(&self, arch: Arch) -> Result<Vec<u32>> { let mut out = Vec::with_capacity(3); self.encode(arch, &mut out)?; Ok(out) }
+    pub fn words(&self, arch: Arch) -> Result<Vec<u32>> {
+        let mut out = Vec::with_capacity(3);
+        self.encode(arch, &mut out)?;
+        Ok(out)
+    }
 
     /// Decode the instruction starting at `words[0]`; returns it and its
     /// dword count.
@@ -173,32 +274,91 @@ impl Inst {
         let first = *words.first().ok_or("decode past the end of the code")?;
         let format = classify(first).ok_or_else(|| format!("unknown encoding {first:#010x}"))?;
         Ok(match format {
-            Format::Sop1 => { let (i, n) = Sop1::decode(arch, words)?; (Self::Sop1(i), n) }
-            Format::Sop2 => { let (i, n) = Sop2::decode(arch, words)?; (Self::Sop2(i), n) }
-            Format::Sopk => { let (i, n) = Sopk::decode(arch, words)?; (Self::Sopk(i), n) }
-            Format::Sopc => { let (i, n) = Sopc::decode(arch, words)?; (Self::Sopc(i), n) }
-            Format::Sopp => { let (i, n) = Sopp::decode(arch, words)?; (Self::Sopp(i), n) }
-            Format::Smem => { let (i, n) = Smem::decode(arch, words)?; (Self::Smem(i), n) }
-            Format::Vop1 => { let (i, n) = Vop1::decode(arch, words)?; (Self::Vop1(i), n) }
-            Format::Vop2 => { let (i, n) = Vop2::decode(arch, words)?; (Self::Vop2(i), n) }
-            Format::Vopc => { let (i, n) = Vopc::decode(arch, words)?; (Self::Vopc(i), n) }
-            Format::Vop3 => { let (i, n) = Vop3::decode(arch, words)?; (Self::Vop3(i), n) }
-            Format::Vop3p => { let (i, n) = Vop3p::decode(arch, words)?; (Self::Vop3p(i), n) }
-            Format::Mai => { let (i, n) = Mai::decode(arch, words)?; (Self::Mai(i), n) }
-            Format::Ds => { let (i, n) = Ds::decode(arch, words)?; (Self::Ds(i), n) }
-            Format::Flat => { let (i, n) = Flat::decode(arch, words)?; (Self::Flat(i), n) }
-            Format::Mubuf => { let (i, n) = Mubuf::decode(arch, words)?; (Self::Mubuf(i), n) }
-            other => return Err(format!("{other:?} encoding {first:#010x} is outside the PeaceMaker CDNA instruction table")),
+            Format::Sop1 => {
+                let (i, n) = Sop1::decode(arch, words)?;
+                (Self::Sop1(i), n)
+            }
+            Format::Sop2 => {
+                let (i, n) = Sop2::decode(arch, words)?;
+                (Self::Sop2(i), n)
+            }
+            Format::Sopk => {
+                let (i, n) = Sopk::decode(arch, words)?;
+                (Self::Sopk(i), n)
+            }
+            Format::Sopc => {
+                let (i, n) = Sopc::decode(arch, words)?;
+                (Self::Sopc(i), n)
+            }
+            Format::Sopp => {
+                let (i, n) = Sopp::decode(arch, words)?;
+                (Self::Sopp(i), n)
+            }
+            Format::Smem => {
+                let (i, n) = Smem::decode(arch, words)?;
+                (Self::Smem(i), n)
+            }
+            Format::Vop1 => {
+                let (i, n) = Vop1::decode(arch, words)?;
+                (Self::Vop1(i), n)
+            }
+            Format::Vop2 => {
+                let (i, n) = Vop2::decode(arch, words)?;
+                (Self::Vop2(i), n)
+            }
+            Format::Vopc => {
+                let (i, n) = Vopc::decode(arch, words)?;
+                (Self::Vopc(i), n)
+            }
+            Format::Vop3 => {
+                let (i, n) = Vop3::decode(arch, words)?;
+                (Self::Vop3(i), n)
+            }
+            Format::Vop3p => {
+                let (i, n) = Vop3p::decode(arch, words)?;
+                (Self::Vop3p(i), n)
+            }
+            Format::Mai => {
+                let (i, n) = Mai::decode(arch, words)?;
+                (Self::Mai(i), n)
+            }
+            Format::Ds => {
+                let (i, n) = Ds::decode(arch, words)?;
+                (Self::Ds(i), n)
+            }
+            Format::Flat => {
+                let (i, n) = Flat::decode(arch, words)?;
+                (Self::Flat(i), n)
+            }
+            Format::Mubuf => {
+                let (i, n) = Mubuf::decode(arch, words)?;
+                (Self::Mubuf(i), n)
+            }
+            other => {
+                return Err(format!(
+                "{other:?} encoding {first:#010x} is outside the PeaceMaker CDNA instruction table"
+            ))
+            }
         })
     }
 
     pub fn footprint(&self) -> Footprint {
         match self {
-            Self::Sop1(i) => i.footprint(), Self::Sop2(i) => i.footprint(), Self::Sopk(i) => i.footprint(),
-            Self::Sopc(i) => i.footprint(), Self::Sopp(i) => i.footprint(), Self::Smem(i) => i.footprint(),
-            Self::Vop1(i) => i.footprint(), Self::Vop2(i) => i.footprint(), Self::Vopc(i) => i.footprint(),
-            Self::Vop3(i) => i.footprint(), Self::Vop3p(i) => i.footprint(), Self::Mai(i) => i.footprint(),
-            Self::Ds(i) => i.footprint(), Self::Flat(i) => i.footprint(), Self::Mubuf(i) => i.footprint(),
+            Self::Sop1(i) => i.footprint(),
+            Self::Sop2(i) => i.footprint(),
+            Self::Sopk(i) => i.footprint(),
+            Self::Sopc(i) => i.footprint(),
+            Self::Sopp(i) => i.footprint(),
+            Self::Smem(i) => i.footprint(),
+            Self::Vop1(i) => i.footprint(),
+            Self::Vop2(i) => i.footprint(),
+            Self::Vopc(i) => i.footprint(),
+            Self::Vop3(i) => i.footprint(),
+            Self::Vop3p(i) => i.footprint(),
+            Self::Mai(i) => i.footprint(),
+            Self::Ds(i) => i.footprint(),
+            Self::Flat(i) => i.footprint(),
+            Self::Mubuf(i) => i.footprint(),
         }
     }
 
@@ -214,17 +374,33 @@ impl Inst {
 
     /// `s_branch` / `s_cbranch_*`: the signed dword offset from the next
     /// instruction (`SIMM16`, CDNA3 ISA §4.2 p.18: PC = PC + 4 + SIMM16 * 4).
-    pub fn branch_offset(&self) -> Option<i16> { if let Self::Sopp(p) = self { p.branch_offset() } else { None } }
+    pub fn branch_offset(&self) -> Option<i16> {
+        if let Self::Sopp(p) = self {
+            p.branch_offset()
+        } else {
+            None
+        }
+    }
 }
 
 impl fmt::Display for Inst {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Sop1(i) => i.fmt(f), Self::Sop2(i) => i.fmt(f), Self::Sopk(i) => i.fmt(f),
-            Self::Sopc(i) => i.fmt(f), Self::Sopp(i) => i.fmt(f), Self::Smem(i) => i.fmt(f),
-            Self::Vop1(i) => i.fmt(f), Self::Vop2(i) => i.fmt(f), Self::Vopc(i) => i.fmt(f),
-            Self::Vop3(i) => i.fmt(f), Self::Vop3p(i) => i.fmt(f), Self::Mai(i) => i.fmt(f),
-            Self::Ds(i) => i.fmt(f), Self::Flat(i) => i.fmt(f), Self::Mubuf(i) => i.fmt(f),
+            Self::Sop1(i) => i.fmt(f),
+            Self::Sop2(i) => i.fmt(f),
+            Self::Sopk(i) => i.fmt(f),
+            Self::Sopc(i) => i.fmt(f),
+            Self::Sopp(i) => i.fmt(f),
+            Self::Smem(i) => i.fmt(f),
+            Self::Vop1(i) => i.fmt(f),
+            Self::Vop2(i) => i.fmt(f),
+            Self::Vopc(i) => i.fmt(f),
+            Self::Vop3(i) => i.fmt(f),
+            Self::Vop3p(i) => i.fmt(f),
+            Self::Mai(i) => i.fmt(f),
+            Self::Ds(i) => i.fmt(f),
+            Self::Flat(i) => i.fmt(f),
+            Self::Mubuf(i) => i.fmt(f),
         }
     }
 }
@@ -232,7 +408,10 @@ impl fmt::Display for Inst {
 /// Encode a straight-line instruction list.
 pub fn encode_all(arch: Arch, insts: &[Inst]) -> Result<Vec<u32>> {
     let mut out = Vec::with_capacity(insts.len() * 2);
-    for (index, inst) in insts.iter().enumerate() { inst.encode(arch, &mut out).map_err(|e| format!("instruction {index} ({inst:?}): {e}"))? }
+    for (index, inst) in insts.iter().enumerate() {
+        inst.encode(arch, &mut out)
+            .map_err(|e| format!("instruction {index} ({inst:?}): {e}"))?
+    }
     Ok(out)
 }
 

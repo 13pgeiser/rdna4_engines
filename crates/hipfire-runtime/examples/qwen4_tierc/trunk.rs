@@ -74,13 +74,29 @@ struct Shape {
 /// Qwen4 trunk projection shapes the BF16 MFMA route launches.
 const MFMA_SHAPES: [Shape; 4] = [
     // GDN in-projection qkv: 2*(16*128) + 48*128.
-    Shape { name: "gdn_qkv", m: 10240, k: HIDDEN },
+    Shape {
+        name: "gdn_qkv",
+        m: 10240,
+        k: HIDDEN,
+    },
     // GDN out-proj (48*128) and QSA out-proj (24*256): K = 6144.
-    Shape { name: "out_proj", m: HIDDEN, k: 6144 },
+    Shape {
+        name: "out_proj",
+        m: HIDDEN,
+        k: 6144,
+    },
     // GDN in_proj_a / in_proj_b: M = 48 = 1.5 MFMA M tiles (tail tile).
-    Shape { name: "gdn_ba", m: GDN_VALUE_HEADS, k: HIDDEN },
+    Shape {
+        name: "gdn_ba",
+        m: GDN_VALUE_HEADS,
+        k: HIDDEN,
+    },
     // HC block-inject gate: M = 4 branches over the wide stream (M % 16 != 0).
-    Shape { name: "hc_gate", m: HC_STREAMS, k: HC_WIDE },
+    Shape {
+        name: "hc_gate",
+        m: HC_STREAMS,
+        k: HC_WIDE,
+    },
 ];
 
 /// F64 reference: `y[r, m] = sum_k w[m, k] * x[r, k]`, rounded to F32 once.
@@ -168,7 +184,11 @@ fn gemm_bf16_mfma_trunk(gpu: &mut Gpu) -> Result<String, String> {
         // The staged bits are the frozen RNE rule's bits.
         let staged = down_bf16(gpu, &xbf)?;
         let want_bits: Vec<u16> = x_host.iter().map(|&v| f32_to_bf16_bits(v)).collect();
-        results.push(exact_bf16(&format!("{label} staged x"), &staged, &want_bits));
+        results.push(exact_bf16(
+            &format!("{label} staged x"),
+            &staged,
+            &want_bits,
+        ));
 
         // Every row count, against the reference.
         let mut by_rows: Vec<(usize, Vec<f32>)> = Vec::new();
@@ -199,7 +219,9 @@ fn gemm_bf16_mfma_trunk(gpu: &mut Gpu) -> Result<String, String> {
                 if r < *n {
                     let (diff, max_abs) = bit_diff(&got[r * m..(r + 1) * m], &one);
                     if diff != 0 {
-                        bad.push(format!("row {r} of n={n}: {diff} bit diffs, max_abs {max_abs:e}"));
+                        bad.push(format!(
+                            "row {r} of n={n}: {diff} bit diffs, max_abs {max_abs:e}"
+                        ));
                     }
                 }
             }
@@ -251,12 +273,32 @@ fn gemm_bf16_mfma_trunk(gpu: &mut Gpu) -> Result<String, String> {
 // block 32 (half a wave64: lanes 32..63 are idle; the tree stays in lanes 0..31).
 fn gemv_bf16_xf32_1row(gpu: &mut Gpu) -> Result<String, String> {
     const SHAPES: [Shape; 5] = [
-        Shape { name: "gdn_qkv", m: 10240, k: HIDDEN },
-        Shape { name: "out_proj", m: HIDDEN, k: 6144 },
-        Shape { name: "gdn_ba", m: GDN_VALUE_HEADS, k: HIDDEN },
-        Shape { name: "hc_gate", m: HC_STREAMS, k: HC_WIDE },
+        Shape {
+            name: "gdn_qkv",
+            m: 10240,
+            k: HIDDEN,
+        },
+        Shape {
+            name: "out_proj",
+            m: HIDDEN,
+            k: 6144,
+        },
+        Shape {
+            name: "gdn_ba",
+            m: GDN_VALUE_HEADS,
+            k: HIDDEN,
+        },
+        Shape {
+            name: "hc_gate",
+            m: HC_STREAMS,
+            k: HC_WIDE,
+        },
         // 8192 rows of the 248,320-row LM head (the grid is one block per row).
-        Shape { name: "lm_head_slice", m: 8192, k: HIDDEN },
+        Shape {
+            name: "lm_head_slice",
+            m: 8192,
+            k: HIDDEN,
+        },
     ];
     let mut results = Vec::new();
     let mut rng = Rng::new(0x7121_0002);
@@ -295,8 +337,16 @@ fn gemm_bf16_xf32_multirow_trunk(gpu: &mut Gpu) -> Result<String, String> {
     let mut rng = Rng::new(0x7121_0003);
     let shapes: Vec<Shape> = MFMA_SHAPES
         .iter()
-        .map(|s| Shape { name: s.name, m: s.m, k: s.k })
-        .chain([Shape { name: "router", m: MOE_EXPERTS, k: HIDDEN }])
+        .map(|s| Shape {
+            name: s.name,
+            m: s.m,
+            k: s.k,
+        })
+        .chain([Shape {
+            name: "router",
+            m: MOE_EXPERTS,
+            k: HIDDEN,
+        }])
         .collect();
     for shape in &shapes {
         let (m, k) = (shape.m, shape.k);
@@ -334,9 +384,15 @@ fn gemm_bf16_xf32_multirow_trunk(gpu: &mut Gpu) -> Result<String, String> {
             let diff: usize = (0..n)
                 .map(|r| bit_diff(&got[r * m..(r + 1) * m], &gemv_rows[r]).0)
                 .sum();
-            report.push(format!("rows={n}: {diff}/{} bits differ from gemv rows", n * m));
+            report.push(format!(
+                "rows={n}: {diff}/{} bits differ from gemv rows",
+                n * m
+            ));
         }
-        results.push(Ok(format!("{label} REPORT multirow vs gemv [{}]", report.join("; "))));
+        results.push(Ok(format!(
+            "{label} REPORT multirow vs gemv [{}]",
+            report.join("; ")
+        )));
         free_all(gpu, vec![w, x])?;
     }
     all(results)
@@ -349,9 +405,21 @@ fn gemm_bf16_xf32_multirow_trunk(gpu: &mut Gpu) -> Result<String, String> {
 fn gemv_bf16_xf32_k4_1row(gpu: &mut Gpu) -> Result<String, String> {
     const SHAPES: [Shape; 3] = [
         // HC read down projection: low-rank 320 over the 10,240-wide stream.
-        Shape { name: "hc_down", m: 320, k: HC_WIDE },
-        Shape { name: "gdn_ba", m: GDN_VALUE_HEADS, k: HIDDEN },
-        Shape { name: "hc_gate", m: HC_STREAMS, k: HC_WIDE },
+        Shape {
+            name: "hc_down",
+            m: 320,
+            k: HC_WIDE,
+        },
+        Shape {
+            name: "gdn_ba",
+            m: GDN_VALUE_HEADS,
+            k: HIDDEN,
+        },
+        Shape {
+            name: "hc_gate",
+            m: HC_STREAMS,
+            k: HC_WIDE,
+        },
     ];
     let mut results = Vec::new();
     let mut rng = Rng::new(0x7121_0004);

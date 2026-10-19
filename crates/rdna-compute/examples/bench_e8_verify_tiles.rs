@@ -129,7 +129,9 @@ fn main() {
         let reps = (MIN_WORKING_SET / one).max(2);
         let mut wbufs = Vec::with_capacity(reps);
         for _ in 0..reps {
-            let t = gpu.alloc_tensor(&[m, row_bytes], DType::MFP4G32E8SOA).expect("alloc w");
+            let t = gpu
+                .alloc_tensor(&[m, row_bytes], DType::MFP4G32E8SOA)
+                .expect("alloc w");
             gpu.hip.memcpy_htod(&t.buf, &soa).expect("htod w");
             wbufs.push(t);
         }
@@ -140,7 +142,16 @@ fn main() {
         );
         println!(
             "    {:>3} {:>10} {:>10} {:>10} {:>10}   {:>9} {:>9} {:>9} {:>9}   {}",
-            "B", "b1 us", "b2 us", "b4 us", "gemv us", "b1 GB/s", "b2 GB/s", "b4 GB/s", "gemv GB/s", "winner"
+            "B",
+            "b1 us",
+            "b2 us",
+            "b4 us",
+            "gemv us",
+            "b1 GB/s",
+            "b2 GB/s",
+            "b4 GB/s",
+            "gemv GB/s",
+            "winner"
         );
 
         for b in [1usize, 2, 3, 4, 5, 6, 8] {
@@ -177,8 +188,13 @@ fn main() {
 
             let us: Vec<Option<f64>> = (0..4).map(|w| time_variant(w, &mut gpu)).collect();
             let gbs = |o: Option<f64>| o.map(|u| one as f64 / 1e9 / (u / 1e6));
-            let fmt_us = |o: Option<f64>| o.map(|u| format!("{u:.1}")).unwrap_or_else(|| "-".into());
-            let fmt_gb = |o: Option<f64>| gbs(o).map(|g| format!("{g:.1}")).unwrap_or_else(|| "-".into());
+            let fmt_us =
+                |o: Option<f64>| o.map(|u| format!("{u:.1}")).unwrap_or_else(|| "-".into());
+            let fmt_gb = |o: Option<f64>| {
+                gbs(o)
+                    .map(|g| format!("{g:.1}"))
+                    .unwrap_or_else(|| "-".into())
+            };
             let names = ["b1", "b2", "b4", "gemv"];
             let winner = us
                 .iter()
@@ -192,8 +208,14 @@ fn main() {
             println!(
                 "    {:>3} {:>10} {:>10} {:>10} {:>10}   {:>9} {:>9} {:>9} {:>9}   {}",
                 b,
-                fmt_us(us[0]), fmt_us(us[1]), fmt_us(us[2]), fmt_us(us[3]),
-                fmt_gb(us[0]), fmt_gb(us[1]), fmt_gb(us[2]), fmt_gb(us[3]),
+                fmt_us(us[0]),
+                fmt_us(us[1]),
+                fmt_us(us[2]),
+                fmt_us(us[3]),
+                fmt_gb(us[0]),
+                fmt_gb(us[1]),
+                fmt_gb(us[2]),
+                fmt_gb(us[3]),
                 wtxt
             );
         }

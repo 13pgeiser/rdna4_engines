@@ -919,7 +919,12 @@ impl Drop for FitMaxTokensGuard {
 /// prefix, trailer) minus [`FIT_MAX_TOKENS_MARGIN`]. With no room left the
 /// value is returned unchanged so the prompt itself is refused.
 pub fn fit_max_tokens(max_tokens: usize, used: usize, cap: usize) -> usize {
-    fit_max_tokens_if(FIT_MAX_TOKENS.with(std::cell::Cell::get), max_tokens, used, cap)
+    fit_max_tokens_if(
+        FIT_MAX_TOKENS.with(std::cell::Cell::get),
+        max_tokens,
+        used,
+        cap,
+    )
 }
 
 /// [`fit_max_tokens`] with the fit decision passed explicitly, for paths that

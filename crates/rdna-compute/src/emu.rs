@@ -118,7 +118,11 @@ pub(crate) fn budget_limits(
 }
 
 /// `min(requested, free.saturating_sub(reserved))` — the Phase-2 handoff math.
-pub(crate) fn resident_budget_from(requested_bytes: u64, free_bytes: u64, reserved_bytes: u64) -> u64 {
+pub(crate) fn resident_budget_from(
+    requested_bytes: u64,
+    free_bytes: u64,
+    reserved_bytes: u64,
+) -> u64 {
     requested_bytes.min(free_bytes.saturating_sub(reserved_bytes))
 }
 
@@ -182,7 +186,10 @@ pub(crate) fn install_for_device(
         .map_err(|message| HipError::new(0, &message))?;
 
     let pci_bdf = hip.device_pci_bus_id(device_id).map_err(|error| {
-        HipError::new(0, &format!("HIPFIRE_EMU: device {device_id} PCI BDF unreadable: {error}"))
+        HipError::new(
+            0,
+            &format!("HIPFIRE_EMU: device {device_id} PCI BDF unreadable: {error}"),
+        )
     })?;
     let integrated = hip
         .get_device_attribute(HIP_DEVICE_ATTRIBUTE_INTEGRATED, device_id)
@@ -190,22 +197,30 @@ pub(crate) fn install_for_device(
         .map_err(|error| {
             HipError::new(
                 0,
-                &format!("HIPFIRE_EMU: device {device_id} integrated attribute unreadable: {error}"),
+                &format!(
+                    "HIPFIRE_EMU: device {device_id} integrated attribute unreadable: {error}"
+                ),
             )
         })?;
     // HIP reports WGPs on RDNA; an unreadable/non-positive count stays 0 and
     // fails closed in `check_host`.
     let multiprocessors = hip
-        .get_device_attribute(crate::profiler::HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device_id)
+        .get_device_attribute(
+            crate::profiler::HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            device_id,
+        )
         .ok()
         .and_then(|count| u32::try_from(count).ok())
         .unwrap_or(0);
-    let raw_device_total_bytes = hip
-        .get_vram_info()
-        .map(|(_, total)| total as u64)
-        .map_err(|error| {
-            HipError::new(0, &format!("HIPFIRE_EMU: raw device memory query failed: {error}"))
-        })?;
+    let raw_device_total_bytes =
+        hip.get_vram_info()
+            .map(|(_, total)| total as u64)
+            .map_err(|error| {
+                HipError::new(
+                    0,
+                    &format!("HIPFIRE_EMU: raw device memory query failed: {error}"),
+                )
+            })?;
     let host_total_bytes = crate::uma_memory::host_total_bytes();
     let facts = HostFacts {
         pci_bdf: pci_bdf.clone(),
@@ -263,7 +278,11 @@ impl Gpu {
             return Ok(requested_bytes);
         }
         let (free, _) = self.device_mem_info()?;
-        Ok(resident_budget_from(requested_bytes, free as u64, reserved_bytes))
+        Ok(resident_budget_from(
+            requested_bytes,
+            free as u64,
+            reserved_bytes,
+        ))
     }
 
     /// Preflight a managed host allocation against the ledger (shared-host /
@@ -402,7 +421,10 @@ mod tests {
         assert!(second_device_refusal("0000:03:00.0", "0000:03:00.0").is_ok());
         assert!(second_device_refusal("0000:0A:00.0", "0000:0a:00.0").is_ok());
         let error = second_device_refusal("0000:03:00.0", "0000:44:00.0").unwrap_err();
-        assert!(error.contains("0000:03:00.0") && error.contains("0000:44:00.0"), "{error}");
+        assert!(
+            error.contains("0000:03:00.0") && error.contains("0000:44:00.0"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -410,7 +432,10 @@ mod tests {
         let different = other_device_refusal(0, "0000:03:00.0", 1, Some("0000:44:00.0"));
         assert!(different.contains("second"), "{different}");
         let unknown_bdf = other_device_refusal(0, "0000:03:00.0", 3, None);
-        assert!(unknown_bdf.contains("device 3") && unknown_bdf.contains("device 0"), "{unknown_bdf}");
+        assert!(
+            unknown_bdf.contains("device 3") && unknown_bdf.contains("device 0"),
+            "{unknown_bdf}"
+        );
         let aliased = other_device_refusal(0, "0000:03:00.0", 1, Some("0000:03:00.0"));
         assert!(aliased.contains("single-device"), "{aliased}");
     }
@@ -424,7 +449,11 @@ mod tests {
         let error = install_error(&conflict);
         assert!(error.message.contains("second"), "{}", error.message);
         let after = install_error(&BudgetError::InstallAfterAllocations);
-        assert!(after.message.contains("install failed"), "{}", after.message);
+        assert!(
+            after.message.contains("install failed"),
+            "{}",
+            after.message
+        );
     }
 
     #[test]
@@ -508,7 +537,10 @@ mod tests {
     #[test]
     fn host_class_and_refusal_codes() {
         assert_eq!(host_allocation_class(true), AllocationClass::HostPinnedGtt);
-        assert_eq!(host_allocation_class(false), AllocationClass::HostPinnedUserptr);
+        assert_eq!(
+            host_allocation_class(false),
+            AllocationClass::HostPinnedUserptr
+        );
         let oom = host_refusal_error(&BudgetError::OutOfMemory {
             dimension: emu_budget::BudgetDimension::SharedHost,
             requested: 2,

@@ -1022,7 +1022,13 @@ impl Tokenizer {
         // this bound (added tokens are handled separately before BPE).
         let ignore_merges_max_chunk_bytes = (is_gpt2_bpe
             && model.get("ignore_merges").and_then(|v| v.as_bool()) == Some(true))
-        .then(|| vocab_map.keys().map(|s| s.chars().count()).max().unwrap_or(0));
+        .then(|| {
+            vocab_map
+                .keys()
+                .map(|s| s.chars().count())
+                .max()
+                .unwrap_or(0)
+        });
 
         let (merges, merge_pair_rank) = resolve_merges(&merges_strings, &token_to_id)?;
         let byte_to_id = if is_gpt2_bpe {
@@ -1244,7 +1250,9 @@ impl Tokenizer {
     /// GPT-2 BPE pre-tokenizer: the tokenizer.json `Split` chain when one was
     /// loaded, else the shared canonical splitter (compiled once, lazily).
     fn pretokenizer(&self) -> &Gpt2Pretokenizer {
-        self.hf_pretok.as_ref().unwrap_or_else(|| default_pretokenizer())
+        self.hf_pretok
+            .as_ref()
+            .unwrap_or_else(|| default_pretokenizer())
     }
 
     /// True if `id` is any end-of-generation terminator (`eos_id` or the
@@ -1723,7 +1731,8 @@ impl Tokenizer {
                         key[used..used + encoded.len()].copy_from_slice(encoded.as_bytes());
                         used += encoded.len();
                     }
-                    self.token_to_id.get(std::str::from_utf8(&key[..used]).unwrap())
+                    self.token_to_id
+                        .get(std::str::from_utf8(&key[..used]).unwrap())
                 } else {
                     let mut owned = String::with_capacity(chunk_bytes.len().saturating_mul(2));
                     for &b in chunk_bytes {
@@ -2752,7 +2761,10 @@ mod token_text_stream_tests {
         let mut out = String::new();
         for &t in seq {
             out.push_str(&stream.push(tk, t));
-            assert!(stream.pending.len() <= 3, "holdback grew past one code point");
+            assert!(
+                stream.pending.len() <= 3,
+                "holdback grew past one code point"
+            );
         }
         out.push_str(&stream.flush());
         out
@@ -2764,7 +2776,10 @@ mod token_text_stream_tests {
         let text = "emoji 🎉🔥 中文 ∑";
         let seq = byte_tokens(text);
         let per_token: String = seq.iter().map(|&t| tk.decode(&[t])).collect();
-        assert!(per_token.contains('\u{FFFD}'), "baseline must reproduce the bug");
+        assert!(
+            per_token.contains('\u{FFFD}'),
+            "baseline must reproduce the bug"
+        );
         assert_eq!(stream_all(&tk, &seq), text);
     }
 
@@ -2984,7 +2999,6 @@ mod bpe_tests {
         assert_ne!(enabled.config_digest(), disabled.config_digest());
     }
 
-
     #[test]
     fn encode_leftmost_on_tie_priority() {
         // Equal-rank tiebreak invariant: when the same merge could fire at
@@ -3179,7 +3193,10 @@ mod pretok_tests {
         assert_eq!(d.pieces("a\n1234\n"), vec!["a\n", "1", "234", "\n"]);
         // A digit run after a letter is still a run (HF has no start constraint).
         assert_eq!(d.pieces("a1 1234"), vec!["a", "1", " ", "1", "234"]);
-        assert_eq!(d.pieces("1234 12a 5678"), vec!["1", "234", " 12a ", "5", "678"]);
+        assert_eq!(
+            d.pieces("1234 12a 5678"),
+            vec!["1", "234", " 12a ", "5", "678"]
+        );
         assert_eq!(d.pieces(""), Vec::<&str>::new());
         // Exact-literal only: other lookaheads stay unsupported.
         assert!(PretokSplitter::compile(r"\d{1,3}(?=\d)").is_err());
@@ -3203,7 +3220,10 @@ mod pretok_tests {
         // it as end-of-piece, so `\s+(?!\S)` takes the whole run.
         assert_eq!(chain.pieces("  2"), vec!["  ", "2"]);
         assert_eq!(chain.pieces("x 1234 "), vec!["x", " ", "1", "234", " "]);
-        assert_eq!(chain.pieces("a\n12345\n"), vec!["a", "\n", "12", "345", "\n"]);
+        assert_eq!(
+            chain.pieces("a\n12345\n"),
+            vec!["a", "\n", "12", "345", "\n"]
+        );
     }
 
     #[test]
@@ -3237,7 +3257,11 @@ mod pretok_tests {
 
     /// Byte-level BPE tokenizer.json: ids 0..=255 are the GPT-2 byte
     /// symbols, `extra` follows at 256.., `merges` as `"a b"` strings.
-    fn byte_level_json(extra: &[&str], merges: &[&str], pre_tokenizer: serde_json::Value) -> String {
+    fn byte_level_json(
+        extra: &[&str],
+        merges: &[&str],
+        pre_tokenizer: serde_json::Value,
+    ) -> String {
         let mut vocab = serde_json::Map::new();
         for b in 0u32..=255 {
             vocab.insert(byte_to_gpt2_char(b as u8).to_string(), json!(b));
@@ -3281,10 +3305,7 @@ mod pretok_tests {
         assert_eq!(tok.pretokenizer().pieces("a123"), vec!["a", "1", "2", "3"]);
         // Digits are single-char chunks, so the ("1","2") merge never fires.
         assert_eq!(tok.encode_gpt2_bpe("a123"), vec![97, 49, 50, 51]);
-        assert_eq!(
-            tok.pretokenizer().pieces("x  y"),
-            vec!["x", " ", " y"]
-        );
+        assert_eq!(tok.pretokenizer().pieces("x  y"), vec!["x", " ", " y"]);
     }
 
     #[test]
@@ -3456,8 +3477,7 @@ mod pretok_tests {
         added: serde_json::Value,
     ) -> String {
         let mut v: serde_json::Value =
-            serde_json::from_str(&byte_level_json(extra, merges, serde_json::Value::Null))
-                .unwrap();
+            serde_json::from_str(&byte_level_json(extra, merges, serde_json::Value::Null)).unwrap();
         v["normalizer"] = normalizer;
         v["added_tokens"] = added;
         v.to_string()
@@ -3474,7 +3494,9 @@ mod pretok_tests {
         assert!(!normalizer_is_nfc(
             &json!({"type": "Sequence", "normalizers": [{"type": "NFC"}, {"type": "Lowercase"}]})
         ));
-        assert!(!normalizer_is_nfc(&json!({"type": "Sequence", "normalizers": []})));
+        assert!(!normalizer_is_nfc(
+            &json!({"type": "Sequence", "normalizers": []})
+        ));
         assert!(!normalizer_is_nfc(&serde_json::Value::Null));
     }
 
@@ -3496,7 +3518,10 @@ mod pretok_tests {
         // Normalization runs per segment between special tokens (HF
         // `normalized: false` added tokens): a mark after a special token
         // does not compose with the char before it.
-        assert_eq!(tok.encode("e\u{0301}<|x|>\u{0301}"), vec![256, 257, 204, 129]);
+        assert_eq!(
+            tok.encode("e\u{0301}<|x|>\u{0301}"),
+            vec![256, 257, 204, 129]
+        );
         assert_eq!(tok.encode("<|x|>e\u{0301}"), vec![257, 256]);
 
         // Same vocab without a normalizer: no composition.
@@ -3515,7 +3540,10 @@ mod pretok_tests {
 
     #[test]
     fn nfc_fast_path_does_not_allocate_for_nfc_text() {
-        assert!(matches!(nfc_normalize("héllo wörld"), std::borrow::Cow::Borrowed(_)));
+        assert!(matches!(
+            nfc_normalize("héllo wörld"),
+            std::borrow::Cow::Borrowed(_)
+        ));
         let composed = nfc_normalize("e\u{0301}");
         assert!(matches!(composed, std::borrow::Cow::Owned(_)));
         assert_eq!(composed, "\u{00E9}");
@@ -4592,7 +4620,10 @@ mod nfc_exactness_tests {
         // composition of the unblocked mark: a + U+0301 + U+0323 → ạ U+0301.
         assert_eq!(nfc_normalize("a\u{0301}\u{0323}"), "\u{1EA1}\u{0301}");
         assert_eq!(nfc_normalize("a\u{0323}\u{0301}"), "\u{1EA1}\u{0301}");
-        assert!(matches!(nfc_normalize("\u{1EA1}\u{0301}"), Cow::Borrowed(_)));
+        assert!(matches!(
+            nfc_normalize("\u{1EA1}\u{0301}"),
+            Cow::Borrowed(_)
+        ));
 
         // Hangul L V T and LV T compose; the syllable stays borrowed.
         assert_eq!(nfc_normalize("\u{1112}\u{1161}\u{11AB}"), "\u{D55C}");
@@ -4632,7 +4663,10 @@ mod nfc_exactness_tests {
         // allocates (SmallVec spill) while ours does not.
         let (lib_ok, lib_allocs) = allocs_during(|| is_nfc(&s));
         assert!(lib_ok);
-        assert!(lib_allocs > 0, "library is_nfc expected to spill on long runs");
+        assert!(
+            lib_allocs > 0,
+            "library is_nfc expected to spill on long runs"
+        );
     }
 
     #[test]
@@ -4642,10 +4676,10 @@ mod nfc_exactness_tests {
         // pairs, QC=No chars, and post-Unicode-9 code points.
         const POOL: &[char] = &[
             'a', 'e', 'o', 'c', 's', 'x', '\u{00E7}', '\u{1EB7}', '\u{1EDB}', '\u{1E69}',
-            '\u{1EA1}', '\u{01A1}', '\u{0301}', '\u{0302}', '\u{0307}', '\u{0316}',
-            '\u{031B}', '\u{0323}', '\u{0327}', '\u{0328}', '\u{0346}', '\u{0344}',
-            '\u{1100}', '\u{1161}', '\u{11A8}', '\u{AC00}', '\u{AC01}', '\u{0B47}',
-            '\u{0B3E}', '\u{0958}', '\u{065D}', '\u{089B}', '\u{1DF7}',
+            '\u{1EA1}', '\u{01A1}', '\u{0301}', '\u{0302}', '\u{0307}', '\u{0316}', '\u{031B}',
+            '\u{0323}', '\u{0327}', '\u{0328}', '\u{0346}', '\u{0344}', '\u{1100}', '\u{1161}',
+            '\u{11A8}', '\u{AC00}', '\u{AC01}', '\u{0B47}', '\u{0B3E}', '\u{0958}', '\u{065D}',
+            '\u{089B}', '\u{1DF7}',
         ];
         let mut state = 0x9E37_79B9_7F4A_7C15u64;
         let mut next = || {

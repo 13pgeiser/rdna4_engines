@@ -75,12 +75,23 @@ fn items(toks: Vec<TokenTree>, top: bool) -> TokenStream {
         // `region A, B;`
         if kw_name == "region" && top {
             if let Some(end) = (j + 1..toks.len()).find(|&k| is_punct(&toks[k], ';')) {
-                let names: Vec<&TokenTree> = toks[j + 1..end].iter().filter(|t| !is_punct(t, ',')).collect();
-                if !names.is_empty() && names.iter().all(|t| matches!(t, TokenTree::Ident(_))) && toks[j + 1..end].iter().all(|t| matches!(t, TokenTree::Ident(_)) || is_punct(t, ',')) {
+                let names: Vec<&TokenTree> = toks[j + 1..end]
+                    .iter()
+                    .filter(|t| !is_punct(t, ','))
+                    .collect();
+                if !names.is_empty()
+                    && names.iter().all(|t| matches!(t, TokenTree::Ident(_)))
+                    && toks[j + 1..end]
+                        .iter()
+                        .all(|t| matches!(t, TokenTree::Ident(_)) || is_punct(t, ','))
+                {
                     for n in names {
                         out.push(TokenTree::Ident(Ident::new("enum", kw.span())));
                         out.push(n.clone());
-                        out.push(TokenTree::Group(Group::new(Delimiter::Brace, TokenStream::new())));
+                        out.push(TokenTree::Group(Group::new(
+                            Delimiter::Brace,
+                            TokenStream::new(),
+                        )));
                     }
                     i = end + 1;
                     continue;
@@ -88,9 +99,17 @@ fn items(toks: Vec<TokenTree>, top: bool) -> TokenStream {
             }
         }
         // Item end.
-        let semi_item = matches!(kw_name.as_str(), "const" | "static" | "type" | "use" | "extern")
-            && !(kw_name == "const" && toks.get(j + 1).is_some_and(|t| is_ident(t, "fn") || is_ident(t, "unsafe") || is_ident(t, "async")))
-            && !(kw_name == "extern" && toks.get(j + 1).is_some_and(|t| matches!(t, TokenTree::Literal(_)) || is_ident(t, "fn")));
+        let semi_item = matches!(
+            kw_name.as_str(),
+            "const" | "static" | "type" | "use" | "extern"
+        ) && !(kw_name == "const"
+            && toks.get(j + 1).is_some_and(|t| {
+                is_ident(t, "fn") || is_ident(t, "unsafe") || is_ident(t, "async")
+            }))
+            && !(kw_name == "extern"
+                && toks
+                    .get(j + 1)
+                    .is_some_and(|t| matches!(t, TokenTree::Literal(_)) || is_ident(t, "fn")));
         let mut end = j;
         let mut closed_by_brace = false;
         while end < toks.len() {
@@ -118,9 +137,18 @@ fn items(toks: Vec<TokenTree>, top: bool) -> TokenStream {
             _ => {}
         }
         // Items with a nested item list.
-        let recurse = closed_by_brace && matches!(kw_name.as_str(), "impl" | "trait" | "mod" | "unsafe");
-        let is_container = recurse && (kw_name != "unsafe" || toks[j..=last].iter().any(|t| is_ident(t, "impl") || is_ident(t, "trait")));
-        let stop = if is_container { last } else { (last + 1).min(toks.len()) };
+        let recurse =
+            closed_by_brace && matches!(kw_name.as_str(), "impl" | "trait" | "mod" | "unsafe");
+        let is_container = recurse
+            && (kw_name != "unsafe"
+                || toks[j..=last]
+                    .iter()
+                    .any(|t| is_ident(t, "impl") || is_ident(t, "trait")));
+        let stop = if is_container {
+            last
+        } else {
+            (last + 1).min(toks.len())
+        };
         out.extend(toks[body_start..stop].iter().cloned());
         if is_container {
             if let TokenTree::Group(g) = &toks[last] {
@@ -150,7 +178,10 @@ mod tests {
     #[test]
     fn tile_chain_region_become_rust_items() {
         assert_eq!(norm("tile T { a: u8 }"), plain("struct T { a: u8 }"));
-        assert_eq!(norm("pub chain f(x: u8) -> u8 { x }"), plain("pub fn f(x: u8) -> u8 { x }"));
+        assert_eq!(
+            norm("pub chain f(x: u8) -> u8 { x }"),
+            plain("pub fn f(x: u8) -> u8 { x }")
+        );
         assert_eq!(norm("region A;"), plain("enum A {}"));
         assert_eq!(norm("region A, B;"), plain("enum A {} enum B {}"));
     }
@@ -164,20 +195,32 @@ mod tests {
 
     #[test]
     fn attributes_and_docs_stay_attached() {
-        assert_eq!(norm("/// doc\n#[derive(Clone)] pub tile T { a: u8 }"), plain("/// doc\n#[derive(Clone)] pub struct T { a: u8 }"));
+        assert_eq!(
+            norm("/// doc\n#[derive(Clone)] pub tile T { a: u8 }"),
+            plain("/// doc\n#[derive(Clone)] pub struct T { a: u8 }")
+        );
     }
 
     #[test]
     fn a_const_block_does_not_end_the_item_early() {
         // The braces in a const initializer must not be taken for the item's end.
         let src = "const A: u8 = { 1 }; tile T { a: u8 } chain g() {}";
-        assert_eq!(norm(src), plain("const A: u8 = { 1 }; struct T { a: u8 } fn g() {}"));
+        assert_eq!(
+            norm(src),
+            plain("const A: u8 = { 1 }; struct T { a: u8 } fn g() {}")
+        );
     }
 
     #[test]
     fn chain_inside_impl_is_a_method() {
-        assert_eq!(norm("impl G { chain f(&self) {} fn h(&self) {} }"), plain("impl G { fn f(&self) {} fn h(&self) {} }"));
+        assert_eq!(
+            norm("impl G { chain f(&self) {} fn h(&self) {} }"),
+            plain("impl G { fn f(&self) {} fn h(&self) {} }")
+        );
         // `tile` is a top-level item only.
-        assert_eq!(norm("impl G { tile f(&self) {} }"), plain("impl G { tile f(&self) {} }"));
+        assert_eq!(
+            norm("impl G { tile f(&self) {} }"),
+            plain("impl G { tile f(&self) {} }")
+        );
     }
 }

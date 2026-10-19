@@ -30,44 +30,145 @@ use crate::Result;
 use std::fmt;
 
 op_table!(Sop2Op {
-    AddU32, SubU32, AddI32, SubI32, AddcU32, SubbU32, MinI32, MinU32, MaxI32, MaxU32,
-    CselectB32, CselectB64, AndB32, AndB64, OrB32, OrB64, XorB32, XorB64,
-    Andn2B32, Andn2B64, Orn2B32, Orn2B64, LshlB32, LshlB64, LshrB32, LshrB64, AshrI32, AshrI64,
-    BfmB32, MulI32, BfeU32, BfeI32, MulHiU32, MulHiI32,
-    Lshl1AddU32, Lshl2AddU32, Lshl3AddU32, Lshl4AddU32,
-    PackLlB32B16, PackLhB32B16, PackHhB32B16, AbsdiffI32,
+    AddU32,
+    SubU32,
+    AddI32,
+    SubI32,
+    AddcU32,
+    SubbU32,
+    MinI32,
+    MinU32,
+    MaxI32,
+    MaxU32,
+    CselectB32,
+    CselectB64,
+    AndB32,
+    AndB64,
+    OrB32,
+    OrB64,
+    XorB32,
+    XorB64,
+    Andn2B32,
+    Andn2B64,
+    Orn2B32,
+    Orn2B64,
+    LshlB32,
+    LshlB64,
+    LshrB32,
+    LshrB64,
+    AshrI32,
+    AshrI64,
+    BfmB32,
+    MulI32,
+    BfeU32,
+    BfeI32,
+    MulHiU32,
+    MulHiI32,
+    Lshl1AddU32,
+    Lshl2AddU32,
+    Lshl3AddU32,
+    Lshl4AddU32,
+    PackLlB32B16,
+    PackLhB32B16,
+    PackHhB32B16,
+    AbsdiffI32,
 });
 
 op_table!(Sop1Op {
-    MovB32, MovB64, CmovB32, CmovB64, NotB32, NotB64, BrevB32,
-    Bcnt1I32B32, Bcnt1I32B64, Ff1I32B32, Ff1I32B64, FlbitI32B32, SextI32I8, SextI32I16,
-    AndSaveexecB64, OrSaveexecB64, XorSaveexecB64, Andn2SaveexecB64,
-    GetpcB64, SetpcB64, AbsI32, Bitset0B32, Bitset1B32,
+    MovB32,
+    MovB64,
+    CmovB32,
+    CmovB64,
+    NotB32,
+    NotB64,
+    BrevB32,
+    Bcnt1I32B32,
+    Bcnt1I32B64,
+    Ff1I32B32,
+    Ff1I32B64,
+    FlbitI32B32,
+    SextI32I8,
+    SextI32I16,
+    AndSaveexecB64,
+    OrSaveexecB64,
+    XorSaveexecB64,
+    Andn2SaveexecB64,
+    GetpcB64,
+    SetpcB64,
+    AbsI32,
+    Bitset0B32,
+    Bitset1B32,
 });
 
 op_table!(SopkOp {
-    MovkI32, CmovkI32,
-    CmpkEqI32, CmpkLgI32, CmpkGtI32, CmpkGeI32, CmpkLtI32, CmpkLeI32,
-    CmpkEqU32, CmpkLgU32, CmpkGtU32, CmpkGeU32, CmpkLtU32, CmpkLeU32,
-    AddkI32, MulkI32, GetregB32, SetregB32,
+    MovkI32,
+    CmovkI32,
+    CmpkEqI32,
+    CmpkLgI32,
+    CmpkGtI32,
+    CmpkGeI32,
+    CmpkLtI32,
+    CmpkLeI32,
+    CmpkEqU32,
+    CmpkLgU32,
+    CmpkGtU32,
+    CmpkGeU32,
+    CmpkLtU32,
+    CmpkLeU32,
+    AddkI32,
+    MulkI32,
+    GetregB32,
+    SetregB32,
 });
 
 op_table!(SopcOp {
-    CmpEqI32, CmpLgI32, CmpGtI32, CmpGeI32, CmpLtI32, CmpLeI32,
-    CmpEqU32, CmpLgU32, CmpGtU32, CmpGeU32, CmpLtU32, CmpLeU32,
-    Bitcmp0B32, Bitcmp1B32, CmpEqU64, CmpLgU64,
+    CmpEqI32,
+    CmpLgI32,
+    CmpGtI32,
+    CmpGeI32,
+    CmpLtI32,
+    CmpLeI32,
+    CmpEqU32,
+    CmpLgU32,
+    CmpGtU32,
+    CmpGeU32,
+    CmpLtU32,
+    CmpLeU32,
+    Bitcmp0B32,
+    Bitcmp1B32,
+    CmpEqU64,
+    CmpLgU64,
 });
 
 op_table!(SoppOp {
-    Nop, Endpgm, Branch, CbranchScc0, CbranchScc1, CbranchVccz, CbranchVccnz, CbranchExecz, CbranchExecnz,
-    Barrier, Waitcnt, Sleep, Setprio, Sendmsg, Trap, IcacheInv,
+    Nop,
+    Endpgm,
+    Branch,
+    CbranchScc0,
+    CbranchScc1,
+    CbranchVccz,
+    CbranchVccnz,
+    CbranchExecz,
+    CbranchExecnz,
+    Barrier,
+    Waitcnt,
+    Sleep,
+    Setprio,
+    Sendmsg,
+    Trap,
+    IcacheInv,
 });
 
 macro_rules! op_meta {
     ($t:ty, $w:ty) => {
         impl $t {
             /// Inverse of [`Self::opcode`].
-            pub fn from_opcode(arch: Arch, opcode: $w) -> Option<Self> { Self::ALL.iter().copied().find(|op| op.opcode(arch) == Some(opcode)) }
+            pub fn from_opcode(arch: Arch, opcode: $w) -> Option<Self> {
+                Self::ALL
+                    .iter()
+                    .copied()
+                    .find(|op| op.opcode(arch) == Some(opcode))
+            }
         }
     };
 }
@@ -95,7 +196,8 @@ impl Sop1Op {
     pub fn widths(self) -> (u8, u8) {
         use Sop1Op::*;
         match self {
-            MovB64 | CmovB64 | NotB64 | AndSaveexecB64 | OrSaveexecB64 | XorSaveexecB64 | Andn2SaveexecB64 => (2, 2),
+            MovB64 | CmovB64 | NotB64 | AndSaveexecB64 | OrSaveexecB64 | XorSaveexecB64
+            | Andn2SaveexecB64 => (2, 2),
             Bcnt1I32B64 | Ff1I32B64 => (1, 2),
             GetpcB64 => (2, 0),
             SetpcB64 => (0, 2),
@@ -105,33 +207,68 @@ impl Sop1Op {
 }
 impl SopcOp {
     /// Dword width of both sources.
-    pub fn width(self) -> u8 { if matches!(self, SopcOp::CmpEqU64 | SopcOp::CmpLgU64) { 2 } else { 1 } }
+    pub fn width(self) -> u8 {
+        if matches!(self, SopcOp::CmpEqU64 | SopcOp::CmpLgU64) {
+            2
+        } else {
+            1
+        }
+    }
 }
 
 /// `sdst = op(ssrc0, ssrc1)`; at most one source may be a literal.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Sop2 { pub op: Sop2Op, pub sdst: Src, pub ssrc0: Src, pub ssrc1: Src }
+pub struct Sop2 {
+    pub op: Sop2Op,
+    pub sdst: Src,
+    pub ssrc0: Src,
+    pub ssrc1: Src,
+}
 /// `sdst = op(ssrc0)`; `None` where the opcode has no such operand (the
 /// field encodes as 0 and decodes back to `None`).
 #[derive(Clone, Debug, PartialEq)]
-pub struct Sop1 { pub op: Sop1Op, pub sdst: Option<Src>, pub ssrc0: Option<Src> }
+pub struct Sop1 {
+    pub op: Sop1Op,
+    pub sdst: Option<Src>,
+    pub ssrc0: Option<Src>,
+}
 /// 16-bit immediate forms. `s_getreg_b32`/`s_setreg_b32`: `sdst` is the SGPR
 /// read or written and `simm16` the hwreg(id, offset, size) field.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Sopk { pub op: SopkOp, pub sdst: Src, pub simm16: u16 }
+pub struct Sopk {
+    pub op: SopkOp,
+    pub sdst: Src,
+    pub simm16: u16,
+}
 /// `SCC = op(ssrc0, ssrc1)`.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Sopc { pub op: SopcOp, pub ssrc0: Src, pub ssrc1: Src }
+pub struct Sopc {
+    pub op: SopcOp,
+    pub ssrc0: Src,
+    pub ssrc1: Src,
+}
 /// Program control. Branches carry the signed dword offset from the next
 /// instruction in `simm16`; `s_waitcnt` carries [`waitcnt_imm`].
 #[derive(Clone, Debug, PartialEq)]
-pub struct Sopp { pub op: SoppOp, pub simm16: u16 }
+pub struct Sopp {
+    pub op: SoppOp,
+    pub simm16: u16,
+}
 
 impl Sopp {
     /// `Some(simm16 as i16)` for `s_branch` / `s_cbranch_*`.
     pub fn branch_offset(&self) -> Option<i16> {
-        matches!(self.op, SoppOp::Branch | SoppOp::CbranchScc0 | SoppOp::CbranchScc1 | SoppOp::CbranchVccz
-            | SoppOp::CbranchVccnz | SoppOp::CbranchExecz | SoppOp::CbranchExecnz).then_some(self.simm16 as i16)
+        matches!(
+            self.op,
+            SoppOp::Branch
+                | SoppOp::CbranchScc0
+                | SoppOp::CbranchScc1
+                | SoppOp::CbranchVccz
+                | SoppOp::CbranchVccnz
+                | SoppOp::CbranchExecz
+                | SoppOp::CbranchExecnz
+        )
+        .then_some(self.simm16 as i16)
     }
 }
 
@@ -146,9 +283,24 @@ const WAITCNT_UNUSED: u16 = 0x3080;
 /// maxima of `arch` ([`crate::Caps`]).
 pub fn waitcnt_imm(arch: Arch, vm: u8, exp: u8, lgkm: u8) -> Result<u16> {
     let caps = arch.caps();
-    if vm > caps.vmcnt_max { return Err(format!("s_waitcnt vmcnt({vm}) exceeds the {} maximum {}", caps.name, caps.vmcnt_max)) }
-    if exp > caps.expcnt_max { return Err(format!("s_waitcnt expcnt({exp}) exceeds the {} maximum {}", caps.name, caps.expcnt_max)) }
-    if lgkm > caps.lgkmcnt_max { return Err(format!("s_waitcnt lgkmcnt({lgkm}) exceeds the {} maximum {}", caps.name, caps.lgkmcnt_max)) }
+    if vm > caps.vmcnt_max {
+        return Err(format!(
+            "s_waitcnt vmcnt({vm}) exceeds the {} maximum {}",
+            caps.name, caps.vmcnt_max
+        ));
+    }
+    if exp > caps.expcnt_max {
+        return Err(format!(
+            "s_waitcnt expcnt({exp}) exceeds the {} maximum {}",
+            caps.name, caps.expcnt_max
+        ));
+    }
+    if lgkm > caps.lgkmcnt_max {
+        return Err(format!(
+            "s_waitcnt lgkmcnt({lgkm}) exceeds the {} maximum {}",
+            caps.name, caps.lgkmcnt_max
+        ));
+    }
     let (vm, exp, lgkm) = (u16::from(vm), u16::from(exp), u16::from(lgkm));
     Ok(match arch {
         Arch::Gfx942 => (vm & 0xf) | (vm >> 4) << 14 | exp << 4 | lgkm << 8,
@@ -172,15 +324,25 @@ pub fn waitcnt_fields(arch: Arch, simm16: u16) -> (u8, u8, u8) {
 /// p.25-26; llvm rejects misaligned pairs).
 fn check_operand(arch: Arch, src: Src, dwords: u8, dst: bool, what: &str) -> Result<()> {
     let bad = |why: &str| Err(format!("{what} {src:?}: {why}"));
-    if dst && !src.is_sreg() { return bad("not a scalar register destination") }
+    if dst && !src.is_sreg() {
+        return bad("not a scalar register destination");
+    }
     let wide = dwords == 2;
     match src {
         Src::Vgpr(_) | Src::Agpr(_) => bad("vector registers are not SALU operands"),
-        Src::Sgpr(n) if u16::from(n) + u16::from(dwords.max(1)) > arch.caps().sgprs => bad("past the last addressable SGPR"),
+        Src::Sgpr(n) if u16::from(n) + u16::from(dwords.max(1)) > arch.caps().sgprs => {
+            bad("past the last addressable SGPR")
+        }
         Src::Ttmp(n) if u16::from(n) + u16::from(dwords.max(1)) > 16 => bad("past ttmp15"),
-        Src::Sgpr(n) | Src::Ttmp(n) if wide && n % 2 != 0 => bad("a 64-bit register pair must start at an even register"),
-        Src::VccHi | Src::ExecHi | Src::FlatScratchHi | Src::XnackMaskHi | Src::M0 if wide => bad("a 32-bit register cannot be a 64-bit operand"),
-        Src::Int(i) if !(-16..=64).contains(&i) => bad("inline integers are -16..=64 (use a literal)"),
+        Src::Sgpr(n) | Src::Ttmp(n) if wide && n % 2 != 0 => {
+            bad("a 64-bit register pair must start at an even register")
+        }
+        Src::VccHi | Src::ExecHi | Src::FlatScratchHi | Src::XnackMaskHi | Src::M0 if wide => {
+            bad("a 32-bit register cannot be a 64-bit operand")
+        }
+        Src::Int(i) if !(-16..=64).contains(&i) => {
+            bad("inline integers are -16..=64 (use a literal)")
+        }
         _ => Ok(()),
     }
 }
@@ -200,8 +362,14 @@ fn shared_literal(what: &str, srcs: &[Src]) -> Result<Option<u32>> {
 
 /// The literal dword following `words[0]`, when a source field holds code 255.
 fn literal_after(what: &str, words: &[u32], codes: &[u16]) -> Result<Option<u32>> {
-    if !codes.contains(&LITERAL) { return Ok(None) }
-    words.get(1).copied().map(Some).ok_or_else(|| format!("{what}: literal operand without a literal dword"))
+    if !codes.contains(&LITERAL) {
+        return Ok(None);
+    }
+    words
+        .get(1)
+        .copied()
+        .map(Some)
+        .ok_or_else(|| format!("{what}: literal operand without a literal dword"))
 }
 
 /// A literal value an inline constant of the operand's type could also
@@ -215,7 +383,9 @@ fn literal_after(what: &str, words: &[u32], codes: &[u16]) -> Result<Option<u32>
 /// literal (§6.2.1 p.32 states the rule only for VALU: unsigned zero-extend,
 /// signed sign-extend).
 fn literal_is_inlinable(value: u32, dwords: u8) -> bool {
-    if dwords == 2 { return value <= 64 }
+    if dwords == 2 {
+        return value <= 64;
+    }
     (-16..=64).contains(&(value as i32)) || InlineFloat::ALL.iter().any(|f| f.f32_bits() == value)
 }
 
@@ -232,8 +402,12 @@ fn operand_text(src: Src, dwords: u8) -> String {
 
 /// Fetch and classify the first dword of a scalar format.
 fn first_word(words: &[u32], format: Format) -> Result<u32> {
-    let word = *words.first().ok_or_else(|| format!("{format:?}: decode past the end of the code"))?;
-    if classify(word) != Some(format) { return Err(format!("{word:#010x} is not a {format:?} encoding")) }
+    let word = *words
+        .first()
+        .ok_or_else(|| format!("{format:?}: decode past the end of the code"))?;
+    if classify(word) != Some(format) {
+        return Err(format!("{word:#010x} is not a {format:?} encoding"));
+    }
     Ok(word)
 }
 
@@ -250,9 +424,18 @@ impl Sop2 {
 
     /// Append this instruction's dwords (and literal) to `out`.
     pub fn encode(&self, arch: Arch, out: &mut Vec<u32>) -> Result<()> {
-        let op = self.op.opcode(arch).ok_or_else(|| format!("{} does not exist on {arch}", self.op.name()))?;
+        let op = self
+            .op
+            .opcode(arch)
+            .ok_or_else(|| format!("{} does not exist on {arch}", self.op.name()))?;
         let lit = self.check(arch)?;
-        out.push(0b10 << 30 | u32::from(op) << 23 | u32::from(self.sdst.code()) << 16 | u32::from(self.ssrc1.code()) << 8 | u32::from(self.ssrc0.code()));
+        out.push(
+            0b10 << 30
+                | u32::from(op) << 23
+                | u32::from(self.sdst.code()) << 16
+                | u32::from(self.ssrc1.code()) << 8
+                | u32::from(self.ssrc0.code()),
+        );
         out.extend(lit);
         Ok(())
     }
@@ -260,10 +443,16 @@ impl Sop2 {
     pub fn decode(arch: Arch, words: &[u32]) -> Result<(Self, usize)> {
         let word = first_word(words, Format::Sop2)?;
         let opcode = ((word >> 23) & 0x7f) as u8;
-        let op = Sop2Op::from_opcode(arch, opcode).ok_or_else(|| format!("SOP2 opcode {opcode} is not in the {arch} table"))?;
+        let op = Sop2Op::from_opcode(arch, opcode)
+            .ok_or_else(|| format!("SOP2 opcode {opcode} is not in the {arch} table"))?;
         let (c0, c1) = ((word & 0xff) as u16, ((word >> 8) & 0xff) as u16);
         let lit = literal_after(op.name(), words, &[c0, c1])?;
-        let inst = Self { op, sdst: Src::from_code(((word >> 16) & 0x7f) as u16, None)?, ssrc0: Src::from_code(c0, lit)?, ssrc1: Src::from_code(c1, lit)? };
+        let inst = Self {
+            op,
+            sdst: Src::from_code(((word >> 16) & 0x7f) as u16, None)?,
+            ssrc0: Src::from_code(c0, lit)?,
+            ssrc1: Src::from_code(c1, lit)?,
+        };
         inst.check(arch)?;
         Ok((inst, 1 + usize::from(lit.is_some())))
     }
@@ -277,9 +466,22 @@ impl Sop2 {
         let mut f = Footprint::default();
         f.read(self.ssrc0, w0);
         f.read(self.ssrc1, w1);
-        if matches!(self.op, AddcU32 | SubbU32 | CselectB32 | CselectB64) { f.read_file(RegFile::Scc, 0, 1) }
+        if matches!(self.op, AddcU32 | SubbU32 | CselectB32 | CselectB64) {
+            f.read_file(RegFile::Scc, 0, 1)
+        }
         f.write(self.sdst, wd);
-        if !matches!(self.op, CselectB32 | CselectB64 | BfmB32 | MulI32 | MulHiU32 | MulHiI32 | PackLlB32B16 | PackLhB32B16 | PackHhB32B16) {
+        if !matches!(
+            self.op,
+            CselectB32
+                | CselectB64
+                | BfmB32
+                | MulI32
+                | MulHiU32
+                | MulHiI32
+                | PackLlB32B16
+                | PackLhB32B16
+                | PackHhB32B16
+        ) {
             f.write_file(RegFile::Scc, 0, 1)
         }
         f
@@ -289,7 +491,14 @@ impl fmt::Display for Sop2 {
     /// Exactly `llvm-objdump --mcpu=gfx942` text (single spaces).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (wd, w0, w1) = self.op.widths();
-        write!(f, "{} {}, {}, {}", self.op.name(), operand_text(self.sdst, wd), operand_text(self.ssrc0, w0), operand_text(self.ssrc1, w1))
+        write!(
+            f,
+            "{} {}, {}, {}",
+            self.op.name(),
+            operand_text(self.sdst, wd),
+            operand_text(self.ssrc0, w0),
+            operand_text(self.ssrc1, w1)
+        )
     }
 }
 
@@ -309,14 +518,22 @@ impl Sop1 {
             (_, None) => Err(format!("{what} needs a source")),
             // s_setpc_b64 takes a register pair only (llvm's SReg_64 operand:
             // a constant source has no assembler text).
-            (_, Some(s)) if self.op == Sop1Op::SetpcB64 && !s.is_sreg() => Err(format!("{what} needs a scalar register pair source (got {s:?})")),
-            (_, Some(s)) => { check_operand(arch, s, w0, false, what)?; Ok(s.literal()) }
+            (_, Some(s)) if self.op == Sop1Op::SetpcB64 && !s.is_sreg() => Err(format!(
+                "{what} needs a scalar register pair source (got {s:?})"
+            )),
+            (_, Some(s)) => {
+                check_operand(arch, s, w0, false, what)?;
+                Ok(s.literal())
+            }
         }
     }
 
     /// Append this instruction's dwords (and literal) to `out`.
     pub fn encode(&self, arch: Arch, out: &mut Vec<u32>) -> Result<()> {
-        let op = self.op.opcode(arch).ok_or_else(|| format!("{} does not exist on {arch}", self.op.name()))?;
+        let op = self
+            .op
+            .opcode(arch)
+            .ok_or_else(|| format!("{} does not exist on {arch}", self.op.name()))?;
         let lit = self.check(arch)?;
         let sdst = self.sdst.map_or(0, |d| u32::from(d.code()));
         let ssrc0 = self.ssrc0.map_or(0, |s| u32::from(s.code()));
@@ -329,14 +546,31 @@ impl Sop1 {
     pub fn decode(arch: Arch, words: &[u32]) -> Result<(Self, usize)> {
         let word = first_word(words, Format::Sop1)?;
         let opcode = ((word >> 8) & 0xff) as u8;
-        let op = Sop1Op::from_opcode(arch, opcode).ok_or_else(|| format!("SOP1 opcode {opcode} is not in the {arch} table"))?;
+        let op = Sop1Op::from_opcode(arch, opcode)
+            .ok_or_else(|| format!("SOP1 opcode {opcode} is not in the {arch} table"))?;
         let (wd, w0) = op.widths();
         let (cd, c0) = (((word >> 16) & 0x7f) as u16, (word & 0xff) as u16);
-        if wd == 0 && cd != 0 { return Err(format!("{}: unused SDST field is {cd}, not 0", op.name())) }
-        if w0 == 0 && c0 != 0 { return Err(format!("{}: unused SSRC0 field is {c0}, not 0", op.name())) }
-        let lit = if w0 == 0 { None } else { literal_after(op.name(), words, &[c0])? };
-        let sdst = if wd == 0 { None } else { Some(Src::from_code(cd, None)?) };
-        let ssrc0 = if w0 == 0 { None } else { Some(Src::from_code(c0, lit)?) };
+        if wd == 0 && cd != 0 {
+            return Err(format!("{}: unused SDST field is {cd}, not 0", op.name()));
+        }
+        if w0 == 0 && c0 != 0 {
+            return Err(format!("{}: unused SSRC0 field is {c0}, not 0", op.name()));
+        }
+        let lit = if w0 == 0 {
+            None
+        } else {
+            literal_after(op.name(), words, &[c0])?
+        };
+        let sdst = if wd == 0 {
+            None
+        } else {
+            Some(Src::from_code(cd, None)?)
+        };
+        let ssrc0 = if w0 == 0 {
+            None
+        } else {
+            Some(Src::from_code(c0, lit)?)
+        };
         let inst = Self { op, sdst, ssrc0 };
         inst.check(arch)?;
         Ok((inst, 1 + usize::from(lit.is_some())))
@@ -350,15 +584,37 @@ impl Sop1 {
         use Sop1Op::*;
         let (wd, w0) = self.op.widths();
         let mut f = Footprint::default();
-        if let Some(s) = self.ssrc0 { f.read(s, w0) }
+        if let Some(s) = self.ssrc0 {
+            f.read(s, w0)
+        }
         let conditional_or_rmw = matches!(self.op, CmovB32 | CmovB64 | Bitset0B32 | Bitset1B32);
-        if let Some(d) = self.sdst.filter(|_| conditional_or_rmw) { f.read(d, wd) }
-        if matches!(self.op, CmovB32 | CmovB64) { f.read_file(RegFile::Scc, 0, 1) }
-        let saveexec = matches!(self.op, AndSaveexecB64 | OrSaveexecB64 | XorSaveexecB64 | Andn2SaveexecB64);
-        if saveexec { f.read_file(RegFile::Exec, 0, 2) }
-        if let Some(d) = self.sdst { f.write(d, wd) }
-        if saveexec { f.write_file(RegFile::Exec, 0, 2) }
-        if saveexec || matches!(self.op, NotB32 | NotB64 | Bcnt1I32B32 | Bcnt1I32B64 | AbsI32) { f.write_file(RegFile::Scc, 0, 1) }
+        if let Some(d) = self.sdst.filter(|_| conditional_or_rmw) {
+            f.read(d, wd)
+        }
+        if matches!(self.op, CmovB32 | CmovB64) {
+            f.read_file(RegFile::Scc, 0, 1)
+        }
+        let saveexec = matches!(
+            self.op,
+            AndSaveexecB64 | OrSaveexecB64 | XorSaveexecB64 | Andn2SaveexecB64
+        );
+        if saveexec {
+            f.read_file(RegFile::Exec, 0, 2)
+        }
+        if let Some(d) = self.sdst {
+            f.write(d, wd)
+        }
+        if saveexec {
+            f.write_file(RegFile::Exec, 0, 2)
+        }
+        if saveexec
+            || matches!(
+                self.op,
+                NotB32 | NotB64 | Bcnt1I32B32 | Bcnt1I32B64 | AbsI32
+            )
+        {
+            f.write_file(RegFile::Scc, 0, 1)
+        }
         f
     }
 }
@@ -366,7 +622,10 @@ impl fmt::Display for Sop1 {
     /// Exactly `llvm-objdump --mcpu=gfx942` text (single spaces).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (wd, w0) = self.op.widths();
-        let ops: Vec<String> = [(self.sdst, wd), (self.ssrc0, w0)].into_iter().filter_map(|(s, w)| s.map(|s| operand_text(s, w))).collect();
+        let ops: Vec<String> = [(self.sdst, wd), (self.ssrc0, w0)]
+            .into_iter()
+            .filter_map(|(s, w)| s.map(|s| operand_text(s, w)))
+            .collect();
         write!(f, "{} {}", self.op.name(), ops.join(", "))
     }
 }
@@ -404,25 +663,44 @@ fn hwreg_text(simm16: u16) -> String {
     let offset = (simm16 >> 6) & 0x1f;
     let size = (simm16 >> 11) + 1;
     let name = hwreg_name(id).map_or_else(|| id.to_string(), str::to_string);
-    if offset == 0 && size == 32 { format!("hwreg({name})") } else { format!("hwreg({name}, {offset}, {size})") }
+    if offset == 0 && size == 32 {
+        format!("hwreg({name})")
+    } else {
+        format!("hwreg({name}, {offset}, {size})")
+    }
 }
 
 impl Sopk {
-    fn check(&self, arch: Arch) -> Result<()> { check_operand(arch, self.sdst, 1, true, self.op.name()) }
+    fn check(&self, arch: Arch) -> Result<()> {
+        check_operand(arch, self.sdst, 1, true, self.op.name())
+    }
 
     /// Append this instruction's dword to `out`.
     pub fn encode(&self, arch: Arch, out: &mut Vec<u32>) -> Result<()> {
-        let op = self.op.opcode(arch).ok_or_else(|| format!("{} does not exist on {arch}", self.op.name()))?;
+        let op = self
+            .op
+            .opcode(arch)
+            .ok_or_else(|| format!("{} does not exist on {arch}", self.op.name()))?;
         self.check(arch)?;
-        out.push(0b1011 << 28 | u32::from(op) << 23 | u32::from(self.sdst.code()) << 16 | u32::from(self.simm16));
+        out.push(
+            0b1011 << 28
+                | u32::from(op) << 23
+                | u32::from(self.sdst.code()) << 16
+                | u32::from(self.simm16),
+        );
         Ok(())
     }
     /// Decode from `words[0..]`; returns the dword count consumed (always 1).
     pub fn decode(arch: Arch, words: &[u32]) -> Result<(Self, usize)> {
         let word = first_word(words, Format::Sopk)?;
         let opcode = ((word >> 23) & 0x1f) as u8;
-        let op = SopkOp::from_opcode(arch, opcode).ok_or_else(|| format!("SOPK opcode {opcode} is not in the {arch} table"))?;
-        let inst = Self { op, sdst: Src::from_code(((word >> 16) & 0x7f) as u16, None)?, simm16: word as u16 };
+        let op = SopkOp::from_opcode(arch, opcode)
+            .ok_or_else(|| format!("SOPK opcode {opcode} is not in the {arch} table"))?;
+        let inst = Self {
+            op,
+            sdst: Src::from_code(((word >> 16) & 0x7f) as u16, None)?,
+            simm16: word as u16,
+        };
         inst.check(arch)?;
         Ok((inst, 1))
     }
@@ -439,11 +717,25 @@ impl Sopk {
         let mut f = Footprint::default();
         match self.op {
             MovkI32 => f.write(self.sdst, 1),
-            CmovkI32 => { f.read_file(RegFile::Scc, 0, 1); f.read(self.sdst, 1); f.write(self.sdst, 1) }
-            CmpkEqI32 | CmpkLgI32 | CmpkGtI32 | CmpkGeI32 | CmpkLtI32 | CmpkLeI32
-            | CmpkEqU32 | CmpkLgU32 | CmpkGtU32 | CmpkGeU32 | CmpkLtU32 | CmpkLeU32 => { f.read(self.sdst, 1); f.write_file(RegFile::Scc, 0, 1) }
-            AddkI32 => { f.read(self.sdst, 1); f.write(self.sdst, 1); f.write_file(RegFile::Scc, 0, 1) }
-            MulkI32 => { f.read(self.sdst, 1); f.write(self.sdst, 1) }
+            CmovkI32 => {
+                f.read_file(RegFile::Scc, 0, 1);
+                f.read(self.sdst, 1);
+                f.write(self.sdst, 1)
+            }
+            CmpkEqI32 | CmpkLgI32 | CmpkGtI32 | CmpkGeI32 | CmpkLtI32 | CmpkLeI32 | CmpkEqU32
+            | CmpkLgU32 | CmpkGtU32 | CmpkGeU32 | CmpkLtU32 | CmpkLeU32 => {
+                f.read(self.sdst, 1);
+                f.write_file(RegFile::Scc, 0, 1)
+            }
+            AddkI32 => {
+                f.read(self.sdst, 1);
+                f.write(self.sdst, 1);
+                f.write_file(RegFile::Scc, 0, 1)
+            }
+            MulkI32 => {
+                f.read(self.sdst, 1);
+                f.write(self.sdst, 1)
+            }
             GetregB32 => {
                 if self.simm16 & 0x3f == 2 {
                     f.read_file(RegFile::Scc, 0, 1);
@@ -481,9 +773,17 @@ impl Sopc {
 
     /// Append this instruction's dwords (and literal) to `out`.
     pub fn encode(&self, arch: Arch, out: &mut Vec<u32>) -> Result<()> {
-        let op = self.op.opcode(arch).ok_or_else(|| format!("{} does not exist on {arch}", self.op.name()))?;
+        let op = self
+            .op
+            .opcode(arch)
+            .ok_or_else(|| format!("{} does not exist on {arch}", self.op.name()))?;
         let lit = self.check(arch)?;
-        out.push(0b1_0111_1110 << 23 | u32::from(op) << 16 | u32::from(self.ssrc1.code()) << 8 | u32::from(self.ssrc0.code()));
+        out.push(
+            0b1_0111_1110 << 23
+                | u32::from(op) << 16
+                | u32::from(self.ssrc1.code()) << 8
+                | u32::from(self.ssrc0.code()),
+        );
         out.extend(lit);
         Ok(())
     }
@@ -491,10 +791,15 @@ impl Sopc {
     pub fn decode(arch: Arch, words: &[u32]) -> Result<(Self, usize)> {
         let word = first_word(words, Format::Sopc)?;
         let opcode = ((word >> 16) & 0x7f) as u8;
-        let op = SopcOp::from_opcode(arch, opcode).ok_or_else(|| format!("SOPC opcode {opcode} is not in the {arch} table"))?;
+        let op = SopcOp::from_opcode(arch, opcode)
+            .ok_or_else(|| format!("SOPC opcode {opcode} is not in the {arch} table"))?;
         let (c0, c1) = ((word & 0xff) as u16, ((word >> 8) & 0xff) as u16);
         let lit = literal_after(op.name(), words, &[c0, c1])?;
-        let inst = Self { op, ssrc0: Src::from_code(c0, lit)?, ssrc1: Src::from_code(c1, lit)? };
+        let inst = Self {
+            op,
+            ssrc0: Src::from_code(c0, lit)?,
+            ssrc1: Src::from_code(c1, lit)?,
+        };
         inst.check(arch)?;
         Ok((inst, 1 + usize::from(lit.is_some())))
     }
@@ -512,7 +817,13 @@ impl fmt::Display for Sopc {
     /// Exactly `llvm-objdump --mcpu=gfx942` text (single spaces).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let w = self.op.width();
-        write!(f, "{} {}, {}", self.op.name(), operand_text(self.ssrc0, w), operand_text(self.ssrc1, w))
+        write!(
+            f,
+            "{} {}, {}",
+            self.op.name(),
+            operand_text(self.ssrc0, w),
+            operand_text(self.ssrc1, w)
+        )
     }
 }
 
@@ -543,7 +854,10 @@ fn sendmsg_text(simm16: u16) -> (String, bool) {
     let gs_op = ["GS_OP_NOP", "GS_OP_CUT", "GS_OP_EMIT", "GS_OP_EMIT_CUT"];
     let named = match (id, name) {
         // MSG_GS needs CUT/EMIT/EMIT_CUT plus a stream; MSG_GS_DONE also takes NOP (stream 0, unprinted).
-        (2 | 3, Some(n)) if (1..=3).contains(&op) => Some(format!("sendmsg({n}, {}, {stream})", gs_op[usize::from(op)])),
+        (2 | 3, Some(n)) if (1..=3).contains(&op) => Some(format!(
+            "sendmsg({n}, {}, {stream})",
+            gs_op[usize::from(op)]
+        )),
         (3, Some(n)) if op == 0 && stream == 0 => Some(format!("sendmsg({n}, {})", gs_op[0])),
         (15, Some(n)) if stream == 0 => match op {
             1 => Some(format!("sendmsg({n}, SYSMSG_OP_ECC_ERR_INTERRUPT)")),
@@ -569,9 +883,15 @@ fn waitcnt_text(arch: Arch, simm16: u16) -> String {
     let (vm, exp, lgkm) = waitcnt_fields(arch, simm16);
     let all = vm == caps.vmcnt_max && exp == caps.expcnt_max && lgkm == caps.lgkmcnt_max;
     let mut parts = Vec::with_capacity(3);
-    if all || vm != caps.vmcnt_max { parts.push(format!("vmcnt({vm})")) }
-    if all || exp != caps.expcnt_max { parts.push(format!("expcnt({exp})")) }
-    if all || lgkm != caps.lgkmcnt_max { parts.push(format!("lgkmcnt({lgkm})")) }
+    if all || vm != caps.vmcnt_max {
+        parts.push(format!("vmcnt({vm})"))
+    }
+    if all || exp != caps.expcnt_max {
+        parts.push(format!("expcnt({exp})"))
+    }
+    if all || lgkm != caps.lgkmcnt_max {
+        parts.push(format!("lgkmcnt({lgkm})"))
+    }
     parts.join(" ")
 }
 
@@ -583,16 +903,27 @@ impl Sopp {
     fn check(&self) -> Result<()> {
         let name = self.op.name();
         match self.op {
-            SoppOp::Barrier | SoppOp::IcacheInv if self.simm16 != 0 => Err(format!("{name} takes no SIMM16 (got {:#x})", self.simm16)),
-            SoppOp::Waitcnt if self.simm16 & WAITCNT_UNUSED != 0 => Err(format!("s_waitcnt SIMM16 {:#06x} sets unused bits {WAITCNT_UNUSED:#06x}", self.simm16)),
-            SoppOp::Sendmsg if !sendmsg_text(self.simm16).1 => Err(format!("s_sendmsg SIMM16 {:#06x} sets bits outside the message id/op/stream fields", self.simm16)),
+            SoppOp::Barrier | SoppOp::IcacheInv if self.simm16 != 0 => {
+                Err(format!("{name} takes no SIMM16 (got {:#x})", self.simm16))
+            }
+            SoppOp::Waitcnt if self.simm16 & WAITCNT_UNUSED != 0 => Err(format!(
+                "s_waitcnt SIMM16 {:#06x} sets unused bits {WAITCNT_UNUSED:#06x}",
+                self.simm16
+            )),
+            SoppOp::Sendmsg if !sendmsg_text(self.simm16).1 => Err(format!(
+                "s_sendmsg SIMM16 {:#06x} sets bits outside the message id/op/stream fields",
+                self.simm16
+            )),
             _ => Ok(()),
         }
     }
 
     /// Append this instruction's dword to `out`.
     pub fn encode(&self, arch: Arch, out: &mut Vec<u32>) -> Result<()> {
-        let op = self.op.opcode(arch).ok_or_else(|| format!("{} does not exist on {arch}", self.op.name()))?;
+        let op = self
+            .op
+            .opcode(arch)
+            .ok_or_else(|| format!("{} does not exist on {arch}", self.op.name()))?;
         self.check()?;
         out.push(0b1_0111_1111 << 23 | u32::from(op) << 16 | u32::from(self.simm16));
         Ok(())
@@ -601,8 +932,12 @@ impl Sopp {
     pub fn decode(arch: Arch, words: &[u32]) -> Result<(Self, usize)> {
         let word = first_word(words, Format::Sopp)?;
         let opcode = ((word >> 16) & 0x7f) as u8;
-        let op = SoppOp::from_opcode(arch, opcode).ok_or_else(|| format!("SOPP opcode {opcode} is not in the {arch} table"))?;
-        let inst = Self { op, simm16: word as u16 };
+        let op = SoppOp::from_opcode(arch, opcode)
+            .ok_or_else(|| format!("SOPP opcode {opcode} is not in the {arch} table"))?;
+        let inst = Self {
+            op,
+            simm16: word as u16,
+        };
         inst.check()?;
         Ok((inst, 1))
     }
@@ -622,8 +957,14 @@ impl Sopp {
             SoppOp::CbranchExecz | SoppOp::CbranchExecnz => f.read_file(RegFile::Exec, 0, 2),
             SoppOp::Sendmsg => f.read_file(RegFile::M0, 0, 1),
             SoppOp::Trap => f.write_file(RegFile::Ttmp, 0, 2),
-            SoppOp::Nop | SoppOp::Endpgm | SoppOp::Branch | SoppOp::Barrier | SoppOp::Waitcnt
-            | SoppOp::Sleep | SoppOp::Setprio | SoppOp::IcacheInv => {}
+            SoppOp::Nop
+            | SoppOp::Endpgm
+            | SoppOp::Branch
+            | SoppOp::Barrier
+            | SoppOp::Waitcnt
+            | SoppOp::Sleep
+            | SoppOp::Setprio
+            | SoppOp::IcacheInv => {}
         }
         f
     }
@@ -641,7 +982,9 @@ impl fmt::Display for Sopp {
             SoppOp::Waitcnt => write!(f, "{name} {}", waitcnt_text(Arch::Gfx942, imm)),
             SoppOp::Sendmsg => write!(f, "{name} {}", sendmsg_text(imm).0),
             // llvm prints these immediates as inline-constant-style values.
-            SoppOp::Nop | SoppOp::Sleep | SoppOp::Setprio | SoppOp::Trap if imm > 64 => write!(f, "{name} {imm:#x}"),
+            SoppOp::Nop | SoppOp::Sleep | SoppOp::Setprio | SoppOp::Trap if imm > 64 => {
+                write!(f, "{name} {imm:#x}")
+            }
             // Endpgm, branches (unsigned SIMM16, not the signed offset), small immediates.
             _ => write!(f, "{name} {imm}"),
         }

@@ -97,21 +97,32 @@ impl HotsetBudget {
         let Some(raw) = raw else {
             return Ok(Self { fixed_bytes: None });
         };
-        let invalid = || format!(
-            "{HOT_BUDGET_MIB_ENV}={raw:?}: expected positive unsigned decimal MiB \
+        let invalid = || {
+            format!(
+                "{HOT_BUDGET_MIB_ENV}={raw:?}: expected positive unsigned decimal MiB \
              that fit in u64 bytes; unset it for automatic sizing"
-        );
+            )
+        };
         if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
             return Err(invalid());
         }
         let mib = raw.parse::<u64>().map_err(|_| invalid())?;
-        let bytes = mib.checked_mul(1 << 20).filter(|&bytes| bytes > 0).ok_or_else(invalid)?;
-        Ok(Self { fixed_bytes: Some(bytes) })
+        let bytes = mib
+            .checked_mul(1 << 20)
+            .filter(|&bytes| bytes > 0)
+            .ok_or_else(invalid)?;
+        Ok(Self {
+            fixed_bytes: Some(bytes),
+        })
     }
 
     /// Read once from the process configuration snapshot, like [`HotsetPolicy`].
     pub fn from_env() -> Result<Self, String> {
-        Self::parse(hipfire_config::developer_var(HOT_BUDGET_MIB_ENV).ok().as_deref())
+        Self::parse(
+            hipfire_config::developer_var(HOT_BUDGET_MIB_ENV)
+                .ok()
+                .as_deref(),
+        )
     }
 
     /// Whether failure to apply the requested hotset must fail the load.
@@ -128,14 +139,14 @@ impl HotsetBudget {
                 "{HOT_BUDGET_MIB_ENV} requests {requested} bytes ({} MiB), \
                  but only {available} bytes ({} MiB) are available for hot experts \
                  after reserves; refusing to shrink the fixed budget",
-                requested >> 20, available >> 20,
+                requested >> 20,
+                available >> 20,
             )),
             Some(requested) => Ok(requested),
             None => require_budget(Ok(available)).map_err(|skip| skip.to_string()),
         }
     }
 }
-
 
 /// `HIPFIRE_QWEN4_EXPERT_HOTSET`: where the sidecar comes from.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1368,7 +1379,11 @@ mod tests {
             ("gfx942", true, true),
             ("gfx12010", false, false),
         ] {
-            assert_eq!(hotset_arch_admits(arch, explicit), admitted, "{arch} explicit={explicit}");
+            assert_eq!(
+                hotset_arch_admits(arch, explicit),
+                admitted,
+                "{arch} explicit={explicit}"
+            );
             let mut env = good_env();
             env.gpu_arch = arch;
             let policy = if explicit {
@@ -1490,7 +1505,10 @@ mod tests {
         let max_mib = u64::MAX >> 20;
         let max_raw = max_mib.to_string();
         assert_eq!(
-            HotsetBudget::parse(Some(&max_raw)).unwrap().select(u64::MAX).unwrap(),
+            HotsetBudget::parse(Some(&max_raw))
+                .unwrap()
+                .select(u64::MAX)
+                .unwrap(),
             max_mib << 20,
         );
     }
@@ -1526,27 +1544,35 @@ mod tests {
         let slabs: Vec<_> = (0..count)
             .map(|id| ExpertSlab {
                 format: ExpertFormat::Mq4Xts,
-                gate_up: ExpertSlabSpan { offset: id * (1 << 19), len: 1 << 18 },
-                down: ExpertSlabSpan { offset: id * (1 << 19) + (1 << 18), len: 1 << 18 },
+                gate_up: ExpertSlabSpan {
+                    offset: id * (1 << 19),
+                    len: 1 << 18,
+                },
+                down: ExpertSlabSpan {
+                    offset: id * (1 << 19) + (1 << 18),
+                    len: 1 << 18,
+                },
             })
             .collect();
         let rank: Vec<u32> = (0..count as u32).rev().collect();
         let fixed = HotsetBudget::parse(Some("2")).unwrap();
         // Different auto headroom (e.g. AR versus MTP) and stage reserves
         // cannot change the selected ceiling or the logical partition.
-        let ar = plan_expert_tiers_from_slabs(
-            &slabs, &rank, fixed.select(8 << 20).unwrap(),
-        ).unwrap();
-        let mtp = plan_expert_tiers_from_slabs(
-            &slabs, &rank, fixed.select(3 << 20).unwrap(),
-        ).unwrap();
+        let ar =
+            plan_expert_tiers_from_slabs(&slabs, &rank, fixed.select(8 << 20).unwrap()).unwrap();
+        let mtp =
+            plan_expert_tiers_from_slabs(&slabs, &rank, fixed.select(3 << 20).unwrap()).unwrap();
         assert_eq!(ar.device_experts(), 3);
         assert_eq!(ar.logical_digest(), mtp.logical_digest());
         assert_eq!(ar, mtp);
         for (index, &id) in rank.iter().enumerate() {
             assert_eq!(
                 ar.entry(id as usize / 512, id as usize % 512).unwrap().tier,
-                if index < 3 { Placement::Device } else { Placement::HostMapped },
+                if index < 3 {
+                    Placement::Device
+                } else {
+                    Placement::HostMapped
+                },
             );
         }
         assert!(fixed.select((2 << 20) - 1).is_err());

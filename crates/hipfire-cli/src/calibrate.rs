@@ -1156,8 +1156,7 @@ mod tests {
             let d2 = rows[0].d2.as_ref().expect("a fresh device has a standing");
             assert_eq!(d2.status, "load");
             assert!(
-                d2.text
-                    .contains("calibration rates alone cannot enable it"),
+                d2.text.contains("calibration rates alone cannot enable it"),
                 "{}",
                 d2.text
             );
@@ -1165,8 +1164,7 @@ mod tests {
             assert!(text.contains("D2 default"), "{text}");
             assert!(!text.contains("D2 default    Flash-Next"), "{text}");
             assert!(!text.contains("ON ("), "{text}");
-            let value =
-                show_json(Some(&rec), &host_freshness(Some(&rec), &host()), &rows).unwrap();
+            let value = show_json(Some(&rec), &host_freshness(Some(&rec), &host()), &rows).unwrap();
             let json = &value["devices"][0]["d2_default"];
             assert_eq!(json["status"], "load");
             assert!(json.get("cpu_gbps").is_none() && json.get("stored_k").is_none());

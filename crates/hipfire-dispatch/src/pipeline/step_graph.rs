@@ -286,10 +286,18 @@ impl std::fmt::Display for StepGraphError {
         match self {
             Self::UnknownResource(r) => write!(f, "unknown resource {}", r.0),
             Self::AliasForward { resource, of } => {
-                write!(f, "resource {} aliases non-earlier resource {}", resource.0, of.0)
+                write!(
+                    f,
+                    "resource {} aliases non-earlier resource {}",
+                    resource.0, of.0
+                )
             }
             Self::AliasOutOfRange { resource } => {
-                write!(f, "alias range of resource {} exceeds its target", resource.0)
+                write!(
+                    f,
+                    "alias range of resource {} exceeds its target",
+                    resource.0
+                )
             }
             Self::RuleOperandNotDeclared { operand } => {
                 write!(f, "rule operand {} not in op reads/writes", operand.0)
@@ -323,9 +331,8 @@ impl StepGraph {
     /// Append a resource; its id is its index. An alias must target a strictly
     /// earlier resource and its `offset + numel` must lie inside the target.
     pub fn add_resource(&mut self, decl: ResourceDecl) -> Result<ResourceId, StepGraphError> {
-        let id = ResourceId(
-            u32::try_from(self.resources.len()).map_err(|_| StepGraphError::TooMany)?,
-        );
+        let id =
+            ResourceId(u32::try_from(self.resources.len()).map_err(|_| StepGraphError::TooMany)?);
         if let Some(alias) = decl.alias {
             if alias.of.0 >= id.0 {
                 return Err(StepGraphError::AliasForward {

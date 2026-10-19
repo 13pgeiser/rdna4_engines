@@ -18,7 +18,10 @@ pub fn populate(registry: &mut KernelRegistry) {
         // Explicit exact verify QKV (1..=128 rows, singleton F16-WMMA chain);
         // only for `DenseBatchMath::SingletonWmma`, never selected by dtype. The
         // Gpu method fails closed off gfx1201 itself, so the predicate matches.
-        (KernelKey::FusedQkvMq4G256V2VerifyExact, ArchPredicate::IsGfx1201),
+        (
+            KernelKey::FusedQkvMq4G256V2VerifyExact,
+            ArchPredicate::IsGfx1201,
+        ),
         (KernelKey::FusedQkvMq4G256V2Lloyd, ArchPredicate::Always),
         (KernelKey::FusedQkvMq5G256V2, ArchPredicate::Always),
         (KernelKey::FusedQkvMq6G256V2, ArchPredicate::Always),
@@ -88,7 +91,10 @@ pub fn populate(registry: &mut KernelRegistry) {
         // Explicit exact verify QKVZA (1..=128 rows, singleton F16-WMMA chain);
         // only for `DenseBatchMath::SingletonWmma`, never selected by dtype. The
         // Gpu method fails closed off gfx1201 itself, so the predicate matches.
-        (KernelKey::FusedQkvzaMq4G256V2VerifyExact, ArchPredicate::IsGfx1201),
+        (
+            KernelKey::FusedQkvzaMq4G256V2VerifyExact,
+            ArchPredicate::IsGfx1201,
+        ),
         (KernelKey::FusedQkvzaMq4G256V2Lloyd, ArchPredicate::Always),
         (KernelKey::FusedQkvzaMq5G256V2, ArchPredicate::Always),
         (KernelKey::FusedQkvzaMq6G256V2, ArchPredicate::Always),
@@ -159,7 +165,10 @@ pub fn populate(registry: &mut KernelRegistry) {
         // Explicit exact verify gate+up (1..=128 rows, singleton F16-WMMA chain);
         // only for `DenseBatchMath::SingletonWmma`, never selected by dtype. The
         // Gpu method fails closed off gfx1201 itself, so the predicate matches.
-        (KernelKey::FusedGateUpMq4G256V2VerifyExact, ArchPredicate::IsGfx1201),
+        (
+            KernelKey::FusedGateUpMq4G256V2VerifyExact,
+            ArchPredicate::IsGfx1201,
+        ),
         (KernelKey::FusedGateUpMq4G256V2Lloyd, ArchPredicate::Always),
         (KernelKey::FusedGateUpMq5G256V2, ArchPredicate::Always),
         (KernelKey::FusedGateUpMq6G256V2, ArchPredicate::Always),

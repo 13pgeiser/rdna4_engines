@@ -215,7 +215,10 @@ mod test {
 
     #[test]
     fn splice_pool_runs_work() {
-        let pool = splice_pool(SplicePoolConfig { threads: 0, pin: true });
+        let pool = splice_pool(SplicePoolConfig {
+            threads: 0,
+            pin: true,
+        });
         let sum: usize = pool.install(|| {
             use rayon::prelude::*;
             (0..1000usize).into_par_iter().sum()

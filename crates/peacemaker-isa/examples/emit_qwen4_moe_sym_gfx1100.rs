@@ -1101,7 +1101,10 @@ mod app {
                 });
                 row["contract_sha256"] = json!(sha256(&contract_bytes));
                 contract_files.push((
-                    ctx.root.join(format!("crates/peacemaker-isa/kernels/qwen4_moe_sym.{}.{variant}.contract.json", ctx.arch.name())),
+                    ctx.root.join(format!(
+                        "crates/peacemaker-isa/kernels/qwen4_moe_sym.{}.{variant}.contract.json",
+                        ctx.arch.name()
+                    )),
                     contract_bytes,
                 ));
             }
@@ -1581,7 +1584,11 @@ mod app {
                             modules.push(j);
                         }
                         Err(e) => failures.push(Failure {
-                            scope: format!("negative:{}:{}", negative.tag(), codec.module(ctx.arch)),
+                            scope: format!(
+                                "negative:{}:{}",
+                                negative.tag(),
+                                codec.module(ctx.arch)
+                            ),
                             message: e,
                         }),
                     }

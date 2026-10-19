@@ -1334,7 +1334,9 @@ pub(crate) fn resolve_serve_positionals(
         }
         let is_model = registry.model(value).is_some()
             || crate::find_local_model_path(paths, &registry, value).is_some()
-            || crate::model_card(paths, &registry, value).retired().is_some();
+            || crate::model_card(paths, &registry, value)
+                .retired()
+                .is_some();
         if is_model && model.is_none() {
             model = Some(value.clone());
         } else if host.replace(value.clone()).is_some() {

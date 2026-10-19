@@ -44,6 +44,7 @@ mod host {
     use hipfire_runtime::weight_host::{
         certify_source, Epoch, HostConnection, ReleasePoll, ServeOptions, WeightPublication,
     };
+    use parking_lot::Mutex;
     use std::collections::BTreeMap;
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
@@ -51,7 +52,6 @@ mod host {
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-    use parking_lot::Mutex;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -61,7 +61,8 @@ mod host {
     const EXIT_USAGE: i32 = 2;
     const EXIT_DRAIN_TIMEOUT: i32 = 3;
 
-    const USAGE: &str = "usage: hipfire-weight-host --model <dense-qwen35.hfq> --socket <absolute path> \
+    const USAGE: &str =
+        "usage: hipfire-weight-host --model <dense-qwen35.hfq> --socket <absolute path> \
 [--drain-timeout-secs N (600)] [--handshake-timeout-ms N (10000)]";
 
     struct Args {
@@ -78,19 +79,27 @@ mod host {
         let mut handshake_timeout = Duration::from_millis(10_000);
         let mut it = std::env::args_os().skip(1);
         while let Some(flag) = it.next() {
-            let mut value = || it.next().ok_or_else(|| format!("{} needs a value", flag.to_string_lossy()));
+            let mut value = || {
+                it.next()
+                    .ok_or_else(|| format!("{} needs a value", flag.to_string_lossy()))
+            };
             match flag.to_str() {
                 Some("--model") => model = Some(PathBuf::from(value()?)),
                 Some("--socket") => socket = Some(PathBuf::from(value()?)),
                 Some("--drain-timeout-secs") => {
                     let v = value()?;
                     drain_timeout = Duration::from_secs(
-                        v.to_str().and_then(|s| s.parse().ok()).ok_or("--drain-timeout-secs: integer")?,
+                        v.to_str()
+                            .and_then(|s| s.parse().ok())
+                            .ok_or("--drain-timeout-secs: integer")?,
                     );
                 }
                 Some("--handshake-timeout-ms") => {
                     let v = value()?;
-                    let ms: u64 = v.to_str().and_then(|s| s.parse().ok()).ok_or("--handshake-timeout-ms: integer")?;
+                    let ms: u64 = v
+                        .to_str()
+                        .and_then(|s| s.parse().ok())
+                        .ok_or("--handshake-timeout-ms: integer")?;
                     if ms == 0 {
                         return Err("--handshake-timeout-ms must be > 0".into());
                     }
@@ -104,7 +113,12 @@ mod host {
         if !socket.is_absolute() {
             return Err("--socket must be an absolute path".into());
         }
-        Ok(Args { model, socket, drain_timeout, handshake_timeout })
+        Ok(Args {
+            model,
+            socket,
+            drain_timeout,
+            handshake_timeout,
+        })
     }
 
     // ── Signals: one sigwait thread, everything else blocks them ─────────
@@ -215,8 +229,11 @@ mod host {
     /// The socket directory is the generation's private publication area:
     /// it must exist, belong to this user and be mode 0700.
     fn check_socket_dir(socket: &Path) -> Result<(), String> {
-        let dir = socket.parent().ok_or("socket path has no parent directory")?;
-        let md = std::fs::symlink_metadata(dir).map_err(|e| format!("socket directory {}: {e}", dir.display()))?;
+        let dir = socket
+            .parent()
+            .ok_or("socket path has no parent directory")?;
+        let md = std::fs::symlink_metadata(dir)
+            .map_err(|e| format!("socket directory {}: {e}", dir.display()))?;
         let uid = unsafe { libc::geteuid() };
         if !md.is_dir() || md.uid() != uid || md.mode() & 0o777 != 0o700 {
             return Err(format!(
@@ -237,13 +254,23 @@ mod host {
             Err(e) => return Err(format!("{}: {e}", socket.display())),
         };
         if !md.file_type().is_socket() {
-            return Err(format!("{} exists and is not a socket; refusing to replace it", socket.display()));
+            return Err(format!(
+                "{} exists and is not a socket; refusing to replace it",
+                socket.display()
+            ));
         }
         match UnixStream::connect(socket) {
-            Ok(_) => Err(format!("a live weight host already publishes on {}", socket.display())),
+            Ok(_) => Err(format!(
+                "a live weight host already publishes on {}",
+                socket.display()
+            )),
             Err(e) if e.raw_os_error() == Some(libc::ECONNREFUSED) => {
-                eprintln!("[weight-host] removing stale socket {} (no listener)", socket.display());
-                std::fs::remove_file(socket).map_err(|e| format!("remove stale {}: {e}", socket.display()))
+                eprintln!(
+                    "[weight-host] removing stale socket {} (no listener)",
+                    socket.display()
+                );
+                std::fs::remove_file(socket)
+                    .map_err(|e| format!("remove stale {}: {e}", socket.display()))
             }
             Err(e) => Err(format!("probe {}: {e}", socket.display())),
         }
@@ -252,23 +279,38 @@ mod host {
     /// Bind under a temporary name, set 0600, then publish atomically with
     /// `renameat2(RENAME_NOREPLACE)`: a concurrent host is never overwritten.
     fn publish_socket(socket: &Path) -> Result<UnixListener, String> {
-        let dir = socket.parent().ok_or("socket path has no parent directory")?;
+        let dir = socket
+            .parent()
+            .ok_or("socket path has no parent directory")?;
         let name = socket.file_name().ok_or("socket path has no file name")?;
         let mut tmp_name = std::ffi::OsString::from(".");
         tmp_name.push(name);
         tmp_name.push(format!(".{}.tmp", std::process::id()));
         let tmp = dir.join(tmp_name);
-        let listener = UnixListener::bind(&tmp).map_err(|e| format!("bind {}: {e}", tmp.display()))?;
+        let listener =
+            UnixListener::bind(&tmp).map_err(|e| format!("bind {}: {e}", tmp.display()))?;
         let publish = (|| -> Result<(), String> {
             std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
                 .map_err(|e| format!("chmod {}: {e}", tmp.display()))?;
-            let from = std::ffi::CString::new(tmp.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
-            let to = std::ffi::CString::new(socket.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+            let from =
+                std::ffi::CString::new(tmp.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+            let to =
+                std::ffi::CString::new(socket.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
             let rc = unsafe {
-                libc::renameat2(libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), libc::RENAME_NOREPLACE)
+                libc::renameat2(
+                    libc::AT_FDCWD,
+                    from.as_ptr(),
+                    libc::AT_FDCWD,
+                    to.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
             };
             if rc != 0 {
-                return Err(format!("publish {}: {}", socket.display(), std::io::Error::last_os_error()));
+                return Err(format!(
+                    "publish {}: {}",
+                    socket.display(),
+                    std::io::Error::last_os_error()
+                ));
             }
             Ok(())
         })();
@@ -287,7 +329,10 @@ mod host {
     fn claim_card() -> Result<(GpuLocks, fabric::FabricAdmission), String> {
         use hipfire_config::devices::{DeviceRoot, IdentitySource, ObservedDevice};
         let token = std::env::var(fabric::ADMISSION_ENV).map_err(|_| {
-            format!("{} is unset: run the host under fabric-run.sh --class correct", fabric::ADMISSION_ENV)
+            format!(
+                "{} is unset: run the host under fabric-run.sh --class correct",
+                fabric::ADMISSION_ENV
+            )
         })?;
         let admission = fabric::FabricAdmission::verify_for_pid(&token, std::process::id())?;
         let mut locks = GpuLocks::open_shared(&token)?;
@@ -296,13 +341,17 @@ mod host {
         let hip = hip_bridge::HipRuntime::load().map_err(|e| e.to_string())?;
         let count = hip.device_count().map_err(|e| e.to_string())?;
         if count != 1 {
-            return Err(format!("weight host v1 needs exactly one visible device, HIP exposes {count}"));
+            return Err(format!(
+                "weight host v1 needs exactly one visible device, HIP exposes {count}"
+            ));
         }
         let observed = vec![ObservedDevice {
             logical: 0,
             arch: hip.get_arch(0).map_err(|e| e.to_string())?,
             pci_bus_id: hip.device_pci_bus_id(0).map_err(|e| e.to_string())?,
-            uuid: with_uuid.then(|| hip.device_uuid(0).map_err(|e| e.to_string())).transpose()?,
+            uuid: with_uuid
+                .then(|| hip.device_uuid(0).map_err(|e| e.to_string()))
+                .transpose()?,
         }];
         let devices = hipfire_config::devices::identify_observed(&root, &observed)?;
         locks.claim_all(&devices)?;
@@ -310,7 +359,10 @@ mod host {
     }
 
     fn raise_nofile_limit() -> Result<u64, String> {
-        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
         if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
             return Err(format!("getrlimit: {}", std::io::Error::last_os_error()));
         }
@@ -352,13 +404,14 @@ mod host {
             conn.reject("weight host is draining");
             return Err(format!("pid {pid}: refused, draining"));
         }
-        let tenant = match fabric::FabricAdmission::verify_for_pid(&conn.hello().admission_token, pid) {
-            Ok(tenant) => tenant,
-            Err(e) => {
-                conn.reject(&e);
-                return Err(format!("pid {pid}: {e}"));
-            }
-        };
+        let tenant =
+            match fabric::FabricAdmission::verify_for_pid(&conn.hello().admission_token, pid) {
+                Ok(tenant) => tenant,
+                Err(e) => {
+                    conn.reject(&e);
+                    return Err(format!("pid {pid}: {e}"));
+                }
+            };
         if tenant.state_path != shared.admission.state_path {
             let reason = format!(
                 "fabric admission {} is for another card than the host's {}",
@@ -368,10 +421,18 @@ mod host {
             conn.reject(&reason);
             return Err(format!("pid {pid}: {reason}"));
         }
-        let start = fabric::proc_start(pid).ok_or_else(|| format!("pid {pid} vanished during handshake"))?;
+        let start = fabric::proc_start(pid)
+            .ok_or_else(|| format!("pid {pid} vanished during handshake"))?;
         let mut session = conn
             .admit(|_| {
-                shared.registry.insert(id, Lease { pid, start, state: LeaseState::Pending });
+                shared.registry.insert(
+                    id,
+                    Lease {
+                        pid,
+                        start,
+                        state: LeaseState::Pending,
+                    },
+                );
                 Ok(())
             })
             .map_err(|e| format!("pid {pid}: admission: {e}"))?;
@@ -393,7 +454,9 @@ mod host {
         shared.registry.set(id, LeaseState::Active);
         eprintln!(
             "WEIGHT_HOST_LEASE id={id} pid={pid} epoch={} imported_bytes={} fds={} state=active",
-            ack.epoch, ack.imported_bytes, session.fd_count()
+            ack.epoch,
+            ack.imported_bytes,
+            session.fd_count()
         );
         let mut drain_sent = false;
         loop {
@@ -456,7 +519,11 @@ mod host {
         let (_locks, admission) = claim_card()?;
         let mut gpu = rdna_compute::Gpu::init().map_err(|e| format!("GPU init: {e}"))?;
         if gpu.arch != shared_weights::SUPPORTED_DEVICE_ARCH {
-            return Err(format!("weight host v1 supports {} only, card is {}", shared_weights::SUPPORTED_DEVICE_ARCH, gpu.arch));
+            return Err(format!(
+                "weight host v1 supports {} only, card is {}",
+                shared_weights::SUPPORTED_DEVICE_ARCH,
+                gpu.arch
+            ));
         }
         let card = qcarrier::weight_host_card_identity(&gpu)?;
         eprintln!(
@@ -471,33 +538,45 @@ mod host {
         // Loading: one full-content hash of the read-only source (kept open
         // for the host's lifetime), then the incumbent loader.
         let hash_started = Instant::now();
-        let (_source_file, cert) = certify_source(&args.model, "base").map_err(|e| format!("certify {}: {e}", args.model.display()))?;
+        let (_source_file, cert) = certify_source(&args.model, "base")
+            .map_err(|e| format!("certify {}: {e}", args.model.display()))?;
         let source_sha256 = qcarrier::weight_host_source_sha256(&cert)?;
         let hash_ms = ms(hash_started);
         let load_started = Instant::now();
-        let mut hfq = hipfire_runtime::hfq::HfqFile::open(&args.model).map_err(|e| format!("open {}: {e}", args.model.display()))?;
-        let config = <hipfire_arch_qwen35::Qwen35 as Architecture>::config_from_hfq(&hfq).map_err(|e| e.to_string())?;
+        let mut hfq = hipfire_runtime::hfq::HfqFile::open(&args.model)
+            .map_err(|e| format!("open {}: {e}", args.model.display()))?;
+        let config = <hipfire_arch_qwen35::Qwen35 as Architecture>::config_from_hfq(&hfq)
+            .map_err(|e| e.to_string())?;
         shared_weights::check_dense_config(&config).map_err(|e| e.to_string())?;
         shared_weights::apply_source_dispatch_flags(&mut gpu, &hfq);
-        let weights = <hipfire_arch_qwen35::Qwen35 as Architecture>::load_weights(&mut hfq, &config, &mut gpu)?;
+        let weights = <hipfire_arch_qwen35::Qwen35 as Architecture>::load_weights(
+            &mut hfq, &config, &mut gpu,
+        )?;
         let source_load_ms = ms(load_started);
         if draining() {
             weights.free_gpu(&mut gpu);
             return Err("signalled while loading; nothing published".into());
         }
         let convert_started = Instant::now();
-        let recipe = shared_weights::resolve_dense_recipe(&gpu, &config).map_err(|e| e.to_string())?;
-        let mut exported = shared_weights::export_dense_weights(&mut gpu, weights, &config, &recipe)
-            .map_err(|e| format!("export: {e}"))?;
+        let recipe =
+            shared_weights::resolve_dense_recipe(&gpu, &config).map_err(|e| e.to_string())?;
+        let mut exported =
+            shared_weights::export_dense_weights(&mut gpu, weights, &config, &recipe)
+                .map_err(|e| format!("export: {e}"))?;
         let convert_ms = ms(convert_started);
         let fds = std::mem::take(&mut exported.allocation_fds);
         if fds.len() as u64 + 256 > nofile {
             let _ = exported.free_gpu(&mut gpu);
-            return Err(format!("RLIMIT_NOFILE {nofile} too low for {} allocation FDs", fds.len()));
+            return Err(format!(
+                "RLIMIT_NOFILE {nofile} too low for {} allocation FDs",
+                fds.len()
+            ));
         }
 
         // Publishing: seal, certificate, then the socket last.
-        let unpublish = |gpu: &mut rdna_compute::Gpu, exported: shared_weights::ExportedDenseWeights, e: String| {
+        let unpublish = |gpu: &mut rdna_compute::Gpu,
+                         exported: shared_weights::ExportedDenseWeights,
+                         e: String| {
             match exported.free_gpu(gpu) {
                 Ok(()) => e,
                 Err(c) => format!("{e}; teardown also failed: {c}"),
@@ -512,14 +591,19 @@ mod host {
             Err(e) => return Err(unpublish(&mut gpu, exported, format!("loader ABI: {e}"))),
         };
         let manifest = exported.manifest.clone();
-        let publication = match WeightPublication::new(epoch, card, source_sha256, abi, recipe, manifest, fds) {
-            Ok(p) => Arc::new(p),
-            Err(e) => return Err(unpublish(&mut gpu, exported, format!("publication: {e}"))),
-        };
+        let publication =
+            match WeightPublication::new(epoch, card, source_sha256, abi, recipe, manifest, fds) {
+                Ok(p) => Arc::new(p),
+                Err(e) => return Err(unpublish(&mut gpu, exported, format!("publication: {e}"))),
+            };
         let cert_path = qcarrier::weight_host_source_certificate_path(&args.socket);
         if let Err(e) = cert.write_to(&cert_path) {
             drop(publication);
-            return Err(unpublish(&mut gpu, exported, format!("certificate {}: {e}", cert_path.display())));
+            return Err(unpublish(
+                &mut gpu,
+                exported,
+                format!("certificate {}: {e}", cert_path.display()),
+            ));
         }
         let listener = match publish_socket(&args.socket) {
             Ok(listener) => listener,
@@ -542,7 +626,10 @@ mod host {
         // Ready: accept until a drain signal shuts the listener down.
         let shared = Arc::new(Shared {
             publication,
-            options: ServeOptions { handshake_timeout: args.handshake_timeout, expected_peer_pid: None },
+            options: ServeOptions {
+                handshake_timeout: args.handshake_timeout,
+                expected_peer_pid: None,
+            },
             admission,
             registry: Registry::default(),
         });
@@ -611,7 +698,10 @@ mod host {
             .and_then(|()| gpu.ensure_vmm_cleaned().map_err(|e| e.to_string()));
         match teardown {
             Ok(()) => {
-                eprintln!("WEIGHT_HOST_CLOSED epoch={epoch} drain_ms={:.3}", ms(drain_started));
+                eprintln!(
+                    "WEIGHT_HOST_CLOSED epoch={epoch} drain_ms={:.3}",
+                    ms(drain_started)
+                );
                 Ok(0)
             }
             Err(e) => Err(format!("teardown of epoch {epoch}: {e}")),

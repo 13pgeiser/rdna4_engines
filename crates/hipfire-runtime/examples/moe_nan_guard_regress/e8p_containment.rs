@@ -1784,7 +1784,10 @@ mod tests {
             let k1 = slab_moe::slab_cold_k1_metadata(arch, SLAB_CODEC_E8P).unwrap();
             assert!(k1.k1.module.ends_with(arch), "{arch}: {}", k1.k1.module);
         }
-        assert_eq!(k2_old_stem("gfx1100", SLAB_CODEC_MQ4), Ok("qwen4_moe_iu4_sym_pm_gfx1100"));
+        assert_eq!(
+            k2_old_stem("gfx1100", SLAB_CODEC_MQ4),
+            Ok("qwen4_moe_iu4_sym_pm_gfx1100")
+        );
         for arch in ["gfx1201", "gfx1151"] {
             assert!(k2_old_stem(arch, SLAB_CODEC_MQ4).is_err(), "{arch}");
         }
@@ -1793,7 +1796,11 @@ mod tests {
         }
         // Resource model: only gfx1100 adds the hot-MQ4 phase.
         for (arch, phases) in [("gfx1201", 1), ("gfx1151", 1), ("gfx1100", 2)] {
-            assert_eq!(resource_model(arch, 1)["phases"].as_array().unwrap().len(), phases, "{arch}");
+            assert_eq!(
+                resource_model(arch, 1)["phases"].as_array().unwrap().len(),
+                phases,
+                "{arch}"
+            );
         }
     }
 

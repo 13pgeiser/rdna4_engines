@@ -125,11 +125,17 @@
 //! | 1024x512x128 | 10,632 | 396 + full + 7 x 10,632 | | derived |
 //! | 512x1024x128 (all parities even) | 8,816 | 396 + full + 7 x 8,816 | | derived |
 //! The 16 sequence patch words of S=8 are unchanged (2 per run); `patch_seq` output equals a fresh build.
-use super::gemm_array::{self, ArrayDesign, MEMTILE_DMA_BASE, PAIR_SHIM_BDS_USED, V8_DEFAULT_EPILOGUE};
+use super::gemm_array::{
+    self, ArrayDesign, MEMTILE_DMA_BASE, PAIR_SHIM_BDS_USED, V8_DEFAULT_EPILOGUE,
+};
 use super::gemm_core::Control;
 use super::gemm_i8::{ArgKind, ArgSpec};
 use crate::{
-    dma::{Bd, Direction::{Mm2s, S2mm}, Location, Task},
+    dma::{
+        Bd,
+        Direction::{Mm2s, S2mm},
+        Location, Task,
+    },
     regs,
     txn::Txn,
 };
@@ -156,21 +162,34 @@ const POLL_CH: u32 = 4;
 const DONE_CH: u32 = 0;
 const DONE_WORDS: u32 = (LINE / 4) as u32;
 /// Channels the POLL / DONE tasks leave in a state a lean body does not expect: `(column, direction, channel)`.
-const LEAN_FORCED: [(u32, crate::dma::Direction, u32); 2] = [(0, S2mm, POLL_CH), (0, Mm2s, DONE_CH)];
+const LEAN_FORCED: [(u32, crate::dma::Direction, u32); 2] =
+    [(0, S2mm, POLL_CH), (0, Mm2s, DONE_CH)];
 
 // Scratch placement vs the V9 memtile layout (A slots at 0x0000 / 0x2000 of `A_HALF_BYTES` each, compact C from 0x4000):
 // X lies in the gap after A slot 0, Y (64 B) in the gap after A slot 1. `scratch_is_outside_v9_footprint` repeats the
 // check against the real descriptors at several shapes including the maximal one.
-const _: () = assert!(POLL_SCRATCH as usize >= gemm_array::A_HALF_BYTES && POLL_SCRATCH + 4 <= 0x2000);
-const _: () = assert!(DONE_SCRATCH as usize >= 0x2000 + gemm_array::A_HALF_BYTES && DONE_SCRATCH + LINE as u32 <= 0x4000);
+const _: () =
+    assert!(POLL_SCRATCH as usize >= gemm_array::A_HALF_BYTES && POLL_SCRATCH + 4 <= 0x2000);
+const _: () = assert!(
+    DONE_SCRATCH as usize >= 0x2000 + gemm_array::A_HALF_BYTES
+        && DONE_SCRATCH + LINE as u32 <= 0x4000
+);
 const _: () = assert!(DONE_SCRATCH % LINE as u32 == 0 && POLL_SCRATCH % 4 == 0);
 
 /// Ring geometry: `nslots` (a power of two) slot lines and `nslots` done lines behind one header line.
 #[derive(Clone, Copy, Debug)]
-pub struct RingLayout { pub nslots: usize }
+pub struct RingLayout {
+    pub nslots: usize,
+}
 
 impl RingLayout {
-    fn check(&self) { assert!(self.nslots.is_power_of_two(), "ring nslots {} must be a power of two", self.nslots); }
+    fn check(&self) {
+        assert!(
+            self.nslots.is_power_of_two(),
+            "ring nslots {} must be a power of two",
+            self.nslots
+        );
+    }
     pub fn slot_line(&self, slot: usize) -> usize {
         assert!(slot < self.nslots, "slot {slot} >= nslots {}", self.nslots);
         LINE * (1 + slot)
@@ -180,14 +199,32 @@ impl RingLayout {
         LINE * (1 + self.nslots + slot)
     }
     /// Byte offset of the sentinel word in the header line.
-    pub fn sentinel(&self) -> usize { 16 }
-    pub fn bytes(&self) -> usize { LINE * (1 + 2 * self.nslots) }
+    pub fn sentinel(&self) -> usize {
+        16
+    }
+    pub fn bytes(&self) -> usize {
+        LINE * (1 + 2 * self.nslots)
+    }
     /// Zero the whole ring and write the header (`magic, version, nslots, slot_line_bytes, sentinel`).
     pub fn initialize(&self, bytes: &mut [u8]) {
         self.check();
-        assert!(bytes.len() >= self.bytes(), "ring buffer {} B < {} B", bytes.len(), self.bytes());
+        assert!(
+            bytes.len() >= self.bytes(),
+            "ring buffer {} B < {} B",
+            bytes.len(),
+            self.bytes()
+        );
         bytes[..self.bytes()].fill(0);
-        for (i, v) in [RING_MAGIC, RING_VERSION, self.nslots as u32, LINE as u32, SENTINEL].into_iter().enumerate() {
+        for (i, v) in [
+            RING_MAGIC,
+            RING_VERSION,
+            self.nslots as u32,
+            LINE as u32,
+            SENTINEL,
+        ]
+        .into_iter()
+        .enumerate()
+        {
             bytes[4 * i..4 * i + 4].copy_from_slice(&v.to_le_bytes());
         }
     }
@@ -195,18 +232,30 @@ impl RingLayout {
 
 /// One run of a submission: ring slot and arena byte offsets (args 0 / 1 / 2) of its operands / result.
 #[derive(Clone, Copy, Debug)]
-pub struct SlotPlan { pub slot: usize, pub a_off: u64, pub b_off: u64, pub c_off: u64 }
+pub struct SlotPlan {
+    pub slot: usize,
+    pub a_off: u64,
+    pub b_off: u64,
+    pub c_off: u64,
+}
 
 /// Patchable value word of run `i` (run index inside the submission).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PatchKind { PollSeq(usize), DoneSeq(usize) }
+pub enum PatchKind {
+    PollSeq(usize),
+    DoneSeq(usize),
+}
 
 /// Negative-test builders. `SkipDone(i)`: run `i` never publishes its DONE line. `SkipSeqPatch` is a HOST-side control
 /// (the host omits [`patch_seq`]); the builder output is the normal one. `SkipLeanRequeue(i)`
 /// ([`persistent_v9_lean`] only, `1 <= i < runs`): lean run `i` omits the forced col0 S2MM4 / MM2S0 reset + lock + requeue
 /// repairs (channels its own parity plan already repairs are unaffected), every other run is normal.
 #[derive(Clone, Copy, Debug)]
-pub enum Neg { SkipDone(usize), SkipSeqPatch, SkipLeanRequeue(usize) }
+pub enum Neg {
+    SkipDone(usize),
+    SkipSeqPatch,
+    SkipLeanRequeue(usize),
+}
 
 pub struct PersistentDesign {
     pub pdi: Vec<u8>,
@@ -220,22 +269,47 @@ pub struct PersistentDesign {
 
 impl PersistentDesign {
     /// Packed `[A, B]` of ONE run (copy to arg0 at `a_off` / arg1 at `b_off`); see [`ArrayDesign::pack_in`].
-    pub fn pack_in(&self, a: &[i8], b: &[i8]) -> [Vec<u8>; 2] { self.design.pack_in(a, b) }
+    pub fn pack_in(&self, a: &[i8], b: &[i8]) -> [Vec<u8>; 2] {
+        self.design.pack_in(a, b)
+    }
     /// Row-major `m*n` result of ONE run from its `c_bytes()` slice of arg2 (starting at `c_off`).
-    pub fn unpack_out(&self, c_run: &[u8]) -> Vec<i32> { self.design.unpack_out(c_run) }
+    pub fn unpack_out(&self, c_run: &[u8]) -> Vec<i32> {
+        self.design.unpack_out(c_run)
+    }
     /// Exact CPU result in the form [`PersistentDesign::unpack_out`] returns.
-    pub fn reference(&self, a: &[i8], b: &[i8]) -> Vec<i32> { self.design.reference(a, b) }
+    pub fn reference(&self, a: &[i8], b: &[i8]) -> Vec<i32> {
+        self.design.reference(a, b)
+    }
     /// Packed bytes of ONE run in args 0 / 1 / 2.
-    pub fn a_bytes(&self) -> usize { self.design.args[0].bytes }
-    pub fn b_bytes(&self) -> usize { self.design.args[1].bytes }
-    pub fn c_bytes(&self) -> usize { self.design.args[2].bytes }
+    pub fn a_bytes(&self) -> usize {
+        self.design.args[0].bytes
+    }
+    pub fn b_bytes(&self) -> usize {
+        self.design.args[1].bytes
+    }
+    pub fn c_bytes(&self) -> usize {
+        self.design.args[2].bytes
+    }
 }
 
 /// Ring-gated V9 GEMM runs: `slots.len()` runs of the `m x n x k` GEMM, run `i` waiting for `seq0 + i`.
-pub fn persistent_v9(m: usize, n: usize, k: usize, ring: RingLayout, slots: &[SlotPlan], seq0: u32, neg: Option<Neg>)
-    -> PersistentDesign
-{
-    build(gemm_array::design_v9(m, n, k, V8_DEFAULT_EPILOGUE, Control::Fast), Some((Bodies::Full, false)), ring, slots, seq0, neg)
+pub fn persistent_v9(
+    m: usize,
+    n: usize,
+    k: usize,
+    ring: RingLayout,
+    slots: &[SlotPlan],
+    seq0: u32,
+    neg: Option<Neg>,
+) -> PersistentDesign {
+    build(
+        gemm_array::design_v9(m, n, k, V8_DEFAULT_EPILOGUE, Control::Fast),
+        Some((Bodies::Full, false)),
+        ring,
+        slots,
+        seq0,
+        neg,
+    )
 }
 
 /// [`persistent_v9`] with the same arguments, operand offsets, patch inventory (exactly [`PatchKind::PollSeq`] and
@@ -245,10 +319,23 @@ pub fn persistent_v9(m: usize, n: usize, k: usize, ring: RingLayout, slots: &[Sl
 /// Every submission built by this function starts with a full body, so it is valid for the first submit after the PDI
 /// and for any submit after a completed submit of the same design; [`persistent_with`] builds the lean-first form.
 /// `Neg::SkipLeanRequeue(i)` (1 <= i < runs) omits only the forced repairs of lean run `i`.
-pub fn persistent_v9_lean(m: usize, n: usize, k: usize, ring: RingLayout, slots: &[SlotPlan], seq0: u32, neg: Option<Neg>)
-    -> PersistentDesign
-{
-    build(gemm_array::design_v9(m, n, k, V8_DEFAULT_EPILOGUE, Control::Fast), Some((Bodies::Lean, false)), ring, slots, seq0, neg)
+pub fn persistent_v9_lean(
+    m: usize,
+    n: usize,
+    k: usize,
+    ring: RingLayout,
+    slots: &[SlotPlan],
+    seq0: u32,
+    neg: Option<Neg>,
+) -> PersistentDesign {
+    build(
+        gemm_array::design_v9(m, n, k, V8_DEFAULT_EPILOGUE, Control::Fast),
+        Some((Bodies::Lean, false)),
+        ring,
+        slots,
+        seq0,
+        neg,
+    )
 }
 
 /// Which body each run of a persistent V9 submission executes.
@@ -269,31 +356,67 @@ pub enum Bodies {
 /// all slots) and the lean runs keep B resident in the memtile instead of refilling it
 /// ([`ArrayDesign::append_lean_run_body_b_resident`]); a `Bodies::LeanFirst` submission is then valid only after one
 /// whose B (at that offset) held the same bytes.
-pub fn persistent_with(design: ArrayDesign, ring: RingLayout, slots: &[SlotPlan], seq0: u32, bodies: Bodies, b_shared: bool)
-    -> PersistentDesign
-{
+pub fn persistent_with(
+    design: ArrayDesign,
+    ring: RingLayout,
+    slots: &[SlotPlan],
+    seq0: u32,
+    bodies: Bodies,
+    b_shared: bool,
+) -> PersistentDesign {
     if b_shared {
-        assert_eq!(design.variant, gemm_array::Variant::G80, "B-resident lean bodies are derived for G80 only");
+        assert_eq!(
+            design.variant,
+            gemm_array::Variant::G80,
+            "B-resident lean bodies are derived for G80 only"
+        );
         assert!(bodies != Bodies::Full, "B-resident needs lean bodies");
-        assert!(slots.iter().all(|s| s.b_off == slots[0].b_off), "b_shared needs one B offset for every run");
+        assert!(
+            slots.iter().all(|s| s.b_off == slots[0].b_off),
+            "b_shared needs one B offset for every run"
+        );
     }
-    assert!(matches!(design.variant, gemm_array::Variant::V9 | gemm_array::Variant::G80),
-        "the ring is derived for the V9 / G80 pair designs, not {}", design.variant);
+    assert!(
+        matches!(
+            design.variant,
+            gemm_array::Variant::V9 | gemm_array::Variant::G80
+        ),
+        "the ring is derived for the V9 / G80 pair designs, not {}",
+        design.variant
+    );
     build(design, Some((bodies, b_shared)), ring, slots, seq0, None)
 }
 
 /// Poll + DONE only (no GEMM, no body) on the `512x512x64` V9 image: measures the protocol.
 pub fn empty_persistent(ring: RingLayout, slots: &[SlotPlan], seq0: u32) -> PersistentDesign {
-    build(gemm_array::design_v9(512, 512, 64, V8_DEFAULT_EPILOGUE, Control::Fast), None, ring, slots, seq0, None)
+    build(
+        gemm_array::design_v9(512, 512, 64, V8_DEFAULT_EPILOGUE, Control::Fast),
+        None,
+        ring,
+        slots,
+        seq0,
+        None,
+    )
 }
 
 fn check_seq_range(seq0: u32, runs: usize) {
-    assert!(runs > 0 && seq0 >= 1 && seq0 as u64 + runs as u64 - 1 < SENTINEL as u64,
-        "seq range {seq0}+{runs} must stay inside 1..={}", SENTINEL - 1);
+    assert!(
+        runs > 0 && seq0 >= 1 && seq0 as u64 + runs as u64 - 1 < SENTINEL as u64,
+        "seq range {seq0}+{runs} must stay inside 1..={}",
+        SENTINEL - 1
+    );
 }
 
 fn ctrl_addr(loc: Location, direction: crate::dma::Direction, channel: u32) -> u32 {
-    Task { direction, channel, bd: 0, repeat: 1, issue_token: false }.write(loc).0 - 4
+    Task {
+        direction,
+        channel,
+        bd: 0,
+        repeat: 1,
+        issue_token: false,
+    }
+    .write(loc)
+    .0 - 4
 }
 
 /// CTRL bit 1 reset then release (the body's own mechanism) of a memtile channel.
@@ -305,32 +428,68 @@ fn reset_release(txn: &mut Txn, loc: Location, direction: crate::dma::Direction,
 }
 
 /// `body`: `None` = protocol only (no GEMM body); else the bodies and whether lean runs keep a shared B resident.
-fn build(mut design: ArrayDesign, body: Option<(Bodies, bool)>, ring: RingLayout, slots: &[SlotPlan], seq0: u32, neg: Option<Neg>)
-    -> PersistentDesign
-{
+fn build(
+    mut design: ArrayDesign,
+    body: Option<(Bodies, bool)>,
+    ring: RingLayout,
+    slots: &[SlotPlan],
+    seq0: u32,
+    neg: Option<Neg>,
+) -> PersistentDesign {
     ring.check();
-    assert!(!slots.is_empty(), "a persistent submission needs at least one run");
+    assert!(
+        !slots.is_empty(),
+        "a persistent submission needs at least one run"
+    );
     check_seq_range(seq0, slots.len());
-    if let Some(Neg::SkipDone(i)) = neg { assert!(i < slots.len(), "SkipDone({i}) but {} runs", slots.len()); }
+    if let Some(Neg::SkipDone(i)) = neg {
+        assert!(i < slots.len(), "SkipDone({i}) but {} runs", slots.len());
+    }
     if let Some(Neg::SkipLeanRequeue(i)) = neg {
-        assert!(matches!(body, Some((Bodies::Lean, _))) && i >= 1 && i < slots.len(),
-            "SkipLeanRequeue({i}) needs a lean run: persistent_v9_lean with 1 <= i < {} runs", slots.len());
+        assert!(
+            matches!(body, Some((Bodies::Lean, _))) && i >= 1 && i < slots.len(),
+            "SkipLeanRequeue({i}) needs a lean run: persistent_v9_lean with 1 <= i < {} runs",
+            slots.len()
+        );
     }
     for s in slots {
-        assert!(s.slot < ring.nslots, "slot {} >= nslots {}", s.slot, ring.nslots);
-        assert!(s.a_off % 4 == 0 && s.b_off % 4 == 0 && s.c_off % 4 == 0, "arena offsets must be word aligned");
+        assert!(
+            s.slot < ring.nslots,
+            "slot {} >= nslots {}",
+            s.slot,
+            ring.nslots
+        );
+        assert!(
+            s.a_off % 4 == 0 && s.b_off % 4 == 0 && s.c_off % 4 == 0,
+            "arena offsets must be word aligned"
+        );
     }
     let spare = gemm_array::v9_spare_memtile_bds(false);
-    assert!(spare.len() >= 2, "no spare even-bank memtile BDs: {spare:?}");
+    assert!(
+        spare.len() >= 2,
+        "no spare even-bank memtile BDs: {spare:?}"
+    );
     let (q_bd, dq_bd) = (spare[0], spare[1]);
-    assert!(!design.uses_memtile_bd(q_bd) && !design.uses_memtile_bd(dq_bd), "ring spare memtile BDs {q_bd}/{dq_bd} collide with {}", design.variant);
+    assert!(
+        !design.uses_memtile_bd(q_bd) && !design.uses_memtile_bd(dq_bd),
+        "ring spare memtile BDs {q_bd}/{dq_bd} collide with {}",
+        design.variant
+    );
     assert!(q_bd < 24 && dq_bd < 24);
 
     let (shim, mem) = (Location::new(0, 0), Location::new(0, 1));
     let shim_bd = |id| Bd::address(shim, id);
-    let poll_loop = { let mut bd = Bd::new(0, 1); bd.next = Some(SHIM_BD_P); bd };
+    let poll_loop = {
+        let mut bd = Bd::new(0, 1);
+        bd.next = Some(SHIM_BD_P);
+        bd
+    };
     // Same BD with `next` = SENT: only the tail word (7) differs.
-    let drain_tail = Bd { next: Some(SHIM_BD_SENT), ..poll_loop }.shim_words()[7];
+    let drain_tail = Bd {
+        next: Some(SHIM_BD_SENT),
+        ..poll_loop
+    }
+    .shim_words()[7];
     let x_addr = mem.address(POLL_SCRATCH);
 
     let mut txn = Txn::aie2p_8col();
@@ -354,10 +513,31 @@ fn build(mut design: ArrayDesign, body: Option<(Bodies, bool)>, ring: RingLayout
         reset_release(&mut txn, mem, S2mm, POLL_CH);
         txn.write32(x_addr, 0);
         poll_loop.emit_txn(shim, SHIM_BD_P, &mut txn);
-        txn.ddr_patch(shim_bd(SHIM_BD_P) + 4, RING_ARG, ring.slot_line(plan.slot) as u64);
-        Task { direction: S2mm, channel: POLL_CH, bd: q_bd, repeat: 1, issue_token: false }.emit_txn(mem, &mut txn);
-        Task { direction: Mm2s, channel: 0, bd: SHIM_BD_P, repeat: 1, issue_token: false }.emit_txn(shim, &mut txn);
-        sites.push((txn.next_op_word() + Txn::MASKPOLL_VALUE_WORD, PatchKind::PollSeq(i)));
+        txn.ddr_patch(
+            shim_bd(SHIM_BD_P) + 4,
+            RING_ARG,
+            ring.slot_line(plan.slot) as u64,
+        );
+        Task {
+            direction: S2mm,
+            channel: POLL_CH,
+            bd: q_bd,
+            repeat: 1,
+            issue_token: false,
+        }
+        .emit_txn(mem, &mut txn);
+        Task {
+            direction: Mm2s,
+            channel: 0,
+            bd: SHIM_BD_P,
+            repeat: 1,
+            issue_token: false,
+        }
+        .emit_txn(shim, &mut txn);
+        sites.push((
+            txn.next_op_word() + Txn::MASKPOLL_VALUE_WORD,
+            PatchKind::PollSeq(i),
+        ));
         txn.mask_poll(x_addr, seq, 0xFFFF_FFFF);
         // DRAIN.
         txn.write32(shim_bd(SHIM_BD_P) + 4 * 7, drain_tail);
@@ -366,9 +546,17 @@ fn build(mut design: ArrayDesign, body: Option<(Bodies, bool)>, ring: RingLayout
         if let Some((body, b_shared)) = body {
             let arena = [plan.a_off, plan.b_off, plan.c_off];
             if body == Bodies::LeanFirst || (body == Bodies::Lean && i > 0) {
-                let forced: &[(u32, crate::dma::Direction, u32)] =
-                    if matches!(neg, Some(Neg::SkipLeanRequeue(skip)) if skip == i) { &[] } else { &LEAN_FORCED };
-                let lean = if b_shared { ArrayDesign::append_lean_run_body_b_resident } else { ArrayDesign::append_lean_run_body_same_design };
+                let forced: &[(u32, crate::dma::Direction, u32)] = if matches!(neg, Some(Neg::SkipLeanRequeue(skip)) if skip == i)
+                {
+                    &[]
+                } else {
+                    &LEAN_FORCED
+                };
+                let lean = if b_shared {
+                    ArrayDesign::append_lean_run_body_b_resident
+                } else {
+                    ArrayDesign::append_lean_run_body_same_design
+                };
                 lean(&design, &mut txn, arena, forced)
                     .unwrap_or_else(|e| panic!("lean body of run {i}: {e}"));
             } else {
@@ -376,29 +564,75 @@ fn build(mut design: ArrayDesign, body: Option<(Bodies, bool)>, ring: RingLayout
             }
         }
         // DONE.
-        if matches!(neg, Some(Neg::SkipDone(skip)) if skip == i) { continue; }
+        if matches!(neg, Some(Neg::SkipDone(skip)) if skip == i) {
+            continue;
+        }
         reset_release(&mut txn, mem, Mm2s, DONE_CH);
         for w in 0..DONE_WORDS {
-            let value = match w { 0 => seq, 1 => plan.slot as u32, 2 => DONE_MAGIC, _ => 0 };
-            if w == 0 { sites.push((txn.next_op_word() + Txn::WRITE32_VALUE_WORD, PatchKind::DoneSeq(i))); }
+            let value = match w {
+                0 => seq,
+                1 => plan.slot as u32,
+                2 => DONE_MAGIC,
+                _ => 0,
+            };
+            if w == 0 {
+                sites.push((
+                    txn.next_op_word() + Txn::WRITE32_VALUE_WORD,
+                    PatchKind::DoneSeq(i),
+                ));
+            }
             txn.write32(mem.address(DONE_SCRATCH + 4 * w), value);
         }
-        txn.ddr_patch(shim_bd(SHIM_BD_D) + 4, RING_ARG, ring.done_line(plan.slot) as u64);
-        Task { direction: S2mm, channel: 0, bd: SHIM_BD_D, repeat: 1, issue_token: true }.emit_txn(shim, &mut txn);
-        Task { direction: Mm2s, channel: DONE_CH, bd: dq_bd, repeat: 1, issue_token: false }.emit_txn(mem, &mut txn);
+        txn.ddr_patch(
+            shim_bd(SHIM_BD_D) + 4,
+            RING_ARG,
+            ring.done_line(plan.slot) as u64,
+        );
+        Task {
+            direction: S2mm,
+            channel: 0,
+            bd: SHIM_BD_D,
+            repeat: 1,
+            issue_token: true,
+        }
+        .emit_txn(shim, &mut txn);
+        Task {
+            direction: Mm2s,
+            channel: DONE_CH,
+            bd: dq_bd,
+            repeat: 1,
+            issue_token: false,
+        }
+        .emit_txn(mem, &mut txn);
         txn.sync(0, 0, 0, 0, 1, 1);
     }
 
     let arena = |bytes: usize, off: fn(&SlotPlan) -> u64| {
-        let hi = slots.iter().map(|s| usize::try_from(off(s)).expect("arena offset")).max().unwrap();
+        let hi = slots
+            .iter()
+            .map(|s| usize::try_from(off(s)).expect("arena offset"))
+            .max()
+            .unwrap();
         hi.checked_add(bytes).expect("arena size")
     };
     let [a, b, c] = [0, 1, 2].map(|i| design.args[i].bytes);
     let args = vec![
-        ArgSpec { bytes: arena(a, |s| s.a_off), kind: ArgKind::In },
-        ArgSpec { bytes: arena(b, |s| s.b_off), kind: ArgKind::In },
-        ArgSpec { bytes: arena(c, |s| s.c_off), kind: ArgKind::Out },
-        ArgSpec { bytes: ring.bytes(), kind: ArgKind::In },
+        ArgSpec {
+            bytes: arena(a, |s| s.a_off),
+            kind: ArgKind::In,
+        },
+        ArgSpec {
+            bytes: arena(b, |s| s.b_off),
+            kind: ArgKind::In,
+        },
+        ArgSpec {
+            bytes: arena(c, |s| s.c_off),
+            kind: ArgKind::Out,
+        },
+        ArgSpec {
+            bytes: ring.bytes(),
+            kind: ArgKind::In,
+        },
     ];
     PersistentDesign {
         pdi: std::mem::take(&mut design.pdi),
@@ -412,13 +646,25 @@ fn build(mut design: ArrayDesign, body: Option<(Bodies, bool)>, ring: RingLayout
 /// Rewrite the declared value words for a submission whose first run has sequence `new_seq0`: `PollSeq(i)` and
 /// `DoneSeq(i)` become `new_seq0 + i`. No other byte of `insts` is touched.
 pub fn patch_seq(insts: &mut [u8], sites: &[(usize, PatchKind)], new_seq0: u32) {
-    let runs = sites.iter().map(|&(_, kind)| match kind { PatchKind::PollSeq(i) | PatchKind::DoneSeq(i) => i + 1 }).max().unwrap_or(0);
-    if runs == 0 { return; }
+    let runs = sites
+        .iter()
+        .map(|&(_, kind)| match kind {
+            PatchKind::PollSeq(i) | PatchKind::DoneSeq(i) => i + 1,
+        })
+        .max()
+        .unwrap_or(0);
+    if runs == 0 {
+        return;
+    }
     check_seq_range(new_seq0, runs);
     for &(word, kind) in sites {
-        let i = match kind { PatchKind::PollSeq(i) | PatchKind::DoneSeq(i) => i };
+        let i = match kind {
+            PatchKind::PollSeq(i) | PatchKind::DoneSeq(i) => i,
+        };
         let at = word.checked_mul(4).expect("site");
-        let dst = insts.get_mut(at..at + 4).unwrap_or_else(|| panic!("patch site word {word} outside insts"));
+        let dst = insts
+            .get_mut(at..at + 4)
+            .unwrap_or_else(|| panic!("patch site word {word} outside insts"));
         dst.copy_from_slice(&(new_seq0 + i as u32).to_le_bytes());
     }
 }
@@ -427,7 +673,9 @@ pub fn patch_seq(insts: &mut [u8], sites: &[(usize, PatchKind)], new_seq0: u32) 
 /// `nslots` runs may always publish, later ones only once `done[s].done_seq` equals the seq of run `run_index - nslots`.
 pub fn producer_may_publish(ring_bytes: &[u8], layout: RingLayout, run_index: usize) -> bool {
     layout.check();
-    if run_index < layout.nslots { return true; }
+    if run_index < layout.nslots {
+        return true;
+    }
     let at = layout.done_line(run_index % layout.nslots);
     let done = u32::from_le_bytes(ring_bytes[at..at + 4].try_into().unwrap());
     done == ((run_index - layout.nslots) as u32).wrapping_add(1)
@@ -437,21 +685,43 @@ pub fn producer_may_publish(ring_bytes: &[u8], layout: RingLayout, run_index: us
 mod tests {
     use super::*;
 
-    fn words(b: &[u8]) -> Vec<u32> { b.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect() }
+    fn words(b: &[u8]) -> Vec<u32> {
+        b.chunks(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    }
     fn plans(n: usize, nslots: usize) -> Vec<SlotPlan> {
-        (0..n).map(|i| SlotPlan { slot: i % nslots, a_off: 4096 * i as u64, b_off: 0, c_off: 8192 * i as u64 }).collect()
+        (0..n)
+            .map(|i| SlotPlan {
+                slot: i % nslots,
+                a_off: 4096 * i as u64,
+                b_off: 0,
+                c_off: 8192 * i as u64,
+            })
+            .collect()
     }
 
     #[test]
     fn ring_layout_and_header() {
         let r = RingLayout { nslots: 4 };
-        assert_eq!((r.slot_line(0), r.slot_line(3), r.done_line(0), r.done_line(3), r.sentinel(), r.bytes()),
-            (64, 256, 320, 512, 16, 576));
+        assert_eq!(
+            (
+                r.slot_line(0),
+                r.slot_line(3),
+                r.done_line(0),
+                r.done_line(3),
+                r.sentinel(),
+                r.bytes()
+            ),
+            (64, 256, 320, 512, 16, 576)
+        );
         let mut b = vec![0xAAu8; r.bytes() + 8];
         r.initialize(&mut b);
         let w = words(&b[..20]);
         assert_eq!(w, [RING_MAGIC, 1, 4, 64, SENTINEL]);
-        assert!(b[20..r.bytes()].iter().all(|&x| x == 0) && b[r.bytes()..].iter().all(|&x| x == 0xAA));
+        assert!(
+            b[20..r.bytes()].iter().all(|&x| x == 0) && b[r.bytes()..].iter().all(|&x| x == 0xAA)
+        );
     }
 
     #[test]
@@ -490,7 +760,9 @@ mod tests {
         patch_seq(&mut patched, &a.patch_sites, 40);
         assert_eq!(patched, b.insts);
         for &(w, kind) in &a.patch_sites {
-            let i = match kind { PatchKind::PollSeq(i) | PatchKind::DoneSeq(i) => i };
+            let i = match kind {
+                PatchKind::PollSeq(i) | PatchKind::DoneSeq(i) => i,
+            };
             assert_eq!(wa[w], 1 + i as u32);
             assert_eq!(wb[w], 40 + i as u32);
         }
@@ -501,15 +773,36 @@ mod tests {
         let r = RingLayout { nslots: 2 };
         let p = plans(3, 2);
         let full = empty_persistent(r, &p, 1);
-        let skip = build(gemm_array::design_v9(512, 512, 64, V8_DEFAULT_EPILOGUE, Control::Fast), None, r, &p, 1,
-            Some(Neg::SkipDone(1)));
+        let skip = build(
+            gemm_array::design_v9(512, 512, 64, V8_DEFAULT_EPILOGUE, Control::Fast),
+            None,
+            r,
+            &p,
+            1,
+            Some(Neg::SkipDone(1)),
+        );
         assert_eq!(skip.patch_sites.len(), 5);
-        assert!(!skip.patch_sites.iter().any(|s| s.1 == PatchKind::DoneSeq(1)));
-        assert!(skip.patch_sites.iter().any(|s| s.1 == PatchKind::PollSeq(1)));
+        assert!(!skip
+            .patch_sites
+            .iter()
+            .any(|s| s.1 == PatchKind::DoneSeq(1)));
+        assert!(skip
+            .patch_sites
+            .iter()
+            .any(|s| s.1 == PatchKind::PollSeq(1)));
         // SkipSeqPatch is host-only: the builder output is the normal one.
-        let host = build(gemm_array::design_v9(512, 512, 64, V8_DEFAULT_EPILOGUE, Control::Fast), None, r, &p, 1,
-            Some(Neg::SkipSeqPatch));
-        assert_eq!((host.insts.clone(), host.patch_sites.clone()), (full.insts.clone(), full.patch_sites.clone()));
+        let host = build(
+            gemm_array::design_v9(512, 512, 64, V8_DEFAULT_EPILOGUE, Control::Fast),
+            None,
+            r,
+            &p,
+            1,
+            Some(Neg::SkipSeqPatch),
+        );
+        assert_eq!(
+            (host.insts.clone(), host.patch_sites.clone()),
+            (full.insts.clone(), full.patch_sites.clone())
+        );
     }
 
     /// Public arena allocation: each arena holds the largest slot offset plus one run's packed bytes, ring arg last.
@@ -519,9 +812,14 @@ mod tests {
         let p2 = persistent_v9(512, 512, 64, r, &plans(2, 2), 1, None);
         // Args: arenas hold the largest offset plus one run, ring arg last.
         let (a, b, c) = (p2.a_bytes(), p2.b_bytes(), p2.c_bytes());
-        assert_eq!(p2.args.iter().map(|s| s.bytes).collect::<Vec<_>>(), [4096 + a, b, 8192 + c, r.bytes()]);
-        assert_eq!(p2.args.iter().map(|s| s.kind).collect::<Vec<_>>(),
-            [ArgKind::In, ArgKind::In, ArgKind::Out, ArgKind::In]);
+        assert_eq!(
+            p2.args.iter().map(|s| s.bytes).collect::<Vec<_>>(),
+            [4096 + a, b, 8192 + c, r.bytes()]
+        );
+        assert_eq!(
+            p2.args.iter().map(|s| s.kind).collect::<Vec<_>>(),
+            [ArgKind::In, ArgKind::In, ArgKind::Out, ArgKind::In]
+        );
         assert!(p2.pdi.len() > 0);
     }
 
@@ -530,7 +828,10 @@ mod tests {
         for (kc, mw, nw) in [(1, 1, 1), (10, 8, 5), (40, 8, 3), (54, 16, 8)] {
             for range in gemm_array::v9_memtile_footprint(kc, mw, nw) {
                 for (at, len) in [(POLL_SCRATCH, 4), (DONE_SCRATCH, 64)] {
-                    assert!(range.end <= at || range.start >= at + len, "{range:?} overlaps {at:#x} (kc {kc} mw {mw} nw {nw})");
+                    assert!(
+                        range.end <= at || range.start >= at + len,
+                        "{range:?} overlaps {at:#x} (kc {kc} mw {mw} nw {nw})"
+                    );
                 }
             }
         }
@@ -539,7 +840,12 @@ mod tests {
         // the selected shim BDs sit above the four V9 uses.
         let even = gemm_array::v9_spare_memtile_bds(false);
         assert!(even.len() >= 2 && even.iter().all(|&id| id < 24));
-        assert!(SHIM_BD_P >= PAIR_SHIM_BDS_USED && SHIM_BD_SENT > SHIM_BD_P && SHIM_BD_D > SHIM_BD_SENT && SHIM_BD_D < 16);
+        assert!(
+            SHIM_BD_P >= PAIR_SHIM_BDS_USED
+                && SHIM_BD_SENT > SHIM_BD_P
+                && SHIM_BD_D > SHIM_BD_SENT
+                && SHIM_BD_D < 16
+        );
         assert_eq!(PAIR_SHIM_BDS_USED, 4);
     }
 }

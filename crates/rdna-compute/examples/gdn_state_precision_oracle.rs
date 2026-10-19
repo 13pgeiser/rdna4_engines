@@ -452,7 +452,8 @@ fn decode_q8_slot(slot: &[u8]) -> Vec<f32> {
         .enumerate()
         .map(|(index, code)| {
             let at = index / HD * 4;
-            let scale = f32::from_le_bytes([scales[at], scales[at + 1], scales[at + 2], scales[at + 3]]);
+            let scale =
+                f32::from_le_bytes([scales[at], scales[at + 1], scales[at + 2], scales[at + 3]]);
             (*code as i8 as f32) * scale
         })
         .collect()
@@ -1638,7 +1639,9 @@ fn snapshot_ef(gpu: &Gpu, rig: &Rig, w: &EfWindow<'_>, mode: EfMode) -> Res<EfSn
                 .map(|offset| index * rig.slot_bytes + offset)
         });
     let final_slot = slot(rows - 1).to_vec();
-    let kept = kept_index.map(|index| slot(index).to_vec()).unwrap_or_default();
+    let kept = kept_index
+        .map(|index| slot(index).to_vec())
+        .unwrap_or_default();
     let source = download(gpu, &rig.slot(w.source))?;
     let residual = download(gpu, rig.ef_cand_tensor()?)?;
     Ok(EfSnap {
@@ -1686,11 +1689,26 @@ fn ef_run_once(
 fn check_ef_same(label: &str, a: &EfSnap, b: &EfSnap) -> Vec<Failure> {
     let mut failures: Vec<Failure> = [
         compare(&format!("{label}_output"), &b.out, &a.out, Some(VW * 4)),
-        compare(&format!("{label}_discard"), &b.discard, &a.discard, Some(VW * 4)),
-        compare(&format!("{label}_final_state"), &b.final_slot, &a.final_slot, None),
+        compare(
+            &format!("{label}_discard"),
+            &b.discard,
+            &a.discard,
+            Some(VW * 4),
+        ),
+        compare(
+            &format!("{label}_final_state"),
+            &b.final_slot,
+            &a.final_slot,
+            None,
+        ),
         compare(&format!("{label}_kept_state"), &b.kept, &a.kept, None),
         compare(&format!("{label}_source"), &b.source, &a.source, None),
-        compare(&format!("{label}_residual"), &b.residual, &a.residual, Some(HD * 2)),
+        compare(
+            &format!("{label}_residual"),
+            &b.residual,
+            &a.residual,
+            Some(HD * 2),
+        ),
     ]
     .into_iter()
     .flatten()
@@ -1727,7 +1745,11 @@ fn ef_exec(
         capture_limit.get_or_insert(limit);
         let replay_a = ef_run_once(gpu, rig, w, mode, true, kernels)?;
         let replay_b = ef_run_once(gpu, rig, w, mode, true, kernels)?;
-        failures.extend(check_ef_same("graph_nondeterministic", &replay_a, &replay_b));
+        failures.extend(check_ef_same(
+            "graph_nondeterministic",
+            &replay_a,
+            &replay_b,
+        ));
         failures.extend(check_ef_same("graph_vs_eager", &first, &replay_a));
     }
     Ok((first, failures))
@@ -1754,10 +1776,20 @@ fn check_ef_snap(
     }
     failures.extend(nonfinite("nonfinite_output", &snap.out, VW * 4));
     if is_poison(&snap.final_slot) {
-        failures.push(failure("final_slot_unwritten", None, 0, "final slot still poison"));
+        failures.push(failure(
+            "final_slot_unwritten",
+            None,
+            0,
+            "final slot still poison",
+        ));
     }
     if let Some(index) = q8_slot_stats(&snap.final_slot).1 {
-        failures.push(failure("nonfinite_final_state", None, index, "non-finite decoded state"));
+        failures.push(failure(
+            "nonfinite_final_state",
+            None,
+            index,
+            "non-finite decoded state",
+        ));
     }
     if let Some(offset) = first_nonfinite_f16(&snap.residual) {
         failures.push(failure(
@@ -1772,16 +1804,29 @@ fn check_ef_snap(
             "residual_length",
             None,
             snap.residual.len().min(RESIDUAL_BYTES),
-            &format!("residual is {} bytes, expected {RESIDUAL_BYTES}", snap.residual.len()),
+            &format!(
+                "residual is {} bytes, expected {RESIDUAL_BYTES}",
+                snap.residual.len()
+            ),
         ));
     }
     if let EfMode::Rollback(_) = mode {
         failures.extend(nonfinite("nonfinite_discard", &snap.discard, VW * 4));
         if is_poison(&snap.kept) {
-            failures.push(failure("rollback_target_unwritten", None, 0, "rollback target still poison"));
+            failures.push(failure(
+                "rollback_target_unwritten",
+                None,
+                0,
+                "rollback target still poison",
+            ));
         }
         if let Some(index) = q8_slot_stats(&snap.kept).1 {
-            failures.push(failure("nonfinite_kept_state", None, index, "non-finite decoded state"));
+            failures.push(failure(
+                "nonfinite_kept_state",
+                None,
+                index,
+                "non-finite decoded state",
+            ));
         }
     }
     if matches!(mode, EfMode::Restore | EfMode::Rollback(_)) {
@@ -1806,10 +1851,25 @@ fn check_ef_snap(
         ));
     }
     if let Some(cap) = cap {
-        failures.extend(compare("output_vs_capture", &snap.out, &cap.out, Some(VW * 4)));
-        failures.extend(compare("final_state_vs_capture", &snap.final_slot, &cap.final_slot, None));
+        failures.extend(compare(
+            "output_vs_capture",
+            &snap.out,
+            &cap.out,
+            Some(VW * 4),
+        ));
+        failures.extend(compare(
+            "final_state_vs_capture",
+            &snap.final_slot,
+            &cap.final_slot,
+            None,
+        ));
         if mode == EfMode::Capture {
-            failures.extend(compare("residual_not_kept", &snap.residual, &cap.residual, Some(HD * 2)));
+            failures.extend(compare(
+                "residual_not_kept",
+                &snap.residual,
+                &cap.residual,
+                Some(HD * 2),
+            ));
         }
     }
     failures
@@ -1819,9 +1879,22 @@ fn check_ef_snap(
 fn ef_capture_diags(cap: &EfSnap, reference: &Reference, rows: usize) -> Vec<Diag> {
     let last = rows - 1;
     vec![
-        diag_f32("ar_vs_capture_output", &cap.out, &reference.out, Some(VW * 4)),
-        diag_q8("ar_vs_capture_final_slot", &cap.final_slot, &reference.states[last]),
-        diag_f16("ar_vs_capture_final_residual", &cap.residual, &reference.residuals[last]),
+        diag_f32(
+            "ar_vs_capture_output",
+            &cap.out,
+            &reference.out,
+            Some(VW * 4),
+        ),
+        diag_q8(
+            "ar_vs_capture_final_slot",
+            &cap.final_slot,
+            &reference.states[last],
+        ),
+        diag_f16(
+            "ar_vs_capture_final_residual",
+            &cap.residual,
+            &reference.residuals[last],
+        ),
         diag_effective(
             "ar_vs_capture_effective_state",
             &effective_state(&cap.final_slot, Some(&cap.residual)),
@@ -1958,7 +2031,12 @@ fn run_cases_ef(
             ));
         }
         if let Some(offset) = seed_bad {
-            seed_failures.push(failure("nonfinite_seed_residual", None, offset, "non-finite F16"));
+            seed_failures.push(failure(
+                "nonfinite_seed_residual",
+                None,
+                offset,
+                "non-finite F16",
+            ));
         }
         let mut residual = seed_residual;
         let mut source = 0usize;
@@ -1967,15 +2045,8 @@ fn run_cases_ef(
             upload_window_inputs(gpu, rig, rows, cli.seed, window)?;
             let base = capture_base(source, rig.ring_rows);
             let source_bytes = download(gpu, &rig.slot(source))?;
-            let reference = run_reference(
-                gpu,
-                rig,
-                source,
-                rows,
-                start,
-                Some(&residual),
-                &mut kernels,
-            )?;
+            let reference =
+                run_reference(gpu, rig, source, rows, start, Some(&residual), &mut kernels)?;
             report.max_abs_state = report.max_abs_state.max(reference.max_abs);
             report.max_abs_residual = report.max_abs_residual.max(reference.max_abs_residual);
             let w = EfWindow {
@@ -1991,14 +2062,8 @@ fn run_cases_ef(
             if window == 0 {
                 window_failures.extend(seed_failures.iter().cloned());
             }
-            let (cap, capture_failures) = ef_exec(
-                gpu,
-                rig,
-                &w,
-                EfMode::Capture,
-                &mut kernels,
-                capture_limit,
-            )?;
+            let (cap, capture_failures) =
+                ef_exec(gpu, rig, &w, EfMode::Capture, &mut kernels, capture_limit)?;
             window_failures.extend(capture_failures);
             window_failures.extend(check_ef_snap(
                 &cap,
@@ -2085,13 +2150,7 @@ fn prewarm(gpu: &mut Gpu, rig: &Rig, kernels: &mut BTreeSet<String>) -> Res<()> 
 
 /// One `(rows, window)` input block (projection, gate, beta and the packed
 /// rollback recurrence input).
-fn upload_window_inputs(
-    gpu: &Gpu,
-    rig: &Rig,
-    rows: usize,
-    seed: u64,
-    window: usize,
-) -> Res<()> {
+fn upload_window_inputs(gpu: &Gpu, rig: &Rig, rows: usize, seed: u64, window: usize) -> Res<()> {
     let steps = make_steps(rows, window_seed(seed, rows, window));
     upload(gpu, &rig.proj, &steps.proj)?;
     upload(gpu, &rig.gate, &steps.gate)?;
@@ -2503,7 +2562,11 @@ mod tests {
         let cli = parse_args(&args("--formats q8,q8_ef,fp32 --graph 1")).unwrap();
         assert_eq!(
             cli.formats,
-            vec![GdnStateFormat::Q8, GdnStateFormat::Q8Ef, GdnStateFormat::F32]
+            vec![
+                GdnStateFormat::Q8,
+                GdnStateFormat::Q8Ef,
+                GdnStateFormat::F32
+            ]
         );
         assert_eq!(parse_format("q8_ef").unwrap(), GdnStateFormat::Q8Ef);
         assert_eq!(label(GdnStateFormat::Q8Ef), "q8_ef");
@@ -2693,7 +2756,12 @@ mod tests {
         let eff = diag_effective("e", &[1.0, 2.5, 3.0], &[1.0, 2.0, 3.0]);
         assert!(!eff.equal);
         assert_eq!((eff.byte_offset, eff.max_abs_diff), (Some(6), Some(0.5)));
-        let f = diag_f32("o", &f32_bytes(&[1.0, 2.0]), &f32_bytes(&[1.0, 2.0]), Some(4));
+        let f = diag_f32(
+            "o",
+            &f32_bytes(&[1.0, 2.0]),
+            &f32_bytes(&[1.0, 2.0]),
+            Some(4),
+        );
         assert!(f.equal);
         let r = diag_f16("r", &f16_plane(0x3c00), &f16_plane(0x3800));
         assert!(!r.equal);
@@ -2717,7 +2785,11 @@ mod tests {
                 Vec::new()
             },
             final_slot: q8_slot(1, 0.5),
-            kept: if rollback { q8_slot(2, 0.5) } else { Vec::new() },
+            kept: if rollback {
+                q8_slot(2, 0.5)
+            } else {
+                Vec::new()
+            },
             source: q8_slot(3, 0.25),
             residual: if mode == EfMode::Capture {
                 f16_plane(0x3800)
@@ -2748,7 +2820,10 @@ mod tests {
         let cap = clean_snap(EfMode::Capture);
         let mut snap = clean_snap(EfMode::Capture);
         snap.source = q8_slot(4, 0.25);
-        assert_eq!(kinds(&check(&snap, EfMode::Capture, None)), ["source_modified"]);
+        assert_eq!(
+            kinds(&check(&snap, EfMode::Capture, None)),
+            ["source_modified"]
+        );
 
         let mut snap = clean_snap(EfMode::Capture);
         snap.stray = Some(SLOT_BYTES + 7);
@@ -2766,7 +2841,10 @@ mod tests {
 
         let mut snap = clean_snap(EfMode::Capture);
         snap.out = f32_bytes(&vec![f32::NAN; VW]);
-        assert_eq!(kinds(&check(&snap, EfMode::Capture, None)), ["nonfinite_output"]);
+        assert_eq!(
+            kinds(&check(&snap, EfMode::Capture, None)),
+            ["nonfinite_output"]
+        );
 
         // The capture must write the residual.
         let mut snap = clean_snap(EfMode::Capture);
@@ -2779,7 +2857,10 @@ mod tests {
         // All-accept: the residual must be the capture's, not zeroed.
         let mut snap = clean_snap(EfMode::Capture);
         snap.residual = vec![0; RESIDUAL_BYTES];
-        assert_eq!(kinds(&check(&snap, EfMode::Capture, Some(&cap))), ["residual_not_kept"]);
+        assert_eq!(
+            kinds(&check(&snap, EfMode::Capture, Some(&cap))),
+            ["residual_not_kept"]
+        );
 
         // Reset events leave exactly zero.
         let mut restore = clean_snap(EfMode::Restore);

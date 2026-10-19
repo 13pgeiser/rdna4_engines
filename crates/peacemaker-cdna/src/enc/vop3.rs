@@ -52,21 +52,71 @@ use crate::Result;
 use std::fmt;
 
 op_table!(Vop3OnlyOp {
-    MadI32I24, MadU32U24, FmaF32, BfeU32, BfeI32, BfiB32, AlignbitB32, AlignbyteB32,
-    Min3F32, Min3I32, Min3U32, Max3F32, Max3I32, Max3U32, Med3F32, Med3I32, Med3U32,
-    DivScaleF32, DivFmasF32, DivFixupF32, MadU64U32, MadI64I32,
-    LshlAddU32, AddLshlU32, Add3U32, LshlOrB32, AndOrB32, Or3B32, XadU32, PermB32,
-    MulLoU32, MulHiU32, MulHiI32, LdexpF32,
-    CvtPkFp8F32, CvtPkBf8F32, CvtSrFp8F32, CvtSrBf8F32,
-    CvtPkrtzF16F32, CvtPkU16U32, CvtPkI16I32,
-    LshlrevB64, LshrrevB64, AshrrevI64,
-    ReadlaneB32, WritelaneB32, BcntU32B32, MbcntLoU32B32, MbcntHiU32B32,
-    PackB32F16, BfmB32, AddF64, MulF64, FmaF64, LshlAddU64,
+    MadI32I24,
+    MadU32U24,
+    FmaF32,
+    BfeU32,
+    BfeI32,
+    BfiB32,
+    AlignbitB32,
+    AlignbyteB32,
+    Min3F32,
+    Min3I32,
+    Min3U32,
+    Max3F32,
+    Max3I32,
+    Max3U32,
+    Med3F32,
+    Med3I32,
+    Med3U32,
+    DivScaleF32,
+    DivFmasF32,
+    DivFixupF32,
+    MadU64U32,
+    MadI64I32,
+    LshlAddU32,
+    AddLshlU32,
+    Add3U32,
+    LshlOrB32,
+    AndOrB32,
+    Or3B32,
+    XadU32,
+    PermB32,
+    MulLoU32,
+    MulHiU32,
+    MulHiI32,
+    LdexpF32,
+    CvtPkFp8F32,
+    CvtPkBf8F32,
+    CvtSrFp8F32,
+    CvtSrBf8F32,
+    CvtPkrtzF16F32,
+    CvtPkU16U32,
+    CvtPkI16I32,
+    LshlrevB64,
+    LshrrevB64,
+    AshrrevI64,
+    ReadlaneB32,
+    WritelaneB32,
+    BcntU32B32,
+    MbcntLoU32B32,
+    MbcntHiU32B32,
+    PackB32F16,
+    BfmB32,
+    AddF64,
+    MulF64,
+    FmaF64,
+    LshlAddU64,
 });
 
 /// A VOP3-encoded opcode: a promoted 32-bit opcode or a VOP3-only one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Vop3Op { C(VopcOp), V2(Vop2Op), V1(Vop1Op), Only(Vop3OnlyOp) }
+pub enum Vop3Op {
+    C(VopcOp),
+    V2(Vop2Op),
+    V1(Vop1Op),
+    Only(Vop3OnlyOp),
+}
 
 /// The modifier fields an opcode's VOP3 encoding honours. `neg`/`abs` are
 /// per-source masks (bit `n` = `src[n]`), `op_sel` a mask over the 4-bit
@@ -74,7 +124,13 @@ pub enum Vop3Op { C(VopcOp), V2(Vop2Op), V1(Vop1Op), Only(Vop3OnlyOp) }
 /// [`Vop3::encode`] and [`Vop3::decode`]. Derived from `llvm-mc` (assembler
 /// and disassembler) for gfx942; VOP3B opcodes never have `abs` or `op_sel`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct Vop3Mods { pub neg: u8, pub abs: u8, pub clamp: bool, pub omod: bool, pub op_sel: u8 }
+pub struct Vop3Mods {
+    pub neg: u8,
+    pub abs: u8,
+    pub clamp: bool,
+    pub omod: bool,
+    pub op_sel: u8,
+}
 
 /// Operand class of a source slot.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -93,12 +149,20 @@ enum Slot {
 
 /// Operand class of the destination field.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum DstClass { Vgpr, Pair, Sreg, Nop }
+enum DstClass {
+    Vgpr,
+    Pair,
+    Sreg,
+    Nop,
+}
 
 impl Vop3Op {
     /// Opcodes llvm-mc rejects in their 64-bit form on gfx942.
     fn has_e64(self) -> bool {
-        !matches!(self, Self::V1(Vop1Op::ReadfirstlaneB32 | Vop1Op::AccvgprMovB32 | Vop1Op::SwapB32))
+        !matches!(
+            self,
+            Self::V1(Vop1Op::ReadfirstlaneB32 | Vop1Op::AccvgprMovB32 | Vop1Op::SwapB32)
+        )
     }
 
     /// Every encodable VOP3 opcode: promoted VOPC, VOP2, VOP1 (except those
@@ -119,7 +183,9 @@ impl Vop3Op {
     /// else the VOP3-only number. `None` if `arch` lacks the instruction or
     /// it has no 64-bit form.
     pub fn opcode(self, arch: Arch) -> Option<u16> {
-        if !self.has_e64() { return None }
+        if !self.has_e64() {
+            return None;
+        }
         match self {
             Self::C(op) => op.opcode(arch).map(u16::from),
             Self::V2(op) => op.opcode(arch).map(|o| 0x100 + u16::from(o)),
@@ -133,7 +199,12 @@ impl Vop3Op {
             0..=0xff => Self::C(VopcOp::from_opcode(arch, opcode as u8)?),
             0x100..=0x13f => Self::V2(Vop2Op::from_opcode(arch, (opcode - 0x100) as u8)?),
             0x140..=0x1bf => Self::V1(Vop1Op::from_opcode(arch, (opcode - 0x140) as u8)?),
-            _ => Self::Only(Vop3OnlyOp::ALL.iter().copied().find(|op| op.opcode(arch) == Some(opcode))?),
+            _ => Self::Only(
+                Vop3OnlyOp::ALL
+                    .iter()
+                    .copied()
+                    .find(|op| op.opcode(arch) == Some(opcode))?,
+            ),
         };
         op.has_e64().then_some(op)
     }
@@ -162,8 +233,14 @@ impl Vop3Op {
     pub fn is_vop3b(self) -> bool {
         matches!(
             self,
-            Self::V2(Vop2Op::AddCoU32 | Vop2Op::SubCoU32 | Vop2Op::SubrevCoU32 | Vop2Op::AddcCoU32 | Vop2Op::SubbCoU32 | Vop2Op::SubbrevCoU32)
-                | Self::Only(Vop3OnlyOp::DivScaleF32 | Vop3OnlyOp::MadU64U32 | Vop3OnlyOp::MadI64I32)
+            Self::V2(
+                Vop2Op::AddCoU32
+                    | Vop2Op::SubCoU32
+                    | Vop2Op::SubrevCoU32
+                    | Vop2Op::AddcCoU32
+                    | Vop2Op::SubbCoU32
+                    | Vop2Op::SubbrevCoU32
+            ) | Self::Only(Vop3OnlyOp::DivScaleF32 | Vop3OnlyOp::MadU64U32 | Vop3OnlyOp::MadI64I32)
         )
     }
 
@@ -171,36 +248,89 @@ impl Vop3Op {
     /// SDST is always two dwords and is not part of this tuple.
     pub fn widths(self) -> (u8, u8, u8, u8) {
         use crate::enc::vop::{Vop1Op as P, Vop2Op as B, VopcOp as K};
-        use Vop3Op::{Only, C, V1, V2};
         use Vop3OnlyOp as O;
+        use Vop3Op::{Only, C, V1, V2};
         match self {
-            C(K::CmpClassF32) | C(K::CmpLtF32) | C(K::CmpEqF32) | C(K::CmpLeF32) | C(K::CmpGtF32) |
-                C(K::CmpLgF32) | C(K::CmpGeF32) | C(K::CmpOF32) | C(K::CmpUF32) | C(K::CmpNeqF32) |
-                C(K::CmpLtI32) | C(K::CmpEqI32) | C(K::CmpLeI32) | C(K::CmpGtI32) | C(K::CmpNeI32) |
-                C(K::CmpGeI32) | C(K::CmpLtU32) | C(K::CmpEqU32) | C(K::CmpLeU32) | C(K::CmpGtU32) |
-                C(K::CmpNeU32) | C(K::CmpGeU32) | C(K::CmpxEqU32) | C(K::CmpxNeU32) | C(K::CmpxGtU32) |
-                C(K::CmpxLtU32) | C(K::CmpxGtI32) | C(K::CmpxLtI32) | C(K::CmpxGtF32) | C(K::CmpxLtF32) => (2, 1, 1, 0),
+            C(K::CmpClassF32) | C(K::CmpLtF32) | C(K::CmpEqF32) | C(K::CmpLeF32)
+            | C(K::CmpGtF32) | C(K::CmpLgF32) | C(K::CmpGeF32) | C(K::CmpOF32) | C(K::CmpUF32)
+            | C(K::CmpNeqF32) | C(K::CmpLtI32) | C(K::CmpEqI32) | C(K::CmpLeI32)
+            | C(K::CmpGtI32) | C(K::CmpNeI32) | C(K::CmpGeI32) | C(K::CmpLtU32)
+            | C(K::CmpEqU32) | C(K::CmpLeU32) | C(K::CmpGtU32) | C(K::CmpNeU32)
+            | C(K::CmpGeU32) | C(K::CmpxEqU32) | C(K::CmpxNeU32) | C(K::CmpxGtU32)
+            | C(K::CmpxLtU32) | C(K::CmpxGtI32) | C(K::CmpxLtI32) | C(K::CmpxGtF32)
+            | C(K::CmpxLtF32) => (2, 1, 1, 0),
             C(K::CmpEqU64) | C(K::CmpNeU64) | Only(O::AddF64) | Only(O::MulF64) => (2, 2, 2, 0),
-            V2(B::CndmaskB32) | V2(B::AddcCoU32) | V2(B::SubbCoU32) | V2(B::SubbrevCoU32) => (1, 1, 1, 2),
+            V2(B::CndmaskB32) | V2(B::AddcCoU32) | V2(B::SubbCoU32) | V2(B::SubbrevCoU32) => {
+                (1, 1, 1, 2)
+            }
             V1(P::Nop) => (0, 0, 0, 0),
-            V1(P::MovB32) | V1(P::CvtF32I32) | V1(P::CvtF32U32) | V1(P::CvtU32F32) | V1(P::CvtI32F32) |
-                V1(P::CvtF16F32) | V1(P::CvtF32F16) | V1(P::CvtRpiI32F32) | V1(P::CvtFlrI32F32) |
-                V1(P::CvtF32Ubyte0) | V1(P::CvtF32Ubyte1) | V1(P::CvtF32Ubyte2) | V1(P::CvtF32Ubyte3) |
-                V1(P::FractF32) | V1(P::TruncF32) | V1(P::CeilF32) | V1(P::RndneF32) | V1(P::FloorF32) |
-                V1(P::ExpF32) | V1(P::LogF32) | V1(P::RcpF32) | V1(P::RcpIflagF32) | V1(P::RsqF32) |
-                V1(P::SqrtF32) | V1(P::NotB32) | V1(P::BfrevB32) | V1(P::FfbhU32) | V1(P::FfblB32) |
-                V1(P::FfbhI32) | V1(P::FrexpExpI32F32) | V1(P::FrexpMantF32) | V1(P::CvtF32Fp8) |
-                V1(P::CvtF32Bf8) | V1(P::ReadfirstlaneB32) | V1(P::AccvgprMovB32) | V1(P::SwapB32) => (1, 1, 0, 0),
+            V1(P::MovB32)
+            | V1(P::CvtF32I32)
+            | V1(P::CvtF32U32)
+            | V1(P::CvtU32F32)
+            | V1(P::CvtI32F32)
+            | V1(P::CvtF16F32)
+            | V1(P::CvtF32F16)
+            | V1(P::CvtRpiI32F32)
+            | V1(P::CvtFlrI32F32)
+            | V1(P::CvtF32Ubyte0)
+            | V1(P::CvtF32Ubyte1)
+            | V1(P::CvtF32Ubyte2)
+            | V1(P::CvtF32Ubyte3)
+            | V1(P::FractF32)
+            | V1(P::TruncF32)
+            | V1(P::CeilF32)
+            | V1(P::RndneF32)
+            | V1(P::FloorF32)
+            | V1(P::ExpF32)
+            | V1(P::LogF32)
+            | V1(P::RcpF32)
+            | V1(P::RcpIflagF32)
+            | V1(P::RsqF32)
+            | V1(P::SqrtF32)
+            | V1(P::NotB32)
+            | V1(P::BfrevB32)
+            | V1(P::FfbhU32)
+            | V1(P::FfblB32)
+            | V1(P::FfbhI32)
+            | V1(P::FrexpExpI32F32)
+            | V1(P::FrexpMantF32)
+            | V1(P::CvtF32Fp8)
+            | V1(P::CvtF32Bf8)
+            | V1(P::ReadfirstlaneB32)
+            | V1(P::AccvgprMovB32)
+            | V1(P::SwapB32) => (1, 1, 0, 0),
             V1(P::MovB64) => (2, 2, 0, 0),
             V1(P::CvtPkF32Fp8) | V1(P::CvtPkF32Bf8) | V1(P::CvtF64F32) => (2, 1, 0, 0),
             V1(P::CvtF32F64) => (1, 2, 0, 0),
-            Only(O::MadI32I24) | Only(O::MadU32U24) | Only(O::FmaF32) | Only(O::BfeU32) | Only(O::BfeI32) |
-                Only(O::BfiB32) | Only(O::AlignbitB32) | Only(O::AlignbyteB32) | Only(O::Min3F32) |
-                Only(O::Min3I32) | Only(O::Min3U32) | Only(O::Max3F32) | Only(O::Max3I32) | Only(O::Max3U32) |
-                Only(O::Med3F32) | Only(O::Med3I32) | Only(O::Med3U32) | Only(O::DivScaleF32) |
-                Only(O::DivFmasF32) | Only(O::DivFixupF32) | Only(O::LshlAddU32) | Only(O::AddLshlU32) |
-                Only(O::Add3U32) | Only(O::LshlOrB32) | Only(O::AndOrB32) | Only(O::Or3B32) | Only(O::XadU32) |
-                Only(O::PermB32) => (1, 1, 1, 1),
+            Only(O::MadI32I24)
+            | Only(O::MadU32U24)
+            | Only(O::FmaF32)
+            | Only(O::BfeU32)
+            | Only(O::BfeI32)
+            | Only(O::BfiB32)
+            | Only(O::AlignbitB32)
+            | Only(O::AlignbyteB32)
+            | Only(O::Min3F32)
+            | Only(O::Min3I32)
+            | Only(O::Min3U32)
+            | Only(O::Max3F32)
+            | Only(O::Max3I32)
+            | Only(O::Max3U32)
+            | Only(O::Med3F32)
+            | Only(O::Med3I32)
+            | Only(O::Med3U32)
+            | Only(O::DivScaleF32)
+            | Only(O::DivFmasF32)
+            | Only(O::DivFixupF32)
+            | Only(O::LshlAddU32)
+            | Only(O::AddLshlU32)
+            | Only(O::Add3U32)
+            | Only(O::LshlOrB32)
+            | Only(O::AndOrB32)
+            | Only(O::Or3B32)
+            | Only(O::XadU32)
+            | Only(O::PermB32) => (1, 1, 1, 1),
             Only(O::MadU64U32) | Only(O::MadI64I32) => (2, 1, 1, 2),
             Only(O::LshlrevB64) | Only(O::LshrrevB64) | Only(O::AshrrevI64) => (2, 1, 2, 0),
             Only(O::FmaF64) => (2, 2, 2, 2),
@@ -213,36 +343,135 @@ impl Vop3Op {
     /// [`Vop3Mods`].
     pub fn mods(self) -> Vop3Mods {
         use crate::enc::vop::{Vop1Op as P, Vop2Op as B, VopcOp as K};
-        use Vop3Op::{Only, C, V1, V2};
         use Vop3OnlyOp as O;
+        use Vop3Op::{Only, C, V1, V2};
         match self {
-            V1(P::CvtU32F32) | V1(P::CvtI32F32) | V1(P::CvtF16F32) | V1(P::CvtF32F16) | V1(P::FractF32) |
-                V1(P::TruncF32) | V1(P::CeilF32) | V1(P::RndneF32) | V1(P::FloorF32) | V1(P::ExpF32) |
-                V1(P::LogF32) | V1(P::RcpF32) | V1(P::RcpIflagF32) | V1(P::RsqF32) | V1(P::SqrtF32) |
-                V1(P::FrexpMantF32) | V1(P::CvtF64F32) | V1(P::CvtF32F64) | Only(O::LdexpF32) => Vop3Mods { neg: 0b001, abs: 0b001, clamp: true, omod: true, op_sel: 0b0000 },
-            V2(B::MulI32I24) | V2(B::MulU32U24) | V2(B::AddCoU32) | V2(B::SubCoU32) | V2(B::SubrevCoU32) |
-                V2(B::AddcCoU32) | V2(B::SubbCoU32) | V2(B::SubbrevCoU32) | V2(B::AddU32) | V2(B::SubU32) |
-                V2(B::SubrevU32) | V2(B::AddU16) | V2(B::SubU16) | Only(O::MadI32I24) | Only(O::MadU32U24) |
-                Only(O::MadU64U32) | Only(O::MadI64I32) => Vop3Mods { neg: 0b000, abs: 0b000, clamp: true, omod: false, op_sel: 0b0000 },
-            V2(B::AddF32) | V2(B::SubF32) | V2(B::SubrevF32) | V2(B::MulF32) | V2(B::MinF32) | V2(B::MaxF32) |
-                V2(B::FmacF32) | V2(B::AddF16) | V2(B::SubF16) | V2(B::MulF16) | V2(B::MaxF16) |
-                V2(B::MinF16) | Only(O::CvtPkrtzF16F32) | Only(O::AddF64) | Only(O::MulF64) => Vop3Mods { neg: 0b011, abs: 0b011, clamp: true, omod: true, op_sel: 0b0000 },
-            C(K::CmpLtF32) | C(K::CmpEqF32) | C(K::CmpLeF32) | C(K::CmpGtF32) | C(K::CmpLgF32) |
-                C(K::CmpGeF32) | C(K::CmpOF32) | C(K::CmpUF32) | C(K::CmpNeqF32) | C(K::CmpxGtF32) |
-                C(K::CmpxLtF32) => Vop3Mods { neg: 0b011, abs: 0b011, clamp: true, omod: false, op_sel: 0b0000 },
-            V1(P::CvtF32I32) | V1(P::CvtF32U32) | V1(P::CvtF32Ubyte0) | V1(P::CvtF32Ubyte1) |
-                V1(P::CvtF32Ubyte2) | V1(P::CvtF32Ubyte3) | V1(P::CvtF32Fp8) | V1(P::CvtF32Bf8) |
-                V1(P::CvtPkF32Fp8) | V1(P::CvtPkF32Bf8) => Vop3Mods { neg: 0b000, abs: 0b000, clamp: true, omod: true, op_sel: 0b0000 },
-            Only(O::FmaF32) | Only(O::Min3F32) | Only(O::Max3F32) | Only(O::Med3F32) | Only(O::DivFmasF32) |
-                Only(O::DivFixupF32) | Only(O::FmaF64) => Vop3Mods { neg: 0b111, abs: 0b111, clamp: true, omod: true, op_sel: 0b0000 },
-            V1(P::CvtRpiI32F32) | V1(P::CvtFlrI32F32) | V1(P::FrexpExpI32F32) => Vop3Mods { neg: 0b001, abs: 0b001, clamp: true, omod: false, op_sel: 0b0000 },
-            Only(O::AlignbitB32) | Only(O::AlignbyteB32) => Vop3Mods { neg: 0b000, abs: 0b000, clamp: true, omod: false, op_sel: 0b1111 },
-            Only(O::CvtPkFp8F32) | Only(O::CvtPkBf8F32) => Vop3Mods { neg: 0b011, abs: 0b011, clamp: false, omod: false, op_sel: 0b1011 },
-            Only(O::CvtSrFp8F32) | Only(O::CvtSrBf8F32) => Vop3Mods { neg: 0b001, abs: 0b001, clamp: false, omod: false, op_sel: 0b1111 },
-            C(K::CmpClassF32) => Vop3Mods { neg: 0b001, abs: 0b001, clamp: false, omod: false, op_sel: 0b0000 },
-            V2(B::CndmaskB32) => Vop3Mods { neg: 0b011, abs: 0b011, clamp: false, omod: false, op_sel: 0b0000 },
-            Only(O::DivScaleF32) => Vop3Mods { neg: 0b111, abs: 0b000, clamp: true, omod: true, op_sel: 0b0000 },
-            Only(O::PackB32F16) => Vop3Mods { neg: 0b011, abs: 0b011, clamp: true, omod: false, op_sel: 0b1011 },
+            V1(P::CvtU32F32) | V1(P::CvtI32F32) | V1(P::CvtF16F32) | V1(P::CvtF32F16)
+            | V1(P::FractF32) | V1(P::TruncF32) | V1(P::CeilF32) | V1(P::RndneF32)
+            | V1(P::FloorF32) | V1(P::ExpF32) | V1(P::LogF32) | V1(P::RcpF32)
+            | V1(P::RcpIflagF32) | V1(P::RsqF32) | V1(P::SqrtF32) | V1(P::FrexpMantF32)
+            | V1(P::CvtF64F32) | V1(P::CvtF32F64) | Only(O::LdexpF32) => Vop3Mods {
+                neg: 0b001,
+                abs: 0b001,
+                clamp: true,
+                omod: true,
+                op_sel: 0b0000,
+            },
+            V2(B::MulI32I24) | V2(B::MulU32U24) | V2(B::AddCoU32) | V2(B::SubCoU32)
+            | V2(B::SubrevCoU32) | V2(B::AddcCoU32) | V2(B::SubbCoU32) | V2(B::SubbrevCoU32)
+            | V2(B::AddU32) | V2(B::SubU32) | V2(B::SubrevU32) | V2(B::AddU16) | V2(B::SubU16)
+            | Only(O::MadI32I24) | Only(O::MadU32U24) | Only(O::MadU64U32) | Only(O::MadI64I32) => {
+                Vop3Mods {
+                    neg: 0b000,
+                    abs: 0b000,
+                    clamp: true,
+                    omod: false,
+                    op_sel: 0b0000,
+                }
+            }
+            V2(B::AddF32)
+            | V2(B::SubF32)
+            | V2(B::SubrevF32)
+            | V2(B::MulF32)
+            | V2(B::MinF32)
+            | V2(B::MaxF32)
+            | V2(B::FmacF32)
+            | V2(B::AddF16)
+            | V2(B::SubF16)
+            | V2(B::MulF16)
+            | V2(B::MaxF16)
+            | V2(B::MinF16)
+            | Only(O::CvtPkrtzF16F32)
+            | Only(O::AddF64)
+            | Only(O::MulF64) => Vop3Mods {
+                neg: 0b011,
+                abs: 0b011,
+                clamp: true,
+                omod: true,
+                op_sel: 0b0000,
+            },
+            C(K::CmpLtF32) | C(K::CmpEqF32) | C(K::CmpLeF32) | C(K::CmpGtF32) | C(K::CmpLgF32)
+            | C(K::CmpGeF32) | C(K::CmpOF32) | C(K::CmpUF32) | C(K::CmpNeqF32)
+            | C(K::CmpxGtF32) | C(K::CmpxLtF32) => Vop3Mods {
+                neg: 0b011,
+                abs: 0b011,
+                clamp: true,
+                omod: false,
+                op_sel: 0b0000,
+            },
+            V1(P::CvtF32I32) | V1(P::CvtF32U32) | V1(P::CvtF32Ubyte0) | V1(P::CvtF32Ubyte1)
+            | V1(P::CvtF32Ubyte2) | V1(P::CvtF32Ubyte3) | V1(P::CvtF32Fp8) | V1(P::CvtF32Bf8)
+            | V1(P::CvtPkF32Fp8) | V1(P::CvtPkF32Bf8) => Vop3Mods {
+                neg: 0b000,
+                abs: 0b000,
+                clamp: true,
+                omod: true,
+                op_sel: 0b0000,
+            },
+            Only(O::FmaF32) | Only(O::Min3F32) | Only(O::Max3F32) | Only(O::Med3F32)
+            | Only(O::DivFmasF32) | Only(O::DivFixupF32) | Only(O::FmaF64) => Vop3Mods {
+                neg: 0b111,
+                abs: 0b111,
+                clamp: true,
+                omod: true,
+                op_sel: 0b0000,
+            },
+            V1(P::CvtRpiI32F32) | V1(P::CvtFlrI32F32) | V1(P::FrexpExpI32F32) => Vop3Mods {
+                neg: 0b001,
+                abs: 0b001,
+                clamp: true,
+                omod: false,
+                op_sel: 0b0000,
+            },
+            Only(O::AlignbitB32) | Only(O::AlignbyteB32) => Vop3Mods {
+                neg: 0b000,
+                abs: 0b000,
+                clamp: true,
+                omod: false,
+                op_sel: 0b1111,
+            },
+            Only(O::CvtPkFp8F32) | Only(O::CvtPkBf8F32) => Vop3Mods {
+                neg: 0b011,
+                abs: 0b011,
+                clamp: false,
+                omod: false,
+                op_sel: 0b1011,
+            },
+            Only(O::CvtSrFp8F32) | Only(O::CvtSrBf8F32) => Vop3Mods {
+                neg: 0b001,
+                abs: 0b001,
+                clamp: false,
+                omod: false,
+                op_sel: 0b1111,
+            },
+            C(K::CmpClassF32) => Vop3Mods {
+                neg: 0b001,
+                abs: 0b001,
+                clamp: false,
+                omod: false,
+                op_sel: 0b0000,
+            },
+            V2(B::CndmaskB32) => Vop3Mods {
+                neg: 0b011,
+                abs: 0b011,
+                clamp: false,
+                omod: false,
+                op_sel: 0b0000,
+            },
+            Only(O::DivScaleF32) => Vop3Mods {
+                neg: 0b111,
+                abs: 0b000,
+                clamp: true,
+                omod: true,
+                op_sel: 0b0000,
+            },
+            Only(O::PackB32F16) => Vop3Mods {
+                neg: 0b011,
+                abs: 0b011,
+                clamp: true,
+                omod: false,
+                op_sel: 0b1011,
+            },
             _ => Vop3Mods::default(),
         }
     }
@@ -251,9 +480,14 @@ impl Vop3Op {
         match self {
             Self::Only(Vop3OnlyOp::ReadlaneB32) => [Slot::Vgpr, Slot::Lane, Slot::Any],
             Self::Only(Vop3OnlyOp::WritelaneB32) => [Slot::Scalar, Slot::Lane, Slot::Any],
-            Self::V2(Vop2Op::CndmaskB32 | Vop2Op::AddcCoU32 | Vop2Op::SubbCoU32 | Vop2Op::SubbrevCoU32) => [Slot::Any, Slot::Any, Slot::Mask],
+            Self::V2(
+                Vop2Op::CndmaskB32 | Vop2Op::AddcCoU32 | Vop2Op::SubbCoU32 | Vop2Op::SubbrevCoU32,
+            ) => [Slot::Any, Slot::Any, Slot::Mask],
             Self::Only(
-                Vop3OnlyOp::CvtPkFp8F32 | Vop3OnlyOp::CvtPkBf8F32 | Vop3OnlyOp::CvtSrFp8F32 | Vop3OnlyOp::CvtSrBf8F32,
+                Vop3OnlyOp::CvtPkFp8F32
+                | Vop3OnlyOp::CvtPkBf8F32
+                | Vop3OnlyOp::CvtSrFp8F32
+                | Vop3OnlyOp::CvtSrBf8F32,
             ) => [Slot::Vgpr, Slot::Vgpr, Slot::Any],
             _ => [Slot::Any; 3],
         }
@@ -274,7 +508,11 @@ impl Vop3Op {
         matches!(
             self,
             Self::Only(
-                Vop3OnlyOp::CvtPkFp8F32 | Vop3OnlyOp::CvtPkBf8F32 | Vop3OnlyOp::CvtSrFp8F32 | Vop3OnlyOp::CvtSrBf8F32 | Vop3OnlyOp::WritelaneB32,
+                Vop3OnlyOp::CvtPkFp8F32
+                    | Vop3OnlyOp::CvtPkBf8F32
+                    | Vop3OnlyOp::CvtSrFp8F32
+                    | Vop3OnlyOp::CvtSrBf8F32
+                    | Vop3OnlyOp::WritelaneB32,
             )
         )
     }
@@ -282,7 +520,10 @@ impl Vop3Op {
     /// Lane-masked VALU op. `v_readlane_b32` / `v_writelane_b32` address one
     /// lane regardless of EXEC. [UNVERIFIED: confirm on MI300X]
     fn reads_exec(self) -> bool {
-        !matches!(self, Self::V1(Vop1Op::Nop) | Self::Only(Vop3OnlyOp::ReadlaneB32 | Vop3OnlyOp::WritelaneB32))
+        !matches!(
+            self,
+            Self::V1(Vop1Op::Nop) | Self::Only(Vop3OnlyOp::ReadlaneB32 | Vop3OnlyOp::WritelaneB32)
+        )
     }
 
     /// `v_cmpx_*` in the 64-bit form writes EXEC as well as SDST.
@@ -290,8 +531,14 @@ impl Vop3Op {
         matches!(
             self,
             Self::C(
-                VopcOp::CmpxEqU32 | VopcOp::CmpxNeU32 | VopcOp::CmpxGtU32 | VopcOp::CmpxLtU32
-                    | VopcOp::CmpxGtI32 | VopcOp::CmpxLtI32 | VopcOp::CmpxGtF32 | VopcOp::CmpxLtF32,
+                VopcOp::CmpxEqU32
+                    | VopcOp::CmpxNeU32
+                    | VopcOp::CmpxGtU32
+                    | VopcOp::CmpxLtU32
+                    | VopcOp::CmpxGtI32
+                    | VopcOp::CmpxLtI32
+                    | VopcOp::CmpxGtF32
+                    | VopcOp::CmpxLtF32,
             )
         )
     }
@@ -300,7 +547,9 @@ impl Vop3Op {
     /// print `[src0, src1, dst]` (bits 0, 1, 3), the others bits 0..=3.
     fn op_sel_bits(self) -> &'static [u8] {
         match self {
-            Self::Only(Vop3OnlyOp::CvtPkFp8F32 | Vop3OnlyOp::CvtPkBf8F32 | Vop3OnlyOp::PackB32F16) => &[0, 1, 3],
+            Self::Only(
+                Vop3OnlyOp::CvtPkFp8F32 | Vop3OnlyOp::CvtPkBf8F32 | Vop3OnlyOp::PackB32F16,
+            ) => &[0, 1, 3],
             _ => &[0, 1, 2, 3],
         }
     }
@@ -332,14 +581,25 @@ fn check_reg(s: Src, w: u8) -> std::result::Result<(), String> {
         Src::Lit(_) => Err("gfx9 VOP3 has no literal constant".into()),
         Src::Agpr(_) => Err("an AccVGPR is not a VOP3 operand".into()),
         Src::Sgpr(n) if n > 101 => Err(format!("s{n} does not exist (s0..=s101)")),
-        Src::Sgpr(n) if w == 2 && n % 2 == 1 => Err(format!("64-bit operand s[{n}:{}] is not even-aligned", u16::from(n) + 1)),
+        Src::Sgpr(n) if w == 2 && n % 2 == 1 => Err(format!(
+            "64-bit operand s[{n}:{}] is not even-aligned",
+            u16::from(n) + 1
+        )),
         Src::Ttmp(n) if n > 15 => Err(format!("ttmp{n} does not exist (ttmp0..=ttmp15)")),
-        Src::Ttmp(n) if w == 2 && n % 2 == 1 => Err(format!("64-bit operand ttmp[{n}:{}] is not even-aligned", u16::from(n) + 1)),
-        Src::Vgpr(n) if w == 2 && n % 2 == 1 => Err(format!("64-bit operand v[{n}:{}] is not even-aligned", u16::from(n) + 1)),
+        Src::Ttmp(n) if w == 2 && n % 2 == 1 => Err(format!(
+            "64-bit operand ttmp[{n}:{}] is not even-aligned",
+            u16::from(n) + 1
+        )),
+        Src::Vgpr(n) if w == 2 && n % 2 == 1 => Err(format!(
+            "64-bit operand v[{n}:{}] is not even-aligned",
+            u16::from(n) + 1
+        )),
         Src::VccHi | Src::ExecHi | Src::FlatScratchHi | Src::XnackMaskHi | Src::M0 if w == 2 => {
             Err(format!("{} cannot start a 64-bit operand", s.fmt(1)))
         }
-        Src::Int(i) if !(-16..=64).contains(&i) => Err(format!("inline integer {i} is outside -16..=64")),
+        Src::Int(i) if !(-16..=64).contains(&i) => {
+            Err(format!("inline integer {i} is outside -16..=64"))
+        }
         _ => Ok(()),
     }
 }
@@ -348,19 +608,35 @@ fn check_slot(kind: Slot, s: Src, w: u8) -> std::result::Result<(), String> {
     match kind {
         Slot::Any => {}
         Slot::Vgpr => {
-            if !s.is_vgpr() { return Err(format!("{} must be a VGPR", s.fmt(w))) }
+            if !s.is_vgpr() {
+                return Err(format!("{} must be a VGPR", s.fmt(w)));
+            }
         }
         Slot::Scalar | Slot::Lane => {
-            if s.is_vgpr() { return Err(format!("{} must be a scalar operand", s.fmt(w))) }
+            if s.is_vgpr() {
+                return Err(format!("{} must be a scalar operand", s.fmt(w)));
+            }
         }
         Slot::Mask => {
             let ok = matches!(
                 s,
-                Src::Sgpr(_) | Src::Ttmp(_) | Src::VccLo | Src::ExecLo | Src::FlatScratchLo | Src::XnackMaskLo
-                    | Src::SharedBase | Src::SharedLimit | Src::PrivateBase | Src::PrivateLimit
-                    | Src::Vccz | Src::Execz | Src::Scc
+                Src::Sgpr(_)
+                    | Src::Ttmp(_)
+                    | Src::VccLo
+                    | Src::ExecLo
+                    | Src::FlatScratchLo
+                    | Src::XnackMaskLo
+                    | Src::SharedBase
+                    | Src::SharedLimit
+                    | Src::PrivateBase
+                    | Src::PrivateLimit
+                    | Src::Vccz
+                    | Src::Execz
+                    | Src::Scc
             );
-            if !ok { return Err(format!("{} is not a 64-bit lane-mask operand", s.fmt(w))) }
+            if !ok {
+                return Err(format!("{} is not a 64-bit lane-mask operand", s.fmt(w)));
+            }
         }
     }
     check_reg(s, w)
@@ -369,25 +645,55 @@ fn check_slot(kind: Slot, s: Src, w: u8) -> std::result::Result<(), String> {
 fn check_dst(class: DstClass, s: Src, w: u8) -> std::result::Result<(), String> {
     match class {
         DstClass::Vgpr => {
-            if !s.is_vgpr() { return Err(format!("destination {} must be a VGPR", s.fmt(w))) }
+            if !s.is_vgpr() {
+                return Err(format!("destination {} must be a VGPR", s.fmt(w)));
+            }
             check_reg(s, w)
         }
         DstClass::Pair => {
-            let ok = matches!(s, Src::Sgpr(_) | Src::Ttmp(_) | Src::VccLo | Src::ExecLo | Src::FlatScratchLo | Src::XnackMaskLo);
-            if !ok { return Err(format!("{} is not a writable 64-bit scalar destination", s.fmt(2))) }
+            let ok = matches!(
+                s,
+                Src::Sgpr(_)
+                    | Src::Ttmp(_)
+                    | Src::VccLo
+                    | Src::ExecLo
+                    | Src::FlatScratchLo
+                    | Src::XnackMaskLo
+            );
+            if !ok {
+                return Err(format!(
+                    "{} is not a writable 64-bit scalar destination",
+                    s.fmt(2)
+                ));
+            }
             check_reg(s, 2)
         }
         DstClass::Sreg => {
             let ok = matches!(
                 s,
-                Src::Sgpr(_) | Src::Ttmp(_) | Src::VccLo | Src::VccHi | Src::ExecLo | Src::ExecHi
-                    | Src::FlatScratchLo | Src::FlatScratchHi | Src::XnackMaskLo | Src::XnackMaskHi
+                Src::Sgpr(_)
+                    | Src::Ttmp(_)
+                    | Src::VccLo
+                    | Src::VccHi
+                    | Src::ExecLo
+                    | Src::ExecHi
+                    | Src::FlatScratchLo
+                    | Src::FlatScratchHi
+                    | Src::XnackMaskLo
+                    | Src::XnackMaskHi
             );
-            if !ok { return Err(format!("{} is not a writable 32-bit scalar destination", s.fmt(1))) }
+            if !ok {
+                return Err(format!(
+                    "{} is not a writable 32-bit scalar destination",
+                    s.fmt(1)
+                ));
+            }
             check_reg(s, 1)
         }
         DstClass::Nop => {
-            if s != Src::Vgpr(0) { return Err("v_nop has no destination (dst must be Vgpr(0))".into()) }
+            if s != Src::Vgpr(0) {
+                return Err("v_nop has no destination (dst must be Vgpr(0))".into());
+            }
             Ok(())
         }
     }
@@ -408,37 +714,74 @@ impl Vop3 {
     fn validate(&self, arch: Arch) -> Result<u16> {
         let op = self.op;
         let name = op.name();
-        let opcode = op.opcode(arch).ok_or_else(|| format!("{name}: no VOP3 encoding on {arch}"))?;
+        let opcode = op
+            .opcode(arch)
+            .ok_or_else(|| format!("{name}: no VOP3 encoding on {arch}"))?;
         let (wd, w0, w1, w2) = op.widths();
         let ws = [w0, w1, w2];
         let mods = op.mods();
 
         if op.is_vop3b() != self.sdst.is_some() {
-            return Err(if op.is_vop3b() { format!("{name}: VOP3B form requires an SDST operand") } else { format!("{name}: VOP3A form has no SDST operand") });
+            return Err(if op.is_vop3b() {
+                format!("{name}: VOP3B form requires an SDST operand")
+            } else {
+                format!("{name}: VOP3A form has no SDST operand")
+            });
         }
         for (j, &w) in ws.iter().enumerate() {
             if (w > 0) != self.src[j].is_some() {
-                return Err(format!("{name}: src{j} must be {}", if w > 0 { "present" } else { "absent" }));
+                return Err(format!(
+                    "{name}: src{j} must be {}",
+                    if w > 0 { "present" } else { "absent" }
+                ));
             }
         }
         if self.neg > 7 || self.abs > 7 || self.omod > 3 || self.op_sel > 15 {
-            return Err(format!("{name}: modifier field out of range (neg {:#x}, abs {:#x}, omod {}, op_sel {:#x})", self.neg, self.abs, self.omod, self.op_sel));
+            return Err(format!(
+                "{name}: modifier field out of range (neg {:#x}, abs {:#x}, omod {}, op_sel {:#x})",
+                self.neg, self.abs, self.omod, self.op_sel
+            ));
         }
-        if self.neg & !mods.neg != 0 { return Err(format!("{name}: neg {:#05b} not supported (allowed {:#05b})", self.neg, mods.neg)) }
-        if self.abs & !mods.abs != 0 { return Err(format!("{name}: abs {:#05b} not supported (allowed {:#05b})", self.abs, mods.abs)) }
-        if self.clamp && !mods.clamp { return Err(format!("{name}: clamp not supported")) }
-        if self.omod != 0 && !mods.omod { return Err(format!("{name}: omod not supported")) }
-        if self.op_sel & !mods.op_sel != 0 { return Err(format!("{name}: op_sel {:#06b} not supported (allowed {:#06b})", self.op_sel, mods.op_sel)) }
+        if self.neg & !mods.neg != 0 {
+            return Err(format!(
+                "{name}: neg {:#05b} not supported (allowed {:#05b})",
+                self.neg, mods.neg
+            ));
+        }
+        if self.abs & !mods.abs != 0 {
+            return Err(format!(
+                "{name}: abs {:#05b} not supported (allowed {:#05b})",
+                self.abs, mods.abs
+            ));
+        }
+        if self.clamp && !mods.clamp {
+            return Err(format!("{name}: clamp not supported"));
+        }
+        if self.omod != 0 && !mods.omod {
+            return Err(format!("{name}: omod not supported"));
+        }
+        if self.op_sel & !mods.op_sel != 0 {
+            return Err(format!(
+                "{name}: op_sel {:#06b} not supported (allowed {:#06b})",
+                self.op_sel, mods.op_sel
+            ));
+        }
 
         check_dst(op.dst_class(), self.dst, wd).map_err(|e| format!("{name}: {e}"))?;
-        if let Some(s) = self.sdst { check_dst(DstClass::Pair, s, 2).map_err(|e| format!("{name}: sdst: {e}"))? }
+        if let Some(s) = self.sdst {
+            check_dst(DstClass::Pair, s, 2).map_err(|e| format!("{name}: sdst: {e}"))?
+        }
         let slots = op.slots();
         for j in 0..3 {
-            if let Some(s) = self.src[j] { check_slot(slots[j], s, ws[j]).map_err(|e| format!("{name}: src{j}: {e}"))? }
+            if let Some(s) = self.src[j] {
+                check_slot(slots[j], s, ws[j]).map_err(|e| format!("{name}: src{j}: {e}"))?
+            }
         }
         if matches!(op, Vop3Op::Only(Vop3OnlyOp::LshlAddU64)) {
             if let Some(Src::Int(i)) = self.src[1] {
-                if !(0..=4).contains(&i) { return Err(format!("{name}: shift count {i} is unsupported (0..=4)")) }
+                if !(0..=4).contains(&i) {
+                    return Err(format!("{name}: shift count {i} is unsupported (0..=4)"));
+                }
             }
         }
 
@@ -446,12 +789,18 @@ impl Vop3 {
         let mut bus: Vec<(u16, u8)> = Vec::with_capacity(4);
         for j in 0..3 {
             let Some(s) = self.src[j] else { continue };
-            if matches!(op, Vop3Op::Only(Vop3OnlyOp::WritelaneB32)) && j == 1 && s == Src::M0 { continue }
+            if matches!(op, Vop3Op::Only(Vop3OnlyOp::WritelaneB32)) && j == 1 && s == Src::M0 {
+                continue;
+            }
             if let Some(key) = bus_key(s, ws[j]) {
-                if !bus.contains(&key) { bus.push(key) }
+                if !bus.contains(&key) {
+                    bus.push(key)
+                }
             }
         }
-        if matches!(op, Vop3Op::Only(Vop3OnlyOp::DivFmasF32)) && !bus.contains(&(106, 2)) { bus.push((106, 2)) }
+        if matches!(op, Vop3Op::Only(Vop3OnlyOp::DivFmasF32)) && !bus.contains(&(106, 2)) {
+            bus.push((106, 2))
+        }
         if bus.len() > 1 {
             return Err(format!("{name}: violates the gfx9 constant-bus limit (one scalar source; implicit VCC counts)"));
         }
@@ -464,13 +813,18 @@ impl Vop3 {
             Src::Vgpr(n) => u32::from(n),
             s => u32::from(s.code()),
         };
-        let mut lo = (0b11_0100u32 << 26) | (u32::from(opcode) << 16) | vdst | (u32::from(self.clamp) << 15);
+        let mut lo =
+            (0b11_0100u32 << 26) | (u32::from(opcode) << 16) | vdst | (u32::from(self.clamp) << 15);
         lo |= match self.sdst {
             Some(s) => u32::from(s.code()) << 8,
             None => (u32::from(self.abs) << 8) | (u32::from(self.op_sel) << 11),
         };
         let field = |j: usize| self.src[j].map_or(0u32, |s| u32::from(s.code()));
-        let hi = field(0) | (field(1) << 9) | (field(2) << 18) | (u32::from(self.omod) << 27) | (u32::from(self.neg) << 29);
+        let hi = field(0)
+            | (field(1) << 9)
+            | (field(2) << 18)
+            | (u32::from(self.omod) << 27)
+            | (u32::from(self.neg) << 29);
         out.push(lo);
         out.push(hi);
         Ok(())
@@ -481,9 +835,12 @@ impl Vop3 {
             [lo, hi, ..] => (*lo, *hi),
             _ => return Err("VOP3 needs two dwords".to_string()),
         };
-        if lo >> 26 != 0b11_0100 { return Err(format!("{lo:#010x} is not a VOP3 first dword")) }
+        if lo >> 26 != 0b11_0100 {
+            return Err(format!("{lo:#010x} is not a VOP3 first dword"));
+        }
         let opcode = ((lo >> 16) & 0x3ff) as u16;
-        let op = Vop3Op::from_opcode(arch, opcode).ok_or_else(|| format!("no VOP3 instruction with opcode {opcode:#x} on {arch}"))?;
+        let op = Vop3Op::from_opcode(arch, opcode)
+            .ok_or_else(|| format!("no VOP3 instruction with opcode {opcode:#x} on {arch}"))?;
         let (_, w0, w1, w2) = op.widths();
         let vdst = lo & 0xff;
         let dst = match op.dst_class() {
@@ -501,10 +858,23 @@ impl Vop3 {
             if w > 0 {
                 src[j] = Some(Src::from_code(code as u16, None)?);
             } else if code != 0 {
-                return Err(format!("{}: unused src{j} field is {code:#x}, must be 0", op.name()));
+                return Err(format!(
+                    "{}: unused src{j} field is {code:#x}, must be 0",
+                    op.name()
+                ));
             }
         }
-        let inst = Vop3 { op, dst, sdst, src, abs, neg: (hi >> 29) as u8, clamp: (lo >> 15) & 1 != 0, omod: ((hi >> 27) & 0x3) as u8, op_sel };
+        let inst = Vop3 {
+            op,
+            dst,
+            sdst,
+            src,
+            abs,
+            neg: (hi >> 29) as u8,
+            clamp: (lo >> 15) & 1 != 0,
+            omod: ((hi >> 27) & 0x3) as u8,
+            op_sel,
+        };
         inst.validate(arch)?;
         Ok((inst, 2))
     }
@@ -519,15 +889,27 @@ impl Vop3 {
         let mut fp = Footprint::default();
         if wd > 0 {
             fp.write(self.dst, wd);
-            if self.op.reads_dst() { fp.read(self.dst, wd) }
+            if self.op.reads_dst() {
+                fp.read(self.dst, wd)
+            }
         }
-        if let Some(s) = self.sdst { fp.write(s, 2) }
+        if let Some(s) = self.sdst {
+            fp.write(s, 2)
+        }
         for (src, w) in self.src.iter().zip([w0, w1, w2]) {
-            if let Some(s) = *src { fp.read(s, w) }
+            if let Some(s) = *src {
+                fp.read(s, w)
+            }
         }
-        if self.op.reads_exec() { fp.read_file(RegFile::Exec, 0, 2) }
-        if self.op.writes_exec() { fp.write_file(RegFile::Exec, 0, 2) }
-        if matches!(self.op, Vop3Op::Only(Vop3OnlyOp::DivFmasF32)) { fp.read_file(RegFile::Vcc, 0, 2) }
+        if self.op.reads_exec() {
+            fp.read_file(RegFile::Exec, 0, 2)
+        }
+        if self.op.writes_exec() {
+            fp.write_file(RegFile::Exec, 0, 2)
+        }
+        if matches!(self.op, Vop3Op::Only(Vop3OnlyOp::DivFmasF32)) {
+            fp.read_file(RegFile::Vcc, 0, 2)
+        }
         fp
     }
 }
@@ -536,9 +918,21 @@ impl Vop3 {
 /// `-|v1|`, and `neg(1.0)` for a negated inline constant (`-` would read as
 /// part of the number). `1/(2*pi)` in a 64-bit slot prints as the f64.
 fn src_text(s: Src, w: u8, neg: bool, abs: bool) -> String {
-    let mut t = if w == 2 && s == Src::Float(InlineFloat::InvTwoPi) { "0.15915494309189532".to_string() } else { s.fmt(w) };
-    if abs { t = format!("|{t}|") }
-    if neg { t = if s.is_inline() && !abs { format!("neg({t})") } else { format!("-{t}") } }
+    let mut t = if w == 2 && s == Src::Float(InlineFloat::InvTwoPi) {
+        "0.15915494309189532".to_string()
+    } else {
+        s.fmt(w)
+    };
+    if abs {
+        t = format!("|{t}|")
+    }
+    if neg {
+        t = if s.is_inline() && !abs {
+            format!("neg({t})")
+        } else {
+            format!("-{t}")
+        }
+    }
     t
 }
 
@@ -547,20 +941,38 @@ impl fmt::Display for Vop3 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (wd, w0, w1, w2) = self.op.widths();
         let mut operands: Vec<String> = Vec::with_capacity(5);
-        if wd > 0 { operands.push(self.dst.fmt(wd)) }
-        if let Some(s) = self.sdst { operands.push(s.fmt(2)) }
+        if wd > 0 {
+            operands.push(self.dst.fmt(wd))
+        }
+        if let Some(s) = self.sdst {
+            operands.push(s.fmt(2))
+        }
         for (j, w) in [w0, w1, w2].into_iter().enumerate() {
             if let Some(s) = self.src[j] {
-                operands.push(src_text(s, w, (self.neg >> j) & 1 != 0, (self.abs >> j) & 1 != 0));
+                operands.push(src_text(
+                    s,
+                    w,
+                    (self.neg >> j) & 1 != 0,
+                    (self.abs >> j) & 1 != 0,
+                ));
             }
         }
         write!(f, "{}{}", self.op.name(), self.op.suffix())?;
-        if !operands.is_empty() { write!(f, " {}", operands.join(", "))? }
+        if !operands.is_empty() {
+            write!(f, " {}", operands.join(", "))?
+        }
         if self.op_sel != 0 {
-            let bits: Vec<String> = self.op.op_sel_bits().iter().map(|&b| ((self.op_sel >> b) & 1).to_string()).collect();
+            let bits: Vec<String> = self
+                .op
+                .op_sel_bits()
+                .iter()
+                .map(|&b| ((self.op_sel >> b) & 1).to_string())
+                .collect();
             write!(f, " op_sel:[{}]", bits.join(","))?;
         }
-        if self.clamp { f.write_str(" clamp")? }
+        if self.clamp {
+            f.write_str(" clamp")?
+        }
         match self.omod {
             1 => f.write_str(" mul:2")?,
             2 => f.write_str(" mul:4")?,

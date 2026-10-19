@@ -116,7 +116,10 @@ pub const EP_TILE_MASK_GFX1100_MODULE: &str = "ep_tile_mask_pm_gfx1100";
 const MQ_I4_MOE_GEMV_C1_MODULE: &str = "mq_i4_moe_gemv_c1_pm_gfx1151";
 
 /// K1-C1 symbols: `[kind]`, 0 = gate/up (R256), 1 = down (R128). Each serves both codecs.
-pub const MQ_I4_MOE_GEMV_C1_SYMBOLS: [&str; 2] = ["mq_i4_moe_gemv_c1_r256_gate_up", "mq_i4_moe_gemv_c1_r128_down"];
+pub const MQ_I4_MOE_GEMV_C1_SYMBOLS: [&str; 2] = [
+    "mq_i4_moe_gemv_c1_r256_gate_up",
+    "mq_i4_moe_gemv_c1_r128_down",
+];
 /// Bytes of the K1-C1 kernarg blob (frozen ABI: `n_experts@72`, zero `reserved@76`).
 pub const MQ_I4_MOE_GEMV_C1_KERNARG_BYTES: usize = 80;
 /// Explicit arguments supplied through HIP's kernelParams launch path for K1-C1:
@@ -140,8 +143,14 @@ const MQ_I4_MOE_GEMV_CN_MODULE: &str = "mq_i4_moe_gemv_cn_pm_gfx1151";
 /// K1-Cn symbols in the K1 bucket order, `[bucket][kind]`: bucket 0 = W3 (`mq3i4`), 1 = MQ4
 /// (`mq4sym`), kind 0 = gate/up (R256), 1 = down (R128). Same kernarg ABI as the K1 symbols.
 pub const MQ_I4_MOE_GEMV_CN_SYMBOLS: [[&str; 2]; 2] = [
-    ["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up", "mq_i4_moe_gemv_cn_mq3i4_r128_down"],
-    ["mq_i4_moe_gemv_cn_mq4sym_r256_gate_up", "mq_i4_moe_gemv_cn_mq4sym_r128_down"],
+    [
+        "mq_i4_moe_gemv_cn_mq3i4_r256_gate_up",
+        "mq_i4_moe_gemv_cn_mq3i4_r128_down",
+    ],
+    [
+        "mq_i4_moe_gemv_cn_mq4sym_r256_gate_up",
+        "mq_i4_moe_gemv_cn_mq4sym_r128_down",
+    ],
 ];
 /// Output rows per K1-Cn workgroup (one wave32 each).
 pub const MQ_I4_MOE_GEMV_CN_ROWS_PER_WG: usize = 8;
@@ -182,7 +191,14 @@ pub struct SlabK1Pick {
 /// rows over `slots` union slots. K1: the bucket's entry `k1`, grid `[m, slots, 1]`, block
 /// `[32, 1, 1]`; Cn (gfx1151 MQ4/W3 layers; `k1` unused): grid `[m / 8, slots, 1]`, block
 /// `[256, 1, 1]`.
-pub fn slab_k1_pick(k1: &SlabK1, module: SlabK1Module, bucket: usize, down: bool, m: usize, slots: usize) -> SlabK1Pick {
+pub fn slab_k1_pick(
+    k1: &SlabK1,
+    module: SlabK1Module,
+    bucket: usize,
+    down: bool,
+    m: usize,
+    slots: usize,
+) -> SlabK1Pick {
     match module {
         SlabK1Module::K1 => SlabK1Pick {
             module_key: k1.module,
@@ -218,10 +234,19 @@ pub const fn slab_c1_launch(down: bool) -> SlabC1Launch {
     let (m, k, x_row_div, y_slot_stride) = if down {
         (SLAB_DOWN_M, SLAB_DOWN_K, 1, SLAB_DOWN_M)
     } else {
-        (SLAB_GATE_UP_M, SLAB_GATE_UP_K, SLAB_TOP_K, SLAB_GATE_UP_M / 2)
+        (
+            SLAB_GATE_UP_M,
+            SLAB_GATE_UP_K,
+            SLAB_TOP_K,
+            SLAB_GATE_UP_M / 2,
+        )
     };
     SlabC1Launch {
-        grid: [(m / MQ_I4_MOE_GEMV_C1_ROWS_PER_WG) as u32, SLAB_TOP_K as u32, 1],
+        grid: [
+            (m / MQ_I4_MOE_GEMV_C1_ROWS_PER_WG) as u32,
+            SLAB_TOP_K as u32,
+            1,
+        ],
         block: [MQ_I4_MOE_GEMV_C1_BLOCK, 1, 1],
         m: m as u32,
         k: k as u32,
@@ -648,12 +673,20 @@ impl Gpu {
         }
         if self.slab_k1_c1() && k1_rows8_cold_codec(cold_codec) {
             for symbol in MQ_I4_MOE_GEMV_C1_SYMBOLS {
-                self.ensure_embedded_kernel(MQ_I4_MOE_GEMV_C1_MODULE, kernels::MQ_I4_MOE_GEMV_C1_PM_GFX1151, symbol)?;
+                self.ensure_embedded_kernel(
+                    MQ_I4_MOE_GEMV_C1_MODULE,
+                    kernels::MQ_I4_MOE_GEMV_C1_PM_GFX1151,
+                    symbol,
+                )?;
             }
         }
         if self.slab_k1_cn() && k1_rows8_cold_codec(cold_codec) {
             for symbol in MQ_I4_MOE_GEMV_CN_SYMBOLS.iter().flatten() {
-                self.ensure_embedded_kernel(MQ_I4_MOE_GEMV_CN_MODULE, kernels::MQ_I4_MOE_GEMV_CN_PM_GFX1151, symbol)?;
+                self.ensure_embedded_kernel(
+                    MQ_I4_MOE_GEMV_CN_MODULE,
+                    kernels::MQ_I4_MOE_GEMV_CN_PM_GFX1151,
+                    symbol,
+                )?;
             }
         }
         Ok(())
@@ -826,7 +859,17 @@ impl Gpu {
         lanes: usize,
         cold_codec: u8,
     ) -> HipResult<()> {
-        self.mq_i4_moe_gemv_slab_with(down, buckets, weight_ptrs, xrot, y0, y1, lanes, cold_codec, None)
+        self.mq_i4_moe_gemv_slab_with(
+            down,
+            buckets,
+            weight_ptrs,
+            xrot,
+            y0,
+            y1,
+            lanes,
+            cold_codec,
+            None,
+        )
     }
 
     /// [`Gpu::mq_i4_moe_gemv_slab`] with the K1 schedule optionally forced (`None` = the default
@@ -851,13 +894,23 @@ impl Gpu {
         let cold = self.slab_cold_opt("mq_i4_moe_gemv_slab", cold_codec)?;
         let gfx1151 = arch.arch == "gfx1151";
         let module = force.unwrap_or_else(|| {
-            slab_k1_default_module(gfx1151, lanes, self.slab_k1_cn() && k1_rows8_cold_codec(cold_codec))
+            slab_k1_default_module(
+                gfx1151,
+                lanes,
+                self.slab_k1_cn() && k1_rows8_cold_codec(cold_codec),
+            )
         });
         if module == SlabK1Module::Cn && !gfx1151 {
-            return Err(hip_bridge::HipError::new(0, "mq_i4_moe_gemv_slab: the K1-Cn kernels are gfx1151-only"));
+            return Err(hip_bridge::HipError::new(
+                0,
+                "mq_i4_moe_gemv_slab: the K1-Cn kernels are gfx1151-only",
+            ));
         }
         if module == SlabK1Module::Cn && lanes > SLAB_NARROW_MAX_LANES {
-            return Err(hip_bridge::HipError::new(0, "mq_i4_moe_gemv_slab: the K1-Cn kernels serve 1..=8 lanes"));
+            return Err(hip_bridge::HipError::new(
+                0,
+                "mq_i4_moe_gemv_slab: the K1-Cn kernels serve 1..=8 lanes",
+            ));
         }
         if module == SlabK1Module::Cn && !k1_rows8_cold_codec(cold_codec) {
             return Err(hip_bridge::HipError::new(
@@ -943,7 +996,8 @@ impl Gpu {
                 SlabK1Pick {
                     module_key: k1.module,
                     image: k1.image,
-                    symbol: MQ_I4_MOE_GEMV_WIDE_SYMBOLS[usize::from(lanes > 16)][bucket][down as usize],
+                    symbol: MQ_I4_MOE_GEMV_WIDE_SYMBOLS[usize::from(lanes > 16)][bucket]
+                        [down as usize],
                     grid: [(m as u32).div_ceil(8), s as u32, 1],
                     block: [256, 1, 1],
                 }
@@ -1005,8 +1059,9 @@ impl Gpu {
     /// Whether the slab decode uses the K1-C1 kernels at `lanes == 1`: exact gfx1151 and
     /// `HIPFIRE_QWEN4_SLAB_K1_C1` not `0` (default on). The environment is read once per process.
     pub fn slab_k1_c1(&self) -> bool {
-        static ENABLED: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_SLAB_K1_C1", true));
+        static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            hipfire_config::developer_bool("HIPFIRE_QWEN4_SLAB_K1_C1", true)
+        });
         self.arch == "gfx1151" && *ENABLED
     }
 
@@ -1014,8 +1069,9 @@ impl Gpu {
     /// exact gfx1151 and `HIPFIRE_QWEN4_SLAB_K1_CN` not `0` (default on). The environment is read
     /// once per process.
     pub fn slab_k1_cn(&self) -> bool {
-        static ENABLED: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_SLAB_K1_CN", true));
+        static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            hipfire_config::developer_bool("HIPFIRE_QWEN4_SLAB_K1_CN", true)
+        });
         self.arch == "gfx1151" && *ENABLED
     }
 
@@ -1044,7 +1100,10 @@ impl Gpu {
         if self.arch != "gfx1151" {
             return Err(hip_bridge::HipError::new(
                 0,
-                &format!("mq_i4_moe_gemv_slab_c1: the K1-C1 kernels are gfx1151-only, got {}", self.arch),
+                &format!(
+                    "mq_i4_moe_gemv_slab_c1: the K1-C1 kernels are gfx1151-only, got {}",
+                    self.arch
+                ),
             ));
         }
         if !k1_rows8_cold_codec(cold_codec) {
@@ -1068,7 +1127,10 @@ impl Gpu {
             || y0.buf.size() < slots * geo.y_slot_stride as usize * 4
             || y1.is_some_and(|y| y.buf.size() < slots * geo.y_slot_stride as usize * 4)
         {
-            return Err(hip_bridge::HipError::new(0, "mq_i4_moe_gemv_slab_c1: operand smaller than the launch extent"));
+            return Err(hip_bridge::HipError::new(
+                0,
+                "mq_i4_moe_gemv_slab_c1: operand smaller than the launch extent",
+            ));
         }
         let (codec_ptr, uniform) = match buckets {
             // K1 bucket 0 = W3 = codec 1, bucket 1 = MQ4 = codec 0.
@@ -1095,7 +1157,11 @@ impl Gpu {
         let nexp = SLAB_EXPERTS as u32;
         self.bind_thread()?;
         let func = MQ_I4_MOE_GEMV_C1_SYMBOLS[down as usize];
-        self.ensure_embedded_kernel(MQ_I4_MOE_GEMV_C1_MODULE, kernels::MQ_I4_MOE_GEMV_C1_PM_GFX1151, func)?;
+        self.ensure_embedded_kernel(
+            MQ_I4_MOE_GEMV_C1_MODULE,
+            kernels::MQ_I4_MOE_GEMV_C1_PM_GFX1151,
+            func,
+        )?;
         let wp = weight_ptrs.buf.as_ptr();
         let tp = topk.buf.as_ptr();
         let xp = xrot.buf.as_ptr();
@@ -1515,7 +1581,10 @@ mod tests {
             }
         }
         // W2 has no gfx1151 table row; the E8P row has its own test (`gfx1151_e8p_k1_table_*`).
-        assert!(slab_cold_kernels("gfx1151", 2).is_none() && slab_cold_k1_metadata("gfx1151", 2).is_none());
+        assert!(
+            slab_cold_kernels("gfx1151", 2).is_none()
+                && slab_cold_k1_metadata("gfx1151", 2).is_none()
+        );
     }
 
     /// The gfx1151 E8P K1 table row is the gfx1100 one under gfx1151 names (module, symbols,
@@ -1525,35 +1594,66 @@ mod tests {
         let e8p = slab_cold_k1_metadata("gfx1151", 3).unwrap();
         assert_eq!(e8p.cold_codec, 3);
         assert_eq!(e8p.k1.module, "e8p_i4_moe_gemv_pm_gfx1151");
-        assert_eq!(e8p.k1.module, crate::e8p_moe_decode::E8P_I4_MOE_GEMV_GFX1151_MODULE);
+        assert_eq!(
+            e8p.k1.module,
+            crate::e8p_moe_decode::E8P_I4_MOE_GEMV_GFX1151_MODULE
+        );
         assert_eq!(e8p.k1.image, kernels::E8P_I4_MOE_GEMV_PM_GFX1151);
         assert_eq!(
             e8p.k1.symbols,
-            ["e8p_i4_moe_gemv_r256_gate_up_pm_gfx1151", "e8p_i4_moe_gemv_r128_down_pm_gfx1151"]
+            [
+                "e8p_i4_moe_gemv_r256_gate_up_pm_gfx1151",
+                "e8p_i4_moe_gemv_r128_down_pm_gfx1151"
+            ]
         );
         // Symbol for symbol the gfx1100 names with only the arch spelling changed.
         for (halo, xtx) in e8p.k1.symbols.iter().zip(E8P_I4_MOE_GEMV_GFX1100_SYMBOLS) {
             assert_eq!(*halo, xtx.replace("gfx1100", "gfx1151"));
         }
-        assert_eq!(e8p.k1.module, E8P_I4_MOE_GEMV_GFX1100_MODULE.replace("gfx1100", "gfx1151"));
+        assert_eq!(
+            e8p.k1.module,
+            E8P_I4_MOE_GEMV_GFX1100_MODULE.replace("gfx1100", "gfx1151")
+        );
         let k = slab_arch_kernels("gfx1151").unwrap();
         assert_ne!(e8p.k1.module, k.mq4_k1.module);
         assert!(!std::ptr::eq(e8p.k1.image, k.mq4_k1.image));
-        assert!(!std::ptr::eq(e8p.k1.image, kernels::E8P_I4_MOE_GEMV_PM_GFX1100));
-        assert!(!std::ptr::eq(e8p.k1.image, kernels::E8P_I4_MOE_GEMV_PM_GFX1201));
+        assert!(!std::ptr::eq(
+            e8p.k1.image,
+            kernels::E8P_I4_MOE_GEMV_PM_GFX1100
+        ));
+        assert!(!std::ptr::eq(
+            e8p.k1.image,
+            kernels::E8P_I4_MOE_GEMV_PM_GFX1201
+        ));
         for symbol in e8p.k1.symbols {
-            assert!(contains_bytes(e8p.k1.image, format!("{symbol}.kd").as_bytes()), "{symbol}.kd missing");
+            assert!(
+                contains_bytes(e8p.k1.image, format!("{symbol}.kd").as_bytes()),
+                "{symbol}.kd missing"
+            );
             assert!(!symbol.contains("mq2i4") && !symbol.ends_with("_acc"));
             // Each symbol is its own contract: kernels/e8p_i4_moe_gemv.gfx1151.<kind>.contract.json.
-            let kind = if symbol.contains("r256_gate_up") { "r256_gate_up" } else { "r128_down" };
-            let contract = std::fs::read_to_string(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join(format!("../../kernels/e8p_i4_moe_gemv.gfx1151.{kind}.contract.json")),
-            )
-            .unwrap();
-            assert!(contract.contains(&format!("\"symbol\": \"{symbol}\"")), "{kind} contract symbol");
-            assert!(contract.contains("\"group_segment_fixed_bytes\": 1536"), "{kind} contract static LDS");
-            assert!(contract.contains("\"launch_dynamic_lds_bytes\": 0"), "{kind} contract dynamic LDS");
+            let kind = if symbol.contains("r256_gate_up") {
+                "r256_gate_up"
+            } else {
+                "r128_down"
+            };
+            let contract =
+                std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                    format!("../../kernels/e8p_i4_moe_gemv.gfx1151.{kind}.contract.json"),
+                ))
+                .unwrap();
+            assert!(
+                contract.contains(&format!("\"symbol\": \"{symbol}\"")),
+                "{kind} contract symbol"
+            );
+            assert!(
+                contract.contains("\"group_segment_fixed_bytes\": 1536"),
+                "{kind} contract static LDS"
+            );
+            assert!(
+                contract.contains("\"launch_dynamic_lds_bytes\": 0"),
+                "{kind} contract dynamic LDS"
+            );
         }
         assert!(!e8p.k1.module.contains("mq_i4") && !e8p.k1.module.contains("gfx1201"));
         assert!(!contains_bytes(e8p.k1.image, b"mq_i4_moe_gemv"));
@@ -1564,8 +1664,14 @@ mod tests {
             assert!(std::ptr::eq(slab_cold_kernels("gfx1151", 3).unwrap(), e8p));
         }
         // W2 stays refused and W3 keeps its own shared-image table.
-        assert!(slab_cold_kernels("gfx1151", 2).is_none() && slab_cold_k1_metadata("gfx1151", 2).is_none());
-        assert!(!std::ptr::eq(slab_cold_k1_metadata("gfx1151", 1).unwrap(), e8p));
+        assert!(
+            slab_cold_kernels("gfx1151", 2).is_none()
+                && slab_cold_k1_metadata("gfx1151", 2).is_none()
+        );
+        assert!(!std::ptr::eq(
+            slab_cold_k1_metadata("gfx1151", 1).unwrap(),
+            e8p
+        ));
     }
 
     /// The gfx1151 mask is beta's hipcc source (never reinterpreted as an image): its kernel is the
@@ -1857,7 +1963,13 @@ mod tests {
         }
         assert_eq!(
             available,
-            [("gfx1201", 1), ("gfx1201", 3), ("gfx1100", 3), ("gfx1151", 1), ("gfx1151", 3)]
+            [
+                ("gfx1201", 1),
+                ("gfx1201", 3),
+                ("gfx1100", 3),
+                ("gfx1151", 1),
+                ("gfx1151", 3)
+            ]
         );
         // Runtime selection = metadata AND the shared admission matrix (what
         // `Gpu::ensure_qwen4_slab_kernels` and `Gpu::mq_i4_moe_gemv_slab` consult): a tabled entry
@@ -1968,17 +2080,34 @@ mod tests {
         assert_eq!(
             MQ_I4_MOE_GEMV_CN_SYMBOLS,
             [
-                ["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up", "mq_i4_moe_gemv_cn_mq3i4_r128_down"],
-                ["mq_i4_moe_gemv_cn_mq4sym_r256_gate_up", "mq_i4_moe_gemv_cn_mq4sym_r128_down"],
+                [
+                    "mq_i4_moe_gemv_cn_mq3i4_r256_gate_up",
+                    "mq_i4_moe_gemv_cn_mq3i4_r128_down"
+                ],
+                [
+                    "mq_i4_moe_gemv_cn_mq4sym_r256_gate_up",
+                    "mq_i4_moe_gemv_cn_mq4sym_r128_down"
+                ],
             ]
         );
         for (bucket, codec) in ["mq3i4", "mq4sym"].into_iter().enumerate() {
-            assert_eq!(MQ_I4_MOE_GEMV_CN_SYMBOLS[bucket][0], format!("mq_i4_moe_gemv_cn_{codec}_r256_gate_up"));
-            assert_eq!(MQ_I4_MOE_GEMV_CN_SYMBOLS[bucket][1], format!("mq_i4_moe_gemv_cn_{codec}_r128_down"));
+            assert_eq!(
+                MQ_I4_MOE_GEMV_CN_SYMBOLS[bucket][0],
+                format!("mq_i4_moe_gemv_cn_{codec}_r256_gate_up")
+            );
+            assert_eq!(
+                MQ_I4_MOE_GEMV_CN_SYMBOLS[bucket][1],
+                format!("mq_i4_moe_gemv_cn_{codec}_r128_down")
+            );
         }
         for lanes in 1..=SLAB_NARROW_MAX_LANES {
             let slots = SLAB_TOP_K * lanes;
-            for (bucket, down, m) in [(0, false, SLAB_GATE_UP_M), (1, false, SLAB_GATE_UP_M), (0, true, SLAB_DOWN_M), (1, true, SLAB_DOWN_M)] {
+            for (bucket, down, m) in [
+                (0, false, SLAB_GATE_UP_M),
+                (1, false, SLAB_GATE_UP_M),
+                (0, true, SLAB_DOWN_M),
+                (1, true, SLAB_DOWN_M),
+            ] {
                 assert_eq!(m % MQ_I4_MOE_GEMV_CN_ROWS_PER_WG, 0);
                 let mq4 = &slab_arch_kernels("gfx1151").unwrap().mq4_k1;
                 let cn = slab_k1_pick(mq4, SlabK1Module::Cn, bucket, down, m, slots);
@@ -1993,7 +2122,11 @@ mod tests {
                         &slab_arch_kernels(arch).unwrap().mq4_k1
                     };
                     let k1 = slab_k1_pick(entry, SlabK1Module::K1, bucket, down, m, slots);
-                    assert_eq!((k1.module_key, k1.image.as_ptr()), (entry.module, entry.image.as_ptr()), "{arch}");
+                    assert_eq!(
+                        (k1.module_key, k1.image.as_ptr()),
+                        (entry.module, entry.image.as_ptr()),
+                        "{arch}"
+                    );
                     assert_eq!(k1.symbol, MQ_I4_MOE_GEMV_SYMBOLS[bucket][down as usize]);
                     assert_eq!(k1.grid, [m as u32, slots as u32, 1]);
                     assert_eq!(k1.block, [32, 1, 1]);
@@ -2002,7 +2135,10 @@ mod tests {
         }
         for lanes in 0..=9 {
             let cn_range = (2..=8).contains(&lanes);
-            assert_eq!(slab_k1_default_module(true, lanes, true) == SlabK1Module::Cn, cn_range);
+            assert_eq!(
+                slab_k1_default_module(true, lanes, true) == SlabK1Module::Cn,
+                cn_range
+            );
             assert_eq!(slab_k1_default_module(true, lanes, false), SlabK1Module::K1);
             assert_eq!(slab_k1_default_module(false, lanes, true), SlabK1Module::K1);
         }
@@ -2129,7 +2265,12 @@ mod tests {
             assert_eq!(find("n_experts"), Some((72, 4, "by_value")), "{symbol}");
             let last = metadata.args.last().expect("K1-C1 arguments");
             assert_eq!(
-                (last.name.as_str(), last.offset, last.size, last.value_kind.as_str()),
+                (
+                    last.name.as_str(),
+                    last.offset,
+                    last.size,
+                    last.value_kind.as_str()
+                ),
                 ("reserved", 76, 4, "by_value"),
                 "{symbol}"
             );
@@ -2161,12 +2302,25 @@ mod tests {
         for (down, n_experts) in [(false, 512u32), (true, 1234)] {
             let geo = slab_c1_launch(down);
             let ptr = |n: usize| (0x1000 * n) as *mut c_void;
-            let blob = slab_c1_kernarg(ptr(1), ptr(2), ptr(3), ptr(4), ptr(5), ptr(6), -1, n_experts, &geo);
+            let blob = slab_c1_kernarg(
+                ptr(1),
+                ptr(2),
+                ptr(3),
+                ptr(4),
+                ptr(5),
+                ptr(6),
+                -1,
+                n_experts,
+                &geo,
+            );
             let bytes = blob.as_bytes();
             assert_eq!(bytes.len(), MQ_I4_MOE_GEMV_C1_KERNARG_BYTES);
             for n in 1..=6usize {
                 let off = 8 * (n - 1);
-                assert_eq!(u64::from_ne_bytes(bytes[off..off + 8].try_into().unwrap()), (0x1000 * n) as u64);
+                assert_eq!(
+                    u64::from_ne_bytes(bytes[off..off + 8].try_into().unwrap()),
+                    (0x1000 * n) as u64
+                );
             }
             let word = |off: usize| u32::from_ne_bytes(bytes[off..off + 4].try_into().unwrap());
             assert_eq!(word(48), geo.m);

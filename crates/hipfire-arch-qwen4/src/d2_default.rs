@@ -144,8 +144,8 @@ use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
 use hipfire_config::memory::OffloadExec;
-use hipfire_dispatch::cpu_exec::{moe_cpu_host_slot_outputs, reserve_moe_cpu_host_slot_scratch};
 use hipfire_dispatch::cpu_exec::CpuMoeExpert;
+use hipfire_dispatch::cpu_exec::{moe_cpu_host_slot_outputs, reserve_moe_cpu_host_slot_scratch};
 use rdna_compute::{DType, Gpu};
 
 use crate::config::Qwen4Config;
@@ -407,8 +407,8 @@ impl DecodeMeasurement {
         let link = SampleStats::of(&self.link_ns).ok_or(Unusable::InvalidSample)?;
         let floor = SampleStats::of(&self.launch_floor_ns).ok_or(Unusable::InvalidSample)?;
         let pcie = |link_ns: u64, floor_ns: u64| -> Option<u64> {
-            let transfer = u128::from(layer_bytes) * u128::from(link_ns)
-                / u128::from(self.link_sample_bytes);
+            let transfer =
+                u128::from(layer_bytes) * u128::from(link_ns) / u128::from(self.link_sample_bytes);
             u64::try_from(transfer).ok()?.checked_add(floor_ns)
         };
         let d2 = |arm_ns: u64| arm_ns.checked_add(CURRENT_COPY_TRANSPORT_HANDOFF_NS);
@@ -762,7 +762,9 @@ pub fn sample_cpu_arm(
     n_experts: usize,
     experts: &[ProbeExpert<'_>],
 ) -> Result<([u64; PROBE_SAMPLES], [u64; PROBE_SAMPLES]), Unusable> {
-    if top_k == 0 || top_k > n_experts || experts.len() != (PROBE_WARM_BATCHES + PROBE_SAMPLES) * top_k
+    if top_k == 0
+        || top_k > n_experts
+        || experts.len() != (PROBE_WARM_BATCHES + PROBE_SAMPLES) * top_k
     {
         return Err(Unusable::Arm);
     }
@@ -1232,11 +1234,11 @@ mod tests {
         let arm = arm_ns(66.9);
         let link = link_ns(7.1);
         for by in [
-            [1.0, 1.0, 1.0, 1.0, 3.0],  // one outlier
-            [3.0; PROBE_SAMPLES],       // sustained contention
-            [5.0; PROBE_SAMPLES],       // heavy sustained contention
-            [1.0, 1.5, 3.0, 4.0, 2.5],  // scattered
-            [0.5, 0.7, 1.0, 1.2, 4.5],  // spread 9x, slowest still clears
+            [1.0, 1.0, 1.0, 1.0, 3.0], // one outlier
+            [3.0; PROBE_SAMPLES],      // sustained contention
+            [5.0; PROBE_SAMPLES],      // heavy sustained contention
+            [1.0, 1.5, 3.0, 4.0, 2.5], // scattered
+            [0.5, 0.7, 1.0, 1.2, 4.5], // spread 9x, slowest still clears
         ] {
             let measurement = sampled(scaled([arm; PROBE_SAMPLES], by), [link; PROBE_SAMPLES]);
             let costs = measurement.costs().expect("a spread is not an error");
@@ -1265,7 +1267,10 @@ mod tests {
     fn ambiguous_or_past_the_margin_noise_stays_on_pcie() {
         let arm = arm_ns(66.9);
         let link = link_ns(7.1);
-        let heavy = sampled(scaled([arm; PROBE_SAMPLES], [7.0; PROBE_SAMPLES]), [link; PROBE_SAMPLES]);
+        let heavy = sampled(
+            scaled([arm; PROBE_SAMPLES], [7.0; PROBE_SAMPLES]),
+            [link; PROBE_SAMPLES],
+        );
         assert!(!heavy.costs().unwrap().favors_d2());
         assert!(!arms(heavy));
         let ambiguous = sampled(
@@ -1310,19 +1315,21 @@ mod tests {
             let wire = link_ns(link);
             for by in [
                 [1.0; PROBE_SAMPLES],
-                [1.0, 1.0, 1.0, 1.0, 4.0],      // one slow outlier
-                [0.25, 1.0, 1.0, 1.0, 1.0],     // one fast outlier
-                [0.5; PROBE_SAMPLES],           // sustained, disturbed FAST arm
-                [2.0; PROBE_SAMPLES],           // sustained contention
-                [0.4, 0.8, 1.5, 3.0, 2.0],      // scattered
+                [1.0, 1.0, 1.0, 1.0, 4.0],  // one slow outlier
+                [0.25, 1.0, 1.0, 1.0, 1.0], // one fast outlier
+                [0.5; PROBE_SAMPLES],       // sustained, disturbed FAST arm
+                [2.0; PROBE_SAMPLES],       // sustained contention
+                [0.4, 0.8, 1.5, 3.0, 2.0],  // scattered
             ] {
                 for link_by in [
                     [1.0; PROBE_SAMPLES],
                     [0.9, 1.0, 1.1, 1.0, 1.0],
                     [1.0, 1.0, 1.0, 1.0, 1.8],
                 ] {
-                    let measurement =
-                        sampled(scaled([arm; PROBE_SAMPLES], by), scaled([wire; PROBE_SAMPLES], link_by));
+                    let measurement = sampled(
+                        scaled([arm; PROBE_SAMPLES], by),
+                        scaled([wire; PROBE_SAMPLES], link_by),
+                    );
                     assert!(
                         !measurement.costs().unwrap().favors_d2(),
                         "cpu {cpu} link {link} {by:?} {link_by:?}"
@@ -1465,7 +1472,10 @@ mod tests {
     fn calibration_verdict_never_claims_an_actual_decision() {
         let (status, text) = calibration_verdict(false);
         assert_eq!(status, "load");
-        assert!(text.contains("calibration rates alone cannot enable it"), "{text}");
+        assert!(
+            text.contains("calibration rates alone cannot enable it"),
+            "{text}"
+        );
         assert!(!text.starts_with("ON"));
         let (status, text) = calibration_verdict(true);
         assert_eq!(status, "off");
@@ -1628,7 +1638,11 @@ mod tests {
         let mut unique = picked.clone();
         unique.sort_unstable();
         unique.dedup();
-        assert_eq!(unique.len(), picked.len(), "every pick is a distinct expert");
+        assert_eq!(
+            unique.len(),
+            picked.len(),
+            "every pick is a distinct expert"
+        );
         // 3 layers x 4 experts minus layer 1's two odd ones = 10 cold.
         assert_eq!(round_robin_pick(3, 4, cold, 10).unwrap().len(), 10);
         assert_eq!(round_robin_pick(3, 4, cold, 11), Err(10));

@@ -222,7 +222,15 @@ fn run_tp2_demo(a: Tp2RunArgs) {
         chat.extend_from_slice(&nl);
         prompt_tokens = chat;
     }
-    eprintln!("prompt tokens ({}): {}", prompt_tokens.len(), if prompt_tokens.len() < 64 { format!("{prompt_tokens:?}") } else { format!("[{} tokens]", prompt_tokens.len()) });
+    eprintln!(
+        "prompt tokens ({}): {}",
+        prompt_tokens.len(),
+        if prompt_tokens.len() < 64 {
+            format!("{prompt_tokens:?}")
+        } else {
+            format!("[{} tokens]", prompt_tokens.len())
+        }
+    );
     // ── Mesh draft owner ──
     let mut spec = load_dflash_speculator_dense_tp2(
         &a.draft_path,
@@ -275,7 +283,10 @@ fn run_tp2_demo(a: Tp2RunArgs) {
     let mut stats = SpecStats::new(16);
     let mut ttft_ms: Option<f64> = None;
     let mut accepts: Vec<usize> = Vec::new();
-    eprintln!("decoding (max {} tokens, tp=2 mesh block_size 16)...", a.max_tokens);
+    eprintln!(
+        "decoding (max {} tokens, tp=2 mesh block_size 16)...",
+        a.max_tokens
+    );
     let t_decode = Instant::now();
     while emitted.len() < a.max_tokens {
         if position >= a.ctx_capacity {
@@ -322,7 +333,12 @@ fn run_tp2_demo(a: Tp2RunArgs) {
         }
         position += step.accepted + 1;
         seed_token = step.bonus_token;
-        if step.committed.iter().skip(1).any(|&t| tokenizer.is_terminator(t)) {
+        if step
+            .committed
+            .iter()
+            .skip(1)
+            .any(|&t| tokenizer.is_terminator(t))
+        {
             eprintln!("eos");
             break;
         }
@@ -334,7 +350,10 @@ fn run_tp2_demo(a: Tp2RunArgs) {
     eprintln!("--- OUTPUT ---");
     println!("{text}");
     eprintln!("--------------");
-    eprintln!("emitted: {} tokens in {elapsed:.2}s  ({tok_s:.2} tok/s)", emitted.len());
+    eprintln!(
+        "emitted: {} tokens in {elapsed:.2}s  ({tok_s:.2} tok/s)",
+        emitted.len()
+    );
     eprintln!(
         "cycles: {}  committed: {}  accepted: {}  τ={:.3}  mean_committed={:.3}",
         stats.cycles,
@@ -348,8 +367,7 @@ fn run_tp2_demo(a: Tp2RunArgs) {
     } else {
         0.0
     };
-    let (vram_free_bytes, vram_total_bytes) =
-        gpus.devices[0].hip.get_vram_info().unwrap_or((0, 0));
+    let (vram_free_bytes, vram_total_bytes) = gpus.devices[0].hip.get_vram_info().unwrap_or((0, 0));
     let vram_used_mb =
         ((vram_total_bytes.saturating_sub(vram_free_bytes)) as f64 / (1024.0 * 1024.0)) as u64;
     let vram_total_mb = (vram_total_bytes as f64 / (1024.0 * 1024.0)) as u64;
@@ -1810,7 +1828,8 @@ fn main() {
         draft_cfg.block_size = b;
         eprintln!("block_size override: {orig} -> {b} (checkpoint declares {orig})");
     } else {
-        let runtime_b = draft_cfg.runtime_block_size(hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED);
+        let runtime_b =
+            draft_cfg.runtime_block_size(hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED);
         if runtime_b != draft_cfg.block_size {
             eprintln!(
                 "DFlash2 runtime block: {} -> {} (selector/conv path is length-generic)",

@@ -781,14 +781,39 @@ impl NpuForward {
                     Ok(n) if n > 0 => Some(n),
                     _ => { eprintln!("npu-trunk: HIPFIRE_QWEN4_NPU_TRUNK_FAULT_CHAIN={v:?} ignored (expects a chain number >= 1)"); None }
                 });
-                Some(NpuTrunkRuntime::open_with_builder(programs, resident, trunk::TRUNK_BANKS, trunk::TRUNK_ROWS_MAX, &pci, OpenOptions { fault_chain, ..OpenOptions::default() }, Some(builder)).map_err(fail)?)
-            } else { None };
-            let arenas = runtime.as_ref().map(|rt| -> Result<_, Qwen4GpuForwardError> {
-                Ok([
-                    [registered_c_view(rt, 0, Shape::GdnIn, families)?, registered_c_view(rt, 0, Shape::QsaIn, families)?],
-                    [registered_c_view(rt, 1, Shape::GdnIn, families)?, registered_c_view(rt, 1, Shape::QsaIn, families)?],
-                ])
-            }).transpose()?;
+                Some(
+                    NpuTrunkRuntime::open_with_builder(
+                        programs,
+                        resident,
+                        trunk::TRUNK_BANKS,
+                        trunk::TRUNK_ROWS_MAX,
+                        &pci,
+                        OpenOptions {
+                            fault_chain,
+                            ..OpenOptions::default()
+                        },
+                        Some(builder),
+                    )
+                    .map_err(fail)?,
+                )
+            } else {
+                None
+            };
+            let arenas = runtime
+                .as_ref()
+                .map(|rt| -> Result<_, Qwen4GpuForwardError> {
+                    Ok([
+                        [
+                            registered_c_view(rt, 0, Shape::GdnIn, families)?,
+                            registered_c_view(rt, 0, Shape::QsaIn, families)?,
+                        ],
+                        [
+                            registered_c_view(rt, 1, Shape::GdnIn, families)?,
+                            registered_c_view(rt, 1, Shape::QsaIn, families)?,
+                        ],
+                    ])
+                })
+                .transpose()?;
             // `emulate` runs the same pair executor as `on` (twin projection
             // instead of pack + kick), so it needs bank B too; its in-projection
             // outputs land in scratch, so bank B keeps private copies of them.
@@ -830,14 +855,46 @@ impl NpuForward {
                 );
             }
             eprintln!("npu-trunk: mode={mode} families={:#x} contract=bf16_direct trunk_route={trunk_route} zab_source={zab_source} pack_ms={pack_ms:.3} download_ms={download_ms:.3} resident_bytes={resident_bytes} npu_panels_bytes={npu_panels_bytes} gpu_twin_bytes={gpu_twin_bytes} bank_b_bytes={bank_b_bytes} runtime={} raw=DtoH(no-retained-host-copy)", families.bits(), if runtime.is_some() { "open" } else { "not-opened" });
-            let rates = (mode == NpuTrunkMode::Auto && runtime.is_some())
-                .then(|| trunk::RateEstimator::new(calibration.as_ref().expect("auto calibration").clone()));
-            let sampling = if rates.is_some() { Some(PairSampling::new(gpu, layers.len())?) } else { None };
-            let request_families = intersect_families(family_override.unwrap_or(families), families);
-            Ok(Some(Self { mode, families, request_families, family_override, rates, sampling, request_epoch: 0, request_gpu: false, guard_tripped: false,
-                sample_log, request_cal: None,
-                layers, emulation, scales: [d0,d1], bank_b, runtime, arenas, trace,host_tokens,host_ple,pair_logged:false,
-                calibration, n_star_cache: None, request_plan: None, request_origin: 0, adaptive: Vec::new(), latch: trunk::containment::FaultLatch::default(), gpu_pci }))
+            let rates = (mode == NpuTrunkMode::Auto && runtime.is_some()).then(|| {
+                trunk::RateEstimator::new(calibration.as_ref().expect("auto calibration").clone())
+            });
+            let sampling = if rates.is_some() {
+                Some(PairSampling::new(gpu, layers.len())?)
+            } else {
+                None
+            };
+            let request_families =
+                intersect_families(family_override.unwrap_or(families), families);
+            Ok(Some(Self {
+                mode,
+                families,
+                request_families,
+                family_override,
+                rates,
+                sampling,
+                request_epoch: 0,
+                request_gpu: false,
+                guard_tripped: false,
+                sample_log,
+                request_cal: None,
+                layers,
+                emulation,
+                scales: [d0, d1],
+                bank_b,
+                runtime,
+                arenas,
+                trace,
+                host_tokens,
+                host_ple,
+                pair_logged: false,
+                calibration,
+                n_star_cache: None,
+                request_plan: None,
+                request_origin: 0,
+                adaptive: Vec::new(),
+                latch: trunk::containment::FaultLatch::default(),
+                gpu_pci,
+            }))
         })();
         if result.is_err() {
             for tensor in allocations {
@@ -848,9 +905,13 @@ impl NpuForward {
     }
     /// Pairs run layer-major through the pair executor: `on`/`auto` on the NPU,
     /// `emulate` with the GPU twin projection in its place.
-    pub(super) fn pipelined(&self) -> bool { self.bank_b.is_some() }
+    pub(super) fn pipelined(&self) -> bool {
+        self.bank_b.is_some()
+    }
     /// GPU-only scheduling: either the process fault latch is set or this request is diagnostic GPU-only.
-    pub(super) fn route_off(&self) -> bool { self.latch.tripped() || self.request_gpu }
+    pub(super) fn route_off(&self) -> bool {
+        self.latch.tripped() || self.request_gpu
+    }
     /// Whether the request in flight faulted; clears the per-request flag.
     pub(super) fn take_request_fault(&mut self) -> bool {
         self.latch.take_request_fault()
@@ -879,7 +940,9 @@ impl NpuForward {
         self.pair_logged = false;
         self.request_plan = None;
         self.latch.begin_request();
-        if self.latch.tripped() { return Ok(()); }
+        if self.latch.tripped() {
+            return Ok(());
+        }
         self.poll(gpu)?;
         self.request_epoch = self.request_epoch.wrapping_add(1);
         self.guard_tripped = false;
@@ -887,7 +950,12 @@ impl NpuForward {
     }
     /// With a matched calibration every mode (`auto`, `on`, `emulate`) executes the planner's pairs, including the
     /// rebalanced last pair; `auto` logs the plan. Without one the forced modes keep the natural 8192 + B pairing.
-    pub(super) fn plan_request(&mut self, gpu: &Gpu, rows: usize, position: usize) -> Result<(), Qwen4GpuForwardError> {
+    pub(super) fn plan_request(
+        &mut self,
+        gpu: &Gpu,
+        rows: usize,
+        position: usize,
+    ) -> Result<(), Qwen4GpuForwardError> {
         if self.request_gpu {
             if !self.pair_logged {
                 eprintln!("npu-trunk: rows={rows} route=gpu (diagnostic)");
@@ -895,7 +963,9 @@ impl NpuForward {
             }
             return Ok(());
         }
-        if self.latch.tripped() { return Ok(()); }
+        if self.latch.tripped() {
+            return Ok(());
+        }
         self.poll(gpu)?;
         if self.request_plan.is_some() {
             return Ok(());
@@ -962,8 +1032,15 @@ impl NpuForward {
     /// split, or (forced modes without a matched calibration) the natural
     /// 8192 + B. `None` without a bank-B scratch (an `emulate` load that cannot
     /// hold one runs every chunk native).
-    pub(super) fn selected_pair(&self, position: usize, remaining: usize, chunk: usize) -> Option<[usize; 2]> {
-        if self.route_off() { return None; }
+    pub(super) fn selected_pair(
+        &self,
+        position: usize,
+        remaining: usize,
+        chunk: usize,
+    ) -> Option<[usize; 2]> {
+        if self.route_off() {
+            return None;
+        }
         self.bank_b.as_ref()?;
         if self.guard_tripped || self.request_families.is_empty() {
             return None;
@@ -1534,7 +1611,11 @@ impl NpuForward {
                     model.npu_ms, model.window_ms, snapshot.generation, snapshot.gpu_scale, snapshot.npu_scale,
                     if snapshot.frozen { " frozen" } else { "" });
             }
-            if pending.epoch == self.request_epoch && !self.request_gpu && !self.guard_tripped && stalls_ms > savings {
+            if pending.epoch == self.request_epoch
+                && !self.request_gpu
+                && !self.guard_tripped
+                && stalls_ms > savings
+            {
                 self.guard_tripped = true;
                 eprintln!("npu-trunk: guard: pair at row {}: the GPU waited {stalls_ms:.0} ms on the NPU, more than the {savings:.0} ms pairing saves it (pair {span_ms:.0} ms; gpu_x{:.3} npu_x{:.3}); the rest of this request runs GPU-only",
                     pending.position, snapshot.gpu_scale, snapshot.npu_scale);

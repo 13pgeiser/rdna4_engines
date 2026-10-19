@@ -203,11 +203,7 @@ impl NgramModPool {
             }
             out.push(tok);
 
-            let old = if k < n {
-                context[base + k]
-            } else {
-                out[k - n]
-            };
+            let old = if k < n { context[base + k] } else { out[k - n] };
             hash = roll_hash(hash, old, tok, self.mul_pow);
         }
 
@@ -352,7 +348,9 @@ impl MtpNgramContext {
             return None;
         }
         self.sync_emitted(emitted);
-        if self.pool.draft_into(&self.history, caller_max, &mut self.candidate)
+        if self
+            .pool
+            .draft_into(&self.history, caller_max, &mut self.candidate)
             && !self.candidate.is_empty()
         {
             Some(&self.candidate)
@@ -902,15 +900,7 @@ mod tests {
             let cfg = small_cfg(1 << 20, 2, n_min, 4);
             let mut pool = NgramModPool::new(cfg).unwrap();
             pool.insert_range(&ctx_tokens, 0);
-            let contexts: [&[u32]; 7] = [
-                &[1, 2],
-                &[3, 4],
-                &[5, 6],
-                &[7, 8],
-                &[9, 9],
-                &[1],
-                &[],
-            ];
+            let contexts: [&[u32]; 7] = [&[1, 2], &[3, 4], &[5, 6], &[7, 8], &[9, 9], &[1], &[]];
             for context in contexts {
                 for caller_max in 0..=6usize {
                     let expected = pool.draft(context, caller_max);
@@ -1020,7 +1010,7 @@ mod tests {
         ctx.sync_emitted(&[4]);
         assert_eq!(ctx.history(), &[1, 2, 3, 4]);
         assert_eq!(ctx.pool.occupied(), 2); // + (2,3)->4
-        // Re-syncing the same emitted stream (seed included once) is idempotent.
+                                            // Re-syncing the same emitted stream (seed included once) is idempotent.
         ctx.sync_emitted(&[4]);
         ctx.sync_emitted(&[4]);
         assert_eq!(ctx.history(), &[1, 2, 3, 4]);
@@ -1073,10 +1063,7 @@ mod tests {
 
         ctx.begin_request(&prompt_a);
         assert_eq!(ctx.pool.occupied(), prompt_a.len() - 2);
-        assert_eq!(
-            ctx.propose(&[1, 2], 4).expect("A copies A"),
-            &[3, 4, 5, 6]
-        );
+        assert_eq!(ctx.propose(&[1, 2], 4).expect("A copies A"), &[3, 4, 5, 6]);
 
         ctx.reset_request();
         ctx.begin_request(&prompt_b);
@@ -1095,10 +1082,7 @@ mod tests {
         ctx.begin_request(&prompt_a);
         assert_eq!(ctx.pool.occupied(), prompt_a.len() - 2);
         assert_eq!(ctx.history(), prompt_a.as_slice());
-        assert_eq!(
-            ctx.propose(&[1, 2], 4).expect("A again"),
-            &[3, 4, 5, 6]
-        );
+        assert_eq!(ctx.propose(&[1, 2], 4).expect("A again"), &[3, 4, 5, 6]);
         ctx.begin_request(&prompt_b);
         assert_eq!(ctx.pool.occupied(), prompt_b.len() - 2);
         assert!(ctx.propose(&[1, 2], 4).is_none());

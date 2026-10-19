@@ -203,7 +203,11 @@ fn host_x(k: usize, rng: &mut Rng) -> Vec<f32> {
                 3 => {
                     // Alternating signs of nearly equal magnitude: heavy cancellation.
                     let m = 0.75 + 0.015625 * (rng.unit() - 0.5);
-                    if j % 2 == 0 { m } else { -m }
+                    if j % 2 == 0 {
+                        m
+                    } else {
+                        -m
+                    }
                 }
                 5 => match j % 3 {
                     0 => 0.0,
@@ -225,8 +229,19 @@ fn upload_x(gpu: &mut Gpu, k: usize, rng: &mut Rng) -> GpuTensor {
 }
 
 /// The AR singleton on every activation row of `x` into its own buffer.
-fn singleton_reference(gpu: &mut Gpu, w: &GpuTensor, x: &GpuTensor, m: usize, k: usize) -> Vec<u32> {
-    let y = gpu.upload_f32(&vec![f32::from_bits(NAN_BITS); MAX_ROWS * m], &[MAX_ROWS * m]).expect("alloc ref");
+fn singleton_reference(
+    gpu: &mut Gpu,
+    w: &GpuTensor,
+    x: &GpuTensor,
+    m: usize,
+    k: usize,
+) -> Vec<u32> {
+    let y = gpu
+        .upload_f32(
+            &vec![f32::from_bits(NAN_BITS); MAX_ROWS * m],
+            &[MAX_ROWS * m],
+        )
+        .expect("alloc ref");
     for r in 0..MAX_ROWS {
         gpu.gemv_mq4g256v2(w, &x.sub_offset(r * k, k), &y.sub_offset(r * m, m), m, k)
             .expect("singleton gemv_mq4g256v2");
@@ -242,16 +257,28 @@ fn singleton_reference(gpu: &mut Gpu, w: &GpuTensor, x: &GpuTensor, m: usize, k:
 
 fn make_mat(gpu: &mut Gpu, name: String, m: usize, k: usize, x: &GpuTensor, rng: &mut Rng) -> Mat {
     let bytes = pack_random_mq4g256v2(m, k, rng);
-    let w = gpu.upload_raw(&bytes, &[bytes.len()]).expect("upload weights");
+    let w = gpu
+        .upload_raw(&bytes, &[bytes.len()])
+        .expect("upload weights");
     let reference = singleton_reference(gpu, &w, x, m, k);
-    Mat { name, m, k, w, reference }
+    Mat {
+        name,
+        m,
+        k,
+        w,
+        reference,
+    }
 }
 
 /// `[GUARD NaN][expected][GUARD NaN]` split into (even-column, odd-column,
 /// guard) mismatching word counts. Column = index % m (matrix-local).
 fn tally(got: &[u32], want: &[u32], m: usize) -> (usize, usize, usize) {
     assert_eq!(got.len(), want.len() + 2 * GUARD);
-    let guard = got[..GUARD].iter().chain(&got[got.len() - GUARD..]).filter(|&&b| b != NAN_BITS).count();
+    let guard = got[..GUARD]
+        .iter()
+        .chain(&got[got.len() - GUARD..])
+        .filter(|&&b| b != NAN_BITS)
+        .count();
     let (mut even, mut odd) = (0, 0);
     for (i, (&g, &w)) in got[GUARD..got.len() - GUARD].iter().zip(want).enumerate() {
         if g != w {
@@ -288,7 +315,8 @@ fn launch(gpu: &mut Gpu, slots: &Slots, x: &GpuTensor, rows: usize, graph: bool)
         .iter()
         .map(|mat| {
             let n = GUARD + rows * mat.m + GUARD;
-            gpu.upload_f32(&vec![f32::from_bits(NAN_BITS); n], &[n]).expect("alloc y")
+            gpu.upload_f32(&vec![f32::from_bits(NAN_BITS); n], &[n])
+                .expect("alloc y")
         })
         .collect();
     let views: Vec<GpuTensor> = mats
@@ -345,7 +373,11 @@ fn launch(gpu: &mut Gpu, slots: &Slots, x: &GpuTensor, rows: usize, graph: bool)
 fn expected_rows(slots: &Slots, ids: &[usize]) -> Vec<Vec<u32>> {
     present(slots)
         .iter()
-        .map(|m| ids.iter().flat_map(|&r| m.reference[r * m.m..(r + 1) * m.m].iter().copied()).collect())
+        .map(|m| {
+            ids.iter()
+                .flat_map(|&r| m.reference[r * m.m..(r + 1) * m.m].iter().copied())
+                .collect()
+        })
         .collect()
 }
 
@@ -379,11 +411,23 @@ struct Ctx {
 
 impl Ctx {
     fn bad_total(&self) -> usize {
-        self.tallies.values().map(|t| t.even + t.odd + t.guard + t.symbol).sum()
+        self.tallies
+            .values()
+            .map(|t| t.even + t.odd + t.guard + t.symbol)
+            .sum()
     }
 
     /// Compare one launch against the reference rows `ids`.
-    fn check(&mut self, gpu: &mut Gpu, label: &str, tag: &str, slots: &Slots, x: &GpuTensor, ids: &[usize], graph: bool) {
+    fn check(
+        &mut self,
+        gpu: &mut Gpu,
+        label: &str,
+        tag: &str,
+        slots: &Slots,
+        x: &GpuTensor,
+        ids: &[usize],
+        graph: bool,
+    ) {
         let rows = ids.len();
         let launched = launch(gpu, slots, x, rows, graph);
         let want = expected_rows(slots, ids);
@@ -397,7 +441,10 @@ impl Ctx {
         if !graph {
             if let Some(want_symbol) = expected_symbol(gpu, &self.arch, rows, self.pm) {
                 if launched.symbol.as_deref() != Some(want_symbol.as_str()) {
-                    eprintln!("SYMBOL {label} rows={rows} {tag}: launched {:?}, expected {want_symbol}", launched.symbol);
+                    eprintln!(
+                        "SYMBOL {label} rows={rows} {tag}: launched {:?}, expected {want_symbol}",
+                        launched.symbol
+                    );
                     symbol = 1;
                 }
             }
@@ -436,9 +483,12 @@ impl Ctx {
             // Reversed rows: launch row i is reference row rows-1-i.
             let mut permuted = host.clone();
             for i in 0..rows {
-                permuted[i * k..(i + 1) * k].copy_from_slice(&host[(rows - 1 - i) * k..(rows - i) * k]);
+                permuted[i * k..(i + 1) * k]
+                    .copy_from_slice(&host[(rows - 1 - i) * k..(rows - i) * k]);
             }
-            let xp = gpu.upload_f32(&permuted, &[permuted.len()]).expect("upload permuted x");
+            let xp = gpu
+                .upload_f32(&permuted, &[permuted.len()])
+                .expect("upload permuted x");
             let ids: Vec<usize> = (0..rows).rev().collect();
             self.check(gpu, label, "permuted", slots, &xp, &ids, false);
             gpu.free_tensor(xp).expect("free permuted x");
@@ -454,22 +504,39 @@ impl Ctx {
 
 /// Graph replay repeated after the activation is overwritten at the same
 /// address: capture once, replay with x, overwrite x in place, replay again.
-fn graph_changed_x(gpu: &mut Gpu, label: &str, slots: &Slots, rows: usize, seed: u64, ctx: &mut Ctx) {
+fn graph_changed_x(
+    gpu: &mut Gpu,
+    label: &str,
+    slots: &Slots,
+    rows: usize,
+    seed: u64,
+    ctx: &mut Ctx,
+) {
     let mats = present(slots);
     let k = mats[0].k;
     let mut rng = Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03));
     let first = host_x(k, &mut rng);
-    let x = gpu.upload_f32(&first, &[first.len()]).expect("upload stable x");
+    let x = gpu
+        .upload_f32(&first, &[first.len()])
+        .expect("upload stable x");
     // References of the first activation (a fresh singleton pass per matrix).
-    let mut refs: Vec<Vec<u32>> = mats.iter().map(|m| singleton_reference(gpu, &m.w, &x, m.m, m.k)).collect();
+    let mut refs: Vec<Vec<u32>> = mats
+        .iter()
+        .map(|m| singleton_reference(gpu, &m.w, &x, m.m, m.k))
+        .collect();
     let outs: Vec<GpuTensor> = mats
         .iter()
         .map(|mat| {
             let n = GUARD + rows * mat.m + GUARD;
-            gpu.upload_f32(&vec![f32::from_bits(NAN_BITS); n], &[n]).expect("alloc y")
+            gpu.upload_f32(&vec![f32::from_bits(NAN_BITS); n], &[n])
+                .expect("alloc y")
         })
         .collect();
-    let views: Vec<GpuTensor> = mats.iter().zip(&outs).map(|(mat, y)| y.sub_offset(GUARD, rows * mat.m)).collect();
+    let views: Vec<GpuTensor> = mats
+        .iter()
+        .zip(&outs)
+        .map(|(mat, y)| y.sub_offset(GUARD, rows * mat.m))
+        .collect();
     let mut next = 0usize;
     let parts: Vec<(&GpuTensor, &GpuTensor, usize)> = slots
         .iter()
@@ -496,8 +563,13 @@ fn graph_changed_x(gpu: &mut Gpu, label: &str, slots: &Slots, rows: usize, seed:
             let second = host_x(k, &mut rng);
             gpu.hip.device_synchronize().expect("sync");
             let bytes: Vec<u8> = second.iter().flat_map(|v| v.to_le_bytes()).collect();
-            gpu.hip.memcpy_htod(&x.buf, &bytes).expect("overwrite x in place");
-            refs = mats.iter().map(|m| singleton_reference(gpu, &m.w, &x, m.m, m.k)).collect();
+            gpu.hip
+                .memcpy_htod(&x.buf, &bytes)
+                .expect("overwrite x in place");
+            refs = mats
+                .iter()
+                .map(|m| singleton_reference(gpu, &m.w, &x, m.m, m.k))
+                .collect();
         }
         for y in &outs {
             fill_nan(gpu, y);
@@ -515,7 +587,10 @@ fn graph_changed_x(gpu: &mut Gpu, label: &str, slots: &Slots, rows: usize, seed:
         if even + odd + guard != 0 {
             eprintln!("MISMATCH {label} rows={rows} graph round {round} (changed x): even {even} odd {odd} guard {guard}");
         }
-        let entry = ctx.tallies.entry(format!("{label} graph changed-x")).or_default();
+        let entry = ctx
+            .tallies
+            .entry(format!("{label} graph changed-x"))
+            .or_default();
         entry.runs += 1;
         entry.even += even;
         entry.odd += odd;
@@ -542,11 +617,24 @@ fn main() {
     println!("mq4_rows_oracle: arch={arch}");
     println!(
         "mq4_rows_oracle: route={} (HIPFIRE_QWEN4_MQ4_ROWS_PM {}); rows 9..=32 {}",
-        if pm { "embedded PM image mq4_rows_x4_pm" } else { "per-row gemv_mq4g256v2 fallback" },
+        if pm {
+            "embedded PM image mq4_rows_x4_pm"
+        } else {
+            "per-row gemv_mq4g256v2 fallback"
+        },
         if flag { "on" } else { "0" },
-        if wide_on { "-> wide twins r16/r32 (HIPFIRE_QWEN4_WIDE_TWIN_MQ4)" } else { "-> exact 8-row group loops (wide twins OFF)" },
+        if wide_on {
+            "-> wide twins r16/r32 (HIPFIRE_QWEN4_WIDE_TWIN_MQ4)"
+        } else {
+            "-> exact 8-row group loops (wide twins OFF)"
+        },
     );
-    let mut ctx = Ctx { arch: arch.clone(), pm, cases: 0, tallies: BTreeMap::new() };
+    let mut ctx = Ctx {
+        arch: arch.clone(),
+        pm,
+        cases: 0,
+        tallies: BTreeMap::new(),
+    };
 
     for seed in 1..=3u64 {
         let mut rng = Rng(seed.wrapping_mul(0xA24B_AED4_963E_E407));
@@ -559,11 +647,24 @@ fn main() {
         // (a) trunk shapes, one per launch; (b) the real groupings.
         let mut trunk: Vec<Mat> = Vec::new();
         for &(name, m, k) in &SHAPES {
-            trunk.push(make_mat(&mut gpu, name.to_string(), m, k, &xs[&k], &mut rng));
+            trunk.push(make_mat(
+                &mut gpu,
+                name.to_string(),
+                m,
+                k,
+                &xs[&k],
+                &mut rng,
+            ));
         }
         for (i, mat) in trunk.iter().enumerate() {
             let label = format!("single {} M={} K={}", mat.name, mat.m, mat.k);
-            ctx.run(&mut gpu, &label, &[Some(mat), None, None, None], &xs[&mat.k], i == 0);
+            ctx.run(
+                &mut gpu,
+                &label,
+                &[Some(mat), None, None, None],
+                &xs[&mat.k],
+                i == 0,
+            );
         }
         for &(name, idx) in &GROUPS {
             let mut slots: Slots = [None; 4];
@@ -583,7 +684,12 @@ fn main() {
         // activation, and gdn.a's output must disagree with gdn.b's reference
         // (swapped matrices).
         if seed == 1 {
-            let slots: Slots = [Some(&trunk[0]), Some(&trunk[1]), Some(&trunk[2]), Some(&trunk[3])];
+            let slots: Slots = [
+                Some(&trunk[0]),
+                Some(&trunk[1]),
+                Some(&trunk[2]),
+                Some(&trunk[3]),
+            ];
             for rows in [3usize, 20] {
                 let got = launch(&mut gpu, &slots, &xs[&2560], rows, false).bits;
                 let mut host = gpu.download_f32(&xs[&2560]).expect("download x");
@@ -594,14 +700,19 @@ fn main() {
                     .flatten()
                     .zip(&got)
                     .map(|(mat, g)| {
-                        let want = &singleton_reference(&mut gpu, &mat.w, &x_perturbed, mat.m, mat.k)[..rows * mat.m];
+                        let want =
+                            &singleton_reference(&mut gpu, &mat.w, &x_perturbed, mat.m, mat.k)
+                                [..rows * mat.m];
                         let (e, o, gd) = tally(g, want, mat.m);
                         e + o + gd
                     })
                     .collect();
                 gpu.free_tensor(x_perturbed).expect("free x'");
                 let (a, b) = (trunk[2].m, trunk[3].m);
-                assert_eq!((trunk[2].name.as_str(), trunk[3].name.as_str(), a, b), ("gdn.a", "gdn.b", 48, 48));
+                assert_eq!(
+                    (trunk[2].name.as_str(), trunk[3].name.as_str(), a, b),
+                    ("gdn.a", "gdn.b", 48, 48)
+                );
                 let (e, o, gd) = tally(&got[2], &trunk[3].reference[..rows * b], a);
                 let swapped_bad = e + o + gd;
                 // Even/odd column swap: column 2j of the launch against reference column 2j+1.
@@ -610,13 +721,17 @@ fn main() {
                 for r in 0..rows {
                     for c in (0..a).step_by(2) {
                         parity_total += 1;
-                        parity_agree += usize::from(ga[r * a + c] == trunk[2].reference[r * a + c + 1]);
+                        parity_agree +=
+                            usize::from(ga[r * a + c] == trunk[2].reference[r * a + c + 1]);
                     }
                 }
                 println!(
                     "mq4_rows_oracle: negative control rows={rows}: perturbed-x mismatch words per output {perturbed_bad:?}, swapped a/b {swapped_bad}, even/odd-swapped columns agreeing {parity_agree}/{parity_total}"
                 );
-                if perturbed_bad.iter().any(|&n| n == 0) || swapped_bad == 0 || parity_agree * 2 > parity_total {
+                if perturbed_bad.iter().any(|&n| n == 0)
+                    || swapped_bad == 0
+                    || parity_agree * 2 > parity_total
+                {
                     eprintln!("negative control FAILED: a wrong reference agreed with the launch (vacuous oracle)");
                     std::process::exit(1);
                 }
@@ -631,10 +746,23 @@ fn main() {
         for &k in &SYN_K {
             for &m in &SYN_M {
                 syn += 1;
-                let mat = make_mat(&mut gpu, format!("syn M={m} K={k}"), m, k, &xs[&k], &mut rng);
+                let mat = make_mat(
+                    &mut gpu,
+                    format!("syn M={m} K={k}"),
+                    m,
+                    k,
+                    &xs[&k],
+                    &mut rng,
+                );
                 let label = format!("synthetic single M={m} K={k}");
                 // The full 1..=32 sweep for every (M, K); views and graph sample on the small ones.
-                ctx.run(&mut gpu, &label, &[Some(&mat), None, None, None], &xs[&k], syn % 5 == 0);
+                ctx.run(
+                    &mut gpu,
+                    &label,
+                    &[Some(&mat), None, None, None],
+                    &xs[&k],
+                    syn % 5 == 0,
+                );
                 gpu.free_tensor(mat.w).expect("free weights");
             }
         }
@@ -645,9 +773,25 @@ fn main() {
                 let mats: Vec<Option<Mat>> = ms
                     .iter()
                     .enumerate()
-                    .map(|(s, &m)| (m > 0).then(|| make_mat(&mut gpu, format!("slot{s} M={m} K={k}"), m, k, &xs[&k], &mut rng)))
+                    .map(|(s, &m)| {
+                        (m > 0).then(|| {
+                            make_mat(
+                                &mut gpu,
+                                format!("slot{s} M={m} K={k}"),
+                                m,
+                                k,
+                                &xs[&k],
+                                &mut rng,
+                            )
+                        })
+                    })
                     .collect();
-                let slots: Slots = [mats[0].as_ref(), mats[1].as_ref(), mats[2].as_ref(), mats[3].as_ref()];
+                let slots: Slots = [
+                    mats[0].as_ref(),
+                    mats[1].as_ref(),
+                    mats[2].as_ref(),
+                    mats[3].as_ref(),
+                ];
                 let label = format!("synthetic x4 M={ms:?} K={k}");
                 ctx.run(&mut gpu, &label, &slots, &xs[&k], true);
                 if seed == 1 && k == 1280 {
@@ -677,12 +821,20 @@ fn main() {
     }
     let bad = ctx.bad_total();
     if bad != 0 {
-        println!("mq4_rows_oracle: FAIL cases={} mismatch_bytes={}", ctx.cases, bad * 4);
+        println!(
+            "mq4_rows_oracle: FAIL cases={} mismatch_bytes={}",
+            ctx.cases,
+            bad * 4
+        );
         std::process::exit(1);
     }
     println!(
         "mq4_rows_oracle: PASS cases={} mismatch_bytes=0 ({})",
         ctx.cases,
-        if wide_on { "wide twins r16/r32 exercised for rows 9..=32" } else { "wide twins OFF: exact 8-row group loops" }
+        if wide_on {
+            "wide twins r16/r32 exercised for rows 9..=32"
+        } else {
+            "wide twins OFF: exact 8-row group loops"
+        }
     );
 }

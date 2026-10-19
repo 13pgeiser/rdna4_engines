@@ -145,7 +145,10 @@ mod tests {
         let v = serde_json::to_value(&msg_none).unwrap();
         assert_eq!(v["role"], "assistant");
         assert_eq!(v["content"], "answer");
-        assert!(v.get("reasoning_content").is_none(), "None must not serialize");
+        assert!(
+            v.get("reasoning_content").is_none(),
+            "None must not serialize"
+        );
 
         let msg_some = ChatMessage {
             role: "assistant".into(),

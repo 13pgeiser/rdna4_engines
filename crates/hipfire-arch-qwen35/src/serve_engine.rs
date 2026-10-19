@@ -246,7 +246,10 @@ impl SlotEngine {
     pub fn spawn(mut cfg: EngineConfig) -> Result<SlotEngine, String> {
         let admitted_k = slot_mtp_k(cfg.mtp_mode, cfg.mtp_k, crate::MTP_MEASURED_AR_FLOOR);
         if cfg.mtp_k > 0 && admitted_k == 0 && cfg.mtp_mode == hipfire_config::MtpMode::Auto {
-            eprintln!("{}", hipfire_config::mtp_no_floor_decline_line("qwen35 slots"));
+            eprintln!(
+                "{}",
+                hipfire_config::mtp_no_floor_decline_line("qwen35 slots")
+            );
         }
         cfg.mtp_k = admitted_k;
         let (tx, rx) = channel::<EngineCommand>();
@@ -982,9 +985,7 @@ impl Rig {
         // Descriptor-kernel evidence: `test_bf16_slots_parity` check 4 on
         // gfx1201 covers zero/nonzero bases, two-slot reads, and writes.
         // This does not establish full-serve parity.
-        if matches!(kv_mode, hipfire_runtime::kv_mode::KvMode::Fp8)
-            && !gpu.arch_caps.is_gfx1201()
-        {
+        if matches!(kv_mode, hipfire_runtime::kv_mode::KvMode::Fp8) && !gpu.arch_caps.is_gfx1201() {
             return Err(format!(
                 "experimental multi-slot kv_mode \"fp8\" needs gfx1201 (have {}); \
                  use q8 or auto",
@@ -7735,22 +7736,24 @@ mod spill_agreement_tests {
     /// The sequential twin's fact construction for these inputs (tp 1 by
     /// construction, EP never, pp/paged/REAP from the load, VL from the
     /// probe): one predicate call, mirroring `carrier::spill_facts`.
-    fn sequential_verdict(pp: usize, paged_experts: bool, reap_keep: bool, is_vl: bool) -> SpillSupport {
+    fn sequential_verdict(
+        pp: usize,
+        paged_experts: bool,
+        reap_keep: bool,
+        is_vl: bool,
+    ) -> SpillSupport {
         spill_support(6, 1, pp, None, paged_experts, reap_keep, is_vl)
     }
 
     /// The slots twin's fact construction: single-GPU by the capability gate,
     /// EP never, tower from `is_vl || vl_path`.
-    fn slots_verdict(paged_experts: bool, reap_keep: bool, is_vl: bool, vl_path: bool) -> SpillSupport {
-        spill_support(
-            6,
-            1,
-            1,
-            None,
-            paged_experts,
-            reap_keep,
-            is_vl || vl_path,
-        )
+    fn slots_verdict(
+        paged_experts: bool,
+        reap_keep: bool,
+        is_vl: bool,
+        vl_path: bool,
+    ) -> SpillSupport {
+        spill_support(6, 1, 1, None, paged_experts, reap_keep, is_vl || vl_path)
     }
 
     #[test]
@@ -7760,7 +7763,10 @@ mod spill_agreement_tests {
             sequential_verdict(1, false, false, false),
             SpillSupport::Supported
         );
-        assert_eq!(slots_verdict(false, false, false, false), SpillSupport::Supported);
+        assert_eq!(
+            slots_verdict(false, false, false, false),
+            SpillSupport::Supported
+        );
         // VL refuses on both routes now (the added term): inline tower on the
         // sequential twin, flag or sidecar path on the slots twin.
         assert_eq!(

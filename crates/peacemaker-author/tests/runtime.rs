@@ -55,14 +55,15 @@ fn k_tile_loop_typed(b: &mut Trace) {
     let k0 = wg.lds::<KTile>("K0", 0, 8704).unwrap();
     let k1 = wg.lds::<KTile>("K1", 8704, 8704).unwrap();
     let (ring, st) = wg.ds_store(Ring::new(k0, k1), STAGE.into()).unwrap();
-    let _ = wg.loop_carried(".Lk_tile", (ring.into_steady(), st), |wg, (ring, st)| {
-        let drained = wg.wait(st)?;
-        let (ring,) = wg.barrier((rotate(ring, drained),))?;
-        wg.ds_load_cur(&ring, LOAD.into())?;
-        let next = wg.ds_store(ring, STAGE.into())?;
-        Ok((next, wg.scmp_wg_uniform(CMP.into())?))
-    })
-    .unwrap();
+    let _ = wg
+        .loop_carried(".Lk_tile", (ring.into_steady(), st), |wg, (ring, st)| {
+            let drained = wg.wait(st)?;
+            let (ring,) = wg.barrier((rotate(ring, drained),))?;
+            wg.ds_load_cur(&ring, LOAD.into())?;
+            let next = wg.ds_store(ring, STAGE.into())?;
+            Ok((next, wg.scmp_wg_uniform(CMP.into())?))
+        })
+        .unwrap();
 }
 
 #[test]
@@ -70,7 +71,11 @@ fn halo_verify_attn_race_is_rejected_at_the_loop_head_barrier() {
     let mut b = Trace::new("gfx1151");
     let e = err(k_tile_loop(&mut b, false));
     assert!(e.contains("undrained LDS store"), "{e}");
-    assert_eq!(b.count("s_barrier"), 0, "the racy barrier never reached the backend");
+    assert_eq!(
+        b.count("s_barrier"),
+        0,
+        "the racy barrier never reached the backend"
+    );
 }
 
 #[test]
@@ -81,7 +86,10 @@ fn halo_verify_attn_fix_emits_the_typed_twin_exactly() {
     assert_eq!(dynamic.text, typed.text);
     let barrier = dynamic.text.iter().position(|t| t == "s_barrier").unwrap();
     assert_eq!(dynamic.text[barrier - 1], "s_waitcnt lgkmcnt(0)");
-    assert_eq!((dynamic.count("s_waitcnt"), dynamic.count("s_barrier")), (1, 1));
+    assert_eq!(
+        (dynamic.count("s_waitcnt"), dynamic.count("s_barrier")),
+        (1, 1)
+    );
 }
 
 #[test]
@@ -105,7 +113,10 @@ fn loop_back_edge_must_return_the_store_state_it_entered_with() {
         d.wait(ring)?;
         d.scmp_wg_uniform(CMP.into())
     }));
-    assert!(e.contains("differs between the entry and the back edge"), "{e}");
+    assert!(
+        e.contains("differs between the entry and the back edge"),
+        "{e}"
+    );
 }
 
 // ---- gfx11 FA2 mailbox ----------------------------------------------------
@@ -151,9 +162,20 @@ fn fa2_non_fill_typed(b: &mut Trace) {
 fn fa2_mailbox_race_is_rejected_at_the_join() {
     let mut b = Trace::new("gfx1100");
     let e = err(fa2_mailbox(&mut b, false));
-    assert!(e.contains("cannot join mailbox") && e.contains("Published"), "{e}");
-    assert_eq!(b.count("s_barrier"), 1, "only the publishing barrier was emitted");
-    assert_eq!(b.count("ds_store_b128"), 0, "the V fill never reached the backend");
+    assert!(
+        e.contains("cannot join mailbox") && e.contains("Published"),
+        "{e}"
+    );
+    assert_eq!(
+        b.count("s_barrier"),
+        1,
+        "only the publishing barrier was emitted"
+    );
+    assert_eq!(
+        b.count("ds_store_b128"),
+        0,
+        "the V fill never reached the backend"
+    );
 }
 
 #[test]
@@ -179,7 +201,10 @@ fn rejected_requests_emit_nothing_and_leave_the_driver_usable() {
     assert!(err(d.ds_load(mbox, MBOX_LOAD.into())).contains("not published"));
     assert!(err(d.barrier(&[Transition::Ready(v)])).contains("only a Writing region"));
     assert_eq!(d.position(), before);
-    assert_eq!((d.region_phase(mbox).unwrap(), d.region_phase(v).unwrap()), (Phase::RtWriting, Phase::RtFree));
+    assert_eq!(
+        (d.region_phase(mbox).unwrap(), d.region_phase(v).unwrap()),
+        (Phase::RtWriting, Phase::RtFree)
+    );
     d.wait(mbox).unwrap();
     d.barrier(&[Transition::Ready(mbox)]).unwrap();
     // A published region takes no store and cannot be waited on again.
@@ -252,7 +277,9 @@ fn ids_belong_to_their_driver_and_a_second_driver_cannot_seal_the_backend() {
     let r = da.lds("R", 0, 64).unwrap();
     assert!(err(dc.ds_store(r, STAGE.into())).contains("another Driver"));
     drop((da, dc));
-    let e = Driver::<Gfx1100, Trace>::new(&mut a).err().expect("sealed backend");
+    let e = Driver::<Gfx1100, Trace>::new(&mut a)
+        .err()
+        .expect("sealed backend");
     assert!(e.contains("already owned"), "{e}");
 }
 
@@ -333,7 +360,8 @@ fn a_begun_write_is_pending_even_before_its_first_store() {
     assert!(err(d.barrier(&[Transition::Ready(r)])).contains("undrained LDS store"));
     // A conditional store keeps `Pending` as `Pending`: same ownership shape.
     let c = d.scmp("s_cmp_lg_u32 s4, 0".into()).unwrap();
-    d.skip_if(c, ".Lskip", |d| d.ds_store(r, STAGE.into())).unwrap();
+    d.skip_if(c, ".Lskip", |d| d.ds_store(r, STAGE.into()))
+        .unwrap();
     // A wait inside the body would turn it `Drained` on one path only.
     let c = d.scmp("s_cmp_lg_u32 s4, 0".into()).unwrap();
     assert!(err(d.skip_if(c, ".Lskip2", |d| d.wait(r))).contains("disagree on LDS ownership"));

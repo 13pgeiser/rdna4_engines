@@ -546,10 +546,8 @@ impl hipfire_dispatch::families::moe::RoutedExpertWeights for MoeFfnWeights {
         let expert = self.experts.get(expert_idx)?;
         let gate_up =
             packed_expert_host_bytes(gpu, &owners.gate_up, &expert.gate_up.buf, "gate_up").ok()?;
-        let down =
-            packed_expert_host_bytes(gpu, &owners.down, &expert.down.buf, "down").ok()?;
-        let gate_up_quant =
-            hipfire_dispatch::cpu_exec::cpu_quant_for(expert.gate_up.gpu_dtype)?;
+        let down = packed_expert_host_bytes(gpu, &owners.down, &expert.down.buf, "down").ok()?;
+        let gate_up_quant = hipfire_dispatch::cpu_exec::cpu_quant_for(expert.gate_up.gpu_dtype)?;
         let down_quant = hipfire_dispatch::cpu_exec::cpu_quant_for(expert.down.gpu_dtype)?;
         Some(hipfire_dispatch::cpu_exec::CpuMoeExpert {
             gate_up_quant,
@@ -775,8 +773,8 @@ fn moe_ffn_decode_impl<'a>(
     let hidden = config.dim;
     // MoE bisection dump (HIPFIRE_MOE_DUMP_DIR): the single-device post-MoE
     // residual; root-routed EP is captured after `residual_finish` instead.
-    let dump_final = moe_params.ep_mode == MoeEpMode::None
-        && hipfire_dispatch::pipeline::moe_dump::enabled();
+    let dump_final =
+        moe_params.ep_mode == MoeEpMode::None && hipfire_dispatch::pipeline::moe_dump::enabled();
     let dump_deferred = moe_params.defer_routed_combine;
     let dump_x = moe_params.x_residual;
     let k = config.num_experts_per_tok;
@@ -1681,18 +1679,53 @@ fn ar_graph_binding(
     mix(s.pos_buf.as_ptr());
     mix(s.pos_buf3.as_ptr());
     for t in [
-        &s.x, &s.tmp, &s.dn_qkv, &s.dn_z, &s.dn_alpha, &s.dn_beta, &s.dn_conv_out, &s.dn_q,
-        &s.dn_k, &s.dn_v, &s.dn_q_raw, &s.dn_k_raw, &s.dn_attn_out, &s.dn_normed, &s.fa_q_full,
-        &s.fa_q, &s.fa_gate, &s.fa_k, &s.fa_v, &s.fa_attn_out, &s.o, &s.gate_ffn, &s.up,
-        &s.ffn_hidden, &s.ffn_out, &s.logits, &s.sample_buf, &s.repeat_buf, &s.x_rot,
+        &s.x,
+        &s.tmp,
+        &s.dn_qkv,
+        &s.dn_z,
+        &s.dn_alpha,
+        &s.dn_beta,
+        &s.dn_conv_out,
+        &s.dn_q,
+        &s.dn_k,
+        &s.dn_v,
+        &s.dn_q_raw,
+        &s.dn_k_raw,
+        &s.dn_attn_out,
+        &s.dn_normed,
+        &s.fa_q_full,
+        &s.fa_q,
+        &s.fa_gate,
+        &s.fa_k,
+        &s.fa_v,
+        &s.fa_attn_out,
+        &s.o,
+        &s.gate_ffn,
+        &s.up,
+        &s.ffn_hidden,
+        &s.ffn_out,
+        &s.logits,
+        &s.sample_buf,
+        &s.repeat_buf,
+        &s.x_rot,
         &s.flash_partials,
     ] {
         mix(t.buf.as_ptr());
     }
     for t in [
-        &s.moe_router_logits, &s.moe_scalar_buf, &s.moe_x_rot, &s.moe_gate_up_buf,
-        &s.moe_gate_buf, &s.moe_up_buf, &s.moe_ffn_hidden, &s.moe_ffn_out, &s.moe_gate_batch,
-        &s.moe_up_batch, &s.moe_rot_batch, &s.moe_topk_indices, &s.moe_topk_weights,
+        &s.moe_router_logits,
+        &s.moe_scalar_buf,
+        &s.moe_x_rot,
+        &s.moe_gate_up_buf,
+        &s.moe_gate_buf,
+        &s.moe_up_buf,
+        &s.moe_ffn_hidden,
+        &s.moe_ffn_out,
+        &s.moe_gate_batch,
+        &s.moe_up_batch,
+        &s.moe_rot_batch,
+        &s.moe_topk_indices,
+        &s.moe_topk_weights,
         &s.moe_down_expanded,
     ]
     .into_iter()
@@ -4507,7 +4540,10 @@ pub(crate) fn kv_cache_attention_dispatch(
         // rows for this token; dispatch attention only. The fold gate
         // guarantees the q8 write/attend route and a single decode token.
         if !qwen35_fa_kvwrite_fold_route_supported(&plan) {
-            return Err(HipError::new(0, "folded FA prep requires single-token Q8_0 flash KV"));
+            return Err(HipError::new(
+                0,
+                "folded FA prep requires single-token Q8_0 flash KV",
+            ));
         }
         use hipfire_dispatch::families::attention::AttentionFamily;
         static ATTENTION: std::sync::OnceLock<AttentionFamily> = std::sync::OnceLock::new();
@@ -5695,7 +5731,9 @@ fn forward_prefill_dense_tp_batched(
                                 hd,
                                 BatchSemantics::Sequential,
                                 None,
-                                captures.as_ref().and_then(|caps| caps[rank].tape.as_deref()),
+                                captures
+                                    .as_ref()
+                                    .and_then(|caps| caps[rank].tape.as_deref()),
                                 0,
                                 delta_layer_idx,
                                 q8_flags[rank],
@@ -7405,11 +7443,7 @@ fn gfx1201_qwen35_a3b_state_fusion_shape(config: &Qwen35Config) -> bool {
 
 /// The campaign adds defaults only for the measured Qwen3.5-4B geometry.
 /// Existing A3B/27B admissions and the gfx1101 experiment are separate gates.
-fn gfx1100_qwen35_4b_campaign_shape(
-    arch: &str,
-    config: &Qwen35Config,
-    n_v_heads: usize,
-) -> bool {
+fn gfx1100_qwen35_4b_campaign_shape(arch: &str, config: &Qwen35Config, n_v_heads: usize) -> bool {
     arch == "gfx1100"
         && config.dim == 2_560
         && config.n_heads == 16
@@ -7570,11 +7604,11 @@ pub(crate) fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
         && config.n_kv_heads == 2)
         || (gfx1201_state_fusions_enabled(gpu) && gfx1201_qwen35_a3b_state_fusion_shape(config))
         || gfx1100_qwen35_4b_campaign_shape(
-            gpu.arch_caps.arch(), config, config.linear_num_value_heads,
+            gpu.arch_caps.arch(),
+            config,
+            config.linear_num_value_heads,
         )
-        || (gfx1101_campaign_gates_enabled(gpu)
-            && config.n_heads == 16
-            && config.n_kv_heads == 4)
+        || (gfx1101_campaign_gates_enabled(gpu) && config.n_heads == 16 && config.n_kv_heads == 4)
         || ((gpu.arch_caps.is_gfx1100() || gfx1201_state_fusions_enabled(gpu))
             && super::config::qwen36_27b_dense_shape(config, config.linear_num_value_heads)
             && config.n_heads == 24
@@ -7591,7 +7625,11 @@ pub(crate) fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
 /// to Qwen3.6-27B's asym3 route measured +0.37% over a 512-token A/B/B/A and
 /// reduced 709 -> 677 dispatches/token; a 1025-token replay remained exact. Set
 /// `HIPFIRE_QWEN35_FA_EPILOGUE_FUSE=0` to retain the legacy path.
-pub(crate) fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &WeightTensor) -> bool {
+pub(crate) fn qwen35_fa_epilogue_enabled(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    wo: &WeightTensor,
+) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let enabled = *ENABLED.get_or_init(|| {
         hipfire_config::developer_var("HIPFIRE_QWEN35_FA_EPILOGUE_FUSE")
@@ -7605,11 +7643,11 @@ pub(crate) fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &
         && config.n_kv_heads == 2)
         || (gfx1201_state_fusions_enabled(gpu) && gfx1201_qwen35_a3b_state_fusion_shape(config))
         || gfx1100_qwen35_4b_campaign_shape(
-            gpu.arch_caps.arch(), config, config.linear_num_value_heads,
+            gpu.arch_caps.arch(),
+            config,
+            config.linear_num_value_heads,
         )
-        || (gfx1101_campaign_gates_enabled(gpu)
-            && config.n_heads == 16
-            && config.n_kv_heads == 4)
+        || (gfx1101_campaign_gates_enabled(gpu) && config.n_heads == 16 && config.n_kv_heads == 4)
         || (gpu.arch_caps.is_gfx1100()
             && super::config::qwen36_27b_dense_shape(config, config.linear_num_value_heads)
             && config.n_heads == 24
@@ -7643,10 +7681,12 @@ fn conv_scalar_prep_requested(
     match mode {
         Some("0") => false,
         Some("1") => true,
-        _ => qwen36_27b_dense_shape(config, n_v_heads)
+        _ => {
+            qwen36_27b_dense_shape(config, n_v_heads)
             || gfx1100_qwen35_4b_campaign_shape(arch, config, n_v_heads)
             // The gfx1101 gate remains experimental; no default arch admission.
-            || (arch == "gfx1101" && gfx1101_campaign),
+            || (arch == "gfx1101" && gfx1101_campaign)
+        }
     }
 }
 
@@ -7701,7 +7741,10 @@ pub(crate) fn conv_scalar_prep_enabled(
     // Keep beta's exact 27B default and add only the measured gfx1100 4B
     // geometry. Explicit value 1 retains the structurally supported experiment.
     let enabled = conv_scalar_prep_requested(
-        gpu.arch_caps.arch(), config, n_v_heads, mode.as_deref(),
+        gpu.arch_caps.arch(),
+        config,
+        n_v_heads,
+        mode.as_deref(),
         gfx1101_campaign_gates_enabled(gpu),
     );
     let shape = hipfire_config::developer_var("HIPFIRE_CONV_QKNORM_SHAPE").ok();
@@ -7983,19 +8026,24 @@ mod tests {
         assert!(gfx1100_qwen35_4b_campaign_shape("gfx1100", &cfg, 32));
         for arch in ["gfx1101", "gfx1102", "gfx1151", "gfx1201", "gfx942"] {
             assert!(!gfx1100_qwen35_4b_campaign_shape(arch, &cfg, 32), "{arch}");
-            assert!(!conv_scalar_prep_requested(arch, &cfg, 32, None, false), "{arch}");
+            assert!(
+                !conv_scalar_prep_requested(arch, &cfg, 32, None, false),
+                "{arch}"
+            );
         }
         assert!(!gfx1100_qwen35_4b_campaign_shape("gfx1100", &cfg, 31));
         let mutations: [fn(&mut Qwen35Config); 13] = [
             |c| c.dim = 4_096, // 9B: same 16Q/4K is not evidence.
-            |c| { // 0.8B fixture geometry
+            |c| {
+                // 0.8B fixture geometry
                 c.dim = 1_024;
                 c.n_layers = 24;
                 c.n_heads = 8;
                 c.n_kv_heads = 2;
                 c.linear_num_value_heads = 16;
             },
-            |c| { // 2B fixture geometry (existing A3B gates stay separate).
+            |c| {
+                // 2B fixture geometry (existing A3B gates stay separate).
                 c.dim = 2_048;
                 c.n_layers = 24;
                 c.n_heads = 8;
@@ -8017,10 +8065,16 @@ mod tests {
             let mut other = cfg.clone();
             mutate(&mut other);
             assert!(!gfx1100_qwen35_4b_campaign_shape(
-                "gfx1100", &other, other.linear_num_value_heads,
+                "gfx1100",
+                &other,
+                other.linear_num_value_heads,
             ));
             assert!(!conv_scalar_prep_requested(
-                "gfx1100", &other, other.linear_num_value_heads, None, false,
+                "gfx1100",
+                &other,
+                other.linear_num_value_heads,
+                None,
+                false,
             ));
         }
     }
@@ -8031,25 +8085,59 @@ mod tests {
         for mode in [None, Some("unrecognized"), Some("1")] {
             assert!(conv_scalar_prep_requested("gfx1100", &cfg, 32, mode, false));
         }
-        assert!(!conv_scalar_prep_requested("gfx1100", &cfg, 32, Some("0"), false));
+        assert!(!conv_scalar_prep_requested(
+            "gfx1100",
+            &cfg,
+            32,
+            Some("0"),
+            false
+        ));
         let mut cfg27 = cfg.clone();
         cfg27.dim = 5_120;
         cfg27.n_layers = 64;
         cfg27.n_heads = 24;
         cfg27.linear_num_value_heads = 48;
-        assert!(conv_scalar_prep_requested("gfx1100", &cfg27, 48, None, false));
+        assert!(conv_scalar_prep_requested(
+            "gfx1100", &cfg27, 48, None, false
+        ));
         assert!(!gfx1100_qwen35_4b_campaign_shape("gfx1100", &cfg27, 48));
         let mut cfg9 = cfg;
         cfg9.dim = 4_096;
-        assert!(!conv_scalar_prep_requested("gfx1100", &cfg9, 32, None, false));
-        assert!(conv_scalar_prep_requested("gfx1100", &cfg9, 32, Some("1"), false));
+        assert!(!conv_scalar_prep_requested(
+            "gfx1100", &cfg9, 32, None, false
+        ));
+        assert!(conv_scalar_prep_requested(
+            "gfx1100",
+            &cfg9,
+            32,
+            Some("1"),
+            false
+        ));
         for arch in ["gfx1101", "gfx1151", "gfx1201"] {
             assert!(!conv_scalar_prep_requested(arch, &cfg27, 48, None, false));
-            assert!(!conv_scalar_prep_requested(arch, &cfg9, 32, Some("1"), false));
+            assert!(!conv_scalar_prep_requested(
+                arch,
+                &cfg9,
+                32,
+                Some("1"),
+                false
+            ));
         }
         assert!(conv_scalar_prep_requested("gfx1101", &cfg9, 32, None, true));
-        assert!(conv_scalar_prep_requested("gfx1101", &cfg9, 32, Some("1"), true));
-        assert!(!conv_scalar_prep_requested("gfx1101", &cfg9, 32, Some("0"), true));
+        assert!(conv_scalar_prep_requested(
+            "gfx1101",
+            &cfg9,
+            32,
+            Some("1"),
+            true
+        ));
+        assert!(!conv_scalar_prep_requested(
+            "gfx1101",
+            &cfg9,
+            32,
+            Some("0"),
+            true
+        ));
     }
 
     #[test]
@@ -8066,12 +8154,17 @@ mod tests {
         };
         assert!(qwen35_fa_kvwrite_fold_route_supported(&plan));
         assert!(!qwen35_fa_kvwrite_fold_route_supported(&KvTierPlan {
-            batch_size: 2, ..plan
+            batch_size: 2,
+            ..plan
         }));
         for v_mode_bits in [2, 3, 4] {
-            assert!(!qwen35_fa_kvwrite_fold_route_supported(&KvTierPlan {
-                v_mode_bits, ..plan
-            }), "Lloyd V bits={v_mode_bits}");
+            assert!(
+                !qwen35_fa_kvwrite_fold_route_supported(&KvTierPlan {
+                    v_mode_bits,
+                    ..plan
+                }),
+                "Lloyd V bits={v_mode_bits}"
+            );
         }
         for (write_key, attend_key) in [
             (KernelKey::KvWriteQ8_0, KernelKey::AttnQ8_0Kv),
@@ -8080,13 +8173,21 @@ mod tests {
             (KernelKey::KvWriteF32, KernelKey::AttnFlash),
             (KernelKey::KvWriteFp8E4m3, KernelKey::AttnFlashFp8E4m3),
             (KernelKey::KvWriteAsym3Fwht, KernelKey::AttnFlashAsym3Fwht),
-            (KernelKey::KvWriteQ8_0Batched, KernelKey::AttnQ8_0KvBatchedMasked),
+            (
+                KernelKey::KvWriteQ8_0Batched,
+                KernelKey::AttnQ8_0KvBatchedMasked,
+            ),
             (KernelKey::KvWriteBf16, KernelKey::AttnFlashQ8_0),
             (KernelKey::KvWriteQ8_0, KernelKey::AttnFlashBf16),
         ] {
-            assert!(!qwen35_fa_kvwrite_fold_route_supported(&KvTierPlan {
-                write_key, attend_key, ..plan
-            }), "{write_key:?}/{attend_key:?}");
+            assert!(
+                !qwen35_fa_kvwrite_fold_route_supported(&KvTierPlan {
+                    write_key,
+                    attend_key,
+                    ..plan
+                }),
+                "{write_key:?}/{attend_key:?}"
+            );
         }
     }
 

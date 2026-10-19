@@ -20,21 +20,47 @@ use crate::Result;
 use std::fmt;
 
 op_table!(FlatOp {
-    LoadUbyte, LoadSbyte, LoadUshort, LoadSshort, LoadDword, LoadDwordx2, LoadDwordx3, LoadDwordx4,
-    StoreByte, StoreShort, StoreDword, StoreDwordx2, StoreDwordx3, StoreDwordx4,
-    AtomicAdd, AtomicAddF32,
+    LoadUbyte,
+    LoadSbyte,
+    LoadUshort,
+    LoadSshort,
+    LoadDword,
+    LoadDwordx2,
+    LoadDwordx3,
+    LoadDwordx4,
+    StoreByte,
+    StoreShort,
+    StoreDword,
+    StoreDwordx2,
+    StoreDwordx3,
+    StoreDwordx4,
+    AtomicAdd,
+    AtomicAddF32,
 });
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum FlatSeg { Flat, Scratch, Global }
+pub enum FlatSeg {
+    Flat,
+    Scratch,
+    Global,
+}
 
 impl FlatOp {
-    pub fn from_opcode(arch: Arch, opcode: u8) -> Option<Self> { Self::ALL.iter().copied().find(|op| op.opcode(arch) == Some(opcode)) }
+    pub fn from_opcode(arch: Arch, opcode: u8) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|op| op.opcode(arch) == Some(opcode))
+    }
     /// Dwords of (vdst, data): loads `(n, 0)`, stores `(0, n)`, atomics `(1, 1)`
     /// (`vdst` only when `sc0` returns the old value).
     pub fn widths(self) -> (u8, u8) {
         match self {
-            Self::LoadUbyte | Self::LoadSbyte | Self::LoadUshort | Self::LoadSshort | Self::LoadDword => (1, 0),
+            Self::LoadUbyte
+            | Self::LoadSbyte
+            | Self::LoadUshort
+            | Self::LoadSshort
+            | Self::LoadDword => (1, 0),
             Self::LoadDwordx2 => (2, 0),
             Self::LoadDwordx3 => (3, 0),
             Self::LoadDwordx4 => (4, 0),
@@ -76,7 +102,11 @@ pub struct Flat {
 /// The three operation shapes of the table: a load defines `vdst` from memory,
 /// a store reads `data`, an atomic reads `data` and (with `sc0`) defines `vdst`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Class { Load, Store, Atomic }
+enum Class {
+    Load,
+    Store,
+    Atomic,
+}
 
 const ENC_FLAT: u32 = 0b11_0111;
 
@@ -91,13 +121,25 @@ impl Flat {
     fn addr_dwords(&self) -> u8 {
         match self.seg {
             FlatSeg::Flat => 2,
-            FlatSeg::Global => if self.saddr.is_some() { 1 } else { 2 },
+            FlatSeg::Global => {
+                if self.saddr.is_some() {
+                    1
+                } else {
+                    2
+                }
+            }
             FlatSeg::Scratch => 1,
         }
     }
 
     /// Dwords of the SGPR base operand: a pair for GLOBAL, one SGPR for SCRATCH.
-    fn saddr_dwords(&self) -> u8 { if self.seg == FlatSeg::Global { 2 } else { 1 } }
+    fn saddr_dwords(&self) -> u8 {
+        if self.seg == FlatSeg::Global {
+            2
+        } else {
+            1
+        }
+    }
 
     /// A VGPR/AccVGPR operand `width` dwords wide: returns `(first register, acc)`.
     /// Tuples of two or more dwords are even-aligned on gfx90a+/gfx942 (llvm
@@ -107,47 +149,86 @@ impl Flat {
         let (n, acc) = match src {
             Src::Vgpr(n) => (n, false),
             Src::Agpr(n) if allow_agpr => (n, true),
-            other => return Err(format!("{what} must be a {}, got {other:?}", if allow_agpr { "VGPR or AccVGPR" } else { "VGPR" })),
+            other => {
+                return Err(format!(
+                    "{what} must be a {}, got {other:?}",
+                    if allow_agpr {
+                        "VGPR or AccVGPR"
+                    } else {
+                        "VGPR"
+                    }
+                ))
+            }
         };
-        if width >= 2 && n % 2 != 0 { return Err(format!("{what} {} is not even-aligned", src.fmt(width))) }
-        if usize::from(n) + usize::from(width) > 256 { return Err(format!("{what} {} runs past register 255", src.fmt(width))) }
+        if width >= 2 && n % 2 != 0 {
+            return Err(format!("{what} {} is not even-aligned", src.fmt(width)));
+        }
+        if usize::from(n) + usize::from(width) > 256 {
+            return Err(format!("{what} {} runs past register 255", src.fmt(width)));
+        }
         Ok((n, acc))
     }
 
     pub fn encode(&self, arch: Arch, out: &mut Vec<u32>) -> Result<()> {
-        let opcode = self.op.opcode(arch).ok_or_else(|| format!("{:?} does not exist on {arch:?}", self.op))?;
-        self.op.name(self.seg).ok_or_else(|| format!("{:?} has no {:?} form", self.op, self.seg))?;
+        let opcode = self
+            .op
+            .opcode(arch)
+            .ok_or_else(|| format!("{:?} does not exist on {arch:?}", self.op))?;
+        self.op
+            .name(self.seg)
+            .ok_or_else(|| format!("{:?} has no {:?} form", self.op, self.seg))?;
         let class = self.op.class();
         let (vw, dw) = self.op.widths();
 
         // Offset: 13-bit signed (global/scratch) or 12-bit unsigned (flat).
-        let (lo, hi) = if self.seg == FlatSeg::Flat { (0, 4095) } else { (-4096, 4095) };
-        if !(lo..=hi).contains(&self.offset) { return Err(format!("offset {} outside {lo}..={hi} for {:?}", self.offset, self.seg)) }
+        let (lo, hi) = if self.seg == FlatSeg::Flat {
+            (0, 4095)
+        } else {
+            (-4096, 4095)
+        };
+        if !(lo..=hi).contains(&self.offset) {
+            return Err(format!(
+                "offset {} outside {lo}..={hi} for {:?}",
+                self.offset, self.seg
+            ));
+        }
 
         // vdst / data / ACC.
         let (vdst, data, acc) = match class {
             Class::Load => {
-                if self.data.is_some() { return Err("a load takes no data operand".into()) }
+                if self.data.is_some() {
+                    return Err("a load takes no data operand".into());
+                }
                 let (n, acc) = Self::vreg(self.vdst, vw, "vdst", true)?;
                 (u32::from(n), 0, acc)
             }
             Class::Store => {
-                if self.vdst.is_some() { return Err("a store has no vdst".into()) }
+                if self.vdst.is_some() {
+                    return Err("a store has no vdst".into());
+                }
                 let (n, acc) = Self::vreg(self.data, dw, "data", true)?;
                 (0, u32::from(n), acc)
             }
             Class::Atomic => {
-                if self.sc0 != self.vdst.is_some() { return Err("an atomic returns its old value into vdst exactly when sc0 is set".into()) }
+                if self.sc0 != self.vdst.is_some() {
+                    return Err(
+                        "an atomic returns its old value into vdst exactly when sc0 is set".into(),
+                    );
+                }
                 let (n, acc) = Self::vreg(self.data, dw, "data", true)?;
                 let mut vdst = 0;
                 if self.vdst.is_some() {
                     let (d, vacc) = Self::vreg(self.vdst, vw, "vdst", true)?;
-                    if vacc != acc { return Err("vdst and data of an atomic must be in the same register file (one ACC bit)".into()) }
+                    if vacc != acc {
+                        return Err("vdst and data of an atomic must be in the same register file (one ACC bit)".into());
+                    }
                     vdst = u32::from(d);
                 }
                 // llvm-mc has no AccVGPR form of the returning f32 atomic
                 // (`global_atomic_add_f32 a1, v[2:3], a1, off sc0` is rejected).
-                if acc && self.sc0 && self.op == FlatOp::AtomicAddF32 { return Err("returning atomic_add_f32 takes VGPRs only".into()) }
+                if acc && self.sc0 && self.op == FlatOp::AtomicAddF32 {
+                    return Err("returning atomic_add_f32 takes VGPRs only".into());
+                }
                 (vdst, u32::from(n), acc)
             }
         };
@@ -169,11 +250,18 @@ impl Flat {
             (_, None) => 0x7f,
             (seg, Some(s)) => {
                 let code = s.code();
-                if !s.is_sreg() { return Err(format!("saddr must be a scalar register, got {s:?}")) }
+                if !s.is_sreg() {
+                    return Err(format!("saddr must be a scalar register, got {s:?}"));
+                }
                 if seg == FlatSeg::Global {
                     // 64-bit SGPR base: even first register, below m0/exec (llvm
                     // rejects `exec`; m0 is not a pair).
-                    if code % 2 != 0 || code > 123 { return Err(format!("global saddr {} is not a valid SGPR pair", s.fmt(2))) }
+                    if code % 2 != 0 || code > 123 {
+                        return Err(format!(
+                            "global saddr {} is not a valid SGPR pair",
+                            s.fmt(2)
+                        ));
+                    }
                 } else if code > 126 {
                     return Err(format!("scratch saddr {s:?} is not a valid SGPR"));
                 }
@@ -182,7 +270,11 @@ impl Flat {
         };
 
         let off13 = (self.offset as u16 as u32) & 0x1fff;
-        let seg = match self.seg { FlatSeg::Flat => 0, FlatSeg::Scratch => 1, FlatSeg::Global => 2 };
+        let seg = match self.seg {
+            FlatSeg::Flat => 0,
+            FlatSeg::Scratch => 1,
+            FlatSeg::Global => 2,
+        };
         let w0 = off13
             | u32::from(sve) << 13
             | seg << 14
@@ -201,8 +293,13 @@ impl Flat {
     /// FLAT, ...) are rejected: the decoded instruction is re-encoded and
     /// must reproduce the input words exactly.
     pub fn decode(arch: Arch, words: &[u32]) -> Result<(Self, usize)> {
-        let (&w0, &w1) = match words { [a, b, ..] => (a, b), _ => return Err("FLAT needs two dwords".into()) };
-        if w0 >> 26 != ENC_FLAT { return Err(format!("{w0:#010x} is not a FLAT-family encoding")) }
+        let (&w0, &w1) = match words {
+            [a, b, ..] => (a, b),
+            _ => return Err("FLAT needs two dwords".into()),
+        };
+        if w0 >> 26 != ENC_FLAT {
+            return Err(format!("{w0:#010x} is not a FLAT-family encoding"));
+        }
         let seg = match (w0 >> 14) & 3 {
             0 => FlatSeg::Flat,
             1 => FlatSeg::Scratch,
@@ -210,13 +307,28 @@ impl Flat {
             _ => return Err("reserved FLAT segment 3".into()),
         };
         let opcode = ((w0 >> 18) & 0x7f) as u8;
-        let op = FlatOp::from_opcode(arch, opcode).ok_or_else(|| format!("unknown FLAT opcode {opcode:#x}"))?;
+        let op = FlatOp::from_opcode(arch, opcode)
+            .ok_or_else(|| format!("unknown FLAT opcode {opcode:#x}"))?;
         let sve = (w0 >> 13) & 1 != 0;
         let off13 = (w0 & 0x1fff) as i16;
-        let offset = if seg == FlatSeg::Flat { off13 } else { (off13 << 3) >> 3 };
-        let (sc0, nt, sc1) = ((w0 >> 16) & 1 != 0, (w0 >> 17) & 1 != 0, (w0 >> 25) & 1 != 0);
+        let offset = if seg == FlatSeg::Flat {
+            off13
+        } else {
+            (off13 << 3) >> 3
+        };
+        let (sc0, nt, sc1) = (
+            (w0 >> 16) & 1 != 0,
+            (w0 >> 17) & 1 != 0,
+            (w0 >> 25) & 1 != 0,
+        );
         let acc = w1 & ACC_BIT != 0;
-        let vreg = |n: u32| if acc { Src::Agpr(n as u8) } else { Src::Vgpr(n as u8) };
+        let vreg = |n: u32| {
+            if acc {
+                Src::Agpr(n as u8)
+            } else {
+                Src::Vgpr(n as u8)
+            }
+        };
         let (vdst, data) = match op.class() {
             Class::Load => (Some(vreg(w1 >> 24)), None),
             Class::Store => (None, Some(vreg((w1 >> 8) & 0xff))),
@@ -232,10 +344,25 @@ impl Flat {
             _ if saddr_code == 0x7f => None,
             _ => Some(Src::from_code(saddr_code as u16, None)?),
         };
-        let inst = Self { op, seg, vdst, addr, data, saddr, offset, sc0, sc1, nt };
+        let inst = Self {
+            op,
+            seg,
+            vdst,
+            addr,
+            data,
+            saddr,
+            offset,
+            sc0,
+            sc1,
+            nt,
+        };
         let mut again = Vec::with_capacity(2);
         inst.encode(arch, &mut again)?;
-        if again != [w0, w1] { return Err(format!("{w0:#010x} {w1:#010x} has reserved/ignored bits set (canonical form {again:08x?})")) }
+        if again != [w0, w1] {
+            return Err(format!(
+                "{w0:#010x} {w1:#010x} has reserved/ignored bits set (canonical form {again:08x?})"
+            ));
+        }
         Ok((inst, 2))
     }
 
@@ -246,11 +373,21 @@ impl Flat {
         let (vw, dw) = self.op.widths();
         let mut fp = Footprint::default();
         fp.read_file(RegFile::Exec, 0, 2);
-        if let Some(a) = self.addr { fp.read(a, self.addr_dwords()) }
-        if let Some(s) = self.saddr { fp.read(s, self.saddr_dwords()) }
-        if let Some(d) = self.data { fp.read(d, dw) }
-        if self.seg == FlatSeg::Scratch { fp.read_file(RegFile::FlatScratch, 0, 2) }
-        if let Some(v) = self.vdst { fp.write(v, vw) }
+        if let Some(a) = self.addr {
+            fp.read(a, self.addr_dwords())
+        }
+        if let Some(s) = self.saddr {
+            fp.read(s, self.saddr_dwords())
+        }
+        if let Some(d) = self.data {
+            fp.read(d, dw)
+        }
+        if self.seg == FlatSeg::Scratch {
+            fp.read_file(RegFile::FlatScratch, 0, 2)
+        }
+        if let Some(v) = self.vdst {
+            fp.write(v, vw)
+        }
         fp
     }
 
@@ -271,9 +408,12 @@ impl fmt::Display for Flat {
     /// llvm-mc spelling: operands in assembler order, then `offset:N` (omitted
     /// when 0), then `sc0 nt sc1`. A missing `addr`/`saddr` prints `off`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Some(name) = self.op.name(self.seg) else { return write!(f, "<{:?} has no {:?} form>", self.op, self.seg) };
+        let Some(name) = self.op.name(self.seg) else {
+            return write!(f, "<{:?} has no {:?} form>", self.op, self.seg);
+        };
         let (vw, dw) = self.op.widths();
-        let operand = |src: Option<Src>, width: u8| src.map_or_else(|| "off".to_string(), |s| s.fmt(width));
+        let operand =
+            |src: Option<Src>, width: u8| src.map_or_else(|| "off".to_string(), |s| s.fmt(width));
         write!(f, "{name}")?;
         let mut sep = " ";
         if self.vdst.is_some() || self.op.class() == Class::Load {
@@ -281,12 +421,24 @@ impl fmt::Display for Flat {
             sep = ", ";
         }
         write!(f, "{sep}{}", operand(self.addr, self.addr_dwords()))?;
-        if self.op.class() != Class::Load { write!(f, ", {}", operand(self.data, dw))? }
-        if self.seg != FlatSeg::Flat { write!(f, ", {}", operand(self.saddr, self.saddr_dwords()))? }
-        if self.offset != 0 { write!(f, " offset:{}", self.offset)? }
-        if self.sc0 { f.write_str(" sc0")? }
-        if self.nt { f.write_str(" nt")? }
-        if self.sc1 { f.write_str(" sc1")? }
+        if self.op.class() != Class::Load {
+            write!(f, ", {}", operand(self.data, dw))?
+        }
+        if self.seg != FlatSeg::Flat {
+            write!(f, ", {}", operand(self.saddr, self.saddr_dwords()))?
+        }
+        if self.offset != 0 {
+            write!(f, " offset:{}", self.offset)?
+        }
+        if self.sc0 {
+            f.write_str(" sc0")?
+        }
+        if self.nt {
+            f.write_str(" nt")?
+        }
+        if self.sc1 {
+            f.write_str(" sc1")?
+        }
         Ok(())
     }
 }

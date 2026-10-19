@@ -24,25 +24,53 @@ const S_ENDPGM: [u8; 4] = 0xbfb0_0000u32.to_le_bytes();
 fn kernel(arch: Arch, symbol: &str) -> Emitted {
     let mut plan = RegPlan::new(16, 8).unwrap();
     plan.v::<1>("a", 0, Live::Whole).unwrap();
-    let mut b = Builder::new(KernelSpec {
-        kernel_id: symbol.into(), variant: "default".into(), arch, symbol: symbol.into(), kernargs: KernargLayout::new(8),
-        user_sgpr_count: 2, system_sgpr_workgroup_id_y: false, workgroup_size: 64, group_segment_fixed_size: 0, wave32: true, cu_mode: false,
-    }, plan);
+    let mut b = Builder::new(
+        KernelSpec {
+            kernel_id: symbol.into(),
+            variant: "default".into(),
+            arch,
+            symbol: symbol.into(),
+            kernargs: KernargLayout::new(8),
+            user_sgpr_count: 2,
+            system_sgpr_workgroup_id_y: false,
+            workgroup_size: 64,
+            group_segment_fixed_size: 0,
+            wave32: true,
+            cu_mode: false,
+        },
+        plan,
+    );
     b.control(Sop::End.encode(arch).unwrap()).unwrap();
     b.finish().unwrap()
 }
 
 fn module(arch: Arch) -> String {
-    iu4_gemm::module(&[kernel(arch, "guard_a"), kernel(arch, "guard_b")], "guard_pair").unwrap().0
+    iu4_gemm::module(
+        &[kernel(arch, "guard_a"), kernel(arch, "guard_b")],
+        "guard_pair",
+    )
+    .unwrap()
+    .0
 }
 
-fn u16_at(b: &[u8], at: usize) -> usize { u16::from_le_bytes(b[at..at + 2].try_into().unwrap()) as usize }
-fn u32_at(b: &[u8], at: usize) -> usize { u32::from_le_bytes(b[at..at + 4].try_into().unwrap()) as usize }
-fn u64_at(b: &[u8], at: usize) -> usize { u64::from_le_bytes(b[at..at + 8].try_into().unwrap()) as usize }
+fn u16_at(b: &[u8], at: usize) -> usize {
+    u16::from_le_bytes(b[at..at + 2].try_into().unwrap()) as usize
+}
+fn u32_at(b: &[u8], at: usize) -> usize {
+    u32::from_le_bytes(b[at..at + 4].try_into().unwrap()) as usize
+}
+fn u64_at(b: &[u8], at: usize) -> usize {
+    u64::from_le_bytes(b[at..at + 8].try_into().unwrap()) as usize
+}
 
 /// The bytes of the named section.
 fn section(elf: &[u8], name: &str) -> Vec<u8> {
-    let (shoff, entsize, count, strndx) = (u64_at(elf, 40), u16_at(elf, 58), u16_at(elf, 60), u16_at(elf, 62));
+    let (shoff, entsize, count, strndx) = (
+        u64_at(elf, 40),
+        u16_at(elf, 58),
+        u16_at(elf, 60),
+        u16_at(elf, 62),
+    );
     let header = |i: usize| shoff + i * entsize;
     let names = u64_at(elf, header(strndx) + 24);
     for i in 0..count {
@@ -58,16 +86,28 @@ fn section(elf: &[u8], name: &str) -> Vec<u8> {
 
 /// `.symtab` kernel (FUNC) symbol sizes in order.
 fn function_sizes(elf: &[u8]) -> Vec<usize> {
-    section(elf, ".symtab").chunks(24).filter(|s| s[4] & 0xf == 2).map(|s| u64_at(s, 16)).collect()
+    section(elf, ".symtab")
+        .chunks(24)
+        .filter(|s| s[4] & 0xf == 2)
+        .map(|s| u64_at(s, 16))
+        .collect()
 }
 
-fn without_guard(text: &str) -> &str { text.strip_suffix(CODE_END_TAIL).expect("text ends with the guard") }
+fn without_guard(text: &str) -> &str {
+    text.strip_suffix(CODE_END_TAIL)
+        .expect("text ends with the guard")
+}
 
-fn all(bytes: &[u8], word: [u8; 4]) -> bool { bytes.chunks(4).all(|w| w == word) }
+fn all(bytes: &[u8], word: [u8; 4]) -> bool {
+    bytes.chunks(4).all(|w| w == word)
+}
 
 #[test]
 fn guard_text_is_llvms_spelling() {
-    assert_eq!(CODE_END_TAIL, ".text\n\t.p2alignl 7, 3214868480\n\t.fill 96, 4, 3214868480\n");
+    assert_eq!(
+        CODE_END_TAIL,
+        ".text\n\t.p2alignl 7, 3214868480\n\t.fill 96, 4, 3214868480\n"
+    );
     assert_eq!(3214868480u32, 0xbf9f_0000);
 }
 
@@ -106,10 +146,17 @@ fn native_single_kernel_pads_to_128_then_96_s_code_end_dwords() {
         let bare = native::assemble(without_guard(&text), arch).unwrap();
         let (guarded_text, bare_text) = (section(&guarded, ".text"), section(&bare, ".text"));
         let code = bare_text.len();
-        assert_eq!(&bare_text[..], S_ENDPGM.as_slice(), "the kernel is exactly s_endpgm, nothing is appended without the guard");
+        assert_eq!(
+            &bare_text[..],
+            S_ENDPGM.as_slice(),
+            "the kernel is exactly s_endpgm, nothing is appended without the guard"
+        );
         assert_eq!(guarded_text.len(), 128 + 96 * 4);
         assert_eq!(guarded_text[..code], bare_text[..]);
-        assert!(all(&guarded_text[code..], S_CODE_END), "alignment fill and guard are s_code_end, not s_nop");
+        assert!(
+            all(&guarded_text[code..], S_CODE_END),
+            "alignment fill and guard are s_code_end, not s_nop"
+        );
         // Symbol sizes and descriptors are untouched.
         assert_eq!(function_sizes(&guarded), vec![code]);
         assert_eq!(function_sizes(&bare), vec![code]);
@@ -146,7 +193,9 @@ fn native_assembler_accepts_only_the_exact_guard_once_after_the_last_kernel() {
     let bad = |source: String| native::assemble(&source, arch).unwrap_err();
     // A different alignment, fill value or count is not the LLVM guard.
     assert!(bad(text.replace(".p2alignl 7,", ".p2alignl 6,")).contains("unsupported"));
-    assert!(bad(text.replace("3214868480\n\t.fill", "3221225472\n\t.fill")).contains("unsupported"));
+    assert!(
+        bad(text.replace("3214868480\n\t.fill", "3221225472\n\t.fill")).contains("unsupported")
+    );
     assert!(bad(text.replace(".fill 96,", ".fill 95,")).contains("unsupported"));
     // The alignment without its fill, a fill without the alignment, and a second guard.
     assert!(bad(format!("{bare}.text\n\t.p2alignl 7, 3214868480\n")).contains("not followed"));

@@ -59,7 +59,10 @@ pub fn build_mrope_positions(
     spans: &[ImageSpan],
     spatial_merge_size: usize,
 ) -> MropePositions {
-    assert!(spatial_merge_size > 0, "spatial_merge_size must be positive");
+    assert!(
+        spatial_merge_size > 0,
+        "spatial_merge_size must be positive"
+    );
     let mut positions = Vec::with_capacity(n_tokens);
     let mut cursor: i32 = 0;
     let mut tok = 0usize;
@@ -99,5 +102,8 @@ pub fn build_mrope_positions(
         .unwrap_or(0);
     let rope_delta = max_pos + 1 - n_tokens as i32;
 
-    MropePositions { positions, rope_delta }
+    MropePositions {
+        positions,
+        rope_delta,
+    }
 }

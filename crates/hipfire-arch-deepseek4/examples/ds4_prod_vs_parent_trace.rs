@@ -40,6 +40,7 @@
 //! Must run prod/parent modes on gfx942 (mi300x).
 
 use hipfire_arch_deepseek4::forward::{decode_step, take_layer_norm_trace};
+use hipfire_arch_deepseek4::DeepseekV4;
 use hipfire_ds4_parent::forward::{
     parent_layer_forward, parent_layer_forward_traced, ParentForwardScratch, ParentLayerTrace,
     PARENT_HC_DIM,
@@ -52,9 +53,8 @@ use hipfire_ds4_parent::model::{
 };
 use hipfire_ds4_parent::weights::{ParentLoadPlan, ParentWeights};
 use hipfire_ds4_parent::Ds4ParentBackend;
-use hipfire_arch_deepseek4::DeepseekV4;
-use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::arch::Architecture;
+use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::safetensors_source::SafetensorsSource;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::io::{BufRead, Write};
@@ -65,8 +65,7 @@ use std::time::Instant;
 const DEFAULT_PARENT_MODEL: &str = "/mnt/scratch/models/DeepSeek-V4-Flash-0731";
 const DEFAULT_MQ2R: &str =
     "/mnt/scratch/quantization/deepseek-v4-flash-0731-mq2r-p3/artifacts/deepseek-v4-flash-0731.mq2r";
-const DEFAULT_MQ2R_SHA: &str =
-    "cbf2bbcfa3f47b1712a071836b2c48232dad7dfb763813a720f7d348a9318cce";
+const DEFAULT_MQ2R_SHA: &str = "cbf2bbcfa3f47b1712a071836b2c48232dad7dfb763813a720f7d348a9318cce";
 const DEFAULT_TOKEN_IDS: &str =
     "/mnt/scratch/quantization/deepseek-v4-flash-0731-parent-baseline/tokens.bin";
 const DEFAULT_ROWS: usize = 128;
@@ -75,14 +74,49 @@ const DEFAULT_ROWS: usize = 128;
 /// (engine commit f8b98f0a2, logits sha 65e8e75b…). Multi-row L2 over all 1024
 /// positions × 4 streams × 4096.
 const PARENT_BASELINE_1024: &[f64] = &[
-    494.179871, 474.714539, 483.457733, 482.975098, 486.401825, 777.972900,
-    1188.696289, 1263.666992, 1483.049683, 1808.714600, 2081.460205, 2448.574463,
-    2984.153564, 3357.408936, 3460.070312, 3531.552002, 3701.159180, 4005.140137,
-    4563.366699, 4789.596191, 5978.350586, 6502.970703, 7430.394531, 7603.702148,
-    9409.650391, 12910.570312, 41513.074219, 52746.164062, 63270.675781, 67993.132812,
-    89999.773438, 127263.906250, 157817.453125, 189329.296875, 274753.968750,
-    364817.343750, 426390.687500, 510029.375000, 618344.125000, 643934.000000,
-    677608.437500, 670448.625000, 631609.125000,
+    494.179871,
+    474.714539,
+    483.457733,
+    482.975098,
+    486.401825,
+    777.972900,
+    1188.696289,
+    1263.666992,
+    1483.049683,
+    1808.714600,
+    2081.460205,
+    2448.574463,
+    2984.153564,
+    3357.408936,
+    3460.070312,
+    3531.552002,
+    3701.159180,
+    4005.140137,
+    4563.366699,
+    4789.596191,
+    5978.350586,
+    6502.970703,
+    7430.394531,
+    7603.702148,
+    9409.650391,
+    12910.570312,
+    41513.074219,
+    52746.164062,
+    63270.675781,
+    67993.132812,
+    89999.773438,
+    127263.906250,
+    157817.453125,
+    189329.296875,
+    274753.968750,
+    364817.343750,
+    426390.687500,
+    510029.375000,
+    618344.125000,
+    643934.000000,
+    677608.437500,
+    670448.625000,
+    631609.125000,
 ];
 
 fn main() -> ExitCode {
@@ -155,11 +189,7 @@ fn run_prod(args: &Args) -> Result<(), String> {
     cfg.load_dspark = false;
     println!(
         "config: layers={} hidden={} hc_mult={} mq2r={} route_scale_cfg={}",
-        cfg.num_hidden_layers,
-        cfg.hidden_size,
-        cfg.hc_mult,
-        cfg.mq2r,
-        cfg.routed_scaling_factor
+        cfg.num_hidden_layers, cfg.hidden_size, cfg.hc_mult, cfg.mq2r, cfg.routed_scaling_factor
     );
     println!(
         "note: production mhc_pre default post_scale=1.5 (env HIPFIRE_DEEPSEEK4_POST_SCALE); \
@@ -247,12 +277,8 @@ fn run_parent(args: &Args) -> Result<(), String> {
     }
     let token_ids = &token_ids[..n];
 
-    let source = SafetensorsSource::open(model_path).map_err(|e| {
-        format!(
-            "SafetensorsSource::open({}): {e}",
-            model_path.display()
-        )
-    })?;
+    let source = SafetensorsSource::open(model_path)
+        .map_err(|e| format!("SafetensorsSource::open({}): {e}", model_path.display()))?;
 
     let mut gpu = Gpu::init().map_err(|e| format!("Gpu::init: {e:?}"))?;
     println!("gpu: {}", gpu.arch);
@@ -311,7 +337,15 @@ fn run_parent(args: &Args) -> Result<(), String> {
     }
 
     if args.stage_dump {
-        dump_parent_stages(&mut gpu, backend, &weights, &cfg, token_ids, n, &args.stage_layers)?;
+        dump_parent_stages(
+            &mut gpu,
+            backend,
+            &weights,
+            &cfg,
+            token_ids,
+            n,
+            &args.stage_layers,
+        )?;
     }
 
     print_structural_diff();
@@ -342,9 +376,7 @@ fn dump_parent_stages(
     let max_l = *stage_layers.iter().max().unwrap_or(&0);
     let end = (max_l + 1).min(cfg.num_hidden_layers);
     // SWA ring shape from parent attention constants.
-    use hipfire_ds4_parent::attention::{
-        PARENT_HEAD_DIM, PARENT_N_KV_HEADS, PARENT_SWA_WINDOW,
-    };
+    use hipfire_ds4_parent::attention::{PARENT_HEAD_DIM, PARENT_N_KV_HEADS, PARENT_SWA_WINDOW};
     let mut rings: Vec<GpuTensor> = Vec::with_capacity(end);
     for _ in 0..end {
         rings.push(zeros_f32(
@@ -403,9 +435,7 @@ fn dump_parent_stages(
                 .map_err(|e| format!("download out: {e:?}"))?;
             let need = n * PARENT_HC_DIM;
             let res_l2 = l2_f64(&res[..need.min(res.len())]);
-            println!(
-                "PARENT_STAGE layer={layer_idx} residual_out_l2={res_l2:.6} (nelems={need})"
-            );
+            println!("PARENT_STAGE layer={layer_idx} residual_out_l2={res_l2:.6} (nelems={need})");
             // Indexer / compressed dump for ratio-4 layers.
             if ratio == 4 {
                 dump_parent_indexer(gpu, &layer_scratch, layer_idx, n)?;
@@ -437,9 +467,7 @@ fn dump_parent_indexer(
     layer_idx: usize,
     rows: usize,
 ) -> Result<(), String> {
-    use hipfire_ds4_parent::attention::{
-        PARENT_ATTN_INDEX_TOPK, PARENT_HEAD_DIM,
-    };
+    use hipfire_ds4_parent::attention::{PARENT_ATTN_INDEX_TOPK, PARENT_HEAD_DIM};
     use hipfire_ds4_parent::indexer::PARENT_INDEX_HEAD_DIM;
     let attn = layer_scratch.attn_scratch();
     let n_comp = attn.last_compress_events();
@@ -478,7 +506,9 @@ fn dump_parent_indexer(
     let idx_kv = gpu
         .download_f32(attn.indexer_scratch().kv_cache_f32_ref())
         .map_err(|e| format!("idx_kv: {e:?}"))?;
-    let idx_n = n_comp.saturating_mul(PARENT_INDEX_HEAD_DIM).min(idx_kv.len());
+    let idx_n = n_comp
+        .saturating_mul(PARENT_INDEX_HEAD_DIM)
+        .min(idx_kv.len());
     let idx_l2 = l2_f64(&idx_kv[..idx_n]);
     println!(
         "PARENT_INDEXER layer={layer_idx} row={last} n_comp={n_comp} n_pos_topk={n_pos} \
@@ -487,7 +517,6 @@ fn dump_parent_indexer(
     );
     Ok(())
 }
-
 
 // ── compare (offline) ───────────────────────────────────────────────────────
 
@@ -570,9 +599,7 @@ fn compare_ratio_trajectories(parent: &[f64], prod: &[f64]) {
         println!("  {i:>5}   {pr:.6}   {qr:.6}   {rel:.4}{mark}");
     }
     match first_sep {
-        Some(l) => println!(
-            "first layer where consecutive-ratio shape diverges >25%: L{l}"
-        ),
+        Some(l) => println!("first layer where consecutive-ratio shape diverges >25%: L{l}"),
         None => println!(
             "ratio trajectories track within 25% across {} steps \
              (quantitative, not structural?)",
@@ -608,33 +635,19 @@ fn print_structural_diff() {
     println!(
         "| 3 | `q_lora` (attn_norm fused inside) | `parent_rms_norm(attn_norm)` then attn | prod fuses norm |"
     );
-    println!(
-        "| 4 | `kv_joint` | (inside `parent_attention_swa`) | same |"
-    );
-    println!(
-        "| 5 | `apply_tail_rope` | (inside attention) | same |"
-    );
+    println!("| 4 | `kv_joint` | (inside `parent_attention_swa`) | same |");
+    println!("| 5 | `apply_tail_rope` | (inside attention) | same |");
     println!(
         "| 6 | `compressor_forward` ratio>0 | (inside attention via ParentAttnScratch) | same |"
     );
-    println!(
-        "| 7 | `indexer_forward` ratio==4 | (inside attention) | same |"
-    );
-    println!(
-        "| 8 | `attn_stub` | `parent_attention_swa` | same role |"
-    );
-    println!(
-        "| 9 | `hc_attn_mix` | `parent_hc_post` | same: comb·res + post·attn |"
-    );
-    println!(
-        "|10 | `mhc_pre(..., is_attn=false)` | `parent_hc_pre(hc_ffn_*)` | same |"
-    );
+    println!("| 7 | `indexer_forward` ratio==4 | (inside attention) | same |");
+    println!("| 8 | `attn_stub` | `parent_attention_swa` | same role |");
+    println!("| 9 | `hc_attn_mix` | `parent_hc_post` | same: comb·res + post·attn |");
+    println!("|10 | `mhc_pre(..., is_attn=false)` | `parent_hc_pre(hc_ffn_*)` | same |");
     println!(
         "|11 | `ffn_stub` + hash/score routed | `parent_rms_norm(ffn)` + route + moe | same |"
     );
-    println!(
-        "|12 | `hc_ffn_mix` | `parent_hc_post` | same |"
-    );
+    println!("|12 | `hc_ffn_mix` | `parent_hc_post` | same |");
     println!();
     println!(
         "Steps present in BOTH: HC-pre attn, attn path, HC-post attn, HC-pre ffn, MoE, HC-post ffn."
@@ -658,9 +671,7 @@ fn print_structural_diff() {
         "  - production residual is single-token `[hc_mult, hidden]`; \
          parent is `[rows, hc_mult, hidden]`."
     );
-    println!(
-        "  - NO missing Block.forward step on either side relative to model.py:695-707."
-    );
+    println!("  - NO missing Block.forward step on either side relative to model.py:695-707.");
 }
 
 fn print_embed_head_boundary() {

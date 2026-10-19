@@ -57,8 +57,7 @@ fn loose_json_with_complete_args_still_recovered() {
     // Broken outer JSON (leading `{` lost to special-token leakage) but a
     // COMPLETE balanced args object — the fallback still recovers it,
     // distinguishing real recovery from the truncation case above.
-    let s =
-        "<tool_call>\nname\": \"read\", \"arguments\": {\"path\": \"/tmp/x\"}\n</tool_call>";
+    let s = "<tool_call>\nname\": \"read\", \"arguments\": {\"path\": \"/tmp/x\"}\n</tool_call>";
     let calls = extract_tool_calls_from_text(s);
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "read");

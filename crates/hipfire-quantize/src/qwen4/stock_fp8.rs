@@ -504,7 +504,10 @@ fn require_dtype(tensor: &SourceTensor, dtype: &str, what: &str) -> Result<(), Q
 }
 
 fn scale_grid(rows: u64, k: u64) -> Vec<u64> {
-    vec![rows.div_ceil(B128_BLOCK as u64), k.div_ceil(B128_BLOCK as u64)]
+    vec![
+        rows.div_ceil(B128_BLOCK as u64),
+        k.div_ceil(B128_BLOCK as u64),
+    ]
 }
 
 fn check_expert_tensor(
@@ -737,8 +740,7 @@ fn plan_stock_entries(
         }
         if let Some(shard) = ple_shard_index(&name) {
             require_dtype(&tensor, FP8_DTYPE, "PLE shard")?;
-            if tensor.shape.len() != 2 || tensor.shape[1] != PLE_ROW_WIDTH || tensor.shape[0] == 0
-            {
+            if tensor.shape.len() != 2 || tensor.shape[1] != PLE_ROW_WIDTH || tensor.shape[0] == 0 {
                 return invalid(format!(
                     "PLE shard {name} has shape {:?}, expected [rows, {PLE_ROW_WIDTH}]",
                     tensor.shape
@@ -996,7 +998,9 @@ fn plan_stock_entries(
             .name
             .find(".shard_")
             .map(|at| &codes.name[..at])
-            .ok_or_else(|| Qwen4Error::Invalid(format!("{} is not a PLE shard name", codes.name)))?;
+            .ok_or_else(|| {
+                Qwen4Error::Invalid(format!("{} is not a PLE shard name", codes.name))
+            })?;
         let scale_name = format!("{table}.weight_scale");
         let scale = ple_scales.get(&scale_name).ok_or_else(|| {
             Qwen4Error::Invalid(format!(
@@ -1049,7 +1053,9 @@ fn plan_stock_entries(
     let mut metadata_entries = Vec::new();
     for role in [I64Role::Multipliers, I64Role::VocabSizes, I64Role::Offsets] {
         let source = metadata_sources.remove(&role).ok_or_else(|| {
-            Qwen4Error::Invalid(format!("stock-fp8 input is missing PLE metadata role {role:?}"))
+            Qwen4Error::Invalid(format!(
+                "stock-fp8 input is missing PLE metadata role {role:?}"
+            ))
         })?;
         let expected_len = match role {
             I64Role::Multipliers => 3,
@@ -1058,7 +1064,8 @@ fn plan_stock_entries(
         let values = read_i64_array(&source, expected_len)?;
         if let Some(index) = index {
             let declared = index.metadata.get(&source.name);
-            if declared.map(|d| (d.role, d.shape.as_slice())) != Some((role, source.shape.as_slice()))
+            if declared.map(|d| (d.role, d.shape.as_slice()))
+                != Some((role, source.shape.as_slice()))
             {
                 return invalid(format!(
                     "{} is not the manifest's {role:?} metadata record",
@@ -1163,13 +1170,7 @@ fn scan_job(job: ScanJob) -> Result<Vec<(String, ScanDigest)>, Qwen4Error> {
         }
         let mut sha256 = [0u8; 32];
         sha256.copy_from_slice(hasher.finalize().as_slice());
-        out.push((
-            name.clone(),
-            ScanDigest {
-                sha256,
-                count_0x80,
-            },
-        ));
+        out.push((name.clone(), ScanDigest { sha256, count_0x80 }));
     }
     Ok(out)
 }
@@ -1235,7 +1236,10 @@ impl Copier<'_> {
                 ));
             }
             None if tensor.dtype == FP8_DTYPE => {
-                return invalid(format!("FP8 source tensor {} was never scanned", tensor.name));
+                return invalid(format!(
+                    "FP8 source tensor {} was never scanned",
+                    tensor.name
+                ));
             }
             _ => {}
         }
@@ -1318,7 +1322,10 @@ fn reopen_stock_artifact(path: &Path) -> Result<Qwen4ReopenPlan, Qwen4Error> {
         .map_err(|error| Qwen4Error::io(format!("stat {}", path.display()), error))?
         .len();
     if file_len < 32 {
-        return invalid(format!("{} is shorter than its HFQM header", path.display()));
+        return invalid(format!(
+            "{} is shorter than its HFQM header",
+            path.display()
+        ));
     }
     let mut header = [0u8; 32];
     read_exact_at(&file, 0, &mut header)
@@ -1386,7 +1393,9 @@ fn reopen_stock_artifact(path: &Path) -> Result<Qwen4ReopenPlan, Qwen4Error> {
             .checked_add(data_len)
             .filter(|end| *end <= file_len)
             .ok_or_else(|| {
-                Qwen4Error::Invalid(format!("{name} payload exceeds the file ({file_len} bytes)"))
+                Qwen4Error::Invalid(format!(
+                    "{name} payload exceeds the file ({file_len} bytes)"
+                ))
             })?;
         if !seen.insert(name.clone()) {
             return invalid(format!("duplicate output tensor {name}"));
@@ -1448,7 +1457,9 @@ fn validate_stock_entry_len(
             }
             Ok(())
         }
-        other => invalid(format!("{name} uses unsupported stock-fp8 quant type {other}")),
+        other => invalid(format!(
+            "{name} uses unsupported stock-fp8 quant type {other}"
+        )),
     }
 }
 

@@ -1179,7 +1179,8 @@ fn run_kind(
             y0: DevView::new(y0.ptr, n_words * 4),
             y1: y1.map(|b| DevView::new(b.ptr, n_words * 4)),
         };
-        let planned = plan_launch_on(ctx.module.arch(), &req).map_err(|e| format!("{}: plan_launch: {e}", case.name))?;
+        let planned = plan_launch_on(ctx.module.arch(), &req)
+            .map_err(|e| format!("{}: plan_launch: {e}", case.name))?;
         t.plan_checks += 1;
         plan_checked = true;
         if planned.kernargs.to_bytes() != ka.to_bytes()
@@ -2249,8 +2250,12 @@ fn parse_args(argv: &[String]) -> Result<Cfg> {
         i += 1;
     }
     cfg.fabric = fab;
-    cfg.target = E8pArch::of_name(&cfg.expect_arch)
-        .ok_or_else(|| format!("--expect-arch {:?}: this oracle serves gfx1201 and gfx1151\n{USAGE}", cfg.expect_arch))?;
+    cfg.target = E8pArch::of_name(&cfg.expect_arch).ok_or_else(|| {
+        format!(
+            "--expect-arch {:?}: this oracle serves gfx1201 and gfx1151\n{USAGE}",
+            cfg.expect_arch
+        )
+    })?;
     if cfg.target == E8pArch::Gfx1151 && cfg.expect_bdf.is_none() {
         return Err(format!("gfx1151 has no ROCr UUID: --expect-bdf is required (--expect-uuid is optional)\n{USAGE}"));
     }
@@ -2369,7 +2374,11 @@ fn run() -> Result<(Value, i32)> {
     let device = json!({"index": id, "uuid": uuid, "bdf": bdf, "arch": arch, "card": cfg.card,
         "expected_uuid": cfg.expect_uuid, "expected_bdf": cfg.expect_bdf, "expected_arch": cfg.expect_arch,
         "uuid_authoritative": cfg.target != E8pArch::Gfx1151, "uuid_checked": cfg.expect_uuid.is_some(), "identity_match": identity_match});
-    let fabric: serde_json::Map<String, Value> = cfg.fabric.iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
+    let fabric: serde_json::Map<String, Value> = cfg
+        .fabric
+        .iter()
+        .map(|(k, v)| (k.to_string(), json!(v)))
+        .collect();
     let mut receipt = json!({"schema": SCHEMA, "mode": format!("{:?}", cfg.mode).to_lowercase(),
         "command": {"argv": argv, "build_command": BUILD_COMMAND}, "fabric": Value::Object(fabric), "device": device,
         "harness_sha256": sha_hex(HARNESS_SRC), "reference_sha256": sha_hex(REFERENCE_SRC), "reference_sha256_pinned": REFERENCE_SHA256,

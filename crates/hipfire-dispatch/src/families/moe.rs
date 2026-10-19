@@ -481,7 +481,11 @@ pub fn slab_codec_pair(arch: &str, gate_up: DType, down: DType) -> bool {
 /// The K1/K2 codec bucket of an admitted slab dtype pair: the cold codec (W3
 /// or E8P) is bucket 0, MQ4 bucket 1.
 pub fn slab_bucket_of_pair(arch: &str, gate_up: DType, down: DType) -> Option<usize> {
-    slab_bucket_of_pair_by(&|codec| rdna_compute::qwen4_slab_codec_admitted(arch, codec), gate_up, down)
+    slab_bucket_of_pair_by(
+        &|codec| rdna_compute::qwen4_slab_codec_admitted(arch, codec),
+        gate_up,
+        down,
+    )
 }
 
 /// [`slab_bucket_of_pair`] over an explicit admission predicate (the pure decision: `admits`
@@ -3163,7 +3167,9 @@ mod tests {
         // switch flips, W3 is served either way, and W3 + E8P is never one layer.
         let gfx1151 = |landed: bool| {
             move |codec: u8| {
-                rdna_compute::slab_admission::qwen4_slab_codec_admitted_with("gfx1151", codec, landed)
+                rdna_compute::slab_admission::qwen4_slab_codec_admitted_with(
+                    "gfx1151", codec, landed,
+                )
             }
         };
         let (refused, landed) = (gfx1151(false), gfx1151(true));
@@ -3176,7 +3182,11 @@ mod tests {
             assert_eq!(layer(&[MQ4, W3, E8P], admits), None);
             assert_eq!(layer(&[MQ4, MQ4, W2], admits), None);
         }
-        let uniform_e8p = MoeDtypes { routed_gate_up: E8P.0, routed_down: E8P.1, ..uniform_mq4() };
+        let uniform_e8p = MoeDtypes {
+            routed_gate_up: E8P.0,
+            routed_down: E8P.1,
+            ..uniform_mq4()
+        };
         assert_eq!(layer_cold_codec(&uniform_e8p, &refused), None);
         assert_eq!(layer_cold_codec(&uniform_e8p, &landed), Some(Some(3)));
         // Uniform layers: MQ4 has no cold codec, W3 / E8P are their own.

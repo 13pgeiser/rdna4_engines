@@ -59,7 +59,10 @@ const BODY_MARK: &str = "/*BODY*/";
 #[derive(Debug, PartialEq)]
 enum Kind {
     /// `rip` (and `rip body`): compiled by `check`.
-    Rip { body: bool, fails: Option<String> },
+    Rip {
+        body: bool,
+        fails: Option<String>,
+    },
     Eval,
     Mnemonics,
     Other,
@@ -80,7 +83,9 @@ struct Block {
 }
 
 fn parse_arch(name: &str) -> Option<Arch> {
-    [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201].into_iter().find(|a| a.name() == name)
+    [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201]
+        .into_iter()
+        .find(|a| a.name() == name)
 }
 
 fn is_code(s: &str) -> bool {
@@ -97,7 +102,10 @@ fn classify(info: &str) -> (Kind, String, Option<Arch>, Option<String>) {
     let kind = match lang {
         "mnemonics" => {
             if !rest.is_empty() {
-                bad = Some(format!("`mnemonics` takes no attributes, found `{}`", rest.join(" ")));
+                bad = Some(format!(
+                    "`mnemonics` takes no attributes, found `{}`",
+                    rest.join(" ")
+                ));
             }
             Kind::Mnemonics
         }
@@ -112,7 +120,9 @@ fn classify(info: &str) -> (Kind, String, Option<Arch>, Option<String>) {
                     if is_code(c) {
                         fails = Some(c.to_string());
                     } else {
-                        bad = Some(format!("`fails={c}` is not an error code (R followed by four digits)"));
+                        bad = Some(format!(
+                            "`fails={c}` is not an error code (R followed by four digits)"
+                        ));
                     }
                 } else if let Some(v) = w.strip_prefix("variant=") {
                     if v.is_empty() {
@@ -122,7 +132,9 @@ fn classify(info: &str) -> (Kind, String, Option<Arch>, Option<String>) {
                 } else if let Some(a) = w.strip_prefix("arch=") {
                     match parse_arch(a) {
                         Some(a) => arch = Some(a),
-                        None => bad = Some(format!("`arch={a}`: expected gfx1100, gfx1151 or gfx1201")),
+                        None => {
+                            bad = Some(format!("`arch={a}`: expected gfx1100, gfx1151 or gfx1201"))
+                        }
                     }
                 } else {
                     bad = Some(format!("unknown attribute `{w}` on a `rip` block (known: eval, body, fails=R0xxx, variant=NAME, arch=gfxNNNN)"));
@@ -131,7 +143,11 @@ fn classify(info: &str) -> (Kind, String, Option<Arch>, Option<String>) {
             if eval && (body || fails.is_some() || arch.is_some() || variant != "default") {
                 bad = Some("`eval` cannot be combined with other attributes".into());
             }
-            if eval { Kind::Eval } else { Kind::Rip { body, fails } }
+            if eval {
+                Kind::Eval
+            } else {
+                Kind::Rip { body, fails }
+            }
         }
         _ => Kind::Other,
     };
@@ -158,7 +174,15 @@ fn blocks(md: &str) -> Vec<Block> {
                     let (kind, variant, arch, bad_info) = classify(info);
                     let mut text = lines.join("\n");
                     text.push('\n');
-                    out.push(Block { line: *line, info: info.clone(), kind, variant, arch, text, bad_info });
+                    out.push(Block {
+                        line: *line,
+                        info: info.clone(),
+                        kind,
+                        variant,
+                        arch,
+                        text,
+                        bad_info,
+                    });
                     open = None;
                 } else {
                     lines.push(raw);
@@ -192,9 +216,14 @@ fn rip_arches(b: &Block) -> Vec<Arch> {
 /// Splice a `rip body` block into the template; returns the source and the
 /// 1-based template line of the `/*BODY*/` marker.
 fn splice(body: &str) -> (String, usize) {
-    let at = BODY_TEMPLATE.find(BODY_MARK).expect("template has a body marker");
+    let at = BODY_TEMPLATE
+        .find(BODY_MARK)
+        .expect("template has a body marker");
     let marker_line = BODY_TEMPLATE[..at].matches('\n').count() + 1;
-    (BODY_TEMPLATE.replacen(BODY_MARK, body.trim_end_matches('\n'), 1), marker_line)
+    (
+        BODY_TEMPLATE.replacen(BODY_MARK, body.trim_end_matches('\n'), 1),
+        marker_line,
+    )
 }
 
 /// `name` is also what diagnostics print; it carries no colon so positions
@@ -204,7 +233,11 @@ fn check_rip(doc: &str, b: &Block, errors: &mut Vec<String>) {
         Kind::Rip { body, fails } => (*body, fails.as_deref()),
         _ => unreachable!(),
     };
-    let (src, marker_line) = if body { splice(&b.text) } else { (b.text.clone(), 0) };
+    let (src, marker_line) = if body {
+        splice(&b.text)
+    } else {
+        (b.text.clone(), 0)
+    };
     let name = format!("block-L{}", b.line);
     for arch in rip_arches(b) {
         let checked = peacemaker_rip::check(&src, &name, arch, &b.variant);
@@ -213,12 +246,22 @@ fn check_rip(doc: &str, b: &Block, errors: &mut Vec<String>) {
             .diagnostics
             .iter()
             .find(|d| d.severity == Severity::Error)
-            .or_else(|| if fails.is_some() { checked.diagnostics.first() } else { None });
+            .or_else(|| {
+                if fails.is_some() {
+                    checked.diagnostics.first()
+                } else {
+                    None
+                }
+            });
         // Position of a diagnostic in the document, when it points into the block's own text.
         let at = |d: &diag::Diagnostic| -> String {
-            let Some(span) = d.span else { return format!("{doc}:{}", b.line) };
+            let Some(span) = d.span else {
+                return format!("{doc}:{}", b.line);
+            };
             let inner = if body {
-                (span.line + 1).checked_sub(marker_line).filter(|&l| l >= 1 && l <= b.text.lines().count().max(1))
+                (span.line + 1)
+                    .checked_sub(marker_line)
+                    .filter(|&l| l >= 1 && l <= b.text.lines().count().max(1))
             } else {
                 Some(span.line)
             };
@@ -277,18 +320,29 @@ fn check_mnemonics(doc: &str, b: &Block, errors: &mut Vec<String>) {
             None => (false, line),
         };
         let Some((arch_name, text)) = rest.split_once(':') else {
-            errors.push(format!("{at}: mnemonics line must be `gfxNNNN: <instruction>`: `{line}`"));
+            errors.push(format!(
+                "{at}: mnemonics line must be `gfxNNNN: <instruction>`: `{line}`"
+            ));
             continue;
         };
         let Some(arch) = parse_arch(arch_name.trim()) else {
-            errors.push(format!("{at}: unknown architecture `{}` (gfx1100, gfx1151 or gfx1201)", arch_name.trim()));
+            errors.push(format!(
+                "{at}: unknown architecture `{}` (gfx1100, gfx1151 or gfx1201)",
+                arch_name.trim()
+            ));
             continue;
         };
         let text = text.trim();
         match (mnemonic_verdict(arch, text), negated) {
             (Ok(()), false) | (Err(_), true) => {}
-            (Err(e), false) => errors.push(format!("{at}: `{text}` is rejected for {}: {e}", arch.name())),
-            (Ok(()), true) => errors.push(format!("{at}: `{text}` is accepted for {}, but the line is marked `!`", arch.name())),
+            (Err(e), false) => errors.push(format!(
+                "{at}: `{text}` is rejected for {}: {e}",
+                arch.name()
+            )),
+            (Ok(()), true) => errors.push(format!(
+                "{at}: `{text}` is accepted for {}, but the line is marked `!`",
+                arch.name()
+            )),
         }
     }
 }
@@ -320,7 +374,12 @@ fn docs_dir() -> PathBuf {
 }
 
 fn report(errors: Vec<String>) {
-    assert!(errors.is_empty(), "{} documentation block(s) failed:\n\n{}", errors.len(), errors.join("\n\n"));
+    assert!(
+        errors.is_empty(),
+        "{} documentation block(s) failed:\n\n{}",
+        errors.len(),
+        errors.join("\n\n")
+    );
 }
 
 // ---------------------------------------------------------------- tests
@@ -355,7 +414,11 @@ fn cookbook_blocks_compile_and_run() {
         eprintln!("note: {} does not exist; skipped", dir.display());
         return;
     };
-    let mut files: Vec<PathBuf> = rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "md")).collect();
+    let mut files: Vec<PathBuf> = rd
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "md"))
+        .collect();
     files.sort();
     if files.is_empty() {
         eprintln!("note: {} has no .md files; skipped", dir.display());
@@ -380,13 +443,29 @@ fn errors_md_matches_registered_codes() {
         .filter(|c| is_code(c))
         .map(str::to_string)
         .collect();
-    let mut registered: Vec<String> = diag::codes().into_iter().map(|c| c.code.to_string()).collect();
+    let mut registered: Vec<String> = diag::codes()
+        .into_iter()
+        .map(|c| c.code.to_string())
+        .collect();
     documented.sort();
     registered.sort();
-    let dup: Vec<_> = documented.windows(2).filter(|w| w[0] == w[1]).map(|w| w[0].clone()).collect();
-    assert!(dup.is_empty(), "docs/ERRORS.md documents {dup:?} more than once");
-    let missing_in_code: Vec<_> = documented.iter().filter(|c| !registered.contains(c)).collect();
-    let missing_in_docs: Vec<_> = registered.iter().filter(|c| !documented.contains(c)).collect();
+    let dup: Vec<_> = documented
+        .windows(2)
+        .filter(|w| w[0] == w[1])
+        .map(|w| w[0].clone())
+        .collect();
+    assert!(
+        dup.is_empty(),
+        "docs/ERRORS.md documents {dup:?} more than once"
+    );
+    let missing_in_code: Vec<_> = documented
+        .iter()
+        .filter(|c| !registered.contains(c))
+        .collect();
+    let missing_in_docs: Vec<_> = registered
+        .iter()
+        .filter(|c| !documented.contains(c))
+        .collect();
     assert!(
         missing_in_code.is_empty() && missing_in_docs.is_empty(),
         "docs/ERRORS.md has sections for {missing_in_code:?} that diag::codes() lacks; diag::codes() has {missing_in_docs:?} without a section"
@@ -400,8 +479,18 @@ fn body_template_compiles_empty_on_both_arches() {
     let (src, _) = splice("");
     for arch in [Arch::Gfx1151, Arch::Gfx1201] {
         let c = peacemaker_rip::check(&src, "template", arch, "default");
-        let errs: Vec<String> = c.diagnostics.iter().filter(|d| d.severity == Severity::Error).map(|d| d.render(&src)).collect();
-        assert!(errs.is_empty(), "{}: the `rip body` template does not compile with an empty body:\n{}", arch.name(), errs.join("\n"));
+        let errs: Vec<String> = c
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .map(|d| d.render(&src))
+            .collect();
+        assert!(
+            errs.is_empty(),
+            "{}: the `rip body` template does not compile with an empty body:\n{}",
+            arch.name(),
+            errs.join("\n")
+        );
     }
 }
 
@@ -438,17 +527,37 @@ not a fence
 ";
     let bs = blocks(md);
     assert_eq!(bs.len(), 8);
-    assert_eq!(bs[0].kind, Kind::Rip { body: false, fails: None });
+    assert_eq!(
+        bs[0].kind,
+        Kind::Rip {
+            body: false,
+            fails: None
+        }
+    );
     assert_eq!(bs[0].line, 1);
     assert_eq!(bs[1].kind, Kind::Eval);
-    assert_eq!(bs[2].kind, Kind::Rip { body: false, fails: Some("R0201".into()) });
-    assert_eq!(bs[3].kind, Kind::Rip { body: true, fails: None });
+    assert_eq!(
+        bs[2].kind,
+        Kind::Rip {
+            body: false,
+            fails: Some("R0201".into())
+        }
+    );
+    assert_eq!(
+        bs[3].kind,
+        Kind::Rip {
+            body: true,
+            fails: None
+        }
+    );
     assert_eq!(bs[3].variant, "x");
     assert_eq!(bs[3].arch, Some(Arch::Gfx1151));
     assert_eq!(bs[4].kind, Kind::Mnemonics);
     assert_eq!(bs[5].kind, Kind::Other);
     assert!(bs[6].bad_info.is_some() && bs[7].bad_info.is_some());
-    assert!(blocks("```rip\nfn emit() {}\n")[0].bad_info.as_deref() == Some("unterminated code fence"));
+    assert!(
+        blocks("```rip\nfn emit() {}\n")[0].bad_info.as_deref() == Some("unterminated code fence")
+    );
     // `eval` cannot be combined; an unknown attribute is an error.
     assert!(classify("rip eval body").3.is_some());
     assert!(classify("rip bogus").3.is_some());
@@ -470,18 +579,31 @@ fn mnemonics_blocks_enforce_both_polarities() {
     let mut errors = Vec::new();
     check_mnemonics("t.md", &ok, &mut errors);
     assert!(errors.is_empty(), "{errors:?}");
-    let bad = Block { text: "gfx1151: s_no_such_instruction\n!gfx1151: s_endpgm\ngfx1151 s_endpgm\n".into(), ..ok };
+    let bad = Block {
+        text: "gfx1151: s_no_such_instruction\n!gfx1151: s_endpgm\ngfx1151 s_endpgm\n".into(),
+        ..ok
+    };
     check_mnemonics("t.md", &bad, &mut errors);
     assert_eq!(errors.len(), 3, "{errors:?}");
 }
 
 #[test]
 fn fails_blocks_require_the_named_code() {
-    let src = "```rip fails=R0501\nfn not_emit() {}\n```\n\n```rip fails=R0201\nfn not_emit() {}\n```\n";
+    let src =
+        "```rip fails=R0501\nfn not_emit() {}\n```\n\n```rip fails=R0201\nfn not_emit() {}\n```\n";
     let mut errors = Vec::new();
     for b in blocks(src) {
         check_rip("t.md", &b, &mut errors);
     }
-    assert_eq!(errors.len(), 2, "one right code (R0501 passes on both arches), one wrong: {errors:?}");
-    assert!(errors.iter().all(|e| e.contains("expected first diagnostic R0201")), "{errors:?}");
+    assert_eq!(
+        errors.len(),
+        2,
+        "one right code (R0501 passes on both arches), one wrong: {errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .all(|e| e.contains("expected first diagnostic R0201")),
+        "{errors:?}"
+    );
 }

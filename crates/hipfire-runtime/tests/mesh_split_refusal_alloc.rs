@@ -73,14 +73,13 @@ fn counted<T>(f: impl FnOnce() -> T) -> (T, usize) {
 }
 
 /// Call `split_program`, requiring `Err` and zero allocator calls.
-fn refusal(
-    case: &str,
-    graph: &StepGraph,
-    plan: &ManifestPlan,
-    mesh: &DeviceMesh,
-) -> SplitError {
-    let (result, allocations) = counted(|| split_program(black_box(graph), black_box(plan), black_box(mesh)));
-    assert_eq!(allocations, 0, "{case}: refusal path allocated {allocations} time(s)");
+fn refusal(case: &str, graph: &StepGraph, plan: &ManifestPlan, mesh: &DeviceMesh) -> SplitError {
+    let (result, allocations) =
+        counted(|| split_program(black_box(graph), black_box(plan), black_box(mesh)));
+    assert_eq!(
+        allocations, 0,
+        "{case}: refusal path allocated {allocations} time(s)"
+    );
     match result {
         Err(error) => error,
         Ok(_) => panic!("{case}: expected a refusal, got Ok(SplitPlan)"),
@@ -138,15 +137,10 @@ fn project_graph(
     (graph, weight)
 }
 
-fn expect_plan(
-    entries: &[WeightEntry],
-    mesh: &DeviceMesh,
-    n_layers: usize,
-) -> ManifestPlan {
+fn expect_plan(entries: &[WeightEntry], mesh: &DeviceMesh, n_layers: usize) -> ManifestPlan {
     let placement =
         BandPlacement::uniform(mesh, n_layers).expect("uniform placement on its own mesh");
-    plan_manifest(entries, &[], mesh, n_layers, &placement)
-        .expect("manifest plans on its own mesh")
+    plan_manifest(entries, &[], mesh, n_layers, &placement).expect("manifest plans on its own mesh")
 }
 
 #[test]
@@ -311,7 +305,10 @@ fn split_program_refuses_without_allocating() {
             }),
             "self alias must be refused by add_resource"
         );
-        assert!(graph.resources().is_empty(), "refused alias must not be recorded");
+        assert!(
+            graph.resources().is_empty(),
+            "refused alias must not be recorded"
+        );
 
         let base = graph
             .add_resource(ResourceDecl {
@@ -323,13 +320,20 @@ fn split_program_refuses_without_allocating() {
         let past_end = graph.add_resource(ResourceDecl {
             class: ResourceClass::Activation,
             shape: vec![4],
-            alias: Some(hipfire_dispatch::pipeline::step_graph::Alias { of: base, offset: 2 }),
+            alias: Some(hipfire_dispatch::pipeline::step_graph::Alias {
+                of: base,
+                offset: 2,
+            }),
         });
         assert!(
             matches!(past_end, Err(StepGraphError::AliasOutOfRange { .. })),
             "alias past the target extent must be refused, got {past_end:?}"
         );
-        assert_eq!(graph.resources().len(), 1, "refused alias must not be recorded");
+        assert_eq!(
+            graph.resources().len(),
+            1,
+            "refused alias must not be recorded"
+        );
     }
 
     // Keep the success type referenced so a future signature drift fails here.

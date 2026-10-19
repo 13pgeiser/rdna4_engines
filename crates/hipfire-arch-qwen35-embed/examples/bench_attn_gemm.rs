@@ -36,9 +36,15 @@ fn main() -> Result<(), String> {
     };
     let w_words: Vec<u16> = (0..n * hd).map(|_| rnd()).collect();
     let x_words: Vec<u16> = (0..n * hd).map(|_| rnd()).collect();
-    let w = gpu.upload_f16_bits(&w_words, &[n, hd]).map_err(|e| format!("w: {e:?}"))?;
-    let x = gpu.upload_f16_bits(&x_words, &[n, hd]).map_err(|e| format!("x: {e:?}"))?;
-    let y = gpu.alloc_tensor(&[n, n], DType::F32).map_err(|e| format!("y: {e:?}"))?;
+    let w = gpu
+        .upload_f16_bits(&w_words, &[n, hd])
+        .map_err(|e| format!("w: {e:?}"))?;
+    let x = gpu
+        .upload_f16_bits(&x_words, &[n, hd])
+        .map_err(|e| format!("x: {e:?}"))?;
+    let y = gpu
+        .alloc_tensor(&[n, n], DType::F32)
+        .map_err(|e| format!("y: {e:?}"))?;
 
     // ml_dtypes/lldm: out[M=n, k=hd] times x[batch=n, k=hd] -> y[n, n].
     let run = |gpu: &mut Gpu| -> Result<(), String> {

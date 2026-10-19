@@ -120,7 +120,11 @@ fn f16_to_f32(h: u16) -> f32 {
         0 => {
             // m * 2^-24, exact in F32
             let v = m as f32 * f32::from_bits(0x3380_0000);
-            if s != 0 { -v } else { v }
+            if s != 0 {
+                -v
+            } else {
+                v
+            }
         }
         31 => f32::from_bits(s | 0x7f80_0000 | (m << 13)),
         _ => f32::from_bits(s | ((e + 112) << 23) | (m << 13)),
@@ -149,12 +153,20 @@ fn f32_to_f16_rne(f: f32) -> u16 {
         let half = m >> shift;
         let rem = m & ((1u32 << shift) - 1);
         let mid = 1u32 << (shift - 1);
-        let r = if rem > mid || (rem == mid && half & 1 == 1) { half + 1 } else { half };
+        let r = if rem > mid || (rem == mid && half & 1 == 1) {
+            half + 1
+        } else {
+            half
+        };
         return s | r as u16;
     }
     let half = ((ne as u32) << 10) | (m >> 13);
     let rem = m & 0x1fff;
-    let r = if rem > 0x1000 || (rem == 0x1000 && half & 1 == 1) { half + 1 } else { half };
+    let r = if rem > 0x1000 || (rem == 0x1000 && half & 1 == 1) {
+        half + 1
+    } else {
+        half
+    };
     s | r as u16
 }
 
@@ -182,12 +194,16 @@ impl Guarded {
     fn new(gpu: &mut Gpu, elems: usize) -> Res<Self> {
         let total = elems + 2 * GUARD / 4;
         let store = gpu.alloc_tensor(&[total], DType::F32)?;
-        let g = Self { store, payload_elems: elems };
+        let g = Self {
+            store,
+            payload_elems: elems,
+        };
         g.poison(gpu)?;
         Ok(g)
     }
     fn poison(&self, gpu: &Gpu) -> Res<()> {
-        gpu.hip.memset(&self.store.buf, i32::from(POISON), self.store.byte_size())?;
+        gpu.hip
+            .memset(&self.store.buf, i32::from(POISON), self.store.byte_size())?;
         Ok(())
     }
     fn view(&self) -> GpuTensor {
@@ -216,7 +232,9 @@ fn region_ok(buf: &[u8], written: usize) -> bool {
 
 /// F32 words of the payload that are still the poison pattern.
 fn poison_left(p: &[u8]) -> usize {
-    p.chunks_exact(4).filter(|c| c.iter().all(|&b| b == POISON)).count()
+    p.chunks_exact(4)
+        .filter(|c| c.iter().all(|&b| b == POISON))
+        .count()
 }
 
 /// (differing byte count incl. length difference, first differing byte offset).
@@ -229,15 +247,22 @@ fn first_diff(a: &[u8], b: &[u8]) -> (usize, Option<usize>) {
             first.get_or_insert(i);
         }
     }
-    (n + a.len().abs_diff(b.len()), first.or((a.len() != b.len()).then_some(a.len().min(b.len()))))
+    (
+        n + a.len().abs_diff(b.len()),
+        first.or((a.len() != b.len()).then_some(a.len().min(b.len()))),
+    )
 }
 
 fn row_bad(a: &[u8], b: &[u8], row_bytes: usize) -> usize {
-    a.chunks_exact(row_bytes).zip(b.chunks_exact(row_bytes)).filter(|(x, y)| x != y).count()
+    a.chunks_exact(row_bytes)
+        .zip(b.chunks_exact(row_bytes))
+        .filter(|(x, y)| x != y)
+        .count()
 }
 
 fn f32s(b: &[u8]) -> impl Iterator<Item = f32> + '_ {
-    b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
 }
 
 /// Count of executed checks and the failure messages.
@@ -255,13 +280,23 @@ impl Ledger {
 }
 
 /// An API guard: the call must return an error whose message contains `needle`.
-fn expect_err<T, E: std::fmt::Display>(lg: &mut Ledger, name: &str, r: Result<T, E>, needle: &str) -> Value {
+fn expect_err<T, E: std::fmt::Display>(
+    lg: &mut Ledger,
+    name: &str,
+    r: Result<T, E>,
+    needle: &str,
+) -> Value {
     let (errored, msg) = match r {
         Ok(_) => (false, String::new()),
         Err(e) => (true, e.to_string()),
     };
     let ok = errored && msg.contains(needle);
-    lg.check(ok, || format!("guard {name}: expected an error containing {needle:?}, got {}", if errored { msg.clone() } else { "Ok".into() }));
+    lg.check(ok, || {
+        format!(
+            "guard {name}: expected an error containing {needle:?}, got {}",
+            if errored { msg.clone() } else { "Ok".into() }
+        )
+    });
     json!({"guard": name, "errored": errored, "needle": needle, "message": msg, "ok": ok})
 }
 
@@ -289,7 +324,9 @@ fn converter(gpu: &mut Gpu, seed: u64, lg: &mut Ledger) -> Res<Value> {
             rt_bad += 1;
         }
     }
-    lg.check(rt_bad == 0, || format!("host F16 round trip: {rt_bad} of {rt_checked} finite patterns differ"));
+    lg.check(rt_bad == 0, || {
+        format!("host F16 round trip: {rt_bad} of {rt_checked} finite patterns differ")
+    });
 
     // Finite scales: boundary list, then random finite patterns up to CONV_SCALES.
     let mut scales: Vec<u16> = vec![
@@ -330,13 +367,17 @@ fn converter(gpu: &mut Gpu, seed: u64, lg: &mut Ledger) -> Res<Value> {
     let mut expect_bytes: Vec<u8> = Vec::with_capacity(elems * 2);
     let mut seen_q = [false; 256];
     let mut seen_slot = vec![false; 256 * 32];
-    let (mut ovf_pos, mut ovf_neg, mut subnormal, mut plus_zero, mut minus_zero) = (0usize, 0usize, 0usize, 0usize, 0usize);
-    let (mut max_fin, mut inexact, mut underflow_nonzero, mut normal_finite) = (0usize, 0usize, 0usize, 0usize);
+    let (mut ovf_pos, mut ovf_neg, mut subnormal, mut plus_zero, mut minus_zero) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
+    let (mut max_fin, mut inexact, mut underflow_nonzero, mut normal_finite) =
+        (0usize, 0usize, 0usize, 0usize);
     for b in 0..blocks {
         let (s_idx, j) = (b / 8, b % 8);
         let scale = scales[s_idx];
         let rot = s_idx % 32;
-        let block_q: Vec<i8> = (0..32).map(|t| (-128 + 32 * j as i32 + ((t + rot) % 32) as i32) as i8).collect();
+        let block_q: Vec<i8> = (0..32)
+            .map(|t| (-128 + 32 * j as i32 + ((t + rot) % 32) as i32) as i8)
+            .collect();
         push_block(&mut packed, scale, block_q.iter().copied());
         for (t, &q) in block_q.iter().enumerate() {
             qs.push(q);
@@ -372,19 +413,33 @@ fn converter(gpu: &mut Gpu, seed: u64, lg: &mut Ledger) -> Res<Value> {
     }
     let q_values = seen_q.iter().filter(|&&s| s).count();
     let q_slot_pairs = seen_slot.iter().filter(|&&s| s).count();
-    lg.check(q_values == 256, || format!("coverage: {q_values} of 256 int8 values"));
-    lg.check(q_slot_pairs == 256 * 32, || format!("coverage: {q_slot_pairs} of 8192 (int8, slot) pairs"));
-    lg.check(ovf_pos > 0 && ovf_neg > 0, || format!("coverage: overflow +Inf {ovf_pos} / -Inf {ovf_neg}"));
-    lg.check(subnormal > 0 && max_fin > 0, || format!("coverage: subnormal {subnormal}, max finite {max_fin}"));
-    lg.check(plus_zero > 0 && minus_zero > 0, || format!("coverage: +0 {plus_zero}, -0 {minus_zero}"));
-    lg.check(inexact > 0 && normal_finite > 0, || format!("coverage: inexact {inexact}, normal finite {normal_finite}"));
+    lg.check(q_values == 256, || {
+        format!("coverage: {q_values} of 256 int8 values")
+    });
+    lg.check(q_slot_pairs == 256 * 32, || {
+        format!("coverage: {q_slot_pairs} of 8192 (int8, slot) pairs")
+    });
+    lg.check(ovf_pos > 0 && ovf_neg > 0, || {
+        format!("coverage: overflow +Inf {ovf_pos} / -Inf {ovf_neg}")
+    });
+    lg.check(subnormal > 0 && max_fin > 0, || {
+        format!("coverage: subnormal {subnormal}, max finite {max_fin}")
+    });
+    lg.check(plus_zero > 0 && minus_zero > 0, || {
+        format!("coverage: +0 {plus_zero}, -0 {minus_zero}")
+    });
+    lg.check(inexact > 0 && normal_finite > 0, || {
+        format!("coverage: inexact {inexact}, normal finite {normal_finite}")
+    });
 
     let w = upload_dtype(gpu, &packed, DType::Q8_0, elems)?;
     let shadow = gpu.mtp_q8_det_pm_weight_shadow(&w, m, k)?;
     gpu.hip.device_synchronize()?;
     let shadow_ptr = shadow.buf.as_ptr() as usize;
     let got = gpu.download_raw_bytes(&shadow)?;
-    lg.check(got.len() == elems * 2, || format!("shadow is {} bytes, expected {}", got.len(), elems * 2));
+    lg.check(got.len() == elems * 2, || {
+        format!("shadow is {} bytes, expected {}", got.len(), elems * 2)
+    });
     let (diff_bytes, first_byte) = first_diff(&got, &expect_bytes);
     let mut bad_elems = 0usize;
     let mut first_bad: Vec<Value> = Vec::new();
@@ -415,22 +470,55 @@ fn converter(gpu: &mut Gpu, seed: u64, lg: &mut Ledger) -> Res<Value> {
     let (reuse_diff, _) = first_diff(&got2, &got);
     gpu.hip.memcpy_htod(&w.buf, &packed)?;
     gpu.hip.device_synchronize()?;
-    lg.check(same_ptr, || "cache: second shadow call returned a different buffer".into());
-    lg.check(reuse_diff == 0, || format!("cache: shadow bytes changed after the weight was overwritten ({reuse_diff} bytes)"));
+    lg.check(same_ptr, || {
+        "cache: second shadow call returned a different buffer".into()
+    });
+    lg.check(reuse_diff == 0, || {
+        format!("cache: shadow bytes changed after the weight was overwritten ({reuse_diff} bytes)")
+    });
 
     // API guards (each errors before allocating or launching; the cached shadow stays intact).
     let small = upload_dtype(gpu, &vec![0u8; 34 * 2], DType::F16, 64)?;
     let guards = vec![
-        expect_err(lg, "dtype_not_q8_0", gpu.mtp_q8_det_pm_weight_shadow(&small, 1, 64), "needs a Q8_0 weight"),
-        expect_err(lg, "k_not_multiple_of_64", gpu.mtp_q8_det_pm_weight_shadow(&w, m, k - 32), "K % 64 == 0"),
-        expect_err(lg, "m_zero", gpu.mtp_q8_det_pm_weight_shadow(&w, 0, k), "K % 64 == 0"),
-        expect_err(lg, "packed_capacity_too_small", gpu.mtp_q8_det_pm_weight_shadow(&w, m * 2, k), "packed capacity"),
-        expect_err(lg, "cached_shadow_other_size", gpu.mtp_q8_det_pm_weight_shadow(&w, m, k / 2), "cached shadow is"),
+        expect_err(
+            lg,
+            "dtype_not_q8_0",
+            gpu.mtp_q8_det_pm_weight_shadow(&small, 1, 64),
+            "needs a Q8_0 weight",
+        ),
+        expect_err(
+            lg,
+            "k_not_multiple_of_64",
+            gpu.mtp_q8_det_pm_weight_shadow(&w, m, k - 32),
+            "K % 64 == 0",
+        ),
+        expect_err(
+            lg,
+            "m_zero",
+            gpu.mtp_q8_det_pm_weight_shadow(&w, 0, k),
+            "K % 64 == 0",
+        ),
+        expect_err(
+            lg,
+            "packed_capacity_too_small",
+            gpu.mtp_q8_det_pm_weight_shadow(&w, m * 2, k),
+            "packed capacity",
+        ),
+        expect_err(
+            lg,
+            "cached_shadow_other_size",
+            gpu.mtp_q8_det_pm_weight_shadow(&w, m, k / 2),
+            "cached shadow is",
+        ),
     ];
     gpu.hip.device_synchronize()?;
     let got3 = gpu.download_raw_bytes(&shadow)?;
     let (after_guard_diff, _) = first_diff(&got3, &expect_bytes);
-    lg.check(after_guard_diff == 0, || format!("shadow differs from the host oracle after the guard calls ({after_guard_diff} bytes)"));
+    lg.check(after_guard_diff == 0, || {
+        format!(
+            "shadow differs from the host oracle after the guard calls ({after_guard_diff} bytes)"
+        )
+    });
 
     Ok(json!({
         "shape": {"M": m, "K": k, "blocks": blocks, "elements": elems, "scales": CONV_SCALES},
@@ -464,15 +552,29 @@ fn check_arms(stage: &str, n: usize, o: &[u8], nat: &[u8], lo: &[u8], lg: &mut L
     let nat_bad_rows = row_bad(payload(nat, pay), payload(o, pay), row_bytes);
     let lo_bad_rows = row_bad(payload(lo, pay), payload(o, pay), row_bytes);
     let guards = [region_ok(o, pay), region_ok(nat, pay), region_ok(lo, pay)];
-    let left = [poison_left(payload(o, pay)), poison_left(payload(nat, pay)), poison_left(payload(lo, pay))];
+    let left = [
+        poison_left(payload(o, pay)),
+        poison_left(payload(nat, pay)),
+        poison_left(payload(lo, pay)),
+    ];
     let nonfinite = f32s(payload(nat, pay)).filter(|v| !v.is_finite()).count();
     let nonzero = f32s(payload(nat, pay)).filter(|v| *v != 0.0).count();
     lg.check(nd == 0, || format!("{stage} N={n}: native conversion-inclusive differs from the oracle ({nd} bytes, {nat_bad_rows} rows)"));
     lg.check(ld == 0, || format!("{stage} N={n}: native launch-only differs from the oracle ({ld} bytes, {lo_bad_rows} rows)"));
-    lg.check(guards.iter().all(|&g| g), || format!("{stage} N={n}: a guard was written {guards:?} (oracle, native, launch-only)"));
-    lg.check(left.iter().all(|&p| p == 0), || format!("{stage} N={n}: poison words left in an output {left:?} (oracle, native, launch-only)"));
-    lg.check(nonfinite == 0, || format!("{stage} N={n}: {nonfinite} non-finite native outputs"));
-    lg.check(nonzero > 0, || format!("{stage} N={n}: every native output is zero"));
+    lg.check(guards.iter().all(|&g| g), || {
+        format!("{stage} N={n}: a guard was written {guards:?} (oracle, native, launch-only)")
+    });
+    lg.check(left.iter().all(|&p| p == 0), || {
+        format!(
+            "{stage} N={n}: poison words left in an output {left:?} (oracle, native, launch-only)"
+        )
+    });
+    lg.check(nonfinite == 0, || {
+        format!("{stage} N={n}: {nonfinite} non-finite native outputs")
+    });
+    lg.check(nonzero > 0, || {
+        format!("{stage} N={n}: every native output is zero")
+    });
     json!({
         "stage": stage, "N": n, "payload_bytes": pay,
         "native_vs_oracle": {"diff_bytes": nd, "first_diff_byte": nf, "bad_rows": nat_bad_rows},
@@ -496,13 +598,35 @@ fn fixtures() -> Vec<Fixture> {
     duplicated.extend(std::iter::repeat(Some(5)).take(19));
     duplicated.extend(std::iter::repeat(Some(PN - 1)).take(9));
     duplicated.extend(std::iter::repeat(Some(0)).take(4));
-    let scattered: Vec<Option<usize>> = (0..FIXTURE_MAX_ROWS).map(|i| Some((i * 7 + 3) % PN)).collect();
-    let padded: Vec<Option<usize>> = (0..20).map(|j| if j % 2 == 0 { Some((j * 5 + 2) % PN) } else { None }).collect();
+    let scattered: Vec<Option<usize>> = (0..FIXTURE_MAX_ROWS)
+        .map(|i| Some((i * 7 + 3) % PN))
+        .collect();
+    let padded: Vec<Option<usize>> = (0..20)
+        .map(|j| {
+            if j % 2 == 0 {
+                Some((j * 5 + 2) % PN)
+            } else {
+                None
+            }
+        })
+        .collect();
     vec![
-        Fixture { name: "reordered", rows: reordered },
-        Fixture { name: "duplicated", rows: duplicated },
-        Fixture { name: "scattered", rows: scattered },
-        Fixture { name: "zero_padded", rows: padded },
+        Fixture {
+            name: "reordered",
+            rows: reordered,
+        },
+        Fixture {
+            name: "duplicated",
+            rows: duplicated,
+        },
+        Fixture {
+            name: "scattered",
+            rows: scattered,
+        },
+        Fixture {
+            name: "zero_padded",
+            rows: padded,
+        },
     ]
 }
 
@@ -516,7 +640,9 @@ fn dense(gpu: &mut Gpu, seed: u64, lg: &mut Ledger) -> Res<Value> {
     let (mut q_min, mut q_max) = (i8::MAX, i8::MIN);
     for b in 0..blocks {
         let scale = gen_scale(b as u64, (b / blocks_per_row) as u64, seed ^ 0x57A11);
-        let q: Vec<i8> = (0..32).map(|t| gen_q((b * 32 + t) as u64, seed ^ 0xA11CE)).collect();
+        let q: Vec<i8> = (0..32)
+            .map(|t| gen_q((b * 32 + t) as u64, seed ^ 0xA11CE))
+            .collect();
         for &v in &q {
             q_min = q_min.min(v);
             q_max = q_max.max(v);
@@ -524,7 +650,9 @@ fn dense(gpu: &mut Gpu, seed: u64, lg: &mut Ledger) -> Res<Value> {
         }
         push_block(&mut packed, scale, q.into_iter());
     }
-    let x: Vec<f32> = (0..(PN * PK) as u64).map(|e| gen_x(e, seed ^ 0xC0FFEE)).collect();
+    let x: Vec<f32> = (0..(PN * PK) as u64)
+        .map(|e| gen_x(e, seed ^ 0xC0FFEE))
+        .collect();
     let w = upload_dtype(gpu, &packed, DType::Q8_0, PM * PK)?;
     let x32 = gpu.upload_f32(&x, &[PN * PK])?;
 
@@ -532,7 +660,9 @@ fn dense(gpu: &mut Gpu, seed: u64, lg: &mut Ledger) -> Res<Value> {
     gpu.hip.device_synchronize()?;
     let shadow_bytes = gpu.download_raw_bytes(&shadow)?;
     let (shadow_diff, _) = first_diff(&shadow_bytes, &shadow_expect);
-    lg.check(shadow_diff == 0, || format!("dense weight shadow differs from the host F16RNE(scale*q) ({shadow_diff} bytes)"));
+    lg.check(shadow_diff == 0, || {
+        format!("dense weight shadow differs from the host F16RNE(scale*q) ({shadow_diff} bytes)")
+    });
     drop(shadow_bytes);
 
     // ---- ragged cells: oracle / native / launch-only over the whole guarded buffers
@@ -545,9 +675,14 @@ fn dense(gpu: &mut Gpu, seed: u64, lg: &mut Ledger) -> Res<Value> {
         let x16_view = gpu.qwen4_convert_f16_x(&xv, n * PK)?;
         gpu.hip.device_synchronize()?;
         let x16_bytes = gpu.download_raw_bytes(&x16_view)?;
-        let x16_expect: Vec<u8> = x[..n * PK].iter().flat_map(|v| f32_to_f16_rne(*v).to_le_bytes()).collect();
+        let x16_expect: Vec<u8> = x[..n * PK]
+            .iter()
+            .flat_map(|v| f32_to_f16_rne(*v).to_le_bytes())
+            .collect();
         let (x16_diff, _) = first_diff(&x16_bytes, &x16_expect);
-        lg.check(x16_diff == 0, || format!("N={n}: X16 differs from the host F32 -> F16 RNE ({x16_diff} bytes)"));
+        lg.check(x16_diff == 0, || {
+            format!("N={n}: X16 differs from the host F32 -> F16 RNE ({x16_diff} bytes)")
+        });
         // Own copy: the conversion-inclusive arm reuses the shared X16 scratch.
         let x16 = upload_dtype(gpu, &x16_bytes, DType::F16, n * PK)?;
 
@@ -579,8 +714,12 @@ fn dense(gpu: &mut Gpu, seed: u64, lg: &mut Ledger) -> Res<Value> {
         } else {
             let (nd, _) = first_diff(payload(&n1, pay), &full_nat[..pay]);
             let (od, _) = first_diff(payload(&o1, pay), &full_orc[..pay]);
-            lg.check(nd == 0, || format!("N={n}: native rows differ from the same rows of N={PN} ({nd} bytes)"));
-            lg.check(od == 0, || format!("N={n}: oracle rows differ from the same rows of N={PN} ({od} bytes)"));
+            lg.check(nd == 0, || {
+                format!("N={n}: native rows differ from the same rows of N={PN} ({nd} bytes)")
+            });
+            lg.check(od == 0, || {
+                format!("N={n}: oracle rows differ from the same rows of N={PN} ({od} bytes)")
+            });
             json!({"native_vs_n17_prefix_diff_bytes": nd, "oracle_vs_n17_prefix_diff_bytes": od})
         };
         cells.push(json!({"N": n, "x16_vs_host_diff_bytes": x16_diff, "first_run": first, "rerun": rerun, "prefix_identity": prefix}));
@@ -619,42 +758,95 @@ fn dense(gpu: &mut Gpu, seed: u64, lg: &mut Ledger) -> Res<Value> {
             }
         }
         let guards_ok = region_ok(&got, written);
-        lg.check(bad_rows == 0, || format!("fixture {}: {bad_rows} of {rows} rows differ (first {first_bad:?})", f.name));
-        lg.check(guards_ok, || format!("fixture {}: a guard was written", f.name));
+        lg.check(bad_rows == 0, || {
+            format!(
+                "fixture {}: {bad_rows} of {rows} rows differ (first {first_bad:?})",
+                f.name
+            )
+        });
+        lg.check(guards_ok, || {
+            format!("fixture {}: a guard was written", f.name)
+        });
         fixture_json.push(json!({"fixture": f.name, "rows": rows, "bad_rows": bad_rows, "first_bad_row": first_bad, "guards_ok": guards_ok}));
     }
     let mut subparts = Vec::new();
-    for &(start, len) in &[(0usize, 1usize), (8, 1), (16, 1), (0, 15), (2, 15), (0, 16), (1, 16)] {
+    for &(start, len) in &[
+        (0usize, 1usize),
+        (8, 1),
+        (16, 1),
+        (0, 15),
+        (2, 15),
+        (0, 16),
+        (1, 16),
+    ] {
         part.poison(gpu)?;
         let xv = x32.sub_offset(start * PK, len * PK);
         gpu.gemm_q8_0_xf32_mtp_dense_det_pm(&w, &xv, &part.view(), PM, PK, len)?;
         gpu.hip.device_synchronize()?;
         let got = part.fetch(gpu)?;
         let written = len * row_bytes;
-        let (d, _) = first_diff(payload(&got, written), &full_nat[start * row_bytes..(start + len) * row_bytes]);
+        let (d, _) = first_diff(
+            payload(&got, written),
+            &full_nat[start * row_bytes..(start + len) * row_bytes],
+        );
         let guards_ok = region_ok(&got, written);
-        lg.check(d == 0, || format!("subpartition rows {start}..{}: {d} bytes differ from the N={PN} rows", start + len));
-        lg.check(guards_ok, || format!("subpartition rows {start}..{}: a guard was written", start + len));
-        subparts.push(json!({"start": start, "rows": len, "diff_bytes": d, "guards_ok": guards_ok}));
+        lg.check(d == 0, || {
+            format!(
+                "subpartition rows {start}..{}: {d} bytes differ from the N={PN} rows",
+                start + len
+            )
+        });
+        lg.check(guards_ok, || {
+            format!(
+                "subpartition rows {start}..{}: a guard was written",
+                start + len
+            )
+        });
+        subparts
+            .push(json!({"start": start, "rows": len, "diff_bytes": d, "guards_ok": guards_ok}));
     }
 
     // ---- dense API guards: error, nothing written
     part.poison(gpu)?;
     let ysmall = part.view().sub_offset(0, PM);
     let guards = vec![
-        expect_err(lg, "m_not_multiple_of_16", gpu.gemm_q8_0_xf32_mtp_dense_det_pm(&w, &x32, &part.view(), 24, PK, 1), "outside the kernel's limits"),
-        expect_err(lg, "n_zero", gpu.gemm_q8_0_xf32_mtp_dense_det_pm(&w, &x32, &part.view(), PM, PK, 0), "outside the kernel's limits"),
-        expect_err(lg, "launch_x_not_f16", gpu.mtp_q8_det_pm_launch(&w, &x32, &part.view(), PM, PK, 1), "dtypes must be weight"),
-        expect_err(lg, "y_capacity_too_small", gpu.gemm_q8_0_xf32_mtp_dense_det_pm(&w, &x32, &ysmall, PM, PK, 2), "buffer capacity is too small"),
+        expect_err(
+            lg,
+            "m_not_multiple_of_16",
+            gpu.gemm_q8_0_xf32_mtp_dense_det_pm(&w, &x32, &part.view(), 24, PK, 1),
+            "outside the kernel's limits",
+        ),
+        expect_err(
+            lg,
+            "n_zero",
+            gpu.gemm_q8_0_xf32_mtp_dense_det_pm(&w, &x32, &part.view(), PM, PK, 0),
+            "outside the kernel's limits",
+        ),
+        expect_err(
+            lg,
+            "launch_x_not_f16",
+            gpu.mtp_q8_det_pm_launch(&w, &x32, &part.view(), PM, PK, 1),
+            "dtypes must be weight",
+        ),
+        expect_err(
+            lg,
+            "y_capacity_too_small",
+            gpu.gemm_q8_0_xf32_mtp_dense_det_pm(&w, &x32, &ysmall, PM, PK, 2),
+            "buffer capacity is too small",
+        ),
     ];
     gpu.hip.device_synchronize()?;
     let untouched = part.fetch(gpu)?.iter().all(|&b| b == POISON);
-    lg.check(untouched, || "a rejected dense call wrote its output".into());
+    lg.check(untouched, || {
+        "a rejected dense call wrote its output".into()
+    });
 
     // ---- the shadow is immutable across every launch above
     let shadow_after = gpu.download_raw_bytes(&shadow)?;
     let (shadow_after_diff, _) = first_diff(&shadow_after, &shadow_expect);
-    lg.check(shadow_after_diff == 0, || format!("dense weight shadow changed during the launches ({shadow_after_diff} bytes)"));
+    lg.check(shadow_after_diff == 0, || {
+        format!("dense weight shadow changed during the launches ({shadow_after_diff} bytes)")
+    });
 
     Ok(json!({
         "shape": {"M": PM, "K": PK, "N": PN, "ragged_N": RAGGED}, "oracle_tile": ORACLE_TILE.entry(),
@@ -669,7 +861,10 @@ fn dense(gpu: &mut Gpu, seed: u64, lg: &mut Ledger) -> Res<Value> {
 // ---------------------------------------------------------------------- main
 
 fn verdict_fail(reason: String, code: i32) -> ! {
-    println!("{}", json!({"event": "verdict", "pass": false, "reason": reason}));
+    println!(
+        "{}",
+        json!({"event": "verdict", "pass": false, "reason": reason})
+    );
     println!("Q8 DET BYTE ORACLE FAIL");
     std::process::exit(code);
 }
@@ -693,7 +888,8 @@ fn main() {
             other => usage(&format!("unknown argument {other}")),
         }
     }
-    let no_compiler = hipfire_config::developer_var_os("HIPFIRE_NO_DEVICE_COMPILER").is_some_and(|v| v != "0" && !v.is_empty());
+    let no_compiler = hipfire_config::developer_var_os("HIPFIRE_NO_DEVICE_COMPILER")
+        .is_some_and(|v| v != "0" && !v.is_empty());
     if !no_compiler {
         verdict_fail("HIPFIRE_NO_DEVICE_COMPILER is not set: this oracle runs the pre-built pack only, with no runtime compile".into(), 3);
     }
@@ -701,16 +897,32 @@ fn main() {
         Ok(g) => g,
         Err(e) => verdict_fail(format!("gpu init: {e}"), 3),
     };
-    let pci = gpu.hip.device_pci_bus_id(gpu.device_id).unwrap_or_default().to_ascii_lowercase();
-    println!("{}", json!({
-        "event": "start", "arch": gpu.arch, "pci_bus_id": pci, "device_id": gpu.device_id, "seed": seed,
-        "no_device_compiler": no_compiler,
-    }));
+    let pci = gpu
+        .hip
+        .device_pci_bus_id(gpu.device_id)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    println!(
+        "{}",
+        json!({
+            "event": "start", "arch": gpu.arch, "pci_bus_id": pci, "device_id": gpu.device_id, "seed": seed,
+            "no_device_compiler": no_compiler,
+        })
+    );
     if gpu.arch != "gfx1151" || pci != REQUIRED_PCI {
-        verdict_fail(format!("device is {} at {pci:?}; the admitted device is gfx1151 at {REQUIRED_PCI}", gpu.arch), 3);
+        verdict_fail(
+            format!(
+                "device is {} at {pci:?}; the admitted device is gfx1151 at {REQUIRED_PCI}",
+                gpu.arch
+            ),
+            3,
+        );
     }
 
-    let mut lg = Ledger { checks: 0, fails: Vec::new() };
+    let mut lg = Ledger {
+        checks: 0,
+        fails: Vec::new(),
+    };
     let conv = match converter(&mut gpu, seed, &mut lg) {
         Ok(v) => v,
         Err(e) => verdict_fail(format!("converter error: {e}"), 1),
@@ -719,15 +931,21 @@ fn main() {
         Ok(v) => v,
         Err(e) => verdict_fail(format!("dense error: {e}"), 1),
     };
-    println!("{}", json!({
-        "event": "receipt", "arch": gpu.arch, "pci_bus_id": pci, "seed": seed,
-        "converter": conv, "dense": dense,
-    }));
+    println!(
+        "{}",
+        json!({
+            "event": "receipt", "arch": gpu.arch, "pci_bus_id": pci, "seed": seed,
+            "converter": conv, "dense": dense,
+        })
+    );
     let pass = lg.fails.is_empty();
-    println!("{}", json!({
-        "event": "verdict", "pass": pass, "checks": lg.checks, "failed": lg.fails.len(), "failures": lg.fails,
-        "elapsed_s": start.elapsed().as_secs_f64(),
-    }));
+    println!(
+        "{}",
+        json!({
+            "event": "verdict", "pass": pass, "checks": lg.checks, "failed": lg.fails.len(), "failures": lg.fails,
+            "elapsed_s": start.elapsed().as_secs_f64(),
+        })
+    );
     println!("Q8 DET BYTE ORACLE {}", if pass { "PASS" } else { "FAIL" });
     std::process::exit(if pass { 0 } else { 1 });
 }

@@ -53,19 +53,36 @@ use crate::WAVE;
 /// (`(n & 8) + 7 - (n & 7)`), the only reading under which each half mirrors
 /// onto itself. [UNVERIFIED: confirm on MI300X]
 pub fn dpp_source_lane(ctrl: DppCtrl, n: usize) -> SimResult<Option<usize>> {
-    if n >= WAVE { return fault(format!("DPP lane {n} outside the wave64")) }
+    if n >= WAVE {
+        return fault(format!("DPP lane {n} outside the wave64"));
+    }
     let row_count = |c: u8| -> SimResult<usize> {
-        if (1..=15).contains(&c) { Ok(usize::from(c)) } else { unsupported(format!("DPP row shift/rotate count {c} (legal 1..=15)")) }
+        if (1..=15).contains(&c) {
+            Ok(usize::from(c))
+        } else {
+            unsupported(format!("DPP row shift/rotate count {c} (legal 1..=15)"))
+        }
     };
     Ok(match ctrl {
         DppCtrl::QuadPerm(sel) => {
             let s = sel[n % 4];
-            if s > 3 { return fault(format!("DPP quad_perm element {s} > 3")) }
+            if s > 3 {
+                return fault(format!("DPP quad_perm element {s} > 3"));
+            }
             Some((n & 0x3c) + usize::from(s))
         }
-        DppCtrl::RowShl(c) => { let c = row_count(c)?; (n & 15 < 16 - c).then(|| n + c) }
-        DppCtrl::RowShr(c) => { let c = row_count(c)?; (n & 15 >= c).then(|| n - c) }
-        DppCtrl::RowRor(c) => { let c = row_count(c)?; Some(if n & 15 >= c { n - c } else { n + 16 - c }) }
+        DppCtrl::RowShl(c) => {
+            let c = row_count(c)?;
+            (n & 15 < 16 - c).then(|| n + c)
+        }
+        DppCtrl::RowShr(c) => {
+            let c = row_count(c)?;
+            (n & 15 >= c).then(|| n - c)
+        }
+        DppCtrl::RowRor(c) => {
+            let c = row_count(c)?;
+            Some(if n & 15 >= c { n - c } else { n + 16 - c })
+        }
         DppCtrl::WaveShl1 => (n < 63).then(|| n + 1),
         DppCtrl::WaveRol1 => Some(if n < 63 { n + 1 } else { 0 }),
         DppCtrl::WaveShr1 => (n > 0).then(|| n - 1),
@@ -99,12 +116,22 @@ pub fn dpp_source_lane(ctrl: DppCtrl, n: usize) -> SimResult<Option<usize>> {
 ///
 /// NEG/ABS are not applied here.
 pub fn dpp_read(w: &Wave, dpp: &Dpp, vgpr: u8, agpr: bool, lane: usize) -> SimResult<Option<u32>> {
-    if lane >= WAVE { return fault(format!("DPP lane {lane} outside the wave64")) }
-    let (file, limit, name) = if agpr { (&w.a, w.agpr_limit, 'a') } else { (&w.v, w.vgpr_limit, 'v') };
-    if u16::from(vgpr) >= limit || usize::from(vgpr) >= file.len() {
-        return fault(format!("DPP source {name}{vgpr} beyond the {limit} allocated by the kernel descriptor"));
+    if lane >= WAVE {
+        return fault(format!("DPP lane {lane} outside the wave64"));
     }
-    if !w.lane_active(lane) || !dpp_lane_enabled(dpp, lane) { return Ok(None) }
+    let (file, limit, name) = if agpr {
+        (&w.a, w.agpr_limit, 'a')
+    } else {
+        (&w.v, w.vgpr_limit, 'v')
+    };
+    if u16::from(vgpr) >= limit || usize::from(vgpr) >= file.len() {
+        return fault(format!(
+            "DPP source {name}{vgpr} beyond the {limit} allocated by the kernel descriptor"
+        ));
+    }
+    if !w.lane_active(lane) || !dpp_lane_enabled(dpp, lane) {
+        return Ok(None);
+    }
     let src = dpp_source_lane(dpp.ctrl, lane)?;
     match src {
         Some(s) if w.lane_active(s) => Ok(Some(file[usize::from(vgpr)][s])),
@@ -128,18 +155,33 @@ pub fn dpp_lane_enabled(dpp: &Dpp, lane: usize) -> bool {
 pub fn sdwa_src(raw: u32, sel: SdwaSel, sext: bool) -> u32 {
     let (shift, bits) = sel_field(sel);
     let v = (raw >> shift) & field_mask(bits);
-    if sext && bits < 32 { (((v << (32 - bits)) as i32) >> (32 - bits)) as u32 } else { v }
+    if sext && bits < 32 {
+        (((v << (32 - bits)) as i32) >> (32 - bits)) as u32
+    } else {
+        v
+    }
 }
 
 /// (lowest bit, width) of an SDWA select.
 fn sel_field(sel: SdwaSel) -> (u32, u32) {
     match sel {
-        SdwaSel::Byte0 => (0, 8), SdwaSel::Byte1 => (8, 8), SdwaSel::Byte2 => (16, 8), SdwaSel::Byte3 => (24, 8),
-        SdwaSel::Word0 => (0, 16), SdwaSel::Word1 => (16, 16), SdwaSel::Dword => (0, 32),
+        SdwaSel::Byte0 => (0, 8),
+        SdwaSel::Byte1 => (8, 8),
+        SdwaSel::Byte2 => (16, 8),
+        SdwaSel::Byte3 => (24, 8),
+        SdwaSel::Word0 => (0, 16),
+        SdwaSel::Word1 => (16, 16),
+        SdwaSel::Dword => (0, 32),
     }
 }
 
-fn field_mask(bits: u32) -> u32 { if bits >= 32 { u32::MAX } else { (1u32 << bits) - 1 } }
+fn field_mask(bits: u32) -> u32 {
+    if bits >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << bits) - 1
+    }
+}
 
 /// An SDWA destination: place `result` at `sel` of the old value per
 /// DST_UNUSED (CDNA3 ISA §13.3.7 p.543, DST_SEL / DST_U): the low bits of
@@ -155,7 +197,9 @@ fn field_mask(bits: u32) -> u32 { if bits >= 32 { u32::MAX } else { (1u32 << bit
 /// [UNVERIFIED: confirm on MI300X] — byte destination selects.
 pub fn sdwa_dst(old: u32, result: u32, sel: SdwaSel, unused: SdwaUnused) -> u32 {
     let (shift, bits) = sel_field(sel);
-    if bits == 32 { return result }
+    if bits == 32 {
+        return result;
+    }
     let mask = field_mask(bits);
     let field = (result & mask) << shift;
     match unused {
@@ -163,7 +207,13 @@ pub fn sdwa_dst(old: u32, result: u32, sel: SdwaSel, unused: SdwaUnused) -> u32 
         SdwaUnused::Preserve => (old & !(mask << shift)) | field,
         SdwaUnused::Sext => {
             let top = shift + bits;
-            let upper = if top >= 32 { 0 } else if field >> (top - 1) & 1 != 0 { u32::MAX << top } else { 0 };
+            let upper = if top >= 32 {
+                0
+            } else if field >> (top - 1) & 1 != 0 {
+                u32::MAX << top
+            } else {
+                0
+            };
             upper | field
         }
     }
@@ -203,7 +253,11 @@ pub fn ds_swizzle(pattern: u16, data: &[u32; WAVE], exec: u64) -> SimResult<[u32
         } else if offset >= 0xc000 {
             let mask = offset & 0x1f;
             let rot = (offset >> 5) & 0x1f;
-            let rot = if offset >> 10 & 1 != 0 { rot.wrapping_neg() } else { rot };
+            let rot = if offset >> 10 & 1 != 0 {
+                rot.wrapping_neg()
+            } else {
+                rot
+            };
             ((i & mask) | (i.wrapping_add(rot) & !mask & 0x1f)) | (i & 0x20)
         } else if offset >> 15 & 1 != 0 {
             let sel = (offset >> (2 * (i & 3))) & 3;
@@ -221,7 +275,9 @@ pub fn ds_swizzle(pattern: u16, data: &[u32; WAVE], exec: u64) -> SimResult<[u32
 
 /// Lane index `(addr + offset) / 4 % 64` (CDNA3 ISA p.428-429: "ADDR needs to
 /// be divided by 4. High-order bits are ignored").
-fn perm_lane(addr: u32, offset: u16) -> usize { (addr.wrapping_add(u32::from(offset)) / 4 % 64) as usize }
+fn perm_lane(addr: u32, offset: u16) -> usize {
+    (addr.wrapping_add(u32::from(offset)) / 4 % 64) as usize
+}
 
 /// `ds_bpermute_b32`: lane i reads `data[(addr[i] + offset) / 4 % 64]`
 /// (CDNA3 ISA §12.12 DS_BPERMUTE_B32 p.429). "EXEC is applied to the source
@@ -231,9 +287,13 @@ fn perm_lane(addr: u32, offset: u16) -> usize { (addr.wrapping_add(u32::from(off
 pub fn ds_bpermute(addr: &[u32; WAVE], offset: u16, data: &[u32; WAVE], exec: u64) -> [u32; WAVE] {
     let mut out = [0u32; WAVE];
     for i in 0..WAVE {
-        if exec >> i & 1 == 0 { continue }
+        if exec >> i & 1 == 0 {
+            continue;
+        }
         let src = perm_lane(addr[i], offset);
-        if exec >> src & 1 != 0 { out[i] = data[src] }
+        if exec >> src & 1 != 0 {
+            out[i] = data[src]
+        }
     }
     out
 }
@@ -248,10 +308,14 @@ pub fn ds_bpermute(addr: &[u32; WAVE], offset: u16, data: &[u32; WAVE], exec: u6
 pub fn ds_permute(addr: &[u32; WAVE], offset: u16, data: &[u32; WAVE], exec: u64) -> [u32; WAVE] {
     let mut tmp = [0u32; WAVE];
     for i in 0..WAVE {
-        if exec >> i & 1 != 0 { tmp[perm_lane(addr[i], offset)] = data[i] }
+        if exec >> i & 1 != 0 {
+            tmp[perm_lane(addr[i], offset)] = data[i]
+        }
     }
     for (i, t) in tmp.iter_mut().enumerate() {
-        if exec >> i & 1 == 0 { *t = 0 }
+        if exec >> i & 1 == 0 {
+            *t = 0
+        }
     }
     tmp
 }

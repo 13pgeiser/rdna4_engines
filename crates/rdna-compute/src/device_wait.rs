@@ -233,12 +233,16 @@ pub(crate) struct DeviceWaitMapping {
 impl DeviceWaitMapping {
     pub(crate) fn alloc(hip: &HipRuntime, device_id: i32) -> HipResult<Self> {
         let khz = hip.get_device_attribute(HIP_DEVICE_ATTRIBUTE_WALL_CLOCK_RATE, device_id)?;
-        let khz = u64::try_from(khz).ok().filter(|&khz| khz > 0).ok_or_else(|| {
-            HipError::new(
+        let khz =
+            u64::try_from(khz)
+                .ok()
+                .filter(|&khz| khz > 0)
+                .ok_or_else(|| {
+                    HipError::new(
                 0,
                 &format!("device {device_id}: hipDeviceAttributeWallClockRate returned {khz} kHz"),
             )
-        })?;
+                })?;
         let host = hip.host_malloc(
             std::mem::size_of::<DeviceWaitBlock>(),
             hip_bridge::HIP_HOST_MALLOC_MAPPED | hip_bridge::HIP_HOST_MALLOC_COHERENT,
@@ -309,7 +313,10 @@ mod tests {
             let mut parts = rest.split_whitespace();
             let name = parts.next().expect("define name");
             let value = parts.next().expect("define value");
-            let code: u32 = value.trim_end_matches('u').parse().expect("numeric site code");
+            let code: u32 = value
+                .trim_end_matches('u')
+                .parse()
+                .expect("numeric site code");
             defines.push((name.to_string(), code));
         }
         assert_eq!(defines.len(), DeviceWaitSite::ALL.len());
@@ -338,7 +345,11 @@ mod tests {
         }));
 
         // SAFETY: `ptr` is the live boxed block until `Box::from_raw` below.
-        assert_eq!(unsafe { take_block(ptr, 2) }, None, "clean block reports nothing");
+        assert_eq!(
+            unsafe { take_block(ptr, 2) },
+            None,
+            "clean block reports nothing"
+        );
 
         // What `hf_wait_expired` stores when a TP4 rank's wait3 hits its deadline.
         // SAFETY: as above.
@@ -366,11 +377,18 @@ mod tests {
             "epoch 37",
             "request was aborted",
         ] {
-            assert!(message.contains(needle), "{needle:?} missing from {message:?}");
+            assert!(
+                message.contains(needle),
+                "{needle:?} missing from {message:?}"
+            );
         }
 
         // SAFETY: as above.
-        assert_eq!(unsafe { take_block(ptr, 2) }, None, "a timeout is reported once");
+        assert_eq!(
+            unsafe { take_block(ptr, 2) },
+            None,
+            "a timeout is reported once"
+        );
         // SAFETY: `ptr` came from `Box::into_raw` and is not used afterwards.
         let block = unsafe { Box::from_raw(ptr) };
         // Reading clears the code and detail, but not the deadline.
@@ -394,7 +412,10 @@ mod tests {
             }
             .to_string();
             assert!(message.contains(site.kernel()), "{message}");
-            assert!(message.contains(&format!("{} 3", site.detail_label())), "{message}");
+            assert!(
+                message.contains(&format!("{} 3", site.detail_label())),
+                "{message}"
+            );
         }
         let unknown = DeviceWaitTimeout {
             device_id: 1,

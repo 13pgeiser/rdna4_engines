@@ -15,12 +15,12 @@ use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Weights, StateQuant
 use crate::speculative::{
     apply_eviction_retain_to_draft, apply_host_ar_trunc, sample_categorical,
     scatter_hidden_block_to_interleaved, scatter_hidden_prefill_to_interleaved,
-    seed_target_hidden_dense_tp2_abortable,
-    seed_target_hidden_from_prompt_abortable, seed_target_hidden_from_prompt_abortable_parts,
-    seed_target_hidden_suffix_abortable, seed_target_hidden_suffix_abortable_parts,
-    softmax_temp_into, spec_step_ddtree_batched, spec_step_dflash, spec_step_dflash_dense_tp2,
-    xorshift_next_unit, DdtreeScratch, DeltaNetSnapshot, DenseTpTargetView, DflashTargetParts,
-    GdnTape, HiddenStateRingBuffer, ModelSlot, SpecStepResult, VerifyScratch,
+    seed_target_hidden_dense_tp2_abortable, seed_target_hidden_from_prompt_abortable,
+    seed_target_hidden_from_prompt_abortable_parts, seed_target_hidden_suffix_abortable,
+    seed_target_hidden_suffix_abortable_parts, softmax_temp_into, spec_step_ddtree_batched,
+    spec_step_dflash, spec_step_dflash_dense_tp2, xorshift_next_unit, DdtreeScratch,
+    DeltaNetSnapshot, DenseTpTargetView, DflashTargetParts, GdnTape, HiddenStateRingBuffer,
+    ModelSlot, SpecStepResult, VerifyScratch,
 };
 use hipfire_runtime::dflash::{
     draft_seed_backfill_reads_host, DflashConfig, DflashScratch, DflashWeights, DraftCtxMode,
@@ -681,8 +681,15 @@ pub fn load_dflash_state(
     ) {
         // The IU4 verify producers are eager-only; a recorded PM4 tape would
         // refuse them, so an IU4-verify load keeps the HIP verify route.
-        Ok(()) if qwen35::prefill::multi::dflash_iu4_verify_admitted(gpu, target_weights, target_config) => {
-            let reason = "IU4 verify is on for this load (eager-only; HIPFIRE_CB_VERIFY_IU4=0 turns it off)";
+        Ok(())
+            if qwen35::prefill::multi::dflash_iu4_verify_admitted(
+                gpu,
+                target_weights,
+                target_config,
+            ) =>
+        {
+            let reason =
+                "IU4 verify is on for this load (eager-only; HIPFIRE_CB_VERIFY_IU4=0 turns it off)";
             eprintln!("  DFlash verify PM4: disabled ({reason})");
             DflashVerifyPm4::disabled(reason)
         }
@@ -1026,7 +1033,8 @@ impl Speculator for DflashSpeculator {
         // upload/projection tracking; cache hits preserve the prior turn's GPU
         // projections and extend its suffix.
         let mut host_hidden = Vec::new();
-        let capture_host = dflash_prefill_host_required(df.draft_scratch.ctx_mode, prompt_tokens.len());
+        let capture_host =
+            dflash_prefill_host_required(df.draft_scratch.ctx_mode, prompt_tokens.len());
         if !cache_hit {
             df.draft_scratch.reset_upload_tracking();
         }
@@ -1478,9 +1486,7 @@ impl Speculator for DflashSpeculator {
         let drafter_reset = match self.df.as_ref() {
             Some(df) => {
                 let th = &df.draft_scratch.thlog;
-                th.uploaded_rows() == 0
-                    && th.proj_cached_rows() == 0
-                    && th.full_cached_rows() == 0
+                th.uploaded_rows() == 0 && th.proj_cached_rows() == 0 && th.full_cached_rows() == 0
             }
             None => true,
         };
@@ -1912,10 +1918,7 @@ impl DflashSpeculator {
         }
         let assets = self.vmm_assets()?;
         quiesce_for_lane_move(gpu)?;
-        let df = self
-            .df
-            .take()
-            .ok_or_else(|| SINGLETON_VACANT.to_string())?;
+        let df = self.df.take().ok_or_else(|| SINGLETON_VACANT.to_string())?;
         self.vacant = Some(assets);
         Ok(DflashLaneSnapshot {
             df,

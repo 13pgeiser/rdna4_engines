@@ -41,9 +41,8 @@ static QWEN4_QSA_POOLED_BF16: std::sync::LazyLock<bool> = std::sync::LazyLock::n
 /// The same switch `tensor_ops` reads for the PM score kernels
 /// (`HIPFIRE_QWEN4_QSA_SCORE_PM`, on unless `0`): the mirror is only consumed
 /// by the PM BF16 score kernel, so it is not admitted without it.
-static QWEN4_QSA_SCORE_PM: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_SCORE_PM", true)
-});
+static QWEN4_QSA_SCORE_PM: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_SCORE_PM", true));
 
 /// Load-time admission, no GPU launch: the switch is on, exact gfx1151,
 /// F32 QSA state, `index_dim` 128, and the builder BF16 score module
@@ -164,7 +163,9 @@ fn check_tensors(
         || pooled_f32.numel() < elems
         || pooled_f32.buf.size() < elems * 4
     {
-        return Err(shape_err("pooled keys must be F32 and cover the block range"));
+        return Err(shape_err(
+            "pooled keys must be F32 and cover the block range",
+        ));
     }
     if let Some(mirror) = mirror {
         if mirror.dtype != DType::BF16 || mirror.numel() < elems || mirror.buf.size() < elems * 2 {
@@ -327,7 +328,14 @@ pub fn qsa_pooled_bf16_low_nonzero_count(
             depth,
             "qsa_pooled_bf16_low_nonzero_count",
         );
-        gpu.qsa_extent_check("qsa_pooled_probe_count", &count, 0, 4, depth, "qsa_pooled_bf16_low_nonzero_count");
+        gpu.qsa_extent_check(
+            "qsa_pooled_probe_count",
+            &count,
+            0,
+            4,
+            depth,
+            "qsa_pooled_bf16_low_nonzero_count",
+        );
     }
     let launched = gpu.launch_blob_recorded(
         PROBE,
@@ -351,7 +359,14 @@ pub fn qsa_pooled_bf16_low_nonzero_count(
             depth,
             "qsa_pooled_bf16_low_nonzero_count",
         );
-        gpu.qsa_extent_post_launch("qsa_pooled_probe_count", &count, 0, 4, depth, "qsa_pooled_bf16_low_nonzero_count");
+        gpu.qsa_extent_post_launch(
+            "qsa_pooled_probe_count",
+            &count,
+            0,
+            4,
+            depth,
+            "qsa_pooled_bf16_low_nonzero_count",
+        );
     }
     let bits = launched.and_then(|()| gpu.download_f32(&count));
     let freed = gpu.free_tensor(count);
@@ -399,15 +414,43 @@ mod tests {
     #[test]
     fn admission_requires_every_condition() {
         let f32f = QsaKvFormat::F32;
-        assert!(qsa_pooled_bf16_mirror_admits(true, true, true, true, f32f, 128));
-        assert!(!qsa_pooled_bf16_mirror_admits(false, true, true, true, f32f, 128));
-        assert!(!qsa_pooled_bf16_mirror_admits(true, false, true, true, f32f, 128));
-        assert!(!qsa_pooled_bf16_mirror_admits(true, true, false, true, f32f, 128));
-        assert!(!qsa_pooled_bf16_mirror_admits(true, true, true, false, f32f, 128));
-        assert!(!qsa_pooled_bf16_mirror_admits(true, true, true, true, f32f, 64));
-        assert!(!qsa_pooled_bf16_mirror_admits(true, true, true, true, f32f, 256));
-        assert!(!qsa_pooled_bf16_mirror_admits(true, true, true, true, QsaKvFormat::Q8, 128));
-        assert!(!qsa_pooled_bf16_mirror_admits(true, true, true, true, QsaKvFormat::Fp8, 128));
+        assert!(qsa_pooled_bf16_mirror_admits(
+            true, true, true, true, f32f, 128
+        ));
+        assert!(!qsa_pooled_bf16_mirror_admits(
+            false, true, true, true, f32f, 128
+        ));
+        assert!(!qsa_pooled_bf16_mirror_admits(
+            true, false, true, true, f32f, 128
+        ));
+        assert!(!qsa_pooled_bf16_mirror_admits(
+            true, true, false, true, f32f, 128
+        ));
+        assert!(!qsa_pooled_bf16_mirror_admits(
+            true, true, true, false, f32f, 128
+        ));
+        assert!(!qsa_pooled_bf16_mirror_admits(
+            true, true, true, true, f32f, 64
+        ));
+        assert!(!qsa_pooled_bf16_mirror_admits(
+            true, true, true, true, f32f, 256
+        ));
+        assert!(!qsa_pooled_bf16_mirror_admits(
+            true,
+            true,
+            true,
+            true,
+            QsaKvFormat::Q8,
+            128
+        ));
+        assert!(!qsa_pooled_bf16_mirror_admits(
+            true,
+            true,
+            true,
+            true,
+            QsaKvFormat::Fp8,
+            128
+        ));
     }
 
     #[test]
@@ -415,14 +458,24 @@ mod tests {
         use crate::tensor_ops::QsaStateLayout;
         assert!(!QsaStateLayout::F32.pooled_bf16);
         assert_eq!(QsaStateLayout::F32.pooled_bf16_bytes_per_block(128), 0);
-        let on = QsaStateLayout { pooled_bf16: true, ..QsaStateLayout::F32 };
+        let on = QsaStateLayout {
+            pooled_bf16: true,
+            ..QsaStateLayout::F32
+        };
         assert_eq!(on.pooled_bf16_bytes_per_block(128), 256);
         // 12 layers at 32K / 256K context, compress 4: bytes of the mirrors.
         for (tokens, per_layer) in [(32 * 1024usize, 2 << 20), (256 * 1024, 16 << 20)] {
-            assert_eq!(tokens.div_ceil(4) * on.pooled_bf16_bytes_per_block(128), per_layer);
+            assert_eq!(
+                tokens.div_ceil(4) * on.pooled_bf16_bytes_per_block(128),
+                per_layer
+            );
         }
         // Independent of the F16 arena.
-        let both = QsaStateLayout { pooled_bf16: true, f16_arena: true, ..QsaStateLayout::F32 };
+        let both = QsaStateLayout {
+            pooled_bf16: true,
+            f16_arena: true,
+            ..QsaStateLayout::F32
+        };
         assert_eq!(both.pooled_bf16_bytes_per_block(128), 256);
         assert_eq!(both.f16_arena_bytes_per_token(2, 256), 2048);
     }
@@ -458,7 +511,9 @@ mod tests {
         let mut s = 0x9e37_79b9_7f4a_7c15u64 ^ salt;
         (0..blocks * dim)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let v = f32::from_bits((s >> 32) as u32);
                 // Finite, BF16-rounded: clear the low half, force a normal exponent.
                 f32::from_bits((v.to_bits() & 0xFFFF_0000 & !0x4000_0000) | 0x3000_0000)
@@ -494,7 +549,13 @@ mod tests {
 
         let expect = |upto: usize| -> Vec<u16> {
             (0..CAP * DIM)
-                .map(|i| if i < upto * DIM { (pooled[i].to_bits() >> 16) as u16 } else { 0xA5A5 })
+                .map(|i| {
+                    if i < upto * DIM {
+                        (pooled[i].to_bits() >> 16) as u16
+                    } else {
+                        0xA5A5
+                    }
+                })
                 .collect()
         };
 
@@ -540,15 +601,30 @@ mod tests {
         const CAP: usize = 40;
         let mut pooled = pooled_values(CAP, DIM, 3);
         let t = gpu.upload_f32(&pooled, &[CAP * DIM]).unwrap();
-        assert_eq!(qsa_pooled_bf16_low_nonzero_count(&mut gpu, &t, 0, CAP, DIM).unwrap(), 0);
+        assert_eq!(
+            qsa_pooled_bf16_low_nonzero_count(&mut gpu, &t, 0, CAP, DIM).unwrap(),
+            0
+        );
         for i in [3usize, 4, 127, 128, 129, 5000] {
             pooled[i] = f32::from_bits(pooled[i].to_bits() | 1);
         }
         let t = gpu.upload_f32(&pooled, &[CAP * DIM]).unwrap();
-        assert_eq!(qsa_pooled_bf16_low_nonzero_count(&mut gpu, &t, 0, CAP, DIM).unwrap(), 6);
+        assert_eq!(
+            qsa_pooled_bf16_low_nonzero_count(&mut gpu, &t, 0, CAP, DIM).unwrap(),
+            6
+        );
         // Element 5000 is in block 39; ranges exclude other blocks' elements.
-        assert_eq!(qsa_pooled_bf16_low_nonzero_count(&mut gpu, &t, 1, 2, DIM).unwrap(), 2);
-        assert_eq!(qsa_pooled_bf16_low_nonzero_count(&mut gpu, &t, 39, 40, DIM).unwrap(), 1);
-        assert_eq!(qsa_pooled_bf16_low_nonzero_count(&mut gpu, &t, 10, 39, DIM).unwrap(), 0);
+        assert_eq!(
+            qsa_pooled_bf16_low_nonzero_count(&mut gpu, &t, 1, 2, DIM).unwrap(),
+            2
+        );
+        assert_eq!(
+            qsa_pooled_bf16_low_nonzero_count(&mut gpu, &t, 39, 40, DIM).unwrap(),
+            1
+        );
+        assert_eq!(
+            qsa_pooled_bf16_low_nonzero_count(&mut gpu, &t, 10, 39, DIM).unwrap(),
+            0
+        );
     }
 }

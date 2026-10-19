@@ -33,12 +33,9 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<DotsOcrBundle,
         }
     };
     hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
-    let state = hipfire_arch_qwen2::qwen2::Qwen2State::new_with_max_seq(
-        ctx.gpu,
-        &config.text,
-        ctx.max_seq,
-    )
-    .map_err(|e| format!("dots-ocr: Qwen2State::new_with_max_seq failed: {e:?}"))?;
+    let state =
+        hipfire_arch_qwen2::qwen2::Qwen2State::new_with_max_seq(ctx.gpu, &config.text, ctx.max_seq)
+            .map_err(|e| format!("dots-ocr: Qwen2State::new_with_max_seq failed: {e:?}"))?;
     Ok(DotsOcrBundle {
         config,
         weights,

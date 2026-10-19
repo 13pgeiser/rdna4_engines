@@ -55,7 +55,14 @@ fn address(b: &mut Builder, dst: Src, base: Src, offset: Src) -> Result<(), Stri
     // Carry-in already consumes the gfx9 scalar bus; stage the high word.
     b.push(ops::v1(V1::MovB32, reg(dst, 1), reg(base, 1)))?;
     b.push(ops::v2c(V2::AddCoU32, dst, Src::VccLo, base, offset))?;
-    b.push(ops::v2ci(V2::AddcCoU32, reg(dst, 1), Some(Src::VccLo), Src::Int(0), reg(dst, 1), Src::VccLo))
+    b.push(ops::v2ci(
+        V2::AddcCoU32,
+        reg(dst, 1),
+        Some(Src::VccLo),
+        Src::Int(0),
+        reg(dst, 1),
+        Src::VccLo,
+    ))
 }
 
 // OCP decode by integer exponent construction; deliberately not a FNUZ decode.
@@ -68,18 +75,36 @@ fn decode_ocp(b: &mut Builder, dst: Src, byte: Src, tmp: Src) -> Result<(), Stri
     b.push(ops::v2(V2::AndB32, exponent, Src::Int(15), exponent))?;
     b.push(ops::v2(V2::AndB32, mantissa, Src::Int(7), byte))?;
     b.push(ops::v1(V1::CvtF32U32, subnormal, mantissa))?;
-    b.push(ops::v1(V1::MovB32, sign, Src::Lit((1.0f32 / 512.0).to_bits())))?;
+    b.push(ops::v1(
+        V1::MovB32,
+        sign,
+        Src::Lit((1.0f32 / 512.0).to_bits()),
+    ))?;
     b.push(ops::v2(V2::MulF32, subnormal, sign, subnormal))?;
     b.push(ops::v2(V2::AddU32, dst, Src::Lit(120), exponent))?;
     b.push(ops::v2(V2::LshlrevB32, dst, Src::Int(23), dst))?;
     b.push(ops::v2(V2::LshlrevB32, mantissa, Src::Int(20), mantissa))?;
     b.push(ops::v2(V2::OrB32, dst, mantissa, dst))?;
     b.push(ops::vc(VC::CmpEqU32, Src::VccLo, Src::Int(0), exponent))?;
-    b.push(ops::v2ci(V2::CndmaskB32, dst, None, dst, subnormal, Src::VccLo))?;
+    b.push(ops::v2ci(
+        V2::CndmaskB32,
+        dst,
+        None,
+        dst,
+        subnormal,
+        Src::VccLo,
+    ))?;
     b.push(ops::v2(V2::AndB32, mantissa, Src::Lit(127), byte))?;
     b.push(ops::v1(V1::MovB32, subnormal, Src::Lit(0x7fc0_0000)))?;
     b.push(ops::vc(VC::CmpEqU32, Src::VccLo, Src::Lit(127), mantissa))?;
-    b.push(ops::v2ci(V2::CndmaskB32, dst, None, dst, subnormal, Src::VccLo))?;
+    b.push(ops::v2ci(
+        V2::CndmaskB32,
+        dst,
+        None,
+        dst,
+        subnormal,
+        Src::VccLo,
+    ))?;
     b.push(ops::v2(V2::AndB32, sign, Src::Lit(128), byte))?;
     b.push(ops::v2(V2::LshlrevB32, sign, Src::Int(24), sign))?;
     b.push(ops::v2(V2::OrB32, dst, sign, dst))
@@ -88,10 +113,17 @@ fn decode_ocp(b: &mut Builder, dst: Src, byte: Src, tmp: Src) -> Result<(), Stri
 /// Build a gfx942 wave64 producer. The kernarg ABI is identical to the HIP twin.
 pub fn build(arch: Arch) -> Result<Kernel, String> {
     let mut b = Builder::new(arch, SYMBOL, 64)?;
-    for (name, readonly) in [("x_f32", true), ("x_fp8", false), ("half_sums", false), ("row_scales", false)] {
+    for (name, readonly) in [
+        ("x_f32", true),
+        ("x_fp8", false),
+        ("half_sums", false),
+        ("row_scales", false),
+    ] {
         b.arg_ptr(name, readonly)?;
     }
-    for name in ["K", "N", "scale_mode", "row_scale_shift"] { b.arg_u32(name)?; }
+    for name in ["K", "N", "scale_mode", "row_scale_shift"] {
+        b.arg_u32(name)?;
+    }
     let row = b.workgroup_id(0)?;
     let lane = b.workitem_ids(1)?;
     let args = b.sgprs(12, 4)?;
@@ -171,7 +203,11 @@ pub fn build(arch: Arch) -> Result<Kernel, String> {
     b.push(ops::v1(V1::ReadfirstlaneB32, bits, vmax))?;
     b.push(ops::sc(SC::CmpEqU32, bits, Src::Int(0)))?;
     b.branch(SP::CbranchScc1, "shift")?;
-    b.push(ops::v1(V1::MovB32, other, Src::Lit((1.0f32 / 224.0).to_bits())))?;
+    b.push(ops::v1(
+        V1::MovB32,
+        other,
+        Src::Lit((1.0f32 / 224.0).to_bits()),
+    ))?;
     b.push(ops::v2(V2::MulF32, other, vmax, other))?;
     b.push(ops::v1(V1::ReadfirstlaneB32, bits, other))?;
     b.push(ops::s2(S2::LshrB32, exponent, bits, Src::Int(23)))?;
@@ -180,7 +216,12 @@ pub fn build(arch: Arch) -> Result<Kernel, String> {
     b.push(ops::sc(SC::CmpLgU32, temp, Src::Int(0)))?;
     b.push(ops::s2(S2::CselectB32, temp, Src::Int(1), Src::Int(0)))?;
     b.push(ops::s2(S2::AddI32, exponent, exponent, temp))?;
-    b.push(ops::s2(S2::MaxI32, exponent, exponent, Src::Lit((-31i32) as u32)))?;
+    b.push(ops::s2(
+        S2::MaxI32,
+        exponent,
+        exponent,
+        Src::Lit((-31i32) as u32),
+    ))?;
     b.push(ops::s2(S2::MinI32, exponent, exponent, Src::Int(9)))?;
     b.label("shift")?;
     b.push(ops::s2(S2::AddI32, exponent, exponent, shift))?;
@@ -201,10 +242,24 @@ pub fn build(arch: Arch) -> Result<Kernel, String> {
     b.push(ops::v2(V2::LshlrevB32, offset, Src::Int(4), lane))?;
     address(&mut b, va, xp, offset)?;
     b.push(ops::global_load(FlatOp::LoadDwordx4, values, va, None, 0))?;
-    for i in 0..4 { b.push(ops::v3(V3::LdexpF32, reg(values, i), &[reg(values, i), exponent]))?; }
+    for i in 0..4 {
+        b.push(ops::v3(
+            V3::LdexpF32,
+            reg(values, i),
+            &[reg(values, i), exponent],
+        ))?;
+    }
     b.push(ops::v1(V1::MovB32, packed, Src::Int(0)))?;
     for i in 0..2 {
-        b.push(ops::v3m(Vop3Op::Only(V3::CvtPkFp8F32), packed, &[reg(values, i * 2), reg(values, i * 2 + 1)], ops::Mods { op_sel: i * 8, ..Default::default() }))?;
+        b.push(ops::v3m(
+            Vop3Op::Only(V3::CvtPkFp8F32),
+            packed,
+            &[reg(values, i * 2), reg(values, i * 2 + 1)],
+            ops::Mods {
+                op_sel: i * 8,
+                ..Default::default()
+            },
+        ))?;
     }
     b.push(ops::v2(V2::LshlrevB32, offset, Src::Int(2), lane))?;
     address(&mut b, va, op, offset)?;
@@ -256,42 +311,75 @@ pub struct Reference {
 fn ocp_image(code: u8) -> f64 {
     let e = i32::from(code >> 3);
     let m = i32::from(code & 7);
-    if e == 0 { f64::from(m) / 512.0 }
-    else { f64::from(8 + m) * 2.0f64.powi(e - 10) }
+    if e == 0 {
+        f64::from(m) / 512.0
+    } else {
+        f64::from(8 + m) * 2.0f64.powi(e - 10)
+    }
 }
 
 fn encode_image(value: f64) -> u8 {
     let x = value.abs();
     // MODE.FP16_OVFL=0 tests the unrounded source magnitude (ISA §7.2).
-    if x > 480.0 { return 0x80; }
+    if x > 480.0 {
+        return 0x80;
+    }
     let (mut lo, mut hi) = (0u8, 127u8);
     while hi - lo > 1 {
         let mid = lo + (hi - lo) / 2;
-        if ocp_image(mid) <= x { lo = mid; } else { hi = mid; }
+        if ocp_image(mid) <= x {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
     }
     let lower_error = x - ocp_image(lo);
     let upper_error = ocp_image(hi) - x;
-    let best = if upper_error < lower_error || (upper_error == lower_error && hi & 1 == 0) { hi } else { lo };
-    if best == 0 { 0 } else { best | if value.is_sign_negative() { 128 } else { 0 } }
+    let best = if upper_error < lower_error || (upper_error == lower_error && hi & 1 == 0) {
+        hi
+    } else {
+        lo
+    };
+    if best == 0 {
+        0
+    } else {
+        best | if value.is_sign_negative() { 128 } else { 0 }
+    }
 }
 
 fn decode_reference(code: u8) -> f32 {
     let magnitude = code & 127;
-    let value = if magnitude == 127 { f32::from_bits(0x7fc0_0000) }
-        else { ocp_image(magnitude) as f32 };
-    if code & 128 != 0 { -value } else { value }
+    let value = if magnitude == 127 {
+        f32::from_bits(0x7fc0_0000)
+    } else {
+        ocp_image(magnitude) as f32
+    };
+    if code & 128 != 0 {
+        -value
+    } else {
+        value
+    }
 }
 
 /// Source-exact scale selection and exact rational/f64 OCP→FNUZ image rounding.
 /// `x.len()/k` rows; supported source-route shifts are -1..=3.
-pub fn reference(x: &[f32], k: usize, scale_mode: u32, row_scale_shift: i32) -> Result<Reference, String> {
+pub fn reference(
+    x: &[f32],
+    k: usize,
+    scale_mode: u32,
+    row_scale_shift: i32,
+) -> Result<Reference, String> {
     if k == 0 || k % 256 != 0 || x.len() % k != 0 {
         return Err("K must be a positive multiple of 256 and divide the input length".into());
     }
     if !(-1..=3).contains(&row_scale_shift) || x.iter().any(|v| !v.is_finite()) {
         return Err("finite inputs and a source-route shift in -1..=3 are required".into());
     }
-    let mut result = Reference { codes: Vec::with_capacity(x.len()), half_sums: Vec::with_capacity(x.len() / 128), row_scales: Vec::with_capacity(x.len() / k) };
+    let mut result = Reference {
+        codes: Vec::with_capacity(x.len()),
+        half_sums: Vec::with_capacity(x.len() / 128),
+        row_scales: Vec::with_capacity(x.len() / k),
+    };
     for row in x.chunks_exact(k) {
         let mut e = 0;
         if scale_mode == 1 {
@@ -305,23 +393,31 @@ pub fn reference(x: &[f32], k: usize, scale_mode: u32, row_scale_shift: i32) -> 
             }
             e += row_scale_shift;
         }
-        result.row_scales.push(f32::from_bits(((e + 127) as u32) << 23));
+        result
+            .row_scales
+            .push(f32::from_bits(((e + 127) as u32) << 23));
         let start = result.codes.len();
         let inverse_scale = 2.0f64.powi(-e);
         for &v in row {
             // Division by a and the FNUZ half fold are exact in f64 for all
             // finite f32 inputs in this exponent range. Encoding uses the
             // twice-FNUZ (OCP) image, so the explicit half cancels here.
-            result.codes.push(encode_image(f64::from(v) * inverse_scale));
+            result
+                .codes
+                .push(encode_image(f64::from(v) * inverse_scale));
         }
         for half in result.codes[start..].chunks_exact(128) {
             let mut lanes = [0.0f32; 32];
             for (lane, four) in half.chunks_exact(4).enumerate() {
-                lanes[lane] = ((decode_reference(four[0]) + decode_reference(four[1])) + decode_reference(four[2])) + decode_reference(four[3]);
+                lanes[lane] = ((decode_reference(four[0]) + decode_reference(four[1]))
+                    + decode_reference(four[2]))
+                    + decode_reference(four[3]);
             }
             for off in [16, 8, 4, 2, 1] {
                 let old = lanes;
-                for lane in 0..32 { lanes[lane] = old[lane] + old[lane ^ off]; }
+                for lane in 0..32 {
+                    lanes[lane] = old[lane] + old[lane ^ off];
+                }
             }
             result.half_sums.push(lanes[0]);
         }

@@ -62,12 +62,12 @@
 
 #![cfg(feature = "lab")]
 
+use rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
 use rdna_compute::tensor_ops::{
     indexed_attention_attention_batch, indexed_attention_attention_batch_exact,
     indexed_attention_attention_splitk_for_test, IndexedAttentionAttentionBatch, QsaKvFormat,
     QSA_DECODE_SPLITK_SCORING_LAYOUT, QSA_DECODE_SPLITK_SPLITS,
 };
-use rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Rows of the heterogeneous batched configurations.
@@ -224,9 +224,17 @@ struct Dev {
 fn make_dev(gpu: &mut Gpu) -> Dev {
     let mut rng = Rng(0x5a5a_0001);
     let n = FULL_CAP * NKV * HD;
-    let keys = gpu.upload_f32(&fill(&mut rng, n, 1.0), &[n]).expect("upload keys");
-    let values = gpu.upload_f32(&fill(&mut rng, n, 1.0), &[n]).expect("upload values");
-    Dev { keys, values, full_cap: FULL_CAP }
+    let keys = gpu
+        .upload_f32(&fill(&mut rng, n, 1.0), &[n])
+        .expect("upload keys");
+    let values = gpu
+        .upload_f32(&fill(&mut rng, n, 1.0), &[n])
+        .expect("upload values");
+    Dev {
+        keys,
+        values,
+        full_cap: FULL_CAP,
+    }
 }
 
 fn sentinel(gpu: &mut Gpu, n: usize) -> GpuTensor {
@@ -239,8 +247,13 @@ fn upload_q(gpu: &mut Gpu, q: &[f32]) -> GpuTensor {
 }
 
 fn upload_selected(gpu: &Gpu, rows: &[Vec<i32>]) -> GpuTensor {
-    let bytes: Vec<u8> = rows.iter().flatten().flat_map(|t| t.to_le_bytes()).collect();
-    gpu.upload_raw(&bytes, &[bytes.len()]).expect("upload selected")
+    let bytes: Vec<u8> = rows
+        .iter()
+        .flatten()
+        .flat_map(|t| t.to_le_bytes())
+        .collect();
+    gpu.upload_raw(&bytes, &[bytes.len()])
+        .expect("upload selected")
 }
 
 fn download(gpu: &Gpu, t: &GpuTensor) -> Vec<f32> {
@@ -295,7 +308,11 @@ fn launch(
     };
     // A verify forward of two or more rows runs row-exact to the widest rows;
     // a one-row launch is the decode itself.
-    gpu.set_wide_verify_rows(if sh.rows >= 2 { WIDE_VERIFY_MAX_ROWS } else { 0 });
+    gpu.set_wide_verify_rows(if sh.rows >= 2 {
+        WIDE_VERIFY_MAX_ROWS
+    } else {
+        0
+    });
     let result = match kind {
         Kind::Exact => indexed_attention_attention_batch_exact(gpu, &p),
         Kind::Production => indexed_attention_attention_batch(gpu, &p),
@@ -374,7 +391,10 @@ struct Stats {
 
 impl Stats {
     fn new(combos: usize) -> Self {
-        Stats { fails: Vec::new(), worst: vec![Worst::default(); combos] }
+        Stats {
+            fails: Vec::new(),
+            worst: vec![Worst::default(); combos],
+        }
     }
 
     fn fail(&mut self, msg: String) {
@@ -438,11 +458,17 @@ fn check(
     for r in 0..sh.rows {
         let row = &want[r * row_len..(r + 1) * row_len];
         if row.iter().any(|x| !x.is_finite()) {
-            stats.fail(format!("{label}: exact reference row {r} not finite/unwritten"));
+            stats.fail(format!(
+                "{label}: exact reference row {r} not finite/unwritten"
+            ));
         } else if valid[r] && row.iter().all(|&x| x == 0.0) {
-            stats.fail(format!("{label}: exact reference row {r} is all zero despite valid tokens"));
+            stats.fail(format!(
+                "{label}: exact reference row {r} is all zero despite valid tokens"
+            ));
         } else if !valid[r] && row.iter().any(|x| x.to_bits() != 0) {
-            stats.fail(format!("{label}: exact reference row {r} is not +0 without valid tokens"));
+            stats.fail(format!(
+                "{label}: exact reference row {r} is not +0 without valid tokens"
+            ));
         }
     }
 
@@ -536,12 +562,21 @@ fn rows1_fixture(
     stats: &mut Stats,
 ) {
     let (compress, budget, capacity) = rows1_cfg(cfg, len);
-    let sh = Shape { rows: 1, position_start: len - 1, budget, compress, capacity };
+    let sh = Shape {
+        rows: 1,
+        position_start: len - 1,
+        budget,
+        compress,
+        capacity,
+    };
     let mut rng = Rng(0x1000_0000 + (len * 31 + cfg * 7) as u64 * 977 + mode as u64);
     let q = make_q(&mut rng, 1);
     let sel_len = selected_len(len, budget, compress, capacity);
     let row = gen_row(&mut rng, mode, len, sel_len, capacity);
-    let label = format!("rows1 len={len:<4} {:<31} {mode:?} sel_len={sel_len}", ROWS1_CFGS[cfg]);
+    let label = format!(
+        "rows1 len={len:<4} {:<31} {mode:?} sel_len={sel_len}",
+        ROWS1_CFGS[cfg]
+    );
     check(gpu, dev, &sh, &q, &[row], combos, &label, stats);
 }
 
@@ -582,15 +617,69 @@ struct BatchCfg {
 /// `selected_len`: S > len, budget at the block boundary (selected_len drops when a
 /// block completes), empty slices, capacity clamp, and the long contexts.
 const BATCH_CFGS: [BatchCfg; 9] = [
-    BatchCfg { name: "c8 b2 ps14 cap64", compress: 8, budget: 2, position_start: 14, capacity: 64 },
-    BatchCfg { name: "c8 b2 ps20 cap64 (drop at block 3)", compress: 8, budget: 2, position_start: 20, capacity: 64 },
-    BatchCfg { name: "c8 huge ps0 cap16 (S>len)", compress: 8, budget: HUGE, position_start: 0, capacity: 16 },
-    BatchCfg { name: "c8 b0 ps0 cap16 (empty slice)", compress: 8, budget: 0, position_start: 0, capacity: 16 },
-    BatchCfg { name: "c8 b0 ps6 cap16 (empty slice)", compress: 8, budget: 0, position_start: 6, capacity: 16 },
-    BatchCfg { name: "c1 b5 ps0 cap8", compress: 1, budget: 5, position_start: 0, capacity: 8 },
-    BatchCfg { name: "c8 b140 ps1124 cap1200", compress: 8, budget: 140, position_start: 1124, capacity: 1200 },
-    BatchCfg { name: "c8 huge ps8188 cap8200", compress: 8, budget: HUGE, position_start: 8188, capacity: 8200 },
-    BatchCfg { name: "c8 huge ps20 cap24 (clamp)", compress: 8, budget: HUGE, position_start: 20, capacity: 24 },
+    BatchCfg {
+        name: "c8 b2 ps14 cap64",
+        compress: 8,
+        budget: 2,
+        position_start: 14,
+        capacity: 64,
+    },
+    BatchCfg {
+        name: "c8 b2 ps20 cap64 (drop at block 3)",
+        compress: 8,
+        budget: 2,
+        position_start: 20,
+        capacity: 64,
+    },
+    BatchCfg {
+        name: "c8 huge ps0 cap16 (S>len)",
+        compress: 8,
+        budget: HUGE,
+        position_start: 0,
+        capacity: 16,
+    },
+    BatchCfg {
+        name: "c8 b0 ps0 cap16 (empty slice)",
+        compress: 8,
+        budget: 0,
+        position_start: 0,
+        capacity: 16,
+    },
+    BatchCfg {
+        name: "c8 b0 ps6 cap16 (empty slice)",
+        compress: 8,
+        budget: 0,
+        position_start: 6,
+        capacity: 16,
+    },
+    BatchCfg {
+        name: "c1 b5 ps0 cap8",
+        compress: 1,
+        budget: 5,
+        position_start: 0,
+        capacity: 8,
+    },
+    BatchCfg {
+        name: "c8 b140 ps1124 cap1200",
+        compress: 8,
+        budget: 140,
+        position_start: 1124,
+        capacity: 1200,
+    },
+    BatchCfg {
+        name: "c8 huge ps8188 cap8200",
+        compress: 8,
+        budget: HUGE,
+        position_start: 8188,
+        capacity: 8200,
+    },
+    BatchCfg {
+        name: "c8 huge ps20 cap24 (clamp)",
+        compress: 8,
+        budget: HUGE,
+        position_start: 20,
+        capacity: 24,
+    },
 ];
 
 /// Row `r` mode: row 1 is all invalid (so every batch of 2+ rows has one),
@@ -608,11 +697,9 @@ fn row_mode(r: usize, force: Option<Mode>) -> Mode {
 
 /// Host data of a config's eight rows.
 fn batch_host(cfg: &BatchCfg, force: Option<Mode>) -> (Vec<f32>, Vec<Vec<i32>>, Vec<usize>) {
-    let mut rng = Rng(
-        0x2000_0000
-            + (cfg.position_start * 13 + cfg.compress) as u64 * 7919
-            + cfg.budget as u64 % 1009,
-    );
+    let mut rng = Rng(0x2000_0000
+        + (cfg.position_start * 13 + cfg.compress) as u64 * 7919
+        + cfg.budget as u64 % 1009);
     let q = make_q(&mut rng, MAX_BATCH_ROWS);
     let mut sel = Vec::new();
     let mut lens = Vec::new();
@@ -620,7 +707,13 @@ fn batch_host(cfg: &BatchCfg, force: Option<Mode>) -> (Vec<f32>, Vec<Vec<i32>>, 
         let visible = cfg.position_start + r + 1;
         let sel_len = selected_len(visible, cfg.budget, cfg.compress, cfg.capacity);
         lens.push(sel_len);
-        sel.push(gen_row(&mut rng, row_mode(r, force), visible, sel_len, cfg.capacity));
+        sel.push(gen_row(
+            &mut rng,
+            row_mode(r, force),
+            visible,
+            sel_len,
+            cfg.capacity,
+        ));
     }
     (q, sel, lens)
 }
@@ -654,7 +747,10 @@ fn qsa_splitk_batched_rows_bitwise_individual() {
         let singles: Vec<(GpuTensor, GpuTensor)> = (0..MAX_BATCH_ROWS)
             .map(|r| {
                 let q_row = &q[r * 2 * NH * HD..(r + 1) * 2 * NH * HD];
-                (upload_q(&mut gpu, q_row), upload_selected(&gpu, &sel[r..r + 1]))
+                (
+                    upload_q(&mut gpu, q_row),
+                    upload_selected(&gpu, &sel[r..r + 1]),
+                )
             })
             .collect();
         for rows in 1..=MAX_BATCH_ROWS {
@@ -673,15 +769,31 @@ fn qsa_splitk_batched_rows_bitwise_individual() {
             let row_len = NH * HD;
             for (c, &(s, l)) in combos.iter().enumerate() {
                 for r in 0..rows {
-                    let single = Shape { rows: 1, position_start: cfg.position_start + r, ..sh };
+                    let single = Shape {
+                        rows: 1,
+                        position_start: cfg.position_start + r,
+                        ..sh
+                    };
                     let out = sentinel(&mut gpu, row_len);
-                    launch(&mut gpu, Kind::Split(s, l), &dev, &singles[r].0, &singles[r].1, &out, &single);
+                    launch(
+                        &mut gpu,
+                        Kind::Split(s, l),
+                        &dev,
+                        &singles[r].0,
+                        &singles[r].1,
+                        &out,
+                        &single,
+                    );
                     let alone = download(&gpu, &out);
                     let batched = &outs[c][r * row_len..(r + 1) * row_len];
                     if alone.iter().any(|x| !x.is_finite()) {
-                        stats.fail(format!("{label} splits={s} layout={l}: single-row launch {r} not finite"));
+                        stats.fail(format!(
+                            "{label} splits={s} layout={l}: single-row launch {r} not finite"
+                        ));
                     }
-                    if let Some(i) = (0..row_len).find(|&i| alone[i].to_bits() != batched[i].to_bits()) {
+                    if let Some(i) =
+                        (0..row_len).find(|&i| alone[i].to_bits() != batched[i].to_bits())
+                    {
                         stats.fail(format!(
                             "{label} splits={s} layout={l}: row {r} differs from its single-row launch at {i}: batched {:#010x} single {:#010x}",
                             batched[i].to_bits(),
@@ -704,7 +816,15 @@ fn qsa_splitk_all_invalid_zero() {
     let mut stats = Stats::new(combos.len());
     for len in lengths(&combos) {
         for cfg in 0..ROWS1_CFGS.len() {
-            rows1_fixture(&mut gpu, &dev, &combos, len, cfg, Mode::AllInvalid, &mut stats);
+            rows1_fixture(
+                &mut gpu,
+                &dev,
+                &combos,
+                len,
+                cfg,
+                Mode::AllInvalid,
+                &mut stats,
+            );
         }
     }
     for cfg in &BATCH_CFGS {
@@ -712,7 +832,16 @@ fn qsa_splitk_all_invalid_zero() {
         for rows in 1..=MAX_BATCH_ROWS {
             let sh = batch_shape(cfg, rows);
             let label = format!("all-invalid batched {} rows={rows}", cfg.name);
-            check(&mut gpu, &dev, &sh, &q[..rows * 2 * NH * HD], &sel[..rows], &combos, &label, &mut stats);
+            check(
+                &mut gpu,
+                &dev,
+                &sh,
+                &q[..rows * 2 * NH * HD],
+                &sel[..rows],
+                &combos,
+                &label,
+                &mut stats,
+            );
         }
     }
     stats.finish(&combos);
@@ -757,7 +886,9 @@ fn wide_row_kind(r: usize) -> WideRow {
 fn wide_invalid_token(rng: &mut Rng, visible: usize, full_cap: usize) -> i32 {
     match rng.below(3) {
         0 => -1 - rng.below(100) as i32,
-        1 if visible < full_cap => (visible + rng.below((full_cap - visible).min(4096) as u64) as usize) as i32,
+        1 if visible < full_cap => {
+            (visible + rng.below((full_cap - visible).min(4096) as u64) as usize) as i32
+        }
         _ => (full_cap + rng.below(1000) as usize) as i32,
     }
 }
@@ -812,31 +943,47 @@ fn make_dev_long(gpu: &mut Gpu, full_cap: usize) -> Dev {
     let mut rng = Rng(0x5a5a_1001 ^ full_cap as u64);
     let mut tensors = Vec::new();
     for _ in 0..2 {
-        let t = gpu.alloc_tensor(&[full_cap * row], DType::F32).expect("alloc long K/V");
+        let t = gpu
+            .alloc_tensor(&[full_cap * row], DType::F32)
+            .expect("alloc long K/V");
         let mut first = 0usize;
         while first < full_cap {
             let rows = CHUNK_ROWS.min(full_cap - first);
-            let bytes: Vec<u8> =
-                fill(&mut rng, rows * row, 1.0).iter().flat_map(|v| v.to_le_bytes()).collect();
-            gpu.hip.memcpy_htod_offset(&t.buf, first * row * 4, &bytes).expect("upload K/V chunk");
+            let bytes: Vec<u8> = fill(&mut rng, rows * row, 1.0)
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            gpu.hip
+                .memcpy_htod_offset(&t.buf, first * row * 4, &bytes)
+                .expect("upload K/V chunk");
             first += rows;
         }
         tensors.push(t);
     }
     let values = tensors.pop().unwrap();
     let keys = tensors.pop().unwrap();
-    Dev { keys, values, full_cap }
+    Dev {
+        keys,
+        values,
+        full_cap,
+    }
 }
 
 /// Sets cache rows `[first_row, first_row + rows)` of K and V huge; returns the
 /// saved bytes for [`restore_rows`].
 fn perturb_rows(gpu: &mut Gpu, dev: &Dev, first_row: usize, rows: usize) -> [Vec<u8>; 2] {
     let row_bytes = NKV * HD * 4;
-    let huge: Vec<u8> = (0..rows * NKV * HD).flat_map(|_| 3.0e18f32.to_le_bytes()).collect();
+    let huge: Vec<u8> = (0..rows * NKV * HD)
+        .flat_map(|_| 3.0e18f32.to_le_bytes())
+        .collect();
     let mut saved = [vec![0u8; rows * row_bytes], vec![0u8; rows * row_bytes]];
     for (slot, t) in [&dev.keys, &dev.values].into_iter().enumerate() {
-        gpu.hip.memcpy_dtoh_at(&mut saved[slot], &t.buf, first_row * row_bytes).expect("save rows");
-        gpu.hip.memcpy_htod_offset(&t.buf, first_row * row_bytes, &huge).expect("perturb rows");
+        gpu.hip
+            .memcpy_dtoh_at(&mut saved[slot], &t.buf, first_row * row_bytes)
+            .expect("save rows");
+        gpu.hip
+            .memcpy_htod_offset(&t.buf, first_row * row_bytes, &huge)
+            .expect("perturb rows");
     }
     saved
 }
@@ -844,14 +991,22 @@ fn perturb_rows(gpu: &mut Gpu, dev: &Dev, first_row: usize, rows: usize) -> [Vec
 fn restore_rows(gpu: &mut Gpu, dev: &Dev, first_row: usize, saved: &[Vec<u8>; 2]) {
     let row_bytes = NKV * HD * 4;
     for (slot, t) in [&dev.keys, &dev.values].into_iter().enumerate() {
-        gpu.hip.memcpy_htod_offset(&t.buf, first_row * row_bytes, &saved[slot]).expect("restore rows");
+        gpu.hip
+            .memcpy_htod_offset(&t.buf, first_row * row_bytes, &saved[slot])
+            .expect("restore rows");
     }
 }
 
 /// One window `[e_end - n, e_end)`: every combo's batched launch against the n
 /// single-row launches (bitwise), no-valid-token rows exactly +0, and the
 /// future-cache perturbation. Returns the number of combo cases.
-fn wide_splitk_window(gpu: &mut Gpu, dev: &Dev, e_end: usize, n: usize, fails: &mut Vec<String>) -> usize {
+fn wide_splitk_window(
+    gpu: &mut Gpu,
+    dev: &Dev,
+    e_end: usize,
+    n: usize,
+    fails: &mut Vec<String>,
+) -> usize {
     let ps = e_end - n;
     let sh = Shape {
         rows: n,
@@ -870,9 +1025,17 @@ fn wide_splitk_window(gpu: &mut Gpu, dev: &Dev, e_end: usize, n: usize, fails: &
     let q_t = upload_q(gpu, &q);
     let sel_t = upload_selected(gpu, &sel);
     let singles: Vec<(GpuTensor, GpuTensor)> = (0..n)
-        .map(|r| (upload_q(gpu, &q[r * q_row..(r + 1) * q_row]), upload_selected(gpu, &sel[r..r + 1])))
+        .map(|r| {
+            (
+                upload_q(gpu, &q[r * q_row..(r + 1) * q_row]),
+                upload_selected(gpu, &sel[r..r + 1]),
+            )
+        })
         .collect();
-    let mut kinds: Vec<Kind> = WIDE_COMBOS.iter().map(|&(s, l)| Kind::Split(s, l)).collect();
+    let mut kinds: Vec<Kind> = WIDE_COMBOS
+        .iter()
+        .map(|&(s, l)| Kind::Split(s, l))
+        .collect();
     kinds.push(Kind::Production);
     let mut cases = 0usize;
     let mut base_out: Option<Vec<f32>> = None;
@@ -883,7 +1046,11 @@ fn wide_splitk_window(gpu: &mut Gpu, dev: &Dev, e_end: usize, n: usize, fails: &
         let got = download(gpu, &out);
         gpu.free_tensor(out).expect("free out");
         for r in 0..n {
-            let single = Shape { rows: 1, position_start: ps + r, ..sh };
+            let single = Shape {
+                rows: 1,
+                position_start: ps + r,
+                ..sh
+            };
             let o1 = sentinel(gpu, row_len);
             launch(gpu, kind, dev, &singles[r].0, &singles[r].1, &o1, &single);
             let alone = download(gpu, &o1);
@@ -923,7 +1090,10 @@ fn wide_splitk_window(gpu: &mut Gpu, dev: &Dev, e_end: usize, n: usize, fails: &
         let base = base_out.expect("production split combo ran");
         for r in 0..k {
             let range = r * row_len..(r + 1) * row_len;
-            if let Some(i) = range.clone().find(|&i| perturbed[i].to_bits() != base[i].to_bits()) {
+            if let Some(i) = range
+                .clone()
+                .find(|&i| perturbed[i].to_bits() != base[i].to_bits())
+            {
                 fails.push(format!(
                     "wide E={e_end} n={n}: row {r} changed at {} when only cache rows >= {first} changed",
                     i - r * row_len
@@ -949,8 +1119,11 @@ fn wide_splitk_depth(depth: usize) {
     let (mut windows, mut cases) = (0usize, 0usize);
     for disp in 0..PROD_COMPRESS {
         let e_end = depth - disp;
-        let ns: Vec<usize> =
-            if disp == 0 { (1..=WIDE_VERIFY_MAX_ROWS).collect() } else { WIDE_ROWS_RAGGED.to_vec() };
+        let ns: Vec<usize> = if disp == 0 {
+            (1..=WIDE_VERIFY_MAX_ROWS).collect()
+        } else {
+            WIDE_ROWS_RAGGED.to_vec()
+        };
         for n in ns {
             cases += wide_splitk_window(&mut gpu, &dev, e_end, n, &mut fails);
             windows += 1;
@@ -959,7 +1132,12 @@ fn wide_splitk_depth(depth: usize) {
     println!("depth {depth}: {windows} windows, {cases} combo cases");
     if !fails.is_empty() {
         let shown: Vec<&str> = fails.iter().take(40).map(String::as_str).collect();
-        panic!("{} failure(s); first {}:\n{}", fails.len(), shown.len(), shown.join("\n"));
+        panic!(
+            "{} failure(s); first {}:\n{}",
+            fails.len(),
+            shown.len(),
+            shown.join("\n")
+        );
     }
 }
 
@@ -1002,13 +1180,20 @@ fn time_us(gpu: &mut Gpu, mut call: impl FnMut(&mut Gpu)) -> f64 {
     let stop = gpu.hip.event_create().expect("event_create stop");
     let mut samples = Vec::with_capacity(SAMPLES);
     for _ in 0..SAMPLES {
-        gpu.hip.event_record(&start, None).expect("event_record start");
+        gpu.hip
+            .event_record(&start, None)
+            .expect("event_record start");
         for _ in 0..CALLS_PER_SAMPLE {
             call(gpu);
         }
-        gpu.hip.event_record(&stop, None).expect("event_record stop");
+        gpu.hip
+            .event_record(&stop, None)
+            .expect("event_record stop");
         gpu.hip.event_synchronize(&stop).expect("event_synchronize");
-        let ms = gpu.hip.event_elapsed_ms(&start, &stop).expect("event_elapsed_ms");
+        let ms = gpu
+            .hip
+            .event_elapsed_ms(&start, &stop)
+            .expect("event_elapsed_ms");
         samples.push(ms as f64 * 1000.0 / CALLS_PER_SAMPLE as f64);
     }
     gpu.hip.event_destroy(start).expect("event_destroy start");
@@ -1049,12 +1234,25 @@ fn qsa_splitk_timing_table() {
     // exceeds it and the exact path falls to f32_batched_serial, so it is not
     // timed here (it stays in the correctness tests).
     for len in [1131usize, 8188] {
-        let exact_kernel = if 8 * len + 32 <= 64 * 1024 { "parallel" } else { "serial" };
-        let sh = Shape { rows: 1, position_start: len - 1, budget: HUGE, compress: 8, capacity: len };
+        let exact_kernel = if 8 * len + 32 <= 64 * 1024 {
+            "parallel"
+        } else {
+            "serial"
+        };
+        let sh = Shape {
+            rows: 1,
+            position_start: len - 1,
+            budget: HUGE,
+            compress: 8,
+            capacity: len,
+        };
         let mut rng = Rng(0x3000_0000 + len as u64);
         let q = make_q(&mut rng, 1);
         let sel_len = selected_len(len, sh.budget, sh.compress, sh.capacity);
-        assert_eq!(sel_len, len, "timing rows are all valid with selected_len == len");
+        assert_eq!(
+            sel_len, len,
+            "timing rows are all valid with selected_len == len"
+        );
         let row = gen_row(&mut rng, Mode::AllValid, len, sel_len, sh.capacity);
         let q_t = upload_q(&mut gpu, &q);
         let sel_t = upload_selected(&gpu, &[row]);
@@ -1064,12 +1262,16 @@ fn qsa_splitk_timing_table() {
         // query head; the grouped layout once per KV head.
         let (hk, hv) = modelled_kv_bytes(0, len);
         let (gk, gv) = modelled_kv_bytes(2, len);
-        let exact = time_us(&mut gpu, |g| launch(g, Kind::Exact, &dev, &q_t, &sel_t, &out, &sh));
+        let exact = time_us(&mut gpu, |g| {
+            launch(g, Kind::Exact, &dev, &q_t, &sel_t, &out, &sh)
+        });
         println!(
             "{len},exact-{exact_kernel} (incumbent),-,-,{exact:.2},1.00x,{hk},{hv},{}",
             hk + hv
         );
-        let production = time_us(&mut gpu, |g| launch(g, Kind::Production, &dev, &q_t, &sel_t, &out, &sh));
+        let production = time_us(&mut gpu, |g| {
+            launch(g, Kind::Production, &dev, &q_t, &sel_t, &out, &sh)
+        });
         println!(
             "{len},production-dispatch,-,-,{production:.2},{:.2}x,{hk},{hv},{}",
             exact / production,
@@ -1079,10 +1281,20 @@ fn qsa_splitk_timing_table() {
         let mut best_head: Option<(usize, usize, f64)> = None;
         let mut best_group: Option<(usize, usize, f64)> = None;
         for &(s, l) in &combos {
-            let us = time_us(&mut gpu, |g| launch(g, Kind::Split(s, l), &dev, &q_t, &sel_t, &out, &sh));
+            let us = time_us(&mut gpu, |g| {
+                launch(g, Kind::Split(s, l), &dev, &q_t, &sel_t, &out, &sh)
+            });
             let (k, v) = modelled_kv_bytes(l, len);
-            println!("{len},splitk,{s},{l},{us:.2},{:.2}x,{k},{v},{}", exact / us, k + v);
-            let best = if l == 2 { &mut best_group } else { &mut best_head };
+            println!(
+                "{len},splitk,{s},{l},{us:.2},{:.2}x,{k},{v},{}",
+                exact / us,
+                k + v
+            );
+            let best = if l == 2 {
+                &mut best_group
+            } else {
+                &mut best_head
+            };
             if best.map_or(true, |(_, _, b)| us < b) {
                 *best = Some((s, l, us));
             }

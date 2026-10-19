@@ -7,9 +7,8 @@
 
 use crate::model_source::{
     capture_file_identity, read_file_exact_at, read_file_nowait_at, verify_path_identity,
-    ModelSource, QuantConfig,
-    SourceError, SourceFileIdentity, SourceFormat, SourceIdentity, SourceRangeDescriptor,
-    SourceRangeIdentity, SourceReader, SourceReaderImpl, TensorInfo,
+    ModelSource, QuantConfig, SourceError, SourceFileIdentity, SourceFormat, SourceIdentity,
+    SourceRangeDescriptor, SourceRangeIdentity, SourceReader, SourceReaderImpl, TensorInfo,
 };
 use crate::ple_hot_store::NowaitRead;
 use half::bf16;
@@ -1033,11 +1032,12 @@ mod tests {
         // name discriminates.
         assert_eq!(derive_arch_id(&json!({ "model_type": "qwen3_5" })), 5);
         assert_eq!(
-            derive_arch_id(&json!({ "architectures": ["Qwen3_5ForCausalLM"], "model_type": "qwen3_5" })),
+            derive_arch_id(
+                &json!({ "architectures": ["Qwen3_5ForCausalLM"], "model_type": "qwen3_5" })
+            ),
             5
         );
     }
-
 
     #[test]
     fn bf16_to_f32_basic_values() {

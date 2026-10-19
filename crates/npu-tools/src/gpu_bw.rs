@@ -19,7 +19,9 @@
 //! sink is compared with CPU-computed per-thread four-lane XOR checksums of every loaded element
 //! (a checksum verification, not a byte-exact image of the source).
 
-use railgun::npu::hip_runtime::{HipBuffer, HipEvent, HipFunction, HipMemoryKind, HipRuntime, HostRegistration};
+use railgun::npu::hip_runtime::{
+    HipBuffer, HipEvent, HipFunction, HipMemoryKind, HipRuntime, HostRegistration,
+};
 use railgun::npu::{Bo, Device};
 use std::ffi::c_void;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -33,8 +35,15 @@ const ELEMENT: usize = 16;
 const DEFAULT_BYTES: usize = 1 << 30;
 const DEFAULT_ITERS: u32 = 10;
 
-const BACKINGS: [&str; 7] = ["vram", "vmm-host", "vmm-host-uncached", "host-registered",
-    "host-registered-mapped", "host-registered-portable", "host-registered-userptr"];
+const BACKINGS: [&str; 7] = [
+    "vram",
+    "vmm-host",
+    "vmm-host-uncached",
+    "host-registered",
+    "host-registered-mapped",
+    "host-registered-portable",
+    "host-registered-userptr",
+];
 const OPS: [&str; 3] = ["read", "write", "copy"];
 
 const USAGE: &str = "\
@@ -73,7 +82,12 @@ GB/s = 1e9 bytes/s. Background timestamps are CLOCK_REALTIME nanoseconds.";
 #[inline]
 fn pattern(i: usize) -> [u32; 4] {
     let x = i as u32;
-    [x, x ^ 0x1234_5678, x.wrapping_mul(1_664_525), x.wrapping_add(1_013_904_223)]
+    [
+        x,
+        x ^ 0x1234_5678,
+        x.wrapping_mul(1_664_525),
+        x.wrapping_add(1_013_904_223),
+    ]
 }
 
 /// Lane-wise complement: every lane of the poison differs from the same lane of the pattern.
@@ -110,12 +124,18 @@ fn fill_poison(buf: &mut [u8]) {
 
 /// Elements whose bytes differ from `pattern(i)`.
 fn pattern_mismatches(buf: &[u8]) -> u64 {
-    buf.chunks_exact(ELEMENT).enumerate().filter(|&(i, chunk)| load(chunk) != pattern(i)).count() as u64
+    buf.chunks_exact(ELEMENT)
+        .enumerate()
+        .filter(|&(i, chunk)| load(chunk) != pattern(i))
+        .count() as u64
 }
 
 /// Elements whose bytes differ from `poison(i)`.
 fn poison_mismatches(buf: &[u8]) -> u64 {
-    buf.chunks_exact(ELEMENT).enumerate().filter(|&(i, chunk)| load(chunk) != poison(i)).count() as u64
+    buf.chunks_exact(ELEMENT)
+        .enumerate()
+        .filter(|&(i, chunk)| load(chunk) != poison(i))
+        .count() as u64
 }
 
 /// Per-thread XOR `read_bw` must produce: thread `t` folds elements `t, t+threads, ...`.
@@ -164,7 +184,10 @@ fn parse_list(option: &str, text: &str, names: &[&str]) -> Result<Vec<String>, S
     let mut result: Vec<String> = Vec::new();
     for item in text.split(',') {
         if !names.contains(&item) {
-            return Err(format!("{option}: unknown list entry {item:?}; expected one of {}", names.join(",")));
+            return Err(format!(
+                "{option}: unknown list entry {item:?}; expected one of {}",
+                names.join(",")
+            ));
         }
         if result.iter().any(|seen| seen == item) {
             return Err(format!("{option}: duplicate list entry {item:?}"));
@@ -178,7 +201,9 @@ fn parse_positive(option: &str, text: &str) -> Result<u64, String> {
     if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
         return Err(format!("{option}: invalid number {text:?}"));
     }
-    let value: u64 = text.parse().map_err(|_| format!("{option}: number {text:?} overflows 64 bits"))?;
+    let value: u64 = text
+        .parse()
+        .map_err(|_| format!("{option}: number {text:?} overflows 64 bits"))?;
     if value == 0 {
         return Err(format!("{option}: must be a positive integer"));
     }
@@ -194,10 +219,16 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut it = args.iter();
     while let Some(option) = it.next() {
         let option = option.as_str();
-        if !matches!(option, "--buf" | "--op" | "--bytes" | "--iters" | "--duration") {
+        if !matches!(
+            option,
+            "--buf" | "--op" | "--bytes" | "--iters" | "--duration"
+        ) {
             return Err(format!("unknown option: {option}"));
         }
-        let value = it.next().ok_or_else(|| format!("missing value for {option}"))?.as_str();
+        let value = it
+            .next()
+            .ok_or_else(|| format!("missing value for {option}"))?
+            .as_str();
         let seen = match option {
             "--buf" => backings.is_some(),
             "--op" => ops.is_some(),
@@ -224,7 +255,10 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             }
             "--iters" => {
                 let n = parse_positive(option, value)?;
-                iters = Some(u32::try_from(n).map_err(|_| format!("{option}: {value} exceeds {}", u32::MAX))?);
+                iters = Some(
+                    u32::try_from(n)
+                        .map_err(|_| format!("{option}: {value} exceeds {}", u32::MAX))?,
+                );
             }
             _ => {
                 let seconds: f64 = value
@@ -282,10 +316,14 @@ fn verification_label(op: &str) -> &'static str {
 
 // Linux anonymous mmap, deliberately local to the probe: no new allocator/runtime API.
 unsafe extern "C" {
-    fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
+    fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64)
+        -> *mut c_void;
     fn munmap(addr: *mut c_void, len: usize) -> i32;
 }
-struct Pages { ptr: *mut u8, len: usize }
+struct Pages {
+    ptr: *mut u8,
+    len: usize,
+}
 impl Pages {
     fn new(bytes: usize) -> Result<Self, String> {
         const ALIGN: usize = 2 << 20;
@@ -293,24 +331,42 @@ impl Pages {
         let reserve = len.checked_add(ALIGN).ok_or("mmap size overflow")?;
         // PROT_READ|WRITE, MAP_PRIVATE|ANONYMOUS|POPULATE.
         let raw = unsafe { mmap(std::ptr::null_mut(), reserve, 3, 0x8022, -1, 0) };
-        if raw as usize == usize::MAX { return Err(format!("mmap: {}", std::io::Error::last_os_error())); }
+        if raw as usize == usize::MAX {
+            return Err(format!("mmap: {}", std::io::Error::last_os_error()));
+        }
         let aligned = (raw as usize + ALIGN - 1) & !(ALIGN - 1);
         let prefix = aligned - raw as usize;
         let suffix = reserve - prefix - len;
         unsafe {
-            if prefix != 0 { munmap(raw, prefix); }
-            if suffix != 0 { munmap((aligned + len) as *mut c_void, suffix); }
+            if prefix != 0 {
+                munmap(raw, prefix);
+            }
+            if suffix != 0 {
+                munmap((aligned + len) as *mut c_void, suffix);
+            }
         }
-        Ok(Self { ptr: aligned as *mut u8, len })
+        Ok(Self {
+            ptr: aligned as *mut u8,
+            len,
+        })
     }
 }
 impl Drop for Pages {
-    fn drop(&mut self) { unsafe { munmap(self.ptr.cast(), self.len); } }
+    fn drop(&mut self) {
+        unsafe {
+            munmap(self.ptr.cast(), self.len);
+        }
+    }
 }
 enum Buffer {
     Hip(HipBuffer),
     // Field drop order: unpin both devices before unmapping; BO before its device fd.
-    Registered { reg: HostRegistration, _bo: Option<Bo>, _device: Option<Device>, pages: Pages },
+    Registered {
+        reg: HostRegistration,
+        _bo: Option<Bo>,
+        _device: Option<Device>,
+        pages: Pages,
+    },
 }
 impl Buffer {
     fn allocate(rt: &HipRuntime, bytes: usize, backing: &str) -> Result<Self, String> {
@@ -318,18 +374,33 @@ impl Buffer {
             return rt.allocate(bytes, kind_for(backing)).map(Self::Hip);
         }
         let pages = Pages::new(bytes)?;
-        let device = if backing == "host-registered-userptr" { Some(Device::open()?) } else { None };
-        let bo = device.as_ref().map(|d| d.userptr_bo(pages.ptr, pages.len)).transpose()?;
+        let device = if backing == "host-registered-userptr" {
+            Some(Device::open()?)
+        } else {
+            None
+        };
+        let bo = device
+            .as_ref()
+            .map(|d| d.userptr_bo(pages.ptr, pages.len))
+            .transpose()?;
         let flags = match backing {
             "host-registered-mapped" => 2,
             "host-registered-portable" => 3,
             _ => 0,
         };
         let reg = rt.register_host_flags(pages.ptr, pages.len, flags)?;
-        Ok(Self::Registered { reg, _bo: bo, _device: device, pages })
+        Ok(Self::Registered {
+            reg,
+            _bo: bo,
+            _device: device,
+            pages,
+        })
     }
     fn ptr(&self) -> u64 {
-        match self { Self::Hip(b) => b.ptr(), Self::Registered { reg, .. } => reg.ptr() }
+        match self {
+            Self::Hip(b) => b.ptr(),
+            Self::Registered { reg, .. } => reg.ptr(),
+        }
     }
     fn upload(&self, rt: &HipRuntime, bytes: &[u8]) -> Result<(), String> {
         match self {
@@ -381,7 +452,10 @@ struct Bench {
 
 /// Why a verified step stopped: a verify mismatch is reported and the op skipped, a HIP error aborts.
 enum Stop {
-    Verify { phase: &'static str, mismatches: u64 },
+    Verify {
+        phase: &'static str,
+        mismatches: u64,
+    },
     Fatal(String),
 }
 
@@ -394,10 +468,26 @@ impl From<String> for Stop {
 impl Bench {
     fn launch(&self, op: &str, buffer: &Buffer) -> Result<(), String> {
         if op == "copy" {
-            return self.rt.copy_dtod(buffer.ptr(), self.copy_source.as_ref().ok_or("missing copy source")?.ptr(), self.bytes);
+            return self.rt.copy_dtod(
+                buffer.ptr(),
+                self.copy_source
+                    .as_ref()
+                    .ok_or("missing copy source")?
+                    .ptr(),
+                self.bytes,
+            );
         }
-        let function = if op == "read" { &self.read_fn } else { &self.write_fn };
-        let mut args = kernarg(buffer.ptr(), self.count as u64, self.sink.ptr(), self.total_threads as u64);
+        let function = if op == "read" {
+            &self.read_fn
+        } else {
+            &self.write_fn
+        };
+        let mut args = kernarg(
+            buffer.ptr(),
+            self.count as u64,
+            self.sink.ptr(),
+            self.total_threads as u64,
+        );
         self.rt.launch(function, self.blocks, THREADS, &mut args)
     }
 
@@ -414,12 +504,20 @@ impl Bench {
     fn init(&mut self, op: &str, buffer: &Buffer) -> Result<(), Stop> {
         if op == "copy" {
             fill_pattern(&mut self.host);
-            let source = self.copy_source.as_ref().ok_or("missing copy source".to_string())?;
+            let source = self
+                .copy_source
+                .as_ref()
+                .ok_or("missing copy source".to_string())?;
             source.upload(&self.rt, &self.host)?;
             self.host.fill(0);
             source.download(&self.rt, &mut self.host)?;
             let bad = pattern_mismatches(&self.host);
-            if bad != 0 { return Err(Stop::Verify { phase: "copy-source", mismatches: bad }); }
+            if bad != 0 {
+                return Err(Stop::Verify {
+                    phase: "copy-source",
+                    mismatches: bad,
+                });
+            }
         }
         if op == "read" {
             fill_pattern(&mut self.host);
@@ -430,15 +528,27 @@ impl Bench {
         self.rt.synchronize()?;
         self.host.fill(0);
         self.download_host(buffer)?;
-        let bad = if op == "read" { pattern_mismatches(&self.host) } else { poison_mismatches(&self.host) };
+        let bad = if op == "read" {
+            pattern_mismatches(&self.host)
+        } else {
+            poison_mismatches(&self.host)
+        };
         if bad != 0 {
-            return Err(Stop::Verify { phase: "init", mismatches: bad });
+            return Err(Stop::Verify {
+                phase: "init",
+                mismatches: bad,
+            });
         }
         Ok(())
     }
 
     /// Prepares the op's output so a no-op launch cannot pass: sink 0xA5 for read, poison for write.
-    fn poison_output(&mut self, op: &str, buffer: &Buffer, phase: &'static str) -> Result<(), Stop> {
+    fn poison_output(
+        &mut self,
+        op: &str,
+        buffer: &Buffer,
+        phase: &'static str,
+    ) -> Result<(), Stop> {
         if op == "read" {
             self.rt.memset(&self.sink, SINK_FILL)?;
             self.rt.synchronize()?;
@@ -451,7 +561,10 @@ impl Bench {
         self.download_host(buffer)?;
         let bad = poison_mismatches(&self.host);
         if bad != 0 {
-            return Err(Stop::Verify { phase, mismatches: bad });
+            return Err(Stop::Verify {
+                phase,
+                mismatches: bad,
+            });
         }
         Ok(())
     }
@@ -468,7 +581,10 @@ impl Bench {
             pattern_mismatches(&self.host)
         };
         if bad != 0 {
-            return Err(Stop::Verify { phase, mismatches: bad });
+            return Err(Stop::Verify {
+                phase,
+                mismatches: bad,
+            });
         }
         Ok(())
     }
@@ -486,7 +602,13 @@ impl Bench {
     }
 
     /// Runs one verified op on `buffer`; prints the result row on success.
-    fn run_op(&mut self, options: &Options, backing: &str, op: &str, buffer: &Buffer) -> Result<(), Stop> {
+    fn run_op(
+        &mut self,
+        options: &Options,
+        backing: &str,
+        op: &str,
+        buffer: &Buffer,
+    ) -> Result<(), Stop> {
         self.init(op, buffer)?;
         // Warm-up 1 is verified, warm-up 2 is unverified, as in the original tool.
         self.poison_output(op, buffer, "pre-poison")?;
@@ -582,9 +704,14 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
     println!("device gcnArchName={arch} pci={pci} CUs={cus}");
 
-    let blocks = cus.checked_mul(BLOCKS_PER_CU).ok_or("grid size overflows u32")?;
-    let total_threads = usize::try_from(u64::from(blocks) * u64::from(THREADS)).map_err(|_| "thread count overflows usize")?;
-    let sink_bytes = total_threads.checked_mul(ELEMENT).ok_or("sink size overflows usize")?;
+    let blocks = cus
+        .checked_mul(BLOCKS_PER_CU)
+        .ok_or("grid size overflows u32")?;
+    let total_threads = usize::try_from(u64::from(blocks) * u64::from(THREADS))
+        .map_err(|_| "thread count overflows usize")?;
+    let sink_bytes = total_threads
+        .checked_mul(ELEMENT)
+        .ok_or("sink size overflows usize")?;
     let module = rt.load_module(CODE_OBJECT)?;
     let read_fn = module.function("read_bw")?;
     let write_fn = module.function("write_bw")?;
@@ -593,8 +720,12 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let stop = rt.event()?;
 
     let mut host: Vec<u8> = Vec::new();
-    host.try_reserve_exact(options.bytes)
-        .map_err(|e| format!("cannot allocate {} byte host staging buffer: {e}", options.bytes))?;
+    host.try_reserve_exact(options.bytes).map_err(|e| {
+        format!(
+            "cannot allocate {} byte host staging buffer: {e}",
+            options.bytes
+        )
+    })?;
     host.resize(options.bytes, 0);
 
     let mut bench = Bench {
@@ -621,13 +752,18 @@ pub fn run(args: &[String]) -> Result<(), String> {
             let buffer = Buffer::allocate(&bench.rt, options.bytes, backing)?;
             bench.copy_source = if options.ops.iter().any(|op| op == "copy") {
                 Some(Buffer::allocate(&bench.rt, options.bytes, backing)?)
-            } else { None };
+            } else {
+                None
+            };
             Ok::<_, String>(buffer)
         })();
         let buffer = match allocation {
             Ok(buffer) => buffer,
             Err(error) => {
-                println!("alloc_fail buf={backing} call=allocate err={}", one_line(&error));
+                println!(
+                    "alloc_fail buf={backing} call=allocate err={}",
+                    one_line(&error)
+                );
                 flush();
                 continue;
             }
@@ -661,7 +797,14 @@ mod tests {
 
     #[test]
     fn poison_differs_from_pattern_in_every_lane_and_is_detected() {
-        for i in [0usize, 1, 2, 0x1234_5678, u32::MAX as usize, u32::MAX as usize + 1] {
+        for i in [
+            0usize,
+            1,
+            2,
+            0x1234_5678,
+            u32::MAX as usize,
+            u32::MAX as usize + 1,
+        ] {
             let (p, q) = (pattern(i), poison(i));
             assert!(p.iter().zip(q).all(|(a, b)| *a != b), "i={i}");
         }
@@ -719,22 +862,38 @@ mod tests {
         ] {
             assert!(parse_args(&args(bad)).is_err(), "{bad:?}");
         }
-        assert!(parse_args(&args(&["--duration", "0.5", "--buf", "vram", "--op", "read"])).is_ok());
-        assert!(parse_args(&args(&["--duration", "6", "--buf", "host-registered,vram", "--op", "read,write,copy"])).is_ok());
+        assert!(parse_args(&args(&[
+            "--duration",
+            "0.5",
+            "--buf",
+            "vram",
+            "--op",
+            "read"
+        ]))
+        .is_ok());
+        assert!(parse_args(&args(&[
+            "--duration",
+            "6",
+            "--buf",
+            "host-registered,vram",
+            "--op",
+            "read,write,copy"
+        ]))
+        .is_ok());
     }
 
     #[test]
     fn anonymous_pages_are_populated_and_two_mib_aligned() {
-        for bytes in [16usize,4096,(2<<20)+16] {
-            let pages=Pages::new(bytes).unwrap();
-            assert_eq!(pages.ptr as usize% (2<<20),0);
-            assert!(pages.len>=bytes);
-            assert_eq!(pages.len% (2<<20),0);
+        for bytes in [16usize, 4096, (2 << 20) + 16] {
+            let pages = Pages::new(bytes).unwrap();
+            assert_eq!(pages.ptr as usize % (2 << 20), 0);
+            assert!(pages.len >= bytes);
+            assert_eq!(pages.len % (2 << 20), 0);
             unsafe {
-                assert_eq!(*pages.ptr,0);
-                assert_eq!(*pages.ptr.add(pages.len-1),0);
-                *pages.ptr.add(bytes-1)=0x5a;
-                assert_eq!(*pages.ptr.add(bytes-1),0x5a);
+                assert_eq!(*pages.ptr, 0);
+                assert_eq!(*pages.ptr.add(pages.len - 1), 0);
+                *pages.ptr.add(bytes - 1) = 0x5a;
+                assert_eq!(*pages.ptr.add(bytes - 1), 0x5a);
             }
         }
     }

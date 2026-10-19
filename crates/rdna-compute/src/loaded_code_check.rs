@@ -188,7 +188,11 @@ struct Registry {
 
 impl Registry {
     const fn new() -> Self {
-        Registry { modules: Vec::new(), hsa: None, captured: false }
+        Registry {
+            modules: Vec::new(),
+            hsa: None,
+            captured: false,
+        }
     }
 
     fn remove(&mut self, module: usize) {
@@ -229,7 +233,8 @@ impl Registry {
         let mut attr = attribute(api, &claimed, image);
         if attr.objects.is_empty() && attr.unavailable.is_empty() {
             // Invariant: a registration is never silently dropped.
-            attr.unavailable.push("registration produced no ranges and no reason".into());
+            attr.unavailable
+                .push("registration produced no ranges and no reason".into());
         }
         self.modules.push(ModuleRecord {
             module,
@@ -282,7 +287,10 @@ impl Registry {
             s,
             "{} {} ranges, {} equal, {} differ, {} unavailable",
             mode.label(),
-            st.ranges, st.equal, st.differ, st.unavailable
+            st.ranges,
+            st.equal,
+            st.differ,
+            st.unavailable
         );
         if let Some((mi, oi, ri)) = st.first {
             let m = &self.modules[mi];
@@ -364,7 +372,12 @@ struct SampleStats {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CaptureOutcome {
-    Captured { ranges: usize, equal: usize, differ: usize, unavailable: usize },
+    Captured {
+        ranges: usize,
+        equal: usize,
+        differ: usize,
+        unavailable: usize,
+    },
     AlreadyCaptured,
     /// Registry lock held (registration/unload in progress); nothing sampled.
     Busy,
@@ -407,7 +420,10 @@ fn capture_mode_into(
     let mut g = match reg.try_lock() {
         Ok(g) => g,
         Err(TryLockError::Poisoned(_)) => {
-            emit(&format!("{} skipped: registry poisoned (no range checked)\n", mode.label()));
+            emit(&format!(
+                "{} skipped: registry poisoned (no range checked)\n",
+                mode.label()
+            ));
             return CaptureOutcome::Poisoned;
         }
         Err(TryLockError::WouldBlock) => {
@@ -492,7 +508,9 @@ fn resolve_alias(api: &dyn LoaderApi, va: u64, len: u64) -> Result<usize, String
     va.checked_add(len).ok_or("loaded VA + len overflows")?;
     let info = api.pointer_info(va)?;
     if !info.known {
-        return Err(format!("pointer_info: {va:#x} is not a recognized live HSA allocation"));
+        return Err(format!(
+            "pointer_info: {va:#x} is not a recognized live HSA allocation"
+        ));
     }
     if info.agent_base == 0 || info.host_base == 0 {
         return Err(format!(
@@ -513,7 +531,10 @@ fn resolve_alias(api: &dyn LoaderApi, va: u64, len: u64) -> Result<usize, String
             info.agent_base, info.size
         ));
     }
-    let host = info.host_base.checked_add(off).ok_or("host alias overflows")?;
+    let host = info
+        .host_base
+        .checked_add(off)
+        .ok_or("host alias overflows")?;
     host.checked_add(len).ok_or("host alias + len overflows")?;
     usize::try_from(host).map_err(|_| "host alias exceeds usize".to_string())
 }
@@ -566,13 +587,19 @@ const SHT_NULL: u32 = 0;
 const SHT_NOBITS: u32 = 8;
 
 fn rd_u16(d: &[u8], o: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(d.get(o..o.checked_add(2)?)?.try_into().ok()?))
+    Some(u16::from_le_bytes(
+        d.get(o..o.checked_add(2)?)?.try_into().ok()?,
+    ))
 }
 fn rd_u32(d: &[u8], o: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(d.get(o..o.checked_add(4)?)?.try_into().ok()?))
+    Some(u32::from_le_bytes(
+        d.get(o..o.checked_add(4)?)?.try_into().ok()?,
+    ))
 }
 fn rd_u64(d: &[u8], o: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(d.get(o..o.checked_add(8)?)?.try_into().ok()?))
+    Some(u64::from_le_bytes(
+        d.get(o..o.checked_add(8)?)?.try_into().ok()?,
+    ))
 }
 
 /// Non-writable, file-backed `PT_LOAD` bytes, trimmed to non-writable `SHF_ALLOC`
@@ -625,15 +652,24 @@ fn parse_elf_ranges(elf: &[u8]) -> Result<Vec<RangePlan>, String> {
         if flags & PF_W != 0 || filesz == 0 {
             continue; // writable / BSS-only segments are never selected
         }
-        segs.push(Seg { flags, off, vaddr, filesz });
+        segs.push(Seg {
+            flags,
+            off,
+            vaddr,
+            filesz,
+        });
     }
 
     // Candidate non-writable ALLOC non-NOBITS sections: (addr, offset, size).
     let mut secs: Vec<(u64, u64, u64)> = Vec::new();
     if shoff != 0 && shnum != 0 && shentsize >= 64 {
         for i in 0..shnum {
-            let Some(base) = shoff.checked_add(i * shentsize) else { break };
-            let Ok(base) = usize::try_from(base) else { break };
+            let Some(base) = shoff.checked_add(i * shentsize) else {
+                break;
+            };
+            let Ok(base) = usize::try_from(base) else {
+                break;
+            };
             let (Some(ty), Some(fl), Some(addr), Some(off), Some(size)) = (
                 rd_u32(elf, base + 4),
                 rd_u64(elf, base + 8),
@@ -659,7 +695,9 @@ fn parse_elf_ranges(elf: &[u8]) -> Result<Vec<RangePlan>, String> {
         let seg_end = seg.vaddr + seg.filesz; // checked via vaddr+memsz above
         let mut inside: Vec<(u64, u64)> = Vec::new(); // (addr, end)
         for &(addr, off, size) in &secs {
-            let Some(end) = addr.checked_add(size) else { continue };
+            let Some(end) = addr.checked_add(size) else {
+                continue;
+            };
             if addr >= seg.vaddr && end <= seg_end && off == seg.off + (addr - seg.vaddr) {
                 inside.push((addr, end));
             }
@@ -722,7 +760,9 @@ fn candidate_elfs(image: &[u8]) -> Result<Vec<&[u8]>, String> {
             return Err("truncated bundle id".into());
         }
         pos = next;
-        let Some(end) = off.checked_add(size) else { continue };
+        let Some(end) = off.checked_add(size) else {
+            continue;
+        };
         if end <= image.len() as u64 && size >= 4 {
             let e = &image[off as usize..end as usize];
             if e.starts_with(b"\x7fELF") {
@@ -760,7 +800,12 @@ fn attribute(api: &dyn LoaderApi, claimed: &[u64], image: &[u8]) -> Attribution 
     let mut unavailable = Vec::new();
     let cands = match candidate_elfs(image) {
         Ok(c) => c,
-        Err(e) => return Attribution { objects, unavailable: vec![e] },
+        Err(e) => {
+            return Attribution {
+                objects,
+                unavailable: vec![e],
+            }
+        }
     };
     let mut plans: Vec<(&[u8], Vec<RangePlan>)> = Vec::new();
     let mut parse_notes = Vec::new();
@@ -773,12 +818,20 @@ fn attribute(api: &dyn LoaderApi, claimed: &[u64], image: &[u8]) -> Attribution 
     if plans.is_empty() {
         return Attribution {
             objects,
-            unavailable: vec![format!("no usable ELF in image: {}", parse_notes.join("; "))],
+            unavailable: vec![format!(
+                "no usable ELF in image: {}",
+                parse_notes.join("; ")
+            )],
         };
     }
     let loaded = match api.loaded_objects() {
         Ok(l) => l,
-        Err(e) => return Attribution { objects, unavailable: vec![e] },
+        Err(e) => {
+            return Attribution {
+                objects,
+                unavailable: vec![e],
+            }
+        }
     };
     let (mut examined, mut mismatched, mut not_provable) = (0usize, 0usize, 0usize);
     let mut first_reason: Option<String> = None;
@@ -809,10 +862,15 @@ fn attribute(api: &dyn LoaderApi, claimed: &[u64], image: &[u8]) -> Attribution 
         unavailable.push(format!(
             "no loaded code object matched the image text ({examined} unclaimed objects examined, \
              {mismatched} text mismatches, {not_provable} without a provable CPU alias{})",
-            first_reason.map(|r| format!("; first: {r}")).unwrap_or_default()
+            first_reason
+                .map(|r| format!("; first: {r}"))
+                .unwrap_or_default()
         ));
     }
-    Attribution { objects, unavailable }
+    Attribution {
+        objects,
+        unavailable,
+    }
 }
 
 fn match_object(
@@ -835,7 +893,10 @@ fn match_object(
             ));
         };
         let Some(va_end) = va.checked_add(r.len) else {
-            return MatchResult::NotProvable(format!("loaded VA {va:#x} + len {:#x} overflows", r.len));
+            return MatchResult::NotProvable(format!(
+                "loaded VA {va:#x} + len {:#x} overflows",
+                r.len
+            ));
         };
         if va < obj.load_base || va_end > obj_end {
             return MatchResult::NotProvable(format!(
@@ -905,7 +966,11 @@ fn match_object(
             equal: true,
         });
     }
-    MatchResult::Match(ObjectRecord { load_base: obj.load_base, load_delta: obj.load_delta, ranges })
+    MatchResult::Match(ObjectRecord {
+        load_base: obj.load_base,
+        load_delta: obj.load_delta,
+        ranges,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1011,7 +1076,11 @@ unsafe extern "C" fn collect_executable(e: HsaExecutable, data: *mut c_void) -> 
     HSA_STATUS_SUCCESS
 }
 
-unsafe extern "C" fn collect_lco(_e: HsaExecutable, l: HsaLoadedCodeObject, data: *mut c_void) -> u32 {
+unsafe extern "C" fn collect_lco(
+    _e: HsaExecutable,
+    l: HsaLoadedCodeObject,
+    data: *mut c_void,
+) -> u32 {
     (*(data as *mut Vec<HsaLoadedCodeObject>)).push(l);
     HSA_STATUS_SUCCESS
 }
@@ -1060,12 +1129,15 @@ impl HsaLoader {
             let get_table: GetTableFn =
                 std::mem::transmute(sym(c"hsa_system_get_major_extension_table")?);
             let pointer_info: PointerInfoFn = std::mem::transmute(sym(c"hsa_amd_pointer_info")?);
-            let exec_get_info: ExecGetInfoFn = std::mem::transmute(sym(c"hsa_executable_get_info")?);
+            let exec_get_info: ExecGetInfoFn =
+                std::mem::transmute(sym(c"hsa_executable_get_info")?);
 
             let (mut minor, mut ok) = (0u16, false);
             let st = supported(HSA_EXTENSION_AMD_LOADER, 1, &mut minor, &mut ok);
             if st != HSA_STATUS_SUCCESS || !ok {
-                return Err(format!("AMD loader extension major 1 unsupported (status {st:#x})"));
+                return Err(format!(
+                    "AMD loader extension major 1 unsupported (status {st:#x})"
+                ));
             }
             // Do not gate on `minor`: ROCr reports loader minor 0 yet fills the
             // full 1.03 table (rocm-systems 18f797bd hsa.cpp:315-318 vs :470-489;
@@ -1081,7 +1153,9 @@ impl HsaLoader {
                 &mut t as *mut _ as *mut c_void,
             );
             if st != HSA_STATUS_SUCCESS {
-                return Err(format!("hsa_system_get_major_extension_table failed ({st:#x})"));
+                return Err(format!(
+                    "hsa_system_get_major_extension_table failed ({st:#x})"
+                ));
             }
             let (Some(iterate_executables), Some(iterate_lcos), Some(lco_get_info)) = (
                 t.iterate_executables,
@@ -1090,7 +1164,13 @@ impl HsaLoader {
             ) else {
                 return Err("AMD loader table has null required entries".into());
             };
-            Ok(HsaLoader { pointer_info, exec_get_info, iterate_executables, iterate_lcos, lco_get_info })
+            Ok(HsaLoader {
+                pointer_info,
+                exec_get_info,
+                iterate_executables,
+                iterate_lcos,
+                lco_get_info,
+            })
         }
     }
 
@@ -1099,7 +1179,9 @@ impl HsaLoader {
         // exact documented size (int64_t / uint64_t).
         let st = unsafe { (self.lco_get_info)(l, attr, &mut v as *mut T as *mut c_void) };
         if st != HSA_STATUS_SUCCESS {
-            return Err(format!("loaded_code_object_get_info({attr}) failed ({st:#x})"));
+            return Err(format!(
+                "loaded_code_object_get_info({attr}) failed ({st:#x})"
+            ));
         }
         Ok(v)
     }
@@ -1111,7 +1193,10 @@ impl LoaderApi for HsaLoader {
         // SAFETY: the callback only pushes into `execs`; it must not call
         // executable create/destroy (header :499-509), so enumeration is two-phase.
         let st = unsafe {
-            (self.iterate_executables)(Some(collect_executable), &mut execs as *mut _ as *mut c_void)
+            (self.iterate_executables)(
+                Some(collect_executable),
+                &mut execs as *mut _ as *mut c_void,
+            )
         };
         if st != HSA_STATUS_SUCCESS {
             return Err(format!("iterate_executables failed ({st:#x})"));
@@ -1121,7 +1206,11 @@ impl LoaderApi for HsaLoader {
             let mut state = 0u32;
             // SAFETY: documented out-type for HSA_EXECUTABLE_INFO_STATE is a 4-byte enum.
             let st = unsafe {
-                (self.exec_get_info)(e, HSA_EXECUTABLE_INFO_STATE, &mut state as *mut _ as *mut c_void)
+                (self.exec_get_info)(
+                    e,
+                    HSA_EXECUTABLE_INFO_STATE,
+                    &mut state as *mut _ as *mut c_void,
+                )
             };
             if st != HSA_STATUS_SUCCESS {
                 return Err(format!("hsa_executable_get_info(STATE) failed ({st:#x})"));
@@ -1141,7 +1230,11 @@ impl LoaderApi for HsaLoader {
                 let delta: i64 = self.get_info(l, LOADER_INFO_LOAD_DELTA, 0i64)?;
                 let base: u64 = self.get_info(l, LOADER_INFO_LOAD_BASE, 0u64)?;
                 let size: u64 = self.get_info(l, LOADER_INFO_LOAD_SIZE, 0u64)?;
-                out.push(LoadedObject { load_base: base, load_size: size, load_delta: delta });
+                out.push(LoadedObject {
+                    load_base: base,
+                    load_size: size,
+                    load_delta: delta,
+                });
             }
         }
         Ok(out)
@@ -1252,7 +1345,15 @@ mod tests {
             w64(e, b + 48, 0x1000);
         };
         ph(&mut e, 0, 4, 0, 0, 0x140, 0x140);
-        ph(&mut e, 1, 5, 0x1000, TEXT_VA, TEXT_LEN as u64, TEXT_LEN as u64);
+        ph(
+            &mut e,
+            1,
+            5,
+            0x1000,
+            TEXT_VA,
+            TEXT_LEN as u64,
+            TEXT_LEN as u64,
+        );
         ph(&mut e, 2, 6, 0x2000, DATA_VA, 0x40, 0x100);
         // Only .rodata of the R segment is selected (headers/padding are not).
         for (k, b) in e[0x100..0x140].iter_mut().enumerate() {
@@ -1273,9 +1374,25 @@ mod tests {
             w64(e, b + 32, size);
         };
         sh(&mut e, 1, 1, SHF_ALLOC, RO_VA, 0x100, 0x40); // .rodata
-        sh(&mut e, 2, 1, SHF_ALLOC | 4, TEXT_VA, 0x1000, TEXT_LEN as u64); // .text
+        sh(
+            &mut e,
+            2,
+            1,
+            SHF_ALLOC | 4,
+            TEXT_VA,
+            0x1000,
+            TEXT_LEN as u64,
+        ); // .text
         sh(&mut e, 3, 1, SHF_ALLOC | SHF_WRITE, DATA_VA, 0x2000, 0x40); // .data
-        sh(&mut e, 4, SHT_NOBITS, SHF_ALLOC | SHF_WRITE, DATA_VA + 0x40, 0x2040, 0xc0); // .bss
+        sh(
+            &mut e,
+            4,
+            SHT_NOBITS,
+            SHF_ALLOC | SHF_WRITE,
+            DATA_VA + 0x40,
+            0x2040,
+            0xc0,
+        ); // .bss
         e
     }
 
@@ -1337,8 +1454,18 @@ mod tests {
         assert_eq!(
             plan,
             vec![
-                RangePlan { vaddr: RO_VA, file_off: 0x100, len: 0x40, exec: false },
-                RangePlan { vaddr: TEXT_VA, file_off: 0x1000, len: TEXT_LEN as u64, exec: true },
+                RangePlan {
+                    vaddr: RO_VA,
+                    file_off: 0x100,
+                    len: 0x40,
+                    exec: false
+                },
+                RangePlan {
+                    vaddr: TEXT_VA,
+                    file_off: 0x1000,
+                    len: TEXT_LEN as u64,
+                    exec: true
+                },
             ]
         );
     }
@@ -1352,9 +1479,19 @@ mod tests {
         lock_blocking(&reg).register_with(&api, 1, "m", &elf);
         assert_eq!(lock_blocking(&reg).modules[0].objects[0].ranges.len(), 2);
         let (o, s) = capture_string(&reg);
-        assert_eq!(o, CaptureOutcome::Captured { ranges: 2, equal: 2, differ: 0, unavailable: 0 });
+        assert_eq!(
+            o,
+            CaptureOutcome::Captured {
+                ranges: 2,
+                equal: 2,
+                differ: 0,
+                unavailable: 0
+            }
+        );
         assert!(
-            s.contains("hipfire: code-check after HIP 700: 2 ranges, 2 equal, 0 differ, 0 unavailable"),
+            s.contains(
+                "hipfire: code-check after HIP 700: 2 ranges, 2 equal, 0 differ, 0 unavailable"
+            ),
             "{s}"
         );
     }
@@ -1369,12 +1506,33 @@ mod tests {
         // SAFETY: in-bounds write through the pointer the alias was derived from.
         unsafe { *p.add(va as usize + off_in_range) ^= 0x01 };
         let (o, s) = capture_string(&reg);
-        assert_eq!(o, CaptureOutcome::Captured { ranges: 2, equal: 1, differ: 1, unavailable: 0 });
-        assert!(s.contains(&format!("first diff at offset {off_in_range} ")), "{s}");
-        assert!(s.contains(if exec { "exec range" } else { "read-only range" }), "{s}");
+        assert_eq!(
+            o,
+            CaptureOutcome::Captured {
+                ranges: 2,
+                equal: 1,
+                differ: 1,
+                unavailable: 0
+            }
+        );
+        assert!(
+            s.contains(&format!("first diff at offset {off_in_range} ")),
+            "{s}"
+        );
+        assert!(
+            s.contains(if exec {
+                "exec range"
+            } else {
+                "read-only range"
+            }),
+            "{s}"
+        );
         let want_va = FAKE_AGENT_BASE + va + off_in_range as u64;
         assert!(s.contains(&format!("(VA {want_va:#x})")), "{s}");
-        assert!(s.contains("baseline sha256") && s.contains("current sha256"), "{s}");
+        assert!(
+            s.contains("baseline sha256") && s.contains("current sha256"),
+            "{s}"
+        );
         assert_eq!(s.matches('\n').count(), 1, "single line: {s}");
         drop(mem);
     }
@@ -1406,7 +1564,11 @@ mod tests {
         // Window is <=16 bytes (<=32 hex chars) per side and contains the diff byte.
         assert!(s.contains("baseline[92..108] "), "{s}");
         let w = s.split("baseline[92..108] ").nth(1).unwrap();
-        let hex_len = w.split(|c: char| !c.is_ascii_hexdigit()).next().unwrap().len();
+        let hex_len = w
+            .split(|c: char| !c.is_ascii_hexdigit())
+            .next()
+            .unwrap()
+            .len();
         assert_eq!(hex_len, 32, "{s}");
         drop(mem);
     }
@@ -1423,30 +1585,79 @@ mod tests {
         };
         let sz = IMG_SPAN as u64;
         let infos = [
-            PointerInfo { known: true, agent_base: FAKE_AGENT_BASE, host_base: 0, size: sz, host_access: None },
-            PointerInfo { known: true, agent_base: 0, host_base: poison, size: sz, host_access: None },
+            PointerInfo {
+                known: true,
+                agent_base: FAKE_AGENT_BASE,
+                host_base: 0,
+                size: sz,
+                host_access: None,
+            },
+            PointerInfo {
+                known: true,
+                agent_base: 0,
+                host_base: poison,
+                size: sz,
+                host_access: None,
+            },
             // Allocation too small: range outside containment.
-            PointerInfo { known: true, agent_base: FAKE_AGENT_BASE, host_base: poison, size: 0x200, host_access: None },
+            PointerInfo {
+                known: true,
+                agent_base: FAKE_AGENT_BASE,
+                host_base: poison,
+                size: 0x200,
+                host_access: None,
+            },
             // Allocation starts above the range VA.
-            PointerInfo { known: true, agent_base: FAKE_AGENT_BASE + 0x8000, host_base: poison, size: sz, host_access: None },
-            PointerInfo { known: false, agent_base: FAKE_AGENT_BASE, host_base: poison, size: sz, host_access: None },
-            PointerInfo { known: true, agent_base: FAKE_AGENT_BASE, host_base: poison, size: sz, host_access: Some(false) },
+            PointerInfo {
+                known: true,
+                agent_base: FAKE_AGENT_BASE + 0x8000,
+                host_base: poison,
+                size: sz,
+                host_access: None,
+            },
+            PointerInfo {
+                known: false,
+                agent_base: FAKE_AGENT_BASE,
+                host_base: poison,
+                size: sz,
+                host_access: None,
+            },
+            PointerInfo {
+                known: true,
+                agent_base: FAKE_AGENT_BASE,
+                host_base: poison,
+                size: sz,
+                host_access: Some(false),
+            },
         ];
         for info in infos {
-            let api = Fake { objects: vec![obj], info: Ok(info), calls: Cell::new(0) };
+            let api = Fake {
+                objects: vec![obj],
+                info: Ok(info),
+                calls: Cell::new(0),
+            };
             let reg = Mutex::new(Registry::new());
             lock_blocking(&reg).register_with(&api, 1, "m", &elf);
             assert!(lock_blocking(&reg).modules[0].objects.is_empty());
             let (o, s) = capture_string(&reg);
             assert_eq!(
                 o,
-                CaptureOutcome::Captured { ranges: 0, equal: 0, differ: 0, unavailable: 1 },
+                CaptureOutcome::Captured {
+                    ranges: 0,
+                    equal: 0,
+                    differ: 0,
+                    unavailable: 1
+                },
                 "{info:?}"
             );
             assert!(s.contains("1 unavailable") && !s.contains("intact"), "{s}");
         }
         // pointer_info error is also unavailable.
-        let api = Fake { objects: vec![obj], info: Err("status".into()), calls: Cell::new(0) };
+        let api = Fake {
+            objects: vec![obj],
+            info: Err("status".into()),
+            calls: Cell::new(0),
+        };
         let mut reg = Registry::new();
         reg.register_with(&api, 1, "m", &elf);
         assert_eq!(reg.modules[0].unavailable.len(), 1);
@@ -1454,11 +1665,23 @@ mod tests {
 
     #[test]
     fn unparsable_image_is_counted_unavailable() {
-        let api = Fake { objects: vec![], info: Err("x".into()), calls: Cell::new(0) };
+        let api = Fake {
+            objects: vec![],
+            info: Err("x".into()),
+            calls: Cell::new(0),
+        };
         let reg = Mutex::new(Registry::new());
         lock_blocking(&reg).register_with(&api, 9, "bad", b"not an elf");
         let (o, _) = capture_string(&reg);
-        assert_eq!(o, CaptureOutcome::Captured { ranges: 0, equal: 0, differ: 0, unavailable: 1 });
+        assert_eq!(
+            o,
+            CaptureOutcome::Captured {
+                ranges: 0,
+                equal: 0,
+                differ: 0,
+                unavailable: 1
+            }
+        );
     }
 
     #[test]
@@ -1488,7 +1711,15 @@ mod tests {
         lock_blocking(&reg).remove(2);
         assert!(lock_blocking(&reg).modules.is_empty());
         let (o, _) = capture_string(&reg);
-        assert_eq!(o, CaptureOutcome::Captured { ranges: 0, equal: 0, differ: 0, unavailable: 0 });
+        assert_eq!(
+            o,
+            CaptureOutcome::Captured {
+                ranges: 0,
+                equal: 0,
+                differ: 0,
+                unavailable: 0
+            }
+        );
     }
 
     #[test]
@@ -1517,11 +1748,21 @@ mod tests {
         let mut s = String::new();
         let o = capture_into(&reg, &mut |t| s.push_str(t));
         assert_eq!(o, CaptureOutcome::Busy);
-        assert!(s.contains("skipped: registry busy") && !s.contains("equal"), "{s}");
+        assert!(
+            s.contains("skipped: registry busy") && !s.contains("equal"),
+            "{s}"
+        );
         assert_eq!(s.matches('\n').count(), 1, "{s}");
         drop(guard);
         let (o, _) = capture_string(&reg);
-        assert!(matches!(o, CaptureOutcome::Captured { ranges: 2, equal: 2, .. }));
+        assert!(matches!(
+            o,
+            CaptureOutcome::Captured {
+                ranges: 2,
+                equal: 2,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1536,7 +1777,10 @@ mod tests {
         });
         let (o, s) = capture_string(&reg);
         assert_eq!(o, CaptureOutcome::Poisoned);
-        assert!(s.contains("skipped: registry poisoned") && !s.contains("equal"), "{s}");
+        assert!(
+            s.contains("skipped: registry poisoned") && !s.contains("equal"),
+            "{s}"
+        );
     }
 
     fn self_test_string(reg: &Mutex<Registry>) -> (CaptureOutcome, String) {
@@ -1555,9 +1799,19 @@ mod tests {
         let reg = Mutex::new(Registry::new());
         lock_blocking(&reg).register_with(&api, 1, "m", &elf);
         let (o, s) = self_test_string(&reg);
-        assert_eq!(o, CaptureOutcome::Captured { ranges: 2, equal: 2, differ: 0, unavailable: 0 });
+        assert_eq!(
+            o,
+            CaptureOutcome::Captured {
+                ranges: 2,
+                equal: 2,
+                differ: 0,
+                unavailable: 0
+            }
+        );
         assert!(
-            s.starts_with("hipfire: code-check self-test: 2 ranges, 2 equal, 0 differ, 0 unavailable"),
+            s.starts_with(
+                "hipfire: code-check self-test: 2 ranges, 2 equal, 0 differ, 0 unavailable"
+            ),
             "{s}"
         );
         assert!(!s.contains("after HIP 700"), "{s}");
@@ -1575,9 +1829,19 @@ mod tests {
         // SAFETY: in-bounds write through the pointer the alias was derived from.
         unsafe { *p.add(TEXT_VA as usize + 5) ^= 0x01 };
         let (o, s) = self_test_string(&reg);
-        assert_eq!(o, CaptureOutcome::Captured { ranges: 2, equal: 1, differ: 1, unavailable: 0 });
+        assert_eq!(
+            o,
+            CaptureOutcome::Captured {
+                ranges: 2,
+                equal: 1,
+                differ: 1,
+                unavailable: 0
+            }
+        );
         assert!(
-            s.starts_with("hipfire: code-check self-test: 2 ranges, 1 equal, 1 differ, 0 unavailable"),
+            s.starts_with(
+                "hipfire: code-check self-test: 2 ranges, 1 equal, 1 differ, 0 unavailable"
+            ),
             "{s}"
         );
         assert!(s.contains("first diff at offset 5 "), "{s}");
@@ -1587,13 +1851,27 @@ mod tests {
 
     #[test]
     fn self_test_unavailable_label() {
-        let api = Fake { objects: vec![], info: Err("x".into()), calls: Cell::new(0) };
+        let api = Fake {
+            objects: vec![],
+            info: Err("x".into()),
+            calls: Cell::new(0),
+        };
         let reg = Mutex::new(Registry::new());
         lock_blocking(&reg).register_with(&api, 9, "bad", b"not an elf");
         let (o, s) = self_test_string(&reg);
-        assert_eq!(o, CaptureOutcome::Captured { ranges: 0, equal: 0, differ: 0, unavailable: 1 });
+        assert_eq!(
+            o,
+            CaptureOutcome::Captured {
+                ranges: 0,
+                equal: 0,
+                differ: 0,
+                unavailable: 1
+            }
+        );
         assert!(
-            s.starts_with("hipfire: code-check self-test: 0 ranges, 0 equal, 0 differ, 1 unavailable"),
+            s.starts_with(
+                "hipfire: code-check self-test: 0 ranges, 0 equal, 0 differ, 1 unavailable"
+            ),
             "{s}"
         );
         assert!(s.contains("unavailable (not checked): module 'bad'"), "{s}");
@@ -1606,7 +1884,8 @@ mod tests {
         let (o, s) = self_test_string(&reg);
         assert_eq!(o, CaptureOutcome::Busy);
         assert!(
-            s.starts_with(&format!("{SELF_TEST_LABEL} skipped: registry busy")) && !s.contains("equal"),
+            s.starts_with(&format!("{SELF_TEST_LABEL} skipped: registry busy"))
+                && !s.contains("equal"),
             "{s}"
         );
         assert_eq!(s.matches('\n').count(), 1, "{s}");
@@ -1623,7 +1902,8 @@ mod tests {
         let (o, s) = self_test_string(&reg);
         assert_eq!(o, CaptureOutcome::Poisoned);
         assert!(
-            s.starts_with(&format!("{SELF_TEST_LABEL} skipped: registry poisoned")) && !s.contains("equal"),
+            s.starts_with(&format!("{SELF_TEST_LABEL} skipped: registry poisoned"))
+                && !s.contains("equal"),
             "{s}"
         );
         // A skipped self-test never touches the once-only slot.
@@ -1640,12 +1920,29 @@ mod tests {
         // Repeated self-tests never consume the slot.
         for _ in 0..2 {
             let (o, _) = self_test_string(&reg);
-            assert!(matches!(o, CaptureOutcome::Captured { ranges: 2, equal: 2, .. }));
+            assert!(matches!(
+                o,
+                CaptureOutcome::Captured {
+                    ranges: 2,
+                    equal: 2,
+                    ..
+                }
+            ));
             assert!(!lock_blocking(&reg).captured);
         }
         let (a, sa) = capture_string(&reg);
-        assert!(matches!(a, CaptureOutcome::Captured { ranges: 2, equal: 2, .. }));
-        assert!(sa.starts_with("hipfire: code-check after HIP 700: 2 ranges"), "{sa}");
+        assert!(matches!(
+            a,
+            CaptureOutcome::Captured {
+                ranges: 2,
+                equal: 2,
+                ..
+            }
+        ));
+        assert!(
+            sa.starts_with("hipfire: code-check after HIP 700: 2 ranges"),
+            "{sa}"
+        );
         let (b, sb) = capture_string(&reg);
         assert_eq!(b, CaptureOutcome::AlreadyCaptured);
         assert!(sb.is_empty(), "{sb}");
@@ -1661,7 +1958,14 @@ mod tests {
         let (a, _) = capture_string(&reg);
         assert!(matches!(a, CaptureOutcome::Captured { .. }));
         let (o, s) = self_test_string(&reg);
-        assert!(matches!(o, CaptureOutcome::Captured { ranges: 2, equal: 2, .. }));
+        assert!(matches!(
+            o,
+            CaptureOutcome::Captured {
+                ranges: 2,
+                equal: 2,
+                ..
+            }
+        ));
         assert!(s.starts_with(SELF_TEST_LABEL), "{s}");
         assert!(lock_blocking(&reg).captured);
         let (b, sb) = capture_string(&reg);
@@ -1675,25 +1979,57 @@ mod tests {
         assert_eq!(loaded_va(-0x10, 0x20), Some(0x10));
         assert_eq!(loaded_va(-0x30, 0x20), None);
         assert_eq!(loaded_va(i64::MAX, u64::MAX), None);
-        let obj = LoadedObject { load_base: 1, load_size: 100, load_delta: 0 };
+        let obj = LoadedObject {
+            load_base: 1,
+            load_size: 100,
+            load_delta: 0,
+        };
         let cases: [(i64, u64, u64); 3] = [
-            (0, u64::MAX - 8, 16),     // vaddr + len wraps
-            (i64::MIN, 0x100, 0x10),   // negative delta underflows
+            (0, u64::MAX - 8, 16),             // vaddr + len wraps
+            (i64::MIN, 0x100, 0x10),           // negative delta underflows
             (i64::MAX, u64::MAX - 0x10, 0x10), // delta + vaddr wraps
         ];
         for (delta, vaddr, len) in cases {
-            let api = Fake { objects: vec![], info: Err("must not be called".into()), calls: Cell::new(0) };
-            let obj = LoadedObject { load_delta: delta, ..obj };
-            let plan = [RangePlan { vaddr, file_off: 0, len, exec: true }];
+            let api = Fake {
+                objects: vec![],
+                info: Err("must not be called".into()),
+                calls: Cell::new(0),
+            };
+            let obj = LoadedObject {
+                load_delta: delta,
+                ..obj
+            };
+            let plan = [RangePlan {
+                vaddr,
+                file_off: 0,
+                len,
+                exec: true,
+            }];
             let r = match_object(&api, &obj, &[], &plan);
             assert!(matches!(r, MatchResult::NotProvable(_)));
             assert_eq!(api.calls.get(), 0);
         }
         // LOAD_BASE + LOAD_SIZE overflow.
-        let api = Fake { objects: vec![], info: Err("no".into()), calls: Cell::new(0) };
-        let obj = LoadedObject { load_base: u64::MAX, load_size: 2, load_delta: 0 };
-        let plan = [RangePlan { vaddr: 0x10, file_off: 0, len: 4, exec: true }];
-        assert!(matches!(match_object(&api, &obj, &[], &plan), MatchResult::NotProvable(_)));
+        let api = Fake {
+            objects: vec![],
+            info: Err("no".into()),
+            calls: Cell::new(0),
+        };
+        let obj = LoadedObject {
+            load_base: u64::MAX,
+            load_size: 2,
+            load_delta: 0,
+        };
+        let plan = [RangePlan {
+            vaddr: 0x10,
+            file_off: 0,
+            len: 4,
+            exec: true,
+        }];
+        assert!(matches!(
+            match_object(&api, &obj, &[], &plan),
+            MatchResult::NotProvable(_)
+        ));
         assert_eq!(api.calls.get(), 0);
         // resolve_alias with len overflow.
         assert!(resolve_alias(&api, u64::MAX - 4, 16).is_err());

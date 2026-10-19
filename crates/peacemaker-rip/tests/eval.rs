@@ -20,21 +20,30 @@ fn integer_types_are_exact_and_literals_adopt_them() {
     assert!(err("fn main() -> u8 { let a: u8 = 200; a + 56 }").contains("overflow"));
     assert!(err("fn main() -> u8 { let a: u8 = 0; a - 1 }").contains("overflow"));
     // Mixed typed operands are a type error, as in rustc.
-    assert!(err("fn main() -> u32 { let a: u8 = 1; let b: u32 = 2; a + b }").contains("mismatched"));
+    assert!(
+        err("fn main() -> u32 { let a: u8 = 1; let b: u32 = 2; a + b }").contains("mismatched")
+    );
     // `as` truncates, `u32::from` widens.
     assert_eq!(ok("fn main() -> u8 { 0x1ffu32 as u8 }"), "255");
     assert_eq!(ok("fn main() -> u32 { u32::from(7u8) + 1 }"), "8");
     // A declared parameter type coerces literals and rejects out-of-range ones.
-    assert_eq!(ok("fn f(x: u8) -> u8 { x } fn main() -> u8 { f(255) }"), "255");
+    assert_eq!(
+        ok("fn f(x: u8) -> u8 { x } fn main() -> u8 { f(255) }"),
+        "255"
+    );
     assert!(err("fn f(x: u8) -> u8 { x } fn main() -> u8 { f(256) }").contains("out of range"));
 }
 
 #[test]
 fn closures_capture_the_environment_they_were_written_in() {
-    let src = "fn main() -> u32 { let x: u32 = 1; let f = |y: u32| x + y; let x: u32 = 100; f(2) + x }";
+    let src =
+        "fn main() -> u32 { let x: u32 = 1; let f = |y: u32| x + y; let x: u32 = 100; f(2) + x }";
     assert_eq!(ok(src), "103");
     // The captured binding is shared, not copied: a later write is seen.
-    assert_eq!(ok("fn main() -> u32 { let mut n: u32 = 1; let get = || n; n = 5; get() }"), "5");
+    assert_eq!(
+        ok("fn main() -> u32 { let mut n: u32 = 1; let get = || n; n = 5; get() }"),
+        "5"
+    );
 }
 
 #[test]
@@ -110,12 +119,20 @@ fn faults_carry_their_source_position_and_unreached_code_is_not_examined() {
     assert!(e.starts_with("rip:3:"), "{e}");
     assert!(e.contains("no method `nope`"), "{e}");
     // Unsupported syntax in a function nobody calls is fine ...
-    assert_eq!(ok("fn unused() { let _ = async { 1 }; } fn main() -> u32 { 3 }"), "3");
+    assert_eq!(
+        ok("fn unused() { let _ = async { 1 }; } fn main() -> u32 { 3 }"),
+        "3"
+    );
     // ... and an executed one is a located error, never a no-op.
     let e = err("fn main() -> u32 { weird!(1); 2 }");
-    assert!(e.contains("macro `weird!` is not supported") && e.starts_with("rip:1:"), "{e}");
+    assert!(
+        e.contains("macro `weird!` is not supported") && e.starts_with("rip:1:"),
+        "{e}"
+    );
     // A syntax error is positioned too.
-    let e = peacemaker_rip::parse("fn main() {\n  let = ;\n}", "t.rip").err().expect("syntax error");
+    let e = peacemaker_rip::parse("fn main() {\n  let = ;\n}", "t.rip")
+        .err()
+        .expect("syntax error");
     assert!(e.starts_with("t.rip:2:"), "{e}");
 }
 
@@ -148,7 +165,11 @@ fn builder_vocabulary_emits_instructions_and_the_driver_scope_ends_at_the_next_b
     let src = spec_script(r#"op(wg.isa(), "v_mov_b32_e32 v0, 0", &[v(0)], &[])?;"#);
     for arch in [Arch::Gfx1151, Arch::Gfx1201] {
         let e = peacemaker_rip::compile(&src, arch, "v").unwrap_or_else(|e| panic!("{e}"));
-        assert!(e.s_text.contains("v_mov_b32_e32 v0, 0") && e.s_text.contains("s_endpgm"), "{}", e.s_text);
+        assert!(
+            e.s_text.contains("v_mov_b32_e32 v0, 0") && e.s_text.contains("s_endpgm"),
+            "{}",
+            e.s_text
+        );
         assert_eq!(peacemaker_rip::symbol_of(&e).unwrap(), "t_kernel");
     }
     // Using `wg` after the statement that mentions `b` again is outside the scope.
@@ -164,7 +185,9 @@ fn builder_vocabulary_emits_instructions_and_the_driver_scope_ends_at_the_next_b
             wg.end(end)?;
             b.finish()
         }"#;
-    let e = peacemaker_rip::compile(src, Arch::Gfx1151, "v").err().unwrap();
+    let e = peacemaker_rip::compile(src, Arch::Gfx1151, "v")
+        .err()
+        .unwrap();
     assert!(e.contains("no active Workgroup"), "{e}");
 }
 
@@ -180,23 +203,40 @@ fn lds_handoff_needs_its_wait_before_the_barrier() {
     assert!(e.s_text.contains("s_barrier"));
     // The same program without the wait: the driver names the transition it refuses.
     let bad = spec_script(&format!("{store} let (t,) = wg.barrier((ready(t, st),))?; wg.ds_load(&t, Instruction::new(\"ds_load_b32 v2, v0\", vec![v(2)], vec![v(0)]).memory(MemoryClass::DsLoad))?;"));
-    let e = peacemaker_rip::compile(&bad, Arch::Gfx1151, "v").err().unwrap();
+    let e = peacemaker_rip::compile(&bad, Arch::Gfx1151, "v")
+        .err()
+        .unwrap();
     assert!(e.contains("undrained"), "{e}");
 }
 
 #[test]
 fn chains_emit_wmma_with_exact_operands_and_reject_unsupported_shapes() {
-    let ok_src = spec_script(r#"
+    let ok_src = spec_script(
+        r#"
         for i in 8..16u8 { op(wg.isa(), format!("v_mov_b32_e32 v{i}, 0"), &[v(i)], &[])?; }
         for i in 16..20u8 { op(wg.isa(), format!("v_mov_b32_e32 v{i}, 0"), &[v(i)], &[])?; }
         for i in 24..28u8 { op(wg.isa(), format!("v_mov_b32_e32 v{i}, 0"), &[v(i)], &[])?; }
-        let acc = Chain::new(8, 8, "f16"); acc.step(wg.isa(), 16, 4, 24, 4)?;"#);
+        let acc = Chain::new(8, 8, "f16"); acc.step(wg.isa(), 16, 4, 24, 4)?;"#,
+    );
     let e = peacemaker_rip::compile(&ok_src, Arch::Gfx1201, "v").unwrap_or_else(|e| panic!("{e}"));
-    assert!(e.s_text.contains("v_wmma_f32_16x16x16_f16 v[8:15], v[16:19], v[24:27], v[8:15]"), "{}", e.s_text);
-    let bad = spec_script(r#"let acc = Chain::new(8, 8, "iu4"); acc.step(wg.isa(), 16, 4, 24, 4)?;"#);
-    assert!(peacemaker_rip::compile(&bad, Arch::Gfx1201, "v").err().unwrap().contains("unsupported matrix kind"));
-    let bad = spec_script(r#"let acc = Chain::new(8, 8, "f16"); acc.step(wg.isa(), 16, 3, 24, 4)?;"#);
-    assert!(peacemaker_rip::compile(&bad, Arch::Gfx1201, "v").err().unwrap().contains("operand widths"));
+    assert!(
+        e.s_text
+            .contains("v_wmma_f32_16x16x16_f16 v[8:15], v[16:19], v[24:27], v[8:15]"),
+        "{}",
+        e.s_text
+    );
+    let bad =
+        spec_script(r#"let acc = Chain::new(8, 8, "iu4"); acc.step(wg.isa(), 16, 4, 24, 4)?;"#);
+    assert!(peacemaker_rip::compile(&bad, Arch::Gfx1201, "v")
+        .err()
+        .unwrap()
+        .contains("unsupported matrix kind"));
+    let bad =
+        spec_script(r#"let acc = Chain::new(8, 8, "f16"); acc.step(wg.isa(), 16, 3, 24, 4)?;"#);
+    assert!(peacemaker_rip::compile(&bad, Arch::Gfx1201, "v")
+        .err()
+        .unwrap()
+        .contains("operand widths"));
 }
 
 #[test]
@@ -226,12 +266,27 @@ fn shared_helpers_spell_their_instructions_per_arch() {
             wg.end(end)?;
             b.finish()
         }"#;
-    let g11 = peacemaker_rip::compile(src, Arch::Gfx1151, "v").unwrap_or_else(|e| panic!("{e}")).s_text;
-    let g12 = peacemaker_rip::compile(src, Arch::Gfx1201, "v").unwrap_or_else(|e| panic!("{e}")).s_text;
-    for want in ["s_load_b256 s[8:15], s[0:1], null", "s_mov_b32 s15, 0x31004000", "s_add_u32 s16, s8, s24", "s_addc_u32 s17, s9, 0", "s_add_i32 s17, s17, 1"] {
+    let g11 = peacemaker_rip::compile(src, Arch::Gfx1151, "v")
+        .unwrap_or_else(|e| panic!("{e}"))
+        .s_text;
+    let g12 = peacemaker_rip::compile(src, Arch::Gfx1201, "v")
+        .unwrap_or_else(|e| panic!("{e}"))
+        .s_text;
+    for want in [
+        "s_load_b256 s[8:15], s[0:1], null",
+        "s_mov_b32 s15, 0x31004000",
+        "s_add_u32 s16, s8, s24",
+        "s_addc_u32 s17, s9, 0",
+        "s_add_i32 s17, s17, 1",
+    ] {
         assert!(g11.contains(want), "gfx1151 lacks `{want}`");
     }
-    for want in ["s_load_b256 s[8:15], s[0:1], 0x0", "s_add_co_u32 s16, s8, s24", "s_add_co_ci_u32 s17, s9, 0", "s_add_co_i32 s17, s17, 1"] {
+    for want in [
+        "s_load_b256 s[8:15], s[0:1], 0x0",
+        "s_add_co_u32 s16, s8, s24",
+        "s_add_co_ci_u32 s17, s9, 0",
+        "s_add_co_i32 s17, s17, 1",
+    ] {
         assert!(g12.contains(want), "gfx1201 lacks `{want}`");
     }
 }

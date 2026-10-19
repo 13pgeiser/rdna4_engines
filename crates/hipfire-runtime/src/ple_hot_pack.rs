@@ -111,9 +111,9 @@
 //! plus the offsets and the exact file length (data and rank bytes are not read).
 
 use sha2::{Digest, Sha256};
+use std::fs::File;
 #[cfg(unix)]
 use std::fs::OpenOptions;
-use std::fs::File;
 use std::io::{self, Read};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
@@ -1093,9 +1093,11 @@ pub fn write_ple_hot_pack_with_progress(
     _out: &Path,
     _progress: &mut dyn FnMut(u64, u64),
 ) -> Result<PleHotPackHeader, String> {
-    Err("ple hot pack: writing a PLE hot pack is unsupported on Windows (it needs Unix \
+    Err(
+        "ple hot pack: writing a PLE hot pack is unsupported on Windows (it needs Unix \
          O_DIRECT positional reads and positional writes); use a Unix host"
-        .to_string())
+            .to_string(),
+    )
 }
 
 /// Writer core over any positional model reader (tests drive it with an

@@ -99,11 +99,16 @@ fn qwen4_f16_x_scratch_growth_invalidates_captured_graph() {
     let n_big = big.numel();
     let out_big = gpu.zeros(&[n_big], DType::F32).expect("out_big");
     let eager = gpu.zeros(&[n_big], DType::F32).expect("eager");
-    gpu.copy_f32_buffer(&eager, &big, n_big).expect("eager copy");
+    gpu.copy_f32_buffer(&eager, &big, n_big)
+        .expect("eager copy");
     gpu.hip.device_synchronize().expect("sync");
     let eager = gpu.download_f32(&eager).expect("eager download");
     assert_eq!(eager, want, "eager copy wrong");
 
     capture_copy(&mut gpu, &out_big, &big, n_big);
-    assert_eq!(replay_and_read(&mut gpu, &out_big), eager, "replay != eager");
+    assert_eq!(
+        replay_and_read(&mut gpu, &out_big),
+        eager,
+        "replay != eager"
+    );
 }

@@ -240,7 +240,9 @@ impl AttentionFamily {
                 && (64..=262_144).contains(&io.max_ctx_len)
                 && io.tree_bias.is_none())
         {
-            return Err(DispatchError::Hip("Raw Q requires gfx1201 native-fp8 Q-resident v2 attention".into()));
+            return Err(DispatchError::Hip(
+                "Raw Q requires gfx1201 native-fp8 Q-resident v2 attention".into(),
+            ));
         }
         dispatch_kv_write(gpu, plan.write_key, plan, io).map_err(|error| {
             DispatchError::Hip(format!(
@@ -1471,23 +1473,24 @@ fn dispatch_attend(
                     ));
                 }
                 match (io.output_gate, io.output_awq_scale) {
-                    (Some(gate), Some(scale)) => hip!(gpu.attention_flash_asym3_gated_mq_rotate_awq(
-                        io.q,
-                        io.k_cache,
-                        io.v_cache,
-                        io.output,
-                        io.pos_buf,
-                        ct,
-                        st,
-                        seq_len,
-                        io.n_heads,
-                        io.n_kv_heads,
-                        io.head_dim,
-                        io.physical_cap,
-                        fp,
-                        gate,
-                        scale,
-                    )),
+                    (Some(gate), Some(scale)) => hip!(gpu
+                        .attention_flash_asym3_gated_mq_rotate_awq(
+                            io.q,
+                            io.k_cache,
+                            io.v_cache,
+                            io.output,
+                            io.pos_buf,
+                            ct,
+                            st,
+                            seq_len,
+                            io.n_heads,
+                            io.n_kv_heads,
+                            io.head_dim,
+                            io.physical_cap,
+                            fp,
+                            gate,
+                            scale,
+                        )),
                     (Some(gate), None) => hip!(gpu.attention_flash_asym3(
                         io.q,
                         io.k_cache,
@@ -2217,7 +2220,8 @@ fn dispatch_attend(
                     && !gpu.flash_attn_ck_loaded()
                     && !matches!(
                         hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_KERNEL")
-                            .ok().as_deref(),
+                            .ok()
+                            .as_deref(),
                         Some("scalar") | Some("batched")
                     )
                     && ctx.workload == crate::context::DispatchWorkload::Standard
@@ -2626,12 +2630,11 @@ fn dispatch_attend(
                 // q8: LDS holds occupancy), flash-tile-batched above it.
                 // tree_bias passes through to whichever backend runs; noslots
                 // (null descriptors inside the launchers), like the writer.
-                let crossover: usize =
-                    if gpu.arch_caps.is_gfx1200() || gpu.arch_caps.is_gfx1201() {
-                        4096
-                    } else {
-                        8192
-                    };
+                let crossover: usize = if gpu.arch_caps.is_gfx1200() || gpu.arch_caps.is_gfx1201() {
+                    4096
+                } else {
+                    8192
+                };
                 // DFlash ChainVerify blocks: always the tile + reduce.
                 if io.max_ctx_len <= crossover && !ctx.verify_tile_attend {
                     let positions = io.positions.unwrap();

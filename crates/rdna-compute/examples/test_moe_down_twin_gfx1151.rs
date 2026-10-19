@@ -112,12 +112,11 @@
 //!   cargo run --release -p rdna-compute --features lab --example test_moe_down_twin_gfx1151 -- --precheck [filter]
 
 use hip_bridge::KernargBlob;
-use std::borrow::Cow;
 use rdna_compute::{Gpu, GpuTensor};
+use std::borrow::Cow;
 
-const SRC_INCUMBENT: &str = include_str!(
-    "../../../kernels/src/gemm_mq4g128v2_moe_grouped_top10_o8_r16.gfx1151.hip"
-);
+const SRC_INCUMBENT: &str =
+    include_str!("../../../kernels/src/gemm_mq4g128v2_moe_grouped_top10_o8_r16.gfx1151.hip");
 const SRC_TWIN: &str =
     include_str!("../../../kernels/src/gemm_mq4g128v2_moe_grouped_top10_o8_r8.gfx1151.hip");
 const SRC_O16: &str =
@@ -149,8 +148,21 @@ impl Variant {
     }
 }
 
-const fn xs(label: &'static str, func: &'static str, rows_per_block: usize, block_x: u32) -> Variant {
-    Variant { label, module: MODULE_XS, func, src: SRC_XS, rows_per_block, block_x, grid_z: 1 }
+const fn xs(
+    label: &'static str,
+    func: &'static str,
+    rows_per_block: usize,
+    block_x: u32,
+) -> Variant {
+    Variant {
+        label,
+        module: MODULE_XS,
+        func,
+        src: SRC_XS,
+        rows_per_block,
+        block_x,
+        grid_z: 1,
+    }
 }
 
 /// Index 0 is the incumbent (the bitwise reference); the rest are candidates.
@@ -183,7 +195,12 @@ const VARIANTS: [Variant; 4] = [
         block_x: 32,
         grid_z: 1,
     },
-    xs("xs4", "gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs4_gfx1151", 32, 128),
+    xs(
+        "xs4",
+        "gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs4_gfx1151",
+        32,
+        128,
+    ),
 ];
 
 const K_TOP: usize = 10;
@@ -251,12 +268,22 @@ impl Weights {
                     w.copy_from_slice(&rng.next_u64().to_le_bytes());
                 }
             }
-            let t = gpu.upload_raw(&bytes, &[bytes.len()]).expect("expert upload");
+            let t = gpu
+                .upload_raw(&bytes, &[bytes.len()])
+                .expect("expert upload");
             ptrs.extend_from_slice(&(t.buf.as_ptr() as u64).to_le_bytes());
             tensors.push(t);
         }
-        let ptr_t = gpu.upload_raw(&ptrs, &[ptrs.len()]).expect("ptr table upload");
-        Weights { e, m, k, tensors, ptr_t }
+        let ptr_t = gpu
+            .upload_raw(&ptrs, &[ptrs.len()])
+            .expect("ptr table upload");
+        Weights {
+            e,
+            m,
+            k,
+            tensors,
+            ptr_t,
+        }
     }
     fn free(self, gpu: &mut Gpu) {
         for t in self.tensors {
@@ -371,7 +398,10 @@ fn specs() -> Vec<Spec> {
         spec("u273_E512_M2560_K640", 512, 2560, 640, 273),
         spec("u401_E512_M2560_K640", 512, 2560, 640, 401),
         spec("u529_E512_M2560_K640", 512, 2560, 640, 529),
-        Spec { routing: Routing::Skewed, ..spec("skew401_E512_M2560_K640", 512, 2560, 640, 401) },
+        Spec {
+            routing: Routing::Skewed,
+            ..spec("skew401_E512_M2560_K640", 512, 2560, 640, 401)
+        },
     ];
     // Tiny tail / bounds cases (E = 16 so top-10 without replacement exists).
     v.push(spec("tail_K639_M40", 16, 40, 639, 13));
@@ -379,10 +409,22 @@ fn specs() -> Vec<Spec> {
     v.push(spec("tail_M17_K640", 16, 17, 640, 13));
     v.push(spec("tail_M17_K639", 16, 17, 639, 13));
     v.push(spec("tail_M17_K641", 16, 17, 641, 13));
-    v.push(Spec { xmode: XMode::Div2, ..spec("div2_M40_K640", 16, 40, 640, 13) });
-    v.push(Spec { xmode: XMode::Div2, ..spec("div2_M17_K641", 16, 17, 641, 13) });
-    v.push(Spec { xmode: XMode::Truncated, ..spec("xbound_M40_K640", 16, 40, 640, 13) });
-    v.push(Spec { partial_grouped: true, ..spec("partial_grouped_M40_K640", 16, 40, 640, 13) });
+    v.push(Spec {
+        xmode: XMode::Div2,
+        ..spec("div2_M40_K640", 16, 40, 640, 13)
+    });
+    v.push(Spec {
+        xmode: XMode::Div2,
+        ..spec("div2_M17_K641", 16, 17, 641, 13)
+    });
+    v.push(Spec {
+        xmode: XMode::Truncated,
+        ..spec("xbound_M40_K640", 16, 40, 640, 13)
+    });
+    v.push(Spec {
+        partial_grouped: true,
+        ..spec("partial_grouped_M40_K640", 16, 40, 640, 13)
+    });
     v.push(Spec {
         invalid_topk: true,
         mutate: true,
@@ -406,7 +448,10 @@ fn specs() -> Vec<Spec> {
 // ── host helpers ───────────────────────────────────────────────────────────
 
 fn i32s(bytes: &[u8]) -> Vec<i32> {
-    bytes.chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect()
+    bytes
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
 }
 
 fn i32_bytes(v: &[i32]) -> Vec<u8> {
@@ -414,7 +459,8 @@ fn i32_bytes(v: &[i32]) -> Vec<u8> {
 }
 
 fn zeros_raw(gpu: &Gpu, bytes: usize) -> GpuTensor {
-    gpu.upload_raw(&vec![0u8; bytes], &[bytes]).expect("zero upload")
+    gpu.upload_raw(&vec![0u8; bytes], &[bytes])
+        .expect("zero upload")
 }
 
 /// Structural check of the production scatter against the router output.
@@ -436,7 +482,10 @@ fn validate_scatter(
     for ex in 0..e {
         let padded = flats[ex].len().next_multiple_of(BLOCK_M);
         assert_eq!(offsets[ex] as usize, off, "scatter offset of expert {ex}");
-        assert_eq!(counts_dev[ex] as usize, padded, "scatter padded count of expert {ex}");
+        assert_eq!(
+            counts_dev[ex] as usize, padded,
+            "scatter padded count of expert {ex}"
+        );
         let region = &sorted[off..off + padded];
         let mut got: Vec<i32> = region.iter().copied().filter(|&s| s >= 0).collect();
         assert!(region.iter().all(|&s| s >= -1), "bad slot value");
@@ -448,8 +497,14 @@ fn validate_scatter(
         off += padded;
     }
     assert_eq!(offsets[e] as usize, off, "scatter total");
-    assert!(sorted[off..].iter().all(|&s| s == -1), "slot tail must be -1");
-    assert!(tiles[off / BLOCK_M..].iter().all(|&t| t == -1), "tile tail must be -1");
+    assert!(
+        sorted[off..].iter().all(|&s| s == -1),
+        "slot tail must be -1"
+    );
+    assert!(
+        tiles[off / BLOCK_M..].iter().all(|&t| t == -1),
+        "tile tail must be -1"
+    );
     off
 }
 
@@ -515,7 +570,11 @@ fn traffic(
 fn median(v: &mut [f64]) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = v.len();
-    if n % 2 == 1 { v[n / 2] } else { 0.5 * (v[n / 2 - 1] + v[n / 2]) }
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        0.5 * (v[n / 2 - 1] + v[n / 2])
+    }
 }
 
 fn f32_bytes(v: &[f32]) -> &[u8] {
@@ -546,7 +605,11 @@ fn run_case(
     case_idx: usize,
     requested: &[usize],
 ) -> CaseOutcome {
-    assert_eq!(requested.first(), Some(&0), "incumbent must be the reference variant");
+    assert_eq!(
+        requested.first(),
+        Some(&0),
+        "incumbent must be the reference variant"
+    );
     let (e, m, k) = (spec.e, spec.m, spec.k);
     let mut rng = Rng(SEED ^ ((case_idx as u64 + 1) << 32) ^ 0xA5A5);
     let slots = spec.tokens * K_TOP;
@@ -558,7 +621,12 @@ fn run_case(
         Routing::Skewed => route_skewed(&mut rng, e, spec.tokens),
     };
     if spec.invalid_topk {
-        for (i, bad) in [(3usize, -1i32), (17, e as i32), (40, -9), (41, e as i32 + 100)] {
+        for (i, bad) in [
+            (3usize, -1i32),
+            (17, e as i32),
+            (40, -9),
+            (41, e as i32 + 100),
+        ] {
             if i < topk.len() {
                 topk[i] = bad;
             }
@@ -566,15 +634,16 @@ fn run_case(
     }
 
     // Production scatter.
-    let topk_t = gpu.upload_raw(&i32_bytes(&topk), &[slots * 4]).expect("topk");
+    let topk_t = gpu
+        .upload_raw(&i32_bytes(&topk), &[slots * 4])
+        .expect("topk");
     let counts_t = zeros_raw(gpu, e * 4);
     let offsets_t = zeros_raw(gpu, (e + 1) * 4);
     let sorted_t = zeros_raw(gpu, prod_gr * 4);
     let tiles_t = zeros_raw(gpu, prod_gr / BLOCK_M * 4);
     let inverse_t = zeros_raw(gpu, slots * 4);
     gpu.moe_scatter_fused_top10(
-        &topk_t, &counts_t, &offsets_t, &sorted_t, &tiles_t, &inverse_t, slots, e, prod_gr,
-        BLOCK_M,
+        &topk_t, &counts_t, &offsets_t, &sorted_t, &tiles_t, &inverse_t, slots, e, prod_gr, BLOCK_M,
     )
     .expect("production scatter");
     gpu.hip.device_synchronize().expect("scatter sync");
@@ -606,8 +675,12 @@ fn run_case(
         ] {
             sorted[t * 16 + slot] = val;
         }
-        gpu.hip.memcpy_htod(&sorted_t.buf, &i32_bytes(&sorted)).expect("mutate sorted");
-        gpu.hip.memcpy_htod(&tiles_t.buf, &i32_bytes(&tiles)).expect("mutate tiles");
+        gpu.hip
+            .memcpy_htod(&sorted_t.buf, &i32_bytes(&sorted))
+            .expect("mutate sorted");
+        gpu.hip
+            .memcpy_htod(&tiles_t.buf, &i32_bytes(&tiles))
+            .expect("mutate tiles");
     }
     let gr = if spec.partial_grouped && live_padded > 2 * BLOCK_M {
         live_padded - 5
@@ -617,8 +690,9 @@ fn run_case(
     assert!(gr > 0 && gr <= prod_gr);
 
     // X.
-    let xs: Vec<f32> =
-        (0..x_rows * k).map(|_| (rng.unit() * 4.0 - 2.0) as f32).collect();
+    let xs: Vec<f32> = (0..x_rows * k)
+        .map(|_| (rng.unit() * 4.0 - 2.0) as f32)
+        .collect();
     let x_t = gpu.upload_f32(&xs, &[xs.len()]).expect("x upload");
 
     // Y with a guard band; every variant starts from the NaN-payload sentinel.
@@ -678,15 +752,24 @@ fn run_case(
         b.into_vec()
     };
     let mut blobs: Vec<Vec<u8>> = VARIANTS.iter().map(blob).collect();
-    let grid = |v: &Variant| [m.div_ceil(v.rows_per_block) as u32, tiles_launched as u32, v.grid_z];
+    let grid = |v: &Variant| {
+        [
+            m.div_ceil(v.rows_per_block) as u32,
+            tiles_launched as u32,
+            v.grid_z,
+        ]
+    };
     let block = |v: &Variant| [v.block_x, 1, 1];
 
     // Correctness: one fresh-sentinel run per variant.
     let mut outputs: Vec<Vec<f32>> = Vec::new();
     for &i in &active {
         let v = &VARIANTS[i];
-        gpu.hip.memcpy_htod(&y_t.buf, f32_bytes(&sentinel)).expect("reset y");
-        gpu.launch_kernel_blob(v.func, grid(v), block(v), 0, &mut blobs[i]).expect("launch");
+        gpu.hip
+            .memcpy_htod(&y_t.buf, f32_bytes(&sentinel))
+            .expect("reset y");
+        gpu.launch_kernel_blob(v.func, grid(v), block(v), 0, &mut blobs[i])
+            .expect("launch");
         gpu.hip.device_synchronize().expect("sync");
         outputs.push(gpu.download_f32(&y_t).expect("download y"));
     }
@@ -697,11 +780,19 @@ fn run_case(
         let v = &VARIANTS[vi];
         let i = pos;
         let out = &outputs[i];
-        let unwritten = out[..main_cells].iter().filter(|x| x.to_bits() == SENTINEL_BITS).count();
-        let guard_bad =
-            out[main_cells..].iter().filter(|x| x.to_bits() != SENTINEL_BITS).count();
+        let unwritten = out[..main_cells]
+            .iter()
+            .filter(|x| x.to_bits() == SENTINEL_BITS)
+            .count();
+        let guard_bad = out[main_cells..]
+            .iter()
+            .filter(|x| x.to_bits() != SENTINEL_BITS)
+            .count();
         let nonfinite = out[..main_cells].iter().filter(|x| !x.is_finite()).count();
-        let nonzero = out[..main_cells].iter().filter(|x| x.to_bits() << 1 != 0).count();
+        let nonzero = out[..main_cells]
+            .iter()
+            .filter(|x| x.to_bits() << 1 != 0)
+            .count();
         let mut line = format!(
             "  [{}] unwritten={unwritten} guard_clobbered={guard_bad} nonfinite={nonfinite} \
              nonzero_cells={nonzero}",
@@ -713,7 +804,11 @@ fn run_case(
             line.push_str(" ALL-ZERO");
         }
         if i == 0 {
-            line.push_str(if v_ok { " (reference sane)" } else { " REFERENCE-BAD" });
+            line.push_str(if v_ok {
+                " (reference sane)"
+            } else {
+                " REFERENCE-BAD"
+            });
         } else {
             let diff: Vec<usize> = (0..out.len())
                 .filter(|&j| out[j].to_bits() != outputs[0][j].to_bits())
@@ -747,7 +842,8 @@ fn run_case(
     let time_one = |gpu: &mut Gpu, i: usize, blobs: &mut Vec<Vec<u8>>| -> f64 {
         let v = &VARIANTS[i];
         gpu.hip.event_record(&ev0, None).expect("rec");
-        gpu.launch_kernel_blob(v.func, grid(v), block(v), 0, &mut blobs[i]).expect("launch");
+        gpu.launch_kernel_blob(v.func, grid(v), block(v), 0, &mut blobs[i])
+            .expect("launch");
         gpu.hip.event_record(&ev1, None).expect("rec");
         gpu.hip.event_synchronize(&ev1).expect("evsync");
         gpu.hip.event_elapsed_ms(&ev0, &ev1).expect("elapsed") as f64 * 1000.0
@@ -790,9 +886,15 @@ fn run_case(
             median_us[0] / med
         );
     }
-    println!("  VERDICT {}: {}", spec.name, if ok { "PASS (bitwise)" } else { "FAIL" });
+    println!(
+        "  VERDICT {}: {}",
+        spec.name,
+        if ok { "PASS (bitwise)" } else { "FAIL" }
+    );
 
-    for t in [topk_t, counts_t, offsets_t, sorted_t, tiles_t, inverse_t, x_t, y_t] {
+    for t in [
+        topk_t, counts_t, offsets_t, sorted_t, tiles_t, inverse_t, x_t, y_t,
+    ] {
         gpu.free_tensor(t).expect("free");
     }
     CaseOutcome {
@@ -808,8 +910,9 @@ fn run_case(
 
 /// Production-crossover sweep token counts (E512 M2560 K640, uniform, xdiv 1):
 /// 145..=497 step 32, plus the 529 control.
-const SWEEP_TOKENS: [usize; 13] =
-    [145, 177, 209, 241, 273, 305, 337, 369, 401, 433, 465, 497, 529];
+const SWEEP_TOKENS: [usize; 13] = [
+    145, 177, 209, 241, 273, 305, 337, 369, 401, 433, 465, 497, 529,
+];
 /// Sweep default compares only the incumbent (variant 0) and the O8R8 twin
 /// (variant 1); `--variants=` overrides it.
 const SWEEP_ACTIVE: [usize; 2] = [0, 1];
@@ -826,7 +929,11 @@ fn sweep_specs(tokens: &[usize]) -> Vec<Spec> {
 
 /// Right-aligned fixed-point cell; NaN (variant not run for the case) prints `-`.
 fn cell(x: f64, width: usize, prec: usize) -> String {
-    if x.is_nan() { format!("{:>width$}", "-") } else { format!("{x:>width$.prec$}") }
+    if x.is_nan() {
+        format!("{:>width$}", "-")
+    } else {
+        format!("{x:>width$.prec$}")
+    }
 }
 
 fn main() {
@@ -844,13 +951,24 @@ fn main() {
         } else if let Some(list) = a.strip_prefix("--tokens=") {
             let v: Vec<usize> = list
                 .split(',')
-                .map(|s| s.trim().parse().unwrap_or_else(|_| panic!("bad --tokens entry {s:?}")))
+                .map(|s| {
+                    s.trim()
+                        .parse()
+                        .unwrap_or_else(|_| panic!("bad --tokens entry {s:?}"))
+                })
                 .collect();
-            assert!(!v.is_empty() && v.iter().all(|&t| t > 0), "--tokens needs positive counts");
+            assert!(
+                !v.is_empty() && v.iter().all(|&t| t > 0),
+                "--tokens needs positive counts"
+            );
             tokens_override = Some(v);
         } else if let Some(list) = a.strip_prefix("--variants=") {
-            variant_filter =
-                Some(list.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
+            variant_filter = Some(
+                list.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            );
         } else if a == "--precheck" {
             precheck = true;
         } else if a.starts_with("--") {
@@ -882,7 +1000,10 @@ fn main() {
         std::process::exit(2);
     }
     if !gfx1151 {
-        println!("NOTE: {} correctness pre-check; timings below are NOT gfx1151 numbers", gpu.arch);
+        println!(
+            "NOTE: {} correctness pre-check; timings below are NOT gfx1151 numbers",
+            gpu.arch
+        );
     }
 
     // The incumbent (index 0) always runs; others are substring-matched on label or symbol.
@@ -926,10 +1047,19 @@ fn main() {
     // Sweep cases are seeded by token count (not list position), so a dense
     // follow-up run reproduces the same routing/X for any shared token count.
     let all_specs: Vec<(u64, Spec)> = if sweep {
-        let toks = tokens_override.clone().unwrap_or_else(|| SWEEP_TOKENS.to_vec());
-        sweep_specs(&toks).into_iter().map(|s| (s.tokens as u64, s)).collect()
+        let toks = tokens_override
+            .clone()
+            .unwrap_or_else(|| SWEEP_TOKENS.to_vec());
+        sweep_specs(&toks)
+            .into_iter()
+            .map(|s| (s.tokens as u64, s))
+            .collect()
     } else {
-        specs().into_iter().enumerate().map(|(i, s)| (i as u64, s)).collect()
+        specs()
+            .into_iter()
+            .enumerate()
+            .map(|(i, s)| (i as u64, s))
+            .collect()
     };
 
     let mut cache: Option<Weights> = None;
@@ -938,7 +1068,9 @@ fn main() {
         if filter.as_deref().is_some_and(|f| !sp.name.contains(f)) {
             continue;
         }
-        let rebuild = cache.as_ref().map_or(true, |w| (w.e, w.m, w.k) != (sp.e, sp.m, sp.k));
+        let rebuild = cache
+            .as_ref()
+            .map_or(true, |w| (w.e, w.m, w.k) != (sp.e, sp.m, sp.k));
         if rebuild {
             if let Some(old) = cache.take() {
                 old.free(&mut gpu);
@@ -966,7 +1098,13 @@ fn main() {
     }
 
     // Summary columns are generated from the active variants.
-    let col_name = |i: usize| if i == 0 { "inc".to_string() } else { VARIANTS[i].label.to_string() };
+    let col_name = |i: usize| {
+        if i == 0 {
+            "inc".to_string()
+        } else {
+            VARIANTS[i].label.to_string()
+        }
+    };
     let col_w = |i: usize| (col_name(i).len() + 3).max(9);
     let mut all_ok = !outcomes.is_empty();
     if sweep {
@@ -980,7 +1118,12 @@ fn main() {
             "tokens", "case", "verdict", "live_t", "launch"
         );
         for &i in &active {
-            print!(" | {:>w$} {:>7}", format!("{} us", col_name(i)), "GB/s", w = col_w(i));
+            print!(
+                " | {:>w$} {:>7}",
+                format!("{} us", col_name(i)),
+                "GB/s",
+                w = col_w(i)
+            );
             if i != 0 {
                 print!(" | {:>9} {:>7}", format!("inc-{}", col_name(i)), "inc/var");
             }
@@ -997,7 +1140,11 @@ fn main() {
                 o.launched_tiles,
             );
             for &i in &active {
-                print!(" | {} {}", cell(o.median_us[i], col_w(i), 2), cell(o.gbps[i], 7, 1));
+                print!(
+                    " | {} {}",
+                    cell(o.median_us[i], col_w(i), 2),
+                    cell(o.gbps[i], 7, 1)
+                );
                 if i != 0 {
                     let diff = o.median_us[0] - o.median_us[i];
                     let ratio = o.median_us[0] / o.median_us[i];
@@ -1022,7 +1169,12 @@ fn main() {
         );
         print!("{:<36} {:>8}", "case", "verdict");
         for &i in &active {
-            print!(" | {:>w$} {:>7}", format!("{} us", col_name(i)), "GB/s", w = col_w(i));
+            print!(
+                " | {:>w$} {:>7}",
+                format!("{} us", col_name(i)),
+                "GB/s",
+                w = col_w(i)
+            );
             if i != 0 {
                 print!(" {:>6}", "x");
             }
@@ -1032,7 +1184,11 @@ fn main() {
             all_ok &= o.ok;
             print!("{:<36} {:>8}", o.name, if o.ok { "PASS" } else { "FAIL" });
             for &i in &active {
-                print!(" | {} {}", cell(o.median_us[i], col_w(i), 2), cell(o.gbps[i], 7, 1));
+                print!(
+                    " | {} {}",
+                    cell(o.median_us[i], col_w(i), 2),
+                    cell(o.gbps[i], 7, 1)
+                );
                 if i != 0 {
                     print!(" {}", cell(o.median_us[0] / o.median_us[i], 6, 3));
                 }
@@ -1040,6 +1196,13 @@ fn main() {
             println!();
         }
     }
-    println!("OVERALL: {}", if all_ok { "PASS (all bitwise identical)" } else { "FAIL" });
+    println!(
+        "OVERALL: {}",
+        if all_ok {
+            "PASS (all bitwise identical)"
+        } else {
+            "FAIL"
+        }
+    );
     std::process::exit(if all_ok { 0 } else { 1 });
 }

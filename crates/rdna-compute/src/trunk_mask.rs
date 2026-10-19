@@ -216,7 +216,12 @@ impl Qwen4TrunkMask {
                     bits &= !group;
                 }
             }
-            names.extend(TrunkFamily::ALL.iter().filter(|f| bits & f.bit() != 0).map(|f| f.name()));
+            names.extend(
+                TrunkFamily::ALL
+                    .iter()
+                    .filter(|f| bits & f.bit() != 0)
+                    .map(|f| f.name()),
+            );
             for name in names {
                 for &(lo, hi) in &spans {
                     if !out.is_empty() {
@@ -388,7 +393,10 @@ mod tests {
         assert_eq!(mask.bits(3), TRUNK_GDN_BITS | TrunkFamily::QsaO.bit());
         assert_eq!(mask.bits(15), TRUNK_GDN_BITS | TrunkFamily::QsaO.bit());
         assert_eq!(mask.bits(16), TRUNK_GDN_BITS);
-        assert_eq!(layers(&mask, TrunkFamily::QsaO), (3..=15).collect::<Vec<_>>());
+        assert_eq!(
+            layers(&mask, TrunkFamily::QsaO),
+            (3..=15).collect::<Vec<_>>()
+        );
         assert!(!mask.contains(TrunkFamily::QsaQ, 5));
         assert_eq!(mask.canonical(), "gdn,qsa.o@3-15");
     }
@@ -404,7 +412,10 @@ mod tests {
 
     #[test]
     fn canonical_merges_and_collapses() {
-        let mask = Qwen4TrunkMask::parse("gdn.qkv@0-3,gdn.qkv@4-9,gdn.z@0-9,gdn.a@0-9,gdn.b@0-9,gdn.out@0-9,qsa.idx").unwrap();
+        let mask = Qwen4TrunkMask::parse(
+            "gdn.qkv@0-3,gdn.qkv@4-9,gdn.z@0-9,gdn.a@0-9,gdn.b@0-9,gdn.out@0-9,qsa.idx",
+        )
+        .unwrap();
         assert_eq!(mask.canonical(), "gdn@0-9,qsa.idx");
         assert_eq!(
             Qwen4TrunkMask::parse(&mask.canonical()).unwrap().bits(5),
@@ -429,7 +440,13 @@ mod tests {
 
     #[test]
     fn layer_indices_are_digits_only() {
-        for raw in ["gdn.z@+3", "gdn.z@+3-9", "gdn.z@3-+9", "gdn.z@-3", "gdn.z@3--9"] {
+        for raw in [
+            "gdn.z@+3",
+            "gdn.z@+3-9",
+            "gdn.z@3-+9",
+            "gdn.z@-3",
+            "gdn.z@3--9",
+        ] {
             assert!(Qwen4TrunkMask::parse(raw).is_err(), "{raw}");
         }
         assert!(Qwen4TrunkMask::parse("gdn.z@3-9").is_ok());
@@ -438,10 +455,21 @@ mod tests {
     #[test]
     fn check_layers_rejects_bands_outside_the_trunk() {
         let trunk = 48;
-        for raw in ["all", "1", "0", "gdn", "gdn.qkv@0-47", "qsa.o@47", "gdn,qsa.o@3-15"] {
-            Qwen4TrunkMask::parse(raw).unwrap().check_layers(trunk).unwrap_or_else(|e| {
-                panic!("{raw}: {e}");
-            });
+        for raw in [
+            "all",
+            "1",
+            "0",
+            "gdn",
+            "gdn.qkv@0-47",
+            "qsa.o@47",
+            "gdn,qsa.o@3-15",
+        ] {
+            Qwen4TrunkMask::parse(raw)
+                .unwrap()
+                .check_layers(trunk)
+                .unwrap_or_else(|e| {
+                    panic!("{raw}: {e}");
+                });
         }
         for (raw, token) in [
             ("gdn.qkv@48", "gdn.qkv@48"),
@@ -449,7 +477,10 @@ mod tests {
             ("gdn.z@0-47,gdn.a@50-60", "gdn.a@50-60"),
             ("qsa.k@100", "qsa.k@100"),
         ] {
-            let error = Qwen4TrunkMask::parse(raw).unwrap().check_layers(trunk).unwrap_err();
+            let error = Qwen4TrunkMask::parse(raw)
+                .unwrap()
+                .check_layers(trunk)
+                .unwrap_err();
             assert!(error.contains(&format!("`{token}`")), "{raw}: {error}");
         }
     }
@@ -458,7 +489,11 @@ mod tests {
     const ZAB_BITS: u16 =
         TrunkFamily::GdnZ.bit() | TrunkFamily::GdnA.bit() | TrunkFamily::GdnB.bit();
 
-    fn route(env: Option<&str>, arch: &str, artifact: Option<TrunkIu4Default>) -> Qwen4TrunkIu4Route {
+    fn route(
+        env: Option<&str>,
+        arch: &str,
+        artifact: Option<TrunkIu4Default>,
+    ) -> Qwen4TrunkIu4Route {
         Qwen4TrunkMask::resolve_iu4(env, arch, artifact).unwrap()
     }
 
@@ -481,10 +516,15 @@ mod tests {
     #[test]
     fn marked_artifact_defaults_to_zab_on_exact_gfx1151_only() {
         let on = route(None, "gfx1151", ZAB);
-        assert_eq!(on.source, TrunkIu4MaskSource::ArtifactDefault(TrunkIu4Default::Gfx1151ZabV1));
+        assert_eq!(
+            on.source,
+            TrunkIu4MaskSource::ArtifactDefault(TrunkIu4Default::Gfx1151ZabV1)
+        );
         assert!(!on.mask.is_empty());
         assert_eq!(on.mask.bits(9), ZAB_BITS);
-        for arch in ["gfx1201", "gfx1100", "gfx1150", "gfx11", "gfx1151x", "GFX1151", "gfx942", ""] {
+        for arch in [
+            "gfx1201", "gfx1100", "gfx1150", "gfx11", "gfx1151x", "GFX1151", "gfx942", "",
+        ] {
             let off = route(None, arch, ZAB);
             assert_eq!(off.source, TrunkIu4MaskSource::Off, "{arch:?}");
             assert!(off.mask.is_empty(), "{arch:?}");
@@ -526,16 +566,26 @@ mod tests {
     #[test]
     fn env_behaves_as_before_for_unmarked_artifacts() {
         assert!(route(Some("0"), "gfx1151", None).mask.is_empty());
-        assert_eq!(route(Some("all"), "gfx1151", None).mask.bits(0), TRUNK_ALL_BITS);
-        assert_eq!(route(Some("1"), "gfx1100", None).source, TrunkIu4MaskSource::Env);
-        assert_eq!(route(Some("gdn"), "gfx1151", None).mask.bits(3), TRUNK_GDN_BITS);
+        assert_eq!(
+            route(Some("all"), "gfx1151", None).mask.bits(0),
+            TRUNK_ALL_BITS
+        );
+        assert_eq!(
+            route(Some("1"), "gfx1100", None).source,
+            TrunkIu4MaskSource::Env
+        );
+        assert_eq!(
+            route(Some("gdn"), "gfx1151", None).mask.bits(3),
+            TRUNK_GDN_BITS
+        );
     }
 
     #[test]
     fn bad_env_is_an_error_for_marked_and_unmarked_artifacts() {
         for artifact in [None, ZAB] {
             for arch in ["gfx1151", "gfx1201"] {
-                let error = Qwen4TrunkMask::resolve_iu4(Some("gdn,qsa.x"), arch, artifact).unwrap_err();
+                let error =
+                    Qwen4TrunkMask::resolve_iu4(Some("gdn,qsa.x"), arch, artifact).unwrap_err();
                 assert!(error.contains("HIPFIRE_QWEN4_TRUNK_IU4"), "{error}");
                 assert!(error.contains("`qsa.x`"), "{error}");
             }

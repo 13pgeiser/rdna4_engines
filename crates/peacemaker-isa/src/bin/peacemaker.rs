@@ -7,11 +7,21 @@ use std::path::PathBuf;
 
 fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
-    let Some(command) = args.next() else { return Err(usage().into()); };
-    if command == "audit" { return run_audit(args); }
-    if command == "profile" { return run_profile(args); }
-    if command == "lint" { return run_lint(args); }
-    if command == "native" { return run_native(args); }
+    let Some(command) = args.next() else {
+        return Err(usage().into());
+    };
+    if command == "audit" {
+        return run_audit(args);
+    }
+    if command == "profile" {
+        return run_profile(args);
+    }
+    if command == "lint" {
+        return run_lint(args);
+    }
+    if command == "native" {
+        return run_native(args);
+    }
     if command != "custom" || args.next().as_deref() != Some("build") {
         return Err(usage().into());
     }
@@ -24,7 +34,9 @@ fn run() -> Result<(), String> {
     let mut host_target = None;
     let mut descriptor = None;
     while let Some(option) = args.next() {
-        let value = args.next().ok_or_else(|| format!("missing value for {option}"))?;
+        let value = args
+            .next()
+            .ok_or_else(|| format!("missing value for {option}"))?;
         match option.as_str() {
             "--arch" => arch = Some(value),
             "--s" => source = Some(PathBuf::from(value)),
@@ -41,9 +53,14 @@ fn run() -> Result<(), String> {
     let source = source.ok_or("missing --s")?;
     let output = output.ok_or("missing --out")?;
     let manifest = manifest.ok_or("missing --manifest")?;
-    let contract = contract.map(|path| fs::read(&path)
-        .map_err(|e| format!("{}: {e}", path.display()))
-        .and_then(|bytes| serde_json::from_slice::<IsaShapeContract>(&bytes).map_err(|e| e.to_string())))
+    let contract = contract
+        .map(|path| {
+            fs::read(&path)
+                .map_err(|e| format!("{}: {e}", path.display()))
+                .and_then(|bytes| {
+                    serde_json::from_slice::<IsaShapeContract>(&bytes).map_err(|e| e.to_string())
+                })
+        })
         .transpose()?;
     if contract.is_some() && proof.is_none() {
         return Err("custom shape certification requires --proof".into());
@@ -52,15 +69,27 @@ fn run() -> Result<(), String> {
         let proof_bytes = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let source_bytes = fs::read(&source).map_err(|e| e.to_string())?;
         proof_binding(&proof_bytes, &source_bytes, &arch)?
-    } else { (String::new(), String::new()) };
+    } else {
+        (String::new(), String::new())
+    };
     let mut toolchain = Toolchain::default();
-    if let Some(target) = host_target { toolchain.host_target = target; }
+    if let Some(target) = host_target {
+        toolchain.host_target = target;
+    }
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let build = build(&toolchain, &source, &output, &arch)?;
-    certify(&toolchain, &build, &source, &arch, &manifest, contract.as_ref(),
-        &proof_digest, &builder_git_sha)?;
+    certify(
+        &toolchain,
+        &build,
+        &source,
+        &arch,
+        &manifest,
+        contract.as_ref(),
+        &proof_digest,
+        &builder_git_sha,
+    )?;
     if let Some(symbol) = descriptor {
         println!("{:?}", read_kd(&build.elf, &symbol)?);
     }
@@ -78,7 +107,7 @@ fn usage() -> &'static str {
 }
 
 /// The native build alone, spelled the way `toolchain::build` records it.
-fn run_native(args: impl Iterator<Item=String>) -> Result<(), String> {
+fn run_native(args: impl Iterator<Item = String>) -> Result<(), String> {
     let (mut arch, mut source, mut co, mut bundle) = (None, None, None, None);
     let mut host = peacemaker_isa::native::DEFAULT_HOST_TARGET.to_owned();
     for arg in args {
@@ -91,43 +120,64 @@ fn run_native(args: impl Iterator<Item=String>) -> Result<(), String> {
             _ => return Err(format!("unrecognized native argument {arg}\n{}", usage())),
         }
     }
-    let (arch, source) = (arch.ok_or("missing --arch=")?, source.ok_or("missing source .s")?);
+    let (arch, source) = (
+        arch.ok_or("missing --arch=")?,
+        source.ok_or("missing source .s")?,
+    );
     let text = fs::read_to_string(&source).map_err(|e| format!("{}: {e}", source.display()))?;
     let elf = peacemaker_isa::native::assemble(&text, arch)?;
-    if let Some(path) = &co { fs::write(path, &elf).map_err(|e| format!("{}: {e}", path.display()))? }
-    if let Some(path) = &bundle { fs::write(path, peacemaker_isa::native::bundle(&elf, arch, &host)).map_err(|e| format!("{}: {e}", path.display()))? }
+    if let Some(path) = &co {
+        fs::write(path, &elf).map_err(|e| format!("{}: {e}", path.display()))?
+    }
+    if let Some(path) = &bundle {
+        fs::write(path, peacemaker_isa::native::bundle(&elf, arch, &host))
+            .map_err(|e| format!("{}: {e}", path.display()))?
+    }
     Ok(())
 }
 
-fn run_lint(mut args: impl Iterator<Item=String>) -> Result<(), String> {
+fn run_lint(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     use peacemaker_isa::cost_lint::{self, Route};
     use std::collections::BTreeMap;
     let path = args.next().ok_or_else(|| usage().to_owned())?;
     let mut routes = BTreeMap::<String, Route>::new();
     if let Some(option) = args.next() {
-        if option != "--routes" { return Err(format!("unknown lint option {option}")); }
+        if option != "--routes" {
+            return Err(format!("unknown lint option {option}"));
+        }
         let file = args.next().ok_or("missing --routes path")?;
         routes = serde_json::from_slice(&fs::read(&file).map_err(|e| format!("{file}: {e}"))?)
             .map_err(|e| format!("{file}: {e}"))?;
     }
-    if args.next().is_some() { return Err(usage().into()); }
+    if args.next().is_some() {
+        return Err(usage().into());
+    }
     let object = fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
-    let lifted = peacemaker_lift::lift_object(&object, peacemaker_lift::Options {
-        frontend: peacemaker_ir::inst::Frontend::Hipcc,
-    }).map_err(|e| format!("{path}: {e}"))?;
+    let lifted = peacemaker_lift::lift_object(
+        &object,
+        peacemaker_lift::Options {
+            frontend: peacemaker_ir::inst::Frontend::Hipcc,
+        },
+    )
+    .map_err(|e| format!("{path}: {e}"))?;
     let report = cost_lint::analyze(&lifted.program, &routes)?;
-    println!("{}", serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+    );
     Ok(())
 }
 
 /// DIAGNOSTIC: instrument one kernel with timestamp records, verify the
 /// rewrite, and assemble a separate object whose symbol carries the
 /// `__pm_profile` suffix. The output is never a production artifact.
-fn run_profile(mut args: impl Iterator<Item=String>) -> Result<(), String> {
+fn run_profile(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     use peacemaker_isa::{ledger_replay::replay_hazards, profile};
     let (mut arch, mut source, mut points, mut output) = (None, None, None, None);
     while let Some(option) = args.next() {
-        let value = args.next().ok_or_else(|| format!("missing value for {option}"))?;
+        let value = args
+            .next()
+            .ok_or_else(|| format!("missing value for {option}"))?;
         match option.as_str() {
             "--arch" => arch = Some(value),
             "--s" => source = Some(PathBuf::from(value)),
@@ -149,11 +199,18 @@ fn run_profile(mut args: impl Iterator<Item=String>) -> Result<(), String> {
     // The independent wait replay must find exactly the original's hazards
     // (none for builder kernels; hipcc's interlocked DS-source reuse otherwise).
     let original_replay = replay_hazards(&profile::kernel_body(&source, &map.symbol)?, target)?;
-    let profiled_replay = replay_hazards(&profile::kernel_body(&text, &map.profiled_symbol)?, target)?;
+    let profiled_replay =
+        replay_hazards(&profile::kernel_body(&text, &map.profiled_symbol)?, target)?;
     if original_replay != profiled_replay {
-        return Err(format!("wait replay: profiled kernel has {} hazards, original {}", profiled_replay.len(), original_replay.len()));
+        return Err(format!(
+            "wait replay: profiled kernel has {} hazards, original {}",
+            profiled_replay.len(),
+            original_replay.len()
+        ));
     }
-    if let Some(parent) = output.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
     let s_path = output.with_extension("s");
     fs::write(&s_path, &text).map_err(|e| e.to_string())?;
     let build = build(&Toolchain::default(), &s_path, &output, &arch)?;
@@ -161,12 +218,25 @@ fn run_profile(mut args: impl Iterator<Item=String>) -> Result<(), String> {
     json["source"] = source_path.display().to_string().into();
     json["source_sha256"] = format!("{:x}", Sha256::digest(source.as_bytes())).into();
     json["profiled_s_sha256"] = format!("{:x}", Sha256::digest(text.as_bytes())).into();
-    json["profiled_co_sha256"] = format!("{:x}", Sha256::digest(fs::read(&build.elf).map_err(|e| e.to_string())?)).into();
+    json["profiled_co_sha256"] = format!(
+        "{:x}",
+        Sha256::digest(fs::read(&build.elf).map_err(|e| e.to_string())?)
+    )
+    .into();
     json["wait_replay_hazards_original"] = original_replay.len().into();
     json["wait_replay_hazards_profiled"] = profiled_replay.len().into();
-    json["parse_back"] = if build.parse_back_checked { "pass" } else { "skipped: llvm-objdump absent" }.into();
+    json["parse_back"] = if build.parse_back_checked {
+        "pass"
+    } else {
+        "skipped: llvm-objdump absent"
+    }
+    .into();
     let map_path = output.with_extension("map.json");
-    fs::write(&map_path, serde_json::to_vec_pretty(&json).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    fs::write(
+        &map_path,
+        serde_json::to_vec_pretty(&json).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
     println!("DIAGNOSTIC {} sites={} delay_fixups={} vgpr {}->{} (limit {}) sgpr {}->{} kernarg {}+{}\n{}\n{}\n{}",
         map.profiled_symbol, map.sites.len(), map.delay_fixups.len(), map.vgpr_before, map.vgpr_after, map.vgpr_limit,
         map.sgpr_before, map.sgpr_after, map.kernarg_ext_offset, map.kernarg_ext_bytes,
@@ -174,13 +244,20 @@ fn run_profile(mut args: impl Iterator<Item=String>) -> Result<(), String> {
     Ok(())
 }
 
-fn run_audit(args: impl Iterator<Item=String>) -> Result<(), String> {
+fn run_audit(args: impl Iterator<Item = String>) -> Result<(), String> {
     let mut args = args.peekable();
-    if args.next_if_eq("--lds-barrier").is_some() { return run_lds_barrier(args.map(PathBuf::from).collect()); }
+    if args.next_if_eq("--lds-barrier").is_some() {
+        return run_lds_barrier(args.map(PathBuf::from).collect());
+    }
     let mut options = AuditOptions::default();
     while let Some(option) = args.next() {
-        if option == "--sweep-profiles" { options.sweep_profiles = true; continue; }
-        let value = args.next().ok_or_else(|| format!("missing value for {option}"))?;
+        if option == "--sweep-profiles" {
+            options.sweep_profiles = true;
+            continue;
+        }
+        let value = args
+            .next()
+            .ok_or_else(|| format!("missing value for {option}"))?;
         match option.as_str() {
             "--arch" => options.arch = value,
             "--source" | "--hsaco" | "--input" => options.input = PathBuf::from(value),
@@ -193,9 +270,17 @@ fn run_audit(args: impl Iterator<Item=String>) -> Result<(), String> {
             _ => return Err(format!("unrecognized audit option {option}\n{}", usage())),
         }
     }
-    if options.input.as_os_str().is_empty() { return Err(usage().into()); }
-    let json = options.json.clone().unwrap_or_else(|| options.input.with_extension("audit.json"));
-    let markdown = options.markdown.clone().unwrap_or_else(|| options.input.with_extension("audit.md"));
+    if options.input.as_os_str().is_empty() {
+        return Err(usage().into());
+    }
+    let json = options
+        .json
+        .clone()
+        .unwrap_or_else(|| options.input.with_extension("audit.json"));
+    let markdown = options
+        .markdown
+        .clone()
+        .unwrap_or_else(|| options.input.with_extension("audit.md"));
     audit::run(options)?;
     println!("{}\n{}", json.display(), markdown.display());
     Ok(())
@@ -207,21 +292,39 @@ fn run_audit(args: impl Iterator<Item=String>) -> Result<(), String> {
 fn run_lds_barrier(roots: Vec<PathBuf>) -> Result<(), String> {
     fn collect(path: &std::path::Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
         if path.is_dir() {
-            let mut entries: Vec<_> = fs::read_dir(path).map_err(|e| format!("{}: {e}", path.display()))?
-                .map(|e| e.map(|e| e.path())).collect::<Result<_, _>>().map_err(|e| e.to_string())?;
+            let mut entries: Vec<_> = fs::read_dir(path)
+                .map_err(|e| format!("{}: {e}", path.display()))?
+                .map(|e| e.map(|e| e.path()))
+                .collect::<Result<_, _>>()
+                .map_err(|e| e.to_string())?;
             entries.sort();
-            for entry in entries { collect(&entry, out)?; }
+            for entry in entries {
+                collect(&entry, out)?;
+            }
         } else if path.extension().is_some_and(|x| x == "hsaco" || x == "co") {
             out.push(path.to_owned());
         }
         Ok(())
     }
-    if roots.is_empty() { return Err(usage().into()); }
+    if roots.is_empty() {
+        return Err(usage().into());
+    }
     let mut files = Vec::new();
-    for root in &roots { collect(root, &mut files)?; }
-    if files.is_empty() { return Err(format!("no *.hsaco or *.co under {roots:?}")); }
+    for root in &roots {
+        collect(root, &mut files)?;
+    }
+    if files.is_empty() {
+        return Err(format!("no *.hsaco or *.co under {roots:?}"));
+    }
     #[derive(Default)]
-    struct Row { modules: usize, barrier_modules: usize, kernels: usize, barrier_kernels: usize, barriers: usize, sites: usize }
+    struct Row {
+        modules: usize,
+        barrier_modules: usize,
+        kernels: usize,
+        barrier_kernels: usize,
+        barriers: usize,
+        sites: usize,
+    }
     let mut rows = std::collections::BTreeMap::<String, Row>::new();
     let (mut rejected, mut sites) = (Vec::new(), 0usize);
     for file in &files {
@@ -229,12 +332,22 @@ fn run_lds_barrier(roots: Vec<PathBuf>) -> Result<(), String> {
         match audit::lds_barrier_scan(&bytes) {
             Ok(scan) => {
                 let row = rows.entry(scan.arch.clone()).or_default();
-                row.modules += 1; row.barrier_modules += usize::from(scan.barriers > 0);
-                row.kernels += scan.kernels; row.barrier_kernels += scan.barrier_kernels;
-                row.barriers += scan.barriers; row.sites += scan.sites.len();
+                row.modules += 1;
+                row.barrier_modules += usize::from(scan.barriers > 0);
+                row.kernels += scan.kernels;
+                row.barrier_kernels += scan.barrier_kernels;
+                row.barriers += scan.barriers;
+                row.sites += scan.sites.len();
                 for site in &scan.sites {
                     sites += 1;
-                    println!("{} {} {} pc {:#x}: {}", audit::LDS_BARRIER_FINDING, file.display(), site.kernel, site.pc, site.detail);
+                    println!(
+                        "{} {} {} pc {:#x}: {}",
+                        audit::LDS_BARRIER_FINDING,
+                        file.display(),
+                        site.kernel,
+                        site.pc,
+                        site.detail
+                    );
                 }
             }
             Err(error) => rejected.push(format!("{}: {error}", file.display())),
@@ -242,34 +355,68 @@ fn run_lds_barrier(roots: Vec<PathBuf>) -> Result<(), String> {
     }
     println!("| arch | modules | with barriers | kernels | with barriers | barriers | {} |\n|---|---:|---:|---:|---:|---:|---:|", audit::LDS_BARRIER_FINDING);
     for (arch, r) in &rows {
-        println!("| {arch} | {} | {} | {} | {} | {} | {} |", r.modules, r.barrier_modules, r.kernels, r.barrier_kernels, r.barriers, r.sites);
+        println!(
+            "| {arch} | {} | {} | {} | {} | {} | {} |",
+            r.modules, r.barrier_modules, r.kernels, r.barrier_kernels, r.barriers, r.sites
+        );
     }
-    for line in &rejected { println!("unchecked {line}"); }
-    println!("{} files: {} checked, {} unchecked, {sites} {}", files.len(), files.len() - rejected.len(), rejected.len(), audit::LDS_BARRIER_FINDING);
-    if sites != 0 || !rejected.is_empty() { return Err(format!("lds-barrier audit failed: {sites} sites, {} unchecked modules", rejected.len())); }
+    for line in &rejected {
+        println!("unchecked {line}");
+    }
+    println!(
+        "{} files: {} checked, {} unchecked, {sites} {}",
+        files.len(),
+        files.len() - rejected.len(),
+        rejected.len(),
+        audit::LDS_BARRIER_FINDING
+    );
+    if sites != 0 || !rejected.is_empty() {
+        return Err(format!(
+            "lds-barrier audit failed: {sites} sites, {} unchecked modules",
+            rejected.len()
+        ));
+    }
     Ok(())
 }
 
 fn check_combined_waits(kernel: &serde_json::Value) -> Result<(), String> {
-    let Some(waits) = kernel["waits"].as_array() else { return Ok(()) };
+    let Some(waits) = kernel["waits"].as_array() else {
+        return Ok(());
+    };
     for wait in waits {
-        let Some(text) = wait["insn"].as_str() else { continue };
-        let Some(imm) = text.strip_prefix("s_wait_loadcnt_dscnt 0x") else { continue };
-        let encoded = u16::from_str_radix(imm, 16).map_err(|_| "invalid combined-wait proof immediate")?;
+        let Some(text) = wait["insn"].as_str() else {
+            continue;
+        };
+        let Some(imm) = text.strip_prefix("s_wait_loadcnt_dscnt 0x") else {
+            continue;
+        };
+        let encoded =
+            u16::from_str_radix(imm, 16).map_err(|_| "invalid combined-wait proof immediate")?;
         let (field, shift) = match wait["counter"].as_str() {
             Some("Load") => ("Load", 8),
             Some("Ds") => ("Ds", 0),
             _ => return Err("combined-wait proof has the wrong counter".into()),
         };
-        let count = wait["count"].as_u64().ok_or("combined-wait proof lacks count")?;
+        let count = wait["count"]
+            .as_u64()
+            .ok_or("combined-wait proof lacks count")?;
         if u64::from((encoded >> shift) & 0x3f) != count {
-            return Err(format!("combined-wait {field} field disagrees with the builder proof"));
+            return Err(format!(
+                "combined-wait {field} field disagrees with the builder proof"
+            ));
         }
-        let siblings = waits.iter().filter(|other| other["pc_index"] == wait["pc_index"]
-            && other["insn"] == wait["insn"]).count();
-        if siblings != 2 || !waits.iter().any(|other| other["pc_index"] == wait["pc_index"]
-            && other["insn"] == wait["insn"] && other["counter"] != wait["counter"]) {
-            return Err("combined-wait proof requires one Load and one Ds field".into())
+        let siblings = waits
+            .iter()
+            .filter(|other| other["pc_index"] == wait["pc_index"] && other["insn"] == wait["insn"])
+            .count();
+        if siblings != 2
+            || !waits.iter().any(|other| {
+                other["pc_index"] == wait["pc_index"]
+                    && other["insn"] == wait["insn"]
+                    && other["counter"] != wait["counter"]
+            })
+        {
+            return Err("combined-wait proof requires one Load and one Ds field".into());
         }
     }
     Ok(())
@@ -280,21 +427,34 @@ fn proof_binding(proof: &[u8], source: &[u8], arch: &str) -> Result<(String, Str
     let source_sha = format!("{:x}", Sha256::digest(source));
     if decoded["s_text_sha256"].as_str() != Some(source_sha.as_str())
         || decoded["arch"].as_str() != Some(arch)
-        || decoded["builder_crate_version"].as_str() != Some(env!("CARGO_PKG_VERSION")) {
-        return Err("builder proof does not bind the emitted source, architecture and crate version".into());
+        || decoded["builder_crate_version"].as_str() != Some(env!("CARGO_PKG_VERSION"))
+    {
+        return Err(
+            "builder proof does not bind the emitted source, architecture and crate version".into(),
+        );
     }
     if let Some(kernels) = decoded["kernels"].as_array() {
-        for kernel in kernels { check_combined_waits(kernel)?; }
+        for kernel in kernels {
+            check_combined_waits(kernel)?;
+        }
     } else {
         check_combined_waits(&decoded)?;
     }
-    let builder_sha = decoded["builder_git_sha"].as_str()
-        .filter(|sha| !sha.is_empty()).ok_or("builder proof has no git SHA")?;
-    Ok((format!("{:x}", Sha256::digest(proof)), builder_sha.to_owned()))
+    let builder_sha = decoded["builder_git_sha"]
+        .as_str()
+        .filter(|sha| !sha.is_empty())
+        .ok_or("builder proof has no git SHA")?;
+    Ok((
+        format!("{:x}", Sha256::digest(proof)),
+        builder_sha.to_owned(),
+    ))
 }
 
 fn main() {
-    if let Err(error) = run() { eprintln!("{error}"); std::process::exit(1); }
+    if let Err(error) = run() {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
@@ -332,7 +492,9 @@ mod tests {
         assert!(proof_binding(&serde_json::to_vec(&base).unwrap(), source, "gfx1201").is_ok());
         let mut duplicate = base.clone();
         duplicate["waits"][1] = duplicate["waits"][0].clone();
-        assert!(proof_binding(&serde_json::to_vec(&duplicate).unwrap(), source, "gfx1201").is_err());
+        assert!(
+            proof_binding(&serde_json::to_vec(&duplicate).unwrap(), source, "gfx1201").is_err()
+        );
         let mut swapped = base;
         swapped["waits"][0]["count"] = serde_json::json!(3);
         swapped["waits"][1]["count"] = serde_json::json!(7);

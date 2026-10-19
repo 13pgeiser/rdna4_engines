@@ -304,8 +304,12 @@ mod tests {
         let fn_xts = "/models/qwen3.8-flash-next-gptq3.mq4";
         assert!(redline_with_ep("gfx1201", "qwen4", fn_xts, 1, 1, 1, false));
         for ep in [2, 4] {
-            assert!(!redline_with_ep("gfx1201", "qwen4", fn_xts, 1, 1, ep, false));
-            assert!(!redline_with_ep("gfx1201", "qwen3_5", fn_xts, 1, 1, ep, false));
+            assert!(!redline_with_ep(
+                "gfx1201", "qwen4", fn_xts, 1, 1, ep, false
+            ));
+            assert!(!redline_with_ep(
+                "gfx1201", "qwen3_5", fn_xts, 1, 1, ep, false
+            ));
             assert!(!redline_with_ep(
                 "gfx1201",
                 "qwen4",
@@ -625,14 +629,24 @@ mod tests {
     #[test]
     fn qwen4_redline_default_requires_gfx1201_single_gpu_without_mtp() {
         let fn_xts = "/models/qwen3.8-flash-next-gptq3.mq4";
-        assert!(retained_redline_default("gfx1201", "qwen4", fn_xts, 1, 1, false));
+        assert!(retained_redline_default(
+            "gfx1201", "qwen4", fn_xts, 1, 1, false
+        ));
         // The native MTP head is a drafter: an MTP load keeps its spec path.
-        assert!(!retained_redline_default("gfx1201", "qwen4", fn_xts, 1, 1, true));
-        assert!(!retained_redline_default("gfx1201", "qwen4", fn_xts, 2, 1, false));
-        assert!(!retained_redline_default("gfx1201", "qwen4", fn_xts, 1, 2, false));
+        assert!(!retained_redline_default(
+            "gfx1201", "qwen4", fn_xts, 1, 1, true
+        ));
+        assert!(!retained_redline_default(
+            "gfx1201", "qwen4", fn_xts, 2, 1, false
+        ));
+        assert!(!retained_redline_default(
+            "gfx1201", "qwen4", fn_xts, 1, 2, false
+        ));
         // A plain `.mq4` Flash-Next stays on HIP off gfx1201.
         for gpu_arch in ["gfx1100", "gfx1151", "gfx1200"] {
-            assert!(!retained_redline_default(gpu_arch, "qwen4", fn_xts, 1, 1, false));
+            assert!(!retained_redline_default(
+                gpu_arch, "qwen4", fn_xts, 1, 1, false
+            ));
         }
     }
 
@@ -649,7 +663,11 @@ mod tests {
             OffloadBudget::Auto,
             OffloadBudget::Layers(4),
         ] {
-            assert!(!cpu_offload_configured_from(OffloadExec::Pcie, budget, budget));
+            assert!(!cpu_offload_configured_from(
+                OffloadExec::Pcie,
+                budget,
+                budget
+            ));
         }
         // CPU with both tiers unset is not configured on any model.
         assert!(!cpu_offload_configured_from(
@@ -674,7 +692,11 @@ mod tests {
         ] {
             assert!(cpu_offload_configured_from(OffloadExec::Cpu, layer, expert));
             // `passback` runs the CPU arm of a spilled step, so it counts too.
-            assert!(cpu_offload_configured_from(OffloadExec::Passback, layer, expert));
+            assert!(cpu_offload_configured_from(
+                OffloadExec::Passback,
+                layer,
+                expert
+            ));
         }
     }
 }

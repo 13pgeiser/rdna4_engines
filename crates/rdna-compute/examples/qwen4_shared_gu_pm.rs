@@ -63,7 +63,11 @@ fn f16_to_f32(h: u16) -> f32 {
     half_to_f32(h)
 }
 fn half_to_f32(h: u16) -> f32 {
-    let (s, e, m) = (u32::from(h >> 15), u32::from((h >> 10) & 31), u32::from(h & 1023));
+    let (s, e, m) = (
+        u32::from(h >> 15),
+        u32::from((h >> 10) & 31),
+        u32::from(h & 1023),
+    );
     let bits = if e == 0 {
         if m == 0 {
             s << 31
@@ -86,7 +90,12 @@ fn bf16_exact(f: f32) -> u16 {
 /// Default operand: finite F16-range value, sign-varying, ~1/64 each +0 / -0 / subnormal-sized, exponent field 9..15.
 fn gen_half(idx: u64, seed: u64) -> u16 {
     let h = mix64(idx.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ seed);
-    let (cat, sign, mant, ex) = ((h & 63) as u32, ((h >> 6) & 1) as u32, ((h >> 7) & 0x3ff) as u32, 9 + ((h >> 17) % 7) as u32);
+    let (cat, sign, mant, ex) = (
+        (h & 63) as u32,
+        ((h >> 6) & 1) as u32,
+        ((h >> 7) & 0x3ff) as u32,
+        9 + ((h >> 17) % 7) as u32,
+    );
     match cat {
         0 => 0x0000,
         1 => 0x8000,
@@ -98,7 +107,12 @@ fn gen_half(idx: u64, seed: u64) -> u16 {
 /// Stress X: exponent field 1..30, +-0, subnormals, rare +-Inf and NaN (random payload / sign).
 fn gen_x_stress(idx: u64, seed: u64) -> u16 {
     let h = mix64(idx.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ seed);
-    let (cat, sign, mant, special) = ((h & 63) as u32, ((h >> 6) & 1) as u32, ((h >> 7) & 0x3ff) as u32, ((h >> 17) & 2047) as u32);
+    let (cat, sign, mant, special) = (
+        (h & 63) as u32,
+        ((h >> 6) & 1) as u32,
+        ((h >> 7) & 0x3ff) as u32,
+        ((h >> 17) & 2047) as u32,
+    );
     if special == 0 {
         return ((sign << 15) | 0x7c00) as u16;
     }
@@ -119,7 +133,11 @@ fn gen_w_stress(row: u64, k: u64, kk: u64, seed: u64, which: u32) -> u16 {
     let rh = mix64(row.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ seed);
     let rc = (rh & 7) as u32;
     let h = mix64((row * kk + k).wrapping_mul(0x2545_F491_4F6C_DD1D) ^ seed ^ 0xABCD);
-    let (sign, mant, cat) = (((h >> 6) & 1) as u32, ((h >> 7) & 0x3ff) as u32, (h & 63) as u32);
+    let (sign, mant, cat) = (
+        ((h >> 6) & 1) as u32,
+        ((h >> 7) & 0x3ff) as u32,
+        (h & 63) as u32,
+    );
     {
         let pk = (rh >> 20) % kk;
         let payload = 1 + ((rh >> 44) % 1023) as u32;
@@ -167,7 +185,11 @@ fn gen_w_stress(row: u64, k: u64, kk: u64, seed: u64, which: u32) -> u16 {
 /// Pre-sigmoid selector scalars (F32 bits): +-0, BF16 ties, F32 subnormals, (stress) +-Inf / NaN payloads / huge, else finite.
 fn gen_selector(idx: u64, seed: u64, stress: bool) -> u32 {
     let h = mix64(idx.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ seed);
-    let (cat, sign, r16) = ((h & 15) as u32, ((h >> 4) & 1) as u32, ((h >> 8) & 0xffff) as u32);
+    let (cat, sign, r16) = (
+        (h & 15) as u32,
+        ((h >> 4) & 1) as u32,
+        ((h >> 8) & 0xffff) as u32,
+    );
     match cat {
         0 => return 0,
         1 => return 0x8000_0000,
@@ -205,12 +227,17 @@ impl Guarded {
         let elem = dtype.size();
         let total = elems + 2 * GUARD / elem;
         let store = gpu.alloc_tensor(&[total], dtype)?;
-        let mut g = Self { store, elem, payload_elems: elems };
+        let mut g = Self {
+            store,
+            elem,
+            payload_elems: elems,
+        };
         g.poison(gpu)?;
         Ok(g)
     }
     fn poison(&mut self, gpu: &Gpu) -> Res<()> {
-        gpu.hip.memset(&self.store.buf, i32::from(POISON), self.store.byte_size())?;
+        gpu.hip
+            .memset(&self.store.buf, i32::from(POISON), self.store.byte_size())?;
         Ok(())
     }
     fn view(&self) -> GpuTensor {
@@ -264,7 +291,11 @@ fn locate(first: Option<usize>, payload_bytes: usize, elem: usize, cols: usize) 
         format!("guard_hi+{}", f - GUARD - payload_bytes)
     } else {
         let w = (f - GUARD) / elem;
-        if cols > 0 { format!("out[n={},c={}]", w / cols, w % cols) } else { format!("out[n={w}]") }
+        if cols > 0 {
+            format!("out[n={},c={}]", w / cols, w % cols)
+        } else {
+            format!("out[n={w}]")
+        }
     }
 }
 
@@ -277,30 +308,56 @@ struct Case {
 }
 
 /// One case: returns `(json, all_bytes_equal)`.
-fn run_case(gpu: &mut Gpu, c: &Case, seed: u64, reps: usize, keep: &mut Vec<GpuTensor>) -> Res<(Value, bool)> {
+fn run_case(
+    gpu: &mut Gpu,
+    c: &Case,
+    seed: u64,
+    reps: usize,
+    keep: &mut Vec<GpuTensor>,
+) -> Res<(Value, bool)> {
     let (n, k, i) = (c.n, c.k, c.i);
     assert!(rdna_compute::gemm::qwen4_shared_gu_pm_shape(i, k, n));
     // ---- operands: BF16 weights `[I, K]` (their F16 shadows are what the GEMMs read), F32 X `[N, K]`, selector.
-    let (mut wg, mut wu, mut x) = (Vec::with_capacity(i * k * 2), Vec::with_capacity(i * k * 2), Vec::with_capacity(n * k));
+    let (mut wg, mut wu, mut x) = (
+        Vec::with_capacity(i * k * 2),
+        Vec::with_capacity(i * k * 2),
+        Vec::with_capacity(n * k),
+    );
     for r in 0..i as u64 {
         for kk in 0..k as u64 {
             let (g, u) = if c.stress {
-                (gen_w_stress(r, kk, k as u64, seed ^ 0x57A11, 0), gen_w_stress(r, kk, k as u64, seed ^ 0x0BEEF, 1))
+                (
+                    gen_w_stress(r, kk, k as u64, seed ^ 0x57A11, 0),
+                    gen_w_stress(r, kk, k as u64, seed ^ 0x0BEEF, 1),
+                )
             } else {
-                (gen_half(r * k as u64 + kk, seed ^ 0x57A11), gen_half(r * k as u64 + kk, seed ^ 0x0BEEF))
+                (
+                    gen_half(r * k as u64 + kk, seed ^ 0x57A11),
+                    gen_half(r * k as u64 + kk, seed ^ 0x0BEEF),
+                )
             };
             wg.extend(bf16_exact(f16_to_f32(g)).to_le_bytes());
             wu.extend(bf16_exact(f16_to_f32(u)).to_le_bytes());
         }
     }
     for e in 0..(n * k) as u64 {
-        let h = if c.stress { gen_x_stress(e, seed ^ 0xC0FFEE) } else { gen_half(e, seed ^ 0xC0FFEE) };
+        let h = if c.stress {
+            gen_x_stress(e, seed ^ 0xC0FFEE)
+        } else {
+            gen_half(e, seed ^ 0xC0FFEE)
+        };
         // Half the values keep a non-F16 mantissa (the conversion rounds), the rest are exact F16.
         let f = f16_to_f32(h);
-        let f = if mix64(e ^ seed) & 1 == 1 && f.is_finite() { f32::from_bits(f.to_bits() ^ ((mix64(e) as u32) & 0x1fff)) } else { f };
+        let f = if mix64(e ^ seed) & 1 == 1 && f.is_finite() {
+            f32::from_bits(f.to_bits() ^ ((mix64(e) as u32) & 0x1fff))
+        } else {
+            f
+        };
         x.push(f);
     }
-    let sel_src: Vec<u8> = (0..n as u64).flat_map(|t| gen_selector(t, seed ^ 0x5E1, c.stress).to_le_bytes()).collect();
+    let sel_src: Vec<u8> = (0..n as u64)
+        .flat_map(|t| gen_selector(t, seed ^ 0x5E1, c.stress).to_le_bytes())
+        .collect();
     let w_gate = upload_dtype(gpu, &wg, DType::BF16, i * k)?;
     let w_up = upload_dtype(gpu, &wu, DType::BF16, i * k)?;
     let x32 = gpu.upload_f32(&x, &[n * k])?;
@@ -313,8 +370,12 @@ fn run_case(gpu: &mut Gpu, c: &Case, seed: u64, reps: usize, keep: &mut Vec<GpuT
     let up_out = gpu.zeros(&[n * i], DType::F32)?;
     let hid32 = gpu.zeros(&[n * i], DType::F32)?;
     let sel_a = Guarded::new(gpu, DType::F32, n)?;
-    let hid_b: Vec<Guarded> = (0..2).map(|_| Guarded::new(gpu, DType::F16, n * i)).collect::<Res<_>>()?;
-    let sel_b: Vec<Guarded> = (0..2).map(|_| Guarded::new(gpu, DType::F32, n)).collect::<Res<_>>()?;
+    let hid_b: Vec<Guarded> = (0..2)
+        .map(|_| Guarded::new(gpu, DType::F16, n * i))
+        .collect::<Res<_>>()?;
+    let sel_b: Vec<Guarded> = (0..2)
+        .map(|_| Guarded::new(gpu, DType::F32, n))
+        .collect::<Res<_>>()?;
     let entries = [8u8, 4u8];
 
     let chain = |gpu: &mut Gpu| -> Res<GpuTensor> {
@@ -324,7 +385,17 @@ fn run_case(gpu: &mut Gpu, c: &Case, seed: u64, reps: usize, keep: &mut Vec<GpuT
         Ok(gpu.qwen4_convert_f16_x(&hid32, n * i)?)
     };
     let fused = |gpu: &mut Gpu, e: usize| -> Res<()> {
-        gpu.qwen4_shared_gu_pm_launch(entries[e], &w_gate, &w_up, &x16, &hid_b[e].view(), &sel_b[e].view(), i, k, n)?;
+        gpu.qwen4_shared_gu_pm_launch(
+            entries[e],
+            &w_gate,
+            &w_up,
+            &x16,
+            &hid_b[e].view(),
+            &sel_b[e].view(),
+            i,
+            k,
+            n,
+        )?;
         Ok(())
     };
 
@@ -349,10 +420,18 @@ fn run_case(gpu: &mut Gpu, c: &Case, seed: u64, reps: usize, keep: &mut Vec<GpuT
         let sel_payload = &got_sel[GUARD..GUARD + n * 4];
         let ref_sel_payload = &ref_sel[GUARD..GUARD + n * 4];
         let (sd, sf) = first_diff(sel_payload, ref_sel_payload);
-        let guards = |b: &[u8], payload: usize| b[..GUARD].iter().chain(&b[GUARD + payload..]).all(|&x| x == POISON);
+        let guards = |b: &[u8], payload: usize| {
+            b[..GUARD]
+                .iter()
+                .chain(&b[GUARD + payload..])
+                .all(|&x| x == POISON)
+        };
         let guards_ok = guards(&got_hid, n * i * 2) && guards(&got_sel, n * 4);
         let a_guards_ok = guards(&ref_sel, n * 4);
-        let poison_left = hid_payload.chunks_exact(2).filter(|c| c[0] == POISON && c[1] == POISON).count();
+        let poison_left = hid_payload
+            .chunks_exact(2)
+            .filter(|c| c[0] == POISON && c[1] == POISON)
+            .count();
         let equal = hd == 0 && sd == 0 && guards_ok && a_guards_ok;
         all_equal &= equal;
         results.push(json!({
@@ -364,29 +443,57 @@ fn run_case(gpu: &mut Gpu, c: &Case, seed: u64, reps: usize, keep: &mut Vec<GpuT
         }));
     }
     // ---- coverage of what A exercised
-    let (mut g_nonfinite, mut g_ties, mut u_nonfinite, mut u_ties) = (0usize, 0usize, 0usize, 0usize);
+    let (mut g_nonfinite, mut g_ties, mut u_nonfinite, mut u_ties) =
+        (0usize, 0usize, 0usize, 0usize);
     for (g, u) in gate_ref.iter().zip(&up_ref) {
         let (gb, ub) = (g.to_bits(), u.to_bits());
-        if (gb >> 23) & 0xff == 0xff { g_nonfinite += 1 } else if gb & 0xffff == 0x8000 { g_ties += 1 }
-        if (ub >> 23) & 0xff == 0xff { u_nonfinite += 1 } else if ub & 0xffff == 0x8000 { u_ties += 1 }
+        if (gb >> 23) & 0xff == 0xff {
+            g_nonfinite += 1
+        } else if gb & 0xffff == 0x8000 {
+            g_ties += 1
+        }
+        if (ub >> 23) & 0xff == 0xff {
+            u_nonfinite += 1
+        } else if ub & 0xffff == 0x8000 {
+            u_ties += 1
+        }
     }
     let (mut h_nan, mut h_inf, mut h_sub, mut h_negzero) = (0usize, 0usize, 0usize, 0usize);
     for c in ref_hid.chunks_exact(2) {
         let b = u16::from_le_bytes([c[0], c[1]]);
         let (ex, m) = ((b >> 10) & 31, b & 1023);
-        if ex == 31 && m != 0 { h_nan += 1 } else if ex == 31 { h_inf += 1 } else if ex == 0 && m != 0 { h_sub += 1 } else if b == 0x8000 { h_negzero += 1 }
+        if ex == 31 && m != 0 {
+            h_nan += 1
+        } else if ex == 31 {
+            h_inf += 1
+        } else if ex == 0 && m != 0 {
+            h_sub += 1
+        } else if b == 0x8000 {
+            h_negzero += 1
+        }
     }
-    let sel_nan = ref_sel[GUARD..GUARD + n * 4].chunks_exact(4).filter(|c| {
-        let b = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-        (b >> 23) & 0xff == 0xff && b & 0x7f_ffff != 0
-    }).count();
+    let sel_nan = ref_sel[GUARD..GUARD + n * 4]
+        .chunks_exact(4)
+        .filter(|c| {
+            let b = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            (b >> 23) & 0xff == 0xff && b & 0x7f_ffff != 0
+        })
+        .count();
 
     // ---- timing: WARM warm launches per arm, then `reps` timed, interleaved A, B(w8), B(w4), A, ...
     let ev = (gpu.hip.event_create()?, gpu.hip.event_create()?);
     let mut time = |gpu: &mut Gpu, which: usize| -> Res<f32> {
-        if which == 0 { sel_a.restore(gpu, &sel_src)? } else { sel_b[which - 1].restore(gpu, &sel_src)? }
+        if which == 0 {
+            sel_a.restore(gpu, &sel_src)?
+        } else {
+            sel_b[which - 1].restore(gpu, &sel_src)?
+        }
         gpu.hip.event_record(&ev.0, None)?;
-        if which == 0 { chain(gpu)?; } else { fused(gpu, which - 1)?; }
+        if which == 0 {
+            chain(gpu)?;
+        } else {
+            fused(gpu, which - 1)?;
+        }
         gpu.hip.event_record(&ev.1, None)?;
         gpu.hip.event_synchronize(&ev.1)?;
         Ok(gpu.hip.event_elapsed_ms(&ev.0, &ev.1)?)
@@ -409,8 +516,10 @@ fn run_case(gpu: &mut Gpu, c: &Case, seed: u64, reps: usize, keep: &mut Vec<GpuT
     let mut post = Vec::new();
     for e in 0..2 {
         let (gh, gs) = (hid_b[e].fetch(gpu)?, sel_b[e].fetch(gpu)?);
-        let ok = gh[GUARD..GUARD + n * i * 2] == ref_hid[..] && gs[GUARD..GUARD + n * 4] == ref_sel[GUARD..GUARD + n * 4]
-            && gh[..GUARD].iter().all(|&b| b == POISON) && gh[GUARD + n * i * 2..].iter().all(|&b| b == POISON);
+        let ok = gh[GUARD..GUARD + n * i * 2] == ref_hid[..]
+            && gs[GUARD..GUARD + n * 4] == ref_sel[GUARD..GUARD + n * 4]
+            && gh[..GUARD].iter().all(|&b| b == POISON)
+            && gh[GUARD + n * i * 2..].iter().all(|&b| b == POISON);
         post_equal &= ok;
         post.push(ok);
     }
@@ -427,12 +536,18 @@ fn run_case(gpu: &mut Gpu, c: &Case, seed: u64, reps: usize, keep: &mut Vec<GpuT
     let down_applies = gpu.gemm_bf16_xf32_f16_wmma_qwen4_hcsd_applies(&w_down, MD, i, n);
     let mut down_equal = Value::Null;
     if down_applies {
-        let (out_a, out_b) = (gpu.zeros(&[n * MD], DType::BF16)?, gpu.zeros(&[n * MD], DType::BF16)?);
+        let (out_a, out_b) = (
+            gpu.zeros(&[n * MD], DType::BF16)?,
+            gpu.zeros(&[n * MD], DType::BF16)?,
+        );
         gpu.gemm_bf16_xf32_f16_wmma_qwen4_bf16st(&w_down, &hid32, MD, i, n, &out_a)?;
         let hid_view = hid_b[0].view();
         gpu.gemm_bf16_xf32_f16_wmma_qwen4_bf16st(&w_down, &hid_view, MD, i, n, &out_b)?;
         gpu.hip.device_synchronize()?;
-        let (ba, bb) = (gpu.download_raw_bytes(&out_a)?, gpu.download_raw_bytes(&out_b)?);
+        let (ba, bb) = (
+            gpu.download_raw_bytes(&out_a)?,
+            gpu.download_raw_bytes(&out_b)?,
+        );
         let equal = ba == bb;
         all_equal &= equal;
         down_equal = json!(equal);
@@ -468,7 +583,11 @@ fn run_case(gpu: &mut Gpu, c: &Case, seed: u64, reps: usize, keep: &mut Vec<GpuT
 }
 
 fn arg(args: &[String], k: &str, d: &str) -> String {
-    args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned().unwrap_or_else(|| d.to_string())
+    args.iter()
+        .position(|a| a == k)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| d.to_string())
 }
 
 fn main() {
@@ -477,7 +596,9 @@ fn main() {
     let seed: u64 = match arg(&args, "--seed", "1").parse() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("--seed: {e}\nusage: qwen4_shared_gu_pm [--cases a,b,c] [--seed N] [--reps N]");
+            eprintln!(
+                "--seed: {e}\nusage: qwen4_shared_gu_pm [--cases a,b,c] [--seed N] [--reps N]"
+            );
             std::process::exit(2);
         }
     };
@@ -491,7 +612,10 @@ fn main() {
         }
     };
     if gpu.arch != "gfx1151" {
-        println!("{}", json!({"event": "skip", "reason": format!("device is {}, the fused shared gate/up module is gfx1151-only", gpu.arch)}));
+        println!(
+            "{}",
+            json!({"event": "skip", "reason": format!("device is {}, the fused shared gate/up module is gfx1151-only", gpu.arch)})
+        );
         println!("OVERALL FAIL");
         std::process::exit(3);
     }
@@ -500,11 +624,29 @@ fn main() {
     let mut list: Vec<Case> = Vec::new();
     for tag in cases.split(',').filter(|t| !t.is_empty()) {
         match tag {
-            "a" => list.push(Case { name: "a_flash_next", n: 8192, k: 2560, i: 640, stress: false }),
-            "b" => list.push(Case { name: "b_small_stress", n: 520, k: 256, i: 192, stress: true }),
+            "a" => list.push(Case {
+                name: "a_flash_next",
+                n: 8192,
+                k: 2560,
+                i: 640,
+                stress: false,
+            }),
+            "b" => list.push(Case {
+                name: "b_small_stress",
+                n: 520,
+                k: 256,
+                i: 192,
+                stress: true,
+            }),
             "c" => {
                 for (name, n) in [("c_n1", 1), ("c_n7", 7), ("c_n129", 129), ("c_n513", 513)] {
-                    list.push(Case { name, n, k: 2560, i: 640, stress: false });
+                    list.push(Case {
+                        name,
+                        n,
+                        k: 2560,
+                        i: 640,
+                        stress: false,
+                    });
                 }
             }
             other => {
@@ -527,7 +669,10 @@ fn main() {
             }
             Err(e) => {
                 ok = false;
-                println!("{}", json!({"case": c.name, "error": e.to_string(), "bytes_equal": false}));
+                println!(
+                    "{}",
+                    json!({"case": c.name, "error": e.to_string(), "bytes_equal": false})
+                );
             }
         }
     }

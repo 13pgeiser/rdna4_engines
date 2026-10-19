@@ -65,16 +65,24 @@ pub struct Reading<T> {
 
 impl<T> Reading<T> {
     pub fn known(value: T) -> Self {
-        Self { value: Some(value), reason: None }
+        Self {
+            value: Some(value),
+            reason: None,
+        }
     }
 
     pub fn unknown(reason: impl Into<String>) -> Self {
-        Self { value: None, reason: Some(reason.into()) }
+        Self {
+            value: None,
+            reason: Some(reason.into()),
+        }
     }
 
     fn check(&self, field: &str) -> Result<(), ModelError> {
         if self.value.is_none() && self.reason.as_deref().map_or(true, |r| r.trim().is_empty()) {
-            return Err(ModelError::MissingReason { field: field.to_string() });
+            return Err(ModelError::MissingReason {
+                field: field.to_string(),
+            });
         }
         Ok(())
     }
@@ -147,8 +155,11 @@ impl RunIdentity {
         self.telemetry.sclk_mhz.check("telemetry.sclk_mhz")?;
         self.telemetry.mclk_mhz.check("telemetry.mclk_mhz")?;
         self.telemetry.power_w.check("telemetry.power_w")?;
-        self.telemetry.temperature_c.check("telemetry.temperature_c")?;
-        self.calibration_receipt_digest.check("calibration_receipt_digest")?;
+        self.telemetry
+            .temperature_c
+            .check("telemetry.temperature_c")?;
+        self.calibration_receipt_digest
+            .check("calibration_receipt_digest")?;
         if self.physical_cus == 0 {
             return Err(ModelError::InvalidIdentity {
                 field: "physical_cus".into(),
@@ -174,19 +185,64 @@ impl RunIdentity {
                 out.push(format!("{name}: {a:?} != {b:?}"));
             }
         }
-        diff(&mut out, "source_revision", &self.source_revision, &other.source_revision);
-        diff(&mut out, "source_dirty_note", &self.source_dirty_note, &other.source_dirty_note);
+        diff(
+            &mut out,
+            "source_revision",
+            &self.source_revision,
+            &other.source_revision,
+        );
+        diff(
+            &mut out,
+            "source_dirty_note",
+            &self.source_dirty_note,
+            &other.source_dirty_note,
+        );
         diff(&mut out, "binary_md5", &self.binary_md5, &other.binary_md5);
         diff(&mut out, "model_md5", &self.model_md5, &other.model_md5);
-        diff(&mut out, "sidecar_md5", &self.sidecar_md5, &other.sidecar_md5);
+        diff(
+            &mut out,
+            "sidecar_md5",
+            &self.sidecar_md5,
+            &other.sidecar_md5,
+        );
         diff(&mut out, "prompt_md5", &self.prompt_md5, &other.prompt_md5);
-        diff(&mut out, "token_digest", &self.token_digest, &other.token_digest);
+        diff(
+            &mut out,
+            "token_digest",
+            &self.token_digest,
+            &other.token_digest,
+        );
         diff(&mut out, "pci_bdf", &self.pci_bdf, &other.pci_bdf);
-        diff(&mut out, "physical_gfx", &self.physical_gfx, &other.physical_gfx);
-        diff(&mut out, "physical_cus", &self.physical_cus, &other.physical_cus);
-        diff(&mut out, "hip_mp_count", &self.hip_mp_count, &other.hip_mp_count);
-        diff(&mut out, "rocm_version", &self.rocm_version, &other.rocm_version);
-        diff(&mut out, "driver_version", &self.driver_version, &other.driver_version);
+        diff(
+            &mut out,
+            "physical_gfx",
+            &self.physical_gfx,
+            &other.physical_gfx,
+        );
+        diff(
+            &mut out,
+            "physical_cus",
+            &self.physical_cus,
+            &other.physical_cus,
+        );
+        diff(
+            &mut out,
+            "hip_mp_count",
+            &self.hip_mp_count,
+            &other.hip_mp_count,
+        );
+        diff(
+            &mut out,
+            "rocm_version",
+            &self.rocm_version,
+            &other.rocm_version,
+        );
+        diff(
+            &mut out,
+            "driver_version",
+            &self.driver_version,
+            &other.driver_version,
+        );
         diff(&mut out, "emu_id", &self.emu_id, &other.emu_id);
         diff(&mut out, "emu_limits", &self.emu_limits, &other.emu_limits);
         diff(&mut out, "route", &self.route, &other.route);
@@ -294,7 +350,10 @@ fn check_rates(side: &str, rates: &ResourceRates) -> Result<(), ModelError> {
     ] {
         if let Some(v) = v {
             if !(v.is_finite() && v > 0.0) {
-                return Err(ModelError::InvalidRate { name: format!("{side}.{field}"), value: v });
+                return Err(ModelError::InvalidRate {
+                    name: format!("{side}.{field}"),
+                    value: v,
+                });
             }
         }
     }
@@ -391,7 +450,9 @@ pub fn estimate(input: &DeratingInput) -> Result<DeratingEstimate, ModelError> {
             let id_digest = input.identity.calibration_receipt_digest.value.as_deref();
             let id_conflict = matches!(id_digest, Some(d) if d != receipt_digest);
             if !digest_ok {
-                reasons.push("target_rates_source MeasuredOnTarget has an empty receipt_digest".into());
+                reasons.push(
+                    "target_rates_source MeasuredOnTarget has an empty receipt_digest".into(),
+                );
             }
             if id_conflict {
                 reasons.push(format!(
@@ -453,10 +514,13 @@ pub fn estimate(input: &DeratingInput) -> Result<DeratingEstimate, ModelError> {
                 detail: format!("calls == 0 but total_ns == {}", k.total_ns),
             });
         }
-        sum_ns = sum_ns.checked_add(k.total_ns).ok_or_else(|| overflow("sum of kernel total_ns"))?;
+        sum_ns = sum_ns
+            .checked_add(k.total_ns)
+            .ok_or_else(|| overflow("sum of kernel total_ns"))?;
         if !is_classified(k, basis) {
-            unclass_ns =
-                unclass_ns.checked_add(k.total_ns).ok_or_else(|| overflow("sum of unclassified total_ns"))?;
+            unclass_ns = unclass_ns
+                .checked_add(k.total_ns)
+                .ok_or_else(|| overflow("sum of unclassified total_ns"))?;
         }
     }
     let covered = input
@@ -493,7 +557,9 @@ pub fn estimate(input: &DeratingInput) -> Result<DeratingEstimate, ModelError> {
             note: String::new(),
         };
         if !is_classified(k, basis) {
-            b.note = "unclassified (byte_basis unknown or a traffic field missing); carried unscaled".into();
+            b.note =
+                "unclassified (byte_basis unknown or a traffic field missing); carried unscaled"
+                    .into();
             b.estimated_ns = Some(t as f64);
             sum_fixed_known += t as f64;
             buckets.push(b);
@@ -554,7 +620,9 @@ pub fn estimate(input: &DeratingInput) -> Result<DeratingEstimate, ModelError> {
             None => {
                 let tp0 = finite(t as f64 * ratio, "t' (l = 0)")?;
                 b.estimated_ns = Some(tp0);
-                b.note = "fixed_ns unknown; estimated_ns uses l = 0 (sensitivity: l = t gives t' = t)".into();
+                b.note =
+                    "fixed_ns unknown; estimated_ns uses l = 0 (sensitivity: l = t gives t' = t)"
+                        .into();
                 sum_l0 += tp0;
                 sum_lt += t as f64;
                 unknown_fixed_kernels += 1;
@@ -567,7 +635,9 @@ pub fn estimate(input: &DeratingInput) -> Result<DeratingEstimate, ModelError> {
     }
 
     for m in &missing {
-        reasons.push(format!("{m} is absent but kernels have nonzero traffic in that class"));
+        reasons.push(format!(
+            "{m} is absent but kernels have nonzero traffic in that class"
+        ));
     }
     // Coverage / classification gates (integer-exact comparison).
     if (cov_diff as u128) * 100 > (measured as u128) * COVERAGE_TOLERANCE_PERCENT {
@@ -609,7 +679,9 @@ pub fn estimate(input: &DeratingInput) -> Result<DeratingEstimate, ModelError> {
                         .into(),
                 );
             } else {
-                assumptions.push("scalar estimate uses l = 0 (full scaling of the unknown-fixed kernels)".into());
+                assumptions.push(
+                    "scalar estimate uses l = 0 (full scaling of the unknown-fixed kernels)".into(),
+                );
             }
         }
         estimated = Some(central);
@@ -662,7 +734,9 @@ pub fn spec_ratio_rates(
 
     // Bandwidth ratio.
     let bw_ratio = if host_peak_bw == 0 {
-        notes.push("[INFERENCE] host peak bandwidth is 0; target bandwidth rates unavailable".into());
+        notes.push(
+            "[INFERENCE] host peak bandwidth is 0; target bandwidth rates unavailable".into(),
+        );
         None
     } else {
         let r = target.peak_bw_bytes_s as f64 / host_peak_bw as f64;
@@ -675,7 +749,9 @@ pub fn spec_ratio_rates(
     };
     let scale_bw = |v: Option<f64>, label: &str, notes: &mut Vec<String>| -> Option<f64> {
         let (Some(v), Some(r)) = (valid(v), bw_ratio) else {
-            notes.push(format!("[INFERENCE] target {label} unavailable (host rate or bandwidth ratio missing)"));
+            notes.push(format!(
+                "[INFERENCE] target {label} unavailable (host rate or bandwidth ratio missing)"
+            ));
             return None;
         };
         let out = v * r;
@@ -701,13 +777,16 @@ pub fn spec_ratio_rates(
             None
         }
         (Some(_), None) => {
-            notes.push("[INFERENCE] target compute_ops_s unavailable: host compute rate missing".into());
+            notes.push(
+                "[INFERENCE] target compute_ops_s unavailable: host compute rate missing".into(),
+            );
             None
         }
         (Some(tc), Some(c_h)) => {
             if host_cus == 0 || host_clock_mhz == 0 || tc == 0 || target.target_cus == 0 {
                 notes.push(
-                    "[INFERENCE] target compute_ops_s unavailable: CU count or clock is zero".into(),
+                    "[INFERENCE] target compute_ops_s unavailable: CU count or clock is zero"
+                        .into(),
                 );
                 None
             } else {
@@ -723,7 +802,9 @@ pub fn spec_ratio_rates(
                     ));
                     Some(out)
                 } else {
-                    notes.push("[INFERENCE] target compute_ops_s unavailable: non-finite result".into());
+                    notes.push(
+                        "[INFERENCE] target compute_ops_s unavailable: non-finite result".into(),
+                    );
                     None
                 }
             }
@@ -850,11 +931,35 @@ mod tests {
     fn three_kernels() -> Vec<KernelObservation> {
         vec![
             // K1 memory-bound.
-            kernel("k1_gemv", 2_000_000, Some(100_000), Some(1_000_000_000), Some(1_000_000_000), Some(0), "measured_dram"),
+            kernel(
+                "k1_gemv",
+                2_000_000,
+                Some(100_000),
+                Some(1_000_000_000),
+                Some(1_000_000_000),
+                Some(0),
+                "measured_dram",
+            ),
             // K2 compute-bound.
-            kernel("k2_gemm", 4_000_000, Some(0), Some(4_000_000_000), Some(500_000_000), Some(0), "measured_dram"),
+            kernel(
+                "k2_gemm",
+                4_000_000,
+                Some(0),
+                Some(4_000_000_000),
+                Some(500_000_000),
+                Some(0),
+                "measured_dram",
+            ),
             // K3 host-read-bound.
-            kernel("k3_expert", 4_000_000, Some(200_000), Some(100_000_000), Some(100_000_000), Some(200_000_000), "audited_streaming_proxy"),
+            kernel(
+                "k3_expert",
+                4_000_000,
+                Some(200_000),
+                Some(100_000_000),
+                Some(100_000_000),
+                Some(200_000_000),
+                "audited_streaming_proxy",
+            ),
         ]
     }
 
@@ -879,17 +984,29 @@ mod tests {
     #[test]
     fn three_kernel_hand_computed() {
         let est = estimate(&input(three_kernels(), 500_000, 10_500_000)).unwrap();
-        assert!(est.unavailable_reasons.is_empty(), "{:?}", est.unavailable_reasons);
+        assert!(
+            est.unavailable_reasons.is_empty(),
+            "{:?}",
+            est.unavailable_reasons
+        );
         assert_eq!(est.quality, EstimateQuality::TopologyScenario);
         let t = est.estimated_wall_ns.unwrap();
         assert!((t - 14_350_000.0).abs() < 1e-3, "{t}");
         assert_eq!(est.unclassified_time_fraction, 0.0);
         assert_eq!(est.coverage_error_fraction, Some(0.0));
-        let e: Vec<f64> = est.buckets.iter().map(|b| b.estimated_ns.unwrap()).collect();
+        let e: Vec<f64> = est
+            .buckets
+            .iter()
+            .map(|b| b.estimated_ns.unwrap())
+            .collect();
         for (got, want) in e.iter().zip([3_900_000.0, 5_000_000.0, 4_950_000.0]) {
             assert!((got - want).abs() < 1e-3, "{got} vs {want}");
         }
-        let lim: Vec<_> = est.buckets.iter().map(|b| b.host_limiter.clone().unwrap()).collect();
+        let lim: Vec<_> = est
+            .buckets
+            .iter()
+            .map(|b| b.host_limiter.clone().unwrap())
+            .collect();
         assert_eq!(lim, ["local_dram", "compute", "host_mapped"]);
         assert!(est.assumptions.iter().any(|a| a.contains("[INFERENCE]")));
     }
@@ -912,7 +1029,10 @@ mod tests {
         // serde_json (without `float_roundtrip`) may parse an f64 one ulp off;
         // compare the fractions with a tolerance and everything else exactly.
         let close = |a: f64, b: f64| (a - b).abs() <= 1e-12 * a.abs().max(1.0);
-        assert!(close(eb.unclassified_time_fraction, est.unclassified_time_fraction));
+        assert!(close(
+            eb.unclassified_time_fraction,
+            est.unclassified_time_fraction
+        ));
         assert_eq!(eb.buckets.len(), est.buckets.len());
         let mut eb_norm = eb.clone();
         for (b, e) in eb_norm.buckets.iter_mut().zip(&est.buckets) {
@@ -922,7 +1042,9 @@ mod tests {
         eb_norm.unclassified_time_fraction = est.unclassified_time_fraction;
         assert_eq!(eb_norm, est);
 
-        let src = RatesSource::MeasuredOnTarget { receipt_digest: "abc".into() };
+        let src = RatesSource::MeasuredOnTarget {
+            receipt_digest: "abc".into(),
+        };
         let ss = serde_json::to_string(&src).unwrap();
         assert_eq!(serde_json::from_str::<RatesSource>(&ss).unwrap(), src);
     }
@@ -933,15 +1055,24 @@ mod tests {
         inp.schema_version = 2;
         assert_eq!(
             estimate(&inp).unwrap_err(),
-            ModelError::SchemaVersion { found: 2, expected: SCHEMA_VERSION }
+            ModelError::SchemaVersion {
+                found: 2,
+                expected: SCHEMA_VERSION
+            }
         );
     }
 
     #[test]
     fn unknown_reading_without_reason_rejected() {
         let mut inp = input(three_kernels(), 500_000, 10_500_000);
-        inp.identity.model_md5 = Reading { value: None, reason: None };
-        assert!(matches!(estimate(&inp), Err(ModelError::MissingReason { .. })));
+        inp.identity.model_md5 = Reading {
+            value: None,
+            reason: None,
+        };
+        assert!(matches!(
+            estimate(&inp),
+            Err(ModelError::MissingReason { .. })
+        ));
     }
 
     #[test]
@@ -952,7 +1083,15 @@ mod tests {
 
         // Kernel-sum overflow.
         let ks = vec![
-            kernel("a", u64::MAX, None, Some(1), Some(1), Some(0), "measured_dram"),
+            kernel(
+                "a",
+                u64::MAX,
+                None,
+                Some(1),
+                Some(1),
+                Some(0),
+                "measured_dram",
+            ),
             kernel("b", 1, None, Some(1), Some(1), Some(0), "measured_dram"),
         ];
         assert!(matches!(
@@ -961,7 +1100,15 @@ mod tests {
         ));
 
         // unscaled + kernels overflow.
-        let ks = vec![kernel("a", u64::MAX, None, Some(1), Some(1), Some(0), "measured_dram")];
+        let ks = vec![kernel(
+            "a",
+            u64::MAX,
+            None,
+            Some(1),
+            Some(1),
+            Some(0),
+            "measured_dram",
+        )];
         assert!(matches!(
             estimate(&input(ks, 1, 1_000)),
             Err(ModelError::Overflow(_))
@@ -971,14 +1118,28 @@ mod tests {
         for bad in [0.0, f64::NAN, -1.0, f64::INFINITY] {
             let mut inp = input(three_kernels(), 500_000, 10_500_000);
             inp.host_rates.read_bytes_s = Some(bad);
-            assert!(matches!(estimate(&inp), Err(ModelError::InvalidRate { .. })), "{bad}");
+            assert!(
+                matches!(estimate(&inp), Err(ModelError::InvalidRate { .. })),
+                "{bad}"
+            );
         }
         let mut inp = input(three_kernels(), 500_000, 10_500_000);
         inp.target_rates.compute_ops_s = Some(0.0);
-        assert!(matches!(estimate(&inp), Err(ModelError::InvalidRate { .. })));
+        assert!(matches!(
+            estimate(&inp),
+            Err(ModelError::InvalidRate { .. })
+        ));
 
         // fixed_ns > total_ns.
-        let ks = vec![kernel("a", 10, Some(11), Some(1), Some(1), Some(0), "measured_dram")];
+        let ks = vec![kernel(
+            "a",
+            10,
+            Some(11),
+            Some(1),
+            Some(1),
+            Some(0),
+            "measured_dram",
+        )];
         assert!(matches!(
             estimate(&input(ks, 0, 10)),
             Err(ModelError::InconsistentKernel { .. })
@@ -1023,56 +1184,130 @@ mod tests {
         inp.host_rates.host_read_bytes_s = None;
         inp.target_rates.host_read_bytes_s = None;
         let est = estimate(&inp).unwrap();
-        assert!(est.unavailable_reasons.is_empty(), "{:?}", est.unavailable_reasons);
+        assert!(
+            est.unavailable_reasons.is_empty(),
+            "{:?}",
+            est.unavailable_reasons
+        );
         // 500_000 + 3_900_000 + 5_000_000
         assert!((est.estimated_wall_ns.unwrap() - 9_400_000.0).abs() < 1e-3);
     }
 
     #[test]
     fn coverage_tolerance_five_percent() {
-        let k = vec![kernel("a", 9_500_000, Some(0), Some(1), Some(1_000_000), Some(0), "measured_dram")];
+        let k = vec![kernel(
+            "a",
+            9_500_000,
+            Some(0),
+            Some(1),
+            Some(1_000_000),
+            Some(0),
+            "measured_dram",
+        )];
         // |10_000_000 - 9_500_000| / 10_000_000 = exactly 5% -> allowed.
         let est = estimate(&input(k.clone(), 0, 10_000_000)).unwrap();
-        assert!(est.unavailable_reasons.is_empty(), "{:?}", est.unavailable_reasons);
+        assert!(
+            est.unavailable_reasons.is_empty(),
+            "{:?}",
+            est.unavailable_reasons
+        );
         assert!(est.estimated_wall_ns.is_some());
         assert!((est.coverage_error_fraction.unwrap() - 0.05).abs() < 1e-12);
 
         // 9_499_999 -> just over 5% -> unavailable, diagnostics retained.
-        let k = vec![kernel("a", 9_499_999, Some(0), Some(1), Some(1_000_000), Some(0), "measured_dram")];
+        let k = vec![kernel(
+            "a",
+            9_499_999,
+            Some(0),
+            Some(1),
+            Some(1_000_000),
+            Some(0),
+            "measured_dram",
+        )];
         let est = estimate(&input(k, 0, 10_000_000)).unwrap();
         assert!(est.estimated_wall_ns.is_none());
-        assert!(est.unavailable_reasons.iter().any(|r| r.contains("coverage")));
+        assert!(est
+            .unavailable_reasons
+            .iter()
+            .any(|r| r.contains("coverage")));
         assert_eq!(est.buckets.len(), 1);
         assert!(est.buckets[0].estimated_ns.is_some());
 
         // Over-coverage (kernels + unscaled exceed wall by >5%) is also rejected.
-        let k = vec![kernel("a", 11_000_000, Some(0), Some(1), Some(1_000_000), Some(0), "measured_dram")];
+        let k = vec![kernel(
+            "a",
+            11_000_000,
+            Some(0),
+            Some(1),
+            Some(1_000_000),
+            Some(0),
+            "measured_dram",
+        )];
         let est = estimate(&input(k, 0, 10_000_000)).unwrap();
         assert!(est.estimated_wall_ns.is_none());
     }
 
     #[test]
     fn unclassified_tolerance_ten_percent() {
-        let classified = kernel("c", 9_000_000, Some(0), Some(1), Some(1_000_000), Some(0), "measured_dram");
+        let classified = kernel(
+            "c",
+            9_000_000,
+            Some(0),
+            Some(1),
+            Some(1_000_000),
+            Some(0),
+            "measured_dram",
+        );
         // Exactly 10% unclassified -> allowed, carried unscaled.
         let unk = kernel("u", 1_000_000, None, None, None, None, "unknown");
         let est = estimate(&input(vec![classified.clone(), unk], 0, 10_000_000)).unwrap();
-        assert!(est.unavailable_reasons.is_empty(), "{:?}", est.unavailable_reasons);
+        assert!(
+            est.unavailable_reasons.is_empty(),
+            "{:?}",
+            est.unavailable_reasons
+        );
         assert!((est.unclassified_time_fraction - 0.10).abs() < 1e-12);
         assert!(!est.buckets[1].classified);
         assert_eq!(est.buckets[1].estimated_ns, Some(1_000_000.0));
 
         // 11% -> unavailable.
-        let classified = kernel("c", 8_900_000, Some(0), Some(1), Some(1_000_000), Some(0), "measured_dram");
+        let classified = kernel(
+            "c",
+            8_900_000,
+            Some(0),
+            Some(1),
+            Some(1_000_000),
+            Some(0),
+            "measured_dram",
+        );
         let unk = kernel("u", 1_100_000, None, None, None, None, "unknown");
         let est = estimate(&input(vec![classified, unk], 0, 10_000_000)).unwrap();
         assert!(est.estimated_wall_ns.is_none());
-        assert!(est.unavailable_reasons.iter().any(|r| r.contains("unclassified")));
+        assert!(est
+            .unavailable_reasons
+            .iter()
+            .any(|r| r.contains("unclassified")));
         assert!((est.unclassified_time_fraction - 0.11).abs() < 1e-12);
 
         // A known basis with a missing traffic field is unclassified (unknown != zero).
-        let partial = kernel("p", 1_100_000, None, None, Some(5), Some(0), "measured_dram");
-        let classified = kernel("c", 8_900_000, Some(0), Some(1), Some(1_000_000), Some(0), "measured_dram");
+        let partial = kernel(
+            "p",
+            1_100_000,
+            None,
+            None,
+            Some(5),
+            Some(0),
+            "measured_dram",
+        );
+        let classified = kernel(
+            "c",
+            8_900_000,
+            Some(0),
+            Some(1),
+            Some(1_000_000),
+            Some(0),
+            "measured_dram",
+        );
         let est = estimate(&input(vec![classified, partial], 0, 10_000_000)).unwrap();
         assert!(est.estimated_wall_ns.is_none());
     }
@@ -1082,9 +1317,21 @@ mod tests {
         // Single memory-bound kernel (ratio 2), fixed unknown.
         // l = 0: t' = 2 * 8_000_000 = 16_000_000 ; l = t: t' = 8_000_000.
         // unscaled = 2_000_000 -> T' = 18_000_000 (l=0) or 10_000_000 (l=t).
-        let k = vec![kernel("a", 8_000_000, None, Some(1_000_000_000), Some(1_000_000_000), Some(0), "measured_dram")];
+        let k = vec![kernel(
+            "a",
+            8_000_000,
+            None,
+            Some(1_000_000_000),
+            Some(1_000_000_000),
+            Some(0),
+            "measured_dram",
+        )];
         let est = estimate(&input(k, 2_000_000, 10_000_000)).unwrap();
-        assert!(est.unavailable_reasons.is_empty(), "{:?}", est.unavailable_reasons);
+        assert!(
+            est.unavailable_reasons.is_empty(),
+            "{:?}",
+            est.unavailable_reasons
+        );
         assert!((est.estimated_wall_ns.unwrap() - 18_000_000.0).abs() < 1e-3);
         let s = est
             .assumptions
@@ -1096,19 +1343,40 @@ mod tests {
         assert!(s.contains("l = 0") && s.contains("l = t"), "{s}");
 
         // Known fixed_ns: no sensitivity entry.
-        let k = vec![kernel("a", 8_000_000, Some(0), Some(1_000_000_000), Some(1_000_000_000), Some(0), "measured_dram")];
+        let k = vec![kernel(
+            "a",
+            8_000_000,
+            Some(0),
+            Some(1_000_000_000),
+            Some(1_000_000_000),
+            Some(0),
+            "measured_dram",
+        )];
         let est = estimate(&input(k, 2_000_000, 10_000_000)).unwrap();
         assert!(!est.assumptions.iter().any(|a| a.contains("[SENSITIVITY]")));
 
         // Target-calibrated claim must not silently assume l = 0.
-        let k = vec![kernel("a", 8_000_000, None, Some(1_000_000_000), Some(1_000_000_000), Some(0), "measured_dram")];
+        let k = vec![kernel(
+            "a",
+            8_000_000,
+            None,
+            Some(1_000_000_000),
+            Some(1_000_000_000),
+            Some(0),
+            "measured_dram",
+        )];
         let mut inp = input(k, 2_000_000, 10_000_000);
-        inp.target_rates_source = RatesSource::MeasuredOnTarget { receipt_digest: "d1".into() };
+        inp.target_rates_source = RatesSource::MeasuredOnTarget {
+            receipt_digest: "d1".into(),
+        };
         let est = estimate(&inp).unwrap();
         assert_eq!(est.quality, EstimateQuality::TargetCalibrated);
         assert!(est.estimated_wall_ns.is_none());
         assert!(est.assumptions.iter().any(|a| a.contains("[SENSITIVITY]")));
-        assert!(est.unavailable_reasons.iter().any(|r| r.contains("fixed_ns unknown")));
+        assert!(est
+            .unavailable_reasons
+            .iter()
+            .any(|r| r.contains("fixed_ns unknown")));
     }
 
     #[test]
@@ -1150,14 +1418,18 @@ mod tests {
         assert_eq!(est.quality, EstimateQuality::TopologyScenario);
 
         let mut inp = input(three_kernels(), 500_000, 10_500_000);
-        inp.target_rates_source = RatesSource::MeasuredOnTarget { receipt_digest: "sha-abc".into() };
+        inp.target_rates_source = RatesSource::MeasuredOnTarget {
+            receipt_digest: "sha-abc".into(),
+        };
         let est = estimate(&inp).unwrap();
         assert_eq!(est.quality, EstimateQuality::TargetCalibrated);
         assert!((est.estimated_wall_ns.unwrap() - 14_350_000.0).abs() < 1e-3);
 
         // Empty digest: cannot claim calibration.
         let mut inp = input(three_kernels(), 500_000, 10_500_000);
-        inp.target_rates_source = RatesSource::MeasuredOnTarget { receipt_digest: " ".into() };
+        inp.target_rates_source = RatesSource::MeasuredOnTarget {
+            receipt_digest: " ".into(),
+        };
         let est = estimate(&inp).unwrap();
         assert_eq!(est.quality, EstimateQuality::TopologyScenario);
         assert!(est.estimated_wall_ns.is_none());
@@ -1165,7 +1437,9 @@ mod tests {
         // Identity digest conflicting with the source's digest.
         let mut inp = input(three_kernels(), 500_000, 10_500_000);
         inp.identity.calibration_receipt_digest = Reading::known("other".into());
-        inp.target_rates_source = RatesSource::MeasuredOnTarget { receipt_digest: "sha-abc".into() };
+        inp.target_rates_source = RatesSource::MeasuredOnTarget {
+            receipt_digest: "sha-abc".into(),
+        };
         let est = estimate(&inp).unwrap();
         assert_eq!(est.quality, EstimateQuality::TopologyScenario);
         assert!(est.estimated_wall_ns.is_none());
@@ -1177,7 +1451,9 @@ mod tests {
             host_gfx: "gfx1201",
             target_gfx: "gfx1200",
             target_cus: 32,
-            memory: MemoryKind::Discrete { capacity_bytes: 16 << 30 },
+            memory: MemoryKind::Discrete {
+                capacity_bytes: 16 << 30,
+            },
             peak_bw_bytes_s: 320_000_000_000,
             infinity_cache_bytes: 32 << 20,
             l2_bytes: 4 << 20,
@@ -1195,20 +1471,34 @@ mod tests {
             host_read_bytes_s: Some(50.0e9),
         };
         // Same clock 2000 MHz both: C ratio = (32*2000)/(64*2000) = 0.5; BW ratio 320/640 = 0.5.
-        let (r, notes) = spec_ratio_rates(&host, (64, 2000, 640_000_000_000), &profile_9060(), Some(2000));
+        let (r, notes) = spec_ratio_rates(
+            &host,
+            (64, 2000, 640_000_000_000),
+            &profile_9060(),
+            Some(2000),
+        );
         assert_eq!(r.compute_ops_s, Some(5.0e11));
         assert_eq!(r.read_bytes_s, Some(638.7e9 * 0.5));
         assert_eq!(r.copy_rw_bytes_s, Some(566.0e9 * 0.5));
         assert_eq!(r.host_read_bytes_s, None);
-        assert!(notes.iter().all(|n| n.starts_with("[INFERENCE]")), "{notes:?}");
+        assert!(
+            notes.iter().all(|n| n.starts_with("[INFERENCE]")),
+            "{notes:?}"
+        );
         assert!(notes.iter().any(|n| n.contains("host_read_bytes_s")));
 
         // Different clocks: (32*2500)/(64*2000) = 0.625.
-        let (r, _) = spec_ratio_rates(&host, (64, 2000, 640_000_000_000), &profile_9060(), Some(2500));
+        let (r, _) = spec_ratio_rates(
+            &host,
+            (64, 2000, 640_000_000_000),
+            &profile_9060(),
+            Some(2500),
+        );
         assert_eq!(r.compute_ops_s, Some(6.25e11));
 
         // No explicit clock -> compute unavailable, never invented.
-        let (r, notes) = spec_ratio_rates(&host, (64, 2000, 640_000_000_000), &profile_9060(), None);
+        let (r, notes) =
+            spec_ratio_rates(&host, (64, 2000, 640_000_000_000), &profile_9060(), None);
         assert_eq!(r.compute_ops_s, None);
         assert!(r.read_bytes_s.is_some());
         assert!(notes.iter().any(|n| n.contains("explicit target clock")));
@@ -1216,7 +1506,12 @@ mod tests {
         // Missing host rate stays missing.
         let mut h2 = host.clone();
         h2.read_bytes_s = None;
-        let (r, _) = spec_ratio_rates(&h2, (64, 2000, 640_000_000_000), &profile_9060(), Some(2000));
+        let (r, _) = spec_ratio_rates(
+            &h2,
+            (64, 2000, 640_000_000_000),
+            &profile_9060(),
+            Some(2000),
+        );
         assert_eq!(r.read_bytes_s, None);
 
         // Zero host peak -> no bandwidth scaling.
@@ -1228,19 +1523,50 @@ mod tests {
     #[test]
     fn spec_ratio_rates_feed_estimate() {
         // Target rates from spec_ratio_rates: host -> 9060 (BW/2, C/2, no host-read rate).
-        let (tr, _) = spec_ratio_rates(&host_rates(), (64, 2000, 640_000_000_000), &profile_9060(), Some(2000));
+        let (tr, _) = spec_ratio_rates(
+            &host_rates(),
+            (64, 2000, 640_000_000_000),
+            &profile_9060(),
+            Some(2000),
+        );
         // Memory-bound kernel only (P=0): ratio = 2 (B/2 dominates, C/2 gives 2x too).
-        let k = vec![kernel("a", 1_000_000, Some(0), Some(1_000_000), Some(1_000_000_000), Some(0), "measured_dram")];
+        let k = vec![kernel(
+            "a",
+            1_000_000,
+            Some(0),
+            Some(1_000_000),
+            Some(1_000_000_000),
+            Some(0),
+            "measured_dram",
+        )];
         let mut inp = input(k, 0, 1_000_000);
         inp.target_rates = tr;
         let est = estimate(&inp).unwrap();
-        assert!(est.unavailable_reasons.is_empty(), "{:?}", est.unavailable_reasons);
+        assert!(
+            est.unavailable_reasons.is_empty(),
+            "{:?}",
+            est.unavailable_reasons
+        );
         assert!((est.estimated_wall_ns.unwrap() - 2_000_000.0).abs() < 1e-3);
 
         // A kernel with host-mapped traffic is unavailable: target host link is unknown.
-        let k = vec![kernel("b", 1_000_000, Some(0), Some(1), Some(1), Some(1_000_000), "measured_dram")];
+        let k = vec![kernel(
+            "b",
+            1_000_000,
+            Some(0),
+            Some(1),
+            Some(1),
+            Some(1_000_000),
+            "measured_dram",
+        )];
         let mut inp = input(k, 0, 1_000_000);
-        inp.target_rates = spec_ratio_rates(&host_rates(), (64, 2000, 640_000_000_000), &profile_9060(), Some(2000)).0;
+        inp.target_rates = spec_ratio_rates(
+            &host_rates(),
+            (64, 2000, 640_000_000_000),
+            &profile_9060(),
+            Some(2000),
+        )
+        .0;
         let est = estimate(&inp).unwrap();
         assert!(est.estimated_wall_ns.is_none());
         assert!(est

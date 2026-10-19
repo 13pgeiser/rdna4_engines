@@ -552,10 +552,7 @@ fn observe(
     let waited_extra = waited_extra_ns(join_ns, baseline);
     let gpu_waited = waited_extra > 0;
     if gpu_waited && cpu_ns + waited_extra > 0 {
-        let sample = bytes_per_s(
-            rows_gpu as f64 * row_bytes as f64,
-            cpu_ns + waited_extra,
-        );
+        let sample = bytes_per_s(rows_gpu as f64 * row_bytes as f64, cpu_ns + waited_extra);
         state.r_gpu = Some(match state.r_gpu {
             Some(mut ewma) => {
                 ewma.update(sample);
@@ -1093,7 +1090,10 @@ mod tests {
                     continue;
                 };
                 assert_eq!(g % ROW_ALIGN, 0, "m={m} share={share} g={g}");
-                assert!(g >= ROW_ALIGN && g <= m - ROW_ALIGN, "m={m} share={share} g={g}");
+                assert!(
+                    g >= ROW_ALIGN && g <= m - ROW_ALIGN,
+                    "m={m} share={share} g={g}"
+                );
             }
         }
     }
@@ -1208,7 +1208,10 @@ mod tests {
             observe(key, 3072, 4096, 2176, 500_000, 60_000);
         }
         let after = shape_state(key.0, key.1).expect("seeded");
-        assert!(!after.frozen, "a moved balance point must re-open the latch");
+        assert!(
+            !after.frozen,
+            "a moved balance point must re-open the latch"
+        );
         assert!(
             after.share > before + 0.05,
             "the share must follow the move: {before} -> {}",
@@ -1232,7 +1235,10 @@ mod tests {
     }
     impl Plant {
         fn noise(&mut self) -> i64 {
-            self.seed = self.seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.seed = self
+                .seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let x = (self.seed >> 33) as i64;
             (x % (2 * self.jitter as i64 + 1)) - self.jitter as i64
         }
@@ -1250,7 +1256,13 @@ mod tests {
     /// The field 9B shape: `m=12288 k=4096` at 2176 B/row, a ~40 µs no-wait
     /// floor and ±60 µs host jitter (the checkpoint's `d2h=0.03 / join=0.04ms`).
     fn plant(seed: u64) -> Plant {
-        Plant { m: 12288, rb: 2176, copy_ns: 40_000, jitter: 60_000, seed }
+        Plant {
+            m: 12288,
+            rb: 2176,
+            copy_ns: 40_000,
+            jitter: 60_000,
+            seed,
+        }
     }
 
     /// Drive a shape through the real `observe`/`scheduled_share`/`plan_rows`
@@ -1299,7 +1311,10 @@ mod tests {
             "the trace-visible re-open counter must agree"
         );
         let optimum = 18.0 / (35.0 + 18.0);
-        assert!((end - optimum).abs() < 0.05, "share {end} vs optimum {optimum}");
+        assert!(
+            (end - optimum).abs() < 0.05,
+            "share {end} vs optimum {optimum}"
+        );
     }
 
     #[test]
@@ -1314,7 +1329,10 @@ mod tests {
             "the trace-visible re-open counter must move with the latch"
         );
         let optimum = 18.0 / (22.0 + 18.0);
-        assert!((end - optimum).abs() < 0.03, "share {end} vs optimum {optimum}");
+        assert!(
+            (end - optimum).abs() < 0.03,
+            "share {end} vs optimum {optimum}"
+        );
     }
 
     #[test]
@@ -1328,9 +1346,15 @@ mod tests {
             (35e9 - 13e9 * t, 18e9)
         };
         let (reopens, end) = simulate((DType::Q8_0, 9103), plant(31), 0.36, 4096, &ramp);
-        assert!(reopens >= 2, "a slow drift left the latch shut: reopens={reopens}");
+        assert!(
+            reopens >= 2,
+            "a slow drift left the latch shut: reopens={reopens}"
+        );
         let optimum = 18.0 / (18.0 + 22.0);
-        assert!(end > optimum - 0.05, "the share did not track the drift: {end} vs {optimum}");
+        assert!(
+            end > optimum - 0.05,
+            "the share did not track the drift: {end} vs {optimum}"
+        );
     }
 
     #[test]
@@ -1338,7 +1362,11 @@ mod tests {
         assert_eq!(advance_reopen_streak(0, 0.001), 0, "in band clears the run");
         assert_eq!(advance_reopen_streak(0, 0.03), 1);
         assert_eq!(advance_reopen_streak(1, 0.03), 2, "a same-sign run extends");
-        assert_eq!(advance_reopen_streak(1, -0.03), -1, "noise flips sign, the run restarts");
+        assert_eq!(
+            advance_reopen_streak(1, -0.03),
+            -1,
+            "noise flips sign, the run restarts"
+        );
         assert_eq!(advance_reopen_streak(-2, -0.03), -3);
         assert_eq!(advance_reopen_streak(-2, 0.001), 0);
     }

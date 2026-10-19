@@ -175,7 +175,8 @@ impl ParentAttnScratch {
                 return Err(format!("deepseek4 parent: attn q_lat_f32 alloc: {e:?}"));
             }
         };
-        let q_f32 = match gpu.alloc_tensor(&[max_rows, PARENT_N_HEADS, PARENT_HEAD_DIM], DType::F32) {
+        let q_f32 = match gpu.alloc_tensor(&[max_rows, PARENT_N_HEADS, PARENT_HEAD_DIM], DType::F32)
+        {
             Ok(t) => t,
             Err(e) => {
                 let _ = gpu.free_tensor(act_bf16);
@@ -249,22 +250,22 @@ impl ParentAttnScratch {
                 return Err(format!("deepseek4 parent: attn topk_staged alloc: {e:?}"));
             }
         };
-        let main_kv_cache =
-            match gpu.alloc_tensor(&[max_n_compressed, PARENT_HEAD_DIM], DType::F32) {
-                Ok(t) => t,
-                Err(e) => {
-                    let _ = gpu.free_tensor(act_bf16);
-                    let _ = gpu.free_tensor(kv_nope_bf16);
-                    let _ = gpu.free_tensor(q_lat_f32);
-                    let _ = gpu.free_tensor(q_f32);
-                    let _ = gpu.free_tensor(kv_f32);
-                    let _ = gpu.free_tensor(attn_out_f32);
-                    let _ = gpu.free_tensor(wo_a_out_f32);
-                    let _ = gpu.free_tensor(swa_staged);
-                    let _ = gpu.free_tensor(topk_staged);
-                    return Err(format!("deepseek4 parent: attn main_kv_cache alloc: {e:?}"));
-                }
-            };
+        let main_kv_cache = match gpu.alloc_tensor(&[max_n_compressed, PARENT_HEAD_DIM], DType::F32)
+        {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = gpu.free_tensor(act_bf16);
+                let _ = gpu.free_tensor(kv_nope_bf16);
+                let _ = gpu.free_tensor(q_lat_f32);
+                let _ = gpu.free_tensor(q_f32);
+                let _ = gpu.free_tensor(kv_f32);
+                let _ = gpu.free_tensor(attn_out_f32);
+                let _ = gpu.free_tensor(wo_a_out_f32);
+                let _ = gpu.free_tensor(swa_staged);
+                let _ = gpu.free_tensor(topk_staged);
+                return Err(format!("deepseek4 parent: attn main_kv_cache alloc: {e:?}"));
+            }
+        };
         let topk_idx = match alloc_i32_buf(gpu, max_rows * PARENT_ATTN_INDEX_TOPK) {
             Ok(t) => t,
             Err(e) => {
@@ -482,7 +483,6 @@ impl ParentAttnScratch {
     pub fn clear_compress_events(&mut self) {
         self.last_compress_events = 0;
     }
-
 }
 
 fn alloc_i32_buf(gpu: &mut Gpu, n: usize) -> Result<GpuTensor, String> {
@@ -494,8 +494,6 @@ fn alloc_i32_buf(gpu: &mut Gpu, n: usize) -> Result<GpuTensor, String> {
     gpu.upload_raw(&zeros, &[nbytes])
         .map_err(|e| format!("deepseek4 parent: i32 buf alloc: {e:?}"))
 }
-
-
 
 // ── Host helpers (unit-tested) ──────────────────────────────────────────────
 
@@ -760,11 +758,7 @@ pub fn get_compress_topk_idxs(
         for r in 0..seqlen {
             let cutoff = (r + 1) / ratio;
             for j in 0..k {
-                let v = if j < cutoff {
-                    j as i32 + offset_i
-                } else {
-                    -1
-                };
+                let v = if j < cutoff { j as i32 + offset_i } else { -1 };
                 out[r * k + j] = v;
             }
         }
@@ -791,7 +785,6 @@ pub fn compress_n_visible(start_pos: usize, row: usize, ratio: usize) -> usize {
     }
     (start_pos + row + 1) / ratio
 }
-
 
 /// Per-row number of valid SWA positions at absolute position `start_pos + r`.
 pub fn swa_n_valid(start_pos: usize, row: usize, window: usize) -> usize {
@@ -1092,15 +1085,7 @@ pub fn parent_attention_swa(
     // gather produces topk_staged for the joint softmax.
     if ratio > 0 {
         run_mixed_attn_compress_and_gather(
-            gpu,
-            backend,
-            layer,
-            cfg,
-            scratch,
-            x,
-            rows,
-            start_pos,
-            ratio,
+            gpu, backend, layer, cfg, scratch, x, rows, start_pos, ratio,
         )?;
     } else {
         // Pure SWA: zero active top-k; compress counter already cleared above.
@@ -1152,9 +1137,7 @@ pub fn parent_attention_swa(
                 PARENT_ATTN_INDEX_TOPK as i32,
                 rows as i32,
             )
-            .map_err(|e| {
-                format!("deepseek4 parent: deepseek4_attn_swa_topk_batched: {e:?}")
-            })?;
+            .map_err(|e| format!("deepseek4 parent: deepseek4_attn_swa_topk_batched: {e:?}"))?;
         }
     }
 
@@ -1170,7 +1153,12 @@ pub fn parent_attention_swa(
         &freqs,
         /*inverse=*/ true,
     )?;
-    upload_f32_prefix(gpu, &scratch.attn_out_f32, &attn_host, rows * PARENT_Q_WIDTH)?;
+    upload_f32_prefix(
+        gpu,
+        &scratch.attn_out_f32,
+        &attn_host,
+        rows * PARENT_Q_WIDTH,
+    )?;
 
     // ── 7. O projection: grouped wo_a then wo_b ─────────────────────────
     wo_a_grouped(gpu, backend, &layer.wo_a, scratch, rows)?;
@@ -1379,7 +1367,6 @@ fn run_mixed_attn_compress_and_gather(
     Ok(())
 }
 
-
 /// Grouped `wo_a` projection: 8 independent `[1024, 4096] @ [rows, 4096]`
 /// linears written into `scratch.wo_a_out_f32` as `[rows, 8, 1024]`.
 fn wo_a_grouped(
@@ -1458,8 +1445,7 @@ fn wo_a_grouped(
         for r in 0..rows {
             let src = r * PARENT_O_LORA;
             let dst = r * PARENT_WO_A_OUT + g * PARENT_O_LORA;
-            wo_host[dst..dst + PARENT_O_LORA]
-                .copy_from_slice(&tmp_host[src..src + PARENT_O_LORA]);
+            wo_host[dst..dst + PARENT_O_LORA].copy_from_slice(&tmp_host[src..src + PARENT_O_LORA]);
         }
         upload_f32_prefix(gpu, &scratch.wo_a_out_f32, &wo_host, rows * PARENT_WO_A_OUT)?;
     }
@@ -1478,8 +1464,7 @@ fn kv_nope_act_quant(
     for r in 0..rows {
         let src = r * PARENT_HEAD_DIM;
         let dst = r * PARENT_NOPE_DIM;
-        nope[dst..dst + PARENT_NOPE_DIM]
-            .copy_from_slice(&kv_host[src..src + PARENT_NOPE_DIM]);
+        nope[dst..dst + PARENT_NOPE_DIM].copy_from_slice(&kv_host[src..src + PARENT_NOPE_DIM]);
     }
     let bytes = pack_f32_to_bf16_bytes(&nope);
     upload_bf16_into(gpu, &scratch.kv_nope_bf16, &bytes, rows * PARENT_NOPE_DIM)?;
@@ -1495,8 +1480,7 @@ fn kv_nope_act_quant(
     for r in 0..rows {
         let src = r * PARENT_NOPE_DIM;
         let dst = r * PARENT_HEAD_DIM;
-        kv_host[dst..dst + PARENT_NOPE_DIM]
-            .copy_from_slice(&nope_q[src..src + PARENT_NOPE_DIM]);
+        kv_host[dst..dst + PARENT_NOPE_DIM].copy_from_slice(&nope_q[src..src + PARENT_NOPE_DIM]);
     }
     Ok(())
 }
@@ -1762,13 +1746,11 @@ mod tests {
         let original = 65536usize;
         let freqs = precompute_rope_freqs(dim, original, base, factor, 32.0, 1.0).unwrap();
         // correction range: low=floor(find(32)), high=ceil(find(1))
-        let low = (dim as f64
-            * ((original as f64) / (32.0 * 2.0 * std::f64::consts::PI)).ln()
+        let low = (dim as f64 * ((original as f64) / (32.0 * 2.0 * std::f64::consts::PI)).ln()
             / (2.0 * base.ln()))
         .floor()
         .max(0.0);
-        let high = (dim as f64
-            * ((original as f64) / (1.0 * 2.0 * std::f64::consts::PI)).ln()
+        let high = (dim as f64 * ((original as f64) / (1.0 * 2.0 * std::f64::consts::PI)).ln()
             / (2.0 * base.ln()))
         .ceil()
         .min((dim - 1) as f64);
@@ -1805,17 +1787,8 @@ mod tests {
         x[6] = 0.0;
         x[7] = 1.0; // imag of pair 1
         let freqs = vec![std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2]; // 90°
-        apply_rope_interleaved_inplace(
-            &mut x,
-            rows,
-            n_heads,
-            head_dim,
-            n_rot,
-            &[1],
-            &freqs,
-            false,
-        )
-        .unwrap();
+        apply_rope_interleaved_inplace(&mut x, rows, n_heads, head_dim, n_rot, &[1], &freqs, false)
+            .unwrap();
         // 90°: (1,0) → (0,1); (0,1) → (-1,0)
         assert!(x[4].abs() < 1e-6, "x4={}", x[4]);
         assert!((x[5] - 1.0).abs() < 1e-6, "x5={}", x[5]);
@@ -1935,7 +1908,6 @@ mod tests {
             assert_eq!(*row.last().unwrap(), r as i32);
         }
     }
-
 
     #[test]
     fn scratch_bytes_formula() {

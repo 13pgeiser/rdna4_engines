@@ -50,7 +50,12 @@ use crate::txn::Txn;
 
 /// One expert of a group: `m` rows and the byte offsets of its operands / result inside args 0 / 1 / 2.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ExpertPlan { pub m: usize, pub a_off: u64, pub b_off: u64, pub c_off: u64 }
+pub struct ExpertPlan {
+    pub m: usize,
+    pub a_off: u64,
+    pub b_off: u64,
+    pub c_off: u64,
+}
 
 /// Built grouped image + command stream; no NPU access occurs here.
 pub struct GroupedDesign {
@@ -79,8 +84,20 @@ const HEADER_WORDS: usize = Txn::HEADER_WORDS;
 
 /// Group of V9 experts: expert 0 FULL body, experts `1..` LEAN bodies, optional ring `(layout, slot, seq0)` once around
 /// the whole group. Panics on an empty group, `m` outside `1..=512`, non word aligned offsets or an invalid ring.
-pub fn grouped_v9(n: usize, k: usize, experts: &[ExpertPlan], ring: Option<(RingLayout, usize, u32)>) -> GroupedDesign {
-    grouped(gemm_array::design_v9(WAVE_M, n, k, V8_DEFAULT_EPILOGUE, Control::Fast), WAVE_M, n, k, experts, ring)
+pub fn grouped_v9(
+    n: usize,
+    k: usize,
+    experts: &[ExpertPlan],
+    ring: Option<(RingLayout, usize, u32)>,
+) -> GroupedDesign {
+    grouped(
+        gemm_array::design_v9(WAVE_M, n, k, V8_DEFAULT_EPILOGUE, Control::Fast),
+        WAVE_M,
+        n,
+        k,
+        experts,
+        ring,
+    )
 }
 
 /// Design-generic group (e.g. G80): `design` must be built for exactly `wave_m` padded rows, shape `wave_m x n x k`
@@ -88,8 +105,14 @@ pub fn grouped_v9(n: usize, k: usize, experts: &[ExpertPlan], ring: Option<(Ring
 /// block may be one design M-wave (`wave_m()`) or several: npu-experts passes `design_g80(round_up(max m, 256), ..)`
 /// with `wave_m = waves() * wave_m()` (one or two G80 waves; sim gates `g80_grouped_*two_waves*`). Same contract as
 /// [`grouped_v9`] otherwise; no variant check is made here.
-pub fn grouped(design: ArrayDesign, wave_m: usize, n: usize, k: usize, experts: &[ExpertPlan],
-    ring: Option<(RingLayout, usize, u32)>) -> GroupedDesign {
+pub fn grouped(
+    design: ArrayDesign,
+    wave_m: usize,
+    n: usize,
+    k: usize,
+    experts: &[ExpertPlan],
+    ring: Option<(RingLayout, usize, u32)>,
+) -> GroupedDesign {
     build(design, wave_m, n, k, experts, ring, true)
 }
 
@@ -97,35 +120,78 @@ pub fn grouped(design: ArrayDesign, wave_m: usize, n: usize, k: usize, experts: 
 /// state (no lean argument) and exists so tests can prove the lean bodies leave outputs and retained state unchanged.
 /// It makes no size or performance claim and is not a production entry point.
 #[doc(hidden)]
-pub fn grouped_v9_all_full(n: usize, k: usize, experts: &[ExpertPlan], ring: Option<(RingLayout, usize, u32)>) -> GroupedDesign {
-    build(gemm_array::design_v9(WAVE_M, n, k, V8_DEFAULT_EPILOGUE, Control::Fast), WAVE_M, n, k, experts, ring, false)
+pub fn grouped_v9_all_full(
+    n: usize,
+    k: usize,
+    experts: &[ExpertPlan],
+    ring: Option<(RingLayout, usize, u32)>,
+) -> GroupedDesign {
+    build(
+        gemm_array::design_v9(WAVE_M, n, k, V8_DEFAULT_EPILOGUE, Control::Fast),
+        WAVE_M,
+        n,
+        k,
+        experts,
+        ring,
+        false,
+    )
 }
 
 /// Design-generic all-full oracle (see [`grouped_v9_all_full`]).
 #[doc(hidden)]
-pub fn grouped_all_full(design: ArrayDesign, wave_m: usize, n: usize, k: usize, experts: &[ExpertPlan],
-    ring: Option<(RingLayout, usize, u32)>) -> GroupedDesign {
+pub fn grouped_all_full(
+    design: ArrayDesign,
+    wave_m: usize,
+    n: usize,
+    k: usize,
+    experts: &[ExpertPlan],
+    ring: Option<(RingLayout, usize, u32)>,
+) -> GroupedDesign {
     build(design, wave_m, n, k, experts, ring, false)
 }
 
-fn word(bytes: &[u8], i: usize) -> u32 { u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap()) }
+fn word(bytes: &[u8], i: usize) -> u32 {
+    u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap())
+}
 
-fn build(mut design: ArrayDesign, wave_m: usize, n: usize, k: usize, experts: &[ExpertPlan],
-    ring: Option<(RingLayout, usize, u32)>, lean: bool) -> GroupedDesign {
-    assert!(!experts.is_empty(), "a grouped submission needs at least one expert");
+fn build(
+    mut design: ArrayDesign,
+    wave_m: usize,
+    n: usize,
+    k: usize,
+    experts: &[ExpertPlan],
+    ring: Option<(RingLayout, usize, u32)>,
+    lean: bool,
+) -> GroupedDesign {
+    assert!(
+        !experts.is_empty(),
+        "a grouped submission needs at least one expert"
+    );
     for (e, x) in experts.iter().enumerate() {
-        assert!((1..=wave_m).contains(&x.m), "expert {e}: m {} outside 1..={wave_m}", x.m);
-        assert!(x.a_off % 4 == 0 && x.b_off % 4 == 0 && x.c_off % 4 == 0, "expert {e}: arena offsets must be word aligned");
+        assert!(
+            (1..=wave_m).contains(&x.m),
+            "expert {e}: m {} outside 1..={wave_m}",
+            x.m
+        );
+        assert!(
+            x.a_off % 4 == 0 && x.b_off % 4 == 0 && x.c_off % 4 == 0,
+            "expert {e}: arena offsets must be word aligned"
+        );
     }
     // One M-wave: the design's packed A for `wave_m` rows must be exactly one wave's A (pack_in panics otherwise).
-    assert_eq!(design.pack_in(&vec![0i8; wave_m * k], &vec![0i8; k * n])[0].len(), design.args[0].bytes,
-        "design is not a {wave_m}-row single-wave {wave_m}x{n}x{k} design");
+    assert_eq!(
+        design.pack_in(&vec![0i8; wave_m * k], &vec![0i8; k * n])[0].len(),
+        design.args[0].bytes,
+        "design is not a {wave_m}-row single-wave {wave_m}x{n}x{k} design"
+    );
 
     let mut body = Txn::aie2p_8col();
     for (e, x) in experts.iter().enumerate() {
         let arena = [x.a_off, x.b_off, x.c_off];
         if lean && e > 0 {
-            design.append_lean_run_body(&mut body, arena, &[]).unwrap_or_else(|err| panic!("lean body of expert {e}: {err}"));
+            design
+                .append_lean_run_body(&mut body, arena, &[])
+                .unwrap_or_else(|err| panic!("lean body of expert {e}: {err}"));
         } else {
             design.append_run_body(&mut body, arena);
         }
@@ -134,20 +200,36 @@ fn build(mut design: ArrayDesign, wave_m: usize, n: usize, k: usize, experts: &[
     let payload = &body_bytes[4 * HEADER_WORDS..];
 
     let arena = |bytes: usize, off: fn(&ExpertPlan) -> u64| {
-        let hi = experts.iter().map(|x| usize::try_from(off(x)).expect("arena offset")).max().unwrap();
+        let hi = experts
+            .iter()
+            .map(|x| usize::try_from(off(x)).expect("arena offset"))
+            .max()
+            .unwrap();
         hi.checked_add(bytes).expect("arena size")
     };
     let [a, b, c] = [0, 1, 2].map(|i| design.args[i].bytes);
     let mut args = vec![
-        ArgSpec { bytes: arena(a, |x| x.a_off), kind: ArgKind::In },
-        ArgSpec { bytes: arena(b, |x| x.b_off), kind: ArgKind::In },
-        ArgSpec { bytes: arena(c, |x| x.c_off), kind: ArgKind::Out },
+        ArgSpec {
+            bytes: arena(a, |x| x.a_off),
+            kind: ArgKind::In,
+        },
+        ArgSpec {
+            bytes: arena(b, |x| x.b_off),
+            kind: ArgKind::In,
+        },
+        ArgSpec {
+            bytes: arena(c, |x| x.c_off),
+            kind: ArgKind::Out,
+        },
     ];
 
     let (insts, patch_sites) = match ring {
         None => (body_bytes, Vec::new()),
         Some((layout, slot, seq0)) => {
-            args.push(ArgSpec { bytes: layout.bytes(), kind: ArgKind::In });
+            args.push(ArgSpec {
+                bytes: layout.bytes(),
+                kind: ArgKind::In,
+            });
             wrap_in_ring(layout, slot, seq0, payload, body.op_count())
         }
     };
@@ -165,12 +247,33 @@ fn build(mut design: ArrayDesign, wave_m: usize, n: usize, k: usize, experts: &[
 }
 
 /// The one-run empty ring stream with `payload` (`ops` ops) inserted between its DRAIN and DONE blocks.
-fn wrap_in_ring(layout: RingLayout, slot: usize, seq0: u32, payload: &[u8], ops: usize) -> (Vec<u8>, Vec<(usize, PatchKind)>) {
-    let proto = ring::empty_persistent(layout, &[SlotPlan { slot, a_off: 0, b_off: 0, c_off: 0 }], seq0);
+fn wrap_in_ring(
+    layout: RingLayout,
+    slot: usize,
+    seq0: u32,
+    payload: &[u8],
+    ops: usize,
+) -> (Vec<u8>, Vec<(usize, PatchKind)>) {
+    let proto = ring::empty_persistent(
+        layout,
+        &[SlotPlan {
+            slot,
+            a_off: 0,
+            b_off: 0,
+            c_off: 0,
+        }],
+        seq0,
+    );
     let site = |want: PatchKind| {
         let mut hits = proto.patch_sites.iter().filter(|&&(_, kind)| kind == want);
-        let word = hits.next().unwrap_or_else(|| panic!("ring protocol lost its {want:?} site")).0;
-        assert!(hits.next().is_none() && proto.patch_sites.len() == 2, "ring protocol patch inventory changed");
+        let word = hits
+            .next()
+            .unwrap_or_else(|| panic!("ring protocol lost its {want:?} site"))
+            .0;
+        assert!(
+            hits.next().is_none() && proto.patch_sites.len() == 2,
+            "ring protocol patch inventory changed"
+        );
         word
     };
     let (poll_value, done_value) = (site(PatchKind::PollSeq(0)), site(PatchKind::DoneSeq(0)));
@@ -180,12 +283,21 @@ fn wrap_in_ring(layout: RingLayout, slot: usize, seq0: u32, payload: &[u8], ops:
     let poll_op = poll_value - Txn::MASKPOLL_VALUE_WORD;
     let at = poll_op + MASKPOLL_WORDS + WRITE32_WORDS + MASKPOLL_WORDS;
     let done_op = done_value - Txn::WRITE32_VALUE_WORD;
-    assert_eq!(at + 2 * MASKWRITE_WORDS, done_op, "ring protocol changed: DONE block does not follow the DRAIN poll");
+    assert_eq!(
+        at + 2 * MASKWRITE_WORDS,
+        done_op,
+        "ring protocol changed: DONE block does not follow the DRAIN poll"
+    );
     let drain_poll = at - MASKPOLL_WORDS;
-    assert!(word(p, poll_op) == OP_MASKPOLL && word(p, poll_op + Txn::MASKPOLL_VALUE_WORD) == seq0
-        && word(p, drain_poll) == OP_MASKPOLL && word(p, drain_poll + Txn::MASKPOLL_VALUE_WORD) == ring::SENTINEL
-        && word(p, at) == OP_MASKWRITE && word(p, at + MASKWRITE_WORDS) == OP_MASKWRITE,
-        "ring protocol changed: cut point {at} is not between the DRAIN poll and the DONE block");
+    assert!(
+        word(p, poll_op) == OP_MASKPOLL
+            && word(p, poll_op + Txn::MASKPOLL_VALUE_WORD) == seq0
+            && word(p, drain_poll) == OP_MASKPOLL
+            && word(p, drain_poll + Txn::MASKPOLL_VALUE_WORD) == ring::SENTINEL
+            && word(p, at) == OP_MASKWRITE
+            && word(p, at + MASKWRITE_WORDS) == OP_MASKWRITE,
+        "ring protocol changed: cut point {at} is not between the DRAIN poll and the DONE block"
+    );
 
     let mut out = Vec::with_capacity(p.len() + payload.len());
     out.extend_from_slice(&p[..4 * at]);
@@ -194,21 +306,31 @@ fn wrap_in_ring(layout: RingLayout, slot: usize, seq0: u32, payload: &[u8], ops:
     let (op_count, size) = (word(p, 2) + ops as u32, out.len() as u32);
     out[8..12].copy_from_slice(&op_count.to_le_bytes());
     out[12..16].copy_from_slice(&size.to_le_bytes());
-    let sites = vec![(poll_value, PatchKind::PollSeq(0)), (done_value + payload.len() / 4, PatchKind::DoneSeq(0))];
+    let sites = vec![
+        (poll_value, PatchKind::PollSeq(0)),
+        (done_value + payload.len() / 4, PatchKind::DoneSeq(0)),
+    ];
     (out, sites)
 }
 
 impl GroupedDesign {
-    pub fn experts(&self) -> usize { self.ms.len() }
+    pub fn experts(&self) -> usize {
+        self.ms.len()
+    }
     fn m(&self, expert: usize) -> usize {
-        *self.ms.get(expert).unwrap_or_else(|| panic!("expert {expert} >= {} experts", self.ms.len()))
+        *self
+            .ms
+            .get(expert)
+            .unwrap_or_else(|| panic!("expert {expert} >= {} experts", self.ms.len()))
     }
     /// Packed `[A, B]` of ONE expert (copy to arg0 at `a_off` / arg1 at `b_off`); `a` is row-major `m*k` (zero padded to
     /// the wave), `b` row-major `k*n`.
     pub fn pack_in(&self, expert: usize, a: &[i8], b: &[i8]) -> [Vec<u8>; 2] {
         let m = self.m(expert);
         assert_eq!(a.len(), m * self.k, "expert {expert}: A must be m*k");
-        if m == self.wave_m { return self.design.pack_in(a, b); }
+        if m == self.wave_m {
+            return self.design.pack_in(a, b);
+        }
         let mut padded = vec![0i8; self.wave_m * self.k];
         padded[..a.len()].copy_from_slice(a);
         self.design.pack_in(&padded, b)
@@ -225,11 +347,22 @@ impl GroupedDesign {
         let m = self.m(expert);
         let mut c = gemm_i8::cpu_reference(a, b, m, self.n, self.k);
         let epi = self.design.epilogue().unwrap_or(V8_DEFAULT_EPILOGUE);
-        for x in &mut c { *x = gemm_array::apply_epilogue(*x, epi); }
+        for x in &mut c {
+            *x = gemm_array::apply_epilogue(*x, epi);
+        }
         c
     }
     /// Packed bytes of ONE expert in args 0 / 1 / 2 (identical for every expert: M is padded to one wave).
-    pub fn a_bytes(&self, expert: usize) -> usize { self.m(expert); self.design.args[0].bytes }
-    pub fn b_bytes(&self, expert: usize) -> usize { self.m(expert); self.design.args[1].bytes }
-    pub fn c_bytes(&self, expert: usize) -> usize { self.m(expert); self.design.args[2].bytes }
+    pub fn a_bytes(&self, expert: usize) -> usize {
+        self.m(expert);
+        self.design.args[0].bytes
+    }
+    pub fn b_bytes(&self, expert: usize) -> usize {
+        self.m(expert);
+        self.design.args[1].bytes
+    }
+    pub fn c_bytes(&self, expert: usize) -> usize {
+        self.m(expert);
+        self.design.args[2].bytes
+    }
 }

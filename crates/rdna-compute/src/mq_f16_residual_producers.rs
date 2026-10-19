@@ -584,7 +584,9 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         if self.fp8_verify_scope {
-            return Err(crate::gemm_fp8_verify::fp8_verify_scope_error("gemm_mq4g256v2_residual_wmma_f16"));
+            return Err(crate::gemm_fp8_verify::fp8_verify_scope_error(
+                "gemm_mq4g256v2_residual_wmma_f16",
+            ));
         }
         check_f16_out(x_f16, "gemm_mq4g256v2_residual_wmma_f16")?;
         if m == 0 || batch_size == 0 {

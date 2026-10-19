@@ -258,13 +258,18 @@ fn find_eocd(bytes: &[u8]) -> Result<Eocd, NpzError> {
         });
     }
     // ZIP64: the locator sits immediately before the EOCD.
-    let loc = at.checked_sub(20).ok_or(NpzError::Zip64Missing("locator"))?;
+    let loc = at
+        .checked_sub(20)
+        .ok_or(NpzError::Zip64Missing("locator"))?;
     let sig = rd_u32(bytes, loc, "zip64 locator")?;
     if sig != SIG_EOCD64_LOC {
         return Err(NpzError::Zip64Missing("locator"));
     }
     let loc_disk = rd_u32(bytes, loc + 4, "zip64 locator")?;
-    let eocd64_off = to_usize(rd_u64(bytes, loc + 8, "zip64 locator")?, "zip64 eocd offset")?;
+    let eocd64_off = to_usize(
+        rd_u64(bytes, loc + 8, "zip64 locator")?,
+        "zip64 eocd offset",
+    )?;
     let total_disks = rd_u32(bytes, loc + 16, "zip64 locator")?;
     if loc_disk != 0 || total_disks > 1 {
         return Err(NpzError::MultiDisk);
@@ -631,7 +636,10 @@ fn parse_npy(entry: &str, bytes: &[u8]) -> Result<NpyArray, NpzError> {
             let raw = bytes
                 .get(8..12)
                 .ok_or_else(|| bad(entry, "truncated v2/v3 header length"))?;
-            (u32::from_le_bytes(raw.try_into().unwrap()) as usize, 12usize)
+            (
+                u32::from_le_bytes(raw.try_into().unwrap()) as usize,
+                12usize,
+            )
         }
         v => return Err(bad(entry, format!("unsupported .npy version {v}.{minor}"))),
     };
@@ -701,14 +709,12 @@ fn parse_npy(entry: &str, bytes: &[u8]) -> Result<NpyArray, NpzError> {
             )
         }
         d if d.starts_with("<U") => {
-            let n: usize = d[2..]
-                .parse()
-                .ok()
-                .filter(|&n| n > 0)
-                .ok_or_else(|| NpzError::UnsupportedDescr {
+            let n: usize = d[2..].parse().ok().filter(|&n| n > 0).ok_or_else(|| {
+                NpzError::UnsupportedDescr {
                     entry: entry.to_string(),
                     descr: d.to_string(),
-                })?;
+                }
+            })?;
             let item = n
                 .checked_mul(4)
                 .ok_or_else(|| bad(entry, "<U width overflows"))?;
@@ -761,8 +767,8 @@ pub struct NpzArchive {
 impl NpzArchive {
     /// Read and fully verify an NPZ file.
     pub fn open(path: &Path) -> Result<Self, NpzError> {
-        let bytes = std::fs::read(path)
-            .map_err(|e| NpzError::Io(format!("{}: {e}", path.display())))?;
+        let bytes =
+            std::fs::read(path).map_err(|e| NpzError::Io(format!("{}: {e}", path.display())))?;
         Self::from_bytes(&bytes)
     }
 
@@ -958,7 +964,10 @@ pub(crate) mod testutil {
             [d] => format!("({d},)"),
             dims => format!(
                 "({})",
-                dims.iter().map(usize::to_string).collect::<Vec<_>>().join(", ")
+                dims.iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         };
         match &a.data {
@@ -976,7 +985,12 @@ pub(crate) mod testutil {
                 &v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>(),
             ),
             NpyData::Str(v) => {
-                let width = v.iter().map(|s| s.chars().count()).max().unwrap_or(1).max(1);
+                let width = v
+                    .iter()
+                    .map(|s| s.chars().count())
+                    .max()
+                    .unwrap_or(1)
+                    .max(1);
                 let mut payload = Vec::new();
                 for s in v {
                     let mut n = 0;
@@ -1011,7 +1025,6 @@ mod tests {
     const W2: &[u8] = include_bytes!("../tests/fixtures/subq4/tiny_w2.npz");
 
     // --- tests -------------------------------------------------------------
-
 
     #[test]
     fn crc32_matches_the_standard_check_value() {
@@ -1067,7 +1080,10 @@ mod tests {
             z.u8_array("gc", &[4, 255]),
             Err(NpzError::ShapeMismatch { .. })
         ));
-        assert!(matches!(z.i64_scalar("gc"), Err(NpzError::WrongDtype { .. })));
+        assert!(matches!(
+            z.i64_scalar("gc"),
+            Err(NpzError::WrongDtype { .. })
+        ));
         assert!(matches!(
             z.str_scalar("bits"),
             Err(NpzError::WrongDtype { .. })

@@ -4,8 +4,8 @@
 
 //! Few-row exact MQ4G256V2 GEMV over four matrices (`gemv_mq4g256v2_rows_x4_pm_<arch>`,
 //! gfx1151 and gfx1201): emission, ABI, arch gating and the committed bundles.
-use peacemaker_isa::Arch;
 use peacemaker_isa::kernels::mq4_rows_x4::{self, wide, Spec};
+use peacemaker_isa::Arch;
 #[macro_use]
 #[path = "support/rocm.rs"]
 mod rocm;
@@ -13,20 +13,48 @@ mod rocm;
 const ARCHES: [Arch; 2] = [Arch::Gfx1151, Arch::Gfx1201];
 
 /// Contract ABI: `A0..A3 x y0..y3` pointers, then `M0 M1 M2 M3 K B` i32.
-const ARGS: &[(u32, u32)] = &[(0, 8), (8, 8), (16, 8), (24, 8), (32, 8), (40, 8), (48, 8), (56, 8), (64, 8), (72, 4), (76, 4), (80, 4), (84, 4), (88, 4), (92, 4)];
+const ARGS: &[(u32, u32)] = &[
+    (0, 8),
+    (8, 8),
+    (16, 8),
+    (24, 8),
+    (32, 8),
+    (40, 8),
+    (48, 8),
+    (56, 8),
+    (64, 8),
+    (72, 4),
+    (76, 4),
+    (80, 4),
+    (84, 4),
+    (88, 4),
+    (92, 4),
+];
 
 #[test]
 fn names_follow_the_arch() {
     for arch in ARCHES {
-        assert_eq!(Spec { arch }.symbol(), format!("gemv_mq4g256v2_rows_x4_pm_{}", arch.name()));
-        assert_eq!(Spec::module(arch), format!("mq4_rows_x4_pm_{}", arch.name()));
+        assert_eq!(
+            Spec { arch }.symbol(),
+            format!("gemv_mq4g256v2_rows_x4_pm_{}", arch.name())
+        );
+        assert_eq!(
+            Spec::module(arch),
+            format!("mq4_rows_x4_pm_{}", arch.name())
+        );
         let (emitted, text, proof) = mq4_rows_x4::emit_module(arch).unwrap();
         assert_eq!(emitted.len(), 3);
         assert_eq!(proof.module, Spec::module(arch));
         assert!(text.contains(&format!(".amdhsa_kernel {}\n", Spec { arch }.symbol())));
         for cap in wide::CAPS {
-            assert!(text.contains(&format!(".amdhsa_kernel {}\n", wide::Spec { arch, cap }.symbol())));
-            assert_eq!(wide::Spec { arch, cap }.symbol(), format!("gemv_mq4g256v2_rows_x4_wide_r{cap}_pm_{}", arch.name()));
+            assert!(text.contains(&format!(
+                ".amdhsa_kernel {}\n",
+                wide::Spec { arch, cap }.symbol()
+            )));
+            assert_eq!(
+                wide::Spec { arch, cap }.symbol(),
+                format!("gemv_mq4g256v2_rows_x4_wide_r{cap}_pm_{}", arch.name())
+            );
         }
         assert_eq!(text.matches(".amdhsa_kernel ").count(), 3);
     }
@@ -36,14 +64,20 @@ fn names_follow_the_arch() {
 fn emission_is_deterministic_and_refuses_other_arches() {
     for arch in ARCHES {
         let spec = Spec { arch };
-        let (a, b) = (mq4_rows_x4::emit(spec).unwrap(), mq4_rows_x4::emit(spec).unwrap());
+        let (a, b) = (
+            mq4_rows_x4::emit(spec).unwrap(),
+            mq4_rows_x4::emit(spec).unwrap(),
+        );
         assert_eq!(a.proof.s_text_sha256, b.proof.s_text_sha256, "{arch:?}");
         assert_eq!(a.s_text, b.s_text, "{arch:?}");
         let (_, ta, pa) = mq4_rows_x4::emit_module(arch).unwrap();
         let (_, tb, pb) = mq4_rows_x4::emit_module(arch).unwrap();
         assert_eq!((ta, pa.module), (tb, pb.module));
     }
-    assert!(mq4_rows_x4::emit(Spec { arch: Arch::Gfx1100 }).is_err());
+    assert!(mq4_rows_x4::emit(Spec {
+        arch: Arch::Gfx1100
+    })
+    .is_err());
     assert!(mq4_rows_x4::emit_module(Arch::Gfx1100).is_err());
 }
 
@@ -53,15 +87,26 @@ fn kernarg_abi_matches_the_contract() {
     assert_eq!(mq4_rows_x4::KERNARG_BYTES, 96);
     for arch in ARCHES {
         let e = mq4_rows_x4::emit(Spec { arch }).unwrap();
-        assert!(e.s_text.contains(".kernarg_segment_size: 96\n"), "{arch:?}: kernarg size");
+        assert!(
+            e.s_text.contains(".kernarg_segment_size: 96\n"),
+            "{arch:?}: kernarg size"
+        );
         let field = |key: &str| -> Vec<u32> {
-            e.s_text.lines().filter_map(|l| l.trim().strip_prefix(key)).map(|v| v.trim().parse().unwrap()).collect()
+            e.s_text
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix(key))
+                .map(|v| v.trim().parse().unwrap())
+                .collect()
         };
         let want: Vec<u32> = ARGS.iter().map(|a| a.0).collect();
         assert_eq!(field(".offset:"), want, "{arch:?}: kernarg offsets");
         let want: Vec<u32> = ARGS.iter().map(|a| a.1).collect();
         assert_eq!(field(".size:"), want, "{arch:?}: kernarg sizes");
-        assert!(e.s_text.contains(".max_flat_workgroup_size: 32\n") && e.s_text.contains(".group_segment_fixed_size: 0\n"), "{arch:?}: block 32, no LDS");
+        assert!(
+            e.s_text.contains(".max_flat_workgroup_size: 32\n")
+                && e.s_text.contains(".group_segment_fixed_size: 0\n"),
+            "{arch:?}: block 32, no LDS"
+        );
     }
 }
 
@@ -69,12 +114,37 @@ fn kernarg_abi_matches_the_contract() {
 /// keeps the reference twin's.
 #[test]
 fn gfx12_spellings_are_arch_gated() {
-    let g11 = mq4_rows_x4::emit(Spec { arch: Arch::Gfx1151 }).unwrap().s_text;
-    for gfx12_only in ["scope:SCOPE", "s_add_nc_u64", "s_wait_alu", "s_add_co_", "s_sub_co_", "s_wait_loadcnt", "s_wait_dscnt", "s_wait_kmcnt", "s_wait_storecnt", "ttmp"] {
+    let g11 = mq4_rows_x4::emit(Spec {
+        arch: Arch::Gfx1151,
+    })
+    .unwrap()
+    .s_text;
+    for gfx12_only in [
+        "scope:SCOPE",
+        "s_add_nc_u64",
+        "s_wait_alu",
+        "s_add_co_",
+        "s_sub_co_",
+        "s_wait_loadcnt",
+        "s_wait_dscnt",
+        "s_wait_kmcnt",
+        "s_wait_storecnt",
+        "ttmp",
+    ] {
         assert!(!g11.contains(gfx12_only), "gfx1151 emits {gfx12_only}");
     }
-    let g12 = mq4_rows_x4::emit(Spec { arch: Arch::Gfx1201 }).unwrap().s_text;
-    for gfx12 in ["scope:SCOPE_DEV", "s_add_nc_u64", "s_wait_alu depctr_va_vcc(0)", "ttmp9", "s_wait_loadcnt"] {
+    let g12 = mq4_rows_x4::emit(Spec {
+        arch: Arch::Gfx1201,
+    })
+    .unwrap()
+    .s_text;
+    for gfx12 in [
+        "scope:SCOPE_DEV",
+        "s_add_nc_u64",
+        "s_wait_alu depctr_va_vcc(0)",
+        "ttmp9",
+        "s_wait_loadcnt",
+    ] {
         assert!(g12.contains(gfx12), "gfx1201 lacks {gfx12}");
     }
     assert!(g11.contains("s_waitcnt vmcnt(") && g11.contains("s_waitcnt lgkmcnt("));
@@ -92,7 +162,10 @@ fn committed_bundles_equal_fresh_emission() {
         let module = Spec::module(arch);
         let committed = std::fs::read(format!("{root}/{module}.hxaco")).unwrap();
         let text = mq4_rows_x4::emit_module(arch).unwrap().1;
-        assert!(text_section(&link(&text, arch.name(), &module)) == text_section(&committed), "{module}: fresh emission differs from the committed bundle");
+        assert!(
+            text_section(&link(&text, arch.name(), &module)) == text_section(&committed),
+            "{module}: fresh emission differs from the committed bundle"
+        );
     }
 }
 
@@ -105,7 +178,10 @@ fn committed_bundles_equal_native_emission() {
         let committed = std::fs::read(format!("{root}/{module}.hxaco")).unwrap();
         let text = mq4_rows_x4::emit_module(arch).unwrap().1;
         let elf = peacemaker_isa::native::assemble(&text, arch).unwrap();
-        assert!(text_section(&elf) == text_section(&committed), "{module}: native emission differs from the committed bundle");
+        assert!(
+            text_section(&elf) == text_section(&committed),
+            "{module}: native emission differs from the committed bundle"
+        );
     }
 }
 
@@ -113,12 +189,34 @@ fn link(text: &str, arch: &str, stem: &str) -> Vec<u8> {
     use std::process::Command;
     let dir = std::env::temp_dir().join(format!("peacemaker-isa-mq4rx4-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let (s, o, co) = (dir.join(format!("{stem}.s")), dir.join(format!("{stem}.o")), dir.join(format!("{stem}.co")));
+    let (s, o, co) = (
+        dir.join(format!("{stem}.s")),
+        dir.join(format!("{stem}.o")),
+        dir.join(format!("{stem}.co")),
+    );
     std::fs::write(&s, text).unwrap();
     let llvm_mc = rocm::rocm_tool("llvm-mc").expect("ROCm llvm-mc");
     let linker = rocm::rocm_tool("ld.lld").expect("ROCm ld.lld");
-    assert!(Command::new(llvm_mc).args(["-triple=amdgcn-amd-amdhsa", &format!("-mcpu={arch}"), "-filetype=obj"]).arg(&s).arg("-o").arg(&o).status().unwrap().success());
-    assert!(Command::new(linker).arg("-shared").arg(&o).arg("-o").arg(&co).status().unwrap().success());
+    assert!(Command::new(llvm_mc)
+        .args([
+            "-triple=amdgcn-amd-amdhsa",
+            &format!("-mcpu={arch}"),
+            "-filetype=obj"
+        ])
+        .arg(&s)
+        .arg("-o")
+        .arg(&o)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new(linker)
+        .arg("-shared")
+        .arg(&o)
+        .arg("-o")
+        .arg(&co)
+        .status()
+        .unwrap()
+        .success());
     std::fs::read(co).unwrap()
 }
 
@@ -132,10 +230,13 @@ fn text_section(bytes: &[u8]) -> Vec<u8> {
     let (shoff, shentsize, shnum, shstrndx) = (u64_(0x28), u16_(0x3a), u16_(0x3c), u16_(0x3e));
     let sh = |i: usize| shoff + i * shentsize;
     let names = u64_(sh(shstrndx) + 24);
-    (0..shnum).find_map(|i| {
-        let name = &e[names + u32_(sh(i))..];
-        name.starts_with(b".text\0").then(|| e[u64_(sh(i) + 24)..u64_(sh(i) + 24) + u64_(sh(i) + 32)].to_vec())
-    }).unwrap()
+    (0..shnum)
+        .find_map(|i| {
+            let name = &e[names + u32_(sh(i))..];
+            name.starts_with(b".text\0")
+                .then(|| e[u64_(sh(i) + 24)..u64_(sh(i) + 24) + u64_(sh(i) + 32)].to_vec())
+        })
+        .unwrap()
 }
 
 // ------------------------------------------------------------------ wide twins
@@ -144,18 +245,37 @@ fn text_section(bytes: &[u8]) -> Vec<u8> {
 /// (`peacemaker-isa emit --kernel mq4_rows_x4 --epi entry`): the narrow symbol
 /// must stay byte-for-byte what it was.
 const NARROW_SHA: [(Arch, &str); 2] = [
-    (Arch::Gfx1151, "06a7a3872841a28fa74264e097e864e57f38c182837922a20141705601d70fe5"),
-    (Arch::Gfx1201, "1256f4978f97c2fc9c0df40c965852867ead4068217b614ad6e4b533eddbac4d"),
+    (
+        Arch::Gfx1151,
+        "06a7a3872841a28fa74264e097e864e57f38c182837922a20141705601d70fe5",
+    ),
+    (
+        Arch::Gfx1201,
+        "1256f4978f97c2fc9c0df40c965852867ead4068217b614ad6e4b533eddbac4d",
+    ),
 ];
 
 #[test]
 fn narrow_entry_is_unchanged_and_embedded_verbatim_in_the_module() {
     for (arch, sha) in NARROW_SHA {
         let narrow = mq4_rows_x4::emit(Spec { arch }).unwrap();
-        assert_eq!(narrow.proof.s_text_sha256, sha, "{arch:?}: the narrow entry changed");
-        let body = narrow.s_text.split_once(".text\n").unwrap().1.split_once(".amdgpu_metadata\n").unwrap().0;
+        assert_eq!(
+            narrow.proof.s_text_sha256, sha,
+            "{arch:?}: the narrow entry changed"
+        );
+        let body = narrow
+            .s_text
+            .split_once(".text\n")
+            .unwrap()
+            .1
+            .split_once(".amdgpu_metadata\n")
+            .unwrap()
+            .0;
         let (_, text, proof) = mq4_rows_x4::emit_module(arch).unwrap();
-        assert!(text.contains(body), "{arch:?}: module does not carry the narrow body verbatim");
+        assert!(
+            text.contains(body),
+            "{arch:?}: module does not carry the narrow body verbatim"
+        );
         assert_eq!(proof.kernels[0].s_text_sha256, sha);
     }
 }
@@ -173,21 +293,65 @@ fn wide_launch_contract_and_resource_ceilings() {
             let tag = format!("{arch:?} r{cap}");
             assert!(e.s_text.contains(".kernarg_segment_size: 96\n"), "{tag}");
             let field = |key: &str| -> Vec<u32> {
-                e.s_text.lines().filter_map(|l| l.trim().strip_prefix(key)).map(|v| v.trim().parse().unwrap()).collect()
+                e.s_text
+                    .lines()
+                    .filter_map(|l| l.trim().strip_prefix(key))
+                    .map(|v| v.trim().parse().unwrap())
+                    .collect()
             };
-            assert_eq!(field(".offset:"), ARGS.iter().map(|a| a.0).collect::<Vec<_>>(), "{tag}: offsets");
-            assert_eq!(field(".size:"), ARGS.iter().map(|a| a.1).collect::<Vec<_>>(), "{tag}: sizes");
-            assert!(e.s_text.contains(".max_flat_workgroup_size: 256\n"), "{tag}");
-            assert!(e.s_text.contains(".group_segment_fixed_size: 8192\n") && e.s_text.contains(".amdhsa_group_segment_fixed_size 8192\n"), "{tag}: LDS");
-            assert!(e.s_text.contains(".private_segment_fixed_size: 0\n") && e.s_text.contains(".wavefront_size: 32\n"), "{tag}");
-            assert!(e.s_text.contains(".amdhsa_workgroup_processor_mode 1\n"), "{tag}: WGP mode");
+            assert_eq!(
+                field(".offset:"),
+                ARGS.iter().map(|a| a.0).collect::<Vec<_>>(),
+                "{tag}: offsets"
+            );
+            assert_eq!(
+                field(".size:"),
+                ARGS.iter().map(|a| a.1).collect::<Vec<_>>(),
+                "{tag}: sizes"
+            );
+            assert!(
+                e.s_text.contains(".max_flat_workgroup_size: 256\n"),
+                "{tag}"
+            );
+            assert!(
+                e.s_text.contains(".group_segment_fixed_size: 8192\n")
+                    && e.s_text.contains(".amdhsa_group_segment_fixed_size 8192\n"),
+                "{tag}: LDS"
+            );
+            assert!(
+                e.s_text.contains(".private_segment_fixed_size: 0\n")
+                    && e.s_text.contains(".wavefront_size: 32\n"),
+                "{tag}"
+            );
+            assert!(
+                e.s_text.contains(".amdhsa_workgroup_processor_mode 1\n"),
+                "{tag}: WGP mode"
+            );
             let vgpr = field(".vgpr_count:")[0];
-            let (budget, high) = (if cap == 16 { 128 } else { 192 }, if cap == 16 { 104 } else { 168 });
-            assert_eq!((vgpr, usize::from(e.proof.next_free_vgpr)), (high, high as usize), "{tag}");
+            let (budget, high) = (
+                if cap == 16 { 128 } else { 192 },
+                if cap == 16 { 104 } else { 168 },
+            );
+            assert_eq!(
+                (vgpr, usize::from(e.proof.next_free_vgpr)),
+                (high, high as usize),
+                "{tag}"
+            );
             assert!(vgpr <= budget && field(".sgpr_count:")[0] <= 80, "{tag}");
-            let barriers = if arch.gfx12() { e.s_text.matches("s_barrier_wait").count() } else { e.s_text.matches("s_barrier\n").count() };
+            let barriers = if arch.gfx12() {
+                e.s_text.matches("s_barrier_wait").count()
+            } else {
+                e.s_text.matches("s_barrier\n").count()
+            };
             assert_eq!(barriers, 4 * 2 * (cap as usize / 8), "{tag}: barriers");
-            assert!(!e.s_text.contains("v_dual_") && !e.s_text.lines().any(|l| l.trim().starts_with("scratch_") || l.trim().starts_with("flat_")), "{tag}: plain VALU, no scratch/flat");
+            assert!(
+                !e.s_text.contains("v_dual_")
+                    && !e
+                        .s_text
+                        .lines()
+                        .any(|l| l.trim().starts_with("scratch_") || l.trim().starts_with("flat_")),
+                "{tag}: plain VALU, no scratch/flat"
+            );
         }
     }
 }
@@ -196,12 +360,26 @@ fn wide_launch_contract_and_resource_ceilings() {
 /// both an unsupported capacity and anything past v255.
 #[test]
 fn wide_allocator_rejects_overflow() {
-    assert_eq!((wide::vgpr_high_water(16), wide::vgpr_high_water(32)), (104, 168));
+    assert_eq!(
+        (wide::vgpr_high_water(16), wide::vgpr_high_water(32)),
+        (104, 168)
+    );
     assert!(wide::vgpr_high_water(64) > 256 && wide::vgpr_high_water(255) > 256);
     for cap in [0u8, 8, 24, 48, 64, 255] {
-        assert!(wide::emit(wide::Spec { arch: Arch::Gfx1201, cap }).is_err(), "cap {cap}");
+        assert!(
+            wide::emit(wide::Spec {
+                arch: Arch::Gfx1201,
+                cap
+            })
+            .is_err(),
+            "cap {cap}"
+        );
     }
-    assert!(wide::emit(wide::Spec { arch: Arch::Gfx1100, cap: 16 }).is_err());
+    assert!(wide::emit(wide::Spec {
+        arch: Arch::Gfx1100,
+        cap: 16
+    })
+    .is_err());
 }
 
 /// The emitted arithmetic is the incumbent's DAG: per (row, stream) exactly one
@@ -217,28 +395,88 @@ fn wide_arithmetic_is_the_incumbent_dag() {
             let lines: Vec<&str> = e.s_text.lines().map(str::trim).collect();
             let count = |needle: &str| lines.iter().filter(|l| **l == needle).count();
             let rows = cap as usize;
-            for r in 0..rows { for st in 0..4 {
-                let a = 40 + 4 * r + st;
-                assert_eq!(count(&format!("v_add_f32_e32 v{a}, v{a}, v8")), 1, "{tag}: row {r} stream {st} group add");
-            }}
-            assert_eq!(count("v_mul_f32_e32 v8, v16, v24"), 4 * rows, "{tag}: dot starts");
-            assert_eq!(count("v_fmac_f32_e32 v8, v17, v25"), 4 * rows, "{tag}: fma term 1");
-            for j in 2..8 { assert_eq!(count(&format!("v_fmac_f32_e32 v8, v{}, v{}", 16 + j, 24 + j)), 4 * rows, "{tag}: fma term {j}"); }
+            for r in 0..rows {
+                for st in 0..4 {
+                    let a = 40 + 4 * r + st;
+                    assert_eq!(
+                        count(&format!("v_add_f32_e32 v{a}, v{a}, v8")),
+                        1,
+                        "{tag}: row {r} stream {st} group add"
+                    );
+                }
+            }
+            assert_eq!(
+                count("v_mul_f32_e32 v8, v16, v24"),
+                4 * rows,
+                "{tag}: dot starts"
+            );
+            assert_eq!(
+                count("v_fmac_f32_e32 v8, v17, v25"),
+                4 * rows,
+                "{tag}: fma term 1"
+            );
+            for j in 2..8 {
+                assert_eq!(
+                    count(&format!("v_fmac_f32_e32 v8, v{}, v{}", 16 + j, 24 + j)),
+                    4 * rows,
+                    "{tag}: fma term {j}"
+                );
+            }
             // Parity: only slots 0/1 take the SGPR bit-field offsets, once per unrolled group.
-            assert_eq!((count("v_bfe_u32 v16, v7, s48, 4"), count("v_bfe_u32 v17, v7, s49, 4")), (4, 4), "{tag}: parity offsets");
+            assert_eq!(
+                (
+                    count("v_bfe_u32 v16, v7, s48, 4"),
+                    count("v_bfe_u32 v17, v7, s49, 4")
+                ),
+                (4, 4),
+                "{tag}: parity offsets"
+            );
             for r in 0..rows {
                 let (a0, a1, a2, a3) = (40 + 4 * r, 41 + 4 * r, 42 + 4 * r, 43 + 4 * r);
-                let at = |needle: String| lines.iter().position(|l| *l == needle).unwrap_or_else(|| panic!("{tag}: missing {needle}"));
-                let (i, j, k) = (at(format!("v_add_f32_e32 v{a0}, v{a0}, v{a1}")), at(format!("v_add_f32_e32 v{a2}, v{a2}, v{a3}")), at(format!("v_add_f32_e32 v{a0}, v{a0}, v{a2}")));
+                let at = |needle: String| {
+                    lines
+                        .iter()
+                        .position(|l| *l == needle)
+                        .unwrap_or_else(|| panic!("{tag}: missing {needle}"))
+                };
+                let (i, j, k) = (
+                    at(format!("v_add_f32_e32 v{a0}, v{a0}, v{a1}")),
+                    at(format!("v_add_f32_e32 v{a2}, v{a2}, v{a3}")),
+                    at(format!("v_add_f32_e32 v{a0}, v{a0}, v{a2}")),
+                );
                 assert!(i < j && j < k, "{tag}: fold order row {r}");
             }
-            assert_eq!(count("ds_swizzle_b32 v24, v40 offset:swizzle(BITMASK_PERM,\"1pppp\")"), 1, "{tag}: shfl16");
-            let tree = lines.iter().filter(|l| l.starts_with("ds_bpermute_b32 ")).count();
+            assert_eq!(
+                count("ds_swizzle_b32 v24, v40 offset:swizzle(BITMASK_PERM,\"1pppp\")"),
+                1,
+                "{tag}: shfl16"
+            );
+            let tree = lines
+                .iter()
+                .filter(|l| l.starts_with("ds_bpermute_b32 "))
+                .count();
             assert_eq!(tree, 4 * rows, "{tag}: bpermute rounds 8/4/2/1");
-            for off in [8, 4, 2, 1] { assert!(lines.iter().any(|l| l.starts_with(&format!("v_cndmask_b32_e64 v4, 0, {off}, vcc_lo"))), "{tag}: round {off}"); }
+            for off in [8, 4, 2, 1] {
+                assert!(
+                    lines
+                        .iter()
+                        .any(|l| l.starts_with(&format!("v_cndmask_b32_e64 v4, 0, {off}, vcc_lo"))),
+                    "{tag}: round {off}"
+                );
+            }
             // One lane-0 store per (row, wave); lane id is v5 = tid & 31, never raw tid.
-            assert_eq!(lines.iter().filter(|l| l.starts_with("global_store_b32 ")).count(), rows, "{tag}: stores");
-            assert!(lines.contains(&"v_cmpx_eq_u32_e32 0, v5"), "{tag}: lane-0 store mask");
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|l| l.starts_with("global_store_b32 "))
+                    .count(),
+                rows,
+                "{tag}: stores"
+            );
+            assert!(
+                lines.contains(&"v_cmpx_eq_u32_e32 0, v5"),
+                "{tag}: lane-0 store mask"
+            );
         }
     }
 }
@@ -254,18 +492,43 @@ fn wide_tail_waves_reach_every_barrier() {
             let tag = format!("{arch:?} r{cap}");
             let lines: Vec<&str> = e.s_text.lines().map(str::trim).collect();
             let end = format!("s_cbranch_scc1 .Lmq4w{cap}_end");
-            let fold = lines.iter().position(|l| *l == format!(".Lmq4w{cap}_fold:")).unwrap();
-            let first_barrier = lines.iter().position(|l| l.starts_with("s_barrier")).unwrap();
+            let fold = lines
+                .iter()
+                .position(|l| *l == format!(".Lmq4w{cap}_fold:"))
+                .unwrap();
+            let first_barrier = lines
+                .iter()
+                .position(|l| l.starts_with("s_barrier"))
+                .unwrap();
             // Early exits (workgroup past the sum, R outside 1..=cap) precede the first barrier; the wave-valid exit follows the loop.
-            let exits: Vec<usize> = lines.iter().enumerate().filter(|(_, l)| **l == end).map(|(i, _)| i).collect();
-            assert!(exits[..3].iter().all(|&i| i < first_barrier), "{tag}: uniform early exits");
-            assert!(exits[3] > fold, "{tag}: the invalid-wave exit is after the K loop");
+            let exits: Vec<usize> = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| **l == end)
+                .map(|(i, _)| i)
+                .collect();
+            assert!(
+                exits[..3].iter().all(|&i| i < first_barrier),
+                "{tag}: uniform early exits"
+            );
+            assert!(
+                exits[3] > fold,
+                "{tag}: the invalid-wave exit is after the K loop"
+            );
             // Each barrier is directly followed by a label or the wave-valid test, and no skip branch of a
             // valid-wave region jumps over one (they target `_wdone` / `_cdone`, never past a barrier).
             for (i, l) in lines.iter().enumerate() {
-                if l.starts_with("s_cbranch_scc1 .Lmq4w") && (l.ends_with("_wdone") || l.ends_with("_cdone")) {
-                    let target = lines.iter().position(|t| *t == format!("{}:", l.rsplit(' ').next().unwrap())).unwrap();
-                    assert!(!lines[i..target].iter().any(|t| t.starts_with("s_barrier")), "{tag}: a valid-wave skip jumps over a barrier");
+                if l.starts_with("s_cbranch_scc1 .Lmq4w")
+                    && (l.ends_with("_wdone") || l.ends_with("_cdone"))
+                {
+                    let target = lines
+                        .iter()
+                        .position(|t| *t == format!("{}:", l.rsplit(' ').next().unwrap()))
+                        .unwrap();
+                    assert!(
+                        !lines[i..target].iter().any(|t| t.starts_with("s_barrier")),
+                        "{tag}: a valid-wave skip jumps over a barrier"
+                    );
                 }
             }
         }
@@ -276,13 +539,51 @@ fn wide_tail_waves_reach_every_barrier() {
 #[test]
 fn wide_gfx12_spellings_are_arch_gated() {
     for cap in wide::CAPS {
-        let g11 = wide::emit(wide::Spec { arch: Arch::Gfx1151, cap }).unwrap().s_text;
-        for gfx12_only in ["scope:SCOPE", "s_add_nc_u64", "s_wait_alu", "s_add_co_", "s_sub_co_", "s_wait_loadcnt", "s_wait_dscnt", "s_wait_kmcnt", "s_wait_storecnt", "s_barrier_signal", "s_barrier_wait", "ttmp"] {
-            assert!(!g11.contains(gfx12_only), "gfx1151 r{cap} emits {gfx12_only}");
+        let g11 = wide::emit(wide::Spec {
+            arch: Arch::Gfx1151,
+            cap,
+        })
+        .unwrap()
+        .s_text;
+        for gfx12_only in [
+            "scope:SCOPE",
+            "s_add_nc_u64",
+            "s_wait_alu",
+            "s_add_co_",
+            "s_sub_co_",
+            "s_wait_loadcnt",
+            "s_wait_dscnt",
+            "s_wait_kmcnt",
+            "s_wait_storecnt",
+            "s_barrier_signal",
+            "s_barrier_wait",
+            "ttmp",
+        ] {
+            assert!(
+                !g11.contains(gfx12_only),
+                "gfx1151 r{cap} emits {gfx12_only}"
+            );
         }
-        assert!(g11.contains("s_barrier\n") && g11.contains("s_waitcnt lgkmcnt(") && g11.contains("s_waitcnt vmcnt("));
-        let g12 = wide::emit(wide::Spec { arch: Arch::Gfx1201, cap }).unwrap().s_text;
-        for gfx12 in ["scope:SCOPE_DEV", "s_wait_alu depctr_va_vcc(0)", "ttmp9", "s_wait_loadcnt", "s_barrier_signal -1", "s_barrier_wait 0xffff", "s_wait_dscnt"] {
+        assert!(
+            g11.contains("s_barrier\n")
+                && g11.contains("s_waitcnt lgkmcnt(")
+                && g11.contains("s_waitcnt vmcnt(")
+        );
+        let g12 = wide::emit(wide::Spec {
+            arch: Arch::Gfx1201,
+            cap,
+        })
+        .unwrap()
+        .s_text;
+        for gfx12 in [
+            "scope:SCOPE_DEV",
+            "s_wait_alu depctr_va_vcc(0)",
+            "ttmp9",
+            "s_wait_loadcnt",
+            "s_barrier_signal -1",
+            "s_barrier_wait 0xffff",
+            "s_wait_dscnt",
+        ] {
             assert!(g12.contains(gfx12), "gfx1201 r{cap} lacks {gfx12}");
         }
         assert!(!g12.contains("s_barrier\n"));

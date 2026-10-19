@@ -7,10 +7,13 @@
 //! scope (the rest of the block that created the workgroup).
 
 use crate::interp::{Cx, R};
+use peacemaker_author::runtime::{
+    Arrived, Breaks, Cond, Driver, Exit, Forward, Phase, Place, RegionId, RingId, Transition,
+    WgCond,
+};
+use peacemaker_author::{Gfx1100, Gfx1151, Gfx1201, Target};
 use peacemaker_isa::insn::Instruction;
 use peacemaker_isa::{Arch, Builder};
-use peacemaker_author::runtime::{Arrived, Breaks, Cond, Driver, Exit, Forward, Phase, Place, RegionId, RingId, Transition, WgCond};
-use peacemaker_author::{Gfx1100, Gfx1151, Gfx1201, Target};
 
 type Res<T> = Result<T, String>;
 
@@ -40,25 +43,73 @@ pub trait DynDriver {
     fn scmp(&mut self, insn: Instruction) -> Res<Cond>;
     fn scmp_wg_uniform(&mut self, insn: Instruction) -> Res<WgCond>;
     fn label(&mut self, name: &str) -> Res<()>;
-    fn skip_if(&mut self, cond: Cond, target: &str, body: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>) -> Res<()>;
-    fn skip_unless(&mut self, cond: Cond, target: &str, body: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>) -> Res<()>;
-    fn wg_skip_if(&mut self, cond: WgCond, target: &str, body: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>) -> Res<()>;
-    fn exec_if(&mut self, cond: Cond, body: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>) -> Res<()>;
-    fn forward(&mut self, body: &mut dyn FnMut(&mut dyn DynDriver, &mut Forward<Builder>) -> Res<()>) -> Res<()>;
+    fn skip_if(
+        &mut self,
+        cond: Cond,
+        target: &str,
+        body: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>,
+    ) -> Res<()>;
+    fn skip_unless(
+        &mut self,
+        cond: Cond,
+        target: &str,
+        body: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>,
+    ) -> Res<()>;
+    fn wg_skip_if(
+        &mut self,
+        cond: WgCond,
+        target: &str,
+        body: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>,
+    ) -> Res<()>;
+    fn exec_if(
+        &mut self,
+        cond: Cond,
+        body: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>,
+    ) -> Res<()>;
+    fn forward(
+        &mut self,
+        body: &mut dyn FnMut(&mut dyn DynDriver, &mut Forward<Builder>) -> Res<()>,
+    ) -> Res<()>;
     fn fwd_branch_if(&mut self, f: &mut Forward<Builder>, cond: Cond, label: &str) -> Res<()>;
     fn fwd_branch_unless(&mut self, f: &mut Forward<Builder>, cond: Cond, label: &str) -> Res<()>;
     fn fwd_goto(&mut self, f: &mut Forward<Builder>, label: &str) -> Res<()>;
     fn fwd_place(&mut self, f: &mut Forward<Builder>, label: &str) -> Res<()>;
-    fn if_else(&mut self, cond: Cond, else_label: &str, join: &str, then: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>, els: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>) -> Res<()>;
-    fn loop_until(&mut self, head: &str, exit: &str, body: &dyn Fn(&mut dyn DynDriver, &Breaks<Builder>) -> Res<()>) -> Res<()>;
+    fn if_else(
+        &mut self,
+        cond: Cond,
+        else_label: &str,
+        join: &str,
+        then: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>,
+        els: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>,
+    ) -> Res<()>;
+    fn loop_until(
+        &mut self,
+        head: &str,
+        exit: &str,
+        body: &dyn Fn(&mut dyn DynDriver, &Breaks<Builder>) -> Res<()>,
+    ) -> Res<()>;
     fn break_if(&mut self, cond: Cond, exit: &Breaks<Builder>) -> Res<()>;
-    fn loop_carried(&mut self, head: &str, body: &dyn Fn(&mut dyn DynDriver) -> Res<WgCond>) -> Res<()>;
+    fn loop_carried(
+        &mut self,
+        head: &str,
+        body: &dyn Fn(&mut dyn DynDriver) -> Res<WgCond>,
+    ) -> Res<()>;
     fn exit(&mut self, label: &str) -> Res<Exit>;
     fn exit_if(&mut self, cond: WgCond, end: &Exit) -> Res<()>;
     fn wave_exit_unless(&mut self, cond: Cond, end: &Exit) -> Res<()>;
-    fn wg_exit_unless(&mut self, cond: WgCond, target: &str, end: &Exit, body: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>) -> Res<()>;
+    fn wg_exit_unless(
+        &mut self,
+        cond: WgCond,
+        target: &str,
+        end: &Exit,
+        body: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>,
+    ) -> Res<()>;
     fn end(&mut self, end: Exit) -> Res<()>;
-    fn end_with(&mut self, end: Exit, tail: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>) -> Res<()>;
+    fn end_with(
+        &mut self,
+        end: Exit,
+        tail: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>,
+    ) -> Res<()>;
     fn handoff(
         &mut self,
         readers: Cond,
@@ -173,19 +224,41 @@ impl<'b, T: SplitOps> DynDriver for Driver<'b, T, Builder> {
     fn label(&mut self, name: &str) -> Res<()> {
         Driver::label(self, name)
     }
-    fn skip_if(&mut self, cond: Cond, target: &str, body: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>) -> Res<()> {
+    fn skip_if(
+        &mut self,
+        cond: Cond,
+        target: &str,
+        body: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>,
+    ) -> Res<()> {
         Driver::skip_if(self, cond, target, |d| body(d))
     }
-    fn skip_unless(&mut self, cond: Cond, target: &str, body: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>) -> Res<()> {
+    fn skip_unless(
+        &mut self,
+        cond: Cond,
+        target: &str,
+        body: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>,
+    ) -> Res<()> {
         Driver::skip_unless(self, cond, target, |d| body(d))
     }
-    fn wg_skip_if(&mut self, cond: WgCond, target: &str, body: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>) -> Res<()> {
+    fn wg_skip_if(
+        &mut self,
+        cond: WgCond,
+        target: &str,
+        body: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>,
+    ) -> Res<()> {
         Driver::wg_skip_if(self, cond, target, |d| body(d))
     }
-    fn exec_if(&mut self, cond: Cond, body: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>) -> Res<()> {
+    fn exec_if(
+        &mut self,
+        cond: Cond,
+        body: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>,
+    ) -> Res<()> {
         Driver::exec_if(self, cond, |d| body(d))
     }
-    fn forward(&mut self, body: &mut dyn FnMut(&mut dyn DynDriver, &mut Forward<Builder>) -> Res<()>) -> Res<()> {
+    fn forward(
+        &mut self,
+        body: &mut dyn FnMut(&mut dyn DynDriver, &mut Forward<Builder>) -> Res<()>,
+    ) -> Res<()> {
         Driver::forward(self, |d, f| body(d, f))
     }
     fn fwd_branch_if(&mut self, f: &mut Forward<Builder>, cond: Cond, label: &str) -> Res<()> {
@@ -200,16 +273,32 @@ impl<'b, T: SplitOps> DynDriver for Driver<'b, T, Builder> {
     fn fwd_place(&mut self, f: &mut Forward<Builder>, label: &str) -> Res<()> {
         f.place(self, label)
     }
-    fn if_else(&mut self, cond: Cond, else_label: &str, join: &str, then: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>, els: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>) -> Res<()> {
+    fn if_else(
+        &mut self,
+        cond: Cond,
+        else_label: &str,
+        join: &str,
+        then: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>,
+        els: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>,
+    ) -> Res<()> {
         Driver::if_else(self, cond, else_label, join, |d| then(d), |d| els(d))
     }
-    fn loop_until(&mut self, head: &str, exit: &str, body: &dyn Fn(&mut dyn DynDriver, &Breaks<Builder>) -> Res<()>) -> Res<()> {
+    fn loop_until(
+        &mut self,
+        head: &str,
+        exit: &str,
+        body: &dyn Fn(&mut dyn DynDriver, &Breaks<Builder>) -> Res<()>,
+    ) -> Res<()> {
         Driver::loop_until(self, head, exit, |d, b| body(d, b))
     }
     fn break_if(&mut self, cond: Cond, exit: &Breaks<Builder>) -> Res<()> {
         Driver::break_if(self, cond, exit)
     }
-    fn loop_carried(&mut self, head: &str, body: &dyn Fn(&mut dyn DynDriver) -> Res<WgCond>) -> Res<()> {
+    fn loop_carried(
+        &mut self,
+        head: &str,
+        body: &dyn Fn(&mut dyn DynDriver) -> Res<WgCond>,
+    ) -> Res<()> {
         Driver::loop_carried(self, head, |d| body(d))
     }
     fn exit(&mut self, label: &str) -> Res<Exit> {
@@ -221,13 +310,23 @@ impl<'b, T: SplitOps> DynDriver for Driver<'b, T, Builder> {
     fn wave_exit_unless(&mut self, cond: Cond, end: &Exit) -> Res<()> {
         Driver::wave_exit_unless(self, cond, end)
     }
-    fn wg_exit_unless(&mut self, cond: WgCond, target: &str, end: &Exit, body: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>) -> Res<()> {
+    fn wg_exit_unless(
+        &mut self,
+        cond: WgCond,
+        target: &str,
+        end: &Exit,
+        body: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>,
+    ) -> Res<()> {
         Driver::wg_exit_unless(self, cond, target, end, |d| body(d))
     }
     fn end(&mut self, end: Exit) -> Res<()> {
         Driver::end(self, end)
     }
-    fn end_with(&mut self, end: Exit, tail: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>) -> Res<()> {
+    fn end_with(
+        &mut self,
+        end: Exit,
+        tail: &mut dyn FnMut(&mut dyn DynDriver) -> Res<()>,
+    ) -> Res<()> {
         Driver::end_with(self, end, |d| tail(d))
     }
     fn handoff(
@@ -239,19 +338,38 @@ impl<'b, T: SplitOps> DynDriver for Driver<'b, T, Builder> {
         write: &mut dyn FnMut(&mut dyn DynDriver, RegionId) -> Res<()>,
         read: &mut dyn FnMut(&mut dyn DynDriver, RegionId, &Exit) -> Res<()>,
     ) -> Res<()> {
-        Driver::handoff(self, readers, reader_label, end, region, |d, r| write(d, r), |d, r, e| read(d, r, e))
+        Driver::handoff(
+            self,
+            readers,
+            reader_label,
+            end,
+            region,
+            |d, r| write(d, r),
+            |d, r, e| read(d, r, e),
+        )
     }
 }
 
-fn drive_t<'a, T: SplitOps>(bld: &mut Builder, body: &mut dyn FnMut(&mut Cx<'_>) -> R<'a>) -> Res<R<'a>> {
+fn drive_t<'a, T: SplitOps>(
+    bld: &mut Builder,
+    body: &mut dyn FnMut(&mut Cx<'_>) -> R<'a>,
+) -> Res<R<'a>> {
     let mut d = Driver::<T, Builder>::new(bld)?;
-    let mut cx = Cx { d: Some(&mut d), fwd: None, brk: None };
+    let mut cx = Cx {
+        d: Some(&mut d),
+        fwd: None,
+        brk: None,
+    };
     Ok(body(&mut cx))
 }
 
 /// Seal `bld` under a new driver for `arch` and run `body` with it as the
 /// current scope. The driver ends with `body`: the builder is free again.
-pub fn drive<'a>(arch: Arch, bld: &mut Builder, body: &mut dyn FnMut(&mut Cx<'_>) -> R<'a>) -> Res<R<'a>> {
+pub fn drive<'a>(
+    arch: Arch,
+    bld: &mut Builder,
+    body: &mut dyn FnMut(&mut Cx<'_>) -> R<'a>,
+) -> Res<R<'a>> {
     match arch {
         Arch::Gfx1151 => drive_t::<Gfx1151>(bld, body),
         Arch::Gfx1201 => drive_t::<Gfx1201>(bld, body),

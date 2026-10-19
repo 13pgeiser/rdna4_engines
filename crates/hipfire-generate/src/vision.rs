@@ -870,8 +870,9 @@ pub fn generate_vl(
     }
 
     if m.eviction.is_none()
-        && prompt_est.saturating_add(crate::common::fit_max_tokens(max_tokens, prompt_est, m.max_seq))
-            > m.max_seq
+        && prompt_est.saturating_add(crate::common::fit_max_tokens(
+            max_tokens, prompt_est, m.max_seq,
+        )) > m.max_seq
     {
         write_error(
             stdout,

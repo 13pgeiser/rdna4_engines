@@ -565,10 +565,7 @@ fn digest_from_json(value: &Value) -> Result<Digest32, String> {
 /// The live digest of the target state; every GDN layer must contribute its
 /// `ef_residual` row (`DigestRow::GdnResidual`).
 fn live_digest(bundle: &Qwen4Bundle, gpu: &mut Gpu) -> Result<Digest32, String> {
-    let rows = bundle
-        .state
-        .debug_digest(gpu)
-        .map_err(|e| e.to_string())?;
+    let rows = bundle.state.debug_digest(gpu).map_err(|e| e.to_string())?;
     let layers = bundle.state.gdn.len();
     let residual_rows = rows
         .iter()
@@ -748,7 +745,8 @@ fn parse_trace(stderr: &str) -> Result<Vec<TraceWindow>, String> {
             position: trace_number(line, "\"position\":").ok_or_else(|| missing("position"))?,
             k: trace_number(line, "\"k\":").ok_or_else(|| missing("k"))?,
             accepted: trace_number(line, "\"accepted\":").ok_or_else(|| missing("accepted"))?,
-            route: trace_string(line, "\"verify_route\":").ok_or_else(|| missing("verify_route"))?,
+            route: trace_string(line, "\"verify_route\":")
+                .ok_or_else(|| missing("verify_route"))?,
             resets: trace_number(line, "\"gdn_residual_resets\":"),
         });
     }
@@ -1078,7 +1076,9 @@ fn check_windows(
         if row.drafts == 0 {
             stats.target_only += 1;
             if delta != 0 {
-                errors.push(format!("{at}: target-only window reset the residual {delta}x"));
+                errors.push(format!(
+                    "{at}: target-only window reset the residual {delta}x"
+                ));
             }
             continue;
         }
@@ -1263,11 +1263,14 @@ fn resolved_state_evidence(
         }
         match &state.ef_residual {
             Some(ef) if ef.dtype == DType::F16 && ef.byte_size() == residual_bytes => {}
-            _ => return Err(format!("GDN layer {layer} has no F16 residual of {residual_bytes} bytes")),
+            _ => {
+                return Err(format!(
+                    "GDN layer {layer} has no F16 residual of {residual_bytes} bytes"
+                ))
+            }
         }
     }
-    let scope =
-        SessionState::snapshot_scope(bundle, SessionRoute::Ar).ok_or("no session scope")?;
+    let scope = SessionState::snapshot_scope(bundle, SessionRoute::Ar).ok_or("no session scope")?;
     if !scope.contains("q8_ef-reset") {
         return Err(format!("session scope {scope:?} lacks the q8_ef-reset ABI"));
     }
@@ -1504,7 +1507,10 @@ fn load(model: &Path, max_seq: usize, cache_budget: Option<u64>) -> Result<Loade
         .attach_forward(&mut gpu, max_seq, scratch_mode)
         .map_err(|e| e.to_string())?;
     let evidence = resolved_state_evidence(&bundle, state_request, state_format)?;
-    println!("{evidence} replay_backend={replay_backend} backend={}", backend.name());
+    println!(
+        "{evidence} replay_backend={replay_backend} backend={}",
+        backend.name()
+    );
     if let (Some(budget), Some(domain)) = (cache_budget, domain) {
         bundle.attach_session_cache(SessionCache::new(domain, budget));
     }
@@ -1659,8 +1665,8 @@ fn spawn_arm(
     let json = |suffix: &str| -> Result<Value, String> {
         serde_json::from_slice(&read(suffix)?).map_err(|e| format!("{stem}.{suffix}: {e}"))
     };
-    let ids: Vec<u32> = serde_json::from_value(json("ids.json")?)
-        .map_err(|e| format!("{stem}.ids.json: {e}"))?;
+    let ids: Vec<u32> =
+        serde_json::from_value(json("ids.json")?).map_err(|e| format!("{stem}.ids.json: {e}"))?;
     if ids.len() != case.generated() {
         return Err(format!(
             "{stem}: {} ids, expected {}",
@@ -1702,7 +1708,10 @@ fn spawn_arm(
             .collect::<Result<Vec<_>, _>>()?;
         (
             rows,
-            doc["request_stats"].as_str().unwrap_or_default().to_string(),
+            doc["request_stats"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
         )
     };
     let trace = parse_trace(&stderr)?;
@@ -1756,7 +1765,11 @@ fn check_state(arm: Arm, label: &str, data: &RunData) -> (Vec<String>, Vec<Strin
         ));
     }
     if arm.route == Route::Ar {
-        if state["final_residual"]["nonzero_layers"].as_u64().unwrap_or(0) == 0 {
+        if state["final_residual"]["nonzero_layers"]
+            .as_u64()
+            .unwrap_or(0)
+            == 0
+        {
             failures.push(format!(
                 "{label}: the AR arm ended with an all-zero residual: the EF plane is not live"
             ));
@@ -1804,7 +1817,10 @@ fn compare_pair(a: &RunData, b: &RunData) -> PairVerdict {
     let digest_diff_keys = digest_diff(&a.digest, &b.digest);
     let (ha, hb) = (history(&a.windows, &a.trace), history(&b.windows, &b.trace));
     let first_history_diff = first_difference(&ha, &hb);
-    let (da, db) = (decisions(&a.windows, &a.trace), decisions(&b.windows, &b.trace));
+    let (da, db) = (
+        decisions(&a.windows, &a.trace),
+        decisions(&b.windows, &b.trace),
+    );
     let first_decision_diff = first_difference(&da, &db);
     PairVerdict {
         ids_equal: first_id_diff.is_none(),
@@ -2181,7 +2197,8 @@ fn run_arm(arm: Arm, case: Case, run: u32, model: &Path, dir: &Path) -> Result<(
             );
             check_logits_finite(&gpu, &logits, &mut host, &format!("AR step {step}"))?;
         }
-        logits_report = json!({"observed": true, "checked_forwards": 1 + generated, "nonfinite": 0});
+        logits_report =
+            json!({"observed": true, "checked_forwards": 1 + generated, "nonfinite": 0});
         final_digest = live_digest(&bundle, &mut gpu)?;
         final_scan = scan_residuals(&bundle, &mut gpu, &mut scratch)?;
         final_resets = bundle.state.gdn_residual_resets();
@@ -2413,7 +2430,12 @@ impl Restore<'_> {
             .prefill_final(&mut self.gpu, tokens, reused, &self.logits)
             .map_err(|e| format!("{label}: prefill: {e}"))?;
         let reset_events = self.bundle.state.gdn_residual_resets() - before;
-        check_logits_finite(&self.gpu, &self.logits, &mut self.host, &format!("{label} prefill"))?;
+        check_logits_finite(
+            &self.gpu,
+            &self.logits,
+            &mut self.host,
+            &format!("{label} prefill"),
+        )?;
         let prefill_digest = live_digest(&self.bundle, &mut self.gpu)?;
         self.bundle.session_commit();
         let (ids, pending) = ar_decode(
@@ -2584,11 +2606,19 @@ fn run_restore(model: &Path, dir: &Path) -> Result<(Value, String, Vec<String>),
     let pending = last.pending;
     let snap0 = r.bundle.snapshot(&mut r.gpu).map_err(|e| e.to_string())?;
     let (uninterrupted, _) = ar_decode(
-        &mut r.bundle, &mut r.gpu, &r.logits, &mut r.host, Some(pending), TX_DECODE, "uninterrupted",
+        &mut r.bundle,
+        &mut r.gpu,
+        &r.logits,
+        &mut r.host,
+        Some(pending),
+        TX_DECODE,
+        "uninterrupted",
     )?;
     let digest_u = live_digest(&r.bundle, &mut r.gpu)?;
     let resets = r.bundle.state.gdn_residual_resets();
-    r.bundle.restore(&mut r.gpu, snap0).map_err(|e| e.to_string())?;
+    r.bundle
+        .restore(&mut r.gpu, snap0)
+        .map_err(|e| e.to_string())?;
     r.require_zero("transaction restore")?;
     zero_checks.push("transaction restore: zero immediately".into());
     if r.bundle.state.gdn_residual_resets() != resets + 1 {
@@ -2603,18 +2633,34 @@ fn run_restore(model: &Path, dir: &Path) -> Result<(Value, String, Vec<String>),
     }
     let snap1 = r.bundle.snapshot(&mut r.gpu).map_err(|e| e.to_string())?;
     let (tx1, _) = ar_decode(
-        &mut r.bundle, &mut r.gpu, &r.logits, &mut r.host, Some(pending), TX_DECODE, "restored#1",
+        &mut r.bundle,
+        &mut r.gpu,
+        &r.logits,
+        &mut r.host,
+        Some(pending),
+        TX_DECODE,
+        "restored#1",
     )?;
     let digest_1 = live_digest(&r.bundle, &mut r.gpu)?;
-    r.bundle.restore(&mut r.gpu, snap1).map_err(|e| e.to_string())?;
+    r.bundle
+        .restore(&mut r.gpu, snap1)
+        .map_err(|e| e.to_string())?;
     r.require_zero("transaction restore #2")?;
     zero_checks.push("transaction restore #2: zero immediately".into());
     let (tx2, _) = ar_decode(
-        &mut r.bundle, &mut r.gpu, &r.logits, &mut r.host, Some(pending), TX_DECODE, "restored#2",
+        &mut r.bundle,
+        &mut r.gpu,
+        &r.logits,
+        &mut r.host,
+        Some(pending),
+        TX_DECODE,
+        "restored#2",
     )?;
     let digest_2 = live_digest(&r.bundle, &mut r.gpu)?;
     if let Some(index) = first_difference(&tx1, &tx2) {
-        r.fail(format!("two transaction-restored continuations differ at index {index}"));
+        r.fail(format!(
+            "two transaction-restored continuations differ at index {index}"
+        ));
     }
     let keys = digest_diff(&digest_1, &digest_2);
     if !keys.is_empty() {
@@ -2641,7 +2687,12 @@ fn run_restore(model: &Path, dir: &Path) -> Result<(Value, String, Vec<String>),
     }
     let digest_before = live_digest(&r.bundle, &mut r.gpu)?;
     let (scan, events) = {
-        let Restore { bundle, gpu, scratch, .. } = &mut r;
+        let Restore {
+            bundle,
+            gpu,
+            scratch,
+            ..
+        } = &mut r;
         session_restore_in_place(bundle, gpu, scratch)?
     };
     zero_checks.push("session restore entry: zero immediately".into());
@@ -2652,25 +2703,45 @@ fn run_restore(model: &Path, dir: &Path) -> Result<(Value, String, Vec<String>),
         ));
     }
     if events != 1 {
-        r.fail(format!("SessionState::restore_parts bumped the reset counter {events}x, expected 1"));
+        r.fail(format!(
+            "SessionState::restore_parts bumped the reset counter {events}x, expected 1"
+        ));
     }
     let after = live_digest(&r.bundle, &mut r.gpu)?;
     let keys = digest_diff_in(&digest_before, &after, &q8_rows);
     if !keys.is_empty() {
-        r.fail(format!("the session restore entry changed the Q8 state rows: {keys:?}"));
+        r.fail(format!(
+            "the session restore entry changed the Q8 state rows: {keys:?}"
+        ));
     }
     let snap2 = r.bundle.snapshot(&mut r.gpu).map_err(|e| e.to_string())?;
     let (s1, _) = ar_decode(
-        &mut r.bundle, &mut r.gpu, &r.logits, &mut r.host, Some(pending_s), TX_DECODE, "session-restored#1",
+        &mut r.bundle,
+        &mut r.gpu,
+        &r.logits,
+        &mut r.host,
+        Some(pending_s),
+        TX_DECODE,
+        "session-restored#1",
     )?;
     let digest_s1 = live_digest(&r.bundle, &mut r.gpu)?;
-    r.bundle.restore(&mut r.gpu, snap2).map_err(|e| e.to_string())?;
+    r.bundle
+        .restore(&mut r.gpu, snap2)
+        .map_err(|e| e.to_string())?;
     let (s2, _) = ar_decode(
-        &mut r.bundle, &mut r.gpu, &r.logits, &mut r.host, Some(pending_s), TX_DECODE, "session-restored#2",
+        &mut r.bundle,
+        &mut r.gpu,
+        &r.logits,
+        &mut r.host,
+        Some(pending_s),
+        TX_DECODE,
+        "session-restored#2",
     )?;
     let digest_s2 = live_digest(&r.bundle, &mut r.gpu)?;
     if let Some(index) = first_difference(&s1, &s2) {
-        r.fail(format!("two session-restored continuations differ at index {index}"));
+        r.fail(format!(
+            "two session-restored continuations differ at index {index}"
+        ));
     }
     let keys = digest_diff(&digest_s1, &digest_s2);
     if !keys.is_empty() {
@@ -2717,7 +2788,9 @@ fn run_restore(model: &Path, dir: &Path) -> Result<(Value, String, Vec<String>),
         let digest = live_digest(&r.bundle, &mut r.gpu)?;
         r.bundle.session_commit();
         if events == 0 {
-            r.fail(format!("{label}: the MTP prefill did not reset the residual"));
+            r.fail(format!(
+                "{label}: the MTP prefill did not reset the residual"
+            ));
         }
         Ok((seed, digest, events))
     };
@@ -2737,10 +2810,17 @@ fn run_restore(model: &Path, dir: &Path) -> Result<(Value, String, Vec<String>),
                     links * chunk
                 ));
             }
-            legs.push(mtp_leg(&mut r, &format!("MTP restored-{name}#{n}"), tokens, reused)?);
+            legs.push(mtp_leg(
+                &mut r,
+                &format!("MTP restored-{name}#{n}"),
+                tokens,
+                reused,
+            )?);
         }
         if legs[0].0 != legs[1].0 || !digest_diff(&legs[0].1, &legs[1].1).is_empty() {
-            r.fail(format!("MTP restored-{name} twice: seed or live digest differs"));
+            r.fail(format!(
+                "MTP restored-{name} twice: seed or live digest differs"
+            ));
         }
         mtp_notes.push(json!({
             "name": format!("MTP {name}"),
@@ -2780,9 +2860,7 @@ fn run_restore(model: &Path, dir: &Path) -> Result<(Value, String, Vec<String>),
         serde_json::to_string_pretty(&summary["observations"]).unwrap_or_default(),
         failures.join("\n"),
     );
-    r.gpu
-        .free_tensor(r.logits)
-        .map_err(|e| e.to_string())?;
+    r.gpu.free_tensor(r.logits).map_err(|e| e.to_string())?;
     r.bundle.free_gpu(&mut r.gpu).map_err(|e| e.to_string())?;
     Ok((summary, text, failures))
 }
@@ -2817,7 +2895,9 @@ fn q8_ef_restore_routes_on_flash_next() {
 fn q8ef_explicit_mode_refuses_unset_and_other_modes() {
     assert!(explicit_q8ef(None).unwrap_err().contains("unset"));
     assert!(explicit_q8ef(Some("q8")).unwrap_err().contains("not q8_ef"));
-    assert!(explicit_q8ef(Some("fp32")).unwrap_err().contains("not q8_ef"));
+    assert!(explicit_q8ef(Some("fp32"))
+        .unwrap_err()
+        .contains("not q8_ef"));
     assert!(explicit_q8ef(Some("bogus")).is_err());
     assert_eq!(explicit_q8ef(Some("q8_ef")), Ok(()));
 }
@@ -2963,8 +3043,14 @@ fn q8ef_window_rules_reject_missing_reset_nonzero_residual_and_route_errors() {
     // Rejected batched window with no reset event and an unscanned residual.
     let rows = vec![window(0, 100, 3, 1, (1, 1))];
     let (_, errors) = check_windows(Route::Batched, &rows, &trace, true);
-    assert!(errors.iter().any(|e| e.contains("did not reset")), "{errors:?}");
-    assert!(errors.iter().any(|e| e.contains("not scanned")), "{errors:?}");
+    assert!(
+        errors.iter().any(|e| e.contains("did not reset")),
+        "{errors:?}"
+    );
+    assert!(
+        errors.iter().any(|e| e.contains("not scanned")),
+        "{errors:?}"
+    );
     // Non-zero residual after the rejection.
     let mut row = window(0, 100, 3, 1, (1, 2));
     row.residual_nonzero = Some(7);
@@ -2976,7 +3062,10 @@ fn q8ef_window_rules_reject_missing_reset_nonzero_residual_and_route_errors() {
     // A full-commit batched window (committed = drafts + 1) never resets.
     let rows = vec![window(0, 100, 3, 3, (1, 2))];
     let (_, errors) = check_windows(Route::Adaptive, &rows, &[traced(100, 3, "batched")], true);
-    assert!(errors.iter().any(|e| e.contains("full-commit")), "{errors:?}");
+    assert!(
+        errors.iter().any(|e| e.contains("full-commit")),
+        "{errors:?}"
+    );
     // Interleaved windows take no assumed reset (see the lab-tap test).
     let rows = vec![window(0, 100, 3, 1, (1, 2))];
     let (_, errors) = check_windows(
@@ -2988,18 +3077,28 @@ fn q8ef_window_rules_reject_missing_reset_nonzero_residual_and_route_errors() {
     assert!(errors.is_empty(), "{errors:?}");
     // A window with drafts and no trace event, and a trace/window mismatch.
     let (_, errors) = check_windows(Route::Adaptive, &[window(0, 100, 3, 3, (1, 1))], &[], true);
-    assert!(errors.iter().any(|e| e.contains("no trace event")), "{errors:?}");
+    assert!(
+        errors.iter().any(|e| e.contains("no trace event")),
+        "{errors:?}"
+    );
     let (_, errors) = check_windows(
         Route::Adaptive,
         &[window(0, 100, 3, 3, (1, 1))],
         &[traced(100, 2, "batched")],
         true,
     );
-    assert!(errors.iter().any(|e| e.contains("trace accepted")), "{errors:?}");
+    assert!(
+        errors.iter().any(|e| e.contains("trace accepted")),
+        "{errors:?}"
+    );
     // Target-only windows never reset.
-    let (stats, errors) = check_windows(Route::Adaptive, &[window(0, 100, 0, 0, (1, 2))], &[], true);
+    let (stats, errors) =
+        check_windows(Route::Adaptive, &[window(0, 100, 0, 0, (1, 2))], &[], true);
     assert_eq!(stats.target_only, 1);
-    assert!(errors.iter().any(|e| e.contains("target-only")), "{errors:?}");
+    assert!(
+        errors.iter().any(|e| e.contains("target-only")),
+        "{errors:?}"
+    );
 }
 
 #[cfg(test)]
@@ -3035,7 +3134,9 @@ fn q8ef_truncated_full_accept_batched_window_is_a_rolled_back_window() {
     row.residual_nonzero = Some(0);
     let (_, errors) = check_windows(Route::Adaptive, &[row], &trace, true);
     assert!(
-        errors.iter().any(|e| e.contains("rolled-back batched window") && e.contains("did not reset")),
+        errors
+            .iter()
+            .any(|e| e.contains("rolled-back batched window") && e.contains("did not reset")),
         "{errors:?}"
     );
     // A non-zero or unscanned residual after it is a failure too.
@@ -3044,7 +3145,10 @@ fn q8ef_truncated_full_accept_batched_window_is_a_rolled_back_window() {
     let (_, errors) = check_windows(Route::Adaptive, &[row], &trace, true);
     assert!(errors.iter().any(|e| e.contains("not zero")), "{errors:?}");
     let (_, errors) = check_windows(Route::Adaptive, &[truncated_window((1, 2))], &trace, true);
-    assert!(errors.iter().any(|e| e.contains("not scanned")), "{errors:?}");
+    assert!(
+        errors.iter().any(|e| e.contains("not scanned")),
+        "{errors:?}"
+    );
     // (c) A full-commit window (committed 4) with a reset is a failure.
     let (_, errors) = check_windows(
         Route::Adaptive,
@@ -3052,7 +3156,10 @@ fn q8ef_truncated_full_accept_batched_window_is_a_rolled_back_window() {
         &trace,
         true,
     );
-    assert!(errors.iter().any(|e| e.contains("full-commit")), "{errors:?}");
+    assert!(
+        errors.iter().any(|e| e.contains("full-commit")),
+        "{errors:?}"
+    );
     // ... and passes with no reset.
     let (stats, errors) = check_windows(
         Route::Adaptive,
@@ -3070,9 +3177,17 @@ fn q8ef_window_rules_require_route_coverage() {
     let trace = vec![traced(100, 3, "batched")];
     // No rejected batched window: no reset coverage on a batched arm.
     let (_, errors) = check_windows(Route::Batched, &rows, &trace, true);
-    assert!(errors.iter().any(|e| e.contains("no reset coverage")), "{errors:?}");
+    assert!(
+        errors.iter().any(|e| e.contains("no reset coverage")),
+        "{errors:?}"
+    );
     let (_, errors) = check_windows(Route::Incremental, &rows, &trace, true);
-    assert!(errors.iter().any(|e| e.contains("interleaved windows only")), "{errors:?}");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("interleaved windows only")),
+        "{errors:?}"
+    );
     let (_, errors) = check_windows(Route::Adaptive, &rows, &trace, true);
     assert!(errors.is_empty(), "{errors:?}");
     let (_, errors) = check_windows(Route::Ar, &rows, &trace, true);
@@ -3080,7 +3195,10 @@ fn q8ef_window_rules_require_route_coverage() {
     let mut no_resets = trace.clone();
     no_resets[0].resets = None;
     let (_, errors) = check_windows(Route::Adaptive, &rows, &no_resets, true);
-    assert!(errors.iter().any(|e| e.contains("gdn_residual_resets")), "{errors:?}");
+    assert!(
+        errors.iter().any(|e| e.contains("gdn_residual_resets")),
+        "{errors:?}"
+    );
 }
 
 #[test]
@@ -3100,17 +3218,28 @@ fn q8ef_window_rules_use_the_lab_tap_observations() {
     let mut bad = row.clone();
     bad.logits_nonfinite = Some(3);
     let (_, errors) = check_windows(Route::Batched, &[bad], &trace, true);
-    assert!(errors.iter().any(|e| e.contains("non-finite verify-row logits")), "{errors:?}");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("non-finite verify-row logits")),
+        "{errors:?}"
+    );
     // The state tap's residual events must account for exactly the counter's
     // rise, in either direction.
     let mut silent = row.clone();
     silent.residual_events = Some(Vec::new());
     let (_, errors) = check_windows(Route::Batched, &[silent], &trace, true);
-    assert!(errors.iter().any(|e| e.contains("state tap saw 0")), "{errors:?}");
+    assert!(
+        errors.iter().any(|e| e.contains("state tap saw 0")),
+        "{errors:?}"
+    );
     let mut extra = row.clone();
     extra.residual_events = Some(vec!["PartialRollback".into(), "Restore".into()]);
     let (_, errors) = check_windows(Route::Batched, &[extra], &trace, true);
-    assert!(errors.iter().any(|e| e.contains("state tap saw 2")), "{errors:?}");
+    assert!(
+        errors.iter().any(|e| e.contains("state tap saw 2")),
+        "{errors:?}"
+    );
     // An interleaved window is judged by the hook data, never by an assumed
     // reset: a rejected one with no reset and no events passes, one whose
     // counter rose passes exactly when the tap saw those events, and without
@@ -3120,7 +3249,10 @@ fn q8ef_window_rules_use_the_lab_tap_observations() {
     quiet.residual_events = Some(Vec::new());
     let (stats, errors) = check_windows(Route::Incremental, &[quiet], &itrace, true);
     assert!(errors.is_empty(), "{errors:?}");
-    assert_eq!((stats.rejected_interleaved, stats.interleaved_reset_events), (1, 0));
+    assert_eq!(
+        (stats.rejected_interleaved, stats.interleaved_reset_events),
+        (1, 0)
+    );
     let mut observed = window(0, 100, 3, 1, (1, 2));
     observed.residual_events = Some(vec!["Restore".into()]);
     let (stats, errors) = check_windows(Route::Incremental, &[observed.clone()], &itrace, true);
@@ -3128,7 +3260,10 @@ fn q8ef_window_rules_use_the_lab_tap_observations() {
     assert_eq!(stats.interleaved_reset_events, 1);
     observed.residual_events = Some(Vec::new());
     let (_, errors) = check_windows(Route::Incremental, &[observed], &itrace, true);
-    assert!(errors.iter().any(|e| e.contains("state tap saw 0")), "{errors:?}");
+    assert!(
+        errors.iter().any(|e| e.contains("state tap saw 0")),
+        "{errors:?}"
+    );
     let untapped_rise = window(0, 100, 3, 1, (1, 2));
     let (stats, errors) = check_windows(Route::Incremental, &[untapped_rise], &itrace, true);
     assert!(errors.is_empty(), "{errors:?}");
@@ -3161,7 +3296,10 @@ fn q8ef_window_history_and_row_json_roundtrip() {
     assert!(WindowRow::from_json(&json!({"index": 1})).is_err());
     let h = history(&[row], &[traced(200, 2, "batched")]);
     assert_eq!(h, vec!["200:3:2:3:4:5:batched"]);
-    assert_eq!(history(&[window(0, 9, 0, 0, (1, 1))], &[]), vec!["9:0:0:1:1:1:-"]);
+    assert_eq!(
+        history(&[window(0, 9, 0, 0, (1, 1))], &[]),
+        vec!["9:0:0:1:1:1:-"]
+    );
 }
 
 #[test]
@@ -3177,17 +3315,32 @@ fn q8ef_pair_verdicts_assert_identity_with_history_context() {
         header: String::new(),
     };
     let (a, b) = (make(vec![1, 2], "x"), make(vec![1, 2], "x"));
-    assert!(compare_pair(&a, &b).failures("t", Route::Batched).is_empty());
-    assert!(compare_pair(&a, &b).failures("t", Route::Adaptive).is_empty());
+    assert!(compare_pair(&a, &b)
+        .failures("t", Route::Batched)
+        .is_empty());
+    assert!(compare_pair(&a, &b)
+        .failures("t", Route::Adaptive)
+        .is_empty());
     // A residual difference alone is a hard failure.
     let c = make(vec![1, 2], "y");
     let failures = compare_pair(&a, &c).failures("t", Route::Batched);
-    assert!(failures.iter().any(|f| f.contains("final live digests")), "{failures:?}");
-    assert!(failures.iter().any(|f| f.contains("histories are identical")), "{failures:?}");
+    assert!(
+        failures.iter().any(|f| f.contains("final live digests")),
+        "{failures:?}"
+    );
+    assert!(
+        failures
+            .iter()
+            .any(|f| f.contains("histories are identical")),
+        "{failures:?}"
+    );
     // An ID difference is hard.
     let d = make(vec![1, 3], "x");
     let failures = compare_pair(&a, &d).failures("t", Route::Batched);
-    assert!(failures.iter().any(|f| f.contains("IDs differ")), "{failures:?}");
+    assert!(
+        failures.iter().any(|f| f.contains("IDs differ")),
+        "{failures:?}"
+    );
     // A different accept history with identical route decisions (position,
     // drafts, verify route) is only the failure's context, on every route
     // (adaptive included): the decisions are the same.
@@ -3200,7 +3353,12 @@ fn q8ef_pair_verdicts_assert_identity_with_history_context() {
     for route in [Route::Batched, Route::Adaptive] {
         let failures = verdict.failures("t", route);
         assert_eq!(failures.len(), 2, "{failures:?}");
-        assert!(failures.iter().all(|f| f.contains("window histories differ first at window")), "{failures:?}");
+        assert!(
+            failures
+                .iter()
+                .all(|f| f.contains("window histories differ first at window")),
+            "{failures:?}"
+        );
     }
     let json = verdict.to_json(Route::Adaptive);
     assert_eq!(json["window_history_identical"], json!(false));
@@ -3279,8 +3437,14 @@ fn q8ef_adaptive_pair_with_identical_decisions_must_be_identical() {
     assert_eq!(verdict.diagnostic_note(Route::Adaptive), None);
     let failures = verdict.failures("t", Route::Adaptive);
     assert_eq!(failures.len(), 2, "{failures:?}");
-    assert!(failures.iter().any(|f| f.contains("IDs differ")), "{failures:?}");
-    assert!(failures.iter().any(|f| f.contains("final live digests")), "{failures:?}");
+    assert!(
+        failures.iter().any(|f| f.contains("IDs differ")),
+        "{failures:?}"
+    );
+    assert!(
+        failures.iter().any(|f| f.contains("final live digests")),
+        "{failures:?}"
+    );
     let json = verdict.to_json(Route::Adaptive);
     assert_eq!(json["decisions_identical"], json!(true));
     assert_eq!(json["first_decision_diff"], Value::Null);
@@ -3299,13 +3463,19 @@ fn q8ef_non_adaptive_pairs_stay_hard_with_different_histories() {
         assert_eq!(failures.len(), 2, "{route:?}: {failures:?}");
         assert_eq!(verdict.diagnostic_note(route), None);
     }
-    assert_eq!(verdict.to_json(Route::Batched)["diagnostic_only"], Value::Null);
+    assert_eq!(
+        verdict.to_json(Route::Batched)["diagnostic_only"],
+        Value::Null
+    );
 }
 
 #[test]
 fn q8ef_arm_table_matches_the_identity_harness_routes() {
     let names: Vec<&str> = ARMS.iter().map(|arm| arm.name).collect();
-    assert_eq!(names, ["ar", "batched", "incremental", "adaptive", "full-head"]);
+    assert_eq!(
+        names,
+        ["ar", "batched", "incremental", "adaptive", "full-head"]
+    );
     assert_eq!(Case::P1.generated(), 1200);
     assert_eq!(Case::Seasons.generated(), 256);
     assert_eq!(stem(ARMS[1], 2), "batched.r2");

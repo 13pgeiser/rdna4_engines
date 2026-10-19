@@ -227,7 +227,10 @@ impl fmt::Display for MqI4Error {
                 what,
                 expected,
                 got,
-            } => write!(f, "MQ-I4 {what} length mismatch: expected {expected}, got {got}"),
+            } => write!(
+                f,
+                "MQ-I4 {what} length mismatch: expected {expected}, got {got}"
+            ),
             Self::CodeOutOfRange {
                 row,
                 col,
@@ -238,7 +241,10 @@ impl fmt::Display for MqI4Error {
                 "MQ-I4 code {code} at row {row} col {col} exceeds the grid maximum {max}"
             ),
             Self::ScaleNotFinite { index, bits } => {
-                write!(f, "MQ-I4 scale #{index} (f16 bits {bits:#06x}) is not finite")
+                write!(
+                    f,
+                    "MQ-I4 scale #{index} (f16 bits {bits:#06x}) is not finite"
+                )
             }
             Self::ScaleNegative { index, bits } => write!(
                 f,
@@ -384,11 +390,7 @@ fn pack_into(codec: MqI4Codec, codes: &[u8], out: &mut [u8], k: usize) -> Result
             }
         }
         MqI4Codec::W2 => {
-            for (ci, (src, dst)) in codes
-                .chunks_exact(4)
-                .zip(out.iter_mut())
-                .enumerate()
-            {
+            for (ci, (src, dst)) in codes.chunks_exact(4).zip(out.iter_mut()).enumerate() {
                 let mut acc = 0u8;
                 for (j, &c) in src.iter().enumerate() {
                     if c > max {
@@ -423,9 +425,7 @@ pub fn unpack_codes(
     match codec {
         MqI4Codec::W3 => {
             for (src, dst) in bytes.chunks_exact(3).zip(out.chunks_exact_mut(8)) {
-                let acc = u32::from(src[0])
-                    | (u32::from(src[1]) << 8)
-                    | (u32::from(src[2]) << 16);
+                let acc = u32::from(src[0]) | (u32::from(src[1]) << 8) | (u32::from(src[2]) << 16);
                 for (j, d) in dst.iter_mut().enumerate() {
                     *d = ((acc >> (3 * j)) & 7) as u8;
                 }
@@ -783,8 +783,14 @@ mod tests {
                 rotation_width: 256
             })
         );
-        assert_eq!(tensor_bytes(MqI4Profile::MQ3_R128, 2, 640).unwrap(), 2 * 240 + 2 * 5 * 2);
-        assert_eq!(tensor_bytes(MqI4Profile::MQ2_R128, 2, 640).unwrap(), 2 * 160 + 2 * 5 * 2);
+        assert_eq!(
+            tensor_bytes(MqI4Profile::MQ3_R128, 2, 640).unwrap(),
+            2 * 240 + 2 * 5 * 2
+        );
+        assert_eq!(
+            tensor_bytes(MqI4Profile::MQ2_R128, 2, 640).unwrap(),
+            2 * 160 + 2 * 5 * 2
+        );
         // encode/decode apply the same rule.
         let (codes, scales) = random_tensor(MqI4Codec::W3, 2, 640, 7);
         assert!(matches!(
@@ -846,7 +852,7 @@ mod tests {
             let mid = codec.midpoint();
             let mut codes = vec![mid; m * k];
             let scales = vec![0u16, 0x3C00]; // group 0 zero, group 1 one
-            // All-midpoint zero group is legal (group 1 may hold anything).
+                                             // All-midpoint zero group is legal (group 1 may hold anything).
             codes[200] = 0;
             let bytes = encode_tensor(profile, m, k, &codes, &scales).unwrap();
             assert_eq!(decode_tensor(profile, m, k, &bytes).unwrap().codes, codes);
@@ -915,7 +921,14 @@ mod tests {
             assert_eq!(scale_bits_from_f16_valued_f32(v), Ok(bits));
         }
         // Not f16-representable: needs rounding.
-        for v in [0.1f32, 1.0 + 2f32.powi(-12), 65520.0, 2f32.powi(-25), 1e-10, 1e10] {
+        for v in [
+            0.1f32,
+            1.0 + 2f32.powi(-12),
+            65520.0,
+            2f32.powi(-25),
+            1e-10,
+            1e10,
+        ] {
             assert!(
                 matches!(
                     scale_bits_from_f16_valued_f32(v),
@@ -925,7 +938,14 @@ mod tests {
             );
         }
         // Non-finite and negative values, including -0.0.
-        for v in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1.0, -0.0, -2f32.powi(-24)] {
+        for v in [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            -1.0,
+            -0.0,
+            -2f32.powi(-24),
+        ] {
             assert!(
                 matches!(
                     scale_bits_from_f16_valued_f32(v),
@@ -961,14 +981,8 @@ mod tests {
 
     #[test]
     fn codec_and_rotation_constants() {
-        assert_eq!(
-            (MqI4Codec::W3.bits(), MqI4Codec::W3.levels()),
-            (3, 7)
-        );
-        assert_eq!(
-            (MqI4Codec::W2.bits(), MqI4Codec::W2.levels()),
-            (2, 3)
-        );
+        assert_eq!((MqI4Codec::W3.bits(), MqI4Codec::W3.levels()), (3, 7));
+        assert_eq!((MqI4Codec::W2.bits(), MqI4Codec::W2.levels()), (2, 3));
         assert_eq!(
             (MqI4Rotation::R256.width(), MqI4Rotation::R256.seeds()),
             (256, (42, 1042))

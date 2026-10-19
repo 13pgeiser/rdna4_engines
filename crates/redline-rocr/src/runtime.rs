@@ -1322,9 +1322,12 @@ impl AqlQueue {
     }
 
     fn cu_mask_from_hsa(&self, device: &GpuDevice) -> Result<Vec<bool>, RuntimeError> {
-        let runtime = self.runtime.as_ref().ok_or(RuntimeError::InvalidRuntimeObject(
-            "queue runtime is not retained",
-        ))?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(RuntimeError::InvalidRuntimeObject(
+                "queue runtime is not retained",
+            ))?;
         if !Arc::ptr_eq(runtime, &device.runtime) {
             return Err(RuntimeError::InvalidRuntimeObject(
                 "CU mask query device belongs to another HSA runtime",
@@ -2569,7 +2572,10 @@ mod emu_kernarg_budget_tests {
     fn raw_failure_rolls_back_reservation() {
         let log = RefCell::new(Vec::new());
         let result: Result<(Option<FakeReservation<'_>>, u32), &'static str> =
-            reserve_then_allocate(|| Ok(Some(FakeReservation::new(&log))), || Err("raw failed"));
+            reserve_then_allocate(
+                || Ok(Some(FakeReservation::new(&log))),
+                || Err("raw failed"),
+            );
         assert_eq!(result.err(), Some("raw failed"));
         assert_eq!(*log.borrow(), ["rollback"]);
     }
@@ -2590,11 +2596,9 @@ mod emu_kernarg_budget_tests {
 
     #[test]
     fn disabled_path_passes_through_without_reservation() {
-        let (reservation, value) = reserve_then_allocate::<FakeReservation<'_>, _, &'static str>(
-            || Ok(None),
-            || Ok(5u32),
-        )
-        .unwrap();
+        let (reservation, value) =
+            reserve_then_allocate::<FakeReservation<'_>, _, &'static str>(|| Ok(None), || Ok(5u32))
+                .unwrap();
         assert!(reservation.is_none());
         assert_eq!(value, 5);
     }
@@ -2823,13 +2827,21 @@ impl CodeObjectBytes {
 impl From<Arc<[u8]>> for CodeObjectBytes {
     fn from(bytes: Arc<[u8]>) -> Self {
         let end = bytes.len();
-        Self { backing: CodeObjectBacking::Owned(bytes), start: 0, end }
+        Self {
+            backing: CodeObjectBacking::Owned(bytes),
+            start: 0,
+            end,
+        }
     }
 }
 
 impl From<&'static [u8]> for CodeObjectBytes {
     fn from(bytes: &'static [u8]) -> Self {
-        Self { backing: CodeObjectBacking::Static(bytes), start: 0, end: bytes.len() }
+        Self {
+            backing: CodeObjectBacking::Static(bytes),
+            start: 0,
+            end: bytes.len(),
+        }
     }
 }
 
@@ -2850,7 +2862,10 @@ impl fmt::Debug for CodeObjectBytes {
 }
 
 impl Executable {
-    pub fn load(device: &GpuDevice, image: impl Into<CodeObjectBytes>) -> Result<Self, RuntimeError> {
+    pub fn load(
+        device: &GpuDevice,
+        image: impl Into<CodeObjectBytes>,
+    ) -> Result<Self, RuntimeError> {
         let code_object = unwrap_clang_offload_bundle(image.into())?;
         if code_object.as_bytes().is_empty() {
             return Err(RuntimeError::EmptyCodeObject);
@@ -3632,7 +3647,10 @@ mod tests {
     #[test]
     fn normalize_cu_mask_pads_and_truncates_to_device_width() {
         assert_eq!(normalize_cu_mask(&[true], 3), vec![true, false, false]);
-        assert_eq!(normalize_cu_mask(&[true, false, true, true], 2), vec![true, false]);
+        assert_eq!(
+            normalize_cu_mask(&[true, false, true, true], 2),
+            vec![true, false]
+        );
         // Empty request means all CUs per hsa_amd_queue_cu_set_mask.
         assert_eq!(normalize_cu_mask(&[], 2), vec![true, true]);
     }
@@ -3685,8 +3703,8 @@ mod tests {
 
     #[test]
     fn cu_mask_env_refused_display_is_the_guard_message() {
-        let text = RuntimeError::CuMaskEnvRefused("HSA_CU_MASK set but refused".to_owned())
-            .to_string();
+        let text =
+            RuntimeError::CuMaskEnvRefused("HSA_CU_MASK set but refused".to_owned()).to_string();
         assert_eq!(text, "HSA_CU_MASK set but refused");
     }
 
@@ -3749,15 +3767,25 @@ mod tests {
     #[test]
     fn bundle_unwrap_is_a_view_of_owned_backing_not_a_copy() {
         let bundle: Arc<[u8]> = Arc::from(
-            offload_bundle(&[("host-x86_64-unknown-linux-gnu-", b""), ("hipv4-amdgcn-amd-amdhsa--gfx1201", ELF)])
-                .as_slice(),
+            offload_bundle(&[
+                ("host-x86_64-unknown-linux-gnu-", b""),
+                ("hipv4-amdgcn-amd-amdhsa--gfx1201", ELF),
+            ])
+            .as_slice(),
         );
         let base = bundle.as_ptr() as usize;
         let out = unwrap_clang_offload_bundle(bundle.clone().into()).unwrap();
         assert_eq!(out.as_bytes(), ELF);
         let view = out.as_bytes().as_ptr() as usize;
-        assert!(view >= base && view + ELF.len() <= base + bundle.len(), "view must alias the bundle");
-        assert_eq!(Arc::strong_count(&bundle), 2, "the view retains the backing");
+        assert!(
+            view >= base && view + ELF.len() <= base + bundle.len(),
+            "view must alias the bundle"
+        );
+        assert_eq!(
+            Arc::strong_count(&bundle),
+            2,
+            "the view retains the backing"
+        );
         // Lifetime: dropping every other owner keeps the view's bytes valid.
         drop(bundle);
         assert_eq!(out.as_bytes(), ELF);
@@ -3765,13 +3793,17 @@ mod tests {
 
     #[test]
     fn static_and_owned_images_unwrap_identically() {
-        static BUNDLE: std::sync::LazyLock<Vec<u8>> =
-            std::sync::LazyLock::new(|| offload_bundle(&[("hipv4-amdgcn-amd-amdhsa--gfx1201", ELF)]));
+        static BUNDLE: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| {
+            offload_bundle(&[("hipv4-amdgcn-amd-amdhsa--gfx1201", ELF)])
+        });
         let bundle: &'static [u8] = BUNDLE.as_slice();
         let from_static = unwrap_clang_offload_bundle(bundle.into()).unwrap();
         let from_owned = unwrap_clang_offload_bundle(Arc::<[u8]>::from(bundle).into()).unwrap();
         assert_eq!(from_static.as_bytes(), from_owned.as_bytes());
-        assert_eq!(from_static.as_bytes().as_ptr(), bundle[bundle.len() - ELF.len()..].as_ptr());
+        assert_eq!(
+            from_static.as_bytes().as_ptr(),
+            bundle[bundle.len() - ELF.len()..].as_ptr()
+        );
     }
 
     #[test]
@@ -3780,14 +3812,16 @@ mod tests {
             ("hipv4-amdgcn-amd-amdhsa--gfx1100", ELF),
             ("hipv4-amdgcn-amd-amdhsa--gfx1201", ELF),
         ]);
-        let err = unwrap_clang_offload_bundle(Arc::<[u8]>::from(two.as_slice()).into()).unwrap_err();
+        let err =
+            unwrap_clang_offload_bundle(Arc::<[u8]>::from(two.as_slice()).into()).unwrap_err();
         assert!(err.to_string().contains("multiple AMDGPU"), "{err}");
         let one = offload_bundle(&[("hipv4-amdgcn-amd-amdhsa--gfx1201", ELF)]);
         let truncated = &one[..one.len() - 1];
         let err = unwrap_clang_offload_bundle(Arc::<[u8]>::from(truncated).into()).unwrap_err();
         assert!(err.to_string().contains("exceeds bundle"), "{err}");
         let none = offload_bundle(&[("host-x86_64-unknown-linux-gnu-", ELF)]);
-        let err = unwrap_clang_offload_bundle(Arc::<[u8]>::from(none.as_slice()).into()).unwrap_err();
+        let err =
+            unwrap_clang_offload_bundle(Arc::<[u8]>::from(none.as_slice()).into()).unwrap_err();
         assert!(err.to_string().contains("no AMDGPU"), "{err}");
     }
 

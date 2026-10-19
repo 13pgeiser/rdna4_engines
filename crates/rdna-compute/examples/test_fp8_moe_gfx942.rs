@@ -51,7 +51,9 @@
 //! Run: `cargo run --release -p rdna-compute --features lab --example test_fp8_moe_gfx942 -- [--fixtures DIR] [--byte-identity]`
 //! Time: `... -- --time [--time-out PATH.json] [--time-tokens 1,16,512,2048] [--time-shapes gate_up,down] [--time-xdt f32|bf16|both]`
 
-use rdna_compute::fp8_e4m3::{b128_block_stride, b128_scale_count, bf16_to_f32, dequant_b128_block};
+use rdna_compute::fp8_e4m3::{
+    b128_block_stride, b128_scale_count, bf16_to_f32, dequant_b128_block,
+};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::cell::{Cell, RefCell};
 
@@ -91,7 +93,11 @@ fn rand_codes(n: usize, st: &mut u64) -> Vec<u8> {
     (0..n)
         .map(|_| {
             let b = (lcg(st) >> 8) as u8;
-            if b & 0x7F == 0x7F { b ^ 1 } else { b }
+            if b & 0x7F == 0x7F {
+                b ^ 1
+            } else {
+                b
+            }
         })
         .collect()
 }
@@ -130,7 +136,10 @@ fn gpu_dequant(gpu: &mut Gpu, blocks: &[u8], e: usize, r: usize, k: usize) -> Ve
     let bytes = gpu.download_raw_bytes(&d_out).expect("download");
     gpu.free_tensor(d_out).ok();
     gpu.free_tensor(d_blk).ok();
-    bytes.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect()
+    bytes
+        .chunks_exact(2)
+        .map(|p| u16::from_le_bytes([p[0], p[1]]))
+        .collect()
 }
 
 struct Experts {
@@ -148,11 +157,19 @@ impl Experts {
         let mut w = Vec::new();
         for _ in 0..n {
             let codes = rand_codes(r * k, &mut st);
-            let scales: Vec<u16> = (0..b128_scale_count(r, k).unwrap()).map(|_| rand_scale(&mut st)).collect();
+            let scales: Vec<u16> = (0..b128_scale_count(r, k).unwrap())
+                .map(|_| rand_scale(&mut st))
+                .collect();
             w.push(dequant_b128_block(&codes, &scales, r, k).expect("cpu decode"));
             payload.extend(block_bytes(&codes, &scales, r, k));
         }
-        Experts { r, k, n, payload, w }
+        Experts {
+            r,
+            k,
+            n,
+            payload,
+            w,
+        }
     }
 }
 
@@ -175,28 +192,66 @@ impl Launch<'_> {
     /// One grouped launch (candidate = production entry, or the retained P1
     /// baseline when `reference`); returns Y [rows.len(), r] (POISON where the
     /// kernel wrote nothing).
-    fn raw(&self, gpu: &mut Gpu, tiles: &[Tile], rows: &[i32], bf16_x: bool, reference: bool) -> Vec<f32> {
+    fn raw(
+        &self,
+        gpu: &mut Gpu,
+        tiles: &[Tile],
+        rows: &[i32],
+        bf16_x: bool,
+        reference: bool,
+    ) -> Vec<f32> {
         let stride = b128_block_stride(self.ex.r, self.ex.k).unwrap();
         let flat: Vec<i32> = tiles.iter().flatten().copied().collect();
         let d_tiles = upload_i32(gpu, &flat);
         let d_rows = upload_i32(gpu, rows);
         let n = rows.len();
-        let y = gpu.upload_f32(&vec![POISON; n * self.ex.r], &[n * self.ex.r]).expect("y");
+        let y = gpu
+            .upload_f32(&vec![POISON; n * self.ex.r], &[n * self.ex.r])
+            .expect("y");
         let x = if bf16_x { self.x_bf16 } else { self.x_f32 };
         let mut dev = gpu.try_gfx942().expect("exact gfx942");
         let res = if reference {
             dev.gemm_fp8b128_moe_grouped_bf16mfma_reference(
-                self.d_payload, stride, self.ex.n, &d_tiles, tiles.len(), &d_rows, x, self.x_row_div, self.x_rows, &y, n,
-                self.ex.r, self.ex.k,
+                self.d_payload,
+                stride,
+                self.ex.n,
+                &d_tiles,
+                tiles.len(),
+                &d_rows,
+                x,
+                self.x_row_div,
+                self.x_rows,
+                &y,
+                n,
+                self.ex.r,
+                self.ex.k,
             )
         } else {
             dev.gemm_fp8b128_moe_grouped_bf16mfma(
-                self.d_payload, stride, self.ex.n, &d_tiles, tiles.len(), &d_rows, x, self.x_row_div, self.x_rows, &y, n,
-                self.ex.r, self.ex.k,
+                self.d_payload,
+                stride,
+                self.ex.n,
+                &d_tiles,
+                tiles.len(),
+                &d_rows,
+                x,
+                self.x_row_div,
+                self.x_rows,
+                &y,
+                n,
+                self.ex.r,
+                self.ex.k,
             )
         };
         res.unwrap_or_else(|e| {
-            panic!("{}: {e:?}", if reference { "gemm_fp8b128_moe_grouped_bf16mfma_reference" } else { "gemm_fp8b128_moe_grouped_bf16mfma" })
+            panic!(
+                "{}: {e:?}",
+                if reference {
+                    "gemm_fp8b128_moe_grouped_bf16mfma_reference"
+                } else {
+                    "gemm_fp8b128_moe_grouped_bf16mfma"
+                }
+            )
         });
         gpu.hip.device_synchronize().expect("sync");
         let out = gpu.download_f32(&y).expect("download y");
@@ -214,11 +269,23 @@ impl Launch<'_> {
         let out = self.raw(gpu, tiles, rows, bf16_x, false);
         if let Some(ab) = self.ab {
             let base = self.raw(gpu, tiles, rows, bf16_x, true);
-            ab.compare(self.tag, if bf16_x { "bf16-x" } else { "f32-x" }, &base, &out, self.ex.r);
+            ab.compare(
+                self.tag,
+                if bf16_x { "bf16-x" } else { "f32-x" },
+                &base,
+                &out,
+                self.ex.r,
+            );
             drop(base);
             let other = self.raw(gpu, tiles, rows, !bf16_x, false);
             let other_base = self.raw(gpu, tiles, rows, !bf16_x, true);
-            ab.compare(self.tag, if bf16_x { "f32-x" } else { "bf16-x" }, &other_base, &other, self.ex.r);
+            ab.compare(
+                self.tag,
+                if bf16_x { "f32-x" } else { "bf16-x" },
+                &other_base,
+                &other,
+                self.ex.r,
+            );
         }
         out
     }
@@ -236,7 +303,10 @@ fn scatter(slot_expert: &[usize], n_exp: usize, padded: bool) -> (Vec<Tile>, Vec
     let mut tiles = Vec::new();
     let mut rows = Vec::new();
     for e in 0..n_exp {
-        let mine: Vec<i32> = (0..slot_expert.len()).filter(|&i| slot_expert[i] == e).map(|i| i as i32).collect();
+        let mine: Vec<i32> = (0..slot_expert.len())
+            .filter(|&i| slot_expert[i] == e)
+            .map(|i| i as i32)
+            .collect();
         for chunk in mine.chunks(16) {
             let row0 = rows.len() as i32;
             rows.extend_from_slice(chunk);
@@ -268,12 +338,18 @@ struct Ab {
 
 impl Ab {
     fn new() -> Self {
-        Ab { launches: Cell::new(0), values: Cell::new(0), mismatched: Cell::new(0), first: RefCell::new(Vec::new()) }
+        Ab {
+            launches: Cell::new(0),
+            values: Cell::new(0),
+            mismatched: Cell::new(0),
+            first: RefCell::new(Vec::new()),
+        }
     }
 
     fn compare(&self, tag: &str, what: &str, base: &[f32], cand: &[f32], r: usize) {
         self.launches.set(self.launches.get() + 1);
-        self.values.set(self.values.get() + base.len().max(cand.len()) as u64);
+        self.values
+            .set(self.values.get() + base.len().max(cand.len()) as u64);
         let mut bad = base.len().abs_diff(cand.len()) as u64;
         let mut first = None;
         for (i, (b, c)) in base.iter().zip(cand).enumerate() {
@@ -321,17 +397,30 @@ impl Experts {
         let mut payload = Vec::with_capacity(n * b128_block_stride(r, k).unwrap());
         for e in 0..n {
             let (codes, scales) = make(e);
-            assert_eq!((codes.len(), scales.len()), (r * k, b128_scale_count(r, k).unwrap()));
+            assert_eq!(
+                (codes.len(), scales.len()),
+                (r * k, b128_scale_count(r, k).unwrap())
+            );
             payload.extend(block_bytes(&codes, &scales, r, k));
         }
-        Experts { r, k, n, payload, w: Vec::new() }
+        Experts {
+            r,
+            k,
+            n,
+            payload,
+            w: Vec::new(),
+        }
     }
 }
 
 /// Every finite E4M3 code is `b & 0x7F != 0x7F`; map the two NaNs to +/-0.
 fn finite_code(c: usize) -> u8 {
     let b = (c % 256) as u8;
-    if b & 0x7F == 0x7F { b & 0x80 } else { b }
+    if b & 0x7F == 0x7F {
+        b & 0x80
+    } else {
+        b
+    }
 }
 
 /// Four random finite codes per LCG draw (fast enough for 512 x 3.3 MB).
@@ -355,8 +444,8 @@ fn expert_seed(seed: u64, e: usize) -> u64 {
 /// BF16-subnormal-underflowed). All finite; none can overflow F32 with the X
 /// generators below.
 const SPECIAL_SCALES: [u16; 16] = [
-    0x3F80, 0x3F81, 0x3FFF, 0x3C00, 0x3800, 0x2F80, 0x3B7F, 0x4321, 0xBF80, 0xBA83, 0x0D80, 0x0001, 0x0080, 0x0000,
-    0x8000, 0x3A83,
+    0x3F80, 0x3F81, 0x3FFF, 0x3C00, 0x3800, 0x2F80, 0x3B7F, 0x4321, 0xBF80, 0xBA83, 0x0D80, 0x0001,
+    0x0080, 0x0000, 0x8000, 0x3A83,
 ];
 
 /// Finite-FP8 stress codes per expert kind: +0, -0, subnormals with sign, +/-max
@@ -371,9 +460,19 @@ fn special_codes(e: usize, r: usize, k: usize) -> Vec<u8> {
                 1 => 0x80,
                 2 => {
                     let m = (kk % 7 + 1) as u8; // 0x01..0x07: the E4M3 subnormals
-                    if (kk / 7 + o) & 1 == 1 { 0x80 | m } else { m }
+                    if (kk / 7 + o) & 1 == 1 {
+                        0x80 | m
+                    } else {
+                        m
+                    }
                 }
-                3 => if (kk / 16 + o) & 1 == 1 { 0xFE } else { 0x7E },
+                3 => {
+                    if (kk / 16 + o) & 1 == 1 {
+                        0xFE
+                    } else {
+                        0x7E
+                    }
+                }
                 4 => finite_code(kk + o * 17 + e * 5),
                 _ => finite_code((lcg(&mut st) >> 8) as usize),
             }
@@ -382,7 +481,9 @@ fn special_codes(e: usize, r: usize, k: usize) -> Vec<u8> {
 }
 
 fn special_scales(e: usize, r: usize, k: usize) -> Vec<u16> {
-    (0..b128_scale_count(r, k).unwrap()).map(|i| SPECIAL_SCALES[(i * 5 + e * 3) % SPECIAL_SCALES.len()]).collect()
+    (0..b128_scale_count(r, k).unwrap())
+        .map(|i| SPECIAL_SCALES[(i * 5 + e * 3) % SPECIAL_SCALES.len()])
+        .collect()
 }
 
 /// Cancellation-heavy W: every scale equal and the codes mirrored (kind e%3:
@@ -441,16 +542,42 @@ fn special_x_row(k: usize, row: usize, st: &mut u64) -> Vec<u16> {
     match row % 9 {
         0 => vec![0x0000; k],
         1 => vec![0x8000; k],
-        2 => (0..k).map(|_| sgn(st) | ((lcg(st) % 0x7F) as u16 + 1)).collect(),
-        3 => (0..k).map(|i| sgn(st) | if i % 2 == 0 { 0x4E80 } else { 0x3080 }).collect(),
+        2 => (0..k)
+            .map(|_| sgn(st) | ((lcg(st) % 0x7F) as u16 + 1))
+            .collect(),
+        3 => (0..k)
+            .map(|i| sgn(st) | if i % 2 == 0 { 0x4E80 } else { 0x3080 })
+            .collect(),
         4 => (0..k).map(|_| wide_bf16(st)).collect(),
         5 => {
             let hot = (row * 37 + 11) % k;
-            (0..k).map(|i| if i == hot { 0x3F80 | sgn(st) } else if i % 2 == 0 { 0x0000 } else { 0x8000 }).collect()
+            (0..k)
+                .map(|i| {
+                    if i == hot {
+                        0x3F80 | sgn(st)
+                    } else if i % 2 == 0 {
+                        0x0000
+                    } else {
+                        0x8000
+                    }
+                })
+                .collect()
         }
-        6 => (0..k).map(|i| if i % 3 == 0 { sgn(st) } else { f32_to_bf16(((lcg(st) as f32 / u32::MAX as f32) - 0.5) * 4.0) }).collect(),
-        7 => (0..k).map(|i| if (i / 16) % 2 == 0 { 0x3F80 } else { 0xBF80 }).collect(),
-        _ => (0..k).map(|_| f32_to_bf16(((lcg(st) as f32 / u32::MAX as f32) - 0.5) * 4.0)).collect(),
+        6 => (0..k)
+            .map(|i| {
+                if i % 3 == 0 {
+                    sgn(st)
+                } else {
+                    f32_to_bf16(((lcg(st) as f32 / u32::MAX as f32) - 0.5) * 4.0)
+                }
+            })
+            .collect(),
+        7 => (0..k)
+            .map(|i| if (i / 16) % 2 == 0 { 0x3F80 } else { 0xBF80 })
+            .collect(),
+        _ => (0..k)
+            .map(|_| f32_to_bf16(((lcg(st) as f32 / u32::MAX as f32) - 0.5) * 4.0))
+            .collect(),
     }
 }
 
@@ -474,7 +601,11 @@ fn zipf_slots(tokens: usize, n_exp: usize, st: &mut u64, uniform_mix: bool) -> V
         let mut chosen: Vec<usize> = Vec::with_capacity(10);
         while chosen.len() < 10 {
             let u = lcg(st) as f64 / 4294967296.0;
-            let f = if uniform_mix && t % 2 == 0 { u } else { u * u * u };
+            let f = if uniform_mix && t % 2 == 0 {
+                u
+            } else {
+                u * u * u
+            };
             let e = ((f * n_exp as f64) as usize).min(n_exp - 1);
             if !chosen.contains(&e) {
                 chosen.push(e);
@@ -500,7 +631,10 @@ fn sample_flats(n: usize) -> Vec<usize> {
 fn upload_x(gpu: &mut Gpu, xb: &[u16]) -> (GpuTensor, GpuTensor) {
     let xf: Vec<f32> = xb.iter().map(|&b| bf16_to_f32(b)).collect();
     let x_f32 = gpu.upload_f32(&xf, &[xb.len()]).expect("x f32");
-    let mut x_bf16 = upload_bytes(gpu, &xb.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    let mut x_bf16 = upload_bytes(
+        gpu,
+        &xb.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+    );
     x_bf16.shape = vec![xb.len()];
     x_bf16.dtype = DType::BF16;
     (x_f32, x_bf16)
@@ -511,14 +645,36 @@ fn upload_x(gpu: &mut Gpu, xb: &[u16]) -> (GpuTensor, GpuTensor) {
 /// launches of sampled slots. Every launch is A/B'd against the retained P1
 /// baseline for both X dtypes; on the candidate the padding/skipped/guard
 /// sentinels, compact == padded and M=1 == grouped bytes are also checked.
-fn ab_route(gpu: &mut Gpu, fail: &mut Fail, name: &str, ex: &Experts, xb: &[u16], x_row_div: usize, slot_expert: &[usize]) {
+fn ab_route(
+    gpu: &mut Gpu,
+    fail: &mut Fail,
+    name: &str,
+    ex: &Experts,
+    xb: &[u16],
+    x_row_div: usize,
+    slot_expert: &[usize],
+) {
     let (r, k) = (ex.r, ex.k);
-    assert!(xb.len() % k == 0 && !slot_expert.is_empty() && (slot_expert.len() - 1) / x_row_div < xb.len() / k, "{name}: route/X geometry");
+    assert!(
+        xb.len() % k == 0
+            && !slot_expert.is_empty()
+            && (slot_expert.len() - 1) / x_row_div < xb.len() / k,
+        "{name}: route/X geometry"
+    );
     let x_rows = xb.len() / k;
     let d_payload = upload_bytes(gpu, &ex.payload);
     let (x_f32, x_bf16) = upload_x(gpu, xb);
     let ab = Ab::new();
-    let l = Launch { ex, d_payload: &d_payload, x_row_div, x_rows, x_f32: &x_f32, x_bf16: &x_bf16, ab: Some(&ab), tag: name };
+    let l = Launch {
+        ex,
+        d_payload: &d_payload,
+        x_row_div,
+        x_rows,
+        x_f32: &x_f32,
+        x_bf16: &x_bf16,
+        ab: Some(&ab),
+        tag: name,
+    };
 
     let live = slot_expert.len();
     let (mut tiles, mut rows) = scatter(slot_expert, ex.n, true);
@@ -537,15 +693,24 @@ fn ab_route(gpu: &mut Gpu, fail: &mut Fail, name: &str, ex: &Experts, xb: &[u16]
             flat_g[flat as usize] = g;
         }
     }
-    skip_ok &= y[live_rows * r..].iter().all(|v| v.to_bits() == POISON.to_bits());
+    skip_ok &= y[live_rows * r..]
+        .iter()
+        .all(|v| v.to_bits() == POISON.to_bits());
     let row_of = |y: &[f32], g: usize| -> Vec<f32> { y[g * r..(g + 1) * r].to_vec() };
 
     let (ct, cr) = scatter(slot_expert, ex.n, false);
     let mut cr_guard = cr.clone();
     cr_guard.extend(std::iter::repeat_n(0, 16));
     let yc = l.run(gpu, &ct, &cr_guard, true);
-    let compact_ok = cr.iter().enumerate().all(|(g, &flat)| bits_eq(&yc[g * r..(g + 1) * r], &y[flat_g[flat as usize] * r..][..r]));
-    let guard_ok = yc[cr.len() * r..].iter().all(|v| v.to_bits() == POISON.to_bits());
+    let compact_ok = cr.iter().enumerate().all(|(g, &flat)| {
+        bits_eq(
+            &yc[g * r..(g + 1) * r],
+            &y[flat_g[flat as usize] * r..][..r],
+        )
+    });
+    let guard_ok = yc[cr.len() * r..]
+        .iter()
+        .all(|v| v.to_bits() == POISON.to_bits());
 
     let sample = sample_flats(live);
     let mut bad_single = 0usize;
@@ -557,8 +722,14 @@ fn ab_route(gpu: &mut Gpu, fail: &mut Fail, name: &str, ex: &Experts, xb: &[u16]
     drop(yc);
 
     ab.check(fail, name);
-    fail.check(pad_ok && skip_ok && guard_ok, format!("{name}: candidate padding rows +0, skipped tile and guard rows untouched"));
-    fail.check(compact_ok, format!("{name}: candidate compact tiles byte-identical to padded layout ({live} slots)"));
+    fail.check(
+        pad_ok && skip_ok && guard_ok,
+        format!("{name}: candidate padding rows +0, skipped tile and guard rows untouched"),
+    );
+    fail.check(
+        compact_ok,
+        format!("{name}: candidate compact tiles byte-identical to padded layout ({live} slots)"),
+    );
     fail.check(bad_single == 0, format!("{name}: candidate sampled M=1 launches byte-identical to grouped rows ({} sampled, {bad_single} mismatched)", sample.len()));
     for t in [x_bf16, x_f32, d_payload] {
         gpu.free_tensor(t).ok();
@@ -572,10 +743,28 @@ fn byte_cases(gpu: &mut Gpu, fail: &mut Fail) {
     // one full D=2 prefetch group; 128/384: odd/tail groups) through the FULL
     // existing case (F64 oracle, both X dtypes, padded/compact/skipped tiles,
     // M-invariance, tile positions).
-    for (r, k) in [(16usize, 128usize), (16, 256), (16, 384), (48, 128), (48, 256), (48, 384), (80, 128), (80, 256), (80, 384)] {
+    for (r, k) in [
+        (16usize, 128usize),
+        (16, 256),
+        (16, 384),
+        (48, 128),
+        (48, 256),
+        (48, 384),
+        (80, 128),
+        (80, 256),
+        (80, 384),
+    ] {
         let ex = Experts::synthetic(r, k, 12, 0x7a11_0000 ^ (r * 1000 + k) as u64);
         for (div, tokens) in [(10usize, 37usize), (1, 13)] {
-            gemm_case(gpu, fail, &format!("tail r={r} k={k} x_row_div={div}"), &ex, div, tokens, true);
+            gemm_case(
+                gpu,
+                fail,
+                &format!("tail r={r} k={k} x_row_div={div}"),
+                &ex,
+                div,
+                tokens,
+                true,
+            );
         }
     }
 
@@ -597,47 +786,116 @@ fn byte_cases(gpu: &mut Gpu, fail: &mut Fail) {
         let slots = zipf_slots(tokens, 12, &mut st, true);
 
         // (b) finite-FP8 +/-0/subnormal/max/sign codes x extreme scales; (c) BF16 X stress.
-        let ex = Experts::ab_only(r, k, 12, |e| (special_codes(e, r, k), special_scales(e, r, k)));
-        let xb: Vec<u16> = (0..x_rows).flat_map(|row| special_x_row(k, row, &mut st)).collect();
-        ab_route(gpu, fail, &format!("fp8-special r={r} k={k} x_row_div={div}"), &ex, &xb, div, &slots);
+        let ex = Experts::ab_only(r, k, 12, |e| {
+            (special_codes(e, r, k), special_scales(e, r, k))
+        });
+        let xb: Vec<u16> = (0..x_rows)
+            .flat_map(|row| special_x_row(k, row, &mut st))
+            .collect();
+        ab_route(
+            gpu,
+            fail,
+            &format!("fp8-special r={r} k={k} x_row_div={div}"),
+            &ex,
+            &xb,
+            div,
+            &slots,
+        );
 
         // BF16 X stress against ordinary random weights.
         let rnd = Experts::ab_only(r, k, 12, |e| {
             let mut s = expert_seed(0x4a4d_0000, e);
             let codes = rand_codes4(r * k, &mut s);
-            (codes, (0..b128_scale_count(r, k).unwrap()).map(|_| rand_scale(&mut s)).collect())
+            (
+                codes,
+                (0..b128_scale_count(r, k).unwrap())
+                    .map(|_| rand_scale(&mut s))
+                    .collect(),
+            )
         });
-        ab_route(gpu, fail, &format!("bf16-x-special r={r} k={k} x_row_div={div}"), &rnd, &xb, div, &slots);
+        ab_route(
+            gpu,
+            fail,
+            &format!("bf16-x-special r={r} k={k} x_row_div={div}"),
+            &rnd,
+            &xb,
+            div,
+            &slots,
+        );
         drop(rnd);
         drop(ex);
 
         // Cancellation-heavy: mirrored W against antisymmetric wide-exponent X.
-        let canc = Experts::ab_only(r, k, 12, |e| (cancel_codes(e, r, k), cancel_scales(e, r, k)));
-        let xc: Vec<u16> = (0..x_rows).flat_map(|row| cancel_x_row(k, row, &mut st)).collect();
-        ab_route(gpu, fail, &format!("cancellation r={r} k={k} x_row_div={div}"), &canc, &xc, div, &slots);
+        let canc = Experts::ab_only(r, k, 12, |e| {
+            (cancel_codes(e, r, k), cancel_scales(e, r, k))
+        });
+        let xc: Vec<u16> = (0..x_rows)
+            .flat_map(|row| cancel_x_row(k, row, &mut st))
+            .collect();
+        ab_route(
+            gpu,
+            fail,
+            &format!("cancellation r={r} k={k} x_row_div={div}"),
+            &canc,
+            &xc,
+            div,
+            &slots,
+        );
     }
 
     // (d) Target routes at the real shapes: C1 (one token, 10 distinct
     // experts, 10 one-row tiles) and 16/512/2048-token Zipf-like top-10 over
     // 512 experts. Baseline vs candidate on every live output; no F64 oracle.
-    for (label, r, k, div) in [("gate_up", 1280usize, 2560usize, 10usize), ("down", 2560, 640, 1)] {
+    for (label, r, k, div) in [
+        ("gate_up", 1280usize, 2560usize, 10usize),
+        ("down", 2560, 640, 1),
+    ] {
         let ex = Experts::ab_only(r, k, 512, |e| {
             let mut s = expert_seed(0x7a46_e700 ^ r as u64, e);
             let codes = rand_codes4(r * k, &mut s);
-            (codes, (0..b128_scale_count(r, k).unwrap()).map(|_| rand_scale(&mut s)).collect())
+            (
+                codes,
+                (0..b128_scale_count(r, k).unwrap())
+                    .map(|_| rand_scale(&mut s))
+                    .collect(),
+            )
         });
         for tokens in [1usize, 16, 512, 2048] {
             let mut st = 0x7a46_0000_u64 ^ tokens as u64 ^ (r as u64) << 24;
-            let slots = if tokens == 1 { (0..10).map(|j| j * 51 + 7).collect() } else { zipf_slots(tokens, 512, &mut st, false) };
+            let slots = if tokens == 1 {
+                (0..10).map(|j| j * 51 + 7).collect()
+            } else {
+                zipf_slots(tokens, 512, &mut st, false)
+            };
             let x_rows = if div == 1 { slots.len() } else { tokens };
             let xb = random_x(x_rows, k, 0x7a46_5eed ^ tokens as u64);
-            let tag = if tokens == 1 { "C1 (10 experts)".to_string() } else { format!("{tokens}-token route") };
-            ab_route(gpu, fail, &format!("target {label} r={r} k={k} {tag}"), &ex, &xb, div, &slots);
+            let tag = if tokens == 1 {
+                "C1 (10 experts)".to_string()
+            } else {
+                format!("{tokens}-token route")
+            };
+            ab_route(
+                gpu,
+                fail,
+                &format!("target {label} r={r} k={k} {tag}"),
+                &ex,
+                &xb,
+                div,
+                &slots,
+            );
         }
     }
 }
 
-fn gemm_case(gpu: &mut Gpu, fail: &mut Fail, name: &str, ex: &Experts, x_row_div: usize, tokens: usize, byte_ab: bool) {
+fn gemm_case(
+    gpu: &mut Gpu,
+    fail: &mut Fail,
+    name: &str,
+    ex: &Experts,
+    x_row_div: usize,
+    tokens: usize,
+    byte_ab: bool,
+) {
     let (r, k) = (ex.r, ex.k);
     // x: BF16-exact values, including signed zeros. At least 128 rows so the
     // M-invariance sweep can reach n = 128.
@@ -653,11 +911,23 @@ fn gemm_case(gpu: &mut Gpu, fail: &mut Fail, name: &str, ex: &Experts, x_row_div
     let xf: Vec<f32> = xb.iter().map(|&b| bf16_to_f32(b)).collect();
     let d_payload = upload_bytes(gpu, &ex.payload);
     let x_f32 = gpu.upload_f32(&xf, &[x_rows * k]).expect("x f32");
-    let mut x_bf16 = upload_bytes(gpu, &xb.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    let mut x_bf16 = upload_bytes(
+        gpu,
+        &xb.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+    );
     x_bf16.shape = vec![x_rows * k];
     x_bf16.dtype = DType::BF16;
     let ab = byte_ab.then(Ab::new);
-    let l = Launch { ex, d_payload: &d_payload, x_row_div, x_rows, x_f32: &x_f32, x_bf16: &x_bf16, ab: ab.as_ref(), tag: name };
+    let l = Launch {
+        ex,
+        d_payload: &d_payload,
+        x_row_div,
+        x_rows,
+        x_f32: &x_f32,
+        x_bf16: &x_bf16,
+        ab: ab.as_ref(),
+        tag: name,
+    };
 
     // Top-10 distinct experts per token (deterministic, skewed).
     let mut slot_expert = Vec::with_capacity(tokens * 10);
@@ -680,7 +950,13 @@ fn gemm_case(gpu: &mut Gpu, fail: &mut Fail, name: &str, ex: &Experts, x_row_div
     rows.extend(std::iter::repeat_n(0, 16));
     let y = l.run(gpu, &tiles, &rows, false);
     let yb = l.run(gpu, &tiles, &rows, true);
-    fail.check(bits_eq(&y, &yb), format!("{name}: F32-x and BF16-x entries byte-identical ({} values)", y.len()));
+    fail.check(
+        bits_eq(&y, &yb),
+        format!(
+            "{name}: F32-x and BF16-x entries byte-identical ({} values)",
+            y.len()
+        ),
+    );
 
     // GPU tile-desc builder from padded-16 tile ids == the host descriptors.
     {
@@ -699,7 +975,13 @@ fn gemm_case(gpu: &mut Gpu, fail: &mut Fail, name: &str, ex: &Experts, x_row_div
             .map(|p| i32::from_le_bytes([p[0], p[1], p[2], p[3]]))
             .collect();
         let want: Vec<i32> = tiles.iter().flatten().copied().collect();
-        fail.check(got == want, format!("{name}: fp8b128_moe_tile_desc_pad16 == host descriptors ({} tiles)", ids.len()));
+        fail.check(
+            got == want,
+            format!(
+                "{name}: fp8b128_moe_tile_desc_pad16 == host descriptors ({} tiles)",
+                ids.len()
+            ),
+        );
         for t in [d_desc, d_ids] {
             gpu.free_tensor(t).ok();
         }
@@ -750,8 +1032,14 @@ fn gemm_case(gpu: &mut Gpu, fail: &mut Fail, name: &str, ex: &Experts, x_row_div
             worst_abs / maxref.max(1e-30)
         ),
     );
-    fail.check(pad_ok, format!("{name}: padding rows (-1) of live tiles written as +0"));
-    fail.check(skip_ok, format!("{name}: skipped tile (expert -1) left untouched"));
+    fail.check(
+        pad_ok,
+        format!("{name}: padding rows (-1) of live tiles written as +0"),
+    );
+    fail.check(
+        skip_ok,
+        format!("{name}: skipped tile (expert -1) left untouched"),
+    );
 
     // Compact layout (nrows < 16 tails, no padding): same bytes per flat slot,
     // and nothing beyond the live rows written.
@@ -759,8 +1047,15 @@ fn gemm_case(gpu: &mut Gpu, fail: &mut Fail, name: &str, ex: &Experts, x_row_div
     let mut cr_guard = cr.clone();
     cr_guard.extend(std::iter::repeat_n(0, 16)); // guard rows no tile covers
     let yc = l.run(gpu, &ct, &cr_guard, false);
-    let compact_ok = cr.iter().enumerate().all(|(g, &flat)| bits_eq(&yc[g * r..(g + 1) * r], by_flat[flat as usize].as_ref().unwrap()));
-    let guard_ok = yc[cr.len() * r..].iter().all(|v| v.to_bits() == POISON.to_bits());
+    let compact_ok = cr.iter().enumerate().all(|(g, &flat)| {
+        bits_eq(
+            &yc[g * r..(g + 1) * r],
+            by_flat[flat as usize].as_ref().unwrap(),
+        )
+    });
+    let guard_ok = yc[cr.len() * r..]
+        .iter()
+        .all(|v| v.to_bits() == POISON.to_bits());
     fail.check(compact_ok && guard_ok, format!("{name}: compact tiles (nrows<16) byte-identical to padded layout, rows past the tiles untouched"));
 
     // Every grouped row == its single-row launch (same expert, same X row).
@@ -777,7 +1072,9 @@ fn gemm_case(gpu: &mut Gpu, fail: &mut Fail, name: &str, ex: &Experts, x_row_div
     for n in [2usize, 7, 8, 16, 17, 128] {
         let (t, s) = scatter(&vec![0usize; n], 1, true);
         let yn = l1.run(gpu, &t, &s, false);
-        let bad_rows = (0..n).filter(|&row| !bits_eq(&yn[row * r..(row + 1) * r], &singles[row])).count();
+        let bad_rows = (0..n)
+            .filter(|&row| !bits_eq(&yn[row * r..(row + 1) * r], &singles[row]))
+            .count();
         fail.check(bad_rows == 0, format!("{name}: bytes(M=1) == row of bytes(M={n}) for all {n} rows ({bad_rows} mismatched)"));
     }
 
@@ -788,7 +1085,9 @@ fn gemm_case(gpu: &mut Gpu, fail: &mut Fail, name: &str, ex: &Experts, x_row_div
     let checked_rows = [0i32, 37, 127];
     for &q in &checked_rows {
         for p in 0..16usize {
-            let mut tile_rows: Vec<i32> = (0..16).map(|i| ((q as usize + 1 + i * 7) % 128) as i32).collect();
+            let mut tile_rows: Vec<i32> = (0..16)
+                .map(|i| ((q as usize + 1 + i * 7) % 128) as i32)
+                .collect();
             tile_rows[p] = q;
             for tile_index in [0usize, 5] {
                 let mut rows_l = Vec::new();
@@ -856,13 +1155,35 @@ fn timed_launch(gpu: &mut Gpu, rt: &TimedRoute, bf16_x: bool, reference: bool, y
     let mut dev = gpu.try_gfx942().expect("exact gfx942");
     let res = if reference {
         dev.gemm_fp8b128_moe_grouped_bf16mfma_reference(
-            rt.d_payload, rt.stride, rt.n_exp, rt.d_tiles, rt.n_tiles, rt.d_rows, x, rt.x_row_div, rt.x_rows, y,
-            rt.n_sorted, rt.r, rt.k,
+            rt.d_payload,
+            rt.stride,
+            rt.n_exp,
+            rt.d_tiles,
+            rt.n_tiles,
+            rt.d_rows,
+            x,
+            rt.x_row_div,
+            rt.x_rows,
+            y,
+            rt.n_sorted,
+            rt.r,
+            rt.k,
         )
     } else {
         dev.gemm_fp8b128_moe_grouped_bf16mfma(
-            rt.d_payload, rt.stride, rt.n_exp, rt.d_tiles, rt.n_tiles, rt.d_rows, x, rt.x_row_div, rt.x_rows, y,
-            rt.n_sorted, rt.r, rt.k,
+            rt.d_payload,
+            rt.stride,
+            rt.n_exp,
+            rt.d_tiles,
+            rt.n_tiles,
+            rt.d_rows,
+            x,
+            rt.x_row_div,
+            rt.x_rows,
+            y,
+            rt.n_sorted,
+            rt.r,
+            rt.k,
         )
     };
     res.unwrap_or_else(|e| panic!("timed grouped launch (reference={reference}): {e:?}"));
@@ -870,12 +1191,22 @@ fn timed_launch(gpu: &mut Gpu, rt: &TimedRoute, bf16_x: bool, reference: bool, y
 
 /// Event-timed span (microseconds) of `n` back-to-back runs of `f`, synchronized
 /// on the stop event only.
-fn event_span_us(gpu: &mut Gpu, e0: &hip_bridge::Event, e1: &hip_bridge::Event, n: usize, mut f: impl FnMut(&mut Gpu)) -> f64 {
-    gpu.hip.event_record(e0, gpu.active_stream.as_ref()).expect("record start");
+fn event_span_us(
+    gpu: &mut Gpu,
+    e0: &hip_bridge::Event,
+    e1: &hip_bridge::Event,
+    n: usize,
+    mut f: impl FnMut(&mut Gpu),
+) -> f64 {
+    gpu.hip
+        .event_record(e0, gpu.active_stream.as_ref())
+        .expect("record start");
     for _ in 0..n {
         f(gpu);
     }
-    gpu.hip.event_record(e1, gpu.active_stream.as_ref()).expect("record stop");
+    gpu.hip
+        .event_record(e1, gpu.active_stream.as_ref())
+        .expect("record stop");
     gpu.hip.event_synchronize(e1).expect("sync stop");
     gpu.hip.event_elapsed_ms(e0, e1).expect("elapsed") as f64 * 1000.0
 }
@@ -935,10 +1266,18 @@ fn identity_json(id: &rdna_compute::cdna::gfx942::Fp8MoeBuildIdentity) -> serde_
 /// After timing, the WHOLE Y of both sides is downloaded and compared on raw
 /// F32 bits; any mismatch fails the run (exit 1) after the JSON is written.
 fn time_mode(gpu: &mut Gpu, args: &[String]) {
-    let opt = |name: &str| args.iter().position(|a| a == name).map(|i| args[i + 1].clone());
+    let opt = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .map(|i| args[i + 1].clone())
+    };
     let out_path = opt("--time-out").unwrap_or_else(|| "fp8_moe_time.json".to_string());
     let tokens_sel: Vec<usize> = opt("--time-tokens")
-        .map(|s| s.split(',').map(|t| t.trim().parse().expect("--time-tokens")).collect())
+        .map(|s| {
+            s.split(',')
+                .map(|t| t.trim().parse().expect("--time-tokens"))
+                .collect()
+        })
         .unwrap_or_else(|| vec![1, 16, 512, 2048]);
     let shapes_sel = opt("--time-shapes").unwrap_or_else(|| "gate_up,down".to_string());
     let xdt = opt("--time-xdt").unwrap_or_else(|| "both".to_string());
@@ -948,10 +1287,13 @@ fn time_mode(gpu: &mut Gpu, args: &[String]) {
         "both" => vec![false, true],
         other => panic!("--time-xdt must be f32|bf16|both, got {other}"),
     };
-    let shapes: Vec<(&str, usize, usize, usize)> = [("gate_up", 1280usize, 2560usize, 10usize), ("down", 2560, 640, 1)]
-        .into_iter()
-        .filter(|(l, ..)| shapes_sel.split(',').any(|s| s.trim() == *l))
-        .collect();
+    let shapes: Vec<(&str, usize, usize, usize)> = [
+        ("gate_up", 1280usize, 2560usize, 10usize),
+        ("down", 2560, 640, 1),
+    ]
+    .into_iter()
+    .filter(|(l, ..)| shapes_sel.split(',').any(|s| s.trim() == *l))
+    .collect();
     assert!(!shapes.is_empty(), "--time-shapes selects no shape");
 
     let e0 = gpu.hip.event_create().expect("start event");
@@ -964,15 +1306,23 @@ fn time_mode(gpu: &mut Gpu, args: &[String]) {
         let ex = Experts::ab_only(r, k, 512, |e| {
             let mut s = expert_seed(0x7a46_e700 ^ r as u64, e);
             let codes = rand_codes4(r * k, &mut s);
-            (codes, (0..b128_scale_count(r, k).unwrap()).map(|_| rand_scale(&mut s)).collect())
+            (
+                codes,
+                (0..b128_scale_count(r, k).unwrap())
+                    .map(|_| rand_scale(&mut s))
+                    .collect(),
+            )
         });
         let stride = b128_block_stride(r, k).unwrap();
         let weights_digest = sha_hex(&[&ex.payload]);
         let d_payload = upload_bytes(gpu, &ex.payload);
         for &tokens in &tokens_sel {
             let mut st = 0x7a46_0000_u64 ^ tokens as u64 ^ (r as u64) << 24;
-            let slots: Vec<usize> =
-                if tokens == 1 { (0..10).map(|j| j * 51 + 7).collect() } else { zipf_slots(tokens, 512, &mut st, false) };
+            let slots: Vec<usize> = if tokens == 1 {
+                (0..10).map(|j| j * 51 + 7).collect()
+            } else {
+                zipf_slots(tokens, 512, &mut st, false)
+            };
             let x_rows = if div == 1 { slots.len() } else { tokens };
             let xb = random_x(x_rows, k, 0x7a46_5eed ^ tokens as u64);
             let (tiles, rows) = scatter(&slots, ex.n, true);
@@ -988,7 +1338,8 @@ fn time_mode(gpu: &mut Gpu, args: &[String]) {
                 &i32_bytes(&flat_tiles),
                 &i32_bytes(&rows),
             ]);
-            let x_digest = sha_hex(&[&xb.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()]);
+            let x_digest =
+                sha_hex(&[&xb.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()]);
             let useful_flops = 2.0 * slots.len() as f64 * r as f64 * k as f64;
 
             let d_tiles = upload_i32(gpu, &flat_tiles);
@@ -1011,12 +1362,20 @@ fn time_mode(gpu: &mut Gpu, args: &[String]) {
             };
 
             for &bf16_x in &dtypes {
-                let y_ref = gpu.upload_f32(&vec![POISON; rows.len() * r], &[rows.len() * r]).expect("y ref");
-                let y_cand = gpu.upload_f32(&vec![POISON; rows.len() * r], &[rows.len() * r]).expect("y cand");
+                let y_ref = gpu
+                    .upload_f32(&vec![POISON; rows.len() * r], &[rows.len() * r])
+                    .expect("y ref");
+                let y_cand = gpu
+                    .upload_f32(&vec![POISON; rows.len() * r], &[rows.len() * r])
+                    .expect("y cand");
                 if identities.is_none() {
                     let mut dev = gpu.try_gfx942().expect("exact gfx942");
-                    let rid = dev.fp8b128_moe_grouped_build_identity(true).expect("reference identity");
-                    let pid = dev.fp8b128_moe_grouped_build_identity(false).expect("production identity");
+                    let rid = dev
+                        .fp8b128_moe_grouped_build_identity(true)
+                        .expect("reference identity");
+                    let pid = dev
+                        .fp8b128_moe_grouped_build_identity(false)
+                        .expect("production identity");
                     identities = Some((identity_json(&rid), identity_json(&pid)));
                 }
                 for _ in 0..TIME_WARMUPS {
@@ -1024,11 +1383,16 @@ fn time_mode(gpu: &mut Gpu, args: &[String]) {
                     timed_launch(gpu, &rt, bf16_x, false, &y_cand);
                 }
                 gpu.hip.device_synchronize().expect("sync warmup");
-                let (mut t_ref, mut t_cand) = (Vec::with_capacity(TIME_LAUNCHES), Vec::with_capacity(TIME_LAUNCHES));
+                let (mut t_ref, mut t_cand) = (
+                    Vec::with_capacity(TIME_LAUNCHES),
+                    Vec::with_capacity(TIME_LAUNCHES),
+                );
                 for i in 0..TIME_LAUNCHES {
                     let one = |gpu: &mut Gpu, reference: bool| {
                         let y = if reference { &y_ref } else { &y_cand };
-                        event_span_us(gpu, &e0, &e1, 1, |g| timed_launch(g, &rt, bf16_x, reference, y))
+                        event_span_us(gpu, &e0, &e1, 1, |g| {
+                            timed_launch(g, &rt, bf16_x, reference, y)
+                        })
                     };
                     if i % 2 == 0 {
                         t_ref.push(one(gpu, true));
@@ -1038,17 +1402,22 @@ fn time_mode(gpu: &mut Gpu, args: &[String]) {
                         t_ref.push(one(gpu, true));
                     }
                 }
-                let burst_ref = event_span_us(gpu, &e0, &e1, TIME_LAUNCHES, |g| timed_launch(g, &rt, bf16_x, true, &y_ref))
-                    / TIME_LAUNCHES as f64;
-                let burst_cand = event_span_us(gpu, &e0, &e1, TIME_LAUNCHES, |g| timed_launch(g, &rt, bf16_x, false, &y_cand))
-                    / TIME_LAUNCHES as f64;
+                let burst_ref = event_span_us(gpu, &e0, &e1, TIME_LAUNCHES, |g| {
+                    timed_launch(g, &rt, bf16_x, true, &y_ref)
+                }) / TIME_LAUNCHES as f64;
+                let burst_cand = event_span_us(gpu, &e0, &e1, TIME_LAUNCHES, |g| {
+                    timed_launch(g, &rt, bf16_x, false, &y_cand)
+                }) / TIME_LAUNCHES as f64;
 
                 // Whole-Y raw-bit comparison (live, padding rows, every element).
                 gpu.hip.device_synchronize().expect("sync compare");
                 let a = gpu.download_f32(&y_ref).expect("download ref");
                 let b = gpu.download_f32(&y_cand).expect("download cand");
                 let mismatches = a.len().abs_diff(b.len()) as u64
-                    + a.iter().zip(&b).filter(|(x, y)| x.to_bits() != y.to_bits()).count() as u64;
+                    + a.iter()
+                        .zip(&b)
+                        .filter(|(x, y)| x.to_bits() != y.to_bits())
+                        .count() as u64;
                 let unwritten = b.iter().filter(|v| v.to_bits() == POISON.to_bits()).count();
                 total_mismatch += mismatches;
                 for t in [y_ref, y_cand] {
@@ -1122,20 +1491,26 @@ fn time_mode(gpu: &mut Gpu, args: &[String]) {
         "total_raw_f32_bit_mismatches": total_mismatch,
         "records": records,
     });
-    std::fs::write(&out_path, serde_json::to_string_pretty(&doc).unwrap()).unwrap_or_else(|e| panic!("write {out_path}: {e}"));
+    std::fs::write(&out_path, serde_json::to_string_pretty(&doc).unwrap())
+        .unwrap_or_else(|e| panic!("write {out_path}: {e}"));
     println!("timing JSON: {out_path}");
     for ev in [e0, e1] {
         gpu.hip.event_destroy(ev).ok();
     }
     if total_mismatch != 0 {
-        println!("FAILED: {total_mismatch} raw F32 bit mismatches between reference and production");
+        println!(
+            "FAILED: {total_mismatch} raw F32 bit mismatches between reference and production"
+        );
         std::process::exit(1);
     }
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let fixtures = args.iter().position(|a| a == "--fixtures").map(|i| args[i + 1].clone());
+    let fixtures = args
+        .iter()
+        .position(|a| a == "--fixtures")
+        .map(|i| args[i + 1].clone());
     let byte = args.iter().any(|a| a == "--byte-identity");
     let mut gpu = Gpu::init().expect("Gpu::init");
     println!("detected arch: {}", gpu.arch);
@@ -1152,8 +1527,8 @@ fn main() {
         let (r, k) = (128usize, 256usize);
         let mut st = 0xdec0_de42_u64;
         let mut sweep: Vec<u16> = vec![
-            0x3F80, 0x3F81, 0x3FFF, 0x3C00, 0x3800, 0x3A83, 0x3B7F, 0x3901, 0x39FF, 0x4000, 0x4321, 0x3E55,
-            0x3D2B, 0x2F80, 0x2FFF, 0xBA83, 0xBF80, 0x0D80, 0x7000,
+            0x3F80, 0x3F81, 0x3FFF, 0x3C00, 0x3800, 0x3A83, 0x3B7F, 0x3901, 0x39FF, 0x4000, 0x4321,
+            0x3E55, 0x3D2B, 0x2F80, 0x2FFF, 0xBA83, 0xBF80, 0x0D80, 0x7000,
         ];
         sweep.extend((0..45).map(|_| rand_scale(&mut st)));
         if sweep.len() % 2 == 1 {
@@ -1162,7 +1537,11 @@ fn main() {
         let codes: Vec<u8> = (0..r * k)
             .map(|i| {
                 let b = (i % 256) as u8;
-                if b & 0x7F == 0x7F { 0x80 } else { b }
+                if b & 0x7F == 0x7F {
+                    0x80
+                } else {
+                    b
+                }
             })
             .collect();
         let e = sweep.len() / 2;
@@ -1170,7 +1549,9 @@ fn main() {
         let mut want = Vec::new();
         for p in sweep.chunks(2) {
             payload.extend(block_bytes(&codes, p, r, k));
-            want.extend(dequant_b128_block(&codes, p, r, k).expect("cpu twin refused a sweep scale"));
+            want.extend(
+                dequant_b128_block(&codes, p, r, k).expect("cpu twin refused a sweep scale"),
+            );
         }
         let got = gpu_dequant(&mut gpu, &payload, e, r, k);
         let bad = got.iter().zip(&want).filter(|(a, b)| a != b).count();
@@ -1182,11 +1563,22 @@ fn main() {
 
     // 1b. Python-teacher bits (fixtures from mkfix.py), if given.
     if let Some(dir) = fixtures.as_deref() {
-        let scales: Vec<u16> = read(dir, "codes256.scales").chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
-        let refs: Vec<u16> = read(dir, "codes256.ref").chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
+        let scales: Vec<u16> = read(dir, "codes256.scales")
+            .chunks_exact(2)
+            .map(|p| u16::from_le_bytes([p[0], p[1]]))
+            .collect();
+        let refs: Vec<u16> = read(dir, "codes256.ref")
+            .chunks_exact(2)
+            .map(|p| u16::from_le_bytes([p[0], p[1]]))
+            .collect();
         let (r, k) = (1usize, 256usize);
-        let codes: Vec<u8> = (0..256).map(|b| if b & 0x7F == 0x7F { 0 } else { b as u8 }).collect();
-        let payload: Vec<u8> = scales.iter().flat_map(|&s| block_bytes(&codes, &[s, s], r, k)).collect();
+        let codes: Vec<u8> = (0..256)
+            .map(|b| if b & 0x7F == 0x7F { 0 } else { b as u8 })
+            .collect();
+        let payload: Vec<u8> = scales
+            .iter()
+            .flat_map(|&s| block_bytes(&codes, &[s, s], r, k))
+            .collect();
         let got = gpu_dequant(&mut gpu, &payload, scales.len(), r, k);
         let (mut cmp, mut bad) = (0usize, 0usize);
         for (i, (&g, &w)) in got.iter().zip(&refs).enumerate() {
@@ -1199,17 +1591,33 @@ fn main() {
         fail.check(bad == 0, format!("decode: 256 codes x {} scales vs Python teacher bits ({cmp} compared, {bad} mismatched)", scales.len()));
         for (name, r, k) in [("gateup", 1280usize, 2560usize), ("down", 2560, 640)] {
             let blk = read(dir, &format!("{name}.blk"));
-            let want: Vec<u16> = read(dir, &format!("{name}.ref")).chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
+            let want: Vec<u16> = read(dir, &format!("{name}.ref"))
+                .chunks_exact(2)
+                .map(|p| u16::from_le_bytes([p[0], p[1]]))
+                .collect();
             let got = gpu_dequant(&mut gpu, &blk, 1, r, k);
             fail.check(got == want, format!("decode: real checkpoint {name} expert [{r},{k}] GPU dequant == Python teacher bits"));
-            let cpu = rdna_compute::fp8_e4m3::dequant_b128_expert_bytes(&blk, r, k).expect("cpu decode real");
-            fail.check(cpu == want, format!("decode: real checkpoint {name} expert CPU twin == Python teacher bits"));
+            let cpu = rdna_compute::fp8_e4m3::dequant_b128_expert_bytes(&blk, r, k)
+                .expect("cpu decode real");
+            fail.check(
+                cpu == want,
+                format!("decode: real checkpoint {name} expert CPU twin == Python teacher bits"),
+            );
         }
         // Real expert in the grouped GEMM (single expert, x_row_div 1).
         for (name, r, k) in [("gateup", 1280usize, 2560usize), ("down", 2560, 640)] {
             let blk = read(dir, &format!("{name}.blk"));
-            let w: Vec<u16> = read(dir, &format!("{name}.ref")).chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
-            let ex = Experts { r, k, n: 1, payload: blk, w: vec![w] };
+            let w: Vec<u16> = read(dir, &format!("{name}.ref"))
+                .chunks_exact(2)
+                .map(|p| u16::from_le_bytes([p[0], p[1]]))
+                .collect();
+            let ex = Experts {
+                r,
+                k,
+                n: 1,
+                payload: blk,
+                w: vec![w],
+            };
             // Reuse the synthetic driver with a single-expert pool: tokens=1 slot row per
             // flat index, every slot on expert 0.
             real_gemm(&mut gpu, &mut fail, name, &ex, byte);
@@ -1218,7 +1626,15 @@ fn main() {
 
     // 2-4. Grouped GEMM Tier C at the Qwen4 shapes.
     let gate_up = Experts::synthetic(1280, 2560, 12, 0x6a7e_0001);
-    gemm_case(&mut gpu, &mut fail, "gate_up r=1280 k=2560", &gate_up, 10, 37, byte);
+    gemm_case(
+        &mut gpu,
+        &mut fail,
+        "gate_up r=1280 k=2560",
+        &gate_up,
+        10,
+        37,
+        byte,
+    );
     drop(gate_up);
     let down = Experts::synthetic(2560, 640, 12, 0xd0e1_0002);
     gemm_case(&mut gpu, &mut fail, "down r=2560 k=640", &down, 1, 13, byte);
@@ -1246,15 +1662,29 @@ fn real_gemm(gpu: &mut Gpu, fail: &mut Fail, name: &str, ex: &Experts, byte_ab: 
     let (r, k) = (ex.r, ex.k);
     let rows = 64usize;
     let mut st = 0x7ea1_u64;
-    let xb: Vec<u16> = (0..rows * k).map(|_| f32_to_bf16(((lcg(&mut st) as f32 / u32::MAX as f32) - 0.5) * 4.0)).collect();
+    let xb: Vec<u16> = (0..rows * k)
+        .map(|_| f32_to_bf16(((lcg(&mut st) as f32 / u32::MAX as f32) - 0.5) * 4.0))
+        .collect();
     let xf: Vec<f32> = xb.iter().map(|&b| bf16_to_f32(b)).collect();
     let d_payload = upload_bytes(gpu, &ex.payload);
     let x_f32 = gpu.upload_f32(&xf, &[rows * k]).expect("x");
-    let mut x_bf16 = upload_bytes(gpu, &xb.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    let mut x_bf16 = upload_bytes(
+        gpu,
+        &xb.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+    );
     x_bf16.shape = vec![rows * k];
     x_bf16.dtype = DType::BF16;
     let ab = byte_ab.then(Ab::new);
-    let l = Launch { ex, d_payload: &d_payload, x_row_div: 1, x_rows: rows, x_f32: &x_f32, x_bf16: &x_bf16, ab: ab.as_ref(), tag: name };
+    let l = Launch {
+        ex,
+        d_payload: &d_payload,
+        x_row_div: 1,
+        x_rows: rows,
+        x_f32: &x_f32,
+        x_bf16: &x_bf16,
+        ab: ab.as_ref(),
+        tag: name,
+    };
     let (t, s) = scatter(&vec![0usize; rows], 1, true);
     let y = l.run(gpu, &t, &s, false);
     let bound_k = k as f64 * (2f64).powi(-24);

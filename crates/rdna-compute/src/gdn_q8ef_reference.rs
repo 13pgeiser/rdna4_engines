@@ -50,7 +50,11 @@ pub fn f32_to_f16_bits(x: f32) -> u16 {
     let exp = ((bits >> 23) & 0xff) as i32;
     let man = bits & 0x007f_ffff;
     if exp == 0xff {
-        return if man == 0 { sign | 0x7c00 } else { sign | 0x7e00 | (man >> 13) as u16 };
+        return if man == 0 {
+            sign | 0x7c00
+        } else {
+            sign | 0x7e00 | (man >> 13) as u16
+        };
     }
     let e = exp - 127 + 15;
     if e >= 0x1f {
@@ -92,7 +96,9 @@ pub fn f16_bits_to_f32(h: u16) -> f32 {
                 magnitude
             }
         }
-        31 => f32::from_bits(sign | 0x7f80_0000 | (man << 13) | if man != 0 { 0x0040_0000 } else { 0 }),
+        31 => f32::from_bits(
+            sign | 0x7f80_0000 | (man << 13) | if man != 0 { 0x0040_0000 } else { 0 },
+        ),
         _ => f32::from_bits(sign | ((exp + 112) << 23) | (man << 13)),
     }
 }
@@ -184,7 +190,10 @@ pub struct Q8Slot {
 impl Q8Slot {
     /// A reset slot: all bytes zero (code 0, scale 0.0).
     pub fn zeros(value_heads: usize) -> Self {
-        Self { codes: vec![0; value_heads * HD * HD], scales: vec![0.0; value_heads * HD] }
+        Self {
+            codes: vec![0; value_heads * HD * HD],
+            scales: vec![0.0; value_heads * HD],
+        }
     }
 }
 
@@ -197,7 +206,10 @@ pub struct LiveState {
 
 impl LiveState {
     pub fn zeros(value_heads: usize) -> Self {
-        Self { slot: Q8Slot::zeros(value_heads), ef: vec![0; value_heads * HD * HD] }
+        Self {
+            slot: Q8Slot::zeros(value_heads),
+            ef: vec![0; value_heads * HD * HD],
+        }
     }
 
     /// Fresh encode of a dense `[head][row][key]` F32 state (the
@@ -205,8 +217,10 @@ impl LiveState {
     /// old residual is read).
     pub fn from_dense(dense: &[f32]) -> Self {
         let rows = dense.len() / HD;
-        let mut slot =
-            Q8Slot { codes: Vec::with_capacity(dense.len()), scales: Vec::with_capacity(rows) };
+        let mut slot = Q8Slot {
+            codes: Vec::with_capacity(dense.len()),
+            scales: Vec::with_capacity(rows),
+        };
         let mut ef = Vec::with_capacity(dense.len());
         for row in 0..rows {
             let (c, s, e) = quantize_row_ef(&dense[row * HD..(row + 1) * HD]);
@@ -223,7 +237,11 @@ impl LiveState {
         let mut out = Vec::with_capacity(self.slot.codes.len());
         for (row, &scale) in self.slot.scales.iter().enumerate() {
             let r = row * HD..(row + 1) * HD;
-            out.extend(reconstruct_row_ef(&self.slot.codes[r.clone()], scale, &self.ef[r]));
+            out.extend(reconstruct_row_ef(
+                &self.slot.codes[r.clone()],
+                scale,
+                &self.ef[r],
+            ));
         }
         out
     }
@@ -277,8 +295,10 @@ fn plain_q8_round(value: f32, inv: f32, head: usize, row: usize, column: usize, 
 
 pub fn quantize_plain(dense: &[f32], frame: u32) -> Q8Slot {
     let rows = dense.len() / HD;
-    let mut slot =
-        Q8Slot { codes: Vec::with_capacity(dense.len()), scales: Vec::with_capacity(rows) };
+    let mut slot = Q8Slot {
+        codes: Vec::with_capacity(dense.len()),
+        scales: Vec::with_capacity(rows),
+    };
     for flat in 0..rows {
         let row = &dense[flat * HD..(flat + 1) * HD];
         let mut peak = 0.0f32;
@@ -288,7 +308,8 @@ pub fn quantize_plain(dense: &[f32], frame: u32) -> Q8Slot {
         let inv = q8_inv(peak);
         let (head, r) = (flat / HD, flat % HD);
         for (column, &v) in row.iter().enumerate() {
-            slot.codes.push(plain_q8_round(v, inv, head, r, column, frame));
+            slot.codes
+                .push(plain_q8_round(v, inv, head, r, column, frame));
         }
         slot.scales.push(q8_scale(peak));
     }
@@ -298,7 +319,11 @@ pub fn quantize_plain(dense: &[f32], frame: u32) -> Q8Slot {
 pub fn dequantize_plain(slot: &Q8Slot) -> Vec<f32> {
     let mut out = Vec::with_capacity(slot.codes.len());
     for (flat, &scale) in slot.scales.iter().enumerate() {
-        out.extend(slot.codes[flat * HD..(flat + 1) * HD].iter().map(|&q| scale * q as f32));
+        out.extend(
+            slot.codes[flat * HD..(flat + 1) * HD]
+                .iter()
+                .map(|&q| scale * q as f32),
+        );
     }
     out
 }
@@ -338,8 +363,14 @@ fn qk_norms(q: &[f32], k: &[f32]) -> (Vec<f32>, Vec<f32>) {
     let q_inv = bf16_l2_inv(q);
     let k_inv = bf16_l2_inv(k);
     let scale = (HD as f32).sqrt().recip();
-    let qn = q.iter().map(|&x| bf16_round(bf16_round(x) * q_inv) * scale).collect();
-    let kn = k.iter().map(|&x| bf16_round(bf16_round(x) * k_inv)).collect();
+    let qn = q
+        .iter()
+        .map(|&x| bf16_round(bf16_round(x) * q_inv) * scale)
+        .collect();
+    let kn = k
+        .iter()
+        .map(|&x| bf16_round(bf16_round(x) * k_inv))
+        .collect();
     (qn, kn)
 }
 
@@ -453,7 +484,10 @@ pub fn route_capture(live: &mut LiveState, geom: Geometry, rows: &[RowInput]) ->
     let (outputs, dense) = run_rows_with_register_boundaries(live, geom, rows);
     let fresh = LiveState::from_dense(&dense);
     live.ef = fresh.ef;
-    CaptureResult { outputs, final_slot: fresh.slot }
+    CaptureResult {
+        outputs,
+        final_slot: fresh.slot,
+    }
 }
 
 pub struct VerifyResult {
@@ -482,7 +516,11 @@ pub fn route_verify(
     let capture = route_capture(&mut live, geom, rows);
     if keep == rows.len() {
         live.slot = capture.final_slot;
-        return VerifyResult { outputs: capture.outputs, live, residual_reset: false };
+        return VerifyResult {
+            outputs: capture.outputs,
+            live,
+            residual_reset: false,
+        };
     }
     let mut slot = before.slot.clone();
     for (i, r) in rows.iter().take(keep).enumerate() {
@@ -492,7 +530,11 @@ pub fn route_verify(
     }
     live.slot = slot;
     live.reset_residual();
-    VerifyResult { outputs: capture.outputs, live, residual_reset: true }
+    VerifyResult {
+        outputs: capture.outputs,
+        live,
+        residual_reset: true,
+    }
 }
 
 // ───────────────────────────────── tests ─────────────────────────────────────
@@ -504,7 +546,10 @@ mod tests {
     struct Lcg(u64);
     impl Lcg {
         fn next_u32(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (self.0 >> 32) as u32
         }
         /// Uniform in [-1, 1).
@@ -513,7 +558,10 @@ mod tests {
         }
     }
 
-    const GEOM: Geometry = Geometry { key_heads: 1, value_heads: 2 };
+    const GEOM: Geometry = Geometry {
+        key_heads: 1,
+        value_heads: 2,
+    };
 
     fn random_row(rng: &mut Lcg) -> RowInput {
         let g = GEOM;
@@ -521,8 +569,12 @@ mod tests {
             q: (0..g.key_heads * HD).map(|_| rng.unit() * 1.5).collect(),
             k: (0..g.key_heads * HD).map(|_| rng.unit() * 1.5).collect(),
             v: (0..g.value_heads * HD).map(|_| rng.unit()).collect(),
-            gate: (0..g.value_heads).map(|_| -0.02 - 0.28 * (rng.unit() * 0.5 + 0.5)).collect(),
-            beta: (0..g.value_heads).map(|_| 0.2 + 0.7 * (rng.unit() * 0.5 + 0.5)).collect(),
+            gate: (0..g.value_heads)
+                .map(|_| -0.02 - 0.28 * (rng.unit() * 0.5 + 0.5))
+                .collect(),
+            beta: (0..g.value_heads)
+                .map(|_| 0.2 + 0.7 * (rng.unit() * 0.5 + 0.5))
+                .collect(),
         }
     }
 
@@ -533,7 +585,9 @@ mod tests {
     /// A non-trivial starting live state: an encoded random dense state, so the
     /// residual plane is populated.
     fn random_live(rng: &mut Lcg) -> LiveState {
-        let dense: Vec<f32> = (0..GEOM.value_heads * HD * HD).map(|_| rng.unit() * 0.5).collect();
+        let dense: Vec<f32> = (0..GEOM.value_heads * HD * HD)
+            .map(|_| rng.unit() * 0.5)
+            .collect();
         LiveState::from_dense(&dense)
     }
 
@@ -568,7 +622,11 @@ mod tests {
         // f32 neighbours of each midpoint, both signs.
         for h in 0u16..0x7bff {
             let mid = (f16_bits_to_f32(h) + f16_bits_to_f32(h + 1)) * 0.5;
-            for x in [mid, f32::from_bits(mid.to_bits() - 1), f32::from_bits(mid.to_bits() + 1)] {
+            for x in [
+                mid,
+                f32::from_bits(mid.to_bits() - 1),
+                f32::from_bits(mid.to_bits() + 1),
+            ] {
                 for s in [x, -x] {
                     assert_eq!(
                         f32_to_f16_bits(s),
@@ -580,20 +638,52 @@ mod tests {
             }
         }
         // Range edges: overflow threshold 65520 (tie to inf), max finite, tiny.
-        for x in [65504.0f32, 65519.99, 65520.0, 65536.0, 1.0e30, f32::INFINITY, 0.0, -0.0, 2.9802322e-8, 2.98023e-8, 2.9802325e-8, 5.96046e-8, 1.0e-30] {
+        for x in [
+            65504.0f32,
+            65519.99,
+            65520.0,
+            65536.0,
+            1.0e30,
+            f32::INFINITY,
+            0.0,
+            -0.0,
+            2.9802322e-8,
+            2.98023e-8,
+            2.9802325e-8,
+            5.96046e-8,
+            1.0e-30,
+        ] {
             for s in [x, -x] {
-                assert_eq!(f32_to_f16_bits(s), half::f16::from_f32(s).to_bits(), "{s:e}");
+                assert_eq!(
+                    f32_to_f16_bits(s),
+                    half::f16::from_f32(s).to_bits(),
+                    "{s:e}"
+                );
             }
         }
         assert!(f16_bits_to_f32(f32_to_f16_bits(f32::NAN)).is_nan());
         // rint: ties to even, both signs, vs the std implementation.
         let mut rng = Lcg(7);
         for i in 0..20_000 {
-            let x = if i % 2 == 0 { rng.unit() * 300.0 } else { (rng.next_u32() % 600) as f32 * 0.5 - 150.0 };
-            assert_eq!(rint_ties_even(x).to_bits(), x.round_ties_even().to_bits(), "{x}");
+            let x = if i % 2 == 0 {
+                rng.unit() * 300.0
+            } else {
+                (rng.next_u32() % 600) as f32 * 0.5 - 150.0
+            };
+            assert_eq!(
+                rint_ties_even(x).to_bits(),
+                x.round_ties_even().to_bits(),
+                "{x}"
+            );
         }
-        for x in [0.5f32, 1.5, 2.5, -0.5, -1.5, -2.5, 126.5, 127.5, -127.5, -128.5, 8388609.0] {
-            assert_eq!(rint_ties_even(x).to_bits(), x.round_ties_even().to_bits(), "{x}");
+        for x in [
+            0.5f32, 1.5, 2.5, -0.5, -1.5, -2.5, 126.5, 127.5, -127.5, -128.5, 8388609.0,
+        ] {
+            assert_eq!(
+                rint_ties_even(x).to_bits(),
+                x.round_ties_even().to_bits(),
+                "{x}"
+            );
         }
         assert!(rint_ties_even(f32::NAN).is_nan());
         assert_eq!(rint_ties_even(f32::INFINITY), f32::INFINITY);
@@ -621,7 +711,10 @@ mod tests {
         assert_eq!(scale, 1.0);
         assert_eq!(&codes[..10], &[127, 0, 2, 2, 0, -2, -2, 126, -126, 126]);
         let resid = ef_f32(&ef);
-        assert_eq!(&resid[..10], &[0.0, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5, -0.5]);
+        assert_eq!(
+            &resid[..10],
+            &[0.0, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5, -0.5]
+        );
         assert!(codes[10..].iter().all(|&c| c == 0) && resid[10..].iter().all(|&r| r == 0.0));
         // The code/residual pair reconstructs every element exactly.
         assert_eq!(reconstruct_row_ef(&codes, scale, &ef), row);
@@ -635,11 +728,14 @@ mod tests {
         assert_eq!(ef_code(-128.4, 1.0), -128.0);
         // Peak endpoints: +peak -> +127, -peak -> -127 (never -128).
         for peak in [1.0f32, 0.0173, 3.3e4, 7.7e-6, 123.456] {
-            let (codes, scale, ef) = quantize_row_ef(&row_with(&[(0, peak), (1, -peak), (5, peak * 0.31)]));
+            let (codes, scale, ef) =
+                quantize_row_ef(&row_with(&[(0, peak), (1, -peak), (5, peak * 0.31)]));
             assert_eq!((codes[0], codes[1]), (127, -127), "peak {peak}");
             assert!(codes.iter().all(|&c| c != -128));
             assert!(
-                ef_f32(&ef).iter().all(|r| r.abs() <= 0.5 * scale * 1.001 + (-25f32).exp2()),
+                ef_f32(&ef)
+                    .iter()
+                    .all(|r| r.abs() <= 0.5 * scale * 1.001 + (-25f32).exp2()),
                 "peak {peak}"
             );
         }
@@ -652,7 +748,9 @@ mod tests {
         let (codes, scale, ef) = quantize_row_ef(&vec![-0.0; HD]);
         assert_eq!(scale, 1.0);
         assert!(codes.iter().all(|&c| c == 0));
-        assert!(reconstruct_row_ef(&codes, scale, &ef).iter().all(|&x| x == 0.0));
+        assert!(reconstruct_row_ef(&codes, scale, &ef)
+            .iter()
+            .all(|&x| x == 0.0));
 
         // Random rows: |ef| <= step/2 (+ f32/f16 rounding allowance), both signs
         // occur, and the reconstruction adds the residual once.
@@ -678,7 +776,12 @@ mod tests {
                 // Codes + one residual reproduce the value to f16 residual
                 // precision; adding the residual twice would be off by |ef|.
                 let err = (recon[i] - row[i]).abs();
-                assert!(err <= row[i].abs() * (-22f32).exp2() + resid[i].abs() * (-10f32).exp2() + (-25f32).exp2(), "err {err}");
+                assert!(
+                    err <= row[i].abs() * (-22f32).exp2()
+                        + resid[i].abs() * (-10f32).exp2()
+                        + (-25f32).exp2(),
+                    "err {err}"
+                );
             }
         }
         assert!(pos > 1000 && neg > 1000, "residual signs: +{pos} -{neg}");
@@ -692,8 +795,13 @@ mod tests {
         let v_sub = 10.0 * scale + 3.0e-6;
         let v_tiny_pos = 10.0 * scale + 1.0e-8;
         let v_tiny_neg = 10.0 * scale - 1.0e-8;
-        let (codes, scale, ef) =
-            quantize_row_ef(&row_with(&[(0, peak), (1, v_sub), (2, v_tiny_pos), (3, v_tiny_neg), (4, -v_sub)]));
+        let (codes, scale, ef) = quantize_row_ef(&row_with(&[
+            (0, peak),
+            (1, v_sub),
+            (2, v_tiny_pos),
+            (3, v_tiny_neg),
+            (4, -v_sub),
+        ]));
         for i in 1..=4 {
             assert_eq!(codes[i].abs(), 10, "element {i}");
         }
@@ -734,7 +842,10 @@ mod tests {
         assert!(scale.is_finite());
         let recon = reconstruct_row_ef(&codes, scale, &ef);
         assert!(recon[7].is_nan() && f16_bits_to_f32(ef[7]).is_nan());
-        assert!(recon.iter().enumerate().all(|(i, x)| i == 7 || x.is_finite()));
+        assert!(recon
+            .iter()
+            .enumerate()
+            .all(|(i, x)| i == 7 || x.is_finite()));
         let mut inf_row = row_with(&[(0, 1.0), (1, -0.25)]);
         inf_row[9] = f32::INFINITY;
         let (codes, scale, ef) = quantize_row_ef(&inf_row);
@@ -744,7 +855,9 @@ mod tests {
         let mut ninf_row = row_with(&[(0, 1.0)]);
         ninf_row[3] = f32::NEG_INFINITY;
         let (codes, scale, ef) = quantize_row_ef(&ninf_row);
-        assert!(reconstruct_row_ef(&codes, scale, &ef).iter().all(|x| !x.is_finite()));
+        assert!(reconstruct_row_ef(&codes, scale, &ef)
+            .iter()
+            .all(|x| !x.is_finite()));
 
         // Reconstruction adds the residual exactly once: a state with a non-zero
         // residual decodes to the zero-residual decode plus f32(ef) (one f32
@@ -758,13 +871,18 @@ mod tests {
         let without_ef = no_ef.to_dense();
         for i in 0..with_ef.len() {
             let e = f16_bits_to_f32(live.ef[i]);
-            assert!((with_ef[i] - (without_ef[i] + e)).abs() <= with_ef[i].abs() * (-23f32).exp2() * 2.0);
+            assert!(
+                (with_ef[i] - (without_ef[i] + e)).abs()
+                    <= with_ef[i].abs() * (-23f32).exp2() * 2.0
+            );
             assert_eq!(with_ef[i].to_bits(), (without_ef[i] + e).to_bits());
         }
         let reencoded = LiveState::from_dense(&with_ef);
         let again = reencoded.to_dense();
         for i in 0..with_ef.len() {
-            let tol = with_ef[i].abs() * (-22f32).exp2() + 0.5 * reencoded.slot.scales[i / HD] * (-10f32).exp2() + (-25f32).exp2();
+            let tol = with_ef[i].abs() * (-22f32).exp2()
+                + 0.5 * reencoded.slot.scales[i / HD] * (-10f32).exp2()
+                + (-25f32).exp2();
             assert!((again[i] - with_ef[i]).abs() <= tol);
         }
     }
@@ -807,9 +925,15 @@ mod tests {
         // Same route + reset history -> identical bytes, repeated runs.
         let first = run_history(0xC0FFEE);
         for _ in 0..3 {
-            assert!(run_history(0xC0FFEE) == first, "history replay not byte-identical");
+            assert!(
+                run_history(0xC0FFEE) == first,
+                "history replay not byte-identical"
+            );
         }
-        assert!(run_history(0xC0FFEF) != first, "different inputs must differ");
+        assert!(
+            run_history(0xC0FFEF) != first,
+            "different inputs must differ"
+        );
 
         let mut rng = Lcg(5);
         let start = random_live(&mut rng);
@@ -845,10 +969,17 @@ mod tests {
             let a = route_verify(&start, GEOM, &rows, keep, 1000);
             let b = route_verify(&start, GEOM, &rows, keep, 1000);
             assert_eq!(a.live.bytes(), b.live.bytes(), "keep {keep}");
-            assert_eq!(output_bits(&a.outputs), output_bits(&b.outputs), "keep {keep}");
+            assert_eq!(
+                output_bits(&a.outputs),
+                output_bits(&b.outputs),
+                "keep {keep}"
+            );
             if keep < rows.len() {
                 assert!(a.residual_reset);
-                assert!(a.live.ef.iter().all(|&e| e == 0), "keep {keep}: residual not zero");
+                assert!(
+                    a.live.ef.iter().all(|&e| e == 0),
+                    "keep {keep}: residual not zero"
+                );
             } else {
                 assert!(!a.residual_reset && !a.live.residual_is_zero());
             }
@@ -870,8 +1001,13 @@ mod tests {
             assert!(!ar_k.residual_is_zero());
             assert!(rb.live.residual_is_zero());
             assert_ne!(ar_k.bytes(), rb.live.bytes(), "keep {keep}");
-            let code_diff =
-                ar_k.slot.codes.iter().zip(&rb.live.slot.codes).filter(|(a, b)| a != b).count();
+            let code_diff = ar_k
+                .slot
+                .codes
+                .iter()
+                .zip(&rb.live.slot.codes)
+                .filter(|(a, b)| a != b)
+                .count();
             let ef_nonzero = ar_k.ef.iter().filter(|&&e| e != 0).count();
             eprintln!(
                 "gdn_q8ef_route_determinism: keep {keep}/{}: rollback+reset vs AR differ \
@@ -886,7 +1022,12 @@ mod tests {
         // also reported, different route/rounding order.
         let mut persistent = start.clone();
         route_persistent(&mut persistent, GEOM, &rows);
-        let diff = ar.bytes().iter().zip(persistent.bytes()).filter(|(a, b)| **a != *b).count();
+        let diff = ar
+            .bytes()
+            .iter()
+            .zip(persistent.bytes())
+            .filter(|(a, b)| **a != *b)
+            .count();
         eprintln!("gdn_q8ef_route_determinism: persistent vs AR differing state bytes: {diff}");
 
         // After a reset the next step starts from S_in = q * scale alone.
@@ -898,6 +1039,9 @@ mod tests {
         let out_b = route_ar(&mut next_b, GEOM, &step);
         assert_eq!(next_a.bytes(), next_b.bytes());
         assert_eq!(output_bits(&out_a), output_bits(&out_b));
-        assert!(!next_a.residual_is_zero(), "the next uninterrupted step re-accumulates a residual");
+        assert!(
+            !next_a.residual_is_zero(),
+            "the next uninterrupted step re-accumulates a residual"
+        );
     }
 }

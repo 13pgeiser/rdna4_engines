@@ -91,7 +91,9 @@ const RX9070XT: EmuProfile = EmuProfile {
     host_gfx: "gfx1201",
     target_gfx: "gfx1201",
     target_cus: 64,
-    memory: MemoryKind::Discrete { capacity_bytes: 16 * GIB },
+    memory: MemoryKind::Discrete {
+        capacity_bytes: 16 * GIB,
+    },
     peak_bw_bytes_s: 640 * GB_S,
     infinity_cache_bytes: 64 * MIB,
     l2_bytes: 8 * MIB,
@@ -110,7 +112,9 @@ const RX9070: EmuProfile = EmuProfile {
     host_gfx: "gfx1201",
     target_gfx: "gfx1201",
     target_cus: 56,
-    memory: MemoryKind::Discrete { capacity_bytes: 16 * GIB },
+    memory: MemoryKind::Discrete {
+        capacity_bytes: 16 * GIB,
+    },
     peak_bw_bytes_s: 640 * GB_S,
     infinity_cache_bytes: 64 * MIB,
     l2_bytes: 8 * MIB,
@@ -129,7 +133,9 @@ const RX9060XT: EmuProfile = EmuProfile {
     host_gfx: "gfx1201",
     target_gfx: "gfx1200",
     target_cus: 32,
-    memory: MemoryKind::Discrete { capacity_bytes: 16 * GIB },
+    memory: MemoryKind::Discrete {
+        capacity_bytes: 16 * GIB,
+    },
     peak_bw_bytes_s: 320 * GB_S,
     infinity_cache_bytes: 32 * MIB,
     l2_bytes: 4 * MIB,
@@ -148,7 +154,9 @@ const RX9060XT_8G: EmuProfile = EmuProfile {
     host_gfx: "gfx1201",
     target_gfx: "gfx1200",
     target_cus: 32,
-    memory: MemoryKind::Discrete { capacity_bytes: 8 * GIB },
+    memory: MemoryKind::Discrete {
+        capacity_bytes: 8 * GIB,
+    },
     peak_bw_bytes_s: 320 * GB_S,
     infinity_cache_bytes: 32 * MIB,
     l2_bytes: 4 * MIB,
@@ -167,7 +175,9 @@ const RX7900XT: EmuProfile = EmuProfile {
     host_gfx: "gfx1100",
     target_gfx: "gfx1100",
     target_cus: 84,
-    memory: MemoryKind::Discrete { capacity_bytes: 20 * GIB },
+    memory: MemoryKind::Discrete {
+        capacity_bytes: 20 * GIB,
+    },
     peak_bw_bytes_s: 800 * GB_S,
     infinity_cache_bytes: 80 * MIB,
     l2_bytes: 6 * MIB,
@@ -186,7 +196,9 @@ const RX7800XT: EmuProfile = EmuProfile {
     host_gfx: "gfx1100",
     target_gfx: "gfx1101",
     target_cus: 60,
-    memory: MemoryKind::Discrete { capacity_bytes: 16 * GIB },
+    memory: MemoryKind::Discrete {
+        capacity_bytes: 16 * GIB,
+    },
     peak_bw_bytes_s: 624 * GB_S,
     infinity_cache_bytes: 64 * MIB,
     l2_bytes: 4 * MIB,
@@ -205,7 +217,9 @@ const RX7700XT: EmuProfile = EmuProfile {
     host_gfx: "gfx1100",
     target_gfx: "gfx1101",
     target_cus: 54,
-    memory: MemoryKind::Discrete { capacity_bytes: 12 * GIB },
+    memory: MemoryKind::Discrete {
+        capacity_bytes: 12 * GIB,
+    },
     peak_bw_bytes_s: 432 * GB_S,
     infinity_cache_bytes: 48 * MIB,
     l2_bytes: 4 * MIB,
@@ -225,7 +239,9 @@ const RX7600: EmuProfile = EmuProfile {
     host_gfx: "gfx1100",
     target_gfx: "gfx1102",
     target_cus: 32,
-    memory: MemoryKind::Discrete { capacity_bytes: 8 * GIB },
+    memory: MemoryKind::Discrete {
+        capacity_bytes: 8 * GIB,
+    },
     peak_bw_bytes_s: 288 * GB_S,
     infinity_cache_bytes: 32 * MIB,
     l2_bytes: 2 * MIB,
@@ -294,7 +310,9 @@ pub static PROFILES: &[EmuProfile] = &[
 pub enum EmuError {
     #[error("unknown HIPFIRE_EMU profile `{id}` (ids are exact lower-case; known: {known})")]
     UnknownProfile { id: String, known: String },
-    #[error("{keys} set without an active HIPFIRE_EMU profile; the UMA overrides require a profile")]
+    #[error(
+        "{keys} set without an active HIPFIRE_EMU profile; the UMA overrides require a profile"
+    )]
     OverrideWithoutProfile { keys: String },
     #[error("{name} is a UMA-only override but profile `{profile}` is a discrete SKU")]
     OverrideOnDiscrete { name: &'static str, profile: String },
@@ -316,17 +334,13 @@ pub enum EmuError {
         required: &'static str,
         detected: String,
     },
-    #[error(
-        "emu profile `{profile}` requires an {required} host, detected an {detected} device"
-    )]
+    #[error("emu profile `{profile}` requires an {required} host, detected an {detected} device")]
     WrongKind {
         profile: &'static str,
         required: &'static str,
         detected: &'static str,
     },
-    #[error(
-        "emu profile `{profile}` requires >= {required} physical CUs, host has {detected}"
-    )]
+    #[error("emu profile `{profile}` requires >= {required} physical CUs, host has {detected}")]
     TooFewCus {
         profile: &'static str,
         required: u32,
@@ -351,11 +365,7 @@ pub fn profile(id: &str) -> Result<&'static EmuProfile, EmuError> {
         .find(|candidate| candidate.id == id)
         .ok_or_else(|| EmuError::UnknownProfile {
             id: id.to_owned(),
-            known: PROFILES
-                .iter()
-                .map(|p| p.id)
-                .collect::<Vec<_>>()
-                .join(", "),
+            known: PROFILES.iter().map(|p| p.id).collect::<Vec<_>>().join(", "),
         })
 }
 
@@ -404,9 +414,9 @@ impl UmaScenario {
             )));
         }
         // `reserved < host_total_bytes`, so this cannot underflow; checked anyway.
-        self.host_total_bytes.checked_sub(reserved).ok_or_else(|| {
-            EmuError::InvalidUma("shared-host allowance underflows u64".to_owned())
-        })
+        self.host_total_bytes
+            .checked_sub(reserved)
+            .ok_or_else(|| EmuError::InvalidUma("shared-host allowance underflows u64".to_owned()))
     }
 
     /// Enforce `C + R < H` and `0 < G <= S = H - C - R` with checked arithmetic.
@@ -763,17 +773,138 @@ mod tests {
     fn all_ten_profiles_resolve_with_table_values() {
         // id, host_gfx, target_gfx, cus, capacity GiB (None = UMA), bw GB/s,
         // IC MiB, L2 MiB, VGPR KiB, fidelity
-        let table: &[(&str, &str, &str, u32, Option<u64>, u64, u64, u64, u64, Fidelity)] = &[
-            ("rx9070xt", "gfx1201", "gfx1201", 64, Some(16), 640, 64, 8, 768, Fidelity::CapacityOnly),
-            ("rx9070", "gfx1201", "gfx1201", 56, Some(16), 640, 64, 8, 768, Fidelity::CapacityEstimate),
-            ("rx9060xt", "gfx1201", "gfx1200", 32, Some(16), 320, 32, 4, 768, Fidelity::CrossDieEstimate),
-            ("rx9060xt-8g", "gfx1201", "gfx1200", 32, Some(8), 320, 32, 4, 768, Fidelity::CrossDieEstimate),
-            ("rx7900xt", "gfx1100", "gfx1100", 84, Some(20), 800, 80, 6, 768, Fidelity::CapacityEstimate),
-            ("rx7800xt", "gfx1100", "gfx1101", 60, Some(16), 624, 64, 4, 768, Fidelity::CrossDieEstimate),
-            ("rx7700xt", "gfx1100", "gfx1101", 54, Some(12), 432, 48, 4, 768, Fidelity::CrossDieEstimate),
-            ("rx7600", "gfx1100", "gfx1102", 32, Some(8), 288, 32, 2, 512, Fidelity::CrossDieEstimate),
-            ("strix-point", "gfx1151", "gfx1150", 16, None, 128, 0, 2, 512, Fidelity::UmaScenario),
-            ("krackan", "gfx1151", "gfx1152", 8, None, 128, 0, 1, 512, Fidelity::UmaScenario),
+        let table: &[(
+            &str,
+            &str,
+            &str,
+            u32,
+            Option<u64>,
+            u64,
+            u64,
+            u64,
+            u64,
+            Fidelity,
+        )] = &[
+            (
+                "rx9070xt",
+                "gfx1201",
+                "gfx1201",
+                64,
+                Some(16),
+                640,
+                64,
+                8,
+                768,
+                Fidelity::CapacityOnly,
+            ),
+            (
+                "rx9070",
+                "gfx1201",
+                "gfx1201",
+                56,
+                Some(16),
+                640,
+                64,
+                8,
+                768,
+                Fidelity::CapacityEstimate,
+            ),
+            (
+                "rx9060xt",
+                "gfx1201",
+                "gfx1200",
+                32,
+                Some(16),
+                320,
+                32,
+                4,
+                768,
+                Fidelity::CrossDieEstimate,
+            ),
+            (
+                "rx9060xt-8g",
+                "gfx1201",
+                "gfx1200",
+                32,
+                Some(8),
+                320,
+                32,
+                4,
+                768,
+                Fidelity::CrossDieEstimate,
+            ),
+            (
+                "rx7900xt",
+                "gfx1100",
+                "gfx1100",
+                84,
+                Some(20),
+                800,
+                80,
+                6,
+                768,
+                Fidelity::CapacityEstimate,
+            ),
+            (
+                "rx7800xt",
+                "gfx1100",
+                "gfx1101",
+                60,
+                Some(16),
+                624,
+                64,
+                4,
+                768,
+                Fidelity::CrossDieEstimate,
+            ),
+            (
+                "rx7700xt",
+                "gfx1100",
+                "gfx1101",
+                54,
+                Some(12),
+                432,
+                48,
+                4,
+                768,
+                Fidelity::CrossDieEstimate,
+            ),
+            (
+                "rx7600",
+                "gfx1100",
+                "gfx1102",
+                32,
+                Some(8),
+                288,
+                32,
+                2,
+                512,
+                Fidelity::CrossDieEstimate,
+            ),
+            (
+                "strix-point",
+                "gfx1151",
+                "gfx1150",
+                16,
+                None,
+                128,
+                0,
+                2,
+                512,
+                Fidelity::UmaScenario,
+            ),
+            (
+                "krackan",
+                "gfx1151",
+                "gfx1152",
+                8,
+                None,
+                128,
+                0,
+                1,
+                512,
+                Fidelity::UmaScenario,
+            ),
         ];
         assert_eq!(PROFILES.len(), table.len());
         for &(id, host, target, cus, cap, bw, ic, l2, vgpr, fidelity) in table {
@@ -803,7 +934,15 @@ mod tests {
 
     #[test]
     fn unknown_id_and_wrong_case_fail() {
-        for id in ["rx9070XT", "RX9070XT", "rx9080", " rx9070xt", "rx9070xt ", "off ", "strix_point"] {
+        for id in [
+            "rx9070XT",
+            "RX9070XT",
+            "rx9080",
+            " rx9070xt",
+            "rx9070xt ",
+            "off ",
+            "strix_point",
+        ] {
             assert!(
                 matches!(profile(id), Err(EmuError::UnknownProfile { .. })),
                 "{id:?}"
@@ -816,8 +955,14 @@ mod tests {
     #[test]
     fn off_empty_unset_disable() {
         assert_eq!(from_process_config(&config(&[])), Ok(None));
-        assert_eq!(from_process_config(&config(&[("developer.emu", "")])), Ok(None));
-        assert_eq!(from_process_config(&config(&[("developer.emu", "off")])), Ok(None));
+        assert_eq!(
+            from_process_config(&config(&[("developer.emu", "")])),
+            Ok(None)
+        );
+        assert_eq!(
+            from_process_config(&config(&[("developer.emu", "off")])),
+            Ok(None)
+        );
         // Uppercase OFF is not the disable spelling.
         assert!(from_process_config(&config(&[("developer.emu", "OFF")])).is_err());
     }
@@ -878,7 +1023,7 @@ mod tests {
             ("developer.emu_host_bytes", "17179869184"), // 16 GiB
             ("developer.emu_carveout_bytes", "536870912"), // 512 MiB
             ("developer.emu_host_reserve_bytes", "2147483648"), // 2 GiB
-            ("developer.emu_gtt_bytes", "8589934592"), // 8 GiB
+            ("developer.emu_gtt_bytes", "8589934592"),   // 8 GiB
         ]))
         .unwrap()
         .unwrap();
@@ -895,7 +1040,14 @@ mod tests {
 
     #[test]
     fn override_parsing_is_strict_unsigned_decimal() {
-        for bad in ["-1", "+5", "1.5", "0x10", "16GiB", "99999999999999999999999"] {
+        for bad in [
+            "-1",
+            "+5",
+            "1.5",
+            "0x10",
+            "16GiB",
+            "99999999999999999999999",
+        ] {
             let err = from_process_config(&config(&[
                 ("developer.emu", "strix-point"),
                 ("developer.emu_gtt_bytes", bad),

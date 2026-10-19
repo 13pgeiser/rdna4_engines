@@ -20,8 +20,8 @@ use std::cell::RefCell;
 use hip_bridge::{DeviceBuffer, HipResult, KernargBlob};
 
 use crate::tensor_ops::{
-    GatedDeltaConvBatched, GatedDeltaGateBatched, GatedDeltaParamsBatched,
-    GatedDeltaStepBatched, GdnStateFormat,
+    GatedDeltaConvBatched, GatedDeltaGateBatched, GatedDeltaParamsBatched, GatedDeltaStepBatched,
+    GdnStateFormat,
 };
 use crate::{DType, Gpu, GpuTensor};
 
@@ -45,7 +45,11 @@ pub fn workspace_a_bytes(rows: usize) -> Option<usize> {
 /// rows-independent); 0 below the [`applies`] row floor. A Q8Ef state scans against its live
 /// residual instead and never allocates this ([`workspace_ef_bytes_for`]).
 pub fn workspace_ef_bytes(rows: usize) -> usize {
-    if rows < MIN_ROWS { 0 } else { EF_BYTES }
+    if rows < MIN_ROWS {
+        0
+    } else {
+        EF_BYTES
+    }
 }
 
 /// A scratch bytes the dense scan charges for a state stored in `format`: the
@@ -85,7 +89,6 @@ struct Scratch {
     /// Q8Ef (which scans against the owner's live residual).
     ef: Option<GpuTensor>,
 }
-
 
 thread_local! {
     /// One scratch per device id: a single submission thread can drive several
@@ -130,13 +133,23 @@ pub fn applies(gpu: &Gpu, p: &GatedDeltaStepBatched<'_>) -> bool {
         && (n % 512 == 0 || (64..512).contains(&(n % 512)))
 }
 
-fn launch(gpu: &mut Gpu, sym: &str, grid: [u32; 3], block: u32, args: &mut KernargBlob) -> HipResult<()> {
+fn launch(
+    gpu: &mut Gpu,
+    sym: &str,
+    grid: [u32; 3],
+    block: u32,
+    args: &mut KernargBlob,
+) -> HipResult<()> {
     // Uses the registered module/pack lookup, with the same compiler options
     // as tensor_ops (no chunk-scan-only floating-point flags).
     gpu.ensure_kernel("fn_gdn_dense", crate::kernels::FN_GDN_DENSE_SRC, sym)?;
     args.pad_to(16);
     gpu.launch_blob_recorded(
-        sym, grid, [block, 1, 1], 0, args.as_mut_slice(),
+        sym,
+        grid,
+        [block, 1, 1],
+        0,
+        args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
@@ -157,7 +170,14 @@ pub fn run(
         ));
     }
     crate::tensor_ops::validate_gdn_state(
-        p.format, p.state, p.residual, None, p.rows, p.value_heads, p.key_dim, p.value_dim,
+        p.format,
+        p.state,
+        p.residual,
+        None,
+        p.rows,
+        p.value_heads,
+        p.key_dim,
+        p.value_dim,
     )?;
     let n = p.rows;
     let n64 = n.div_ceil(64) * 64;
@@ -217,14 +237,27 @@ pub fn run(
             (Some(residual), _) => (residual, 0),
             (None, Some(ef)) => (ef, EF_BYTES / 4),
             (None, None) => {
-                return Err(hip_bridge::HipError::new(0, "fn_gdn_dense: missing EF plane"));
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "fn_gdn_dense: missing EF plane",
+                ));
             }
         };
         let mut args = KernargBlob::new();
         for t in [
-            conv.input, conv.kernel, conv.history, conv.next_history,
-            &q, &k, &v, p.gate, p.beta,
-            params.a, params.b, params.a_log, params.dt_bias,
+            conv.input,
+            conv.kernel,
+            conv.history,
+            conv.next_history,
+            &q,
+            &k,
+            &v,
+            p.gate,
+            p.beta,
+            params.a,
+            params.b,
+            params.a_log,
+            params.dt_bias,
         ] {
             args.push_ptr(t.buf.as_ptr());
         }
@@ -235,13 +268,18 @@ pub fn run(
         args.push_i32(i32::from(conv.input.dtype == DType::BF16));
         args.push_f32((p.key_dim as f32).sqrt().recip());
         args.push_i32(ef_words as i32);
-        launch(gpu, "fn_gdn_dense_producer", [82, (n64 / 32) as u32, 1], 256, &mut args)?;
+        launch(
+            gpu,
+            "fn_gdn_dense_producer",
+            [82, (n64 / 32) as u32, 1],
+            256,
+            &mut args,
+        )?;
         gpu.gdn_chunk_kkt_solve_batched(&k, p.gate, p.beta, &s.a, n)?;
         let codes = raw(p.state, 0, 48 * 128 * 128);
         let scales = raw(p.state, 48 * 128 * 128, 48 * 128 * 4);
         gpu.gdn_chunk_scan_layer_mseg(
-            &q, &k, &v, &s.a, p.gate, p.beta,
-            &codes, &scales, ef_plane, &out, n,
+            &q, &k, &v, &s.a, p.gate, p.beta, &codes, &scales, ef_plane, &out, n,
         )
     })();
     SCRATCH.with(|c| c.borrow_mut().push((gpu.device_id, s)));
@@ -265,7 +303,13 @@ pub fn gate(
         args.push_ptr(rotated.buf.as_ptr());
         args.push_ptr(gpu.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr());
         args.push_ptr(gpu.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr());
-        launch(gpu, "fn_gdn_dense_gate_rotate_bf16in", [(elements / 256) as u32, 1, 1], 64, &mut args)?;
+        launch(
+            gpu,
+            "fn_gdn_dense_gate_rotate_bf16in",
+            [(elements / 256) as u32, 1, 1],
+            64,
+            &mut args,
+        )?;
         gpu.scratch.prerotated = Some((
             p.output.buf.as_ptr() as usize,
             rotated.buf.as_ptr() as usize,
@@ -276,7 +320,13 @@ pub fn gate(
         args.push_i32(p.rows as i32);
         args.push_i32(p.value_heads as i32);
         args.push_i32(p.value_dim as i32);
-        launch(gpu, "fn_gdn_dense_gate_bf16in", [(elements / 128) as u32, 1, 1], 32, &mut args)
+        launch(
+            gpu,
+            "fn_gdn_dense_gate_bf16in",
+            [(elements / 128) as u32, 1, 1],
+            32,
+            &mut args,
+        )
     }
 }
 
@@ -310,15 +360,37 @@ mod tests {
         ] {
             assert_eq!(workspace_a_bytes_for(format, 4096), Some(a), "{format:?} A");
             assert_eq!(workspace_ef_bytes_for(format, 4096), ef, "{format:?} EF");
-            assert_eq!(workspace_bytes_for(format, 4096), Some(a + ef), "{format:?} total");
+            assert_eq!(
+                workspace_bytes_for(format, 4096),
+                Some(a + ef),
+                "{format:?} total"
+            );
             // Below the row floor the route never allocates, whatever the format.
-            assert_eq!(workspace_bytes_for(format, MIN_ROWS - 1), Some(0), "{format:?} floor");
+            assert_eq!(
+                workspace_bytes_for(format, MIN_ROWS - 1),
+                Some(0),
+                "{format:?} floor"
+            );
         }
-        assert_eq!(workspace_bytes(4096), workspace_bytes_for(GdnStateFormat::Q8, 4096));
+        assert_eq!(
+            workspace_bytes(4096),
+            workspace_bytes_for(GdnStateFormat::Q8, 4096)
+        );
         // The residual tensor Q8Ef scans against is exactly the scratch plane's extent.
         assert_eq!(GdnStateFormat::Q8Ef.residual_bytes(48, 128, 128), EF_BYTES);
-        for format in [GdnStateFormat::Q8, GdnStateFormat::Q8Ef, GdnStateFormat::F32] {
-            assert_eq!(workspace_a_bytes_for(format, usize::MAX), if format == GdnStateFormat::F32 { Some(0) } else { None });
+        for format in [
+            GdnStateFormat::Q8,
+            GdnStateFormat::Q8Ef,
+            GdnStateFormat::F32,
+        ] {
+            assert_eq!(
+                workspace_a_bytes_for(format, usize::MAX),
+                if format == GdnStateFormat::F32 {
+                    Some(0)
+                } else {
+                    None
+                }
+            );
         }
     }
 
@@ -327,7 +399,7 @@ mod tests {
     /// F32-only), never a residual/format mismatch.
     #[test]
     fn fn_gdn_dense_admission_table() {
-        use GdnStateFormat::{Q8, Q8Ef, F32};
+        use GdnStateFormat::{Q8Ef, F32, Q8};
         let arches = ["gfx1201", "gfx1151", "gfx1100", "gfx942", "gfx1200", ""];
         for arch in arches {
             for (format, residual, want) in [

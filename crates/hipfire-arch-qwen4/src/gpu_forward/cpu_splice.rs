@@ -268,7 +268,10 @@ pub(super) enum SplitRefusal {
 impl SplitRefusal {
     /// A layer outside the mode, not a refused route.
     pub(super) fn is_silent(self) -> bool {
-        matches!(self, Self::NotRequested | Self::NoSpanOwner | Self::NoColdExperts)
+        matches!(
+            self,
+            Self::NotRequested | Self::NoSpanOwner | Self::NoColdExperts
+        )
     }
 
     fn reason(self) -> &'static str {
@@ -662,20 +665,14 @@ impl ColdLayerSource {
                     .resident(down)
                     .map_err(|error| format!("layer {layer}: {error}"))?;
                 let (gate_up_bytes, down_bytes) = extents(gate_up.dtype, down.dtype)?;
-                let owners = CpuExpertOwners::new(
-                    gpu,
-                    gate_up,
-                    down,
-                    experts,
-                    gate_up_bytes,
-                    down_bytes,
-                )
-                .ok_or_else(|| {
-                    format!(
+                let owners =
+                    CpuExpertOwners::new(gpu, gate_up, down, experts, gate_up_bytes, down_bytes)
+                        .ok_or_else(|| {
+                            format!(
                         "layer {layer}: the aggregate expert allocations have no resolvable \
                          pinned host bytes"
                     )
-                })?;
+                        })?;
                 (gate_up.dtype, down.dtype, HostSpanOwner::WholeLayer(owners))
             }
         };
@@ -1259,8 +1256,12 @@ mod tests {
                 SplitRefusal::UnboundHotset,
                 |a| a.bound_hotset = false,
             ),
-            ("no cold experts", SplitRefusal::NoColdExperts, |a| a.host_experts = 0),
-            ("not flash-next", SplitRefusal::NotFlashNext, |a| a.flash_next = false),
+            ("no cold experts", SplitRefusal::NoColdExperts, |a| {
+                a.host_experts = 0
+            }),
+            ("not flash-next", SplitRefusal::NotFlashNext, |a| {
+                a.flash_next = false
+            }),
             ("mixed codec", SplitRefusal::NotCpuExecuted, |a| {
                 a.cpu_executed = false
             }),
@@ -1431,7 +1432,8 @@ mod tests {
             "cpu-all-v1/ffffffffffff"
         );
         let digest = [0xabu8; 32];
-        let split = host_exec_identity(&[], &[(Tier, &all)], Some((&digest, Some(&"c".repeat(64)))));
+        let split =
+            host_exec_identity(&[], &[(Tier, &all)], Some((&digest, Some(&"c".repeat(64)))));
         assert_eq!(
             split,
             format!(

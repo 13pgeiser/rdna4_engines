@@ -3,7 +3,6 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-
 use crate::calibration::awq_eligible;
 use crate::dequant::{dequantize_e2m1_ue8m0_to_f32, e2m1_to_f32};
 use crate::hfq::*;
@@ -25,7 +24,7 @@ mod gptq_damping_probe {
     //!   cargo test -p hipfire-quantize gptq_damping_probe -- --nocapture
     use super::*;
     use crate::quant_fwht::gen_fwht_signs;
-    
+
     use crate::quant_mq::quantize_mq2g256_lloyd;
 
     /// Deterministic Box-Muller-from-LCG Gaussian sampler — no external dep.

@@ -48,9 +48,9 @@ pub use pm4_gfx10::{
 };
 pub use runtime::DEFAULT_WAIT_TIMEOUT;
 pub use runtime::{
-    AqlQueue, CodeObjectBytes, CompletionSignal, Executable, GpuDevice, GpuSelector, KernargBuffer, KernargPool,
-    Kernel, KernelPm4Metadata, PciBusId, PciBusIdParseError, QueueDepthReport, QueueDepthSample,
-    QueueDepthStats, QueueSet, Runtime, RuntimeError,
+    AqlQueue, CodeObjectBytes, CompletionSignal, Executable, GpuDevice, GpuSelector, KernargBuffer,
+    KernargPool, Kernel, KernelPm4Metadata, PciBusId, PciBusIdParseError, QueueDepthReport,
+    QueueDepthSample, QueueDepthStats, QueueSet, Runtime, RuntimeError,
 };
 
 /// Load the installed public ROCr runtime without a link-time ROCm dependency.

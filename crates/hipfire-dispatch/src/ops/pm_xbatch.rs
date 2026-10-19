@@ -12,16 +12,40 @@ use hip_bridge::HipResult;
 use rdna_compute::{Gpu, GpuTensor};
 
 /// `y[b] = W · x[b]` for `batch` columns (`Gpu::gemv_mq4g256v2_xbatch_pm`).
-pub fn plain(gpu: &mut Gpu, w: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize, batch: usize) -> HipResult<()> {
+pub fn plain(
+    gpu: &mut Gpu,
+    w: &GpuTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    batch: usize,
+) -> HipResult<()> {
     gpu.gemv_mq4g256v2_xbatch_pm(w, x, y, m, k, batch)
 }
 
 /// `y[b] += W · x[b]` for `batch` columns (`Gpu::gemv_mq4g256v2_residual_xbatch`).
-pub fn residual(gpu: &mut Gpu, w: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize, batch: usize) -> HipResult<()> {
+pub fn residual(
+    gpu: &mut Gpu,
+    w: &GpuTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    batch: usize,
+) -> HipResult<()> {
     gpu.gemv_mq4g256v2_residual_xbatch(w, x, y, m, k, batch)
 }
 
 /// Multirow-R2 twin for the lm_head (`Gpu::gemv_mq4g256v2_multirow_r2_xbatch_pm`).
-pub fn multirow_r2(gpu: &mut Gpu, w: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize, batch: usize) -> HipResult<()> {
+pub fn multirow_r2(
+    gpu: &mut Gpu,
+    w: &GpuTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    batch: usize,
+) -> HipResult<()> {
     gpu.gemv_mq4g256v2_multirow_r2_xbatch_pm(w, x, y, m, k, batch)
 }

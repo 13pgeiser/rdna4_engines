@@ -198,7 +198,10 @@ pub fn sample_batch<'a>(
     if n > arena.max_lanes {
         return Err(HipError::new(
             0,
-            &format!("sample_batch: {n} jobs exceed the arena's {} lanes", arena.max_lanes),
+            &format!(
+                "sample_batch: {n} jobs exceed the arena's {} lanes",
+                arena.max_lanes
+            ),
         ));
     }
     arena.picks.clear();
@@ -244,7 +247,13 @@ pub fn sample_batch<'a>(
         let vocab = job.logits.numel();
         for &tok in &job.cfg.blocked_tokens {
             if (tok as usize) < vocab {
-                gpu.memcpy_dtod_at_auto(&job.logits.buf, (tok as usize) * 4, &arena.neg_inf.buf, 0, 4)?;
+                gpu.memcpy_dtod_at_auto(
+                    &job.logits.buf,
+                    (tok as usize) * 4,
+                    &arena.neg_inf.buf,
+                    0,
+                    4,
+                )?;
             }
         }
         let (off, len, uploaded) = arena.scopes[i];

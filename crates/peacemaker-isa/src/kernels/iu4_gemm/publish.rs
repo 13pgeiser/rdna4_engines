@@ -6,20 +6,58 @@
 //! token/row metadata. Staging map (hipcc K1's, bank-swizzled): lane `tid`
 //! moves 8 bytes of slab row `R = r * round_rows + tid / 4`, quad `tid % 4`,
 //! to fragment-order slot `st_ldsoff + r * round_rows * 32`.
-use super::{Gen, MetaD, MetaS, PayA, PayW, Staged, Tile, Wv, ds_offset, ds_offsets};
-use crate::kernels::{common::{mem, op, s, sr, v, vr}, iu4_fold::{GROUP_BYTES, XBLK_BYTES}};
-use crate::{Builder, insn::{Instruction, MemoryClass}};
+use super::{ds_offset, ds_offsets, Gen, MetaD, MetaS, PayA, PayW, Staged, Tile, Wv};
+use crate::kernels::{
+    common::{mem, op, s, sr, v, vr},
+    iu4_fold::{GROUP_BYTES, XBLK_BYTES},
+};
+use crate::{
+    insn::{Instruction, MemoryClass},
+    Builder,
+};
 use peacemaker_author::{Free, Ring, State};
 
 /// `buffer_load_b{32,64}` with an optional scalar offset (objdump spelling).
-pub(crate) fn vload(b: &mut Builder, dst: u8, width: u8, voff: u8, srd: u8, soff: Option<u8>, offset: u32) -> Result<(), String> {
-    let name = if width == 2 { "buffer_load_b64" } else { "buffer_load_b32" };
-    let d = if width == 2 { format!("v[{}:{}]", dst, dst + 1) } else { format!("v{dst}") };
+pub(crate) fn vload(
+    b: &mut Builder,
+    dst: u8,
+    width: u8,
+    voff: u8,
+    srd: u8,
+    soff: Option<u8>,
+    offset: u32,
+) -> Result<(), String> {
+    let name = if width == 2 {
+        "buffer_load_b64"
+    } else {
+        "buffer_load_b32"
+    };
+    let d = if width == 2 {
+        format!("v[{}:{}]", dst, dst + 1)
+    } else {
+        format!("v{dst}")
+    };
     let so = soff.map_or("null".to_string(), |r| format!("s{r}"));
-    let off = if offset == 0 { String::new() } else { format!(" offset:{offset}") };
+    let off = if offset == 0 {
+        String::new()
+    } else {
+        format!(" offset:{offset}")
+    };
     let mut uses = vec![v(voff), sr(srd, 4)];
-    if let Some(r) = soff { uses.push(s(r)) }
-    mem(b, format!("{name} {d}, v{voff}, s[{}:{}], {so} offen{off}", srd, srd + 3), &[vr(dst, width)], &uses, MemoryClass::VmemLoad)
+    if let Some(r) = soff {
+        uses.push(s(r))
+    }
+    mem(
+        b,
+        format!(
+            "{name} {d}, v{voff}, s[{}:{}], {so} offen{off}",
+            srd,
+            srd + 3
+        ),
+        &[vr(dst, width)],
+        &uses,
+        MemoryClass::VmemLoad,
+    )
 }
 
 fn ds_store(text: String, uses: Vec<crate::reg::RegRef>) -> Instruction {
@@ -91,13 +129,25 @@ pub(crate) fn fetch_next(b: &mut Builder, g: &Gen, h: usize) -> Result<(), Strin
 /// Flip each uint4 code's sign bit so the signed WMMA consumes `q - 8`.
 pub(crate) fn flip_weights(b: &mut Builder, g: &Gen) -> Result<(), String> {
     for &w in &g.w_pf {
-        for r in [w, w + 1] { op(b, format!("v_xor_b32_e32 v{r}, 0x88888888, v{r}"), &[v(r)], &[v(r)])?; }
+        for r in [w, w + 1] {
+            op(
+                b,
+                format!("v_xor_b32_e32 v{r}, 0x88888888, v{r}"),
+                &[v(r)],
+                &[v(r)],
+            )?;
+        }
     }
     Ok(())
 }
 
 /// Publish the staged slab in `A_pf/W_pf` to the payload rings' next slot.
-pub(crate) fn publish_slab<C: State>(w: &mut Wv, g: &Gen, ra: Ring<PayA, C, Free>, rw: Ring<PayW, C, Free>) -> Result<(Staged<PayA, C>, Staged<PayW, C>), String> {
+pub(crate) fn publish_slab<C: State>(
+    w: &mut Wv,
+    g: &Gen,
+    ra: Ring<PayA, C, Free>,
+    rw: Ring<PayW, C, Free>,
+) -> Result<(Staged<PayA, C>, Staged<PayW, C>), String> {
     let slot = ra.next_index();
     flip_weights(w.isa(), g)?;
     let l = g.layout;
@@ -105,17 +155,58 @@ pub(crate) fn publish_slab<C: State>(w: &mut Wv, g: &Gen, ra: Ring<PayA, C, Free
     let (a, wo) = (l.a[slot] / 512, l.w[slot] / 512);
     let (mut sa, mut sw) = (w.begin_write(ra), w.begin_write(rw));
     match g.tile {
-        Tile::T128x128x8 => for r in 0..g.a_pf.len() {
-            let (ar, wr) = (g.a_pf[r], g.w_pf[r]);
-            (sa, sw) = w.ds_store2(sa, sw, ds_store(format!("ds_store_2addr_stride64_b64 v{}, v[{}:{}], v[{}:{}]{}", g.st_lds, ar, ar + 1, wr, wr + 1,
-                ds_offsets(a + step * r as u32, wo + step * r as u32)), vec![v(g.st_lds), vr(ar, 2), vr(wr, 2)]))?;
-        },
+        Tile::T128x128x8 => {
+            for r in 0..g.a_pf.len() {
+                let (ar, wr) = (g.a_pf[r], g.w_pf[r]);
+                (sa, sw) = w.ds_store2(
+                    sa,
+                    sw,
+                    ds_store(
+                        format!(
+                            "ds_store_2addr_stride64_b64 v{}, v[{}:{}], v[{}:{}]{}",
+                            g.st_lds,
+                            ar,
+                            ar + 1,
+                            wr,
+                            wr + 1,
+                            ds_offsets(a + step * r as u32, wo + step * r as u32)
+                        ),
+                        vec![v(g.st_lds), vr(ar, 2), vr(wr, 2)],
+                    ),
+                )?;
+            }
+        }
         Tile::T256x128x16 => {
             let ar = g.a_pf[0];
-            sa = w.ds_store(sa, ds_store(format!("ds_store_b64 v{}, v[{}:{}]{}", g.st_lds, ar, ar + 1, ds_offset(l.a[slot])), vec![v(g.st_lds), vr(ar, 2)]))?;
+            sa = w.ds_store(
+                sa,
+                ds_store(
+                    format!(
+                        "ds_store_b64 v{}, v[{}:{}]{}",
+                        g.st_lds,
+                        ar,
+                        ar + 1,
+                        ds_offset(l.a[slot])
+                    ),
+                    vec![v(g.st_lds), vr(ar, 2)],
+                ),
+            )?;
             let (w0, w1) = (g.w_pf[0], g.w_pf[1]);
-            sw = w.ds_store(sw, ds_store(format!("ds_store_2addr_stride64_b64 v{}, v[{}:{}], v[{}:{}]{}", g.st_lds, w0, w0 + 1, w1, w1 + 1,
-                ds_offsets(wo, wo + step)), vec![v(g.st_lds), vr(w0, 2), vr(w1, 2)]))?;
+            sw = w.ds_store(
+                sw,
+                ds_store(
+                    format!(
+                        "ds_store_2addr_stride64_b64 v{}, v[{}:{}], v[{}:{}]{}",
+                        g.st_lds,
+                        w0,
+                        w0 + 1,
+                        w1,
+                        w1 + 1,
+                        ds_offsets(wo, wo + step)
+                    ),
+                    vec![v(g.st_lds), vr(w0, 2), vr(w1, 2)],
+                ),
+            )?;
         }
     }
     Ok((sa, sw))
@@ -124,18 +215,61 @@ pub(crate) fn publish_slab<C: State>(w: &mut Wv, g: &Gen, ra: Ring<PayA, C, Free
 /// Publish the next block's `d` (token plane) and converted `sc` (row plane).
 /// Rows past M and tokens past N carry harmless values: they only reach
 /// outputs the epilogue never stores (tokens read 0 through the descriptor).
-pub(crate) fn publish_meta<C: State>(w: &mut Wv, g: &Gen, rd: Ring<MetaD, C, Free>, rs: Ring<MetaS, C, Free>) -> Result<(Staged<MetaD, C>, Staged<MetaS, C>), String> {
+pub(crate) fn publish_meta<C: State>(
+    w: &mut Wv,
+    g: &Gen,
+    rd: Ring<MetaD, C, Free>,
+    rs: Ring<MetaS, C, Free>,
+) -> Result<(Staged<MetaD, C>, Staged<MetaS, C>), String> {
     let plane = rd.next_index();
-    op(w.isa(), format!("v_cvt_f32_f16_e64 v{0}, v{0}.l", g.sz_nx), &[v(g.sz_nx)], &[v(g.sz_nx)])?;
+    op(
+        w.isa(),
+        format!("v_cvt_f32_f16_e64 v{0}, v{0}.l", g.sz_nx),
+        &[v(g.sz_nx)],
+        &[v(g.sz_nx)],
+    )?;
     let l = g.layout;
     let (sd, sz) = (w.begin_write(rd), w.begin_write(rs));
     if g.meta_ds == g.meta_sz {
-        w.ds_store2(sd, sz, ds_store(format!("ds_store_2addr_stride64_b32 v{}, v{}, v{}{}", g.meta_ds, g.ds_nx, g.sz_nx,
-            ds_offsets(l.ds[plane] / 256, l.sz[plane] / 256)), vec![v(g.meta_ds), v(g.ds_nx), v(g.sz_nx)]))
+        w.ds_store2(
+            sd,
+            sz,
+            ds_store(
+                format!(
+                    "ds_store_2addr_stride64_b32 v{}, v{}, v{}{}",
+                    g.meta_ds,
+                    g.ds_nx,
+                    g.sz_nx,
+                    ds_offsets(l.ds[plane] / 256, l.sz[plane] / 256)
+                ),
+                vec![v(g.meta_ds), v(g.ds_nx), v(g.sz_nx)],
+            ),
+        )
     } else {
-        let sd = w.ds_store(sd, ds_store(format!("ds_store_b32 v{}, v{}{}", g.meta_ds, g.ds_nx, ds_offset(l.ds[plane])), vec![v(g.meta_ds), v(g.ds_nx)]))?;
-        let sz = w.ds_store(sz, ds_store(format!("ds_store_b32 v{}, v{}{}", g.meta_sz, g.sz_nx, ds_offset(l.sz[plane])), vec![v(g.meta_sz), v(g.sz_nx)]))?;
+        let sd = w.ds_store(
+            sd,
+            ds_store(
+                format!(
+                    "ds_store_b32 v{}, v{}{}",
+                    g.meta_ds,
+                    g.ds_nx,
+                    ds_offset(l.ds[plane])
+                ),
+                vec![v(g.meta_ds), v(g.ds_nx)],
+            ),
+        )?;
+        let sz = w.ds_store(
+            sz,
+            ds_store(
+                format!(
+                    "ds_store_b32 v{}, v{}{}",
+                    g.meta_sz,
+                    g.sz_nx,
+                    ds_offset(l.sz[plane])
+                ),
+                vec![v(g.meta_sz), v(g.sz_nx)],
+            ),
+        )?;
         Ok((sd, sz))
     }
 }
-

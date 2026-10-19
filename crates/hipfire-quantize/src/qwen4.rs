@@ -4540,8 +4540,13 @@ mod tests {
             Some(value) => env::set_var("HF_TOKEN", value),
             None => env::remove_var("HF_TOKEN"),
         }
-        let message = result.expect_err("newline in token must be refused").to_string();
-        assert!(message.contains("environment variable HF_TOKEN"), "{message}");
+        let message = result
+            .expect_err("newline in token must be refused")
+            .to_string();
+        assert!(
+            message.contains("environment variable HF_TOKEN"),
+            "{message}"
+        );
         assert!(message.contains("a newline at character 7"), "{message}");
         assert!(!message.contains("bad"), "{message}");
     }

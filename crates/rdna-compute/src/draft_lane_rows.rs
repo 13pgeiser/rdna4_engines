@@ -152,7 +152,10 @@ fn build_table(
             return Err(err(what, format!("span {i}: rows {} must be > 0", s.rows)));
         }
         if s.packed_row0 < 0 {
-            return Err(err(what, format!("span {i}: packed_row0 {} < 0", s.packed_row0)));
+            return Err(err(
+                what,
+                format!("span {i}: packed_row0 {} < 0", s.packed_row0),
+            ));
         }
         let rows = s.rows as usize;
         let end = s.packed_row0 as usize + rows;
@@ -174,7 +177,9 @@ fn build_table(
             if a0 < b1 && b0 < a1 {
                 return Err(err(
                     what,
-                    format!("spans {i} [{a0}, {a1}) and {j} [{b0}, {b1}) overlap in the packed rows"),
+                    format!(
+                        "spans {i} [{a0}, {a1}) and {j} [{b0}, {b1}) overlap in the packed rows"
+                    ),
                 ));
             }
         }
@@ -188,12 +193,18 @@ fn build_table(
 
 fn check_f32(what: &str, name: &str, t: &GpuTensor, need_bytes: usize) -> HipResult<()> {
     if t.dtype != DType::F32 {
-        return Err(err(what, format!("{name} dtype must be F32 (got {:?})", t.dtype)));
+        return Err(err(
+            what,
+            format!("{name} dtype must be F32 (got {:?})", t.dtype),
+        ));
     }
     if t.buf.size() < need_bytes {
         return Err(err(
             what,
-            format!("{name} buffer too small (have {} need {need_bytes} bytes)", t.buf.size()),
+            format!(
+                "{name} buffer too small (have {} need {need_bytes} bytes)",
+                t.buf.size()
+            ),
         ));
     }
     Ok(())
@@ -239,7 +250,10 @@ impl Gpu {
             if p.buf.size() < pos_need {
                 return Err(err(
                     WHAT,
-                    format!("positions buffer too small (have {} need {pos_need} bytes)", p.buf.size()),
+                    format!(
+                        "positions buffer too small (have {} need {pos_need} bytes)",
+                        p.buf.size()
+                    ),
                 ));
             }
         }
@@ -250,10 +264,16 @@ impl Gpu {
         for (i, s) in spans.iter().enumerate() {
             let src_bytes = s.rows as u64 * width as u64 * 4;
             if s.src == 0 || s.src % 4 != 0 {
-                return Err(err(WHAT, format!("span {i}: src must be non-null and 4-byte aligned")));
+                return Err(err(
+                    WHAT,
+                    format!("span {i}: src must be non-null and 4-byte aligned"),
+                ));
             }
             if overlaps(s.src, src_bytes, packed_lo, packed_need as u64) {
-                return Err(err(WHAT, format!("span {i}: src overlaps the packed buffer")));
+                return Err(err(
+                    WHAT,
+                    format!("span {i}: src overlaps the packed buffer"),
+                ));
             }
             if positions.is_some() {
                 let pb = s.rows as u64 * 4;
@@ -266,12 +286,19 @@ impl Gpu {
                 if overlaps(s.positions, pb, pos_lo, pos_need as u64)
                     || overlaps(s.positions, pb, packed_lo, packed_need as u64)
                 {
-                    return Err(err(WHAT, format!("span {i}: positions source overlaps a destination")));
+                    return Err(err(
+                        WHAT,
+                        format!("span {i}: positions source overlaps a destination"),
+                    ));
                 }
             }
         }
 
-        self.ensure_kernel(DRAFT_ROWS_PACK_MODULE, DRAFT_ROWS_PACK_SRC, DRAFT_ROWS_GATHER_SYMBOL)?;
+        self.ensure_kernel(
+            DRAFT_ROWS_PACK_MODULE,
+            DRAFT_ROWS_PACK_SRC,
+            DRAFT_ROWS_GATHER_SYMBOL,
+        )?;
         let width_i32 = width as i32;
         let block = 256u32;
         let grid = (max_rows * width).div_ceil(block as usize) as u32;
@@ -283,8 +310,18 @@ impl Gpu {
             &width_i32 as *const _ as *mut c_void,
         ];
         let live_rows: usize = spans.iter().map(|s| s.rows as usize).sum();
-        let bytes = live_rows * width * 4 * 2 + if positions.is_some() { live_rows * 8 } else { 0 };
-        let timer = crate::profile::begin_timer(&self.hip, "draft_lane_rows", DRAFT_ROWS_GATHER_SYMBOL, bytes);
+        let bytes = live_rows * width * 4 * 2
+            + if positions.is_some() {
+                live_rows * 8
+            } else {
+                0
+            };
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "draft_lane_rows",
+            DRAFT_ROWS_GATHER_SYMBOL,
+            bytes,
+        );
         let result = self.launch_maybe_blob(
             DRAFT_ROWS_GATHER_SYMBOL,
             [grid, 1, spans.len() as u32],
@@ -340,7 +377,10 @@ impl Gpu {
         for (i, s) in spans.iter().enumerate() {
             let bytes = s.rows as u64 * width as u64 * 4;
             if s.dst0 == 0 || s.dst0 % 4 != 0 {
-                return Err(err(WHAT, format!("span {i}: dst0 must be non-null and 4-byte aligned")));
+                return Err(err(
+                    WHAT,
+                    format!("span {i}: dst0 must be non-null and 4-byte aligned"),
+                ));
             }
             dsts.push((s.dst0, bytes, format!("span {i} dst0")));
             if packed1.is_some() {
@@ -366,7 +406,11 @@ impl Gpu {
             }
         }
 
-        self.ensure_kernel(DRAFT_ROWS_PACK_MODULE, DRAFT_ROWS_PACK_SRC, DRAFT_ROWS_SCATTER_SYMBOL)?;
+        self.ensure_kernel(
+            DRAFT_ROWS_PACK_MODULE,
+            DRAFT_ROWS_PACK_SRC,
+            DRAFT_ROWS_SCATTER_SYMBOL,
+        )?;
         let width_i32 = width as i32;
         let block = 256u32;
         let grid = (max_rows * width).div_ceil(block as usize) as u32;
@@ -380,7 +424,12 @@ impl Gpu {
         let live_rows: usize = spans.iter().map(|s| s.rows as usize).sum();
         let planes = if packed1.is_some() { 2 } else { 1 };
         let bytes = live_rows * width * 4 * 2 * planes;
-        let timer = crate::profile::begin_timer(&self.hip, "draft_lane_rows", DRAFT_ROWS_SCATTER_SYMBOL, bytes);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "draft_lane_rows",
+            DRAFT_ROWS_SCATTER_SYMBOL,
+            bytes,
+        );
         let result = self.launch_maybe_blob(
             DRAFT_ROWS_SCATTER_SYMBOL,
             [grid, 1, spans.len() as u32],
@@ -425,7 +474,10 @@ impl Gpu {
         const WHAT: &str = "gemv_mq4g256v2_multirow_r2_lanes";
         self.bind_thread()?;
         if batch == 0 || batch > DRAFT_R2_LANES_BATCH_MAX {
-            return Err(err(WHAT, format!("batch {batch} outside 1..={DRAFT_R2_LANES_BATCH_MAX}")));
+            return Err(err(
+                WHAT,
+                format!("batch {batch} outside 1..={DRAFT_R2_LANES_BATCH_MAX}"),
+            ));
         }
         if m == 0 || m > i32::MAX as usize || k == 0 || k > i32::MAX as usize {
             return Err(err(WHAT, format!("m {m} / k {k} outside 1..=i32::MAX")));
@@ -440,12 +492,18 @@ impl Gpu {
             .ok_or_else(|| err(WHAT, "weight size overflow"))?;
         // The kernel's raw-buffer weight offsets are 32-bit (like the singleton R2).
         if weight_bytes > u32::MAX as usize {
-            return Err(err(WHAT, format!("weight of {weight_bytes} bytes exceeds the 32-bit buffer offset range")));
+            return Err(err(
+                WHAT,
+                format!("weight of {weight_bytes} bytes exceeds the 32-bit buffer offset range"),
+            ));
         }
         if a_raw.buf.size() < weight_bytes {
             return Err(err(
                 WHAT,
-                format!("a_raw too small (have {} need {weight_bytes} bytes for [{m},{k}] MQ4G256V2)", a_raw.buf.size()),
+                format!(
+                    "a_raw too small (have {} need {weight_bytes} bytes for [{m},{k}] MQ4G256V2)",
+                    a_raw.buf.size()
+                ),
             ));
         }
         let x_need = batch
@@ -462,9 +520,17 @@ impl Gpu {
         let x_ptr = rotated.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
         if overlaps(y_ptr as u64, y_need as u64, x_ptr as u64, x_need as u64)
-            || overlaps(y_ptr as u64, y_need as u64, a_ptr as u64, weight_bytes as u64)
+            || overlaps(
+                y_ptr as u64,
+                y_need as u64,
+                a_ptr as u64,
+                weight_bytes as u64,
+            )
         {
-            return Err(err(WHAT, "y overlaps the weight or the rotated input (no in-place aliasing)"));
+            return Err(err(
+                WHAT,
+                "y overlaps the weight or the rotated input (no in-place aliasing)",
+            ));
         }
 
         self.ensure_kernel(

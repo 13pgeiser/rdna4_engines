@@ -200,7 +200,10 @@ pub enum Raw {
     /// One kernel module (K1 or K2).
     Kernel(RawKernel),
     /// Both the K1 and the K2 module of the codec exist (staged / tiered execution reuses them).
-    Composite { k1: RawKernel, k2: RawKernel },
+    Composite {
+        k1: RawKernel,
+        k2: RawKernel,
+    },
     /// No arch-specific kernel: the cell is served by an arch-neutral route described by the text.
     ArchNeutral(&'static str),
     /// Inventory owned by a higher crate and supplied by the caller.
@@ -266,13 +269,48 @@ const fn cell(arch: &'static str, qt: ExpertQt, route: Route, hold: Hold) -> Hol
 /// refuses (the three `Gfx1151E8pReceiptsPending` rows only while that switch is false).
 /// The first matching active row names the verdict.
 pub const HOLD_CELLS: [HoldCell; 7] = [
-    cell("gfx1100", QT_E8P, Route::TierStage, Hold::TierPlanE8pRefused),
-    cell("gfx1151", QT_E8P, Route::TierStage, Hold::TierPlanE8pRefused),
-    cell("gfx1201", QT_E8P, Route::TierStage, Hold::TierPlanE8pRefused),
-    cell("gfx1151", QT_W3, Route::TierStage, Hold::TierPlanW3Gfx1151Refused),
-    cell("gfx1151", QT_E8P, Route::PrefillK2, Hold::Gfx1151E8pReceiptsPending),
-    cell("gfx1151", QT_E8P, Route::DecodeGemv, Hold::Gfx1151E8pReceiptsPending),
-    cell("gfx1151", QT_E8P, Route::Stage, Hold::Gfx1151E8pReceiptsPending),
+    cell(
+        "gfx1100",
+        QT_E8P,
+        Route::TierStage,
+        Hold::TierPlanE8pRefused,
+    ),
+    cell(
+        "gfx1151",
+        QT_E8P,
+        Route::TierStage,
+        Hold::TierPlanE8pRefused,
+    ),
+    cell(
+        "gfx1201",
+        QT_E8P,
+        Route::TierStage,
+        Hold::TierPlanE8pRefused,
+    ),
+    cell(
+        "gfx1151",
+        QT_W3,
+        Route::TierStage,
+        Hold::TierPlanW3Gfx1151Refused,
+    ),
+    cell(
+        "gfx1151",
+        QT_E8P,
+        Route::PrefillK2,
+        Hold::Gfx1151E8pReceiptsPending,
+    ),
+    cell(
+        "gfx1151",
+        QT_E8P,
+        Route::DecodeGemv,
+        Hold::Gfx1151E8pReceiptsPending,
+    ),
+    cell(
+        "gfx1151",
+        QT_E8P,
+        Route::Stage,
+        Hold::Gfx1151E8pReceiptsPending,
+    ),
 ];
 
 /// Artifact-load receipts flag of the gfx1100 and gfx1201 slab route. Set because the real-layer
@@ -417,10 +455,9 @@ pub fn capability_with_external(
     let raw = raw_inventory_with_external(arch, qt, route, external);
     let verdict = if !raw.is_present() {
         Verdict::NoKernel
-    } else if let Some(row) = HOLD_CELLS
-        .iter()
-        .find(|row| row.arch == arch && row.qt == qt && row.route == route && row.hold.active(holds))
-    {
+    } else if let Some(row) = HOLD_CELLS.iter().find(|row| {
+        row.arch == arch && row.qt == qt && row.route == route && row.hold.active(holds)
+    }) {
         Verdict::Held(row.hold)
     } else {
         Verdict::Admitted
@@ -663,8 +700,8 @@ mod tests {
 
     #[test]
     fn registry_pairs_have_the_documented_verdicts() {
-        use Verdict::{Admitted, Held, NoKernel};
         use Hold::{TierPlanE8pRefused, TierPlanW3Gfx1151Refused};
+        use Verdict::{Admitted, Held, NoKernel};
         let all_slab = [Route::PrefillK2, Route::DecodeGemv, Route::Stage];
         for arch in arches() {
             for qt in REGISTRY_PAIRS {
@@ -674,7 +711,11 @@ mod tests {
                         | ("gfx1100", QT_MQ4_XTS | QT_E8P) => Admitted,
                         _ => NoKernel,
                     };
-                    assert_eq!(capability(arch, qt, route).verdict, want, "{arch:?} {qt:?} {route:?}");
+                    assert_eq!(
+                        capability(arch, qt, route).verdict,
+                        want,
+                        "{arch:?} {qt:?} {route:?}"
+                    );
                 }
                 let tier = match (arch, qt) {
                     (_, QT_MQ4_XTS) => Admitted,
@@ -683,7 +724,11 @@ mod tests {
                     ("gfx1100" | "gfx1151" | "gfx1201", QT_E8P) => Held(TierPlanE8pRefused),
                     _ => NoKernel,
                 };
-                assert_eq!(capability(arch, qt, Route::TierStage).verdict, tier, "{arch:?} {qt:?} tier");
+                assert_eq!(
+                    capability(arch, qt, Route::TierStage).verdict,
+                    tier,
+                    "{arch:?} {qt:?} tier"
+                );
             }
         }
         // W2 has no kernel anywhere; gfx1100 W3 has none either.
@@ -692,7 +737,12 @@ mod tests {
                 assert_eq!(capability(arch, QT_W2, route).verdict, NoKernel);
             }
         }
-        for route in [Route::PrefillK2, Route::DecodeGemv, Route::Stage, Route::TierStage] {
+        for route in [
+            Route::PrefillK2,
+            Route::DecodeGemv,
+            Route::Stage,
+            Route::TierStage,
+        ] {
             assert_eq!(capability("gfx1100", QT_W3, route).verdict, NoKernel);
         }
     }
@@ -702,12 +752,34 @@ mod tests {
         // Beta: exactly the four tier-plan cells.
         let beta = held_cells(&Holds::BETA);
         assert_eq!(
-            beta.iter().map(|row| (row.arch, row.qt, row.route, row.hold)).collect::<Vec<_>>(),
+            beta.iter()
+                .map(|row| (row.arch, row.qt, row.route, row.hold))
+                .collect::<Vec<_>>(),
             vec![
-                ("gfx1100", QT_E8P, Route::TierStage, Hold::TierPlanE8pRefused),
-                ("gfx1151", QT_E8P, Route::TierStage, Hold::TierPlanE8pRefused),
-                ("gfx1201", QT_E8P, Route::TierStage, Hold::TierPlanE8pRefused),
-                ("gfx1151", QT_W3, Route::TierStage, Hold::TierPlanW3Gfx1151Refused),
+                (
+                    "gfx1100",
+                    QT_E8P,
+                    Route::TierStage,
+                    Hold::TierPlanE8pRefused
+                ),
+                (
+                    "gfx1151",
+                    QT_E8P,
+                    Route::TierStage,
+                    Hold::TierPlanE8pRefused
+                ),
+                (
+                    "gfx1201",
+                    QT_E8P,
+                    Route::TierStage,
+                    Hold::TierPlanE8pRefused
+                ),
+                (
+                    "gfx1151",
+                    QT_W3,
+                    Route::TierStage,
+                    Hold::TierPlanW3Gfx1151Refused
+                ),
             ]
         );
         // Independent derivation: every Held verdict over the whole enumeration is a listed row,
@@ -718,7 +790,9 @@ mod tests {
                     let cap = capability_with_external(arch, qt, route, Some("cpu"), &Holds::BETA);
                     if let Verdict::Held(hold) = cap.verdict {
                         assert!(
-                            beta.iter().any(|row| (row.arch, row.qt, row.route, row.hold) == (arch, qt, route, hold)),
+                            beta.iter()
+                                .any(|row| (row.arch, row.qt, row.route, row.hold)
+                                    == (arch, qt, route, hold)),
                             "{arch:?} {qt:?} {route:?} {hold:?} is held but not listed"
                         );
                         assert!(cap.raw.is_present());
@@ -727,7 +801,10 @@ mod tests {
             }
         }
         for row in HOLD_CELLS {
-            assert!(raw_inventory_with_external(row.arch, row.qt, row.route, Some("cpu")).is_present(), "{row:?}");
+            assert!(
+                raw_inventory_with_external(row.arch, row.qt, row.route, Some("cpu")).is_present(),
+                "{row:?}"
+            );
         }
     }
 
@@ -743,19 +820,32 @@ mod tests {
                 Verdict::Held(Hold::Gfx1151E8pReceiptsPending)
             );
             // Other arches and codecs never read the switch.
-            for (arch, qt) in [("gfx1201", QT_E8P), ("gfx1100", QT_E8P), ("gfx1151", QT_W3), ("gfx1151", QT_MQ4_XTS)] {
-                assert!(capability_with(arch, qt, route, &off).admitted(), "{arch} {qt:?} {route:?}");
+            for (arch, qt) in [
+                ("gfx1201", QT_E8P),
+                ("gfx1100", QT_E8P),
+                ("gfx1151", QT_W3),
+                ("gfx1151", QT_MQ4_XTS),
+            ] {
+                assert!(
+                    capability_with(arch, qt, route, &off).admitted(),
+                    "{arch} {qt:?} {route:?}"
+                );
             }
         }
         assert!(!slab_serves_codec_with("gfx1151", 3, &off));
-        assert!(slab_serves_codec_with("gfx1151", 0, &off) && slab_serves_codec_with("gfx1151", 1, &off));
+        assert!(
+            slab_serves_codec_with("gfx1151", 0, &off)
+                && slab_serves_codec_with("gfx1151", 1, &off)
+        );
         assert_eq!(held_cells(&off).len(), 4 + 3);
         assert_eq!(
-            capability_with_external("gfx1151", QT_MQ4_XTS, Route::D2CpuSplit, Some("cpu"), &off).verdict,
+            capability_with_external("gfx1151", QT_MQ4_XTS, Route::D2CpuSplit, Some("cpu"), &off)
+                .verdict,
             Verdict::Admitted
         );
         assert_eq!(
-            capability_with_external("gfx1151", QT_E8P, Route::D2CpuSplit, Some("cpu"), &off).verdict,
+            capability_with_external("gfx1151", QT_E8P, Route::D2CpuSplit, Some("cpu"), &off)
+                .verdict,
             Verdict::NoKernel
         );
     }
@@ -774,7 +864,10 @@ mod tests {
                         capability_with(arch, qt, route, &off).raw,
                         capability_with(arch, qt, route, &Holds::BETA).raw
                     );
-                    assert_eq!(raw_inventory(arch, qt, route), capability(arch, qt, route).raw);
+                    assert_eq!(
+                        raw_inventory(arch, qt, route),
+                        capability(arch, qt, route).raw
+                    );
                 }
             }
         }
@@ -791,7 +884,10 @@ mod tests {
         );
         assert!(matches!(
             raw_inventory("gfx1151", QT_W3, Route::PrefillK2),
-            Raw::Kernel(RawKernel { module: "qwen4_moe_iu4_sym_w3_nt4_pm_gfx1151", .. })
+            Raw::Kernel(RawKernel {
+                module: "qwen4_moe_iu4_sym_w3_nt4_pm_gfx1151",
+                ..
+            })
         ));
     }
 
@@ -845,11 +941,26 @@ mod tests {
         }
         assert_eq!(ExpertQt::of_slab_codec(4), None);
         assert_eq!(ExpertQt::new(44, 132).slab_codec(), None);
-        assert_eq!(ExpertQt::of_dtypes(DType::MQ4G256V2, DType::MQ4G128V2), Some(QT_MQ4_XTS));
-        assert_eq!(ExpertQt::of_dtypes(DType::MQ3I4G128R256, DType::MQ3I4G128R128), Some(QT_W3));
-        assert_eq!(ExpertQt::of_dtypes(DType::MQ2I4G128R256, DType::MQ2I4G128R128), Some(QT_W2));
-        assert_eq!(ExpertQt::of_dtypes(DType::E8PI4G128R256, DType::E8PI4G128R128), Some(QT_E8P));
-        assert_eq!(ExpertQt::of_dtypes(DType::MQ4G256V2, DType::MQ3I4G128R128), None);
+        assert_eq!(
+            ExpertQt::of_dtypes(DType::MQ4G256V2, DType::MQ4G128V2),
+            Some(QT_MQ4_XTS)
+        );
+        assert_eq!(
+            ExpertQt::of_dtypes(DType::MQ3I4G128R256, DType::MQ3I4G128R128),
+            Some(QT_W3)
+        );
+        assert_eq!(
+            ExpertQt::of_dtypes(DType::MQ2I4G128R256, DType::MQ2I4G128R128),
+            Some(QT_W2)
+        );
+        assert_eq!(
+            ExpertQt::of_dtypes(DType::E8PI4G128R256, DType::E8PI4G128R128),
+            Some(QT_E8P)
+        );
+        assert_eq!(
+            ExpertQt::of_dtypes(DType::MQ4G256V2, DType::MQ3I4G128R128),
+            None
+        );
         assert_eq!(ExpertQt::of_dtypes(DType::MQ4G256, DType::MQ4G256), None);
     }
 
@@ -910,7 +1021,11 @@ mod tests {
             ("gfx1201", QT_W2, false),
         ] {
             assert_eq!(stage_eligible(arch, [qt]), want, "{arch:?} {qt:?}");
-            assert_eq!(stage_eligible(arch, [qt]), slab_serves(arch, qt), "{arch:?} {qt:?}");
+            assert_eq!(
+                stage_eligible(arch, [qt]),
+                slab_serves(arch, qt),
+                "{arch:?} {qt:?}"
+            );
         }
         assert!(stage_eligible("gfx1201", [QT_MQ4_XTS, QT_W3]));
         assert!(!stage_eligible("gfx1100", [QT_MQ4_XTS, QT_W3]));

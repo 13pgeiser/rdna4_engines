@@ -36,12 +36,18 @@ pub struct Drained<E: Event> {
 
 impl<W: WaitModel, E: Event> Pending<W, E> {
     pub(crate) fn new(last: Option<EventId>) -> Self {
-        Self { last, _p: PhantomData }
+        Self {
+            last,
+            _p: PhantomData,
+        }
     }
 }
 impl<E: Event> Drained<E> {
     pub(crate) fn new(last: Option<EventId>) -> Self {
-        Self { last, _p: PhantomData }
+        Self {
+            last,
+            _p: PhantomData,
+        }
     }
 }
 
@@ -56,7 +62,9 @@ pub trait Pendings<W: WaitModel> {
 impl<W: WaitModel, E: Event> Pendings<W> for Pending<W, E> {
     type Drained = Drained<E>;
     fn each_event(&self, f: &mut dyn FnMut(EventId)) {
-        if let Some(e) = self.last { f(e) }
+        if let Some(e) = self.last {
+            f(e)
+        }
     }
     fn drained(self) -> Drained<E> {
         Drained::new(self.last)

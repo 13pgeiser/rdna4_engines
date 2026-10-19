@@ -32,7 +32,9 @@ pub fn format_source(source: &str) -> Result<String, String> {
 /// `region A, B;` -> `__rip_region!(A, B);` (`pub region` -> `__rip_pub_region!(`).
 pub fn mask(source: &str) -> Result<String, String> {
     if let Some(name) = MASK_NAMES.iter().find(|n| source.contains(**n)) {
-        return Err(format!("source uses the reserved formatter marker `{name}`"));
+        return Err(format!(
+            "source uses the reserved formatter marker `{name}`"
+        ));
     }
     let toks: Vec<TokenTree> = lex(source)?.into_iter().collect();
     let lines = LineIndex::new(source);
@@ -79,7 +81,11 @@ impl<'a> LineIndex<'a> {
     fn offset(&self, line: usize, column: usize) -> usize {
         let start = self.starts[line - 1];
         let rest = &self.source[start..];
-        start + rest.char_indices().nth(column).map_or(rest.len(), |(b, _)| b)
+        start
+            + rest
+                .char_indices()
+                .nth(column)
+                .map_or(rest.len(), |(b, _)| b)
     }
     fn start(&self, t: &TokenTree) -> usize {
         let p = t.span().start();
@@ -142,7 +148,9 @@ fn scan(toks: &[TokenTree], top: bool, lines: &LineIndex, edits: &mut Vec<Edit>)
             if let Some(end) = (j + 1..toks.len()).find(|&k| is_punct(&toks[k], ';')) {
                 let names = &toks[j + 1..end];
                 let valid = names.iter().any(|t| matches!(t, TokenTree::Ident(_)))
-                    && names.iter().all(|t| matches!(t, TokenTree::Ident(_)) || is_punct(t, ','));
+                    && names
+                        .iter()
+                        .all(|t| matches!(t, TokenTree::Ident(_)) || is_punct(t, ','));
                 if valid {
                     let masked = match pub_at {
                         None => Some((lines.start(kw), REGION_MACRO)),
@@ -150,18 +158,34 @@ fn scan(toks: &[TokenTree], top: bool, lines: &LineIndex, edits: &mut Vec<Edit>)
                         Some(_) => None,
                     };
                     if let Some((start, text)) = masked {
-                        edits.push(Edit { start, end: lines.start(&names[0]), text: text.into() });
+                        edits.push(Edit {
+                            start,
+                            end: lines.start(&names[0]),
+                            text: text.into(),
+                        });
                         let semi = &toks[end];
-                        edits.push(Edit { start: lines.end(&names[names.len() - 1]), end: lines.end(semi), text: ");".into() });
+                        edits.push(Edit {
+                            start: lines.end(&names[names.len() - 1]),
+                            end: lines.end(semi),
+                            text: ");".into(),
+                        });
                         i = end + 1;
                         continue;
                     }
                 }
             }
         }
-        let semi_item = matches!(kw_name.as_str(), "const" | "static" | "type" | "use" | "extern")
-            && !(kw_name == "const" && toks.get(j + 1).is_some_and(|t| is_ident(t, "fn") || is_ident(t, "unsafe") || is_ident(t, "async")))
-            && !(kw_name == "extern" && toks.get(j + 1).is_some_and(|t| matches!(t, TokenTree::Literal(_)) || is_ident(t, "fn")));
+        let semi_item = matches!(
+            kw_name.as_str(),
+            "const" | "static" | "type" | "use" | "extern"
+        ) && !(kw_name == "const"
+            && toks.get(j + 1).is_some_and(|t| {
+                is_ident(t, "fn") || is_ident(t, "unsafe") || is_ident(t, "async")
+            }))
+            && !(kw_name == "extern"
+                && toks
+                    .get(j + 1)
+                    .is_some_and(|t| matches!(t, TokenTree::Literal(_)) || is_ident(t, "fn")));
         let mut end = j;
         let mut closed_by_brace = false;
         while end < toks.len() {
@@ -184,14 +208,31 @@ fn scan(toks: &[TokenTree], top: bool, lines: &LineIndex, edits: &mut Vec<Edit>)
             let kw_start = lines.start(kw);
             let attr_at = pub_at.map_or(kw_start, |p| lines.start(&toks[p]));
             if attr_at == kw_start {
-                edits.push(Edit { start: kw_start, end: lines.end(kw), text: format!("{attr} {rust}") });
+                edits.push(Edit {
+                    start: kw_start,
+                    end: lines.end(kw),
+                    text: format!("{attr} {rust}"),
+                });
             } else {
-                edits.push(Edit { start: attr_at, end: attr_at, text: format!("{attr} ") });
-                edits.push(Edit { start: kw_start, end: lines.end(kw), text: rust.into() });
+                edits.push(Edit {
+                    start: attr_at,
+                    end: attr_at,
+                    text: format!("{attr} "),
+                });
+                edits.push(Edit {
+                    start: kw_start,
+                    end: lines.end(kw),
+                    text: rust.into(),
+                });
             }
         }
-        let recurse = closed_by_brace && matches!(kw_name.as_str(), "impl" | "trait" | "mod" | "unsafe");
-        let is_container = recurse && (kw_name != "unsafe" || toks[j..=last].iter().any(|t| is_ident(t, "impl") || is_ident(t, "trait")));
+        let recurse =
+            closed_by_brace && matches!(kw_name.as_str(), "impl" | "trait" | "mod" | "unsafe");
+        let is_container = recurse
+            && (kw_name != "unsafe"
+                || toks[j..=last]
+                    .iter()
+                    .any(|t| is_ident(t, "impl") || is_ident(t, "trait")));
         if is_container {
             if let TokenTree::Group(g) = &toks[last] {
                 let inner: Vec<TokenTree> = g.stream().into_iter().collect();
@@ -233,7 +274,9 @@ fn unmask_items(text: &str, attr: &str, rust: &str, word: &str) -> Result<String
                         }
                         (depth == 0).then_some(w + b + 1)
                     })
-                    .ok_or_else(|| format!("unbalanced visibility after `{attr}` in formatted output"))?;
+                    .ok_or_else(|| {
+                        format!("unbalanced visibility after `{attr}` in formatted output")
+                    })?;
                 k = close;
             }
             k = skip_ws(after, k);
@@ -257,8 +300,14 @@ fn unmask_regions(text: &str, marker: &str, prefix: &str) -> Result<String, Stri
     while let Some(p) = rest.find(marker) {
         out.push_str(&rest[..p]);
         let after = &rest[p + marker.len()..];
-        let close = after.find(')').ok_or("unterminated region marker in formatted output")?;
-        let names: Vec<&str> = after[..close].split(',').map(str::trim).filter(|n| !n.is_empty()).collect();
+        let close = after
+            .find(')')
+            .ok_or("unterminated region marker in formatted output")?;
+        let names: Vec<&str> = after[..close]
+            .split(',')
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .collect();
         let semi = skip_ws(after, close + 1);
         if !after[semi..].starts_with(';') {
             return Err("rustfmt changed a region declaration".into());
@@ -274,14 +323,22 @@ fn unmask_regions(text: &str, marker: &str, prefix: &str) -> Result<String, Stri
 
 fn run_rustfmt(masked: &str) -> Result<String, String> {
     let mut child = Command::new("rustfmt")
-        .args(["--edition", "2021", "--emit", "stdout", "--config", RUSTFMT_CONFIG])
+        .args([
+            "--edition",
+            "2021",
+            "--emit",
+            "stdout",
+            "--config",
+            RUSTFMT_CONFIG,
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                "rustfmt not found on PATH: install it with `rustup component add rustfmt`".to_string()
+                "rustfmt not found on PATH: install it with `rustup component add rustfmt`"
+                    .to_string()
             } else {
                 format!("cannot run rustfmt: {e}")
             }
@@ -289,10 +346,18 @@ fn run_rustfmt(masked: &str) -> Result<String, String> {
     let mut stdin = child.stdin.take().ok_or("cannot open rustfmt stdin")?;
     let input = masked.to_owned();
     let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
-    let output = child.wait_with_output().map_err(|e| format!("rustfmt failed: {e}"))?;
-    writer.join().map_err(|_| "rustfmt stdin writer panicked".to_string())?.map_err(|e| format!("cannot write to rustfmt: {e}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("rustfmt failed: {e}"))?;
+    writer
+        .join()
+        .map_err(|_| "rustfmt stdin writer panicked".to_string())?
+        .map_err(|e| format!("cannot write to rustfmt: {e}"))?;
     if !output.status.success() {
-        return Err(format!("rustfmt failed: {}", String::from_utf8_lossy(&output.stderr).trim()));
+        return Err(format!(
+            "rustfmt failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
     String::from_utf8(output.stdout).map_err(|e| format!("rustfmt output is not UTF-8: {e}"))
 }
@@ -319,7 +384,9 @@ fn flatten(ts: TokenStream, in_group: bool, out: &mut Vec<String>) {
                     Delimiter::Bracket => ("[", "]"),
                     Delimiter::None => ("", ""),
                 };
-                let wrapper = g.delimiter() == Delimiter::Brace && k > 0 && (is_punct(&toks[k - 1], '|') || is_fat_arrow(&toks, k - 1));
+                let wrapper = g.delimiter() == Delimiter::Brace
+                    && k > 0
+                    && (is_punct(&toks[k - 1], '|') || is_fat_arrow(&toks, k - 1));
                 if !wrapper {
                     out.push(open.into());
                 }
@@ -377,8 +444,16 @@ mod tests {
 
     #[test]
     fn verification_ignores_layout_tokens_only() {
-        verify_tokens("fn f(a: u8, b: u8) { g(a, b) }", "fn f(\n a: u8,\n b: u8,\n) {\n g(a, b,)\n}").unwrap();
-        verify_tokens("fn f() { let g = |x| x + 1; }", "fn f() { let g = |x| { x + 1 }; }").unwrap();
+        verify_tokens(
+            "fn f(a: u8, b: u8) { g(a, b) }",
+            "fn f(\n a: u8,\n b: u8,\n) {\n g(a, b,)\n}",
+        )
+        .unwrap();
+        verify_tokens(
+            "fn f() { let g = |x| x + 1; }",
+            "fn f() { let g = |x| { x + 1 }; }",
+        )
+        .unwrap();
         let err = verify_tokens("fn f() { a + b }", "fn f() { a - b }").unwrap_err();
         assert!(err.contains("`+`") && err.contains("`-`"), "{err}");
         assert!(verify_tokens("fn f() { a; b }", "fn f() { a; }").is_err());

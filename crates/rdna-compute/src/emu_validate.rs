@@ -135,7 +135,9 @@ impl EmuValidationRequest {
         }
         for &mib in &self.buffer_mib {
             if mib == 0 || mib > MAX_BUFFER_MIB {
-                return Err(format!("buffer_mib entry {mib} is outside 1..={MAX_BUFFER_MIB}"));
+                return Err(format!(
+                    "buffer_mib entry {mib} is outside 1..={MAX_BUFFER_MIB}"
+                ));
             }
         }
         let unique: BTreeSet<u32> = self.buffer_mib.iter().copied().collect();
@@ -143,7 +145,10 @@ impl EmuValidationRequest {
             return Err("buffer_mib entries must be distinct".into());
         }
         if self.passes == 0 || self.passes > MAX_PASSES {
-            return Err(format!("passes {} is outside 1..={MAX_PASSES}", self.passes));
+            return Err(format!(
+                "passes {} is outside 1..={MAX_PASSES}",
+                self.passes
+            ));
         }
         for test in &self.approved_tests {
             if !KNOWN_TESTS.contains(&test.as_str()) {
@@ -155,7 +160,9 @@ impl EmuValidationRequest {
         }
         if let Some(note) = &self.identity_note {
             if note.chars().count() > MAX_IDENTITY_NOTE_CHARS {
-                return Err(format!("identity_note exceeds {MAX_IDENTITY_NOTE_CHARS} characters"));
+                return Err(format!(
+                    "identity_note exceeds {MAX_IDENTITY_NOTE_CHARS} characters"
+                ));
             }
         }
         if (self.requested("bandwidth") || self.requested("graph")) && self.buffer_mib.is_empty() {
@@ -720,7 +727,11 @@ impl EmuValidationReceipt {
 /// `Fail`; else any requested `Unavailable` (or nothing requested) →
 /// `Unavailable`; else `Pass`. Callers must not pass the estimate section.
 pub fn aggregate_status(sections: &[(Status, bool)]) -> (Status, Option<String>) {
-    let requested: Vec<Status> = sections.iter().filter(|(_, r)| *r).map(|(s, _)| *s).collect();
+    let requested: Vec<Status> = sections
+        .iter()
+        .filter(|(_, r)| *r)
+        .map(|(s, _)| *s)
+        .collect();
     if requested.is_empty() {
         return (Status::Unavailable, Some("no test requested".to_string()));
     }
@@ -728,7 +739,10 @@ pub fn aggregate_status(sections: &[(Status, bool)]) -> (Status, Option<String>)
         return (Status::Fail, Some("a requested section failed".to_string()));
     }
     if requested.contains(&Status::Unavailable) {
-        return (Status::Unavailable, Some("a requested section is unavailable".to_string()));
+        return (
+            Status::Unavailable,
+            Some("a requested section is unavailable".to_string()),
+        );
     }
     (Status::Pass, None)
 }
@@ -819,12 +833,14 @@ fn bytes_to_words(bytes: &[u8]) -> Vec<u32> {
 
 /// Fill `buf` (whole 32-bit words) with the pattern starting at word `first_word`.
 pub fn fill_pattern(buf: &mut [u8], first_word: u64, seed: u32) {
-    buf.par_chunks_mut(4096).enumerate().for_each(|(ci, chunk)| {
-        let base = first_word + (ci as u64) * 1024;
-        for (j, w) in chunk.chunks_exact_mut(4).enumerate() {
-            w.copy_from_slice(&pattern_word(base + j as u64, seed).to_le_bytes());
-        }
-    });
+    buf.par_chunks_mut(4096)
+        .enumerate()
+        .for_each(|(ci, chunk)| {
+            let base = first_word + (ci as u64) * 1024;
+            for (j, w) in chunk.chunks_exact_mut(4).enumerate() {
+                w.copy_from_slice(&pattern_word(base + j as u64, seed).to_le_bytes());
+            }
+        });
 }
 
 /// `(mismatching words, first mismatching word index)` of `bytes` against the
@@ -892,7 +908,9 @@ pub fn usage_delta(after: &BudgetUsage, before: &BudgetUsage) -> BudgetUsage {
         device_bytes: after.device_bytes.saturating_sub(before.device_bytes),
         host_bytes: after.host_bytes.saturating_sub(before.host_bytes),
         gtt_bytes: after.gtt_bytes.saturating_sub(before.gtt_bytes),
-        shared_host_bytes: after.shared_host_bytes.saturating_sub(before.shared_host_bytes),
+        shared_host_bytes: after
+            .shared_host_bytes
+            .saturating_sub(before.shared_host_bytes),
     }
 }
 
@@ -910,10 +928,11 @@ pub fn reconcile_cu_sources(
     kfd: Option<u32>,
     facts: Option<u32>,
 ) -> Result<(u32, &'static str), String> {
-    let present: Vec<(&'static str, u32)> = [("host_facts", facts), ("kfd", kfd), ("hip_mp_count", hip)]
-        .into_iter()
-        .filter_map(|(n, v)| v.filter(|&c| c > 0).map(|c| (n, c)))
-        .collect();
+    let present: Vec<(&'static str, u32)> =
+        [("host_facts", facts), ("kfd", kfd), ("hip_mp_count", hip)]
+            .into_iter()
+            .filter_map(|(n, v)| v.filter(|&c| c > 0).map(|c| (n, c)))
+            .collect();
     let Some(&(source, count)) = present.first() else {
         return Err("no physical CU count source is available".to_string());
     };
@@ -1021,18 +1040,25 @@ pub fn evaluate_topology(
     layout_known: bool,
 ) -> (Status, Option<String>) {
     if !layout_known {
-        return (Status::Unavailable, Some("no HW_ID1 layout for this arch".to_string()));
+        return (
+            Status::Unavailable,
+            Some("no HW_ID1 layout for this arch".to_string()),
+        );
     }
     if chain_mismatch_slots > 0 {
         return (
             Status::Fail,
-            Some(format!("{chain_mismatch_slots} probe waves returned a wrong finite-chain result")),
+            Some(format!(
+                "{chain_mismatch_slots} probe waves returned a wrong finite-chain result"
+            )),
         );
     }
     if unwritten_slots > 0 {
         return (
             Status::Unavailable,
-            Some(format!("{unwritten_slots} wave slots were never written (wave size assumption?)")),
+            Some(format!(
+                "{unwritten_slots} wave slots were never written (wave size assumption?)"
+            )),
         );
     }
     if observed == host_cus {
@@ -1091,7 +1117,10 @@ fn world_readable(path: &Path) -> Result<(), String> {
 
 #[cfg(not(unix))]
 fn world_readable(path: &Path) -> Result<(), String> {
-    Err(format!("{}: world-readable check unsupported on this platform", path.display()))
+    Err(format!(
+        "{}: world-readable check unsupported on this platform",
+        path.display()
+    ))
 }
 
 fn read_world_readable_number(path: &Path) -> Result<f64, String> {
@@ -1243,21 +1272,22 @@ struct EventPair {
 
 impl EventPair {
     fn new(gpu: &Gpu) -> HipResult<Self> {
-        Ok(Self { start: gpu.hip.event_create()?, stop: gpu.hip.event_create()? })
+        Ok(Self {
+            start: gpu.hip.event_create()?,
+            stop: gpu.hip.event_create()?,
+        })
     }
 
     /// Milliseconds the stream spent on `f`'s submitted work.
-    fn measure(
-        &self,
-        gpu: &mut Gpu,
-        f: impl FnOnce(&mut Gpu) -> HipResult<()>,
-    ) -> HipResult<f64> {
+    fn measure(&self, gpu: &mut Gpu, f: impl FnOnce(&mut Gpu) -> HipResult<()>) -> HipResult<f64> {
         gpu.hip.event_record(&self.start, gpu.stream_ref())?;
         let result = f(gpu);
         gpu.hip.event_record(&self.stop, gpu.stream_ref())?;
         gpu.hip.event_synchronize(&self.stop)?;
         result?;
-        Ok(f64::from(gpu.hip.event_elapsed_ms(&self.start, &self.stop)?))
+        Ok(f64::from(
+            gpu.hip.event_elapsed_ms(&self.start, &self.stop)?,
+        ))
     }
 
     fn destroy(self, gpu: &Gpu) {
@@ -1279,11 +1309,7 @@ fn distributions(bytes: u64, ms: Vec<f64>) -> HipResult<(Distribution, Distribut
 
 // ── Topology ────────────────────────────────────────────────────────────────
 
-fn run_topology(
-    gpu: &mut Gpu,
-    host_cus: u32,
-    layout: &HwIdLayout,
-) -> HipResult<TopologySection> {
+fn run_topology(gpu: &mut Gpu, host_cus: u32, layout: &HwIdLayout) -> HipResult<TopologySection> {
     let blocks = host_cus
         .checked_mul(TOPOLOGY_BLOCKS_PER_CU)
         .filter(|&b| b > 0 && b <= TRAFFIC_MAX_BLOCKS)
@@ -1358,14 +1384,20 @@ fn run_capacity(gpu: &mut Gpu) -> HipResult<CapacitySection> {
     checks.push(check(
         "total_equals_profile_bytes",
         total0 as u64 == limits.device_bytes,
-        format!("device_mem_info total {total0} vs profile device bytes {}", limits.device_bytes),
+        format!(
+            "device_mem_info total {total0} vs profile device bytes {}",
+            limits.device_bytes
+        ),
     ));
     if let Some(p) = gpu.emu_profile() {
         if let MemoryKind::Discrete { capacity_bytes } = p.memory {
             checks.push(check(
                 "limit_equals_advertised_capacity",
                 limits.device_bytes == capacity_bytes,
-                format!("ledger device limit {} vs advertised {capacity_bytes}", limits.device_bytes),
+                format!(
+                    "ledger device limit {} vs advertised {capacity_bytes}",
+                    limits.device_bytes
+                ),
             ));
         }
     }
@@ -1381,10 +1413,16 @@ fn run_capacity(gpu: &mut Gpu) -> HipResult<CapacitySection> {
     } else {
         sec.controlled_malloc_bytes = Some(CONTROLLED_MALLOC_BYTES as u64);
         match alloc_raw(gpu, CONTROLLED_MALLOC_BYTES) {
-            Err(e) => checks.push(check("controlled_malloc", false, format!("allocation failed: {e}"))),
+            Err(e) => checks.push(check(
+                "controlled_malloc",
+                false,
+                format!("allocation failed: {e}"),
+            )),
             Ok(t) => {
                 let size = t.buf.size() as u64;
-                let snap1 = gpu.emu_budget_snapshot().ok_or_else(|| err("budget vanished"))?;
+                let snap1 = gpu
+                    .emu_budget_snapshot()
+                    .ok_or_else(|| err("budget vanished"))?;
                 let expected = charge_vector(&limits, AllocationClass::Device, size);
                 let delta = usage_delta(&snap1.committed, &snap0.committed);
                 checks.push(check(
@@ -1394,7 +1432,8 @@ fn run_capacity(gpu: &mut Gpu) -> HipResult<CapacitySection> {
                 ));
                 let (free1, _) = gpu.device_mem_info()?;
                 let rem1 = device_remaining(limits.device_bytes, &snap1.committed, &snap1.pending);
-                let budget_bound = !limits.uma && free0 as u64 == remaining0 && free1 as u64 == rem1;
+                let budget_bound =
+                    !limits.uma && free0 as u64 == remaining0 && free1 as u64 == rem1;
                 if budget_bound {
                     checks.push(check(
                         "malloc_moves_free_by_charge",
@@ -1413,7 +1452,9 @@ fn run_capacity(gpu: &mut Gpu) -> HipResult<CapacitySection> {
 
                 // Free to pool: charge stays, bytes are parked.
                 gpu.free_tensor(t)?;
-                let snap2 = gpu.emu_budget_snapshot().ok_or_else(|| err("budget vanished"))?;
+                let snap2 = gpu
+                    .emu_budget_snapshot()
+                    .ok_or_else(|| err("budget vanished"))?;
                 checks.push(check(
                     "pool_free_keeps_charge",
                     snap2.committed == snap1.committed && gpu.pool_parked_bytes() as u64 >= size,
@@ -1429,11 +1470,18 @@ fn run_capacity(gpu: &mut Gpu) -> HipResult<CapacitySection> {
                 let stats0 = gpu.pool_stats();
                 let t2 = alloc_raw(gpu, CONTROLLED_MALLOC_BYTES)?;
                 let stats1 = gpu.pool_stats();
-                let snap3 = gpu.emu_budget_snapshot().ok_or_else(|| err("budget vanished"))?;
+                let snap3 = gpu
+                    .emu_budget_snapshot()
+                    .ok_or_else(|| err("budget vanished"))?;
                 checks.push(check(
                     "pool_reuse_keeps_charge",
-                    stats1.0 == stats0.0 && stats1.1 == stats0.1 + 1 && snap3.committed == snap1.committed,
-                    format!("pool (new, reused) {:?}/{:?} -> {:?}/{:?}", stats0.0, stats0.1, stats1.0, stats1.1),
+                    stats1.0 == stats0.0
+                        && stats1.1 == stats0.1 + 1
+                        && snap3.committed == snap1.committed,
+                    format!(
+                        "pool (new, reused) {:?}/{:?} -> {:?}/{:?}",
+                        stats0.0, stats0.1, stats1.0, stats1.1
+                    ),
                 ));
                 gpu.free_tensor(t2)?;
 
@@ -1441,9 +1489,13 @@ fn run_capacity(gpu: &mut Gpu) -> HipResult<CapacitySection> {
                 // and any buffer an earlier section parked (so compare against the
                 // pre-drain parked bytes, not the section's opening snapshot).
                 let parked_pre = gpu.pool_parked_bytes() as u64;
-                let snap_pre = gpu.emu_budget_snapshot().ok_or_else(|| err("budget vanished"))?;
+                let snap_pre = gpu
+                    .emu_budget_snapshot()
+                    .ok_or_else(|| err("budget vanished"))?;
                 gpu.drain_pool();
-                let snap4 = gpu.emu_budget_snapshot().ok_or_else(|| err("budget vanished"))?;
+                let snap4 = gpu
+                    .emu_budget_snapshot()
+                    .ok_or_else(|| err("budget vanished"))?;
                 let expected_after = snap_pre.committed.device_bytes.checked_sub(parked_pre);
                 checks.push(check(
                     "pool_drain_releases_charge",
@@ -1452,7 +1504,10 @@ fn run_capacity(gpu: &mut Gpu) -> HipResult<CapacitySection> {
                         && gpu.pool_parked_bytes() == 0,
                     format!(
                         "device committed {} -> {} after draining {} parked B (controlled {} B)",
-                        snap_pre.committed.device_bytes, snap4.committed.device_bytes, parked_pre, size
+                        snap_pre.committed.device_bytes,
+                        snap4.committed.device_bytes,
+                        parked_pre,
+                        size
                     ),
                 ));
             }
@@ -1460,10 +1515,16 @@ fn run_capacity(gpu: &mut Gpu) -> HipResult<CapacitySection> {
     }
 
     // Over-cap reservation: refused by the ledger, never reaching HIP.
-    let snap = gpu.emu_budget_snapshot().ok_or_else(|| err("budget vanished"))?;
+    let snap = gpu
+        .emu_budget_snapshot()
+        .ok_or_else(|| err("budget vanished"))?;
     let remaining = device_remaining(limits.device_bytes, &snap.committed, &snap.pending);
     match remaining.checked_add(1) {
-        None => checks.push(check("over_cap_refused", false, "remaining + 1 overflows u64".to_string())),
+        None => checks.push(check(
+            "over_cap_refused",
+            false,
+            "remaining + 1 overflows u64".to_string(),
+        )),
         Some(request) => {
             sec.over_cap_request_bytes = Some(request);
             let stats_before = gpu.pool_stats();
@@ -1472,7 +1533,9 @@ fn run_capacity(gpu: &mut Gpu) -> HipResult<CapacitySection> {
             let refused = matches!(&preflight, Err(e) if e.is_out_of_memory())
                 && matches!(&reserved, Err(e) if e.is_out_of_memory());
             drop(reserved);
-            let snap_after = gpu.emu_budget_snapshot().ok_or_else(|| err("budget vanished"))?;
+            let snap_after = gpu
+                .emu_budget_snapshot()
+                .ok_or_else(|| err("budget vanished"))?;
             let untouched = snap_after.pending == snap.pending
                 && snap_after.committed == snap.committed
                 && gpu.pool_stats() == stats_before;
@@ -1533,7 +1596,8 @@ fn verify_dst(
     let mut off = 0usize;
     while off < bytes {
         let n = CHUNK_BYTES.min(bytes - off);
-        gpu.hip.memcpy_dtoh_at(&mut chunk[..n], &dst.buf, GUARD_BYTES + off)?;
+        gpu.hip
+            .memcpy_dtoh_at(&mut chunk[..n], &dst.buf, GUARD_BYTES + off)?;
         let (c, f) = count_pattern_mismatches(&chunk[..n], (off / 4) as u64, seed);
         mismatched += c;
         if first.is_none() {
@@ -1544,7 +1608,8 @@ fn verify_dst(
     let mut lo = vec![0u8; GUARD_BYTES];
     let mut hi = vec![0u8; GUARD_BYTES];
     gpu.hip.memcpy_dtoh_at(&mut lo, &dst.buf, 0)?;
-    gpu.hip.memcpy_dtoh_at(&mut hi, &dst.buf, GUARD_BYTES + bytes)?;
+    gpu.hip
+        .memcpy_dtoh_at(&mut hi, &dst.buf, GUARD_BYTES + bytes)?;
     let guard_ok = lo.iter().chain(hi.iter()).all(|&b| b == POISON_BYTE as u8);
     // Both guard regions must still hold the poison byte.
     Ok(ChecksumRecord {
@@ -1639,7 +1704,19 @@ fn run_size(
     };
 
     let result = run_size_buffers(
-        gpu, mib, bytes, n_vec, blocks, threads, seed, reps, &src, &dst, &sink, do_eager_report, do_graph,
+        gpu,
+        mib,
+        bytes,
+        n_vec,
+        blocks,
+        threads,
+        seed,
+        reps,
+        &src,
+        &dst,
+        &sink,
+        do_eager_report,
+        do_graph,
     );
     let _ = gpu.free_tensor(src);
     let _ = gpu.free_tensor(dst);
@@ -1665,7 +1742,8 @@ fn run_size_buffers(
     do_graph: bool,
 ) -> HipResult<SizeOutcome> {
     let sink_words = threads as usize;
-    let dst_ptr = unsafe { (dst.buf.as_ptr() as *mut u8).add(GUARD_BYTES) } as *const std::ffi::c_void;
+    let dst_ptr =
+        unsafe { (dst.buf.as_ptr() as *mut u8).add(GUARD_BYTES) } as *const std::ffi::c_void;
     let src_ptr = src.buf.as_ptr() as *const std::ffi::c_void;
     let mut read_args = args_read(src_ptr, sink, n_vec);
     let mut copy_args = args_copy(dst_ptr, src_ptr, n_vec);
@@ -1717,7 +1795,11 @@ fn run_size_buffers(
 
     let read_pass = read_check.mismatched == 0;
     let copy_pass = dst_ok(&copy_check);
-    let bw_status = if read_pass && copy_pass { Status::Pass } else { Status::Fail };
+    let bw_status = if read_pass && copy_pass {
+        Status::Pass
+    } else {
+        Status::Fail
+    };
     let bandwidth = BandwidthSize {
         buffer_mib: mib,
         bytes: bytes as u64,
@@ -1748,11 +1830,28 @@ fn run_size_buffers(
 
     // ── Graph replay ──
     let graph = if !do_graph {
-        GraphSize { buffer_mib: mib, status: Status::Unavailable, reason: Some("not requested".to_string()), read: None, copy: None }
+        GraphSize {
+            buffer_mib: mib,
+            status: Status::Unavailable,
+            reason: Some("not requested".to_string()),
+            read: None,
+            copy: None,
+        }
     } else {
         match run_graph_size(
-            gpu, mib, bytes, blocks, seed, reps, sink, dst, &expected, &last_sink, &mut read_args,
-            &mut copy_args, &events,
+            gpu,
+            mib,
+            bytes,
+            blocks,
+            seed,
+            reps,
+            sink,
+            dst,
+            &expected,
+            &last_sink,
+            &mut read_args,
+            &mut copy_args,
+            &events,
         ) {
             Ok(g) => g,
             Err(e) => GraphSize {
@@ -1902,7 +2001,8 @@ fn run_graph_size(
     Ok(GraphSize {
         buffer_mib: mib,
         status: if ok { Status::Pass } else { Status::Fail },
-        reason: (!ok).then(|| "graph replay differs from the CPU oracle or eager result".to_string()),
+        reason: (!ok)
+            .then(|| "graph replay differs from the CPU oracle or eager result".to_string()),
         read: Some(read),
         copy: Some(copy),
     })
@@ -1935,7 +2035,9 @@ pub fn input_digest(request: &EmuValidationRequest) -> String {
     h.update(b"emu_validate/v1\n");
     h.update(format!("kernels={KERNEL_HWID},{KERNEL_READ},{KERNEL_COPY}\n").as_bytes());
     h.update(format!("fnv={FNV_OFFSET:08x},{FNV_PRIME:08x}\n").as_bytes());
-    h.update(format!("topology_cap={TOPOLOGY_LAUNCH_CAP} chain={TOPOLOGY_CHAIN_ITERS}\n").as_bytes());
+    h.update(
+        format!("topology_cap={TOPOLOGY_LAUNCH_CAP} chain={TOPOLOGY_CHAIN_ITERS}\n").as_bytes(),
+    );
     for mib in &request.buffer_mib {
         h.update(format!("size={mib} seed={:08x}\n", 0x5EED_0000u32 ^ mib).as_bytes());
     }
@@ -1945,7 +2047,9 @@ pub fn input_digest(request: &EmuValidationRequest) -> String {
 
 fn amdgpu_driver_version() -> Reading<String> {
     let path = Path::new("/sys/module/amdgpu/version");
-    match world_readable(path).and_then(|_| std::fs::read_to_string(path).map_err(|e| e.to_string())) {
+    match world_readable(path)
+        .and_then(|_| std::fs::read_to_string(path).map_err(|e| e.to_string()))
+    {
         Ok(v) if !v.trim().is_empty() => Reading::known(v.trim().to_string()),
         Ok(_) => Reading::unknown("/sys/module/amdgpu/version is empty"),
         Err(e) => Reading::unknown(e),
@@ -2025,18 +2129,16 @@ pub fn validate(gpu: &mut Gpu, request: &EmuValidationRequest) -> HipResult<EmuV
         accounting_kind: "managed_application_charge".to_string(),
     };
 
-    let mp = gpu
-        .hip
-        .get_device_attribute(crate::profiler::HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, gpu.device_id)?;
+    let mp = gpu.hip.get_device_attribute(
+        crate::profiler::HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+        gpu.device_id,
+    )?;
     let hip_mp_count = u32::try_from(mp).unwrap_or(0);
     let hip_physical = wgp_to_physical_cus(hip_mp_count, &arch);
     let kfd = kfd_physical_cus(&bdf, &DeviceRoot::system().kfd_topology());
     let facts_cus = gpu.emu_host_facts().map(|f| f.physical_cus);
-    let reconciled = reconcile_cu_sources(
-        Some(hip_physical),
-        kfd.as_ref().ok().copied(),
-        facts_cus,
-    );
+    let reconciled =
+        reconcile_cu_sources(Some(hip_physical), kfd.as_ref().ok().copied(), facts_cus);
     let physical = PhysicalRecord {
         pci_bdf: bdf.clone(),
         physical_gfx: arch.clone(),
@@ -2170,7 +2272,12 @@ pub fn validate(gpu: &mut Gpu, request: &EmuValidationRequest) -> HipResult<EmuV
         copy_rw_bytes_s: copy_rate.map_or_else(|| Reading::unknown(no_rate), Reading::known),
         basis: best.map_or_else(
             || "none".to_string(),
-            |s| format!("median of {} eager reps at buffer_mib={}", request.passes, s.buffer_mib),
+            |s| {
+                format!(
+                    "median of {} eager reps at buffer_mib={}",
+                    request.passes, s.buffer_mib
+                )
+            },
         ),
     };
     let target_peak = profile.map(|p| p.peak_bw_bytes_s);
@@ -2220,8 +2327,9 @@ pub fn validate(gpu: &mut Gpu, request: &EmuValidationRequest) -> HipResult<EmuV
         "no derating estimate is produced; target-bandwidth figures are informational".to_string(),
     ];
     if want_bw && request.buffer_mib.iter().any(|&m| m < 256) {
-        fidelity_limits
-            .push("buffer sizes below 256 MiB may fit in cache and overstate bandwidth".to_string());
+        fidelity_limits.push(
+            "buffer sizes below 256 MiB may fit in cache and overstate bandwidth".to_string(),
+        );
     }
 
     Ok(EmuValidationReceipt {
@@ -2255,13 +2363,17 @@ pub fn validate(gpu: &mut Gpu, request: &EmuValidationRequest) -> HipResult<EmuV
             emu_id: profile.map(|p| p.id.to_string()),
         },
         telemetry: TelemetryRecord {
-            source: Reading::known("world-readable amdgpu hwmon sysfs, sampled before and after the run".to_string()),
+            source: Reading::known(
+                "world-readable amdgpu hwmon sysfs, sampled before and after the run".to_string(),
+            ),
             before: telemetry_before,
             after: telemetry_after,
         },
         run: RunRecord {
             pid: std::process::id(),
-            fresh_process: Reading::unknown("not determinable in-process; the spawning CLI records it"),
+            fresh_process: Reading::unknown(
+                "not determinable in-process; the spawning CLI records it",
+            ),
             timed_reps_per_kernel: request.passes,
             order,
             fabric_job_marker: match std::env::var("HIPFIRE_FABRIC_ADMISSION") {
@@ -2378,7 +2490,11 @@ mod tests {
         let iters = 10;
         let raw = |se: u32, wgp: u32, simd: u32| (se << 18) | (wgp << 10) | (simd << 8);
         let launch1 = [raw(0, 0, 0), raw(0, 0, 1), raw(0, 1, 2), HWID_SENTINEL];
-        let aux = |n: usize| (0..n as u32).map(|s| hwid_chain(s, iters)).collect::<Vec<_>>();
+        let aux = |n: usize| {
+            (0..n as u32)
+                .map(|s| hwid_chain(s, iters))
+                .collect::<Vec<_>>()
+        };
         let mut acc = TopologyAccumulator::default();
         acc.absorb(&launch1, &aux(4), iters, &l);
         // (se0,wgp0,simd0|1) is one CU; (se0,wgp1,simd2) another.
@@ -2413,14 +2529,26 @@ mod tests {
         assert_eq!(evaluate_topology(64, 70, 0, 0, true).0, Status::Unavailable);
         assert_eq!(evaluate_topology(64, 64, 3, 0, true).0, Status::Unavailable);
         assert_eq!(evaluate_topology(64, 64, 0, 1, true).0, Status::Fail);
-        assert_eq!(evaluate_topology(64, 64, 0, 0, false).0, Status::Unavailable);
+        assert_eq!(
+            evaluate_topology(64, 64, 0, 0, false).0,
+            Status::Unavailable
+        );
     }
 
     #[test]
     fn cu_source_reconciliation() {
-        assert_eq!(reconcile_cu_sources(Some(64), Some(64), Some(64)), Ok((64, "host_facts")));
-        assert_eq!(reconcile_cu_sources(Some(64), Some(64), None), Ok((64, "kfd")));
-        assert_eq!(reconcile_cu_sources(Some(64), None, None), Ok((64, "hip_mp_count")));
+        assert_eq!(
+            reconcile_cu_sources(Some(64), Some(64), Some(64)),
+            Ok((64, "host_facts"))
+        );
+        assert_eq!(
+            reconcile_cu_sources(Some(64), Some(64), None),
+            Ok((64, "kfd"))
+        );
+        assert_eq!(
+            reconcile_cu_sources(Some(64), None, None),
+            Ok((64, "hip_mp_count"))
+        );
         assert!(reconcile_cu_sources(Some(32), Some(64), None)
             .unwrap_err()
             .contains("disagree"));
@@ -2430,8 +2558,14 @@ mod tests {
 
     #[test]
     fn kfd_property_parsing() {
-        assert_eq!(cus_from_kfd_properties("simd_count 192\nsimd_per_cu 2\n"), Some(96));
-        assert_eq!(cus_from_kfd_properties("cpu_cores_count 4\nsimd_count 128\n"), Some(64));
+        assert_eq!(
+            cus_from_kfd_properties("simd_count 192\nsimd_per_cu 2\n"),
+            Some(96)
+        );
+        assert_eq!(
+            cus_from_kfd_properties("cpu_cores_count 4\nsimd_count 128\n"),
+            Some(64)
+        );
         assert_eq!(cus_from_kfd_properties("simd_count 0\n"), None);
         assert_eq!(cus_from_kfd_properties("nothing\n"), None);
     }
@@ -2440,8 +2574,14 @@ mod tests {
     fn status_aggregation() {
         use Status::*;
         assert_eq!(aggregate_status(&[(Pass, true), (Pass, true)]).0, Pass);
-        assert_eq!(aggregate_status(&[(Pass, true), (Unavailable, true)]).0, Unavailable);
-        assert_eq!(aggregate_status(&[(Fail, true), (Unavailable, true), (Pass, true)]).0, Fail);
+        assert_eq!(
+            aggregate_status(&[(Pass, true), (Unavailable, true)]).0,
+            Unavailable
+        );
+        assert_eq!(
+            aggregate_status(&[(Fail, true), (Unavailable, true), (Pass, true)]).0,
+            Fail
+        );
         // Unrequested sections never count.
         assert_eq!(aggregate_status(&[(Pass, true), (Fail, false)]).0, Pass);
         assert_eq!(aggregate_status(&[(Unavailable, false)]).0, Unavailable);
@@ -2451,7 +2591,10 @@ mod tests {
         assert_eq!(aggregate_sizes(&[Unavailable]), Unavailable);
         assert_eq!(aggregate_sizes(&[]), Unavailable);
         assert_eq!(aggregate_checks(&[]), Unavailable);
-        assert_eq!(aggregate_checks(&[check("a", true, ""), check("b", false, "")]), Fail);
+        assert_eq!(
+            aggregate_checks(&[check("a", true, ""), check("b", false, "")]),
+            Fail
+        );
         assert_eq!(aggregate_checks(&[check("a", true, "")]), Pass);
     }
 
@@ -2512,11 +2655,26 @@ mod tests {
         assert!(traffic_fits(256 << 20, 2 << 20, 1 << 30));
         assert!(!traffic_fits(2048 << 20, 2 << 20, 4 << 30));
         assert!(traffic_fits(2048 << 20, 2 << 20, 5 << 30));
-        let a = BudgetUsage { device_bytes: 10, host_bytes: 5, gtt_bytes: 0, shared_host_bytes: 3 };
-        let b = BudgetUsage { device_bytes: 4, host_bytes: 5, gtt_bytes: 1, shared_host_bytes: 0 };
+        let a = BudgetUsage {
+            device_bytes: 10,
+            host_bytes: 5,
+            gtt_bytes: 0,
+            shared_host_bytes: 3,
+        };
+        let b = BudgetUsage {
+            device_bytes: 4,
+            host_bytes: 5,
+            gtt_bytes: 1,
+            shared_host_bytes: 0,
+        };
         assert_eq!(
             usage_delta(&a, &b),
-            BudgetUsage { device_bytes: 6, host_bytes: 0, gtt_bytes: 0, shared_host_bytes: 3 }
+            BudgetUsage {
+                device_bytes: 6,
+                host_bytes: 0,
+                gtt_bytes: 0,
+                shared_host_bytes: 3
+            }
         );
         assert_eq!(device_remaining(100, &a, &b), 86);
         assert_eq!(device_remaining(5, &a, &b), 0);
@@ -2588,7 +2746,12 @@ mod tests {
                 raw_real_total_bytes: 32 << 30,
                 budgeted_free_bytes: 16 << 30,
                 budgeted_total_bytes: 16 << 30,
-                limits: Some(LimitsRecord { device_bytes: 16 << 30, gtt_bytes: None, shared_host_bytes: None, uma: false }),
+                limits: Some(LimitsRecord {
+                    device_bytes: 16 << 30,
+                    gtt_bytes: None,
+                    shared_host_bytes: None,
+                    uma: false,
+                }),
                 committed: Some(UsageRecord::default()),
                 pending: Some(UsageRecord::default()),
                 pool_parked_bytes: 0,
@@ -2635,9 +2798,21 @@ mod tests {
                     copy: None,
                 }],
             },
-            graph: GraphSection { status: Status::Unavailable, requested: false, reason: Some("not requested".into()), sizes: vec![] },
-            estimate: EstimateSection { status: Status::Unavailable, reason: Some("capacity-only".into()) },
-            raw_rates: RawRates { read_bytes_s: Reading::known(2.4e11), copy_rw_bytes_s: Reading::unknown("none"), basis: "b".into() },
+            graph: GraphSection {
+                status: Status::Unavailable,
+                requested: false,
+                reason: Some("not requested".into()),
+                sizes: vec![],
+            },
+            estimate: EstimateSection {
+                status: Status::Unavailable,
+                reason: Some("capacity-only".into()),
+            },
+            raw_rates: RawRates {
+                read_bytes_s: Reading::known(2.4e11),
+                copy_rw_bytes_s: Reading::unknown("none"),
+                basis: "b".into(),
+            },
             scenario_goals: ScenarioGoals {
                 target_peak_bw_bytes_s: Some(640_000_000_000),
                 target_cus: Some(64),
@@ -2656,7 +2831,11 @@ mod tests {
                 input_digest: "d".into(),
                 emu_id: Some("rx9070xt".into()),
             },
-            telemetry: TelemetryRecord { source: Reading::known("s".into()), before: tel(), after: tel() },
+            telemetry: TelemetryRecord {
+                source: Reading::known("s".into()),
+                before: tel(),
+                after: tel(),
+            },
             run: RunRecord {
                 pid: 1,
                 fresh_process: Reading::unknown("x"),
@@ -2680,7 +2859,13 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["schema_version"], 1);
         assert_eq!(v["status"], "unavailable");
-        for section in ["capacity", "host_topology", "bandwidth", "graph", "estimate"] {
+        for section in [
+            "capacity",
+            "host_topology",
+            "bandwidth",
+            "graph",
+            "estimate",
+        ] {
             assert!(v[section]["status"].is_string(), "{section}.status");
         }
         assert_eq!(v["accounting_kind"], "managed_application_charge");
@@ -2697,7 +2882,10 @@ mod tests {
         let mut r = blank_receipt();
         assert!(!r.required_failed());
         r.bandwidth.status = Status::Fail;
-        assert!(!r.required_failed(), "bandwidth is not a required-exit section");
+        assert!(
+            !r.required_failed(),
+            "bandwidth is not a required-exit section"
+        );
         r.graph.status = Status::Fail;
         assert!(!r.required_failed(), "graph not requested");
         r.graph.requested = true;
@@ -2734,7 +2922,12 @@ mod tests {
         assert_eq!(t.temperature_c.value, Some(61.0), "edge label preferred");
         assert_eq!(t.sclk_mhz.value, Some(2500));
         assert_eq!(t.mclk_mhz.value, None);
-        assert!(t.mclk_mhz.reason.as_deref().unwrap().contains("not world-readable"));
+        assert!(t
+            .mclk_mhz
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("not world-readable"));
         let none = sample_telemetry_at(&root, "0000:99:00.0");
         assert!(none.power_w.value.is_none() && none.power_w.reason.is_some());
         let _ = std::fs::remove_dir_all(&root);

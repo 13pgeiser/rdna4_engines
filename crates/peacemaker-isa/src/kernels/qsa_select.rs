@@ -16,7 +16,13 @@
 use crate::{Arch, Emitted};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Kind { Score, ScoreBf16, Score32, ScoreBf16Rows32, Select }
+pub enum Kind {
+    Score,
+    ScoreBf16,
+    Score32,
+    ScoreBf16Rows32,
+    Select,
+}
 impl Kind {
     /// The F32 module's kernels, in module order.
     pub const ALL: [Kind; 3] = [Kind::Score, Kind::Score32, Kind::Select];
@@ -25,13 +31,22 @@ impl Kind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Spec { pub arch: Arch, pub kind: Kind }
+pub struct Spec {
+    pub arch: Arch,
+    pub kind: Kind,
+}
 
-pub fn module(arch: Arch) -> String { format!("qsa_select_pm_{}", arch.name()) }
-pub fn module_bf16(arch: Arch) -> String { format!("qsa_select_bf16_pm_{}", arch.name()) }
+pub fn module(arch: Arch) -> String {
+    format!("qsa_select_pm_{}", arch.name())
+}
+pub fn module_bf16(arch: Arch) -> String {
+    format!("qsa_select_bf16_pm_{}", arch.name())
+}
 
 pub fn emit(spec: Spec) -> Result<Emitted, String> {
-    if spec.arch != Arch::Gfx1151 { return Err("qsa_select: built for gfx1151 only".into()) }
+    if spec.arch != Arch::Gfx1151 {
+        return Err("qsa_select: built for gfx1151 only".into());
+    }
     match spec.kind {
         Kind::Score => super::qsa_score::emit(spec.arch),
         Kind::ScoreBf16 => super::qsa_score::emit_bf16(spec.arch),
@@ -42,15 +57,25 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
 }
 
 /// The F32 module's kernels as one module: rows16 score, rows32 score, select.
-pub fn emit_module(arch: Arch) -> Result<(Vec<Emitted>, String, super::iu4_gemm::ModuleProof), String> {
-    let emitted = Kind::ALL.into_iter().map(|kind| emit(Spec { arch, kind })).collect::<Result<Vec<_>, _>>()?;
+pub fn emit_module(
+    arch: Arch,
+) -> Result<(Vec<Emitted>, String, super::iu4_gemm::ModuleProof), String> {
+    let emitted = Kind::ALL
+        .into_iter()
+        .map(|kind| emit(Spec { arch, kind }))
+        .collect::<Result<Vec<_>, _>>()?;
     let (text, proof) = super::iu4_gemm::module(&emitted, &module(arch))?;
     Ok((emitted, text, proof))
 }
 
 /// BF16-pooled scores only (rows16 then rows32); the select symbol is shipped in the F32 module.
-pub fn emit_module_bf16(arch: Arch) -> Result<(Vec<Emitted>, String, super::iu4_gemm::ModuleProof), String> {
-    let emitted = Kind::BF16.into_iter().map(|kind| emit(Spec { arch, kind })).collect::<Result<Vec<_>, _>>()?;
+pub fn emit_module_bf16(
+    arch: Arch,
+) -> Result<(Vec<Emitted>, String, super::iu4_gemm::ModuleProof), String> {
+    let emitted = Kind::BF16
+        .into_iter()
+        .map(|kind| emit(Spec { arch, kind }))
+        .collect::<Result<Vec<_>, _>>()?;
     let (text, proof) = super::iu4_gemm::module(&emitted, &module_bf16(arch))?;
     Ok((emitted, text, proof))
 }

@@ -107,32 +107,17 @@ fn run() -> Result<(), String> {
     if let Some(parent) = out_path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).map_err(|e| {
-                format!(
-                    "deepseek4 parent: create out dir {}: {e}",
-                    parent.display()
-                )
+                format!("deepseek4 parent: create out dir {}: {e}", parent.display())
             })?;
         }
     }
-    let mut f = File::create(out_path).map_err(|e| {
-        format!(
-            "deepseek4 parent: create {}: {e}",
-            out_path.display()
-        )
-    })?;
+    let mut f = File::create(out_path)
+        .map_err(|e| format!("deepseek4 parent: create {}: {e}", out_path.display()))?;
     let bytes = u32_slice_as_le_bytes(&ids);
-    f.write_all(bytes).map_err(|e| {
-        format!(
-            "deepseek4 parent: write {}: {e}",
-            out_path.display()
-        )
-    })?;
-    f.flush().map_err(|e| {
-        format!(
-            "deepseek4 parent: flush {}: {e}",
-            out_path.display()
-        )
-    })?;
+    f.write_all(bytes)
+        .map_err(|e| format!("deepseek4 parent: write {}: {e}", out_path.display()))?;
+    f.flush()
+        .map_err(|e| format!("deepseek4 parent: flush {}: {e}", out_path.display()))?;
 
     let token_ids_sha = sha256_bytes_local(bytes);
     let out_bytes = fs::metadata(out_path)
@@ -148,9 +133,7 @@ fn run() -> Result<(), String> {
     // Round-trip self-check: read back and compare.
     let reread = read_token_ids(out_path)?;
     if reread != ids {
-        return Err(
-            "deepseek4 parent: tokens.bin round-trip mismatch after write".into(),
-        );
+        return Err("deepseek4 parent: tokens.bin round-trip mismatch after write".into());
     }
 
     let first16: Vec<u32> = ids.iter().copied().take(16).collect();
@@ -171,19 +154,18 @@ fn run() -> Result<(), String> {
     println!("out: {} ({out_bytes} bytes)", out_path.display());
     println!("first_16: {first16:?}");
     println!("last_16: {last16:?}");
-    println!("bos_id={} eos_id={} add_bos={}", tokenizer.bos_id, tokenizer.eos_id, tokenizer.add_bos);
+    println!(
+        "bos_id={} eos_id={} add_bos={}",
+        tokenizer.bos_id, tokenizer.eos_id, tokenizer.add_bos
+    );
     println!("OK");
     Ok(())
 }
 
 /// Load a flat `u32` LE token-ids file (shared contract with the forward gate).
 pub fn read_token_ids(path: &Path) -> Result<Vec<u32>, String> {
-    let bytes = fs::read(path).map_err(|e| {
-        format!(
-            "deepseek4 parent: read token-ids {}: {e}",
-            path.display()
-        )
-    })?;
+    let bytes = fs::read(path)
+        .map_err(|e| format!("deepseek4 parent: read token-ids {}: {e}", path.display()))?;
     if bytes.len() % 4 != 0 {
         return Err(format!(
             "deepseek4 parent: token-ids file {} has {} bytes (not a multiple of 4)",
@@ -298,10 +280,7 @@ mod tests {
     #[test]
     fn token_ids_round_trip_u32_le() {
         let ids: Vec<u32> = vec![0, 1, 42, 129_279, 0xDEAD_BEEF];
-        let dir = std::env::temp_dir().join(format!(
-            "ds4-tokenize-rt-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("ds4-tokenize-rt-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tokens.bin");
@@ -316,10 +295,7 @@ mod tests {
 
     #[test]
     fn token_ids_rejects_odd_byte_length() {
-        let dir = std::env::temp_dir().join(format!(
-            "ds4-tokenize-odd-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("ds4-tokenize-odd-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tokens.bin");

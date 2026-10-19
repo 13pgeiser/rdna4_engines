@@ -75,7 +75,10 @@ fn f32_to_f16_trunc(x: f32) -> u16 {
         return s;
     }
     let e = ((b >> 23) & 0xff) as i32 - 127 + 15;
-    assert!((1..31).contains(&e), "synthetic scale out of f16 normal range");
+    assert!(
+        (1..31).contains(&e),
+        "synthetic scale out of f16 normal range"
+    );
     s | ((e as u16) << 10) | (((b >> 13) & 0x3ff) as u16)
 }
 
@@ -104,7 +107,11 @@ fn synth_x(n: usize, k: usize, seed: u64) -> Vec<f32> {
         .map(|i| {
             let v = rng.normal() * col[i % k];
             // One large outlier per ~300 values: the A4 worst case.
-            if rng.next() % 307 == 0 { v * 40.0 } else { v }
+            if rng.next() % 307 == 0 {
+                v * 40.0
+            } else {
+                v
+            }
         })
         .collect()
 }
@@ -169,7 +176,11 @@ fn quant_block(x: &[f32]) -> [u8; 72] {
     let mut s = 0i32;
     let mut q = [0i32; 128];
     for e in 0..128 {
-        q[e] = if amax == 0.0 { 0 } else { (x[e] / best_d).round_ties_even().clamp(-8.0, 7.0) as i32 };
+        q[e] = if amax == 0.0 {
+            0
+        } else {
+            (x[e] / best_d).round_ties_even().clamp(-8.0, 7.0) as i32
+        };
         s += q[e];
     }
     out[0..4].copy_from_slice(&best_d.to_le_bytes());
@@ -216,7 +227,9 @@ fn host_gemm(w: &[u8], xq: &[u8], m: usize, k: usize, n: usize) -> Vec<f32> {
     }
     let row_bytes = k / 256 * GB;
     let mut y = vec![0f32; n * m];
-    let threads = std::thread::available_parallelism().map_or(8, |p| p.get()).min(32);
+    let threads = std::thread::available_parallelism()
+        .map_or(8, |p| p.get())
+        .min(32);
     let rows_per = m.div_ceil(threads);
     let cols: Vec<Vec<f32>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
@@ -233,7 +246,10 @@ fn host_gemm(w: &[u8], xq: &[u8], m: usize, k: usize, n: usize) -> Vec<f32> {
                         for g in 0..k / 256 {
                             let grp = &row[g * GB..(g + 1) * GB];
                             for h in 0..2 {
-                                sc[2 * g + h] = f16_bits_to_f32(u16::from_le_bytes([grp[4 * h], grp[4 * h + 1]]));
+                                sc[2 * g + h] = f16_bits_to_f32(u16::from_le_bytes([
+                                    grp[4 * h],
+                                    grp[4 * h + 1],
+                                ]));
                                 for e in 0..64 {
                                     let byte = grp[8 + 64 * h + e];
                                     wc[g * 256 + h * 128 + 2 * e] = (byte & 15) as i8 - 8;
@@ -273,8 +289,13 @@ fn host_gemm(w: &[u8], xq: &[u8], m: usize, k: usize, n: usize) -> Vec<f32> {
 }
 
 fn poisoned(gpu: &mut Gpu, elems: usize) -> GpuTensor {
-    let bytes: Vec<u8> = std::iter::repeat(POISON.to_le_bytes()).take(elems + 1024).flatten().collect();
-    let mut t = gpu.upload_raw(&bytes, &[bytes.len()]).expect("upload poison");
+    let bytes: Vec<u8> = std::iter::repeat(POISON.to_le_bytes())
+        .take(elems + 1024)
+        .flatten()
+        .collect();
+    let mut t = gpu
+        .upload_raw(&bytes, &[bytes.len()])
+        .expect("upload poison");
     t.dtype = DType::F32;
     t.shape = vec![elems + 1024];
     t
@@ -283,7 +304,10 @@ fn poisoned(gpu: &mut Gpu, elems: usize) -> GpuTensor {
 /// Compare a device output `[n][m]` (plus 1024 poison words) with the host.
 fn compare(gpu: &Gpu, dev: &GpuTensor, host: &[f32]) -> (usize, usize, f32) {
     let bytes = gpu.download_raw_bytes(dev).expect("download");
-    let words: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    let words: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
     let mut bad = 0;
     let mut max_abs = 0f32;
     for (i, h) in host.iter().enumerate() {
@@ -292,24 +316,36 @@ fn compare(gpu: &Gpu, dev: &GpuTensor, host: &[f32]) -> (usize, usize, f32) {
             max_abs = max_abs.max((f32::from_bits(words[i]) - h).abs());
         }
     }
-    let tail = words[host.len()..host.len() + 1024].iter().filter(|w| **w != POISON).count();
+    let tail = words[host.len()..host.len() + 1024]
+        .iter()
+        .filter(|w| **w != POISON)
+        .count();
     (bad, tail, max_abs)
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let arg = |name: &str| args.iter().position(|a| a == name).map(|i| args[i + 1].clone());
+    let arg = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .map(|i| args[i + 1].clone())
+    };
     let xdir = arg("--x");
     let wdir = arg("--w");
     let layer: usize = arg("--layer").map_or(0, |v| v.parse().unwrap());
-    let tokens: Vec<usize> = arg("--tokens")
-        .map_or(vec![1536, 512, 1280], |v| v.split(',').map(|s| s.parse().unwrap()).collect());
+    let tokens: Vec<usize> = arg("--tokens").map_or(vec![1536, 512, 1280], |v| {
+        v.split(',').map(|s| s.parse().unwrap()).collect()
+    });
     let mut gpu = Gpu::init().expect("gpu init");
     gpu.mq4v2_symmetric = true;
     assert_eq!(gpu.arch, "gfx1151", "fn-trunk-iu4 oracle targets gfx1151");
     gpu.ensure_mq_signs().expect("mq signs");
-    let s1 = gpu.download_f32(gpu.scratch.mq_signs1.as_ref().unwrap()).expect("signs1");
-    let s2 = gpu.download_f32(gpu.scratch.mq_signs2.as_ref().unwrap()).expect("signs2");
+    let s1 = gpu
+        .download_f32(gpu.scratch.mq_signs1.as_ref().unwrap())
+        .expect("signs1");
+    let s2 = gpu
+        .download_f32(gpu.scratch.mq_signs2.as_ref().unwrap())
+        .expect("signs2");
     let attn = layer % 4 == 3;
     let pre = |t: &str| {
         format!(
@@ -323,7 +359,12 @@ fn main() {
             ("q", "ain", vec![(pre("q_proj"), 12288)], 2560),
             ("k", "ain", vec![(pre("k_proj"), 512)], 2560),
             ("v", "ain", vec![(pre("v_proj"), 512)], 2560),
-            ("indexer", "ain", vec![(pre("indexer.index_qk_proj"), 640)], 2560),
+            (
+                "indexer",
+                "ain",
+                vec![(pre("indexer.index_qk_proj"), 640)],
+                2560,
+            ),
             ("o", "aout", vec![(pre("o_proj"), 2560)], 6144),
         ]
     } else {
@@ -332,7 +373,11 @@ fn main() {
             (
                 "zba",
                 "gin",
-                vec![(pre("in_proj_z"), 6144), (pre("in_proj_b"), 48), (pre("in_proj_a"), 48)],
+                vec![
+                    (pre("in_proj_z"), 6144),
+                    (pre("in_proj_b"), 48),
+                    (pre("in_proj_a"), 48),
+                ],
                 2560,
             ),
             ("out", "gout", vec![(pre("out_proj"), 2560)], 6144),
@@ -344,8 +389,12 @@ fn main() {
             let k = *k;
             let x: Vec<f32> = match &xdir {
                 Some(dir) => {
-                    let raw = std::fs::read(format!("{dir}/L{layer}.{tag}.bin")).expect("capture file");
-                    raw[..n * k * 4].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+                    let raw =
+                        std::fs::read(format!("{dir}/L{layer}.{tag}.bin")).expect("capture file");
+                    raw[..n * k * 4]
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                        .collect()
                 }
                 None => synth_x(n, k, 0x9e37 + k as u64),
             };
@@ -362,14 +411,22 @@ fn main() {
             }
             let d_x = gpu.upload_f32(&x, &[n, k]).expect("upload x");
             let res = gpu.reserve_int4_mmq(k, n).expect("reserve");
-            let prep = gpu.rotate_x_mq_i4_batched(&d_x, None, None, res, k, n).expect("producer");
+            let prep = gpu
+                .rotate_x_mq_i4_batched(&d_x, None, None, res, k, n)
+                .expect("producer");
             let xq_ptr = gpu.int4_mmq_prepared_ptr(&prep, k, n).expect("prepared");
             let xq_len = k / 128 * n * 72;
             let xq_view = unsafe { hip_bridge::DeviceBuffer::from_raw(xq_ptr, xq_len) };
             let mut xq_dev = vec![0u8; xq_len];
-            gpu.hip.memcpy_dtoh(&mut xq_dev, &xq_view).expect("download xq");
+            gpu.hip
+                .memcpy_dtoh(&mut xq_dev, &xq_view)
+                .expect("download xq");
             let xq_host = host_xq(&x, n, k, &s1, &s2);
-            let xq_bad = xq_dev.chunks_exact(72).zip(xq_host.chunks_exact(72)).filter(|(a, b)| a != b).count();
+            let xq_bad = xq_dev
+                .chunks_exact(72)
+                .zip(xq_host.chunks_exact(72))
+                .filter(|(a, b)| a != b)
+                .count();
             let d_w: Vec<GpuTensor> = if *case == "zba" {
                 let rb = k / 256 * GB;
                 let mut fold = vec![0u8; (6144 + 256) * rb];
@@ -378,13 +435,20 @@ fn main() {
                 fold[6192 * rb..6240 * rb].copy_from_slice(&weights[2]);
                 vec![gpu.upload_raw(&fold, &[fold.len()]).expect("upload fold")]
             } else {
-                vec![gpu.upload_raw(&weights[0], &[weights[0].len()]).expect("upload w")]
+                vec![gpu
+                    .upload_raw(&weights[0], &[weights[0].len()])
+                    .expect("upload w")]
             };
-            let outs: Vec<GpuTensor> = tensors.iter().map(|(_, m)| poisoned(&mut gpu, n * m)).collect();
+            let outs: Vec<GpuTensor> = tensors
+                .iter()
+                .map(|(_, m)| poisoned(&mut gpu, n * m))
+                .collect();
             let t0 = std::time::Instant::now();
             let route = if *case == "zba" {
                 let ok = gpu
-                    .gemm_qwen4_trunk_zba_iu4(&d_w[0], &prep, &outs[0], &outs[1], &outs[2], 6144, k, n)
+                    .gemm_qwen4_trunk_zba_iu4(
+                        &d_w[0], &prep, &outs[0], &outs[1], &outs[2], 6144, k, n,
+                    )
                     .expect("zba");
                 if !ok {
                     // The trunk's fallback: the three SETs on their own rows.
@@ -393,13 +457,25 @@ fn main() {
                         let row0 = [0, 6144, 6192][i];
                         let w = d_w[0].sub_offset(row0 * rb, m * rb);
                         let xq = gpu.int4_mmq_prepared_ptr(&prep, k, n).unwrap();
-                        gpu.gemm_mq4g256v2_mmq_set_prequant_iu4(&w, xq, &outs[i], *m, k, n).expect("set");
+                        gpu.gemm_mq4g256v2_mmq_set_prequant_iu4(&w, xq, &outs[i], *m, k, n)
+                            .expect("set");
                     }
                 }
-                if ok { "zba_v2b_scatter" } else { "set_x3" }
+                if ok {
+                    "zba_v2b_scatter"
+                } else {
+                    "set_x3"
+                }
             } else {
-                gpu.gemm_mq4g256v2_mmq_set_prequant_iu4(&d_w[0], xq_ptr, &outs[0], tensors[0].1, k, n)
-                    .expect("set");
+                gpu.gemm_mq4g256v2_mmq_set_prequant_iu4(
+                    &d_w[0],
+                    xq_ptr,
+                    &outs[0],
+                    tensors[0].1,
+                    k,
+                    n,
+                )
+                .expect("set");
                 "set_prequant_iu4"
             };
             gpu.hip.device_synchronize().expect("sync");

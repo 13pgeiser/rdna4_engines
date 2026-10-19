@@ -1259,7 +1259,10 @@ mod tests {
             budget: 4,
             max_seq_len: 8,
             rotary_dim: 2,
-            rope: Rope { theta: 10_000.0, scaling: RopeScaling::None },
+            rope: Rope {
+                theta: 10_000.0,
+                scaling: RopeScaling::None,
+            },
         };
         let mut qsa = MtpQsaState::new(geometry).unwrap();
         for pos in 0..3 {
@@ -1288,7 +1291,10 @@ mod tests {
             budget: 4,
             max_seq_len: 16,
             rotary_dim: 2,
-            rope: Rope { theta: 10_000.0, scaling: RopeScaling::None },
+            rope: Rope {
+                theta: 10_000.0,
+                scaling: RopeScaling::None,
+            },
         };
         let mut qsa = MtpQsaState::new(geometry).unwrap();
         qsa.append_token(0, &[1.0, 0.0], &[1.0, 0.0], &[0.0, 1.0])
@@ -1315,7 +1321,10 @@ mod tests {
             budget: 4,
             max_seq_len: 8,
             rotary_dim: 2,
-            rope: Rope { theta: 10_000.0, scaling: RopeScaling::None },
+            rope: Rope {
+                theta: 10_000.0,
+                scaling: RopeScaling::None,
+            },
         })
         .unwrap();
         state.wide_hidden = vec![1.0, 2.0];

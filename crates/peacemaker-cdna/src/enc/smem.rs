@@ -23,13 +23,28 @@ use crate::Result;
 use std::fmt;
 
 op_table!(SmemOp {
-    LoadDword, LoadDwordx2, LoadDwordx4, LoadDwordx8, LoadDwordx16,
-    BufferLoadDword, BufferLoadDwordx2, BufferLoadDwordx4, BufferLoadDwordx8, BufferLoadDwordx16,
-    Memtime, Memrealtime, DcacheInv,
+    LoadDword,
+    LoadDwordx2,
+    LoadDwordx4,
+    LoadDwordx8,
+    LoadDwordx16,
+    BufferLoadDword,
+    BufferLoadDwordx2,
+    BufferLoadDwordx4,
+    BufferLoadDwordx8,
+    BufferLoadDwordx16,
+    Memtime,
+    Memrealtime,
+    DcacheInv,
 });
 
 impl SmemOp {
-    pub fn from_opcode(arch: Arch, opcode: u8) -> Option<Self> { Self::ALL.iter().copied().find(|op| op.opcode(arch) == Some(opcode)) }
+    pub fn from_opcode(arch: Arch, opcode: u8) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|op| op.opcode(arch) == Some(opcode))
+    }
     /// Dwords written to `sdata` (0 for `s_dcache_inv`).
     pub fn data_dwords(self) -> u8 {
         match self {
@@ -43,28 +58,53 @@ impl SmemOp {
     }
     /// The op reads memory through an address (`s_load_*`, `s_buffer_load_*`);
     /// `s_memtime`, `s_memrealtime` and `s_dcache_inv` do not.
-    pub fn has_address(self) -> bool { !matches!(self, Self::Memtime | Self::Memrealtime | Self::DcacheInv) }
+    pub fn has_address(self) -> bool {
+        !matches!(self, Self::Memtime | Self::Memrealtime | Self::DcacheInv)
+    }
     /// `s_buffer_load_*` reads a 4-SGPR buffer resource at `sbase`; the
     /// others a 2-SGPR address.
-    pub fn buffer(self) -> bool { matches!(self, Self::BufferLoadDword | Self::BufferLoadDwordx2 | Self::BufferLoadDwordx4 | Self::BufferLoadDwordx8 | Self::BufferLoadDwordx16) }
+    pub fn buffer(self) -> bool {
+        matches!(
+            self,
+            Self::BufferLoadDword
+                | Self::BufferLoadDwordx2
+                | Self::BufferLoadDwordx4
+                | Self::BufferLoadDwordx8
+                | Self::BufferLoadDwordx16
+        )
+    }
 }
 
 /// The address offset: a 21-bit signed byte immediate, an SGPR, or both
 /// (`soffset_en`; CDNA3 ISA §13.2 SMEM fields IMM / SOFFSET_EN / OFFSET / SOFFSET).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SmemOffset { Imm(i32), Sgpr(Src), SgprImm(Src, i32) }
+pub enum SmemOffset {
+    Imm(i32),
+    Sgpr(Src),
+    SgprImm(Src, i32),
+}
 
 /// `sdata = load(sbase + offset)`. `sdata` and `sbase` are `None` for the
 /// opcodes without them (`s_dcache_inv`; `s_memtime` has `sdata` only).
 #[derive(Clone, Debug, PartialEq)]
-pub struct Smem { pub op: SmemOp, pub sdata: Option<Src>, pub sbase: Option<Src>, pub offset: SmemOffset, pub glc: bool }
+pub struct Smem {
+    pub op: SmemOp,
+    pub sdata: Option<Src>,
+    pub sbase: Option<Src>,
+    pub offset: SmemOffset,
+    pub glc: bool,
+}
 
 /// Whether a `dwords`-wide register range starting at `src` is a legal SMEM
 /// register operand: inside one register file and aligned (pairs even,
 /// quads and wider a multiple of 4; CDNA3 ISA §8.1 Table 38 p.59).
 fn span_ok(src: Src, dwords: u8) -> bool {
     let w = u16::from(dwords);
-    let align = match dwords { 0 | 1 => 1, 2 => 2, _ => 4 };
+    let align = match dwords {
+        0 | 1 => 1,
+        2 => 2,
+        _ => 4,
+    };
     match src {
         Src::Sgpr(n) => u16::from(n) % align == 0 && u16::from(n) + w <= 102,
         Src::Ttmp(n) => u16::from(n) % align == 0 && u16::from(n) + w <= 16,
@@ -75,12 +115,18 @@ fn span_ok(src: Src, dwords: u8) -> bool {
 }
 
 /// SDATA: an SGPR, TTMP, VCC, FLAT_SCRATCH or XNACK_MASK range; "Not: exec or m0".
-fn sdata_ok(src: Src, dwords: u8) -> bool { span_ok(src, dwords) }
+fn sdata_ok(src: Src, dwords: u8) -> bool {
+    span_ok(src, dwords)
+}
 
 /// SBASE: a pair (quad for `s_buffer_*`) that is a plain SGPR/TTMP range, or
 /// (non-buffer only) VCC / FLAT_SCRATCH / XNACK_MASK / EXEC as llvm-mc accepts.
 fn sbase_ok(src: Src, buffer: bool) -> bool {
-    if buffer { matches!(src, Src::Sgpr(_) | Src::Ttmp(_)) && span_ok(src, 4) } else { src == Src::ExecLo || span_ok(src, 2) }
+    if buffer {
+        matches!(src, Src::Sgpr(_) | Src::Ttmp(_)) && span_ok(src, 4)
+    } else {
+        src == Src::ExecLo || span_ok(src, 2)
+    }
 }
 
 /// SOFFSET / OFFSET[6:0] register: SGPR, TTMP, VCC, FLAT_SCRATCH, XNACK_MASK, M0 or EXEC halves.
@@ -88,7 +134,15 @@ fn soffset_ok(src: Src) -> bool {
     match src {
         Src::Sgpr(n) => n <= 101,
         Src::Ttmp(n) => n <= 15,
-        Src::VccLo | Src::VccHi | Src::FlatScratchLo | Src::FlatScratchHi | Src::XnackMaskLo | Src::XnackMaskHi | Src::M0 | Src::ExecLo | Src::ExecHi => true,
+        Src::VccLo
+        | Src::VccHi
+        | Src::FlatScratchLo
+        | Src::FlatScratchHi
+        | Src::XnackMaskLo
+        | Src::XnackMaskHi
+        | Src::M0
+        | Src::ExecLo
+        | Src::ExecHi => true,
         _ => false,
     }
 }
@@ -99,10 +153,20 @@ fn soffset_ok(src: Src) -> bool {
 /// (`expected a 20-bit unsigned offset`). [UNVERIFIED: confirm on MI300X that
 /// bit 20 is ignored rather than a sign for buffer loads.]
 fn imm_ok(imm: i32, buffer: bool) -> bool {
-    if buffer { (0..=0xf_ffff).contains(&imm) } else { (-0x10_0000..=0xf_ffff).contains(&imm) }
+    if buffer {
+        (0..=0xf_ffff).contains(&imm)
+    } else {
+        (-0x10_0000..=0xf_ffff).contains(&imm)
+    }
 }
 
-fn fmt_imm(imm: i32) -> String { if imm < 0 { format!("-{:#x}", imm.unsigned_abs()) } else { format!("{imm:#x}") } }
+fn fmt_imm(imm: i32) -> String {
+    if imm < 0 {
+        format!("-{:#x}", imm.unsigned_abs())
+    } else {
+        format!("{imm:#x}")
+    }
+}
 
 impl Smem {
     /// Encode to two dwords. Errors: opcode absent on `arch`, operands missing
@@ -111,42 +175,81 @@ impl Smem {
     /// range, `glc` on an op without a cache policy.
     pub fn encode(&self, arch: Arch, out: &mut Vec<u32>) -> Result<()> {
         let name = self.op.name();
-        let opcode = self.op.opcode(arch).ok_or_else(|| format!("{name} does not exist on {}", arch.name()))?;
+        let opcode = self
+            .op
+            .opcode(arch)
+            .ok_or_else(|| format!("{name} does not exist on {}", arch.name()))?;
         let mut w0 = 0b11_0000u32 << 26 | u32::from(opcode) << 18;
         let mut w1 = 0u32;
         if self.op.has_address() {
-            if self.glc { w0 |= 1 << 16 }
+            if self.glc {
+                w0 |= 1 << 16
+            }
             let sbase = self.sbase.ok_or_else(|| format!("{name} needs an sbase"))?;
-            if !sbase_ok(sbase, self.op.buffer()) { return Err(format!("{name}: unsupported or misaligned sbase {sbase:?}")) }
+            if !sbase_ok(sbase, self.op.buffer()) {
+                return Err(format!("{name}: unsupported or misaligned sbase {sbase:?}"));
+            }
             w0 |= u32::from(sbase.code() >> 1);
             match self.offset {
                 SmemOffset::Imm(i) => {
-                    if !imm_ok(i, self.op.buffer()) { return Err(format!("{name}: offset {i} outside the {} range", if self.op.buffer() { "unsigned 20-bit" } else { "signed 21-bit" })) }
+                    if !imm_ok(i, self.op.buffer()) {
+                        return Err(format!(
+                            "{name}: offset {i} outside the {} range",
+                            if self.op.buffer() {
+                                "unsigned 20-bit"
+                            } else {
+                                "signed 21-bit"
+                            }
+                        ));
+                    }
                     w0 |= 1 << 17;
                     w1 = i as u32 & 0x1f_ffff;
                 }
                 SmemOffset::Sgpr(s) => {
-                    if !soffset_ok(s) { return Err(format!("{name}: {s:?} cannot be an SMEM soffset register")) }
+                    if !soffset_ok(s) {
+                        return Err(format!("{name}: {s:?} cannot be an SMEM soffset register"));
+                    }
                     w1 = u32::from(s.code());
                 }
                 SmemOffset::SgprImm(s, i) => {
-                    if !soffset_ok(s) { return Err(format!("{name}: {s:?} cannot be an SMEM soffset register")) }
-                    if !imm_ok(i, self.op.buffer()) { return Err(format!("{name}: offset {i} outside the {} range", if self.op.buffer() { "unsigned 20-bit" } else { "signed 21-bit" })) }
+                    if !soffset_ok(s) {
+                        return Err(format!("{name}: {s:?} cannot be an SMEM soffset register"));
+                    }
+                    if !imm_ok(i, self.op.buffer()) {
+                        return Err(format!(
+                            "{name}: offset {i} outside the {} range",
+                            if self.op.buffer() {
+                                "unsigned 20-bit"
+                            } else {
+                                "signed 21-bit"
+                            }
+                        ));
+                    }
                     w0 |= 1 << 17 | 1 << 14;
                     w1 = (i as u32 & 0x1f_ffff) | u32::from(s.code()) << 25;
                 }
             }
         } else {
-            if self.glc { return Err(format!("{name} has no glc")) }
-            if self.sbase.is_some() { return Err(format!("{name} has no sbase")) }
-            if self.offset != SmemOffset::Imm(0) { return Err(format!("{name} has no address offset")) }
+            if self.glc {
+                return Err(format!("{name} has no glc"));
+            }
+            if self.sbase.is_some() {
+                return Err(format!("{name} has no sbase"));
+            }
+            if self.offset != SmemOffset::Imm(0) {
+                return Err(format!("{name} has no address offset"));
+            }
         }
         match (self.op.data_dwords(), self.sdata) {
             (0, None) => {}
             (0, Some(_)) => return Err(format!("{name} has no sdata")),
             (_, None) => return Err(format!("{name} needs an sdata")),
             (n, Some(d)) => {
-                if !sdata_ok(d, n) { return Err(format!("{name}: unsupported or misaligned sdata {d:?} for {n} dwords")) }
+                if !sdata_ok(d, n) {
+                    return Err(format!(
+                        "{name}: unsupported or misaligned sdata {d:?} for {n} dwords"
+                    ));
+                }
                 w0 |= u32::from(d.code()) << 6;
             }
         }
@@ -160,42 +263,81 @@ impl Smem {
     /// `NV` set, the redundant `IMM=0,SOE=1` form, nonzero reserved or
     /// ignored fields, unsupported register codes.
     pub fn decode(arch: Arch, words: &[u32]) -> Result<(Self, usize)> {
-        let (&w0, &w1) = match words { [a, b, ..] => (a, b), _ => return Err("SMEM needs two dwords".into()) };
-        if w0 >> 26 != 0b11_0000 { return Err(format!("{w0:#010x} is not an SMEM instruction")) }
+        let (&w0, &w1) = match words {
+            [a, b, ..] => (a, b),
+            _ => return Err("SMEM needs two dwords".into()),
+        };
+        if w0 >> 26 != 0b11_0000 {
+            return Err(format!("{w0:#010x} is not an SMEM instruction"));
+        }
         let opcode = (w0 >> 18 & 0xff) as u8;
-        let op = SmemOp::from_opcode(arch, opcode).ok_or_else(|| format!("SMEM opcode {opcode} is not modelled on {}", arch.name()))?;
+        let op = SmemOp::from_opcode(arch, opcode)
+            .ok_or_else(|| format!("SMEM opcode {opcode} is not modelled on {}", arch.name()))?;
         let name = op.name();
-        if w0 >> 15 & 1 != 0 { return Err(format!("{name}: NV bit set is not modelled")) }
+        if w0 >> 15 & 1 != 0 {
+            return Err(format!("{name}: NV bit set is not modelled"));
+        }
         let (glc, imm, soe) = (w0 >> 16 & 1 != 0, w0 >> 17 & 1 != 0, w0 >> 14 & 1 != 0);
         let sdata_field = (w0 >> 6 & 0x7f) as u16;
         let sbase_field = (w0 & 0x3f) as u16;
         let (off, soff) = (w1 & 0x1f_ffff, (w1 >> 25) as u16);
-        if w1 >> 21 & 0xf != 0 { return Err(format!("{name}: reserved SMEM bits 24:21 set")) }
+        if w1 >> 21 & 0xf != 0 {
+            return Err(format!("{name}: reserved SMEM bits 24:21 set"));
+        }
         let sdata = match op.data_dwords() {
             0 => {
-                if sdata_field != 0 { return Err(format!("{name}: sdata field must be zero")) }
+                if sdata_field != 0 {
+                    return Err(format!("{name}: sdata field must be zero"));
+                }
                 None
             }
             n => {
-                let d = Src::from_code(sdata_field, None).map_err(|e| format!("{name}: sdata: {e}"))?;
-                if !sdata_ok(d, n) { return Err(format!("{name}: unsupported or misaligned sdata {d:?} for {n} dwords")) }
+                let d =
+                    Src::from_code(sdata_field, None).map_err(|e| format!("{name}: sdata: {e}"))?;
+                if !sdata_ok(d, n) {
+                    return Err(format!(
+                        "{name}: unsupported or misaligned sdata {d:?} for {n} dwords"
+                    ));
+                }
                 Some(d)
             }
         };
         if !op.has_address() {
             if glc || imm || soe || sbase_field != 0 || off != 0 || soff != 0 {
-                return Err(format!("{name}: address, glc and offset fields must be zero"));
+                return Err(format!(
+                    "{name}: address, glc and offset fields must be zero"
+                ));
             }
-            return Ok((Self { op, sdata, sbase: None, offset: SmemOffset::Imm(0), glc: false }, 2));
+            return Ok((
+                Self {
+                    op,
+                    sdata,
+                    sbase: None,
+                    offset: SmemOffset::Imm(0),
+                    glc: false,
+                },
+                2,
+            ));
         }
-        let sbase = Src::from_code(sbase_field * 2, None).map_err(|e| format!("{name}: sbase: {e}"))?;
-        if !sbase_ok(sbase, op.buffer()) { return Err(format!("{name}: unsupported or misaligned sbase {sbase:?}")) }
+        let sbase =
+            Src::from_code(sbase_field * 2, None).map_err(|e| format!("{name}: sbase: {e}"))?;
+        if !sbase_ok(sbase, op.buffer()) {
+            return Err(format!("{name}: unsupported or misaligned sbase {sbase:?}"));
+        }
         let soffset = |code: u16| -> Result<Src> {
             let s = Src::from_code(code, None).map_err(|e| format!("{name}: soffset: {e}"))?;
-            if soffset_ok(s) { Ok(s) } else { Err(format!("{name}: {s:?} cannot be an SMEM soffset register")) }
+            if soffset_ok(s) {
+                Ok(s)
+            } else {
+                Err(format!("{name}: {s:?} cannot be an SMEM soffset register"))
+            }
         };
         let simm = ((off << 11) as i32) >> 11;
-        if imm && !imm_ok(simm, op.buffer()) { return Err(format!("{name}: offset {simm} outside the unsigned 20-bit range")) }
+        if imm && !imm_ok(simm, op.buffer()) {
+            return Err(format!(
+                "{name}: offset {simm} outside the unsigned 20-bit range"
+            ));
+        }
         let offset = match (imm, soe) {
             (true, false) => {
                 if soff != 0 { return Err(format!("{name}: soffset field set without SOE")) }
@@ -208,15 +350,28 @@ impl Smem {
             }
             (false, true) => return Err(format!("{name}: IMM=0 with SOE=1 (register in SOFFSET) is not the canonical register-offset encoding")),
         };
-        Ok((Self { op, sdata, sbase: Some(sbase), offset, glc }, 2))
+        Ok((
+            Self {
+                op,
+                sdata,
+                sbase: Some(sbase),
+                offset,
+                glc,
+            },
+            2,
+        ))
     }
 
     /// `sdata` is defined; `sbase` (2 SGPRs, 4 for `s_buffer_*`) and the
     /// offset register are used.
     pub fn footprint(&self) -> Footprint {
         let mut fp = Footprint::default();
-        if let Some(d) = self.sdata { fp.write(d, self.op.data_dwords()) }
-        if let Some(b) = self.sbase { fp.read(b, if self.op.buffer() { 4 } else { 2 }) }
+        if let Some(d) = self.sdata {
+            fp.write(d, self.op.data_dwords())
+        }
+        if let Some(b) = self.sbase {
+            fp.read(b, if self.op.buffer() { 4 } else { 2 })
+        }
         match self.offset {
             SmemOffset::Imm(_) => {}
             SmemOffset::Sgpr(s) | SmemOffset::SgprImm(s, _) => fp.read(s, 1),
@@ -224,7 +379,9 @@ impl Smem {
         fp
     }
     /// `SmemLoad` for every opcode here (all count on LGKM_CNT).
-    pub fn mem_kind(&self) -> Option<MemKind> { Some(MemKind::SmemLoad) }
+    pub fn mem_kind(&self) -> Option<MemKind> {
+        Some(MemKind::SmemLoad)
+    }
 }
 
 impl fmt::Display for Smem {
@@ -248,7 +405,9 @@ impl fmt::Display for Smem {
                 SmemOffset::SgprImm(s, i) => write!(f, "{sep}{} offset:{}", s.fmt(1), fmt_imm(i))?,
             }
         }
-        if self.glc { write!(f, " glc")?; }
+        if self.glc {
+            write!(f, " glc")?;
+        }
         Ok(())
     }
 }

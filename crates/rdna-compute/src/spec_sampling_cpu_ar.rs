@@ -95,7 +95,13 @@ pub struct SpecCpuArPolicy {
 impl SpecCpuArPolicy {
     /// Plain field constructor (no clamping: pass `SampleSpec` fields as-is).
     pub fn new(temperature: f32, top_p: f32, pool: u32, cap: u32, min_p: f32) -> Self {
-        Self { temperature, top_p, pool, cap, min_p }
+        Self {
+            temperature,
+            top_p,
+            pool,
+            cap,
+            min_p,
+        }
     }
 
     fn validate(&self, what: &str) -> HipResult<()> {
@@ -109,7 +115,10 @@ impl SpecCpuArPolicy {
             return Err(err(format!("{what}: pool {} outside 1..=64", self.pool)));
         }
         if self.cap == 0 || self.cap > self.pool {
-            return Err(err(format!("{what}: cap {} outside 1..=pool {}", self.cap, self.pool)));
+            return Err(err(format!(
+                "{what}: cap {} outside 1..=pool {}",
+                self.cap, self.pool
+            )));
         }
         Ok(())
     }
@@ -278,7 +287,11 @@ impl Gpu {
             SPEC_CPU_AR_CANDIDATES_SYMBOL,
             SPEC_ACCEPT_ORDERED_SYMBOL,
         ] {
-            self.ensure_kernel(SPEC_SAMPLING_CPU_AR_MODULE, SPEC_SAMPLING_CPU_AR_SRC, symbol)?;
+            self.ensure_kernel(
+                SPEC_SAMPLING_CPU_AR_MODULE,
+                SPEC_SAMPLING_CPU_AR_SRC,
+                symbol,
+            )?;
         }
         Ok(())
     }
@@ -308,7 +321,9 @@ impl Gpu {
     ) -> HipResult<()> {
         policy.validate("spec_cpu_ar_rows_enqueue")?;
         if row_count == 0 || vocab == 0 {
-            return Err(err(format!("rows: row_count {row_count} and vocab {vocab} must be > 0")));
+            return Err(err(format!(
+                "rows: row_count {row_count} and vocab {vocab} must be > 0"
+            )));
         }
         if vocab > i32::MAX as usize
             || row_count
@@ -324,7 +339,10 @@ impl Gpu {
             )));
         }
         if logits.dtype != DType::F32 {
-            return Err(err(format!("rows: logits must be F32, got {:?}", logits.dtype)));
+            return Err(err(format!(
+                "rows: logits must be F32, got {:?}",
+                logits.dtype
+            )));
         }
         check_bytes("logits", logits, row_count * vocab * 4)?;
         self.bind_thread()?;
@@ -496,7 +514,14 @@ impl Gpu {
         self.bind_thread()?;
         self.ensure_embedded_kernel(pm.accept_module, pm.accept_image, pm.accept_symbol)?;
         self.spec_accept_ordered_launch(
-            pm.accept_symbol, target, draft, proposal_ids, uniforms, result, k, eos,
+            pm.accept_symbol,
+            target,
+            draft,
+            proposal_ids,
+            uniforms,
+            result,
+            k,
+            eos,
         )
     }
 
@@ -539,7 +564,14 @@ impl Gpu {
             SPEC_ACCEPT_ORDERED_SYMBOL,
         )?;
         self.spec_accept_ordered_launch(
-            SPEC_ACCEPT_ORDERED_SYMBOL, target, draft, proposal_ids, uniforms, result, k, eos,
+            SPEC_ACCEPT_ORDERED_SYMBOL,
+            target,
+            draft,
+            proposal_ids,
+            uniforms,
+            result,
+            k,
+            eos,
         )
     }
 
@@ -590,28 +622,21 @@ impl Gpu {
             &k_i as *const _ as *mut c_void,
             &eos as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(
-            symbol,
-            [1, 1, 1],
-            [1, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = KernargBlob::new();
-                b.push_ptr(tc);
-                b.push_ptr(ti);
-                b.push_ptr(tp);
-                b.push_ptr(dc);
-                b.push_ptr(di);
-                b.push_ptr(dp);
-                b.push_ptr(pr);
-                b.push_ptr(un);
-                b.push_ptr(rs);
-                b.push_i32(k_i);
-                b.push_u32(eos);
-                b
-            },
-        )
+        self.launch_maybe_blob(symbol, [1, 1, 1], [1, 1, 1], 0, &mut params, || {
+            let mut b = KernargBlob::new();
+            b.push_ptr(tc);
+            b.push_ptr(ti);
+            b.push_ptr(tp);
+            b.push_ptr(dc);
+            b.push_ptr(di);
+            b.push_ptr(dp);
+            b.push_ptr(pr);
+            b.push_ptr(un);
+            b.push_ptr(rs);
+            b.push_i32(k_i);
+            b.push_u32(eos);
+            b
+        })
     }
 }
 
@@ -706,7 +731,14 @@ impl Gpu {
             SPEC_SAMPLING_CPU_AR_PARALLEL_SRC,
             SPEC_CPU_AR_ROWS_PARALLEL_SYMBOL,
         )?;
-        self.rows_parallel_launch(SPEC_CPU_AR_ROWS_PARALLEL_SYMBOL, logits, rows, vocab, row_count, policy)
+        self.rows_parallel_launch(
+            SPEC_CPU_AR_ROWS_PARALLEL_SYMBOL,
+            logits,
+            rows,
+            vocab,
+            row_count,
+            policy,
+        )
     }
 
     /// Launch the (already bound) parallel rows kernel `symbol`.
@@ -778,7 +810,9 @@ fn rows_parallel_check(
         )));
     }
     if vocab > i32::MAX as usize || row_count > u32::MAX as usize {
-        return Err(err("rows_parallel: vocab or row_count exceeds the launch range"));
+        return Err(err(
+            "rows_parallel: vocab or row_count exceeds the launch range",
+        ));
     }
     let logit_bytes = row_count
         .checked_mul(vocab)
@@ -795,7 +829,10 @@ fn rows_parallel_check(
         )));
     }
     if logits.dtype != DType::F32 {
-        return Err(err(format!("rows_parallel: logits must be F32, got {:?}", logits.dtype)));
+        return Err(err(format!(
+            "rows_parallel: logits must be F32, got {:?}",
+            logits.dtype
+        )));
     }
     check_bytes("logits", logits, logit_bytes)?;
     check_bytes("counts", &rows.counts, row_count * 4)?;

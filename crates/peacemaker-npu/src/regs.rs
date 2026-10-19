@@ -116,8 +116,14 @@ pub const fn ss_slot(id: u32, mask: u32, msel: u32, arbit: u32) -> u32 {
 pub fn shim_token_route(col: u32) -> [(u32, u32); 3] {
     [
         (tile(col, 0, shim::SS_MASTER_SOUTH0), ss_master_packet(3, 5)),
-        (tile(col, 0, shim::SS_SLAVE_TILE_CTRL), SS_ENABLE | SS_PACKET),
-        (tile(col, 0, shim::SS_SLAVE_TILE_CTRL_SLOT0), ss_slot(0xF, 0x1F, 3, 5)),
+        (
+            tile(col, 0, shim::SS_SLAVE_TILE_CTRL),
+            SS_ENABLE | SS_PACKET,
+        ),
+        (
+            tile(col, 0, shim::SS_SLAVE_TILE_CTRL_SLOT0),
+            ss_slot(0xF, 0x1F, 3, 5),
+        ),
     ]
 }
 
@@ -126,6 +132,13 @@ mod tests {
     /// Values from the vendor add_one PDI (mlir-aie npu2).
     #[test]
     fn token_route_matches_vendor() {
-        assert_eq!(super::shim_token_route(0), [(0x0003_F008, 0xC000_0045), (0x0003_F100, 0xC000_0000), (0x0003_F200, 0x0F1F_0135)]);
+        assert_eq!(
+            super::shim_token_route(0),
+            [
+                (0x0003_F008, 0xC000_0045),
+                (0x0003_F100, 0xC000_0000),
+                (0x0003_F200, 0x0F1F_0135)
+            ]
+        );
     }
 }

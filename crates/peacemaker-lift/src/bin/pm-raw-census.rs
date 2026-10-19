@@ -26,20 +26,33 @@ use serde_json::{json, Value};
 
 const SCHEMA: &str = "pm-raw-census-v1";
 
-fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
 
 fn kill(stage: &str, reason: impl ToString) -> Value {
     json!({"schema": SCHEMA, "verdict": "kill", "stage": stage, "reason": reason.to_string()})
 }
 
 fn word_at(bytes: &[u8], offset: u64) -> Value {
-    usize::try_from(offset).ok()
+    usize::try_from(offset)
+        .ok()
         .and_then(|at| bytes.get(at..at + 4))
-        .map_or(Value::Null, |w| json!(format!("{:#010x}", u32::from_le_bytes(w.try_into().expect("four bytes")))))
+        .map_or(Value::Null, |w| {
+            json!(format!(
+                "{:#010x}",
+                u32::from_le_bytes(w.try_into().expect("four bytes"))
+            ))
+        })
 }
 
 fn lift_kill(stage: &str, error: &LiftError, bytes: &[u8]) -> Value {
-    let LiftError::Rejected { kernel, offset, rule, reason } = error;
+    let LiftError::Rejected {
+        kernel,
+        offset,
+        rule,
+        reason,
+    } = error;
     json!({
         "schema": SCHEMA, "verdict": "kill", "stage": stage, "rule": format!("{rule:?}"),
         "kernel": kernel, "offset": offset, "word": word_at(bytes, *offset), "reason": reason,
@@ -48,8 +61,16 @@ fn lift_kill(stage: &str, error: &LiftError, bytes: &[u8]) -> Value {
 
 fn census(bytes: &[u8], file: &SpecFile) -> Value {
     let spec = &file.spec;
-    let range = spec.extent.offset.checked_add(spec.extent.len)
-        .and_then(|end| Some((usize::try_from(spec.extent.offset).ok()?, usize::try_from(end).ok()?)));
+    let range = spec
+        .extent
+        .offset
+        .checked_add(spec.extent.len)
+        .and_then(|end| {
+            Some((
+                usize::try_from(spec.extent.offset).ok()?,
+                usize::try_from(end).ok()?,
+            ))
+        });
     let Some(code) = range.and_then(|(start, end)| bytes.get(start..end)) else {
         return json!({"error": "executable extent is outside the binary"});
     };
@@ -60,10 +81,16 @@ fn census(bytes: &[u8], file: &SpecFile) -> Value {
         *opcodes.entry(inst.opcode.as_str()).or_default() += 1;
         *forms.entry(inst.form.as_str()).or_default() += 1;
     }
-    let failures: Vec<Value> = scan.failures.iter().map(|f| json!({
-        "offset": spec.extent.offset + f.offset, "word": format!("{:#010x}", f.word),
-        "rule": format!("{:?}", f.rule), "reason": f.reason,
-    })).collect();
+    let failures: Vec<Value> = scan
+        .failures
+        .iter()
+        .map(|f| {
+            json!({
+                "offset": spec.extent.offset + f.offset, "word": format!("{:#010x}", f.word),
+                "rule": format!("{:?}", f.rule), "reason": f.reason,
+            })
+        })
+        .collect();
     json!({
         "words": scan.words, "instructions": scan.decoded.len(), "opcodes": opcodes, "forms": forms,
         "failures": failures, "failures_after_first_are_best_effort": true,
@@ -99,7 +126,13 @@ fn run(spec_path: &Path) -> (Value, bool) {
         verdict["census"] = census;
         return fail(verdict);
     }
-    match lift_raw(&bytes, &file.spec, Options { frontend: Frontend::Aco }) {
+    match lift_raw(
+        &bytes,
+        &file.spec,
+        Options {
+            frontend: Frontend::Aco,
+        },
+    ) {
         Err(e) => {
             let mut verdict = lift_kill("lift", &e, &bytes);
             verdict["census"] = census;
@@ -108,26 +141,39 @@ fn run(spec_path: &Path) -> (Value, bool) {
         Ok(lifted) => {
             let kernel = &lifted.program.kernels[0];
             let arch = lifted.program.target.arch;
-            let range = file.spec.extent.offset as usize..(file.spec.extent.offset + file.spec.extent.len) as usize;
+            let range = file.spec.extent.offset as usize
+                ..(file.spec.extent.offset + file.spec.extent.len) as usize;
             let identical = emit::bytes(kernel, arch).is_ok_and(|code| code == bytes[range]);
-            let Abi::Raw(raw) = &kernel.abi else { return fail(kill("lift", "lifted kernel has no raw ABI")) };
-            let streams: Vec<Value> = lifted.proof.streams.iter().map(|s| json!({
-                "entry": s.entry, "size": s.size, "stream_sha256": hex(&s.stream_sha256),
-            })).collect();
-            (json!({
-                "schema": SCHEMA, "verdict": if identical { "pass" } else { "kill" },
-                "stage": if identical { "complete" } else { "identity" },
-                "kernel": kernel.symbol.0, "arch": format!("{arch:?}"), "wave": format!("{:?}", kernel.wave),
-                "instructions": kernel.body.layout.len(), "blocks": kernel.body.blocks.len(),
-                "entry_facts": raw.entry.len(), "relocations": raw.relocations.len(),
-                "identity": {
-                    "emit_bytes_equals_executable": identical,
-                    "input_sha256": hex(&lifted.proof.input_sha256),
-                    "sidecar_sha256": lifted.proof.sidecar_sha256.as_ref().map(|h| hex(h.as_slice())),
-                    "streams": streams,
-                },
-                "census": census,
-            }), identical)
+            let Abi::Raw(raw) = &kernel.abi else {
+                return fail(kill("lift", "lifted kernel has no raw ABI"));
+            };
+            let streams: Vec<Value> = lifted
+                .proof
+                .streams
+                .iter()
+                .map(|s| {
+                    json!({
+                        "entry": s.entry, "size": s.size, "stream_sha256": hex(&s.stream_sha256),
+                    })
+                })
+                .collect();
+            (
+                json!({
+                    "schema": SCHEMA, "verdict": if identical { "pass" } else { "kill" },
+                    "stage": if identical { "complete" } else { "identity" },
+                    "kernel": kernel.symbol.0, "arch": format!("{arch:?}"), "wave": format!("{:?}", kernel.wave),
+                    "instructions": kernel.body.layout.len(), "blocks": kernel.body.blocks.len(),
+                    "entry_facts": raw.entry.len(), "relocations": raw.relocations.len(),
+                    "identity": {
+                        "emit_bytes_equals_executable": identical,
+                        "input_sha256": hex(&lifted.proof.input_sha256),
+                        "sidecar_sha256": lifted.proof.sidecar_sha256.as_ref().map(|h| hex(h.as_slice())),
+                        "streams": streams,
+                    },
+                    "census": census,
+                }),
+                identical,
+            )
         }
     }
 }
@@ -139,6 +185,13 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     let (verdict, pass) = run(Path::new(path));
-    println!("{}", serde_json::to_string_pretty(&verdict).expect("verdict serializes"));
-    if pass { ExitCode::SUCCESS } else { ExitCode::from(1) }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&verdict).expect("verdict serializes")
+    );
+    if pass {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
 }

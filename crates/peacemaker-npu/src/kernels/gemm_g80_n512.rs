@@ -47,14 +47,20 @@
 //! to `min(kc, 63)` that the guarded reader returns (the V10 B-prefix scheme): ready never exceeds 63 and the credit ends at
 //! its initial value. Completed-submit end state: all tasks finite; the A rings and core rings park at
 //! BD `J%2` with `J = kc*W` (the lean repair of the G80 BF16 design applies unchanged), C locks end empty 1 / full 0.
-use super::gemm_array::{self as array, ArrayDesign, CycleEstimate, Geometry, Kind, Topo, Variant, MAX_WAVES};
+use super::gemm_array::{
+    self as array, ArrayDesign, CycleEstimate, Geometry, Kind, Topo, Variant, MAX_WAVES,
+};
 use super::gemm_core::{self, Control, CoreVariant, Epilogue, PairRole};
 use super::gemm_core_g80 as g80_core;
 use super::gemm_g80::{self as g80, Bf16Layout};
 use super::gemm_i8::{peak_ops_per_second, ArgKind, ArgSpec};
 use super::iu4_ief15_core::g80_bf16 as bf16;
 use crate::{
-    dma::{Bd, BdLocks, Dim, Direction::{Mm2s, S2mm}, Iteration, Location, Task},
+    dma::{
+        Bd, BdLocks, Dim,
+        Direction::{Mm2s, S2mm},
+        Iteration, Location, Task,
+    },
     route::Circuit,
 };
 
@@ -74,12 +80,21 @@ pub const WAVE_N: usize = array::G80_N512_WAVE_N;
 pub const A_CHUNK_BYTES: usize = TILE.a_bytes();
 pub const B_CHUNK_BYTES: usize = TILE.b_bytes();
 pub const TILE_BYTES: usize = TILE.out_bytes();
-const _: () = assert!(WAVE_M == 512 && WAVE_N == 512 && A_CHUNK_BYTES == 4608 && B_CHUNK_BYTES == 4352 && TILE_BYTES == 16384);
+const _: () = assert!(
+    WAVE_M == 512
+        && WAVE_N == 512
+        && A_CHUNK_BYTES == 4608
+        && B_CHUNK_BYTES == 4352
+        && TILE_BYTES == 16384
+);
 
 // Memtile map (byte offsets).
 const C_OFF: u32 = 0x4000;
 const C_STAGE: u32 = TILE_BYTES as u32;
-const A_OFF: [u32; 2] = [C_OFF + ROWS as u32 * C_STAGE, C_OFF + ROWS as u32 * C_STAGE + A_CHUNK_BYTES as u32];
+const A_OFF: [u32; 2] = [
+    C_OFF + ROWS as u32 * C_STAGE,
+    C_OFF + ROWS as u32 * C_STAGE + A_CHUNK_BYTES as u32,
+];
 const B_OFF: u32 = A_OFF[1] + A_CHUNK_BYTES as u32;
 const MEM_END: u32 = 0x80000;
 /// Largest K64 chunk count: the resident B panel must fit behind the A rings.
@@ -101,18 +116,31 @@ fn b_groups(kc: usize) -> Vec<(usize, usize)> {
     assert!(n <= B_GUARD_BD.len(), "N512 kc {kc} needs {n} B groups");
     let (base, extra) = (kc / n, kc % n);
     let mut first = 0;
-    (0..n).map(|g| { let len = base + usize::from(g < extra); let at = first; first += len; (at, len) }).collect()
+    (0..n)
+        .map(|g| {
+            let len = base + usize::from(g < extra);
+            let at = first;
+            first += len;
+            (at, len)
+        })
+        .collect()
 }
 
 fn shape(topo: Topo) -> (usize, usize) {
     match topo.kind {
-        Kind::G80 { kc, mw, n512: true, .. } => (kc, mw),
+        Kind::G80 {
+            kc, mw, n512: true, ..
+        } => (kc, mw),
         other => panic!("gemm_g80_n512 needs an N512 topology, got {other:?}"),
     }
 }
 
-fn c_off(row: usize) -> u32 { C_OFF + row as u32 * C_STAGE }
-fn c_lock(row: usize) -> u32 { g80::c_lock(0, row) }
+fn c_off(row: usize) -> u32 {
+    C_OFF + row as u32 * C_STAGE
+}
+fn c_lock(row: usize) -> u32 {
+    g80::c_lock(0, row)
+}
 
 /// Static stream-switch circuits of one column: V8's.
 pub(crate) fn column_circuits(topo: Topo, col: u32) -> Vec<Circuit> {
@@ -128,7 +156,11 @@ pub(crate) fn memtile_descriptors(topo: Topo, col: u32) -> Vec<(u32, Bd)> {
     let chunk_words = (B_CHUNK_BYTES / 4) as u32;
     for (g, (first, len)) in b_groups(kc).into_iter().enumerate() {
         let addr = (array::MEM_BASE + B_OFF) as u64 + (first * B_CHUNK_BYTES) as u64;
-        let iteration = Iteration { step: chunk_words, wrap: len as u32, current: 0 };
+        let iteration = Iteration {
+            step: chunk_words,
+            wrap: len as u32,
+            current: 0,
+        };
         let mut fill = Bd::new(addr, chunk_words);
         fill.iteration = iteration;
         fill.locks = BdLocks {
@@ -145,11 +177,21 @@ pub(crate) fn memtile_descriptors(topo: Topo, col: u32) -> Vec<(u32, Bd)> {
         };
         v.push((B_GUARD_BD[g], guard));
     }
-    v.push((B_WHOLE_BD, Bd::new((array::MEM_BASE + B_OFF) as u64, kc as u32 * chunk_words)));
+    v.push((
+        B_WHOLE_BD,
+        Bd::new((array::MEM_BASE + B_OFF) as u64, kc as u32 * chunk_words),
+    ));
     let words = (A_CHUNK_BYTES / 4) as u32;
     let (empty, full) = (gemm_core::A_EMPTY, gemm_core::A_FULL);
     v.extend(array::ring(g80::A_S2MM_BD, A_OFF, words, empty, full, true));
-    v.extend(array::ring(g80::A_MM2S_BD, A_OFF, words, empty, full, false));
+    v.extend(array::ring(
+        g80::A_MM2S_BD,
+        A_OFF,
+        words,
+        empty,
+        full,
+        false,
+    ));
     let tile_words = (TILE_BYTES / 4) as u32;
     for r in 0..ROWS {
         let addr = (array::MEM_BASE + c_off(r)) as u64;
@@ -165,9 +207,15 @@ pub(crate) fn memtile_descriptors(topo: Topo, col: u32) -> Vec<(u32, Bd)> {
             // Native (mb, nb, i, 4 words) -> rows (mb, i, nb, 4 words): the same 4096 stream words, 64 columns per row.
             drain.dims = [
                 Dim { step: 1, wrap: 4 },
-                Dim { step: 32, wrap: NB as u32 },
+                Dim {
+                    step: 32,
+                    wrap: NB as u32,
+                },
                 Dim { step: 4, wrap: 8 },
-                Dim { step: (NB * 32) as u32, wrap: 0 },
+                Dim {
+                    step: (NB * 32) as u32,
+                    wrap: 0,
+                },
             ];
         }
         drain.locks = BdLocks {
@@ -184,9 +232,16 @@ pub(crate) fn memtile_descriptors(topo: Topo, col: u32) -> Vec<(u32, Bd)> {
 pub(crate) fn memtile_locks(topo: Topo, col: u32) -> Vec<(u32, u32)> {
     let _ = col;
     let (kc, _) = shape(topo);
-    let mut v = vec![(g80::B_READY[0], 0), (B_CREDIT, (kc as u32).min(B_CREDIT_MAX))];
-    for i in 0..2 { v.extend([(gemm_core::A_EMPTY[i], 1), (gemm_core::A_FULL[i], 0)]); }
-    for r in 0..ROWS { v.extend([(c_lock(r), 1), (c_lock(r) + 1, 0)]); }
+    let mut v = vec![
+        (g80::B_READY[0], 0),
+        (B_CREDIT, (kc as u32).min(B_CREDIT_MAX)),
+    ];
+    for i in 0..2 {
+        v.extend([(gemm_core::A_EMPTY[i], 1), (gemm_core::A_FULL[i], 0)]);
+    }
+    for r in 0..ROWS {
+        v.extend([(c_lock(r), 1), (c_lock(r) + 1, 0)]);
+    }
     v
 }
 
@@ -195,7 +250,13 @@ pub(crate) fn memtile_locks(topo: Topo, col: u32) -> Vec<(u32, u32)> {
 pub(crate) fn ring_tasks(topo: Topo, col: u32) -> Vec<(Location, Task)> {
     let _ = col;
     let (kc, mw) = shape(topo);
-    let rep = |direction, channel, bd, repeat| Task { direction, channel, bd, repeat, issue_token: false };
+    let rep = |direction, channel, bd, repeat| Task {
+        direction,
+        channel,
+        bd,
+        repeat,
+        issue_token: false,
+    };
     let task = |direction, channel, bd| rep(direction, channel, bd, 1);
     let mut v = Vec::new();
     for r in 0..ROWS {
@@ -205,16 +266,34 @@ pub(crate) fn ring_tasks(topo: Topo, col: u32) -> Vec<(Location, Task)> {
         v.push((tile, task(Mm2s, gemm_core::C_CHANNEL, gemm_core::C_BD)));
     }
     let mem = array::mem_loc(col);
-    for r in 0..ROWS { v.push((mem, rep(S2mm, r as u32, g80::C_S2MM_BD[r][0], mw as u32))); }
+    for r in 0..ROWS {
+        v.push((mem, rep(S2mm, r as u32, g80::C_S2MM_BD[r][0], mw as u32)));
+    }
     for (g, (_, len)) in b_groups(kc).into_iter().enumerate() {
-        v.push((mem, rep(S2mm, g80::B_FILL_CH, g80::B_FILL_BD[g], len as u32)));
+        v.push((
+            mem,
+            rep(S2mm, g80::B_FILL_CH, g80::B_FILL_BD[g], len as u32),
+        ));
     }
     v.push((mem, task(S2mm, g80::A_S2MM_CH, g80::A_S2MM_BD[0])));
-    for g in 0..2 { v.push((mem, rep(Mm2s, g80::C_DRAIN_CH[g], g80::C_DRAIN_BD0[g], mw as u32))); }
-    for (g, (_, len)) in b_groups(kc).into_iter().enumerate() {
-        v.push((mem, rep(Mm2s, g80::G80_B_MM2S_CH[0], B_GUARD_BD[g], len as u32)));
+    for g in 0..2 {
+        v.push((
+            mem,
+            rep(Mm2s, g80::C_DRAIN_CH[g], g80::C_DRAIN_BD0[g], mw as u32),
+        ));
     }
-    if mw > 1 { v.push((mem, rep(Mm2s, g80::G80_B_MM2S_CH[0], B_WHOLE_BD, (mw - 1) as u32))); }
+    for (g, (_, len)) in b_groups(kc).into_iter().enumerate() {
+        v.push((
+            mem,
+            rep(Mm2s, g80::G80_B_MM2S_CH[0], B_GUARD_BD[g], len as u32),
+        ));
+    }
+    if mw > 1 {
+        v.push((
+            mem,
+            rep(Mm2s, g80::G80_B_MM2S_CH[0], B_WHOLE_BD, (mw - 1) as u32),
+        ));
+    }
     v.push((mem, task(Mm2s, g80::A_MM2S_CH, g80::A_MM2S_BD[0])));
     v
 }
@@ -224,7 +303,13 @@ pub(crate) fn ring_tasks(topo: Topo, col: u32) -> Vec<(Location, Task)> {
 /// each of these channels is idle with an empty queue and `current = len mod len = 0`; the ready / credit locks are back at
 /// `0 / min(kc, 63)`, so no B lock write or reset is ever needed.
 pub(crate) fn lean_b_tasks(kc: usize, mw: usize) -> (Vec<Task>, Vec<u32>) {
-    let rep = |direction, channel, bd, repeat| Task { direction, channel, bd, repeat, issue_token: false };
+    let rep = |direction, channel, bd, repeat| Task {
+        direction,
+        channel,
+        bd,
+        repeat,
+        issue_token: false,
+    };
     let groups = b_groups(kc);
     let mut tasks = Vec::new();
     let mut currents = Vec::new();
@@ -232,15 +317,31 @@ pub(crate) fn lean_b_tasks(kc: usize, mw: usize) -> (Vec<Task>, Vec<u32>) {
         tasks.push(rep(S2mm, g80::B_FILL_CH, g80::B_FILL_BD[g], len as u32));
         currents.extend([g80::B_FILL_BD[g], B_GUARD_BD[g]]);
     }
-    for (g, &(_, len)) in groups.iter().enumerate() { tasks.push(rep(Mm2s, g80::G80_B_MM2S_CH[0], B_GUARD_BD[g], len as u32)); }
-    if mw > 1 { tasks.push(rep(Mm2s, g80::G80_B_MM2S_CH[0], B_WHOLE_BD, (mw - 1) as u32)); }
+    for (g, &(_, len)) in groups.iter().enumerate() {
+        tasks.push(rep(Mm2s, g80::G80_B_MM2S_CH[0], B_GUARD_BD[g], len as u32));
+    }
+    if mw > 1 {
+        tasks.push(rep(
+            Mm2s,
+            g80::G80_B_MM2S_CH[0],
+            B_WHOLE_BD,
+            (mw - 1) as u32,
+        ));
+    }
     (tasks, currents)
 }
 
 fn check_geometry(geo: &Geometry) -> (usize, usize) {
     let (kc, mw) = shape(geo.topo);
-    assert!(geo.kc == kc && geo.mw == mw && geo.nw == 1 && geo.waves == mw && geo.n == WAVE_N && geo.k == kc * CHUNK_K,
-        "inconsistent G80 N512 geometry {geo:?}");
+    assert!(
+        geo.kc == kc
+            && geo.mw == mw
+            && geo.nw == 1
+            && geo.waves == mw
+            && geo.n == WAVE_N
+            && geo.k == kc * CHUNK_K,
+        "inconsistent G80 N512 geometry {geo:?}"
+    );
     (kc, mw)
 }
 
@@ -258,11 +359,13 @@ pub(crate) fn pack_a(geo: &Geometry, a: &[i8]) -> Vec<u8> {
     let mut out = vec![0u8; COLS * segment];
     assert_eq!(out.len(), geo.a_bytes(), "A stream size");
     for c in 0..COLS {
-        for w in 0..geo.waves { for ch in 0..kc {
-            let (row0, h) = a_source(c, w);
-            let at = c * segment + (w * kc + ch) * A_CHUNK_BYTES;
-            geo.pack_a_half_chunk(a, row0, h, ch, &mut out[at..at + 4096]);
-        } }
+        for w in 0..geo.waves {
+            for ch in 0..kc {
+                let (row0, h) = a_source(c, w);
+                let at = c * segment + (w * kc + ch) * A_CHUNK_BYTES;
+                geo.pack_a_half_chunk(a, row0, h, ch, &mut out[at..at + 4096]);
+            }
+        }
     }
     out
 }
@@ -274,19 +377,29 @@ pub(crate) fn pack_b(geo: &Geometry, b: &[i8]) -> Vec<u8> {
     assert_eq!(b.len(), geo.k * geo.n, "B must be k*n");
     let mut out = vec![0u8; COLS * kc * B_CHUNK_BYTES];
     assert_eq!(out.len(), geo.b_bytes(), "B stream size");
-    for col in 0..COLS { for ch in 0..kc {
-        let n0 = (col / 2) * 2 * TN + (col % 2) * TN;
-        let base = (col * kc + ch) * B_CHUNK_BYTES;
-        for kb in 0..KB { for nb in 0..NB { for kk in 0..8 {
-            let c0 = n0 + nb * 8;
-            if c0 >= geo.n { continue; }
-            let width = (geo.n - c0).min(8);
-            let row = ch * CHUNK_K + kb * 8 + kk;
-            let dst = base + (kb * NB + nb) * 64 + kk * 8;
-            let s = row * geo.n + c0;
-            for (x, y) in out[dst..dst + width].iter_mut().zip(&b[s..s + width]) { *x = *y as u8; }
-        } } }
-    } }
+    for col in 0..COLS {
+        for ch in 0..kc {
+            let n0 = (col / 2) * 2 * TN + (col % 2) * TN;
+            let base = (col * kc + ch) * B_CHUNK_BYTES;
+            for kb in 0..KB {
+                for nb in 0..NB {
+                    for kk in 0..8 {
+                        let c0 = n0 + nb * 8;
+                        if c0 >= geo.n {
+                            continue;
+                        }
+                        let width = (geo.n - c0).min(8);
+                        let row = ch * CHUNK_K + kb * 8 + kk;
+                        let dst = base + (kb * NB + nb) * 64 + kk * 8;
+                        let s = row * geo.n + c0;
+                        for (x, y) in out[dst..dst + width].iter_mut().zip(&b[s..s + width]) {
+                            *x = *y as u8;
+                        }
+                    }
+                }
+            }
+        }
+    }
     out
 }
 
@@ -294,37 +407,49 @@ pub(crate) fn pack_b(geo: &Geometry, b: &[i8]) -> Vec<u8> {
 /// of a block repeat the full token scale row). Padding tokens have zero scales.
 pub fn pack_a_bf16(design: &ArrayDesign, a: &[i8], scales: &[(u16, i16)]) -> Vec<u8> {
     let geo = &design.geo;
-    assert!(geo.topo.is_g80_n512(), "N512 sidecars require an N512 design");
+    assert!(
+        geo.topo.is_g80_n512(),
+        "N512 sidecars require an N512 design"
+    );
     assert_eq!(scales.len(), geo.m);
     let mut out = pack_a(geo, a);
     let segment = geo.a_segment_bytes();
-    for col in 0..COLS { for wave in 0..geo.waves { for ch in 0..geo.kc {
-        let base = col * segment + (wave * geo.kc + ch) * A_CHUNK_BYTES + 4096;
-        let (row0, _) = a_source(col, wave);
-        for t in 0..TM {
-            let (m, e) = scales.get(row0 + t).copied().unwrap_or((0, 0));
-            out[base + 2 * t..base + 2 * t + 2].copy_from_slice(&m.to_le_bytes());
-            out[base + 256 + 2 * t..base + 258 + 2 * t].copy_from_slice(&e.to_le_bytes());
+    for col in 0..COLS {
+        for wave in 0..geo.waves {
+            for ch in 0..geo.kc {
+                let base = col * segment + (wave * geo.kc + ch) * A_CHUNK_BYTES + 4096;
+                let (row0, _) = a_source(col, wave);
+                for t in 0..TM {
+                    let (m, e) = scales.get(row0 + t).copied().unwrap_or((0, 0));
+                    out[base + 2 * t..base + 2 * t + 2].copy_from_slice(&m.to_le_bytes());
+                    out[base + 256 + 2 * t..base + 258 + 2 * t].copy_from_slice(&e.to_le_bytes());
+                }
+            }
         }
-    } } }
+    }
     out
 }
 
 /// BF16 resident B panel: each 4096-byte K64 N64 tile is followed by `Sm[64]` u16 and `Se[64]` i16.
 pub fn pack_b_bf16(design: &ArrayDesign, b: &[i8], scales: &[(u16, i16)]) -> Vec<u8> {
     let geo = &design.geo;
-    assert!(geo.topo.is_g80_n512(), "N512 sidecars require an N512 design");
+    assert!(
+        geo.topo.is_g80_n512(),
+        "N512 sidecars require an N512 design"
+    );
     assert_eq!(scales.len(), geo.n);
     let mut out = pack_b(geo, b);
-    for col in 0..COLS { for ch in 0..geo.kc {
-        let base = (col * geo.kc + ch) * B_CHUNK_BYTES + 4096;
-        let n0 = (col / 2) * 2 * TN + (col % 2) * TN;
-        for n in 0..TN {
-            let (m, e) = scales[n0 + n];
-            out[base + 2 * n..base + 2 * n + 2].copy_from_slice(&m.to_le_bytes());
-            out[base + 128 + 2 * n..base + 130 + 2 * n].copy_from_slice(&e.to_le_bytes());
+    for col in 0..COLS {
+        for ch in 0..geo.kc {
+            let base = (col * geo.kc + ch) * B_CHUNK_BYTES + 4096;
+            let n0 = (col / 2) * 2 * TN + (col % 2) * TN;
+            for n in 0..TN {
+                let (m, e) = scales[n0 + n];
+                out[base + 2 * n..base + 2 * n + 2].copy_from_slice(&m.to_le_bytes());
+                out[base + 128 + 2 * n..base + 130 + 2 * n].copy_from_slice(&e.to_le_bytes());
+            }
         }
-    } }
+    }
     out
 }
 
@@ -333,28 +458,48 @@ pub(crate) fn unpack_c(geo: &Geometry, output: &[u8]) -> Vec<i32> {
     check_geometry(geo);
     assert_eq!(output.len(), geo.c_bytes(), "C stream size");
     if let Some((pitch, col0)) = geo.topo.bf16_rowmajor() {
-        return (0..geo.m).flat_map(|row| (0..geo.n).map(move |col| {
-            let off = 2 * (row * pitch + col0 + col);
-            i32::from(u16::from_le_bytes(output[off..off + 2].try_into().unwrap()))
-        })).collect();
+        return (0..geo.m)
+            .flat_map(|row| {
+                (0..geo.n).map(move |col| {
+                    let off = 2 * (row * pitch + col0 + col);
+                    i32::from(u16::from_le_bytes(output[off..off + 2].try_into().unwrap()))
+                })
+            })
+            .collect();
     }
     let mut c = vec![0i32; geo.m * geo.n];
-    for col in 0..COLS { for w in 0..geo.waves { for rho in 0..ROWS {
-        let m0 = w * WAVE_M + (2 * (rho / 2) + col % 2) * TM;
-        let n0 = (col / 2) * 2 * TN + (rho % 2) * TN;
-        let base = geo.pair_c_offset(col, w, rho);
-        if m0 >= geo.m || n0 >= geo.n { continue; }
-        for mb in 0..MB { for nb in 0..NB { for i in 0..8 {
-            let row = m0 + mb * 8 + i;
-            if row >= geo.m { break; }
-            for j in 0..8 {
-                let cc = n0 + nb * 8 + j;
-                if cc >= geo.n { break; }
-                let off = base + ((mb * NB + nb) * 64 + i * 8 + j) * 2;
-                c[row * geo.n + cc] = i32::from(u16::from_le_bytes(output[off..off + 2].try_into().unwrap()));
+    for col in 0..COLS {
+        for w in 0..geo.waves {
+            for rho in 0..ROWS {
+                let m0 = w * WAVE_M + (2 * (rho / 2) + col % 2) * TM;
+                let n0 = (col / 2) * 2 * TN + (rho % 2) * TN;
+                let base = geo.pair_c_offset(col, w, rho);
+                if m0 >= geo.m || n0 >= geo.n {
+                    continue;
+                }
+                for mb in 0..MB {
+                    for nb in 0..NB {
+                        for i in 0..8 {
+                            let row = m0 + mb * 8 + i;
+                            if row >= geo.m {
+                                break;
+                            }
+                            for j in 0..8 {
+                                let cc = n0 + nb * 8 + j;
+                                if cc >= geo.n {
+                                    break;
+                                }
+                                let off = base + ((mb * NB + nb) * 64 + i * 8 + j) * 2;
+                                c[row * geo.n + cc] = i32::from(u16::from_le_bytes(
+                                    output[off..off + 2].try_into().unwrap(),
+                                ));
+                            }
+                        }
+                    }
+                }
             }
-        } } }
-    } } }
+        }
+    }
     c
 }
 
@@ -396,32 +541,72 @@ pub fn design_g80_n512(m: usize, n: usize, k: usize, epi: Epilogue, ctl: Control
 
 /// [`design_g80_n512`] with an explicit BF16 destination (native tiles, or row-major at `pitch` / `col0` with
 /// `col0 + 512 <= pitch`).
-pub fn design_g80_n512_layout(m: usize, n: usize, k: usize, epi: Epilogue, ctl: Control, layout: Bf16Layout) -> ArrayDesign {
-    assert_eq!(epi, Epilogue::Bf16, "G80 N512 is a direct-BF16 design, got {epi:?}");
-    assert_eq!(ctl.probe().layout, 0, "G80 N512 has one fixed data-memory map; Probe::layout={} is not defined", ctl.probe().layout);
+pub fn design_g80_n512_layout(
+    m: usize,
+    n: usize,
+    k: usize,
+    epi: Epilogue,
+    ctl: Control,
+    layout: Bf16Layout,
+) -> ArrayDesign {
+    assert_eq!(
+        epi,
+        Epilogue::Bf16,
+        "G80 N512 is a direct-BF16 design, got {epi:?}"
+    );
+    assert_eq!(
+        ctl.probe().layout,
+        0,
+        "G80 N512 has one fixed data-memory map; Probe::layout={} is not defined",
+        ctl.probe().layout
+    );
     assert!(m > 0, "G80 N512 needs M >= 1");
     let waves = m.div_ceil(WAVE_M);
-    assert!(waves <= MAX_WAVES, "G80 N512 M={m} needs {waves} waves, exceeding {MAX_WAVES}");
-    layout.validate_for(waves * WAVE_M, WAVE_N).unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        waves <= MAX_WAVES,
+        "G80 N512 M={m} needs {waves} waves, exceeding {MAX_WAVES}"
+    );
+    layout
+        .validate_for(waves * WAVE_M, WAVE_N)
+        .unwrap_or_else(|e| panic!("{e}"));
     let geo = Geometry::g80_n512(m, n, k, ctl, layout);
     let topo = geo.topo;
     let program = |role| g80_core::program_bf16_n64(geo.kc, geo.waves, role, ctl).finish();
     let (lower, upper) = (program(PairRole::Lower), program(PairRole::Upper));
-    for p in [&lower, &upper] { assert!(p.len() <= 16 * 1024, "G80 N512 core program {} B exceeds 16 KiB", p.len()); }
+    for p in [&lower, &upper] {
+        assert!(
+            p.len() <= 16 * 1024,
+            "G80 N512 core program {} B exceeds 16 KiB",
+            p.len()
+        );
+    }
     let insts = array::build_txn_dynamic(&geo, false);
     ArrayDesign {
         pdi: crate::pdi::build(&array::build_cdo(topo, [&lower, &upper], false).to_words()),
         insts: insts.to_bytes(),
         args: vec![
-            ArgSpec { bytes: geo.a_bytes(), kind: ArgKind::In },
-            ArgSpec { bytes: geo.b_bytes(), kind: ArgKind::In },
-            ArgSpec { bytes: geo.c_bytes(), kind: ArgKind::Out },
+            ArgSpec {
+                bytes: geo.a_bytes(),
+                kind: ArgKind::In,
+            },
+            ArgSpec {
+                bytes: geo.b_bytes(),
+                kind: ArgKind::In,
+            },
+            ArgSpec {
+                bytes: geo.c_bytes(),
+                kind: ArgKind::Out,
+            },
         ],
         geo,
         variant: Variant::G80,
         program: lower,
         upper_program: upper,
-        core: if ctl.is_slow() { CoreVariant::FastSlowCtl } else { CoreVariant::Fast },
+        core: if ctl.is_slow() {
+            CoreVariant::FastSlowCtl
+        } else {
+            CoreVariant::Fast
+        },
         v8: Some((epi, ctl)),
         shim_axi: crate::dma::ShimAxi::default(),
     }
@@ -430,14 +615,31 @@ pub fn design_g80_n512_layout(m: usize, n: usize, k: usize, epi: Epilogue, ctl: 
 /// CPU-only deployment builder for one K6144, N512 BF16 panel into a fused row-major arena (`pitch` even, `col0` even,
 /// `col0 + 512 <= pitch`; M padded to 512). Build once with `col0 = 0` and advance arg2's base by `panel_col0 * 2` through
 /// `append_run_body` / `append_lean_run_body` for every panel; the caller retains the full arena behind that offset.
-pub fn build_panel_program_out(rows_max: usize, pitch: usize, col0: usize) -> Result<ArrayDesign, String> {
+pub fn build_panel_program_out(
+    rows_max: usize,
+    pitch: usize,
+    col0: usize,
+) -> Result<ArrayDesign, String> {
     if !(1..=MAX_WAVES * WAVE_M).contains(&rows_max) {
-        return Err(format!("G80 N512 rows_max {rows_max} outside 1..={}", MAX_WAVES * WAVE_M));
+        return Err(format!(
+            "G80 N512 rows_max {rows_max} outside 1..={}",
+            MAX_WAVES * WAVE_M
+        ));
     }
     let rows = rows_max.div_ceil(WAVE_M) * WAVE_M;
-    let layout = Bf16Layout::RowMajor { pitch_elems: pitch, col0_elems: col0 };
+    let layout = Bf16Layout::RowMajor {
+        pitch_elems: pitch,
+        col0_elems: col0,
+    };
     layout.validate_for(rows, WAVE_N)?;
-    Ok(design_g80_n512_layout(rows, WAVE_N, OUT_K, Epilogue::Bf16, Control::Fast, layout))
+    Ok(design_g80_n512_layout(
+        rows,
+        WAVE_N,
+        OUT_K,
+        Epilogue::Bf16,
+        Control::Fast,
+        layout,
+    ))
 }
 
 /// K of the out-projection programs.

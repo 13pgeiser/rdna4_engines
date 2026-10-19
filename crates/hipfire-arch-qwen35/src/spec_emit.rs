@@ -1017,7 +1017,11 @@ mod tests {
         let mut tokens = String::new();
         let mut saw_stop = false;
         for (i, id) in ids.iter().enumerate() {
-            let outcome = if i == 0 { emit.begin(*id) } else { emit.observe(*id) };
+            let outcome = if i == 0 {
+                emit.begin(*id)
+            } else {
+                emit.observe(*id)
+            };
             for e in &outcome.events {
                 if let ClientEvent::Token(t) = e {
                     tokens.push_str(t);

@@ -3,18 +3,17 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-
+use memmap2::Mmap;
+use safetensors::{Dtype, SafeTensors};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::BufReader;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, OnceLock};
-use memmap2::Mmap;
-use safetensors::{Dtype, SafeTensors};
 
-use hipfire_quantize::float16::{f16_to_f32, f32_to_f16};
 use crate::gguf_input;
+use hipfire_quantize::float16::{f16_to_f32, f32_to_f16};
 
 pub(crate) static IMATRIX: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 pub(crate) static AWQ_ALPHA: OnceLock<f32> = OnceLock::new();
@@ -79,10 +78,14 @@ impl MappedMq4v2FinalCodeRecord {
 
 fn checked_record_sizes(m: usize, k: usize) -> Result<(usize, usize), String> {
     if m == 0 || k == 0 {
-        return Err(format!("MQ4V2 final-code dimensions must be nonzero, got M={m}, K={k}"));
+        return Err(format!(
+            "MQ4V2 final-code dimensions must be nonzero, got M={m}, K={k}"
+        ));
     }
     if k % 256 != 0 {
-        return Err(format!("MQ4V2 final-code K must be divisible by 256, got K={k}"));
+        return Err(format!(
+            "MQ4V2 final-code K must be divisible by 256, got K={k}"
+        ));
     }
     let codes = m
         .checked_mul(k)
@@ -293,10 +296,12 @@ pub(crate) fn load_mqn_final_code_record(
     let qt_usize = parse_record_metadata_usize(metadata, "qt", path)?;
     let qt = u8::try_from(qt_usize)
         .map_err(|_| format!("{}: metadata `qt` does not fit u8", path.display()))?;
-    let source_sha = metadata
-        .get("source_sha")
-        .cloned()
-        .ok_or_else(|| format!("{}: missing safetensors metadata `source_sha`", path.display()))?;
+    let source_sha = metadata.get("source_sha").cloned().ok_or_else(|| {
+        format!(
+            "{}: missing safetensors metadata `source_sha`",
+            path.display()
+        )
+    })?;
 
     let s = parsed
         .tensor("S_f16")
@@ -429,7 +434,8 @@ pub(crate) fn mq4v2_shared_scale_group(name: &str) -> Option<String> {
 
 pub(crate) fn sha256_file_hex(path: &Path) -> Result<String, String> {
     use sha2::{Digest, Sha256};
-    let file = File::open(path).map_err(|error| format!("open {} for SHA-256: {error}", path.display()))?;
+    let file = File::open(path)
+        .map_err(|error| format!("open {} for SHA-256: {error}", path.display()))?;
     let mut reader = BufReader::with_capacity(4 * 1024 * 1024, file);
     let mut hasher = Sha256::new();
     std::io::copy(&mut reader, &mut hasher)
@@ -728,12 +734,21 @@ pub(crate) fn load_imatrix(path: &Path, fix_la_head_order: bool) -> HashMap<Stri
         let mut values = Vec::with_capacity(k);
         for i in 0..k {
             let off = i * 4;
-            values.push(f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]));
+            values.push(f32::from_le_bytes([
+                data[off],
+                data[off + 1],
+                data[off + 2],
+                data[off + 3],
+            ]));
         }
-        if fix_la_head_order && (name.ends_with(".linear_attn.out_proj.weight")
-            || name.ends_with(".ssm_out.weight"))
+        if fix_la_head_order
+            && (name.ends_with(".linear_attn.out_proj.weight") || name.ends_with(".ssm_out.weight"))
         {
-            assert_eq!(k, 48 * 128, "{name}: Qwen3.8 LA out_proj must have 48 V-heads x 128");
+            assert_eq!(
+                k,
+                48 * 128,
+                "{name}: Qwen3.8 LA out_proj must have 48 V-heads x 128"
+            );
             let raw = values;
             values = vec![0.0; k];
             // llama.cpp stores three V heads per K head (V-major/K-minor);
@@ -750,8 +765,13 @@ pub(crate) fn load_imatrix(path: &Path, fix_la_head_order: bool) -> HashMap<Stri
         total_entries += 1;
     }
     if fix_la_head_order {
-        assert_eq!(fixed_la_out, 48, "Qwen3.8 LA imatrix head fix expected 48 out_proj tensors, found {fixed_la_out}");
-        eprintln!("imatrix: corrected V-head order for {fixed_la_out} linear-attention out_proj tensors");
+        assert_eq!(
+            fixed_la_out, 48,
+            "Qwen3.8 LA imatrix head fix expected 48 out_proj tensors, found {fixed_la_out}"
+        );
+        eprintln!(
+            "imatrix: corrected V-head order for {fixed_la_out} linear-attention out_proj tensors"
+        );
     }
 
     eprintln!(
@@ -982,7 +1002,7 @@ pub(crate) struct BlockI4_128 {
 }
 
 impl BlockI4_128 {
-#[cfg(test)]
+    #[cfg(test)]
     pub(crate) fn to_bytes(&self) -> [u8; 72] {
         let mut bytes = [0u8; 72];
         bytes[..4].copy_from_slice(&self.d.to_le_bytes());
@@ -1038,7 +1058,12 @@ pub(crate) fn fake_quantize_block_i4_128(input: &[f32; 128], candidates: usize) 
         let multipliers: &[f32] = match candidates {
             1 => &[],
             2 => &[f32::from_bits(0x3fdb_6db7), 2.0],
-            4 => &[1.0, f32::from_bits(0x3fa4_9249), f32::from_bits(0x3fdb_6db7), 2.0],
+            4 => &[
+                1.0,
+                f32::from_bits(0x3fa4_9249),
+                f32::from_bits(0x3fdb_6db7),
+                2.0,
+            ],
             8 => &[],
             _ => unreachable!(),
         };
@@ -1046,7 +1071,11 @@ pub(crate) fn fake_quantize_block_i4_128(input: &[f32; 128], candidates: usize) 
             best_d = amax / 7.0;
         }
         let mut best_mse = 1.0e30f32;
-        for index in 0..if candidates == 8 { 8 } else { multipliers.len() } {
+        for index in 0..if candidates == 8 {
+            8
+        } else {
+            multipliers.len()
+        } {
             let d = if candidates == 8 {
                 (amax / 7.0) * 0.5 * (1.0 + index as f32 / 7.0)
             } else {
@@ -1057,9 +1086,7 @@ pub(crate) fn fake_quantize_block_i4_128(input: &[f32; 128], candidates: usize) 
                 let base = lane * 4;
                 let mut mse = 0.0f32;
                 for e in 0..4 {
-                    let q = (input[base + e] / d)
-                        .round_ties_even()
-                        .clamp(-8.0, 7.0);
+                    let q = (input[base + e] / d).round_ties_even().clamp(-8.0, 7.0);
                     let err = (-q).mul_add(d, input[base + e]);
                     mse = err.mul_add(err, mse);
                 }
@@ -1083,9 +1110,7 @@ pub(crate) fn fake_quantize_block_i4_128(input: &[f32; 128], candidates: usize) 
         q4[i] = if amax == 0.0 {
             0
         } else {
-            (input[i] / best_d)
-                .round_ties_even()
-                .clamp(-8.0, 7.0) as i32
+            (input[i] / best_d).round_ties_even().clamp(-8.0, 7.0) as i32
         };
     }
     let s = q4.iter().sum();
@@ -1109,8 +1134,10 @@ pub(crate) struct A4AwareAwqResult {
 fn signed_awq_rows(name: &str, k: usize) -> Option<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
     let root = AWQ_A4_SIGNED_CAPTURE.get()?;
     let manifest = AWQ_A4_CAPTURE_MANIFEST.get_or_init(|| {
-        serde_json::from_reader(File::open(root.join("manifest.json")).expect("AWQ capture manifest missing"))
-            .expect("AWQ capture manifest invalid")
+        serde_json::from_reader(
+            File::open(root.join("manifest.json")).expect("AWQ capture manifest missing"),
+        )
+        .expect("AWQ capture manifest invalid")
     });
     assert_eq!(
         manifest["schema_version"].as_str(),
@@ -1125,16 +1152,21 @@ fn signed_awq_rows(name: &str, k: usize) -> Option<(Vec<Vec<f32>>, Vec<Vec<f32>>
     let prompt = &manifest["corpus"]["token_stream"];
     let prompt_path = root.join(prompt["file"].as_str().expect("capture token file missing"));
     {
-        let mut verified = AWQ_A4_VERIFIED_FILES.lock().expect("capture hash cache poisoned");
+        let mut verified = AWQ_A4_VERIFIED_FILES
+            .lock()
+            .expect("capture hash cache poisoned");
         if verified.insert(prompt_path.clone()) {
             assert_eq!(
                 sha256_file_hex(&prompt_path).expect("unable to hash capture prompt"),
-                prompt["sha256"].as_str().expect("capture prompt SHA missing"),
+                prompt["sha256"]
+                    .as_str()
+                    .expect("capture prompt SHA missing"),
                 "AWQ capture prompt checksum mismatch"
             );
         }
     }
-    let suffix = name.strip_prefix("model.language_model.layers.")
+    let suffix = name
+        .strip_prefix("model.language_model.layers.")
         .or_else(|| name.strip_prefix("model.layers."))?;
     let (block, projection) = suffix.split_once('.')?;
     let block: usize = block.parse().ok()?;
@@ -1143,8 +1175,7 @@ fn signed_awq_rows(name: &str, k: usize) -> Option<(Vec<Vec<f32>>, Vec<Vec<f32>>
         "silu_mul_down"
     } else if projection == "mlp.gate_proj.weight" || projection == "mlp.up_proj.weight" {
         "post_attention_norm_gate_up"
-    } else if projection == "self_attn.o_proj.weight"
-        || projection == "linear_attn.out_proj.weight"
+    } else if projection == "self_attn.o_proj.weight" || projection == "linear_attn.out_proj.weight"
     {
         "mixer_out"
     } else if projection.starts_with("linear_attn.in_proj_") {
@@ -1153,7 +1184,10 @@ fn signed_awq_rows(name: &str, k: usize) -> Option<(Vec<Vec<f32>>, Vec<Vec<f32>>
         || projection == "self_attn.k_proj.weight"
         || projection == "self_attn.v_proj.weight"
     {
-        if block_record["producer_sites"].get("input_norm_qkv").is_some() {
+        if block_record["producer_sites"]
+            .get("input_norm_qkv")
+            .is_some()
+        {
             "input_norm_qkv"
         } else {
             "input_norm_qkvza"
@@ -1162,20 +1196,47 @@ fn signed_awq_rows(name: &str, k: usize) -> Option<(Vec<Vec<f32>>, Vec<Vec<f32>>
         return None;
     };
     let record = block_record["producer_sites"].get(site)?;
-    assert_eq!(record["dtype"].as_str(), Some("float32-le"), "{name}: wrong capture dtype");
-    assert_eq!(record["axes"], serde_json::json!(["sample", "channel"]), "{name}: wrong capture axes");
+    assert_eq!(
+        record["dtype"].as_str(),
+        Some("float32-le"),
+        "{name}: wrong capture dtype"
+    );
+    assert_eq!(
+        record["axes"],
+        serde_json::json!(["sample", "channel"]),
+        "{name}: wrong capture axes"
+    );
     let shape = record["shape"].as_array().expect("capture shape missing");
     let n_rows = shape[0].as_u64().expect("capture rows invalid") as usize;
-    assert_eq!(shape[1].as_u64(), Some(k as u64), "{name}: capture K mismatch");
-    let bytes = n_rows.checked_mul(k).and_then(|v| v.checked_mul(4)).expect("capture size overflow");
-    assert_eq!(record["bytes"].as_u64(), Some(bytes as u64), "{name}: capture byte count mismatch");
-    let indices = record["global_sample_indices"].as_array().expect("capture indices missing");
+    assert_eq!(
+        shape[1].as_u64(),
+        Some(k as u64),
+        "{name}: capture K mismatch"
+    );
+    let bytes = n_rows
+        .checked_mul(k)
+        .and_then(|v| v.checked_mul(4))
+        .expect("capture size overflow");
+    assert_eq!(
+        record["bytes"].as_u64(),
+        Some(bytes as u64),
+        "{name}: capture byte count mismatch"
+    );
+    let indices = record["global_sample_indices"]
+        .as_array()
+        .expect("capture indices missing");
     assert_eq!(indices.len(), n_rows, "{name}: capture row count mismatch");
     let path = root.join(record["file"].as_str().expect("capture file missing"));
     let file = File::open(&path).expect("capture tensor missing");
-    assert_eq!(file.metadata().expect("capture metadata unavailable").len(), bytes as u64, "{name}: capture file size mismatch");
+    assert_eq!(
+        file.metadata().expect("capture metadata unavailable").len(),
+        bytes as u64,
+        "{name}: capture file size mismatch"
+    );
     {
-        let mut verified = AWQ_A4_VERIFIED_FILES.lock().expect("capture hash cache poisoned");
+        let mut verified = AWQ_A4_VERIFIED_FILES
+            .lock()
+            .expect("capture hash cache poisoned");
         if verified.insert(path.clone()) {
             assert_eq!(
                 sha256_file_hex(&path).expect("unable to hash capture tensor"),
@@ -1185,21 +1246,39 @@ fn signed_awq_rows(name: &str, k: usize) -> Option<(Vec<Vec<f32>>, Vec<Vec<f32>>
         }
     }
     let mmap = unsafe { Mmap::map(&file).expect("unable to map capture tensor") };
-    let train_limit = manifest["corpus"]["train_sequences"].as_u64().expect("train count missing")
-        * manifest["corpus"]["sequence_length"].as_u64().expect("sequence length missing");
+    let train_limit = manifest["corpus"]["train_sequences"]
+        .as_u64()
+        .expect("train count missing")
+        * manifest["corpus"]["sequence_length"]
+            .as_u64()
+            .expect("sequence length missing");
     let split = |train: bool, target: usize| {
-        let eligible: Vec<usize> = indices.iter().enumerate().filter_map(|(i, index)| {
-            ((index.as_u64().expect("sample index invalid") < train_limit) == train).then_some(i)
-        }).collect();
-        assert!(!eligible.is_empty(), "{name}: no {} captured rows", if train { "train" } else { "heldout" });
-        (0..eligible.len().min(target)).map(|i| {
-            let row = eligible[i * eligible.len() / eligible.len().min(target)];
-            mmap[row * k * 4..(row + 1) * k * 4].chunks_exact(4).map(|b| {
-                let value = f32::from_le_bytes(b.try_into().unwrap());
-                assert!(value.is_finite(), "{name}: non-finite captured activation");
-                value
-            }).collect::<Vec<f32>>()
-        }).collect()
+        let eligible: Vec<usize> = indices
+            .iter()
+            .enumerate()
+            .filter_map(|(i, index)| {
+                ((index.as_u64().expect("sample index invalid") < train_limit) == train)
+                    .then_some(i)
+            })
+            .collect();
+        assert!(
+            !eligible.is_empty(),
+            "{name}: no {} captured rows",
+            if train { "train" } else { "heldout" }
+        );
+        (0..eligible.len().min(target))
+            .map(|i| {
+                let row = eligible[i * eligible.len() / eligible.len().min(target)];
+                mmap[row * k * 4..(row + 1) * k * 4]
+                    .chunks_exact(4)
+                    .map(|b| {
+                        let value = f32::from_le_bytes(b.try_into().unwrap());
+                        assert!(value.is_finite(), "{name}: non-finite captured activation");
+                        value
+                    })
+                    .collect::<Vec<f32>>()
+            })
+            .collect()
     };
     let train: Vec<Vec<f32>> = split(true, 8);
     let heldout: Vec<Vec<f32>> = split(false, 4);
@@ -1215,12 +1294,8 @@ fn representative_activation(in_sum2: &[f32]) -> Vec<f32> {
         .iter()
         .map(|&v| (v as f64).max(1e-12).min(1e30).sqrt() as f32)
         .collect();
-    let rms = (x
-        .iter()
-        .map(|&v| (v as f64) * (v as f64))
-        .sum::<f64>()
-        / x.len() as f64)
-        .sqrt() as f32;
+    let rms =
+        (x.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / x.len() as f64).sqrt() as f32;
     if rms.is_finite() && rms > 0.0 {
         for value in &mut x {
             *value /= rms;
@@ -1365,8 +1440,7 @@ fn w4a4_relative_output_mse(
             cpu_fwht_256(&mut group, signs1, signs2);
             fake_quantize_mq4v2_weight_group(&mut group, symmetric);
             for i in 0..256 {
-                output +=
-                    (group[i] as f64) * (quantized_activation[group_start + i] as f64);
+                output += (group[i] as f64) * (quantized_activation[group_start + i] as f64);
             }
         }
         let reference = reference_outputs[sample];
@@ -1422,26 +1496,39 @@ pub(crate) fn compute_a4_aware_awq_scales(
     if captured.is_some() {
         eprintln!("    AWQ capture {}: signed train rows, c2 symmetric", name);
     } else if c2_symmetric {
-        eprintln!("    AWQ route {}: imatrix RMS statistic, c2 symmetric", name);
+        eprintln!(
+            "    AWQ route {}: imatrix RMS statistic, c2 symmetric",
+            name
+        );
     }
     let score = |scales: &[f32], rows: &[Vec<f32>], references: &[Vec<f64>]| {
-        rows.iter().zip(references).map(|(activation, reference)| {
-            w4a4_relative_output_mse(
-                weights, m, k, activation, reference, &sampled_rows,
-                scales, signs1, signs2,
-                if c2_symmetric { 2 } else { 4 },
-                c2_symmetric,
-            )
-        }).sum::<f64>() / rows.len() as f64
+        rows.iter()
+            .zip(references)
+            .map(|(activation, reference)| {
+                w4a4_relative_output_mse(
+                    weights,
+                    m,
+                    k,
+                    activation,
+                    reference,
+                    &sampled_rows,
+                    scales,
+                    signs1,
+                    signs2,
+                    if c2_symmetric { 2 } else { 4 },
+                    c2_symmetric,
+                )
+            })
+            .sum::<f64>()
+            / rows.len() as f64
     };
     let mut best: Option<A4AwareAwqResult> = None;
     for alpha in AWQ_A4_CANDIDATE_ALPHAS {
         let scales = compute_awq_scales(in_sum2, alpha);
         let relative_output_mse = score(&scales, &activations, &reference_outputs);
-        if best
-            .as_ref()
-            .map_or(true, |current| relative_output_mse < current.relative_output_mse)
-        {
+        if best.as_ref().map_or(true, |current| {
+            relative_output_mse < current.relative_output_mse
+        }) {
             best = Some(A4AwareAwqResult {
                 scales,
                 alpha,
@@ -1451,15 +1538,26 @@ pub(crate) fn compute_a4_aware_awq_scales(
     }
     let best = best.expect("AWQ A4 alpha grid is non-empty");
     if let Some((_, heldout)) = captured {
-        let heldout_reference: Vec<Vec<f64>> = heldout.iter().map(|activation| {
-            sampled_rows.iter().map(|&row| {
-                weights[row * k..(row + 1) * k].iter().zip(activation)
-                    .map(|(&w, &x)| w as f64 * x as f64).sum()
-            }).collect()
-        }).collect();
+        let heldout_reference: Vec<Vec<f64>> = heldout
+            .iter()
+            .map(|activation| {
+                sampled_rows
+                    .iter()
+                    .map(|&row| {
+                        weights[row * k..(row + 1) * k]
+                            .iter()
+                            .zip(activation)
+                            .map(|(&w, &x)| w as f64 * x as f64)
+                            .sum()
+                    })
+                    .collect()
+            })
+            .collect();
         eprintln!(
             "    AWQ signed heldout {}: alpha={:.2}, relative_output_mse={:.8e}",
-            name, best.alpha, score(&best.scales, &heldout, &heldout_reference)
+            name,
+            best.alpha,
+            score(&best.scales, &heldout, &heldout_reference)
         );
     }
     best
@@ -1958,7 +2056,9 @@ fn apply_gemma4_fields(
 /// the `.hfq` header's metadata blob. A future engine-side `from_hfq` for
 /// Llama-style models can read these fields the same way the existing
 /// `from_gguf` reads them today.
-pub(crate) fn gguf_meta_to_json(meta: &HashMap<String, gguf_input::MetaValue>) -> serde_json::Value {
+pub(crate) fn gguf_meta_to_json(
+    meta: &HashMap<String, gguf_input::MetaValue>,
+) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     for (k, v) in meta {
         let json_v = mv_to_json(v);
@@ -2189,12 +2289,18 @@ mod gemma4_config_tests {
             .map(|i| MetaValue::U32(if i % 6 == 5 { 1 } else { 8 }))
             .collect();
         let pattern: Vec<MetaValue> = (0..48).map(|i| MetaValue::Bool(i % 6 != 5)).collect();
-        m.insert("gemma4_text.attention.head_count".into(), MetaValue::U32(16));
+        m.insert(
+            "gemma4_text.attention.head_count".into(),
+            MetaValue::U32(16),
+        );
         m.insert(
             "gemma4_text.attention.head_count_kv".into(),
             MetaValue::Array(kv_arr),
         );
-        m.insert("gemma4_text.attention.key_length".into(), MetaValue::U32(512));
+        m.insert(
+            "gemma4_text.attention.key_length".into(),
+            MetaValue::U32(512),
+        );
         m.insert(
             "gemma4_text.attention.key_length_swa".into(),
             MetaValue::U32(256),
@@ -2222,7 +2328,10 @@ mod gemma4_config_tests {
             "gemma4_text.embedding_length_per_layer_input".into(),
             MetaValue::U32(0),
         );
-        m.insert("gemma4_text.feed_forward_length".into(), MetaValue::U32(15360));
+        m.insert(
+            "gemma4_text.feed_forward_length".into(),
+            MetaValue::U32(15360),
+        );
         m.insert(
             "gemma4_text.final_logit_softcapping".into(),
             MetaValue::F32(30.0),
@@ -2282,9 +2391,7 @@ mod gemma4_name_translation_tests {
 
     #[test]
     fn gemma4_sandwich_norms_map_to_loader_names() {
-        let f = |slot: &str| {
-            gguf_to_safetensors_name(&format!("blk.7.{slot}.weight"), 13).unwrap()
-        };
+        let f = |slot: &str| gguf_to_safetensors_name(&format!("blk.7.{slot}.weight"), 13).unwrap();
         assert_eq!(f("attn_norm"), "model.layers.7.input_layernorm.weight");
         assert_eq!(
             f("post_attention_norm"),
@@ -2352,12 +2459,12 @@ mod block_i4_128_tests {
             *value = centered as f32 * (1.0f32 / 4096.0f32);
         }
         let expected = [
-            0xe5, 0x54, 0x7a, 0x3f, 0x05, 0x00, 0x00, 0x00, 0xbc, 0xe6, 0x36, 0x59, 0x5b,
-            0xd0, 0x8f, 0x68, 0x01, 0x3e, 0x48, 0x9d, 0x72, 0x1e, 0x70, 0xfc, 0xc5, 0x1c,
-            0xfa, 0x7b, 0x2f, 0x0a, 0xdc, 0x5a, 0x18, 0x1a, 0xb4, 0x7d, 0x15, 0xc2, 0xae,
-            0x60, 0x3f, 0x17, 0x22, 0x43, 0x4a, 0xe5, 0x25, 0x70, 0xa1, 0x06, 0x27, 0x91,
-            0xc8, 0x19, 0xd5, 0x2e, 0x5b, 0x6c, 0xb6, 0xbe, 0x1e, 0x45, 0x63, 0x25, 0x4c,
-            0xa6, 0x4a, 0x07, 0xec, 0xa7, 0xec, 0x62,
+            0xe5, 0x54, 0x7a, 0x3f, 0x05, 0x00, 0x00, 0x00, 0xbc, 0xe6, 0x36, 0x59, 0x5b, 0xd0,
+            0x8f, 0x68, 0x01, 0x3e, 0x48, 0x9d, 0x72, 0x1e, 0x70, 0xfc, 0xc5, 0x1c, 0xfa, 0x7b,
+            0x2f, 0x0a, 0xdc, 0x5a, 0x18, 0x1a, 0xb4, 0x7d, 0x15, 0xc2, 0xae, 0x60, 0x3f, 0x17,
+            0x22, 0x43, 0x4a, 0xe5, 0x25, 0x70, 0xa1, 0x06, 0x27, 0x91, 0xc8, 0x19, 0xd5, 0x2e,
+            0x5b, 0x6c, 0xb6, 0xbe, 0x1e, 0x45, 0x63, 0x25, 0x4c, 0xa6, 0x4a, 0x07, 0xec, 0xa7,
+            0xec, 0x62,
         ];
         assert_eq!(fake_quantize_block_i4_128(&input, 4).to_bytes(), expected);
         // This block also matched a separate fused c2 gfx1201 kernel dump.
@@ -2380,7 +2487,11 @@ mod symmetric_awq_writer_tests {
             let mut input = [0.0f32; 256];
             for x in &mut input {
                 state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                *x = if seed == 0 { 0.0 } else { ((state >> 8) as i32 % 1021) as f32 / 137.0 };
+                *x = if seed == 0 {
+                    0.0
+                } else {
+                    ((state >> 8) as i32 % 1021) as f32 / 137.0
+                };
             }
             let packed = quantize_mq4g256v2_symmetric(&input, 1, 256, &signs1, &signs2);
             let mut surrogate = input;
@@ -2388,12 +2499,23 @@ mod symmetric_awq_writer_tests {
             fake_quantize_mq4v2_weight_group(&mut surrogate, true);
             for (i, &value) in surrogate.iter().enumerate() {
                 let h = i / 128;
-                let scale = f16_to_f32(u16::from_le_bytes(packed[h * 4..h * 4 + 2].try_into().unwrap()));
-                let zero = f16_to_f32(u16::from_le_bytes(packed[h * 4 + 2..h * 4 + 4].try_into().unwrap()));
+                let scale = f16_to_f32(u16::from_le_bytes(
+                    packed[h * 4..h * 4 + 2].try_into().unwrap(),
+                ));
+                let zero = f16_to_f32(u16::from_le_bytes(
+                    packed[h * 4 + 2..h * 4 + 4].try_into().unwrap(),
+                ));
                 let code_byte = packed[8 + i / 2];
-                let code = if i & 1 == 0 { code_byte & 15 } else { code_byte >> 4 };
-                assert_eq!(value.to_bits(), (code as f32).mul_add(scale, zero).to_bits(),
-                    "writer mismatch seed={seed} index={i}");
+                let code = if i & 1 == 0 {
+                    code_byte & 15
+                } else {
+                    code_byte >> 4
+                };
+                assert_eq!(
+                    value.to_bits(),
+                    (code as f32).mul_add(scale, zero).to_bits(),
+                    "writer mismatch seed={seed} index={i}"
+                );
             }
         }
     }
@@ -2401,11 +2523,21 @@ mod symmetric_awq_writer_tests {
     fn c2_uses_the_fused_subset_not_the_legacy_four_point_grid() {
         let mut input = [0.0f32; 128];
         for (i, value) in input.iter_mut().enumerate() {
-            *value = if i == 0 { 7.0 } else if i & 1 == 0 { 0.53 } else { -0.53 };
+            *value = if i == 0 {
+                7.0
+            } else if i & 1 == 0 {
+                0.53
+            } else {
+                -0.53
+            };
         }
         let c2 = super::fake_quantize_block_i4_128(&input, 2);
         let c4 = super::fake_quantize_block_i4_128(&input, 4);
-        assert_ne!(c2.d.to_bits(), c4.d.to_bits(), "c2 must omit the c4-only scales");
+        assert_ne!(
+            c2.d.to_bits(),
+            c4.d.to_bits(),
+            "c2 must omit the c4-only scales"
+        );
         // Dumped by quantize_block_i4_128_wave<true> on gfx1201 with
         // IU4_A4_CANDIDATES=2, including the wave-reduced signed sum.
         let mut expected = [0xf1u8; 72];

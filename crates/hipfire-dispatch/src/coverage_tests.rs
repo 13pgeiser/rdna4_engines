@@ -1943,12 +1943,18 @@ fn mq4v2_verify_exact_keys_resolve_on_gfx1201_only() {
         let admitted = arch == "gfx1201";
         for &key in &fused_keys {
             if fused.resolve(key, &ctx, None).is_ok() != admitted {
-                failures.push(format!("  fused {:?} on {} admitted != {}", key, arch, admitted));
+                failures.push(format!(
+                    "  fused {:?} on {} admitted != {}",
+                    key, arch, admitted
+                ));
             }
         }
         for &key in &gemm_keys {
             if gemm.registry().resolve(key, &ctx, None).is_ok() != admitted {
-                failures.push(format!("  gemm {:?} on {} admitted != {}", key, arch, admitted));
+                failures.push(format!(
+                    "  gemm {:?} on {} admitted != {}",
+                    key, arch, admitted
+                ));
             }
         }
     }

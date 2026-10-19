@@ -131,7 +131,14 @@ fn conv_row_cpu(input: &[f32], kernel: &[f32], ring: &mut [f32], cursor: usize, 
 }
 
 /// `gated_delta_params_head` (`tensor_ops.hip:2584-2598`).
-fn params_cpu(a: &[f32], b: &[f32], a_log: &[f32], dt_bias: &[f32], gate: &mut [f32], beta: &mut [f32]) {
+fn params_cpu(
+    a: &[f32],
+    b: &[f32],
+    a_log: &[f32],
+    dt_bias: &[f32],
+    gate: &mut [f32],
+    beta: &mut [f32],
+) {
     for flat in 0..a.len() {
         let head = flat % VH;
         let value = bf(a[flat]) + dt_bias[head];
@@ -329,7 +336,11 @@ fn make_steps(rows: usize, seed: u64, zero_even_gates: bool) -> Steps {
     for _ in 0..rows {
         for h in 0..VH {
             let g = rng.range(-0.3, -0.02);
-            gate.push(if zero_even_gates && h % 2 == 0 { 0.0 } else { g });
+            gate.push(if zero_even_gates && h % 2 == 0 {
+                0.0
+            } else {
+                g
+            });
         }
     }
     let beta = rng.vec(rows * VH, 0.1, 0.9);
@@ -415,7 +426,12 @@ struct ConvOut {
 /// kernels are compared with). `fused == false` runs the two standalone
 /// kernels (`gated_delta_conv_bf16_f32`, `gated_delta_params_bf16_f32`) the
 /// fused kernel claims to be bitwise equal to.
-fn gpu_conv_params_rows(gpu: &mut Gpu, rows: usize, c: &ConvIn, fused: bool) -> Result<ConvOut, String> {
+fn gpu_conv_params_rows(
+    gpu: &mut Gpu,
+    rows: usize,
+    c: &ConvIn,
+    fused: bool,
+) -> Result<ConvOut, String> {
     let input = up_f32(gpu, &c.input)?;
     let kernel = up_bf16(gpu, &c.kernel)?;
     let hist = up_f32(gpu, &c.history)?;
@@ -463,7 +479,10 @@ fn gpu_conv_params_rows(gpu: &mut Gpu, rows: usize, c: &ConvIn, fused: bool) -> 
         gate: down_f32(gpu, &gate)?,
         beta: down_f32(gpu, &beta)?,
     };
-    free_all(gpu, vec![input, kernel, hist, out, a, b, a_log, dt, gate, beta])?;
+    free_all(
+        gpu,
+        vec![input, kernel, hist, out, a, b, a_log, dt, gate, beta],
+    )?;
     Ok(result)
 }
 
@@ -501,13 +520,43 @@ fn conv_params(gpu: &mut Gpu) -> Result<String, String> {
             &want_out,
             BF16_INPUT_F32_ACCUM,
         ));
-        checks.push(exact_f32(&format!("rows={rows} conv ring out"), &fused.hist, &ring));
-        checks.push(close_f32(&format!("rows={rows} gate"), &fused.gate, &want_gate, F32_ACCUM));
-        checks.push(close_f32(&format!("rows={rows} beta"), &fused.beta, &want_beta, F32_ACCUM));
-        checks.push(exact_f32(&format!("rows={rows} fused==split conv"), &fused.out, &split.out));
-        checks.push(exact_f32(&format!("rows={rows} fused==split ring"), &fused.hist, &split.hist));
-        checks.push(exact_f32(&format!("rows={rows} fused==split gate"), &fused.gate, &split.gate));
-        checks.push(exact_f32(&format!("rows={rows} fused==split beta"), &fused.beta, &split.beta));
+        checks.push(exact_f32(
+            &format!("rows={rows} conv ring out"),
+            &fused.hist,
+            &ring,
+        ));
+        checks.push(close_f32(
+            &format!("rows={rows} gate"),
+            &fused.gate,
+            &want_gate,
+            F32_ACCUM,
+        ));
+        checks.push(close_f32(
+            &format!("rows={rows} beta"),
+            &fused.beta,
+            &want_beta,
+            F32_ACCUM,
+        ));
+        checks.push(exact_f32(
+            &format!("rows={rows} fused==split conv"),
+            &fused.out,
+            &split.out,
+        ));
+        checks.push(exact_f32(
+            &format!("rows={rows} fused==split ring"),
+            &fused.hist,
+            &split.hist,
+        ));
+        checks.push(exact_f32(
+            &format!("rows={rows} fused==split gate"),
+            &fused.gate,
+            &split.gate,
+        ));
+        checks.push(exact_f32(
+            &format!("rows={rows} fused==split beta"),
+            &fused.beta,
+            &split.beta,
+        ));
     }
     all(checks)
 }
@@ -556,8 +605,17 @@ fn gate_decode(gpu: &mut Gpu) -> Result<String, String> {
         let got = down_f32(gpu, &out_t)?;
         // The output boundary is BF16: every stored F32 is BF16-exact.
         let rounded: Vec<f32> = got.iter().map(|&x| bf(x)).collect();
-        checks.push(close_f32(&format!("rows={rows} gate out"), &got, &want, BF16_INPUT_F32_ACCUM));
-        checks.push(exact_f32(&format!("rows={rows} gate out is BF16-exact"), &got, &rounded));
+        checks.push(close_f32(
+            &format!("rows={rows} gate out"),
+            &got,
+            &want,
+            BF16_INPUT_F32_ACCUM,
+        ));
+        checks.push(exact_f32(
+            &format!("rows={rows} gate out is BF16-exact"),
+            &got,
+            &rounded,
+        ));
         free_all(gpu, vec![rec_t, z_t, norm_t, out_t])?;
     }
     all(checks)
@@ -599,7 +657,17 @@ fn step_f32_gated(gpu: &mut Gpu) -> Result<String, String> {
         );
         let (g_row, b_row) = (view(&gate, row, VH), view(&beta, row, VH));
         let rec_row = view(&rec, row, VW);
-        let step = gdn_step_args(&q, &k, &v, &g_row, &b_row, &state, GdnStateFormat::F32, &rec_row, START_POSITION + row);
+        let step = gdn_step_args(
+            &q,
+            &k,
+            &v,
+            &g_row,
+            &b_row,
+            &state,
+            GdnStateFormat::F32,
+            &rec_row,
+            START_POSITION + row,
+        );
         let gate_args = GatedDeltaGate {
             recurrent_output: &rec_row,
             z: &view(&z_t, row, VW),
@@ -617,7 +685,11 @@ fn step_f32_gated(gpu: &mut Gpu) -> Result<String, String> {
     let mut cpu_state = state0.clone();
     let mut want_rec = vec![0.0f32; rows * VW];
     for row in 0..rows {
-        step_f32_cpu(&mut cpu_state, &steps.row(row), &mut want_rec[row * VW..(row + 1) * VW]);
+        step_f32_cpu(
+            &mut cpu_state,
+            &steps.row(row),
+            &mut want_rec[row * VW..(row + 1) * VW],
+        );
     }
     // Isolate the gate from recurrence rounding: feed it the recurrent output
     // the kernel actually stored (or the twin's where the fused kernel keeps it in LDS).
@@ -633,10 +705,25 @@ fn step_f32_gated(gpu: &mut Gpu) -> Result<String, String> {
     }
     let mut checks = Vec::new();
     if !fused_arch {
-        checks.push(close_f32("recurrent out (F32)", &got_rec, &want_rec, F32_ACCUM));
+        checks.push(close_f32(
+            "recurrent out (F32)",
+            &got_rec,
+            &want_rec,
+            F32_ACCUM,
+        ));
     }
-    checks.push(close_f32("final state (F32)", &got_state, &cpu_state, F32_ACCUM));
-    checks.push(close_f32("gated out (BF16 boundary)", &got_out, &want_out, BF16_INPUT_F32_ACCUM));
+    checks.push(close_f32(
+        "final state (F32)",
+        &got_state,
+        &cpu_state,
+        F32_ACCUM,
+    ));
+    checks.push(close_f32(
+        "gated out (BF16 boundary)",
+        &got_out,
+        &want_out,
+        BF16_INPUT_F32_ACCUM,
+    ));
     free_all(gpu, vec![proj, gate, beta, state, z_t, norm_t, rec, out])?;
     all(checks)
 }
@@ -655,7 +742,9 @@ fn step_q8_gated(gpu: &mut Gpu) -> Result<String, String> {
     let fused_arch = gpu.arch_caps.has_gfx11_plus_simt();
     let steps = make_steps(rows, 0x6764_6e04, true);
     let mut rng = Rng::new(0x6764_6e14);
-    let codes0: Vec<i8> = (0..Q8_CODES).map(|_| (rng.below(255) as i32 - 127) as i8).collect();
+    let codes0: Vec<i8> = (0..Q8_CODES)
+        .map(|_| (rng.below(255) as i32 - 127) as i8)
+        .collect();
     let scales0: Vec<f32> = (0..Q8_ROWS).map(|_| rng.range(0.002, 0.01)).collect();
     let z = rng.vec(rows * VW, -6.0, 6.0);
     let norm = rng.vec_bf16_exact(HD, 0.5, 1.5);
@@ -668,7 +757,11 @@ fn step_q8_gated(gpu: &mut Gpu) -> Result<String, String> {
         .upload_raw(&join_q8(&codes0, &scales0), &[Q8_BYTES])
         .map_err(e)?;
     if state.dtype != DType::Raw || state.byte_size() != Q8_BYTES {
-        return Err(format!("Q8 state upload: dtype {:?} bytes {}", state.dtype, state.byte_size()));
+        return Err(format!(
+            "Q8 state upload: dtype {:?} bytes {}",
+            state.dtype,
+            state.byte_size()
+        ));
     }
     let z_t = up_f32(gpu, &z)?;
     let norm_t = up_bf16(gpu, &norm)?;
@@ -682,7 +775,14 @@ fn step_q8_gated(gpu: &mut Gpu) -> Result<String, String> {
         let (mut codes, mut scales) = split_q8(&pre);
         let mut want_rec = vec![0.0f32; VW];
         let frame = (START_POSITION + row) as u32;
-        step_q8_cpu(&mut codes, &mut scales, &steps.row(row), frame, &mut want_rec, &mut prefloor);
+        step_q8_cpu(
+            &mut codes,
+            &mut scales,
+            &steps.row(row),
+            frame,
+            &mut want_rec,
+            &mut prefloor,
+        );
 
         let (q, k, v) = (
             proj.sub_offset(row * QKV, QK),
@@ -692,7 +792,17 @@ fn step_q8_gated(gpu: &mut Gpu) -> Result<String, String> {
         let (g_row, b_row) = (view(&gate, row, VH), view(&beta, row, VH));
         let rec_row = view(&rec, row, VW);
         let out_row = view(&out, row, VW);
-        let step = gdn_step_args(&q, &k, &v, &g_row, &b_row, &state, GdnStateFormat::Q8, &rec_row, START_POSITION + row);
+        let step = gdn_step_args(
+            &q,
+            &k,
+            &v,
+            &g_row,
+            &b_row,
+            &state,
+            GdnStateFormat::Q8,
+            &rec_row,
+            START_POSITION + row,
+        );
         let gate_args = GatedDeltaGate {
             recurrent_output: &rec_row,
             z: &view(&z_t, row, VW),
@@ -708,7 +818,12 @@ fn step_q8_gated(gpu: &mut Gpu) -> Result<String, String> {
 
         let mut checks = Vec::new();
         if !fused_arch {
-            checks.push(close_f32(&format!("row {row} recurrent out"), &got_rec, &want_rec, F32_ACCUM));
+            checks.push(close_f32(
+                &format!("row {row} recurrent out"),
+                &got_rec,
+                &want_rec,
+                F32_ACCUM,
+            ));
         }
         let gate_in = if fused_arch { &want_rec } else { &got_rec };
         let mut want_out = vec![0.0f32; VW];
@@ -732,14 +847,22 @@ fn step_q8_gated(gpu: &mut Gpu) -> Result<String, String> {
                     es_got.push(got_scales[r]);
                     es_want.push(scales[r]);
                 } else {
-                    dq_got.extend(got_codes[span.clone()].iter().map(|&c| got_scales[r] * c as f32));
+                    dq_got.extend(
+                        got_codes[span.clone()]
+                            .iter()
+                            .map(|&c| got_scales[r] * c as f32),
+                    );
                     dq_want.extend(codes[span].iter().map(|&c| scales[r] * c as f32));
                     sc_got.push(got_scales[r]);
                     sc_want.push(scales[r]);
                 }
             }
         }
-        let codes_check = exact_ints(&format!("row {row} decay-1 heads Q8 codes"), &ec_got, &ec_want);
+        let codes_check = exact_ints(
+            &format!("row {row} decay-1 heads Q8 codes"),
+            &ec_got,
+            &ec_want,
+        );
         // Classify code mismatches: report the twin's pre-floor value
         // fma(decayed, inv, noise) and its distance to the floor boundary, and
         // whether the row scale (absmax) matched. A ±1 code with the twin
@@ -771,14 +894,23 @@ fn step_q8_gated(gpu: &mut Gpu) -> Result<String, String> {
             format!("{msg}; {}", notes.join(" "))
         });
         checks.push(codes_check);
-        checks.push(exact_f32(&format!("row {row} decay-1 heads Q8 scales"), &es_got, &es_want));
+        checks.push(exact_f32(
+            &format!("row {row} decay-1 heads Q8 scales"),
+            &es_got,
+            &es_want,
+        ));
         checks.push(close_f32(
             &format!("row {row} decaying heads dequantized state"),
             &dq_got,
             &dq_want,
             BF16_INPUT_F32_ACCUM,
         ));
-        checks.push(close_f32(&format!("row {row} decaying heads scales"), &sc_got, &sc_want, F32_ACCUM));
+        checks.push(close_f32(
+            &format!("row {row} decaying heads scales"),
+            &sc_got,
+            &sc_want,
+            F32_ACCUM,
+        ));
         match all(checks) {
             Ok(msg) => last = msg,
             Err(msg) => row_results.push(Err(msg)),
@@ -836,11 +968,30 @@ fn conv_params_batched(gpu: &mut Gpu) -> Result<String, String> {
             heads: VH,
         };
         gated_delta_conv_params_batched(gpu, &conv, &params).map_err(e)?;
-        checks.push(exact_f32(&format!("rows={rows} conv out"), &down_f32(gpu, &out)?, &want.out));
-        checks.push(exact_f32(&format!("rows={rows} ring"), &down_f32(gpu, &hist)?, &want.hist));
-        checks.push(exact_f32(&format!("rows={rows} gate"), &down_f32(gpu, &gate)?, &want.gate));
-        checks.push(exact_f32(&format!("rows={rows} beta"), &down_f32(gpu, &beta)?, &want.beta));
-        free_all(gpu, vec![input, kernel, hist, out, a, b, a_log, dt, gate, beta])?;
+        checks.push(exact_f32(
+            &format!("rows={rows} conv out"),
+            &down_f32(gpu, &out)?,
+            &want.out,
+        ));
+        checks.push(exact_f32(
+            &format!("rows={rows} ring"),
+            &down_f32(gpu, &hist)?,
+            &want.hist,
+        ));
+        checks.push(exact_f32(
+            &format!("rows={rows} gate"),
+            &down_f32(gpu, &gate)?,
+            &want.gate,
+        ));
+        checks.push(exact_f32(
+            &format!("rows={rows} beta"),
+            &down_f32(gpu, &beta)?,
+            &want.beta,
+        ));
+        free_all(
+            gpu,
+            vec![input, kernel, hist, out, a, b, a_log, dt, gate, beta],
+        )?;
     }
     all(checks)
 }
@@ -900,7 +1051,17 @@ fn step_batched(gpu: &mut Gpu) -> Result<String, String> {
             let o_row = view(&out_s, row, VW);
             gated_delta_step(
                 gpu,
-                &gdn_step_args(&q, &k, &v, &g_row, &b_row, &state_s, GdnStateFormat::F32, &o_row, START_POSITION + row),
+                &gdn_step_args(
+                    &q,
+                    &k,
+                    &v,
+                    &g_row,
+                    &b_row,
+                    &state_s,
+                    GdnStateFormat::F32,
+                    &o_row,
+                    START_POSITION + row,
+                ),
             )
             .map_err(e)?;
         }
@@ -920,10 +1081,24 @@ fn step_batched(gpu: &mut Gpu) -> Result<String, String> {
             let mut cpu_state = state0.clone();
             let mut want_out = vec![0.0f32; rows * VW];
             for row in 0..rows {
-                step_f32_cpu(&mut cpu_state, &steps.row(row), &mut want_out[row * VW..(row + 1) * VW]);
+                step_f32_cpu(
+                    &mut cpu_state,
+                    &steps.row(row),
+                    &mut want_out[row * VW..(row + 1) * VW],
+                );
             }
-            checks.push(close_f32(&format!("rows={rows} out vs CPU"), &got_out, &want_out, F32_ACCUM));
-            checks.push(close_f32(&format!("rows={rows} state vs CPU"), &got_state, &cpu_state, F32_ACCUM));
+            checks.push(close_f32(
+                &format!("rows={rows} out vs CPU"),
+                &got_out,
+                &want_out,
+                F32_ACCUM,
+            ));
+            checks.push(close_f32(
+                &format!("rows={rows} state vs CPU"),
+                &got_state,
+                &cpu_state,
+                F32_ACCUM,
+            ));
         }
         free_all(gpu, vec![proj, gate, beta, state_b, out_b, state_s, out_s])?;
     }
@@ -990,7 +1165,10 @@ fn gate_batched(gpu: &mut Gpu) -> Result<String, String> {
             &want,
             BF16_INPUT_F32_ACCUM,
         ));
-        free_all(gpu, vec![rec_row, rec_batch, z_t, norm_t, out_row, out_batch])?;
+        free_all(
+            gpu,
+            vec![rec_row, rec_batch, z_t, norm_t, out_row, out_batch],
+        )?;
     }
     all(checks)
 }

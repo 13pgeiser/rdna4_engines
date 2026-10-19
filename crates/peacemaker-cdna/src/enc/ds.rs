@@ -29,25 +29,60 @@ use crate::Result;
 use std::fmt;
 
 op_table!(DsOp {
-    ReadB32, ReadB64, ReadB96, ReadB128, Read2B32, Read2B64, Read2st64B32, Read2st64B64,
-    ReadU8, ReadI8, ReadU16, ReadI16,
-    WriteB8, WriteB16, WriteB32, WriteB64, WriteB96, WriteB128, Write2B32, Write2B64, Write2st64B32, Write2st64B64,
-    AddU32, AddRtnU32, MaxU32, MaxI32, MaxF32, MinF32, AddF32,
-    SwizzleB32, PermuteB32, BpermuteB32, Nop,
+    ReadB32,
+    ReadB64,
+    ReadB96,
+    ReadB128,
+    Read2B32,
+    Read2B64,
+    Read2st64B32,
+    Read2st64B64,
+    ReadU8,
+    ReadI8,
+    ReadU16,
+    ReadI16,
+    WriteB8,
+    WriteB16,
+    WriteB32,
+    WriteB64,
+    WriteB96,
+    WriteB128,
+    Write2B32,
+    Write2B64,
+    Write2st64B32,
+    Write2st64B64,
+    AddU32,
+    AddRtnU32,
+    MaxU32,
+    MaxI32,
+    MaxF32,
+    MinF32,
+    AddF32,
+    SwizzleB32,
+    PermuteB32,
+    BpermuteB32,
+    Nop,
 });
 
 /// `ENCODING` field `[31:26]` = `110110` (CDNA3 ISA §13.4.1 Table 94 p.545).
 const ENC_DS: u32 = 0b11_0110 << 26;
 
 impl DsOp {
-    pub fn from_opcode(arch: Arch, opcode: u8) -> Option<Self> { Self::ALL.iter().copied().find(|op| op.opcode(arch) == Some(opcode)) }
+    pub fn from_opcode(arch: Arch, opcode: u8) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|op| op.opcode(arch) == Some(opcode))
+    }
     /// Dword widths of (vdst, data0, data1); 0 where absent. Sub-dword ops
     /// (`u8`/`i8`/`u16`/`i16`/`b8`/`b16`) occupy one VGPR; `read2*` return
     /// two elements (`vdst` = 2 dwords for `b32`, 4 for `b64`); `write2*`
     /// take two data operands of one element each.
     pub fn widths(self) -> (u8, u8, u8) {
         match self {
-            Self::ReadB32 | Self::ReadU8 | Self::ReadI8 | Self::ReadU16 | Self::ReadI16 => (1, 0, 0),
+            Self::ReadB32 | Self::ReadU8 | Self::ReadI8 | Self::ReadU16 | Self::ReadI16 => {
+                (1, 0, 0)
+            }
             Self::ReadB64 | Self::Read2B32 | Self::Read2st64B32 => (2, 0, 0),
             Self::ReadB96 => (3, 0, 0),
             Self::ReadB128 | Self::Read2B64 | Self::Read2st64B64 => (4, 0, 0),
@@ -57,7 +92,12 @@ impl DsOp {
             Self::WriteB128 => (0, 4, 0),
             Self::Write2B32 | Self::Write2st64B32 => (0, 1, 1),
             Self::Write2B64 | Self::Write2st64B64 => (0, 2, 2),
-            Self::AddU32 | Self::MaxU32 | Self::MaxI32 | Self::MaxF32 | Self::MinF32 | Self::AddF32 => (0, 1, 0),
+            Self::AddU32
+            | Self::MaxU32
+            | Self::MaxI32
+            | Self::MaxF32
+            | Self::MinF32
+            | Self::AddF32 => (0, 1, 0),
             Self::AddRtnU32 => (1, 1, 0),
             Self::SwizzleB32 => (1, 0, 0),
             Self::PermuteB32 | Self::BpermuteB32 => (1, 1, 0),
@@ -69,26 +109,67 @@ impl DsOp {
     /// `st64`); otherwise one 16-bit byte offset `offset1:offset0`.
     /// (CDNA3 ISA §11.3.1 Table 56 p.86.)
     pub fn two_addr(self) -> bool {
-        matches!(self, Self::Read2B32 | Self::Read2B64 | Self::Read2st64B32 | Self::Read2st64B64 | Self::Write2B32 | Self::Write2B64 | Self::Write2st64B32 | Self::Write2st64B64)
+        matches!(
+            self,
+            Self::Read2B32
+                | Self::Read2B64
+                | Self::Read2st64B32
+                | Self::Read2st64B64
+                | Self::Write2B32
+                | Self::Write2B64
+                | Self::Write2st64B32
+                | Self::Write2st64B64
+        )
     }
     /// Whether the op takes an `ADDR` VGPR (everything but `ds_nop`).
-    pub fn has_addr(self) -> bool { self != Self::Nop }
+    pub fn has_addr(self) -> bool {
+        self != Self::Nop
+    }
     /// Whether the op reads or writes LDS memory. `ds_swizzle_b32` "does not
     /// read or write the DS memory banks", `ds_permute_b32` /
     /// `ds_bpermute_b32` "do not access LDS memory" (CDNA3 ISA §12.12
     /// p.424-427); `ds_nop` does nothing (p.415).
-    pub fn accesses_lds(self) -> bool { !matches!(self, Self::SwizzleB32 | Self::PermuteB32 | Self::BpermuteB32 | Self::Nop) }
+    pub fn accesses_lds(self) -> bool {
+        !matches!(
+            self,
+            Self::SwizzleB32 | Self::PermuteB32 | Self::BpermuteB32 | Self::Nop
+        )
+    }
     /// The wait-counter behaviour (all DS ops count on LGKM_CNT, CDNA3 ISA
     /// §4.4 p.20). `ds_nop` is classed [`MemKind::DsStore`]: it is a DS
     /// instruction that returns no data. [UNVERIFIED: confirm on MI300X that
     /// `ds_nop` moves LGKM_CNT like other DS instructions.]
     pub fn mem_kind(self) -> MemKind {
         match self {
-            Self::ReadB32 | Self::ReadB64 | Self::ReadB96 | Self::ReadB128 | Self::Read2B32 | Self::Read2B64 | Self::Read2st64B32 | Self::Read2st64B64
-            | Self::ReadU8 | Self::ReadI8 | Self::ReadU16 | Self::ReadI16 => MemKind::DsLoad,
-            Self::WriteB8 | Self::WriteB16 | Self::WriteB32 | Self::WriteB64 | Self::WriteB96 | Self::WriteB128
-            | Self::Write2B32 | Self::Write2B64 | Self::Write2st64B32 | Self::Write2st64B64 | Self::Nop => MemKind::DsStore,
-            Self::AddU32 | Self::MaxU32 | Self::MaxI32 | Self::MaxF32 | Self::MinF32 | Self::AddF32 => MemKind::DsAtomic,
+            Self::ReadB32
+            | Self::ReadB64
+            | Self::ReadB96
+            | Self::ReadB128
+            | Self::Read2B32
+            | Self::Read2B64
+            | Self::Read2st64B32
+            | Self::Read2st64B64
+            | Self::ReadU8
+            | Self::ReadI8
+            | Self::ReadU16
+            | Self::ReadI16 => MemKind::DsLoad,
+            Self::WriteB8
+            | Self::WriteB16
+            | Self::WriteB32
+            | Self::WriteB64
+            | Self::WriteB96
+            | Self::WriteB128
+            | Self::Write2B32
+            | Self::Write2B64
+            | Self::Write2st64B32
+            | Self::Write2st64B64
+            | Self::Nop => MemKind::DsStore,
+            Self::AddU32
+            | Self::MaxU32
+            | Self::MaxI32
+            | Self::MaxF32
+            | Self::MinF32
+            | Self::AddF32 => MemKind::DsAtomic,
             Self::AddRtnU32 => MemKind::DsAtomicRtn,
             Self::SwizzleB32 | Self::PermuteB32 | Self::BpermuteB32 => MemKind::DsXlane,
         }
@@ -111,13 +192,16 @@ pub struct Ds {
 
 impl Ds {
     /// The 16-bit byte offset of single-address forms.
-    pub fn offset(&self) -> u16 { u16::from(self.offset1) << 8 | u16::from(self.offset0) }
+    pub fn offset(&self) -> u16 {
+        u16::from(self.offset1) << 8 | u16::from(self.offset0)
+    }
 
     /// `(offset0, offset1)` of a single-address op's 16-bit byte offset;
     /// `Err` above 0xffff (the field is `{OFFSET1, OFFSET0}`, CDNA3 ISA
     /// §11.3.1 Table 56 p.86).
     pub fn split_offset(offset: u32) -> Result<(u8, u8)> {
-        let o = u16::try_from(offset).map_err(|_| format!("DS byte offset {offset} exceeds the 16-bit field (max 65535)"))?;
+        let o = u16::try_from(offset)
+            .map_err(|_| format!("DS byte offset {offset} exceeds the 16-bit field (max 65535)"))?;
         Ok((o as u8, (o >> 8) as u8))
     }
 
@@ -125,8 +209,10 @@ impl Ds {
     /// offset in units of the element size (CDNA3 ISA §11.3.1 p.86); `Err`
     /// above 255.
     pub fn pair_offsets(offset0: u32, offset1: u32) -> Result<(u8, u8)> {
-        let a = u8::try_from(offset0).map_err(|_| format!("DS offset0 {offset0} exceeds the 8-bit field (max 255)"))?;
-        let b = u8::try_from(offset1).map_err(|_| format!("DS offset1 {offset1} exceeds the 8-bit field (max 255)"))?;
+        let a = u8::try_from(offset0)
+            .map_err(|_| format!("DS offset0 {offset0} exceeds the 8-bit field (max 255)"))?;
+        let b = u8::try_from(offset1)
+            .map_err(|_| format!("DS offset1 {offset1} exceeds the 8-bit field (max 255)"))?;
         Ok((a, b))
     }
 
@@ -134,13 +220,21 @@ impl Ds {
     /// the opcode.
     fn check(&self, arch: Arch) -> Result<u8> {
         let name = self.op.name();
-        let opcode = self.op.opcode(arch).ok_or_else(|| format!("{name} does not exist on {arch:?}"))?;
+        let opcode = self
+            .op
+            .opcode(arch)
+            .ok_or_else(|| format!("{name} does not exist on {arch:?}"))?;
         if self.gds {
             return Err(format!("{name}: the GDS bit (GWS) is not supported on {arch:?}; llvm-mc rejects the `gds` modifier there"));
         }
         let (wv, w0, w1) = self.op.widths();
         let wa = u8::from(self.op.has_addr());
-        for (role, field, width) in [("vdst", self.vdst, wv), ("addr", self.addr, wa), ("data0", self.data0, w0), ("data1", self.data1, w1)] {
+        for (role, field, width) in [
+            ("vdst", self.vdst, wv),
+            ("addr", self.addr, wa),
+            ("data0", self.data0, w0),
+            ("data1", self.data1, w1),
+        ] {
             match (field, width) {
                 (None, 0) => {}
                 (Some(_), 0) => return Err(format!("{name}: takes no {role} operand")),
@@ -150,11 +244,20 @@ impl Ds {
                         return Err(format!("{name}: {role} v{n} must be even-aligned for a {w}-dword tuple (gfx90a+)"));
                     }
                     if u16::from(n) + u16::from(w) > 256 {
-                        return Err(format!("{name}: {role} v[{n}:{}] runs past v255", u16::from(n) + u16::from(w) - 1));
+                        return Err(format!(
+                            "{name}: {role} v[{n}:{}] runs past v255",
+                            u16::from(n) + u16::from(w) - 1
+                        ));
                     }
                 }
-                (Some(Src::Agpr(_)), _) => return Err(format!("{name}: {role} AccVGPR operands (ACC bit) are not supported")),
-                (Some(other), _) => return Err(format!("{name}: {role} must be a VGPR, got {other:?}")),
+                (Some(Src::Agpr(_)), _) => {
+                    return Err(format!(
+                        "{name}: {role} AccVGPR operands (ACC bit) are not supported"
+                    ))
+                }
+                (Some(other), _) => {
+                    return Err(format!("{name}: {role} must be a VGPR, got {other:?}"))
+                }
             }
         }
         if self.op == DsOp::Nop && (self.offset0 | self.offset1) != 0 {
@@ -166,27 +269,46 @@ impl Ds {
     pub fn encode(&self, arch: Arch, out: &mut Vec<u32>) -> Result<()> {
         let opcode = self.check(arch)?;
         let field = |s: Option<Src>| s.map_or(0, |s| u32::from(s.code() as u8));
-        out.push(ENC_DS | u32::from(opcode) << 17 | u32::from(self.offset1) << 8 | u32::from(self.offset0));
-        out.push(field(self.addr) | field(self.data0) << 8 | field(self.data1) << 16 | field(self.vdst) << 24);
+        out.push(
+            ENC_DS
+                | u32::from(opcode) << 17
+                | u32::from(self.offset1) << 8
+                | u32::from(self.offset0),
+        );
+        out.push(
+            field(self.addr)
+                | field(self.data0) << 8
+                | field(self.data1) << 16
+                | field(self.vdst) << 24,
+        );
         Ok(())
     }
 
     pub fn decode(arch: Arch, words: &[u32]) -> Result<(Self, usize)> {
-        let &[w0, w1, ..] = words else { return Err("DS instruction needs two dwords".into()) };
+        let &[w0, w1, ..] = words else {
+            return Err("DS instruction needs two dwords".into());
+        };
         if w0 & 0xfc00_0000 != ENC_DS {
             return Err(format!("{w0:#010x} is not a DS encoding"));
         }
         if w0 >> 25 & 1 != 0 {
-            return Err(format!("{w0:#010x}: DS ACC bit set (AccVGPR operands unsupported)"));
+            return Err(format!(
+                "{w0:#010x}: DS ACC bit set (AccVGPR operands unsupported)"
+            ));
         }
         let opcode = (w0 >> 17 & 0xff) as u8;
-        let op = DsOp::from_opcode(arch, opcode).ok_or_else(|| format!("DS opcode {opcode} is not in the PeaceMaker CDNA table for {arch:?}"))?;
+        let op = DsOp::from_opcode(arch, opcode).ok_or_else(|| {
+            format!("DS opcode {opcode} is not in the PeaceMaker CDNA table for {arch:?}")
+        })?;
         let (wv, d0, d1) = op.widths();
         let (addr, data0, data1, vdst) = (w1 & 0xff, w1 >> 8 & 0xff, w1 >> 16 & 0xff, w1 >> 24);
         let pick = |value: u32, width: u8, role: &str| -> Result<Option<Src>> {
             match (width, value) {
                 (0, 0) => Ok(None),
-                (0, v) => Err(format!("{}: unused {role} field is {v}, must be 0", op.name())),
+                (0, v) => Err(format!(
+                    "{}: unused {role} field is {v}, must be 0",
+                    op.name()
+                )),
                 (_, v) => Ok(Some(Src::Vgpr(v as u8))),
             }
         };
@@ -224,14 +346,24 @@ impl Ds {
         if self.op.accesses_lds() {
             fp.read_file(RegFile::M0, 0, 1);
         }
-        if let Some(a) = self.addr { fp.read(a, 1) }
-        if let Some(d) = self.data0 { fp.read(d, w0) }
-        if let Some(d) = self.data1 { fp.read(d, w1) }
-        if let Some(d) = self.vdst { fp.write(d, wv) }
+        if let Some(a) = self.addr {
+            fp.read(a, 1)
+        }
+        if let Some(d) = self.data0 {
+            fp.read(d, w0)
+        }
+        if let Some(d) = self.data1 {
+            fp.read(d, w1)
+        }
+        if let Some(d) = self.vdst {
+            fp.write(d, wv)
+        }
         fp
     }
 
-    pub fn mem_kind(&self) -> MemKind { self.op.mem_kind() }
+    pub fn mem_kind(&self) -> MemKind {
+        self.op.mem_kind()
+    }
 }
 
 /// `offset:swizzle(...)` as llvm's `AMDGPUInstPrinter::printSwizzle` prints
@@ -246,12 +378,22 @@ fn swizzle_offset(imm: u16) -> String {
         return if imm >= 0xe000 {
             format!(" offset:swizzle(FFT,{})", imm & 0x1f)
         } else {
-            format!(" offset:swizzle(ROTATE,{},{})", imm >> 10 & 1, imm >> 5 & 0x1f)
+            format!(
+                " offset:swizzle(ROTATE,{},{})",
+                imm >> 10 & 1,
+                imm >> 5 & 0x1f
+            )
         };
     }
     if imm & 0xff00 == 0x8000 {
         let lane = |i: u32| imm >> (2 * i) & 3;
-        return format!(" offset:swizzle(QUAD_PERM,{},{},{},{})", lane(0), lane(1), lane(2), lane(3));
+        return format!(
+            " offset:swizzle(QUAD_PERM,{},{},{},{})",
+            lane(0),
+            lane(1),
+            lane(2),
+            lane(3)
+        );
     }
     if imm & 0x8000 == 0 {
         let (and, or, xor) = (imm & 0x1f, imm >> 5 & 0x1f, imm >> 10 & 0x1f);
@@ -267,10 +409,18 @@ fn swizzle_offset(imm: u16) -> String {
         }
         let probe0 = or ^ xor;
         let probe1 = (0x1f & and | or) ^ xor;
-        let mask: String = (0..5).rev().map(|b| {
-            let (p0, p1) = (probe0 >> b & 1, probe1 >> b & 1);
-            match (p0 == p1, p0) { (true, 0) => '0', (true, _) => '1', (false, 0) => 'p', (false, _) => 'i' }
-        }).collect();
+        let mask: String = (0..5)
+            .rev()
+            .map(|b| {
+                let (p0, p1) = (probe0 >> b & 1, probe1 >> b & 1);
+                match (p0 == p1, p0) {
+                    (true, 0) => '0',
+                    (true, _) => '1',
+                    (false, 0) => 'p',
+                    (false, _) => 'i',
+                }
+            })
+            .collect();
         return format!(" offset:swizzle(BITMASK_PERM,\"{mask}\")");
     }
     format!(" offset:{imm}")
@@ -281,21 +431,32 @@ impl fmt::Display for Ds {
         let (wv, w0, w1) = self.op.widths();
         f.write_str(self.op.name())?;
         let mut sep = " ";
-        for (src, width) in [(self.vdst, wv), (self.addr, 1), (self.data0, w0), (self.data1, w1)] {
+        for (src, width) in [
+            (self.vdst, wv),
+            (self.addr, 1),
+            (self.data0, w0),
+            (self.data1, w1),
+        ] {
             if let Some(s) = src {
                 write!(f, "{sep}{}", s.fmt(width))?;
                 sep = ", ";
             }
         }
         if self.op.two_addr() {
-            if self.offset0 != 0 { write!(f, " offset0:{}", self.offset0)? }
-            if self.offset1 != 0 { write!(f, " offset1:{}", self.offset1)? }
+            if self.offset0 != 0 {
+                write!(f, " offset0:{}", self.offset0)?
+            }
+            if self.offset1 != 0 {
+                write!(f, " offset1:{}", self.offset1)?
+            }
         } else if self.op == DsOp::SwizzleB32 {
             f.write_str(&swizzle_offset(self.offset()))?;
         } else if self.offset() != 0 {
             write!(f, " offset:{}", self.offset())?;
         }
-        if self.gds { f.write_str(" gds")?; }
+        if self.gds {
+            f.write_str(" gds")?;
+        }
         Ok(())
     }
 }

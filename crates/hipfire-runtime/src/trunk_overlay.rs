@@ -39,9 +39,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::hfq::{
-    write_hfqm_package_streaming, HfqFile, HfqStreamEntry, HfqTensorInfo,
-};
+use crate::hfq::{write_hfqm_package_streaming, HfqFile, HfqStreamEntry, HfqTensorInfo};
 use crate::ple_sidecar::{hex_lower, short_hex};
 
 /// The one metadata key of a trunk overlay sidecar.
@@ -144,8 +142,8 @@ fn matrix_shape(info: &HfqTensorInfo) -> Option<[usize; 2]> {
 /// The error is a one-line refusal reason (no path prefix).
 pub fn bind_trunk_overlay(base: &HfqFile, path: &Path) -> Result<BoundTrunkOverlay, String> {
     // Offset 0 on purpose: `HfqFile::open` would auto-attach a REAP overlay.
-    let mut sidecar = HfqFile::open_at_offset(path, 0)
-        .map_err(|e| format!("cannot open the sidecar: {e}"))?;
+    let mut sidecar =
+        HfqFile::open_at_offset(path, 0).map_err(|e| format!("cannot open the sidecar: {e}"))?;
     // Payloads are read positionally; nothing needs the mapping after the index.
     sidecar.drop_mmap();
 
@@ -410,9 +408,7 @@ pub fn write_trunk_overlay(
         .filter(|t| suffixes.iter().any(|s| t.name.ends_with(s.as_str())))
         .collect();
     if selected.is_empty() {
-        return Err(format!(
-            "no base tensor name ends with any of {suffixes:?}"
-        ));
+        return Err(format!("no base tensor name ends with any of {suffixes:?}"));
     }
 
     let mut entries = Vec::with_capacity(selected.len());
@@ -434,9 +430,8 @@ pub fn write_trunk_overlay(
             )
         })?;
         let bin = payload_dir.join(format!("{}.bin", info.name));
-        let metadata = std::fs::metadata(&bin).map_err(|e| {
-            format!("payload for {}: {}: {e}", info.name, bin.display())
-        })?;
+        let metadata = std::fs::metadata(&bin)
+            .map_err(|e| format!("payload for {}: {}: {e}", info.name, bin.display()))?;
         if metadata.len() != expected as u64 {
             return Err(format!(
                 "payload {} is {} bytes, QT44 [{m}, {k}] is {expected}",
@@ -493,12 +488,8 @@ pub fn write_trunk_overlay(
     let mut partial_name = output.as_os_str().to_os_string();
     partial_name.push(".partial");
     let partial = PathBuf::from(partial_name);
-    let written = write_hfqm_package_streaming(
-        &partial,
-        base.arch_id,
-        &metadata_json,
-        &entries,
-        |i, w| {
+    let written =
+        write_hfqm_package_streaming(&partial, base.arch_id, &metadata_json, &entries, |i, w| {
             let mut file = File::open(&payload_paths[i])?;
             let copied = std::io::copy(&mut file, w)?;
             if copied != entries[i].data_len {
@@ -512,9 +503,8 @@ pub fn write_trunk_overlay(
                 ));
             }
             Ok(())
-        },
-    )
-    .and_then(|()| File::open(&partial)?.sync_all());
+        })
+        .and_then(|()| File::open(&partial)?.sync_all());
     if let Err(e) = written {
         let _ = std::fs::remove_file(&partial);
         return Err(format!("write {}: {e}", partial.display()));
@@ -592,7 +582,12 @@ mod tests {
         let tensors = vec![
             base_tensor("model.layers.0.in_proj_z.weight", 15, &[4, 256], 4 * 192),
             base_tensor("model.layers.0.other.weight", 13, &[4, 256], 4 * 136),
-            base_tensor("model.layers.1.in_proj_z.weight", 15, &[2, 512], 2 * 2 * 192),
+            base_tensor(
+                "model.layers.1.in_proj_z.weight",
+                15,
+                &[2, 512],
+                2 * 2 * 192,
+            ),
         ];
         write_hfqm_package_mem(&base, ARCH, metadata, &tensors).unwrap();
         let payloads = dir.path().join("payloads");
@@ -758,8 +753,7 @@ mod tests {
         let mut h = hand(&fx);
         // Same length, different metadata: the index digest differs.
         let other = fixture(r#"{"a":2}"#);
-        h.manifest.base.index_sha256 =
-            hex_lower(&open(&other.base).index_sha256().unwrap());
+        h.manifest.base.index_sha256 = hex_lower(&open(&other.base).index_sha256().unwrap());
         assert_eq!(open(&other.base).file_len(), open(&fx.base).file_len());
         let err = refusal(&fx, &h);
         assert!(err.starts_with("base index sha256 "), "{err}");
@@ -805,7 +799,10 @@ mod tests {
         h.tensors[0].data = payload_bytes(1, 2, 512);
         h.manifest.tensors[0].sha256 = hex_lower(&Sha256::digest(&h.tensors[0].data));
         let err = refusal(&fx, &h);
-        assert!(err.contains("base shape is [4, 256], overlay shape is [2, 512]"), "{err}");
+        assert!(
+            err.contains("base shape is [4, 256], overlay shape is [2, 512]"),
+            "{err}"
+        );
     }
 
     #[test]

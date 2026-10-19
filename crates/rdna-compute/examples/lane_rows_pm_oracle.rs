@@ -130,7 +130,10 @@ fn err<E: std::fmt::Display>(e: E) -> String {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 struct Rng(u64);
@@ -164,7 +167,10 @@ impl Rng {
         match self.below(32) {
             0 => sign,
             1 => sign | (1 + self.below(0x3ff) as u16),
-            _ => sign | ((15 - lo_exp + self.below(u64::from(lo_exp + hi_exp + 1)) as u16) << 10) | self.below(0x400) as u16,
+            _ => {
+                sign | ((15 - lo_exp + self.below(u64::from(lo_exp + hi_exp + 1)) as u16) << 10)
+                    | self.below(0x400) as u16
+            }
         }
     }
 }
@@ -225,7 +231,9 @@ struct Out {
 
 impl Out {
     fn new(gpu: &mut Gpu, m: usize) -> Result<Self> {
-        let full = gpu.zeros(&[2 * GUARD + MAXB * m], DType::F32).map_err(err)?;
+        let full = gpu
+            .zeros(&[2 * GUARD + MAXB * m], DType::F32)
+            .map_err(err)?;
         Ok(Self { full, m })
     }
     fn view(&self) -> GpuTensor {
@@ -235,7 +243,9 @@ impl Out {
         (2 * GUARD + MAXB * self.m) * 4
     }
     fn reset(&self, gpu: &Gpu) -> Result<()> {
-        gpu.hip.memset(&self.full.buf, i32::from(SENTINEL), self.bytes()).map_err(err)
+        gpu.hip
+            .memset(&self.full.buf, i32::from(SENTINEL), self.bytes())
+            .map_err(err)
     }
     fn download(&self, gpu: &Gpu) -> Result<Vec<u8>> {
         gpu.hip.device_synchronize().map_err(err)?;
@@ -282,8 +292,15 @@ const Q8_K2560_STEM: &str = "gemv_q8_0_k2560_xbatch";
 const Q8_WIDE_STEM: &str = "gemv_q8_0_wide_xbatch";
 const Q8_K2560_X2_STEM: &str = "gemv_q8_0_k2560_x2_xbatch";
 
-const STEMS: [&str; 7] =
-    [MQ6_STEM, MQ6_X4_STEM, Q8_K8_STEM, Q8_K320_STEM, Q8_K2560_STEM, Q8_WIDE_STEM, Q8_K2560_X2_STEM];
+const STEMS: [&str; 7] = [
+    MQ6_STEM,
+    MQ6_X4_STEM,
+    Q8_K8_STEM,
+    Q8_K320_STEM,
+    Q8_K2560_STEM,
+    Q8_WIDE_STEM,
+    Q8_K2560_X2_STEM,
+];
 
 /// The embedded `qwen4_lane_rows_pm` image, loaded as a private module with
 /// every wide symbol of the selected caps resolved up front.
@@ -300,10 +317,15 @@ impl WideImage {
             return Err("QWEN4_LANE_ROWS_PM_GFX1151_SHA256 is not pinned".into());
         }
         if got != want {
-            return Err(format!("embedded qwen4_lane_rows_pm image sha256 {got} is not the pinned {want}"));
+            return Err(format!(
+                "embedded qwen4_lane_rows_pm image sha256 {got} is not the pinned {want}"
+            ));
         }
         gpu.bind_thread().map_err(err)?;
-        let module = gpu.hip.module_load_data(kernels::QWEN4_LANE_ROWS_PM_GFX1151).map_err(err)?;
+        let module = gpu
+            .hip
+            .module_load_data(kernels::QWEN4_LANE_ROWS_PM_GFX1151)
+            .map_err(err)?;
         let mut funcs = HashMap::new();
         let mut missing = Vec::new();
         for &cap in caps {
@@ -318,26 +340,56 @@ impl WideImage {
             }
         }
         if !missing.is_empty() {
-            return Err(format!("embedded image {got} lacks wide symbols: {}", missing.join(", ")));
+            return Err(format!(
+                "embedded image {got} lacks wide symbols: {}",
+                missing.join(", ")
+            ));
         }
-        Ok(Self { _module: module, funcs })
+        Ok(Self {
+            _module: module,
+            funcs,
+        })
     }
 
     /// One launch of `symbol` over `kb` (whose length must be the symbol's ABI
     /// size `abi`), 1-D grid `grid` x `block`.
-    fn launch(&self, gpu: &Gpu, symbol: &str, grid: usize, block: u32, mut kb: KernargBlob, abi: usize) -> Result<()> {
+    fn launch(
+        &self,
+        gpu: &Gpu,
+        symbol: &str,
+        grid: usize,
+        block: u32,
+        mut kb: KernargBlob,
+        abi: usize,
+    ) -> Result<()> {
         if kb.len() != abi {
-            return Err(format!("{symbol}: kernarg is {} bytes, ABI is {abi}", kb.len()));
+            return Err(format!(
+                "{symbol}: kernarg is {} bytes, ABI is {abi}",
+                kb.len()
+            ));
         }
         if grid == 0 || grid > u32::MAX as usize {
             return Err(format!("{symbol}: grid {grid} out of range"));
         }
-        let func = self.funcs.get(symbol).ok_or_else(|| format!("{symbol}: not loaded"))?;
+        let func = self
+            .funcs
+            .get(symbol)
+            .ok_or_else(|| format!("{symbol}: not loaded"))?;
         gpu.bind_thread().map_err(err)?;
         // The raw launch is not ordered against the Gpu's own stream.
         gpu.hip.device_synchronize().map_err(err)?;
         // SAFETY: the blob follows the symbol's ABI and addresses live allocations.
-        unsafe { gpu.hip.launch_kernel_blob(func, [grid as u32, 1, 1], [block, 1, 1], 0, None, kb.as_mut_slice()) }.map_err(err)
+        unsafe {
+            gpu.hip.launch_kernel_blob(
+                func,
+                [grid as u32, 1, 1],
+                [block, 1, 1],
+                0,
+                None,
+                kb.as_mut_slice(),
+            )
+        }
+        .map_err(err)
     }
 }
 
@@ -398,10 +450,23 @@ fn mq6_case(gpu: &mut Gpu, m: usize, k: usize, rng: &mut Rng) -> Result<Case> {
         weight_bytes: weights.len(),
         ref_symbol: None,
         single: Box::new(move |gpu, c| {
-            gpu.gemv_mq6g256v2(&w1, &x1.sub_offset(c * k, k), &y1.sub_offset(c * m, m), m, k).map_err(err)
+            gpu.gemv_mq6g256v2(
+                &w1,
+                &x1.sub_offset(c * k, k),
+                &y1.sub_offset(c * m, m),
+                m,
+                k,
+            )
+            .map_err(err)
         }),
-        rows: Some(Box::new(move |gpu, b| gpu.gemm_mq6g256v2_f32_rows(&w2, &x2, &y2, m, k, b).map_err(err))),
-        pm: Some(Box::new(move |gpu, b| gpu.gemv_mq6g256v2_xbatch_pm(&w, &x, &y, m, k, b).map_err(err))),
+        rows: Some(Box::new(move |gpu, b| {
+            gpu.gemm_mq6g256v2_f32_rows(&w2, &x2, &y2, m, k, b)
+                .map_err(err)
+        })),
+        pm: Some(Box::new(move |gpu, b| {
+            gpu.gemv_mq6g256v2_xbatch_pm(&w, &x, &y, m, k, b)
+                .map_err(err)
+        })),
         wide: Box::new(move |gpu, img, cap, b| {
             let mut kb = KernargBlob::new();
             kb.push_ptr(w3.buf.as_ptr());
@@ -421,9 +486,15 @@ fn mq6_x4_case(gpu: &mut Gpu, ms: [usize; 4], k: usize, rng: &mut Rng) -> Result
     let mut weight_bytes = 0;
     for &m in &ms {
         // An unused slot still needs a valid pointer.
-        let bytes = if m == 0 { vec![0u8; 256] } else { gen_mq6(m, k, rng) };
+        let bytes = if m == 0 {
+            vec![0u8; 256]
+        } else {
+            gen_mq6(m, k, rng)
+        };
         weight_bytes += if m == 0 { 0 } else { bytes.len() };
-        ws.push(Rc::new(gpu.upload_raw(&bytes, &[bytes.len()]).map_err(err)?));
+        ws.push(Rc::new(
+            gpu.upload_raw(&bytes, &[bytes.len()]).map_err(err)?,
+        ));
         outs.push(Out::new(gpu, m)?);
     }
     let xs = gen_x(k, rng);
@@ -441,18 +512,29 @@ fn mq6_x4_case(gpu: &mut Gpu, ms: [usize; 4], k: usize, rng: &mut Rng) -> Result
             for i in 0..4 {
                 if ms[i] > 0 {
                     let (m, yv) = (ms[i], &ys1[i]);
-                    gpu.gemv_mq6g256v2(&ws1[i], &x1.sub_offset(c * k, k), &yv.sub_offset(c * m, m), m, k).map_err(err)?;
+                    gpu.gemv_mq6g256v2(
+                        &ws1[i],
+                        &x1.sub_offset(c * k, k),
+                        &yv.sub_offset(c * m, m),
+                        m,
+                        k,
+                    )
+                    .map_err(err)?;
                 }
             }
             Ok(())
         }),
         rows: Some(Box::new(move |gpu, b| {
-            let parts: [(&GpuTensor, &GpuTensor, usize); 4] = std::array::from_fn(|i| (&*ws2[i], &*ys2[i], ms[i]));
-            gpu.gemm_mq6g256v2_f32_rows_x4(parts, &x2, k, b).map_err(err)
+            let parts: [(&GpuTensor, &GpuTensor, usize); 4] =
+                std::array::from_fn(|i| (&*ws2[i], &*ys2[i], ms[i]));
+            gpu.gemm_mq6g256v2_f32_rows_x4(parts, &x2, k, b)
+                .map_err(err)
         })),
         pm: Some(Box::new(move |gpu, b| {
-            let parts: [(&GpuTensor, &GpuTensor, usize); 4] = std::array::from_fn(|i| (&*ws[i], &*ys[i], ms[i]));
-            gpu.gemv_mq6g256v2_x4_xbatch_pm(parts, &x, k, b).map_err(err)
+            let parts: [(&GpuTensor, &GpuTensor, usize); 4] =
+                std::array::from_fn(|i| (&*ws[i], &*ys[i], ms[i]));
+            gpu.gemv_mq6g256v2_x4_xbatch_pm(parts, &x, k, b)
+                .map_err(err)
         })),
         wide: Box::new(move |gpu, img, cap, b| {
             let mut kb = KernargBlob::new();
@@ -489,17 +571,33 @@ fn q8_k8_case(gpu: &mut Gpu, m: usize, k: usize, hc_act: bool, rng: &mut Rng) ->
     let (w1, x1, y1) = (w.clone(), x.clone(), y.clone());
     let (w2, x2, y2) = (w.clone(), x.clone(), y.clone());
     let (w3, x3, y3) = (w.clone(), x.clone(), y.clone());
-    let rows: Option<Launch> = narrow
-        .then(|| Box::new(move |gpu: &mut Gpu, b: usize| gpu.gemv_q8_0_k8_rows(&w2, &x2, &y2, m, k, scale, b).map_err(err)) as Launch);
-    let pm: Option<Launch> = narrow
-        .then(|| Box::new(move |gpu: &mut Gpu, b: usize| gpu.gemv_q8_0_k8_xbatch_pm(&w, &x, &y, m, k, scale, b).map_err(err)) as Launch);
+    let rows: Option<Launch> = narrow.then(|| {
+        Box::new(move |gpu: &mut Gpu, b: usize| {
+            gpu.gemv_q8_0_k8_rows(&w2, &x2, &y2, m, k, scale, b)
+                .map_err(err)
+        }) as Launch
+    });
+    let pm: Option<Launch> = narrow.then(|| {
+        Box::new(move |gpu: &mut Gpu, b: usize| {
+            gpu.gemv_q8_0_k8_xbatch_pm(&w, &x, &y, m, k, scale, b)
+                .map_err(err)
+        }) as Launch
+    });
     Ok(Case {
         name: format!("q8 k8 m={m} k={k} hc_act={}", u8::from(hc_act)),
         outs: vec![out],
         weight_bytes: weights.len(),
         ref_symbol: Some("gemv_q8_0_k8"),
         single: Box::new(move |gpu, c| {
-            gpu.gemv_q8_0_k8(&w1, &x1.sub_offset(c * k, k), &y1.sub_offset(c * m, m), m, k, scale).map_err(err)
+            gpu.gemv_q8_0_k8(
+                &w1,
+                &x1.sub_offset(c * k, k),
+                &y1.sub_offset(c * m, m),
+                m,
+                k,
+                scale,
+            )
+            .map_err(err)
         }),
         rows,
         pm,
@@ -513,7 +611,14 @@ fn q8_k8_case(gpu: &mut Gpu, m: usize, k: usize, hc_act: bool, rng: &mut Rng) ->
             kb.push_i32(b as i32);
             kb.push_f32(scale.unwrap_or(1.0));
             kb.push_i32(i32::from(scale.is_some()));
-            img.launch(gpu, &wide_symbol(Q8_K8_STEM, cap), m.div_ceil(2), 512, kb, 44)
+            img.launch(
+                gpu,
+                &wide_symbol(Q8_K8_STEM, cap),
+                m.div_ceil(2),
+                512,
+                kb,
+                44,
+            )
         }),
     })
 }
@@ -578,8 +683,13 @@ fn q8_case(gpu: &mut Gpu, kind: Q8Kind, m: usize, k: usize, rng: &mut Rng) -> Re
     let (w3, x3, y3) = (w.clone(), x.clone(), y.clone());
     let (rows, pm): (Option<Launch>, Option<Launch>) = if matches!(kind, Q8Kind::K320) {
         (
-            Some(Box::new(move |gpu, b| gpu.gemv_q8_0_staged_rows(&w2, &x2, &y2, m, k, b).map_err(err))),
-            Some(Box::new(move |gpu, b| gpu.gemv_q8_0_k320_xbatch_pm(&w, &x, &y, m, b).map_err(err))),
+            Some(Box::new(move |gpu, b| {
+                gpu.gemv_q8_0_staged_rows(&w2, &x2, &y2, m, k, b)
+                    .map_err(err)
+            })),
+            Some(Box::new(move |gpu, b| {
+                gpu.gemv_q8_0_k320_xbatch_pm(&w, &x, &y, m, b).map_err(err)
+            })),
         )
     } else {
         (None, None)
@@ -590,7 +700,14 @@ fn q8_case(gpu: &mut Gpu, kind: Q8Kind, m: usize, k: usize, rng: &mut Rng) -> Re
         weight_bytes: weights.len(),
         ref_symbol: Some(q8_decode_symbol(k)),
         single: Box::new(move |gpu, c| {
-            gpu.gemv_q8_0(&w1, &x1.sub_offset(c * k, k), &y1.sub_offset(c * m, m), m, k).map_err(err)
+            gpu.gemv_q8_0(
+                &w1,
+                &x1.sub_offset(c * k, k),
+                &y1.sub_offset(c * m, m),
+                m,
+                k,
+            )
+            .map_err(err)
         }),
         rows,
         pm,
@@ -602,7 +719,14 @@ fn q8_case(gpu: &mut Gpu, kind: Q8Kind, m: usize, k: usize, rng: &mut Rng) -> Re
             kb.push_i32(m as i32);
             kb.push_i32(k as i32);
             kb.push_i32(b as i32);
-            img.launch(gpu, &wide_symbol(kind.stem(), cap), m.div_ceil(8), 256, kb, 36)
+            img.launch(
+                gpu,
+                &wide_symbol(kind.stem(), cap),
+                m.div_ceil(8),
+                256,
+                kb,
+                36,
+            )
         }),
     })
 }
@@ -615,9 +739,15 @@ fn q8_x2_case(gpu: &mut Gpu, ms: [usize; 2], rng: &mut Rng) -> Result<Case> {
     let mut outs = Vec::new();
     let mut weight_bytes = 0;
     for &m in &ms {
-        let bytes = if m == 0 { vec![0u8; 256] } else { gen_q8(m, K, rng) };
+        let bytes = if m == 0 {
+            vec![0u8; 256]
+        } else {
+            gen_q8(m, K, rng)
+        };
         weight_bytes += if m == 0 { 0 } else { bytes.len() };
-        ws.push(Rc::new(gpu.upload_raw(&bytes, &[bytes.len()]).map_err(err)?));
+        ws.push(Rc::new(
+            gpu.upload_raw(&bytes, &[bytes.len()]).map_err(err)?,
+        ));
         outs.push(Out::new(gpu, m)?);
     }
     let xs = gen_x(K, rng);
@@ -633,7 +763,14 @@ fn q8_x2_case(gpu: &mut Gpu, ms: [usize; 2], rng: &mut Rng) -> Result<Case> {
             for i in 0..2 {
                 if ms[i] > 0 {
                     let (m, yv) = (ms[i], &ys1[i]);
-                    gpu.gemv_q8_0(&ws1[i], &x1.sub_offset(c * K, K), &yv.sub_offset(c * m, m), m, K).map_err(err)?;
+                    gpu.gemv_q8_0(
+                        &ws1[i],
+                        &x1.sub_offset(c * K, K),
+                        &yv.sub_offset(c * m, m),
+                        m,
+                        K,
+                    )
+                    .map_err(err)?;
                 }
             }
             Ok(())
@@ -695,13 +832,24 @@ fn compare(case: &Case, got: &[Vec<u8>], want: &[Vec<u8>]) -> (usize, Option<Str
         let (n, at) = diff(g, w);
         bad += n;
         if let (None, Some(at)) = (&first, at) {
-            first = Some(format!("matrix {i} {} (got {:#04x}, want {:#04x})", out.locate(at), g[at], w[at]));
+            first = Some(format!(
+                "matrix {i} {} (got {:#04x}, want {:#04x})",
+                out.locate(at),
+                g[at],
+                w[at]
+            ));
         }
     }
     (bad, first)
 }
 
-fn verify(gpu: &mut Gpu, img: &WideImage, wide_flag: Option<usize>, case: &Case, tally: &mut Tally) -> Result<()> {
+fn verify(
+    gpu: &mut Gpu,
+    img: &WideImage,
+    wide_flag: Option<usize>,
+    case: &Case,
+    tally: &mut Tally,
+) -> Result<()> {
     case.reset(gpu)?;
     let mut ref_symbol = String::from("<none>");
     for c in 0..MAXB {
@@ -712,7 +860,10 @@ fn verify(gpu: &mut Gpu, img: &WideImage, wide_flag: Option<usize>, case: &Case,
     }
     if let Some(want) = case.ref_symbol {
         if ref_symbol != want {
-            return Err(format!("{}: the 1-row reference launched {ref_symbol}, not the decode object {want}", case.name));
+            return Err(format!(
+                "{}: the 1-row reference launched {ref_symbol}, not the decode object {want}",
+                case.name
+            ));
         }
     }
     let reference = case.download(gpu)?;
@@ -722,7 +873,12 @@ fn verify(gpu: &mut Gpu, img: &WideImage, wide_flag: Option<usize>, case: &Case,
     // Narrow PM (and the incumbent rows kernel) over B = 1..=8.
     if let Some(pm) = &case.pm {
         for b in 1..=NARROW_MAX {
-            let expected: Vec<Vec<u8>> = case.outs.iter().zip(&reference).map(|(o, r)| o.expected(r, b)).collect();
+            let expected: Vec<Vec<u8>> = case
+                .outs
+                .iter()
+                .zip(&reference)
+                .map(|(o, r)| o.expected(r, b))
+                .collect();
             case.reset(gpu)?;
             pm(gpu, b)?;
             let got_pm = case.download(gpu)?;
@@ -731,7 +887,9 @@ fn verify(gpu: &mut Gpu, img: &WideImage, wide_flag: Option<usize>, case: &Case,
             tally.launches += 1;
             let mut note = String::new();
             if let Some(first) = first {
-                note.push_str(&format!(" B={b}: PM differs from 1-row incumbent at {first};"));
+                note.push_str(&format!(
+                    " B={b}: PM differs from 1-row incumbent at {first};"
+                ));
             }
             if let (true, Some(rows)) = (b >= 2, &case.rows) {
                 case.reset(gpu)?;
@@ -743,10 +901,14 @@ fn verify(gpu: &mut Gpu, img: &WideImage, wide_flag: Option<usize>, case: &Case,
                 tally.pm_vs_rows += pm_rows_bad;
                 tally.launches += 1;
                 if let Some(first) = rows_first {
-                    note.push_str(&format!(" B={b}: incumbent rows differs from 1-row incumbent at {first};"));
+                    note.push_str(&format!(
+                        " B={b}: incumbent rows differs from 1-row incumbent at {first};"
+                    ));
                 }
                 if let Some(first) = pm_rows_first {
-                    note.push_str(&format!(" B={b}: PM differs from incumbent rows at {first};"));
+                    note.push_str(&format!(
+                        " B={b}: PM differs from incumbent rows at {first};"
+                    ));
                 }
                 bad_case += rows_bad + pm_rows_bad;
             }
@@ -758,8 +920,15 @@ fn verify(gpu: &mut Gpu, img: &WideImage, wide_flag: Option<usize>, case: &Case,
     // Exact-wide PM over every B the cap selection admits.
     let mut wide_launches = 0;
     for b in 1..=MAXB {
-        let Some(cap) = wide_cap_for(wide_flag, b) else { continue };
-        let expected: Vec<Vec<u8>> = case.outs.iter().zip(&reference).map(|(o, r)| o.expected(r, b)).collect();
+        let Some(cap) = wide_cap_for(wide_flag, b) else {
+            continue;
+        };
+        let expected: Vec<Vec<u8>> = case
+            .outs
+            .iter()
+            .zip(&reference)
+            .map(|(o, r)| o.expected(r, b))
+            .collect();
         case.reset(gpu)?;
         (case.wide)(gpu, img, cap, b)?;
         let got = case.download(gpu)?;
@@ -770,7 +939,9 @@ fn verify(gpu: &mut Gpu, img: &WideImage, wide_flag: Option<usize>, case: &Case,
         wide_launches += 1;
         bad_case += bad;
         if let Some(first) = first {
-            line.push_str(&format!(" B={b}: wide_r{cap} differs from 1-row incumbent at {first};"));
+            line.push_str(&format!(
+                " B={b}: wide_r{cap} differs from 1-row incumbent at {first};"
+            ));
         }
     }
     tally.cases += 1;
@@ -781,7 +952,11 @@ fn verify(gpu: &mut Gpu, img: &WideImage, wide_flag: Option<usize>, case: &Case,
     scope.push(format!("wide {wide_launches} launches"));
     println!(
         "{line} [ref {ref_symbol}] {}",
-        if bad_case == 0 { format!("ok ({})", scope.join(", ")) } else { format!("MISMATCH ({bad_case} bytes)") }
+        if bad_case == 0 {
+            format!("ok ({})", scope.join(", "))
+        } else {
+            format!("MISMATCH ({bad_case} bytes)")
+        }
     );
     Ok(())
 }
@@ -792,7 +967,10 @@ fn median(mut v: Vec<f64>) -> f64 {
 }
 
 fn time_us(gpu: &mut Gpu, n: usize, f: &dyn Fn(&mut Gpu) -> Result<()>) -> Result<f64> {
-    let (start, stop) = (gpu.hip.event_create().map_err(err)?, gpu.hip.event_create().map_err(err)?);
+    let (start, stop) = (
+        gpu.hip.event_create().map_err(err)?,
+        gpu.hip.event_create().map_err(err)?,
+    );
     for _ in 0..5 {
         f(gpu)?;
     }
@@ -812,7 +990,10 @@ fn time_us(gpu: &mut Gpu, n: usize, f: &dyn Fn(&mut Gpu) -> Result<()>) -> Resul
 
 fn bench(gpu: &mut Gpu, case: &Case, n: usize) -> Result<()> {
     let (Some(pm_launch), Some(rows_launch)) = (&case.pm, &case.rows) else {
-        return Err(format!("{}: bench needs the narrow PM and rows routes", case.name));
+        return Err(format!(
+            "{}: bench needs the narrow PM and rows routes",
+            case.name
+        ));
     };
     for b in [4, 8] {
         let pm = time_us(gpu, n, &|g| pm_launch(g, b))?;
@@ -832,7 +1013,9 @@ fn verify_cases(gpu: &mut Gpu) -> Result<Vec<Case>> {
     let mut cases = Vec::new();
     let mut seed = 0x1234_5678_9abc_def1u64;
     let mut next_rng = || {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         Rng(seed | 1)
     };
     // MQ6: odd M, M = 48, K tails mod four groups (K/256 = 1, 2, 3, 5, 10, 24).
@@ -849,7 +1032,13 @@ fn verify_cases(gpu: &mut Gpu) -> Result<Vec<Case>> {
     ] {
         cases.push(mq6_case(gpu, m, k, &mut next_rng())?);
     }
-    for ms in [[10240, 6144, 48, 48], [12288, 640, 512, 512], [3, 0, 5, 0], [7, 9, 15, 33], [0, 17, 0, 1]] {
+    for ms in [
+        [10240, 6144, 48, 48],
+        [12288, 640, 512, 512],
+        [3, 0, 5, 0],
+        [7, 9, 15, 33],
+        [0, 17, 0, 1],
+    ] {
         cases.push(mq6_x4_case(gpu, ms, 2560, &mut next_rng())?);
     }
     cases.push(mq6_x4_case(gpu, [17, 5, 48, 9], 1280, &mut next_rng())?);
@@ -889,12 +1078,21 @@ fn run() -> Result<bool> {
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         match flag.as_str() {
-            "--bench" => bench_n = Some(args.next().ok_or("--bench needs N")?.parse::<usize>().map_err(err)?),
+            "--bench" => {
+                bench_n = Some(
+                    args.next()
+                        .ok_or("--bench needs N")?
+                        .parse::<usize>()
+                        .map_err(err)?,
+                )
+            }
             "--wide-cap" => {
                 wide_flag = match args.next().ok_or("--wide-cap needs 16 or 32")?.as_str() {
                     "16" => Some(16),
                     "32" => Some(32),
-                    other => return Err(format!("--wide-cap takes 16 or 32, got {other} ({USAGE})")),
+                    other => {
+                        return Err(format!("--wide-cap takes 16 or 32, got {other} ({USAGE})"))
+                    }
                 }
             }
             other => return Err(format!("unknown argument {other} ({USAGE})")),
@@ -913,7 +1111,10 @@ fn run() -> Result<bool> {
     println!(
         "wide image: {} symbols; selection: {}",
         img.funcs.len(),
-        wide_flag.map_or("production (r16 for B<=16, r32 for B=17..=32)".to_string(), |c| format!("--wide-cap {c} (r{c} at B=1..={c})"))
+        wide_flag.map_or(
+            "production (r16 for B<=16, r32 for B=17..=32)".to_string(),
+            |c| format!("--wide-cap {c} (r{c} at B=1..={c})")
+        )
     );
     let mut tally = Tally::default();
     for case in verify_cases(&mut gpu)? {

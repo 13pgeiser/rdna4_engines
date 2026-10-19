@@ -33,8 +33,10 @@ fn main() {
         (8192, 1024, "lm_head-ish 8192x1024"),
     ];
 
-    println!("{:24} {:>10} {:>10} {:>9}   {:>10} {:>10} {:>9}",
-             "shape", "bf16 us", "bf16 GB/s", "% roof", "q8 us", "q8 GB/s", "% roof");
+    println!(
+        "{:24} {:>10} {:>10} {:>9}   {:>10} {:>10} {:>9}",
+        "shape", "bf16 us", "bf16 GB/s", "% roof", "q8 us", "q8 GB/s", "% roof"
+    );
 
     for &(m, k, label) in shapes {
         let x = gpu.zeros(&[k], DType::F32).expect("x");
@@ -42,7 +44,9 @@ fn main() {
 
         // bf16 weights: [M, K] raw u16.
         let wb = gpu.hip.malloc(m * k * 2).expect("malloc bf16 W");
-        gpu.hip.memcpy_htod(&wb, &vec![0x3Fu8; m * k * 2]).expect("copy bf16");
+        gpu.hip
+            .memcpy_htod(&wb, &vec![0x3Fu8; m * k * 2])
+            .expect("copy bf16");
         let w_bf16 = rdna_compute::GpuTensor {
             buf: wb,
             shape: vec![m, k],
@@ -50,12 +54,14 @@ fn main() {
         };
 
         for _ in 0..WARMUP {
-            gpu.gemv_bf16_xf32(&w_bf16, &x, &y, m, k).expect("bf16 warmup");
+            gpu.gemv_bf16_xf32(&w_bf16, &x, &y, m, k)
+                .expect("bf16 warmup");
         }
         gpu.hip.device_synchronize().expect("sync");
         let t0 = Instant::now();
         for _ in 0..TRIALS {
-            gpu.gemv_bf16_xf32(&w_bf16, &x, &y, m, k).expect("bf16 trial");
+            gpu.gemv_bf16_xf32(&w_bf16, &x, &y, m, k)
+                .expect("bf16 trial");
         }
         gpu.hip.device_synchronize().expect("sync");
         let bf16_us = t0.elapsed().as_secs_f64() / TRIALS as f64 * 1e6;
@@ -64,7 +70,9 @@ fn main() {
         // q8_0 control: 34 bytes per 32-element block.
         let q8_bytes = m * (k / 32) * 34;
         let wq = gpu.hip.malloc(q8_bytes).expect("malloc q8 W");
-        gpu.hip.memcpy_htod(&wq, &vec![0x10u8; q8_bytes]).expect("copy q8");
+        gpu.hip
+            .memcpy_htod(&wq, &vec![0x10u8; q8_bytes])
+            .expect("copy q8");
         let w_q8 = rdna_compute::GpuTensor {
             buf: wq,
             shape: vec![m, k],
@@ -90,5 +98,7 @@ fn main() {
         gpu.free_tensor(x).ok();
         gpu.free_tensor(y).ok();
     }
-    println!("\nroof = {ROOF_GBS} GB/s. Batch-1 GEMV is weight-streaming; % roof is the whole story.");
+    println!(
+        "\nroof = {ROOF_GBS} GB/s. Batch-1 GEMV is weight-streaming; % roof is the whole story."
+    );
 }

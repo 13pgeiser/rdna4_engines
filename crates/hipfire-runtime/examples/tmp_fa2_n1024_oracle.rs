@@ -57,11 +57,8 @@ const SHAPES_LE512: &[(usize, usize, usize)] = &[
 ];
 
 /// N=1024 fixtures: one full launch vs two N=512 halves.
-const SHAPES_N1024: &[(usize, usize, usize)] = &[
-    (1024, 0, 1024),
-    (1024, 7168, 8192),
-    (1024, 31744, 32768),
-];
+const SHAPES_N1024: &[(usize, usize, usize)] =
+    &[(1024, 0, 1024), (1024, 7168, 8192), (1024, 31744, 32768)];
 
 const COPY_POS_SRC: &str = r#"
 #include <hip/hip_runtime.h>
@@ -144,8 +141,8 @@ fn fill_q8_cache(seq_len: usize, salt: u32) -> Vec<u8> {
                     let r = prng_u32((g * 64 + kv * 8 + b) as u64 * 32 + c as u64, salt);
                     codes[c] = ((r % 61) as i8).wrapping_sub(30);
                 }
-                let scale =
-                    0.01 + (prng_u32((g * 32 + kv * 8 + b) as u64, salt ^ 0xabc) % 100) as f32 * 0.001;
+                let scale = 0.01
+                    + (prng_u32((g * 32 + kv * 8 + b) as u64, salt ^ 0xabc) % 100) as f32 * 0.001;
                 let blk = pack_q8_block(scale, &codes);
                 let off = g * ROW_STRIDE + (kv * BPH + b) * Q8_BLOCK;
                 buf[off..off + 34].copy_from_slice(&blk);
@@ -179,9 +176,7 @@ fn fill_fwht3_k(seq_len: usize, salt: u32) -> Vec<u8> {
 
 fn fill_q(batch: usize, salt: u32) -> Vec<f32> {
     let n = batch * N_HEADS * HD;
-    (0..n)
-        .map(|i| prng_f32(i as u64, salt) * 0.5)
-        .collect()
+    (0..n).map(|i| prng_f32(i as u64, salt) * 0.5).collect()
 }
 
 fn fill_positions(batch: usize, start: usize) -> Vec<i32> {
@@ -247,8 +242,7 @@ fn download_i32_view(gpu: &Gpu, view: &GpuTensor) -> Vec<i32> {
     assert_eq!(nbytes % 4, 0, "i32 view byte size not multiple of 4");
     let n = nbytes / 4;
     let mut data = vec![0i32; n];
-    let bytes =
-        unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, nbytes) };
+    let bytes = unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, nbytes) };
     gpu.hip
         .memcpy_dtoh(bytes, &view.buf)
         .unwrap_or_else(|e| panic!("download_i32_view: {e:?}"));
@@ -373,19 +367,20 @@ fn launch_copy_positions(gpu: &mut Gpu, pos: &GpuTensor, echo: &GpuTensor, n: i3
     blob.push_i32(nn);
     let _ = (&mut pos_ptr, &mut echo_ptr, &mut nn); // keep live across blob build
     let grid = ((n as u32) + 63) / 64;
-    gpu.launch_kernel_blob(COPY_POS_NAME, [grid.max(1), 1, 1], [64, 1, 1], 0, blob.as_mut_slice())
-        .unwrap_or_else(|e| panic!("launch {COPY_POS_NAME}: {e:?}"));
+    gpu.launch_kernel_blob(
+        COPY_POS_NAME,
+        [grid.max(1), 1, 1],
+        [64, 1, 1],
+        0,
+        blob.as_mut_slice(),
+    )
+    .unwrap_or_else(|e| panic!("launch {COPY_POS_NAME}: {e:?}"));
     gpu.hip.device_synchronize().unwrap();
 }
 
 /// Positive: correct view → echo equals expected i32s.
 /// Negative: historical wrong view fails host geometry/value checks (no launch).
-fn run_position_contract(
-    gpu: &mut Gpu,
-    start: usize,
-    batch: usize,
-    tag: &str,
-) {
+fn run_position_contract(gpu: &mut Gpu, start: usize, batch: usize, tag: &str) {
     let pos_h = fill_positions(batch, start);
     let d_pos = upload_positions(gpu, &pos_h);
     assert_eq!(d_pos.buf.size(), batch * 4);
@@ -521,7 +516,15 @@ fn fixture_le512_q8(
     let d_out = gpu.zeros(&[batch * QO_ROW], DType::F32).unwrap();
 
     let pos_full = pos_view(&d_pos, 0, batch);
-    assert_pos_view(gpu, &d_pos, &pos_full, start, 0, batch, &format!("Q8/{tag}/pos"));
+    assert_pos_view(
+        gpu,
+        &d_pos,
+        &pos_full,
+        start,
+        0,
+        batch,
+        &format!("Q8/{tag}/pos"),
+    );
 
     run_q8(gpu, &d_q, &d_k, &d_v, &d_out, &pos_full, batch, seq_len);
     let o_a = gpu.download_f32(&d_out).unwrap();
@@ -529,7 +532,12 @@ fn fixture_le512_q8(
     // Guards: K/V/positions unchanged.
     check_guards_raw(gpu, &d_k, &k_h, &format!("Q8/{tag}/K"));
     check_guards_raw(gpu, &d_v, &v_h, &format!("Q8/{tag}/V"));
-    check_guards_raw(gpu, &d_pos, &positions_to_bytes(&pos_h), &format!("Q8/{tag}/pos"));
+    check_guards_raw(
+        gpu,
+        &d_pos,
+        &positions_to_bytes(&pos_h),
+        &format!("Q8/{tag}/pos"),
+    );
 
     // Second launch (old-vs-new at N≤512: accepted FA2 is bit-exact baseline).
     let d_out2 = gpu.zeros(&[batch * QO_ROW], DType::F32).unwrap();
@@ -552,10 +560,7 @@ fn fixture_le512_q8(
             run_q8(gpu, &d_q, &d_k, &d_v, &d_out, &pos_full, batch, seq_len);
             us.push(t0.elapsed().as_secs_f64() * 1e6);
         }
-        eprintln!(
-            "TIME Q8  {tag:>24}  med={:.1}us",
-            median_us(&mut us)
-        );
+        eprintln!("TIME Q8  {tag:>24}  med={:.1}us", median_us(&mut us));
     }
 }
 
@@ -579,7 +584,15 @@ fn fixture_le512_fwht3(
     let d_v = gpu.upload_raw(&v_h, &[v_h.len()]).unwrap();
     let d_pos = upload_positions(gpu, &pos_h);
     let pos_full = pos_view(&d_pos, 0, batch);
-    assert_pos_view(gpu, &d_pos, &pos_full, start, 0, batch, &format!("F3/{tag}/pos"));
+    assert_pos_view(
+        gpu,
+        &d_pos,
+        &pos_full,
+        start,
+        0,
+        batch,
+        &format!("F3/{tag}/pos"),
+    );
 
     let d_q_a = gpu.upload_f32(&q_h, &[batch, N_HEADS, HD]).unwrap();
     let d_out_a = gpu.zeros(&[batch * QO_ROW], DType::F32).unwrap();
@@ -591,7 +604,12 @@ fn fixture_le512_fwht3(
 
     check_guards_raw(gpu, &d_k, &k_h, &format!("F3/{tag}/K"));
     check_guards_raw(gpu, &d_v, &v_h, &format!("F3/{tag}/V"));
-    check_guards_raw(gpu, &d_pos, &positions_to_bytes(&pos_h), &format!("F3/{tag}/pos"));
+    check_guards_raw(
+        gpu,
+        &d_pos,
+        &positions_to_bytes(&pos_h),
+        &format!("F3/{tag}/pos"),
+    );
 
     // Second launch with fresh Q (in-place rotate).
     let d_q_b = gpu.upload_f32(&q_h, &[batch, N_HEADS, HD]).unwrap();
@@ -625,10 +643,7 @@ fn fixture_le512_fwht3(
             );
             us.push(t0.elapsed().as_secs_f64() * 1e6);
         }
-        eprintln!(
-            "TIME F3  {tag:>24}  med={:.1}us",
-            median_us(&mut us)
-        );
+        eprintln!("TIME F3  {tag:>24}  med={:.1}us", median_us(&mut us));
     }
 }
 
@@ -657,8 +672,18 @@ fn fixture_n1024_q8(
     let d_pos_a = upload_positions(gpu, &pos_h);
     let d_out_a = gpu.zeros(&[batch * QO_ROW], DType::F32).unwrap();
     let pos_a = pos_view(&d_pos_a, 0, batch);
-    assert_pos_view(gpu, &d_pos_a, &pos_a, start, 0, batch, &format!("Q8/{tag}/a"));
-    run_q8(gpu, &d_q_a, &d_k_a, &d_v_a, &d_out_a, &pos_a, batch, seq_len);
+    assert_pos_view(
+        gpu,
+        &d_pos_a,
+        &pos_a,
+        start,
+        0,
+        batch,
+        &format!("Q8/{tag}/a"),
+    );
+    run_q8(
+        gpu, &d_q_a, &d_k_a, &d_v_a, &d_out_a, &pos_a, batch, seq_len,
+    );
     let o_a = gpu.download_f32(&d_out_a).unwrap();
     check_guards_raw(gpu, &d_k_a, &k_h, &format!("Q8/{tag}/a/K"));
     check_guards_raw(gpu, &d_v_a, &v_h, &format!("Q8/{tag}/a/V"));
@@ -683,7 +708,15 @@ fn fixture_n1024_q8(
     let p0 = pos_view(&d_pos_b, 0, HALF);
     let p1 = pos_view(&d_pos_b, HALF, HALF);
     assert_pos_view(gpu, &d_pos_b, &p0, start, 0, HALF, &format!("Q8/{tag}/b0"));
-    assert_pos_view(gpu, &d_pos_b, &p1, start, HALF, HALF, &format!("Q8/{tag}/b1"));
+    assert_pos_view(
+        gpu,
+        &d_pos_b,
+        &p1,
+        start,
+        HALF,
+        HALF,
+        &format!("Q8/{tag}/b1"),
+    );
 
     run_q8(gpu, &q0, &d_k_b, &d_v_b, &o0, &p0, HALF, seq_len);
     run_q8(gpu, &q1, &d_k_b, &d_v_b, &o1, &p1, HALF, seq_len);
@@ -698,7 +731,9 @@ fn fixture_n1024_q8(
 
     if time {
         // Warm
-        run_q8(gpu, &d_q_a, &d_k_a, &d_v_a, &d_out_a, &pos_a, batch, seq_len);
+        run_q8(
+            gpu, &d_q_a, &d_k_a, &d_v_a, &d_out_a, &pos_a, batch, seq_len,
+        );
         run_q8(gpu, &q0, &d_k_b, &d_v_b, &o0, &p0, HALF, seq_len);
         run_q8(gpu, &q1, &d_k_b, &d_v_b, &o1, &p1, HALF, seq_len);
         const IT: usize = 10;
@@ -707,7 +742,9 @@ fn fixture_n1024_q8(
         for _ in 0..IT {
             gpu.hip.device_synchronize().unwrap();
             let t0 = Instant::now();
-            run_q8(gpu, &d_q_a, &d_k_a, &d_v_a, &d_out_a, &pos_a, batch, seq_len);
+            run_q8(
+                gpu, &d_q_a, &d_k_a, &d_v_a, &d_out_a, &pos_a, batch, seq_len,
+            );
             us_a.push(t0.elapsed().as_secs_f64() * 1e6);
 
             gpu.hip.device_synchronize().unwrap();
@@ -748,7 +785,15 @@ fn fixture_n1024_fwht3(
     let d_pos_a = upload_positions(gpu, &pos_h);
     let d_out_a = gpu.zeros(&[batch * QO_ROW], DType::F32).unwrap();
     let pos_a = pos_view(&d_pos_a, 0, batch);
-    assert_pos_view(gpu, &d_pos_a, &pos_a, start, 0, batch, &format!("F3/{tag}/a"));
+    assert_pos_view(
+        gpu,
+        &d_pos_a,
+        &pos_a,
+        start,
+        0,
+        batch,
+        &format!("F3/{tag}/a"),
+    );
     run_fwht3(
         gpu, &d_q_a, &d_k_a, &d_v_a, &d_out_a, &pos_a, d_s1, d_s2, batch, seq_len,
     );
@@ -777,7 +822,15 @@ fn fixture_n1024_fwht3(
     let p0 = pos_view(&d_pos_b, 0, HALF);
     let p1 = pos_view(&d_pos_b, HALF, HALF);
     assert_pos_view(gpu, &d_pos_b, &p0, start, 0, HALF, &format!("F3/{tag}/b0"));
-    assert_pos_view(gpu, &d_pos_b, &p1, start, HALF, HALF, &format!("F3/{tag}/b1"));
+    assert_pos_view(
+        gpu,
+        &d_pos_b,
+        &p1,
+        start,
+        HALF,
+        HALF,
+        &format!("F3/{tag}/b1"),
+    );
 
     run_fwht3(
         gpu, &q0, &d_k_b, &d_v_b, &o0, &p0, d_s1, d_s2, HALF, seq_len,
@@ -872,7 +925,14 @@ fn main() {
         run_position_contract(&mut gpu, start, batch, &format!("le512/b{batch}_s{start}"));
         fixture_le512_q8(&mut gpu, batch, start, seq_len, time, &mut n_fail);
         fixture_le512_fwht3(
-            &mut gpu, &d_s1, &d_s2, batch, start, seq_len, time, &mut n_fail,
+            &mut gpu,
+            &d_s1,
+            &d_s2,
+            batch,
+            start,
+            seq_len,
+            time,
+            &mut n_fail,
         );
     }
 
@@ -880,7 +940,14 @@ fn main() {
     for &(batch, start, seq_len) in SHAPES_N1024 {
         fixture_n1024_q8(&mut gpu, batch, start, seq_len, time, &mut n_fail);
         fixture_n1024_fwht3(
-            &mut gpu, &d_s1, &d_s2, batch, start, seq_len, time, &mut n_fail,
+            &mut gpu,
+            &d_s1,
+            &d_s2,
+            batch,
+            start,
+            seq_len,
+            time,
+            &mut n_fail,
         );
     }
 

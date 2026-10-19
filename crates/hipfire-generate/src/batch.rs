@@ -266,7 +266,10 @@ fn request_has_stop(msg: &serde_json::Value) -> bool {
 /// `reasoning.max_total_tokens`. Same predicate as the admission's
 /// [`crate::vmm_conv::ThinkCtl::budgeted`].
 fn request_think_budgeted(msg: &serde_json::Value) -> bool {
-    let max_think = msg.get("max_think_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let max_think = msg
+        .get("max_think_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
     crate::vmm_conv::ThinkCtl::new(max_think).budgeted()
 }
 
@@ -454,302 +457,295 @@ pub(crate) fn drain_qwen_batch_inbox(
     vmm_route: bool,
 ) -> Result<Option<DaemonMsg>, String> {
     let mut barrier: Option<DaemonMsg> = None;
-        loop {
-            let dm = match inbox.try_recv() {
-                Ok(m) => m,
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => break,
-            };
-            let (dm, carried_admission) = match dm {
-                DaemonMsg::RegularWithAdmission(json, admission) => {
-                    (DaemonMsg::Regular(json), Some(admission))
-                }
-                other => (other, None),
-            };
-            match dm {
-                DaemonMsg::RegularWithAdmission(json, admission) => {
-                    barrier = Some(DaemonMsg::RegularWithAdmission(json, admission));
-                    break;
-                }
-                DaemonMsg::SingletonWithAdmission(json, transfer) => {
-                    barrier = Some(DaemonMsg::SingletonWithAdmission(json, transfer));
-                    break;
-                }
-                DaemonMsg::ParseError(e) => {
-                    emit_uncorrelated_error(
-                        stdout,
-                        None,
-                        &format!("invalid JSON: {e}"),
-                        "validation",
-                        false,
-                        false,
-                    );
-                    let _ = stdout.flush();
-                }
-                DaemonMsg::Regular(json) => {
-                    let t = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    if t == "generate" {
-                        let attempt_id = match json.get("attempt_id").and_then(|v| v.as_u64()) {
-                            Some(0) => {
-                                emit_uncorrelated_error(
-                                    stdout,
-                                    json.get("id").and_then(|v| v.as_str()),
-                                    "generate attempt_id must be nonzero",
-                                    "validation",
-                                    false,
-                                    false,
-                                );
-                                continue;
-                            }
-                            Some(v) => v,
-                            None => {
-                                emit_uncorrelated_error(
-                                    stdout,
-                                    json.get("id").and_then(|v| v.as_str()),
-                                    "generate missing attempt_id",
-                                    "validation",
-                                    false,
-                                    false,
-                                );
-                                continue;
-                            }
-                        };
-                        let id = json
-                            .get("id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("0")
-                            .to_string();
-                        let Some(admission) = carried_admission else {
-                            barrier = Some(daemon_regular_with_admission(json, None));
-                            break;
-                        };
-                        if batch_check_abort(&id, attempt_id, admission) {
-                            let _scope =
-                                BatchAttemptScope::enter_for_generation(&id, attempt_id, admission);
-                            crate::ar::emit_generation_start(
-                                route,
+    loop {
+        let dm = match inbox.try_recv() {
+            Ok(m) => m,
+            Err(mpsc::TryRecvError::Empty) => break,
+            Err(mpsc::TryRecvError::Disconnected) => break,
+        };
+        let (dm, carried_admission) = match dm {
+            DaemonMsg::RegularWithAdmission(json, admission) => {
+                (DaemonMsg::Regular(json), Some(admission))
+            }
+            other => (other, None),
+        };
+        match dm {
+            DaemonMsg::RegularWithAdmission(json, admission) => {
+                barrier = Some(DaemonMsg::RegularWithAdmission(json, admission));
+                break;
+            }
+            DaemonMsg::SingletonWithAdmission(json, transfer) => {
+                barrier = Some(DaemonMsg::SingletonWithAdmission(json, transfer));
+                break;
+            }
+            DaemonMsg::ParseError(e) => {
+                emit_uncorrelated_error(
+                    stdout,
+                    None,
+                    &format!("invalid JSON: {e}"),
+                    "validation",
+                    false,
+                    false,
+                );
+                let _ = stdout.flush();
+            }
+            DaemonMsg::Regular(json) => {
+                let t = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if t == "generate" {
+                    let attempt_id = match json.get("attempt_id").and_then(|v| v.as_u64()) {
+                        Some(0) => {
+                            emit_uncorrelated_error(
                                 stdout,
-                                &id,
-                                false,
-                            );
-                            crate::ar::emit_generation_cancel(route, stdout, &id, 0);
-                            batch_clear_terminal_at_generation(&id, attempt_id, admission);
-                            continue;
-                        }
-                        if !eligible(
-                            &json,
-                            model,
-                            batch_size,
-                            parse_serve_continuous_batch(&json),
-                            false,
-                        ) {
-                            barrier = Some(daemon_regular_with_admission(json, carried_admission));
-                            break;
-                        }
-                        let prompt_str = batch_single_user_content(&json).unwrap_or_else(|| {
-                            let prompt = json.get("prompt").and_then(|v| v.as_str()).unwrap_or("Hello");
-                            if vmm_route {
-                                // As the singleton dispatch normalizes `prompt`.
-                                hipfire_runtime::tokenizer::maybe_normalize_prompt(prompt).into_owned()
-                            } else {
-                                prompt.to_string()
-                            }
-                        });
-                        let system_str = json
-                            .get("system")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                        let assistant_prefix = match json
-                            .get("assistant_prefix")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("plain")
-                        {
-                            "open_think" => {
-                                hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
-                            }
-                            "closed_think" => {
-                                hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink
-                            }
-                            _ => hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-                        };
-                        let max_think = json
-                            .get("max_think_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as usize;
-                        let max_tokens_req = json
-                            .get("max_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(4096) as usize;
-                        let parsed_messages = if vmm_route {
-                            hipfire_engine::prompt::parse_generate_messages(&json)
-                        } else {
-                            json.get("messages")
-                                .map(|v| {
-                                    serde_json::from_value::<Vec<hipfire_runtime::prompt_frame::Message>>(v.clone())
-                                        .map_err(|e| e.to_string())
-                                })
-                                .transpose()
-                        };
-                        let batch_messages = match parsed_messages {
-                            Ok(v) => v,
-                            Err(e) => {
-                                emit_batch_admission_error(
-                                    stdout,
-                                    &id,
-                                    attempt_id,
-                                    admission,
-                                    &format!("invalid messages field: {e}"),
-                                    "validation",
-                                    false,
-                                    false,
-                                );
-                                continue;
-                            }
-                        };
-                        let raw_effort = json
-                            .get("reasoning_effort")
-                            .or_else(|| json.get("thinking_mode"))
-                            .and_then(|v| v.as_str());
-                        let thinking_enabled =
-                            json.get("thinking_enabled").and_then(|v| v.as_bool());
-                        let (batch_enable_thinking, batch_reasoning_effort) =
-                            qwen_jinja_reasoning(thinking_enabled, raw_effort, max_think);
-                        // Qwen4Ar: the lane driver renders the exact qwen4 prompt
-                        // at assignment (its own template/think handling), so the
-                        // shared qwen35 render must neither run nor reject here.
-                        let rendered = if route == GenerationRoute::Qwen4Ar {
-                            Ok((Vec::new(), false))
-                        } else {
-                            batch_render_prompt_tokens(
-                                &prompt_str,
-                                system_str.as_deref(),
-                                assistant_prefix,
-                                tokenizer,
-                                chat_template,
-                                max_think,
-                                batch_messages.as_deref(),
-                                batch_enable_thinking,
-                                batch_reasoning_effort.as_deref(),
-                            )
-                        };
-                        let (prompt_tokens, started_in_think) = match rendered {
-                            Ok(v) => v,
-                            Err(e) => {
-                                emit_batch_admission_error(
-                                    stdout,
-                                    &id,
-                                    attempt_id,
-                                    admission,
-                                    &format!("render failed: {e}"),
-                                    "validation",
-                                    false,
-                                    false,
-                                );
-                                continue;
-                            }
-                        };
-                        if started_in_think && !vmm_route {
-                            let handoff = match handoff_admitted_started_in_think(
-                                &id,
-                                attempt_id,
-                                admission,
-                                json,
-                                GenerationRoute::QwenAr,
-                            ) {
-                                Ok(msg) => msg,
-                                Err(reason) => {
-                                    return Err(reason)
-                                }
-                            };
-                            barrier = Some(handoff);
-                            break;
-                        }
-                        // Qwen4Ar defers rendering to the lane driver, so the
-                        // prompt-length gate runs there (before store admit).
-                        if route != GenerationRoute::Qwen4Ar
-                            && (prompt_tokens.is_empty() || prompt_tokens.len() >= sched.lane_capacity)
-                        {
-                            emit_batch_admission_error(
-                                stdout,
-                                &id,
-                                attempt_id,
-                                admission,
-                                "prompt exceeds lane capacity or empty",
+                                json.get("id").and_then(|v| v.as_str()),
+                                "generate attempt_id must be nonzero",
                                 "validation",
                                 false,
                                 false,
                             );
                             continue;
                         }
-                        // Explicit wire `seed` must reach the lane RNG on the
-                        // batched route too; out-of-domain values are rejected
-                        // loudly, never silently unseeded.
-                        let client_seed = match wire_seed::parse_wire_seed(json.get("seed")) {
-                            Ok(s) => s,
-                            Err(reason) => {
-                                emit_batch_admission_error(
-                                    stdout,
-                                    &id,
-                                    attempt_id,
-                                    admission,
-                                    &reason,
-                                    "validation",
-                                    false,
-                                    false,
-                                );
-                                continue;
-                            }
-                        };
-                        batch_transition_to_queued(&id, attempt_id, admission);
-                        let sampling = resolve_batch_sampling(&json, model);
-                        let req = BatchPendingRequest {
-                            key: AttemptKey::new(&id, attempt_id),
-                            admission,
-                            original_msg: json.clone(),
-                            prompt: prompt_str.clone(),
-                            prompt_tokens: prompt_tokens.clone(),
-                            started_in_think,
-                            system: system_str.clone(),
-                            assistant_prefix,
-                            max_think_tokens: max_think,
-                            max_tokens: max_tokens_req,
-                            client_seed,
-                            sampling,
-                        };
-                        if !sched.enqueue(req) {
-                            // Defensive: a live registry/channel already owns this
-                            // key. Do not emit a keyed error or clear the original.
-                            eprintln!(
-                                "[batch] duplicate enqueue rejected id={} attempt_id={}; preserving live registry",
-                                id, attempt_id
+                        Some(v) => v,
+                        None => {
+                            emit_uncorrelated_error(
+                                stdout,
+                                json.get("id").and_then(|v| v.as_str()),
+                                "generate missing attempt_id",
+                                "validation",
+                                false,
+                                false,
                             );
                             continue;
                         }
-                        if !vmm_route {
-                            let _scope =
-                                BatchAttemptScope::enter_for_generation(&id, attempt_id, admission);
-                            crate::ar::emit_generation_start(
-                                crate::ar::GenerationRoute::QwenAr,
-                                stdout,
-                                &id,
-                                started_in_think,
-                            );
-                        }
-                    } else if t == "abort" || t == "commit" {
-                        if let (Some(id), Some(aid), Some(kind)) = (
-                            json.get("id").and_then(|v| v.as_str()),
-                            json.get("attempt_id").and_then(|v| v.as_u64()),
-                            json.get("type").and_then(|v| v.as_str()),
-                        ) {
-                            batch_apply_terminal_control(kind, id, aid);
-                        }
-                    } else {
+                    };
+                    let id = json
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("0")
+                        .to_string();
+                    let Some(admission) = carried_admission else {
+                        barrier = Some(daemon_regular_with_admission(json, None));
+                        break;
+                    };
+                    if batch_check_abort(&id, attempt_id, admission) {
+                        let _scope =
+                            BatchAttemptScope::enter_for_generation(&id, attempt_id, admission);
+                        crate::ar::emit_generation_start(route, stdout, &id, false);
+                        crate::ar::emit_generation_cancel(route, stdout, &id, 0);
+                        batch_clear_terminal_at_generation(&id, attempt_id, admission);
+                        continue;
+                    }
+                    if !eligible(
+                        &json,
+                        model,
+                        batch_size,
+                        parse_serve_continuous_batch(&json),
+                        false,
+                    ) {
                         barrier = Some(daemon_regular_with_admission(json, carried_admission));
                         break;
                     }
+                    let prompt_str = batch_single_user_content(&json).unwrap_or_else(|| {
+                        let prompt = json
+                            .get("prompt")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Hello");
+                        if vmm_route {
+                            // As the singleton dispatch normalizes `prompt`.
+                            hipfire_runtime::tokenizer::maybe_normalize_prompt(prompt).into_owned()
+                        } else {
+                            prompt.to_string()
+                        }
+                    });
+                    let system_str = json
+                        .get("system")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let assistant_prefix = match json
+                        .get("assistant_prefix")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("plain")
+                    {
+                        "open_think" => hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink,
+                        "closed_think" => {
+                            hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink
+                        }
+                        _ => hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                    };
+                    let max_think = json
+                        .get("max_think_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize;
+                    let max_tokens_req = json
+                        .get("max_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(4096) as usize;
+                    let parsed_messages = if vmm_route {
+                        hipfire_engine::prompt::parse_generate_messages(&json)
+                    } else {
+                        json.get("messages")
+                                .map(|v| {
+                                    serde_json::from_value::<Vec<hipfire_runtime::prompt_frame::Message>>(v.clone())
+                                        .map_err(|e| e.to_string())
+                                })
+                                .transpose()
+                    };
+                    let batch_messages = match parsed_messages {
+                        Ok(v) => v,
+                        Err(e) => {
+                            emit_batch_admission_error(
+                                stdout,
+                                &id,
+                                attempt_id,
+                                admission,
+                                &format!("invalid messages field: {e}"),
+                                "validation",
+                                false,
+                                false,
+                            );
+                            continue;
+                        }
+                    };
+                    let raw_effort = json
+                        .get("reasoning_effort")
+                        .or_else(|| json.get("thinking_mode"))
+                        .and_then(|v| v.as_str());
+                    let thinking_enabled = json.get("thinking_enabled").and_then(|v| v.as_bool());
+                    let (batch_enable_thinking, batch_reasoning_effort) =
+                        qwen_jinja_reasoning(thinking_enabled, raw_effort, max_think);
+                    // Qwen4Ar: the lane driver renders the exact qwen4 prompt
+                    // at assignment (its own template/think handling), so the
+                    // shared qwen35 render must neither run nor reject here.
+                    let rendered = if route == GenerationRoute::Qwen4Ar {
+                        Ok((Vec::new(), false))
+                    } else {
+                        batch_render_prompt_tokens(
+                            &prompt_str,
+                            system_str.as_deref(),
+                            assistant_prefix,
+                            tokenizer,
+                            chat_template,
+                            max_think,
+                            batch_messages.as_deref(),
+                            batch_enable_thinking,
+                            batch_reasoning_effort.as_deref(),
+                        )
+                    };
+                    let (prompt_tokens, started_in_think) = match rendered {
+                        Ok(v) => v,
+                        Err(e) => {
+                            emit_batch_admission_error(
+                                stdout,
+                                &id,
+                                attempt_id,
+                                admission,
+                                &format!("render failed: {e}"),
+                                "validation",
+                                false,
+                                false,
+                            );
+                            continue;
+                        }
+                    };
+                    if started_in_think && !vmm_route {
+                        let handoff = match handoff_admitted_started_in_think(
+                            &id,
+                            attempt_id,
+                            admission,
+                            json,
+                            GenerationRoute::QwenAr,
+                        ) {
+                            Ok(msg) => msg,
+                            Err(reason) => return Err(reason),
+                        };
+                        barrier = Some(handoff);
+                        break;
+                    }
+                    // Qwen4Ar defers rendering to the lane driver, so the
+                    // prompt-length gate runs there (before store admit).
+                    if route != GenerationRoute::Qwen4Ar
+                        && (prompt_tokens.is_empty() || prompt_tokens.len() >= sched.lane_capacity)
+                    {
+                        emit_batch_admission_error(
+                            stdout,
+                            &id,
+                            attempt_id,
+                            admission,
+                            "prompt exceeds lane capacity or empty",
+                            "validation",
+                            false,
+                            false,
+                        );
+                        continue;
+                    }
+                    // Explicit wire `seed` must reach the lane RNG on the
+                    // batched route too; out-of-domain values are rejected
+                    // loudly, never silently unseeded.
+                    let client_seed = match wire_seed::parse_wire_seed(json.get("seed")) {
+                        Ok(s) => s,
+                        Err(reason) => {
+                            emit_batch_admission_error(
+                                stdout,
+                                &id,
+                                attempt_id,
+                                admission,
+                                &reason,
+                                "validation",
+                                false,
+                                false,
+                            );
+                            continue;
+                        }
+                    };
+                    batch_transition_to_queued(&id, attempt_id, admission);
+                    let sampling = resolve_batch_sampling(&json, model);
+                    let req = BatchPendingRequest {
+                        key: AttemptKey::new(&id, attempt_id),
+                        admission,
+                        original_msg: json.clone(),
+                        prompt: prompt_str.clone(),
+                        prompt_tokens: prompt_tokens.clone(),
+                        started_in_think,
+                        system: system_str.clone(),
+                        assistant_prefix,
+                        max_think_tokens: max_think,
+                        max_tokens: max_tokens_req,
+                        client_seed,
+                        sampling,
+                    };
+                    if !sched.enqueue(req) {
+                        // Defensive: a live registry/channel already owns this
+                        // key. Do not emit a keyed error or clear the original.
+                        eprintln!(
+                                "[batch] duplicate enqueue rejected id={} attempt_id={}; preserving live registry",
+                                id, attempt_id
+                            );
+                        continue;
+                    }
+                    if !vmm_route {
+                        let _scope =
+                            BatchAttemptScope::enter_for_generation(&id, attempt_id, admission);
+                        crate::ar::emit_generation_start(
+                            crate::ar::GenerationRoute::QwenAr,
+                            stdout,
+                            &id,
+                            started_in_think,
+                        );
+                    }
+                } else if t == "abort" || t == "commit" {
+                    if let (Some(id), Some(aid), Some(kind)) = (
+                        json.get("id").and_then(|v| v.as_str()),
+                        json.get("attempt_id").and_then(|v| v.as_u64()),
+                        json.get("type").and_then(|v| v.as_str()),
+                    ) {
+                        batch_apply_terminal_control(kind, id, aid);
+                    }
+                } else {
+                    barrier = Some(daemon_regular_with_admission(json, carried_admission));
+                    break;
                 }
             }
         }
+    }
     Ok(barrier)
 }
 
@@ -1623,9 +1619,15 @@ impl VmmLaneDecode {
 enum VmmSpecMode {
     Off,
     /// MTP engine: `(k, head_cap)`.
-    Mtp { k: usize, cap: usize },
+    Mtp {
+        k: usize,
+        cap: usize,
+    },
     /// DFlash engine: configured `block` and the resolved logical context cap.
-    Dflash { block: usize, cap: usize },
+    Dflash {
+        block: usize,
+        cap: usize,
+    },
 }
 
 impl VmmSpecMode {
@@ -1639,7 +1641,9 @@ impl VmmSpecMode {
 }
 
 /// The speculation engine the staged store actually installed.
-fn vmm_store_spec_mode(store: &hipfire_arch_qwen35::forward_slots::vmm::Qwen35VmmStore) -> VmmSpecMode {
+fn vmm_store_spec_mode(
+    store: &hipfire_arch_qwen35::forward_slots::vmm::Qwen35VmmStore,
+) -> VmmSpecMode {
     if let Some(e) = store.dflash_engine() {
         VmmSpecMode::Dflash {
             block: e.block_size(),
@@ -1728,16 +1732,29 @@ fn vmm_head_admissible(
         return true;
     };
     let prompt = req.prompt_tokens.len();
-    let end = prompt + req.max_tokens + hipfire_arch_qwen35::forward_slots::vmm::VMM_RESERVE_SLACK_ROWS;
+    let end =
+        prompt + req.max_tokens + hipfire_arch_qwen35::forward_slots::vmm::VMM_RESERVE_SLACK_ROWS;
     let lane = if req.sampling.temp <= 0.0 {
         engine_kind
     } else {
         hipfire_arch_qwen35::forward_slots::vmm::VmmLaneSpec::Ar
     };
-    match store.admission_check(gpu, &b.weights, &b.config, &b.kv_cache, &b.dn_state, prompt, end, lane) {
+    match store.admission_check(
+        gpu,
+        &b.weights,
+        &b.config,
+        &b.kv_cache,
+        &b.dn_state,
+        prompt,
+        end,
+        lane,
+    ) {
         Ok(a) if a.fits => {
             if wait.as_ref() == Some(key) {
-                eprintln!("[vmm-admit] id={} admitted after waiting for device memory", key.id);
+                eprintln!(
+                    "[vmm-admit] id={} admitted after waiting for device memory",
+                    key.id
+                );
                 *wait = None;
             }
             true
@@ -1753,7 +1770,10 @@ fn vmm_head_admissible(
             false
         }
         Err(e) => {
-            eprintln!("[vmm-admit] id={} memory check failed ({e}); admitting", key.id);
+            eprintln!(
+                "[vmm-admit] id={} memory check failed ({e}); admitting",
+                key.id
+            );
             true
         }
     }
@@ -1764,7 +1784,11 @@ fn vmm_head_admissible(
 /// (the slot deferred first last step), until the next does not fit.
 /// Returns the selected slots and the next cursor (first deferred slot, or 0
 /// when none was deferred).
-fn select_spec_windows(cands: &[(usize, usize)], budget: usize, cursor: usize) -> (Vec<usize>, usize) {
+fn select_spec_windows(
+    cands: &[(usize, usize)],
+    budget: usize,
+    cursor: usize,
+) -> (Vec<usize>, usize) {
     let start = cands.iter().position(|&(s, _)| s >= cursor).unwrap_or(0);
     let mut used = 0usize;
     let mut chosen: Vec<usize> = Vec::new();
@@ -1805,7 +1829,11 @@ fn attach_vmm_spec_evidence(done: &mut serde_json::Value, decode: VmmLaneDecode,
 /// `select_generation_route` inputs the singleton builds, so a request the
 /// singleton would serve through DFlash/MTP (neutral penalties, no forced-AR
 /// chat) or AR is the mode a lane must serve.
-fn vmm_singleton_route(msg: &serde_json::Value, m: &LoadedModel, sampling: &BatchSampling) -> GenerationRoute {
+fn vmm_singleton_route(
+    msg: &serde_json::Value,
+    m: &LoadedModel,
+    sampling: &BatchSampling,
+) -> GenerationRoute {
     let user_explicit = [
         "top_p",
         "top_k",
@@ -1832,9 +1860,18 @@ fn vmm_singleton_route(msg: &serde_json::Value, m: &LoadedModel, sampling: &Batc
         nonneutral_penalties: sampling.repeat_penalty != 1.0
             || sampling.presence_penalty != 0.0
             || sampling.frequency_penalty != 0.0,
-        force_ar_chat: hipfire_config::developer_var("HIPFIRE_DFLASH_CHAT").ok().as_deref() == Some("0"),
-        temp_spec_env_off: hipfire_config::developer_var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0"),
-        fast_sample_on: hipfire_config::developer_var("HIPFIRE_FAST_SAMPLE").ok().as_deref() != Some("0"),
+        force_ar_chat: hipfire_config::developer_var("HIPFIRE_DFLASH_CHAT")
+            .ok()
+            .as_deref()
+            == Some("0"),
+        temp_spec_env_off: hipfire_config::developer_var("HIPFIRE_DFLASH_TEMP_SPEC")
+            .ok()
+            .as_deref()
+            == Some("0"),
+        fast_sample_on: hipfire_config::developer_var("HIPFIRE_FAST_SAMPLE")
+            .ok()
+            .as_deref()
+            != Some("0"),
         supports_temp_swor: spec.is_some_and(|s| s.supports_temp_verify()),
         supports_chain_nucleus_verify: spec.is_some_and(|s| s.supports_chain_nucleus_verify()),
         kv_adaptive: m.kv_adaptive.is_some(),
@@ -1872,7 +1909,9 @@ fn sampled_lane_for(
     let spec_shape = !has_stops && !think_budgeted;
     match route {
         GenerationRoute::QwenAr => Some(VmmLaneDecode::Ar),
-        GenerationRoute::QwenDflash if speculator_is_mtp => (mtp_engine && spec_shape).then_some(VmmLaneDecode::Mtp),
+        GenerationRoute::QwenDflash if speculator_is_mtp => {
+            (mtp_engine && spec_shape).then_some(VmmLaneDecode::Mtp)
+        }
         GenerationRoute::QwenDflash => {
             (dflash_engine && dflash_sampled && spec_shape).then_some(VmmLaneDecode::Dflash)
         }
@@ -1889,9 +1928,14 @@ fn vmm_store_mtp_engine(store: &hipfire_arch_qwen35::forward_slots::vmm::Qwen35V
 
 /// Only the production FAST_SAMPLE selector chain has shared sampled seams.
 /// Other DFlash laws remain singleton, even when a greedy engine is staged.
-fn vmm_store_dflash_sampled(store: &hipfire_arch_qwen35::forward_slots::vmm::Qwen35VmmStore) -> bool {
+fn vmm_store_dflash_sampled(
+    store: &hipfire_arch_qwen35::forward_slots::vmm::Qwen35VmmStore,
+) -> bool {
     store.dflash_engine().is_some_and(|e| e.supports_sampled())
-        && hipfire_config::developer_var("HIPFIRE_FAST_SAMPLE").ok().as_deref() != Some("0")
+        && hipfire_config::developer_var("HIPFIRE_FAST_SAMPLE")
+            .ok()
+            .as_deref()
+            != Some("0")
 }
 
 /// Whether the store serves sampled requests at all: staged with
@@ -1903,7 +1947,11 @@ fn vmm_store_sampled(store: &hipfire_arch_qwen35::forward_slots::vmm::Qwen35VmmS
 
 /// `sampled_lane_for` for one request against the loaded model's staged
 /// store; `None` when the store is not staged.
-fn vmm_sampled_lane(msg: &serde_json::Value, m: &LoadedModel, sampling: &BatchSampling) -> Option<VmmLaneDecode> {
+fn vmm_sampled_lane(
+    msg: &serde_json::Value,
+    m: &LoadedModel,
+    sampling: &BatchSampling,
+) -> Option<VmmLaneDecode> {
     let store = m.qwen35().and_then(|b| b.vmm_store.as_ref())?;
     sampled_lane_for(
         vmm_singleton_route(msg, m, sampling),
@@ -1923,7 +1971,9 @@ fn vmm_row_budget(
     params: &VmmBatchParams,
     batch_size: usize,
 ) -> usize {
-    store.row_budget().min(params.max_batch_tokens.max(batch_size))
+    store
+        .row_budget()
+        .min(params.max_batch_tokens.max(batch_size))
 }
 
 /// The VMM driver's spec lane engines: MTP `(k, head_cap)` when the store's
@@ -1931,15 +1981,28 @@ fn vmm_row_budget(
 /// windows; else DFlash `(block, ctx_capacity)` when staged and the row
 /// budget holds one full block (mutually exclusive with MTP at staging).
 type VmmLaneEngines = (Option<(usize, usize)>, Option<(usize, usize)>);
-fn vmm_lane_engines(m: &LoadedModel, params: &VmmBatchParams, gpu_arch: &str, row_budget: usize) -> VmmLaneEngines {
+fn vmm_lane_engines(
+    m: &LoadedModel,
+    params: &VmmBatchParams,
+    gpu_arch: &str,
+    row_budget: usize,
+) -> VmmLaneEngines {
     let store = m.qwen35().and_then(|b| b.vmm_store.as_ref());
     let mtp = (params.spec
         && !hipfire_config::mtp_ngram_enabled()
         && !hipfire_config::mtp_ngram_enabled_for_arch(m.arch_id, gpu_arch))
-    .then(|| store.and_then(|s| s.spec_engine()).map(|e| (e.k(), e.head_cap())))
+    .then(|| {
+        store
+            .and_then(|s| s.spec_engine())
+            .map(|e| (e.k(), e.head_cap()))
+    })
     .flatten();
     let dflash = (params.spec && mtp.is_none())
-        .then(|| store.and_then(|s| s.dflash_engine()).map(|e| (e.block_size(), e.ctx_capacity())))
+        .then(|| {
+            store
+                .and_then(|s| s.dflash_engine())
+                .map(|e| (e.block_size(), e.ctx_capacity()))
+        })
         .flatten()
         .filter(|&(block, _)| row_budget >= block);
     (mtp, dflash)
@@ -1975,7 +2038,9 @@ fn sampled_admission_lane(
 ) -> Option<VmmLaneDecode> {
     match lane? {
         VmmLaneDecode::Ar => Some(VmmLaneDecode::Ar),
-        VmmLaneDecode::Mtp | VmmLaneDecode::Dflash if !singleton_spec_fits => Some(VmmLaneDecode::Ar),
+        VmmLaneDecode::Mtp | VmmLaneDecode::Dflash if !singleton_spec_fits => {
+            Some(VmmLaneDecode::Ar)
+        }
         VmmLaneDecode::Mtp => spec_engine
             .filter(|&(k, cap)| prompt_len + max_tokens + k + 1 <= cap)
             .map(|_| VmmLaneDecode::Mtp),
@@ -2004,10 +2069,16 @@ pub fn vmm_request_fits_batch(
     if sampling.temp <= 0.0 {
         return true;
     }
-    let (Some(params), Some(store)) = (vmm_batch, m.qwen35().and_then(|b| b.vmm_store.as_ref())) else {
+    let (Some(params), Some(store)) = (vmm_batch, m.qwen35().and_then(|b| b.vmm_store.as_ref()))
+    else {
         return true;
     };
-    let engines = vmm_lane_engines(m, &params, gpu_arch, vmm_row_budget(store, &params, batch_size));
+    let engines = vmm_lane_engines(
+        m,
+        &params,
+        gpu_arch,
+        vmm_row_budget(store, &params, batch_size),
+    );
     sampled_admission_lane(
         vmm_sampled_lane(msg, m, sampling),
         singleton_spec_fits(m, prompt_len, max_tokens),
@@ -2047,7 +2118,12 @@ fn vmm_sampled_modes(sampled: bool, mtp_engine: bool, dflash_engine: bool) -> Ve
 
 /// Load-ack sampling receipt: `greedy_only` unless sampled lanes exist, then
 /// `sampled` plus the modes a lane can serve.
-fn attach_vmm_sampling_ack(v: &mut serde_json::Value, sampled: bool, mtp_engine: bool, dflash_engine: bool) {
+fn attach_vmm_sampling_ack(
+    v: &mut serde_json::Value,
+    sampled: bool,
+    mtp_engine: bool,
+    dflash_engine: bool,
+) {
     let modes = vmm_sampled_modes(sampled, mtp_engine, dflash_engine);
     if modes.is_empty() {
         v["continuous_batch_sampling"] = serde_json::json!("greedy_only");
@@ -2061,10 +2137,18 @@ fn attach_vmm_sampling_ack(v: &mut serde_json::Value, sampled: bool, mtp_engine:
 /// decode mode, whether it sampled, and the equivalence claim. Written inside
 /// the `continuous_batch` object (the part serve forwards) and mirrored at
 /// the top level like `continuous_batch_spec_mode`.
-fn attach_vmm_batch_receipts(done: &mut serde_json::Value, decode: VmmLaneDecode, sampled: bool, exact: bool) {
+fn attach_vmm_batch_receipts(
+    done: &mut serde_json::Value,
+    decode: VmmLaneDecode,
+    sampled: bool,
+    exact: bool,
+) {
     let sampling = if sampled { "sampled" } else { "greedy" };
     let equivalence = if exact { "singleton_exact" } else { "nonexact" };
-    if let Some(cb) = done.get_mut("continuous_batch").and_then(|v| v.as_object_mut()) {
+    if let Some(cb) = done
+        .get_mut("continuous_batch")
+        .and_then(|v| v.as_object_mut())
+    {
         cb.insert("spec_mode".into(), serde_json::json!(decode.wire()));
         cb.insert("sampling".into(), serde_json::json!(sampling));
         cb.insert("equivalence".into(), serde_json::json!(equivalence));
@@ -2075,7 +2159,10 @@ fn attach_vmm_batch_receipts(done: &mut serde_json::Value, decode: VmmLaneDecode
 
 /// The singleton MTP route's per-request speculator config for a batch
 /// request's resolved sampling (what `configure_request` installs).
-fn spec_request_config(s: &BatchSampling, rng_seed: u64) -> hipfire_runtime::spec::SpecRequestConfig {
+fn spec_request_config(
+    s: &BatchSampling,
+    rng_seed: u64,
+) -> hipfire_runtime::spec::SpecRequestConfig {
     hipfire_runtime::spec::SpecRequestConfig {
         temp: s.temp,
         top_p: s.top_p,
@@ -2123,7 +2210,8 @@ pub(crate) fn promotion_wanted(generated: usize) -> bool {
             .ok()
             .and_then(|v| v.trim().parse().ok())
     });
-    hipfire_engine::scheduler::queued_batch_generates() > 0 || FORCED_AT.is_some_and(|n| generated >= n)
+    hipfire_engine::scheduler::queued_batch_generates() > 0
+        || FORCED_AT.is_some_and(|n| generated >= n)
 }
 
 pub(crate) fn put_promoted(p: PromotedRequest) {
@@ -2156,7 +2244,8 @@ pub(crate) fn replay_ar_producer(
     tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
     committed: &[u32],
 ) -> Result<(QwenArSemanticProducer, usize), String> {
-    let mut producer = QwenArSemanticProducer::new_with_tool_protocol(id.to_string(), started_in_think, false);
+    let mut producer =
+        QwenArSemanticProducer::new_with_tool_protocol(id.to_string(), started_in_think, false);
     let mut bytes = Vec::new();
     let mut sink = std::io::sink();
     for (i, &t) in committed.iter().enumerate() {
@@ -2206,7 +2295,14 @@ pub(crate) struct SingletonBoundary<'a> {
 pub(crate) fn promote_singleton(
     gpu: &mut rdna_compute::Gpu,
     b: SingletonBoundary<'_>,
-) -> Result<(BatchPendingRequest, QwenBatchLane, hipfire_arch_qwen35::forward_slots::vmm::Qwen35RequestState), String> {
+) -> Result<
+    (
+        BatchPendingRequest,
+        QwenBatchLane,
+        hipfire_arch_qwen35::forward_slots::vmm::Qwen35RequestState,
+    ),
+    String,
+> {
     use hipfire_arch_qwen35::forward_slots::vmm::{Qwen35RequestState, VmmRequestInit};
     use hipfire_runtime::slot_batch::RequestEpoch;
     let attempt_id = active_attempt_id();
@@ -2235,7 +2331,9 @@ pub(crate) fn promote_singleton(
     }
     let Some(admission) = singleton_handoff_to_batch(b.id, attempt_id) else {
         let freed = state.free_gpu(gpu);
-        return Err(format!("terminal transaction not transferable; free: {freed:?}"));
+        return Err(format!(
+            "terminal transaction not transferable; free: {freed:?}"
+        ));
     };
     std::mem::swap(&mut state.kv, b.kv);
     // The singleton keeps its DN objects (copied above); clear them for its
@@ -2245,8 +2343,9 @@ pub(crate) fn promote_singleton(
     }
     state.position = b.position;
     state.pending_seed = Some(b.pending_seed);
-    state.reserve_end =
-        b.prompt_len + b.permit.max_tokens + hipfire_arch_qwen35::forward_slots::vmm::VMM_RESERVE_SLACK_ROWS;
+    state.reserve_end = b.prompt_len
+        + b.permit.max_tokens
+        + hipfire_arch_qwen35::forward_slots::vmm::VMM_RESERVE_SLACK_ROWS;
     let key = AttemptKey::new(b.id, attempt_id);
     let pending = BatchPendingRequest {
         key: key.clone(),
@@ -2319,17 +2418,31 @@ pub(crate) fn promote_qwen4_singleton(
     if b.emitted.last() != Some(&b.seed_token) {
         return Err("pending seed is not the last committed token".into());
     }
-    let spec_store = bundle.lanes().ok_or("qwen4 lanes not staged")?.spec().is_some();
-    let (producer, bytes_fed) = replay_ar_producer(b.id, b.started_in_think, b.tokenizer, b.emitted)?;
+    let spec_store = bundle
+        .lanes()
+        .ok_or("qwen4 lanes not staged")?
+        .spec()
+        .is_some();
+    let (producer, bytes_fed) =
+        replay_ar_producer(b.id, b.started_in_think, b.tokenizer, b.emitted)?;
     let epoch = crate::fn_batch::next_lane_epoch()?;
     let parts = if spec_store {
-        let drafter = drafter.ok_or("lane store carries MTP but the singleton has no MTP drafter")?;
+        let drafter =
+            drafter.ok_or("lane store carries MTP but the singleton has no MTP drafter")?;
         Some(drafter.promotion_parts()?)
     } else {
         None
     };
     let slot = bundle
-        .prepare_promotion(gpu, epoch, b.prompt_tokens.to_vec(), b.emitted.to_vec(), b.seed_token, b.position, parts)
+        .prepare_promotion(
+            gpu,
+            epoch,
+            b.prompt_tokens.to_vec(),
+            b.emitted.to_vec(),
+            b.seed_token,
+            b.position,
+            parts,
+        )
         .map_err(|e| e.to_string())?;
     let attempt_id = active_attempt_id();
     let Some(admission) = singleton_handoff_to_batch(b.id, attempt_id) else {
@@ -2339,7 +2452,10 @@ pub(crate) fn promote_qwen4_singleton(
         });
     };
     if let Err(e) = bundle.commit_promotion(gpu, &epoch) {
-        eprintln!("[fn-lanes-promote] id={} resident reset after promotion: {e}", b.id);
+        eprintln!(
+            "[fn-lanes-promote] id={} resident reset after promotion: {e}",
+            b.id
+        );
     }
     let key = AttemptKey::new(b.id, attempt_id);
     let pending = BatchPendingRequest {
@@ -2567,7 +2683,10 @@ fn vmm_commit_sampled(
     }
     f.loop_hit = loop_guard.check(&lane.streamed_tokens).is_some();
     budgets(&mut f, lane);
-    Ok(batch_should_finish_decode(f.is_eos, f.hit_max, f.hit_lane_cap, f.stopped, f.loop_hit).then_some(f))
+    Ok(
+        batch_should_finish_decode(f.is_eos, f.hit_max, f.hit_lane_cap, f.stopped, f.loop_hit)
+            .then_some(f),
+    )
 }
 
 /// The prompt a batch lane prefills for `req` in the current cache state —
@@ -2589,11 +2708,15 @@ fn vmm_admission_render(
         Ok(Some(h)) => h,
         _ => return Ok(cold),
     };
-    let (Some(tokenizer), Some(template)) = (model.tokenizer.as_ref(), model.chat_template.as_deref()) else {
+    let (Some(tokenizer), Some(template)) =
+        (model.tokenizer.as_ref(), model.chat_template.as_deref())
+    else {
         return Ok(cold);
     };
     let prompt = hipfire_runtime::tokenizer::maybe_normalize_prompt(
-        msg.get("prompt").and_then(|v| v.as_str()).unwrap_or("Hello"),
+        msg.get("prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Hello"),
     );
     let raw_effort = msg
         .get("reasoning_effort")
@@ -2667,9 +2790,9 @@ fn vmm_publish_commit_ready(
 fn vmm_bundle(
     state: &mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
 ) -> Option<&mut hipfire_arch_qwen35::Qwen35Bundle> {
-    state
-        .as_mut()
-        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
+    state.as_mut().and_then(|s| {
+        (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+    })
 }
 
 /// Retire one request owner from the VMM store and free its device state.
@@ -2725,7 +2848,10 @@ pub fn is_vmm_batch_request_eligible(
         .and_then(|v| v.as_array())
         .is_some_and(|a| !a.is_empty());
     let jinja = m.chat_template.is_some()
-        && hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        && hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+            .ok()
+            .as_deref()
+            != Some("0");
     let shape_ok = if jinja {
         batch_messages_are_text_chat(msg)
     } else {
@@ -2733,7 +2859,10 @@ pub fn is_vmm_batch_request_eligible(
     };
     let stop_ok = hipfire_runtime::stop_sequence::parse_stop_field(msg.get("stop")).is_ok();
     // Token logprob envelopes are emitted by the singleton sampler only.
-    let logprobs = msg.get("logprobs").and_then(|v| v.as_bool()).unwrap_or(false);
+    let logprobs = msg
+        .get("logprobs")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if !shape_ok || has_tools || has_image || !stop_ok || logprobs {
         return false;
     }
@@ -2756,7 +2885,8 @@ pub fn is_vmm_batch_request_eligible(
 /// Daemon: the VMM route serves this model (params parsed at load and
 /// `vmm_store` staged).
 pub fn vmm_route_active(vmm_batch: Option<VmmBatchParams>, m: &LoadedModel) -> bool {
-    vmm_batch.is_some() && (m.qwen35().is_some_and(|b| b.vmm_store.is_some()) || qwen4_lanes_staged(m))
+    vmm_batch.is_some()
+        && (m.qwen35().is_some_and(|b| b.vmm_store.is_some()) || qwen4_lanes_staged(m))
 }
 
 /// A Qwen4 model whose AR lane store is staged (`Qwen4Bundle::stage_lanes`).
@@ -2838,7 +2968,11 @@ pub fn vmm_staging_request(
     use hipfire_arch_qwen35::forward_slots::vmm::VmmRoute;
     vmm_batch.map(|p| hipfire_loader::batch_staging::VmmStagingRequest {
         row_budget: p.max_batch_tokens,
-        route: if p.nonexact { VmmRoute::Nonexact } else { VmmRoute::Exact },
+        route: if p.nonexact {
+            VmmRoute::Nonexact
+        } else {
+            VmmRoute::Exact
+        },
         spec: p.spec,
         sampled: p.sampled,
     })
@@ -2848,11 +2982,7 @@ pub fn vmm_staging_request(
 /// `ep_devices` (HIP device id per rank) and `ep_rank_resident_bytes`
 /// (device memory in use on each rank's GPU once the mesh was attached:
 /// resident weights, state and scratch). Absent without a mesh (ep == 1).
-fn qwen4_ep_ack_fields(
-    v: &mut serde_json::Value,
-    device_ids: &[i32],
-    resident_bytes: &[u64],
-) {
+fn qwen4_ep_ack_fields(v: &mut serde_json::Value, device_ids: &[i32], resident_bytes: &[u64]) {
     v["ep"] = serde_json::json!(device_ids.len());
     v["ep_devices"] = serde_json::json!(device_ids);
     v["ep_rank_resident_bytes"] = serde_json::json!(resident_bytes);
@@ -2897,15 +3027,20 @@ pub fn vmm_loaded_ack(
         qwen4_lane_ack_fields(&mut v, &receipt, slots, row_budget, p);
         return v.to_string();
     }
-    let (receipt, spec_mode, dflash_receipt, sampling_ack) = match m.qwen35_mut().and_then(|b| b.vmm_store.as_mut()) {
-        Some(s) => {
-            let mode = vmm_store_spec_mode(s);
-            let rx = s.dflash_engine().map(|e| e.receipt());
-            let ack = (vmm_store_sampled(s), vmm_store_mtp_engine(s), vmm_store_dflash_sampled(s));
-            (Some(s.receipt()), mode, rx, ack)
-        }
-        None => (None, VmmSpecMode::Off, None, (false, false, false)),
-    };
+    let (receipt, spec_mode, dflash_receipt, sampling_ack) =
+        match m.qwen35_mut().and_then(|b| b.vmm_store.as_mut()) {
+            Some(s) => {
+                let mode = vmm_store_spec_mode(s);
+                let rx = s.dflash_engine().map(|e| e.receipt());
+                let ack = (
+                    vmm_store_sampled(s),
+                    vmm_store_mtp_engine(s),
+                    vmm_store_dflash_sampled(s),
+                );
+                (Some(s.receipt()), mode, rx, ack)
+            }
+            None => (None, VmmSpecMode::Off, None, (false, false, false)),
+        };
     let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&ack) else {
         return ack;
     };
@@ -2927,9 +3062,10 @@ pub fn vmm_loaded_ack(
         v["continuous_batch_spec_lane_cap"] = serde_json::json!(cap);
     }
     v["continuous_batch_spec_requested"] = serde_json::json!(p.spec);
-    let exact = m.qwen35().and_then(|b| b.vmm_store.as_ref()).is_some_and(|s| {
-        s.route() == hipfire_arch_qwen35::forward_slots::vmm::VmmRoute::Exact
-    });
+    let exact = m
+        .qwen35()
+        .and_then(|b| b.vmm_store.as_ref())
+        .is_some_and(|s| s.route() == hipfire_arch_qwen35::forward_slots::vmm::VmmRoute::Exact);
     v["continuous_batch_nonexact"] = serde_json::json!(!exact);
     v["continuous_batch_exact"] = serde_json::json!(exact);
     attach_vmm_sampling_ack(&mut v, sampling_ack.0, sampling_ack.1, sampling_ack.2);
@@ -2962,10 +3098,21 @@ pub fn batch_request_eligible_for_route(
     inbox: &mut DaemonInbox,
 ) -> bool {
     if vmm_route {
-        is_vmm_batch_request_eligible(msg, m, continuous_batch_size, serve_continuous_batch, pflash_active)
-            && inbox.has_pending_batch_generate()
+        is_vmm_batch_request_eligible(
+            msg,
+            m,
+            continuous_batch_size,
+            serve_continuous_batch,
+            pflash_active,
+        ) && inbox.has_pending_batch_generate()
     } else {
-        is_batch_request_eligible(msg, m, continuous_batch_size, serve_continuous_batch, pflash_active)
+        is_batch_request_eligible(
+            msg,
+            m,
+            continuous_batch_size,
+            serve_continuous_batch,
+            pflash_active,
+        )
     }
 }
 
@@ -3023,9 +3170,16 @@ pub fn arm_promotion(
     // lanes are greedy-only, so a sampled Qwen4 request never promotes.
     let permit = (armed
         && m.qwen4().is_none_or(|b| b.lanes().is_some())
-        && is_vmm_batch_request_eligible(msg, m, continuous_batch_size, serve_continuous_batch, pflash_active)
+        && is_vmm_batch_request_eligible(
+            msg,
+            m,
+            continuous_batch_size,
+            serve_continuous_batch,
+            pflash_active,
+        )
         && (sampling.temp <= 0.0
-            || (m.qwen4().is_none() && vmm_sampled_lane(msg, m, &sampling) == Some(VmmLaneDecode::Ar))))
+            || (m.qwen4().is_none()
+                && vmm_sampled_lane(msg, m, &sampling) == Some(VmmLaneDecode::Ar))))
     .then(|| PromotionPermit {
         original_msg: msg.clone(),
         sampling,
@@ -3060,10 +3214,18 @@ pub fn drive_promoted(
     if m.qwen4().is_some() {
         let promoted = take_promoted_qwen4()?;
         return Some(match (sched, vmm_batch) {
-            (Some(sched), Some(params)) => {
-                crate::fn_batch::drive_qwen4_lane_batch(sched, gpu, m, params, stdout, inbox, Some(promoted))
-            }
-            _ => Err(BatchDriveError::Gpu("promoted request without a staged fn-lanes route".into())),
+            (Some(sched), Some(params)) => crate::fn_batch::drive_qwen4_lane_batch(
+                sched,
+                gpu,
+                m,
+                params,
+                stdout,
+                inbox,
+                Some(promoted),
+            ),
+            _ => Err(BatchDriveError::Gpu(
+                "promoted request without a staged fn-lanes route".into(),
+            )),
         });
     }
     let Some(promoted) = take_promoted() else {
@@ -3076,7 +3238,9 @@ pub fn drive_promoted(
         (Some(sched), Some(params)) => {
             drive_qwen_vmm_continuous_batch(sched, gpu, m, params, stdout, inbox, Some(promoted))
         }
-        _ => Err(BatchDriveError::Gpu("promoted request without a staged VMM batch route".into())),
+        _ => Err(BatchDriveError::Gpu(
+            "promoted request without a staged VMM batch route".into(),
+        )),
     })
 }
 
@@ -3192,7 +3356,8 @@ pub fn drive_qwen_vmm_continuous_batch(
     // Conversation continuity (`vmm_conv`): AR lanes keep their finished
     // conversation in the prefix pool and admissions reuse it. A conversation
     // the singleton left resident is parked there first.
-    let keep_conversations = spec_engine.is_none() && dflash_engine.is_none() && crate::vmm_conv::pool_enabled(model);
+    let keep_conversations =
+        spec_engine.is_none() && dflash_engine.is_none() && crate::vmm_conv::pool_enabled(model);
     if keep_conversations {
         crate::vmm_conv::park_resident(model, gpu);
     }
@@ -3214,7 +3379,9 @@ pub fn drive_qwen_vmm_continuous_batch(
     let mut producers: Vec<Option<QwenArSemanticProducer>> =
         (0..batch_size).map(|_| None).collect();
     let mut loop_guards: Vec<hipfire_runtime::loop_guard::LoopGuard> = (0..batch_size)
-        .map(|_| hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get()))
+        .map(
+            |_| hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get()),
+        )
         .collect();
     // Attempts whose `gen_start` is already on the wire: the request the
     // daemon enqueued before entering this driver, and every request this
@@ -3352,7 +3519,8 @@ pub fn drive_qwen_vmm_continuous_batch(
             // A sampled speculative singleton is never continued as AR (the
             // reseeded stream would not be its own): fail it visibly.
             Some(_) if sampling.temp > 0.0 && !matches!(kind, PromotedDecode::Ar) => {
-                installed = Err("sampled speculative singleton cannot continue as an AR lane".into());
+                installed =
+                    Err("sampled speculative singleton cannot continue as an AR lane".into());
                 None
             }
             Some(_) => sched.adopt_running(pending, progress),
@@ -3397,9 +3565,21 @@ pub fn drive_qwen_vmm_continuous_batch(
                         let b = vmm_bundle(&mut model.state);
                         match (fits, b) {
                             (true, Some(b)) => {
-                                let hipfire_arch_qwen35::Qwen35Bundle { vmm_store, config, scratch, .. } = b;
+                                let hipfire_arch_qwen35::Qwen35Bundle {
+                                    vmm_store,
+                                    config,
+                                    scratch,
+                                    ..
+                                } = b;
                                 let store = vmm_store.as_mut().expect("admitted above");
-                                match store.spec_adopt(gpu, config, scratch, &epoch, snap, spec_request_config(&sampling, rng as u64)) {
+                                match store.spec_adopt(
+                                    gpu,
+                                    config,
+                                    scratch,
+                                    &epoch,
+                                    snap,
+                                    spec_request_config(&sampling, rng as u64),
+                                ) {
                                     Ok(()) => VmmLaneDecode::Mtp,
                                     Err(e) => {
                                         eprintln!("[vmm-promote] id={} spec lane refused ({e}); continuing as AR", key.id);
@@ -3458,11 +3638,17 @@ pub fn drive_qwen_vmm_continuous_batch(
                 let conv = conv.take().expect("installed once");
                 ctl[lane] = VmmLaneCtl {
                     started_in_think,
-                    think: conv.think.unwrap_or_else(|| crate::vmm_conv::ThinkCtl::new(max_think_tokens)),
+                    think: conv
+                        .think
+                        .unwrap_or_else(|| crate::vmm_conv::ThinkCtl::new(max_think_tokens)),
                     keep: keep_conversations && !adopted,
                     checkpoints: conv.checkpoints,
                     cached: conv.cached_tokens,
-                    prefill_tokens: if conv.prefill_tokens > 0 { conv.prefill_tokens } else { decode_start },
+                    prefill_tokens: if conv.prefill_tokens > 0 {
+                        conv.prefill_tokens
+                    } else {
+                        decode_start
+                    },
                     decode_start,
                     // The pending seed is a sampled token.
                     main_row: true,
@@ -3503,7 +3689,8 @@ pub fn drive_qwen_vmm_continuous_batch(
         if let Err(reason) = installed {
             // The singleton's KV/DN left the bundle with the promotion; the
             // request cannot continue anywhere. Fail it visibly.
-            let _scope = BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
             let ep = crate::common::RollbackEpilogue {
                 rolled_back: true,
                 context: None,
@@ -3590,7 +3777,10 @@ pub fn drive_qwen_vmm_continuous_batch(
                             let cache = &mut model.asst_turn_cache;
                             let _ = qwen_ar_apply_cache_action(
                                 |fp, seq| {
-                                    cache.insert(fp, crate::qwen::qwen_cached_turn_entry(tok, seq, started))
+                                    cache.insert(
+                                        fp,
+                                        crate::qwen::qwen_cached_turn_entry(tok, seq, started),
+                                    )
                                 },
                                 &action,
                                 cached_seq,
@@ -3671,7 +3861,9 @@ pub fn drive_qwen_vmm_continuous_batch(
         };
         let barrier = match drained {
             Ok(b) => b,
-            Err(reason) => return fail_all(sched, gpu, model, &mut epochs, &mut ctl, stdout, reason),
+            Err(reason) => {
+                return fail_all(sched, gpu, model, &mut epochs, &mut ctl, stdout, reason)
+            }
         };
         if let Some(msg) = barrier {
             inbox.push_front(msg);
@@ -3737,8 +3929,10 @@ pub fn drive_qwen_vmm_continuous_batch(
                 _ => continue,
             };
             let think = crate::vmm_conv::ThinkCtl::new(pending_req.max_think_tokens);
-            let stops = hipfire_runtime::stop_sequence::parse_stop_field(pending_req.original_msg.get("stop"))
-                .unwrap_or_default();
+            let stops = hipfire_runtime::stop_sequence::parse_stop_field(
+                pending_req.original_msg.get("stop"),
+            )
+            .unwrap_or_default();
             // The singleton's prompt for this cache state: with a kept
             // conversation anywhere, the history render splices verbatim
             // assistant turns (`ar.rs` prompt cache); else the cold render.
@@ -3750,12 +3944,26 @@ pub fn drive_qwen_vmm_continuous_batch(
             } else {
                 Ok(pending_req.prompt_tokens.clone())
             };
-            let refuse = |stdout: &mut std::io::Stdout, sched: &mut ContinuousBatchScheduler, msg: String, kind: &str| {
+            let refuse = |stdout: &mut std::io::Stdout,
+                          sched: &mut ContinuousBatchScheduler,
+                          msg: String,
+                          kind: &str| {
                 announce(stdout, &key, ticket.admission, started_in_think);
                 {
-                    let _scope =
-                        BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, ticket.admission);
-                    crate::ar::emit_generation_error(route, stdout, Some(&key.id), &msg, kind, false, true);
+                    let _scope = BatchAttemptScope::enter_for_generation(
+                        &key.id,
+                        key.attempt_id,
+                        ticket.admission,
+                    );
+                    crate::ar::emit_generation_error(
+                        route,
+                        stdout,
+                        Some(&key.id),
+                        &msg,
+                        kind,
+                        false,
+                        true,
+                    );
                     let _ = stdout.flush();
                 }
                 let _ = sched.abort_lane(lane_idx, &key, ticket.admission);
@@ -3763,7 +3971,12 @@ pub fn drive_qwen_vmm_continuous_batch(
             let rendered = match rendered {
                 Ok(r) if !r.is_empty() && r.len() < sched.lane_capacity => r,
                 Ok(_) => {
-                    refuse(stdout, sched, "prompt exceeds lane capacity or empty".into(), "validation");
+                    refuse(
+                        stdout,
+                        sched,
+                        "prompt exceeds lane capacity or empty".into(),
+                        "validation",
+                    );
                     continue;
                 }
                 Err(e) => {
@@ -3800,7 +4013,10 @@ pub fn drive_qwen_vmm_continuous_batch(
             // otherwise it goes back to the singleton route
             // (`sampled_handback`).
             let mut sampled_handback = false;
-            let spec_pick: Option<(VmmLaneDecode, hipfire_runtime::spec::SpecRequestConfig)> = if s.temp > 0.0 {
+            let spec_pick: Option<(VmmLaneDecode, hipfire_runtime::spec::SpecRequestConfig)> = if s
+                .temp
+                > 0.0
+            {
                 let max_tokens = lane_max_tokens(&key, sched);
                 match sampled_admission_lane(
                     vmm_sampled_lane(&pending_req.original_msg, model, s),
@@ -3827,8 +4043,14 @@ pub fn drive_qwen_vmm_continuous_batch(
                     && !think.budgeted()
                     && stops.is_empty()
                     && dflash_lane_fits(rendered.len(), lane_max_tokens(&key, sched), block, cap)
-                    && vmm_singleton_route(&pending_req.original_msg, model, s) == GenerationRoute::QwenDflash)
-                .then(|| (VmmLaneDecode::Dflash, spec_request_config(s, rng_state as u64)))
+                    && vmm_singleton_route(&pending_req.original_msg, model, s)
+                        == GenerationRoute::QwenDflash)
+                    .then(|| {
+                        (
+                            VmmLaneDecode::Dflash,
+                            spec_request_config(s, rng_state as u64),
+                        )
+                    })
             } else {
                 None
             };
@@ -3870,7 +4092,9 @@ pub fn drive_qwen_vmm_continuous_batch(
                     GenerationRoute::QwenAr,
                 ) {
                     Ok(msg) => msg,
-                    Err(reason) => return fail_all(sched, gpu, model, &mut epochs, &mut ctl, stdout, reason),
+                    Err(reason) => {
+                        return fail_all(sched, gpu, model, &mut epochs, &mut ctl, stdout, reason)
+                    }
                 };
                 inbox.push_front(handoff);
                 continue;
@@ -3885,83 +4109,97 @@ pub fn drive_qwen_vmm_continuous_batch(
             let reserve_end = rendered.len()
                 + lane_max_tokens(&key, sched)
                 + hipfire_arch_qwen35::forward_slots::vmm::VMM_RESERVE_SLACK_ROWS;
-            let admitted = (|| -> Result<(SpecAdmit, crate::vmm_conv::Checkpoints, usize), String> {
-                let b = vmm_bundle(&mut model.state).ok_or("model is not Qwen35")?;
-                let init = || hipfire_arch_qwen35::forward_slots::vmm::VmmRequestInit {
-                    prompt_len: rendered.len(),
-                    stop_ids: stop_ids.clone(),
-                    sampler: sampler.clone(),
-                    rng_state,
-                    history: Vec::new(),
-                };
-                let (mut state, checkpoints, start) = if keep {
-                    crate::vmm_conv::lane_owner(gpu, b, &rendered, epoch, lane_idx, init)?
-                } else {
-                    let state = hipfire_arch_qwen35::forward_slots::vmm::Qwen35RequestState::new_like(
-                        gpu,
-                        &b.config,
-                        &b.kv_cache,
-                        &b.dn_state,
-                        epoch,
-                        lane_idx,
-                        init(),
-                    )?;
-                    (state, Vec::new(), 0)
-                };
-                state.reserve_end = reserve_end;
-                let hipfire_arch_qwen35::Qwen35Bundle {
-                    vmm_store,
-                    weights,
-                    config,
-                    scratch,
-                    ..
-                } = b;
-                let store = vmm_store.as_mut().expect("lane owner came from the staged store");
-                if let Err((state, e)) = store.admit(state) {
-                    let freed = state.free_gpu(gpu);
-                    crate::vmm_conv::free_checkpoints(checkpoints, gpu);
-                    return Err(format!("{e}; free: {freed:?}"));
-                }
-                let Some((decode, request)) = spec_pick else {
-                    return Ok((SpecAdmit::None, checkpoints, start));
-                };
-                if decode == VmmLaneDecode::Dflash {
-                    // The singleton DFlash prompt seed on the request's own
-                    // KV/DeltaNet; cancel is polled through its chunks, an
-                    // abort retires only this lane.
-                    let abort = || batch_check_abort(&key.id, key.attempt_id, ticket.admission);
-                    return match store.dflash_prefill(gpu, weights, config, scratch, &epoch, &rendered, request, &abort) {
-                        Ok(hipfire_runtime::spec::PrefillOutcome::Ready { first_token }) => {
-                            Ok((SpecAdmit::Seed(first_token), checkpoints, start))
-                        }
-                        Ok(hipfire_runtime::spec::PrefillOutcome::Aborted) => {
-                            let freed = store.retire(&epoch).and_then(|st| st.free_gpu(gpu));
-                            crate::vmm_conv::free_checkpoints(checkpoints, gpu);
-                            freed.map(|()| (SpecAdmit::Aborted, Vec::new(), start))
-                                .map_err(|e| format!("dflash prefill abort: free: {e}"))
-                        }
+            let admitted =
+                (|| -> Result<(SpecAdmit, crate::vmm_conv::Checkpoints, usize), String> {
+                    let b = vmm_bundle(&mut model.state).ok_or("model is not Qwen35")?;
+                    let init = || hipfire_arch_qwen35::forward_slots::vmm::VmmRequestInit {
+                        prompt_len: rendered.len(),
+                        stop_ids: stop_ids.clone(),
+                        sampler: sampler.clone(),
+                        rng_state,
+                        history: Vec::new(),
+                    };
+                    let (mut state, checkpoints, start) = if keep {
+                        crate::vmm_conv::lane_owner(gpu, b, &rendered, epoch, lane_idx, init)?
+                    } else {
+                        let state =
+                            hipfire_arch_qwen35::forward_slots::vmm::Qwen35RequestState::new_like(
+                                gpu,
+                                &b.config,
+                                &b.kv_cache,
+                                &b.dn_state,
+                                epoch,
+                                lane_idx,
+                                init(),
+                            )?;
+                        (state, Vec::new(), 0)
+                    };
+                    state.reserve_end = reserve_end;
+                    let hipfire_arch_qwen35::Qwen35Bundle {
+                        vmm_store,
+                        weights,
+                        config,
+                        scratch,
+                        ..
+                    } = b;
+                    let store = vmm_store
+                        .as_mut()
+                        .expect("lane owner came from the staged store");
+                    if let Err((state, e)) = store.admit(state) {
+                        let freed = state.free_gpu(gpu);
+                        crate::vmm_conv::free_checkpoints(checkpoints, gpu);
+                        return Err(format!("{e}; free: {freed:?}"));
+                    }
+                    let Some((decode, request)) = spec_pick else {
+                        return Ok((SpecAdmit::None, checkpoints, start));
+                    };
+                    if decode == VmmLaneDecode::Dflash {
+                        // The singleton DFlash prompt seed on the request's own
+                        // KV/DeltaNet; cancel is polled through its chunks, an
+                        // abort retires only this lane.
+                        let abort = || batch_check_abort(&key.id, key.attempt_id, ticket.admission);
+                        return match store.dflash_prefill(
+                            gpu, weights, config, scratch, &epoch, &rendered, request, &abort,
+                        ) {
+                            Ok(hipfire_runtime::spec::PrefillOutcome::Ready { first_token }) => {
+                                Ok((SpecAdmit::Seed(first_token), checkpoints, start))
+                            }
+                            Ok(hipfire_runtime::spec::PrefillOutcome::Aborted) => {
+                                let freed = store.retire(&epoch).and_then(|st| st.free_gpu(gpu));
+                                crate::vmm_conv::free_checkpoints(checkpoints, gpu);
+                                freed
+                                    .map(|()| (SpecAdmit::Aborted, Vec::new(), start))
+                                    .map_err(|e| format!("dflash prefill abort: free: {e}"))
+                            }
+                            Err(e) => {
+                                let freed = store.retire(&epoch).and_then(|st| st.free_gpu(gpu));
+                                crate::vmm_conv::free_checkpoints(checkpoints, gpu);
+                                Err(format!("dflash prefill: {e}; free: {freed:?}"))
+                            }
+                        };
+                    }
+                    match store
+                        .spec_prefill(gpu, weights, config, scratch, &epoch, &rendered, request)
+                    {
+                        Ok(seed) => Ok((SpecAdmit::Seed(seed), checkpoints, start)),
                         Err(e) => {
                             let freed = store.retire(&epoch).and_then(|st| st.free_gpu(gpu));
                             crate::vmm_conv::free_checkpoints(checkpoints, gpu);
-                            Err(format!("dflash prefill: {e}; free: {freed:?}"))
+                            Err(format!("spec prefill: {e}; free: {freed:?}"))
                         }
-                    };
-                }
-                match store.spec_prefill(gpu, weights, config, scratch, &epoch, &rendered, request) {
-                    Ok(seed) => Ok((SpecAdmit::Seed(seed), checkpoints, start)),
-                    Err(e) => {
-                        let freed = store.retire(&epoch).and_then(|st| st.free_gpu(gpu));
-                        crate::vmm_conv::free_checkpoints(checkpoints, gpu);
-                        Err(format!("spec prefill: {e}; free: {freed:?}"))
                     }
-                }
-            })();
+                })();
             let (spec_admit, checkpoints, start) = match admitted {
                 Ok(v) => v,
                 Err(e) => {
                     // Per-admission refusal (capacity/budget): this request
                     // fails visibly; peers keep running.
-                    refuse(stdout, sched, format!("VMM batch admission refused: {e}"), "context_length");
+                    refuse(
+                        stdout,
+                        sched,
+                        format!("VMM batch admission refused: {e}"),
+                        "context_length",
+                    );
                     continue;
                 }
             };
@@ -3969,7 +4207,11 @@ pub fn drive_qwen_vmm_continuous_batch(
                 // Cancelled during the DFlash prompt fill: only this lane is
                 // retired; one cancel terminal.
                 announce(stdout, &key, ticket.admission, started_in_think);
-                let _scope = BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, ticket.admission);
+                let _scope = BatchAttemptScope::enter_for_generation(
+                    &key.id,
+                    key.attempt_id,
+                    ticket.admission,
+                );
                 crate::ar::emit_generation_cancel(route, stdout, &key.id, 0);
                 let _ = sched.abort_lane(lane_idx, &key, ticket.admission);
                 continue;
@@ -4066,12 +4308,15 @@ pub fn drive_qwen_vmm_continuous_batch(
                 decode_start: rendered.len(),
                 ..VmmLaneCtl::default()
             };
-            loop_guards[lane_idx] = hipfire_runtime::loop_guard::LoopGuard::from_config(
-                hipfire_runtime::config::get(),
-            );
+            loop_guards[lane_idx] =
+                hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
             producers[lane_idx] = Some(
-                QwenArSemanticProducer::new_with_tool_protocol(key.id.clone(), started_in_think, false)
-                    .with_stop(&stops),
+                QwenArSemanticProducer::new_with_tool_protocol(
+                    key.id.clone(),
+                    started_in_think,
+                    false,
+                )
+                .with_stop(&stops),
             );
         }
         // ── Commit phase: the last step's picks, one token at a time in the
@@ -4146,7 +4391,8 @@ pub fn drive_qwen_vmm_continuous_batch(
             }
         }
         for (idx, f) in finished {
-            let hit_length_cap = batch_hit_length_cap(f.hit_max, f.hit_lane_cap, f.is_eos, f.stopped, f.loop_hit);
+            let hit_length_cap =
+                batch_hit_length_cap(f.hit_max, f.hit_lane_cap, f.is_eos, f.stopped, f.loop_hit);
             let Some(producer_owned) = producers[idx].take() else {
                 continue;
             };
@@ -4155,7 +4401,8 @@ pub fn drive_qwen_vmm_continuous_batch(
             };
             let key = lane.key.clone();
             let admission = lane.ticket.admission;
-            let _scope = BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+            let _scope =
+                BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
             let (finish, visible) = match producer_owned.finish(stdout, hit_length_cap) {
                 Ok(v) => v,
                 Err(e) => {
@@ -4186,7 +4433,11 @@ pub fn drive_qwen_vmm_continuous_batch(
             };
             let c = &mut ctl[idx];
             let generated = lane.streamed_tokens.len();
-            let prefill_tokens = if c.prefill_tokens > 0 { c.prefill_tokens } else { lane.prompt_len };
+            let prefill_tokens = if c.prefill_tokens > 0 {
+                c.prefill_tokens
+            } else {
+                lane.prompt_len
+            };
             let metrics = batch_lane_done_metrics(
                 lane.created_at,
                 lane.prefill_done_at,
@@ -4221,13 +4472,22 @@ pub fn drive_qwen_vmm_continuous_batch(
             if spec_engine.is_some() || dflash_engine.is_some() {
                 attach_vmm_spec_evidence(&mut pending_done, lane_decode[idx], spec_stats[idx]);
             }
-            attach_vmm_batch_receipts(&mut pending_done, lane_decode[idx], lane.sampling.temp > 0.0, !params.nonexact);
+            attach_vmm_batch_receipts(
+                &mut pending_done,
+                lane_decode[idx],
+                lane.sampling.temp > 0.0,
+                !params.nonexact,
+            );
             // The singleton's verbatim assistant-turn store: the generated
             // body less its ChatML trailer and `<|im_end|>`, applied when the
             // client commits.
             let action = qwen_ar_cache_action(&finish, &visible);
             if action.store {
-                let mut seq = lane.conversation_tokens.get(c.decode_start..).unwrap_or(&[]).to_vec();
+                let mut seq = lane
+                    .conversation_tokens
+                    .get(c.decode_start..)
+                    .unwrap_or(&[])
+                    .to_vec();
                 while seq.last().is_some_and(|t| nl_tokens.contains(t)) {
                     seq.pop();
                 }
@@ -4244,8 +4504,14 @@ pub fn drive_qwen_vmm_continuous_batch(
                     .and_then(|b| b.vmm_store.as_ref())
                     .and_then(|s| s.request_state(&epochs[idx]));
                 if let Some(st) = st {
-                    let mut rows: Vec<u32> = st.pending_seed.into_iter().chain(c.forced.drain(..)).collect();
-                    let trailer = stop_ids.get(1).is_some_and(|t| lane.conversation_tokens.last() == Some(t));
+                    let mut rows: Vec<u32> = st
+                        .pending_seed
+                        .into_iter()
+                        .chain(c.forced.drain(..))
+                        .collect();
+                    let trailer = stop_ids
+                        .get(1)
+                        .is_some_and(|t| lane.conversation_tokens.last() == Some(t));
                     if trailer {
                         rows.extend_from_slice(&nl_tokens);
                     }
@@ -4377,8 +4643,9 @@ pub fn drive_qwen_vmm_continuous_batch(
             }
         }
         // ── One planned step: provision → forward → commit → publish ──
-        let eligible: Vec<bool> =
-            (0..batch_size).map(|i| running.contains(&i) && lane_decode[i] == VmmLaneDecode::Ar).collect();
+        let eligible: Vec<bool> = (0..batch_size)
+            .map(|i| running.contains(&i) && lane_decode[i] == VmmLaneDecode::Ar)
+            .collect();
         // Exact route: every prefill chunk must be the singleton route's own
         // chunk for that request (DeltaNet requant cadence), so the planner
         // takes exactly that length or nothing.
@@ -4409,7 +4676,15 @@ pub fn drive_qwen_vmm_continuous_batch(
         planner.forced_prefill_len = match forced {
             Ok(f) => f,
             Err(e) => {
-                return fail_all(sched, gpu, model, &mut epochs, &mut ctl, stdout, format!("exact chunk: {e}"))
+                return fail_all(
+                    sched,
+                    gpu,
+                    model,
+                    &mut epochs,
+                    &mut ctl,
+                    stdout,
+                    format!("exact chunk: {e}"),
+                )
             }
         };
         // Device-memory grants: a lane whose KV growth this step would leave
@@ -4446,7 +4721,13 @@ pub fn drive_qwen_vmm_continuous_batch(
             };
             let grants = vmm_bundle(&mut model.state)
                 .and_then(|b| b.vmm_store.as_ref())
-                .map(|s| s.step_grants(gpu, &[], &reqs.iter().map(|&(_, e, end)| (e, end)).collect::<Vec<_>>()));
+                .map(|s| {
+                    s.step_grants(
+                        gpu,
+                        &[],
+                        &reqs.iter().map(|&(_, e, end)| (e, end)).collect::<Vec<_>>(),
+                    )
+                });
             match grants {
                 Some(Ok(g)) => {
                     for (&(i, e, end), ok) in reqs.iter().zip(g) {
@@ -4458,7 +4739,9 @@ pub fn drive_qwen_vmm_continuous_batch(
                         }
                     }
                 }
-                Some(Err(e)) => eprintln!("[vmm-memory] step grants unavailable ({e}); lanes proceed"),
+                Some(Err(e)) => {
+                    eprintln!("[vmm-memory] step grants unavailable ({e}); lanes proceed")
+                }
                 None => {}
             }
         }
@@ -4470,7 +4753,17 @@ pub fn drive_qwen_vmm_continuous_batch(
             params.prefill_min_tokens,
         ) {
             Ok(p) => p,
-            Err(e) => return fail_all(sched, gpu, model, &mut epochs, &mut ctl, stdout, format!("plan: {e}")),
+            Err(e) => {
+                return fail_all(
+                    sched,
+                    gpu,
+                    model,
+                    &mut epochs,
+                    &mut ctl,
+                    stdout,
+                    format!("plan: {e}"),
+                )
+            }
         };
         // Spec lanes whose seed is already on the wire take one window: a
         // Verify request in the same step plan as the AR/prefill rows
@@ -4499,13 +4792,17 @@ pub fn drive_qwen_vmm_continuous_batch(
             {
                 let store = vmm_bundle(&mut model.state).and_then(|b| b.vmm_store.as_ref());
                 if let Some(s) = store {
-                    trunk_exact = s.route() == hipfire_arch_qwen35::forward_slots::vmm::VmmRoute::Exact;
+                    trunk_exact =
+                        s.route() == hipfire_arch_qwen35::forward_slots::vmm::VmmRoute::Exact;
                 }
-                for &i in running.iter().filter(|&&i| lane_decode[i].is_spec() && !spec_seeds.iter().any(|a| a.epoch == epochs[i])) {
+                for &i in running.iter().filter(|&&i| {
+                    lane_decode[i].is_spec() && !spec_seeds.iter().any(|a| a.epoch == epochs[i])
+                }) {
                     let BatchLane::Running(lane) = &sched.lanes[i] else {
                         continue;
                     };
-                    let max_emit = lane_max_tokens(&lane.key, sched).saturating_sub(lane.streamed_tokens.len());
+                    let max_emit = lane_max_tokens(&lane.key, sched)
+                        .saturating_sub(lane.streamed_tokens.len());
                     let Some(st) = store.and_then(|s| s.request_state(&epochs[i])) else {
                         continue;
                     };
@@ -4514,7 +4811,9 @@ pub fn drive_qwen_vmm_continuous_batch(
                     };
                     let rows = match lane_decode[i] {
                         VmmLaneDecode::Mtp => (max_emit - 1).min(k_max) + 1,
-                        VmmLaneDecode::Dflash => hipfire_arch_qwen35::dflash_cb::dflash_block_for_emit(block, max_emit),
+                        VmmLaneDecode::Dflash => {
+                            hipfire_arch_qwen35::dflash_cb::dflash_block_for_emit(block, max_emit)
+                        }
                         VmmLaneDecode::Ar => continue,
                     };
                     cands.push(SpecCand {
@@ -4553,12 +4852,18 @@ pub fn drive_qwen_vmm_continuous_batch(
                     .map(|s| s.step_grants(gpu, &mem_granted, &reqs));
                 match grants {
                     Some(Ok(g)) => {
-                        let denied: Vec<RequestEpoch> =
-                            reqs.iter().zip(g).filter(|(_, ok)| !ok).map(|((e, _), _)| *e).collect();
+                        let denied: Vec<RequestEpoch> = reqs
+                            .iter()
+                            .zip(g)
+                            .filter(|(_, ok)| !ok)
+                            .map(|((e, _), _)| *e)
+                            .collect();
                         mem_denied |= !denied.is_empty();
                         chosen.retain(|s| !denied.contains(&epochs[*s]));
                     }
-                    Some(Err(e)) => eprintln!("[vmm-memory] spec window grants unavailable ({e}); lanes proceed"),
+                    Some(Err(e)) => eprintln!(
+                        "[vmm-memory] spec window grants unavailable ({e}); lanes proceed"
+                    ),
                     None => {}
                 }
             }
@@ -4584,7 +4889,15 @@ pub fn drive_qwen_vmm_continuous_batch(
                             )
                         }
                         Err(e) => {
-                            return fail_all(sched, gpu, model, &mut epochs, &mut ctl, stdout, format!("dflash lane {i}: {e}"))
+                            return fail_all(
+                                sched,
+                                gpu,
+                                model,
+                                &mut epochs,
+                                &mut ctl,
+                                stdout,
+                                format!("dflash lane {i}: {e}"),
+                            )
                         }
                     }
                     dflash_win[i] = Some(DflashWindow {
@@ -4607,11 +4920,13 @@ pub fn drive_qwen_vmm_continuous_batch(
                 }
                 b.m_per_slot[i] = k + 1;
                 step_plan.verify_rows += k + 1;
-                step_plan.requests.push(hipfire_runtime::slot_batch::RequestRows {
-                    epoch: epochs[i],
-                    rows: hipfire_runtime::slot_batch::RowRange { begin, len: k + 1 },
-                    kind: hipfire_runtime::slot_batch::RequestStepKind::Verify { draft_len: k },
-                });
+                step_plan
+                    .requests
+                    .push(hipfire_runtime::slot_batch::RequestRows {
+                        epoch: epochs[i],
+                        rows: hipfire_runtime::slot_batch::RowRange { begin, len: k + 1 },
+                        kind: hipfire_runtime::slot_batch::RequestStepKind::Verify { draft_len: k },
+                    });
             }
             // Stable slot order.
             let rs = step_plan.batch.row_slot.clone();
@@ -4629,31 +4944,40 @@ pub fn drive_qwen_vmm_continuous_batch(
             planner.discard();
             Vec::new()
         } else {
-            let stepped = (|| -> Result<Vec<hipfire_runtime::slot_batch::RequestAdvance>, String> {
-                let b = vmm_bundle(&mut model.state).ok_or("model is not Qwen35")?;
-                let hipfire_arch_qwen35::Qwen35Bundle {
-                    vmm_store,
-                    weights,
-                    config,
-                    scratch,
-                    ..
-                } = b;
-                let store = vmm_store.as_mut().ok_or("store not staged")?;
-                let mut ex = store.executor(weights, config, scratch);
-                let out = ex
-                    .provision_step(gpu, &step_plan)
-                    .and_then(|()| ex.forward_step(gpu, &step_plan))
-                    .and_then(|o| ex.commit_step(gpu, &step_plan, o));
-                if out.is_err() {
-                    store.abort_step(&step_plan);
-                }
-                out
-            })();
+            let stepped =
+                (|| -> Result<Vec<hipfire_runtime::slot_batch::RequestAdvance>, String> {
+                    let b = vmm_bundle(&mut model.state).ok_or("model is not Qwen35")?;
+                    let hipfire_arch_qwen35::Qwen35Bundle {
+                        vmm_store,
+                        weights,
+                        config,
+                        scratch,
+                        ..
+                    } = b;
+                    let store = vmm_store.as_mut().ok_or("store not staged")?;
+                    let mut ex = store.executor(weights, config, scratch);
+                    let out = ex
+                        .provision_step(gpu, &step_plan)
+                        .and_then(|()| ex.forward_step(gpu, &step_plan))
+                        .and_then(|o| ex.commit_step(gpu, &step_plan, o));
+                    if out.is_err() {
+                        store.abort_step(&step_plan);
+                    }
+                    out
+                })();
             let advances = match stepped {
                 Ok(a) => a,
                 Err(e) => {
                     planner.discard();
-                    return fail_all(sched, gpu, model, &mut epochs, &mut ctl, stdout, format!("step: {e}"));
+                    return fail_all(
+                        sched,
+                        gpu,
+                        model,
+                        &mut epochs,
+                        &mut ctl,
+                        stdout,
+                        format!("step: {e}"),
+                    );
                 }
             };
             if plan.requests.is_empty() {
@@ -4666,7 +4990,15 @@ pub fn drive_qwen_vmm_continuous_batch(
                     .cloned()
                     .collect();
                 if let Err(e) = planner.publish(&mut work, &epochs, &plan, &planned) {
-                    return fail_all(sched, gpu, model, &mut epochs, &mut ctl, stdout, format!("publish: {e}"));
+                    return fail_all(
+                        sched,
+                        gpu,
+                        model,
+                        &mut epochs,
+                        &mut ctl,
+                        stdout,
+                        format!("publish: {e}"),
+                    );
                 }
             }
             advances
@@ -4708,7 +5040,12 @@ pub fn drive_qwen_vmm_continuous_batch(
                         _ => false,
                     };
                 if let (true, Some(st)) = (take, store.request_state(&r.epoch)) {
-                    crate::vmm_conv::checkpoint(&mut ctl[idx].checkpoints, &st.dn, gpu, st.position);
+                    crate::vmm_conv::checkpoint(
+                        &mut ctl[idx].checkpoints,
+                        &st.dn,
+                        gpu,
+                        st.position,
+                    );
                 }
             }
             // A lane with committed-but-unfed tokens (forced think close,
@@ -4721,7 +5058,8 @@ pub fn drive_qwen_vmm_continuous_batch(
                     continue;
                 };
                 let ar_row = plan.requests.iter().any(|r| {
-                    r.epoch == adv.epoch && matches!(r.kind, hipfire_runtime::slot_batch::RequestStepKind::Ar)
+                    r.epoch == adv.epoch
+                        && matches!(r.kind, hipfire_runtime::slot_batch::RequestStepKind::Ar)
                 });
                 if lane_decode[idx].is_spec() || !ar_row {
                     continue;
@@ -4802,9 +5140,18 @@ pub fn drive_qwen_vmm_continuous_batch(
                     let _ = st.free_gpu(gpu);
                     crate::vmm_conv::free_checkpoints(checkpoints, gpu);
                 }
-                if !vmm_publish_commit_ready(sched, stdout, idx, &key, admission, drain.pending_done) {
+                if !vmm_publish_commit_ready(
+                    sched,
+                    stdout,
+                    idx,
+                    &key,
+                    admission,
+                    drain.pending_done,
+                ) {
                     if let Some(i) = store.prefix_pool.iter().position(|e| {
-                        e.pending.as_ref().is_some_and(|(id, a)| *id == key.id && *a == key.attempt_id)
+                        e.pending
+                            .as_ref()
+                            .is_some_and(|(id, a)| *id == key.id && *a == key.attempt_id)
                     }) {
                         let _ = store.prefix_pool.remove(i).free_gpu(gpu);
                     }
@@ -7360,11 +7707,18 @@ mod tests {
     #[test]
     fn qwen4_ep_ack_reports_rank_count_devices_and_per_rank_bytes() {
         let mut v = serde_json::json!({"type": "loaded"});
-        qwen4_ep_ack_fields(&mut v, &[0, 1, 2, 3], &[30 << 30, 29 << 30, 29 << 30, 29 << 30]);
+        qwen4_ep_ack_fields(
+            &mut v,
+            &[0, 1, 2, 3],
+            &[30 << 30, 29 << 30, 29 << 30, 29 << 30],
+        );
         assert_eq!(v["ep"], 4);
         assert_eq!(v["ep_devices"], serde_json::json!([0, 1, 2, 3]));
         assert_eq!(v["ep_rank_resident_bytes"][0], 30u64 << 30);
-        assert_eq!(v["ep_rank_resident_bytes"].as_array().map(Vec::len), Some(4));
+        assert_eq!(
+            v["ep_rank_resident_bytes"].as_array().map(Vec::len),
+            Some(4)
+        );
     }
 
     #[test]
@@ -7412,7 +7766,11 @@ mod tests {
         assert_eq!(v["fn_lanes_mapped_bytes"], 123_456);
         assert_eq!(v["fn_lanes_stage_policy"], "embed=once,argmax=once");
         assert_eq!(v["fn_lanes_stage_evidence"], "g0-receipt");
-        let off = hipfire_arch_qwen4::lane::LaneStoreReceipt { spec: "off", spec_k: 0, ..receipt };
+        let off = hipfire_arch_qwen4::lane::LaneStoreReceipt {
+            spec: "off",
+            spec_k: 0,
+            ..receipt
+        };
         let mut w = serde_json::json!({"type": "loaded"});
         qwen4_lane_ack_fields(&mut w, &off, 4, 32, params);
         assert_eq!(w["continuous_batch_spec"], false);
@@ -7426,13 +7784,28 @@ mod tests {
         use serde_json::json;
         let neutral = qwen4_neutral_sampling();
         assert!(qwen4_lane_request_supported(&json!({}), &neutral));
-        assert!(qwen4_lane_request_supported(&json!({"tools": []}), &neutral));
-        assert!(qwen4_lane_request_supported(&json!({"logprobs": false}), &neutral));
+        assert!(qwen4_lane_request_supported(
+            &json!({"tools": []}),
+            &neutral
+        ));
+        assert!(qwen4_lane_request_supported(
+            &json!({"logprobs": false}),
+            &neutral
+        ));
 
         let penalized = [
-            hipfire_engine::scheduler::BatchSampling { repeat_penalty: 1.1, ..neutral.clone() },
-            hipfire_engine::scheduler::BatchSampling { presence_penalty: 0.5, ..neutral.clone() },
-            hipfire_engine::scheduler::BatchSampling { frequency_penalty: -0.5, ..neutral.clone() },
+            hipfire_engine::scheduler::BatchSampling {
+                repeat_penalty: 1.1,
+                ..neutral.clone()
+            },
+            hipfire_engine::scheduler::BatchSampling {
+                presence_penalty: 0.5,
+                ..neutral.clone()
+            },
+            hipfire_engine::scheduler::BatchSampling {
+                frequency_penalty: -0.5,
+                ..neutral.clone()
+            },
         ];
         for s in &penalized {
             assert!(!qwen4_lane_request_supported(&json!({}), s), "{s:?}");
@@ -7447,18 +7820,30 @@ mod tests {
             json!({"logprobs": true}),
             json!({"top_logprobs": 2}),
         ] {
-            assert!(!qwen4_lane_request_supported(&refused, &neutral), "{refused}");
+            assert!(
+                !qwen4_lane_request_supported(&refused, &neutral),
+                "{refused}"
+            );
         }
     }
 
     #[test]
     fn any_stop_form_leaves_the_batch_path() {
         use serde_json::json;
-        for absent in [json!({}), json!({"stop": null}), json!({"stop": []}), json!({"stop": ""})] {
+        for absent in [
+            json!({}),
+            json!({"stop": null}),
+            json!({"stop": []}),
+            json!({"stop": ""}),
+        ] {
             assert!(!request_has_stop(&absent), "{absent}");
         }
         // The string form was batch-eligible before and silently ignored there.
-        for present in [json!({"stop": "\n"}), json!({"stop": ["END"]}), json!({"stop": 7})] {
+        for present in [
+            json!({"stop": "\n"}),
+            json!({"stop": ["END"]}),
+            json!({"stop": 7}),
+        ] {
             assert!(request_has_stop(&present), "{present}");
         }
     }
@@ -8802,7 +9187,16 @@ mod tests {
         flag: bool,
         stops: bool,
     ) -> Option<VmmLaneDecode> {
-        sampled_lane_for(route, mtp_spec, mtp_engine, dflash_engine, dflash_sampled, flag, stops, false)
+        sampled_lane_for(
+            route,
+            mtp_spec,
+            mtp_engine,
+            dflash_engine,
+            dflash_sampled,
+            flag,
+            stops,
+            false,
+        )
     }
 
     #[test]
@@ -8813,7 +9207,10 @@ mod tests {
             GenerationRoute::Qwen4Ar,
         ] {
             for mtp_spec in [false, true] {
-                assert_eq!(lane_for(route, mtp_spec, true, true, true, false, false), None);
+                assert_eq!(
+                    lane_for(route, mtp_spec, true, true, true, false, false),
+                    None
+                );
             }
         }
     }
@@ -8822,7 +9219,11 @@ mod tests {
     fn sampled_lane_ar_route_is_an_ar_lane() {
         // Engines and stops do not matter: the AR producer runs stops, and
         // an AR singleton is compared against an AR lane.
-        for (mtp, df, stops) in [(false, false, false), (true, true, false), (true, true, true)] {
+        for (mtp, df, stops) in [
+            (false, false, false),
+            (true, true, false),
+            (true, true, true),
+        ] {
             assert_eq!(
                 lane_for(GenerationRoute::QwenAr, false, mtp, df, true, true, stops),
                 Some(VmmLaneDecode::Ar)
@@ -8833,9 +9234,15 @@ mod tests {
     #[test]
     fn sampled_lane_mtp_route_needs_engine_and_no_stops_never_ar() {
         let r = GenerationRoute::QwenDflash;
-        assert_eq!(lane_for(r, true, true, false, false, true, false), Some(VmmLaneDecode::Mtp));
+        assert_eq!(
+            lane_for(r, true, true, false, false, true, false),
+            Some(VmmLaneDecode::Mtp)
+        );
         // DFlash capability is irrelevant to an MTP singleton.
-        assert_eq!(lane_for(r, true, true, true, true, true, false), Some(VmmLaneDecode::Mtp));
+        assert_eq!(
+            lane_for(r, true, true, true, true, true, false),
+            Some(VmmLaneDecode::Mtp)
+        );
         // No engine / stop strings: stays singleton, never an AR lane.
         assert_eq!(lane_for(r, true, false, false, false, true, false), None);
         assert_eq!(lane_for(r, true, false, true, true, true, false), None);
@@ -8847,7 +9254,10 @@ mod tests {
         let r = GenerationRoute::QwenDflash;
         assert_eq!(lane_for(r, false, false, true, false, true, false), None);
         assert_eq!(lane_for(r, false, true, true, false, true, false), None);
-        assert_eq!(lane_for(r, false, false, true, true, true, false), Some(VmmLaneDecode::Dflash));
+        assert_eq!(
+            lane_for(r, false, false, true, true, true, false),
+            Some(VmmLaneDecode::Dflash)
+        );
         assert_eq!(lane_for(r, false, false, false, true, true, false), None);
         assert_eq!(lane_for(r, false, false, true, true, true, true), None);
         // The shipped capability admits the supported sampled selector chain.
@@ -8862,15 +9272,34 @@ mod tests {
         // so never refused after its start is announced); an AR lane runs
         // the singleton's think control and still batches.
         let r = GenerationRoute::QwenDflash;
-        assert_eq!(sampled_lane_for(r, true, true, false, false, true, false, true), None);
-        assert_eq!(sampled_lane_for(r, false, false, true, true, true, false, true), None);
         assert_eq!(
-            sampled_lane_for(GenerationRoute::QwenAr, false, true, true, true, true, false, true),
+            sampled_lane_for(r, true, true, false, false, true, false, true),
+            None
+        );
+        assert_eq!(
+            sampled_lane_for(r, false, false, true, true, true, false, true),
+            None
+        );
+        assert_eq!(
+            sampled_lane_for(
+                GenerationRoute::QwenAr,
+                false,
+                true,
+                true,
+                true,
+                true,
+                false,
+                true
+            ),
             Some(VmmLaneDecode::Ar)
         );
         if hipfire_runtime::config::get().max_total_think_tokens == 0 {
-            assert!(request_think_budgeted(&serde_json::json!({"max_think_tokens": 1})));
-            assert!(!request_think_budgeted(&serde_json::json!({"max_think_tokens": 0})));
+            assert!(request_think_budgeted(
+                &serde_json::json!({"max_think_tokens": 1})
+            ));
+            assert!(!request_think_budgeted(
+                &serde_json::json!({"max_think_tokens": 0})
+            ));
             assert!(!request_think_budgeted(&serde_json::json!({})));
         }
     }
@@ -8893,12 +9322,18 @@ mod tests {
         assert_eq!(sampled_admission_lane(m, true, mtp, 100, 32768 - 104), m);
         assert_eq!(sampled_admission_lane(m, true, mtp, 100, 32768 - 103), None);
         // A singleton that falls back to AR itself is an AR lane.
-        assert_eq!(sampled_admission_lane(m, false, mtp, 25, 81920), Some(VmmLaneDecode::Ar));
+        assert_eq!(
+            sampled_admission_lane(m, false, mtp, 25, 81920),
+            Some(VmmLaneDecode::Ar)
+        );
         // No engine for the singleton's mode: singleton.
         assert_eq!(sampled_admission_lane(m, true, df, 100, 1000), None);
         assert_eq!(sampled_admission_lane(d, true, mtp, 100, 1000), None);
         // AR and non-lanes pass through.
-        assert_eq!(sampled_admission_lane(Some(VmmLaneDecode::Ar), true, (None, None), 1, 1 << 20), Some(VmmLaneDecode::Ar));
+        assert_eq!(
+            sampled_admission_lane(Some(VmmLaneDecode::Ar), true, (None, None), 1, 1 << 20),
+            Some(VmmLaneDecode::Ar)
+        );
         assert_eq!(sampled_admission_lane(None, true, mtp, 1, 1), None);
     }
 
@@ -8930,24 +9365,39 @@ mod tests {
         assert_eq!(vmm_sampled_modes(true, false, false), vec!["ar"]);
         assert_eq!(vmm_sampled_modes(true, true, false), vec!["ar", "mtp"]);
         // The DFlash capability represents an admitted FAST_SAMPLE selector engine.
-        assert_eq!(vmm_sampled_modes(true, true, true), vec!["ar", "mtp", "dflash"]);
+        assert_eq!(
+            vmm_sampled_modes(true, true, true),
+            vec!["ar", "mtp", "dflash"]
+        );
 
         let mut off = serde_json::json!({});
         attach_vmm_sampling_ack(&mut off, false, true, true);
-        assert_eq!(off, serde_json::json!({"continuous_batch_sampling": "greedy_only"}));
+        assert_eq!(
+            off,
+            serde_json::json!({"continuous_batch_sampling": "greedy_only"})
+        );
 
         let mut on = serde_json::json!({});
         attach_vmm_sampling_ack(&mut on, true, true, false);
         assert_eq!(on["continuous_batch_sampling"], "sampled");
-        assert_eq!(on["continuous_batch_sampled_modes"], serde_json::json!(["ar", "mtp"]));
+        assert_eq!(
+            on["continuous_batch_sampled_modes"],
+            serde_json::json!(["ar", "mtp"])
+        );
 
         let mut dflash = serde_json::json!({});
         attach_vmm_sampling_ack(&mut dflash, true, false, true);
-        assert_eq!(dflash["continuous_batch_sampled_modes"], serde_json::json!(["ar", "dflash"]));
+        assert_eq!(
+            dflash["continuous_batch_sampled_modes"],
+            serde_json::json!(["ar", "dflash"])
+        );
 
         let mut ar_only = serde_json::json!({});
         attach_vmm_sampling_ack(&mut ar_only, true, false, false);
-        assert_eq!(ar_only["continuous_batch_sampled_modes"], serde_json::json!(["ar"]));
+        assert_eq!(
+            ar_only["continuous_batch_sampled_modes"],
+            serde_json::json!(["ar"])
+        );
     }
 
     #[test]

@@ -54,15 +54,13 @@
 // HIPFIRE_SAMPLE_PARALLEL=0 (the batch then runs the serial sampler).
 
 use hip_bridge::memory_effects;
-use hipfire_runtime::batch_sampler::{
-    sample_batch, BatchSampleJob, BatchSamplerArena,
-};
+use hipfire_runtime::batch_sampler::{sample_batch, BatchSampleJob, BatchSamplerArena};
 use hipfire_runtime::sampler::{self, SamplerConfig};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::json;
-use std::time::Instant;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::Instant;
 
 struct Rng(u64);
 impl Rng {
@@ -143,7 +141,10 @@ fn build_pool(rng: &mut Rng, vocab: usize) -> Vec<PoolRow> {
         let v = r[top[19] as usize];
         let mut ranked: Vec<u32> = (0..vocab as u32).collect();
         ranked.sort_unstable_by(|&a, &b| {
-            r[b as usize].partial_cmp(&r[a as usize]).unwrap().then(a.cmp(&b))
+            r[b as usize]
+                .partial_cmp(&r[a as usize])
+                .unwrap()
+                .then(a.cmp(&b))
         });
         for &t in &ranked[18..=24] {
             r[t as usize] = v;
@@ -154,7 +155,10 @@ fn build_pool(rng: &mut Rng, vocab: usize) -> Vec<PoolRow> {
         let mut r = normal_row(rng, vocab, 2.0);
         let mut ranked: Vec<u32> = (0..vocab as u32).collect();
         ranked.sort_unstable_by(|&a, &b| {
-            r[b as usize].partial_cmp(&r[a as usize]).unwrap().then(a.cmp(&b))
+            r[b as usize]
+                .partial_cmp(&r[a as usize])
+                .unwrap()
+                .then(a.cmp(&b))
         });
         let v = r[ranked[4] as usize];
         for &t in &ranked[3..=7] {
@@ -164,7 +168,10 @@ fn build_pool(rng: &mut Rng, vocab: usize) -> Vec<PoolRow> {
     }
     // Six equal tokens carry ~all the mass, so the top-p cut falls inside a tie.
     {
-        let mut r: Vec<f32> = normal_row(rng, vocab, 0.1).iter().map(|x| x - 20.0).collect();
+        let mut r: Vec<f32> = normal_row(rng, vocab, 0.1)
+            .iter()
+            .map(|x| x - 20.0)
+            .collect();
         for _ in 0..6 {
             let t = rng.below(vocab);
             r[t] = 5.0;
@@ -208,7 +215,11 @@ struct Lane {
 
 fn random_lane(rng: &mut Rng, pool: &[PoolRow], vocab: usize, row: usize) -> Lane {
     let temperature = rng.pick(&[0.0f32, 0.7, 0.7, 0.7, 1.0]);
-    let top_p = if temperature == 0.0 { 1.0 } else { rng.pick(&[0.95f32, 0.95, 1.0, 0.5]) };
+    let top_p = if temperature == 0.0 {
+        1.0
+    } else {
+        rng.pick(&[0.95f32, 0.95, 1.0, 0.5])
+    };
     let repeat_penalty = rng.pick(&[1.0f32, 1.05, 1.3]);
     let presence_penalty = rng.pick(&[0.0f32, 0.5]);
     let frequency_penalty = rng.pick(&[0.0f32, 0.5]);
@@ -281,18 +292,30 @@ fn build_penalty_suite(rng: &mut Rng, pool: &[PoolRow], vocab: usize) -> Vec<Lan
         for (pi, &pat) in PATTERNS.iter().enumerate() {
             for &(rp, pp, fp) in &CONFIGS {
                 // "signed" draws its alphabet from a normal row so both signs occur.
-                let row = if pat == "signed" { rng.below(2) } else { rng.below(pool.len()) };
+                let row = if pat == "signed" {
+                    rng.below(2)
+                } else {
+                    rng.below(pool.len())
+                };
                 let n = if idx % 5 == 0 { w + 50 } else { w };
                 let history: Vec<u32> = match pat {
                     "dups3" => {
-                        let a = [pool[row].top[0], rng.below(vocab) as u32, rng.below(vocab) as u32];
+                        let a = [
+                            pool[row].top[0],
+                            rng.below(vocab) as u32,
+                            rng.below(vocab) as u32,
+                        ];
                         (0..n).map(|_| a[rng.below(3)]).collect()
                     }
                     "distinct" => {
                         let mut seen = HashSet::new();
                         let mut h = Vec::with_capacity(n);
                         while h.len() < n {
-                            let t = if vocab >= 2 * n { rng.below(vocab) as u32 } else { (h.len() % vocab) as u32 };
+                            let t = if vocab >= 2 * n {
+                                rng.below(vocab) as u32
+                            } else {
+                                (h.len() % vocab) as u32
+                            };
                             if vocab < 2 * n || seen.insert(t) {
                                 h.push(t);
                             }
@@ -301,9 +324,20 @@ fn build_penalty_suite(rng: &mut Rng, pool: &[PoolRow], vocab: usize) -> Vec<Lan
                     }
                     "oov" => {
                         let alpha: Vec<u32> = (0..40).map(|_| rng.below(vocab) as u32).collect();
-                        let oov = [vocab as u32, vocab as u32 + 1, vocab as u32 + 1000, 0x7FFF_FFFF];
+                        let oov = [
+                            vocab as u32,
+                            vocab as u32 + 1,
+                            vocab as u32 + 1000,
+                            0x7FFF_FFFF,
+                        ];
                         (0..n)
-                            .map(|_| if rng.below(3) == 0 { oov[rng.below(4)] } else { alpha[rng.below(40)] })
+                            .map(|_| {
+                                if rng.below(3) == 0 {
+                                    oov[rng.below(4)]
+                                } else {
+                                    alpha[rng.below(40)]
+                                }
+                            })
                             .collect()
                     }
                     "signed" => {
@@ -322,7 +356,13 @@ fn build_penalty_suite(rng: &mut Rng, pool: &[PoolRow], vocab: usize) -> Vec<Lan
                         (0..n).map(|_| alpha[rng.below(32)]).collect()
                     }
                     "mixed" => (0..n)
-                        .map(|_| if rng.below(2) == 0 { pool[row].top[rng.below(32)] } else { rng.below(24) as u32 })
+                        .map(|_| {
+                            if rng.below(2) == 0 {
+                                pool[row].top[rng.below(32)]
+                            } else {
+                                rng.below(24) as u32
+                            }
+                        })
                         .collect(),
                     _ => {
                         let base: Vec<u32> = (0..7).map(|_| rng.below(vocab) as u32).collect();
@@ -330,7 +370,11 @@ fn build_penalty_suite(rng: &mut Rng, pool: &[PoolRow], vocab: usize) -> Vec<Lan
                     }
                 };
                 let temperature = [0.0f32, 0.7, 0.7, 1.0][idx % 4];
-                let top_p = if temperature == 0.0 { 1.0 } else { [0.95f32, 1.0][(idx / 4) % 2] };
+                let top_p = if temperature == 0.0 {
+                    1.0
+                } else {
+                    [0.95f32, 1.0][(idx / 4) % 2]
+                };
                 let top_k = [None, Some(40u32), Some(5), Some(20)][(idx / 4) % 4];
                 suite.push(Lane {
                     row,
@@ -431,7 +475,11 @@ fn bits_eq(a: &[f32], b: &[f32]) -> bool {
 fn median(xs: &mut [f64]) -> f64 {
     xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = xs.len();
-    if n % 2 == 1 { xs[n / 2] } else { 0.5 * (xs[n / 2 - 1] + xs[n / 2]) }
+    if n % 2 == 1 {
+        xs[n / 2]
+    } else {
+        0.5 * (xs[n / 2 - 1] + xs[n / 2])
+    }
 }
 
 /// Bootstrap 95% CI of median(active) - median(neutral).
@@ -450,7 +498,11 @@ fn bootstrap_delta(rng: &mut Rng, active: &[f64], neutral: &[f64]) -> (f64, f64,
         diffs.push(median(&mut a) - median(&mut n));
     }
     diffs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    (point, diffs[(diffs.len() as f64 * 0.025) as usize], diffs[(diffs.len() as f64 * 0.975) as usize - 1])
+    (
+        point,
+        diffs[(diffs.len() as f64 * 0.025) as usize],
+        diffs[(diffs.len() as f64 * 0.975) as usize - 1],
+    )
 }
 
 fn upload_rows(gpu: &Gpu, buf: &GpuTensor, pos: usize, vocab: usize, row: &[f32]) {
@@ -460,7 +512,9 @@ fn upload_rows(gpu: &Gpu, buf: &GpuTensor, pos: usize, vocab: usize, row: &[f32]
 }
 
 fn arg(args: &[String], name: &str) -> Option<String> {
-    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1).cloned())
 }
 
 fn main() {
@@ -470,11 +524,18 @@ fn main() {
         .split(',')
         .map(|s| s.trim().parse().expect("--lanes"))
         .collect();
-    let trials: usize = arg(&args, "--trials").map(|s| s.parse().expect("--trials")).unwrap_or(40);
-    let vocab: usize = arg(&args, "--vocab").map(|s| s.parse().expect("--vocab")).unwrap_or(248_320);
-    let repeat_cap: usize =
-        arg(&args, "--repeat-cap").map(|s| s.parse().expect("--repeat-cap")).unwrap_or(4608);
-    let seed: u64 = arg(&args, "--seed").map(|s| s.parse().expect("--seed")).unwrap_or(0x5eed_5a3b);
+    let trials: usize = arg(&args, "--trials")
+        .map(|s| s.parse().expect("--trials"))
+        .unwrap_or(40);
+    let vocab: usize = arg(&args, "--vocab")
+        .map(|s| s.parse().expect("--vocab"))
+        .unwrap_or(248_320);
+    let repeat_cap: usize = arg(&args, "--repeat-cap")
+        .map(|s| s.parse().expect("--repeat-cap"))
+        .unwrap_or(4608);
+    let seed: u64 = arg(&args, "--seed")
+        .map(|s| s.parse().expect("--seed"))
+        .unwrap_or(0x5eed_5a3b);
     let penalty_only = args.iter().any(|a| a == "--penalty-only");
     let out_path = match arg(&args, "--out") {
         Some(p) => p,
@@ -486,10 +547,16 @@ fn main() {
     let mut dumper: Option<Dumper> = arg(&args, "--dump").map(|d| {
         let dir = PathBuf::from(d);
         std::fs::create_dir_all(&dir).expect("--dump dir");
-        Dumper { dir, sparse: dump_sparse, index: Vec::new() }
+        Dumper {
+            dir,
+            sparse: dump_sparse,
+            index: Vec::new(),
+        }
     });
-    let iters: usize =
-        arg(&args, "--iters").map(|s| s.parse().expect("--iters")).unwrap_or(200).max(200);
+    let iters: usize = arg(&args, "--iters")
+        .map(|s| s.parse().expect("--iters"))
+        .unwrap_or(200)
+        .max(200);
     let max_k = *lanes_list.iter().max().expect("--lanes");
 
     let mut gpu = Gpu::init().expect("gpu init");
@@ -497,13 +564,16 @@ fn main() {
     let pool = build_pool(&mut rng, vocab);
     let mut arena = BatchSamplerArena::new(&mut gpu, max_k.max(8), repeat_cap).expect("arena");
     let sample_buf = gpu.alloc_tensor(&[2], DType::F32).expect("sample_buf");
-    let repeat_buf = gpu.alloc_tensor(&[repeat_cap], DType::F32).expect("repeat_buf");
+    let repeat_buf = gpu
+        .alloc_tensor(&[repeat_cap], DType::F32)
+        .expect("repeat_buf");
 
     if penalty_only {
         let result = run_penalty_only(&mut gpu, &repeat_buf, &pool, vocab, iters, &mut rng);
         if !out_path.is_empty() {
             let report = json!({ "vocab": vocab, "repeat_cap": repeat_cap, "seed": seed, "penalty_only": result });
-            std::fs::write(&out_path, serde_json::to_string_pretty(&report).unwrap()).expect("write --out");
+            std::fs::write(&out_path, serde_json::to_string_pretty(&report).unwrap())
+                .expect("write --out");
         }
         gpu.free_tensor(sample_buf).ok();
         gpu.free_tensor(repeat_buf).ok();
@@ -538,7 +608,11 @@ fn main() {
                     .map(|i| {
                         // The first trials walk the whole pool through lane 0 so
                         // every adversarial row kind is covered for every K.
-                        let row = if i == 0 && trial < pool.len() { trial } else { rng.below(pool.len()) };
+                        let row = if i == 0 && trial < pool.len() {
+                            trial
+                        } else {
+                            rng.below(pool.len())
+                        };
                         random_lane(&mut rng, &pool, vocab, row)
                     })
                     .collect()
@@ -579,8 +653,9 @@ fn main() {
                 let mid = memory_effects::snapshot();
 
                 // Batched.
-                let views: Vec<GpuTensor> =
-                    (0..k).map(|pos| b_rows.sub_offset(pos * vocab, vocab)).collect();
+                let views: Vec<GpuTensor> = (0..k)
+                    .map(|pos| b_rows.sub_offset(pos * vocab, vocab))
+                    .collect();
                 let jobs: Vec<BatchSampleJob<'_>> = order
                     .iter()
                     .enumerate()
@@ -695,7 +770,16 @@ fn main() {
 
     let mut timing_json = serde_json::Value::Null;
     if timing {
-        timing_json = run_timing(&mut gpu, &mut arena, &sample_buf, &repeat_buf, &pool, vocab, iters, &mut rng);
+        timing_json = run_timing(
+            &mut gpu,
+            &mut arena,
+            &sample_buf,
+            &repeat_buf,
+            &pool,
+            vocab,
+            iters,
+            &mut rng,
+        );
     }
 
     let report = json!({
@@ -751,7 +835,9 @@ fn run_penalty_only(
     const K: usize = 8;
     const WARMUP: usize = 20;
     let cap = repeat_buf.numel();
-    let pristine = gpu.alloc_tensor(&[K * vocab], DType::F32).expect("pristine");
+    let pristine = gpu
+        .alloc_tensor(&[K * vocab], DType::F32)
+        .expect("pristine");
     let work = gpu.alloc_tensor(&[K * vocab], DType::F32).expect("work");
     for pos in 0..K {
         upload_rows(gpu, &pristine, pos, vocab, &pool[0].logits);
@@ -759,11 +845,20 @@ fn run_penalty_only(
     let views: Vec<GpuTensor> = (0..K).map(|p| work.sub_offset(p * vocab, vocab)).collect();
     let mut out = Vec::new();
     for window in [128usize, 512, 2048] {
-        assert!(window <= cap, "--repeat-cap {cap} < penalty-only window {window}");
+        assert!(
+            window <= cap,
+            "--repeat-cap {cap} < penalty-only window {window}"
+        );
         for pattern in ["dups", "distinct"] {
             let history: Vec<u32> = if pattern == "dups" {
                 (0..window)
-                    .map(|_| if rng.below(2) == 0 { pool[0].top[rng.below(32)] } else { rng.below(24) as u32 })
+                    .map(|_| {
+                        if rng.below(2) == 0 {
+                            pool[0].top[rng.below(32)]
+                        } else {
+                            rng.below(24) as u32
+                        }
+                    })
                     .collect()
             } else {
                 let mut seen = HashSet::new();
@@ -777,10 +872,13 @@ fn run_penalty_only(
                 h
             };
             let bytes: Vec<u8> = history.iter().flat_map(|t| t.to_ne_bytes()).collect();
-            gpu.hip.memcpy_htod(&repeat_buf.buf, &bytes).expect("upload history");
+            gpu.hip
+                .memcpy_htod(&repeat_buf.buf, &bytes)
+                .expect("upload history");
             let mut ms_all = Vec::with_capacity(iters);
             for it in 0..WARMUP + iters {
-                gpu.memcpy_dtod_at_auto(&work.buf, 0, &pristine.buf, 0, K * vocab * 4).expect("restore");
+                gpu.memcpy_dtod_at_auto(&work.buf, 0, &pristine.buf, 0, K * vocab * 4)
+                    .expect("restore");
                 gpu.hip.device_synchronize().expect("sync");
                 let t = Instant::now();
                 for v in &views {
@@ -837,14 +935,22 @@ fn run_timing(
     const K: usize = 8;
     const WARMUP: usize = 20;
     let row = &pool[0];
-    let pristine = gpu.alloc_tensor(&[K * vocab], DType::F32).expect("pristine");
+    let pristine = gpu
+        .alloc_tensor(&[K * vocab], DType::F32)
+        .expect("pristine");
     let work = gpu.alloc_tensor(&[K * vocab], DType::F32).expect("work");
     for pos in 0..K {
         upload_rows(gpu, &pristine, pos, vocab, &row.logits);
     }
     let views: Vec<GpuTensor> = (0..K).map(|p| work.sub_offset(p * vocab, vocab)).collect();
     let history: Vec<u32> = (0..3000)
-        .map(|_| if rng.below(2) == 0 { row.top[rng.below(32)] } else { rng.below(24) as u32 })
+        .map(|_| {
+            if rng.below(2) == 0 {
+                row.top[rng.below(32)]
+            } else {
+                rng.below(24) as u32
+            }
+        })
         .collect();
 
     // (name, repeat, presence, frequency)
@@ -875,11 +981,17 @@ fn run_timing(
             let mut serial_ms = Vec::with_capacity(iters);
             for it in 0..WARMUP + iters {
                 // Batch.
-                gpu.memcpy_dtod_at_auto(&work.buf, 0, &pristine.buf, 0, K * vocab * 4).expect("restore");
+                gpu.memcpy_dtod_at_auto(&work.buf, 0, &pristine.buf, 0, K * vocab * 4)
+                    .expect("restore");
                 gpu.hip.device_synchronize().expect("sync");
                 let jobs: Vec<BatchSampleJob<'_>> = views
                     .iter()
-                    .map(|v| BatchSampleJob { logits: v, history: &history, cfg: &cfg, rng_state: 12345 })
+                    .map(|v| BatchSampleJob {
+                        logits: v,
+                        history: &history,
+                        cfg: &cfg,
+                        rng_state: 12345,
+                    })
                     .collect();
                 let t = Instant::now();
                 sample_batch(gpu, arena, &jobs).expect("sample_batch");
@@ -889,12 +1001,15 @@ fn run_timing(
                     batch_ms.push(ms);
                 }
                 // Serial.
-                gpu.memcpy_dtod_at_auto(&work.buf, 0, &pristine.buf, 0, K * vocab * 4).expect("restore");
+                gpu.memcpy_dtod_at_auto(&work.buf, 0, &pristine.buf, 0, K * vocab * 4)
+                    .expect("restore");
                 gpu.hip.device_synchronize().expect("sync");
                 let t = Instant::now();
                 for v in &views {
                     let mut r = 12345u32;
-                    sampler::sample(gpu, v, sample_buf, repeat_buf, vocab, &history, &cfg, &mut r);
+                    sampler::sample(
+                        gpu, v, sample_buf, repeat_buf, vocab, &history, &cfg, &mut r,
+                    );
                 }
                 gpu.hip.device_synchronize().expect("sync");
                 let ms = t.elapsed().as_secs_f64() * 1e3;

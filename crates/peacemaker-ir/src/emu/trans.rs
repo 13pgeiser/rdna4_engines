@@ -75,7 +75,9 @@ use tables::{
 fn qualify(arch: Arch, func: &str) {
     match arch {
         Arch::Gfx1151 | Arch::Gfx1201 => {}
-        other => panic!("emu::trans::{func}: {other:?} is not qualified (only Gfx1151 and Gfx1201)"),
+        other => {
+            panic!("emu::trans::{func}: {other:?} is not qualified (only Gfx1151 and Gfx1201)")
+        }
     }
 }
 
@@ -92,7 +94,11 @@ fn round_even(value: u64, shift: u32) -> u64 {
 /// otherwise rounds at bit 23; shared by the EXP/LOG quadratic stages.
 #[inline]
 fn round_product_q36(product: u64) -> u64 {
-    if product >= (1u64 << 47) { round_even(product, 24) * 2 } else { round_even(product, 23) }
+    if product >= (1u64 << 47) {
+        round_even(product, 24) * 2
+    } else {
+        round_even(product, 23)
+    }
 }
 
 /// Binary search a residual bucket for `key`; returns its entry on a hit.
@@ -146,20 +152,34 @@ mod exp {
         let exponent = (mag >> 23) as i32 - 127;
         let mantissa = u64::from((mag & 0x7f_ffff) | 0x80_0000);
         let shift = exponent + 6;
-        let absolute = if shift >= 0 { mantissa << shift } else { mantissa >> -shift };
-        let phase: i64 = if negative { -(absolute as i64) - 1 } else { absolute as i64 };
+        let absolute = if shift >= 0 {
+            mantissa << shift
+        } else {
+            mantissa >> -shift
+        };
+        let phase: i64 = if negative {
+            -(absolute as i64) - 1
+        } else {
+            absolute as i64
+        };
         let fraction = (phase as u32) & 0xff_ffff;
         let c = EXP[(((phase as u64) >> 24) & 31) as usize];
         // Linear product rounded to Q29 (capped at Q28 for large products),
         // then its low guard bit is dropped before accumulation.
         let lp = u64::from(c.linear) * u64::from(fraction);
-        let linear = if lp >= (1u64 << 47) { round_even(lp, 24) } else { round_even(lp, 23) >> 1 };
+        let linear = if lp >= (1u64 << 47) {
+            round_even(lp, 24)
+        } else {
+            round_even(lp, 23) >> 1
+        };
         // Quadratic stage: 18 coordinate bits, Q24 square, inner coefficient
         // rounded to Q35 before the multiply.
         let coordinate = u64::from(fraction >> 6);
         let square = (coordinate * coordinate) >> 12;
-        let inner =
-            round_even((u64::from(c.quadratic) << 7) + u64::from(c.cubic) * coordinate, 7);
+        let inner = round_even(
+            (u64::from(c.quadratic) << 7) + u64::from(c.cubic) * coordinate,
+            7,
+        );
         let quad = round_product_q36(inner * square);
         // Combine in Q36 and round once to the FP32 significand.
         let sum = ((u64::from(c.constant) + linear) << 8) + quad;
@@ -182,9 +202,21 @@ mod log {
         let c2: u64 = if upper { 12_097_323 } else { 12_101_979 };
         let c3: u64 = if upper { 2_088_428 } else { 2_035_248 };
         let width = 32 - k.leading_zeros();
-        let normalization = if width < 18 { 4 * ((18 - width) / 4) } else { 0 };
-        let linear_shift = if normalization < 14 { 14 - normalization } else { 0 };
-        let square_shift = if normalization < 12 { 12 - normalization } else { 0 };
+        let normalization = if width < 18 {
+            4 * ((18 - width) / 4)
+        } else {
+            0
+        };
+        let linear_shift = if normalization < 14 {
+            14 - normalization
+        } else {
+            0
+        };
+        let square_shift = if normalization < 12 {
+            12 - normalization
+        } else {
+            0
+        };
         let k64 = u64::from(k);
         let linear = ((2 * c1 * k64) >> linear_shift) << linear_shift;
         let square = ((k64 * k64) >> square_shift) << square_shift;
@@ -209,7 +241,13 @@ mod log {
     /// including exact grid hits.
     fn near_one_positive(bits: u32) -> u32 {
         let i = bits - 0x3f80_0000;
-        let row = if i < 0x1_0000 { 0 } else if i < 0x2_0000 { 1 } else { 2 };
+        let row = if i < 0x1_0000 {
+            0
+        } else if i < 0x2_0000 {
+            1
+        } else {
+            2
+        };
         const CONSTANTS: [u64; 3] = [0, 192, 2856];
         const LINEARS: [u64; 3] = [12_102_203, 12_102_186, 12_102_072];
         const QUADRATICS: [u64; 3] = [12_102_094, 12_097_614, 12_084_310];
@@ -260,8 +298,7 @@ mod log {
         let magnitude = fixed.unsigned_abs();
         let mut leading = 63 - magnitude.leading_zeros();
         let shift = leading - 23;
-        let mut mantissa =
-            (magnitude + if negative { (1u64 << shift) - 1 } else { 0 }) >> shift;
+        let mut mantissa = (magnitude + if negative { (1u64 << shift) - 1 } else { 0 }) >> shift;
         if mantissa == 1u64 << 24 {
             mantissa >>= 1;
             leading += 1;
@@ -311,7 +348,11 @@ mod rcp {
         let c = RCP[(mantissa >> 18) as usize];
         let fraction = u64::from(mantissa & 0x3_ffff);
         let linear_product = u64::from(c.linear) * fraction;
-        let shift = if linear_product >= (1u64 << 38) { 15 } else { 14 };
+        let shift = if linear_product >= (1u64 << 38) {
+            15
+        } else {
+            14
+        };
         let linear = round_even(linear_product, shift) << (shift - 14);
         let inner = (u64::from(c.quadratic) << 18) - u64::from(c.cubic) * fraction;
         let square_input = u128::from(fraction & !1);
@@ -427,7 +468,11 @@ mod sqrt {
         let at = SQRT_CORRECTIONS.partition_point(|&e| (e & !1) < key);
         match SQRT_CORRECTIONS.get(at) {
             Some(&e) if (e & !1) == key => {
-                if e & 1 != 0 { result.wrapping_add(1) } else { result.wrapping_sub(1) }
+                if e & 1 != 0 {
+                    result.wrapping_add(1)
+                } else {
+                    result.wrapping_sub(1)
+                }
             }
             _ => result,
         }
@@ -438,7 +483,11 @@ mod sqrt {
         let c = SQRT[(index >> 19) as usize];
         let fraction = i64::from(index & 0x7_ffff);
         let product = u64::from(c.linear) * fraction as u64;
-        let bias = if product >= (1u64 << 40) { 1u64 << 16 } else { 1u64 << 15 };
+        let bias = if product >= (1u64 << 40) {
+            1u64 << 16
+        } else {
+            1u64 << 15
+        };
         let linear = ((product + bias) >> 17) as i64;
         let square_input = fraction & !3;
         let square = (square_input * square_input) >> 14;
@@ -453,8 +502,8 @@ mod sqrt {
         let quotient = sum >> 24;
         let remainder = sum & ((1i64 << 24) - 1);
         let midpoint = 1i64 << 23;
-        let mantissa =
-            quotient + i64::from(remainder > midpoint || (remainder == midpoint && quotient & 1 != 0));
+        let mantissa = quotient
+            + i64::from(remainder > midpoint || (remainder == midpoint && quotient & 1 != 0));
         let result = 0x3f80_0000u32.wrapping_add(mantissa as u32);
         // Exhaustive normalised captures bound every residual to within 1/2048
         // ULP of a rounding midpoint; other inputs need no table lookup.
@@ -565,17 +614,31 @@ mod tests {
     #[test]
     fn rcp_published_words() {
         let cases: [(u32, u32); 16] = [
-            (0x3f80_0000, 0x3f80_0000), (0x3f80_0001, 0x3f7f_fffe), (0x3f81_ffff, 0x3f7c_0fc3),
-            (0x3f82_0000, 0x3f7c_0fc1), (0x3f83_ffff, 0x3f78_3e12), (0x3f84_0000, 0x3f78_3e10),
-            (0x3fc0_0000, 0x3f2a_aaaa), (0x3fff_ffff, 0x3f00_0001), (0x3f80_2922, 0x3f7f_add6),
-            (0x3f93_2edd, 0x3f5e_a262), (0x3fb0_333c, 0x3f39_f868), (0x3fff_f486, 0x3f00_05be),
-            (0x0080_0000, 0x7e80_0000), (0x7f00_0000, 0x0000_0000), (0x0000_0001, 0x7f80_0000),
+            (0x3f80_0000, 0x3f80_0000),
+            (0x3f80_0001, 0x3f7f_fffe),
+            (0x3f81_ffff, 0x3f7c_0fc3),
+            (0x3f82_0000, 0x3f7c_0fc1),
+            (0x3f83_ffff, 0x3f78_3e12),
+            (0x3f84_0000, 0x3f78_3e10),
+            (0x3fc0_0000, 0x3f2a_aaaa),
+            (0x3fff_ffff, 0x3f00_0001),
+            (0x3f80_2922, 0x3f7f_add6),
+            (0x3f93_2edd, 0x3f5e_a262),
+            (0x3fb0_333c, 0x3f39_f868),
+            (0x3fff_f486, 0x3f00_05be),
+            (0x0080_0000, 0x7e80_0000),
+            (0x7f00_0000, 0x0000_0000),
+            (0x0000_0001, 0x7f80_0000),
             (0x7fa1_2345, 0x7fe1_2345),
         ];
         for arch in ARCHES {
             for (input, want) in cases {
                 for sign in [0u32, 0x8000_0000] {
-                    assert_eq!(rcp_f32(arch, input | sign), want | sign, "{arch:?} {input:#x}");
+                    assert_eq!(
+                        rcp_f32(arch, input | sign),
+                        want | sign,
+                        "{arch:?} {input:#x}"
+                    );
                     assert_eq!(rcp_iflag_f32(arch, input | sign), want | sign);
                 }
             }
@@ -585,14 +648,30 @@ mod tests {
     #[test]
     fn rsq_published_words() {
         let cases: [(u32, u32); 25] = [
-            (0x3f80_0000, 0x3f80_0000), (0x3f80_0001, 0x3f7f_ffff), (0x3f83_ffff, 0x3f7c_1765),
-            (0x3f84_0000, 0x3f7c_1764), (0x3f80_40c4, 0x3f7f_bf55), (0x3f80_cab3, 0x3f7f_363d),
-            (0x3fbf_ffff, 0x3f51_05ec), (0x3fc0_0000, 0x3f51_05ec), (0x3fff_ffff, 0x3f35_04f3),
-            (0x4000_0000, 0x3f35_04f3), (0x4000_0001, 0x3f35_04f2), (0x4003_ffff, 0x3f32_416a),
-            (0x4004_0000, 0x3f32_416a), (0x403f_ffff, 0x3f13_cd3b), (0x4040_0000, 0x3f13_cd3a),
-            (0x407f_ffff, 0x3f00_0000), (0x0000_0000, 0x7f80_0000), (0x8000_0000, 0xff80_0000),
-            (0x0000_0001, 0x7f80_0000), (0x8000_0001, 0xff80_0000), (0xbf80_0000, 0xffc0_0000),
-            (0xff80_0000, 0xffc0_0000), (0x7f80_0000, 0x0000_0000), (0x7fa1_2345, 0x7fe1_2345),
+            (0x3f80_0000, 0x3f80_0000),
+            (0x3f80_0001, 0x3f7f_ffff),
+            (0x3f83_ffff, 0x3f7c_1765),
+            (0x3f84_0000, 0x3f7c_1764),
+            (0x3f80_40c4, 0x3f7f_bf55),
+            (0x3f80_cab3, 0x3f7f_363d),
+            (0x3fbf_ffff, 0x3f51_05ec),
+            (0x3fc0_0000, 0x3f51_05ec),
+            (0x3fff_ffff, 0x3f35_04f3),
+            (0x4000_0000, 0x3f35_04f3),
+            (0x4000_0001, 0x3f35_04f2),
+            (0x4003_ffff, 0x3f32_416a),
+            (0x4004_0000, 0x3f32_416a),
+            (0x403f_ffff, 0x3f13_cd3b),
+            (0x4040_0000, 0x3f13_cd3a),
+            (0x407f_ffff, 0x3f00_0000),
+            (0x0000_0000, 0x7f80_0000),
+            (0x8000_0000, 0xff80_0000),
+            (0x0000_0001, 0x7f80_0000),
+            (0x8000_0001, 0xff80_0000),
+            (0xbf80_0000, 0xffc0_0000),
+            (0xff80_0000, 0xffc0_0000),
+            (0x7f80_0000, 0x0000_0000),
+            (0x7fa1_2345, 0x7fe1_2345),
             (0xffa1_2345, 0xffe1_2345),
         ];
         for arch in ARCHES {
@@ -605,15 +684,32 @@ mod tests {
     #[test]
     fn sqrt_published_words() {
         let cases: [(u32, u32); 26] = [
-            (0x3f7a_2707, 0x3f7d_0f30), (0x3f80_0001, 0x3f80_0000), (0x3f80_0005, 0x3f80_0002),
-            (0x3f80_005f, 0x3f80_0030), (0x3f80_15ee, 0x3f80_0af7), (0x4005_a8f7, 0x3fb8_fa71),
-            (0x3f82_3902, 0x3f81_1b48), (0x4006_e699, 0x3fb9_d5ba), (0x3f83_39a8, 0x3f81_9a42),
-            (0x4006_59f1, 0x3fb9_74bf), (0x0080_0001, 0x2000_0000), (0x00ff_ffff, 0x2035_04f3),
-            (0x0100_0001, 0x2035_04f4), (0x3fff_ffff, 0x3fb5_04f3), (0x407f_ffff, 0x3fff_ffff),
-            (0x7e80_0001, 0x5f00_0000), (0x7f7f_ffff, 0x5f7f_ffff), (0x0000_0000, 0x0000_0000),
-            (0x8000_0000, 0x8000_0000), (0x0000_0001, 0x0000_0000), (0x8000_0001, 0x8000_0000),
-            (0xbf80_0000, 0xffc0_0000), (0xff80_0000, 0xffc0_0000), (0x7f80_0000, 0x7f80_0000),
-            (0x7fa1_2345, 0x7fe1_2345), (0xffa1_2345, 0xffe1_2345),
+            (0x3f7a_2707, 0x3f7d_0f30),
+            (0x3f80_0001, 0x3f80_0000),
+            (0x3f80_0005, 0x3f80_0002),
+            (0x3f80_005f, 0x3f80_0030),
+            (0x3f80_15ee, 0x3f80_0af7),
+            (0x4005_a8f7, 0x3fb8_fa71),
+            (0x3f82_3902, 0x3f81_1b48),
+            (0x4006_e699, 0x3fb9_d5ba),
+            (0x3f83_39a8, 0x3f81_9a42),
+            (0x4006_59f1, 0x3fb9_74bf),
+            (0x0080_0001, 0x2000_0000),
+            (0x00ff_ffff, 0x2035_04f3),
+            (0x0100_0001, 0x2035_04f4),
+            (0x3fff_ffff, 0x3fb5_04f3),
+            (0x407f_ffff, 0x3fff_ffff),
+            (0x7e80_0001, 0x5f00_0000),
+            (0x7f7f_ffff, 0x5f7f_ffff),
+            (0x0000_0000, 0x0000_0000),
+            (0x8000_0000, 0x8000_0000),
+            (0x0000_0001, 0x0000_0000),
+            (0x8000_0001, 0x8000_0000),
+            (0xbf80_0000, 0xffc0_0000),
+            (0xff80_0000, 0xffc0_0000),
+            (0x7f80_0000, 0x7f80_0000),
+            (0x7fa1_2345, 0x7fe1_2345),
+            (0xffa1_2345, 0xffe1_2345),
         ];
         for arch in ARCHES {
             for (input, want) in cases {
@@ -625,16 +721,36 @@ mod tests {
     #[test]
     fn log_published_words() {
         let cases: [(u32, u32); 31] = [
-            (0x3f00_0000, 0xbf80_0000), (0x3f7b_ffff, 0xbcba_1fa3), (0x3f7c_0000, 0xbcba_1f74),
-            (0x3f7c_0001, 0xbcba_1f46), (0x3f7d_ffec, 0xbc39_6b23), (0x3f7d_ffff, 0xbc39_643a),
-            (0x3f7e_0000, 0xbc39_63dd), (0x3f7e_0001, 0xbc39_6380), (0x3f7f_f5cb, 0xb96b_a0e4),
-            (0x3f7f_fffd, 0xb48a_7fae), (0x3f7f_fffe, 0xb438_aa3c), (0x3f7f_ffff, 0xb3b8_aa3c),
-            (0x3f80_0000, 0x0000_0000), (0x3f80_0001, 0x3438_aa3b), (0x3f80_0005, 0x3566_d4c6),
-            (0x3f80_0006, 0x358a_7faa), (0x3f80_0043, 0x3741_5204), (0x3f80_0c30, 0x3a0c_a2fa),
-            (0x3f80_ffff, 0x3c37_f1ce), (0x3f81_0000, 0x3c37_f286), (0x3f81_0001, 0x3c37_f33d),
-            (0x3f81_ffff, 0x3cb7_3c5a), (0x3f82_0000, 0x3cb7_3cb4), (0x3f82_0001, 0x3cb7_3d0f),
-            (0x3f83_5d48, 0x3d19_508b), (0x3f83_ffff, 0x3d35_d66f), (0x3f84_0000, 0x3d35_d69c),
-            (0x3f85_ffff, 0x3d87_59af), (0x3f86_0000, 0x3d87_59c5), (0x3f86_0001, 0x3d87_59db),
+            (0x3f00_0000, 0xbf80_0000),
+            (0x3f7b_ffff, 0xbcba_1fa3),
+            (0x3f7c_0000, 0xbcba_1f74),
+            (0x3f7c_0001, 0xbcba_1f46),
+            (0x3f7d_ffec, 0xbc39_6b23),
+            (0x3f7d_ffff, 0xbc39_643a),
+            (0x3f7e_0000, 0xbc39_63dd),
+            (0x3f7e_0001, 0xbc39_6380),
+            (0x3f7f_f5cb, 0xb96b_a0e4),
+            (0x3f7f_fffd, 0xb48a_7fae),
+            (0x3f7f_fffe, 0xb438_aa3c),
+            (0x3f7f_ffff, 0xb3b8_aa3c),
+            (0x3f80_0000, 0x0000_0000),
+            (0x3f80_0001, 0x3438_aa3b),
+            (0x3f80_0005, 0x3566_d4c6),
+            (0x3f80_0006, 0x358a_7faa),
+            (0x3f80_0043, 0x3741_5204),
+            (0x3f80_0c30, 0x3a0c_a2fa),
+            (0x3f80_ffff, 0x3c37_f1ce),
+            (0x3f81_0000, 0x3c37_f286),
+            (0x3f81_0001, 0x3c37_f33d),
+            (0x3f81_ffff, 0x3cb7_3c5a),
+            (0x3f82_0000, 0x3cb7_3cb4),
+            (0x3f82_0001, 0x3cb7_3d0f),
+            (0x3f83_5d48, 0x3d19_508b),
+            (0x3f83_ffff, 0x3d35_d66f),
+            (0x3f84_0000, 0x3d35_d69c),
+            (0x3f85_ffff, 0x3d87_59af),
+            (0x3f86_0000, 0x3d87_59c5),
+            (0x3f86_0001, 0x3d87_59db),
             (0x3fff_ffff, 0x3f7f_ffff),
         ];
         for arch in ARCHES {
@@ -654,13 +770,26 @@ mod tests {
     #[test]
     fn exp_published_words() {
         let cases: [(u32, u32); 20] = [
-            (0x337f_ffff, 0x3f80_0000), (0x3380_0000, 0x3f80_0000), (0x3380_0001, 0x3f80_0000),
-            (0xb37f_ffff, 0x3f80_0000), (0xb380_0000, 0x3f7f_ffff), (0xb380_0001, 0x3f7f_ffff),
-            (0x42ff_ffff, 0x7f7f_ffa7), (0x4300_0000, 0x7f80_0000), (0xc2fc_0000, 0x0080_0000),
-            (0xc2fc_0001, 0x0000_0000), (0x3f05_67ec, 0x3fb7_b03d), (0xc114_ed44, 0x3ace_cc1e),
-            (0x3550_0000, 0x3f80_0004), (0x3e00_0090, 0x3f8b_95d0), (0x3e80_001e, 0x3f98_37f6),
-            (0x3ec0_001a, 0x3fa5_fedc), (0x3f00_0013, 0x3fb5_04fc), (0x3f20_002a, 0x3fc5_6740),
-            (0x3f40_006f, 0x3fd7_453e), (0x3f60_0022, 0x3fea_c0dc),
+            (0x337f_ffff, 0x3f80_0000),
+            (0x3380_0000, 0x3f80_0000),
+            (0x3380_0001, 0x3f80_0000),
+            (0xb37f_ffff, 0x3f80_0000),
+            (0xb380_0000, 0x3f7f_ffff),
+            (0xb380_0001, 0x3f7f_ffff),
+            (0x42ff_ffff, 0x7f7f_ffa7),
+            (0x4300_0000, 0x7f80_0000),
+            (0xc2fc_0000, 0x0080_0000),
+            (0xc2fc_0001, 0x0000_0000),
+            (0x3f05_67ec, 0x3fb7_b03d),
+            (0xc114_ed44, 0x3ace_cc1e),
+            (0x3550_0000, 0x3f80_0004),
+            (0x3e00_0090, 0x3f8b_95d0),
+            (0x3e80_001e, 0x3f98_37f6),
+            (0x3ec0_001a, 0x3fa5_fedc),
+            (0x3f00_0013, 0x3fb5_04fc),
+            (0x3f20_002a, 0x3fc5_6740),
+            (0x3f40_006f, 0x3fd7_453e),
+            (0x3f60_0022, 0x3fea_c0dc),
         ];
         for arch in ARCHES {
             for (input, want) in cases {
@@ -734,7 +863,10 @@ mod tests {
             let mut digest = FNV_OFFSET;
             for index in 0..(1u32 << 24) {
                 let positive = (index as f32) * f32::from_bits(0x3380_0000);
-                digest = fnv(digest, exp_f32(Arch::Gfx1201, positive.to_bits() | ((sign as u32) << 31)));
+                digest = fnv(
+                    digest,
+                    exp_f32(Arch::Gfx1201, positive.to_bits() | ((sign as u32) << 31)),
+                );
             }
             assert_eq!(digest, want, "sign={sign}");
         }

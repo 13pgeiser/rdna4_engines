@@ -49,43 +49,86 @@ const POISON: u8 = 0xee;
 /// The kernel built, emitted as a v5 code object and loaded once for the whole test binary.
 static IMAGE: LazyLock<KernelImage> = LazyLock::new(|| {
     let kernel = build(Arch::Gfx942).unwrap_or_else(|e| panic!("build(gfx942): {e}"));
-    let elf = code_object(&[&kernel], CodeObjectVersion::V5).unwrap_or_else(|e| panic!("code_object: {e}"));
-    sim::load_code_object(&elf, SYMBOL).unwrap_or_else(|e| panic!("load_code_object({SYMBOL}): {e}"))
+    let elf = code_object(&[&kernel], CodeObjectVersion::V5)
+        .unwrap_or_else(|e| panic!("code_object: {e}"));
+    sim::load_code_object(&elf, SYMBOL)
+        .unwrap_or_else(|e| panic!("load_code_object({SYMBOL}): {e}"))
 });
 
-struct Outputs { codes: Vec<u8>, half_sums: Vec<f32>, row_scales: Vec<f32> }
+struct Outputs {
+    codes: Vec<u8>,
+    half_sums: Vec<f32>,
+    row_scales: Vec<f32>,
+}
 
 /// Launch grid `[n]` × block 64 over `n = x.len() / k` rows.
 fn run_sim(x: &[f32], k: usize, mode: u32, shift: i32) -> Outputs {
     let n = x.len() / k;
     let mut mem = Memory::default();
-    mem.map_readonly("x_f32", X_ADDR, x.iter().flat_map(|v| v.to_le_bytes()).collect()).unwrap();
+    mem.map_readonly(
+        "x_f32",
+        X_ADDR,
+        x.iter().flat_map(|v| v.to_le_bytes()).collect(),
+    )
+    .unwrap();
     mem.map("x_fp8", FP8_ADDR, vec![POISON; n * k]).unwrap();
-    mem.map("half_sums", HALF_ADDR, vec![POISON; n * (k / 256) * 2 * 4]).unwrap();
-    mem.map("row_scales", SCALE_ADDR, vec![POISON; n * 4]).unwrap();
+    mem.map("half_sums", HALF_ADDR, vec![POISON; n * (k / 256) * 2 * 4])
+        .unwrap();
+    mem.map("row_scales", SCALE_ADDR, vec![POISON; n * 4])
+        .unwrap();
     let mut kernarg = Vec::with_capacity(48);
-    for p in [X_ADDR, FP8_ADDR, HALF_ADDR, SCALE_ADDR] { kernarg.extend(p.to_le_bytes()) }
+    for p in [X_ADDR, FP8_ADDR, HALF_ADDR, SCALE_ADDR] {
+        kernarg.extend(p.to_le_bytes())
+    }
     kernarg.extend((k as u32).to_le_bytes());
     kernarg.extend((n as u32).to_le_bytes());
     kernarg.extend(mode.to_le_bytes());
     kernarg.extend(shift.to_le_bytes());
     assert_eq!(kernarg.len(), 48);
-    let launch = Launch { grid: [n as u32, 1, 1], block: [64, 1, 1], kernarg, kernarg_addr: KARG_ADDR, dynamic_lds: 0 };
-    sim::run(&IMAGE, &launch, &mut mem, &Config::default()).unwrap_or_else(|e| panic!("sim (K={k} N={n} mode={mode} shift={shift}): {e}"));
-    let floats = |name: &str| mem.region(name).unwrap().bytes.chunks_exact(4).map(|c| f32::from_bits(u32::from_le_bytes(c.try_into().unwrap()))).collect::<Vec<f32>>();
-    Outputs { codes: mem.region("x_fp8").unwrap().bytes.clone(), half_sums: floats("half_sums"), row_scales: floats("row_scales") }
+    let launch = Launch {
+        grid: [n as u32, 1, 1],
+        block: [64, 1, 1],
+        kernarg,
+        kernarg_addr: KARG_ADDR,
+        dynamic_lds: 0,
+    };
+    sim::run(&IMAGE, &launch, &mut mem, &Config::default())
+        .unwrap_or_else(|e| panic!("sim (K={k} N={n} mode={mode} shift={shift}): {e}"));
+    let floats = |name: &str| {
+        mem.region(name)
+            .unwrap()
+            .bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_bits(u32::from_le_bytes(c.try_into().unwrap())))
+            .collect::<Vec<f32>>()
+    };
+    Outputs {
+        codes: mem.region("x_fp8").unwrap().bytes.clone(),
+        half_sums: floats("half_sums"),
+        row_scales: floats("row_scales"),
+    }
 }
 
 // ----------------------------------------------------------------------------
 // Independent model of the original source
 
-fn pow2_f64(e: i32) -> f64 { assert!((-1022..=1023).contains(&e), "{e}"); f64::from_bits(((1023 + e) as u64) << 52) }
-fn pow2_f32(e: i32) -> f32 { assert!((-126..=127).contains(&e), "{e}"); f32::from_bits(((e + 127) as u32) << 23) }
+fn pow2_f64(e: i32) -> f64 {
+    assert!((-1022..=1023).contains(&e), "{e}");
+    f64::from_bits(((1023 + e) as u64) << 52)
+}
+fn pow2_f32(e: i32) -> f32 {
+    assert!((-126..=127).contains(&e), "{e}");
+    f32::from_bits(((e + 127) as u32) << 23)
+}
 
 /// OCP float8_e4m3fn magnitude of a non-NaN byte (bias 7; max 0x7e = 448).
 fn ocp_value(byte: u8) -> f64 {
     let (e, m) = (i32::from((byte >> 3) & 15), f64::from(byte & 7));
-    if e == 0 { m * pow2_f64(-9) } else { (1.0 + m / 8.0) * pow2_f64(e - 7) }
+    if e == 0 {
+        m * pow2_f64(-9)
+    } else {
+        (1.0 + m / 8.0) * pow2_f64(e - 7)
+    }
 }
 
 /// Nearest-even OCP E4M3 byte of `x` (`|x| <= 448`): the neighbour pair is
@@ -95,10 +138,22 @@ fn ocp_code(x: f64) -> u8 {
     let a = x.abs();
     assert!(a <= 448.0, "{x} is outside the OCP finite range");
     let mut lo = 0u8;
-    while lo < 0x7e && ocp_value(lo + 1) <= a { lo += 1 }
-    let mag = if lo == 0x7e { lo } else {
+    while lo < 0x7e && ocp_value(lo + 1) <= a {
+        lo += 1
+    }
+    let mag = if lo == 0x7e {
+        lo
+    } else {
         let (below, above) = (a - ocp_value(lo), ocp_value(lo + 1) - a);
-        if below < above { lo } else if above < below { lo + 1 } else if lo % 2 == 0 { lo } else { lo + 1 }
+        if below < above {
+            lo
+        } else if above < below {
+            lo + 1
+        } else if lo % 2 == 0 {
+            lo
+        } else {
+            lo + 1
+        }
     };
     mag | (u8::from(x.is_sign_negative()) << 7)
 }
@@ -115,30 +170,51 @@ fn scale_exponents(amax: f32) -> (i32, i32) {
 
 /// `(a_n, e_f)` with `a_n = 2^e_f` the final row scale.
 fn model_scale(row: &[f32], mode: u32, shift: i32) -> (f32, i32) {
-    if mode != 1 { return (1.0, 0) }
+    if mode != 1 {
+        return (1.0, 0);
+    }
     let amax = row.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-    let e = if amax == 0.0 { 0 } else { scale_exponents(amax).1 };
+    let e = if amax == 0.0 {
+        0
+    } else {
+        scale_exponents(amax).1
+    };
     let mut a = pow2_f32(e);
-    if shift != 0 { a *= pow2_f32(shift) }
+    if shift != 0 {
+        a *= pow2_f32(shift)
+    }
     (a, (a.to_bits() >> 23) as i32 - 127)
 }
 
 /// Every `|x| / a_n` lies in the OCP finite range.
 fn fits(row: &[f32], mode: u32, shift: i32) -> bool {
     let (_, ef) = model_scale(row, mode, shift);
-    row.iter().all(|v| f64::from(v.abs()) * pow2_f64(-ef) <= 448.0)
+    row.iter()
+        .all(|v| f64::from(v.abs()) * pow2_f64(-ef) <= 448.0)
 }
 
 fn ocp_decode(byte: u8) -> f32 {
     assert!(byte != 0x7f && byte != 0xff, "NaN byte");
     let v = ocp_value(byte & 0x7f) as f32;
-    if byte & 0x80 != 0 { -v } else { v }
+    if byte & 0x80 != 0 {
+        -v
+    } else {
+        v
+    }
 }
 
-struct Model { codes: Vec<u8>, half_sums: Vec<f32>, row_scales: Vec<f32> }
+struct Model {
+    codes: Vec<u8>,
+    half_sums: Vec<f32>,
+    row_scales: Vec<f32>,
+}
 
 fn model(x: &[f32], k: usize, mode: u32, shift: i32) -> Model {
-    let mut m = Model { codes: Vec::with_capacity(x.len()), half_sums: Vec::new(), row_scales: Vec::new() };
+    let mut m = Model {
+        codes: Vec::with_capacity(x.len()),
+        half_sums: Vec::new(),
+        row_scales: Vec::new(),
+    };
     for row in x.chunks_exact(k) {
         let (a_n, _) = model_scale(row, mode, shift);
         m.row_scales.push(a_n);
@@ -153,10 +229,12 @@ fn model(x: &[f32], k: usize, mode: u32, shift: i32) -> Model {
             for side in 0..2 {
                 let base = g * 256 + side * 128;
                 // Per logical lane: four consecutive decoded bytes, left-associated.
-                let mut lane: Vec<f32> = (0..32).map(|l| {
-                    let d = |i: usize| ocp_decode(codes[base + 4 * l + i]);
-                    ((d(0) + d(1)) + d(2)) + d(3)
-                }).collect();
+                let mut lane: Vec<f32> = (0..32)
+                    .map(|l| {
+                        let d = |i: usize| ocp_decode(codes[base + 4 * l + i]);
+                        ((d(0) + d(1)) + d(2)) + d(3)
+                    })
+                    .collect();
                 for off in [16usize, 8, 4, 2, 1] {
                     lane = (0..32).map(|l| lane[l] + lane[l ^ off]).collect();
                 }
@@ -173,7 +251,13 @@ fn model(x: &[f32], k: usize, mode: u32, shift: i32) -> Model {
 fn assert_bytes(what: &str, ctx: &str, got: &[u8], want: &[u8], k: usize) {
     assert_eq!(got.len(), want.len(), "{ctx}: {what} length");
     if let Some(i) = (0..got.len()).find(|&i| got[i] != want[i]) {
-        panic!("{ctx}: {what} differs at row {} element {} (byte {i}): got {:#04x}, want {:#04x}", i / k, i % k, got[i], want[i]);
+        panic!(
+            "{ctx}: {what} differs at row {} element {} (byte {i}): got {:#04x}, want {:#04x}",
+            i / k,
+            i % k,
+            got[i],
+            want[i]
+        );
     }
 }
 
@@ -192,64 +276,147 @@ fn assert_bits(what: &str, ctx: &str, got: &[f32], want: &[f32], per_row: usize)
 /// anything else, in either scale mode.
 const SHIFTS: std::ops::RangeInclusive<i32> = -1..=3;
 
-struct Case { name: String, k: usize, mode: u32, shift: i32, rows: Vec<Vec<f32>> }
+struct Case {
+    name: String,
+    k: usize,
+    mode: u32,
+    shift: i32,
+    rows: Vec<Vec<f32>>,
+}
 
 impl Case {
     fn new(name: impl Into<String>, k: usize, mode: u32, shift: i32, rows: Vec<Vec<f32>>) -> Self {
-        assert!(SHIFTS.contains(&shift), "shift {shift} is outside the supported range {SHIFTS:?}");
+        assert!(
+            SHIFTS.contains(&shift),
+            "shift {shift} is outside the supported range {SHIFTS:?}"
+        );
         let name = name.into();
         assert!(!rows.is_empty(), "{name}: no rows");
         for (r, row) in rows.iter().enumerate() {
             assert_eq!(row.len(), k, "{name}: row {r} length");
-            assert!(row.iter().all(|v| v.is_finite()), "{name}: row {r} not finite");
-            assert!(fits(row, mode, shift), "{name}: row {r} leaves the OCP finite range");
+            assert!(
+                row.iter().all(|v| v.is_finite()),
+                "{name}: row {r} not finite"
+            );
+            assert!(
+                fits(row, mode, shift),
+                "{name}: row {r} leaves the OCP finite range"
+            );
         }
-        Self { name, k, mode, shift, rows }
+        Self {
+            name,
+            k,
+            mode,
+            shift,
+            rows,
+        }
     }
     /// Keeps only the rows that fit; the case must retain at least one.
-    fn filtered(name: impl Into<String>, k: usize, mode: u32, shift: i32, rows: Vec<Vec<f32>>) -> Self {
+    fn filtered(
+        name: impl Into<String>,
+        k: usize,
+        mode: u32,
+        shift: i32,
+        rows: Vec<Vec<f32>>,
+    ) -> Self {
         let rows = rows.into_iter().filter(|r| fits(r, mode, shift)).collect();
         Self::new(name, k, mode, shift, rows)
     }
     /// A case that deliberately leaves the OCP finite range (`|x / a_n| > 480`, FNUZ overflow):
     /// compared with `reference` only, never with the OCP model. No scaled magnitude may sit in
     /// (448, 480], where OCP (`0x7f` NaN) and FNUZ (`0x7f` = 240) are both defined but disagree.
-    fn overflow(name: impl Into<String>, k: usize, mode: u32, shift: i32, rows: Vec<Vec<f32>>) -> Self {
+    fn overflow(
+        name: impl Into<String>,
+        k: usize,
+        mode: u32,
+        shift: i32,
+        rows: Vec<Vec<f32>>,
+    ) -> Self {
         let name = name.into();
-        assert!(SHIFTS.contains(&shift), "shift {shift} is outside the supported range {SHIFTS:?}");
+        assert!(
+            SHIFTS.contains(&shift),
+            "shift {shift} is outside the supported range {SHIFTS:?}"
+        );
         assert!(!rows.is_empty(), "{name}: no rows");
         let mut overflowing = 0;
         for (r, row) in rows.iter().enumerate() {
             assert_eq!(row.len(), k, "{name}: row {r} length");
-            assert!(row.iter().all(|v| v.is_finite()), "{name}: row {r} not finite");
+            assert!(
+                row.iter().all(|v| v.is_finite()),
+                "{name}: row {r} not finite"
+            );
             let (_, ef) = model_scale(row, mode, shift);
             for v in row {
                 let s = f64::from(v.abs()) * pow2_f64(-ef);
-                assert!(!(448.0 < s && s <= 480.0), "{name}: row {r} has a scaled magnitude {s} in (448, 480]");
-                if s > 480.0 { overflowing += 1 }
+                assert!(
+                    !(448.0 < s && s <= 480.0),
+                    "{name}: row {r} has a scaled magnitude {s} in (448, 480]"
+                );
+                if s > 480.0 {
+                    overflowing += 1
+                }
             }
         }
         assert!(overflowing > 0, "{name}: no element overflows");
-        Self { name, k, mode, shift, rows }
+        Self {
+            name,
+            k,
+            mode,
+            shift,
+            rows,
+        }
     }
     /// No scaled magnitude of `row` in (448, 480].
     fn gray_free(row: &[f32], mode: u32, shift: i32) -> bool {
         let (_, ef) = model_scale(row, mode, shift);
-        row.iter().all(|v| { let s = f64::from(v.abs()) * pow2_f64(-ef); !(448.0 < s && s <= 480.0) })
+        row.iter().all(|v| {
+            let s = f64::from(v.abs()) * pow2_f64(-ef);
+            !(448.0 < s && s <= 480.0)
+        })
     }
-    fn ctx(&self) -> String { format!("{} (K={} N={} mode={} shift={})", self.name, self.k, self.rows.len(), self.mode, self.shift) }
-    fn flat(&self) -> Vec<f32> { self.rows.concat() }
+    fn ctx(&self) -> String {
+        format!(
+            "{} (K={} N={} mode={} shift={})",
+            self.name,
+            self.k,
+            self.rows.len(),
+            self.mode,
+            self.shift
+        )
+    }
+    fn flat(&self) -> Vec<f32> {
+        self.rows.concat()
+    }
 }
 
 /// The reference equals the independent model of the original formula.
 fn check_reference(c: &Case) {
     let x = c.flat();
-    let r = reference(&x, c.k, c.mode, c.shift).unwrap_or_else(|e| panic!("{}: reference: {e}", c.ctx()));
+    let r = reference(&x, c.k, c.mode, c.shift)
+        .unwrap_or_else(|e| panic!("{}: reference: {e}", c.ctx()));
     let m = model(&x, c.k, c.mode, c.shift);
     let ctx = c.ctx();
-    assert_bytes("reference codes vs original OCP formula (0x80 -> 0)", &ctx, &r.codes, &m.codes, c.k);
-    assert_bits("reference row_scales vs model", &ctx, &r.row_scales, &m.row_scales, 1);
-    assert_bits("reference half_sums vs model", &ctx, &r.half_sums, &m.half_sums, c.k / 128);
+    assert_bytes(
+        "reference codes vs original OCP formula (0x80 -> 0)",
+        &ctx,
+        &r.codes,
+        &m.codes,
+        c.k,
+    );
+    assert_bits(
+        "reference row_scales vs model",
+        &ctx,
+        &r.row_scales,
+        &m.row_scales,
+        1,
+    );
+    assert_bits(
+        "reference half_sums vs model",
+        &ctx,
+        &r.half_sums,
+        &m.half_sums,
+        c.k / 128,
+    );
 }
 
 /// The kernel on the emulator equals the reference (and so the model) bitwise.
@@ -269,38 +436,74 @@ fn check_sim(c: &Case) {
 
 struct Rng(u64);
 impl Rng {
-    fn next(&mut self) -> u64 { self.0 ^= self.0 << 13; self.0 ^= self.0 >> 7; self.0 ^= self.0 << 17; self.0 }
-    fn below(&mut self, n: u64) -> u64 { self.next() % n }
-    fn mantissa(&mut self) -> f64 { 1.0 + (self.next() >> 41) as f64 / (1u64 << 23) as f64 }
-    fn sign(&mut self) -> f64 { if self.next() & 1 == 0 { 1.0 } else { -1.0 } }
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+    fn mantissa(&mut self) -> f64 {
+        1.0 + (self.next() >> 41) as f64 / (1u64 << 23) as f64
+    }
+    fn sign(&mut self) -> f64 {
+        if self.next() & 1 == 0 {
+            1.0
+        } else {
+            -1.0
+        }
+    }
 }
 
-fn up(f: f32) -> f32 { assert!(f > 0.0); f32::from_bits(f.to_bits() + 1) }
-fn down(f: f32) -> f32 { assert!(f > 0.0); f32::from_bits(f.to_bits() - 1) }
+fn up(f: f32) -> f32 {
+    assert!(f > 0.0);
+    f32::from_bits(f.to_bits() + 1)
+}
+fn down(f: f32) -> f32 {
+    assert!(f > 0.0);
+    f32::from_bits(f.to_bits() - 1)
+}
 
 /// A row whose largest magnitude lies in `[2^b, 2^(b+1))`: values spread over
 /// 24 binades below it, some zeros of either sign.
 fn random_row(rng: &mut Rng, k: usize, b: i32) -> Vec<f32> {
-    let mut row: Vec<f32> = (0..k).map(|_| {
-        if rng.below(16) == 0 { return if rng.below(2) == 0 { 0.0 } else { -0.0 } }
-        (rng.sign() * rng.mantissa() * pow2_f64(b - rng.below(24) as i32 - 1)) as f32
-    }).collect();
+    let mut row: Vec<f32> = (0..k)
+        .map(|_| {
+            if rng.below(16) == 0 {
+                return if rng.below(2) == 0 { 0.0 } else { -0.0 };
+            }
+            (rng.sign() * rng.mantissa() * pow2_f64(b - rng.below(24) as i32 - 1)) as f32
+        })
+        .collect();
     let i = rng.below(k as u64) as usize;
     row[i] = (rng.sign() * rng.mantissa() * pow2_f64(b)) as f32;
     row
 }
 
-fn amax_exponent(rng: &mut Rng) -> i32 { rng.below(78) as i32 - 60 }
+fn amax_exponent(rng: &mut Rng) -> i32 {
+    rng.below(78) as i32 - 60
+}
 
 fn random_rows(rng: &mut Rng, n: usize, k: usize, mode: u32, shift: i32) -> Vec<Vec<f32>> {
     let mut rows = Vec::new();
     let mut tries = 0;
     while rows.len() < n {
         tries += 1;
-        assert!(tries < 100_000, "cannot generate fitting random rows for mode {mode} shift {shift}");
-        let b = if mode != 1 { rng.below(24) as i32 - 14 } else { amax_exponent(rng) };
+        assert!(
+            tries < 100_000,
+            "cannot generate fitting random rows for mode {mode} shift {shift}"
+        );
+        let b = if mode != 1 {
+            rng.below(24) as i32 - 14
+        } else {
+            amax_exponent(rng)
+        };
         let row = random_row(rng, k, b);
-        if fits(&row, mode, shift) { rows.push(row) }
+        if fits(&row, mode, shift) {
+            rows.push(row)
+        }
     }
     rows
 }
@@ -319,7 +522,10 @@ fn tie_magnitudes() -> Vec<f32> {
 /// One row of rounding ties of both signs scaled by `2^ef`, with
 /// `x[0] = cap * 2^ef` and no larger magnitude.
 fn ties_row(k: usize, ef: i32, cap: f64) -> Vec<f32> {
-    let mags: Vec<f32> = tie_magnitudes().into_iter().filter(|&m| f64::from(m) <= cap).collect();
+    let mags: Vec<f32> = tie_magnitudes()
+        .into_iter()
+        .filter(|&m| f64::from(m) <= cap)
+        .collect();
     let mut row = vec![(cap * pow2_f64(ef)) as f32];
     let mut i = 0usize;
     while row.len() < k {
@@ -338,17 +544,38 @@ const KS: [usize; 4] = [256, 512, 768, 2048];
 fn zero_cases() -> Vec<Case> {
     let mut cases = Vec::new();
     for k in [256, 768] {
-        let mut mixed: Vec<f32> = (0..k).map(|i| if i % 3 == 0 { -0.0 } else { 0.0 }).collect();
+        let mut mixed: Vec<f32> = (0..k)
+            .map(|i| if i % 3 == 0 { -0.0 } else { 0.0 })
+            .collect();
         mixed[k - 1] = -0.0;
         let rows = vec![vec![0.0; k], vec![-0.0; k], mixed];
         for (mode, shift) in [(0, 0), (0, 3), (1, 0), (1, 3), (1, -1)] {
-            cases.push(Case::new(format!("zero rows K{k}"), k, mode, shift, rows.clone()));
+            cases.push(Case::new(
+                format!("zero rows K{k}"),
+                k,
+                mode,
+                shift,
+                rows.clone(),
+            ));
         }
         // One nonzero among zeros, positive and negative, at several positions.
-        let single: Vec<Vec<f32>> = [0, 1, 127, 128, k / 2, k - 1].iter().enumerate()
-            .map(|(j, &i)| { let mut r = vec![if j % 2 == 0 { 0.0 } else { -0.0 }; k]; r[i] = if j % 2 == 0 { 1.0 } else { -3.5 }; r }).collect();
+        let single: Vec<Vec<f32>> = [0, 1, 127, 128, k / 2, k - 1]
+            .iter()
+            .enumerate()
+            .map(|(j, &i)| {
+                let mut r = vec![if j % 2 == 0 { 0.0 } else { -0.0 }; k];
+                r[i] = if j % 2 == 0 { 1.0 } else { -3.5 };
+                r
+            })
+            .collect();
         for (mode, shift) in [(0, 0), (1, 0), (1, 2)] {
-            cases.push(Case::new(format!("single nonzero K{k}"), k, mode, shift, single.clone()));
+            cases.push(Case::new(
+                format!("single nonzero K{k}"),
+                k,
+                mode,
+                shift,
+                single.clone(),
+            ));
         }
     }
     cases
@@ -360,29 +587,107 @@ fn tiny_cases() -> Vec<Case> {
     let min_sub = f32::from_bits(1);
     let rows: Vec<Vec<f32>> = vec![
         // The smallest subnormal alone: RN(amax * RN(1/224)) underflows to zero, exponent field 0.
-        { let mut r = vec![0.0; k]; r[7] = min_sub; r },
-        { let mut r = vec![-0.0; k]; r[200] = -min_sub; r },
-        (0..k).map(|i| if i % 2 == 0 { min_sub } else { -min_sub }).collect(),
-        (0..k).map(|i| f32::from_bits(i as u32 + 1) * if i % 3 == 0 { -1.0 } else { 1.0 }).collect(),
-        (0..k).map(|i| f32::from_bits(0x7f_ffff - i as u32) * if i % 2 == 0 { -1.0 } else { 1.0 }).collect(),
+        {
+            let mut r = vec![0.0; k];
+            r[7] = min_sub;
+            r
+        },
+        {
+            let mut r = vec![-0.0; k];
+            r[200] = -min_sub;
+            r
+        },
+        (0..k)
+            .map(|i| if i % 2 == 0 { min_sub } else { -min_sub })
+            .collect(),
+        (0..k)
+            .map(|i| f32::from_bits(i as u32 + 1) * if i % 3 == 0 { -1.0 } else { 1.0 })
+            .collect(),
+        (0..k)
+            .map(|i| f32::from_bits(0x7f_ffff - i as u32) * if i % 2 == 0 { -1.0 } else { 1.0 })
+            .collect(),
         // Largest subnormal, smallest normal and neighbours.
-        (0..k).map(|i| f32::from_bits(0x7f_fff0 + (i as u32 % 32)) * if i % 2 == 0 { 1.0 } else { -1.0 }).collect(),
-        (0..k).map(|i| if i == 0 { f32::MIN_POSITIVE } else { f32::from_bits(i as u32 * 31) }).collect(),
-        (0..k).map(|i| if i == 5 { -1.0e-30 } else { f32::from_bits(i as u32 * 977) }).collect(),
+        (0..k)
+            .map(|i| {
+                f32::from_bits(0x7f_fff0 + (i as u32 % 32)) * if i % 2 == 0 { 1.0 } else { -1.0 }
+            })
+            .collect(),
+        (0..k)
+            .map(|i| {
+                if i == 0 {
+                    f32::MIN_POSITIVE
+                } else {
+                    f32::from_bits(i as u32 * 31)
+                }
+            })
+            .collect(),
+        (0..k)
+            .map(|i| {
+                if i == 5 {
+                    -1.0e-30
+                } else {
+                    f32::from_bits(i as u32 * 977)
+                }
+            })
+            .collect(),
         // Tiny amax (< 224 * 2^-31): scale clamped to 2^-31, values scaled up into the FP8 range.
-        (0..k).map(|i| if i == 3 { 1.0e-8 } else { f32::from_bits(0x3200_0000 + (i as u32) * 0x1_0003) * if i % 2 == 0 { 1.0 } else { -1.0 } }).collect(),
+        (0..k)
+            .map(|i| {
+                if i == 3 {
+                    1.0e-8
+                } else {
+                    f32::from_bits(0x3200_0000 + (i as u32) * 0x1_0003)
+                        * if i % 2 == 0 { 1.0 } else { -1.0 }
+                }
+            })
+            .collect(),
     ];
     for (mode, shift) in [(1, 0), (1, 3), (1, -1), (0, 0), (0, 3)] {
-        cases.push(Case::filtered(format!("tiny/subnormal rows mode {mode} shift {shift}"), k, mode, shift, rows.clone()));
+        cases.push(Case::filtered(
+            format!("tiny/subnormal rows mode {mode} shift {shift}"),
+            k,
+            mode,
+            shift,
+            rows.clone(),
+        ));
     }
     // Mode 0 around the OCP minimum subnormal (2^-9) and its half (2^-10, the tie with zero).
-    let near_min: Vec<f32> = (0..k).map(|i| {
-        let base = [pow2_f32(-9), pow2_f32(-10), pow2_f32(-11), 1.5 * pow2_f32(-9), 2.5 * pow2_f32(-9), 7.0 * pow2_f32(-9)][i % 6];
-        let v = match (i / 6) % 3 { 0 => base, 1 => up(base), _ => down(base) };
-        if (i / 18) % 2 == 0 { v } else { -v }
-    }).collect();
-    cases.push(Case::new("near OCP minimum subnormal, mode 0", k, 0, 0, vec![near_min.clone()]));
-    cases.push(Case::new("near OCP minimum subnormal, mode 0 ignores shift", k, 0, -1, vec![near_min]));
+    let near_min: Vec<f32> = (0..k)
+        .map(|i| {
+            let base = [
+                pow2_f32(-9),
+                pow2_f32(-10),
+                pow2_f32(-11),
+                1.5 * pow2_f32(-9),
+                2.5 * pow2_f32(-9),
+                7.0 * pow2_f32(-9),
+            ][i % 6];
+            let v = match (i / 6) % 3 {
+                0 => base,
+                1 => up(base),
+                _ => down(base),
+            };
+            if (i / 18) % 2 == 0 {
+                v
+            } else {
+                -v
+            }
+        })
+        .collect();
+    cases.push(Case::new(
+        "near OCP minimum subnormal, mode 0",
+        k,
+        0,
+        0,
+        vec![near_min.clone()],
+    ));
+    cases.push(Case::new(
+        "near OCP minimum subnormal, mode 0 ignores shift",
+        k,
+        0,
+        -1,
+        vec![near_min],
+    ));
     cases
 }
 
@@ -391,22 +696,86 @@ fn pow2_cases() -> Vec<Case> {
     for (k, rows_n) in [(256, 1), (512, 3)] {
         for shift in [0, -1, 1] {
             // Row per amax = 2^a (a = -40..=17), elements ±2^(a-i%16).
-            let by_amax: Vec<Vec<f32>> = (-40..=17).map(|a| (0..k).map(|i| {
-                let v = pow2_f64(a - (i % 16) as i32) as f32;
-                if (i / 16) % 2 == 0 { v } else { -v }
-            }).collect()).collect();
-            cases.push(Case::filtered(format!("powers of two by amax K{k}"), k, 1, shift, by_amax));
+            let by_amax: Vec<Vec<f32>> = (-40..=17)
+                .map(|a| {
+                    (0..k)
+                        .map(|i| {
+                            let v = pow2_f64(a - (i % 16) as i32) as f32;
+                            if (i / 16) % 2 == 0 {
+                                v
+                            } else {
+                                -v
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            cases.push(Case::filtered(
+                format!("powers of two by amax K{k}"),
+                k,
+                1,
+                shift,
+                by_amax,
+            ));
             // Wide ramps: 2^-26..2^7 and the whole f32 subnormal/normal low range.
-            let ramps: Vec<Vec<f32>> = (0..rows_n).map(|r| (0..k).map(|i| {
-                let v = pow2_f64(((i + 5 * r) % 34) as i32 - 26) as f32;
-                if (i + r) % 3 == 0 { -v } else { v }
-            }).collect()).collect();
-            cases.push(Case::new(format!("power-of-two ramp K{k}"), k, 1, shift, ramps));
+            let ramps: Vec<Vec<f32>> = (0..rows_n)
+                .map(|r| {
+                    (0..k)
+                        .map(|i| {
+                            let v = pow2_f64(((i + 5 * r) % 34) as i32 - 26) as f32;
+                            if (i + r) % 3 == 0 {
+                                -v
+                            } else {
+                                v
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            cases.push(Case::new(
+                format!("power-of-two ramp K{k}"),
+                k,
+                1,
+                shift,
+                ramps,
+            ));
         }
     }
-    let low: Vec<f32> = (0..256u32).map(|i| if i < 24 { f32::from_bits(1 << i) } else { pow2_f32(((i - 24) % 126) as i32 - 126) }).collect();
-    cases.push(Case::new("power-of-two subnormal/low-normal row", 256, 1, 0, vec![low.clone()]));
-    cases.push(Case::new("power-of-two mode 0", 256, 0, 0, vec![(0..256).map(|i| { let v = pow2_f32(i % 18 - 12); if i % 2 == 0 { v } else { -v } }).collect(), low]));
+    let low: Vec<f32> = (0..256u32)
+        .map(|i| {
+            if i < 24 {
+                f32::from_bits(1 << i)
+            } else {
+                pow2_f32(((i - 24) % 126) as i32 - 126)
+            }
+        })
+        .collect();
+    cases.push(Case::new(
+        "power-of-two subnormal/low-normal row",
+        256,
+        1,
+        0,
+        vec![low.clone()],
+    ));
+    cases.push(Case::new(
+        "power-of-two mode 0",
+        256,
+        0,
+        0,
+        vec![
+            (0..256)
+                .map(|i| {
+                    let v = pow2_f32(i % 18 - 12);
+                    if i % 2 == 0 {
+                        v
+                    } else {
+                        -v
+                    }
+                })
+                .collect(),
+            low,
+        ],
+    ));
     cases
 }
 
@@ -421,19 +790,58 @@ fn boundary_cases() -> Vec<Case> {
             let base = (224.0 * pow2_f64(kexp)) as f32;
             for d in -2i32..=2 {
                 let amax = f32::from_bits((base.to_bits() as i32 + d) as u32);
-                let mut row: Vec<f32> = (0..256).map(|_| (rng.sign() * (rng.next() >> 11) as f64 / (1u64 << 53) as f64 * f64::from(amax)) as f32).collect();
+                let mut row: Vec<f32> = (0..256)
+                    .map(|_| {
+                        (rng.sign() * (rng.next() >> 11) as f64 / (1u64 << 53) as f64
+                            * f64::from(amax)) as f32
+                    })
+                    .collect();
                 row[(rng.below(256)) as usize] = if (kexp + d) % 2 == 0 { amax } else { -amax };
                 rows.push(row);
             }
         }
-        cases.push(Case::filtered(format!("amax = 224*2^k ± 2 ulp, k=-40..10"), 256, 1, shift, rows));
+        cases.push(Case::filtered(
+            format!("amax = 224*2^k ± 2 ulp, k=-40..10"),
+            256,
+            1,
+            shift,
+            rows,
+        ));
     }
     // The 112 boundary (t = 0.5 -> e = -1) and 224 boundary (t = 1.0 -> e = 0) with the whole row on
     // exactly representable binary fractions of amax.
-    for amax in [112.0f32, up(112.0), down(112.0), 224.0, up(224.0), down(224.0), 448.0, up(448.0), down(448.0), 56.0, 896.0] {
-        let row: Vec<f32> = (0..256).map(|i| if i == 0 { amax } else { amax * [0.5, -0.25, 0.75, -0.9375, 0.03125, -0.0078125, 0.99, -1.0][i % 8] }).collect();
+    for amax in [
+        112.0f32,
+        up(112.0),
+        down(112.0),
+        224.0,
+        up(224.0),
+        down(224.0),
+        448.0,
+        up(448.0),
+        down(448.0),
+        56.0,
+        896.0,
+    ] {
+        let row: Vec<f32> = (0..256)
+            .map(|i| {
+                if i == 0 {
+                    amax
+                } else {
+                    amax * [0.5, -0.25, 0.75, -0.9375, 0.03125, -0.0078125, 0.99, -1.0][i % 8]
+                }
+            })
+            .collect();
         for shift in [0, -1, 2] {
-            if fits(&row, 1, shift) { cases.push(Case::new(format!("amax {amax} (112/224 boundary)"), 256, 1, shift, vec![row.clone()])) }
+            if fits(&row, 1, shift) {
+                cases.push(Case::new(
+                    format!("amax {amax} (112/224 boundary)"),
+                    256,
+                    1,
+                    shift,
+                    vec![row.clone()],
+                ))
+            }
         }
     }
     cases
@@ -444,26 +852,109 @@ fn clamp_cases() -> Vec<Case> {
     let mut cases = Vec::new();
     // Upper clamp e = 9: amax >= 224*2^9 = 114688 (t >= 512) up to 224*2^10 (scaled 448).
     let uppers = [
-        114_688.0f32, up(114_688.0), down(114_688.0), 114_688.0 * 1.5, 200_000.0, down(229_376.0), 229_376.0, 130_000.5, 114_689.0, 4096.0 * 28.0,
+        114_688.0f32,
+        up(114_688.0),
+        down(114_688.0),
+        114_688.0 * 1.5,
+        200_000.0,
+        down(229_376.0),
+        229_376.0,
+        130_000.5,
+        114_689.0,
+        4096.0 * 28.0,
     ];
-    let upper_rows: Vec<Vec<f32>> = uppers.iter().enumerate().map(|(r, &amax)| {
-        (0..512).map(|i| if i == 17 * r % 512 { amax } else { (rng.sign() * rng.mantissa() / 2.0 * f64::from(amax)) as f32 }).collect()
-    }).collect();
-    for shift in [0, 1, 3] { cases.push(Case::new(format!("upper clamp e=9 shift {shift}"), 512, 1, shift, upper_rows.clone())) }
+    let upper_rows: Vec<Vec<f32>> = uppers
+        .iter()
+        .enumerate()
+        .map(|(r, &amax)| {
+            (0..512)
+                .map(|i| {
+                    if i == 17 * r % 512 {
+                        amax
+                    } else {
+                        (rng.sign() * rng.mantissa() / 2.0 * f64::from(amax)) as f32
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    for shift in [0, 1, 3] {
+        cases.push(Case::new(
+            format!("upper clamp e=9 shift {shift}"),
+            512,
+            1,
+            shift,
+            upper_rows.clone(),
+        ))
+    }
     // Rows past the clamp whose scaled values still fit: scaled amax > 224.
-    let past: Vec<Vec<f32>> = [(114_688.0f32 * 1.0001), 114_688.0 * 1.9, 114_688.0 * 1.99999].iter().map(|&amax| {
-        (0..256).map(|i| if i == 1 { -amax } else { amax * [0.1, 0.5, -0.99, 0.0, -0.0, 0.8765, -0.4321, 0.2][i % 8] }).collect()
-    }).collect();
-    cases.push(Case::new("past upper clamp (scaled amax in (224, 448))", 256, 1, 0, past));
+    let past: Vec<Vec<f32>> = [
+        (114_688.0f32 * 1.0001),
+        114_688.0 * 1.9,
+        114_688.0 * 1.99999,
+    ]
+    .iter()
+    .map(|&amax| {
+        (0..256)
+            .map(|i| {
+                if i == 1 {
+                    -amax
+                } else {
+                    amax * [0.1, 0.5, -0.99, 0.0, -0.0, 0.8765, -0.4321, 0.2][i % 8]
+                }
+            })
+            .collect()
+    })
+    .collect();
+    cases.push(Case::new(
+        "past upper clamp (scaled amax in (224, 448))",
+        256,
+        1,
+        0,
+        past,
+    ));
     // Lower clamp e = -31: amax <= 224*2^-31, down to subnormals; other scales below it.
     let base = (224.0 * pow2_f64(-31)) as f32;
     let lowers = [
-        base, up(base), down(base), base * 0.5, base * 0.25, base * 0.01, pow2_f32(-60), pow2_f32(-100), 1.0e-38, 1.0e-44, f32::from_bits(1), f32::MIN_POSITIVE, 1.0e-30, 3.0e-12,
+        base,
+        up(base),
+        down(base),
+        base * 0.5,
+        base * 0.25,
+        base * 0.01,
+        pow2_f32(-60),
+        pow2_f32(-100),
+        1.0e-38,
+        1.0e-44,
+        f32::from_bits(1),
+        f32::MIN_POSITIVE,
+        1.0e-30,
+        3.0e-12,
     ];
-    let lower_rows: Vec<Vec<f32>> = lowers.iter().enumerate().map(|(r, &amax)| {
-        (0..256).map(|i| if i == 31 * r % 256 { -amax } else { (rng.sign() * rng.mantissa() / 2.0 * f64::from(amax)) as f32 }).collect()
-    }).collect();
-    for shift in [0, -1, 3] { cases.push(Case::filtered(format!("lower clamp e=-31 shift {shift}"), 256, 1, shift, lower_rows.clone())) }
+    let lower_rows: Vec<Vec<f32>> = lowers
+        .iter()
+        .enumerate()
+        .map(|(r, &amax)| {
+            (0..256)
+                .map(|i| {
+                    if i == 31 * r % 256 {
+                        -amax
+                    } else {
+                        (rng.sign() * rng.mantissa() / 2.0 * f64::from(amax)) as f32
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    for shift in [0, -1, 3] {
+        cases.push(Case::filtered(
+            format!("lower clamp e=-31 shift {shift}"),
+            256,
+            1,
+            shift,
+            lower_rows.clone(),
+        ))
+    }
     cases
 }
 
@@ -471,16 +962,53 @@ fn tie_cases() -> Vec<Case> {
     let mut cases = Vec::new();
     // Mode 1: x[0] = 224*2^e, ties of the final scale 2^(e+shift) up to the cap 224*2^-shift.
     for shift in [-1, 0, 2, 3] {
-        let rows: Vec<Vec<f32>> = [0, -1, 5, -31, 9, -20, 3].iter().map(|&e| ties_row(2048, e + shift, 224.0 * pow2_f64(-shift))).collect();
-        cases.push(Case::new(format!("rounding ties, mode 1 shift {shift}"), 2048, 1, shift, rows));
+        let rows: Vec<Vec<f32>> = [0, -1, 5, -31, 9, -20, 3]
+            .iter()
+            .map(|&e| ties_row(2048, e + shift, 224.0 * pow2_f64(-shift)))
+            .collect();
+        cases.push(Case::new(
+            format!("rounding ties, mode 1 shift {shift}"),
+            2048,
+            1,
+            shift,
+            rows,
+        ));
     }
     // Mode 0: scale 1, every tie up to 448 (including those between 224 and 448).
-    cases.push(Case::new("rounding ties, mode 0", 2048, 0, 0, vec![ties_row(2048, 0, 448.0), ties_row(2048, 0, 224.0)]));
-    cases.push(Case::new("rounding ties, mode 0 ignores shift", 2048, 0, 3, vec![ties_row(2048, 0, 448.0)]));
+    cases.push(Case::new(
+        "rounding ties, mode 0",
+        2048,
+        0,
+        0,
+        vec![ties_row(2048, 0, 448.0), ties_row(2048, 0, 224.0)],
+    ));
+    cases.push(Case::new(
+        "rounding ties, mode 0 ignores shift",
+        2048,
+        0,
+        3,
+        vec![ties_row(2048, 0, 448.0)],
+    ));
     // Ties scaled by a non-trivial scale and then values at the exact top of the grid.
-    let top: Vec<f32> = (0..256).map(|i| [448.0f32, 432.0, 416.0, 400.0, 384.0, -448.0, -432.0, -440.0][i % 8]).collect();
-    cases.push(Case::new("top of the OCP grid, mode 0", 256, 0, 0, vec![top.clone()]));
-    cases.push(Case::new("top of the OCP grid, mode 1 shift -1", 256, 1, -1, vec![(0..256).map(|i| if i == 0 { 224.0 } else { top[i] / 2.0 }).collect()]));
+    let top: Vec<f32> = (0..256)
+        .map(|i| [448.0f32, 432.0, 416.0, 400.0, 384.0, -448.0, -432.0, -440.0][i % 8])
+        .collect();
+    cases.push(Case::new(
+        "top of the OCP grid, mode 0",
+        256,
+        0,
+        0,
+        vec![top.clone()],
+    ));
+    cases.push(Case::new(
+        "top of the OCP grid, mode 1 shift -1",
+        256,
+        1,
+        -1,
+        vec![(0..256)
+            .map(|i| if i == 0 { 224.0 } else { top[i] / 2.0 })
+            .collect()],
+    ));
     cases
 }
 
@@ -517,7 +1045,9 @@ fn all_cases() -> Vec<Case> {
 fn reference_equals_independent_original_formula() {
     let cases = all_cases();
     assert!(cases.len() > 100, "{} cases", cases.len());
-    for c in &cases { check_reference(c) }
+    for c in &cases {
+        check_reference(c)
+    }
 }
 
 /// The OCP model itself: spot values of the grid, ties to even, -0 handling.
@@ -538,7 +1068,9 @@ fn ocp_model_self_check() {
     assert_eq!(ocp_code(-0.0), 0x80);
     // Every byte round-trips through its own value.
     for b in (0..=0x7eu8).chain(0x80..=0xfe) {
-        if b == 0x80 { continue }
+        if b == 0x80 {
+            continue;
+        }
         let v = ocp_decode(b);
         assert_eq!(ocp_code(f64::from(v)), b, "{b:#04x}");
     }
@@ -552,10 +1084,24 @@ fn build_shape_and_kernarg_abi() {
     assert_eq!(k.resources.kernarg_size, 48);
     assert_eq!(k.resources.workgroup_size, 64);
     assert_eq!(k.resources.group_segment_fixed_size, 0);
-    assert!(k.resources.workgroup_id[0] && !k.resources.workgroup_id[1] && !k.resources.workgroup_id[2]);
+    assert!(
+        k.resources.workgroup_id[0] && !k.resources.workgroup_id[1] && !k.resources.workgroup_id[2]
+    );
     assert_eq!(k.resources.workitem_id, 0);
     let abi: Vec<(u32, u32)> = k.kernargs.iter().map(|a| (a.offset, a.size)).collect();
-    assert_eq!(abi, [(0, 8), (8, 8), (16, 8), (24, 8), (32, 4), (36, 4), (40, 4), (44, 4)]);
+    assert_eq!(
+        abi,
+        [
+            (0, 8),
+            (8, 8),
+            (16, 8),
+            (24, 8),
+            (32, 4),
+            (36, 4),
+            (40, 4),
+            (44, 4)
+        ]
+    );
     for other in [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201] {
         assert!(build(other).is_err(), "{other:?}");
     }
@@ -566,7 +1112,10 @@ fn build_shape_and_kernarg_abi() {
 #[test]
 fn reference_rejects_unsupported_inputs() {
     assert!(reference(&[], 0, 1, 0).is_err(), "K = 0");
-    assert!(reference(&vec![1.0; 128], 128, 1, 0).is_err(), "K not a multiple of 256");
+    assert!(
+        reference(&vec![1.0; 128], 128, 1, 0).is_err(),
+        "K not a multiple of 256"
+    );
     assert!(reference(&vec![1.0; 300], 300, 1, 0).is_err(), "K = 300");
     for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
         let mut x = vec![1.0f32; 256];
@@ -576,7 +1125,10 @@ fn reference_rejects_unsupported_inputs() {
     }
     // A well-formed row passes and has K codes, K/128 half sums, one scale.
     let r = reference(&vec![1.0; 512], 512, 1, 0).unwrap();
-    assert_eq!((r.codes.len(), r.half_sums.len(), r.row_scales.len()), (512, 4, 1));
+    assert_eq!(
+        (r.codes.len(), r.half_sums.len(), r.row_scales.len()),
+        (512, 4, 1)
+    );
 }
 
 /// `row_scale_shift` is supported only in [-1, 3]: `reference` rejects everything else, in
@@ -586,10 +1138,16 @@ fn reference_rejects_shift_outside_minus1_to_3() {
     let x = vec![1.0f32; 256];
     for mode in [0u32, 1] {
         for shift in [-40, -3, -2, 4, 5, 9, 40, 100, i32::MIN, i32::MAX] {
-            assert!(reference(&x, 256, mode, shift).is_err(), "mode {mode} shift {shift} accepted");
+            assert!(
+                reference(&x, 256, mode, shift).is_err(),
+                "mode {mode} shift {shift} accepted"
+            );
         }
         for shift in SHIFTS {
-            assert!(reference(&x, 256, mode, shift).is_ok(), "mode {mode} shift {shift} rejected");
+            assert!(
+                reference(&x, 256, mode, shift).is_ok(),
+                "mode {mode} shift {shift} rejected"
+            );
         }
     }
 }
@@ -598,7 +1156,11 @@ fn reference_rejects_shift_outside_minus1_to_3() {
 /// from the bit pattern, clamp [-31, 9], zero -> 1, then `*2^shift` (mode 1 only).
 #[test]
 fn row_scales_pinned_by_hand() {
-    let row = |amax: f32| { let mut r = vec![0.0f32; 256]; r[3] = -amax; r };
+    let row = |amax: f32| {
+        let mut r = vec![0.0f32; 256];
+        r[3] = -amax;
+        r
+    };
     let scale = |amax: f32, shift: i32| reference(&row(amax), 256, 1, shift).unwrap().row_scales[0];
     assert_eq!(scale(1.0, 0), pow2_f32(-7));
     assert_eq!(scale(128.0, 0), 1.0);
@@ -613,7 +1175,10 @@ fn row_scales_pinned_by_hand() {
     assert_eq!(scale(f32::from_bits(1), 0), pow2_f32(-31));
     assert_eq!(scale(1.0e6, 0), pow2_f32(9));
     assert_eq!(scale(1.0e6, -1), pow2_f32(8));
-    assert_eq!(reference(&row(1.0e6), 256, 0, 3).unwrap().row_scales[0], 1.0);
+    assert_eq!(
+        reference(&row(1.0e6), 256, 0, 3).unwrap().row_scales[0],
+        1.0
+    );
 }
 
 /// The RN(1/224) edge. `RN(1/224) * 224 == 1.0` exactly, so amax = 224 gives
@@ -642,19 +1207,54 @@ fn rounded_reciprocal_scale_edge() {
             let amax = f32::from_bits((base.to_bits() as i32 + d) as u32);
             // Exact: smallest e with amax <= 224 * 2^e.
             let mut exact = -200;
-            while f64::from(amax) > 224.0 * pow2_f64(exact) { exact += 1 }
-            assert_eq!(scale_exponents(amax).0, exact, "amax {amax:?} = 224*2^{kexp} {d:+} ulp");
+            while f64::from(amax) > 224.0 * pow2_f64(exact) {
+                exact += 1
+            }
+            assert_eq!(
+                scale_exponents(amax).0,
+                exact,
+                "amax {amax:?} = 224*2^{kexp} {d:+} ulp"
+            );
             let mut row = vec![0.0f32; 256];
             row[(kexp + 40) as usize * 3 % 256] = if d % 2 == 0 { amax } else { -amax };
             rows.push(row);
         }
     }
-    check_sim(&Case::filtered("224*2^k boundary sweep", 256, 1, 0, rows.clone()));
-    check_sim(&Case::filtered("224*2^k boundary sweep, shift -1", 256, 1, -1, rows));
+    check_sim(&Case::filtered(
+        "224*2^k boundary sweep",
+        256,
+        1,
+        0,
+        rows.clone(),
+    ));
+    check_sim(&Case::filtered(
+        "224*2^k boundary sweep, shift -1",
+        256,
+        1,
+        -1,
+        rows,
+    ));
 
     // The headline rows, through the kernel: scales and the codes they imply.
-    let amaxes = [224.0f32, up(224.0), down(224.0), 112.0, up(112.0), 448.0, up(448.0)];
-    let rows: Vec<Vec<f32>> = amaxes.iter().map(|&a| { let mut r = vec![0.0f32; 256]; r[0] = a; r[1] = -a / 2.0; r[2] = a / 7.0; r }).collect();
+    let amaxes = [
+        224.0f32,
+        up(224.0),
+        down(224.0),
+        112.0,
+        up(112.0),
+        448.0,
+        up(448.0),
+    ];
+    let rows: Vec<Vec<f32>> = amaxes
+        .iter()
+        .map(|&a| {
+            let mut r = vec![0.0f32; 256];
+            r[0] = a;
+            r[1] = -a / 2.0;
+            r[2] = a / 7.0;
+            r
+        })
+        .collect();
     let got = run_sim(&rows.concat(), 256, 1, 0);
     let want = [1.0f32, 2.0, 1.0, 0.5, 1.0, 2.0, 4.0];
     assert_bits("row_scales", "edge rows", &got.row_scales, &want, 1);
@@ -665,26 +1265,54 @@ fn rounded_reciprocal_scale_edge() {
 }
 
 #[test]
-fn sim_zero_and_negative_zero_rows() { for c in zero_cases() { check_sim(&c) } }
+fn sim_zero_and_negative_zero_rows() {
+    for c in zero_cases() {
+        check_sim(&c)
+    }
+}
 
 #[test]
-fn sim_tiny_and_subnormal_rows() { for c in tiny_cases() { check_sim(&c) } }
+fn sim_tiny_and_subnormal_rows() {
+    for c in tiny_cases() {
+        check_sim(&c)
+    }
+}
 
 #[test]
-fn sim_powers_of_two() { for c in pow2_cases() { check_sim(&c) } }
+fn sim_powers_of_two() {
+    for c in pow2_cases() {
+        check_sim(&c)
+    }
+}
 
 #[test]
-fn sim_224_112_boundaries() { for c in boundary_cases() { check_sim(&c) } }
+fn sim_224_112_boundaries() {
+    for c in boundary_cases() {
+        check_sim(&c)
+    }
+}
 
 #[test]
-fn sim_upper_and_lower_clamps() { for c in clamp_cases() { check_sim(&c) } }
+fn sim_upper_and_lower_clamps() {
+    for c in clamp_cases() {
+        check_sim(&c)
+    }
+}
 
 #[test]
-fn sim_rounding_ties() { for c in tie_cases() { check_sim(&c) } }
+fn sim_rounding_ties() {
+    for c in tie_cases() {
+        check_sim(&c)
+    }
+}
 
 /// K = 256/512/768/2048 with random rows, both modes and several shifts.
 #[test]
-fn sim_random_rows_k_modes_shifts() { for c in random_cases() { check_sim(&c) } }
+fn sim_random_rows_k_modes_shifts() {
+    for c in random_cases() {
+        check_sim(&c)
+    }
+}
 
 /// Mode 0 ignores the shift: identical outputs for different shifts.
 #[test]
@@ -697,7 +1325,10 @@ fn sim_mode0_ignores_row_scale_shift() {
         let b = run_sim(&x, 512, 0, shift);
         assert_eq!(a.codes, b.codes, "shift {shift}");
         assert_bits("half_sums", "mode 0 shifts", &a.half_sums, &b.half_sums, 4);
-        assert!(b.row_scales.iter().all(|s| s.to_bits() == 1.0f32.to_bits()), "shift {shift}");
+        assert!(
+            b.row_scales.iter().all(|s| s.to_bits() == 1.0f32.to_bits()),
+            "shift {shift}"
+        );
     }
 }
 
@@ -706,18 +1337,38 @@ fn sim_mode0_ignores_row_scale_shift() {
 fn hip_twin_compiles_offline_for_gfx942() {
     let _ = require_rocm_tool!("clang");
     let hipcc = rocm::hipcc();
-    assert!(hipcc.is_file(), "required {} missing; set HIPFIRE_TEST_REQUIRE_ROCM=0 only on no-ROCm hosts", hipcc.display());
-    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernels/src/pm_cdna/fp8_act_producer.gfx942.hip");
+    assert!(
+        hipcc.is_file(),
+        "required {} missing; set HIPFIRE_TEST_REQUIRE_ROCM=0 only on no-ROCm hosts",
+        hipcc.display()
+    );
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../kernels/src/pm_cdna/fp8_act_producer.gfx942.hip");
     let text = std::fs::read_to_string(&src).unwrap_or_else(|e| panic!("{}: {e}", src.display()));
-    assert!(text.contains(SYMBOL), "{} does not define {SYMBOL}", src.display());
-    let obj = std::env::temp_dir().join(format!("pm-cdna-fp8-act-producer-{}.o", std::process::id()));
+    assert!(
+        text.contains(SYMBOL),
+        "{} does not define {SYMBOL}",
+        src.display()
+    );
+    let obj =
+        std::env::temp_dir().join(format!("pm-cdna-fp8-act-producer-{}.o", std::process::id()));
     let out = std::process::Command::new(&hipcc)
-        .args(["--offload-arch=gfx942", "-O3", "-c"]).arg(&src).arg("-o").arg(&obj)
-        .env("HIP_VISIBLE_DEVICES", "-1").env("ROCR_VISIBLE_DEVICES", "-1")
-        .output().unwrap_or_else(|e| panic!("{}: {e}", hipcc.display()));
+        .args(["--offload-arch=gfx942", "-O3", "-c"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&obj)
+        .env("HIP_VISIBLE_DEVICES", "-1")
+        .env("ROCR_VISIBLE_DEVICES", "-1")
+        .output()
+        .unwrap_or_else(|e| panic!("{}: {e}", hipcc.display()));
     let size = std::fs::metadata(&obj).map(|m| m.len()).unwrap_or(0);
     let _ = std::fs::remove_file(&obj);
-    assert!(out.status.success(), "hipcc failed ({}):\n{}", out.status, String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "hipcc failed ({}):\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(size > 0, "hipcc produced no object");
 }
 
@@ -730,27 +1381,80 @@ fn overflow_cases() -> Vec<Case> {
     // Every scaled magnitude of the fixed rows is far from (448, 480] for every shift in [-1, 3]
     // (Case::overflow asserts it).
     let amaxes = [250_000.0f32, 300_000.0, 1.0e6, 1.0e12, 1.0e30, f32::MAX];
-    let fixed: Vec<Vec<f32>> = amaxes.iter().map(|&a| (0..512).map(|i| match i % 8 {
-        0 => 0.0, 1 => a, 2 => -a, 3 => a * 0.001, 4 => -a * 0.0001, 5 => -0.0, 6 => 1.0, _ => -3.0,
-    }).collect()).collect();
+    let fixed: Vec<Vec<f32>> = amaxes
+        .iter()
+        .map(|&a| {
+            (0..512)
+                .map(|i| match i % 8 {
+                    0 => 0.0,
+                    1 => a,
+                    2 => -a,
+                    3 => a * 0.001,
+                    4 => -a * 0.0001,
+                    5 => -0.0,
+                    6 => 1.0,
+                    _ => -3.0,
+                })
+                .collect()
+        })
+        .collect();
     for shift in SHIFTS {
         // Random rows with amax in [2^18, 2^20): past the upper clamp at e = 9, overflow at shifts <= 1.
         let mut rows = fixed.clone();
         let mut tries = 0;
         while rows.len() < fixed.len() + 4 {
             tries += 1;
-            assert!(tries < 100_000, "no gray-zone-free random overflow rows for shift {shift}");
+            assert!(
+                tries < 100_000,
+                "no gray-zone-free random overflow rows for shift {shift}"
+            );
             let b = 18 + rng.below(2) as i32;
             let row = random_row(&mut rng, 512, b);
-            if Case::gray_free(&row, 1, shift) { rows.push(row) }
+            if Case::gray_free(&row, 1, shift) {
+                rows.push(row)
+            }
         }
-        cases.push(Case::overflow(format!("overflow above 480, mode 1 shift {shift}"), 512, 1, shift, rows));
+        cases.push(Case::overflow(
+            format!("overflow above 480, mode 1 shift {shift}"),
+            512,
+            1,
+            shift,
+            rows,
+        ));
     }
     // Unit scale: values outside the grid map to 0x80, in-range values keep their codes.
-    let mode0: Vec<Vec<f32>> = [0, 1].iter().map(|&r| (0..256).map(|i| {
-        [600.0f32, -1000.0, 1.0e20, 500.0, -3.0, 0.5, -0.0, 481.5, f32::MAX, -f32::MAX, 100.0, -0.001][(i + 5 * r) % 12]
-    }).collect()).collect();
-    for shift in [0, 3] { cases.push(Case::overflow(format!("overflow above 480, mode 0 shift {shift}"), 256, 0, shift, mode0.clone())) }
+    let mode0: Vec<Vec<f32>> = [0, 1]
+        .iter()
+        .map(|&r| {
+            (0..256)
+                .map(|i| {
+                    [
+                        600.0f32,
+                        -1000.0,
+                        1.0e20,
+                        500.0,
+                        -3.0,
+                        0.5,
+                        -0.0,
+                        481.5,
+                        f32::MAX,
+                        -f32::MAX,
+                        100.0,
+                        -0.001,
+                    ][(i + 5 * r) % 12]
+                })
+                .collect()
+        })
+        .collect();
+    for shift in [0, 3] {
+        cases.push(Case::overflow(
+            format!("overflow above 480, mode 0 shift {shift}"),
+            256,
+            0,
+            shift,
+            mode0.clone(),
+        ))
+    }
     cases
 }
 
@@ -761,7 +1465,8 @@ fn overflow_cases() -> Vec<Case> {
 fn sim_overflow_above_480_matches_reference_without_ocp_oracle() {
     for c in overflow_cases() {
         let x = c.flat();
-        let r = reference(&x, c.k, c.mode, c.shift).unwrap_or_else(|e| panic!("{}: reference: {e}", c.ctx()));
+        let r = reference(&x, c.k, c.mode, c.shift)
+            .unwrap_or_else(|e| panic!("{}: reference: {e}", c.ctx()));
         let got = run_sim(&x, c.k, c.mode, c.shift);
         let ctx = c.ctx();
         assert_bytes("x_fp8", &ctx, &got.codes, &r.codes, c.k);
@@ -773,7 +1478,11 @@ fn sim_overflow_above_480_matches_reference_without_ocp_oracle() {
             for (i, v) in row.iter().enumerate() {
                 if f64::from(v.abs()) * pow2_f64(-ef) > 480.0 {
                     overflowed += 1;
-                    assert_eq!(got.codes[row_idx * c.k + i], 0x80, "{ctx}: row {row_idx} element {i} ({v:?}) must overflow to FNUZ 0x80");
+                    assert_eq!(
+                        got.codes[row_idx * c.k + i],
+                        0x80,
+                        "{ctx}: row {row_idx} element {i} ({v:?}) must overflow to FNUZ 0x80"
+                    );
                 }
             }
         }
@@ -795,11 +1504,31 @@ fn sim_scale_modes_other_than_1_are_unit_scale() {
             let unit = run_sim(&case.flat(), k, 0, 0);
             let got = run_sim(&case.flat(), k, mode, shift);
             assert_eq!(got.codes, unit.codes, "{}", case.ctx());
-            assert_bits("half_sums", &case.ctx(), &got.half_sums, &unit.half_sums, k / 128);
-            assert!(got.row_scales.iter().all(|s| s.to_bits() == 1.0f32.to_bits()), "{}", case.ctx());
+            assert_bits(
+                "half_sums",
+                &case.ctx(),
+                &got.half_sums,
+                &unit.half_sums,
+                k / 128,
+            );
+            assert!(
+                got.row_scales
+                    .iter()
+                    .all(|s| s.to_bits() == 1.0f32.to_bits()),
+                "{}",
+                case.ctx()
+            );
         }
     }
     // Zero and -0 rows too (a_n = 1.0, not 2^shift).
     let zeros = vec![vec![0.0f32; 256], vec![-0.0f32; 256]];
-    for shift in SHIFTS { check_sim(&Case::new("zero rows, scale_mode 2", 256, 2, shift, zeros.clone())) }
+    for shift in SHIFTS {
+        check_sim(&Case::new(
+            "zero rows, scale_mode 2",
+            256,
+            2,
+            shift,
+            zeros.clone(),
+        ))
+    }
 }

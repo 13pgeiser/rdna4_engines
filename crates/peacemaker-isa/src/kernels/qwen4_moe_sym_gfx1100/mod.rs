@@ -86,7 +86,9 @@
 //! a plain `-MAGIC`: the activation sum `s` is dropped but the signed dot and the `0.25` multiplier stay,
 //! so each epoch contributes `2C/4` instead of `(2C + s)/4`). The symbol is unchanged so
 //! the object is drop-in; keep these out of every candidate module.
-use peacemaker_author::{End, Full, Gfx11Waits, Gfx1100, Gfx1151, MmaIu4, Scc, Target, WgUniform, Workgroup};
+use peacemaker_author::{
+    End, Full, Gfx1100, Gfx1151, Gfx11Waits, MmaIu4, Scc, Target, WgUniform, Workgroup,
+};
 use peacemaker_isa::{
     insn::{Instruction, MemoryClass},
     kernels::{

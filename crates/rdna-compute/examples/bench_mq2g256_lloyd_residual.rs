@@ -303,8 +303,9 @@ fn rms(v: &[f64]) -> f64 {
 // ───────────────────────────── gpu helpers ─────────────────────────────
 
 fn reseed(gpu: &Gpu, t: &GpuTensor, seed: &[f32]) {
-    let bytes =
-        unsafe { std::slice::from_raw_parts(seed.as_ptr() as *const u8, std::mem::size_of_val(seed)) };
+    let bytes = unsafe {
+        std::slice::from_raw_parts(seed.as_ptr() as *const u8, std::mem::size_of_val(seed))
+    };
     gpu.hip.memcpy_htod(&t.buf, bytes).expect("reseed y");
 }
 
@@ -330,7 +331,10 @@ fn rdna3_source() -> String {
          the symbol-collision workaround in this bench needs updating"
     );
     let out = GFX1100_SRC.replace(decl, "void gemv_mq2g256_lloyd_residual_rdna3(");
-    assert!(out.contains(RDNA3_FN), "symbol rewrite produced no {RDNA3_FN}");
+    assert!(
+        out.contains(RDNA3_FN),
+        "symbol rewrite produced no {RDNA3_FN}"
+    );
     out
 }
 
@@ -374,9 +378,7 @@ fn main() {
     // K=4096 → groups_per_row=16 → tail==0, so TAIL_LOAD_AND_DOT is dead code
     // at the production shape. These K are NOT a3b shapes; they exist only to
     // reach tail ∈ {1,2,3}.
-    println!(
-        "\n--- tail-path coverage (gfx1100 K4 variant): non-a3b K, small M, parity only ---"
-    );
+    println!("\n--- tail-path coverage (gfx1100 K4 variant): non-a3b K, small M, parity only ---");
     for (kk, tail) in [(2304usize, 1), (2560, 2), (2816, 3)] {
         println!(
             "\n[tail={tail}] M=256 K={kk}  (groups_per_row={}, quads={}, tail={})",

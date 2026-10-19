@@ -492,7 +492,12 @@ impl QualifiedHooks {
 /// Qualification problems of an intrinsic observation document: schema, passing selfcheck, the expected device
 /// identity (arch, uuid / bdf when pinned, `identity_match`) and `FLOAT_DENORM_MODE_32 = FLOAT_DENORM_MODE_16_64 = 3`
 /// (`probe.denorm`, else top-level `denorm`). gfx1100 pins the xtx uuid and bdf; gfx1151 has no ROCr UUID, so its uuid is `None`.
-pub fn intrinsic_qualification(doc: &Value, arch: &str, uuid: Option<&str>, bdf: Option<&str>) -> Vec<String> {
+pub fn intrinsic_qualification(
+    doc: &Value,
+    arch: &str,
+    uuid: Option<&str>,
+    bdf: Option<&str>,
+) -> Vec<String> {
     let mut p = Vec::new();
     if doc["schema"] != json!(INTRINSIC_OBS_SCHEMA) {
         p.push(format!("schema is not {INTRINSIC_OBS_SCHEMA}"));
@@ -501,7 +506,11 @@ pub fn intrinsic_qualification(doc: &Value, arch: &str, uuid: Option<&str>, bdf:
         p.push("selfcheck.ok is not true".into());
     }
     let d = &doc["device"];
-    if d["arch"] != json!(arch) || uuid.is_some_and(|u| d["uuid"] != json!(u)) || bdf.is_some_and(|b| d["bdf"] != json!(b)) || d["identity_match"] != json!(true) {
+    if d["arch"] != json!(arch)
+        || uuid.is_some_and(|u| d["uuid"] != json!(u))
+        || bdf.is_some_and(|b| d["bdf"] != json!(b))
+        || d["identity_match"] != json!(true)
+    {
         p.push(format!("device is not the expected {arch} (uuid {uuid:?}, bdf {bdf:?}) with identity_match true: {d}"));
     }
     let den = if doc["probe"]["denorm"].is_object() {

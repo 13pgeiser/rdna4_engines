@@ -80,7 +80,12 @@ struct Variant {
 }
 
 const fn twin(label: &'static str, func: &'static str) -> Variant {
-    Variant { label, module: MODULE_TWIN, func, src: SRC_TWIN }
+    Variant {
+        label,
+        module: MODULE_TWIN,
+        func,
+        src: SRC_TWIN,
+    }
 }
 
 /// Index 0 is the incumbent (the bitwise reference); the rest are twins.
@@ -143,11 +148,19 @@ fn f32_bytes(v: &[f32]) -> &[u8] {
 fn median(v: &mut [f64]) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = v.len();
-    if n % 2 == 1 { v[n / 2] } else { 0.5 * (v[n / 2 - 1] + v[n / 2]) }
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        0.5 * (v[n / 2 - 1] + v[n / 2])
+    }
 }
 
 fn sha_prefix(s: &str) -> String {
-    Sha256::digest(s.as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(s.as_bytes())
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 // ── cases ──────────────────────────────────────────────────────────────────
@@ -197,19 +210,29 @@ fn run_case(
     w_t: &rdna_compute::GpuTensor,
     active: &[usize],
 ) -> CaseOutcome {
-    assert_eq!(active.first(), Some(&0), "incumbent must be the reference variant");
+    assert_eq!(
+        active.first(),
+        Some(&0),
+        "incumbent must be the reference variant"
+    );
     let rows = spec.rows;
     let mut rng = Rng(SEED ^ ((rows as u64) << 32) ^ ((spec.normalized_bf16 as u64) << 8) ^ 0xA5A5);
 
     // X [rows, K] uniform [-1, 1); normalized [rows, 4*hidden] uniform [-2, 2).
-    let xs: Vec<f32> = (0..rows * LOW_RANK).map(|_| (rng.unit() * 2.0 - 1.0) as f32).collect();
-    let norm: Vec<f32> = (0..rows * WIDE).map(|_| (rng.unit() * 4.0 - 2.0) as f32).collect();
+    let xs: Vec<f32> = (0..rows * LOW_RANK)
+        .map(|_| (rng.unit() * 2.0 - 1.0) as f32)
+        .collect();
+    let norm: Vec<f32> = (0..rows * WIDE)
+        .map(|_| (rng.unit() * 4.0 - 2.0) as f32)
+        .collect();
     let x_t = gpu.upload_f32(&xs, &[xs.len()]).expect("x upload");
     let n_t = if spec.normalized_bf16 {
         let bits: Vec<u16> = norm.iter().map(|&v| bf16_bits(v)).collect();
-        gpu.upload_raw(&u16_bytes(&bits), &[bits.len() * 2]).expect("normalized bf16 upload")
+        gpu.upload_raw(&u16_bytes(&bits), &[bits.len() * 2])
+            .expect("normalized bf16 upload")
     } else {
-        gpu.upload_f32(&norm, &[norm.len()]).expect("normalized upload")
+        gpu.upload_f32(&norm, &[norm.len()])
+            .expect("normalized upload")
     };
     drop(norm);
 
@@ -252,13 +275,21 @@ fn run_case(
     let mut reference: Vec<f32> = Vec::new();
     for (pos, &vi) in active.iter().enumerate() {
         let v = &VARIANTS[vi];
-        gpu.hip.memcpy_htod(&y_t.buf, f32_bytes(&sentinel)).expect("reset y");
-        gpu.launch_kernel_blob(v.func, grid, block, LDS_BYTES, &mut blobs[vi]).expect("launch");
+        gpu.hip
+            .memcpy_htod(&y_t.buf, f32_bytes(&sentinel))
+            .expect("reset y");
+        gpu.launch_kernel_blob(v.func, grid, block, LDS_BYTES, &mut blobs[vi])
+            .expect("launch");
         gpu.hip.device_synchronize().expect("sync");
         let out = gpu.download_f32(&y_t).expect("download y");
-        let unwritten =
-            out[..main_cells].iter().filter(|x| x.to_bits() == SENTINEL_BITS).count();
-        let guard_bad = out[main_cells..].iter().filter(|x| x.to_bits() != SENTINEL_BITS).count();
+        let unwritten = out[..main_cells]
+            .iter()
+            .filter(|x| x.to_bits() == SENTINEL_BITS)
+            .count();
+        let guard_bad = out[main_cells..]
+            .iter()
+            .filter(|x| x.to_bits() != SENTINEL_BITS)
+            .count();
         let nonfinite = out[..main_cells]
             .iter()
             .filter(|x| !x.is_finite() && x.to_bits() != SENTINEL_BITS)
@@ -282,7 +313,11 @@ fn run_case(
                 v_ok = false;
                 line.push_str(" UNWRITTEN-CELLS");
             }
-            line.push_str(if v_ok { " (reference sane)" } else { " REFERENCE-BAD" });
+            line.push_str(if v_ok {
+                " (reference sane)"
+            } else {
+                " REFERENCE-BAD"
+            });
             reference = out;
         } else {
             let mut count = 0usize;
@@ -322,7 +357,8 @@ fn run_case(
     let time_one = |gpu: &mut Gpu, vi: usize, blobs: &mut Vec<Vec<u8>>| -> f64 {
         let v = &VARIANTS[vi];
         gpu.hip.event_record(&ev0, None).expect("rec");
-        gpu.launch_kernel_blob(v.func, grid, block, LDS_BYTES, &mut blobs[vi]).expect("launch");
+        gpu.launch_kernel_blob(v.func, grid, block, LDS_BYTES, &mut blobs[vi])
+            .expect("launch");
         gpu.hip.event_record(&ev1, None).expect("rec");
         gpu.hip.event_synchronize(&ev1).expect("evsync");
         gpu.hip.event_elapsed_ms(&ev0, &ev1).expect("elapsed") as f64 * 1000.0
@@ -361,12 +397,22 @@ fn run_case(
             median_us[0] / med
         );
     }
-    println!("  VERDICT {}: {}", spec.name, if ok { "PASS (bitwise)" } else { "FAIL" });
+    println!(
+        "  VERDICT {}: {}",
+        spec.name,
+        if ok { "PASS (bitwise)" } else { "FAIL" }
+    );
 
     for t in [x_t, n_t, y_t] {
         gpu.free_tensor(t).expect("free");
     }
-    CaseOutcome { name: spec.name.clone(), rows, geo: spec.geo, ok, median_us }
+    CaseOutcome {
+        name: spec.name.clone(),
+        rows,
+        geo: spec.geo,
+        ok,
+        median_us,
+    }
 }
 
 fn main() {
@@ -387,14 +433,25 @@ fn main() {
                         Some(n) => (n, true),
                         None => (s, false),
                     };
-                    (num.parse().unwrap_or_else(|_| panic!("bad --rows entry {s:?}")), bf)
+                    (
+                        num.parse()
+                            .unwrap_or_else(|_| panic!("bad --rows entry {s:?}")),
+                        bf,
+                    )
                 })
                 .collect();
-            assert!(!v.is_empty() && v.iter().all(|&(r, _)| r > 0), "--rows needs positive counts");
+            assert!(
+                !v.is_empty() && v.iter().all(|&(r, _)| r > 0),
+                "--rows needs positive counts"
+            );
             rows_override = Some(v);
         } else if let Some(list) = a.strip_prefix("--variants=") {
-            variant_filter =
-                Some(list.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
+            variant_filter = Some(
+                list.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            );
         } else if a == "--precheck" {
             precheck = true;
         } else if a.starts_with("--") {
@@ -419,16 +476,19 @@ fn main() {
         std::process::exit(2);
     }
     if !gfx1151 {
-        println!("NOTE: {} correctness pre-check; timings below are NOT gfx1151 numbers", gpu.arch);
+        println!(
+            "NOTE: {} correctness pre-check; timings below are NOT gfx1151 numbers",
+            gpu.arch
+        );
     }
 
     // The incumbent (index 0) always runs; twins are substring-matched on the symbol.
     let active: Vec<usize> = (0..VARIANTS.len())
         .filter(|&i| {
             i == 0
-                || variant_filter
-                    .as_ref()
-                    .map_or(true, |f| f.iter().any(|p| VARIANTS[i].func.contains(p.as_str())))
+                || variant_filter.as_ref().map_or(true, |f| {
+                    f.iter().any(|p| VARIANTS[i].func.contains(p.as_str()))
+                })
         })
         .collect();
     if active.len() == 1 && variant_filter.is_some() {
@@ -459,7 +519,8 @@ fn main() {
                 bf16_bits((sign * mag) as f32)
             })
             .collect();
-        gpu.upload_raw(&u16_bytes(&bits), &[bits.len() * 2]).expect("W upload")
+        gpu.upload_raw(&u16_bytes(&bits), &[bits.len() * 2])
+            .expect("W upload")
     };
 
     let all_specs = specs(rows_override.as_deref());
@@ -474,7 +535,10 @@ fn main() {
 
     let mut all_ok = !outcomes.is_empty();
     println!("\n================ SUMMARY (median us; ratio = incumbent median / variant median) ================");
-    print!("{:<10} {:>6} {:>7} | {:>9}", "case", "rows", "verdict", "inc us");
+    print!(
+        "{:<10} {:>6} {:>7} | {:>9}",
+        "case", "rows", "verdict", "inc us"
+    );
     for &i in active.iter().skip(1) {
         print!(" | {:>9} {:>6}", format!("{} us", VARIANTS[i].label), "x");
     }
@@ -489,7 +553,11 @@ fn main() {
             o.median_us[0]
         );
         for &i in active.iter().skip(1) {
-            print!(" | {:>9.2} {:>6.3}", o.median_us[i], o.median_us[0] / o.median_us[i]);
+            print!(
+                " | {:>9.2} {:>6.3}",
+                o.median_us[i],
+                o.median_us[0] / o.median_us[i]
+            );
         }
         println!();
     }
@@ -503,12 +571,21 @@ fn main() {
             geo.len()
         );
         for &i in active.iter().skip(1) {
-            let ln: f64 =
-                geo.iter().map(|o| (o.median_us[0] / o.median_us[i]).ln()).sum::<f64>()
-                    / geo.len() as f64;
+            let ln: f64 = geo
+                .iter()
+                .map(|o| (o.median_us[0] / o.median_us[i]).ln())
+                .sum::<f64>()
+                / geo.len() as f64;
             println!("  {:<9} {:.4}x", VARIANTS[i].label, ln.exp());
         }
     }
-    println!("OVERALL: {}", if all_ok { "PASS (all bitwise identical)" } else { "FAIL" });
+    println!(
+        "OVERALL: {}",
+        if all_ok {
+            "PASS (all bitwise identical)"
+        } else {
+            "FAIL"
+        }
+    );
     std::process::exit(if all_ok { 0 } else { 1 });
 }

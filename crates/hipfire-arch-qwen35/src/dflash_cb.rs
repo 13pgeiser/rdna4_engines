@@ -48,43 +48,56 @@ use crate::dflash_spec::{
     DflashCheckpointPolicy, DflashLaneSnapshot, DflashState, DflashWindowMark,
 };
 use crate::qwen35::prefill::multi::{
-    cb_dn_save_free_enabled, dflash_iu4_verify_admitted, forward_prefill_batch_multi, lane_gdn_batch_ready,
-    lane_gdn_varrows_enabled, multi_chunk_pack_cap, multi_chunk_scratch_rows, pack_whole_lanes, MultiChunkRequest,
-    MultiChunkScratch, MULTI_CHUNK_MAX_LANE_ROWS, MULTI_CHUNK_PRODUCT_MAX_ROWS,
+    cb_dn_save_free_enabled, dflash_iu4_verify_admitted, forward_prefill_batch_multi,
+    lane_gdn_batch_ready, lane_gdn_varrows_enabled, multi_chunk_pack_cap, multi_chunk_scratch_rows,
+    pack_whole_lanes, MultiChunkRequest, MultiChunkScratch, MULTI_CHUNK_MAX_LANE_ROWS,
+    MULTI_CHUNK_PRODUCT_MAX_ROWS,
 };
 use crate::qwen35::prefill::{fp8_verify_open, verify_dense_math, DenseBatchMath};
 use crate::qwen35::{self, DeltaNetState, DflashFusionCtx};
 use crate::qwen35::{Qwen35Config, Qwen35Weights};
 use crate::speculative::{
-    dflash_download_verify_argmax, dflash_draft_batch_eligible, dflash_enqueue_verify_lm_head_argmax,
-    draft_dflash_block_rank, draft_dflash_blocks_batched, DeltaNetSnapshot, DflashCbDraft, DflashDraftLane,
-    dflash_sampled_selector_draft_into, dflash_target_rows_into, DflashSampleCfg, DflashSampledDraft,
-    DflashSampledDraftLane, draft_dflash_sampled_blocks_batched,
-    dflash_draft_batch_max_rows, dflash_sparse_target_enabled, FastTargetRows, TargetRowsScratch, VerifyScratch,
-    dflash_device_accept_eligible, dflash_device_accept_enabled, dflash_sampled_accept_device,
-    SampledWindowDecision,
+    dflash_device_accept_eligible, dflash_device_accept_enabled, dflash_download_verify_argmax,
+    dflash_draft_batch_eligible, dflash_draft_batch_max_rows, dflash_enqueue_verify_lm_head_argmax,
+    dflash_sampled_accept_device, dflash_sampled_selector_draft_into, dflash_sparse_target_enabled,
+    dflash_target_rows_into, draft_dflash_block_rank, draft_dflash_blocks_batched,
+    draft_dflash_sampled_blocks_batched, DeltaNetSnapshot, DflashCbDraft, DflashDraftLane,
+    DflashSampleCfg, DflashSampledDraft, DflashSampledDraftLane, FastTargetRows,
+    SampledWindowDecision, TargetRowsScratch, VerifyScratch,
 };
-use hipfire_runtime::dflash::DflashScratch;
 use hip_bridge::{HipError, HipResult};
+use hipfire_runtime::dflash::DflashScratch;
 use hipfire_runtime::llama::KvCache;
 use hipfire_runtime::spec::{request_rng_state, SpecRequestConfig};
 use rdna_compute::Gpu;
 use std::ops::Range;
 
 static CB_SAMPLED_TARGET_BATCH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_CB_SAMPLED_TARGET_BATCH").ok().as_deref() != Some("0")
+    hipfire_config::developer_var("HIPFIRE_CB_SAMPLED_TARGET_BATCH")
+        .ok()
+        .as_deref()
+        != Some("0")
 });
 
 static CB_SAMPLED_PACKED_HEAD: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_CB_SAMPLED_PACKED_HEAD").ok().as_deref() != Some("0")
+    hipfire_config::developer_var("HIPFIRE_CB_SAMPLED_PACKED_HEAD")
+        .ok()
+        .as_deref()
+        != Some("0")
 });
 
 static CB_DFLASH_DRAFT_BATCH_MASTER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_CB_DFLASH_DRAFT_BATCH").ok().as_deref() != Some("0")
+    hipfire_config::developer_var("HIPFIRE_CB_DFLASH_DRAFT_BATCH")
+        .ok()
+        .as_deref()
+        != Some("0")
 });
 
 static CB_SAMPLED_DRAFT_BATCH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_CB_SAMPLED_DRAFT_BATCH").ok().as_deref() != Some("0")
+    hipfire_config::developer_var("HIPFIRE_CB_SAMPLED_DRAFT_BATCH")
+        .ok()
+        .as_deref()
+        != Some("0")
 });
 
 /// The singleton's verify block for remaining output budget `max_emit`
@@ -297,7 +310,10 @@ pub fn dflash_lane_draft(
         ));
     }
     if b < 2 {
-        return Err(hip_bridge::HipError::new(0, "dflash_lane_draft: block size must be >= 2"));
+        return Err(hip_bridge::HipError::new(
+            0,
+            "dflash_lane_draft: block size must be >= 2",
+        ));
     }
     if gpu.active_stream.is_none() {
         gpu.active_stream = Some(gpu.hip.stream_create()?);
@@ -343,7 +359,11 @@ pub fn dflash_cb_head_argmax(
         gpu.active_stream = Some(gpu.hip.stream_create()?);
     }
     let final_hidden = vs.final_hidden.sub_offset(0, rows * config.dim);
-    let math = if rows > MULTI_CHUNK_PRODUCT_MAX_ROWS { DenseBatchMath::SingletonWmma } else { verify_dense_math(gpu) };
+    let math = if rows > MULTI_CHUNK_PRODUCT_MAX_ROWS {
+        DenseBatchMath::SingletonWmma
+    } else {
+        verify_dense_math(gpu)
+    };
     dflash_enqueue_verify_lm_head_argmax(
         gpu,
         &weights.output,
@@ -395,8 +415,10 @@ fn cb_sampled_device_accept_eligible(lane: &DflashCbVerifyLane<'_>, device_ok: b
     lane.state.sample_temp > 1e-6
         && lane.state.sampled_draft.as_ref().is_some_and(|receipt| {
             dflash_device_accept_eligible(
-                dflash_device_accept_enabled() && device_ok, &lane.state.sample_cfg(),
-                receipt, lane.draft.verify_tokens.len(),
+                dflash_device_accept_enabled() && device_ok,
+                &lane.state.sample_cfg(),
+                receipt,
+                lane.draft.verify_tokens.len(),
             )
         })
 }
@@ -426,8 +448,11 @@ fn cb_sampled_target_run_len(lanes: &[DflashCbVerifyLane<'_>], device_ok: bool) 
     };
     lanes
         .iter()
-        .take_while(|l| l.state.sample_temp > 1e-6
-            && !cb_sampled_device_accept_eligible(l, device_ok) && same(&l.state.sample_cfg()))
+        .take_while(|l| {
+            l.state.sample_temp > 1e-6
+                && !cb_sampled_device_accept_eligible(l, device_ok)
+                && same(&l.state.sample_cfg())
+        })
         .count()
 }
 
@@ -476,11 +501,22 @@ impl DflashCbScratch {
     /// `max(cap, min(planned, dflash_draft_batch_max_rows(gpu)))` rows so a
     /// 64-row batched draft chunk fits even when the verify cap is 63
     /// ([`Self::draft_rows`]); with the 48-row draft cap this equals the cap.
-    pub fn new(gpu: &mut Gpu, weights: &Qwen35Weights, config: &Qwen35Config, planned_rows: usize) -> HipResult<Self> {
+    pub fn new(
+        gpu: &mut Gpu,
+        weights: &Qwen35Weights,
+        config: &Qwen35Config,
+        planned_rows: usize,
+    ) -> HipResult<Self> {
         let max_rows = multi_chunk_scratch_rows(gpu, weights, config, planned_rows);
         let draft_rows = max_rows.max(planned_rows.min(dflash_draft_batch_max_rows(gpu)));
         let trunk = MultiChunkScratch::new(gpu, config, max_rows)?;
-        let head = match VerifyScratch::new(gpu, draft_rows, config.dim, config.vocab_size, config.dim.next_power_of_two()) {
+        let head = match VerifyScratch::new(
+            gpu,
+            draft_rows,
+            config.dim,
+            config.vocab_size,
+            config.dim.next_power_of_two(),
+        ) {
             Ok(h) => h,
             Err(e) => {
                 let _ = trunk.free_gpu(gpu);
@@ -506,9 +542,19 @@ impl DflashCbScratch {
     /// engine never allocates inside a step; `dflash_cb_draft` otherwise
     /// allocates it on the first batched chunk. The scratch also OWNS the
     /// FWHT rotation buffers every lane borrows ([`Self::lend_mq`]).
-    pub fn reserve_draft(&mut self, gpu: &mut Gpu, draft_config: &hipfire_runtime::dflash::DflashConfig) -> HipResult<()> {
+    pub fn reserve_draft(
+        &mut self,
+        gpu: &mut Gpu,
+        draft_config: &hipfire_runtime::dflash::DflashConfig,
+    ) -> HipResult<()> {
         if self.draft.is_none() {
-            let mut ds = DflashScratch::new_with_mq(gpu, draft_config, dflash_draft_batch_max_rows(gpu), 1, true)?;
+            let mut ds = DflashScratch::new_with_mq(
+                gpu,
+                draft_config,
+                dflash_draft_batch_max_rows(gpu),
+                1,
+                true,
+            )?;
             if let Err(e) = ds.enable_lane_workspace(gpu, draft_config) {
                 ds.free_gpu(gpu);
                 return Err(e);
@@ -535,12 +581,17 @@ impl DflashCbScratch {
         if lane.mq_x_rot.is_some() {
             return Ok(false);
         }
-        let shared = self
-            .draft
-            .as_mut()
-            .ok_or_else(|| HipError::new(0, "lend_mq: no shared draft scratch to lend rotation buffers from"))?;
+        let shared = self.draft.as_mut().ok_or_else(|| {
+            HipError::new(
+                0,
+                "lend_mq: no shared draft scratch to lend rotation buffers from",
+            )
+        })?;
         if shared.mq_x_rot.is_none() || shared.mq_x_rot_f16.is_none() {
-            return Err(HipError::new(0, "lend_mq: the shared draft scratch has no FWHT rotation buffers"));
+            return Err(HipError::new(
+                0,
+                "lend_mq: the shared draft scratch has no FWHT rotation buffers",
+            ));
         }
         lane.mq_x_rot = shared.mq_x_rot.take();
         lane.mq_x_rot_f16 = shared.mq_x_rot_f16.take();
@@ -609,7 +660,11 @@ pub struct DflashCbDraftLane<'a> {
 
 /// Whether one sampled lane may join a batched sampled-draft run led by
 /// `first`'s shared draft assets (host-only; touches no device state).
-fn cb_sampled_draft_lane_eligible(l: &DflashCbDraftLane<'_>, first: &DflashCbDraftLane<'_>, cap: usize) -> bool {
+fn cb_sampled_draft_lane_eligible(
+    l: &DflashCbDraftLane<'_>,
+    first: &DflashCbDraftLane<'_>,
+    cap: usize,
+) -> bool {
     let (df, f) = (&l.state.df, &first.state.df);
     l.state.sample_temp > 1e-6
         && l.state.sampled_draft.is_some()
@@ -671,7 +726,8 @@ fn cb_sampled_draft_run_admitted(
     let ok = ks.iter().all(|&k| {
         gpu.draft_overwrite_gfx12_admitted(k, rows)
             && run.iter().all(|l| {
-                gpu.draft_overwrite_gfx12_admitted(k, l.b) && gpu.draft_overwrite_gfx12_admitted(k, l.b - 1)
+                gpu.draft_overwrite_gfx12_admitted(k, l.b)
+                    && gpu.draft_overwrite_gfx12_admitted(k, l.b - 1)
             })
     });
     gpu.draft_rows64_exit(prev);
@@ -713,7 +769,10 @@ pub fn dflash_cb_draft(
     // chunk id per lane (None = singleton draft).
     let mut chunk_of: Vec<Option<usize>> = vec![None; n];
     let mut n_chunks = 0usize;
-    if batched && n > 0 && dflash_draft_batch_eligible(gpu, weights, config, &lanes[0].state.df.draft_weights) {
+    if batched
+        && n > 0
+        && dflash_draft_batch_eligible(gpu, weights, config, &lanes[0].state.df.draft_weights)
+    {
         let cap = dflash_draft_batch_max_rows(gpu).min(cb.draft_rows);
         let mut rows = 0usize;
         let mut members: Vec<Vec<usize>> = Vec::new();
@@ -739,9 +798,14 @@ pub fn dflash_cb_draft(
     }
     cb.draft_stats = (chunk_of.iter().flatten().count(), n_chunks);
     if n_chunks > 0 && cb.draft.is_none() {
-        let cfg = lanes.iter().zip(&chunk_of).find(|(_, c)| c.is_some()).map(|(l, _)| l.state.df.draft_config.clone());
+        let cfg = lanes
+            .iter()
+            .zip(&chunk_of)
+            .find(|(_, c)| c.is_some())
+            .map(|(l, _)| l.state.df.draft_config.clone());
         if let Some(cfg) = cfg {
-            let mut ds = DflashScratch::new_with_mq(gpu, &cfg, dflash_draft_batch_max_rows(gpu), 1, true)?;
+            let mut ds =
+                DflashScratch::new_with_mq(gpu, &cfg, dflash_draft_batch_max_rows(gpu), 1, true)?;
             if let Err(e) = ds.enable_lane_workspace(gpu, &cfg) {
                 ds.free_gpu(gpu);
                 return Err(e);
@@ -765,8 +829,11 @@ pub fn dflash_cb_draft(
             }
         }
         let DflashCbScratch { draft, head, .. } = &mut *cb;
-        let shared = draft.as_mut().ok_or_else(|| HipError::new(0, "dflash_cb_draft: no draft batch scratch"))?;
-        let toks = draft_dflash_blocks_batched(gpu, weights, config.vocab_size, shared, head, &mut dl)?;
+        let shared = draft
+            .as_mut()
+            .ok_or_else(|| HipError::new(0, "dflash_cb_draft: no draft batch scratch"))?;
+        let toks =
+            draft_dflash_blocks_batched(gpu, weights, config.vocab_size, shared, head, &mut dl)?;
         for (i, t) in idx.into_iter().zip(toks) {
             out[i] = Some(t);
         }
@@ -798,7 +865,9 @@ pub fn dflash_cb_draft(
                 rows += lanes[j].b;
                 j += 1;
             }
-            if j - i >= sampled_min_lanes && cb_sampled_draft_run_admitted(gpu, weights, &lanes[i..j], rows, sampled_cap) {
+            if j - i >= sampled_min_lanes
+                && cb_sampled_draft_run_admitted(gpu, weights, &lanes[i..j], rows, sampled_cap)
+            {
                 if cb.draft.is_none() {
                     cb.reserve_draft(gpu, &lanes[i].state.df.draft_config)?;
                 }
@@ -807,7 +876,10 @@ pub fn dflash_cb_draft(
                     let st = &mut *l.state;
                     let cfg = st.sample_cfg();
                     let Some(receipt) = st.sampled_draft.as_mut() else {
-                        return Err(HipError::new(0, "dflash_cb_draft: sampled receipt not reserved"));
+                        return Err(HipError::new(
+                            0,
+                            "dflash_cb_draft: sampled receipt not reserved",
+                        ));
                     };
                     dl.push(DflashSampledDraftLane {
                         draft: DflashDraftLane {
@@ -823,8 +895,17 @@ pub fn dflash_cb_draft(
                     });
                 }
                 let DflashCbScratch { draft, head, .. } = &mut *cb;
-                let shared = draft.as_mut().ok_or_else(|| HipError::new(0, "dflash_cb_draft: no draft batch scratch"))?;
-                let toks = draft_dflash_sampled_blocks_batched(gpu, weights, config.vocab_size, shared, head, &mut dl)?;
+                let shared = draft
+                    .as_mut()
+                    .ok_or_else(|| HipError::new(0, "dflash_cb_draft: no draft batch scratch"))?;
+                let toks = draft_dflash_sampled_blocks_batched(
+                    gpu,
+                    weights,
+                    config.vocab_size,
+                    shared,
+                    head,
+                    &mut dl,
+                )?;
                 drop(dl);
                 for (k, t) in toks.into_iter().enumerate() {
                     out[i + k] = Some(t);
@@ -835,10 +916,19 @@ pub fn dflash_cb_draft(
                 continue;
             }
         }
-        out[i] = Some(cb_draft_lane_singleton(gpu, weights, config, cb, &mut lanes[i])?);
+        out[i] = Some(cb_draft_lane_singleton(
+            gpu,
+            weights,
+            config,
+            cb,
+            &mut lanes[i],
+        )?);
         i += 1;
     }
-    Ok(out.into_iter().map(|t| t.expect("every lane drafted")).collect())
+    Ok(out
+        .into_iter()
+        .map(|t| t.expect("every lane drafted"))
+        .collect())
 }
 
 /// The singleton draft of one lane (sampled selector draft or greedy
@@ -860,10 +950,22 @@ fn cb_draft_lane_singleton(
     let r = if l.state.sample_temp > 1e-6 {
         let cfg = l.state.sample_cfg();
         match l.state.sampled_draft.as_mut() {
-            None => Err(HipError::new(0, "dflash_cb_draft: sampled receipt not reserved")),
+            None => Err(HipError::new(
+                0,
+                "dflash_cb_draft: sampled receipt not reserved",
+            )),
             Some(receipt) => dflash_sampled_selector_draft_into(
-                gpu, weights, &mut l.state.df, l.position, l.compact_offset,
-                l.seed, l.b, config.vocab_size, cfg, &mut l.state.rng_state, receipt,
+                gpu,
+                weights,
+                &mut l.state.df,
+                l.position,
+                l.compact_offset,
+                l.seed,
+                l.b,
+                config.vocab_size,
+                cfg,
+                &mut l.state.rng_state,
+                receipt,
             )
             .map(|()| receipt.block.clone()),
         }
@@ -946,12 +1048,22 @@ pub fn dflash_cb_verify(
         if b > df.gdn_tape.max_n || b > df.hidden_rb.max_batch || b > df.hidden_rb.max_positions {
             return refuse(format!("lane {i}: {b} rows exceed its tape/ring staging"));
         }
-        if !qwen35::prefill_batch_pbs_eligible(weights, config, lane.dn_state, b, gpu.arch.as_str(), true) {
-            return refuse(format!("lane {i}: {b} rows not eligible for the batched prefill body"));
+        if !qwen35::prefill_batch_pbs_eligible(
+            weights,
+            config,
+            lane.dn_state,
+            b,
+            gpu.arch.as_str(),
+            true,
+        ) {
+            return refuse(format!(
+                "lane {i}: {b} rows not eligible for the batched prefill body"
+            ));
         }
         cb.rows.push(b);
     }
-    pack_whole_lanes(&cb.rows, pack_cap, &mut cb.ranges).map_err(|e| HipError::new(0, &format!("dflash_cb_verify: {e}")))?;
+    pack_whole_lanes(&cb.rows, pack_cap, &mut cb.ranges)
+        .map_err(|e| HipError::new(0, &format!("dflash_cb_verify: {e}")))?;
     if gpu.active_stream.is_none() {
         gpu.active_stream = Some(gpu.hip.stream_create()?);
     }
@@ -996,13 +1108,21 @@ pub fn dflash_cb_verify(
         let prev = fp8_verify_open(gpu, weights, config, &*lanes[range.start].kv_cache)?;
         if save_free {
             for lane in lanes[range.clone()].iter_mut() {
-                lane.state.df.target_snap.exchange_buffers(&mut *lane.dn_state);
+                lane.state
+                    .df
+                    .target_snap
+                    .exchange_buffers(&mut *lane.dn_state);
             }
         }
         let fwd = {
             let mut reqs: Vec<MultiChunkRequest<'_>> = Vec::with_capacity(range.len());
             for lane in lanes[range.clone()].iter_mut() {
-                let DflashCbVerifyLane { kv_cache, dn_state, state, draft } = lane;
+                let DflashCbVerifyLane {
+                    kv_cache,
+                    dn_state,
+                    state,
+                    draft,
+                } = lane;
                 let df = &mut state.df;
                 reqs.push(MultiChunkRequest {
                     tokens: &draft.verify_tokens,
@@ -1012,7 +1132,11 @@ pub fn dflash_cb_verify(
                     gdn_tape: Some(&df.gdn_tape),
                     fusion: DflashFusionCtx::ChainVerify,
                     hidden_rb: Some(&mut df.hidden_rb),
-                    dn_state_src: if save_free { Some(&df.target_snap) } else { None },
+                    dn_state_src: if save_free {
+                        Some(&df.target_snap)
+                    } else {
+                        None
+                    },
                 });
             }
             // Trunk row-byte identity at aggregates 63/64/65/96/128, chunk128
@@ -1022,7 +1146,15 @@ pub fn dflash_cb_verify(
             // scope, the same A4 producers + IU4 GEMMs as the singleton verify;
             // the heads below stay F16.
             let iu4 = gpu.iu4_verify_enter(dflash_iu4_verify_admitted(gpu, weights, config));
-            let r = forward_prefill_batch_multi(gpu, weights, config, scratch, &cb.trunk, &mut reqs, Some(&cb.head.final_hidden));
+            let r = forward_prefill_batch_multi(
+                gpu,
+                weights,
+                config,
+                scratch,
+                &cb.trunk,
+                &mut reqs,
+                Some(&cb.head.final_hidden),
+            );
             gpu.iu4_verify_exit(iu4);
             r
         };
@@ -1031,15 +1163,27 @@ pub fn dflash_cb_verify(
         let packed_sampled = rows <= cb.head.max_n
             && rows * weights.output.k <= cb.head.max_n * cb.head.hidden_k
             && cb_sampled_packed_head_admitted(gpu, weights, config, &lanes[range.clone()], rows);
-        let any_greedy = lanes[range.clone()].iter().any(|l| l.state.sample_temp <= 1e-6);
+        let any_greedy = lanes[range.clone()]
+            .iter()
+            .any(|l| l.state.sample_temp <= 1e-6);
         let picks = match fwd {
             Ok(()) if packed_sampled => {
                 let hidden = cb.head.final_hidden.sub_offset(0, rows * dim);
                 dflash_enqueue_verify_lm_head_argmax(
-                    gpu, &weights.output, &hidden, &cb.head, rows, vocab, DenseBatchMath::SingletonWmma,
-                ).and_then(|()| dflash_download_verify_argmax(gpu, &cb.head, rows)).map(Some)
+                    gpu,
+                    &weights.output,
+                    &hidden,
+                    &cb.head,
+                    rows,
+                    vocab,
+                    DenseBatchMath::SingletonWmma,
+                )
+                .and_then(|()| dflash_download_verify_argmax(gpu, &cb.head, rows))
+                .map(Some)
             }
-            Ok(()) if any_greedy => dflash_cb_head_argmax(gpu, weights, config, &cb.head, rows).map(Some),
+            Ok(()) if any_greedy => {
+                dflash_cb_head_argmax(gpu, weights, config, &cb.head, rows).map(Some)
+            }
             Ok(()) => Ok(None),
             Err(e) => Err(e),
         };
@@ -1053,24 +1197,39 @@ pub fn dflash_cb_verify(
             let mut batched_until = 0usize;
             for li in 0..chunk.len() {
                 if packed_sampled && li >= batched_until && *CB_SAMPLED_TARGET_BATCH {
-                    let n = cb_sampled_target_run_len(&chunk[li..], gpu.dflash_device_accept_supported());
+                    let n = cb_sampled_target_run_len(
+                        &chunk[li..],
+                        gpu.dflash_device_accept_supported(),
+                    );
                     if n >= 2 {
                         let end = li + n;
-                        let run_rows: usize = chunk[li..end].iter().map(|l| l.draft.verify_tokens.len()).sum();
+                        let run_rows: usize = chunk[li..end]
+                            .iter()
+                            .map(|l| l.draft.verify_tokens.len())
+                            .sum();
                         let cfg = chunk[li].state.sample_cfg();
                         let logits = cb.head.logits.sub_offset(row * vocab, run_rows * vocab);
-                        cb.target_rows.run_sparse(gpu, &logits, run_rows, vocab, cfg)?;
+                        cb.target_rows
+                            .run_sparse(gpu, &logits, run_rows, vocab, cfg)?;
                         let mut r0 = 0usize;
                         for l in chunk[li..end].iter_mut() {
                             let b = l.draft.verify_tokens.len();
-                            cb.target_rows.split_lane_into(r0, b, vocab, &mut l.state.sampled_target)?;
+                            cb.target_rows.split_lane_into(
+                                r0,
+                                b,
+                                vocab,
+                                &mut l.state.sampled_target,
+                            )?;
                             r0 += b;
                         }
                         batched_until = end;
                     }
                 }
                 let in_run = li < batched_until;
-                let device_accept = cb_sampled_device_accept_eligible(&chunk[li], gpu.dflash_device_accept_supported());
+                let device_accept = cb_sampled_device_accept_eligible(
+                    &chunk[li],
+                    gpu.dflash_device_accept_supported(),
+                );
                 let lane = &mut chunk[li];
                 let b = lane.draft.verify_tokens.len();
                 let st = &mut *lane.state;
@@ -1079,53 +1238,122 @@ pub fn dflash_cb_verify(
                 if st.sample_temp > 1e-6 {
                     let cfg = st.sample_cfg();
                     let v = &st.df.verify_scratch;
-                    gpu.memcpy_dtod_at_auto(&v.final_hidden.buf, 0, &cb.head.final_hidden.buf, row * dim * 4, b * dim * 4)?;
+                    gpu.memcpy_dtod_at_auto(
+                        &v.final_hidden.buf,
+                        0,
+                        &cb.head.final_hidden.buf,
+                        row * dim * 4,
+                        b * dim * 4,
+                    )?;
                     if packed_sampled {
-                        st.picks.extend_from_slice(&picks.as_ref().expect("packed sampled head")[row..row + b]);
+                        st.picks.extend_from_slice(
+                            &picks.as_ref().expect("packed sampled head")[row..row + b],
+                        );
                         if device_accept {
                             let logits = cb.head.logits.sub_offset(row * vocab, b * vocab);
                             st.device_decision = Some(dflash_sampled_accept_device(
-                                gpu, &logits, &lane.draft.verify_tokens,
+                                gpu,
+                                &logits,
+                                &lane.draft.verify_tokens,
                                 st.sampled_draft.as_ref().expect("eligible sampled receipt"),
-                                vocab, cfg, lane.draft.max_accept, &mut st.rng_state,
+                                vocab,
+                                cfg,
+                                lane.draft.max_accept,
+                                &mut st.rng_state,
                                 &mut *v.device_accept.lock().unwrap_or_else(|e| e.into_inner()),
                             )?);
                         } else if !in_run {
                             let logits = cb.head.logits.sub_offset(row * vocab, b * vocab);
                             // Keep normalization at the original lane point/order,
                             // including SparseRows' request-owned representation.
-                            dflash_target_rows_into(gpu, &logits, b, vocab, cfg, &mut st.sampled_target)?;
+                            dflash_target_rows_into(
+                                gpu,
+                                &logits,
+                                b,
+                                vocab,
+                                cfg,
+                                &mut st.sampled_target,
+                            )?;
                         }
                         if cb.keep_lane_rows {
-                            gpu.memcpy_dtod_at_auto(&v.logits.buf, 0, &cb.head.logits.buf, row * vocab * 4, b * vocab * 4)?;
-                            gpu.memcpy_dtod_at_auto(&v.argmax.buf, 0, &cb.head.argmax.buf, row * 4, b * 4)?;
+                            gpu.memcpy_dtod_at_auto(
+                                &v.logits.buf,
+                                0,
+                                &cb.head.logits.buf,
+                                row * vocab * 4,
+                                b * vocab * 4,
+                            )?;
+                            gpu.memcpy_dtod_at_auto(
+                                &v.argmax.buf,
+                                0,
+                                &cb.head.argmax.buf,
+                                row * 4,
+                                b * 4,
+                            )?;
                         }
                     } else {
                         let hidden = v.final_hidden.sub_offset(0, b * dim);
                         dflash_enqueue_verify_lm_head_argmax(
-                            gpu, &weights.output, &hidden, v, b, vocab, DenseBatchMath::Product,
+                            gpu,
+                            &weights.output,
+                            &hidden,
+                            v,
+                            b,
+                            vocab,
+                            DenseBatchMath::Product,
                         )?;
                         st.picks = dflash_download_verify_argmax(gpu, v, b)?;
                         let logits = v.logits.sub_offset(0, b * vocab);
                         // Decide/materialize before shared scratch or v.logits reuse.
                         if device_accept {
                             st.device_decision = Some(dflash_sampled_accept_device(
-                                gpu, &logits, &lane.draft.verify_tokens,
+                                gpu,
+                                &logits,
+                                &lane.draft.verify_tokens,
                                 st.sampled_draft.as_ref().expect("eligible sampled receipt"),
-                                vocab, cfg, lane.draft.max_accept, &mut st.rng_state,
+                                vocab,
+                                cfg,
+                                lane.draft.max_accept,
+                                &mut st.rng_state,
                                 &mut *v.device_accept.lock().unwrap_or_else(|e| e.into_inner()),
                             )?);
                         } else {
-                            dflash_target_rows_into(gpu, &logits, b, vocab, cfg, &mut st.sampled_target)?;
+                            dflash_target_rows_into(
+                                gpu,
+                                &logits,
+                                b,
+                                vocab,
+                                cfg,
+                                &mut st.sampled_target,
+                            )?;
                         }
                     }
                 } else {
-                    st.picks.extend_from_slice(&picks.as_ref().expect("greedy head")[row..row + b]);
+                    st.picks
+                        .extend_from_slice(&picks.as_ref().expect("greedy head")[row..row + b]);
                     if cb.keep_lane_rows {
                         let v = &st.df.verify_scratch;
-                        gpu.memcpy_dtod_at_auto(&v.final_hidden.buf, 0, &cb.head.final_hidden.buf, row * dim * 4, b * dim * 4)?;
-                        gpu.memcpy_dtod_at_auto(&v.logits.buf, 0, &cb.head.logits.buf, row * vocab * 4, b * vocab * 4)?;
-                        gpu.memcpy_dtod_at_auto(&v.argmax.buf, 0, &cb.head.argmax.buf, row * 4, b * 4)?;
+                        gpu.memcpy_dtod_at_auto(
+                            &v.final_hidden.buf,
+                            0,
+                            &cb.head.final_hidden.buf,
+                            row * dim * 4,
+                            b * dim * 4,
+                        )?;
+                        gpu.memcpy_dtod_at_auto(
+                            &v.logits.buf,
+                            0,
+                            &cb.head.logits.buf,
+                            row * vocab * 4,
+                            b * vocab * 4,
+                        )?;
+                        gpu.memcpy_dtod_at_auto(
+                            &v.argmax.buf,
+                            0,
+                            &cb.head.argmax.buf,
+                            row * 4,
+                            b * 4,
+                        )?;
                     }
                 }
                 st.verified = true;
@@ -1145,8 +1373,9 @@ pub fn dflash_cb_verify(
 /// attributing why a chunk keeps the SAVE route. Investigative only: it never
 /// changes the verdict, and when off nothing below runs (no formatting, no
 /// allocation, no extra family walk).
-static CB_DN_SAVE_FREE_DIAG: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_CB_DN_SAVE_FREE_DIAG", false));
+static CB_DN_SAVE_FREE_DIAG: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_CB_DN_SAVE_FREE_DIAG", false)
+});
 
 /// Early-return refusal of [`cb_dn_save_free_admitted`]. The detail arguments
 /// are only evaluated when `$diag` is set.
@@ -1181,7 +1410,12 @@ fn dn_sf_log(
     }
     let _ = per_lane.write_str("] sample_temp=[");
     for (i, l) in lanes.iter().enumerate() {
-        let _ = write!(per_lane, "{}{}", if i == 0 { "" } else { "," }, l.state.sample_temp);
+        let _ = write!(
+            per_lane,
+            "{}{}",
+            if i == 0 { "" } else { "," },
+            l.state.sample_temp
+        );
     }
     per_lane.push(']');
     if let Some((i, l)) = lane.and_then(|i| lanes.get(i).map(|l| (i, l))) {
@@ -1241,8 +1475,15 @@ fn dn_sf_replay_detail(
 /// buffers are private, so its ownership is reported by elimination.
 /// The logical extents repeat `DnCbExtents::for_config` (private to
 /// `speculative.rs`).
-fn dn_sf_owned_detail(state: &DeltaNetState, snap: &DeltaNetSnapshot, config: &Qwen35Config) -> String {
-    if config.conv_kernel_dim != 4 || config.linear_key_head_dim != 128 || config.linear_value_head_dim != 128 {
+fn dn_sf_owned_detail(
+    state: &DeltaNetState,
+    snap: &DeltaNetSnapshot,
+    config: &Qwen35Config,
+) -> String {
+    if config.conv_kernel_dim != 4
+        || config.linear_key_head_dim != 128
+        || config.linear_value_head_dim != 128
+    {
         return format!(
             "geometry conv_kernel_dim={} key_head_dim={} value_head_dim={} (exact kernels need 4/128/128)",
             config.conv_kernel_dim, config.linear_key_head_dim, config.linear_value_head_dim
@@ -1264,8 +1505,18 @@ fn dn_sf_owned_detail(state: &DeltaNetState, snap: &DeltaNetSnapshot, config: &Q
     let fams: [(&str, &[rdna_compute::GpuTensor], usize, bool); 4] = [
         ("s", state.s_matrices.as_slice(), hv * 128 * 128, true),
         ("scales", state.s_scales.as_slice(), hv * 128 * 4, false),
-        ("conv", state.conv_states.as_slice(), conv_channels * 3 * 4, false),
-        ("ef", state.s_ef_residual.as_slice(), hv * 128 * 128 * 2, true),
+        (
+            "conv",
+            state.conv_states.as_slice(),
+            conv_channels * 3 * 4,
+            false,
+        ),
+        (
+            "ef",
+            state.s_ef_residual.as_slice(),
+            hv * 128 * 128 * 2,
+            true,
+        ),
     ];
     for (name, live, logical, exact) in fams {
         if live.len() != n {
@@ -1310,7 +1561,10 @@ fn dn_sf_alias_detail(lanes: &[DflashCbVerifyLane<'_>], sorted: &[u64]) -> Strin
     let Some(dup) = sorted.windows(2).find(|w| w[0] == w[1]).map(|w| w[0]) else {
         return String::new();
     };
-    let mut out = format!("dup_ptr={dup:#x} occurrences={} slots:", sorted.iter().filter(|&&p| p == dup).count());
+    let mut out = format!(
+        "dup_ptr={dup:#x} occurrences={} slots:",
+        sorted.iter().filter(|&&p| p == dup).count()
+    );
     let mut tmp: Vec<u64> = Vec::new();
     for (li, lane) in lanes.iter().enumerate() {
         let state: &DeltaNetState = &*lane.dn_state;
@@ -1324,13 +1578,21 @@ fn dn_sf_alias_detail(lanes: &[DflashCbVerifyLane<'_>], sorted: &[u64]) -> Strin
         ];
         let live_len: usize = lens.iter().sum();
         for (idx, _) in tmp.iter().enumerate().filter(|(_, p)| **p == dup) {
-            let (bank, mut rel) = if idx < live_len { ("live", idx) } else { ("snap", idx - live_len) };
+            let (bank, mut rel) = if idx < live_len {
+                ("live", idx)
+            } else {
+                ("snap", idx - live_len)
+            };
             let mut fam = 0;
             while fam < 3 && rel >= lens[fam] {
                 rel -= lens[fam];
                 fam += 1;
             }
-            let _ = write!(out, " {li}:{bank}:{}[{rel}]", ["s", "scales", "conv", "ef"][fam]);
+            let _ = write!(
+                out,
+                " {li}:{bank}:{}[{rel}]",
+                ["s", "scales", "conv", "ef"][fam]
+            );
         }
     }
     out
@@ -1429,7 +1691,15 @@ pub(crate) fn cb_dn_save_free_admitted(
         let kv: &KvCache = &*lane.kv_cache;
         let b_i = lane.draft.verify_tokens.len();
         if !(2..=DFLASH_GDN_REPLAY_MAX_STEPS).contains(&b_i) {
-            dn_sf_refuse!(diag, gpu, lanes, Some(li), "b_range", "allowed=2..={}", DFLASH_GDN_REPLAY_MAX_STEPS)
+            dn_sf_refuse!(
+                diag,
+                gpu,
+                lanes,
+                Some(li),
+                "b_range",
+                "allowed=2..={}",
+                DFLASH_GDN_REPLAY_MAX_STEPS
+            )
         }
         if !(varrows || b_i == b0) {
             dn_sf_refuse!(diag, gpu, lanes, Some(li), "b_mixed_no_varrows", "")
@@ -1440,7 +1710,10 @@ pub(crate) fn cb_dn_save_free_admitted(
         if !df.gdn_tape.snapshot_source_armed() {
             dn_sf_refuse!(diag, gpu, lanes, Some(li), "source_unarmed", "")
         }
-        if !df.gdn_tape.replay_from_snapshot_admits(gpu, state, &df.target_snap, b_i) {
+        if !df
+            .gdn_tape
+            .replay_from_snapshot_admits(gpu, state, &df.target_snap, b_i)
+        {
             dn_sf_refuse!(
                 diag,
                 gpu,
@@ -1463,7 +1736,16 @@ pub(crate) fn cb_dn_save_free_admitted(
             )
         }
         if !(kv.quant_q8 || kv.quant_fp8) {
-            dn_sf_refuse!(diag, gpu, lanes, Some(li), "kv_mode", "quant_q8={} quant_fp8={}", kv.quant_q8, kv.quant_fp8)
+            dn_sf_refuse!(
+                diag,
+                gpu,
+                lanes,
+                Some(li),
+                "kv_mode",
+                "quant_q8={} quant_fp8={}",
+                kv.quant_q8,
+                kv.quant_fp8
+            )
         }
         if kv.compact_offset != 0 {
             dn_sf_refuse!(diag, gpu, lanes, Some(li), "compact_offset", "")
@@ -1472,7 +1754,15 @@ pub(crate) fn cb_dn_save_free_admitted(
     }
     ptrs.sort_unstable();
     if !ptrs.windows(2).all(|w| w[0] != w[1]) {
-        dn_sf_refuse!(diag, gpu, lanes, None, "owner_alias", "{}", dn_sf_alias_detail(lanes, &ptrs))
+        dn_sf_refuse!(
+            diag,
+            gpu,
+            lanes,
+            None,
+            "owner_alias",
+            "{}",
+            dn_sf_alias_detail(lanes, &ptrs)
+        )
     }
     true
 }
@@ -1484,7 +1774,10 @@ mod tests {
     #[test]
     fn block_follows_the_singleton_budget_rule() {
         // B = min(16, max(E, 2)); E = 1 still verifies two rows.
-        let b: Vec<usize> = [1, 2, 3, 15, 16, 17, 1000].iter().map(|&e| dflash_block_for_emit(16, e)).collect();
+        let b: Vec<usize> = [1, 2, 3, 15, 16, 17, 1000]
+            .iter()
+            .map(|&e| dflash_block_for_emit(16, e))
+            .collect();
         assert_eq!(b, vec![2, 2, 3, 15, 16, 16, 16]);
     }
 }

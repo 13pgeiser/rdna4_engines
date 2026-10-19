@@ -54,14 +54,22 @@ impl Trace {
     }
     /// Instructions whose mnemonic is `m`.
     pub fn count(&self, m: &str) -> usize {
-        self.text.iter().filter(|t| t.split_whitespace().next() == Some(m)).count()
+        self.text
+            .iter()
+            .filter(|t| t.split_whitespace().next() == Some(m))
+            .count()
     }
     /// A raw ALU instruction. LDS, barriers, branches and the program end
     /// belong to the typed core.
     pub fn raw(&mut self, t: impl Into<String>) -> Result<(), String> {
         let t = t.into();
         let m = t.split_whitespace().next().unwrap_or("");
-        if m.starts_with("ds_") || m.starts_with("s_barrier") || m.starts_with("s_branch") || m.starts_with("s_cbranch") || m == "s_endpgm" {
+        if m.starts_with("ds_")
+            || m.starts_with("s_barrier")
+            || m.starts_with("s_branch")
+            || m.starts_with("s_cbranch")
+            || m == "s_endpgm"
+        {
             return Err(format!("{m} goes through the typed core"));
         }
         if self.text.last().is_some_and(|l| l == "s_endpgm") {
@@ -73,7 +81,12 @@ impl Trace {
     /// Every reserved exit was placed (the production builder's `finish`
     /// makes the same check).
     pub fn finish(&self) -> Result<(), String> {
-        match self.exits.iter().find(|e| !self.text.iter().any(|t| t.strip_suffix(':') == Some(e.as_str()))) {
+        match self.exits.iter().find(|e| {
+            !self
+                .text
+                .iter()
+                .any(|t| t.strip_suffix(':') == Some(e.as_str()))
+        }) {
             Some(e) => Err(format!("kernel exit {e} is never placed")),
             None => Ok(()),
         }
@@ -199,7 +212,11 @@ impl Backend for Trace {
         self.emit("s_barrier");
         Ok(())
     }
-    fn barrier_signal(&mut self, auth: &Auth, transitions: &[SlotTransition]) -> Result<(), String> {
+    fn barrier_signal(
+        &mut self,
+        auth: &Auth,
+        transitions: &[SlotTransition],
+    ) -> Result<(), String> {
         self.seal.check(auth)?;
         if !self.gfx12() {
             return Err("split barriers require gfx12".into());
@@ -213,13 +230,17 @@ impl Backend for Trace {
     fn label(&mut self, auth: &Auth, name: &str) -> Result<(), String> {
         self.seal.check(auth)?;
         if self.exits.iter().any(|e| e == name) {
-            return Err(format!("{name} is a kernel exit: only Workgroup::end places it"));
+            return Err(format!(
+                "{name} is a kernel exit: only Workgroup::end places it"
+            ));
         }
         self.place(name)
     }
     fn reserve_exit(&mut self, auth: &Auth, name: &str) -> Result<(), String> {
         self.seal.check(auth)?;
-        if self.exits.iter().any(|e| e == name) || self.text.iter().any(|t| t.strip_suffix(':') == Some(name)) {
+        if self.exits.iter().any(|e| e == name)
+            || self.text.iter().any(|t| t.strip_suffix(':') == Some(name))
+        {
             return Err(format!("duplicate label {name}"));
         }
         self.exits.push(name.into());
@@ -237,7 +258,11 @@ impl Backend for Trace {
     }
     fn end_program(&mut self, auth: &Auth) -> Result<(), String> {
         self.seal.check(auth)?;
-        if !self.exits.iter().any(|e| self.text.iter().any(|t| t.strip_suffix(':') == Some(e.as_str()))) {
+        if !self.exits.iter().any(|e| {
+            self.text
+                .iter()
+                .any(|t| t.strip_suffix(':') == Some(e.as_str()))
+        }) {
             return Err("s_endpgm without a placed kernel exit".into());
         }
         self.emit("s_endpgm");
@@ -298,7 +323,11 @@ impl Backend for Trace {
                 // Stored on one path only: the region is `Writing` on both,
                 // and the next barrier publishes what any wave stored.
                 (Slot::Free | Slot::Publishing, Slot::Free | Slot::Publishing) => Slot::Publishing,
-                (a, b) => return Err(format!("paths join with {name} {a:?} on one and {b:?} on the other")),
+                (a, b) => {
+                    return Err(format!(
+                        "paths join with {name} {a:?} on one and {b:?} on the other"
+                    ))
+                }
             };
         }
         // A store pending on either path is pending at the join.
@@ -315,7 +344,10 @@ impl Backend for Trace {
         for &id in slots {
             let slot = self.slots.get_mut(id).ok_or("unknown LDS slot")?;
             if slot.1 != Slot::Free {
-                return Err(format!("{} cannot be stored by other waves while {:?}", slot.0, slot.1));
+                return Err(format!(
+                    "{} cannot be stored by other waves while {:?}",
+                    slot.0, slot.1
+                ));
             }
             slot.1 = Slot::Publishing;
         }
@@ -331,7 +363,12 @@ impl Backend for Trace {
         self.emit("s_mov_b32 exec_lo, -1");
         Ok(())
     }
-    fn loop_(&mut self, auth: &Auth, head: &str, body: &dyn Fn(&mut Self) -> Result<(), String>) -> Result<(), String> {
+    fn loop_(
+        &mut self,
+        auth: &Auth,
+        head: &str,
+        body: &dyn Fn(&mut Self) -> Result<(), String>,
+    ) -> Result<(), String> {
         self.seal.check(auth)?;
         let entry = self.stores.len();
         let mut first = self.clone();
@@ -339,7 +376,10 @@ impl Backend for Trace {
         let start = first.text.len();
         body(&mut first)?;
         if first.stores.len() != entry {
-            return Err("loop back edge leaves a different number of LDS stores pending than its entry".into());
+            return Err(
+                "loop back edge leaves a different number of LDS stores pending than its entry"
+                    .into(),
+            );
         }
         let mut second = first.clone();
         second.text.truncate(start - 1);

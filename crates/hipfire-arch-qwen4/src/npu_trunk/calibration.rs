@@ -71,10 +71,22 @@ pub struct FamilyCalibration {
 /// per kilo-op and the GPU o-proj GEMM time it removes from the layer per 8192 rows.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OutFamily { pub k: usize, pub panel_cols: usize, pub tops_alone: f64, pub bytes_per_kop: f64, pub gpu_ms_per_8192: f64 }
-fn selectable_default() -> bool { true }
-fn is_true(v: &bool) -> bool { *v }
-fn is_zero(v: &f64) -> bool { *v == 0.0 }
+pub struct OutFamily {
+    pub k: usize,
+    pub panel_cols: usize,
+    pub tops_alone: f64,
+    pub bytes_per_kop: f64,
+    pub gpu_ms_per_8192: f64,
+}
+fn selectable_default() -> bool {
+    true
+}
+fn is_true(v: &bool) -> bool {
+    *v
+}
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GlueCalibration {
@@ -110,7 +122,12 @@ pub struct ContentionCalibration {
 /// Measured per-8192-row QSA phase times at the 16K pair (bank A prefix 0, bank B prefix 8192).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct QsaOrder { pub core_a_ms: f64, pub core_b_ms: f64, pub post_ms: f64, pub inproj_chain_ms: f64 }
+pub struct QsaOrder {
+    pub core_a_ms: f64,
+    pub core_b_ms: f64,
+    pub post_ms: f64,
+    pub inproj_chain_ms: f64,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Calibration {
@@ -134,7 +151,10 @@ impl Calibration {
         Ok(cal)
     }
     /// Only a missing file falls back; invalid/unreadable files are authoritative.
-    pub fn load_with_builtin(path: impl AsRef<Path>, route: &str) -> Result<(Self, &'static str), String> {
+    pub fn load_with_builtin(
+        path: impl AsRef<Path>,
+        route: &str,
+    ) -> Result<(Self, &'static str), String> {
         let (bytes, source) = match fs::read(path) {
             Ok(bytes) => (std::borrow::Cow::Owned(bytes), "file"),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -197,22 +217,44 @@ impl Calibration {
             differ.push("device.pci_bdf");
         }
         if self.key.device.npu_fw_version != key.device.npu_fw_version {
-            self.key.device.npu_fw_version.clone_from(&key.device.npu_fw_version);
+            self.key
+                .device
+                .npu_fw_version
+                .clone_from(&key.device.npu_fw_version);
             differ.push("device.npu_fw_version");
         }
         if self.key.kernel.uname_release != key.kernel.uname_release {
-            self.key.kernel.uname_release.clone_from(&key.kernel.uname_release);
+            self.key
+                .kernel
+                .uname_release
+                .clone_from(&key.kernel.uname_release);
             differ.push("kernel.uname_release");
         }
         Ok(differ)
     }
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != CALIBRATION_SCHEMA_VERSION { return Err("unsupported calibration schema_version".into()); }
-        if !self.margin.is_finite() || !(0.0..1.0).contains(&self.margin) { return Err("margin must be finite and in [0,1)".into()); }
-        if self.npu.panel_cols == 0 || self.gpu.min_bank_rows == 0 { return Err("panel_cols and min_bank_rows must be positive".into()); }
-        if self.npu.epilogue != "bf16" { return Err("npu.epilogue must be bf16".into()); }
-        if self.key.epilogue != self.npu.epilogue { return Err("key.epilogue differs from npu.epilogue".into()); }
-        if self.key.trunk_route != "stock" && !self.key.trunk_route.strip_prefix("overlay:").is_some_and(|marker| !marker.trim().is_empty()) {
+        if self.schema_version != CALIBRATION_SCHEMA_VERSION {
+            return Err("unsupported calibration schema_version".into());
+        }
+        if !self.margin.is_finite() || !(0.0..1.0).contains(&self.margin) {
+            return Err("margin must be finite and in [0,1)".into());
+        }
+        if self.npu.panel_cols == 0 || self.gpu.min_bank_rows == 0 {
+            return Err("panel_cols and min_bank_rows must be positive".into());
+        }
+        if self.npu.epilogue != "bf16" {
+            return Err("npu.epilogue must be bf16".into());
+        }
+        if self.key.epilogue != self.npu.epilogue {
+            return Err("key.epilogue differs from npu.epilogue".into());
+        }
+        if self.key.trunk_route != "stock"
+            && !self
+                .key
+                .trunk_route
+                .strip_prefix("overlay:")
+                .is_some_and(|marker| !marker.trim().is_empty())
+        {
             return Err("key.trunk_route must be stock or overlay:<marker>".into());
         }
         if self.glue.consume_mode != "retile" && self.glue.consume_mode != "direct" {
@@ -222,8 +264,14 @@ impl Calibration {
             return Err("expected bf16,f32 consume_ms_per_col_8192".into());
         }
         for dtype in ["bf16", "f32"] {
-            let cost = self.glue.consume_ms_per_col_8192.get(dtype).ok_or_else(|| format!("missing glue.consume_ms_per_col_8192.{dtype}"))?;
-            if !cost.is_finite() || *cost < 0.0 { return Err(format!("invalid glue.consume_ms_per_col_8192.{dtype}")); }
+            let cost = self
+                .glue
+                .consume_ms_per_col_8192
+                .get(dtype)
+                .ok_or_else(|| format!("missing glue.consume_ms_per_col_8192.{dtype}"))?;
+            if !cost.is_finite() || *cost < 0.0 {
+                return Err(format!("invalid glue.consume_ms_per_col_8192.{dtype}"));
+            }
         }
         for (name, value) in [
             ("device.arch", self.key.device.arch.as_str()),
@@ -250,27 +298,59 @@ impl Calibration {
             return Err("expected qkv,zab,q,kvidx calibration families".into());
         }
         for name in self.families.keys() {
-            if !FAMILY_NAMES.contains(&name.as_str()) && !OUT_FAMILY_NAMES.contains(&name.as_str()) {
+            if !FAMILY_NAMES.contains(&name.as_str()) && !OUT_FAMILY_NAMES.contains(&name.as_str())
+            {
                 return Err(format!("unknown families.{name}"));
             }
         }
         for (i, name) in FAMILY_NAMES.iter().enumerate() {
-            let f = self.families.get(*name).ok_or_else(|| format!("missing families.{name}"))?;
-            if f.cols == 0 || f.layer != if i < 2 { "gdn" } else { "qsa" } { return Err(format!("invalid families.{name}")); }
-            if f.out_dtype != "bf16" && f.out_dtype != "f32" { return Err(format!("invalid families.{name}.out_dtype")); }
-            let cost = self.gpu.trunk_in_ms_per_8192.get(*name).ok_or_else(|| format!("missing gpu.trunk_in_ms_per_8192.{name}"))?;
-            if !cost.is_finite() || *cost < 0.0 { return Err(format!("invalid gpu.trunk_in_ms_per_8192.{name}")); }
+            let f = self
+                .families
+                .get(*name)
+                .ok_or_else(|| format!("missing families.{name}"))?;
+            if f.cols == 0 || f.layer != if i < 2 { "gdn" } else { "qsa" } {
+                return Err(format!("invalid families.{name}"));
+            }
+            if f.out_dtype != "bf16" && f.out_dtype != "f32" {
+                return Err(format!("invalid families.{name}.out_dtype"));
+            }
+            let cost = self
+                .gpu
+                .trunk_in_ms_per_8192
+                .get(*name)
+                .ok_or_else(|| format!("missing gpu.trunk_in_ms_per_8192.{name}"))?;
+            if !cost.is_finite() || *cost < 0.0 {
+                return Err(format!("invalid gpu.trunk_in_ms_per_8192.{name}"));
+            }
         }
         for (name, value) in [
-            ("uniform_per_layer_ms", self.gpu.uniform_per_layer_ms), ("gdn_core_per_layer_ms", self.gpu.gdn_core_per_layer_ms),
-            ("qsa_per_layer_ms", self.gpu.qsa_per_layer_ms), ("qsa_growth_per_layer_ms_per_8192_prefix", self.gpu.qsa_growth_per_layer_ms_per_8192_prefix),
-            ("fixed_per_chunk_ms", self.gpu.fixed_per_chunk_ms), ("boundary_tax_ms", self.gpu.boundary_tax_ms),
-            ("pack_ms_8192", self.glue.pack_ms_8192), ("visit_ms_8192", self.glue.visit_ms_8192),
-            ("sync_ms", self.glue.sync_ms), ("bytes_per_kop", self.npu.bytes_per_kop),
-        ] { if !value.is_finite() || value < 0.0 { return Err(format!("{name} must be finite and nonnegative")); } }
-        if !self.npu.tops_corun.is_finite() || self.npu.tops_corun <= 0.0 { return Err("tops_corun must be finite and positive".into()); }
-        if !self.contention.alpha_overlap.is_finite() || self.contention.alpha_overlap < 1.0 { return Err("alpha_overlap must be finite and >= 1".into()); }
-        if !self.contention.ms_per_gb.is_finite() || self.contention.ms_per_gb < 0.0 { return Err("ms_per_gb must be finite and nonnegative".into()); }
+            ("uniform_per_layer_ms", self.gpu.uniform_per_layer_ms),
+            ("gdn_core_per_layer_ms", self.gpu.gdn_core_per_layer_ms),
+            ("qsa_per_layer_ms", self.gpu.qsa_per_layer_ms),
+            (
+                "qsa_growth_per_layer_ms_per_8192_prefix",
+                self.gpu.qsa_growth_per_layer_ms_per_8192_prefix,
+            ),
+            ("fixed_per_chunk_ms", self.gpu.fixed_per_chunk_ms),
+            ("boundary_tax_ms", self.gpu.boundary_tax_ms),
+            ("pack_ms_8192", self.glue.pack_ms_8192),
+            ("visit_ms_8192", self.glue.visit_ms_8192),
+            ("sync_ms", self.glue.sync_ms),
+            ("bytes_per_kop", self.npu.bytes_per_kop),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(format!("{name} must be finite and nonnegative"));
+            }
+        }
+        if !self.npu.tops_corun.is_finite() || self.npu.tops_corun <= 0.0 {
+            return Err("tops_corun must be finite and positive".into());
+        }
+        if !self.contention.alpha_overlap.is_finite() || self.contention.alpha_overlap < 1.0 {
+            return Err("alpha_overlap must be finite and >= 1".into());
+        }
+        if !self.contention.ms_per_gb.is_finite() || self.contention.ms_per_gb < 0.0 {
+            return Err("ms_per_gb must be finite and nonnegative".into());
+        }
         self.validate_out_families()?;
         Ok(())
     }
@@ -278,24 +358,51 @@ impl Calibration {
     /// in-proj alone rate their co-run rate is scaled by, and (for `qsa.o`) the measured QSA phase windows.
     fn validate_out_families(&self) -> Result<(), String> {
         for (name, layer) in OUT_FAMILY_NAMES.into_iter().zip(["gdn", "qsa"]) {
-            let Some(f) = self.families.get(name) else { continue };
-            let Some(o) = &f.out else { return Err(format!("families.{name} needs an out block")); };
-            if f.cols == 0 || f.layer != layer || f.out_dtype != "bf16" { return Err(format!("invalid families.{name}")); }
-            if o.k == 0 || o.panel_cols == 0 { return Err(format!("invalid families.{name}.out")); }
-            for (field, value) in [("tops_alone", o.tops_alone), ("bytes_per_kop", o.bytes_per_kop), ("gpu_ms_per_8192", o.gpu_ms_per_8192)] {
+            let Some(f) = self.families.get(name) else {
+                continue;
+            };
+            let Some(o) = &f.out else {
+                return Err(format!("families.{name} needs an out block"));
+            };
+            if f.cols == 0 || f.layer != layer || f.out_dtype != "bf16" {
+                return Err(format!("invalid families.{name}"));
+            }
+            if o.k == 0 || o.panel_cols == 0 {
+                return Err(format!("invalid families.{name}.out"));
+            }
+            for (field, value) in [
+                ("tops_alone", o.tops_alone),
+                ("bytes_per_kop", o.bytes_per_kop),
+                ("gpu_ms_per_8192", o.gpu_ms_per_8192),
+            ] {
                 if !value.is_finite() || value < 0.0 || (field == "tops_alone" && value == 0.0) {
                     return Err(format!("invalid families.{name}.out.{field}"));
                 }
             }
-            if !self.npu.tops_alone.is_some_and(|t| t.is_finite() && t > 0.0) { return Err("out families need a positive npu.tops_alone".into()); }
+            if !self
+                .npu
+                .tops_alone
+                .is_some_and(|t| t.is_finite() && t > 0.0)
+            {
+                return Err("out families need a positive npu.tops_alone".into());
+            }
         }
         for name in FAMILY_NAMES {
-            if self.families.get(name).is_some_and(|f| f.out.is_some()) { return Err(format!("families.{name} must not carry an out block")); }
+            if self.families.get(name).is_some_and(|f| f.out.is_some()) {
+                return Err(format!("families.{name} must not carry an out block"));
+            }
         }
         if self.families.contains_key("qsa.o") {
             let q = self.qsa_order.as_ref().ok_or("qsa.o needs qsa_order")?;
-            for (field, value) in [("core_a_ms", q.core_a_ms), ("core_b_ms", q.core_b_ms), ("post_ms", q.post_ms), ("inproj_chain_ms", q.inproj_chain_ms)] {
-                if !value.is_finite() || value < 0.0 { return Err(format!("qsa_order.{field} must be finite and nonnegative")); }
+            for (field, value) in [
+                ("core_a_ms", q.core_a_ms),
+                ("core_b_ms", q.core_b_ms),
+                ("post_ms", q.post_ms),
+                ("inproj_chain_ms", q.inproj_chain_ms),
+            ] {
+                if !value.is_finite() || value < 0.0 {
+                    return Err(format!("qsa_order.{field} must be finite and nonnegative"));
+                }
             }
         } else if self.qsa_order.is_some() {
             return Err("qsa_order without families.qsa.o".into());
@@ -305,9 +412,20 @@ impl Calibration {
 }
 
 /// Pure construction shared by runtime and CPU identity tests.
-pub fn calibration_key(arch: &str, pci_bdf: &str, firmware: &str, release: &str, index: &str, trunk_route: &str) -> CalKey {
+pub fn calibration_key(
+    arch: &str,
+    pci_bdf: &str,
+    firmware: &str,
+    release: &str,
+    index: &str,
+    trunk_route: &str,
+) -> CalKey {
     CalKey {
-        device: DeviceKey { arch: arch.into(), pci_bdf: pci_bdf.to_ascii_lowercase(), npu_fw_version: firmware.trim().into() },
+        device: DeviceKey {
+            arch: arch.into(),
+            pci_bdf: pci_bdf.to_ascii_lowercase(),
+            npu_fw_version: firmware.trim().into(),
+        },
         build: calibration_build_identity(),
         kernel: KernelKey {
             uname_release: release.trim().into(),
@@ -322,17 +440,28 @@ pub fn calibration_key(arch: &str, pci_bdf: &str, firmware: &str, release: &str,
 #[cfg(unix)]
 pub fn npu_firmware() -> Result<String, String> {
     use std::os::unix::fs::FileTypeExt;
-    let node = fs::metadata("/dev/accel/accel0").map_err(|e| format!("NPU accel0 unavailable: {e}"))?;
-    if !node.file_type().is_char_device() { return Err("NPU accel0 is not an accel device".into()); }
+    let node =
+        fs::metadata("/dev/accel/accel0").map_err(|e| format!("NPU accel0 unavailable: {e}"))?;
+    if !node.file_type().is_char_device() {
+        return Err("NPU accel0 is not an accel device".into());
+    }
     let device = Path::new("/sys/class/accel/accel0/device");
     let driver = fs::read_link(device.join("driver")).map_err(|e| format!("NPU driver: {e}"))?;
-    if driver.file_name().is_none_or(|name| name != "amdxdna") { return Err("NPU accel0 is not amdxdna".into()); }
+    if driver.file_name().is_none_or(|name| name != "amdxdna") {
+        return Err("NPU accel0 is not amdxdna".into());
+    }
     let pci = fs::canonicalize(device).map_err(|e| format!("NPU PCI device: {e}"))?;
-    if pci.file_name().is_none_or(|name| !name.to_string_lossy().contains(':')) {
+    if pci
+        .file_name()
+        .is_none_or(|name| !name.to_string_lossy().contains(':'))
+    {
         return Err("NPU accel0 PCI identity unavailable".into());
     }
-    let firmware = fs::read_to_string(device.join("fw_version")).map_err(|e| format!("NPU fw_version: {e}"))?;
-    if firmware.trim().is_empty() { return Err("NPU fw_version is empty".into()); }
+    let firmware = fs::read_to_string(device.join("fw_version"))
+        .map_err(|e| format!("NPU fw_version: {e}"))?;
+    if firmware.trim().is_empty() {
+        return Err("NPU fw_version is empty".into());
+    }
     Ok(firmware)
 }
 
@@ -371,16 +500,24 @@ impl HostFacts {
         Self {
             kernel: fact(&root.join("proc/sys/kernel/osrelease")),
             iommu_gpu: gpu_pci.and_then(|pci| {
-                fact(&root.join("sys/bus/pci/devices").join(pci.to_lowercase()).join("iommu_group/type"))
+                fact(
+                    &root
+                        .join("sys/bus/pci/devices")
+                        .join(pci.to_lowercase())
+                        .join("iommu_group/type"),
+                )
             }),
             iommu_npu: fact(&accel.join("iommu_group/type")),
-            amdxdna: fact(&module.join("version")).or_else(|| module.is_dir().then(|| "in-tree".into())),
+            amdxdna: fact(&module.join("version"))
+                .or_else(|| module.is_dir().then(|| "in-tree".into())),
             npu_fw: fact(&accel.join("fw_version")),
         }
     }
 
     #[cfg(not(unix))]
-    pub fn read(_root: &Path, _gpu_pci: Option<&str>) -> Self { Self::default() }
+    pub fn read(_root: &Path, _gpu_pci: Option<&str>) -> Self {
+        Self::default()
+    }
 }
 
 impl std::fmt::Display for HostFacts {
@@ -389,15 +526,23 @@ impl std::fmt::Display for HostFacts {
         write!(
             f,
             "kernel={} iommu=gpu:{},npu:{} amdxdna={} npu_fw={}",
-            v(&self.kernel), v(&self.iommu_gpu), v(&self.iommu_npu), v(&self.amdxdna), v(&self.npu_fw),
+            v(&self.kernel),
+            v(&self.iommu_gpu),
+            v(&self.iommu_npu),
+            v(&self.amdxdna),
+            v(&self.npu_fw),
         )
     }
 }
 
-pub fn host_facts(gpu_pci: Option<&str>) -> String { HostFacts::read(Path::new("/"), gpu_pci).to_string() }
+pub fn host_facts(gpu_pci: Option<&str>) -> String {
+    HostFacts::read(Path::new("/"), gpu_pci).to_string()
+}
 
 #[cfg(unix)]
-fn host_facts_from(root: &Path, gpu_pci: Option<&str>) -> String { HostFacts::read(root, gpu_pci).to_string() }
+fn host_facts_from(root: &Path, gpu_pci: Option<&str>) -> String {
+    HostFacts::read(root, gpu_pci).to_string()
+}
 
 /// Rows and banks of the serving trunk transport (what `forward.rs` opens).
 #[cfg(target_os = "linux")]
@@ -409,13 +554,16 @@ pub(crate) const TRUNK_BANKS: usize = 2;
 /// the layout code the transport open itself uses, for the serving 8192-row, all-family programs.
 #[cfg(target_os = "linux")]
 pub fn trunk_pin_bytes() -> u64 {
-    use railgun::npu::trunk::{ArenaLayout, Shape as Transport};
     use super::shapes::{FamilyMask, Shape};
-    let programs: Vec<(Transport, usize)> = [(Shape::GdnIn, Transport::GdnIn), (Shape::QsaIn, Transport::QsaIn)]
-        .into_iter()
-        .map(|(shape, transport)| (transport, shape.column_map(FamilyMask::ALL).padded_cols()))
-        .filter(|&(_, pitch)| pitch != 0)
-        .collect();
+    use railgun::npu::trunk::{ArenaLayout, Shape as Transport};
+    let programs: Vec<(Transport, usize)> = [
+        (Shape::GdnIn, Transport::GdnIn),
+        (Shape::QsaIn, Transport::QsaIn),
+    ]
+    .into_iter()
+    .map(|(shape, transport)| (transport, shape.column_map(FamilyMask::ALL).padded_cols()))
+    .filter(|&(_, pitch)| pitch != 0)
+    .collect();
     ArenaLayout::trunk_pinned_bytes(TRUNK_ROWS_MAX, TRUNK_BANKS, &programs)
         .expect("serving trunk rows are a valid layout") as u64
 }
@@ -425,19 +573,42 @@ pub fn trunk_pin_bytes() -> u64 {
 pub use railgun::npu::bounded_memlock_bytes;
 
 /// Read only unprivileged metadata, never open a GPU/NPU or time work.
-pub fn runtime_calibration_key(arch: &str, pci_bdf: &str, index: &str, trunk_route: &str) -> Result<CalKey, String> {
+pub fn runtime_calibration_key(
+    arch: &str,
+    pci_bdf: &str,
+    index: &str,
+    trunk_route: &str,
+) -> Result<CalKey, String> {
     // railgun opens accel0; key that exact device, not the first PCI directory.
     let firmware = npu_firmware()?;
     runtime_key_with_firmware(arch, pci_bdf, &firmware, index, trunk_route)
 }
 
-pub(crate) fn runtime_key_with_firmware(arch: &str, pci_bdf: &str, firmware: &str, index: &str, trunk_route: &str) -> Result<CalKey, String> {
-    let release = std::process::Command::new("uname").arg("-r").output().map_err(|e| format!("uname -r: {e}"))?;
-    if !release.status.success() { return Err("uname -r failed".into()); }
+pub(crate) fn runtime_key_with_firmware(
+    arch: &str,
+    pci_bdf: &str,
+    firmware: &str,
+    index: &str,
+    trunk_route: &str,
+) -> Result<CalKey, String> {
+    let release = std::process::Command::new("uname")
+        .arg("-r")
+        .output()
+        .map_err(|e| format!("uname -r: {e}"))?;
+    if !release.status.success() {
+        return Err("uname -r failed".into());
+    }
     let release = std::str::from_utf8(&release.stdout).map_err(|e| e.to_string())?;
     // PerfOpt's armed message is privileged dmesg, with no sysfs/proc ABI.
     // Schema 3 deliberately keys kernel identity on uname_release alone.
-    Ok(calibration_key(arch, pci_bdf, firmware, release, index, trunk_route))
+    Ok(calibration_key(
+        arch,
+        pci_bdf,
+        firmware,
+        release,
+        index,
+        trunk_route,
+    ))
 }
 
 /// Capture the base before it moves into the source owner. Off does nothing; on reads only the
@@ -571,8 +742,14 @@ mod builtin_tests {
     #[test]
     fn measured_builtin_keys_validate_for_this_build() {
         for (json, route) in [
-            (include_str!("calibrations/halo-xdna2-overlay-v4.json"), "overlay:gfx1151-zab-v1"),
-            (include_str!("calibrations/halo-xdna2-stock-v2.json"), "stock"),
+            (
+                include_str!("calibrations/halo-xdna2-overlay-v4.json"),
+                "overlay:gfx1151-zab-v1",
+            ),
+            (
+                include_str!("calibrations/halo-xdna2-stock-v2.json"),
+                "stock",
+            ),
         ] {
             let cal: Calibration = serde_json::from_str(json).unwrap();
             cal.validate().unwrap();
@@ -590,12 +767,22 @@ mod builtin_tests {
             assert!(!super::super::auto_admission(&cal, &key).unwrap().is_empty());
             let mut mismatched = key;
             mismatched.device.npu_fw_version.push('x');
-            assert_eq!(cal.key_matches(&mismatched), Err("calibration key mismatch: device.npu_fw_version".into()));
+            assert_eq!(
+                cal.key_matches(&mismatched),
+                Err("calibration key mismatch: device.npu_fw_version".into())
+            );
         }
     }
 
-    fn builtin_with_host(route: &str, uname: &str, fw: &str, bdf: &str) -> (Calibration, CalKey, Result<Vec<&'static str>, String>) {
-        let (mut cal, source) = Calibration::load_with_builtin("/nonexistent/npu-trunk-calibration.json", route).unwrap();
+    fn builtin_with_host(
+        route: &str,
+        uname: &str,
+        fw: &str,
+        bdf: &str,
+    ) -> (Calibration, CalKey, Result<Vec<&'static str>, String>) {
+        let (mut cal, source) =
+            Calibration::load_with_builtin("/nonexistent/npu-trunk-calibration.json", route)
+                .unwrap();
         assert_eq!(source, "builtin");
         let key = calibration_key("gfx1151", bdf, fw, uname, NORMALIZED_TRUNK_INDEX, route);
         let differ = cal.bind_builtin(&key);
@@ -606,11 +793,20 @@ mod builtin_tests {
     fn builtin_binds_any_kernel_firmware_gpu_address_at_margin_zero() {
         use super::super::{auto_admission, plan, Step};
         for route in ["overlay:gfx1151-zab-v1", "stock"] {
-            let (cal, key, differ) = builtin_with_host(route, "7.3.0-rc7-perfopt+", "1.1.2.65", "0000:c0:00.0");
+            let (cal, key, differ) =
+                builtin_with_host(route, "7.3.0-rc7-perfopt+", "1.1.2.65", "0000:c0:00.0");
             assert!(differ.unwrap().is_empty());
             assert_eq!(cal.margin, 0.0);
-            let (cal, key2, differ) = builtin_with_host(route, "6.17.0-stock", "1.1.9.9", "0000:c1:00.0");
-            assert_eq!(differ.unwrap(), ["device.pci_bdf", "device.npu_fw_version", "kernel.uname_release"]);
+            let (cal, key2, differ) =
+                builtin_with_host(route, "6.17.0-stock", "1.1.9.9", "0000:c1:00.0");
+            assert_eq!(
+                differ.unwrap(),
+                [
+                    "device.pci_bdf",
+                    "device.npu_fw_version",
+                    "kernel.uname_release"
+                ]
+            );
             assert_eq!(cal.margin, 0.0);
             assert_eq!(cal.key, key2);
             assert_ne!(key2, key);
@@ -618,8 +814,12 @@ mod builtin_tests {
             let families = auto_admission(&cal, &key2).unwrap();
             assert!(!families.is_empty());
             let p = plan(&cal, families, 16384);
-            assert!(p.steps.iter().any(|s| matches!(s, Step::Pipe { .. })), "{route}: {p:?}");
-            let (cal, _, differ) = builtin_with_host(route, "6.17.0-stock", "1.1.2.65", "0000:c0:00.0");
+            assert!(
+                p.steps.iter().any(|s| matches!(s, Step::Pipe { .. })),
+                "{route}: {p:?}"
+            );
+            let (cal, _, differ) =
+                builtin_with_host(route, "6.17.0-stock", "1.1.2.65", "0000:c0:00.0");
             assert_eq!(differ.unwrap(), ["kernel.uname_release"]);
             assert_eq!(cal.margin, 0.0);
         }
@@ -641,10 +841,16 @@ mod builtin_tests {
         );
         let mut arch = base.clone();
         arch.device.arch = "gfx1150".into();
-        assert_eq!(cal.clone().bind_builtin(&arch), Err("calibration key mismatch: device.arch".into()));
+        assert_eq!(
+            cal.clone().bind_builtin(&arch),
+            Err("calibration key mismatch: device.arch".into())
+        );
         let mut build = base.clone();
         build.build.push('x');
-        assert_eq!(cal.clone().bind_builtin(&build), Err("calibration key mismatch: build".into()));
+        assert_eq!(
+            cal.clone().bind_builtin(&build),
+            Err("calibration key mismatch: build".into())
+        );
         let mut model = base.clone();
         model.model_trunk_index_sha256 = "0".repeat(64);
         assert_eq!(
@@ -653,16 +859,25 @@ mod builtin_tests {
         );
         let mut epilogue = base.clone();
         epilogue.epilogue = "f32".into();
-        assert_eq!(cal.clone().bind_builtin(&epilogue), Err("calibration key mismatch: epilogue".into()));
+        assert_eq!(
+            cal.clone().bind_builtin(&epilogue),
+            Err("calibration key mismatch: epilogue".into())
+        );
         let mut other_route = base.clone();
         other_route.trunk_route = "overlay:gfx1151-zab-v1".into();
-        assert_eq!(cal.clone().bind_builtin(&other_route), Err("calibration key mismatch: trunk_route".into()));
+        assert_eq!(
+            cal.clone().bind_builtin(&other_route),
+            Err("calibration key mismatch: trunk_route".into())
+        );
         // A refused bind leaves the record untouched.
         let mut refused = cal.clone();
         assert!(refused.bind_builtin(&model).is_err());
         assert_eq!(refused.key, cal.key);
         // A calibration file is never bound: the host's kernel differs from the record's, so the strict key refuses it.
-        assert_eq!(super::super::auto_admission(&cal, &base), Err("calibration key mismatch: kernel.uname_release".into()));
+        assert_eq!(
+            super::super::auto_admission(&cal, &base),
+            Err("calibration key mismatch: kernel.uname_release".into())
+        );
     }
 
     #[test]
@@ -681,7 +896,8 @@ mod builtin_tests {
         fs::write(&path, b"{}").unwrap();
         assert!(Calibration::load_with_builtin(&path, "stock").is_err());
         fs::remove_file(&path).unwrap();
-        let (overlay, source) = Calibration::load_with_builtin(&path, "overlay:gfx1151-zab-v1").unwrap();
+        let (overlay, source) =
+            Calibration::load_with_builtin(&path, "overlay:gfx1151-zab-v1").unwrap();
         assert_eq!(source, "builtin");
         assert_eq!(overlay.key.trunk_route, "overlay:gfx1151-zab-v1");
         fs::remove_dir(dir).unwrap();
@@ -1011,8 +1227,14 @@ mod trunk_index_tests {
             super::builtin_tests::NORMALIZED_TRUNK_INDEX,
         )
         .unwrap();
-        assert_ne!(baseline.family_mask, 0, "{route}: built-in admits no family");
-        assert!(baseline.n_star.is_some(), "{route}: built-in has no crossover");
+        assert_ne!(
+            baseline.family_mask, 0,
+            "{route}: built-in admits no family"
+        );
+        assert!(
+            baseline.n_star.is_some(),
+            "{route}: built-in has no crossover"
+        );
         assert!(
             baseline
                 .eligibility
@@ -1137,8 +1359,14 @@ mod host_facts_tests {
     struct TempRoot(std::path::PathBuf);
     impl TempRoot {
         fn new(tag: &str) -> Self {
-            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-            let dir = std::env::temp_dir().join(format!("hipfire-host-facts-{tag}-{}-{nanos}", std::process::id()));
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "hipfire-host-facts-{tag}-{}-{nanos}",
+                std::process::id()
+            ));
             fs::create_dir_all(&dir).unwrap();
             Self(dir)
         }
@@ -1148,26 +1376,41 @@ mod host_facts_tests {
             fs::write(path, text).unwrap();
         }
     }
-    impl Drop for TempRoot { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn host_facts_stock_kernel_fixture() {
         let root = TempRoot::new("stock");
         root.put("proc/sys/kernel/osrelease", "7.2.8\n");
-        root.put("sys/bus/pci/devices/0000:c0:00.0/iommu_group/type", "DMA-FQ\n");
+        root.put(
+            "sys/bus/pci/devices/0000:c0:00.0/iommu_group/type",
+            "DMA-FQ\n",
+        );
         root.put("sys/class/accel/accel0/device/iommu_group/type", "DMA-FQ\n");
         fs::create_dir_all(root.0.join("sys/module/amdxdna")).unwrap();
         root.put("sys/class/accel/accel0/device/fw_version", "1.1.2.65\n");
-        assert_eq!(host_facts_from(&root.0, Some("0000:C0:00.0")),
-            "kernel=7.2.8 iommu=gpu:DMA-FQ,npu:DMA-FQ amdxdna=in-tree npu_fw=1.1.2.65");
+        assert_eq!(
+            host_facts_from(&root.0, Some("0000:C0:00.0")),
+            "kernel=7.2.8 iommu=gpu:DMA-FQ,npu:DMA-FQ amdxdna=in-tree npu_fw=1.1.2.65"
+        );
     }
 
     #[test]
     fn host_facts_perfopt_kernel_fixture() {
         let root = TempRoot::new("perfopt");
         root.put("proc/sys/kernel/osrelease", "7.3.0-rc7-perfopt+\n");
-        root.put("sys/bus/pci/devices/0000:c0:00.0/iommu_group/type", "identity\n");
-        root.put("sys/class/accel/accel0/device/iommu_group/type", "identity\n");
+        root.put(
+            "sys/bus/pci/devices/0000:c0:00.0/iommu_group/type",
+            "identity\n",
+        );
+        root.put(
+            "sys/class/accel/accel0/device/iommu_group/type",
+            "identity\n",
+        );
         root.put("sys/module/amdxdna/version", "2.21.0\n");
         root.put("sys/class/accel/accel0/device/fw_version", "1.1.2.65\n");
         assert_eq!(host_facts_from(&root.0, Some("0000:c0:00.0")),
@@ -1182,25 +1425,37 @@ mod host_facts_tests {
         assert_eq!(host_facts_from(&root.0, None), unknown);
         root.put("sys/bus/pci/devices/0000:c0:00.0/iommu_group/type", "DMA\n");
         root.put("proc/sys/kernel/osrelease", "7.2.8\n");
-        assert_eq!(host_facts_from(&root.0, None), "kernel=7.2.8 iommu=gpu:unknown,npu:unknown amdxdna=unknown npu_fw=unknown");
+        assert_eq!(
+            host_facts_from(&root.0, None),
+            "kernel=7.2.8 iommu=gpu:unknown,npu:unknown amdxdna=unknown npu_fw=unknown"
+        );
     }
 
     #[test]
     fn host_facts_struct_fields_match_the_line() {
         let root = TempRoot::new("fields");
         root.put("proc/sys/kernel/osrelease", "7.3.0-rc7-perfopt+\n");
-        root.put("sys/bus/pci/devices/0000:c0:00.0/iommu_group/type", "identity\n");
+        root.put(
+            "sys/bus/pci/devices/0000:c0:00.0/iommu_group/type",
+            "identity\n",
+        );
         root.put("sys/class/accel/accel0/device/iommu_group/type", "DMA-FQ\n");
         fs::create_dir_all(root.0.join("sys/module/amdxdna")).unwrap();
         let facts = HostFacts::read(&root.0, Some("0000:C0:00.0"));
-        assert_eq!(facts, HostFacts {
-            kernel: Some("7.3.0-rc7-perfopt+".into()),
-            iommu_gpu: Some("identity".into()),
-            iommu_npu: Some("DMA-FQ".into()),
-            amdxdna: Some("in-tree".into()),
-            npu_fw: None,
-        });
-        assert_eq!(facts.to_string(), host_facts_from(&root.0, Some("0000:C0:00.0")));
+        assert_eq!(
+            facts,
+            HostFacts {
+                kernel: Some("7.3.0-rc7-perfopt+".into()),
+                iommu_gpu: Some("identity".into()),
+                iommu_npu: Some("DMA-FQ".into()),
+                amdxdna: Some("in-tree".into()),
+                npu_fw: None,
+            }
+        );
+        assert_eq!(
+            facts.to_string(),
+            host_facts_from(&root.0, Some("0000:C0:00.0"))
+        );
         assert_eq!(facts.to_string(),
             "kernel=7.3.0-rc7-perfopt+ iommu=gpu:identity,npu:DMA-FQ amdxdna=in-tree npu_fw=unknown");
     }

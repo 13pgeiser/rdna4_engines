@@ -53,7 +53,10 @@ fn dispatch_representation(source: &str) -> String {
             in_dtype = false;
         }
     }
-    assert!(out.contains("pub enum DType"), "loader ABI: DType enum not found in {DISPATCH}");
+    assert!(
+        out.contains("pub enum DType"),
+        "loader ABI: DType enum not found in {DISPATCH}"
+    );
     out
 }
 
@@ -69,7 +72,8 @@ fn main() {
     }
     let dispatch = root.join(DISPATCH);
     println!("cargo:rerun-if-changed={}", dispatch.display());
-    let source = std::fs::read_to_string(&dispatch).unwrap_or_else(|e| panic!("loader ABI: read {DISPATCH}: {e}"));
+    let source = std::fs::read_to_string(&dispatch)
+        .unwrap_or_else(|e| panic!("loader ABI: read {DISPATCH}: {e}"));
     components.push((
         format!("{DISPATCH}#representation"),
         Sha256::digest(dispatch_representation(&source).as_bytes()).into(),
@@ -111,5 +115,6 @@ fn main() {
     }
     out.push_str("];\n");
     let dest = Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("loader_abi.rs");
-    std::fs::write(&dest, out).unwrap_or_else(|e| panic!("loader ABI: write {}: {e}", dest.display()));
+    std::fs::write(&dest, out)
+        .unwrap_or_else(|e| panic!("loader ABI: write {}: {e}", dest.display()));
 }

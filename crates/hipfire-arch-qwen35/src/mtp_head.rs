@@ -74,9 +74,8 @@ use std::path::{Path, PathBuf};
 /// Kill switch for the kv_only MTP fill concat acceleration
 /// (`HIPFIRE_MTP_FILL_FAST=0` restores the per-row D2D concat loop).
 pub(crate) fn mtp_fill_fast_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        hipfire_config::developer_bool("HIPFIRE_MTP_FILL_FAST", true)
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_MTP_FILL_FAST", true));
     *ON
 }
 
@@ -2484,8 +2483,9 @@ impl Qwen35MtpHeadBatchedScratch {
         if prompt_len == 0 || legacy_rows == 0 || trunk_chunk_max == 0 {
             return 0;
         }
-        let budget = Self::full_requested_bytes(cfg, legacy_rows)
-            .saturating_add(Self::rotation_requested_bytes(legacy_rows, legacy_rotation_k));
+        let budget = Self::full_requested_bytes(cfg, legacy_rows).saturating_add(
+            Self::rotation_requested_bytes(legacy_rows, legacy_rotation_k),
+        );
         let fits = |rows: usize| {
             Self::lean_requested_bytes(cfg, rows)
                 .saturating_add(Self::rotation_requested_bytes(rows, fill_rotation_k))
@@ -2565,7 +2565,13 @@ fn weight_gemm_batched(
             let rot = rotated_x_scratch.expect("MQ4 batched gemm requires rotated_x_scratch");
             llama::rotate_x_mq_batched_for(gpu, w, x_batched, rot, w.k, n)?;
             hipfire_dispatch::families::gemm::run_mtp_fill_mq4(
-                gpu, &w.buf, rot, y_batched, w.m, w.k, n,
+                gpu,
+                &w.buf,
+                rot,
+                y_batched,
+                w.m,
+                w.k,
+                n,
                 fast_fill && mtp_fill_pm_gemm_enabled(),
             )
         }
@@ -2868,7 +2874,15 @@ pub fn mtp_head_forward_block_batched(
     if !fast_fill {
         let q_full_view = scratch.q_full.sub_offset(0, n * 2 * q_dim);
         let gate_view = scratch.gate.sub_offset(0, n * q_dim);
-        weight_gemm_batched(gpu, &w.wq, &tmp_view, &q_full_view, n, rotated_x_scratch, false)?;
+        weight_gemm_batched(
+            gpu,
+            &w.wq,
+            &tmp_view,
+            &q_full_view,
+            n,
+            rotated_x_scratch,
+            false,
+        )?;
 
         // Deinterleave per-head into Q + Gate. Output: [n × n_head × head_dim] each.
         gpu.deinterleave_f32_batched(
@@ -2899,7 +2913,15 @@ pub fn mtp_head_forward_block_batched(
     // K, V projections.
     let k_view = scratch.k.sub_offset(0, n * kv_dim);
     let v_view = scratch.v.sub_offset(0, n * kv_dim);
-    weight_gemm_batched(gpu, &w.wk, &tmp_view, &k_view, n, rotated_x_scratch, fast_fill)?;
+    weight_gemm_batched(
+        gpu,
+        &w.wk,
+        &tmp_view,
+        &k_view,
+        n,
+        rotated_x_scratch,
+        fast_fill,
+    )?;
     // fast_fill: wk and wv share input tmp_view; when both are plain MQ4G256
     // (no AWQ sidecar, same k) the rotation wk just wrote into rotated_x_scratch
     // is bit-identical to what wv would recompute, so reuse it.
@@ -2930,7 +2952,15 @@ pub fn mtp_head_forward_block_batched(
                 )?;
             }
         }
-        _ => weight_gemm_batched(gpu, &w.wv, &tmp_view, &v_view, n, rotated_x_scratch, fast_fill)?,
+        _ => weight_gemm_batched(
+            gpu,
+            &w.wv,
+            &tmp_view,
+            &v_view,
+            n,
+            rotated_x_scratch,
+            fast_fill,
+        )?,
     }
     gpu.rmsnorm_batched(
         &k_view,
@@ -3029,7 +3059,15 @@ pub fn mtp_head_forward_block_batched(
 
     // ── 8. Output projection + residual ──────────────────────────────────
     let o_view = scratch.o.sub_offset(0, n * dim);
-    weight_gemm_batched(gpu, &w.wo, &attn_out_view, &o_view, n, rotated_x_scratch, false)?;
+    weight_gemm_batched(
+        gpu,
+        &w.wo,
+        &attn_out_view,
+        &o_view,
+        n,
+        rotated_x_scratch,
+        false,
+    )?;
     let res_view = scratch.residual.sub_offset(0, n * dim);
     gpu.add_inplace_f32(&o_view, &res_view)?;
 
@@ -3058,7 +3096,15 @@ pub fn mtp_head_forward_block_batched(
                 rotated_x_scratch,
                 false,
             )?;
-            weight_gemm_batched(gpu, &ffn.up, &tmp_view, &up_view, n, rotated_x_scratch, false)?;
+            weight_gemm_batched(
+                gpu,
+                &ffn.up,
+                &tmp_view,
+                &up_view,
+                n,
+                rotated_x_scratch,
+                false,
+            )?;
             gpu.silu_mul_f32(&gate_ffn_view, &up_view, &ffn_hidden_view)?;
             weight_gemm_batched(
                 gpu,
@@ -3215,7 +3261,10 @@ mod prompt_fill_budget_tests {
                 + Qwen35MtpHeadBatchedScratch::rotation_requested_bytes(legacy, LEGACY_K);
             for prompt in [1usize, 2, 9, 383, 1264, 1688, 4096, 16_059] {
                 let r = rows(legacy, 8192, prompt);
-                assert!(r >= 1 && r <= prompt.min(8192), "legacy={legacy} prompt={prompt} r={r}");
+                assert!(
+                    r >= 1 && r <= prompt.min(8192),
+                    "legacy={legacy} prompt={prompt} r={r}"
+                );
                 let used = Qwen35MtpHeadBatchedScratch::lean_requested_bytes(&c, r)
                     + Qwen35MtpHeadBatchedScratch::rotation_requested_bytes(r, FILL_K);
                 assert!(

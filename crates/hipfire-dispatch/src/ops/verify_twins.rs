@@ -36,5 +36,14 @@ pub fn attention_fp8_segs(
     head_dim: usize,
     max_seq: usize,
 ) -> HipResult<()> {
-    gpu.attention_fp8_e4m3_kv_batched_segs(table, at, max_rows, max_ctx_lens, n_heads, n_kv_heads, head_dim, max_seq)
+    gpu.attention_fp8_e4m3_kv_batched_segs(
+        table,
+        at,
+        max_rows,
+        max_ctx_lens,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_seq,
+    )
 }

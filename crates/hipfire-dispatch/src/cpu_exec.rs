@@ -76,13 +76,12 @@ enum HostExecMode {
 }
 
 fn host_exec_mode() -> HostExecMode {
-    static MODE: LazyLock<HostExecMode> = LazyLock::new(|| {
-        match hipfire_config::memory::offload_exec() {
+    static MODE: LazyLock<HostExecMode> =
+        LazyLock::new(|| match hipfire_config::memory::offload_exec() {
             hipfire_config::memory::OffloadExec::Cpu => HostExecMode::Cpu,
             hipfire_config::memory::OffloadExec::Passback => HostExecMode::Passback,
             hipfire_config::memory::OffloadExec::Pcie => HostExecMode::Pcie,
-        }
-    });
+        });
     *MODE
 }
 
@@ -1014,7 +1013,8 @@ pub fn moe_cpu_experts<'a>(
     // The splice's whole wall time, started after validation and stopped just
     // before the trace print (which is not part of the call's cost).
     let t_total = Instant::now();
-    gpu.bind_thread().map_err(|e| cpu_err(&format!("bind: {e}")))?;
+    gpu.bind_thread()
+        .map_err(|e| cpu_err(&format!("bind: {e}")))?;
     let stage_bytes = n_x
         .checked_add(slots)
         .and_then(|n| n.checked_mul(8))
@@ -1058,7 +1058,8 @@ pub fn moe_cpu_experts<'a>(
             download_transfer(gpu, transfer, residual, n_x + 2 * slots, n_x)?;
             timing.d2h_enqueue_ns = t_enqueue.elapsed().as_nanos() as u64;
             let t_complete = Instant::now();
-            transfer.complete(&gpu.hip)
+            transfer
+                .complete(&gpu.hip)
                 .map_err(|e| cpu_err(&format!("D2H completion: {e}")))?;
             timing.d2h_complete_ns = t_complete.elapsed().as_nanos() as u64;
             let values = transfer_values(transfer, stage_bytes / 4);
@@ -1256,11 +1257,7 @@ fn moe_cpu_experts_host(
 
 /// One expert's span contract: both projections' group widths divide the
 /// shapes and both retained spans cover their extents.
-fn validate_expert_spans(
-    dim: usize,
-    mi: usize,
-    e: &CpuMoeExpert<'_>,
-) -> Result<(), DispatchError> {
+fn validate_expert_spans(dim: usize, mi: usize, e: &CpuMoeExpert<'_>) -> Result<(), DispatchError> {
     if dim % e.gate_up_quant.k_multiple() != 0 || mi % e.down_quant.k_multiple() != 0 {
         return Err(cpu_err(&format!(
             "moe cpu expert splice: dim={dim} / mi={mi} not a multiple of the expert's gate_up / down group width"
@@ -1546,9 +1543,7 @@ pub fn validate_moe_cpu_host_slot_outputs(
         )));
     }
     if experts.len() != host_slots.len() {
-        return Err(cpu_err(
-            "moe cpu host slots: span count != host slot count",
-        ));
+        return Err(cpu_err("moe cpu host slots: span count != host slot count"));
     }
     let words = slots.div_ceil(64);
     let mut stack = [0u64; HOST_SLOT_MASK_STACK_WORDS];
@@ -1708,7 +1703,9 @@ pub fn moe_cpu_host_slot_outputs(
         let mut guard = cell.borrow_mut();
         let scratch: &mut MoeScratch = &mut guard;
         in_splice_pool(|| {
-            host_slot_outputs_core(dim, mi, top_k, ids, host_slots, experts, x_rot, scratch, out)
+            host_slot_outputs_core(
+                dim, mi, top_k, ids, host_slots, experts, x_rot, scratch, out,
+            )
         })
     })
 }
@@ -1844,8 +1841,7 @@ pub(crate) fn finish_step(
     match exec {
         HostExec::Cpu => {
             CPU_STEPS.fetch_add(1, Ordering::Relaxed);
-            CPU_STEP_WALL_NS
-                .fetch_add(step_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            CPU_STEP_WALL_NS.fetch_add(step_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
         HostExec::Split { gpu_rows } => {
             SPLIT_STEPS.fetch_add(1, Ordering::Relaxed);
@@ -1963,7 +1959,9 @@ fn trace_moe_step(
     let Ok(mut shapes) = MOE_SHAPES.lock() else {
         return;
     };
-    let stats = shapes.entry((q as u8, dim, mi, k, rows, graded)).or_default();
+    let stats = shapes
+        .entry((q as u8, dim, mi, k, rows, graded))
+        .or_default();
     stats.calls += 1;
     stats.d2h_enqueue_ns += timing.d2h_enqueue_ns;
     stats.d2h_complete_ns += timing.d2h_complete_ns;
@@ -2402,8 +2400,7 @@ fn download_into_f32(
     );
     // Safety: `out[..n]` is a live `n`-element f32 buffer; the slice covers
     // exactly those bytes and does not outlive the call.
-    let bytes =
-        unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * 4) };
+    let bytes = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * 4) };
     gpu.memcpy_dtoh_auto(bytes, &t.buf)
         .map_err(|e| cpu_err(&format!("D2H: {e}")))
 }
@@ -2429,19 +2426,29 @@ fn with_cpu_transfer<R>(
     run: impl FnOnce(&mut hip_bridge::PinnedTransferBuffer) -> Result<R, DispatchError>,
 ) -> Result<R, DispatchError> {
     if gpu.graphs.capture_mode || gpu.replay.is_recording() {
-        return Err(cpu_err("CPU transfer cannot run during capture or retained recording"));
+        return Err(cpu_err(
+            "CPU transfer cannot run during capture or retained recording",
+        ));
     }
-    gpu.bind_thread().map_err(|e| cpu_err(&format!("bind: {e}")))?;
-    let bytes = values.checked_mul(4)
+    gpu.bind_thread()
+        .map_err(|e| cpu_err(&format!("bind: {e}")))?;
+    let bytes = values
+        .checked_mul(4)
         .ok_or_else(|| cpu_err("CPU transfer extent overflows"))?;
     CPU_TRANSFER.with(|cell| {
         let mut owner = cell.borrow_mut();
-        if owner.as_ref().is_none_or(|b| b.size() < bytes || b.device() != gpu.device_id) {
+        if owner
+            .as_ref()
+            .is_none_or(|b| b.size() < bytes || b.device() != gpu.device_id)
+        {
             // Retire the old allocation before binding/allocating the new one.
             // Its destructor restores this caller's current device.
             drop(owner.take());
-            *owner = Some(gpu.hip.transfer_buffer(bytes)
-                .map_err(|e| cpu_err(&format!("pinned transfer stage: {e}")))?);
+            *owner = Some(
+                gpu.hip
+                    .transfer_buffer(bytes)
+                    .map_err(|e| cpu_err(&format!("pinned transfer stage: {e}")))?,
+            );
         }
         let result = run(owner.as_mut().expect("stage allocated above"));
         // Earlier enqueues can survive a later error. Protect their device
@@ -2470,7 +2477,14 @@ fn download_transfer(
     if tensor.numel() < n {
         return Err(cpu_err("D2H tensor extent too small"));
     }
-    transfer.download_async(&gpu.hip, &tensor.buf, offset * 4, n * 4, gpu.active_stream.as_ref())
+    transfer
+        .download_async(
+            &gpu.hip,
+            &tensor.buf,
+            offset * 4,
+            n * 4,
+            gpu.active_stream.as_ref(),
+        )
         .map_err(|e| cpu_err(&format!("D2H enqueue: {e}")))
 }
 
@@ -2484,7 +2498,14 @@ fn upload_transfer(
     if tensor.numel() < n {
         return Err(cpu_err("H2D tensor extent too small"));
     }
-    transfer.upload_async(&gpu.hip, &tensor.buf, offset * 4, n * 4, gpu.active_stream.as_ref())
+    transfer
+        .upload_async(
+            &gpu.hip,
+            &tensor.buf,
+            offset * 4,
+            n * 4,
+            gpu.active_stream.as_ref(),
+        )
         .map_err(|e| cpu_err(&format!("H2D enqueue: {e}")))
 }
 
@@ -2643,7 +2664,9 @@ fn moe_layer_trace_inner(layer_idx: usize, is_full_attn: bool, timing: MoeLayerT
     let Ok(mut layers) = MOE_LAYERS.lock() else {
         return;
     };
-    let stats = layers.entry((layer_idx, is_full_attn, timing.rows)).or_default();
+    let stats = layers
+        .entry((layer_idx, is_full_attn, timing.rows))
+        .or_default();
     stats.calls += 1;
     stats.total_ns += timing.total_ns;
     stats.attn_ns += timing.attn_ns;
@@ -2891,8 +2914,9 @@ mod moe_splice_tests {
             CpuQuant::Mq4G256 => b[..8].copy_from_slice(&f32x2(0.03125, -0.5)),
             CpuQuant::Mq6G256 => b[..8].copy_from_slice(&f32x2(0.0078125, -0.125)),
             CpuQuant::Mq3G256Lloyd => {
-                const CB: [u16; 8] =
-                    [0xbc00, 0xb800, 0xb400, 0xb000, 0x3000, 0x3400, 0x3800, 0x3c00];
+                const CB: [u16; 8] = [
+                    0xbc00, 0xb800, 0xb400, 0xb000, 0x3000, 0x3400, 0x3800, 0x3c00,
+                ];
                 for (k, v) in CB.iter().enumerate() {
                     b[2 * k..2 * k + 2].copy_from_slice(&v.to_le_bytes());
                 }
@@ -3092,7 +3116,14 @@ mod moe_splice_tests {
                 let s = t * top_k + j;
                 let e = idx[s];
                 let mut gv = vec![0.0f32; 2 * mi];
-                gemv(gu_q[e], &gu[e], 2 * mi, dim, &x[t * dim..(t + 1) * dim], &mut gv);
+                gemv(
+                    gu_q[e],
+                    &gu[e],
+                    2 * mi,
+                    dim,
+                    &x[t * dim..(t + 1) * dim],
+                    &mut gv,
+                );
                 let mut hid = vec![0.0f32; mi];
                 silu_mul(&gv, &mut hid);
                 if dn_q[e].is_fwht_g256() {
@@ -3545,7 +3576,15 @@ mod moe_splice_tests {
                 let mut scratch = MoeScratch::default();
                 pool.install(|| {
                     host_slot_outputs_core(
-                        HS_DIM, HS_MI, top_k, ids, host, experts, x, &mut scratch, out,
+                        HS_DIM,
+                        HS_MI,
+                        top_k,
+                        ids,
+                        host,
+                        experts,
+                        x,
+                        &mut scratch,
+                        out,
                     )
                 })
             }
@@ -3622,7 +3661,11 @@ mod moe_splice_tests {
                 let row = s / top_k;
                 assert_eq!(
                     bits(&full[range(s)]),
-                    bits(&slot_reference(&fx, ids[s], &x[row * HS_DIM..(row + 1) * HS_DIM])),
+                    bits(&slot_reference(
+                        &fx,
+                        ids[s],
+                        &x[row * HS_DIM..(row + 1) * HS_DIM]
+                    )),
                     "slot {s} != scalar reference"
                 );
             } else {
@@ -3639,8 +3682,9 @@ mod moe_splice_tests {
         let mut ar = vec![0.0f32; rows * HS_DIM];
         for t in 0..rows {
             let r_ids = &ids[t * top_k..(t + 1) * top_k];
-            let r_host: Vec<u32> =
-                (0..top_k as u32).filter(|&s| route_id_valid(r_ids[s as usize], n_exp)).collect();
+            let r_host: Vec<u32> = (0..top_k as u32)
+                .filter(|&s| route_id_valid(r_ids[s as usize], n_exp))
+                .collect();
             let mut r_full = stale(top_k * HS_DIM);
             hs_run(
                 None,
@@ -3733,9 +3777,19 @@ mod moe_splice_tests {
             for t in 0..rows {
                 got[t * HS_DIM..(t + 1) * HS_DIM].copy_from_slice(&residual0);
             }
-            moe_canonical_combine_reference(HS_DIM, rows, top_k, n_exp, ids, w, &expanded, &mut got);
-            assert_eq!(bits(&got), bits(&reference), "mask {mask:#b}: split join != unsplit");
-            assert_eq!(bits(&got), bits(&ar), "mask {mask:#b}: split join != per-row one-row AR");
+            moe_canonical_combine_reference(
+                HS_DIM, rows, top_k, n_exp, ids, w, &expanded, &mut got,
+            );
+            assert_eq!(
+                bits(&got),
+                bits(&reference),
+                "mask {mask:#b}: split join != unsplit"
+            );
+            assert_eq!(
+                bits(&got),
+                bits(&ar),
+                "mask {mask:#b}: split join != per-row one-row AR"
+            );
 
             // Two-partial: the GPU arm reduces first (host slots masked to -1),
             // then the host arm reduces over its result.
@@ -3771,7 +3825,11 @@ mod moe_splice_tests {
     /// Deterministic LCG masks for windows too wide to enumerate; the all-cold,
     /// all-hot and per-row-only / per-row-excluded masks are always included.
     fn sampled_masks(slots: usize, top_k: usize, n: usize) -> Vec<u64> {
-        let all = if slots == 64 { u64::MAX } else { (1u64 << slots) - 1 };
+        let all = if slots == 64 {
+            u64::MAX
+        } else {
+            (1u64 << slots) - 1
+        };
         let mut row0 = 0u64;
         for s in 0..top_k {
             row0 |= 1 << s;
@@ -3796,7 +3854,9 @@ mod moe_splice_tests {
     #[test]
     fn canonical_join_is_byte_identical_for_all_1024_masks() {
         let ids = [7, 2, 9, 2, 8, 5, 0, 5, 3, 4];
-        let w = [0.5, 1.0e30, 0.35, -1.0e30, 0.3, 1.0e37, 1.0e-38, -1.0e37, 0.0, -0.0];
+        let w = [
+            0.5, 1.0e30, 0.35, -1.0e30, 0.3, 1.0e37, 1.0e-38, -1.0e37, 0.0, -0.0,
+        ];
         assert!(
             run_mask_case(ids, w),
             "fixture cannot distinguish a two-partial combine from the canonical one"
@@ -3808,7 +3868,18 @@ mod moe_splice_tests {
     #[test]
     fn canonical_join_ignores_sentinel_and_invalid_slots_for_all_1024_masks() {
         let ids = [7, -1, 9, 2, 8, 5, 40, 5, 3, 2];
-        let w = [0.5, f32::NAN, 0.35, 1.0e30, 0.3, 1.0e37, f32::INFINITY, -1.0e37, 0.0, -1.0e30];
+        let w = [
+            0.5,
+            f32::NAN,
+            0.35,
+            1.0e30,
+            0.3,
+            1.0e37,
+            f32::INFINITY,
+            -1.0e37,
+            0.0,
+            -1.0e30,
+        ];
         assert!(
             run_mask_case(ids, w),
             "fixture cannot distinguish a two-partial combine from the canonical one"
@@ -3828,9 +3899,15 @@ mod moe_splice_tests {
             [4, 3, 5, 0, 8, 9, 2, 7, 2, 5],
         ];
         let base_w: [[f32; 10]; 4] = [
-            [0.5, 1.0e30, 0.35, -1.0e30, 0.3, 1.0e37, 1.0e-38, -1.0e37, 0.0, -0.0],
-            [0.25, -1.0e30, 0.4, 1.0e30, 0.15, -1.0e37, 3.0e-39, 1.0e37, 0.7, 0.01],
-            [0.125, 0.3, -0.2, 0.9, 1.0e30, -1.0e30, 0.6, 0.05, 1.0e37, -1.0e37],
+            [
+                0.5, 1.0e30, 0.35, -1.0e30, 0.3, 1.0e37, 1.0e-38, -1.0e37, 0.0, -0.0,
+            ],
+            [
+                0.25, -1.0e30, 0.4, 1.0e30, 0.15, -1.0e37, 3.0e-39, 1.0e37, 0.7, 0.01,
+            ],
+            [
+                0.125, 0.3, -0.2, 0.9, 1.0e30, -1.0e30, 0.6, 0.05, 1.0e37, -1.0e37,
+            ],
             [0.45, 0.35, 0.2, -0.0, 0.0, 0.33, 0.66, -0.5, 1.0e-30, 2.0],
         ];
         let mut ids = Vec::new();
@@ -3882,7 +3959,18 @@ mod moe_splice_tests {
     #[test]
     fn canonical_join_two_row_window_is_byte_identical_for_all_1024_masks() {
         let ids = [7, 2, 7, 2, 5, 2, 7, 5, -1, 40];
-        let w = [0.5, 1.0e30, 0.35, -1.0e30, 0.3, 1.0e37, 1.0e-38, -1.0e37, f32::NAN, f32::INFINITY];
+        let w = [
+            0.5,
+            1.0e30,
+            0.35,
+            -1.0e30,
+            0.3,
+            1.0e37,
+            1.0e-38,
+            -1.0e37,
+            f32::NAN,
+            f32::INFINITY,
+        ];
         let masks: Vec<u64> = (0..1024).collect();
         for identical in [false, true] {
             let mut x = x_of(2 * HS_DIM);
@@ -3948,7 +4036,17 @@ mod moe_splice_tests {
         ) {
             let spans: Vec<_> = host.iter().map(|&s| self.expert(ids[s as usize])).collect();
             moe_cpu_host_slot_outputs(
-                self.dim, self.mi, rows, top_k, self.gu.len(), ids, None, host, &spans, x, false,
+                self.dim,
+                self.mi,
+                rows,
+                top_k,
+                self.gu.len(),
+                ids,
+                None,
+                host,
+                &spans,
+                x,
+                false,
                 out,
             )
             .unwrap();
@@ -4023,9 +4121,7 @@ mod moe_splice_tests {
                         }
                     }
                     for &cold in &cold_sets {
-                        let is_host = |id: i32| {
-                            route_id_valid(id, n_exp) && (cold >> id) & 1 == 1
-                        };
+                        let is_host = |id: i32| route_id_valid(id, n_exp) && (cold >> id) & 1 == 1;
                         // One-row AR per token (its own call, its own cold slots).
                         let ar: Vec<(Vec<u32>, Vec<f32>)> = (0..4)
                             .map(|t| {
@@ -4034,13 +4130,21 @@ mod moe_splice_tests {
                                     .filter(|&s| is_host(r_ids[s as usize]))
                                     .collect();
                                 let mut out = stale(top_k * dim);
-                                fx.run(1, top_k, r_ids, &host, &x[t * dim..(t + 1) * dim], &mut out);
+                                fx.run(
+                                    1,
+                                    top_k,
+                                    r_ids,
+                                    &host,
+                                    &x[t * dim..(t + 1) * dim],
+                                    &mut out,
+                                );
                                 (host, out)
                             })
                             .collect();
                         let mut window_outs: Vec<(usize, Vec<f32>)> = Vec::new();
                         for width in [2usize, 3, 4, 3, 2] {
-                            let ids: Vec<i32> = scenario[..width].iter().flatten().copied().collect();
+                            let ids: Vec<i32> =
+                                scenario[..width].iter().flatten().copied().collect();
                             let host: Vec<u32> = (0..(width * top_k) as u32)
                                 .filter(|&s| is_host(ids[s as usize]))
                                 .collect();
@@ -4115,7 +4219,14 @@ mod moe_splice_tests {
                                 joined[t * dim..(t + 1) * dim].copy_from_slice(&residual);
                             }
                             moe_canonical_combine_reference(
-                                dim, width, top_k, n_exp, &ids, &wts, &expanded, &mut joined,
+                                dim,
+                                width,
+                                top_k,
+                                n_exp,
+                                &ids,
+                                &wts,
+                                &expanded,
+                                &mut joined,
                             );
                             for t in 0..width {
                                 let mut row = residual.clone();
@@ -4176,7 +4287,11 @@ mod moe_splice_tests {
             let row = s / top_k;
             assert_eq!(
                 bits(&full[range(s)]),
-                bits(&slot_reference(&fx, ids[s], &x[row * HS_DIM..(row + 1) * HS_DIM])),
+                bits(&slot_reference(
+                    &fx,
+                    ids[s],
+                    &x[row * HS_DIM..(row + 1) * HS_DIM]
+                )),
                 "slot {s} != scalar reference"
             );
         }
@@ -4188,7 +4303,11 @@ mod moe_splice_tests {
             .chain((0..12u32).filter(|s| s % 2 == 1))
             .collect();
         for order in [&reversed, &interleaved] {
-            assert_eq!(bits(&run(None, order, &x)), bits(&full), "host-slot order changed bytes");
+            assert_eq!(
+                bits(&run(None, order, &x)),
+                bits(&full),
+                "host-slot order changed bytes"
+            );
         }
         // Each slot alone (group size 1): only that slot is written.
         for s in 0..12u32 {
@@ -4200,7 +4319,10 @@ mod moe_splice_tests {
             );
             for o in 0..12 {
                 if o != s as usize {
-                    assert!(all_stale(&out[range(o)]), "slot {o} written by a call for slot {s}");
+                    assert!(
+                        all_stale(&out[range(o)]),
+                        "slot {o} written by a call for slot {s}"
+                    );
                 }
             }
         }
@@ -4234,7 +4356,11 @@ mod moe_splice_tests {
                 .num_threads(threads)
                 .build()
                 .unwrap();
-            assert_eq!(bits(&run(Some(&pool), &every, &x)), bits(&full), "{threads} workers");
+            assert_eq!(
+                bits(&run(Some(&pool), &every, &x)),
+                bits(&full),
+                "{threads} workers"
+            );
             assert_eq!(
                 bits(&run(Some(&pool), &reversed, &x)),
                 bits(&full),
@@ -4248,7 +4374,11 @@ mod moe_splice_tests {
         let out = run(None, &sparse, &poisoned);
         for s in 0..12usize {
             if sparse.contains(&(s as u32)) {
-                assert_eq!(bits(&out[range(s)]), bits(&full[range(s)]), "sparse slot {s}");
+                assert_eq!(
+                    bits(&out[range(s)]),
+                    bits(&full[range(s)]),
+                    "sparse slot {s}"
+                );
             } else {
                 assert!(all_stale(&out[range(s)]), "slot {s} written");
             }
@@ -4257,7 +4387,10 @@ mod moe_splice_tests {
 
     fn expect_err(r: Result<(), DispatchError>, needle: &str) {
         let e = r.expect_err(needle);
-        assert!(format!("{e}").contains(needle), "expected {needle:?}, got: {e}");
+        assert!(
+            format!("{e}").contains(needle),
+            "expected {needle:?}, got: {e}"
+        );
     }
 
     /// Every defect of the plan is an error from the validator, before any
@@ -4291,12 +4424,27 @@ mod moe_splice_tests {
         val(&bad, Some(&[-1, 77, 2, -1]), &host, &bad_ex, xl, false, ol).unwrap();
 
         let dup = [1u32, 1];
-        expect_err(val(&ids, None, &dup, &fx.spans(&ids, &dup), xl, false, ol), "twice");
-        expect_err(val(&ids, None, &[4], &[fx.expert(0)], xl, false, ol), "out of range");
-        expect_err(val(&bad, None, &[1], &[fx.expert(0)], xl, false, ol), "invalid expert id");
+        expect_err(
+            val(&ids, None, &dup, &fx.spans(&ids, &dup), xl, false, ol),
+            "twice",
+        );
+        expect_err(
+            val(&ids, None, &[4], &[fx.expert(0)], xl, false, ol),
+            "out of range",
+        );
+        expect_err(
+            val(&bad, None, &[1], &[fx.expert(0)], xl, false, ol),
+            "invalid expert id",
+        );
         let big = [0i32, 9, 2, 3];
-        expect_err(val(&big, None, &[1], &[fx.expert(0)], xl, false, ol), "invalid expert id");
-        expect_err(val(&ids, None, &host, &ex[..1], xl, false, ol), "span count");
+        expect_err(
+            val(&big, None, &[1], &[fx.expert(0)], xl, false, ol),
+            "invalid expert id",
+        );
+        expect_err(
+            val(&ids, None, &host, &ex[..1], xl, false, ol),
+            "span count",
+        );
         let short = CpuMoeExpert {
             gate_up_quant: HS_Q,
             gate_up: &fx.gu[0][..16],
@@ -4308,27 +4456,69 @@ mod moe_splice_tests {
         let same = [1i32, 1, 2, 3];
         let h2 = [0u32, 1];
         expect_err(
-            val(&same, None, &h2, &[fx.expert(1), fx.expert(2)], xl, false, ol),
+            val(
+                &same,
+                None,
+                &h2,
+                &[fx.expert(1), fx.expert(2)],
+                xl,
+                false,
+                ol,
+            ),
             "different spans",
         );
         // Ownership partition against the masked GPU route.
-        expect_err(val(&ids, Some(&[0, 1, 2, -1]), &host, &ex, xl, false, ol), "ownership");
-        expect_err(val(&ids, Some(&[-1, -1, 2, -1]), &host, &ex, xl, false, ol), "ownership");
-        expect_err(val(&ids, Some(&[-1, 1, 3, -1]), &host, &ex, xl, false, ol), "ownership");
-        expect_err(val(&bad, Some(&[-1, 1, 2, -1]), &host, &bad_ex, xl, false, ol), "ownership");
+        expect_err(
+            val(&ids, Some(&[0, 1, 2, -1]), &host, &ex, xl, false, ol),
+            "ownership",
+        );
+        expect_err(
+            val(&ids, Some(&[-1, -1, 2, -1]), &host, &ex, xl, false, ol),
+            "ownership",
+        );
+        expect_err(
+            val(&ids, Some(&[-1, 1, 3, -1]), &host, &ex, xl, false, ol),
+            "ownership",
+        );
+        expect_err(
+            val(&bad, Some(&[-1, 1, 2, -1]), &host, &bad_ex, xl, false, ol),
+            "ownership",
+        );
         // Extents.
         expect_err(val(&ids, None, &host, &ex, xl - 1, false, ol), "activation");
         expect_err(val(&ids, None, &host, &ex, xl, false, ol - 1), "activation");
         expect_err(val(&ids[..3], None, &host, &ex, xl, false, ol), "route ids");
         expect_err(
             validate_moe_cpu_host_slot_outputs(
-                HS_DIM, HS_MI, 0, top_k, n_exp, &ids, None, &[], &[], 0, false, 0,
+                HS_DIM,
+                HS_MI,
+                0,
+                top_k,
+                n_exp,
+                &ids,
+                None,
+                &[],
+                &[],
+                0,
+                false,
+                0,
             ),
             "non-zero",
         );
         expect_err(
             validate_moe_cpu_host_slot_outputs(
-                255, HS_MI, rows, top_k, n_exp, &ids, None, &[], &[], xl, false, ol,
+                255,
+                HS_MI,
+                rows,
+                top_k,
+                n_exp,
+                &ids,
+                None,
+                &[],
+                &[],
+                xl,
+                false,
+                ol,
             ),
             "multiple of 256",
         );

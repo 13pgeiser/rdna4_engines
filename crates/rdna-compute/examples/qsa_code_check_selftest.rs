@@ -42,7 +42,9 @@ use rdna_compute::kernel_registry::{PlannedKernel, RouteKernelPlan};
 use rdna_compute::{kernels, Gpu};
 
 type Result<T, E = String> = std::result::Result<T, E>;
-fn err(e: impl std::fmt::Debug) -> String { format!("{e:?}") }
+fn err(e: impl std::fmt::Debug) -> String {
+    format!("{e:?}")
+}
 
 const SWITCH: &str = "HIPFIRE_QWEN4_QSA_CODE_CHECK";
 const PREFIX: &str = "hipfire: code-check self-test: ";
@@ -53,11 +55,19 @@ const JIT_SRC: &str = "#include <hip/hip_runtime.h>\n\
 
 /// The parsed `N ranges, E equal, D differ, U unavailable` head of the line.
 #[derive(Debug, PartialEq, Eq)]
-struct Summary { ranges: usize, equal: usize, differ: usize, unavailable: usize }
+struct Summary {
+    ranges: usize,
+    equal: usize,
+    differ: usize,
+    unavailable: usize,
+}
 
 /// What `qsa_code_check_self_test()` returned.
 #[derive(Debug, PartialEq, Eq)]
-enum Report { Sampled(Summary), Skipped(String) }
+enum Report {
+    Sampled(Summary),
+    Skipped(String),
+}
 
 /// Strict parse of the one-line report: the `hipfire: code-check self-test: `
 /// prefix, then either `skipped: ...` or four `<count> <label>` fields in the
@@ -68,9 +78,13 @@ fn parse_report(report: &str) -> Result<Report> {
     if line.contains('\n') {
         return Err(format!("expected one report line, got {report:?}"));
     }
-    let rest = line.strip_prefix(PREFIX).ok_or_else(|| format!("unexpected report prefix: {line:?}"))?;
+    let rest = line
+        .strip_prefix(PREFIX)
+        .ok_or_else(|| format!("unexpected report prefix: {line:?}"))?;
     if let Some(why) = rest.strip_prefix("skipped") {
-        return Ok(Report::Skipped(why.trim_start_matches(':').trim().to_owned()));
+        return Ok(Report::Skipped(
+            why.trim_start_matches(':').trim().to_owned(),
+        ));
     }
     let head = rest.split(';').next().unwrap_or(rest);
     let fields: Vec<&str> = head.split(", ").collect();
@@ -91,7 +105,9 @@ fn parse_report(report: &str) -> Result<Report> {
         unavailable: count(unavailable, "unavailable")?,
     };
     if s.equal.checked_add(s.differ) != Some(s.ranges) {
-        return Err(format!("inconsistent summary: {s:?} (equal + differ != ranges)"));
+        return Err(format!(
+            "inconsistent summary: {s:?} (equal + differ != ranges)"
+        ));
     }
     Ok(Report::Sampled(s))
 }
@@ -100,8 +116,13 @@ fn parse_report(report: &str) -> Result<Report> {
 fn verdict(report: &Report) -> Result<()> {
     match report {
         Report::Skipped(why) => Err(format!("self-test skipped: {why}")),
-        Report::Sampled(s) if s.ranges == 0 => Err("self-test sampled 0 ranges (no usable alias/baseline)".into()),
-        Report::Sampled(s) if s.differ != 0 => Err(format!("{} range(s) differ from the registration baseline", s.differ)),
+        Report::Sampled(s) if s.ranges == 0 => {
+            Err("self-test sampled 0 ranges (no usable alias/baseline)".into())
+        }
+        Report::Sampled(s) if s.differ != 0 => Err(format!(
+            "{} range(s) differ from the registration baseline",
+            s.differ
+        )),
         Report::Sampled(_) => Ok(()),
     }
 }
@@ -114,7 +135,10 @@ const PM_GFX1151: &[Pm] = &[
     (
         "qsa_select_bf16_pm_gfx1151",
         kernels::QSA_SELECT_BF16_PM_GFX1151,
-        &["indexed_attention_select_scores_rows16_bf16_pm_gfx1151", "indexed_attention_select_scores_rows32_bf16_pm_gfx1151"],
+        &[
+            "indexed_attention_select_scores_rows16_bf16_pm_gfx1151",
+            "indexed_attention_select_scores_rows32_bf16_pm_gfx1151",
+        ],
     ),
     (
         "qsa_select_pm_gfx1151",
@@ -135,7 +159,11 @@ const PM_GFX1151: &[Pm] = &[
         kernels::SPEC_ACCEPT_ORDERED_PM_GFX1151,
         &["spec_accept_ordered_u32_pm_gfx1151"],
     ),
-    ("mq_i4_moe_gemv_pm_gfx1151", kernels::MQ_I4_MOE_GEMV_PM_GFX1151, MQ_I4_MOE_SYMBOLS),
+    (
+        "mq_i4_moe_gemv_pm_gfx1151",
+        kernels::MQ_I4_MOE_GEMV_PM_GFX1151,
+        MQ_I4_MOE_SYMBOLS,
+    ),
     (
         "mq_i4_moe_gemv_c1_pm_gfx1151",
         kernels::MQ_I4_MOE_GEMV_C1_PM_GFX1151,
@@ -154,7 +182,11 @@ const PM_GFX1201: &[Pm] = &[
         kernels::SPEC_ACCEPT_ORDERED_PM_GFX1201,
         &["spec_accept_ordered_u32_pm_gfx1201"],
     ),
-    ("mq_i4_moe_gemv_pm_gfx1201", kernels::MQ_I4_MOE_GEMV_PM_GFX1201, MQ_I4_MOE_SYMBOLS),
+    (
+        "mq_i4_moe_gemv_pm_gfx1201",
+        kernels::MQ_I4_MOE_GEMV_PM_GFX1201,
+        MQ_I4_MOE_SYMBOLS,
+    ),
 ];
 
 /// gfx1100: the residual/gate-up IU4 GEMM module (one embedded image, the
@@ -211,9 +243,17 @@ fn pm_plan(arch: &str) -> Result<(RouteKernelPlan, Vec<&'static str>)> {
     };
     let entries = set
         .iter()
-        .map(|&(module, image, symbols)| PlannedKernel::Embedded { module, image, radiowave_json: None, symbols })
+        .map(|&(module, image, symbols)| PlannedKernel::Embedded {
+            module,
+            image,
+            radiowave_json: None,
+            symbols,
+        })
         .collect();
-    Ok((RouteKernelPlan { entries }, set.iter().map(|m| m.0).collect()))
+    Ok((
+        RouteKernelPlan { entries },
+        set.iter().map(|m| m.0).collect(),
+    ))
 }
 
 fn run() -> Result<i32> {
@@ -271,13 +311,22 @@ fn main() {
 mod tests {
     use super::*;
 
-    const NOTE: &str = "; note: differ = persistent CPU-visible loaded-code corruption at this sample";
+    const NOTE: &str =
+        "; note: differ = persistent CPU-visible loaded-code corruption at this sample";
 
     #[test]
     fn parses_clean_line() {
         let l = format!("{PREFIX}12 ranges, 12 equal, 0 differ, 0 unavailable{NOTE}\n");
         let r = parse_report(&l).unwrap();
-        assert_eq!(r, Report::Sampled(Summary { ranges: 12, equal: 12, differ: 0, unavailable: 0 }));
+        assert_eq!(
+            r,
+            Report::Sampled(Summary {
+                ranges: 12,
+                equal: 12,
+                differ: 0,
+                unavailable: 0
+            })
+        );
         assert!(verdict(&r).is_ok());
     }
 
@@ -287,20 +336,37 @@ mod tests {
             "{PREFIX}4 ranges, 4 equal, 0 differ, 2 unavailable; unavailable (not checked): module 'a; 9 ranges, 1 equal' (handle 0x1): x{NOTE}\n"
         );
         let r = parse_report(&l).unwrap();
-        assert_eq!(r, Report::Sampled(Summary { ranges: 4, equal: 4, differ: 0, unavailable: 2 }));
+        assert_eq!(
+            r,
+            Report::Sampled(Summary {
+                ranges: 4,
+                equal: 4,
+                differ: 0,
+                unavailable: 2
+            })
+        );
         assert!(verdict(&r).is_ok());
     }
 
     #[test]
     fn differ_zero_ranges_and_skipped_fail() {
-        let d = parse_report(&format!("{PREFIX}3 ranges, 2 equal, 1 differ, 0 unavailable; first differing range: x{NOTE}\n")).unwrap();
+        let d = parse_report(&format!(
+            "{PREFIX}3 ranges, 2 equal, 1 differ, 0 unavailable; first differing range: x{NOTE}\n"
+        ))
+        .unwrap();
         assert!(verdict(&d).unwrap_err().contains("differ"));
-        let z = parse_report(&format!("{PREFIX}0 ranges, 0 equal, 0 differ, 3 unavailable{NOTE}\n")).unwrap();
+        let z = parse_report(&format!(
+            "{PREFIX}0 ranges, 0 equal, 0 differ, 3 unavailable{NOTE}\n"
+        ))
+        .unwrap();
         assert!(verdict(&z).unwrap_err().contains("0 ranges"));
         let s = parse_report(&format!("{PREFIX}skipped: registry busy (registration or unload in progress; no range checked)\n")).unwrap();
         assert!(matches!(&s, Report::Skipped(w) if w.starts_with("registry busy")));
         assert!(verdict(&s).unwrap_err().contains("skipped"));
-        let p = parse_report(&format!("{PREFIX}skipped: registry poisoned (no range checked)\n")).unwrap();
+        let p = parse_report(&format!(
+            "{PREFIX}skipped: registry poisoned (no range checked)\n"
+        ))
+        .unwrap();
         assert!(verdict(&p).is_err());
     }
 
@@ -309,7 +375,8 @@ mod tests {
         let ok = "1 ranges, 1 equal, 0 differ, 0 unavailable";
         for l in [
             String::new(),
-            "hipfire: code-check after HIP 700: 1 ranges, 1 equal, 0 differ, 0 unavailable\n".to_owned(),
+            "hipfire: code-check after HIP 700: 1 ranges, 1 equal, 0 differ, 0 unavailable\n"
+                .to_owned(),
             format!("{PREFIX}1 ranges, 1 equal, 0 differ\n"),
             format!("{PREFIX}{ok}, 1 extra\n"),
             format!("{PREFIX}x ranges, 1 equal, 0 differ, 0 unavailable\n"),

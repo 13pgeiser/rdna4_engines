@@ -141,19 +141,33 @@ struct Arm {
 
 fn make_arm(gpu: &mut Gpu, h: &Host, total: usize, partials_floats: &[usize]) -> Arm {
     let sentinel = |gpu: &mut Gpu, w: usize| {
-        gpu.upload_f32(&vec![f32::from_bits(0x7fc0_dead); total * w], &[total * w]).expect("alloc sentinel")
+        gpu.upload_f32(&vec![f32::from_bits(0x7fc0_dead); total * w], &[total * w])
+            .expect("alloc sentinel")
     };
     Arm {
-        q_full: gpu.upload_f32(&h.q_full, &[h.q_full.len()]).expect("q_full"),
+        q_full: gpu
+            .upload_f32(&h.q_full, &[h.q_full.len()])
+            .expect("q_full"),
         q: sentinel(gpu, Q_DIM),
         gate: sentinel(gpu, Q_DIM),
         k: gpu.upload_f32(&h.k, &[h.k.len()]).expect("k"),
         v: gpu.upload_f32(&h.v, &[h.v.len()]).expect("v"),
         out: sentinel(gpu, Q_DIM),
         pos: gpu.upload_f32(&h.pos, &[h.pos.len()]).expect("pos"),
-        k_cache: h.k_cache.iter().map(|c| gpu.upload_raw(c, &[c.len()]).expect("k_cache")).collect(),
-        v_cache: h.v_cache.iter().map(|c| gpu.upload_raw(c, &[c.len()]).expect("v_cache")).collect(),
-        partials: partials_floats.iter().map(|&f| gpu.zeros(&[f], DType::F32).expect("partials")).collect(),
+        k_cache: h
+            .k_cache
+            .iter()
+            .map(|c| gpu.upload_raw(c, &[c.len()]).expect("k_cache"))
+            .collect(),
+        v_cache: h
+            .v_cache
+            .iter()
+            .map(|c| gpu.upload_raw(c, &[c.len()]).expect("v_cache"))
+            .collect(),
+        partials: partials_floats
+            .iter()
+            .map(|&f| gpu.zeros(&[f], DType::F32).expect("partials"))
+            .collect(),
     }
 }
 
@@ -190,11 +204,15 @@ fn main() {
             for shift in 0..2usize {
                 cases += 1;
                 let total = lanes * n;
-                let starts: Vec<usize> = (0..lanes).map(|i| CTXS[(i + 2 * shift) % CTXS.len()]).collect();
+                let starts: Vec<usize> = (0..lanes)
+                    .map(|i| CTXS[(i + 2 * shift) % CTXS.len()])
+                    .collect();
                 let host = make_host(&mut rng, &starts, n);
                 let lane_shape: Vec<(usize, usize)> = starts.iter().map(|&s| (n, s + n)).collect();
-                let lane_floats: Vec<usize> =
-                    lane_shape.iter().map(|&l| Gpu::lane_fa_partials_len(NH, &[l])).collect();
+                let lane_floats: Vec<usize> = lane_shape
+                    .iter()
+                    .map(|&l| Gpu::lane_fa_partials_len(NH, &[l]))
+                    .collect();
                 let b_floats = Gpu::lane_fa_partials_len(NH, &lane_shape);
                 let a = make_arm(&mut gpu, &host, total, &lane_floats);
                 let b = make_arm(&mut gpu, &host, total, &[b_floats]);
@@ -205,19 +223,56 @@ fn main() {
                     let r0 = i * n;
                     let vw = |t: &GpuTensor, w: usize| t.sub_offset(r0 * w, n * w);
                     gpu.deinterleave_q_rmsnorm_f32_batched(
-                        &vw(&a.q_full, 2 * Q_DIM), &vw(&a.q, Q_DIM), &vw(&a.gate, Q_DIM), &d_q_norm, NH, HD, n, EPS,
+                        &vw(&a.q_full, 2 * Q_DIM),
+                        &vw(&a.q, Q_DIM),
+                        &vw(&a.gate, Q_DIM),
+                        &d_q_norm,
+                        NH,
+                        HD,
+                        n,
+                        EPS,
                     )
                     .expect("A deinterleave");
-                    gpu.rmsnorm_batched(&vw(&a.k, KV_DIM), &d_k_norm, &vw(&a.k, KV_DIM), n * NKV, HD, EPS)
-                        .expect("A k rmsnorm");
+                    gpu.rmsnorm_batched(
+                        &vw(&a.k, KV_DIM),
+                        &d_k_norm,
+                        &vw(&a.k, KV_DIM),
+                        n * NKV,
+                        HD,
+                        EPS,
+                    )
+                    .expect("A k rmsnorm");
                     gpu.rope_partial_interleaved_f32_batched(
-                        &vw(&a.q, Q_DIM), &vw(&a.k, KV_DIM), &vw(&a.pos, 1), NH, NKV, HD, N_ROT, THETA, n, 0,
+                        &vw(&a.q, Q_DIM),
+                        &vw(&a.k, KV_DIM),
+                        &vw(&a.pos, 1),
+                        NH,
+                        NKV,
+                        HD,
+                        N_ROT,
+                        THETA,
+                        n,
+                        0,
                     )
                     .expect("A rope");
-                    gpu.kv_cache_write_fp8_e4m3_batched(&a.k_cache[i], &vw(&a.k, KV_DIM), &vw(&a.pos, 1), NKV, HD, n)
-                        .expect("A k write");
-                    gpu.kv_cache_write_fp8_e4m3_batched(&a.v_cache[i], &vw(&a.v, KV_DIM), &vw(&a.pos, 1), NKV, HD, n)
-                        .expect("A v write");
+                    gpu.kv_cache_write_fp8_e4m3_batched(
+                        &a.k_cache[i],
+                        &vw(&a.k, KV_DIM),
+                        &vw(&a.pos, 1),
+                        NKV,
+                        HD,
+                        n,
+                    )
+                    .expect("A k write");
+                    gpu.kv_cache_write_fp8_e4m3_batched(
+                        &a.v_cache[i],
+                        &vw(&a.v, KV_DIM),
+                        &vw(&a.pos, 1),
+                        NKV,
+                        HD,
+                        n,
+                    )
+                    .expect("A v write");
                     gpu.attention_flash_fp8_e4m3_tile_batched(
                         &vw(&a.q, Q_DIM),
                         &a.k_cache[i],
@@ -240,11 +295,16 @@ fn main() {
                 gpu.hip.device_synchronize().expect("sync A");
 
                 // Arm B: the lane route.
-                gpu.deinterleave_q_rmsnorm_f32_batched(&b.q_full, &b.q, &b.gate, &d_q_norm, NH, HD, total, EPS)
-                    .expect("B deinterleave");
-                gpu.rmsnorm_batched(&b.k, &d_k_norm, &b.k, total * NKV, HD, EPS).expect("B k rmsnorm");
-                gpu.rope_partial_interleaved_f32_batched(&b.q, &b.k, &b.pos, NH, NKV, HD, N_ROT, THETA, total, 0)
-                    .expect("B rope");
+                gpu.deinterleave_q_rmsnorm_f32_batched(
+                    &b.q_full, &b.q, &b.gate, &d_q_norm, NH, HD, total, EPS,
+                )
+                .expect("B deinterleave");
+                gpu.rmsnorm_batched(&b.k, &d_k_norm, &b.k, total * NKV, HD, EPS)
+                    .expect("B k rmsnorm");
+                gpu.rope_partial_interleaved_f32_batched(
+                    &b.q, &b.k, &b.pos, NH, NKV, HD, N_ROT, THETA, total, 0,
+                )
+                .expect("B rope");
                 let views = |t: &GpuTensor, w: usize| -> Vec<GpuTensor> {
                     (0..lanes).map(|i| t.sub_offset(i * n * w, n * w)).collect()
                 };
@@ -256,13 +316,25 @@ fn main() {
                     views(&b.pos, 1),
                 );
                 let k_writes: Vec<LaneFaWrite<'_>> = (0..lanes)
-                    .map(|i| LaneFaWrite { cache: &b.k_cache[i], src: &k_rows[i], positions: &pos_rows[i], rows: n })
+                    .map(|i| LaneFaWrite {
+                        cache: &b.k_cache[i],
+                        src: &k_rows[i],
+                        positions: &pos_rows[i],
+                        rows: n,
+                    })
                     .collect();
-                gpu.kv_cache_write_fp8_e4m3_lanes(&k_writes, NKV, HD).expect("B k write");
+                gpu.kv_cache_write_fp8_e4m3_lanes(&k_writes, NKV, HD)
+                    .expect("B k write");
                 let v_writes: Vec<LaneFaWrite<'_>> = (0..lanes)
-                    .map(|i| LaneFaWrite { cache: &b.v_cache[i], src: &v_rows[i], positions: &pos_rows[i], rows: n })
+                    .map(|i| LaneFaWrite {
+                        cache: &b.v_cache[i],
+                        src: &v_rows[i],
+                        positions: &pos_rows[i],
+                        rows: n,
+                    })
                     .collect();
-                gpu.kv_cache_write_fp8_e4m3_lanes(&v_writes, NKV, HD).expect("B v write");
+                gpu.kv_cache_write_fp8_e4m3_lanes(&v_writes, NKV, HD)
+                    .expect("B v write");
                 let attends: Vec<LaneFaAttend<'_>> = (0..lanes)
                     .map(|i| LaneFaAttend {
                         q: &q_rows[i],
@@ -275,8 +347,10 @@ fn main() {
                         physical_cap: starts[i] + n,
                     })
                     .collect();
-                gpu.attention_verify_gqa_fp8_lanes(&attends, &b.partials[0], NH, NKV, HD).expect("B verify");
-                gpu.attention_verify_reduce_lanes(&attends, &b.partials[0], NH).expect("B reduce");
+                gpu.attention_verify_gqa_fp8_lanes(&attends, &b.partials[0], NH, NKV, HD)
+                    .expect("B verify");
+                gpu.attention_verify_reduce_lanes(&attends, &b.partials[0], NH)
+                    .expect("B reduce");
                 gpu.hip.device_synchronize().expect("sync B");
 
                 // Compare.
@@ -297,8 +371,16 @@ fn main() {
                     cmp(name.to_string(), bytes(&gpu, x), bytes(&gpu, y));
                 }
                 for i in 0..lanes {
-                    cmp(format!("k_cache[{i}]"), bytes(&gpu, &a.k_cache[i]), bytes(&gpu, &b.k_cache[i]));
-                    cmp(format!("v_cache[{i}]"), bytes(&gpu, &a.v_cache[i]), bytes(&gpu, &b.v_cache[i]));
+                    cmp(
+                        format!("k_cache[{i}]"),
+                        bytes(&gpu, &a.k_cache[i]),
+                        bytes(&gpu, &b.k_cache[i]),
+                    );
+                    cmp(
+                        format!("v_cache[{i}]"),
+                        bytes(&gpu, &a.v_cache[i]),
+                        bytes(&gpu, &b.v_cache[i]),
+                    );
                 }
                 let b_partials = bytes(&gpu, &b.partials[0]);
                 let mut base = 0usize;
@@ -321,7 +403,10 @@ fn main() {
                     bad.join(", "),
                 );
 
-                for t in [a.q_full, a.q, a.gate, a.k, a.v, a.out, a.pos, b.q_full, b.q, b.gate, b.k, b.v, b.out, b.pos] {
+                for t in [
+                    a.q_full, a.q, a.gate, a.k, a.v, a.out, a.pos, b.q_full, b.q, b.gate, b.k, b.v,
+                    b.out, b.pos,
+                ] {
                     gpu.free_tensor(t).expect("free");
                 }
                 for t in a

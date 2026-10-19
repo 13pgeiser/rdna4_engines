@@ -60,8 +60,8 @@ use crate::external_rows::RowEncoding;
 use crate::hfq::{HfqFile, HfqTensorInfo};
 use crate::model_source::{
     capture_file_identity, read_file_exact_at, read_file_nowait_at, SourceError,
-    SourceFileIdentity, SourceFormat,
-    SourceIdentity, SourceRangeDescriptor, SourceRangeIdentity, SourceReader, SourceReaderImpl,
+    SourceFileIdentity, SourceFormat, SourceIdentity, SourceRangeDescriptor, SourceRangeIdentity,
+    SourceReader, SourceReaderImpl,
 };
 use crate::ple_convert::{derive_q4, PleProgress};
 use crate::ple_hot_pack::{
@@ -854,7 +854,10 @@ pub fn attach_validation_ple_rows(
         model_path,
         request,
         gpu_arch,
-        ResolvePolicy { derive_missing_q4: false, progress: None },
+        ResolvePolicy {
+            derive_missing_q4: false,
+            progress: None,
+        },
     )
 }
 
@@ -1952,7 +1955,8 @@ mod tests {
         for i in 0..extra {
             tensors.push(i64_tensor(&format!("extra.{i}")));
         }
-        let metadata = marker.replacen('{', &format!("{{\"pad\":\"{}\",", "x".repeat(extra * 7)), 1);
+        let metadata =
+            marker.replacen('{', &format!("{{\"pad\":\"{}\",", "x".repeat(extra * 7)), 1);
         write_hfqm_package_mem(path, 16, &metadata, &tensors).unwrap();
     }
 
@@ -1972,7 +1976,10 @@ mod tests {
         // one shared table, bound (for its header fields only) to base `a`
         let shared = dir.path().join("shared.ple-q8");
         let header = write_bound_sidecar(&shared, &a, RowEncoding::Q8F16, &sha, 1);
-        assert_eq!(header.table.as_ref().unwrap().base_file_bytes, ha.file_len());
+        assert_eq!(
+            header.table.as_ref().unwrap().base_file_bytes,
+            ha.file_len()
+        );
 
         for base in [&a, &b] {
             let mut hfq = HfqFile::open(base).unwrap();
@@ -1994,7 +2001,10 @@ mod tests {
 
         // a base marked R with different geometry refuses it
         for (from, to) in [
-            (format!("\"row_width\":{WIDTH}"), format!("\"row_width\":{}", WIDTH + 32)),
+            (
+                format!("\"row_width\":{WIDTH}"),
+                format!("\"row_width\":{}", WIDTH + 32),
+            ),
             (
                 format!("\"rows_per_shard\":{ROWS}"),
                 format!("\"rows_per_shard\":{}", ROWS + 1),
@@ -2379,16 +2389,17 @@ mod tests {
         let q4 = sidecar_of(&base, PleFormat::Q4);
         write_bound_sidecar(&q8, &base, RowEncoding::Q8F16, &sha, 2);
         let mut hfq = HfqFile::open(&base).unwrap();
-        let error =
-            attach_validation_ple_rows(&mut hfq, &base, PleFormatRequest::Q4, "gfx1201")
-                .unwrap_err();
-        assert!(!q4.exists(), "validation must never derive a missing q4 table");
+        let error = attach_validation_ple_rows(&mut hfq, &base, PleFormatRequest::Q4, "gfx1201")
+            .unwrap_err();
+        assert!(
+            !q4.exists(),
+            "validation must never derive a missing q4 table"
+        );
         assert!(error.contains(q4.to_str().unwrap()));
         assert!(hfq.ple_rows().is_none());
         write_bound_sidecar(&q4, &base, RowEncoding::Q4Lm, &sha, 2);
         let choice =
-            attach_validation_ple_rows(&mut hfq, &base, PleFormatRequest::Q4, "gfx1201")
-                .unwrap();
+            attach_validation_ple_rows(&mut hfq, &base, PleFormatRequest::Q4, "gfx1201").unwrap();
         assert_eq!(
             choice,
             PleRowsChoice {
@@ -2405,7 +2416,10 @@ mod tests {
             &base,
             PleFormatRequest::Q4,
             "gfx1201",
-            ResolvePolicy { derive_missing_q4: false, progress: None },
+            ResolvePolicy {
+                derive_missing_q4: false,
+                progress: None,
+            },
         )
         .unwrap();
         assert_eq!(choice, replay_choice);
@@ -2447,7 +2461,8 @@ mod tests {
                 "{err}"
             );
             assert!(
-                err.contains("hipfire ple derive --format q4") && err.contains("q8 file is present"),
+                err.contains("hipfire ple derive --format q4")
+                    && err.contains("q8 file is present"),
                 "{err}"
             );
         }
@@ -2706,7 +2721,13 @@ mod tests {
         });
         let link_q4 = sidecar_of(&linked.link, PleFormat::Q4);
         let real_q4 = sidecar_of(&linked.real, PleFormat::Q4);
-        write_bound_sidecar(&real_q4, &linked.real, RowEncoding::Q4Lm, &q8_rows_sha(4), 4);
+        write_bound_sidecar(
+            &real_q4,
+            &linked.real,
+            RowEncoding::Q4Lm,
+            &q8_rows_sha(4),
+            4,
+        );
 
         let (hfq, choice) = resolve_at(&linked.link, PleFormatRequest::Q4, "gfx1100", false);
         let choice = choice.unwrap();

@@ -122,10 +122,12 @@ fn pack_mq4g256v2_synth(m: usize, k: usize, salt: u32) -> Vec<u8> {
 }
 
 fn cache_dir(arch: &str) -> PathBuf {
-    let root = std::env::var_os("HIPFIRE_KERNEL_CACHE").map(PathBuf::from).unwrap_or_else(|| {
-        let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
-        PathBuf::from(home).join(".hipfire_kernels")
-    });
+    let root = std::env::var_os("HIPFIRE_KERNEL_CACHE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
+            PathBuf::from(home).join(".hipfire_kernels")
+        });
     root.join(arch)
 }
 
@@ -384,15 +386,33 @@ fn run_case(
                 restore(gpu, &d_y_ref.buf);
             }
             launch_once(
-                gpu, ref_sym, grid, REF_BLOCK, a_ptr, xq_ptr as *const _,
-                d_y_ref.buf.as_ptr() as *const _, mi, ki, ni, add_i,
+                gpu,
+                ref_sym,
+                grid,
+                REF_BLOCK,
+                a_ptr,
+                xq_ptr as *const _,
+                d_y_ref.buf.as_ptr() as *const _,
+                mi,
+                ki,
+                ni,
+                add_i,
             );
             if add {
                 restore(gpu, &d_y_lf.buf);
             }
             launch_once(
-                gpu, lf_sym, grid, LF_BLOCK, a_ptr, xq_ptr as *const _,
-                d_y_lf.buf.as_ptr() as *const _, mi, ki, ni, add_i,
+                gpu,
+                lf_sym,
+                grid,
+                LF_BLOCK,
+                a_ptr,
+                xq_ptr as *const _,
+                d_y_lf.buf.as_ptr() as *const _,
+                mi,
+                ki,
+                ni,
+                add_i,
             );
         }
         gpu.hip.device_synchronize().expect("sync warm");
@@ -407,30 +427,66 @@ fn run_case(
                     restore(gpu, &d_y_ref.buf);
                 }
                 ref_us.push(time_us(
-                    gpu, ref_sym, grid, REF_BLOCK, a_ptr, xq_ptr as *const _,
-                    d_y_ref.buf.as_ptr() as *const _, mi, ki, ni, add_i,
+                    gpu,
+                    ref_sym,
+                    grid,
+                    REF_BLOCK,
+                    a_ptr,
+                    xq_ptr as *const _,
+                    d_y_ref.buf.as_ptr() as *const _,
+                    mi,
+                    ki,
+                    ni,
+                    add_i,
                 ));
                 if add {
                     restore(gpu, &d_y_lf.buf);
                 }
                 lf_us.push(time_us(
-                    gpu, lf_sym, grid, LF_BLOCK, a_ptr, xq_ptr as *const _,
-                    d_y_lf.buf.as_ptr() as *const _, mi, ki, ni, add_i,
+                    gpu,
+                    lf_sym,
+                    grid,
+                    LF_BLOCK,
+                    a_ptr,
+                    xq_ptr as *const _,
+                    d_y_lf.buf.as_ptr() as *const _,
+                    mi,
+                    ki,
+                    ni,
+                    add_i,
                 ));
             } else {
                 if add {
                     restore(gpu, &d_y_lf.buf);
                 }
                 lf_us.push(time_us(
-                    gpu, lf_sym, grid, LF_BLOCK, a_ptr, xq_ptr as *const _,
-                    d_y_lf.buf.as_ptr() as *const _, mi, ki, ni, add_i,
+                    gpu,
+                    lf_sym,
+                    grid,
+                    LF_BLOCK,
+                    a_ptr,
+                    xq_ptr as *const _,
+                    d_y_lf.buf.as_ptr() as *const _,
+                    mi,
+                    ki,
+                    ni,
+                    add_i,
                 ));
                 if add {
                     restore(gpu, &d_y_ref.buf);
                 }
                 ref_us.push(time_us(
-                    gpu, ref_sym, grid, REF_BLOCK, a_ptr, xq_ptr as *const _,
-                    d_y_ref.buf.as_ptr() as *const _, mi, ki, ni, add_i,
+                    gpu,
+                    ref_sym,
+                    grid,
+                    REF_BLOCK,
+                    a_ptr,
+                    xq_ptr as *const _,
+                    d_y_ref.buf.as_ptr() as *const _,
+                    mi,
+                    ki,
+                    ni,
+                    add_i,
                 ));
             }
         }
@@ -473,7 +529,10 @@ fn main() {
             return;
         }
     };
-    eprintln!("tmp_halo_iu4_lf_oracle on {}  model={model}  TIME={time}", gpu.arch);
+    eprintln!(
+        "tmp_halo_iu4_lf_oracle on {}  model={model}  TIME={time}",
+        gpu.arch
+    );
     if gpu.arch != "gfx1151" {
         eprintln!(
             "WARN: lf16 symbols are #if __gfx1151__; arch={} may fail JIT of lf entries",
@@ -518,25 +577,157 @@ fn main() {
 
     let mut ok = true;
     // Production bits, both modes; timing only on gate-set + down-add.
-    ok &= run_case(&mut gpu, "gate_proj/set", &gate, gate_m, gate_k, 512, false, REF_SET, LF_SET, 0xA5A5_00C0, time);
-    ok &= run_case(&mut gpu, "gate_proj/add", &gate, gate_m, gate_k, 512, true, REF_ADD, LF_ADD, 0xA5A5_00C1, false);
-    ok &= run_case(&mut gpu, "down_proj/set", &down, down_m, down_k, 512, false, REF_SET, LF_SET, 0xA5A5_00C2, false);
-    ok &= run_case(&mut gpu, "down_proj/add", &down, down_m, down_k, 512, true, REF_ADD, LF_ADD, 0xA5A5_00C3, time);
+    ok &= run_case(
+        &mut gpu,
+        "gate_proj/set",
+        &gate,
+        gate_m,
+        gate_k,
+        512,
+        false,
+        REF_SET,
+        LF_SET,
+        0xA5A5_00C0,
+        time,
+    );
+    ok &= run_case(
+        &mut gpu,
+        "gate_proj/add",
+        &gate,
+        gate_m,
+        gate_k,
+        512,
+        true,
+        REF_ADD,
+        LF_ADD,
+        0xA5A5_00C1,
+        false,
+    );
+    ok &= run_case(
+        &mut gpu,
+        "down_proj/set",
+        &down,
+        down_m,
+        down_k,
+        512,
+        false,
+        REF_SET,
+        LF_SET,
+        0xA5A5_00C2,
+        false,
+    );
+    ok &= run_case(
+        &mut gpu,
+        "down_proj/add",
+        &down,
+        down_m,
+        down_k,
+        512,
+        true,
+        REF_ADD,
+        LF_ADD,
+        0xA5A5_00C3,
+        time,
+    );
 
     // Phase edges, synthetic data.
     for (ki, kk) in [256usize, 512, 768].iter().enumerate() {
         let a = pack_mq4g256v2_synth(256, *kk, 0xED6E_0000 + ki as u32);
-        ok &= run_case(&mut gpu, &format!("edgeK{kk}/set"), &a, 256, *kk, 256, false, REF_SET, LF_SET, 0xE001 + ki as u32, false);
-        ok &= run_case(&mut gpu, &format!("edgeK{kk}/add"), &a, 256, *kk, 256, true, REF_ADD, LF_ADD, 0xE101 + ki as u32, false);
+        ok &= run_case(
+            &mut gpu,
+            &format!("edgeK{kk}/set"),
+            &a,
+            256,
+            *kk,
+            256,
+            false,
+            REF_SET,
+            LF_SET,
+            0xE001 + ki as u32,
+            false,
+        );
+        ok &= run_case(
+            &mut gpu,
+            &format!("edgeK{kk}/add"),
+            &a,
+            256,
+            *kk,
+            256,
+            true,
+            REF_ADD,
+            LF_ADD,
+            0xE101 + ki as u32,
+            false,
+        );
     }
     let a1024 = pack_mq4g256v2_synth(1024, 5120, 0xED6E_1000);
-    ok &= run_case(&mut gpu, "m1024n128/set", &a1024, 1024, 5120, 128, false, REF_SET, LF_SET, 0xE010, false);
-    ok &= run_case(&mut gpu, "m1024n128/add", &a1024, 1024, 5120, 128, true, REF_ADD, LF_ADD, 0xE011, false);
+    ok &= run_case(
+        &mut gpu,
+        "m1024n128/set",
+        &a1024,
+        1024,
+        5120,
+        128,
+        false,
+        REF_SET,
+        LF_SET,
+        0xE010,
+        false,
+    );
+    ok &= run_case(
+        &mut gpu,
+        "m1024n128/add",
+        &a1024,
+        1024,
+        5120,
+        128,
+        true,
+        REF_ADD,
+        LF_ADD,
+        0xE011,
+        false,
+    );
     let a128 = pack_mq4g256v2_synth(128, 5120, 0xED6E_2000);
-    ok &= run_case(&mut gpu, "m128n512/set", &a128, 128, 5120, 512, false, REF_SET, LF_SET, 0xE020, false);
-    ok &= run_case(&mut gpu, "m128n512/add", &a128, 128, 5120, 512, true, REF_ADD, LF_ADD, 0xE021, false);
+    ok &= run_case(
+        &mut gpu,
+        "m128n512/set",
+        &a128,
+        128,
+        5120,
+        512,
+        false,
+        REF_SET,
+        LF_SET,
+        0xE020,
+        false,
+    );
+    ok &= run_case(
+        &mut gpu,
+        "m128n512/add",
+        &a128,
+        128,
+        5120,
+        512,
+        true,
+        REF_ADD,
+        LF_ADD,
+        0xE021,
+        false,
+    );
     let a128b = pack_mq4g256v2_synth(128, 5120, 0xED6E_3000);
-    ok &= run_case(&mut gpu, "m128n256/add", &a128b, 128, 5120, 256, true, REF_ADD, LF_ADD, 0xE030, false);
+    ok &= run_case(
+        &mut gpu,
+        "m128n256/add",
+        &a128b,
+        128,
+        5120,
+        256,
+        true,
+        REF_ADD,
+        LF_ADD,
+        0xE030,
+        false,
+    );
 
     if ok {
         eprintln!("LF PASS: occ3_col vs lf16 bitwise-equal on all cases");

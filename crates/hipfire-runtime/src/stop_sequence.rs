@@ -202,7 +202,10 @@ mod tests {
     #[test]
     fn stop_text_is_never_emitted() {
         assert_eq!(run(&["END"], &["Hello END world"]), ("Hello ".into(), true));
-        assert_eq!(run(&["\n"], &["line one\nline two"]), ("line one".into(), true));
+        assert_eq!(
+            run(&["\n"], &["line one\nline two"]),
+            ("line one".into(), true)
+        );
     }
 
     #[test]
@@ -247,7 +250,10 @@ mod tests {
 
     #[test]
     fn multibyte_stop_and_text() {
-        assert_eq!(run(&["。"], &["你好", "世界。再见"]), ("你好世界".into(), true));
+        assert_eq!(
+            run(&["。"], &["你好", "世界。再见"]),
+            ("你好世界".into(), true)
+        );
         // Held tail is a whole char, never a split code point.
         let mut m = StopMatcher::new(&stops(&["🎉!"]));
         assert_eq!(m.push("hi 🎉"), "hi ");

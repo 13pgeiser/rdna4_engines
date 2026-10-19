@@ -36,7 +36,10 @@ use crate::arch::Fp8Encoding;
 
 /// FP8 (E4M3) or BF8 (E5M2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum F8 { Fp8, Bf8 }
+pub enum F8 {
+    Fp8,
+    Bf8,
+}
 
 /// Geometry of one 8-bit format.
 #[derive(Clone, Copy)]
@@ -52,15 +55,33 @@ struct Fmt {
 impl Fmt {
     const fn of(enc: Fp8Encoding, kind: F8) -> Self {
         match (enc, kind) {
-            (Fp8Encoding::Fnuz, F8::Fp8) => Fmt { mbits: 3, bias: 8, max_code: 0x7f },
-            (Fp8Encoding::Fnuz, F8::Bf8) => Fmt { mbits: 2, bias: 16, max_code: 0x7f },
-            (Fp8Encoding::Ocp, F8::Fp8) => Fmt { mbits: 3, bias: 7, max_code: 0x7e },
-            (Fp8Encoding::Ocp, F8::Bf8) => Fmt { mbits: 2, bias: 15, max_code: 0x7b },
+            (Fp8Encoding::Fnuz, F8::Fp8) => Fmt {
+                mbits: 3,
+                bias: 8,
+                max_code: 0x7f,
+            },
+            (Fp8Encoding::Fnuz, F8::Bf8) => Fmt {
+                mbits: 2,
+                bias: 16,
+                max_code: 0x7f,
+            },
+            (Fp8Encoding::Ocp, F8::Fp8) => Fmt {
+                mbits: 3,
+                bias: 7,
+                max_code: 0x7e,
+            },
+            (Fp8Encoding::Ocp, F8::Bf8) => Fmt {
+                mbits: 2,
+                bias: 15,
+                max_code: 0x7b,
+            },
         }
     }
 
     /// Minimum normal exponent (unbiased).
-    const fn emin(self) -> i32 { 1 - self.bias }
+    const fn emin(self) -> i32 {
+        1 - self.bias
+    }
 
     /// Exact value of the finite magnitude code `mag` (`mag <= max_code`).
     fn magnitude(self, mag: u8) -> f32 {
@@ -76,7 +97,9 @@ impl Fmt {
     }
 
     /// f32 bits of the largest finite magnitude.
-    fn max_bits(self) -> u32 { self.magnitude(self.max_code).to_bits() }
+    fn max_bits(self) -> u32 {
+        self.magnitude(self.max_code).to_bits()
+    }
 }
 
 /// `2^k` for a normal-range exponent (`-126 <= k <= 127`).
@@ -182,7 +205,11 @@ fn f8_overflow(enc: Fp8Encoding, kind: F8, sign: u8, fp16_ovfl: bool) -> u8 {
 /// Attaches the sign to a rounded magnitude code; zero is `0x00` in FNUZ
 /// (no -0) and keeps its sign in OCP.
 fn f8_finish(enc: Fp8Encoding, sign: u8, mag: u8) -> u8 {
-    if mag == 0 && enc == Fp8Encoding::Fnuz { 0 } else { (sign << 7) | mag }
+    if mag == 0 && enc == Fp8Encoding::Fnuz {
+        0
+    } else {
+        (sign << 7) | mag
+    }
 }
 
 /// `v_cvt_pk_{fp8,bf8}_f32` on one element: RNE with the FP16_OVFL rule.
@@ -319,16 +346,22 @@ fn f32_to_f16(x: f32, mode: Round) -> u16 {
 /// Subnormals kept, overflow → ±Inf (with MODE.FP16_OVFL=0; the instruction's
 /// FP16_OVFL clamp is the emulator's to apply), NaN → quiet NaN keeping the
 /// top payload bits `[UNVERIFIED: confirm on MI300X]` (NaN payload).
-pub fn f32_to_f16_rne(x: f32) -> u16 { f32_to_f16(x, Round::Rne) }
+pub fn f32_to_f16_rne(x: f32) -> u16 {
+    f32_to_f16(x, Round::Rne)
+}
 
 /// f32 → binary16, round toward zero (`v_cvt_pkrtz_f16_f32`).
 ///
 /// Finite values beyond 65504 give ±65504, ±Inf stays ±Inf, NaN as in
 /// [`f32_to_f16_rne`] `[UNVERIFIED: confirm on MI300X]` (NaN payload).
-pub fn f32_to_f16_rtz(x: f32) -> u16 { f32_to_f16(x, Round::Rtz) }
+pub fn f32_to_f16_rtz(x: f32) -> u16 {
+    f32_to_f16(x, Round::Rtz)
+}
 
 /// BF16 bits → f32 (exact).
-pub fn bf16_to_f32(bits: u16) -> f32 { f32::from_bits(u32::from(bits) << 16) }
+pub fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits(u32::from(bits) << 16)
+}
 
 /// f32 → BF16, round to nearest even; NaN stays NaN (quiet).
 ///

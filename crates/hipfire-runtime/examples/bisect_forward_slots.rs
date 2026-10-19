@@ -30,11 +30,11 @@ fn main() {
     use hipfire_arch_qwen35::qwen35::{
         self, DeltaNetState, LayerType, PrefillBatchScratch, Qwen35Scratch,
     };
+    use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::kv_backend::KvBackend;
     use hipfire_runtime::kv_mode::{self, KvMode, SlotKvTierPlan};
     use hipfire_runtime::llama::{KvCache, KvCacheExt, KvDims, KvLayers, KvTarget};
     use hipfire_runtime::slot_batch::SlotBatch;
-    use hipfire_runtime::hfq::HfqFile;
     use rdna_compute::kv_slots::{preflight_alloc, R9700_VRAM_BYTES};
     use rdna_compute::slot_pool::{SlotId, SlotPool};
     use rdna_compute::{DType, Gpu, GpuTensor};
@@ -170,13 +170,9 @@ fn main() {
         ref_pbs.free_gpu(&mut gpu);
 
         // ---- candidate: fresh SlotPool/arenas/DeltaNetState/scratch every time ----
-        let mut pool = SlotPool::new_with_strides(
-            1,
-            CAP_TOKENS,
-            plan.k_bytes_per_pos,
-            plan.v_bytes_per_pos,
-        )
-        .expect("SlotPool::new_with_strides");
+        let mut pool =
+            SlotPool::new_with_strides(1, CAP_TOKENS, plan.k_bytes_per_pos, plan.v_bytes_per_pos)
+                .expect("SlotPool::new_with_strides");
         let slot0 = pool.acquire().expect("acquire slot 0");
         assert_eq!(slot0.0, 0);
         let k_arena_bytes = pool.k_arena_bytes();

@@ -23,7 +23,12 @@ fn spans_for(case: &Value) -> (usize, Vec<ImageSpan>) {
             let gh = seg[1].as_u64().unwrap() as usize;
             let gw = seg[2].as_u64().unwrap() as usize;
             let len = (gh / merge) * (gw / merge);
-            spans.push(ImageSpan { start: n, len, grid_h: gh, grid_w: gw });
+            spans.push(ImageSpan {
+                start: n,
+                len,
+                grid_h: gh,
+                grid_w: gw,
+            });
             n += len;
         }
     }
@@ -35,7 +40,11 @@ fn check_case(name: &str) {
     let case = &fx[name];
     let merge = case["merge"].as_u64().unwrap() as usize;
     let (n, spans) = spans_for(case);
-    assert_eq!(n, case["n_tokens"].as_u64().unwrap() as usize, "{name}: token count");
+    assert_eq!(
+        n,
+        case["n_tokens"].as_u64().unwrap() as usize,
+        "{name}: token count"
+    );
 
     let got = build_mrope_positions(n, &spans, merge);
     let want = case["positions"].as_array().unwrap();
@@ -61,13 +70,19 @@ fn check_case(name: &str) {
 }
 
 #[test]
-fn parity_smoke_70x54() { check_case("smoke_70x54"); }
+fn parity_smoke_70x54() {
+    check_case("smoke_70x54");
+}
 
 #[test]
-fn parity_wide_28x70() { check_case("wide_28x70"); }
+fn parity_wide_28x70() {
+    check_case("wide_28x70");
+}
 
 #[test]
-fn parity_text_img_text() { check_case("text_img_text"); }
+fn parity_text_img_text() {
+    check_case("text_img_text");
+}
 
 /// A pure-text sequence MUST equal plain sequential on all three axes. This
 /// is the regression guard for the untouched text-only path: if it ever
@@ -88,7 +103,12 @@ fn text_only_equals_sequential() {
 /// reproduces the exact bug being fixed.
 #[test]
 fn image_advance_is_grid_dimension_not_token_count() {
-    let spans = [ImageSpan { start: 0, len: 945, grid_h: 70, grid_w: 54 }];
+    let spans = [ImageSpan {
+        start: 0,
+        len: 945,
+        grid_h: 70,
+        grid_w: 54,
+    }];
     let got = build_mrope_positions(946, &spans, 2);
     // Token 945 is the first text token after the image.
     assert_eq!(

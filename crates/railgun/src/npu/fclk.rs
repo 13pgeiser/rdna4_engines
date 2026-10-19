@@ -31,7 +31,9 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 /// Strix Halo iGPU PCI bus id: `NPU_IGPU_PCI`, default `0000:bf:00.0` (hipx). Halo boxes enumerate it differently.
-pub fn igpu_pci() -> String { std::env::var("NPU_IGPU_PCI").unwrap_or_else(|_| "0000:bf:00.0".into()) }
+pub fn igpu_pci() -> String {
+    std::env::var("NPU_IGPU_PCI").unwrap_or_else(|_| "0000:bf:00.0".into())
+}
 /// Guard mode variable: `require` (default) | `pin` | `off`.
 pub const ENV: &str = "NPU_FCLK_GUARD";
 pub const PERF: &str = "power_dpm_force_performance_level";
@@ -44,7 +46,11 @@ const POLL: Duration = Duration::from_millis(100);
 pub type WriteFn = fn(&Path, &str) -> Result<(), String>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode { Require, Pin, Off }
+pub enum Mode {
+    Require,
+    Pin,
+    Off,
+}
 
 impl Mode {
     pub fn parse(s: &str) -> Result<Mode, String> {
@@ -68,36 +74,74 @@ impl Mode {
 
 /// One `pp_dpm_fclk` line.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Level { pub index: String, pub freq: String, pub current: bool }
+pub struct Level {
+    pub index: String,
+    pub freq: String,
+    pub current: bool,
+}
 
 /// Read-back of the two attributes.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct State { pub perf: String, pub levels: Vec<Level> }
+pub struct State {
+    pub perf: String,
+    pub levels: Vec<Level>,
+}
 
 impl State {
     pub fn parse(perf: &str, fclk: &str) -> Result<State, String> {
-        let levels = fclk.lines().filter(|l| !l.trim().is_empty()).map(|l| {
-            let (index, rest) = l.split_once(':').ok_or_else(|| format!("{FCLK}: malformed line {l:?}"))?;
-            let rest = rest.trim();
-            let current = rest.ends_with('*');
-            Ok(Level { index: index.trim().to_string(), freq: rest.trim_end_matches('*').trim().to_string(), current })
-        }).collect::<Result<Vec<_>, String>>()?;
-        if levels.is_empty() { return Err(format!("{FCLK}: no levels")); }
-        Ok(State { perf: perf.trim().to_string(), levels })
+        let levels = fclk
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                let (index, rest) = l
+                    .split_once(':')
+                    .ok_or_else(|| format!("{FCLK}: malformed line {l:?}"))?;
+                let rest = rest.trim();
+                let current = rest.ends_with('*');
+                Ok(Level {
+                    index: index.trim().to_string(),
+                    freq: rest.trim_end_matches('*').trim().to_string(),
+                    current,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if levels.is_empty() {
+            return Err(format!("{FCLK}: no levels"));
+        }
+        Ok(State {
+            perf: perf.trim().to_string(),
+            levels,
+        })
     }
 
     /// `manual` AND exactly one `*`, on the top (last) level.
     pub fn pinned(&self) -> bool {
-        self.perf == "manual" && self.levels.iter().filter(|l| l.current).count() == 1 && self.top().current
+        self.perf == "manual"
+            && self.levels.iter().filter(|l| l.current).count() == 1
+            && self.top().current
     }
 
-    pub fn top(&self) -> &Level { self.levels.last().expect("State::parse guarantees a level") }
+    pub fn top(&self) -> &Level {
+        self.levels.last().expect("State::parse guarantees a level")
+    }
 }
 
 impl fmt::Display for State {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let cur: Vec<String> = self.levels.iter().filter(|l| l.current).map(|l| format!("{}:{}", l.index, l.freq)).collect();
-        write!(f, "perf={} fclk_current=[{}] top={}:{}", self.perf, cur.join(","), self.top().index, self.top().freq)
+        let cur: Vec<String> = self
+            .levels
+            .iter()
+            .filter(|l| l.current)
+            .map(|l| format!("{}:{}", l.index, l.freq))
+            .collect();
+        write!(
+            f,
+            "perf={} fclk_current=[{}] top={}:{}",
+            self.perf,
+            cur.join(","),
+            self.top().index,
+            self.top().freq
+        )
     }
 }
 
@@ -113,33 +157,68 @@ pub fn write_attr(path: &Path, value: &str) -> Result<(), String> {
     if direct.kind() != io::ErrorKind::PermissionDenied {
         return Err(format!("write {value:?} to {}: {direct}", path.display()));
     }
-    let mut child = Command::new("sudo").args(["-n", "tee"]).arg(path)
-        .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()
+    let mut child = Command::new("sudo")
+        .args(["-n", "tee"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("write {value:?} to {}: {direct}; sudo: {e}", path.display()))?;
-    child.stdin.take().expect("piped stdin").write_all(value.as_bytes())
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(value.as_bytes())
         .map_err(|e| format!("write {value:?} to {}: sudo tee stdin: {e}", path.display()))?;
-    let out = child.wait_with_output().map_err(|e| format!("sudo tee {}: {e}", path.display()))?;
-    if out.status.success() { Ok(()) } else {
-        Err(format!("no permission to write {value:?} to {} (direct: {direct}; sudo -n tee: {} {})", path.display(),
-            out.status, String::from_utf8_lossy(&out.stderr).trim()))
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("sudo tee {}: {e}", path.display()))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "no permission to write {value:?} to {} (direct: {direct}; sudo -n tee: {} {})",
+            path.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
     }
 }
 
 /// The two attributes of one amdgpu device.
-pub struct Sysfs { dir: PathBuf, write: WriteFn, settle: Duration }
+pub struct Sysfs {
+    dir: PathBuf,
+    write: WriteFn,
+    settle: Duration,
+}
 
 impl Sysfs {
     /// The Halo iGPU, real writes, 30 s settle.
-    pub fn igpu() -> Sysfs { Sysfs::at(format!("/sys/bus/pci/devices/{}", igpu_pci()), write_attr, PIN_SETTLE) }
+    pub fn igpu() -> Sysfs {
+        Sysfs::at(
+            format!("/sys/bus/pci/devices/{}", igpu_pci()),
+            write_attr,
+            PIN_SETTLE,
+        )
+    }
 
-    pub fn at(dir: impl Into<PathBuf>, write: WriteFn, settle: Duration) -> Sysfs { Sysfs { dir: dir.into(), write, settle } }
+    pub fn at(dir: impl Into<PathBuf>, write: WriteFn, settle: Duration) -> Sysfs {
+        Sysfs {
+            dir: dir.into(),
+            write,
+            settle,
+        }
+    }
 
     fn read(&self, attr: &str) -> Result<String, String> {
         let p = self.dir.join(attr);
         fs::read_to_string(&p).map_err(|e| format!("read {}: {e}", p.display()))
     }
 
-    pub fn state(&self) -> Result<State, String> { State::parse(&self.read(PERF)?, &self.read(FCLK)?) }
+    pub fn state(&self) -> Result<State, String> {
+        State::parse(&self.read(PERF)?, &self.read(FCLK)?)
+    }
 
     /// `manual`, top index, then wait for the pinned read-back. Leaves the writes in place on failure (caller restores).
     pub fn pin(&self) -> Result<State, String> {
@@ -149,9 +228,14 @@ impl Sysfs {
         let t0 = Instant::now();
         loop {
             let s = self.state()?;
-            if s.pinned() { return Ok(s); }
+            if s.pinned() {
+                return Ok(s);
+            }
             if t0.elapsed() >= self.settle {
-                return Err(format!("fclk pin not read back after {:.1} s: {s}", t0.elapsed().as_secs_f64()));
+                return Err(format!(
+                    "fclk pin not read back after {:.1} s: {s}",
+                    t0.elapsed().as_secs_f64()
+                ));
             }
             sleep(POLL);
         }
@@ -161,12 +245,19 @@ impl Sysfs {
     pub fn set_perf(&self, level: &str) -> Result<State, String> {
         (self.write)(&self.dir.join(PERF), level)?;
         let s = self.state()?;
-        if s.perf == level { Ok(s) } else { Err(format!("perf level {level:?} not read back: {s}")) }
+        if s.perf == level {
+            Ok(s)
+        } else {
+            Err(format!("perf level {level:?} not read back: {s}"))
+        }
     }
 }
 
 /// Holds the precondition for concurrent GPU+NPU work for its lifetime; see the module doc.
-pub struct FabricClockGuard { sys: Sysfs, restore: Option<String> }
+pub struct FabricClockGuard {
+    sys: Sysfs,
+    restore: Option<String>,
+}
 
 impl FabricClockGuard {
     /// The Halo iGPU, mode from `NPU_FCLK_GUARD`. `what` names the concurrent path in messages.
@@ -185,7 +276,9 @@ impl FabricClockGuard {
             eprintln!("fclk: ################################################################################");
             return Ok(FabricClockGuard { sys, restore: None });
         }
-        let s = sys.state().map_err(|e| format!("fclk guard ({what}): cannot read the fabric clock state: {e}"))?;
+        let s = sys
+            .state()
+            .map_err(|e| format!("fclk guard ({what}): cannot read the fabric clock state: {e}"))?;
         if s.pinned() {
             eprintln!("fclk: {what}: {dev} pinned ({s}); mode {mode:?}, held as found");
             return Ok(FabricClockGuard { sys, restore: None });
@@ -228,10 +321,17 @@ const CLI_USAGE: &str = "usage: npu-tools fclk status|pin|restore
   restore  write `auto` and verify (exit 4 on failure)";
 
 /// `npu-tools fclk ...` (the `npu-window.sh` steps). Ok = exit status.
-pub fn cli(args: &[String]) -> Result<i32, String> { cli_on(&Sysfs::igpu(), args) }
+pub fn cli(args: &[String]) -> Result<i32, String> {
+    cli_on(&Sysfs::igpu(), args)
+}
 
 fn cli_on(sys: &Sysfs, args: &[String]) -> Result<i32, String> {
-    match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+    match args
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
         ["status"] => {
             let s = sys.state()?;
             println!("fclk: {} {s} pinned={}", sys.dir.display(), s.pinned());
@@ -240,12 +340,22 @@ fn cli_on(sys: &Sysfs, args: &[String]) -> Result<i32, String> {
         ["pin"] => {
             let s = sys.state()?;
             if s.perf != "auto" {
-                println!("fclk: REFUSE: incoming perf level is {:?}, not auto ({s})", s.perf);
+                println!(
+                    "fclk: REFUSE: incoming perf level is {:?}, not auto ({s})",
+                    s.perf
+                );
                 return Ok(6);
             }
             let t0 = Instant::now();
             match sys.pin() {
-                Ok(p) => { println!("fclk: pinned {} after {} ms ({p})", sys.dir.display(), t0.elapsed().as_millis()); Ok(0) }
+                Ok(p) => {
+                    println!(
+                        "fclk: pinned {} after {} ms ({p})",
+                        sys.dir.display(),
+                        t0.elapsed().as_millis()
+                    );
+                    Ok(0)
+                }
                 Err(e) => {
                     println!("fclk: PIN FAILED: {e}");
                     match sys.set_perf("auto") {
@@ -257,10 +367,19 @@ fn cli_on(sys: &Sysfs, args: &[String]) -> Result<i32, String> {
             }
         }
         ["restore"] => match sys.set_perf("auto") {
-            Ok(s) => { println!("fclk: restored {} ({s})", sys.dir.display()); Ok(0) }
-            Err(e) => { println!("fclk: RESTORE FAILED: {e}"); Ok(4) }
+            Ok(s) => {
+                println!("fclk: restored {} ({s})", sys.dir.display());
+                Ok(0)
+            }
+            Err(e) => {
+                println!("fclk: RESTORE FAILED: {e}");
+                Ok(4)
+            }
         },
-        ["-h"] | ["--help"] => { println!("{CLI_USAGE}"); Ok(0) }
+        ["-h"] | ["--help"] => {
+            println!("{CLI_USAGE}");
+            Ok(0)
+        }
         _ => Err(CLI_USAGE.to_string()),
     }
 }
@@ -270,26 +389,47 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    const LEVELS: [&str; 8] = ["400Mhz", "1000Mhz", "1200Mhz", "1400Mhz", "1600Mhz", "1700Mhz", "1850Mhz", "2000Mhz"];
+    const LEVELS: [&str; 8] = [
+        "400Mhz", "1000Mhz", "1200Mhz", "1400Mhz", "1600Mhz", "1700Mhz", "1850Mhz", "2000Mhz",
+    ];
 
     /// A fake device directory with hipx's level table; removed on drop.
     struct Fake(PathBuf);
     impl Fake {
         fn new(perf: &str, current: Option<usize>) -> Fake {
             static N: AtomicUsize = AtomicUsize::new(0);
-            let dir = std::env::temp_dir().join(format!("fclk-test-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+            let dir = std::env::temp_dir().join(format!(
+                "fclk-test-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
             fs::create_dir_all(&dir).unwrap();
             fs::write(dir.join(PERF), format!("{perf}\n")).unwrap();
             fs::write(dir.join(FCLK), table(current)).unwrap();
             Fake(dir)
         }
-        fn sys(&self, write: WriteFn) -> Sysfs { Sysfs::at(&self.0, write, Duration::from_millis(300)) }
-        fn perf(&self) -> String { fs::read_to_string(self.0.join(PERF)).unwrap().trim().to_string() }
+        fn sys(&self, write: WriteFn) -> Sysfs {
+            Sysfs::at(&self.0, write, Duration::from_millis(300))
+        }
+        fn perf(&self) -> String {
+            fs::read_to_string(self.0.join(PERF))
+                .unwrap()
+                .trim()
+                .to_string()
+        }
     }
-    impl Drop for Fake { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+    impl Drop for Fake {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn table(current: Option<usize>) -> String {
-        LEVELS.iter().enumerate().map(|(i, f)| format!("{i}: {f} {}\n", if current == Some(i) { "*" } else { "" })).collect()
+        LEVELS
+            .iter()
+            .enumerate()
+            .map(|(i, f)| format!("{i}: {f} {}\n", if current == Some(i) { "*" } else { "" }))
+            .collect()
     }
 
     /// Emulates the driver: perf writes replace the level (`auto` clears the mask, no `*` shown); an fclk index write
@@ -299,11 +439,15 @@ mod tests {
         match path.file_name().unwrap().to_str().unwrap() {
             PERF => {
                 fs::write(path, format!("{value}\n")).unwrap();
-                if value == "auto" { fs::write(dir.join(FCLK), table(None)).unwrap(); }
+                if value == "auto" {
+                    fs::write(dir.join(FCLK), table(None)).unwrap();
+                }
                 Ok(())
             }
             FCLK => {
-                if fs::read_to_string(dir.join(PERF)).unwrap().trim() != "manual" { return Err("EINVAL: not manual".into()); }
+                if fs::read_to_string(dir.join(PERF)).unwrap().trim() != "manual" {
+                    return Err("EINVAL: not manual".into());
+                }
                 let i: usize = value.trim().parse().map_err(|_| "EINVAL".to_string())?;
                 fs::write(path, table(Some(i))).unwrap();
                 Ok(())
@@ -314,10 +458,16 @@ mod tests {
 
     /// A driver that takes `manual` but ignores the fclk index (the read-back never shows the pin).
     fn stuck(path: &Path, value: &str) -> Result<(), String> {
-        if path.file_name().unwrap() == FCLK { Ok(()) } else { emulate(path, value) }
+        if path.file_name().unwrap() == FCLK {
+            Ok(())
+        } else {
+            emulate(path, value)
+        }
     }
 
-    fn forbidden(_: &Path, _: &str) -> Result<(), String> { panic!("require mode must not write") }
+    fn forbidden(_: &Path, _: &str) -> Result<(), String> {
+        panic!("require mode must not write")
+    }
 
     #[test]
     fn require_accepts_pinned() {
@@ -330,7 +480,9 @@ mod tests {
     #[test]
     fn require_refuses_unpinned() {
         let f = Fake::new("auto", None);
-        let e = FabricClockGuard::with(f.sys(forbidden), Mode::Require, "t").err().unwrap();
+        let e = FabricClockGuard::with(f.sys(forbidden), Mode::Require, "t")
+            .err()
+            .unwrap();
         assert!(e.contains("not pinned"), "{e}");
         // auto that happens to sit on the top level is still not pinned
         let f = Fake::new("auto", Some(7));
@@ -341,16 +493,24 @@ mod tests {
     fn require_refuses_wrong_level() {
         let f = Fake::new("manual", Some(6));
         assert!(FabricClockGuard::with(f.sys(forbidden), Mode::Require, "t").is_err());
-        let two = fs::read_to_string(f.0.join(FCLK)).unwrap().replace("2000Mhz ", "2000Mhz *");
+        let two = fs::read_to_string(f.0.join(FCLK))
+            .unwrap()
+            .replace("2000Mhz ", "2000Mhz *");
         fs::write(f.0.join(FCLK), two).unwrap();
-        assert!(!f.sys(forbidden).state().unwrap().pinned(), "two current levels");
+        assert!(
+            !f.sys(forbidden).state().unwrap().pinned(),
+            "two current levels"
+        );
         assert!(FabricClockGuard::with(f.sys(forbidden), Mode::Require, "t").is_err());
     }
 
     #[test]
     fn require_errors_without_sysfs() {
         let sys = Sysfs::at("/nonexistent/fclk", forbidden, Duration::ZERO);
-        assert!(FabricClockGuard::with(sys, Mode::Require, "t").err().unwrap().contains("cannot read"));
+        assert!(FabricClockGuard::with(sys, Mode::Require, "t")
+            .err()
+            .unwrap()
+            .contains("cannot read"));
     }
 
     #[test]
@@ -395,13 +555,18 @@ mod tests {
     fn pin_refuses_foreign_manual_mask() {
         let f = Fake::new("manual", Some(3));
         assert!(FabricClockGuard::with(f.sys(forbidden), Mode::Pin, "t").is_err());
-        assert!(f.sys(forbidden).state().unwrap().levels[3].current, "foreign mask left untouched");
+        assert!(
+            f.sys(forbidden).state().unwrap().levels[3].current,
+            "foreign mask left untouched"
+        );
     }
 
     #[test]
     fn pin_failure_restores_prior() {
         let f = Fake::new("auto", None);
-        let e = FabricClockGuard::with(f.sys(stuck), Mode::Pin, "t").err().unwrap();
+        let e = FabricClockGuard::with(f.sys(stuck), Mode::Pin, "t")
+            .err()
+            .unwrap();
         assert!(e.contains("not read back"), "{e}");
         assert_eq!(f.perf(), "auto");
     }
@@ -428,7 +593,11 @@ mod tests {
         assert_eq!(cli_on(&f.sys(emulate), &a("status")).unwrap(), 1);
         assert_eq!(cli_on(&f.sys(emulate), &a("pin")).unwrap(), 0);
         assert_eq!(cli_on(&f.sys(emulate), &a("status")).unwrap(), 0);
-        assert_eq!(cli_on(&f.sys(emulate), &a("pin")).unwrap(), 6, "incoming manual is refused");
+        assert_eq!(
+            cli_on(&f.sys(emulate), &a("pin")).unwrap(),
+            6,
+            "incoming manual is refused"
+        );
         assert_eq!(cli_on(&f.sys(emulate), &a("restore")).unwrap(), 0);
         assert_eq!(f.perf(), "auto");
         assert_eq!(cli_on(&f.sys(stuck), &a("pin")).unwrap(), 5);

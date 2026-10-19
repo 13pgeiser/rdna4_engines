@@ -47,6 +47,11 @@ pub mod carrier;
 /// last-token semantics and GPU-backed capture/restore paths.
 #[cfg(feature = "deltanet")]
 pub mod checkpoint;
+/// Minimal DFlash batched-lane seam (lane state wrapper, lane draft, shared
+/// verify head) used by the Gate 0 replay probe. Deltanet-gated like
+/// `dflash_spec`.
+#[cfg(feature = "deltanet")]
+pub mod dflash_cb;
 /// DFlash2 speculative decode for the multi-slot serve engine: shared draft
 /// state, per-slot draft context, and the draft/verify-accept steps that
 /// plug into `serve_engine`'s batched forward. Deltanet-gated like
@@ -59,11 +64,6 @@ pub mod dflash_slot;
 /// based draft verify.
 #[cfg(feature = "deltanet")]
 pub mod dflash_spec;
-/// Minimal DFlash batched-lane seam (lane state wrapper, lane draft, shared
-/// verify head) used by the Gate 0 replay probe. Deltanet-gated like
-/// `dflash_spec`.
-#[cfg(feature = "deltanet")]
-pub mod dflash_cb;
 /// Retained-PM4 route state for the fixed B=16 DFlash2 target-verify forward
 /// (`DflashVerifyPm4`). Owns the phase machine, admission binding, and
 /// route-proof counters; `speculative` owns the GPU half.
@@ -97,13 +97,13 @@ pub mod mtp_speculator;
 pub(crate) mod paro_moe;
 #[cfg(feature = "deltanet")]
 pub mod qwen35;
+#[cfg(feature = "deltanet")]
+#[cfg(feature = "deltanet")]
+pub mod serve_engine;
 /// Shared-weight host v1: typed export/import of a dense Qwen3.5 weight set
 /// as read-only POSIX-FD VMM allocations. Linux only.
 #[cfg(all(feature = "deltanet", target_os = "linux"))]
 pub mod shared_weights;
-#[cfg(feature = "deltanet")]
-#[cfg(feature = "deltanet")]
-pub mod serve_engine;
 /// Qwen3.5 impls of the arch-generic `hipfire_runtime::spec` seam
 /// (`impl SpecTarget for ModelSlot`). Deltanet-gated — it touches `ModelSlot`.
 #[cfg(feature = "deltanet")]
@@ -129,7 +129,6 @@ pub use grammar_config::{resolve_grammar_config, resolve_qwen35_grammar_config};
 /// Per-token spec-decode emission (`SpecEmit`). Pure CPU; named here because it
 /// drives the qwen35 `grammar` matcher. Built via [`spec_emit::Qwen35Emit::from_ctx`].
 pub mod spec_emit;
-
 
 #[cfg(feature = "deltanet")]
 pub use arch::Qwen35;

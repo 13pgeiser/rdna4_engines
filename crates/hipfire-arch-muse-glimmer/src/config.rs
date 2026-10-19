@@ -23,25 +23,25 @@ pub enum GlimmerLayerType {
 /// Typed Muse Glimmer dense-text shape constants.
 #[derive(Debug, Clone)]
 pub struct GlimmerConfig {
-    pub dim: usize,                // hidden_size = 6656
-    pub n_layers: usize,           // num_hidden_layers = 52
-    pub vocab_size: usize,         // 202048
-    pub n_heads: usize,            // num_attention_heads = 32
-    pub n_kv_heads: usize,         // num_key_value_heads = 2
-    pub head_dim: usize,           // 128 (uniform)
-    pub sliding_window: usize,     // 2048
+    pub dim: usize,                     // hidden_size = 6656
+    pub n_layers: usize,                // num_hidden_layers = 52
+    pub vocab_size: usize,              // 202048
+    pub n_heads: usize,                 // num_attention_heads = 32
+    pub n_kv_heads: usize,              // num_key_value_heads = 2
+    pub head_dim: usize,                // 128 (uniform)
+    pub sliding_window: usize,          // 2048
     pub max_position_embeddings: usize, // 131072
-    pub hidden_dim: usize,         // intermediate_size = 19968
-    pub rms_norm_eps: f32,         // 1e-5 for pre-norms
-    pub post_norm_eps: f32,        // 1e-8 for post-norms — SEPARATE value
-    pub qk_scale_factor: f32,      // 3.87 (scale-less QK-norm, no weight tensors)
-    pub output_multiplier: f32,    // 0.196116135 == 1/sqrt(6656/256)
-    pub final_logit_softcapping: f32, // 20.0
-    pub hidden_activation: String, // "silu"
-    pub attention_bias: bool,      // false
-    pub tie_word_embeddings: bool, // false (untied lm_head)
-    pub bos_token: u32,            // 200000
-    pub eos_token: u32,            // 200001
+    pub hidden_dim: usize,              // intermediate_size = 19968
+    pub rms_norm_eps: f32,              // 1e-5 for pre-norms
+    pub post_norm_eps: f32,             // 1e-8 for post-norms — SEPARATE value
+    pub qk_scale_factor: f32,           // 3.87 (scale-less QK-norm, no weight tensors)
+    pub output_multiplier: f32,         // 0.196116135 == 1/sqrt(6656/256)
+    pub final_logit_softcapping: f32,   // 20.0
+    pub hidden_activation: String,      // "silu"
+    pub attention_bias: bool,           // false
+    pub tie_word_embeddings: bool,      // false (untied lm_head)
+    pub bos_token: u32,                 // 200000
+    pub eos_token: u32,                 // 200001
     pub pad_token: Option<u32>,
     pub layer_types: Vec<GlimmerLayerType>,
     /// Per-layer RoPE theta. 500000.0 on sliding layers, 0.0 on full (NoPE).
@@ -65,8 +65,8 @@ impl GlimmerConfig {
         let getb = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_bool());
 
         let dim = getu(tc, "hidden_size").ok_or("glimmer: missing hidden_size")? as usize;
-        let n_layers = getu(tc, "num_hidden_layers")
-            .ok_or("glimmer: missing num_hidden_layers")? as usize;
+        let n_layers =
+            getu(tc, "num_hidden_layers").ok_or("glimmer: missing num_hidden_layers")? as usize;
         let vocab_size = getu(tc, "vocab_size").ok_or("glimmer: missing vocab_size")? as usize;
         // split eps — using one value for both is silently wrong (brief RESOLVED)
         let rms_norm_eps = getf(tc, "rms_norm_eps").unwrap_or(1e-5) as f32;
@@ -84,9 +84,10 @@ impl GlimmerConfig {
 
         let n_heads =
             getu(tc, "num_attention_heads").ok_or("glimmer: missing num_attention_heads")? as usize;
-        let n_kv_heads =
-            getu(tc, "num_key_value_heads").unwrap_or(n_heads as u64) as usize;
-        let head_dim = getu(tc, "head_dim").map(|v| v as usize).unwrap_or(dim / n_heads);
+        let n_kv_heads = getu(tc, "num_key_value_heads").unwrap_or(n_heads as u64) as usize;
+        let head_dim = getu(tc, "head_dim")
+            .map(|v| v as usize)
+            .unwrap_or(dim / n_heads);
 
         let sliding_window = getu(tc, "sliding_window").unwrap_or(2048) as usize;
         let max_position_embeddings =

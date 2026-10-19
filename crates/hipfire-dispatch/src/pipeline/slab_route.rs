@@ -245,7 +245,16 @@ pub(crate) fn k1_down(
 ) -> Result<(), DispatchError> {
     k1_check_lanes(gpu, "k1_down", lanes)?;
     if lanes == 1 && gpu.slab_k1_c1() && k1_rows8_cold_codec(layer.cold_codec) {
-        return hip(gpu.mq_i4_moe_gemv_slab_c1(true, layer.buckets, down_ptrs, topk, xrot, y0, None, layer.cold_codec));
+        return hip(gpu.mq_i4_moe_gemv_slab_c1(
+            true,
+            layer.buckets,
+            down_ptrs,
+            topk,
+            xrot,
+            y0,
+            None,
+            layer.cold_codec,
+        ));
     }
     if lanes <= K1_MAX_ROWS || gpu.qwen4_slab_wide_twin(lanes, layer.cold_codec) {
         return hip(gpu.mq_i4_moe_gemv_slab(
@@ -348,22 +357,41 @@ mod tests {
     fn c1_launcher_contract() {
         assert_eq!(
             gpu::MQ_I4_MOE_GEMV_C1_SYMBOLS,
-            ["mq_i4_moe_gemv_c1_r256_gate_up", "mq_i4_moe_gemv_c1_r128_down"]
+            [
+                "mq_i4_moe_gemv_c1_r256_gate_up",
+                "mq_i4_moe_gemv_c1_r128_down"
+            ]
         );
         assert_eq!(gpu::MQ_I4_MOE_GEMV_C1_KERNARG_BYTES, 80);
-        assert_eq!((gpu::MQ_I4_MOE_GEMV_C1_ROWS_PER_WG, gpu::MQ_I4_MOE_GEMV_C1_BLOCK), (8, 256));
+        assert_eq!(
+            (
+                gpu::MQ_I4_MOE_GEMV_C1_ROWS_PER_WG,
+                gpu::MQ_I4_MOE_GEMV_C1_BLOCK
+            ),
+            (8, 256)
+        );
         let gate = gpu::slab_c1_launch(false);
         assert_eq!(gate.grid, [1280 / 8, 10, 1]);
         assert_eq!(gate.block, [256, 1, 1]);
         assert_eq!(
-            (gate.m as usize, gate.k as usize, gate.x_row_div as usize, gate.y_slot_stride as usize),
+            (
+                gate.m as usize,
+                gate.k as usize,
+                gate.x_row_div as usize,
+                gate.y_slot_stride as usize
+            ),
             (k1::GATE_UP_M, k1::GATE_UP_K, k1::TOP_K, k1::GATE_UP_M / 2)
         );
         let down = gpu::slab_c1_launch(true);
         assert_eq!(down.grid, [2560 / 8, 10, 1]);
         assert_eq!(down.block, [256, 1, 1]);
         assert_eq!(
-            (down.m as usize, down.k as usize, down.x_row_div as usize, down.y_slot_stride as usize),
+            (
+                down.m as usize,
+                down.k as usize,
+                down.x_row_div as usize,
+                down.y_slot_stride as usize
+            ),
             (k1::DOWN_M, k1::DOWN_K, 1, k1::DOWN_M)
         );
     }

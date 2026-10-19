@@ -86,7 +86,8 @@ fn mix(x: usize) -> u32 {
 }
 
 fn poisoned(gpu: &Gpu, len: usize) -> GpuTensor {
-    gpu.upload_raw(&vec![POISON; len], &[len]).expect("poisoned upload")
+    gpu.upload_raw(&vec![POISON; len], &[len])
+        .expect("poisoned upload")
 }
 
 fn poison(gpu: &Gpu, t: &GpuTensor) {
@@ -96,7 +97,10 @@ fn poison(gpu: &Gpu, t: &GpuTensor) {
 }
 
 fn stat_tuples(stats: &[QsaFilterRowStat]) -> Vec<(u64, u32, bool)> {
-    stats.iter().map(|s| (s.threshold, s.count, s.repaired)).collect()
+    stats
+        .iter()
+        .map(|s| (s.threshold, s.count, s.repaired))
+        .collect()
 }
 
 fn i32_bytes(values: &[i32]) -> Vec<u8> {
@@ -108,11 +112,18 @@ fn all_poison(bytes: &[u8]) -> bool {
 }
 
 fn underfill_knobs() -> QsaFilterKnobs {
-    QsaFilterKnobs { target: 1, ..QsaFilterKnobs::default() }
+    QsaFilterKnobs {
+        target: 1,
+        ..QsaFilterKnobs::default()
+    }
 }
 
 fn overflow_knobs() -> QsaFilterKnobs {
-    QsaFilterKnobs { cap: 600, target: 4096, ..QsaFilterKnobs::default() }
+    QsaFilterKnobs {
+        cap: 600,
+        target: 4096,
+        ..QsaFilterKnobs::default()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -156,7 +167,9 @@ impl Fixture {
         // Positive queries: an all-negative block scores 0.
         let query: Vec<f32> = (0..MAX_ROWS * QUERY_STRIDE).map(|_| rng.unit()).collect();
         Self {
-            query: gpu.upload_f32(&query, &[query.len()]).expect("query upload"),
+            query: gpu
+                .upload_f32(&query, &[query.len()])
+                .expect("query upload"),
             selected: poisoned(gpu, MAX_ROWS * CAPACITY * 4 + CANARY),
             mirror: poisoned(gpu, CAPACITY * 4 + CANARY),
         }
@@ -196,8 +209,12 @@ impl Fixture {
     fn download(&self, gpu: &Gpu, persisted: bool, stats: Vec<QsaFilterRowStat>) -> Out {
         Out {
             persisted,
-            selected: gpu.download_raw_bytes(&self.selected).expect("selected download"),
-            mirror: gpu.download_raw_bytes(&self.mirror).expect("mirror download"),
+            selected: gpu
+                .download_raw_bytes(&self.selected)
+                .expect("selected download"),
+            mirror: gpu
+                .download_raw_bytes(&self.mirror)
+                .expect("mirror download"),
             stats,
         }
     }
@@ -230,7 +247,10 @@ fn run_reference(
         QsaSelectPmArm::Hipcc,
     )
     .unwrap_or_else(|e| {
-        panic!("hipcc reference rows={} blocks={} ps={}: {e}", p.rows, p.block_count, p.position_start)
+        panic!(
+            "hipcc reference rows={} blocks={} ps={}: {e}",
+            p.rows, p.block_count, p.position_start
+        )
     });
     fx.download(gpu, persisted, Vec::new())
 }
@@ -264,25 +284,50 @@ fn run_filter(
 /// and a mirror only when one was given.
 fn check_against(label: &str, out: &Out, reference: &Out, rows: usize, with_mirror: bool) {
     let used = rows * CAPACITY * 4;
-    assert!(out.selected == reference.selected, "{label}: selection differs from the hipcc incumbent");
-    assert!(out.mirror == reference.mirror, "{label}: mirror differs from the hipcc incumbent");
-    assert_eq!(out.persisted, reference.persisted, "{label}: persisted flag");
-    assert_eq!(out.persisted, with_mirror, "{label}: persisted without/with mirror");
-    assert!(all_poison(&out.selected[used..]), "{label}: wrote past the selected rows");
-    assert!(all_poison(&out.mirror[CAPACITY * 4..]), "{label}: wrote past the mirror");
+    assert!(
+        out.selected == reference.selected,
+        "{label}: selection differs from the hipcc incumbent"
+    );
+    assert!(
+        out.mirror == reference.mirror,
+        "{label}: mirror differs from the hipcc incumbent"
+    );
+    assert_eq!(
+        out.persisted, reference.persisted,
+        "{label}: persisted flag"
+    );
+    assert_eq!(
+        out.persisted, with_mirror,
+        "{label}: persisted without/with mirror"
+    );
+    assert!(
+        all_poison(&out.selected[used..]),
+        "{label}: wrote past the selected rows"
+    );
+    assert!(
+        all_poison(&out.mirror[CAPACITY * 4..]),
+        "{label}: wrote past the mirror"
+    );
     if with_mirror {
         assert!(
             out.mirror[..CAPACITY * 4] == out.selected[used - CAPACITY * 4..used],
             "{label}: mirror is not the final row's selection"
         );
     } else {
-        assert!(all_poison(&out.mirror), "{label}: wrote a mirror it was not given");
+        assert!(
+            all_poison(&out.mirror),
+            "{label}: wrote a mirror it was not given"
+        );
     }
     assert_eq!(out.stats.len(), rows, "{label}: one stat per row");
 }
 
 fn score_arms(gpu: &Gpu) -> Vec<bool> {
-    if gpu.arch_caps.is_gfx1151() { vec![false, true] } else { vec![false] }
+    if gpu.arch_caps.is_gfx1151() {
+        vec![false, true]
+    } else {
+        vec![false]
+    }
 }
 
 /// `(position_start + rows) / compress == blocks`, with `tail` extra tokens.
@@ -307,7 +352,10 @@ fn qsa_filter_selection_matches_hipcc_incumbent_byte_for_byte() {
                 let with = run_reference(&mut gpu, &fx, &p, true);
                 let without = run_reference(&mut gpu, &fx, &p, false);
                 assert!(with.persisted && !without.persisted);
-                assert!(with.selected == without.selected, "reference differs with a mirror");
+                assert!(
+                    with.selected == without.selected,
+                    "reference differs with a mirror"
+                );
                 for &score_pm in &arms {
                     for with_mirror in [true, false] {
                         let label = format!(
@@ -315,7 +363,12 @@ fn qsa_filter_selection_matches_hipcc_incumbent_byte_for_byte() {
                         );
                         let reference = if with_mirror { &with } else { &without };
                         let out = run_filter(
-                            &mut gpu, &fx, &p, with_mirror, score_pm, QsaFilterKnobs::default(),
+                            &mut gpu,
+                            &fx,
+                            &p,
+                            with_mirror,
+                            score_pm,
+                            QsaFilterKnobs::default(),
                         );
                         check_against(&label, &out, reference, rows, with_mirror);
                         repaired_rows += out.stats.iter().filter(|s| s.repaired).count();
@@ -323,9 +376,20 @@ fn qsa_filter_selection_matches_hipcc_incumbent_byte_for_byte() {
                         // Repeat: selection, mirror and per-row stats are
                         // bit-identical run to run.
                         let again = run_filter(
-                            &mut gpu, &fx, &p, with_mirror, score_pm, QsaFilterKnobs::default(),
+                            &mut gpu,
+                            &fx,
+                            &p,
+                            with_mirror,
+                            score_pm,
+                            QsaFilterKnobs::default(),
                         );
-                        check_against(&format!("{label} repeat"), &again, reference, rows, with_mirror);
+                        check_against(
+                            &format!("{label} repeat"),
+                            &again,
+                            reference,
+                            rows,
+                            with_mirror,
+                        );
                         assert_eq!(
                             stat_tuples(&again.stats),
                             stat_tuples(&out.stats),
@@ -357,7 +421,10 @@ fn qsa_filter_forced_underfill_and_overflow_repair_to_the_exact_selection() {
                 let p = fx.params(&pooled, blocks, rows, position_start(blocks, rows, tail));
                 let with = run_reference(&mut gpu, &fx, &p, true);
                 let without = run_reference(&mut gpu, &fx, &p, false);
-                for (name, knobs) in [("underfill", underfill_knobs()), ("overflow", overflow_knobs())] {
+                for (name, knobs) in [
+                    ("underfill", underfill_knobs()),
+                    ("overflow", overflow_knobs()),
+                ] {
                     for &score_pm in &arms {
                         for with_mirror in [true, false] {
                             let label = format!(
@@ -367,10 +434,19 @@ fn qsa_filter_forced_underfill_and_overflow_repair_to_the_exact_selection() {
                             let out = run_filter(&mut gpu, &fx, &p, with_mirror, score_pm, knobs);
                             check_against(&label, &out, reference, rows, with_mirror);
                             for (row, stat) in out.stats.iter().enumerate() {
-                                assert!(stat.repaired, "{label}: row {row} was not reported repaired");
+                                assert!(
+                                    stat.repaired,
+                                    "{label}: row {row} was not reported repaired"
+                                );
                             }
                             let again = run_filter(&mut gpu, &fx, &p, with_mirror, score_pm, knobs);
-                            check_against(&format!("{label} repeat"), &again, reference, rows, with_mirror);
+                            check_against(
+                                &format!("{label} repeat"),
+                                &again,
+                                reference,
+                                rows,
+                                with_mirror,
+                            );
                             assert_eq!(
                                 stat_tuples(&again.stats),
                                 stat_tuples(&out.stats),
@@ -561,8 +637,10 @@ impl ScoreFixture {
 
     fn download(&self, gpu: &Gpu) -> (Vec<u8>, Vec<u8>) {
         (
-            gpu.download_raw_bytes(&self.selected).expect("selected download"),
-            gpu.download_raw_bytes(&self.mirror).expect("mirror download"),
+            gpu.download_raw_bytes(&self.selected)
+                .expect("selected download"),
+            gpu.download_raw_bytes(&self.mirror)
+                .expect("mirror download"),
         )
     }
 
@@ -612,11 +690,18 @@ fn qsa_filter_from_scores_matches_oracle_and_incumbents() {
                     for budget in [0usize, 1, 511, 512] {
                         let bits = score_matrix(pattern, budget, blocks, rows, ps);
                         let floats: Vec<f32> = bits.iter().map(|b| f32::from_bits(*b)).collect();
-                        let scores = gpu.upload_f32(&floats, &[floats.len()]).expect("scores upload");
-                        for capacity in [budget * COMPRESS + COMPRESS - 1, (budget * COMPRESS) / 2 + 1] {
+                        let scores = gpu
+                            .upload_f32(&floats, &[floats.len()])
+                            .expect("scores upload");
+                        for capacity in [
+                            budget * COMPRESS + COMPRESS - 1,
+                            (budget * COMPRESS) / 2 + 1,
+                        ] {
                             let expected = oracle(&bits, blocks, rows, budget, ps, capacity);
-                            let want_with = expected_buffers(&expected, rows, capacity, MAX_ROWS, true);
-                            let want_without = expected_buffers(&expected, rows, capacity, MAX_ROWS, false);
+                            let want_with =
+                                expected_buffers(&expected, rows, capacity, MAX_ROWS, true);
+                            let want_without =
+                                expected_buffers(&expected, rows, capacity, MAX_ROWS, false);
                             let p = fx.params(&scores, blocks, rows, budget, ps, capacity);
                             let label = format!(
                                 "{pattern:?} blocks={blocks} rows={rows} ps={ps} budget={budget} cap={capacity}"
@@ -628,28 +713,48 @@ fn qsa_filter_from_scores_matches_oracle_and_incumbents() {
                                     continue;
                                 }
                                 fx.poison(&gpu);
-                                qsa_incumbent_select_from_scores_lab(&mut gpu, &p, Some(&fx.mirror), pm)
-                                    .unwrap_or_else(|e| panic!("incumbent pm={pm} {label}: {e}"));
+                                qsa_incumbent_select_from_scores_lab(
+                                    &mut gpu,
+                                    &p,
+                                    Some(&fx.mirror),
+                                    pm,
+                                )
+                                .unwrap_or_else(|e| panic!("incumbent pm={pm} {label}: {e}"));
                                 let got = fx.download(&gpu);
-                                assert!(got.0 == want_with.0, "incumbent pm={pm} {label}: selection != oracle");
-                                assert!(got.1 == want_with.1, "incumbent pm={pm} {label}: mirror != oracle");
+                                assert!(
+                                    got.0 == want_with.0,
+                                    "incumbent pm={pm} {label}: selection != oracle"
+                                );
+                                assert!(
+                                    got.1 == want_with.1,
+                                    "incumbent pm={pm} {label}: mirror != oracle"
+                                );
                             }
 
                             for (knob_name, knobs) in knob_sets {
                                 let label = format!("{label} knobs={knob_name}");
                                 fx.poison(&gpu);
                                 let stats = qsa_filter_select_from_scores_lab(
-                                    &mut gpu, &p, Some(&fx.mirror), knobs,
+                                    &mut gpu,
+                                    &p,
+                                    Some(&fx.mirror),
+                                    knobs,
                                 )
                                 .unwrap_or_else(|e| panic!("filter {label}: {e}"));
                                 let got = fx.download(&gpu);
                                 assert_eq!(stats.len(), rows, "{label}: one stat per row");
-                                assert!(got.0 == want_with.0, "filter {label}: selection != oracle");
+                                assert!(
+                                    got.0 == want_with.0,
+                                    "filter {label}: selection != oracle"
+                                );
                                 assert!(got.1 == want_with.1, "filter {label}: mirror != oracle");
 
                                 fx.poison(&gpu);
                                 let again = qsa_filter_select_from_scores_lab(
-                                    &mut gpu, &p, Some(&fx.mirror), knobs,
+                                    &mut gpu,
+                                    &p,
+                                    Some(&fx.mirror),
+                                    knobs,
                                 )
                                 .unwrap_or_else(|e| panic!("filter repeat {label}: {e}"));
                                 let repeat = fx.download(&gpu);
@@ -665,8 +770,14 @@ fn qsa_filter_from_scores_matches_oracle_and_incumbents() {
                                 qsa_filter_select_from_scores_lab(&mut gpu, &p, None, knobs)
                                     .unwrap_or_else(|e| panic!("filter no-mirror {label}: {e}"));
                                 let bare = fx.download(&gpu);
-                                assert!(bare.0 == want_without.0, "filter no-mirror {label}: selection != oracle");
-                                assert!(bare.1 == want_without.1, "filter no-mirror {label}: wrote a mirror");
+                                assert!(
+                                    bare.0 == want_without.0,
+                                    "filter no-mirror {label}: selection != oracle"
+                                );
+                                assert!(
+                                    bare.1 == want_without.1,
+                                    "filter no-mirror {label}: wrote a mirror"
+                                );
                                 cases += 1;
                             }
                         }
@@ -727,8 +838,13 @@ fn qsa_select_only_bench() {
     let fx = ScoreFixture::new(&gpu, 256);
     let knobs = QsaFilterKnobs::default();
     let (samples, target, cap) = (knobs.samples as i32, knobs.target as i32, knobs.cap as i32);
-    for kernel in ["qsa_filter_threshold", "qsa_filter_compact", "qsa_filter_finish"] {
-        gpu.ensure_kernel_public(FILTER_MODULE, FILTER_SRC, kernel).expect("load filter kernel");
+    for kernel in [
+        "qsa_filter_threshold",
+        "qsa_filter_compact",
+        "qsa_filter_finish",
+    ] {
+        gpu.ensure_kernel_public(FILTER_MODULE, FILTER_SRC, kernel)
+            .expect("load filter kernel");
     }
     println!(
         "select-only median of {BENCH_RUNS} (ms), per call after {BENCH_WARM} warm; budget_blocks={BUDGET_BLOCKS} compress={COMPRESS} samples={samples} target={target} cap={cap}"
@@ -747,26 +863,45 @@ fn qsa_select_only_bench() {
                 })
                 .collect();
             let floats: Vec<f32> = bits.iter().map(|b| f32::from_bits(*b)).collect();
-            let scores = gpu.upload_f32(&floats, &[floats.len()]).expect("scores upload");
+            let scores = gpu
+                .upload_f32(&floats, &[floats.len()])
+                .expect("scores upload");
             let p = fx.params(&scores, blocks, rows, BUDGET_BLOCKS, ps, CAPACITY);
             let used = rows * CAPACITY * 4;
 
             // Equality gates before timing: lab filter and raw trio vs incumbent.
             fx.poison(&gpu);
-            qsa_incumbent_select_from_scores_lab(&mut gpu, &p, Some(&fx.mirror), false).expect("incumbent");
+            qsa_incumbent_select_from_scores_lab(&mut gpu, &p, Some(&fx.mirror), false)
+                .expect("incumbent");
             let reference = fx.download(&gpu);
             fx.poison(&gpu);
-            qsa_filter_select_from_scores_lab(&mut gpu, &p, Some(&fx.mirror), knobs).expect("filter");
-            assert!(fx.download(&gpu) == reference, "rows={rows} blocks={blocks}: lab filter != incumbent");
+            qsa_filter_select_from_scores_lab(&mut gpu, &p, Some(&fx.mirror), knobs)
+                .expect("filter");
+            assert!(
+                fx.download(&gpu) == reference,
+                "rows={rows} blocks={blocks}: lab filter != incumbent"
+            );
 
-            let ctl = gpu.upload_raw(&vec![0u8; rows * 16], &[rows * 16]).expect("ctl");
+            let ctl = gpu
+                .upload_raw(&vec![0u8; rows * 16], &[rows * 16])
+                .expect("ctl");
             let cand_bytes = rows * cap as usize * 8;
-            let cand = gpu.upload_raw(&vec![0u8; cand_bytes], &[cand_bytes]).expect("cand");
+            let cand = gpu
+                .upload_raw(&vec![0u8; cand_bytes], &[cand_bytes])
+                .expect("cand");
             let mut threshold = KernargBlob::new();
             threshold.push_ptr(scores.buf.as_ptr());
             threshold.push_i32(blocks as i32);
             threshold.push_ptr(ctl.buf.as_ptr());
-            for v in [rows as i32, blocks as i32, COMPRESS as i32, ps as i32, samples, target, cap] {
+            for v in [
+                rows as i32,
+                blocks as i32,
+                COMPRESS as i32,
+                ps as i32,
+                samples,
+                target,
+                cap,
+            ] {
                 threshold.push_i32(v);
             }
             threshold.pad_to(16);
@@ -787,26 +922,55 @@ fn qsa_select_only_bench() {
             finish.push_ptr(fx.selected.buf.as_ptr());
             finish.push_ptr(fx.mirror.buf.as_ptr());
             for v in [
-                rows as i32, blocks as i32, BUDGET_BLOCKS as i32, COMPRESS as i32, ps as i32,
-                CAPACITY as i32, cap,
+                rows as i32,
+                blocks as i32,
+                BUDGET_BLOCKS as i32,
+                COMPRESS as i32,
+                ps as i32,
+                CAPACITY as i32,
+                cap,
             ] {
                 finish.push_i32(v);
             }
             finish.pad_to(16);
             let tiles = blocks.div_ceil(4096) as u32;
             let mut trio = |g: &mut Gpu| {
-                g.launch_kernel_blob("qsa_filter_threshold", [rows as u32, 1, 1], [256, 1, 1], 0, threshold.as_mut_slice())
-                    .expect("threshold");
-                g.launch_kernel_blob("qsa_filter_compact", [tiles, rows as u32, 1], [256, 1, 1], 0, compact.as_mut_slice())
-                    .expect("compact");
-                g.launch_kernel_blob("qsa_filter_finish", [rows as u32, 1, 1], [256, 1, 1], 0, finish.as_mut_slice())
-                    .expect("finish");
+                g.launch_kernel_blob(
+                    "qsa_filter_threshold",
+                    [rows as u32, 1, 1],
+                    [256, 1, 1],
+                    0,
+                    threshold.as_mut_slice(),
+                )
+                .expect("threshold");
+                g.launch_kernel_blob(
+                    "qsa_filter_compact",
+                    [tiles, rows as u32, 1],
+                    [256, 1, 1],
+                    0,
+                    compact.as_mut_slice(),
+                )
+                .expect("compact");
+                g.launch_kernel_blob(
+                    "qsa_filter_finish",
+                    [rows as u32, 1, 1],
+                    [256, 1, 1],
+                    0,
+                    finish.as_mut_slice(),
+                )
+                .expect("finish");
             };
             fx.poison(&gpu);
             trio(&mut gpu);
             gpu.hip.device_synchronize().expect("sync");
-            assert!(fx.download(&gpu) == reference, "rows={rows} blocks={blocks}: raw trio != incumbent");
-            assert!(all_poison(&reference.0[used..]), "rows={rows} blocks={blocks}: reference wrote past rows");
+            assert!(
+                fx.download(&gpu) == reference,
+                "rows={rows} blocks={blocks}: raw trio != incumbent"
+            );
+            assert!(
+                all_poison(&reference.0[used..]),
+                "rows={rows} blocks={blocks}: reference wrote past rows"
+            );
 
             // Raw incumbent: same kernarg layout and grid as
             // `indexed_attention_select_rows8` (scores, stride, selected, rows,
@@ -819,7 +983,11 @@ fn qsa_select_only_bench() {
             incumbent.push_i32(blocks as i32);
             incumbent.push_ptr(fx.selected.buf.as_ptr());
             for v in [
-                rows as i32, blocks as i32, BUDGET_BLOCKS as i32, COMPRESS as i32, ps as i32,
+                rows as i32,
+                blocks as i32,
+                BUDGET_BLOCKS as i32,
+                COMPRESS as i32,
+                ps as i32,
                 CAPACITY as i32,
             ] {
                 incumbent.push_i32(v);
@@ -828,25 +996,47 @@ fn qsa_select_only_bench() {
             incumbent.pad_to(16);
             let mut images = vec![HIPCC_SELECT];
             if pm_available {
-                qsa_incumbent_select_from_scores_lab(&mut gpu, &p, Some(&fx.mirror), true).expect("load PM image");
+                qsa_incumbent_select_from_scores_lab(&mut gpu, &p, Some(&fx.mirror), true)
+                    .expect("load PM image");
                 images.push(PM_SELECT);
             }
             for image in images {
                 fx.poison(&gpu);
-                gpu.launch_kernel_blob(image, [rows as u32, 1, 1], [256, 1, 1], 0, incumbent.as_mut_slice())
-                    .unwrap_or_else(|e| panic!("raw {image}: {e}"));
+                gpu.launch_kernel_blob(
+                    image,
+                    [rows as u32, 1, 1],
+                    [256, 1, 1],
+                    0,
+                    incumbent.as_mut_slice(),
+                )
+                .unwrap_or_else(|e| panic!("raw {image}: {e}"));
                 gpu.hip.device_synchronize().expect("sync");
-                assert!(fx.download(&gpu) == reference, "rows={rows} blocks={blocks}: raw {image} != reference");
+                assert!(
+                    fx.download(&gpu) == reference,
+                    "rows={rows} blocks={blocks}: raw {image} != reference"
+                );
             }
 
             let hipcc = median_event_ms(&mut gpu, |g| {
-                g.launch_kernel_blob(HIPCC_SELECT, [rows as u32, 1, 1], [256, 1, 1], 0, incumbent.as_mut_slice())
-                    .expect("hipcc incumbent");
+                g.launch_kernel_blob(
+                    HIPCC_SELECT,
+                    [rows as u32, 1, 1],
+                    [256, 1, 1],
+                    0,
+                    incumbent.as_mut_slice(),
+                )
+                .expect("hipcc incumbent");
             });
             let pm = pm_available.then(|| {
                 median_event_ms(&mut gpu, |g| {
-                    g.launch_kernel_blob(PM_SELECT, [rows as u32, 1, 1], [256, 1, 1], 0, incumbent.as_mut_slice())
-                        .expect("pm incumbent");
+                    g.launch_kernel_blob(
+                        PM_SELECT,
+                        [rows as u32, 1, 1],
+                        [256, 1, 1],
+                        0,
+                        incumbent.as_mut_slice(),
+                    )
+                    .expect("pm incumbent");
                 })
             });
             let filter = median_event_ms(&mut gpu, &mut trio);

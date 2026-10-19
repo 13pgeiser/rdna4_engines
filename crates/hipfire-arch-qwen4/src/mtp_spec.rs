@@ -11616,8 +11616,8 @@ mod tests {
     /// every window losing to a 30 ms AR step, then re-priced AR: its
     /// verdict would retire, so it starts the bounded shallow re-probe.
     fn deep_only_losing_floor(bad: &Agreement) -> MtpFloor {
-        let mut floor = MtpFloor::with_retire_after(MTP_SINGLETON_FLOOR_MIN_WINDOWS)
-            .with_retire_evidence(2);
+        let mut floor =
+            MtpFloor::with_retire_after(MTP_SINGLETON_FLOOR_MIN_WINDOWS).with_retire_evidence(2);
         floor.observe_calibration(30_000.0, bad);
         for _ in 0..MTP_SINGLETON_FLOOR_MIN_WINDOWS {
             floor.observe_window(NativeWindow::Batched, capped(5, 5, 0), 200_000.0, 7, bad);
@@ -11819,8 +11819,8 @@ mod tests {
         }
         // A deep request whose current route budget is 3: the override
         // starts no shallow windows even though deep windows were seen.
-        let mut floor = MtpFloor::with_retire_after(MTP_SINGLETON_FLOOR_MIN_WINDOWS)
-            .with_retire_evidence(2);
+        let mut floor =
+            MtpFloor::with_retire_after(MTP_SINGLETON_FLOOR_MIN_WINDOWS).with_retire_evidence(2);
         floor.observe_calibration(30_000.0, &bad);
         for _ in 0..MTP_SINGLETON_FLOOR_MIN_WINDOWS {
             floor.observe_window(NativeWindow::Batched, capped(5, 5, 0), 200_000.0, 7, &bad);
@@ -11840,8 +11840,8 @@ mod tests {
     #[test]
     fn floor_shallow_reprobe_ignores_stale_shallow_samples() {
         let bad = agreement(0.0, 2.0);
-        let mut floor = MtpFloor::with_retire_after(MTP_SINGLETON_FLOOR_MIN_WINDOWS)
-            .with_retire_evidence(2);
+        let mut floor =
+            MtpFloor::with_retire_after(MTP_SINGLETON_FLOOR_MIN_WINDOWS).with_retire_evidence(2);
         floor.observe_calibration(30_000.0, &bad);
         for _ in 0..MTP_FLOOR_PROBE_WINDOWS {
             floor.observe_window(NativeWindow::Batched, capped(3, 3, 0), 60_000.0, 7, &bad);
@@ -11880,7 +11880,11 @@ mod tests {
         let mut climbed = None;
         for window in 1..=40 {
             floor.observe_window(NativeWindow::Batched, capped(3, 3, 3), 60_000.0, 7, &good);
-            assert_eq!(floor.shallow_state, ShallowState::Holding, "window {window}");
+            assert_eq!(
+                floor.shallow_state,
+                ShallowState::Holding,
+                "window {window}"
+            );
             assert!(!floor.retired);
             let route = floor.route(&good, 7, 3);
             if floor.climb_streak < MTP_FLOOR_PROBE_WINDOWS {
@@ -12624,7 +12628,11 @@ mod tests {
             .expect("armed")
             .note_row(1, armed.target.entries(), false);
         assert_eq!(armed.host_bonus(), 5);
-        assert_eq!(rng_word(&armed.rng), rng_word(&reference), "observing moved no draw");
+        assert_eq!(
+            rng_word(&armed.rng),
+            rng_word(&reference),
+            "observing moved no draw"
+        );
         let window = armed.lab.take().expect("armed");
         let tape = crate::lab_window::peek_uniforms(&start, 2);
         assert_eq!(window.proposals.len(), 1);
@@ -12632,7 +12640,10 @@ mod tests {
         assert_eq!(
             window.proposals[0].verdict,
             Some(LabVerdict::Accept {
-                draw: crate::lab_window::LabDraw { index: 0, u: tape[0] }
+                draw: crate::lab_window::LabDraw {
+                    index: 0,
+                    u: tape[0]
+                }
             })
         );
         let bonus = window.bonus.expect("bonus noted");

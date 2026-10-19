@@ -95,8 +95,18 @@ fn grouped_case(gpu: &mut Gpu, m: usize, k: usize, slots: usize, label: &str) {
     gpu.hip.memcpy_htod(&perm, &permutation_bytes).unwrap();
 
     let ep_t = wrap(ep.as_ptr(), 8, vec![1], DType::Raw);
-    let tile_t = wrap(tile.as_ptr(), tile_bytes.len(), vec![slots / 16], DType::Raw);
-    let perm_t = wrap(perm.as_ptr(), permutation_bytes.len(), vec![slots], DType::Raw);
+    let tile_t = wrap(
+        tile.as_ptr(),
+        tile_bytes.len(),
+        vec![slots / 16],
+        DType::Raw,
+    );
+    let perm_t = wrap(
+        perm.as_ptr(),
+        permutation_bytes.len(),
+        vec![slots],
+        DType::Raw,
+    );
     let x_t = wrap(x_dev.as_ptr(), x_bytes.len(), vec![slots, k], DType::F32);
     let y_t = wrap(y.as_ptr(), slots * m * 4, vec![slots, m], DType::F32);
 
@@ -107,9 +117,8 @@ fn grouped_case(gpu: &mut Gpu, m: usize, k: usize, slots: usize, label: &str) {
     gpu.hip.device_synchronize().unwrap();
     let mut y_bytes = vec![0u8; slots * m * 4];
     gpu.hip.memcpy_dtoh(&mut y_bytes, &y).unwrap();
-    let y_host: &[f32] = unsafe {
-        std::slice::from_raw_parts(y_bytes.as_ptr() as *const f32, slots * m)
-    };
+    let y_host: &[f32] =
+        unsafe { std::slice::from_raw_parts(y_bytes.as_ptr() as *const f32, slots * m) };
 
     let mut max_abs = 0.0f32;
     let mut max_rel = 0.0f32;
@@ -193,10 +202,14 @@ fn indexer_case(gpu: &mut Gpu) {
     let rt = wrap(reference.as_ptr(), B * N * 4, vec![B, N], DType::F32);
     let ct = wrap(candidate.as_ptr(), B * N * 4, vec![B, N], DType::F32);
 
-    gpu.indexer_relu_score_batched_f32(&qt, &kt, &wt, &nt, &rt, H as i32, D as i32, N as i32, B as i32)
-        .unwrap();
-    gpu.indexer_relu_score_wmma_batched_f32(&qt, &kt, &wt, &nt, &ct, H as i32, D as i32, N as i32, B as i32)
-        .unwrap();
+    gpu.indexer_relu_score_batched_f32(
+        &qt, &kt, &wt, &nt, &rt, H as i32, D as i32, N as i32, B as i32,
+    )
+    .unwrap();
+    gpu.indexer_relu_score_wmma_batched_f32(
+        &qt, &kt, &wt, &nt, &ct, H as i32, D as i32, N as i32, B as i32,
+    )
+    .unwrap();
     gpu.hip.device_synchronize().unwrap();
     let mut rb = vec![0u8; B * N * 4];
     let mut cb = vec![0u8; B * N * 4];
@@ -221,11 +234,15 @@ fn indexer_case(gpu: &mut Gpu) {
         let start = Instant::now();
         for _ in 0..20 {
             if wmma {
-                gpu.indexer_relu_score_wmma_batched_f32(&qt, &kt, &wt, &nt, &ct, H as i32, D as i32, N as i32, B as i32)
-                    .unwrap();
+                gpu.indexer_relu_score_wmma_batched_f32(
+                    &qt, &kt, &wt, &nt, &ct, H as i32, D as i32, N as i32, B as i32,
+                )
+                .unwrap();
             } else {
-                gpu.indexer_relu_score_batched_f32(&qt, &kt, &wt, &nt, &rt, H as i32, D as i32, N as i32, B as i32)
-                    .unwrap();
+                gpu.indexer_relu_score_batched_f32(
+                    &qt, &kt, &wt, &nt, &rt, H as i32, D as i32, N as i32, B as i32,
+                )
+                .unwrap();
             }
         }
         gpu.hip.device_synchronize().unwrap();

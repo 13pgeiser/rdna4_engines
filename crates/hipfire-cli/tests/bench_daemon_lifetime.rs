@@ -152,7 +152,10 @@ fn sigterm_while_the_daemon_loads_kills_and_reaps_the_owned_daemon() {
     // The harness-timeout case: SIGTERM reaches only the CLI, and the daemon
     // would ignore it anyway.
     // SAFETY: `cli.id()` is the live child this test spawned.
-    assert_eq!(unsafe { libc::kill(cli.id() as libc::pid_t, libc::SIGTERM) }, 0);
+    assert_eq!(
+        unsafe { libc::kill(cli.id() as libc::pid_t, libc::SIGTERM) },
+        0
+    );
     let status = wait_for_exit(&mut cli, "SIGTERM while loading");
     let leaked = alive(daemon_pid);
     if leaked {
@@ -216,7 +219,10 @@ fn interrupt_leaves_an_unrelated_daemon_alone() {
     assert_ne!(owned_pid, bystander_pid);
 
     // SAFETY: `cli.id()` is the live child this test spawned.
-    assert_eq!(unsafe { libc::kill(cli.id() as libc::pid_t, libc::SIGTERM) }, 0);
+    assert_eq!(
+        unsafe { libc::kill(cli.id() as libc::pid_t, libc::SIGTERM) },
+        0
+    );
     wait_for_exit(&mut cli, "SIGTERM with a bystander daemon");
     let bystander_alive = alive(bystander_pid);
     let owned_alive = alive(owned_pid);

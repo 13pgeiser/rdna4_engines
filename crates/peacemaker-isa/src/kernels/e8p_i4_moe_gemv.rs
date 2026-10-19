@@ -197,7 +197,10 @@ impl Spec {
     }
     pub fn validate(&self) -> R {
         if !matches!(self.arch, Arch::Gfx1201 | Arch::Gfx1100 | Arch::Gfx1151) {
-            return Err("e8p_i4_moe_gemv builder is exact-gfx1201 / exact-gfx1100 / exact-gfx1151 only".into());
+            return Err(
+                "e8p_i4_moe_gemv builder is exact-gfx1201 / exact-gfx1100 / exact-gfx1151 only"
+                    .into(),
+            );
         }
         Ok(())
     }

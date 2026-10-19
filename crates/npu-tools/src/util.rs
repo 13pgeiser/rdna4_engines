@@ -6,7 +6,9 @@ use std::time::Duration;
 
 /// 64-bit LCG (Knuth MMIX constants) yielding the top byte as i8: the deterministic operand generator every GEMM driver uses.
 pub fn lcg(seed: &mut u64) -> i8 {
-    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *seed = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     (*seed >> 33) as i8
 }
 
@@ -17,7 +19,8 @@ pub fn percentile(sorted: &[f64], p: f64) -> f64 {
 }
 
 pub fn parse_num<T: std::str::FromStr>(name: &str, s: &str) -> Result<T, String> {
-    s.parse().map_err(|_| format!("{name} expects a number, got {s:?}"))
+    s.parse()
+        .map_err(|_| format!("{name} expects a number, got {s:?}"))
 }
 
 pub fn round_up(x: usize, a: usize) -> usize {

@@ -172,7 +172,11 @@ fn f32_to_f16_bits(x: f32) -> u16 {
         let q = mant >> shift;
         let rem = mant & ((1u32 << shift) - 1);
         let half = 1u32 << (shift - 1);
-        let q = if rem > half || (rem == half && q & 1 == 1) { q + 1 } else { q };
+        let q = if rem > half || (rem == half && q & 1 == 1) {
+            q + 1
+        } else {
+            q
+        };
         return sign | q as u16;
     }
     let m = abs - 0x3800_0000;
@@ -185,13 +189,21 @@ fn f16_to_f32(bits: u16) -> f32 {
     let e = ((bits >> 10) & 0x1f) as i32;
     let m = (bits & 0x3ff) as f64;
     assert!(e != 31, "f16 inf/nan scale {bits:#06x}");
-    let v = if e == 0 { m * 2f64.powi(-24) } else { (1024.0 + m) * 2f64.powi(e - 25) };
+    let v = if e == 0 {
+        m * 2f64.powi(-24)
+    } else {
+        (1024.0 + m) * 2f64.powi(e - 25)
+    };
     (sign * v) as f32
 }
 
 /// f16 scale bits of a head with absolute maximum `amax` (`qsa_kv_store`).
 fn scale_bits(amax: f32) -> u16 {
-    let mut s16 = if amax == 0.0 { 0x3c00 } else { f32_to_f16_bits(amax / 448.0) };
+    let mut s16 = if amax == 0.0 {
+        0x3c00
+    } else {
+        f32_to_f16_bits(amax / 448.0)
+    };
     if amax > 0.0 && s16 == 0 {
         s16 = 1;
     }
@@ -344,7 +356,13 @@ fn gen_head(kind: usize, rng: &mut Rng, tab: &[f32; 128]) -> Vec<f32> {
         2 => vec![0.0; HD],
         3 => vec![-0.0; HD],
         4 => (0..HD)
-            .map(|c| if c % 7 == 3 { -0.0 } else { -(rng.value(1.0) + 1.0) })
+            .map(|c| {
+                if c % 7 == 3 {
+                    -0.0
+                } else {
+                    -(rng.value(1.0) + 1.0)
+                }
+            })
             .collect(),
         5 => {
             let s = f16_to_f32(SCALE_BITS[rng.below(6) as usize]);
@@ -389,7 +407,11 @@ fn gen_head(kind: usize, rng: &mut Rng, tab: &[f32; 128]) -> Vec<f32> {
 
 fn init_gpu() -> Gpu {
     let gpu = Gpu::init().expect("HIP device init");
-    assert_eq!(gpu.arch.as_str(), "gfx1201", "these tests need an exact gfx1201 device");
+    assert_eq!(
+        gpu.arch.as_str(),
+        "gfx1201",
+        "these tests need an exact gfx1201 device"
+    );
     gpu
 }
 
@@ -409,8 +431,13 @@ fn sentinel(gpu: &mut Gpu, n: usize) -> GpuTensor {
 }
 
 fn upload_selected(gpu: &Gpu, rows: &[Vec<i32>]) -> GpuTensor {
-    let bytes: Vec<u8> = rows.iter().flatten().flat_map(|t| t.to_le_bytes()).collect();
-    gpu.upload_raw(&bytes, &[bytes.len()]).expect("upload selected")
+    let bytes: Vec<u8> = rows
+        .iter()
+        .flatten()
+        .flat_map(|t| t.to_le_bytes())
+        .collect();
+    gpu.upload_raw(&bytes, &[bytes.len()])
+        .expect("upload selected")
 }
 
 // ---------------------------------------------------------------------------
@@ -446,10 +473,18 @@ fn qsa_fp8_append_encodes_e4m3_rows() {
 
     let k_in = gpu.upload_f32(&k, &[k.len()]).expect("upload K");
     let v_in = gpu.upload_f32(&v, &[v.len()]).expect("upload V");
-    let k32 = gpu.zeros(&[ROWS_CAP * width], DType::F32).expect("F32 K cache");
-    let v32 = gpu.zeros(&[ROWS_CAP * width], DType::F32).expect("F32 V cache");
-    let k8 = gpu.zeros(&[ROWS_CAP * ROW_BYTES], DType::Raw).expect("Fp8 K cache");
-    let v8 = gpu.zeros(&[ROWS_CAP * ROW_BYTES], DType::Raw).expect("Fp8 V cache");
+    let k32 = gpu
+        .zeros(&[ROWS_CAP * width], DType::F32)
+        .expect("F32 K cache");
+    let v32 = gpu
+        .zeros(&[ROWS_CAP * width], DType::F32)
+        .expect("F32 V cache");
+    let k8 = gpu
+        .zeros(&[ROWS_CAP * ROW_BYTES], DType::Raw)
+        .expect("Fp8 K cache");
+    let v8 = gpu
+        .zeros(&[ROWS_CAP * ROW_BYTES], DType::Raw)
+        .expect("Fp8 V cache");
     for (format, kc, vc) in [(QsaKvFormat::F32, &k32, &v32), (QsaKvFormat::Fp8, &k8, &v8)] {
         indexed_attention_cache_append_batch(
             &mut gpu,
@@ -485,7 +520,10 @@ fn qsa_fp8_append_encodes_e4m3_rows() {
         if let Some(i) = f32c[..P * width].iter().position(|x| x.to_bits() != 0) {
             fails.push(format!("{name}: F32 cache prefix element {i} is not +0"));
         }
-        if let Some(i) = f32c[(P + N) * width..].iter().position(|x| x.to_bits() != 0) {
+        if let Some(i) = f32c[(P + N) * width..]
+            .iter()
+            .position(|x| x.to_bits() != 0)
+        {
             fails.push(format!("{name}: F32 cache suffix element {i} is not +0"));
         }
         if let Some(i) = fp8c[..P * ROW_BYTES].iter().position(|&b| b != 0) {
@@ -515,8 +553,12 @@ fn qsa_fp8_append_encodes_e4m3_rows() {
                 if first.is_none() {
                     let msg = if b < NKV * HD {
                         let (h, c) = (b / HD, b % HD);
-                        let s_got = u16::from_le_bytes([got[NKV * HD + 2 * h], got[NKV * HD + 2 * h + 1]]);
-                        let s_want = u16::from_le_bytes([want[NKV * HD + 2 * h], want[NKV * HD + 2 * h + 1]]);
+                        let s_got =
+                            u16::from_le_bytes([got[NKV * HD + 2 * h], got[NKV * HD + 2 * h + 1]]);
+                        let s_want = u16::from_le_bytes([
+                            want[NKV * HD + 2 * h],
+                            want[NKV * HD + 2 * h + 1],
+                        ]);
                         format!(
                             "{name} row {i} (position {pos}) head {h} channel {c} [{}]: code got {:#04x} want {:#04x} for input {:e} ({:#010x}); scale bits got {s_got:#06x} want {s_want:#06x}",
                             KIND_NAMES[kinds[(which * N + i) * NKV + h]],
@@ -542,7 +584,10 @@ fn qsa_fp8_append_encodes_e4m3_rows() {
             }
             // Decoded element against the F32 cache element.
             for h in 0..NKV {
-                let s = f16_to_f32(u16::from_le_bytes([got[NKV * HD + 2 * h], got[NKV * HD + 2 * h + 1]]));
+                let s = f16_to_f32(u16::from_le_bytes([
+                    got[NKV * HD + 2 * h],
+                    got[NKV * HD + 2 * h + 1],
+                ]));
                 for c in 0..HD {
                     let d = e4m3_decode(got[h * HD + c], s, &tab);
                     let xe = got32[h * HD + c];
@@ -627,7 +672,10 @@ fn decode_cache(
     for tok in 0..FULL_CAP {
         let row = &bytes[tok * ROW_BYTES..(tok + 1) * ROW_BYTES];
         for h in 0..NKV {
-            let s = f16_to_f32(u16::from_le_bytes([row[NKV * HD + 2 * h], row[NKV * HD + 2 * h + 1]]));
+            let s = f16_to_f32(u16::from_le_bytes([
+                row[NKV * HD + 2 * h],
+                row[NKV * HD + 2 * h + 1],
+            ]));
             for c in 0..HD {
                 let i = (tok * NKV + h) * HD + c;
                 let d = e4m3_decode(row[h * HD + c], s, tab);
@@ -656,8 +704,12 @@ impl Cache {
         let vf = gen_cache(&mut rng);
         let k32 = gpu.upload_f32(&kf, &[n]).expect("upload F32 K cache");
         let v32 = gpu.upload_f32(&vf, &[n]).expect("upload F32 V cache");
-        let k8 = gpu.zeros(&[FULL_CAP * ROW_BYTES], DType::Raw).expect("Fp8 K cache");
-        let v8 = gpu.zeros(&[FULL_CAP * ROW_BYTES], DType::Raw).expect("Fp8 V cache");
+        let k8 = gpu
+            .zeros(&[FULL_CAP * ROW_BYTES], DType::Raw)
+            .expect("Fp8 K cache");
+        let v8 = gpu
+            .zeros(&[FULL_CAP * ROW_BYTES], DType::Raw)
+            .expect("Fp8 V cache");
         indexed_attention_cache_append_batch(
             gpu,
             &IndexedAttentionCacheAppendBatch {
@@ -678,7 +730,19 @@ impl Cache {
         let vb = gpu.download_raw_bytes(&v8).expect("download Fp8 V");
         let (kd, ek, _kxmax, kdmax) = decode_cache(&kf, &kb, &tab, "K");
         let (vd, ev, vmax, vdmax) = decode_cache(&vf, &vb, &tab, "V");
-        Cache { kd, vd, k32, v32, k8, v8, ek, ev, vmax, kdmax, vdmax }
+        Cache {
+            kd,
+            vd,
+            k32,
+            v32,
+            k8,
+            v8,
+            ek,
+            ev,
+            vmax,
+            kdmax,
+            vdmax,
+        }
     }
 
     fn free(self, gpu: &mut Gpu) {
@@ -719,8 +783,11 @@ struct Layout {
     capacity: usize,
 }
 
-const GATHER_LAYOUT: Layout =
-    Layout { budget: GATHER_BUDGET, compress: GATHER_COMPRESS, capacity: GATHER_CAPACITY };
+const GATHER_LAYOUT: Layout = Layout {
+    budget: GATHER_BUDGET,
+    compress: GATHER_COMPRESS,
+    capacity: GATHER_CAPACITY,
+};
 
 /// The kernels' own selected length of the row with `visible` keys.
 fn selected_len(visible: usize, l: Layout) -> usize {
@@ -736,13 +803,7 @@ fn is_valid(token: i32, hi: usize) -> bool {
 /// batched kernels' bound, and the single-row entry's `full_capacity`); the
 /// invalid ones are negative, in [visible, FULL_CAP) or >= FULL_CAP. Slots at or
 /// past `sel_len` hold valid-looking tokens unless the mode is AllInvalid.
-fn gen_row(
-    rng: &mut Rng,
-    mode: Mode,
-    visible: usize,
-    sel_len: usize,
-    capacity: usize,
-) -> Vec<i32> {
+fn gen_row(rng: &mut Rng, mode: Mode, visible: usize, sel_len: usize, capacity: usize) -> Vec<i32> {
     let valid = |rng: &mut Rng| -> i32 { rng.below(visible as u64) as i32 };
     let invalid = |rng: &mut Rng, kind: usize| -> i32 {
         match kind % 3 {
@@ -763,7 +824,11 @@ fn gen_row(
     (0..capacity)
         .map(|j| {
             if j >= sel_len {
-                return if mode == Mode::AllInvalid { invalid(rng, j) } else { valid(rng) };
+                return if mode == Mode::AllInvalid {
+                    invalid(rng, j)
+                } else {
+                    valid(rng)
+                };
             }
             match mode {
                 Mode::AllValid => valid(rng),
@@ -793,14 +858,32 @@ struct Case {
 /// `rows` rows ending at `len` visible tokens (`single`: the single-row entry
 /// over `len` selected slots). Row 1 of every batch of two or more rows has no
 /// valid token; every third row from 2 is all-valid, the rest mixed.
-fn build_case(rng: &mut Rng, rows: usize, len: usize, layout: Layout, single: bool, qscale: f32) -> Case {
+fn build_case(
+    rng: &mut Rng,
+    rows: usize,
+    len: usize,
+    layout: Layout,
+    single: bool,
+    qscale: f32,
+) -> Case {
     let rows = if single { 1 } else { rows };
     let position_start = len - rows;
     let (mut sel, mut sel_len, mut hi) = (Vec::new(), Vec::new(), Vec::new());
-    let layout = if single { Layout { capacity: len, ..layout } } else { layout };
+    let layout = if single {
+        Layout {
+            capacity: len,
+            ..layout
+        }
+    } else {
+        layout
+    };
     for r in 0..rows {
         let visible = position_start + r + 1;
-        let n = if single { len } else { selected_len(visible, layout) };
+        let n = if single {
+            len
+        } else {
+            selected_len(visible, layout)
+        };
         let mode = if r == 1 {
             Mode::AllInvalid
         } else if r >= 2 && r % 3 == 2 {
@@ -812,13 +895,25 @@ fn build_case(rng: &mut Rng, rows: usize, len: usize, layout: Layout, single: bo
         sel_len.push(n);
         hi.push(visible.min(FULL_CAP));
     }
-    Case { rows, position_start, layout, q: make_q(rng, rows, qscale), sel, sel_len, hi }
+    Case {
+        rows,
+        position_start,
+        layout,
+        q: make_q(rng, rows, qscale),
+        sel,
+        sel_len,
+        hi,
+    }
 }
 
 impl Case {
     fn valid_rows(&self) -> Vec<bool> {
         (0..self.rows)
-            .map(|r| self.sel[r][..self.sel_len[r]].iter().any(|&t| is_valid(t, self.hi[r])))
+            .map(|r| {
+                self.sel[r][..self.sel_len[r]]
+                    .iter()
+                    .any(|&t| is_valid(t, self.hi[r]))
+            })
             .collect()
     }
 
@@ -975,7 +1070,13 @@ fn rel_l2(want: &[f64], got: &[f32]) -> f64 {
 
 /// Exact-route check: invalid rows exactly +0, every other head within
 /// `1e-5 * maxabsref + 1e-7`. Returns (worst maxdiff, worst diff/tol).
-fn check_exact(label: &str, case: &Case, got: &[f32], want: &[f64], fails: &mut Vec<String>) -> (f64, f64) {
+fn check_exact(
+    label: &str,
+    case: &Case,
+    got: &[f32],
+    want: &[f64],
+    fails: &mut Vec<String>,
+) -> (f64, f64) {
     let valid = case.valid_rows();
     let row_len = NH * HD;
     let (mut worst, mut ratio) = (0.0f64, 0.0f64);
@@ -1004,7 +1105,9 @@ fn check_exact(label: &str, case: &Case, got: &[f32], want: &[f64], fails: &mut 
                 bad = true;
             }
             if maxabs == 0.0 {
-                fails.push(format!("{label}: row {r} head {h} reference is all zero despite valid tokens"));
+                fails.push(format!(
+                    "{label}: row {r} head {h} reference is all zero despite valid tokens"
+                ));
             }
             if bad {
                 fails.push(format!(
@@ -1036,10 +1139,22 @@ fn qsa_fp8_attention_matches_decoded_reference() {
 
     for &len in &LENS {
         // Single-row entry: full_capacity = visible, so tokens >= visible are invalid.
-        let layout = Layout { budget: HUGE, compress: 4, capacity: len };
+        let layout = Layout {
+            budget: HUGE,
+            compress: 4,
+            capacity: len,
+        };
         let case = build_case(&mut rng, 1, len, layout, true, QSCALE);
         let (q, sel) = case.upload(&mut gpu);
-        let got = run(&mut gpu, Route::Single, QsaKvFormat::Fp8, &cache, &q, &sel, &case);
+        let got = run(
+            &mut gpu,
+            Route::Single,
+            QsaKvFormat::Fp8,
+            &cache,
+            &q,
+            &sel,
+            &case,
+        );
         let want = cpu_reference(&case, &cache.kd, &cache.vd);
         check_exact(&format!("len {len} single"), &case, &got, &want, &mut fails);
         free(&mut gpu, vec![q, sel]);
@@ -1048,9 +1163,23 @@ fn qsa_fp8_attention_matches_decoded_reference() {
         for rows in 1..=8usize {
             let case = build_case(&mut rng, rows, len, layout, false, QSCALE);
             let (q, sel) = case.upload(&mut gpu);
-            let got = run(&mut gpu, Route::Production, QsaKvFormat::Fp8, &cache, &q, &sel, &case);
+            let got = run(
+                &mut gpu,
+                Route::Production,
+                QsaKvFormat::Fp8,
+                &cache,
+                &q,
+                &sel,
+                &case,
+            );
             let want = cpu_reference(&case, &cache.kd, &cache.vd);
-            check_exact(&format!("len {len} batch rows {rows}"), &case, &got, &want, &mut fails);
+            check_exact(
+                &format!("len {len} batch rows {rows}"),
+                &case,
+                &got,
+                &want,
+                &mut fails,
+            );
             free(&mut gpu, vec![q, sel]);
         }
     }
@@ -1059,7 +1188,15 @@ fn qsa_fp8_attention_matches_decoded_reference() {
         for (rows, len) in [(64usize, 64usize), (64, 1131), (512, 1131)] {
             let case = build_case(&mut rng, rows, len, GATHER_LAYOUT, false, QSCALE);
             let (q, sel) = case.upload(&mut gpu);
-            let got = run(&mut gpu, Route::Gathered, QsaKvFormat::Fp8, &cache, &q, &sel, &case);
+            let got = run(
+                &mut gpu,
+                Route::Gathered,
+                QsaKvFormat::Fp8,
+                &cache,
+                &q,
+                &sel,
+                &case,
+            );
             let want = cpu_reference(&case, &cache.kd, &cache.vd);
             let label = format!("gathered rows {rows} len {len}");
             let valid = case.valid_rows();
@@ -1196,20 +1333,72 @@ fn qsa_fp8_attention_within_bound_of_f32() {
     const QSCALE: f32 = 0.25;
 
     for &len in &LENS {
-        let layout = Layout { budget: HUGE, compress: 4, capacity: len };
+        let layout = Layout {
+            budget: HUGE,
+            compress: 4,
+            capacity: len,
+        };
         let case = build_case(&mut rng, 1, len, layout, true, QSCALE);
         let (q, sel) = case.upload(&mut gpu);
-        let a = run(&mut gpu, Route::Single, QsaKvFormat::F32, &cache, &q, &sel, &case);
-        let b = run(&mut gpu, Route::Single, QsaKvFormat::Fp8, &cache, &q, &sel, &case);
-        compare_routes(&format!("len {len} single"), &case, &cache, false, &a, &b, &mut fails);
+        let a = run(
+            &mut gpu,
+            Route::Single,
+            QsaKvFormat::F32,
+            &cache,
+            &q,
+            &sel,
+            &case,
+        );
+        let b = run(
+            &mut gpu,
+            Route::Single,
+            QsaKvFormat::Fp8,
+            &cache,
+            &q,
+            &sel,
+            &case,
+        );
+        compare_routes(
+            &format!("len {len} single"),
+            &case,
+            &cache,
+            false,
+            &a,
+            &b,
+            &mut fails,
+        );
         free(&mut gpu, vec![q, sel]);
 
         for rows in 1..=8usize {
             let case = build_case(&mut rng, rows, len, layout, false, QSCALE);
             let (q, sel) = case.upload(&mut gpu);
-            let a = run(&mut gpu, Route::Production, QsaKvFormat::F32, &cache, &q, &sel, &case);
-            let b = run(&mut gpu, Route::Production, QsaKvFormat::Fp8, &cache, &q, &sel, &case);
-            compare_routes(&format!("len {len} batch rows {rows}"), &case, &cache, false, &a, &b, &mut fails);
+            let a = run(
+                &mut gpu,
+                Route::Production,
+                QsaKvFormat::F32,
+                &cache,
+                &q,
+                &sel,
+                &case,
+            );
+            let b = run(
+                &mut gpu,
+                Route::Production,
+                QsaKvFormat::Fp8,
+                &cache,
+                &q,
+                &sel,
+                &case,
+            );
+            compare_routes(
+                &format!("len {len} batch rows {rows}"),
+                &case,
+                &cache,
+                false,
+                &a,
+                &b,
+                &mut fails,
+            );
             free(&mut gpu, vec![q, sel]);
         }
 
@@ -1223,8 +1412,24 @@ fn qsa_fp8_attention_within_bound_of_f32() {
                 // selection-blind dense WMMA route at 512 rows.
                 let case = build_case(&mut rng, rows, len, GATHER_LAYOUT, false, QSCALE);
                 let (q, sel) = case.upload(&mut gpu);
-                let a = run(&mut gpu, Route::Exact, QsaKvFormat::F32, &cache, &q, &sel, &case);
-                let b = run(&mut gpu, Route::Gathered, QsaKvFormat::Fp8, &cache, &q, &sel, &case);
+                let a = run(
+                    &mut gpu,
+                    Route::Exact,
+                    QsaKvFormat::F32,
+                    &cache,
+                    &q,
+                    &sel,
+                    &case,
+                );
+                let b = run(
+                    &mut gpu,
+                    Route::Gathered,
+                    QsaKvFormat::Fp8,
+                    &cache,
+                    &q,
+                    &sel,
+                    &case,
+                );
                 compare_routes(
                     &format!("len {len} gathered rows {rows} (f32 exact vs fp8 gathered)"),
                     &case,

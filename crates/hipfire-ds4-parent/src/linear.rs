@@ -118,11 +118,7 @@ impl ParentDenseWeight {
         let _ = gpu.free_tensor(scales_t);
         dequant.map_err(|e| format!("deepseek4 parent: dense FP8→BF16 dequant: {e:?}"))?;
 
-        Ok(Self {
-            tensor: out,
-            n,
-            k,
-        })
+        Ok(Self { tensor: out, n, k })
     }
 
     pub fn n(&self) -> usize {

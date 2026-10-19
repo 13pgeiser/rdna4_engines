@@ -78,7 +78,10 @@ fn within(what: &str, elapsed: f64, lo: f64, hi: f64) -> Result<(), String> {
 
 fn normal_wait2(gpu: &mut Gpu, s: &[DeviceBuffer; 3]) -> Step {
     let t = Instant::now();
-    api("wait2", gpu.tp_graph_signal_wait2_gfx1201([&s[0], &s[1]], 1))?;
+    api(
+        "wait2",
+        gpu.tp_graph_signal_wait2_gfx1201([&s[0], &s[1]], 1),
+    )?;
     api("sync", gpu.hip.device_synchronize())?;
     let e = ms(t);
     within("wait2", e, 0.0, NORMAL_MAX_MS)?;
@@ -88,7 +91,10 @@ fn normal_wait2(gpu: &mut Gpu, s: &[DeviceBuffer; 3]) -> Step {
 
 fn timeout_wait3(gpu: &mut Gpu, s: &[DeviceBuffer; 3]) -> Step {
     let t = Instant::now();
-    api("wait3", gpu.tp_graph_signal_wait3_gfx1201([&s[0], &s[1], &s[2]], 1))?;
+    api(
+        "wait3",
+        gpu.tp_graph_signal_wait3_gfx1201([&s[0], &s[1], &s[2]], 1),
+    )?;
     api("sync", gpu.hip.device_synchronize())?;
     let e = ms(t);
     within("wait3 timeout", e, 400.0, 1500.0)?;
@@ -100,7 +106,10 @@ fn timeout_wait3(gpu: &mut Gpu, s: &[DeviceBuffer; 3]) -> Step {
 fn download_reports_timeout(gpu: &mut Gpu, s: &[DeviceBuffer; 3]) -> Step {
     let tensor = api("zeros", gpu.zeros(&[4], DType::F32))?;
     let t = Instant::now();
-    api("wait3", gpu.tp_graph_signal_wait3_gfx1201([&s[0], &s[1], &s[2]], 1))?;
+    api(
+        "wait3",
+        gpu.tp_graph_signal_wait3_gfx1201([&s[0], &s[1], &s[2]], 1),
+    )?;
     api("sync", gpu.hip.device_synchronize())?;
     let e = ms(t);
     within("wait3 timeout", e, 400.0, 1500.0)?;
@@ -108,7 +117,9 @@ fn download_reports_timeout(gpu: &mut Gpu, s: &[DeviceBuffer; 3]) -> Step {
     let msg = expect_timeout("download_f32", first.map(|_| ()))?;
     api("second download_f32", gpu.download_f32(&tensor))?;
     api("free_tensor", gpu.free_tensor(tensor))?;
-    Ok(format!("{e:.1} ms, download failed: {msg}; next download Ok"))
+    Ok(format!(
+        "{e:.1} ms, download failed: {msg}; next download Ok"
+    ))
 }
 
 fn fail_fast_after_timeout(gpu: &mut Gpu, s: &[DeviceBuffer; 3]) -> Step {
@@ -131,7 +142,10 @@ fn fail_fast_after_timeout(gpu: &mut Gpu, s: &[DeviceBuffer; 3]) -> Step {
 }
 
 fn launcher_reports_pending(gpu: &mut Gpu, s: &[DeviceBuffer; 3]) -> Step {
-    api("wait3", gpu.tp_graph_signal_wait3_gfx1201([&s[0], &s[1], &s[2]], 1))?;
+    api(
+        "wait3",
+        gpu.tp_graph_signal_wait3_gfx1201([&s[0], &s[1], &s[2]], 1),
+    )?;
     api("sync", gpu.hip.device_synchronize())?;
     // The error is now pending and has not been taken.
     let t = Instant::now();
@@ -145,13 +159,18 @@ fn launcher_reports_pending(gpu: &mut Gpu, s: &[DeviceBuffer; 3]) -> Step {
         return Err(format!("enqueue error is not the pending timeout: {msg}"));
     }
     expect_clear("take after enqueue error", gpu.take_device_wait_error())?;
-    Ok(format!("enqueue refused in {e:.2} ms: {msg}; take Ok after"))
+    Ok(format!(
+        "enqueue refused in {e:.2} ms: {msg}; take Ok after"
+    ))
 }
 
 fn normal_after_timeouts(gpu: &mut Gpu, s: &[DeviceBuffer; 3]) -> Step {
     api("store s2", gpu.tp_graph_signal_store_gfx1201(&s[2], 1))?;
     let t = Instant::now();
-    api("wait3", gpu.tp_graph_signal_wait3_gfx1201([&s[0], &s[1], &s[2]], 1))?;
+    api(
+        "wait3",
+        gpu.tp_graph_signal_wait3_gfx1201([&s[0], &s[1], &s[2]], 1),
+    )?;
     api("sync", gpu.hip.device_synchronize())?;
     let e = ms(t);
     within("satisfied wait3", e, 0.0, NORMAL_MAX_MS)?;
@@ -200,8 +219,10 @@ fn main() {
         signals.push(buf);
     }
     let s: [DeviceBuffer; 3] = signals.try_into().ok().expect("3 signals");
-    gpu.tp_graph_signal_store_gfx1201(&s[0], 1).expect("store s0");
-    gpu.tp_graph_signal_store_gfx1201(&s[1], 1).expect("store s1");
+    gpu.tp_graph_signal_store_gfx1201(&s[0], 1)
+        .expect("store s0");
+    gpu.tp_graph_signal_store_gfx1201(&s[1], 1)
+        .expect("store s1");
 
     // Warm-up: compile both wait kernels and allocate the wait block outside
     // the timed steps. [s0, s1, s0] is fully published, so neither times out.
@@ -210,7 +231,8 @@ fn main() {
     gpu.tp_graph_signal_wait3_gfx1201([&s[0], &s[1], &s[0]], 1)
         .expect("warm wait3");
     gpu.hip.device_synchronize().expect("warm sync");
-    gpu.take_device_wait_error().expect("warm-up recorded a timeout");
+    gpu.take_device_wait_error()
+        .expect("warm-up recorded a timeout");
 
     let mut fails = 0;
     report(&mut fails, "normal_wait2", normal_wait2(&mut gpu, &s));

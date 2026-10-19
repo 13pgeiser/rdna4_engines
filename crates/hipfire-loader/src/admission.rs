@@ -248,7 +248,11 @@ pub(crate) fn qwen4_native_mtp(
     let retained = hipfire_runtime::config::retained_redline_default(
         gpu_arch, "qwen4", path, pp, tp, ep, true,
     );
-    qwen4_native_mtp_for_floor(spec.mtp, retained, hipfire_arch_qwen4::MTP_MEASURED_AR_FLOOR)
+    qwen4_native_mtp_for_floor(
+        spec.mtp,
+        retained,
+        hipfire_arch_qwen4::MTP_MEASURED_AR_FLOOR,
+    )
 }
 
 /// [`qwen4_native_mtp`]'s policy with the retained-Redline fact and the
@@ -271,7 +275,9 @@ pub(crate) fn qwen4_native_mtp_for_floor(
                 .into(),
         ),
         MtpMode::On => Ok(true),
-        auto @ MtpMode::Auto => Ok(!retained && hipfire_config::mtp_mode_admits(auto, measured_ar_floor)),
+        auto @ MtpMode::Auto => {
+            Ok(!retained && hipfire_config::mtp_mode_admits(auto, measured_ar_floor))
+        }
     }
 }
 
@@ -481,7 +487,10 @@ pub fn qwen4_request_admission(
         ));
     }
     if native_mtp && !capabilities.native_mtp {
-        return Err("qwen4: native MTP is not supported by this model file; set speculation.mtp = off".into());
+        return Err(
+            "qwen4: native MTP is not supported by this model file; set speculation.mtp = off"
+                .into(),
+        );
     }
     if !effective_mesh.is_qwen4_admitted() {
         return Err(format!(
@@ -566,7 +575,10 @@ pub fn qwen4_ep_rank_devices(
                 "qwen4: logical expert parallelism emulation (topology.ep = {ep}) needs at least 1 visible device, 0 visible"
             ));
         }
-        Ok(hipfire_runtime::multi_gpu::alias_ids(&ids, physical_count as i32))
+        Ok(hipfire_runtime::multi_gpu::alias_ids(
+            &ids,
+            physical_count as i32,
+        ))
     } else if physical_count < ep {
         Err(format!(
             "qwen4: expert parallelism (topology.ep = {ep}) needs {ep} visible devices, {physical_count} visible"
@@ -1111,9 +1123,11 @@ pub fn classify_vision(
         // request or silently downgraded to text.
         QWEN4_ARCH_ID => {
             if has_vision_tensor {
-                Err("qwen4: this model file contains vision tensors, but Qwen4 loads text only; \
+                Err(
+                    "qwen4: this model file contains vision tensors, but Qwen4 loads text only; \
                      use the text-only build of the model"
-                    .into())
+                        .into(),
+                )
             } else {
                 Ok(false)
             }
@@ -2488,7 +2502,10 @@ pub fn admit_source_with_options(
                 .to_string(),
         )
     } else if !hints.vmm_runtime_available {
-        Some("this GPU runtime does not provide the virtual-memory (VMM) support the backend needs".to_string())
+        Some(
+            "this GPU runtime does not provide the virtual-memory (VMM) support the backend needs"
+                .to_string(),
+        )
     } else if let Some(reason) = hipfire_config::devices::vmm_kv_platform_refusal() {
         Some(reason)
     } else if gpu_arch != "gfx1201"
@@ -2916,7 +2933,11 @@ mod tests {
                 "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
             ] {
                 for qt in [44u8, 47, 48, 49, 50, 17] {
-                    assert_eq!(dflash_lm_head_refusal(Some(qt), arch), None, "{arch} qt={qt}");
+                    assert_eq!(
+                        dflash_lm_head_refusal(Some(qt), arch),
+                        None,
+                        "{arch} qt={qt}"
+                    );
                 }
             }
         }
@@ -2933,9 +2954,15 @@ mod tests {
         #[test]
         fn refusal_message_for_unknown_and_missing_lm_head() {
             let missing = dflash_lm_head_refusal(None, "gfx1030").expect("missing refuses");
-            assert!(missing.contains("no lm_head/embed_tokens tensor"), "{missing}");
+            assert!(
+                missing.contains("no lm_head/embed_tokens tensor"),
+                "{missing}"
+            );
             let other = dflash_lm_head_refusal(Some(45), "gfx1100").expect("qt45 refuses");
-            assert!(other.contains("quant_type=45") && other.contains("gfx1100"), "{other}");
+            assert!(
+                other.contains("quant_type=45") && other.contains("gfx1100"),
+                "{other}"
+            );
         }
     }
 
@@ -3495,7 +3522,9 @@ mod tests {
         assert_eq!(admit(1, 1, 1, true), Ok(()));
         for ep in [0, 9, 16] {
             assert!(
-                admit(1, 1, ep, false).unwrap_err().contains("topology.ep from 1 to 8"),
+                admit(1, 1, ep, false)
+                    .unwrap_err()
+                    .contains("topology.ep from 1 to 8"),
                 "ep {ep}"
             );
         }
@@ -3595,24 +3624,34 @@ mod tests {
                 );
             }
         }
-        assert_eq!(qwen4_ep_device_refusal(2, &ranks(2), &homogeneous("gfx1201", 4), all), Ok(()));
+        assert_eq!(
+            qwen4_ep_device_refusal(2, &ranks(2), &homogeneous("gfx1201", 4), all),
+            Ok(())
+        );
         // Too few devices.
-        assert!(qwen4_ep_device_refusal(4, &ranks(4), &homogeneous("gfx1201", 3), all)
-            .unwrap_err()
-            .contains("3 visible"));
+        assert!(
+            qwen4_ep_device_refusal(4, &ranks(4), &homogeneous("gfx1201", 3), all)
+                .unwrap_err()
+                .contains("3 visible")
+        );
         // A different admitted arch on rank 2 refuses (mixed) and names the ranks.
         let mut mixed = homogeneous("gfx1201", 4);
         mixed[2] = "gfx1100".to_string();
         let error = qwen4_ep_device_refusal(4, &ranks(4), &mixed, all).unwrap_err();
         assert!(
-            error.contains("same architecture") && error.contains("rank 2") && error.contains("gfx1100"),
+            error.contains("same architecture")
+                && error.contains("rank 2")
+                && error.contains("gfx1100"),
             "{error}"
         );
         // An unadmitted arch refuses even when homogeneous.
         for arch in ["gfx1151", "gfx1030", "gfx942", ""] {
             let error =
                 qwen4_ep_device_refusal(2, &ranks(2), &homogeneous(arch, 2), all).unwrap_err();
-            assert!(error.contains("gfx1100 or gfx1201") && error.contains("rank 0"), "{arch}: {error}");
+            assert!(
+                error.contains("gfx1100 or gfx1201") && error.contains("rank 0"),
+                "{arch}: {error}"
+            );
         }
         // An arch beyond the rank count is not part of the mesh.
         assert_eq!(qwen4_ep_device_refusal(2, &ranks(2), &mixed, all), Ok(()));
@@ -3652,10 +3691,15 @@ mod tests {
         // Four physical devices under six ranks: only distinct physical pairs
         // are probed, once each.
         let mut pairs = Vec::new();
-        qwen4_ep_device_refusal(6, &[0, 1, 2, 3, 0, 1], &homogeneous("gfx1100", 4), |a, b| {
-            pairs.push((a, b));
-            Ok(true)
-        })
+        qwen4_ep_device_refusal(
+            6,
+            &[0, 1, 2, 3, 0, 1],
+            &homogeneous("gfx1100", 4),
+            |a, b| {
+                pairs.push((a, b));
+                Ok(true)
+            },
+        )
         .unwrap();
         assert_eq!(pairs.len(), 12);
         // Aliased devices are still arch-checked.
@@ -4078,7 +4122,10 @@ mod tests {
     fn tp_geometry_checks_degree_and_devices_only() {
         let err_zero = tp_geometry_refusal(0, Some(4)).expect("tp=0 refuses");
         assert!(err_zero.contains("tp=0"), "reason: {err_zero}");
-        assert!(err_zero.contains("single GPU"), "names the remedy: {err_zero}");
+        assert!(
+            err_zero.contains("single GPU"),
+            "names the remedy: {err_zero}"
+        );
         let err = tp_geometry_refusal(99, Some(4)).expect("tp=99 refuses");
         assert!(err.contains("tp=99"), "reason: {err}");
         assert!(err.contains("device count=4"), "reason: {err}");
@@ -5389,7 +5436,8 @@ mod tests {
                 } else {
                     qsa_gathered_wmma_scratch_bytes(kv_heads, tokens).unwrap() as u64
                 };
-                let context = layers * config.qsa_context_arena_bytes(tokens, layout).unwrap() as u64;
+                let context =
+                    layers * config.qsa_context_arena_bytes(tokens, layout).unwrap() as u64;
                 (context, gather)
             }
         }
@@ -5647,10 +5695,7 @@ mod tests {
                 ..halo
             };
             assert_eq!(device_free_from(carve), Some(40_000 * MIB));
-            let discrete = DeviceMemory {
-                uma: false,
-                ..halo
-            };
+            let discrete = DeviceMemory { uma: false, ..halo };
             assert_eq!(device_free_from(discrete), Some(40_000 * MIB));
         }
     }
@@ -5840,8 +5885,7 @@ mod qwen4_pp_admission_tests {
         assert!(
             error.contains("topology.pp = 4")
                 && error.contains(MESH_TRANSPORT_ENV)
-                && error
-                    .contains("peer-to-peer transfers between the pipeline GPUs"),
+                && error.contains("peer-to-peer transfers between the pipeline GPUs"),
             "{error}"
         );
         // Edge ids are logical stage pairs.
@@ -5983,17 +6027,46 @@ mod qwen4_pp_admission_tests {
         };
         // Fully resident: the head stays attached unless explicitly off.
         for arch in ["gfx1100", "gfx1151", "gfx1201"] {
-            assert!(qwen4_mtp_with_host_mapped_experts(with(None), arch, 0), "{arch}");
-            assert!(qwen4_mtp_with_host_mapped_experts(with(Some(true)), arch, 0), "{arch}");
-            assert!(!qwen4_mtp_with_host_mapped_experts(with(Some(false)), arch, 0), "{arch}");
+            assert!(
+                qwen4_mtp_with_host_mapped_experts(with(None), arch, 0),
+                "{arch}"
+            );
+            assert!(
+                qwen4_mtp_with_host_mapped_experts(with(Some(true)), arch, 0),
+                "{arch}"
+            );
+            assert!(
+                !qwen4_mtp_with_host_mapped_experts(with(Some(false)), arch, 0),
+                "{arch}"
+            );
         }
         // Host-mapped experts: `auto` keeps the head only on the admitted gfx1201;
         // explicit `on` attaches everywhere; `off` never.
-        assert!(qwen4_mtp_with_host_mapped_experts(with(None), "gfx1201", 24));
-        assert!(!qwen4_mtp_with_host_mapped_experts(with(None), "gfx1100", 24));
-        assert!(!qwen4_mtp_with_host_mapped_experts(with(None), "gfx1151", 24));
-        assert!(qwen4_mtp_with_host_mapped_experts(with(Some(true)), "gfx1100", 24));
-        assert!(!qwen4_mtp_with_host_mapped_experts(with(Some(false)), "gfx1201", 24));
+        assert!(qwen4_mtp_with_host_mapped_experts(
+            with(None),
+            "gfx1201",
+            24
+        ));
+        assert!(!qwen4_mtp_with_host_mapped_experts(
+            with(None),
+            "gfx1100",
+            24
+        ));
+        assert!(!qwen4_mtp_with_host_mapped_experts(
+            with(None),
+            "gfx1151",
+            24
+        ));
+        assert!(qwen4_mtp_with_host_mapped_experts(
+            with(Some(true)),
+            "gfx1100",
+            24
+        ));
+        assert!(!qwen4_mtp_with_host_mapped_experts(
+            with(Some(false)),
+            "gfx1201",
+            24
+        ));
     }
 
     #[test]
@@ -6013,10 +6086,19 @@ mod qwen4_pp_admission_tests {
         assert_eq!(qwen4_native_mtp_for_floor(None, true, true), Ok(false));
         // Explicit `on` ignores the floor declaration; retained still refuses it.
         for floor in [false, true] {
-            assert_eq!(qwen4_native_mtp_for_floor(Some(true), false, floor), Ok(true));
+            assert_eq!(
+                qwen4_native_mtp_for_floor(Some(true), false, floor),
+                Ok(true)
+            );
             assert!(qwen4_native_mtp_for_floor(Some(true), true, floor).is_err());
-            assert_eq!(qwen4_native_mtp_for_floor(Some(false), false, floor), Ok(false));
-            assert_eq!(qwen4_native_mtp_for_floor(Some(false), true, floor), Ok(false));
+            assert_eq!(
+                qwen4_native_mtp_for_floor(Some(false), false, floor),
+                Ok(false)
+            );
+            assert_eq!(
+                qwen4_native_mtp_for_floor(Some(false), true, floor),
+                Ok(false)
+            );
         }
     }
 

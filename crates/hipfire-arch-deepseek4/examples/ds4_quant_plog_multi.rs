@@ -17,12 +17,12 @@
 //! decode state is fully reset (`reset` + `zero_decode_caches`).
 
 use hipfire_arch_deepseek4::forward::decode_step;
+use hipfire_arch_deepseek4::{DeepseekV4, DeepseekV4Config};
 use hipfire_ds4_parent::manifest::{
     sha256_bytes, sha256_file, CaptureBoundary, CaptureInfo, CorpusInfo, ModelInfo, ModelQuantInfo,
     OutputInfo, OutputKind, ParentManifest, ShardInfo, SourceInfo, MANIFEST_SCHEMA,
 };
 use hipfire_ds4_parent::plog::PlogWriter;
-use hipfire_arch_deepseek4::{DeepseekV4, DeepseekV4Config};
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
@@ -53,7 +53,9 @@ fn parse_labeled(flag: &str, raw: &str) -> Result<(String, PathBuf), String> {
         .split_once('=')
         .ok_or_else(|| format!("deepseek4 parent: {flag} wants LABEL=PATH, got {raw}"))?;
     if lab.is_empty() || path.is_empty() {
-        return Err(format!("deepseek4 parent: empty label/path in {flag} {raw}"));
+        return Err(format!(
+            "deepseek4 parent: empty label/path in {flag} {raw}"
+        ));
     }
     Ok((lab.to_string(), PathBuf::from(path)))
 }
@@ -230,19 +232,13 @@ fn run() -> Result<(), String> {
 
     // ── 4. Load model once ──────────────────────────────────────────────
     println!("=== load ===");
-    let mut hfq = HfqFile::open(&model_path).map_err(|e| {
-        format!(
-            "deepseek4 parent: open HFQ {}: {e:?}",
-            model_path.display()
-        )
-    })?;
+    let mut hfq = HfqFile::open(&model_path)
+        .map_err(|e| format!("deepseek4 parent: open HFQ {}: {e:?}", model_path.display()))?;
     let cfg = DeepseekV4::config_from_hfq(&hfq)
         .map_err(|e| format!("deepseek4 parent: config_from_hfq: {e}"))?;
     let cfg_route = cfg.routed_scaling_factor;
     let effective_route = route_scale.unwrap_or(cfg_route);
-    println!(
-        "route_scale: effective={effective_route} (cfg.routed_scaling_factor={cfg_route})"
-    );
+    println!("route_scale: effective={effective_route} (cfg.routed_scaling_factor={cfg_route})");
     println!(
         "config: layers={} hidden={} vocab={} window={} mq2r={} experts={} topk={}",
         cfg.num_hidden_layers,
@@ -377,15 +373,17 @@ fn run() -> Result<(), String> {
         if !last_row.is_empty() {
             let (id, v) = argmax(&last_row);
             let piece = tokenizer.decode(&[id as u32]);
-            println!("[{}] last-pos top-1 id={id} logit={v:.4} piece={piece:?}", pair.label);
+            println!(
+                "[{}] last-pos top-1 id={id} logit={v:.4} piece={piece:?}",
+                pair.label
+            );
         }
 
         let plog_sha = sha256_file(&pair.plog)?;
         let plog_bytes = std::fs::metadata(&pair.plog)
             .map_err(|e| format!("deepseek4 parent: plog metadata: {e}"))?
             .len();
-        let expect_bytes =
-            8u64 + 4 + 4 + 8 + (n_tokens as u64) * (cfg.vocab_size as u64) * 4;
+        let expect_bytes = 8u64 + 4 + 4 + 8 + (n_tokens as u64) * (cfg.vocab_size as u64) * 4;
         println!(
             "[{}] plog path={} bytes={plog_bytes} (expect {expect_bytes}) sha256={plog_sha}",
             pair.label,
@@ -487,7 +485,10 @@ fn run() -> Result<(), String> {
 
     println!("=== multi-length summary ===");
     println!("quant={quant_label}  model_sha={model_sha}");
-    println!("load_s={load_s:.3}  hash_s={hash_s:.1}  wall_s={:.1}", wall0.elapsed().as_secs_f64());
+    println!(
+        "load_s={load_s:.3}  hash_s={hash_s:.1}  wall_s={:.1}",
+        wall0.elapsed().as_secs_f64()
+    );
     println!("effective_route_scale={effective_route}");
     for (pair, ids, sha) in &loaded {
         println!(
@@ -540,12 +541,8 @@ fn chdir_to_git_worktree() -> Result<(), String> {
 }
 
 fn read_token_ids(path: &Path) -> Result<Vec<u32>, String> {
-    let bytes = std::fs::read(path).map_err(|e| {
-        format!(
-            "deepseek4 parent: read tokens {}: {e}",
-            path.display()
-        )
-    })?;
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("deepseek4 parent: read tokens {}: {e}", path.display()))?;
     if bytes.len() % 4 != 0 {
         return Err(format!(
             "deepseek4 parent: tokens {} size {} not multiple of 4",

@@ -3041,8 +3041,8 @@ mod tests {
         }
         // A strict parse of an older payload that still carries the retired
         // entries drops them (and the aliases that pointed at them).
-        let parsed = RegistryV1::parse(&serde_json::to_string(&wire).unwrap(), "old remote")
-            .unwrap();
+        let parsed =
+            RegistryV1::parse(&serde_json::to_string(&wire).unwrap(), "old remote").unwrap();
         for pin in RETIRED_MODELS {
             assert!(parsed.model(pin.tag).is_none(), "{}", pin.tag);
             assert!(parsed.model(pin.file).is_none(), "{}", pin.file);

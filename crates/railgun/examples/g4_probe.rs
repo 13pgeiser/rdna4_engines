@@ -53,10 +53,11 @@ use std::time::{Duration, Instant};
 
 use redline_rocr::packet::PacketImage;
 use redline_rocr::{
-    CompletionSignal, Executable, Gfx10Pm4CommandBuffer, Gfx12Pm4CommandBuffer, Gfx12RmwAcquirePolicy, GpuDevice,
-    GpuSelector, KernargBuffer, KernargPool, Kernel, LaunchGeometry, QueueSet, Runtime, load_symbols,
+    load_symbols, CompletionSignal, Executable, Gfx10Pm4CommandBuffer, Gfx12Pm4CommandBuffer,
+    Gfx12RmwAcquirePolicy, GpuDevice, GpuSelector, KernargBuffer, KernargPool, Kernel,
+    LaunchGeometry, QueueSet, Runtime,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 type R<T> = Result<T, String>;
@@ -128,7 +129,9 @@ impl Rung {
             (_, Self::None) => return "no packet".into(),
             (_, Self::Wait) => return "CS_PARTIAL_FLUSH".into(),
             (Family::Gfx12, Self::WaitVmem) => "GCR 0x300 (HipLlvmVmemL1: GLV|GL1)",
-            (Family::Gfx12, Self::WaitInterNode) => "GCR 0x10180 (acquire_inter_node_gfx12: GLK|GLV|SEQ)",
+            (Family::Gfx12, Self::WaitInterNode) => {
+                "GCR 0x10180 (acquire_inter_node_gfx12: GLK|GLV|SEQ)"
+            }
             (Family::Gfx12, Self::WaitL1) => "GCR 0x380 (SameAgentParallelL1: GLK|GLV|GL1)",
             (Family::Gfx12, Self::WaitGlobal) => "GCR 0xc380 (RadvGlobal: +GL2 INV|WB)",
             (Family::Gfx12, Self::WaitSystem) => "GCR 0xc3b1 (acquire_system_gfx12)",
@@ -183,7 +186,9 @@ impl Row {
             Self::War => "sys; read_v(checked, delay); RUNG; produce",
             Self::Waw => "sys; produce(first, delay); RUNG; produce; sys; consume_v",
             Self::WarPreWriter => "sys; read_v(checked); RUNG; produce; RAW; consume_v",
-            Self::PreWriterAfterBarrier => "sys; read_v(checked); sys; indep; RUNG; produce; RAW; consume_v",
+            Self::PreWriterAfterBarrier => {
+                "sys; read_v(checked); sys; indep; RUNG; produce; RAW; consume_v"
+            }
         }
     }
 
@@ -248,9 +253,18 @@ impl Params {
         b[8..16].copy_from_slice(&self.result.to_le_bytes());
         b[16..24].copy_from_slice(&self.keys.to_le_bytes());
         b[24..32].copy_from_slice(&self.aux.to_le_bytes());
-        for (k, v) in [self.n, self.cover, self.epoch, self.rot, self.flags, self.delay, self.nwg, self.layout]
-            .into_iter()
-            .enumerate()
+        for (k, v) in [
+            self.n,
+            self.cover,
+            self.epoch,
+            self.rot,
+            self.flags,
+            self.delay,
+            self.nwg,
+            self.layout,
+        ]
+        .into_iter()
+        .enumerate()
         {
             b[32 + 4 * k..36 + 4 * k].copy_from_slice(&v.to_le_bytes());
         }
@@ -286,10 +300,16 @@ impl Cmd {
         self.wait();
         match (self, rung) {
             (_, Rung::None | Rung::Wait) => {}
-            (Self::G12(c), Rung::WaitVmem) => c.acquire_rmw_gfx12(Gfx12RmwAcquirePolicy::HipLlvmVmemL1),
+            (Self::G12(c), Rung::WaitVmem) => {
+                c.acquire_rmw_gfx12(Gfx12RmwAcquirePolicy::HipLlvmVmemL1)
+            }
             (Self::G12(c), Rung::WaitInterNode) => c.acquire_inter_node_gfx12(),
-            (Self::G12(c), Rung::WaitL1) => c.acquire_rmw_gfx12(Gfx12RmwAcquirePolicy::SameAgentParallelL1),
-            (Self::G12(c), Rung::WaitGlobal) => c.acquire_rmw_gfx12(Gfx12RmwAcquirePolicy::RadvGlobal),
+            (Self::G12(c), Rung::WaitL1) => {
+                c.acquire_rmw_gfx12(Gfx12RmwAcquirePolicy::SameAgentParallelL1)
+            }
+            (Self::G12(c), Rung::WaitGlobal) => {
+                c.acquire_rmw_gfx12(Gfx12RmwAcquirePolicy::RadvGlobal)
+            }
             (Self::G12(c), Rung::WaitSystem) => c.acquire_system_gfx12(),
             (Self::G11(c), Rung::WaitVmem) => c.acquire_inter_node_vmem(),
             (Self::G11(c), Rung::WaitInterNode | Rung::WaitL1) => c.acquire_inter_node_same_agent(),
@@ -309,7 +329,8 @@ impl Cmd {
     }
 
     fn dispatch(&mut self, kernel: &Kernel, workgroups: u32, kernarg: *mut c_void) -> R<()> {
-        let geometry = LaunchGeometry::new([workgroups * WG, 1, 1], [WG as u16, 1, 1]).map_err(err)?;
+        let geometry =
+            LaunchGeometry::new([workgroups * WG, 1, 1], [WG as u16, 1, 1]).map_err(err)?;
         match self {
             Self::G12(c) => c.dispatch(kernel, geometry, 0, kernarg).map_err(err),
             Self::G11(c) => c.dispatch(kernel, geometry, 0, kernarg).map_err(err),
@@ -381,7 +402,12 @@ fn parse_args() -> R<Args> {
             "--trials" => a.trials = v.parse().map_err(err)?,
             "--per-ib" => a.per_ib = v.parse().map_err(err)?,
             "--soak" => a.soak_secs = v.parse().map_err(err)?,
-            "--footprints" => a.footprints = list(&v).iter().map(|s| s.parse().map_err(err)).collect::<R<_>>()?,
+            "--footprints" => {
+                a.footprints = list(&v)
+                    .iter()
+                    .map(|s| s.parse().map_err(err))
+                    .collect::<R<_>>()?
+            }
             "--layouts" => {
                 a.layouts = list(&v)
                     .iter()
@@ -422,21 +448,28 @@ fn kfd_uuid(bus: &str) -> R<Option<String>> {
     let f = u32::from_str_radix(parts[2], 16).map_err(err)?;
     let location = (b << 8) | (d << 3) | f;
     for entry in std::fs::read_dir("/sys/class/kfd/kfd/topology/nodes").map_err(err)? {
-        let props = std::fs::read_to_string(entry.map_err(err)?.path().join("properties")).unwrap_or_default();
+        let props = std::fs::read_to_string(entry.map_err(err)?.path().join("properties"))
+            .unwrap_or_default();
         let field = |k: &str| {
             props
                 .lines()
                 .find_map(|l| l.strip_prefix(k).and_then(|v| v.trim().parse::<u64>().ok()))
         };
-        if field("location_id ") == Some(location as u64) && field("domain ") == Some(domain as u64) {
-            return Ok(field("unique_id ").filter(|u| *u != 0).map(|u| format!("GPU-{u:016x}")));
+        if field("location_id ") == Some(location as u64) && field("domain ") == Some(domain as u64)
+        {
+            return Ok(field("unique_id ")
+                .filter(|u| *u != 0)
+                .map(|u| format!("GPU-{u:016x}")));
         }
     }
     Ok(None)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn compile(out: &Path, arch: &str) -> R<(Vec<u8>, Value)> {
@@ -460,7 +493,13 @@ fn compile(out: &Path, arch: &str) -> R<(Vec<u8>, Value)> {
     let version = Command::new(&hipcc)
         .arg("--version")
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).lines().take(3).collect::<Vec<_>>().join(" | "))
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
         .unwrap_or_default();
     Ok((
         bytes.clone(),
@@ -501,7 +540,8 @@ struct Cell {
 impl Gpu {
     fn submit(&mut self, ib: &KernargBuffer, dwords: u32) -> R<()> {
         self.completion.reset();
-        let packet = PacketImage::pm4_indirect_buffer(ib.address(), dwords, self.completion.raw()).map_err(err)?;
+        let packet = PacketImage::pm4_indirect_buffer(ib.address(), dwords, self.completion.raw())
+            .map_err(err)?;
         self.queues.prepare_batches(&[vec![packet]]).map_err(err)?;
         self.queues.ring_prepared().map_err(err)?;
         self.queues
@@ -511,7 +551,10 @@ impl Gpu {
 
     fn upload_ib(&self, cmd: &Cmd) -> R<KernargBuffer> {
         let bytes = cmd.bytes();
-        let mut ib = self.host_pool.allocate_executable_bytes(bytes.len()).map_err(err)?;
+        let mut ib = self
+            .host_pool
+            .allocate_executable_bytes(bytes.len())
+            .map_err(err)?;
         ib.as_mut_bytes().copy_from_slice(&bytes);
         Ok(ib)
     }
@@ -551,11 +594,12 @@ impl Gpu {
         let k = &self.kernels;
         let base = kernargs.address() as usize;
         let mut slots: Vec<(usize, Option<u32>, Params)> = Vec::new();
-        let mut push = |cmd: &mut Cmd, kernel: &Kernel, wgs: u32, trial: Option<u32>, p: Params| -> R<()> {
-            let offset = slots.len() * KA_STRIDE;
-            slots.push((offset, trial, p));
-            cmd.dispatch(kernel, wgs, (base + offset) as *mut c_void)
-        };
+        let mut push =
+            |cmd: &mut Cmd, kernel: &Kernel, wgs: u32, trial: Option<u32>, p: Params| -> R<()> {
+                let offset = slots.len() * KA_STRIDE;
+                slots.push((offset, trial, p));
+                cmd.dispatch(kernel, wgs, (base + offset) as *mut c_void)
+            };
         let sys = |cmd: &mut Cmd| cmd.rung(Rung::WaitSystem);
         cmd.rung(Rung::WaitSystem);
         let mut zero = self.base(self.per_ib * SLOTS as u32, 0, layout);
@@ -574,8 +618,11 @@ impl Gpu {
             sys(&mut cmd);
             match row {
                 Row::RawVmem | Row::RawSmem => {
-                    let (warm, consume) =
-                        if row == Row::RawVmem { (&k.read_v, &k.consume_v) } else { (&k.read_s, &k.consume_s) };
+                    let (warm, consume) = if row == Row::RawVmem {
+                        (&k.read_v, &k.consume_v)
+                    } else {
+                        (&k.read_s, &k.consume_s)
+                    };
                     push(&mut cmd, warm, self.nwg, tr, p)?;
                     cmd.wait();
                     push(&mut cmd, &k.produce, self.nwg, tr, p)?;
@@ -583,26 +630,64 @@ impl Gpu {
                     push(&mut cmd, consume, self.nwg, tr, p)?;
                 }
                 Row::War => {
-                    push(&mut cmd, &k.read_v, self.nwg, tr, Params { flags: p.flags | CLASSIFY_OLD, delay: 4, ..p })?;
+                    push(
+                        &mut cmd,
+                        &k.read_v,
+                        self.nwg,
+                        tr,
+                        Params {
+                            flags: p.flags | CLASSIFY_OLD,
+                            delay: 4,
+                            ..p
+                        },
+                    )?;
                     cmd.rung(rung);
                     push(&mut cmd, &k.produce, self.nwg, tr, p)?;
                 }
                 Row::Waw => {
-                    push(&mut cmd, &k.produce, self.nwg, tr, Params { flags: p.flags | FIRST_WRITER, delay: 4, ..p })?;
+                    push(
+                        &mut cmd,
+                        &k.produce,
+                        self.nwg,
+                        tr,
+                        Params {
+                            flags: p.flags | FIRST_WRITER,
+                            delay: 4,
+                            ..p
+                        },
+                    )?;
                     cmd.rung(rung);
                     push(&mut cmd, &k.produce, self.nwg, tr, p)?;
                     sys(&mut cmd);
                     push(&mut cmd, &k.consume_v, self.nwg, tr, p)?;
                 }
                 Row::WarPreWriter => {
-                    push(&mut cmd, &k.read_v, self.nwg, tr, Params { flags: p.flags | CLASSIFY_OLD, ..p })?;
+                    push(
+                        &mut cmd,
+                        &k.read_v,
+                        self.nwg,
+                        tr,
+                        Params {
+                            flags: p.flags | CLASSIFY_OLD,
+                            ..p
+                        },
+                    )?;
                     cmd.rung(rung);
                     push(&mut cmd, &k.produce, self.nwg, tr, p)?;
                     cmd.raw_default(family);
                     push(&mut cmd, &k.consume_v, self.nwg, tr, p)?;
                 }
                 Row::PreWriterAfterBarrier => {
-                    push(&mut cmd, &k.read_v, self.nwg, tr, Params { flags: p.flags | CLASSIFY_OLD, ..p })?;
+                    push(
+                        &mut cmd,
+                        &k.read_v,
+                        self.nwg,
+                        tr,
+                        Params {
+                            flags: p.flags | CLASSIFY_OLD,
+                            ..p
+                        },
+                    )?;
                     sys(&mut cmd);
                     push(&mut cmd, &k.indep, 16, tr, p)?;
                     cmd.rung(rung);
@@ -619,7 +704,12 @@ impl Gpu {
         Ok((cmd, slots))
     }
 
-    fn write_kernargs(&mut self, kernargs: &mut KernargBuffer, slots: &[(usize, Option<u32>, Params)], rots: &[u32]) {
+    fn write_kernargs(
+        &mut self,
+        kernargs: &mut KernargBuffer,
+        slots: &[(usize, Option<u32>, Params)],
+        rots: &[u32],
+    ) {
         let epoch0 = self.epoch;
         let bytes = kernargs.as_mut_bytes();
         for (offset, trial, p) in slots {
@@ -657,11 +747,17 @@ fn run_cell(
 ) -> R<Cell> {
     let n = (footprint / 4) as u32;
     if n % (gpu.nwg * 8) != 0 {
-        return Err(format!("footprint {footprint} not a multiple of nwg*32 bytes"));
+        return Err(format!(
+            "footprint {footprint} not a multiple of nwg*32 bytes"
+        ));
     }
     // ≤L0/≤L1 footprints: every reader workgroup reads the whole buffer, so
     // every WGP holds every (stale) line; larger ones: one slice per group.
-    let cover = if footprint <= (128 << 10) { n } else { n / gpu.nwg };
+    let cover = if footprint <= (128 << 10) {
+        n
+    } else {
+        n / gpu.nwg
+    };
     let mut kernargs = gpu
         .host_pool
         .allocate_fine_grained_bytes((gpu.per_ib as usize * 8 + 4) * KA_STRIDE, 256)
@@ -689,7 +785,11 @@ fn run_cell(
                 cell.words[s] += c[s] as u64;
             }
             if c[CHECKED] == 0 {
-                return Err(format!("{} {} trial {t}: nothing checked", row.name(), rung.name()));
+                return Err(format!(
+                    "{} {} trial {t}: nothing checked",
+                    row.name(),
+                    rung.name()
+                ));
             }
             if row.stale_slots().iter().any(|&s| c[s] != 0) {
                 cell.stale_trials += 1;
@@ -723,14 +823,28 @@ fn run_cell(
             for (label, x, y) in pairs {
                 if cover != n {
                     let same = (0..g).filter(|&w| role(x)[w] == role(y)[w]).count() as u64;
-                    *cell.placement.entry(format!("{label}_same_wgp")).or_default() += same;
-                    *cell.placement.entry(format!("{label}_cross_wgp")).or_default() += g as u64 - same;
+                    *cell
+                        .placement
+                        .entry(format!("{label}_same_wgp"))
+                        .or_default() += same;
+                    *cell
+                        .placement
+                        .entry(format!("{label}_cross_wgp"))
+                        .or_default() += g as u64 - same;
                 }
             }
-            for (label, r, present) in [("reader", 0, has_reader), ("producer", 1, true), ("consumer", 2, has_consumer)] {
+            for (label, r, present) in [
+                ("reader", 0, has_reader),
+                ("producer", 1, true),
+                ("consumer", 2, has_consumer),
+            ] {
                 if present {
-                    let distinct: std::collections::BTreeSet<u32> = role(r).iter().copied().collect();
-                    let e = cell.placement.entry(format!("{label}_distinct_wgps_max")).or_default();
+                    let distinct: std::collections::BTreeSet<u32> =
+                        role(r).iter().copied().collect();
+                    let e = cell
+                        .placement
+                        .entry(format!("{label}_distinct_wgps_max"))
+                        .or_default();
                     *e = (*e).max(distinct.len() as u64);
                 }
             }
@@ -745,9 +859,17 @@ fn run_cell(
 fn soak(gpu: &mut Gpu, secs: u64) -> R<Value> {
     let mut report = serde_json::Map::new();
     let n = (1u32 << 20) / 4;
-    let kernels: Vec<(&'static str, Kernel)> = gpu.kernels.all().iter().map(|(s, k)| (*s, (*k).clone())).collect();
+    let kernels: Vec<(&'static str, Kernel)> = gpu
+        .kernels
+        .all()
+        .iter()
+        .map(|(s, k)| (*s, (*k).clone()))
+        .collect();
     for (name, kernel) in kernels {
-        let mut kernargs = gpu.host_pool.allocate_fine_grained_bytes(64 * KA_STRIDE, 256).map_err(err)?;
+        let mut kernargs = gpu
+            .host_pool
+            .allocate_fine_grained_bytes(64 * KA_STRIDE, 256)
+            .map_err(err)?;
         let mut cmd = Cmd::new(gpu.family);
         cmd.rung(Rung::WaitSystem);
         let mut p = gpu.base(n, n / gpu.nwg, 0);
@@ -772,8 +894,14 @@ fn soak(gpu: &mut Gpu, secs: u64) -> R<Value> {
             gpu.submit(&ib, cmd.len_dwords())?;
             ibs += 1;
         }
-        eprintln!("[g4] soak {name}: {ibs} IBs x 64 dispatches in {:.1}s", started.elapsed().as_secs_f64());
-        report.insert(name.into(), json!({"ibs": ibs, "dispatches": ibs * 64, "seconds": started.elapsed().as_secs_f64()}));
+        eprintln!(
+            "[g4] soak {name}: {ibs} IBs x 64 dispatches in {:.1}s",
+            started.elapsed().as_secs_f64()
+        );
+        report.insert(
+            name.into(),
+            json!({"ibs": ibs, "dispatches": ibs * 64, "seconds": started.elapsed().as_secs_f64()}),
+        );
     }
     Ok(Value::Object(report))
 }
@@ -791,14 +919,20 @@ fn run() -> R<()> {
     let runtime = Runtime::initialize(load_symbols().map_err(err)?).map_err(err)?;
     let devices = runtime.gpu_devices().map_err(err)?;
     if devices.len() != 1 {
-        return Err(format!("expected exactly one visible GPU, found {}", devices.len()));
+        return Err(format!(
+            "expected exactly one visible GPU, found {}",
+            devices.len()
+        ));
     }
     let device: GpuDevice = runtime.select_gpu(GpuSelector::Ordinal(0)).map_err(err)?;
     let name = device.name().to_owned();
     let bus = device.pci_bus_id().to_string();
     let kfd = kfd_uuid(&bus)?;
     if name != args.arch || bus != args.bus {
-        return Err(format!("identity mismatch: device {name} {bus}, expected {} {}", args.arch, args.bus));
+        return Err(format!(
+            "identity mismatch: device {name} {bus}, expected {} {}",
+            args.arch, args.bus
+        ));
     }
     if let Some(want) = &args.uuid {
         if kfd.as_deref() != Some(want.as_str()) {
@@ -806,7 +940,10 @@ fn run() -> R<()> {
         }
     }
     let cus = device.compute_unit_count().map_err(err)?;
-    eprintln!("[g4] asserted {name} {bus} {} cus={cus}", kfd.as_deref().unwrap_or("-"));
+    eprintln!(
+        "[g4] asserted {name} {bus} {} cus={cus}",
+        kfd.as_deref().unwrap_or("-")
+    );
     let family = match name.as_str() {
         "gfx1200" | "gfx1201" => Family::Gfx12,
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" => Family::Gfx11,
@@ -828,10 +965,18 @@ fn run() -> R<()> {
     let host_pool = KernargPool::discover(&device).map_err(err)?;
     let dev_pool = KernargPool::discover_device_local(&device).map_err(err)?;
     let max_fp = *args.footprints.iter().max().ok_or("no footprints")?;
-    let data = dev_pool.allocate_fine_grained_bytes(max_fp as usize, 1 << 16).map_err(err)?;
-    let aux = dev_pool.allocate_fine_grained_bytes(1 << 16, 4096).map_err(err)?;
-    let result = dev_pool.allocate_fine_grained_bytes(args.per_ib as usize * SLOTS * 4, 4096).map_err(err)?;
-    let keys = dev_pool.allocate_fine_grained_bytes(3 * args.nwg as usize * 4, 4096).map_err(err)?;
+    let data = dev_pool
+        .allocate_fine_grained_bytes(max_fp as usize, 1 << 16)
+        .map_err(err)?;
+    let aux = dev_pool
+        .allocate_fine_grained_bytes(1 << 16, 4096)
+        .map_err(err)?;
+    let result = dev_pool
+        .allocate_fine_grained_bytes(args.per_ib as usize * SLOTS * 4, 4096)
+        .map_err(err)?;
+    let keys = dev_pool
+        .allocate_fine_grained_bytes(3 * args.nwg as usize * 4, 4096)
+        .map_err(err)?;
     let completion = CompletionSignal::new(&device).map_err(err)?;
     let queue_size = *device.queue_size_range().start();
     let queues = QueueSet::create(&device, 1, queue_size).map_err(err)?;
@@ -849,12 +994,33 @@ fn run() -> R<()> {
         per_ib: args.per_ib,
         epoch: 0x1000,
     };
-    let soak_report = if args.soak_secs > 0 { soak(&mut gpu, args.soak_secs)? } else { Value::Null };
-    let driver = std::fs::read_to_string("/sys/module/amdgpu/version").unwrap_or_default().trim().to_owned();
-    let rocm = std::fs::read_to_string("/opt/rocm/.info/version").unwrap_or_default().trim().to_owned();
-    let kernel_release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default().trim().to_owned();
-    let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default().trim().to_owned();
-    let started_at = Command::new("date").arg("-u").arg("+%Y-%m-%dT%H:%M:%SZ").output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned()).unwrap_or_default();
+    let soak_report = if args.soak_secs > 0 {
+        soak(&mut gpu, args.soak_secs)?
+    } else {
+        Value::Null
+    };
+    let driver = std::fs::read_to_string("/sys/module/amdgpu/version")
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let rocm = std::fs::read_to_string("/opt/rocm/.info/version")
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let kernel_release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let started_at = Command::new("date")
+        .arg("-u")
+        .arg("+%Y-%m-%dT%H:%M:%SZ")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .unwrap_or_default();
     let identity = json!({
         "arch": name, "bus": bus, "kfd_unique_id": kfd, "compute_units": cus, "host": hostname,
         "amdgpu_module_version": driver, "rocm_version": rocm, "kernel": kernel_release,
@@ -862,7 +1028,8 @@ fn run() -> R<()> {
         "git_commit": std::env::var("G4_GIT_COMMIT").ok(), "started_at": started_at,
     });
     let cells_per = (args.footprints.len() * args.layouts.len()) as u64;
-    let per_cell = args.trials.div_ceil(cells_per).div_ceil(args.per_ib as u64) * args.per_ib as u64;
+    let per_cell =
+        args.trials.div_ceil(cells_per).div_ceil(args.per_ib as u64) * args.per_ib as u64;
     let mut rng = 0x9E37_79B9_7F4A_7C15u64;
     let mut rows_out = Vec::new();
     for &row in &args.rows {
@@ -873,7 +1040,11 @@ fn run() -> R<()> {
             let mut totals = Cell::default();
             for &fp in &args.footprints {
                 for &layout in &args.layouts {
-                    let quota = if disqualified && args.stop_on_stale { args.diag_trials.min(per_cell) } else { per_cell };
+                    let quota = if disqualified && args.stop_on_stale {
+                        args.diag_trials.min(per_cell)
+                    } else {
+                        per_cell
+                    };
                     let cell = run_cell(&mut gpu, row, rung, fp, layout, quota, &mut rng)?;
                     eprintln!(
                         "[g4] {} {} fp={} layout={} trials={} stale_trials={} old={} future={} first={} other={} checked={} {:.1}s",
@@ -904,13 +1075,23 @@ fn run() -> R<()> {
                           "other": totals.words[OTHER], "checked": totals.words[CHECKED]},
                 "seconds": totals.seconds, "cells": cells,
             }));
-            let snapshot = json!({"identity": identity, "partial_row": row.name(), "rungs": rungs_out});
-            std::fs::write(args.out.join(format!("partial.{}.json", row.name())), serde_json::to_vec_pretty(&snapshot).map_err(err)?).map_err(err)?;
+            let snapshot =
+                json!({"identity": identity, "partial_row": row.name(), "rungs": rungs_out});
+            std::fs::write(
+                args.out.join(format!("partial.{}.json", row.name())),
+                serde_json::to_vec_pretty(&snapshot).map_err(err)?,
+            )
+            .map_err(err)?;
         }
         // Weakest safe rung: the first rung in ladder order that is clean and
         // every rung after it that was run is clean too.
-        let clean: Vec<bool> = rungs_out.iter().map(|r| !r["stale"].as_bool().unwrap_or(true)).collect();
-        let weakest = (0..clean.len()).find(|&i| clean[i..].iter().all(|c| *c)).map(|i| rungs_out[i]["rung"].clone());
+        let clean: Vec<bool> = rungs_out
+            .iter()
+            .map(|r| !r["stale"].as_bool().unwrap_or(true))
+            .collect();
+        let weakest = (0..clean.len())
+            .find(|&i| clean[i..].iter().all(|c| *c))
+            .map(|i| rungs_out[i]["rung"].clone());
         let next_weaker_stale = weakest
             .as_ref()
             .and_then(|w| rungs_out.iter().position(|r| &r["rung"] == w))
@@ -924,7 +1105,9 @@ fn run() -> R<()> {
             "trials_per_rung_target": args.trials, "per_ib": args.per_ib, "workgroups": args.nwg,
             "footprints_bytes": args.footprints, "row": rows_out.last().unwrap(),
         });
-        let path = args.out.join(format!("receipt.{}.{}.json", name, row.name()));
+        let path = args
+            .out
+            .join(format!("receipt.{}.{}.json", name, row.name()));
         std::fs::write(&path, serde_json::to_vec_pretty(&receipt).map_err(err)?).map_err(err)?;
         eprintln!("[g4] wrote {}", path.display());
     }
@@ -935,7 +1118,9 @@ fn run() -> R<()> {
             "next_weaker_rung_shown_stale": r["next_weaker_rung_shown_stale"],
             "trials": r["rungs"].as_array().map(|a| a.iter().map(|x| json!({"rung": x["rung"], "trials": x["trials"], "stale_trials": x["stale_trials"]})).collect::<Vec<_>>())})).collect::<Vec<_>>(),
     });
-    let mut f = std::fs::File::create(args.out.join(format!("cache-table.{name}.json"))).map_err(err)?;
-    f.write_all(&serde_json::to_vec_pretty(&table).map_err(err)?).map_err(err)?;
+    let mut f =
+        std::fs::File::create(args.out.join(format!("cache-table.{name}.json"))).map_err(err)?;
+    f.write_all(&serde_json::to_vec_pretty(&table).map_err(err)?)
+        .map_err(err)?;
     Ok(())
 }

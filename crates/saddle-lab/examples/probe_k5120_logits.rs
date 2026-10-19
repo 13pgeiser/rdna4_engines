@@ -130,9 +130,16 @@ fn main() {
     for step in 0..4 {
         // Teacher-forced identical tokens isolate dispatch from sampling.
         qwen35::forward_scratch(
-            &mut gpu, &weights, &config, 42 + step as u32,
-            prefill_len + step, &mut kv_cache, &mut dn_state, &scratch,
-        ).expect("decode forward");
+            &mut gpu,
+            &weights,
+            &config,
+            42 + step as u32,
+            prefill_len + step,
+            &mut kv_cache,
+            &mut dn_state,
+            &scratch,
+        )
+        .expect("decode forward");
         gpu.hip.device_synchronize().expect("decode sync");
         let row = gpu.download_f32(&scratch.logits).expect("decode logits");
         assert!(row.iter().all(|v| v.is_finite()));

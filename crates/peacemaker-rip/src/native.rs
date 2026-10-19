@@ -6,14 +6,16 @@
 //! runtime driver. Everything else a script calls is evaluated script code.
 
 use crate::driver::DynDriver;
-use crate::interp::{Cx, Ctl, Interp, R};
+use crate::interp::{Ctl, Cx, Interp, R};
 use crate::value::*;
+use peacemaker_author::runtime::{
+    Arrived, Cond, Exit, Phase, Place, RegionId, RingId, Transition, WgCond,
+};
 use peacemaker_isa::insn::{Instruction, MemoryClass};
 use peacemaker_isa::kernels::common;
 use peacemaker_isa::ledger::Counter;
 use peacemaker_isa::reg::{Kind as RegKind, Live, RegRef};
 use peacemaker_isa::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan};
-use peacemaker_author::runtime::{Arrived, Cond, Exit, Phase, Place, RegionId, RingId, Transition, WgCond};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -128,18 +130,89 @@ impl Nat {
 // ---- names ----------------------------------------------------------------------
 
 pub(crate) const COMMON_FNS: &[&str] = &[
-    "v", "vr", "s", "sr", "lit", "op", "mem", "sop", "smem", "srd_tail", "add64", "add64_imm", "smem_off", "s_add_u32", "s_addc_u32", "s_add_i32", "bload", "bstore_b128", "gather_offset", "workgroup_id",
-    "ready", "retire", "rotate", "prime", "retire_cur", "join",
+    "v",
+    "vr",
+    "s",
+    "sr",
+    "lit",
+    "op",
+    "mem",
+    "sop",
+    "smem",
+    "srd_tail",
+    "add64",
+    "add64_imm",
+    "smem_off",
+    "s_add_u32",
+    "s_addc_u32",
+    "s_add_i32",
+    "bload",
+    "bstore_b128",
+    "gather_offset",
+    "workgroup_id",
+    "ready",
+    "retire",
+    "rotate",
+    "prime",
+    "retire_cur",
+    "join",
 ];
 pub(crate) const ASSOC_FNS: &[&str] = &[
-    "Builder::new", "RegPlan::new", "KernargLayout::new", "Instruction::new", "Chain::new", "Live::Between", "Ring::new", "Workgroup::new", "String::new", "String::from", "Vec::new", "Vec::with_capacity",
-    "cmp::max", "cmp::min", "mem::swap",
+    "Builder::new",
+    "RegPlan::new",
+    "KernargLayout::new",
+    "Instruction::new",
+    "Chain::new",
+    "Live::Between",
+    "Ring::new",
+    "Workgroup::new",
+    "String::new",
+    "String::from",
+    "Vec::new",
+    "Vec::with_capacity",
+    "cmp::max",
+    "cmp::min",
+    "mem::swap",
 ];
 /// Method names `wg_method` implements on `Workgroup` / `Wave`.
 pub(crate) const WORKGROUP_METHODS: &[&str] = &[
-    "isa", "position", "lds", "relayout", "join", "split", "ring", "ring_steady", "begin_write", "ds_store", "ds_store2", "ds_load", "ds_load_cur", "wait", "wait_all", "barrier", "signal",
-    "wait_arrived", "scmp", "scmp_wg_uniform", "label", "skip_if", "skip_unless", "wg_skip_if", "exec_if", "forward", "if_else", "loop_until", "break_if", "loop_carried", "exit", "exit_if",
-    "wave_exit_unless", "wg_exit_unless", "end", "end_with", "handoff",
+    "isa",
+    "position",
+    "lds",
+    "relayout",
+    "join",
+    "split",
+    "ring",
+    "ring_steady",
+    "begin_write",
+    "ds_store",
+    "ds_store2",
+    "ds_load",
+    "ds_load_cur",
+    "wait",
+    "wait_all",
+    "barrier",
+    "signal",
+    "wait_arrived",
+    "scmp",
+    "scmp_wg_uniform",
+    "label",
+    "skip_if",
+    "skip_unless",
+    "wg_skip_if",
+    "exec_if",
+    "forward",
+    "if_else",
+    "loop_until",
+    "break_if",
+    "loop_carried",
+    "exit",
+    "exit_if",
+    "wave_exit_unless",
+    "wg_exit_unless",
+    "end",
+    "end_with",
+    "handoff",
 ];
 
 pub fn is_fn(name: &str) -> bool {
@@ -150,8 +223,31 @@ pub fn is_fn(name: &str) -> bool {
 }
 
 pub fn is_type(n: &str) -> bool {
-    matches!(n, "Arch" | "MemoryClass" | "Counter" | "Live" | "KernelSpec" | "KernargLayout" | "RegPlan" | "Builder" | "Instruction" | "Chain" | "Ring" | "Workgroup" | "Option" | "Result" | "String" | "Vec" | "Phase" | "f32" | "f64" | "bool" | "char" | "str")
-        || IntTy::parse(n).is_some()
+    matches!(
+        n,
+        "Arch"
+            | "MemoryClass"
+            | "Counter"
+            | "Live"
+            | "KernelSpec"
+            | "KernargLayout"
+            | "RegPlan"
+            | "Builder"
+            | "Instruction"
+            | "Chain"
+            | "Ring"
+            | "Workgroup"
+            | "Option"
+            | "Result"
+            | "String"
+            | "Vec"
+            | "Phase"
+            | "f32"
+            | "f64"
+            | "bool"
+            | "char"
+            | "str"
+    ) || IntTy::parse(n).is_some()
 }
 
 pub fn is_struct(n: &str) -> bool {
@@ -191,9 +287,15 @@ pub fn assoc_const<'a>(ty: &str, item: &str) -> Option<Value<'a>> {
         ("Phase", "Free") => nat(Nat::Phase(Phase::RtFree)),
         ("Phase", "Writing") => nat(Nat::Phase(Phase::RtWriting)),
         ("Phase", "Published") => nat(Nat::Phase(Phase::RtPublished)),
-        (t, "MAX") if IntTy::parse(t).is_some() => IntTy::parse(t).map(|t| Value::Int(t.max(), Some(t))),
-        (t, "MIN") if IntTy::parse(t).is_some() => IntTy::parse(t).map(|t| Value::Int(t.min(), Some(t))),
-        (t, "BITS") if IntTy::parse(t).is_some() => IntTy::parse(t).map(|t| Value::Int(i128::from(t.bits()), Some(IntTy::U32))),
+        (t, "MAX") if IntTy::parse(t).is_some() => {
+            IntTy::parse(t).map(|t| Value::Int(t.max(), Some(t)))
+        }
+        (t, "MIN") if IntTy::parse(t).is_some() => {
+            IntTy::parse(t).map(|t| Value::Int(t.min(), Some(t)))
+        }
+        (t, "BITS") if IntTy::parse(t).is_some() => {
+            IntTy::parse(t).map(|t| Value::Int(i128::from(t.bits()), Some(IntTy::U32)))
+        }
         _ => None,
     }
 }
@@ -205,7 +307,10 @@ type Res<T> = Result<T, String>;
 fn int<'a>(it: &Interp<'a>, v: &Value<'a>, what: &str) -> Res<i128> {
     match it.deref(v.clone()) {
         Value::Int(i, _) => Ok(i),
-        o => Err(format!("{what}: expected an integer, found {}", o.type_name())),
+        o => Err(format!(
+            "{what}: expected an integer, found {}",
+            o.type_name()
+        )),
     }
 }
 fn u8_of<'a>(it: &Interp<'a>, v: &Value<'a>, what: &str) -> Res<u8> {
@@ -223,7 +328,10 @@ fn usize_of<'a>(it: &Interp<'a>, v: &Value<'a>, what: &str) -> Res<usize> {
 fn str_of<'a>(it: &Interp<'a>, v: &Value<'a>, what: &str) -> Res<String> {
     match it.deref(v.clone()) {
         Value::Str(s) => Ok(s.to_string()),
-        o => Err(format!("{what}: expected a string, found {}", o.type_name())),
+        o => Err(format!(
+            "{what}: expected a string, found {}",
+            o.type_name()
+        )),
     }
 }
 fn nat_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Option<Nat> {
@@ -242,19 +350,27 @@ fn regs_of<'a>(it: &Interp<'a>, v: &Value<'a>, what: &str) -> Res<Vec<RegRef>> {
     match it.deref(v.clone()) {
         Value::Array(xs) => xs.iter().map(|x| reg_of(it, x, what)).collect(),
         Value::Nat(Nat::Reg(r)) => Ok(vec![r]),
-        o => Err(format!("{what}: expected an array of registers, found {}", o.type_name())),
+        o => Err(format!(
+            "{what}: expected an array of registers, found {}",
+            o.type_name()
+        )),
     }
 }
 fn reg_of<'a>(it: &Interp<'a>, v: &Value<'a>, what: &str) -> Res<RegRef> {
     match nat_of(it, v) {
         Some(Nat::Reg(r)) => Ok(r),
-        _ => Err(format!("{what}: expected a register (v(..), s(..), vr(..), sr(..))")),
+        _ => Err(format!(
+            "{what}: expected a register (v(..), s(..), vr(..), sr(..))"
+        )),
     }
 }
 fn u8s_of<'a>(it: &Interp<'a>, v: &Value<'a>, what: &str) -> Res<Vec<u8>> {
     match it.deref(v.clone()) {
         Value::Array(xs) => xs.iter().map(|x| u8_of(it, x, what)).collect(),
-        o => Err(format!("{what}: expected an array of register numbers, found {}", o.type_name())),
+        o => Err(format!(
+            "{what}: expected an array of register numbers, found {}",
+            o.type_name()
+        )),
     }
 }
 fn insn_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<Instruction> {
@@ -280,7 +396,10 @@ fn opt_u8<'a>(it: &Interp<'a>, v: &Value<'a>, what: &str) -> Res<Option<u8>> {
                 Ok(None)
             }
         }
-        o => Err(format!("{what}: expected Option<u8>, found {}", o.type_name())),
+        o => Err(format!(
+            "{what}: expected Option<u8>, found {}",
+            o.type_name()
+        )),
     }
 }
 
@@ -313,18 +432,31 @@ fn check_args(name: &str, args: &[Value], n: usize) -> Res<()> {
 
 /// Run `f` on the builder a value names: a `Builder::new` result, or the
 /// current driver's backend (`wg.isa()`).
-fn with_b<'a, T>(it: &Interp<'a>, v: &Value<'a>, cx: &mut Cx<'_>, f: impl FnOnce(&mut Builder) -> T) -> R<'a, T> {
+fn with_b<'a, T>(
+    it: &Interp<'a>,
+    v: &Value<'a>,
+    cx: &mut Cx<'_>,
+    f: impl FnOnce(&mut Builder) -> T,
+) -> R<'a, T> {
     match it.deref(v.clone()) {
         Value::Nat(Nat::Builder(cell)) => {
             let mut g = cell.borrow_mut();
-            let b = g.as_mut().ok_or("the builder is owned by the active Workgroup scope: use wg.isa()")?;
+            let b = g
+                .as_mut()
+                .ok_or("the builder is owned by the active Workgroup scope: use wg.isa()")?;
             Ok(f(b))
         }
         Value::Nat(Nat::Isa) => {
-            let d = cx.d.as_deref_mut().ok_or("wg.isa() outside the Workgroup scope")?;
+            let d =
+                cx.d.as_deref_mut()
+                    .ok_or("wg.isa() outside the Workgroup scope")?;
             Ok(f(d.isa()))
         }
-        o => Err(format!("expected a builder (`Builder::new(..)` or `wg.isa()`), found {}", o.type_name()).into()),
+        o => Err(format!(
+            "expected a builder (`Builder::new(..)` or `wg.isa()`), found {}",
+            o.type_name()
+        )
+        .into()),
     }
 }
 
@@ -343,11 +475,22 @@ fn workgroup_id(b: &mut Builder, axis: i128, dst: u8) -> Res<()> {
     let arch = b.spec.arch;
     let y_flag = b.spec.system_sgpr_workgroup_id_y;
     let name = arch.name();
-    let needs_y = || format!("workgroup_id: axis 1 (y) needs the Y work-group id enabled on {name}: set `system_sgpr_workgroup_id_y: true` in the KernelSpec");
+    let needs_y = || {
+        format!("workgroup_id: axis 1 (y) needs the Y work-group id enabled on {name}: set `system_sgpr_workgroup_id_y: true` in the KernelSpec")
+    };
     match axis {
         0..=1 => {}
-        2 => return Err("workgroup id z is not enabled: KernelSpec has no z flag; fold z into x or y".into()),
-        _ => return Err(format!("workgroup_id: axis must be 0 (x), 1 (y) or 2 (z), got {axis}")),
+        2 => {
+            return Err(
+                "workgroup id z is not enabled: KernelSpec has no z flag; fold z into x or y"
+                    .into(),
+            )
+        }
+        _ => {
+            return Err(format!(
+                "workgroup_id: axis must be 0 (x), 1 (y) or 2 (z), got {axis}"
+            ))
+        }
     }
     if arch.gfx12() {
         let text = match axis {
@@ -357,7 +500,9 @@ fn workgroup_id(b: &mut Builder, axis: i128, dst: u8) -> Res<()> {
         };
         return common::sop(b, text, &[dst], &[]);
     }
-    let ids = arch.workgroup_ids(b.spec.user_sgpr_count).map_err(|e| format!("workgroup_id: {e}"))?;
+    let ids = arch
+        .workgroup_ids(b.spec.user_sgpr_count)
+        .map_err(|e| format!("workgroup_id: {e}"))?;
     let src = match (axis, ids.x, ids.y) {
         (0, WgIdSource::Sgpr(n), _) => n,
         (_, _, WgIdSource::Sgpr(n)) if y_flag => n,
@@ -383,9 +528,18 @@ fn spec_value<'a>(s: &KernelSpec) -> Value<'a> {
             f("symbol", Value::str(&s.symbol)),
             f("kernargs", nat(Nat::Kernargs(s.kernargs.clone()))),
             f("user_sgpr_count", Value::u8(s.user_sgpr_count)),
-            f("system_sgpr_workgroup_id_y", Value::Bool(s.system_sgpr_workgroup_id_y)),
-            f("workgroup_size", Value::int(i128::from(s.workgroup_size), IntTy::U16)),
-            f("group_segment_fixed_size", Value::u32(s.group_segment_fixed_size)),
+            f(
+                "system_sgpr_workgroup_id_y",
+                Value::Bool(s.system_sgpr_workgroup_id_y),
+            ),
+            f(
+                "workgroup_size",
+                Value::int(i128::from(s.workgroup_size), IntTy::U16),
+            ),
+            f(
+                "group_segment_fixed_size",
+                Value::u32(s.group_segment_fixed_size),
+            ),
             f("wave32", Value::Bool(s.wave32)),
             f("cu_mode", Value::Bool(s.cu_mode)),
         ],
@@ -393,11 +547,18 @@ fn spec_value<'a>(s: &KernelSpec) -> Value<'a> {
 }
 
 fn spec_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<KernelSpec> {
-    let Value::Struct(n, fs) = it.deref(v.clone()) else { return Err("expected a KernelSpec { .. }".into()) };
+    let Value::Struct(n, fs) = it.deref(v.clone()) else {
+        return Err("expected a KernelSpec { .. }".into());
+    };
     if &*n != "KernelSpec" {
         return Err(format!("expected a KernelSpec, found {n}"));
     }
-    let get = |k: &str| fs.iter().find(|(f, _)| &**f == k).map(|(_, v)| v.clone()).ok_or_else(|| format!("KernelSpec is missing `{k}`"));
+    let get = |k: &str| {
+        fs.iter()
+            .find(|(f, _)| &**f == k)
+            .map(|(_, v)| v.clone())
+            .ok_or_else(|| format!("KernelSpec is missing `{k}`"))
+    };
     let boolean = |k: &str| match get(k)? {
         Value::Bool(b) => Ok(b),
         _ => Err(format!("KernelSpec.{k} must be bool")),
@@ -415,16 +576,33 @@ fn spec_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<KernelSpec> {
         user_sgpr_count: u8_of(it, &get("user_sgpr_count")?, "user_sgpr_count")?,
         system_sgpr_workgroup_id_y: boolean("system_sgpr_workgroup_id_y")?,
         workgroup_size: u16_of(it, &get("workgroup_size")?, "workgroup_size")?,
-        group_segment_fixed_size: u32_of(it, &get("group_segment_fixed_size")?, "group_segment_fixed_size")?,
+        group_segment_fixed_size: u32_of(
+            it,
+            &get("group_segment_fixed_size")?,
+            "group_segment_fixed_size",
+        )?,
         wave32: boolean("wave32")?,
         cu_mode: boolean("cu_mode")?,
     })
 }
 
-pub fn field<'a>(it: &Interp<'a>, n: &Nat, name: &str, cx: &mut Cx<'_>) -> R<'a, Option<Value<'a>>> {
+pub fn field<'a>(
+    it: &Interp<'a>,
+    n: &Nat,
+    name: &str,
+    cx: &mut Cx<'_>,
+) -> R<'a, Option<Value<'a>>> {
     Ok(match (n, name) {
-        (Nat::Builder(_) | Nat::Isa, "spec") => Some(with_b(it, &Value::Nat(n.clone()), cx, |b| spec_value(&b.spec))?),
-        (Nat::Builder(_) | Nat::Isa, "regs") => Some(with_b(it, &Value::Nat(n.clone()), cx, |b| nat(Nat::Plan(Rc::new(RefCell::new(b.regs.clone())))))?),
+        (Nat::Builder(_) | Nat::Isa, "spec") => {
+            Some(with_b(it, &Value::Nat(n.clone()), cx, |b| {
+                spec_value(&b.spec)
+            })?)
+        }
+        (Nat::Builder(_) | Nat::Isa, "regs") => {
+            Some(with_b(it, &Value::Nat(n.clone()), cx, |b| {
+                nat(Nat::Plan(Rc::new(RefCell::new(b.regs.clone()))))
+            })?)
+        }
         (Nat::Emitted(e), "s_text") => Some(Value::str(&e.s_text)),
         (Nat::Kernargs(k), "size") => Some(Value::u32(k.size)),
         _ => None,
@@ -445,16 +623,34 @@ fn chain_step(b: &mut Builder, c: &Chain, a: u8, aw: u8, bm: u8, bw: u8) -> Res<
     let mn = match &*c.kind {
         "f16" => "v_wmma_f32_16x16x16_f16",
         "bf16" => "v_wmma_f32_16x16x16_bf16",
-        k => return Err(format!("Chain: unsupported matrix kind `{k}` (supported: f16, bf16)")),
+        k => {
+            return Err(format!(
+                "Chain: unsupported matrix kind `{k}` (supported: f16, bf16)"
+            ))
+        }
     };
     if c.width != 8 {
-        return Err(format!("Chain: the accumulator is 8 VGPRs, not {}", c.width));
+        return Err(format!(
+            "Chain: the accumulator is 8 VGPRs, not {}",
+            c.width
+        ));
     }
     if !matches!(aw, 4 | 8) || !matches!(bw, 4 | 8) {
-        return Err(format!("Chain: operand widths must be 4 or 8 VGPRs, got {aw} and {bw}"));
+        return Err(format!(
+            "Chain: operand widths must be 4 or 8 VGPRs, got {aw} and {bw}"
+        ));
     }
     let acc = vtxt(c.dst, c.width);
-    common::op(b, format!("{mn} {acc}, {}, {}, {acc}", vtxt(a, aw), vtxt(bm, bw)), &[common::vr(c.dst, c.width)], &[common::vr(a, aw), common::vr(bm, bw), common::vr(c.dst, c.width)])
+    common::op(
+        b,
+        format!("{mn} {acc}, {}, {}, {acc}", vtxt(a, aw), vtxt(bm, bw)),
+        &[common::vr(c.dst, c.width)],
+        &[
+            common::vr(a, aw),
+            common::vr(bm, bw),
+            common::vr(c.dst, c.width),
+        ],
+    )
 }
 
 // ---- native functions -----------------------------------------------------------
@@ -473,7 +669,10 @@ fn place_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<Place> {
         Value::Nat(Nat::Ring(g)) => Ok(Place::Ring(g)),
         Value::Nat(Nat::Pend(p)) | Value::Nat(Nat::Drained(p)) => Ok(p),
         Value::Tuple(xs) if !xs.is_empty() => place_of(it, &xs[0]),
-        o => Err(format!("expected an LDS region or ring, found {}", o.type_name())),
+        o => Err(format!(
+            "expected an LDS region or ring, found {}",
+            o.type_name()
+        )),
     }
 }
 fn place_val<'a>(p: Place) -> Value<'a> {
@@ -734,8 +933,20 @@ struct Cb<'a> {
     fail: Option<Ctl<'a>>,
 }
 
-fn run_cb<'a>(it: &Interp<'a>, f: &Value<'a>, args: Vec<Value<'a>>, d: &mut dyn DynDriver, fwd: Option<&mut peacemaker_author::runtime::Forward<Builder>>, brk: Option<&peacemaker_author::runtime::Breaks<Builder>>, cb: &mut Cb<'a>) -> Res<Value<'a>> {
-    let mut cx = Cx { d: Some(d), fwd, brk };
+fn run_cb<'a>(
+    it: &Interp<'a>,
+    f: &Value<'a>,
+    args: Vec<Value<'a>>,
+    d: &mut dyn DynDriver,
+    fwd: Option<&mut peacemaker_author::runtime::Forward<Builder>>,
+    brk: Option<&peacemaker_author::runtime::Breaks<Builder>>,
+    cb: &mut Cb<'a>,
+) -> Res<Value<'a>> {
+    let mut cx = Cx {
+        d: Some(d),
+        fwd,
+        brk,
+    };
     let r = it.call_value(f, args, &mut cx);
     let v = match r {
         Ok(v) => v,
@@ -765,7 +976,14 @@ fn finish_cb<'a>(cb: Cb<'a>, r: Res<()>, v: Value<'a>) -> R<'a> {
     Ok(done_with(r, |()| v))
 }
 
-pub fn method<'a>(it: &Interp<'a>, n: &Nat, name: &str, targs: &[String], args: Vec<Value<'a>>, cx: &mut Cx<'_>) -> R<'a, Option<Value<'a>>> {
+pub fn method<'a>(
+    it: &Interp<'a>,
+    n: &Nat,
+    name: &str,
+    targs: &[String],
+    args: Vec<Value<'a>>,
+    cx: &mut Cx<'_>,
+) -> R<'a, Option<Value<'a>>> {
     let a = &args;
     let need = |k: usize| check_args(name, a, k);
     Ok(match n {
@@ -778,7 +996,9 @@ pub fn method<'a>(it: &Interp<'a>, n: &Nat, name: &str, targs: &[String], args: 
         Nat::Insn(i) => match name {
             "memory" => {
                 need(1)?;
-                let Some(Nat::Mem(c)) = nat_of(it, &a[0]) else { return Err("memory(..) takes a MemoryClass".into()) };
+                let Some(Nat::Mem(c)) = nat_of(it, &a[0]) else {
+                    return Err("memory(..) takes a MemoryClass".into());
+                };
                 Some(nat(Nat::Insn(Rc::new((**i).clone().memory(c)))))
             }
             _ => None,
@@ -786,11 +1006,19 @@ pub fn method<'a>(it: &Interp<'a>, n: &Nat, name: &str, targs: &[String], args: 
         Nat::Kernargs(k) => match name {
             "pointer" => {
                 need(2)?;
-                Some(nat(Nat::Kernargs(k.clone().pointer(&str_of(it, &a[0], "pointer")?, u32_of(it, &a[1], "pointer")?))))
+                Some(nat(Nat::Kernargs(k.clone().pointer(
+                    &str_of(it, &a[0], "pointer")?,
+                    u32_of(it, &a[1], "pointer")?,
+                ))))
             }
             "hidden" => {
                 need(4)?;
-                Some(nat(Nat::Kernargs(k.clone().hidden(&str_of(it, &a[0], "hidden")?, u32_of(it, &a[1], "hidden")?, u32_of(it, &a[2], "hidden")?, &str_of(it, &a[3], "hidden")?))))
+                Some(nat(Nat::Kernargs(k.clone().hidden(
+                    &str_of(it, &a[0], "hidden")?,
+                    u32_of(it, &a[1], "hidden")?,
+                    u32_of(it, &a[2], "hidden")?,
+                    &str_of(it, &a[3], "hidden")?,
+                ))))
             }
             "validate" => Some(done(k.validate())),
             _ => None,
@@ -799,20 +1027,44 @@ pub fn method<'a>(it: &Interp<'a>, n: &Nat, name: &str, targs: &[String], args: 
             "s" | "v" => {
                 need(3)?;
                 let width = match targs.first() {
-                    Some(t) => t.parse::<u8>().ok().or_else(|| it.const_int(t).and_then(|c| u8::try_from(c).ok())).ok_or_else(|| format!("`{name}::<{t}>`: the width is not a constant"))?,
+                    Some(t) => t
+                        .parse::<u8>()
+                        .ok()
+                        .or_else(|| it.const_int(t).and_then(|c| u8::try_from(c).ok()))
+                        .ok_or_else(|| format!("`{name}::<{t}>`: the width is not a constant"))?,
                     None => return Err(format!("`{name}` needs a width: `{name}::<N>(..)`").into()),
                 };
-                let (nm, base) = (str_of(it, &a[0], "register name")?, u8_of(it, &a[1], "register base")?);
-                let Some(Nat::Live(live)) = nat_of(it, &a[2]) else { return Err("the last argument is a Live range".into()) };
+                let (nm, base) = (
+                    str_of(it, &a[0], "register name")?,
+                    u8_of(it, &a[1], "register base")?,
+                );
+                let Some(Nat::Live(live)) = nat_of(it, &a[2]) else {
+                    return Err("the last argument is a Live range".into());
+                };
                 let kind = if name == "s" { RegKind::S } else { RegKind::V };
                 let r = p.borrow_mut().add_range(&nm, kind, base, width, live);
-                Some(done_with(r, |()| nat(Nat::Reg(RegRef { kind, base, len: width }))))
+                Some(done_with(r, |()| {
+                    nat(Nat::Reg(RegRef {
+                        kind,
+                        base,
+                        len: width,
+                    }))
+                }))
             }
-            "next_free_vgpr" => Some(Value::int(i128::from(p.borrow().next_free_vgpr()), IntTy::U16)),
-            "next_free_sgpr" => Some(Value::int(i128::from(p.borrow().next_free_sgpr()), IntTy::U16)),
+            "next_free_vgpr" => Some(Value::int(
+                i128::from(p.borrow().next_free_vgpr()),
+                IntTy::U16,
+            )),
+            "next_free_sgpr" => Some(Value::int(
+                i128::from(p.borrow().next_free_sgpr()),
+                IntTy::U16,
+            )),
             "scratch_pool" => {
                 need(2)?;
-                Some(done(p.borrow_mut().scratch_pool(u8_of(it, &a[0], "scratch_pool")?, u8_of(it, &a[1], "scratch_pool")?)))
+                Some(done(p.borrow_mut().scratch_pool(
+                    u8_of(it, &a[0], "scratch_pool")?,
+                    u8_of(it, &a[1], "scratch_pool")?,
+                )))
             }
             _ => None,
         },
@@ -825,46 +1077,74 @@ pub fn method<'a>(it: &Interp<'a>, n: &Nat, name: &str, targs: &[String], args: 
                 need(1)?;
                 let f = a[0].clone();
                 let mut cb = Cb { fail: None };
-                let r = with_b(it, &Value::Nat(n.clone()), cx, |b| b.clause(|draft| {
-                    let cell = Rc::new(RefCell::new(Some(draft.clone())));
-                    let mut cx = Cx { d: None, fwd: None, brk: None };
-                    let r = it.call_value(&f, vec![nat(Nat::Builder(cell.clone()))], &mut cx);
-                    let v = match r {
-                        Ok(v) | Err(Ctl::Return(v)) => v,
-                        Err(other) => {
-                            cb.fail = Some(other);
-                            return Err("script fault".into());
+                let r = with_b(it, &Value::Nat(n.clone()), cx, |b| {
+                    b.clause(|draft| {
+                        let cell = Rc::new(RefCell::new(Some(draft.clone())));
+                        let mut cx = Cx {
+                            d: None,
+                            fwd: None,
+                            brk: None,
+                        };
+                        let r = it.call_value(&f, vec![nat(Nat::Builder(cell.clone()))], &mut cx);
+                        let v = match r {
+                            Ok(v) | Err(Ctl::Return(v)) => v,
+                            Err(other) => {
+                                cb.fail = Some(other);
+                                return Err("script fault".into());
+                            }
+                        };
+                        if let Value::Enum(t, var, mut p) = it.deref(v) {
+                            if &*t == "Result" && &*var != "Ok" {
+                                return Err(crate::fmt::display(&p.pop().unwrap_or(Value::Unit))
+                                    .unwrap_or_else(|e| e));
+                            }
                         }
-                    };
-                    if let Value::Enum(t, var, mut p) = it.deref(v) {
-                        if &*t == "Result" && &*var != "Ok" {
-                            return Err(crate::fmt::display(&p.pop().unwrap_or(Value::Unit)).unwrap_or_else(|e| e));
-                        }
-                    }
-                    *draft = cell.borrow_mut().take().ok_or("the clause builder was already finished")?;
-                    Ok(())
-                }))?;
+                        *draft = cell
+                            .borrow_mut()
+                            .take()
+                            .ok_or("the clause builder was already finished")?;
+                        Ok(())
+                    })
+                })?;
                 return finish_cb(cb, r, Value::Unit).map(Some);
             }
             "wait" => {
                 need(2)?;
-                let Some(Nat::Counter(c)) = nat_of(it, &a[0]) else { return Err("wait(Counter, n)".into()) };
+                let Some(Nat::Counter(c)) = nat_of(it, &a[0]) else {
+                    return Err("wait(Counter, n)".into());
+                };
                 let k = u8_of(it, &a[1], "wait count")?;
-                Some(done(with_b(it, &Value::Nat(n.clone()), cx, |b| b.wait(c, k))?))
+                Some(done(with_b(it, &Value::Nat(n.clone()), cx, |b| {
+                    b.wait(c, k)
+                })?))
             }
             "finish" => {
-                let Nat::Builder(cell) = n else { return Err("finish() is the builder's, not wg.isa()'s".into()) };
-                let b = cell.borrow_mut().take().ok_or("the builder was already finished")?;
+                let Nat::Builder(cell) = n else {
+                    return Err("finish() is the builder's, not wg.isa()'s".into());
+                };
+                let b = cell
+                    .borrow_mut()
+                    .take()
+                    .ok_or("the builder was already finished")?;
                 Some(done_with(b.finish(), |e| nat(Nat::Emitted(Rc::new(e)))))
             }
-            "position" => Some(Value::usize(with_b(it, &Value::Nat(n.clone()), cx, |b| b.program().instructions.len())?)),
+            "position" => Some(Value::usize(with_b(it, &Value::Nat(n.clone()), cx, |b| {
+                b.program().instructions.len()
+            })?)),
             _ => None,
         },
         Nat::Chain(c) => match name {
             "step" => {
                 need(5)?;
-                let (x, aw, bm, bw) = (u8_of(it, &a[1], "step")?, u8_of(it, &a[2], "step")?, u8_of(it, &a[3], "step")?, u8_of(it, &a[4], "step")?);
-                Some(done(with_b(it, &a[0], cx, |b| chain_step(b, c, x, aw, bm, bw))?))
+                let (x, aw, bm, bw) = (
+                    u8_of(it, &a[1], "step")?,
+                    u8_of(it, &a[2], "step")?,
+                    u8_of(it, &a[3], "step")?,
+                    u8_of(it, &a[4], "step")?,
+                );
+                Some(done(with_b(it, &a[0], cx, |b| {
+                    chain_step(b, c, x, aw, bm, bw)
+                })?))
             }
             _ => None,
         },
@@ -891,14 +1171,28 @@ pub fn method<'a>(it: &Interp<'a>, n: &Nat, name: &str, targs: &[String], args: 
             match name {
                 "branch_if" | "branch_unless" => {
                     need(3)?;
-                    let Some(Nat::Cond(c)) = nat_of(it, &a[1]) else { return Err(format!("`{name}` takes a Cond from scmp(..)").into()) };
+                    let Some(Nat::Cond(c)) = nat_of(it, &a[1]) else {
+                        return Err(format!("`{name}` takes a Cond from scmp(..)").into());
+                    };
                     let l = label_arg(2)?;
-                    Some(fwd_op(cx, |d, f| if name == "branch_if" { d.fwd_branch_if(f, c, &l) } else { d.fwd_branch_unless(f, c, &l) })?)
+                    Some(fwd_op(cx, |d, f| {
+                        if name == "branch_if" {
+                            d.fwd_branch_if(f, c, &l)
+                        } else {
+                            d.fwd_branch_unless(f, c, &l)
+                        }
+                    })?)
                 }
                 "goto" | "place" => {
                     need(2)?;
                     let l = label_arg(1)?;
-                    Some(fwd_op(cx, |d, f| if name == "goto" { d.fwd_goto(f, &l) } else { d.fwd_place(f, &l) })?)
+                    Some(fwd_op(cx, |d, f| {
+                        if name == "goto" {
+                            d.fwd_goto(f, &l)
+                        } else {
+                            d.fwd_place(f, &l)
+                        }
+                    })?)
                 }
                 _ => None,
             }
@@ -908,10 +1202,17 @@ pub fn method<'a>(it: &Interp<'a>, n: &Nat, name: &str, targs: &[String], args: 
     })
 }
 
-fn fwd_op<'a>(cx: &mut Cx<'_>, f: impl FnOnce(&mut dyn DynDriver, &mut peacemaker_author::runtime::Forward<Builder>) -> Res<()>) -> R<'a> {
+fn fwd_op<'a>(
+    cx: &mut Cx<'_>,
+    f: impl FnOnce(&mut dyn DynDriver, &mut peacemaker_author::runtime::Forward<Builder>) -> Res<()>,
+) -> R<'a> {
     let Cx { d, fwd, .. } = cx;
-    let d = d.as_deref_mut().ok_or("forward handle used outside the Workgroup scope")?;
-    let fwd = fwd.as_deref_mut().ok_or("forward handle used outside its `forward(|w, f| ..)` block")?;
+    let d = d
+        .as_deref_mut()
+        .ok_or("forward handle used outside the Workgroup scope")?;
+    let fwd = fwd
+        .as_deref_mut()
+        .ok_or("forward handle used outside its `forward(|w, f| ..)` block")?;
     Ok(done(f(d, fwd)))
 }
 
@@ -924,7 +1225,12 @@ fn state_and_fn<'a>(a: &[Value<'a>], from: usize) -> Res<(Option<Value<'a>>, Val
     }
 }
 
-fn wg_method<'a>(it: &Interp<'a>, name: &str, args: Vec<Value<'a>>, cx: &mut Cx<'_>) -> R<'a, Option<Value<'a>>> {
+fn wg_method<'a>(
+    it: &Interp<'a>,
+    name: &str,
+    args: Vec<Value<'a>>,
+    cx: &mut Cx<'_>,
+) -> R<'a, Option<Value<'a>>> {
     let a = &args;
     macro_rules! need {
         ($n:expr) => {
@@ -955,22 +1261,39 @@ fn wg_method<'a>(it: &Interp<'a>, name: &str, args: Vec<Value<'a>>, cx: &mut Cx<
         "position" => Value::usize(driver(cx)?.position()),
         "lds" => {
             need!(3);
-            let (nm, base, len) = (str_of(it, &a[0], "lds name")?, u32_of(it, &a[1], "lds base")?, u32_of(it, &a[2], "lds len")?);
+            let (nm, base, len) = (
+                str_of(it, &a[0], "lds name")?,
+                u32_of(it, &a[1], "lds base")?,
+                u32_of(it, &a[2], "lds len")?,
+            );
             done_with(driver(cx)?.lds(&nm, base, len), |r| nat(Nat::Region(r)))
         }
         "relayout" => done(driver(cx)?.relayout()),
         "join" => {
-            let parts: Vec<RegionId> = if a.len() == 1 { handles(it, &a[0]).iter().map(|v| region_of(it, v)).collect::<Res<_>>()? } else { a.iter().map(|v| region_of(it, v)).collect::<Res<_>>()? };
+            let parts: Vec<RegionId> = if a.len() == 1 {
+                handles(it, &a[0])
+                    .iter()
+                    .map(|v| region_of(it, v))
+                    .collect::<Res<_>>()?
+            } else {
+                a.iter().map(|v| region_of(it, v)).collect::<Res<_>>()?
+            };
             done_with(driver(cx)?.join(&parts), |r| nat(Nat::Region(r)))
         }
         "split" => {
             need!(2);
             let (r, first) = (region_of(it, &a[0])?, usize_of(it, &a[1], "split")?);
-            done_with(driver(cx)?.split(r, first), |(x, y)| Value::Tuple(vec![nat(Nat::Region(x)), nat(Nat::Region(y))]))
+            done_with(driver(cx)?.split(r, first), |(x, y)| {
+                Value::Tuple(vec![nat(Nat::Region(x)), nat(Nat::Region(y))])
+            })
         }
         "ring" => {
             need!(3);
-            let (nm, x, y) = (str_of(it, &a[0], "ring name")?, region_of(it, &a[1])?, region_of(it, &a[2])?);
+            let (nm, x, y) = (
+                str_of(it, &a[0], "ring name")?,
+                region_of(it, &a[1])?,
+                region_of(it, &a[2])?,
+            );
             done_with(driver(cx)?.ring(&nm, x, y), |g| nat(Nat::Ring(g)))
         }
         "ring_steady" => {
@@ -987,12 +1310,23 @@ fn wg_method<'a>(it: &Interp<'a>, name: &str, args: Vec<Value<'a>>, cx: &mut Cx<
         "ds_store" => {
             need!(2);
             let (p, insn) = (place_of(it, &a[0])?, checked_insn(it, &a[1], cx)?);
-            done_with(driver(cx)?.ds_store(p, insn), |()| Value::Tuple(vec![place_val(p), pend(p)]))
+            done_with(driver(cx)?.ds_store(p, insn), |()| {
+                Value::Tuple(vec![place_val(p), pend(p)])
+            })
         }
         "ds_store2" => {
             need!(3);
-            let (x, y, insn) = (place_of(it, &a[0])?, place_of(it, &a[1])?, checked_insn(it, &a[2], cx)?);
-            done_with(driver(cx)?.ds_store2(x, y, insn), |()| Value::Tuple(vec![Value::Tuple(vec![place_val(x), pend(x)]), Value::Tuple(vec![place_val(y), pend(y)])]))
+            let (x, y, insn) = (
+                place_of(it, &a[0])?,
+                place_of(it, &a[1])?,
+                checked_insn(it, &a[2], cx)?,
+            );
+            done_with(driver(cx)?.ds_store2(x, y, insn), |()| {
+                Value::Tuple(vec![
+                    Value::Tuple(vec![place_val(x), pend(x)]),
+                    Value::Tuple(vec![place_val(y), pend(y)]),
+                ])
+            })
         }
         "ds_load" => {
             need!(2);
@@ -1011,13 +1345,20 @@ fn wg_method<'a>(it: &Interp<'a>, name: &str, args: Vec<Value<'a>>, cx: &mut Cx<
         }
         "wait_all" => {
             need!(1);
-            let ps: Vec<Place> = handles(it, &a[0]).iter().map(|v| place_of(it, v)).collect::<Res<_>>()?;
-            done_with(driver(cx)?.wait_all(&ps), |()| Value::Tuple(ps.iter().map(|p| nat(Nat::Drained(*p))).collect()))
+            let ps: Vec<Place> = handles(it, &a[0])
+                .iter()
+                .map(|v| place_of(it, v))
+                .collect::<Res<_>>()?;
+            done_with(driver(cx)?.wait_all(&ps), |()| {
+                Value::Tuple(ps.iter().map(|p| nat(Nat::Drained(*p))).collect())
+            })
         }
         "barrier" => {
             need!(1);
             let ts = trans_of(it, &a[0])?;
-            done_with(driver(cx)?.barrier(&ts), |()| Value::Tuple(ts.iter().map(transition_result).collect()))
+            done_with(driver(cx)?.barrier(&ts), |()| {
+                Value::Tuple(ts.iter().map(transition_result).collect())
+            })
         }
         "signal" => {
             need!(1);
@@ -1026,7 +1367,9 @@ fn wg_method<'a>(it: &Interp<'a>, name: &str, args: Vec<Value<'a>>, cx: &mut Cx<
         }
         "wait_arrived" => {
             need!(1);
-            let Some(Nat::Arrived(arr)) = nat_of(it, &a[0]) else { return Err("wait_arrived takes the Arrived from signal(..)".into()) };
+            let Some(Nat::Arrived(arr)) = nat_of(it, &a[0]) else {
+                return Err("wait_arrived takes the Arrived from signal(..)".into());
+            };
             done(driver(cx)?.wait_arrived(arr))
         }
         "scmp" => {
@@ -1085,14 +1428,26 @@ fn wg_method<'a>(it: &Interp<'a>, name: &str, args: Vec<Value<'a>>, cx: &mut Cx<
             let mut cb = Cb { fail: None };
             let mut out = Value::Unit;
             let r = driver(cx)?.forward(&mut |d, fw| {
-                out = run_cb(it, &f, vec![wgv(), nat(Nat::Fwd)], d, Some(fw), None, &mut cb)?;
+                out = run_cb(
+                    it,
+                    &f,
+                    vec![wgv(), nat(Nat::Fwd)],
+                    d,
+                    Some(fw),
+                    None,
+                    &mut cb,
+                )?;
                 Ok(())
             });
             return finish_cb(cb, r, out).map(Some);
         }
         "if_else" => {
             need!(5);
-            let (c, el, jn) = (cond_of(&a[0])?, str_of(it, &a[1], "else label")?, str_of(it, &a[2], "join label")?);
+            let (c, el, jn) = (
+                cond_of(&a[0])?,
+                str_of(it, &a[1], "else label")?,
+                str_of(it, &a[2], "join label")?,
+            );
             let (t, e) = (a[3].clone(), a[4].clone());
             let mut cb = Cb { fail: None };
             let cb_cell = RefCell::new(&mut cb);
@@ -1100,24 +1455,63 @@ fn wg_method<'a>(it: &Interp<'a>, name: &str, args: Vec<Value<'a>>, cx: &mut Cx<
                 c,
                 &el,
                 &jn,
-                &mut |d| run_cb(it, &t, vec![wgv()], d, None, None, &mut cb_cell.borrow_mut()).map(|_| ()),
-                &mut |d| run_cb(it, &e, vec![wgv()], d, None, None, &mut cb_cell.borrow_mut()).map(|_| ()),
+                &mut |d| {
+                    run_cb(
+                        it,
+                        &t,
+                        vec![wgv()],
+                        d,
+                        None,
+                        None,
+                        &mut cb_cell.borrow_mut(),
+                    )
+                    .map(|_| ())
+                },
+                &mut |d| {
+                    run_cb(
+                        it,
+                        &e,
+                        vec![wgv()],
+                        d,
+                        None,
+                        None,
+                        &mut cb_cell.borrow_mut(),
+                    )
+                    .map(|_| ())
+                },
             );
             drop(cb_cell);
             return finish_cb(cb, r, Value::Unit).map(Some);
         }
         "loop_until" => {
             need!(3);
-            let (head, exit, f) = (str_of(it, &a[0], "loop head")?, str_of(it, &a[1], "loop exit")?, a[2].clone());
+            let (head, exit, f) = (
+                str_of(it, &a[0], "loop head")?,
+                str_of(it, &a[1], "loop exit")?,
+                a[2].clone(),
+            );
             let cb = RefCell::new(Cb { fail: None });
-            let r = driver(cx)?.loop_until(&head, &exit, &|d, brk| run_cb(it, &f, vec![wgv(), nat(Nat::Brk)], d, None, Some(brk), &mut cb.borrow_mut()).map(|_| ()));
+            let r = driver(cx)?.loop_until(&head, &exit, &|d, brk| {
+                run_cb(
+                    it,
+                    &f,
+                    vec![wgv(), nat(Nat::Brk)],
+                    d,
+                    None,
+                    Some(brk),
+                    &mut cb.borrow_mut(),
+                )
+                .map(|_| ())
+            });
             return finish_cb(cb.into_inner(), r, Value::Unit).map(Some);
         }
         "break_if" => {
             need!(2);
             let c = cond_of(&a[0])?;
             let Cx { d, brk, .. } = cx;
-            let d = d.as_deref_mut().ok_or("break_if outside the Workgroup scope")?;
+            let d = d
+                .as_deref_mut()
+                .ok_or("break_if outside the Workgroup scope")?;
             let brk = brk.ok_or("break_if outside a `loop_until(.., |w, brk| ..)` body")?;
             done(d.break_if(c, brk))
         }
@@ -1149,7 +1543,9 @@ fn wg_method<'a>(it: &Interp<'a>, name: &str, args: Vec<Value<'a>>, cx: &mut Cx<
         }
         "exit" => {
             need!(1);
-            done_with(driver(cx)?.exit(&str_of(it, &a[0], "exit label")?), |e| nat(Nat::Exit(e)))
+            done_with(driver(cx)?.exit(&str_of(it, &a[0], "exit label")?), |e| {
+                nat(Nat::Exit(e))
+            })
         }
         "exit_if" => {
             need!(2);
@@ -1163,9 +1559,16 @@ fn wg_method<'a>(it: &Interp<'a>, name: &str, args: Vec<Value<'a>>, cx: &mut Cx<
         }
         "wg_exit_unless" => {
             need!(4);
-            let (c, t, e, f) = (wgcond_of(&a[0])?, str_of(it, &a[1], "target")?, exit_of(&a[2])?, a[3].clone());
+            let (c, t, e, f) = (
+                wgcond_of(&a[0])?,
+                str_of(it, &a[1], "target")?,
+                exit_of(&a[2])?,
+                a[3].clone(),
+            );
             let mut cb = Cb { fail: None };
-            let r = driver(cx)?.wg_exit_unless(c, &t, &e, &mut |d| run_cb(it, &f, vec![wgv()], d, None, None, &mut cb).map(|_| ()));
+            let r = driver(cx)?.wg_exit_unless(c, &t, &e, &mut |d| {
+                run_cb(it, &f, vec![wgv()], d, None, None, &mut cb).map(|_| ())
+            });
             return finish_cb(cb, r, Value::Unit).map(Some);
         }
         "end" => {
@@ -1176,12 +1579,21 @@ fn wg_method<'a>(it: &Interp<'a>, name: &str, args: Vec<Value<'a>>, cx: &mut Cx<
             need!(2);
             let (e, f) = (exit_of(&a[0])?, a[1].clone());
             let mut cb = Cb { fail: None };
-            let r = driver(cx)?.end_with(e, &mut |d| run_cb(it, &f, vec![wgv()], d, None, None, &mut cb).map(|_| ()));
+            let r = driver(cx)?.end_with(e, &mut |d| {
+                run_cb(it, &f, vec![wgv()], d, None, None, &mut cb).map(|_| ())
+            });
             return finish_cb(cb, r, Value::Unit).map(Some);
         }
         "handoff" => {
             need!(6);
-            let (c, lbl, e, r, w, rd) = (cond_of(&a[0])?, str_of(it, &a[1], "reader label")?, exit_of(&a[2])?, region_of(it, &a[3])?, a[4].clone(), a[5].clone());
+            let (c, lbl, e, r, w, rd) = (
+                cond_of(&a[0])?,
+                str_of(it, &a[1], "reader label")?,
+                exit_of(&a[2])?,
+                region_of(it, &a[3])?,
+                a[4].clone(),
+                a[5].clone(),
+            );
             let cb = RefCell::new(Cb { fail: None });
             let mut out = Value::Unit;
             let res = driver(cx)?.handoff(
@@ -1189,9 +1601,28 @@ fn wg_method<'a>(it: &Interp<'a>, name: &str, args: Vec<Value<'a>>, cx: &mut Cx<
                 &lbl,
                 e,
                 r,
-                &mut |d, r| run_cb(it, &w, vec![wgv(), nat(Nat::Region(r))], d, None, None, &mut cb.borrow_mut()).map(|_| ()),
+                &mut |d, r| {
+                    run_cb(
+                        it,
+                        &w,
+                        vec![wgv(), nat(Nat::Region(r))],
+                        d,
+                        None,
+                        None,
+                        &mut cb.borrow_mut(),
+                    )
+                    .map(|_| ())
+                },
                 &mut |d, r, ex| {
-                    out = run_cb(it, &rd, vec![wgv(), nat(Nat::Region(r)), nat(Nat::Exit(ex.clone()))], d, None, None, &mut cb.borrow_mut())?;
+                    out = run_cb(
+                        it,
+                        &rd,
+                        vec![wgv(), nat(Nat::Region(r)), nat(Nat::Exit(ex.clone()))],
+                        d,
+                        None,
+                        None,
+                        &mut cb.borrow_mut(),
+                    )?;
                     Ok(())
                 },
             );
@@ -1204,6 +1635,8 @@ fn wg_method<'a>(it: &Interp<'a>, name: &str, args: Vec<Value<'a>>, cx: &mut Cx<
 fn transition_result<'a>(t: &Transition) -> Value<'a> {
     match *t {
         Transition::Ready(r) | Transition::Retire(r) => nat(Nat::Region(r)),
-        Transition::Rotate(g) | Transition::Prime(g) | Transition::RetireCur(g) => nat(Nat::Ring(g)),
+        Transition::Rotate(g) | Transition::Prime(g) | Transition::RetireCur(g) => {
+            nat(Nat::Ring(g))
+        }
     }
 }

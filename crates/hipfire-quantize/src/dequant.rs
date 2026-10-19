@@ -3,7 +3,6 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-
 use std::collections::HashMap;
 
 use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32};

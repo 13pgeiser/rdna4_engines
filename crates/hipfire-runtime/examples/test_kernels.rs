@@ -449,7 +449,9 @@ fn qwen4_moe_sym_k640_reference(gpu: &mut Gpu) -> Result<(), String> {
         .memcpy_htod_offset(&wt.buf, off, &[w[off] ^ 1])
         .map_err(err)?;
     let refused = !gpu.qwen4_moe_sym_check(&ptrs, M, K, 512, 68).map_err(err)?;
-    gpu.hip.memcpy_htod_offset(&wt.buf, off, &[w[off]]).map_err(err)?;
+    gpu.hip
+        .memcpy_htod_offset(&wt.buf, off, &[w[off]])
+        .map_err(err)?;
     if !refused {
         return Err("asymmetric QT53 header accepted by the header check".into());
     }
@@ -461,17 +463,27 @@ fn qwen4_moe_sym_k640_reference(gpu: &mut Gpu) -> Result<(), String> {
         })
         .collect();
     let ht = gpu.upload_raw(&h, &[h.len()]).map_err(err)?;
-    let sorted: Vec<i32> = (0..ROWS as i32).map(|p| if p < LIVE as i32 { p } else { -1 }).collect();
+    let sorted: Vec<i32> = (0..ROWS as i32)
+        .map(|p| if p < LIVE as i32 { p } else { -1 })
+        .collect();
     let sorted_b: Vec<u8> = sorted.iter().flat_map(|v| v.to_le_bytes()).collect();
     let st = gpu.upload_raw(&sorted_b, &[ROWS]).map_err(err)?;
     let tiles: Vec<u8> = [0i32, -1].iter().flat_map(|v| v.to_le_bytes()).collect();
     let tt = gpu.upload_raw(&tiles, &[2]).map_err(err)?;
-    let y = gpu.upload_raw(&vec![0x5Au8; ROWS * M * 2], &[ROWS * M * 2]).map_err(err)?;
-    let xq = gpu.qwen4_moe_rotate128_i4(&ht, &st, K, ROWS, LIVE).map_err(err)?;
+    let y = gpu
+        .upload_raw(&vec![0x5Au8; ROWS * M * 2], &[ROWS * M * 2])
+        .map_err(err)?;
+    let xq = gpu
+        .qwen4_moe_rotate128_i4(&ht, &st, K, ROWS, LIVE)
+        .map_err(err)?;
     gpu.gemm_qwen4_moe_down_iu4_sym(&ptrs, &tt, &st, &xq, &y, M, K, 1, ROWS, LIVE, false)
         .map_err(err)?;
     gpu.hip.device_synchronize().map_err(err)?;
-    let side = gpu.scratch.qwen4_moe_down_i4_scratch.as_ref().ok_or("no sidecar")?;
+    let side = gpu
+        .scratch
+        .qwen4_moe_down_i4_scratch
+        .as_ref()
+        .ok_or("no sidecar")?;
     let mut xb = vec![0u8; 5 * LIVE * 72];
     gpu.hip.memcpy_dtoh(&mut xb, side).map_err(err)?;
     let got = gpu.download_raw_bytes(&y).map_err(err)?;

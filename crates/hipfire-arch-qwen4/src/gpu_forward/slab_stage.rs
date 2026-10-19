@@ -605,11 +605,9 @@ impl Qwen4ExpertStage {
                 slab.codecs.iter().filter_map(|&codec| {
                     rdna_compute::expert_capabilities::ExpertQt::of_slab_codec(codec)
                 }),
-            ) || slab
-                .codecs
-                .iter()
-                .any(|&codec| rdna_compute::expert_capabilities::ExpertQt::of_slab_codec(codec).is_none())
-            {
+            ) || slab.codecs.iter().any(|&codec| {
+                rdna_compute::expert_capabilities::ExpertQt::of_slab_codec(codec).is_none()
+            }) {
                 return off(&format!(
                     "a host slab layer holds a codec without a Stage capability on {}",
                     gpu.arch

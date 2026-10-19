@@ -48,7 +48,11 @@ pub struct Cx<'c> {
 }
 impl<'c> Cx<'c> {
     pub fn root() -> Self {
-        Cx { d: None, fwd: None, brk: None }
+        Cx {
+            d: None,
+            fwd: None,
+            brk: None,
+        }
     }
 }
 
@@ -100,12 +104,27 @@ fn type_key(t: &syn::Type) -> Option<String> {
     }
 }
 
-fn make_fn<'a>(name: &str, sig: &'a syn::Signature, block: &'a Block, self_ty: Option<Rc<str>>) -> FnDef<'a> {
+fn make_fn<'a>(
+    name: &str,
+    sig: &'a syn::Signature,
+    block: &'a Block,
+    self_ty: Option<Rc<str>>,
+) -> FnDef<'a> {
     let mut params = Vec::new();
     let mut recv = 0;
     for a in &sig.inputs {
         match a {
-            syn::FnArg::Receiver(r) => recv = if r.reference.is_some() { if r.mutability.is_some() { 3 } else { 2 } } else { 1 },
+            syn::FnArg::Receiver(r) => {
+                recv = if r.reference.is_some() {
+                    if r.mutability.is_some() {
+                        3
+                    } else {
+                        2
+                    }
+                } else {
+                    1
+                }
+            }
             syn::FnArg::Typed(pt) => params.push((&*pt.pat, Ty::from_syn(&pt.ty))),
         }
     }
@@ -113,7 +132,15 @@ fn make_fn<'a>(name: &str, sig: &'a syn::Signature, block: &'a Block, self_ty: O
         syn::ReturnType::Type(_, t) => Ty::from_syn(t),
         syn::ReturnType::Default => Ty::Any,
     };
-    FnDef { name: name.to_string(), sig, block, self_ty, params, ret, recv }
+    FnDef {
+        name: name.to_string(),
+        sig,
+        block,
+        self_ty,
+        params,
+        ret,
+        recv,
+    }
 }
 
 impl<'a> Interp<'a> {
@@ -137,26 +164,62 @@ impl<'a> Interp<'a> {
         it
     }
 
-    fn load_items(&mut self, items: &'a [Item], traits: &mut HashMap<String, Vec<(String, &'a syn::TraitItemFn)>>) {
+    fn load_items(
+        &mut self,
+        items: &'a [Item],
+        traits: &mut HashMap<String, Vec<(String, &'a syn::TraitItemFn)>>,
+    ) {
         for item in items {
             match item {
                 Item::Fn(f) => {
                     let n = f.sig.ident.to_string();
-                    self.fns.insert(n.clone(), Rc::new(make_fn(&n, &f.sig, &f.block, None)));
+                    self.fns
+                        .insert(n.clone(), Rc::new(make_fn(&n, &f.sig, &f.block, None)));
                 }
                 Item::Const(c) => {
-                    self.consts.insert(c.ident.to_string(), ConstDef { expr: &c.expr, ty: Ty::from_syn(&c.ty) });
+                    self.consts.insert(
+                        c.ident.to_string(),
+                        ConstDef {
+                            expr: &c.expr,
+                            ty: Ty::from_syn(&c.ty),
+                        },
+                    );
                 }
                 Item::Static(c) => {
-                    self.consts.insert(c.ident.to_string(), ConstDef { expr: &c.expr, ty: Ty::from_syn(&c.ty) });
+                    self.consts.insert(
+                        c.ident.to_string(),
+                        ConstDef {
+                            expr: &c.expr,
+                            ty: Ty::from_syn(&c.ty),
+                        },
+                    );
                 }
                 Item::Struct(s) => {
                     let (fields, tuple) = match &s.fields {
-                        syn::Fields::Named(n) => (n.named.iter().map(|f| (f.ident.as_ref().map(|i| i.to_string()).unwrap_or_default(), Ty::from_syn(&f.ty))).collect(), false),
-                        syn::Fields::Unnamed(u) => (u.unnamed.iter().enumerate().map(|(i, f)| (i.to_string(), Ty::from_syn(&f.ty))).collect(), true),
+                        syn::Fields::Named(n) => (
+                            n.named
+                                .iter()
+                                .map(|f| {
+                                    (
+                                        f.ident.as_ref().map(|i| i.to_string()).unwrap_or_default(),
+                                        Ty::from_syn(&f.ty),
+                                    )
+                                })
+                                .collect(),
+                            false,
+                        ),
+                        syn::Fields::Unnamed(u) => (
+                            u.unnamed
+                                .iter()
+                                .enumerate()
+                                .map(|(i, f)| (i.to_string(), Ty::from_syn(&f.ty)))
+                                .collect(),
+                            true,
+                        ),
                         syn::Fields::Unit => (Vec::new(), false),
                     };
-                    self.structs.insert(s.ident.to_string(), StructDef { fields, tuple });
+                    self.structs
+                        .insert(s.ident.to_string(), StructDef { fields, tuple });
                 }
                 Item::Enum(e) => {
                     let mut next = 0i128;
@@ -192,7 +255,9 @@ impl<'a> Interp<'a> {
                     traits.insert(t.ident.to_string(), v);
                 }
                 Item::Impl(imp) => {
-                    let Some(ty) = type_key(&imp.self_ty) else { continue };
+                    let Some(ty) = type_key(&imp.self_ty) else {
+                        continue;
+                    };
                     let self_ty: Rc<str> = Rc::from(ty.as_str());
                     let mut defined: Vec<String> = Vec::new();
                     for ii in &imp.items {
@@ -200,10 +265,19 @@ impl<'a> Interp<'a> {
                             syn::ImplItem::Fn(f) => {
                                 let n = f.sig.ident.to_string();
                                 defined.push(n.clone());
-                                self.methods.insert(format!("{ty}::{n}"), Rc::new(make_fn(&n, &f.sig, &f.block, Some(self_ty.clone()))));
+                                self.methods.insert(
+                                    format!("{ty}::{n}"),
+                                    Rc::new(make_fn(&n, &f.sig, &f.block, Some(self_ty.clone()))),
+                                );
                             }
                             syn::ImplItem::Const(c) => {
-                                self.consts.insert(format!("{ty}::{}", c.ident), ConstDef { expr: &c.expr, ty: Ty::from_syn(&c.ty) });
+                                self.consts.insert(
+                                    format!("{ty}::{}", c.ident),
+                                    ConstDef {
+                                        expr: &c.expr,
+                                        ty: Ty::from_syn(&c.ty),
+                                    },
+                                );
                             }
                             _ => {}
                         }
@@ -214,7 +288,15 @@ impl<'a> Interp<'a> {
                                 for (n, f) in defaults {
                                     if !defined.contains(n) {
                                         let block = f.default.as_ref().expect("default body");
-                                        self.methods.insert(format!("{ty}::{n}"), Rc::new(make_fn(n, &f.sig, block, Some(self_ty.clone()))));
+                                        self.methods.insert(
+                                            format!("{ty}::{n}"),
+                                            Rc::new(make_fn(
+                                                n,
+                                                &f.sig,
+                                                block,
+                                                Some(self_ty.clone()),
+                                            )),
+                                        );
                                     }
                                 }
                             }
@@ -233,17 +315,23 @@ impl<'a> Interp<'a> {
 
     // ---- driver ownership ------------------------------------------------
 
-
     // ---- entry -------------------------------------------------------------
 
     pub fn has_fn(&self, name: &str) -> bool {
         self.fns.contains_key(name)
     }
     pub fn enum_has_variant(&self, ty: &str, var: &str) -> Option<String> {
-        self.enums.get(ty).and_then(|e| e.variants.iter().find(|(v, _, _)| v.eq_ignore_ascii_case(var)).map(|(v, _, _)| v.clone()))
+        self.enums.get(ty).and_then(|e| {
+            e.variants
+                .iter()
+                .find(|(v, _, _)| v.eq_ignore_ascii_case(var))
+                .map(|(v, _, _)| v.clone())
+        })
     }
     pub fn enum_variants(&self, ty: &str) -> Option<Vec<String>> {
-        self.enums.get(ty).map(|e| e.variants.iter().map(|(v, _, _)| v.clone()).collect())
+        self.enums
+            .get(ty)
+            .map(|e| e.variants.iter().map(|(v, _, _)| v.clone()).collect())
     }
     pub fn fn_arity(&self, name: &str) -> Option<usize> {
         self.fns.get(name).map(|f| f.params.len())
@@ -296,11 +384,17 @@ impl<'a> Interp<'a> {
     /// locate an `Err(String)` script value.
     fn after_native(&self, r: R<'a>, at: (usize, usize)) -> R<'a> {
         for text in crate::validate::take_texts() {
-            self.instruction_sites.borrow_mut().push((text, format!("{}:{}:{}", self.name, at.0, at.1)));
+            self.instruction_sites
+                .borrow_mut()
+                .push((text, format!("{}:{}:{}", self.name, at.0, at.1)));
         }
         match r {
-            Ok(Value::Enum(t, var, p)) if &*t == "Result" && &*var == "Err" && matches!(p.as_slice(), [Value::Str(_)]) => {
-                let Some(Value::Str(s)) = p.into_iter().next() else { unreachable!() };
+            Ok(Value::Enum(t, var, p))
+                if &*t == "Result" && &*var == "Err" && matches!(p.as_slice(), [Value::Str(_)]) =>
+            {
+                let Some(Value::Str(s)) = p.into_iter().next() else {
+                    unreachable!()
+                };
                 Ok(Value::err(self.located(at, &s)))
             }
             r => r,
@@ -310,7 +404,11 @@ impl<'a> Interp<'a> {
     /// Call the script function `name`. Hard faults come back as
     /// `Err(located message)`; the script's own `Err(..)` is a normal value.
     pub fn call_entry(&self, name: &str, args: Vec<Value<'a>>) -> Result<Value<'a>, String> {
-        let f = self.fns.get(name).cloned().ok_or_else(|| format!("{}: no `fn {name}` entry point", self.fn_loc(name)))?;
+        let f = self
+            .fns
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("{}: no `fn {name}` entry point", self.fn_loc(name)))?;
         let mut cx = Cx::root();
         let r = self.call_fn(&f, args, &mut cx);
         match r {
@@ -318,7 +416,10 @@ impl<'a> Interp<'a> {
             Err(Ctl::Return(v)) => Ok(v),
             Err(Ctl::Fatal(m)) => Err(m),
             Err(Ctl::Err(m)) => Err(format!("{}: {m}", self.fn_loc(name))),
-            Err(Ctl::Break(..)) | Err(Ctl::Continue(_)) => Err(format!("{}: `break`/`continue` outside a loop", self.fn_loc(name))),
+            Err(Ctl::Break(..)) | Err(Ctl::Continue(_)) => Err(format!(
+                "{}: `break`/`continue` outside a loop",
+                self.fn_loc(name)
+            )),
         }
     }
 
@@ -336,8 +437,12 @@ impl<'a> Interp<'a> {
 
     fn walk<'v>(v: &'v Value<'a>, p: &Proj) -> Option<&'v Value<'a>> {
         match (v, p) {
-            (Value::Struct(_, fs), Proj::Field(n)) => fs.iter().find(|(k, _)| k == n).map(|(_, x)| x),
-            (Value::Tuple(xs), Proj::Field(n)) | (Value::Enum(_, _, xs), Proj::Field(n)) => n.parse::<usize>().ok().and_then(|i| xs.get(i)),
+            (Value::Struct(_, fs), Proj::Field(n)) => {
+                fs.iter().find(|(k, _)| k == n).map(|(_, x)| x)
+            }
+            (Value::Tuple(xs), Proj::Field(n)) | (Value::Enum(_, _, xs), Proj::Field(n)) => {
+                n.parse::<usize>().ok().and_then(|i| xs.get(i))
+            }
             (Value::Array(xs), Proj::Index(i)) | (Value::Tuple(xs), Proj::Index(i)) => xs.get(*i),
             (Value::Ref(r), _) => {
                 // A reference stored in the path: continue through it (read-only).
@@ -349,9 +454,15 @@ impl<'a> Interp<'a> {
     }
     fn walk_mut<'v>(v: &'v mut Value<'a>, p: &Proj) -> Option<&'v mut Value<'a>> {
         match (v, p) {
-            (Value::Struct(_, fs), Proj::Field(n)) => fs.iter_mut().find(|(k, _)| k == n).map(|(_, x)| x),
-            (Value::Tuple(xs), Proj::Field(n)) | (Value::Enum(_, _, xs), Proj::Field(n)) => n.parse::<usize>().ok().and_then(|i| xs.get_mut(i)),
-            (Value::Array(xs), Proj::Index(i)) | (Value::Tuple(xs), Proj::Index(i)) => xs.get_mut(*i),
+            (Value::Struct(_, fs), Proj::Field(n)) => {
+                fs.iter_mut().find(|(k, _)| k == n).map(|(_, x)| x)
+            }
+            (Value::Tuple(xs), Proj::Field(n)) | (Value::Enum(_, _, xs), Proj::Field(n)) => {
+                n.parse::<usize>().ok().and_then(|i| xs.get_mut(i))
+            }
+            (Value::Array(xs), Proj::Index(i)) | (Value::Tuple(xs), Proj::Index(i)) => {
+                xs.get_mut(*i)
+            }
             _ => None,
         }
     }
@@ -379,7 +490,11 @@ impl<'a> Interp<'a> {
     }
 
     /// Run `f` on the value at a place, mutably.
-    pub fn with_place_mut<T>(&self, r: &PlaceRef<'a>, f: impl FnOnce(&mut Value<'a>) -> Result<T, String>) -> Result<T, String> {
+    pub fn with_place_mut<T>(
+        &self,
+        r: &PlaceRef<'a>,
+        f: impl FnOnce(&mut Value<'a>) -> Result<T, String>,
+    ) -> Result<T, String> {
         let mut cell = r.cell.borrow_mut();
         let mut cur: &mut Value<'a> = &mut cell;
         for p in &r.path {
@@ -395,7 +510,9 @@ impl<'a> Interp<'a> {
             Expr::Paren(p) => self.place(&p.expr, env, cx),
             Expr::Path(p) if p.path.segments.len() == 1 && p.qself.is_none() => {
                 let n = p.path.segments[0].ident.to_string();
-                let cell = lookup(env, &n).ok_or_else(|| Ctl::Err(format!("cannot find variable `{n}`")))?.clone();
+                let cell = lookup(env, &n)
+                    .ok_or_else(|| Ctl::Err(format!("cannot find variable `{n}`")))?
+                    .clone();
                 Ok(PlaceRef { cell, path: vec![] })
             }
             Expr::Field(f) => {
@@ -411,15 +528,22 @@ impl<'a> Interp<'a> {
                 let mut base = self.place(&ix.expr, env, cx)?;
                 self.autoderef(&mut base);
                 let i = self.eval(&ix.index, env, cx)?;
-                let Value::Int(i, _) = self.deref(i) else { return Err("index must be an integer".into()) };
-                base.path.push(Proj::Index(usize::try_from(i).map_err(|_| "negative index")?));
+                let Value::Int(i, _) = self.deref(i) else {
+                    return Err("index must be an integer".into());
+                };
+                base.path.push(Proj::Index(
+                    usize::try_from(i).map_err(|_| "negative index")?,
+                ));
                 Ok(base)
             }
             Expr::Unary(u) if matches!(u.op, UnOp::Deref(_)) => {
                 let v = self.eval(&u.expr, env, cx)?;
                 match v {
                     Value::Ref(r) => {
-                        let mut p = PlaceRef { cell: r.cell.clone(), path: r.path.clone() };
+                        let mut p = PlaceRef {
+                            cell: r.cell.clone(),
+                            path: r.path.clone(),
+                        };
                         self.autoderef(&mut p);
                         Ok(p)
                     }
@@ -438,7 +562,10 @@ impl<'a> Interp<'a> {
                 Value::Ref(r) => {
                     let mut path = r.path.clone();
                     path.extend(std::mem::take(&mut p.path).into_iter().take(0));
-                    *p = PlaceRef { cell: r.cell.clone(), path };
+                    *p = PlaceRef {
+                        cell: r.cell.clone(),
+                        path,
+                    };
                 }
                 _ => return,
             }
@@ -454,7 +581,9 @@ impl<'a> Interp<'a> {
                 None => Err(format!("constant `{key}` depends on itself").into()),
             };
         }
-        let Some(def) = self.consts.get(key) else { return Ok(None) };
+        let Some(def) = self.consts.get(key) else {
+            return Ok(None);
+        };
         self.const_cache.borrow_mut().insert(key.to_string(), None);
         let mut env: Env<'a> = None;
         if let Some((t, _)) = key.split_once("::") {
@@ -463,7 +592,9 @@ impl<'a> Interp<'a> {
         let mut cx = Cx::root();
         let v = self.eval(def.expr, &mut env, &mut cx)?;
         let v = ops::coerce(self.deref(v), &def.ty)?;
-        self.const_cache.borrow_mut().insert(key.to_string(), Some(v.clone()));
+        self.const_cache
+            .borrow_mut()
+            .insert(key.to_string(), Some(v.clone()));
         Ok(Some(v))
     }
 
@@ -489,7 +620,12 @@ impl<'a> Interp<'a> {
             }
         }
         // Drop module qualifiers that carry no type information.
-        while segs.len() > 1 && matches!(segs[0].as_str(), "crate" | "self" | "super" | "std" | "core" | "alloc") {
+        while segs.len() > 1
+            && matches!(
+                segs[0].as_str(),
+                "crate" | "self" | "super" | "std" | "core" | "alloc"
+            )
+        {
             segs.remove(0);
         }
         segs
@@ -510,13 +646,32 @@ impl<'a> Interp<'a> {
                 return Ok(Value::Func(Rc::new(Func::User(f.clone()))));
             }
             if let Some(d) = self.structs.get(n) {
-                return Ok(if d.tuple { Value::Func(Rc::new(Func::TupleStruct(Rc::from(n)))) } else { Value::Struct(Rc::from(n), vec![]) });
+                return Ok(if d.tuple {
+                    Value::Func(Rc::new(Func::TupleStruct(Rc::from(n))))
+                } else {
+                    Value::Struct(Rc::from(n), vec![])
+                });
             }
             match n {
                 "None" => return Ok(Value::none()),
-                "Some" => return Ok(Value::Func(Rc::new(Func::Variant("Option".into(), "Some".into())))),
-                "Ok" => return Ok(Value::Func(Rc::new(Func::Variant("Result".into(), "Ok".into())))),
-                "Err" => return Ok(Value::Func(Rc::new(Func::Variant("Result".into(), "Err".into())))),
+                "Some" => {
+                    return Ok(Value::Func(Rc::new(Func::Variant(
+                        "Option".into(),
+                        "Some".into(),
+                    ))))
+                }
+                "Ok" => {
+                    return Ok(Value::Func(Rc::new(Func::Variant(
+                        "Result".into(),
+                        "Ok".into(),
+                    ))))
+                }
+                "Err" => {
+                    return Ok(Value::Func(Rc::new(Func::Variant(
+                        "Result".into(),
+                        "Err".into(),
+                    ))))
+                }
                 _ => {}
             }
             if let Some(v) = native::global_const(n) {
@@ -535,7 +690,11 @@ impl<'a> Interp<'a> {
                 if *arity >= 1_000_000 {
                     return Err(format!("struct-like enum variant `{key}` is not supported").into());
                 }
-                return Ok(if *arity == 0 { Value::Enum(Rc::from(ty), Rc::from(item), vec![]) } else { Value::Func(Rc::new(Func::Variant(Rc::from(ty), Rc::from(item)))) });
+                return Ok(if *arity == 0 {
+                    Value::Enum(Rc::from(ty), Rc::from(item), vec![])
+                } else {
+                    Value::Func(Rc::new(Func::Variant(Rc::from(ty), Rc::from(item))))
+                });
             }
         }
         if let Some(v) = self.const_value(&key)? {
@@ -546,9 +705,24 @@ impl<'a> Interp<'a> {
         }
         match (ty, item) {
             ("Option", "None") => return Ok(Value::none()),
-            ("Option", "Some") => return Ok(Value::Func(Rc::new(Func::Variant("Option".into(), "Some".into())))),
-            ("Result", "Ok") => return Ok(Value::Func(Rc::new(Func::Variant("Result".into(), "Ok".into())))),
-            ("Result", "Err") => return Ok(Value::Func(Rc::new(Func::Variant("Result".into(), "Err".into())))),
+            ("Option", "Some") => {
+                return Ok(Value::Func(Rc::new(Func::Variant(
+                    "Option".into(),
+                    "Some".into(),
+                ))))
+            }
+            ("Result", "Ok") => {
+                return Ok(Value::Func(Rc::new(Func::Variant(
+                    "Result".into(),
+                    "Ok".into(),
+                ))))
+            }
+            ("Result", "Err") => {
+                return Ok(Value::Func(Rc::new(Func::Variant(
+                    "Result".into(),
+                    "Err".into(),
+                ))))
+            }
             _ => {}
         }
         if let Some(v) = native::assoc_const(ty, item) {
@@ -570,7 +744,12 @@ impl<'a> Interp<'a> {
     }
 
     pub fn enum_discr(&self, ty: &str, var: &str) -> Option<i128> {
-        self.enums.get(ty)?.variants.iter().find(|(v, _, _)| v == var).and_then(|(_, _, d)| *d)
+        self.enums
+            .get(ty)?
+            .variants
+            .iter()
+            .find(|(v, _, _)| v == var)
+            .and_then(|(_, _, d)| *d)
     }
 
     // ---- expressions --------------------------------------------------------
@@ -582,7 +761,11 @@ impl<'a> Interp<'a> {
 
     pub fn eval(&self, e: &'a Expr, env: &mut Env<'a>, cx: &mut Cx<'_>) -> R<'a> {
         match self.eval_inner(e, env, cx) {
-            Err(Ctl::Err(m)) => Err(Ctl::Fatal(format!("{}: {}", self.loc(e), self.with_scope_note(m)))),
+            Err(Ctl::Err(m)) => Err(Ctl::Fatal(format!(
+                "{}: {}",
+                self.loc(e),
+                self.with_scope_note(m)
+            ))),
             r => r,
         }
     }
@@ -595,7 +778,8 @@ impl<'a> Interp<'a> {
                     "" => Value::Int(v, None),
                     "f32" | "f64" => Value::Float(v as f64),
                     s => {
-                        let t = IntTy::parse(s).ok_or_else(|| format!("unsupported literal suffix `{s}`"))?;
+                        let t = IntTy::parse(s)
+                            .ok_or_else(|| format!("unsupported literal suffix `{s}`"))?;
                         if !t.fits(v) {
                             return Err(format!("literal {v} out of range for `{s}`").into());
                         }
@@ -658,14 +842,30 @@ impl<'a> Interp<'a> {
                 if t.elems.is_empty() {
                     return Ok(Value::Unit);
                 }
-                Ok(Value::Tuple(t.elems.iter().map(|x| self.eval(x, env, cx)).collect::<R<Vec<_>>>()?))
+                Ok(Value::Tuple(
+                    t.elems
+                        .iter()
+                        .map(|x| self.eval(x, env, cx))
+                        .collect::<R<Vec<_>>>()?,
+                ))
             }
-            Expr::Array(a) => Ok(Value::Array(a.elems.iter().map(|x| self.eval(x, env, cx)).collect::<R<Vec<_>>>()?)),
+            Expr::Array(a) => Ok(Value::Array(
+                a.elems
+                    .iter()
+                    .map(|x| self.eval(x, env, cx))
+                    .collect::<R<Vec<_>>>()?,
+            )),
             Expr::Repeat(r) => {
                 let v = self.eval(&r.expr, env, cx)?;
                 let n = self.eval(&r.len, env, cx)?;
-                let Value::Int(n, _) = self.deref(n) else { return Err("array length must be an integer".into()) };
-                Ok(Value::Array(vec![self.deref(v); usize::try_from(n).map_err(|_| "bad array length")?]))
+                let Value::Int(n, _) = self.deref(n) else {
+                    return Err("array length must be an integer".into());
+                };
+                Ok(Value::Array(vec![
+                    self.deref(v);
+                    usize::try_from(n)
+                        .map_err(|_| "bad array length")?
+                ]))
             }
             Expr::Struct(s) => self.struct_lit(s, env, cx),
             Expr::Block(b) => {
@@ -700,7 +900,11 @@ impl<'a> Interp<'a> {
                         return self.eval(&arm.body, &mut scope, cx);
                     }
                 }
-                Err(format!("non-exhaustive match: no arm matches {}", crate::fmt::debug(&v, false)).into())
+                Err(format!(
+                    "non-exhaustive match: no arm matches {}",
+                    crate::fmt::debug(&v, false)
+                )
+                .into())
             }
             Expr::While(w) => {
                 let label = w.label.as_ref().map(|l| l.name.ident.to_string());
@@ -711,7 +915,9 @@ impl<'a> Interp<'a> {
                     }
                     match self.eval_block(&w.body, &mut scope, cx) {
                         Ok(_) => {}
-                        Err(Ctl::Break(l, _)) if l.is_none() || l == label => return Ok(Value::Unit),
+                        Err(Ctl::Break(l, _)) if l.is_none() || l == label => {
+                            return Ok(Value::Unit)
+                        }
                         Err(Ctl::Continue(l)) if l.is_none() || l == label => {}
                         Err(c) => return Err(c),
                     }
@@ -758,16 +964,32 @@ impl<'a> Interp<'a> {
                     match v.map(|v| self.deref(v)) {
                         None => Ok(None),
                         Some(Value::Int(i, t)) => Ok(Some((i, t))),
-                        Some(o) => Err(format!("range bounds must be integers, found {}", o.type_name()).into()),
+                        Some(o) => Err(format!(
+                            "range bounds must be integers, found {}",
+                            o.type_name()
+                        )
+                        .into()),
                     }
                 };
                 let (s, en) = (int(s)?, int(en)?);
                 let ty = match (s.and_then(|x| x.1), en.and_then(|x| x.1)) {
-                    (Some(a), Some(b)) if a != b => return Err(format!("mismatched range bound types: {} and {}", a.name(), b.name()).into()),
+                    (Some(a), Some(b)) if a != b => {
+                        return Err(format!(
+                            "mismatched range bound types: {} and {}",
+                            a.name(),
+                            b.name()
+                        )
+                        .into())
+                    }
                     (Some(a), _) | (_, Some(a)) => Some(a),
                     _ => None,
                 };
-                Ok(Value::Range(Box::new(RangeV { start: s.map(|x| x.0), end: en.map(|x| x.0), inclusive: matches!(r.limits, syn::RangeLimits::Closed(_)), ty })))
+                Ok(Value::Range(Box::new(RangeV {
+                    start: s.map(|x| x.0),
+                    end: en.map(|x| x.0),
+                    inclusive: matches!(r.limits, syn::RangeLimits::Closed(_)),
+                    ty,
+                })))
             }
             Expr::Closure(c) => {
                 let params = c.inputs.iter().map(|p| match p {
@@ -778,7 +1000,12 @@ impl<'a> Interp<'a> {
                     syn::ReturnType::Type(_, t) => Ty::from_syn(t),
                     _ => Ty::Any,
                 };
-                Ok(Value::Closure(Rc::new(Closure { params: params.collect(), ret, body: &c.body, env: env.clone() })))
+                Ok(Value::Closure(Rc::new(Closure {
+                    params: params.collect(),
+                    ret,
+                    body: &c.body,
+                    env: env.clone(),
+                })))
             }
             Expr::Reference(r) => {
                 if r.mutability.is_some() {
@@ -814,11 +1041,22 @@ impl<'a> Interp<'a> {
                             Err(Ctl::Return(Value::none()))
                         }
                     }
-                    o => Err(format!("`?` needs a Result or Option, found {}", o.type_name()).into()),
+                    o => {
+                        Err(format!("`?` needs a Result or Option, found {}", o.type_name()).into())
+                    }
                 }
             }
             Expr::Let(_) => Err("`let` is only supported as an `if`/`while` condition".into()),
-            Expr::Macro(m) => Err(format!("macro `{}!` is not supported by the .rip evaluator", m.mac.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default()).into()),
+            Expr::Macro(m) => Err(format!(
+                "macro `{}!` is not supported by the .rip evaluator",
+                m.mac
+                    .path
+                    .segments
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default()
+            )
+            .into()),
             other => Err(format!("unsupported expression ({})", expr_kind(other)).into()),
         }
     }
@@ -837,7 +1075,9 @@ impl<'a> Interp<'a> {
                     Ok(false)
                 }
             }
-            Expr::Binary(b) if matches!(b.op, BinOp::And(_)) => Ok(self.cond(&b.left, env, cx)? && self.cond(&b.right, env, cx)?),
+            Expr::Binary(b) if matches!(b.op, BinOp::And(_)) => {
+                Ok(self.cond(&b.left, env, cx)? && self.cond(&b.right, env, cx)?)
+            }
             Expr::Paren(p) => self.cond(&p.expr, env, cx),
             _ => match self.eval(e, env, cx)? {
                 Value::Bool(b) => Ok(b),
@@ -854,7 +1094,9 @@ impl<'a> Interp<'a> {
         match &b.op {
             And(_) => {
                 let l = self.eval(&b.left, env, cx)?;
-                let Value::Bool(l) = self.deref(l) else { return Err("`&&` needs bool operands".into()) };
+                let Value::Bool(l) = self.deref(l) else {
+                    return Err("`&&` needs bool operands".into());
+                };
                 if !l {
                     return Ok(Value::Bool(false));
                 }
@@ -866,7 +1108,9 @@ impl<'a> Interp<'a> {
             }
             Or(_) => {
                 let l = self.eval(&b.left, env, cx)?;
-                let Value::Bool(l) = self.deref(l) else { return Err("`||` needs bool operands".into()) };
+                let Value::Bool(l) = self.deref(l) else {
+                    return Err("`||` needs bool operands".into());
+                };
                 if l {
                     return Ok(Value::Bool(true));
                 }
@@ -876,7 +1120,8 @@ impl<'a> Interp<'a> {
                     _ => Err("`||` needs bool operands".into()),
                 }
             }
-            AddAssign(_) | SubAssign(_) | MulAssign(_) | DivAssign(_) | RemAssign(_) | BitXorAssign(_) | BitAndAssign(_) | BitOrAssign(_) | ShlAssign(_) | ShrAssign(_) => {
+            AddAssign(_) | SubAssign(_) | MulAssign(_) | DivAssign(_) | RemAssign(_)
+            | BitXorAssign(_) | BitAndAssign(_) | BitOrAssign(_) | ShlAssign(_) | ShrAssign(_) => {
                 let cur = self.eval(&b.left, env, cx)?;
                 let cur = self.deref(cur);
                 let r = self.eval(&b.right, env, cx)?;
@@ -911,7 +1156,9 @@ impl<'a> Interp<'a> {
     fn assign(&self, lhs: &'a Expr, v: Value<'a>, env: &mut Env<'a>, cx: &mut Cx<'_>) -> R<'a, ()> {
         match lhs {
             Expr::Tuple(t) => {
-                let Value::Tuple(xs) = v else { return Err("destructuring assignment needs a tuple".into()) };
+                let Value::Tuple(xs) = v else {
+                    return Err("destructuring assignment needs a tuple".into());
+                };
                 if xs.len() != t.elems.len() {
                     return Err("destructuring assignment arity mismatch".into());
                 }
@@ -940,11 +1187,22 @@ impl<'a> Interp<'a> {
         match (b, m) {
             (Value::Struct(n, fs), Member::Named(i)) => {
                 let k = i.to_string();
-                fs.iter().find(|(f, _)| **f == *k).map(|(_, v)| v.clone()).ok_or_else(|| format!("`{n}` has no field `{k}`").into())
+                fs.iter()
+                    .find(|(f, _)| **f == *k)
+                    .map(|(_, v)| v.clone())
+                    .ok_or_else(|| format!("`{n}` has no field `{k}`").into())
             }
-            (Value::Struct(_, fs), Member::Unnamed(i)) => fs.iter().find(|(f, _)| **f == *i.index.to_string()).map(|(_, v)| v.clone()).ok_or_else(|| "no such tuple field".into()),
-            (Value::Tuple(xs), Member::Unnamed(i)) => xs.get(i.index as usize).cloned().ok_or_else(|| "tuple index out of range".into()),
-            (Value::Nat(n), Member::Named(i)) => native::field(self, n, &i.to_string(), cx)?.ok_or_else(|| format!("`{}` has no field `{i}`", n.type_name()).into()),
+            (Value::Struct(_, fs), Member::Unnamed(i)) => fs
+                .iter()
+                .find(|(f, _)| **f == *i.index.to_string())
+                .map(|(_, v)| v.clone())
+                .ok_or_else(|| "no such tuple field".into()),
+            (Value::Tuple(xs), Member::Unnamed(i)) => xs
+                .get(i.index as usize)
+                .cloned()
+                .ok_or_else(|| "tuple index out of range".into()),
+            (Value::Nat(n), Member::Named(i)) => native::field(self, n, &i.to_string(), cx)?
+                .ok_or_else(|| format!("`{}` has no field `{i}`", n.type_name()).into()),
             (o, Member::Named(i)) => Err(format!("`{}` has no field `{i}`", o.type_name()).into()),
             (o, _) => Err(format!("`{}` has no tuple fields", o.type_name()).into()),
         }
@@ -954,7 +1212,11 @@ impl<'a> Interp<'a> {
         let segs = self.path_segments(&s.path, env);
         let name = segs.last().cloned().unwrap_or_default();
         if segs.len() >= 2 && self.enums.contains_key(&segs[segs.len() - 2]) {
-            return Err(format!("struct-like enum variant `{}` is not supported", segs.join("::")).into());
+            return Err(format!(
+                "struct-like enum variant `{}` is not supported",
+                segs.join("::")
+            )
+            .into());
         }
         let mut given: Vec<(Rc<str>, Value<'a>)> = Vec::new();
         for f in &s.fields {
@@ -983,9 +1245,20 @@ impl<'a> Interp<'a> {
         };
         let mut fields = Vec::with_capacity(def.fields.len());
         for (fname, ty) in &def.fields {
-            let v = given.iter().position(|(k, _)| **k == **fname).map(|i| given.swap_remove(i).1).or_else(|| base.iter().find(|(k, _)| **k == **fname).map(|(_, v)| v.clone()));
+            let v = given
+                .iter()
+                .position(|(k, _)| **k == **fname)
+                .map(|i| given.swap_remove(i).1)
+                .or_else(|| {
+                    base.iter()
+                        .find(|(k, _)| **k == **fname)
+                        .map(|(_, v)| v.clone())
+                });
             let v = v.ok_or_else(|| format!("missing field `{fname}` in `{name}`"))?;
-            fields.push((Rc::from(fname.as_str()), ops::coerce(v, ty).map_err(|e| format!("field `{name}.{fname}`: {e}"))?));
+            fields.push((
+                Rc::from(fname.as_str()),
+                ops::coerce(v, ty).map_err(|e| format!("field `{name}.{fname}`: {e}"))?,
+            ));
         }
         if let Some((k, _)) = given.first() {
             return Err(format!("`{name}` has no field `{k}`").into());
@@ -1011,7 +1284,9 @@ impl<'a> Interp<'a> {
         };
         match it {
             Value::Range(r) => {
-                let Some(start) = r.start else { return Err("`for` over a range needs a start".into()) };
+                let Some(start) = r.start else {
+                    return Err("`for` over a range needs a start".into());
+                };
                 let mut i = start;
                 loop {
                     match r.end {
@@ -1053,7 +1328,9 @@ impl<'a> Interp<'a> {
         let mut i = 0;
         while i < n {
             if let Some(ws) = workgroup_let(&stmts[i]) {
-                let end = (i + 1..n).find(|&k| mentions(&stmts[k], &ws.builder)).unwrap_or(n);
+                let end = (i + 1..n)
+                    .find(|&k| mentions(&stmts[k], &ws.builder))
+                    .unwrap_or(n);
                 *self.scope_note.borrow_mut() = (end < n).then(|| ScopeNote {
                     open_line: ws.call.span().start().line,
                     builder: ws.builder.clone(),
@@ -1081,17 +1358,24 @@ impl<'a> Interp<'a> {
                         return Err("`let` without initializer needs a simple name".into());
                     };
                     let v = self.eval(&init.expr, env, cx)?;
-                    let v = ops::coerce(v, &ty).map_err(|e| Ctl::Fatal(format!("{}: {e}", self.loc(&init.expr))))?;
+                    let v = ops::coerce(v, &ty)
+                        .map_err(|e| Ctl::Fatal(format!("{}: {e}", self.loc(&init.expr))))?;
                     let mut scope = env.clone();
                     if self.bind_pat(pat, &self.deref_for_pat(pat, v), &mut scope, cx)? {
                         *env = scope;
                     } else if let Some((_, els)) = &init.diverge {
                         return match self.eval(els, env, cx) {
-                            Ok(_) => Err(Ctl::Fatal(format!("{}: `let ... else` block did not diverge", self.loc(els)))),
+                            Ok(_) => Err(Ctl::Fatal(format!(
+                                "{}: `let ... else` block did not diverge",
+                                self.loc(els)
+                            ))),
                             Err(e) => Err(e),
                         };
                     } else {
-                        return Err(Ctl::Fatal(format!("{}: refutable pattern in `let`", self.loc(&init.expr))));
+                        return Err(Ctl::Fatal(format!(
+                            "{}: refutable pattern in `let`",
+                            self.loc(&init.expr)
+                        )));
                     }
                 }
                 Stmt::Item(item) => match item {
@@ -1121,19 +1405,55 @@ impl<'a> Interp<'a> {
         Ok(last)
     }
 
-    fn workgroup_scope(&self, ws: &WgLet<'a>, body: &'a [Stmt], env: &mut Env<'a>, cx: &mut Cx<'_>) -> R<'a> {
+    fn workgroup_scope(
+        &self,
+        ws: &WgLet<'a>,
+        body: &'a [Stmt],
+        env: &mut Env<'a>,
+        cx: &mut Cx<'_>,
+    ) -> R<'a> {
         if cx.d.is_some() {
-            return Err(Ctl::Fatal(format!("{}: a Workgroup scope is already open here", self.loc(ws.call))));
+            return Err(Ctl::Fatal(format!(
+                "{}: a Workgroup scope is already open here",
+                self.loc(ws.call)
+            )));
         }
         let arch = self.eval(ws.arch, env, cx)?;
-        let Value::Nat(Nat::Arch(arch)) = self.deref(arch) else { return Err(Ctl::Fatal(format!("{}: Workgroup::new takes an Arch", self.loc(ws.arch)))) };
-        let bv = lookup(env, &ws.builder).map(|c| c.borrow().clone()).ok_or_else(|| Ctl::Fatal(format!("{}: cannot find `{}`", self.loc(ws.call), ws.builder)))?;
-        let Value::Nat(Nat::Builder(cell)) = self.deref(bv) else { return Err(Ctl::Fatal(format!("{}: Workgroup::new borrows a Builder (`&mut {}`)", self.loc(ws.call), ws.builder))) };
-        let Some(mut bld) = cell.borrow_mut().take() else { return Err(Ctl::Fatal(format!("{}: the builder already belongs to a Workgroup", self.loc(ws.call)))) };
+        let Value::Nat(Nat::Arch(arch)) = self.deref(arch) else {
+            return Err(Ctl::Fatal(format!(
+                "{}: Workgroup::new takes an Arch",
+                self.loc(ws.arch)
+            )));
+        };
+        let bv = lookup(env, &ws.builder)
+            .map(|c| c.borrow().clone())
+            .ok_or_else(|| {
+                Ctl::Fatal(format!(
+                    "{}: cannot find `{}`",
+                    self.loc(ws.call),
+                    ws.builder
+                ))
+            })?;
+        let Value::Nat(Nat::Builder(cell)) = self.deref(bv) else {
+            return Err(Ctl::Fatal(format!(
+                "{}: Workgroup::new borrows a Builder (`&mut {}`)",
+                self.loc(ws.call),
+                ws.builder
+            )));
+        };
+        let Some(mut bld) = cell.borrow_mut().take() else {
+            return Err(Ctl::Fatal(format!(
+                "{}: the builder already belongs to a Workgroup",
+                self.loc(ws.call)
+            )));
+        };
         let mut scope = env.clone();
         if !self.bind_pat(ws.pat, &Value::Nat(Nat::Wg), &mut scope, cx)? {
             *cell.borrow_mut() = Some(bld);
-            return Err(Ctl::Fatal(format!("{}: the Workgroup binding must be a plain name", self.loc(ws.call))));
+            return Err(Ctl::Fatal(format!(
+                "{}: the Workgroup binding must be a plain name",
+                self.loc(ws.call)
+            )));
         }
         *env = scope;
         let r = crate::driver::drive(arch, &mut bld, &mut |cx2| self.exec_stmts(body, env, cx2));
@@ -1143,7 +1463,9 @@ impl<'a> Interp<'a> {
             // `Workgroup::new(..)?`: the driver refused the backend.
             Err(e) => {
                 let s = ws.call.span().start();
-                Err(Ctl::Return(Value::err(self.located((s.line, s.column + 1), &e))))
+                Err(Ctl::Return(Value::err(
+                    self.located((s.line, s.column + 1), &e),
+                )))
             }
         }
     }
@@ -1159,16 +1481,26 @@ impl<'a> Interp<'a> {
 
     // ---- patterns -----------------------------------------------------------------
 
-    pub fn bind_pat(&self, p: &'a Pat, v: &Value<'a>, env: &mut Env<'a>, cx: &mut Cx<'_>) -> R<'a, bool> {
+    pub fn bind_pat(
+        &self,
+        p: &'a Pat,
+        v: &Value<'a>,
+        env: &mut Env<'a>,
+        cx: &mut Cx<'_>,
+    ) -> R<'a, bool> {
         match p {
             Pat::Wild(_) => Ok(true),
             Pat::Ident(pi) => {
                 let name = pi.ident.to_string();
                 if pi.subpat.is_none() && pi.by_ref.is_none() {
                     if name == "None" {
-                        return Ok(matches!(self.deref(v.clone()), Value::Enum(t, var, _) if &*t == "Option" && &*var == "None"));
+                        return Ok(
+                            matches!(self.deref(v.clone()), Value::Enum(t, var, _) if &*t == "Option" && &*var == "None"),
+                        );
                     }
-                    if name.chars().next().is_some_and(|c| c.is_uppercase()) && self.consts.contains_key(&name) {
+                    if name.chars().next().is_some_and(|c| c.is_uppercase())
+                        && self.consts.contains_key(&name)
+                    {
                         let c = self.const_value(&name)?.ok_or("constant vanished")?;
                         return Ok(values_eq(&self.deref(v.clone()), &c));
                     }
@@ -1203,7 +1535,8 @@ impl<'a> Interp<'a> {
                 }
                 if let Some(hi) = hi {
                     let o = ops::compare(&v, &hi)?;
-                    if o.is_gt() || (o.is_eq() && matches!(r.limits, syn::RangeLimits::HalfOpen(_))) {
+                    if o.is_gt() || (o.is_eq() && matches!(r.limits, syn::RangeLimits::HalfOpen(_)))
+                    {
                         return Ok(false);
                     }
                 }
@@ -1224,7 +1557,9 @@ impl<'a> Interp<'a> {
             }
             Pat::Slice(s) => {
                 let v = self.deref(v.clone());
-                let Value::Array(xs) = &v else { return Ok(false) };
+                let Value::Array(xs) = &v else {
+                    return Ok(false);
+                };
                 self.bind_seq(s.elems.iter().collect(), xs, env, cx)
             }
             Pat::TupleStruct(ts) => {
@@ -1250,7 +1585,9 @@ impl<'a> Interp<'a> {
                 let v = self.deref(v.clone());
                 let segs = self.path_segments(&sp.path, env);
                 let name = segs.last().cloned().unwrap_or_default();
-                let Value::Struct(n, fs) = &v else { return Ok(false) };
+                let Value::Struct(n, fs) = &v else {
+                    return Ok(false);
+                };
                 if **n != *name {
                     return Ok(false);
                 }
@@ -1259,7 +1596,9 @@ impl<'a> Interp<'a> {
                         Member::Named(i) => i.to_string(),
                         Member::Unnamed(i) => i.index.to_string(),
                     };
-                    let Some((_, x)) = fs.iter().find(|(k, _)| **k == *key) else { return Ok(false) };
+                    let Some((_, x)) = fs.iter().find(|(k, _)| **k == *key) else {
+                        return Ok(false);
+                    };
                     if !self.bind_pat(&fp.pat, x, env, cx)? {
                         return Ok(false);
                     }
@@ -1283,7 +1622,13 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn bind_seq(&self, pats: Vec<&'a Pat>, xs: &[Value<'a>], env: &mut Env<'a>, cx: &mut Cx<'_>) -> R<'a, bool> {
+    fn bind_seq(
+        &self,
+        pats: Vec<&'a Pat>,
+        xs: &[Value<'a>],
+        env: &mut Env<'a>,
+        cx: &mut Cx<'_>,
+    ) -> R<'a, bool> {
         let rest = pats.iter().position(|p| matches!(p, Pat::Rest(_)));
         match rest {
             None => {
@@ -1319,7 +1664,12 @@ impl<'a> Interp<'a> {
 
     // ---- calls -------------------------------------------------------------------
 
-    fn eval_args(&self, args: &'a syn::punctuated::Punctuated<Expr, syn::Token![,]>, env: &mut Env<'a>, cx: &mut Cx<'_>) -> R<'a, Vec<Value<'a>>> {
+    fn eval_args(
+        &self,
+        args: &'a syn::punctuated::Punctuated<Expr, syn::Token![,]>,
+        env: &mut Env<'a>,
+        cx: &mut Cx<'_>,
+    ) -> R<'a, Vec<Value<'a>>> {
         args.iter().map(|a| self.eval(a, env, cx)).collect()
     }
 
@@ -1336,7 +1686,8 @@ impl<'a> Interp<'a> {
         }
         let f = self.eval(&c.func, env, cx)?;
         let args = self.eval_args(&c.args, env, cx)?;
-        let native = matches!(self.deref(f.clone()), Value::Func(func) if matches!(&*func, Func::Native(_)));
+        let native =
+            matches!(self.deref(f.clone()), Value::Func(func) if matches!(&*func, Func::Native(_)));
         let r = self.call_value(&f, args, cx);
         if native {
             let s = c.func.span().start();
@@ -1351,7 +1702,11 @@ impl<'a> Interp<'a> {
             Value::Func(func) => match &*func {
                 Func::User(def) => self.call_fn(def, args, cx),
                 Func::Native(n) => native::call_fn(self, n, args, cx),
-                Func::Variant(t, v) => Ok(Value::Enum(t.clone(), v.clone(), args.into_iter().map(|a| self.deref(a)).collect())),
+                Func::Variant(t, v) => Ok(Value::Enum(
+                    t.clone(),
+                    v.clone(),
+                    args.into_iter().map(|a| self.deref(a)).collect(),
+                )),
                 Func::TupleStruct(n) => {
                     let def = self.structs.get(&**n).ok_or("unknown tuple struct")?;
                     if def.fields.len() != args.len() {
@@ -1368,9 +1723,19 @@ impl<'a> Interp<'a> {
         }
     }
 
-    pub fn call_closure(&self, c: &Rc<Closure<'a>>, args: Vec<Value<'a>>, cx: &mut Cx<'_>) -> R<'a> {
+    pub fn call_closure(
+        &self,
+        c: &Rc<Closure<'a>>,
+        args: Vec<Value<'a>>,
+        cx: &mut Cx<'_>,
+    ) -> R<'a> {
         if args.len() != c.params.len() {
-            return Err(format!("closure takes {} arguments, got {}", c.params.len(), args.len()).into());
+            return Err(format!(
+                "closure takes {} arguments, got {}",
+                c.params.len(),
+                args.len()
+            )
+            .into());
         }
         let mut env = c.env.clone();
         for ((p, ty), a) in c.params.iter().zip(args) {
@@ -1429,7 +1794,10 @@ impl<'a> Interp<'a> {
             Value::Enum(t, _, _) => vec![t.to_string()],
             Value::Nat(n) => vec![n.type_name().to_string()],
             Value::Int(_, Some(t)) => vec![t.name().to_string()],
-            Value::Int(_, None) => ["i32", "u32", "u8", "u64", "usize"].iter().map(|s| s.to_string()).collect(),
+            Value::Int(_, None) => ["i32", "u32", "u8", "u64", "usize"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             Value::Str(_) => vec!["String".into(), "str".into()],
             Value::Array(_) => vec!["Vec".into()],
             Value::Bool(_) => vec!["bool".into()],
@@ -1467,7 +1835,10 @@ impl<'a> Interp<'a> {
         // Mutating methods of std containers go through the place.
         if crate::builtin::is_mutator(&d, &name) {
             let p = match recv {
-                Value::Ref(r) => PlaceRef { cell: r.cell.clone(), path: r.path.clone() },
+                Value::Ref(r) => PlaceRef {
+                    cell: r.cell.clone(),
+                    path: r.path.clone(),
+                },
                 _ => self.place(&m.receiver, env, cx)?,
             };
             let mut p = p;
@@ -1496,11 +1867,21 @@ impl<'a> Interp<'a> {
 
     // ---- internal calls (elaborated macros) ----------------------------------------
 
-    fn internal_call(&self, name: &str, c: &'a syn::ExprCall, env: &mut Env<'a>, cx: &mut Cx<'_>) -> Option<R<'a>> {
+    fn internal_call(
+        &self,
+        name: &str,
+        c: &'a syn::ExprCall,
+        env: &mut Env<'a>,
+        cx: &mut Cx<'_>,
+    ) -> Option<R<'a>> {
         Some(match name {
             "__fmt" => self.format_call(c, env, cx).map(Value::str),
             "__println" | "__eprintln" | "__print" | "__eprint" => {
-                let s = if c.args.is_empty() { Ok(String::new()) } else { self.format_call(c, env, cx) };
+                let s = if c.args.is_empty() {
+                    Ok(String::new())
+                } else {
+                    self.format_call(c, env, cx)
+                };
                 s.map(|s| {
                     if name.contains("err") || name == "__eprintln" {
                         eprintln!("{s}");
@@ -1513,14 +1894,23 @@ impl<'a> Interp<'a> {
                 })
             }
             "__panic" => {
-                let m = self.eval_args(&c.args, env, cx).map(|a| a.first().map(|v| crate::fmt::display(&self.deref(v.clone())).unwrap_or_default()).unwrap_or_default());
+                let m = self.eval_args(&c.args, env, cx).map(|a| {
+                    a.first()
+                        .map(|v| crate::fmt::display(&self.deref(v.clone())).unwrap_or_default())
+                        .unwrap_or_default()
+                });
                 m.and_then(|m| Err(Ctl::Err(format!("panic: {m}"))))
             }
             "__assert" => (|| {
                 let a = self.eval_args(&c.args, env, cx)?;
                 match self.deref(a[0].clone()) {
                     Value::Bool(true) => Ok(Value::Unit),
-                    Value::Bool(false) => Err(Ctl::Err(format!("assertion failed{}", a.get(1).map(|m| format!(": {}", crate::fmt::display(m).unwrap_or_default())).unwrap_or_default()))),
+                    Value::Bool(false) => Err(Ctl::Err(format!(
+                        "assertion failed{}",
+                        a.get(1)
+                            .map(|m| format!(": {}", crate::fmt::display(m).unwrap_or_default()))
+                            .unwrap_or_default()
+                    ))),
                     _ => Err(Ctl::Err("assert! needs a bool".into())),
                 }
             })(),
@@ -1530,12 +1920,18 @@ impl<'a> Interp<'a> {
                 if values_eq(&l, &r) == (name == "__assert_eq") {
                     Ok(Value::Unit)
                 } else {
-                    Err(Ctl::Err(format!("assertion failed: `{}` vs `{}`", crate::fmt::debug(&l, false), crate::fmt::debug(&r, false))))
+                    Err(Ctl::Err(format!(
+                        "assertion failed: `{}` vs `{}`",
+                        crate::fmt::debug(&l, false),
+                        crate::fmt::debug(&r, false)
+                    )))
                 }
             })(),
             "__unsupported" => {
                 let msg = match c.args.first() {
-                    Some(Expr::Lit(syn::ExprLit { lit: Lit::Str(s), .. })) => s.value(),
+                    Some(Expr::Lit(syn::ExprLit {
+                        lit: Lit::Str(s), ..
+                    })) => s.value(),
                     _ => "unsupported construct".into(),
                 };
                 Err(Ctl::Err(msg))
@@ -1544,18 +1940,34 @@ impl<'a> Interp<'a> {
         })
     }
 
-    fn format_call(&self, c: &'a syn::ExprCall, env: &mut Env<'a>, cx: &mut Cx<'_>) -> R<'a, String> {
+    fn format_call(
+        &self,
+        c: &'a syn::ExprCall,
+        env: &mut Env<'a>,
+        cx: &mut Cx<'_>,
+    ) -> R<'a, String> {
         let mut it = c.args.iter();
-        let Some(Expr::Lit(syn::ExprLit { lit: Lit::Str(fmt), .. })) = it.next() else { return Err("format! needs a string literal".into()) };
+        let Some(Expr::Lit(syn::ExprLit {
+            lit: Lit::Str(fmt), ..
+        })) = it.next()
+        else {
+            return Err("format! needs a string literal".into());
+        };
         let pieces = crate::fmt::parse(&fmt.value())?;
         let mut positional: Vec<Value<'a>> = Vec::new();
         let mut named: Vec<(String, Value<'a>)> = Vec::new();
         for a in it {
             match a {
-                Expr::Assign(asg) if matches!(&*asg.left, Expr::Path(p) if p.path.get_ident().is_some()) => {
-                    let Expr::Path(p) = &*asg.left else { unreachable!() };
+                Expr::Assign(asg) if matches!(&*asg.left, Expr::Path(p) if p.path.get_ident().is_some()) =>
+                {
+                    let Expr::Path(p) = &*asg.left else {
+                        unreachable!()
+                    };
                     let v = self.eval(&asg.right, env, cx)?;
-                    named.push((p.path.get_ident().expect("ident").to_string(), self.deref(v)));
+                    named.push((
+                        p.path.get_ident().expect("ident").to_string(),
+                        self.deref(v),
+                    ));
                 }
                 a => {
                     let v = self.eval(a, env, cx)?;
@@ -1571,11 +1983,17 @@ impl<'a> Interp<'a> {
                 crate::fmt::Piece::Arg(target, spec) => {
                     let v = match target {
                         crate::fmt::ArgRef::Next => {
-                            let v = positional.get(next).cloned().ok_or("format string has more `{}` than arguments")?;
+                            let v = positional
+                                .get(next)
+                                .cloned()
+                                .ok_or("format string has more `{}` than arguments")?;
                             next += 1;
                             v
                         }
-                        crate::fmt::ArgRef::Index(i) => positional.get(i).cloned().ok_or_else(|| format!("format argument {i} is missing"))?,
+                        crate::fmt::ArgRef::Index(i) => positional
+                            .get(i)
+                            .cloned()
+                            .ok_or_else(|| format!("format argument {i} is missing"))?,
                         crate::fmt::ArgRef::Name(n) => match named.iter().find(|(k, _)| *k == n) {
                             Some((_, v)) => v.clone(),
                             None => {
@@ -1599,7 +2017,11 @@ impl<'a> Interp<'a> {
         if next < positional.len() && !positional.is_empty() {
             // Rust rejects unused arguments at compile time.
             let used_by_index = false;
-            if !used_by_index && !crate::fmt::parse(&fmt.value())?.iter().any(|p| matches!(p, crate::fmt::Piece::Arg(crate::fmt::ArgRef::Index(_), _))) {
+            if !used_by_index
+                && !crate::fmt::parse(&fmt.value())?
+                    .iter()
+                    .any(|p| matches!(p, crate::fmt::Piece::Arg(crate::fmt::ArgRef::Index(_), _)))
+            {
                 return Err("format! has arguments no placeholder uses".into());
             }
         }
@@ -1617,16 +2039,28 @@ fn adopt<'a>(old: &Value<'a>, new: Value<'a>) -> Value<'a> {
 
 fn index_value<'a>(b: &Value<'a>, i: &Value<'a>) -> Result<Value<'a>, String> {
     match (b, i) {
-        (Value::Array(xs), Value::Int(i, _)) => usize::try_from(*i).ok().and_then(|i| xs.get(i)).cloned().ok_or_else(|| format!("index {i} out of bounds (len {})", xs.len())),
+        (Value::Array(xs), Value::Int(i, _)) => usize::try_from(*i)
+            .ok()
+            .and_then(|i| xs.get(i))
+            .cloned()
+            .ok_or_else(|| format!("index {i} out of bounds (len {})", xs.len())),
         (Value::Array(xs), Value::Range(r)) => {
             let s = r.start.unwrap_or(0) as usize;
-            let e = r.end.map_or(xs.len(), |e| e as usize + usize::from(r.inclusive));
-            xs.get(s..e).map(|x| Value::Array(x.to_vec())).ok_or_else(|| format!("range {s}..{e} out of bounds (len {})", xs.len()))
+            let e = r
+                .end
+                .map_or(xs.len(), |e| e as usize + usize::from(r.inclusive));
+            xs.get(s..e)
+                .map(|x| Value::Array(x.to_vec()))
+                .ok_or_else(|| format!("range {s}..{e} out of bounds (len {})", xs.len()))
         }
         (Value::Str(s), Value::Range(r)) => {
             let a = r.start.unwrap_or(0) as usize;
-            let e = r.end.map_or(s.len(), |e| e as usize + usize::from(r.inclusive));
-            s.get(a..e).map(Value::str).ok_or_else(|| "string slice out of bounds".to_string())
+            let e = r
+                .end
+                .map_or(s.len(), |e| e as usize + usize::from(r.inclusive));
+            s.get(a..e)
+                .map(Value::str)
+                .ok_or_else(|| "string slice out of bounds".to_string())
         }
         (b, _) => Err(format!("cannot index {}", b.type_name())),
     }
@@ -1642,7 +2076,9 @@ pub fn turbofish(t: Option<&syn::AngleBracketedGenericArguments>) -> Vec<String>
                 Lit::Int(i) => Some(i.base10_digits().to_string()),
                 _ => None,
             },
-            syn::GenericArgument::Const(Expr::Block(b)) => Some(format!("{{{}}}", b.block.stmts.len())),
+            syn::GenericArgument::Const(Expr::Block(b)) => {
+                Some(format!("{{{}}}", b.block.stmts.len()))
+            }
             _ => None,
         })
         .collect()
@@ -1683,21 +2119,41 @@ struct WgLet<'a> {
 fn workgroup_let(s: &Stmt) -> Option<WgLet<'_>> {
     let Stmt::Local(l) = s else { return None };
     let init = l.init.as_ref()?;
-    let Expr::Try(t) = &*init.expr else { return None };
+    let Expr::Try(t) = &*init.expr else {
+        return None;
+    };
     let Expr::Call(c) = &*t.expr else { return None };
     let Expr::Path(p) = &*c.func else { return None };
-    let segs: Vec<String> = p.path.segments.iter().map(|s| s.ident.to_string()).collect();
-    if segs.len() < 2 || segs[segs.len() - 2] != "Workgroup" || segs[segs.len() - 1] != "new" || c.args.len() != 2 {
+    let segs: Vec<String> = p
+        .path
+        .segments
+        .iter()
+        .map(|s| s.ident.to_string())
+        .collect();
+    if segs.len() < 2
+        || segs[segs.len() - 2] != "Workgroup"
+        || segs[segs.len() - 1] != "new"
+        || c.args.len() != 2
+    {
         return None;
     }
-    let Expr::Reference(r) = &c.args[0] else { return None };
-    let Expr::Path(bp) = &*r.expr else { return None };
+    let Expr::Reference(r) = &c.args[0] else {
+        return None;
+    };
+    let Expr::Path(bp) = &*r.expr else {
+        return None;
+    };
     let builder = bp.path.get_ident()?.to_string();
     let pat = match &l.pat {
         Pat::Type(pt) => &*pt.pat,
         p => p,
     };
-    Some(WgLet { pat, builder, arch: &c.args[1], call: &t.expr })
+    Some(WgLet {
+        pat,
+        builder,
+        arch: &c.args[1],
+        call: &t.expr,
+    })
 }
 
 /// Does the statement mention the identifier (a token scan, so shadowing

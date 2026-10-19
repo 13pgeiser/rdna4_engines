@@ -3,7 +3,6 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-
 use hipfire_quantize::float16::{f16_to_f32, f32_to_f16};
 
 // ─── HFQ4-G256 Quantization ─────────────────────────────────────────────────
@@ -210,12 +209,7 @@ pub(crate) fn quantize_mq4cg256(
 ///   for i in half: q[i]=clamp(rint((w[i]-z)/st),0,15)
 /// Degenerate half (hi==lo): scale=0, zero=f16(lo), all q=0.
 /// Header: [0..2) fp16 scale h0, [2..4) fp16 zero h0, [4..6) fp16 scale h1, [6..8) fp16 zero h1, [8..136) nibbles.
-fn write_mq4g256v2_group(
-    output: &mut [u8],
-    scales: [u16; 2],
-    zeros: [u16; 2],
-    codes: &[u8],
-) {
+fn write_mq4g256v2_group(output: &mut [u8], scales: [u16; 2], zeros: [u16; 2], codes: &[u8]) {
     debug_assert_eq!(output.len(), MQ4V2_GROUP_BYTES);
     debug_assert_eq!(codes.len(), 256);
     output[..2].copy_from_slice(&scales[0].to_le_bytes());
@@ -239,7 +233,9 @@ pub(crate) fn pack_mq4g256v2_from_codes(
     codes: &[u8],
 ) -> Result<Vec<u8>, String> {
     if k % 256 != 0 {
-        return Err(format!("MQ4V2 learned codes require K % 256 == 0, got K={k}"));
+        return Err(format!(
+            "MQ4V2 learned codes require K % 256 == 0, got K={k}"
+        ));
     }
     let expected_codes = m
         .checked_mul(k)
@@ -363,7 +359,15 @@ fn quantize_mq4g256v2_impl(
     symmetric: bool,
 ) -> Vec<u8> {
     assert!(k % 256 == 0, "MQ4V2 requires K % 256 == 0, got K={k}");
-    assert_eq!(w.len(), m * k, "w.len() {} != m*k {}*{}={}", w.len(), m, k, m * k);
+    assert_eq!(
+        w.len(),
+        m * k,
+        "w.len() {} != m*k {}*{}={}",
+        w.len(),
+        m,
+        k,
+        m * k
+    );
     let group_count = w.len() / 256;
     let mut output = vec![0u8; group_count * MQ4V2_GROUP_BYTES];
     for group_index in 0..group_count {
@@ -378,11 +382,12 @@ fn quantize_mq4g256v2_impl(
             let offset = half * 128;
             let values = &group[offset..offset + 128];
             if symmetric {
-                let (scale_bits, zero_bits) = hipfire_quantize::mq_symmetric::quantize_symmetric_half(
-                    values,
-                    15,
-                    &mut codes[offset..offset + 128],
-                );
+                let (scale_bits, zero_bits) =
+                    hipfire_quantize::mq_symmetric::quantize_symmetric_half(
+                        values,
+                        15,
+                        &mut codes[offset..offset + 128],
+                    );
                 scales[half] = scale_bits;
                 zeros[half] = zero_bits;
             } else {
@@ -396,16 +401,15 @@ fn quantize_mq4g256v2_impl(
                 if hi != lo && step_f32 != 0.0 && scale != 0.0 {
                     let inverse = 1.0 / scale;
                     for i in 0..128 {
-                        codes[offset + i] =
-                            ((group[offset + i] - zero) * inverse + 0.5).floor().clamp(0.0, 15.0)
-                                as u8;
+                        codes[offset + i] = ((group[offset + i] - zero) * inverse + 0.5)
+                            .floor()
+                            .clamp(0.0, 15.0) as u8;
                     }
                 }
             }
         }
         write_mq4g256v2_group(
-            &mut output[group_index * MQ4V2_GROUP_BYTES
-                ..(group_index + 1) * MQ4V2_GROUP_BYTES],
+            &mut output[group_index * MQ4V2_GROUP_BYTES..(group_index + 1) * MQ4V2_GROUP_BYTES],
             scales,
             zeros,
             &codes,
@@ -1007,8 +1011,7 @@ mod tests {
             .iter()
             .flat_map(|header| header.iter().flat_map(|bits| bits.to_le_bytes()))
             .collect();
-        let repacked_from_grid =
-            pack_mq4g256v2_from_f16_grid(m, k, &d_z_f16, &codes).unwrap();
+        let repacked_from_grid = pack_mq4g256v2_from_f16_grid(m, k, &d_z_f16, &codes).unwrap();
         assert_eq!(repacked_from_grid, encoded);
     }
 
@@ -1205,12 +1208,7 @@ mod tests {
             assert!(payload.iter().any(|&b| b != 0));
         }
     }
-    fn decode_mq4g128v2_dot_reference(
-        blob: &[u8],
-        row: usize,
-        k: usize,
-        x_rot: &[f32],
-    ) -> f32 {
+    fn decode_mq4g128v2_dot_reference(blob: &[u8], row: usize, k: usize, x_rot: &[f32]) -> f32 {
         assert_eq!(x_rot.len(), k);
         let groups_per_row = k.div_ceil(128);
         let row_stride = groups_per_row * MQ4G128V2_GROUP_BYTES;
@@ -1223,11 +1221,7 @@ mod tests {
             let logical = (k - group * 128).min(128);
             for i in 0..logical {
                 let qbyte = blob[base + 4 + i / 2];
-                let q = if i & 1 == 0 {
-                    qbyte & 0x0f
-                } else {
-                    qbyte >> 4
-                };
+                let q = if i & 1 == 0 { qbyte & 0x0f } else { qbyte >> 4 };
                 acc += (scale * f32::from(q) + zero) * x_rot[group * 128 + i];
             }
         }
@@ -1280,9 +1274,7 @@ mod tests {
                 );
             }
 
-            let weights: Vec<f32> = (0..m * k)
-                .map(|i| (i as f32 * 0.013).sin() - 0.2)
-                .collect();
+            let weights: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.013).sin() - 0.2).collect();
             let signs1 = gen_fwht_signs(43, 128);
             let signs2 = gen_fwht_signs(1043, 128);
             let encoded = quantize_mq4g128v2(&weights, m, k, &signs1, &signs2)
@@ -1424,20 +1416,90 @@ mod tests {
         const L: &str = "model.language_model.layers.";
         // (role, shard, tensor, rows)
         let roles: [(&str, u32, String, Option<usize>); 14] = [
-            ("LA in_proj_qkv", 13, format!("{L}0.linear_attn.in_proj_qkv.weight"), Some(512)),
-            ("LA in_proj_z", 13, format!("{L}0.linear_attn.in_proj_z.weight"), Some(512)),
-            ("LA out_proj", 13, format!("{L}0.linear_attn.out_proj.weight"), Some(256)),
-            ("LA in_proj_a", 14, format!("{L}0.linear_attn.in_proj_a.weight"), None),
-            ("LA in_proj_b", 14, format!("{L}0.linear_attn.in_proj_b.weight"), None),
-            ("FA q_proj", 13, format!("{L}39.self_attn.q_proj.weight"), Some(512)),
-            ("FA k_proj", 14, format!("{L}39.self_attn.k_proj.weight"), None),
-            ("FA v_proj", 14, format!("{L}39.self_attn.v_proj.weight"), None),
-            ("FA o_proj", 13, format!("{L}39.self_attn.o_proj.weight"), Some(256)),
-            ("routed gate_up e0", 6, format!("{L}0.mlp.experts.gate_up_proj"), Some(1024)),
-            ("routed down e0", 12, format!("{L}0.mlp.experts.down_proj"), Some(512)),
-            ("shared gate", 14, format!("{L}0.mlp.shared_expert.gate_proj.weight"), None),
-            ("shared up", 14, format!("{L}0.mlp.shared_expert.up_proj.weight"), None),
-            ("shared down", 14, format!("{L}0.mlp.shared_expert.down_proj.weight"), None),
+            (
+                "LA in_proj_qkv",
+                13,
+                format!("{L}0.linear_attn.in_proj_qkv.weight"),
+                Some(512),
+            ),
+            (
+                "LA in_proj_z",
+                13,
+                format!("{L}0.linear_attn.in_proj_z.weight"),
+                Some(512),
+            ),
+            (
+                "LA out_proj",
+                13,
+                format!("{L}0.linear_attn.out_proj.weight"),
+                Some(256),
+            ),
+            (
+                "LA in_proj_a",
+                14,
+                format!("{L}0.linear_attn.in_proj_a.weight"),
+                None,
+            ),
+            (
+                "LA in_proj_b",
+                14,
+                format!("{L}0.linear_attn.in_proj_b.weight"),
+                None,
+            ),
+            (
+                "FA q_proj",
+                13,
+                format!("{L}39.self_attn.q_proj.weight"),
+                Some(512),
+            ),
+            (
+                "FA k_proj",
+                14,
+                format!("{L}39.self_attn.k_proj.weight"),
+                None,
+            ),
+            (
+                "FA v_proj",
+                14,
+                format!("{L}39.self_attn.v_proj.weight"),
+                None,
+            ),
+            (
+                "FA o_proj",
+                13,
+                format!("{L}39.self_attn.o_proj.weight"),
+                Some(256),
+            ),
+            (
+                "routed gate_up e0",
+                6,
+                format!("{L}0.mlp.experts.gate_up_proj"),
+                Some(1024),
+            ),
+            (
+                "routed down e0",
+                12,
+                format!("{L}0.mlp.experts.down_proj"),
+                Some(512),
+            ),
+            (
+                "shared gate",
+                14,
+                format!("{L}0.mlp.shared_expert.gate_proj.weight"),
+                None,
+            ),
+            (
+                "shared up",
+                14,
+                format!("{L}0.mlp.shared_expert.up_proj.weight"),
+                None,
+            ),
+            (
+                "shared down",
+                14,
+                format!("{L}0.mlp.shared_expert.down_proj.weight"),
+                None,
+            ),
         ];
         let s1 = gen_fwht_signs(42, 256);
         let s2 = gen_fwht_signs(1042, 256);
@@ -1451,14 +1513,19 @@ mod tests {
             let v1 = quantize_mq6g256(&w, &s1, &s2);
             let v2 = quantize_mq6g256v2(&w, m, k, &s1, &s2);
             assert_eq!(v1.len(), n_groups * MQ6V2_GROUP_BYTES, "{role}: v1 size");
-            assert_eq!(v2.len(), v1.len(), "{role}: v1/v2 container size must match");
+            assert_eq!(
+                v2.len(),
+                v1.len(),
+                "{role}: v1/v2 container size must match"
+            );
             let d1 = mq6_v1_dequant_rotated(&v1);
             let d2 = mq6_v2_dequant_rotated(&v2);
 
             let mut worst1 = 0.0f32; // max err / bound
             let mut worst2 = 0.0f32;
             let mut worst12 = 0.0f32;
-            let (mut sum1, mut sum2, mut sq1, mut sq2, mut sqw) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            let (mut sum1, mut sum2, mut sq1, mut sq2, mut sqw) =
+                (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
             let (mut max1, mut max2) = (0.0f32, 0.0f32);
             for g in 0..n_groups {
                 let mut rot = [0.0f32; 256];
@@ -1484,7 +1551,11 @@ mod tests {
                         let e12 = (d1[g * 256 + i] - d2[g * 256 + i]).abs();
                         assert!(e1 <= tol1, "{role} g={g} i={i}: v1 err {e1} > {tol1}");
                         assert!(e2 <= tol2, "{role} g={g} i={i}: v2 err {e2} > {tol2}");
-                        assert!(e12 <= tol1 + tol2, "{role} g={g} i={i}: |v1-v2| {e12} > {}", tol1 + tol2);
+                        assert!(
+                            e12 <= tol1 + tol2,
+                            "{role} g={g} i={i}: |v1-v2| {e12} > {}",
+                            tol1 + tol2
+                        );
                         worst1 = worst1.max(e1 / tol1);
                         worst2 = worst2.max(e2 / tol2);
                         worst12 = worst12.max(e12 / (tol1 + tol2));

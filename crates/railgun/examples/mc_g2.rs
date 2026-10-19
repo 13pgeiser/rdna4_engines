@@ -29,8 +29,8 @@ use hip_bridge::{DeviceBuffer, Function, GraphExec, HipRuntime, Stream};
 use hipfire_config::{ConfigLayer, ProcessConfig, CONFIG_SCHEMA_VERSION};
 use railgun::copy::{self, Launch};
 use railgun::{
-    Addr, Binding, CopySpec, Formula, Node, Prepared, PreparedNode, Program, Resource, ResourceId, ResourceKind, Slot, Word,
-    WordId,
+    Addr, Binding, CopySpec, Formula, Node, Prepared, PreparedNode, Program, Resource, ResourceId,
+    ResourceKind, Slot, Word, WordId,
 };
 use rdna_compute::{FeatureFlags, KernelCompiler};
 use serde_json::{json, Value};
@@ -99,14 +99,22 @@ fn view(addr: u64, len: u64) -> DeviceBuffer {
 
 impl Dev {
     fn function(&self, l: &Launch) -> &Function {
-        if l.symbol == copy::COPY_SYMBOL { &self.copy } else { &self.batch }
+        if l.symbol == copy::COPY_SYMBOL {
+            &self.copy
+        } else {
+            &self.batch
+        }
     }
 
     fn launch(&self, l: &Launch, stream: Option<&Stream>) -> R<()> {
         let mut blob = l.kernarg.clone();
         // SAFETY: `Launch` carries the kernel's explicit kernarg layout; its
         // pointers were resolved by `Program::prepare` from live allocations.
-        unsafe { self.hip.launch_kernel_blob(self.function(l), l.grid, l.block, 0, stream, &mut blob) }.map_err(err)
+        unsafe {
+            self.hip
+                .launch_kernel_blob(self.function(l), l.grid, l.block, 0, stream, &mut blob)
+        }
+        .map_err(err)
     }
 
     fn sync(&self) -> R<()> {
@@ -115,7 +123,9 @@ impl Dev {
 
     fn upload_tables(&self, p: &Prepared) -> R<()> {
         for t in &p.tables {
-            self.hip.memcpy_htod(&view(t.addr, t.bytes.len() as u64), &t.bytes).map_err(err)?;
+            self.hip
+                .memcpy_htod(&view(t.addr, t.bytes.len() as u64), &t.bytes)
+                .map_err(err)?;
         }
         Ok(())
     }
@@ -123,11 +133,17 @@ impl Dev {
     fn dtod(&self, src: u64, dst: u64, len: u64) -> R<()> {
         // SAFETY: `prepare` checked both ranges against their bindings and
         // refused overlap.
-        unsafe { self.hip.memcpy_dtod_raw(dst as *mut c_void, src as *const c_void, len as usize) }.map_err(err)
+        unsafe {
+            self.hip
+                .memcpy_dtod_raw(dst as *mut c_void, src as *const c_void, len as usize)
+        }
+        .map_err(err)
     }
 
     fn hip_memcpy(&self, src: u64, dst: u64, len: u64) -> R<()> {
-        self.hip.memcpy_dtod_at(&view(dst, len), 0, &view(src, len), 0, len as usize).map_err(err)
+        self.hip
+            .memcpy_dtod_at(&view(dst, len), 0, &view(src, len), 0, len as usize)
+            .map_err(err)
     }
 
     /// The graph lowering: `Kernels` captures each node's copy-kernel launch,
@@ -136,7 +152,9 @@ impl Dev {
         if kind == Arm::KernelGraph {
             self.upload_tables(p)?;
         }
-        self.hip.stream_begin_capture(&self.stream, 0).map_err(err)?;
+        self.hip
+            .stream_begin_capture(&self.stream, 0)
+            .map_err(err)?;
         let body = (|| -> R<()> {
             if kind == Arm::KernelGraph {
                 for l in p.nodes.iter().filter_map(PreparedNode::launch) {
@@ -144,7 +162,16 @@ impl Dev {
                 }
             } else {
                 for (s, d, n) in triples(p) {
-                    self.hip.memcpy_dtod_async_at(&view(d, n), 0, &view(s, n), 0, n as usize, &self.stream).map_err(err)?;
+                    self.hip
+                        .memcpy_dtod_async_at(
+                            &view(d, n),
+                            0,
+                            &view(s, n),
+                            0,
+                            n as usize,
+                            &self.stream,
+                        )
+                        .map_err(err)?;
                 }
             }
             Ok(())
@@ -204,8 +231,12 @@ fn triples(p: &Prepared) -> Vec<(u64, u64, u64)> {
 
 fn run_arm(dev: &Dev, arm: Arm, p: &Prepared) -> R<()> {
     match arm {
-        Arm::DtoD => triples(p).into_iter().try_for_each(|(s, d, n)| dev.dtod(s, d, n))?,
-        Arm::HipMemcpy => triples(p).into_iter().try_for_each(|(s, d, n)| dev.hip_memcpy(s, d, n))?,
+        Arm::DtoD => triples(p)
+            .into_iter()
+            .try_for_each(|(s, d, n)| dev.dtod(s, d, n))?,
+        Arm::HipMemcpy => triples(p)
+            .into_iter()
+            .try_for_each(|(s, d, n)| dev.hip_memcpy(s, d, n))?,
         Arm::Kernels => {
             dev.upload_tables(p)?;
             for l in p.nodes.iter().filter_map(PreparedNode::launch) {
@@ -238,7 +269,10 @@ impl Alloc {
         self.size + 2 * self.guard
     }
     fn binding(&self) -> Binding {
-        Binding { base: self.ptr() + self.guard as u64, bytes: self.size as u64 }
+        Binding {
+            base: self.ptr() + self.guard as u64,
+            bytes: self.size as u64,
+        }
     }
 }
 
@@ -249,7 +283,12 @@ struct Space {
 }
 
 impl Space {
-    fn new(dev: &Dev, sizes: &[usize], guard: usize, fill: impl Fn(usize, usize) -> Vec<u8>) -> R<Self> {
+    fn new(
+        dev: &Dev,
+        sizes: &[usize],
+        guard: usize,
+        fill: impl Fn(usize, usize) -> Vec<u8>,
+    ) -> R<Self> {
         let mut allocs = Vec::new();
         let mut images = Vec::new();
         for (i, &size) in sizes.iter().enumerate() {
@@ -283,7 +322,9 @@ impl Space {
             let (si, so) = self.locate(s, n)?;
             let (di, off) = self.locate(d, n)?;
             if di != dst || si == dst {
-                return Err(format!("copy {s:#x}->{d:#x} is not a read elsewhere / write into allocation {dst}"));
+                return Err(format!(
+                    "copy {s:#x}->{d:#x} is not a read elsewhere / write into allocation {dst}"
+                ));
             }
             image[off..off + n as usize].copy_from_slice(&self.images[si][so..so + n as usize]);
         }
@@ -292,7 +333,9 @@ impl Space {
 
     fn read(&self, dev: &Dev, i: usize) -> R<Vec<u8>> {
         let mut v = vec![0u8; self.allocs[i].len()];
-        dev.hip.memcpy_dtoh(&mut v, &self.allocs[i].buf).map_err(err)?;
+        dev.hip
+            .memcpy_dtoh(&mut v, &self.allocs[i].buf)
+            .map_err(err)?;
         Ok(v)
     }
 }
@@ -362,7 +405,9 @@ impl Poisons {
     }
 
     fn apply(&self, dev: &Dev, kind: usize, target: &Alloc) -> R<()> {
-        dev.hip.memcpy_dtod(&target.buf, &self.bufs[kind], target.len()).map_err(err)?;
+        dev.hip
+            .memcpy_dtod(&target.buf, &self.bufs[kind], target.len())
+            .map_err(err)?;
         dev.sync()
     }
 }
@@ -370,13 +415,19 @@ impl Poisons {
 // ── card, kernel ────────────────────────────────────────────────────────
 
 fn product_config() -> ProcessConfig {
-    ProcessConfig { schema_version: CONFIG_SCHEMA_VERSION, values: ConfigLayer::default() }
+    ProcessConfig {
+        schema_version: CONFIG_SCHEMA_VERSION,
+        values: ConfigLayer::default(),
+    }
 }
 
 fn check_card(hip: &HipRuntime, a: &Args) -> R<Value> {
     let pinned = std::env::var("ROCR_VISIBLE_DEVICES").unwrap_or_default();
     if pinned != a.uuid {
-        return Err(format!("ROCR_VISIBLE_DEVICES={pinned:?}: pin the card with ROCR_VISIBLE_DEVICES={}", a.uuid));
+        return Err(format!(
+            "ROCR_VISIBLE_DEVICES={pinned:?}: pin the card with ROCR_VISIBLE_DEVICES={}",
+            a.uuid
+        ));
     }
     let count = hip.device_count().map_err(err)?;
     hip.set_device(0).map_err(err)?;
@@ -387,24 +438,35 @@ fn check_card(hip: &HipRuntime, a: &Args) -> R<Value> {
     if count != 1 || arch != a.arch || !bus.eq_ignore_ascii_case(&a.bus) || uuid != a.uuid {
         return Err(format!("card mismatch: {count} devices, arch {arch}, bus {bus}, uuid {uuid}; expected 1, {}, {}, {}", a.arch, a.bus, a.uuid));
     }
-    Ok(json!({ "devices": count, "arch": arch, "pci_bus": bus, "uuid": uuid, "hip_runtime": format!("{}.{}", runtime.0, runtime.1),
-               "rocr_visible_devices": pinned }))
+    Ok(
+        json!({ "devices": count, "arch": arch, "pci_bus": bus, "uuid": uuid, "hip_runtime": format!("{}.{}", runtime.0, runtime.1),
+               "rocr_visible_devices": pinned }),
+    )
 }
 
 /// Compile `railgun_copy` exactly as the runtime JIT would (product-default
 /// configuration), into `out/obj`.
 fn compile(arch: &str, out: &Path) -> R<(Vec<u8>, Value)> {
-    hipfire_config::install_process_config(product_config()).map_err(|_| "a process configuration is already installed")?;
+    hipfire_config::install_process_config(product_config())
+        .map_err(|_| "a process configuration is already installed")?;
     let extra = FeatureFlags::from_process_config(arch, &product_config()).hipcc_extra_flags;
     let compiler = KernelCompiler::new(arch, extra.clone()).map_err(err)?;
     let dir = out.join("obj");
     std::fs::create_dir_all(&dir).map_err(err)?;
     let src = dir.join(format!("{}.hip", copy::MODULE));
     let obj = dir.join(format!("{}.{arch}.hsaco", copy::MODULE));
-    compiler.compile_to_paths(copy::MODULE, copy::SOURCE, &src, &obj).map_err(err)?;
+    compiler
+        .compile_to_paths(copy::MODULE, copy::SOURCE, &src, &obj)
+        .map_err(err)?;
     let bytes = std::fs::read(&obj).map_err(err)?;
-    let sha = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect::<String>();
-    let source_sha = Sha256::digest(copy::SOURCE.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let sha = Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let source_sha = Sha256::digest(copy::SOURCE.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
     let info = json!({ "object": obj, "object_sha256": sha, "source_sha256": source_sha, "extra_flags": extra,
                        "toolchain": compiler.toolchain_id(), "argv": compiler.jit_argv(copy::MODULE, copy::SOURCE, &src, &obj) });
     Ok((bytes, info))
@@ -414,8 +476,13 @@ fn compile(arch: &str, out: &Path) -> R<(Vec<u8>, Value)> {
 
 fn sweep(dev: &Dev, failures: &mut Vec<String>) -> R<Value> {
     let pairs: Vec<(u64, u64)> = (0..16).flat_map(|s| (0..16).map(move |d| (s, d))).collect();
-    let some: Vec<(u64, u64)> = [0, 1, 7, 15].iter().flat_map(|&s| [0, 3, 8, 13].map(|d| (s, d))).collect();
-    let medium = [2047u64, 2048, 2049, 4095, 4096, 4097, 8191, 8192, 8193, 12345, 65535, 65536, 65537];
+    let some: Vec<(u64, u64)> = [0, 1, 7, 15]
+        .iter()
+        .flat_map(|&s| [0, 3, 8, 13].map(|d| (s, d)))
+        .collect();
+    let medium = [
+        2047u64, 2048, 2049, 4095, 4096, 4097, 8191, 8192, 8193, 12345, 65535, 65536, 65537,
+    ];
     let large = [(1u64 << 20) - 1, 1 << 20, (1 << 20) + 1, 3 * (1 << 20) + 7];
     // (size class, size, src alignment, dst alignment)
     let mut cases: Vec<(u8, u64, u64, u64)> = Vec::new();
@@ -451,13 +518,27 @@ fn sweep(dev: &Dev, failures: &mut Vec<String>) -> R<Value> {
     const S: ResourceId = ResourceId(0);
     const D: ResourceId = ResourceId(1);
     let spec = |i: usize| CopySpec {
-        src: Addr { resource: S, offset: Formula::constant(offsets[i].0) },
-        dst: Addr { resource: D, offset: Formula::constant(offsets[i].1) },
+        src: Addr {
+            resource: S,
+            offset: Formula::constant(offsets[i].0),
+        },
+        dst: Addr {
+            resource: D,
+            offset: Formula::constant(offsets[i].1),
+        },
         len: Formula::constant(cases[i].1),
     };
     let mut resources = vec![
-        Resource { label: "sweep.src".into(), size: Formula::constant(src_size as u64), kind: ResourceKind::Scratch },
-        Resource { label: "sweep.dst".into(), size: Formula::constant(dst_size as u64), kind: ResourceKind::Scratch },
+        Resource {
+            label: "sweep.src".into(),
+            size: Formula::constant(src_size as u64),
+            kind: ResourceKind::Scratch,
+        },
+        Resource {
+            label: "sweep.dst".into(),
+            size: Formula::constant(dst_size as u64),
+            kind: ResourceKind::Scratch,
+        },
     ];
     for (k, t) in tables.iter().enumerate() {
         resources.push(Resource {
@@ -479,13 +560,18 @@ fn sweep(dev: &Dev, failures: &mut Vec<String>) -> R<Value> {
         nodes: tables
             .iter()
             .enumerate()
-            .map(|(k, t)| Node::CopyBatch { table: ResourceId(2 + k as u32), n: Formula::constant(t.len() as u64) })
+            .map(|(k, t)| Node::CopyBatch {
+                table: ResourceId(2 + k as u32),
+                n: Formula::constant(t.len() as u64),
+            })
             .collect(),
     };
     let guard = 4096;
     let mut sizes = vec![src_size, dst_size];
     sizes.extend(tables.iter().map(|t| t.len() * copy::ENTRY_BYTES as usize));
-    let space = Space::new(dev, &sizes, guard, |i, len| xorshift(0x5EED_0000 + i as u64, len))?;
+    let space = Space::new(dev, &sizes, guard, |i, len| {
+        xorshift(0x5EED_0000 + i as u64, len)
+    })?;
     let bindings = space.bindings();
     let p_copy = per_copy.prepare(&[], &bindings).map_err(err)?;
     let p_batch = batched.prepare(&[], &bindings).map_err(err)?;
@@ -511,8 +597,13 @@ fn sweep(dev: &Dev, failures: &mut Vec<String>) -> R<Value> {
                 // Zero-byte copies launch too, so the kernel sees n = 0.
                 dev.upload_tables(&p_batch)?;
                 for node in &p_copy.nodes {
-                    let PreparedNode::Copy(c) = node else { unreachable!() };
-                    dev.launch(&copy::copy_launch(c.src_addr, c.dst_addr, c.dst.len as u32), None)?;
+                    let PreparedNode::Copy(c) = node else {
+                        unreachable!()
+                    };
+                    dev.launch(
+                        &copy::copy_launch(c.src_addr, c.dst_addr, c.dst.len as u32),
+                        None,
+                    )?;
                 }
                 dev.sync()?;
             } else if arm == Arm::KernelGraph {
@@ -524,7 +615,13 @@ fn sweep(dev: &Dev, failures: &mut Vec<String>) -> R<Value> {
             let got = space.read(dev, 1)?;
             let (vs_expected, first) = diff(&got, &expected);
             let vs_dtod = reference.as_ref().map(|r| diff(&got, r).0);
-            let arm_name = if arm == Arm::Kernels { "railgun_copy per copy" } else if arm == Arm::KernelGraph { "railgun_copy_batch graph" } else { arm.name() };
+            let arm_name = if arm == Arm::Kernels {
+                "railgun_copy per copy"
+            } else if arm == Arm::KernelGraph {
+                "railgun_copy_batch graph"
+            } else {
+                arm.name()
+            };
             if vs_expected != 0 || vs_dtod.unwrap_or(0) != 0 {
                 failures.push(format!("sweep {arm_name} poison {kind}: {vs_expected} bytes differ from the simulation, first at {first:?}"));
             }
@@ -575,26 +672,61 @@ fn slots(dev: &Dev, failures: &mut Vec<String>) -> R<Value> {
     let entries: Vec<CopySpec> = (0..ns)
         .flat_map(|i| (0..nd).map(move |j| (i, j)))
         .map(|(i, j)| CopySpec {
-            src: Addr { resource: ResourceId(i), offset: Formula::constant(4096 * u64::from(j) + u64::from(i)) },
-            dst: Addr { resource: ResourceId(ns + j), offset: Formula::constant(8192 * u64::from(i) + 3 * u64::from(j)) },
+            src: Addr {
+                resource: ResourceId(i),
+                offset: Formula::constant(4096 * u64::from(j) + u64::from(i)),
+            },
+            dst: Addr {
+                resource: ResourceId(ns + j),
+                offset: Formula::constant(8192 * u64::from(i) + 3 * u64::from(j)),
+            },
             len: Formula::constant(1000 + 61 * u64::from(8 * i + j)),
         })
         .collect();
     let n = entries.len() as u64;
     let table = ResourceId(ns + nd);
     let mut resources: Vec<Resource> = (0..ns + nd)
-        .map(|k| Resource { label: format!("slots.r{k}"), size: Formula::constant(size), kind: ResourceKind::Scratch })
+        .map(|k| Resource {
+            label: format!("slots.r{k}"),
+            size: Formula::constant(size),
+            kind: ResourceKind::Scratch,
+        })
         .collect();
-    resources.push(Resource { label: "slots.table".into(), size: Formula::constant(n * copy::ENTRY_BYTES), kind: ResourceKind::PointerTable(entries) });
-    let program = Program { arch: "gfx1201".into(), words: Vec::new(), resources, nodes: vec![Node::CopyBatch { table, n: Formula::constant(n) }] };
+    resources.push(Resource {
+        label: "slots.table".into(),
+        size: Formula::constant(n * copy::ENTRY_BYTES),
+        kind: ResourceKind::PointerTable(entries),
+    });
+    let program = Program {
+        arch: "gfx1201".into(),
+        words: Vec::new(),
+        resources,
+        nodes: vec![Node::CopyBatch {
+            table,
+            n: Formula::constant(n),
+        }],
+    };
     let mut sizes = vec![size as usize; (ns + nd) as usize];
     sizes.push((n * copy::ENTRY_BYTES) as usize);
     let guard = 4096;
-    let space = Space::new(dev, &sizes, guard, |i, len| xorshift(0x5107_0000 + i as u64, len))?;
+    let space = Space::new(dev, &sizes, guard, |i, len| {
+        xorshift(0x5107_0000 + i as u64, len)
+    })?;
     let p = program.prepare(&[], &space.bindings()).map_err(err)?;
-    let PreparedNode::CopyBatch { src_slots, dst_slots, .. } = &p.nodes[0] else { unreachable!() };
+    let PreparedNode::CopyBatch {
+        src_slots,
+        dst_slots,
+        ..
+    } = &p.nodes[0]
+    else {
+        unreachable!()
+    };
     if (src_slots.len(), dst_slots.len()) != (copy::SRC_SLOTS, copy::DST_SLOTS) {
-        return Err(format!("slots: {} source / {} destination slots bound", src_slots.len(), dst_slots.len()));
+        return Err(format!(
+            "slots: {} source / {} destination slots bound",
+            src_slots.len(),
+            dst_slots.len()
+        ));
     }
     let copies = triples(&p);
     let dsts: Vec<usize> = (ns..ns + nd).map(|k| k as usize).collect();
@@ -611,7 +743,11 @@ fn slots(dev: &Dev, failures: &mut Vec<String>) -> R<Value> {
     let mut rows = Vec::new();
     for kind in 0..POISONS.len() {
         let mut reference: Option<Vec<Vec<u8>>> = None;
-        for (arm, name) in [(Arm::DtoD, "hipMemcpyDtoD"), (Arm::Kernels, "railgun_copy_batch launch"), (Arm::KernelGraph, "railgun_copy_batch graph")] {
+        for (arm, name) in [
+            (Arm::DtoD, "hipMemcpyDtoD"),
+            (Arm::Kernels, "railgun_copy_batch launch"),
+            (Arm::KernelGraph, "railgun_copy_batch graph"),
+        ] {
             for &d in &dsts {
                 poisons.apply(dev, kind, &space.allocs[d])?;
             }
@@ -644,16 +780,27 @@ fn slots(dev: &Dev, failures: &mut Vec<String>) -> R<Value> {
     }
     let t = table.0 as usize;
     let table_got = space.read(dev, t)?;
-    let table_changed = diff(&table_got[guard..guard + p.tables[0].bytes.len()], &p.tables[0].bytes).0
-        + diff(&table_got[..guard], &space.images[t][..guard]).0
-        + diff(&table_got[guard + sizes[t]..], &space.images[t][guard + sizes[t]..]).0;
+    let table_changed = diff(
+        &table_got[guard..guard + p.tables[0].bytes.len()],
+        &p.tables[0].bytes,
+    )
+    .0 + diff(&table_got[..guard], &space.images[t][..guard]).0
+        + diff(
+            &table_got[guard + sizes[t]..],
+            &space.images[t][guard + sizes[t]..],
+        )
+        .0;
     if sources_changed != 0 || table_changed != 0 {
-        failures.push(format!("slots: {sources_changed} source bytes and {table_changed} table bytes changed"));
+        failures.push(format!(
+            "slots: {sources_changed} source bytes and {table_changed} table bytes changed"
+        ));
     }
     let written: u64 = copies.iter().map(|c| c.2).sum();
-    Ok(json!({ "entries": n, "source_slots": ns, "destination_slots": nd, "bytes_written": written,
+    Ok(
+        json!({ "entries": n, "source_slots": ns, "destination_slots": nd, "bytes_written": written,
                "destination_bytes_checked": dsts.len() * space.allocs[dsts[0]].len(),
-               "source_bytes_changed": sources_changed, "table_bytes_changed": table_changed, "runs": rows }))
+               "source_bytes_changed": sources_changed, "table_bytes_changed": table_changed, "runs": rows }),
+    )
 }
 
 // ── phase 2: the DFlash hidden scatter as a copies-only program ─────────
@@ -682,8 +829,14 @@ fn scatter_entries() -> Vec<CopySpec> {
     (0..BLOCK)
         .flat_map(|r| {
             (0..NE).map(move |ext| CopySpec {
-                src: Addr { resource: ResourceId(ext as u32), offset: Formula::word(slot(r), ROW) },
-                dst: Addr { resource: TARGET, offset: Formula::word(POSITION, NE * ROW).plus((r * NE + ext) * ROW) },
+                src: Addr {
+                    resource: ResourceId(ext as u32),
+                    offset: Formula::word(slot(r), ROW),
+                },
+                dst: Addr {
+                    resource: TARGET,
+                    offset: Formula::word(POSITION, NE * ROW).plus((r * NE + ext) * ROW),
+                },
                 len: Formula::constant(ROW),
             })
         })
@@ -692,27 +845,58 @@ fn scatter_entries() -> Vec<CopySpec> {
 
 fn scatter_program(nodes: Vec<Node>) -> Program {
     let mut resources: Vec<Resource> = (0..NE)
-        .map(|e| Resource { label: format!("hidden_rb.layer_bufs[{e}]"), size: Formula::constant(MAX_POS * ROW), kind: ResourceKind::HiddenRing })
+        .map(|e| Resource {
+            label: format!("hidden_rb.layer_bufs[{e}]"),
+            size: Formula::constant(MAX_POS * ROW),
+            kind: ResourceKind::HiddenRing,
+        })
         .collect();
-    resources.push(Resource { label: "draft_scratch.target_hidden".into(), size: Formula::constant(MAX_CTX * NE * ROW), kind: ResourceKind::DraftScratch });
+    resources.push(Resource {
+        label: "draft_scratch.target_hidden".into(),
+        size: Formula::constant(MAX_CTX * NE * ROW),
+        kind: ResourceKind::DraftScratch,
+    });
     resources.push(Resource {
         label: "scatter.table".into(),
         size: Formula::constant(NE * BLOCK * copy::ENTRY_BYTES),
         kind: ResourceKind::PointerTable(scatter_entries()),
     });
     let mut words = vec![
-        Word { name: "position".into(), domain: 0..=MAX_CTX - BLOCK },
-        Word { name: "rows".into(), domain: 1..=BLOCK },
+        Word {
+            name: "position".into(),
+            domain: 0..=MAX_CTX - BLOCK,
+        },
+        Word {
+            name: "rows".into(),
+            domain: 1..=BLOCK,
+        },
     ];
-    words.extend((0..BLOCK).map(|r| Word { name: format!("slot_{r}"), domain: 0..=MAX_POS - 1 }));
-    Program { arch: "gfx1201".into(), words, resources, nodes }
+    words.extend((0..BLOCK).map(|r| Word {
+        name: format!("slot_{r}"),
+        domain: 0..=MAX_POS - 1,
+    }));
+    Program {
+        arch: "gfx1201".into(),
+        words,
+        resources,
+        nodes,
+    }
 }
 
 /// The batch program (one `CopyBatch` over `5·rows` entries) and the
 /// per-copy program (today's loop: one `Copy` per row and layer).
 fn scatter_programs(rows: u64) -> (Program, Program) {
-    let batch = scatter_program(vec![Node::CopyBatch { table: TABLE, n: Formula::word(ROWS, NE) }]);
-    let per_copy = scatter_program(scatter_entries().into_iter().take((NE * rows) as usize).map(Node::Copy).collect());
+    let batch = scatter_program(vec![Node::CopyBatch {
+        table: TABLE,
+        n: Formula::word(ROWS, NE),
+    }]);
+    let per_copy = scatter_program(
+        scatter_entries()
+            .into_iter()
+            .take((NE * rows) as usize)
+            .map(Node::Copy)
+            .collect(),
+    );
     (batch, per_copy)
 }
 
@@ -734,9 +918,24 @@ impl Assignment {
 }
 
 const ASSIGNMENTS: [Assignment; 3] = [
-    Assignment { name: "contiguous", head: 100, position: 37, rows: 16 },
-    Assignment { name: "ring_wrap_at_resource_end", head: 5, position: MAX_CTX - BLOCK, rows: 16 },
-    Assignment { name: "partial_rows_7", head: 130, position: 0, rows: 7 },
+    Assignment {
+        name: "contiguous",
+        head: 100,
+        position: 37,
+        rows: 16,
+    },
+    Assignment {
+        name: "ring_wrap_at_resource_end",
+        head: 5,
+        position: MAX_CTX - BLOCK,
+        rows: 16,
+    },
+    Assignment {
+        name: "partial_rows_7",
+        head: 130,
+        position: 0,
+        rows: 7,
+    },
 ];
 
 struct Scatter {
@@ -749,7 +948,9 @@ impl Scatter {
         let mut sizes = vec![(MAX_POS * ROW) as usize; NE as usize];
         sizes.push((MAX_CTX * NE * ROW) as usize);
         sizes.push((NE * BLOCK * copy::ENTRY_BYTES) as usize);
-        let space = Space::new(dev, &sizes, GUARD, |i, len| xorshift(0xF1A5_0000 + i as u64, len))?;
+        let space = Space::new(dev, &sizes, GUARD, |i, len| {
+            xorshift(0xF1A5_0000 + i as u64, len)
+        })?;
         let poisons = Poisons::new(dev, space.allocs[TARGET.0 as usize].len())?;
         Ok(Self { space, poisons })
     }
@@ -789,25 +990,50 @@ fn scatter_g2(dev: &Dev, sc: &Scatter, failures: &mut Vec<String>) -> R<Value> {
         let p_copy = per_copy.prepare(&words, &bindings).map_err(err)?;
         let copies = triples(&p_copy);
         if copies != triples(&p_batch) {
-            return Err(format!("{}: the two programs resolve different copies", a.name));
+            return Err(format!(
+                "{}: the two programs resolve different copies",
+                a.name
+            ));
         }
         let arms: [(Arm, &Prepared, &str); 6] = [
             (Arm::DtoD, &p_copy, "per-copy program"),
             (Arm::HipMemcpy, &p_copy, "per-copy program"),
-            (Arm::Kernels, &p_copy, "per-copy program: railgun_copy launches"),
-            (Arm::MemcpyGraph, &p_copy, "per-copy program: graph of memcpy nodes"),
-            (Arm::Kernels, &p_batch, "CopyBatch program: one railgun_copy_batch launch"),
-            (Arm::KernelGraph, &p_batch, "CopyBatch program: captured graph"),
+            (
+                Arm::Kernels,
+                &p_copy,
+                "per-copy program: railgun_copy launches",
+            ),
+            (
+                Arm::MemcpyGraph,
+                &p_copy,
+                "per-copy program: graph of memcpy nodes",
+            ),
+            (
+                Arm::Kernels,
+                &p_batch,
+                "CopyBatch program: one railgun_copy_batch launch",
+            ),
+            (
+                Arm::KernelGraph,
+                &p_batch,
+                "CopyBatch program: captured graph",
+            ),
         ];
         let mut runs = Vec::new();
         for kind in 0..POISONS.len() {
-            let expected = sc.space.expect(TARGET.0 as usize, &sc.poisons.host[kind], &copies)?;
+            let expected = sc
+                .space
+                .expect(TARGET.0 as usize, &sc.poisons.host[kind], &copies)?;
             let mut reference: Option<Vec<u8>> = None;
             for (arm, p, what) in arms {
                 let got = sc.run(dev, kind, || run_arm(dev, arm, p))?;
                 let (vs_expected, first) = diff(&got, &expected);
                 let vs_dtod = reference.as_ref().map(|r| diff(&got, r).0);
-                let table = if std::ptr::eq(p, &p_batch) { Some(sc.table_intact(dev, &p_batch.tables[0].bytes)?) } else { None };
+                let table = if std::ptr::eq(p, &p_batch) {
+                    Some(sc.table_intact(dev, &p_batch.tables[0].bytes)?)
+                } else {
+                    None
+                };
                 if vs_expected != 0 || vs_dtod.unwrap_or(0) != 0 || table.unwrap_or(0) != 0 {
                     failures.push(format!("scatter {} {} ({what}) poison {kind}: {vs_expected} bytes differ, first at {first:?}, table changed {table:?}", a.name, arm.name()));
                 }
@@ -834,9 +1060,11 @@ fn scatter_g2(dev: &Dev, sc: &Scatter, failures: &mut Vec<String>) -> R<Value> {
     if sources_changed != 0 {
         failures.push(format!("scatter: {sources_changed} ring bytes changed"));
     }
-    Ok(json!({ "shape": { "extract_layers": NE, "hidden": HIDDEN, "row_bytes": ROW, "block": BLOCK, "ring_slots": MAX_POS,
+    Ok(
+        json!({ "shape": { "extract_layers": NE, "hidden": HIDDEN, "row_bytes": ROW, "block": BLOCK, "ring_slots": MAX_POS,
                           "target_rows": MAX_CTX, "guard_bytes_each_side": GUARD },
-               "assignments": out, "ring_bytes_changed": sources_changed }))
+               "assignments": out, "ring_bytes_changed": sources_changed }),
+    )
 }
 
 fn decode(image: &[u8]) -> Vec<copy::CopyEntry> {
@@ -844,7 +1072,13 @@ fn decode(image: &[u8]) -> Vec<copy::CopyEntry> {
         .chunks(copy::ENTRY_BYTES as usize)
         .map(|e| {
             let w = |i: usize| u32::from_le_bytes(e[4 * i..4 * i + 4].try_into().unwrap());
-            copy::CopyEntry { src_slot: w(0), src_offset: w(1), dst_slot: w(2), dst_offset: w(3), bytes: w(4) }
+            copy::CopyEntry {
+                src_slot: w(0),
+                src_offset: w(1),
+                dst_slot: w(2),
+                dst_offset: w(3),
+                bytes: w(4),
+            }
         })
         .collect()
 }
@@ -855,10 +1089,16 @@ fn decode(image: &[u8]) -> Vec<copy::CopyEntry> {
 fn resolve(entries: &[copy::CopyEntry], src: &[Slot], dst: &[Slot]) -> Vec<(u64, u64, u64)> {
     entries
         .iter()
-        .filter(|e| (e.src_slot as usize) < copy::SRC_SLOTS && (e.dst_slot as usize) < copy::DST_SLOTS)
+        .filter(|e| {
+            (e.src_slot as usize) < copy::SRC_SLOTS && (e.dst_slot as usize) < copy::DST_SLOTS
+        })
         .map(|e| {
             let at = |slots: &[Slot], k: u32, off: u32| slots[k as usize].base + u64::from(off);
-            (at(src, e.src_slot, e.src_offset), at(dst, e.dst_slot, e.dst_offset), u64::from(e.bytes))
+            (
+                at(src, e.src_slot, e.src_offset),
+                at(dst, e.dst_slot, e.dst_offset),
+                u64::from(e.bytes),
+            )
         })
         .collect()
 }
@@ -868,19 +1108,39 @@ fn resolve(entries: &[copy::CopyEntry], src: &[Slot], dst: &[Slot]) -> Vec<(u64,
 fn negative(dev: &Dev, sc: &Scatter, failures: &mut Vec<String>) -> R<Value> {
     let a = &ASSIGNMENTS[0];
     let (batch, _) = scatter_programs(a.rows);
-    let p = batch.prepare(&a.words(), &sc.space.bindings()).map_err(err)?;
-    let PreparedNode::CopyBatch { src_slots, dst_slots, .. } = &p.nodes[0] else { unreachable!() };
+    let p = batch
+        .prepare(&a.words(), &sc.space.bindings())
+        .map_err(err)?;
+    let PreparedNode::CopyBatch {
+        src_slots,
+        dst_slots,
+        ..
+    } = &p.nodes[0]
+    else {
+        unreachable!()
+    };
     let copies = triples(&p);
     if resolve(&decode(&p.tables[0].bytes), src_slots, dst_slots) != copies {
-        return Err("negative: the prepared table image does not resolve to the program's copies".into());
+        return Err(
+            "negative: the prepared table image does not resolve to the program's copies".into(),
+        );
     }
     let target = sc.target().binding();
     let victim = 17usize;
     let cases: [(&str, Box<dyn Fn(&mut copy::CopyEntry)>); 4] = [
         ("entry 17 one byte short", Box::new(|e| e.bytes -= 1)),
-        ("entry 17 redirected into the trailing guard", Box::new(move |e| e.dst_offset = (target.bytes + 4096) as u32)),
-        ("entry 17 reads the next ring (source slot + 1)", Box::new(|e| e.src_slot = (e.src_slot + 1) % NE as u32)),
-        ("entry 17 names source slot 8 (outside the kernel's slots)", Box::new(|e| e.src_slot = copy::SRC_SLOTS as u32)),
+        (
+            "entry 17 redirected into the trailing guard",
+            Box::new(move |e| e.dst_offset = (target.bytes + 4096) as u32),
+        ),
+        (
+            "entry 17 reads the next ring (source slot + 1)",
+            Box::new(|e| e.src_slot = (e.src_slot + 1) % NE as u32),
+        ),
+        (
+            "entry 17 names source slot 8 (outside the kernel's slots)",
+            Box::new(|e| e.src_slot = copy::SRC_SLOTS as u32),
+        ),
     ];
     let mut out = Vec::new();
     for (name, corrupt) in &cases {
@@ -892,10 +1152,16 @@ fn negative(dev: &Dev, sc: &Scatter, failures: &mut Vec<String>) -> R<Value> {
         let launch = p.nodes[0].launch().expect("non-empty batch");
         let mut rows = Vec::new();
         for kind in 0..POISONS.len() {
-            let expected = sc.space.expect(TARGET.0 as usize, &sc.poisons.host[kind], &copies)?;
-            let predicted = sc.space.expect(TARGET.0 as usize, &sc.poisons.host[kind], &bad)?;
+            let expected = sc
+                .space
+                .expect(TARGET.0 as usize, &sc.poisons.host[kind], &copies)?;
+            let predicted = sc
+                .space
+                .expect(TARGET.0 as usize, &sc.poisons.host[kind], &bad)?;
             let got = sc.run(dev, kind, || {
-                dev.hip.memcpy_htod(&view(p.tables[0].addr, image.len() as u64), &image).map_err(err)?;
+                dev.hip
+                    .memcpy_htod(&view(p.tables[0].addr, image.len() as u64), &image)
+                    .map_err(err)?;
                 dev.launch(&launch, None)
             })?;
             let detected = diff(&got, &expected).0;
@@ -921,28 +1187,49 @@ fn stress(dev: &Dev, sc: &Scatter, replays: usize, failures: &mut Vec<String>) -
     let p = batch.prepare(&a.words(), &bindings).map_err(err)?;
     let p_copy = per_copy.prepare(&a.words(), &bindings).map_err(err)?;
     let copies = triples(&p);
-    let expected: Vec<Vec<u8>> =
-        (0..POISONS.len()).map(|k| sc.space.expect(TARGET.0 as usize, &sc.poisons.host[k], &copies)).collect::<R<_>>()?;
+    let expected: Vec<Vec<u8>> = (0..POISONS.len())
+        .map(|k| {
+            sc.space
+                .expect(TARGET.0 as usize, &sc.poisons.host[k], &copies)
+        })
+        .collect::<R<_>>()?;
     let graph = dev.graph(Arm::KernelGraph, &p)?;
     let memcpy_graph = dev.graph(Arm::MemcpyGraph, &p_copy)?;
     let launch = p.nodes[0].launch().expect("non-empty batch");
     let mut out = Vec::new();
     for (name, f) in [
-        ("CopyBatch captured graph", Box::new(|| dev.replay(&graph)) as Box<dyn Fn() -> R<()>>),
-        ("CopyBatch HIP launch", Box::new(|| dev.launch(&launch, None))),
-        ("per-copy memcpy graph", Box::new(|| dev.replay(&memcpy_graph))),
+        (
+            "CopyBatch captured graph",
+            Box::new(|| dev.replay(&graph)) as Box<dyn Fn() -> R<()>>,
+        ),
+        (
+            "CopyBatch HIP launch",
+            Box::new(|| dev.launch(&launch, None)),
+        ),
+        (
+            "per-copy memcpy graph",
+            Box::new(|| dev.replay(&memcpy_graph)),
+        ),
     ] {
         let mut identical = 0;
         let mut bad = Vec::new();
         for i in 0..replays {
             let got = sc.run(dev, i % POISONS.len(), &f)?;
             let (n, first) = diff(&got, &expected[i % POISONS.len()]);
-            if n == 0 { identical += 1 } else { bad.push(json!({ "replay": i, "mismatch": n, "first": first })) }
+            if n == 0 {
+                identical += 1
+            } else {
+                bad.push(json!({ "replay": i, "mismatch": n, "first": first }))
+            }
         }
         if identical != replays {
-            failures.push(format!("stress {name}: {identical}/{replays} replays identical"));
+            failures.push(format!(
+                "stress {name}: {identical}/{replays} replays identical"
+            ));
         }
-        out.push(json!({ "lowering": name, "replays": replays, "identical": identical, "failed": bad }));
+        out.push(
+            json!({ "lowering": name, "replays": replays, "identical": identical, "failed": bad }),
+        );
     }
     let table = sc.table_intact(dev, &p.tables[0].bytes)?;
     if table != 0 {
@@ -983,7 +1270,13 @@ fn segment(dev: &Dev, secs: f64, issue: &mut dyn FnMut() -> R<()>) -> R<(Vec<f64
     Ok((enq, total))
 }
 
-fn timing(dev: &Dev, sc: &Scatter, secs: f64, secs_secondary: f64, failures: &mut Vec<String>) -> R<Value> {
+fn timing(
+    dev: &Dev,
+    sc: &Scatter,
+    secs: f64,
+    secs_secondary: f64,
+    failures: &mut Vec<String>,
+) -> R<Value> {
     let a = &ASSIGNMENTS[0];
     let (batch, per_copy) = scatter_programs(a.rows);
     let bindings = sc.space.bindings();
@@ -993,51 +1286,137 @@ fn timing(dev: &Dev, sc: &Scatter, secs: f64, secs_secondary: f64, failures: &mu
     dev.upload_tables(&p)?;
     let launch = p.nodes[0].launch().expect("non-empty batch");
     let mut batch_blob = launch.kernarg.clone();
-    let copy_launches: Vec<Launch> = p_copy.nodes.iter().filter_map(PreparedNode::launch).collect();
+    let copy_launches: Vec<Launch> = p_copy
+        .nodes
+        .iter()
+        .filter_map(PreparedNode::launch)
+        .collect();
     let mut copy_blobs: Vec<Vec<u8>> = copy_launches.iter().map(|l| l.kernarg.clone()).collect();
     let graph = dev.graph(Arm::KernelGraph, &p)?;
     let memcpy_graph = dev.graph(Arm::MemcpyGraph, &p_copy)?;
     let table = &p.tables[0];
     let table_view = view(table.addr, table.bytes.len() as u64);
-    let PreparedNode::CopyBatch { src_slots, dst_slots, .. } = &p.nodes[0] else { unreachable!() };
+    let PreparedNode::CopyBatch {
+        src_slots,
+        dst_slots,
+        ..
+    } = &p.nodes[0]
+    else {
+        unreachable!()
+    };
     let bases = |slots: &[Slot]| slots.iter().map(|s| s.base).collect::<Vec<_>>();
     let floor = copy::batch_launch(table.addr, 1, &bases(src_slots), &bases(dst_slots), ROW);
     let mut floor_blob = floor.kernarg.clone();
     sc.poisons.apply(dev, 0, sc.target())?;
 
     let mut arms: Vec<(&str, Box<dyn FnMut() -> R<()> + '_>)> = vec![
-        ("80 x hipMemcpyDtoD", Box::new(|| copies.iter().try_for_each(|&(s, d, n)| dev.dtod(s, d, n)))),
-        ("1 x CopyBatch launch", Box::new(|| unsafe {
-            dev.hip.launch_kernel_blob(&dev.batch, launch.grid, launch.block, 0, None, &mut batch_blob).map_err(err)
-        })),
-        ("80 x hipMemcpy D2D (memcpy_dtod_at)", Box::new(|| copies.iter().try_for_each(|&(s, d, n)| dev.hip_memcpy(s, d, n)))),
-        ("80 x railgun_copy launch", Box::new(|| {
-            copy_launches.iter().zip(copy_blobs.iter_mut()).try_for_each(|(l, b)| unsafe {
-                dev.hip.launch_kernel_blob(&dev.copy, l.grid, l.block, 0, None, b).map_err(err)
-            })
-        })),
-        ("graph of 80 memcpy nodes", Box::new(|| dev.hip.graph_launch(&memcpy_graph, &dev.stream).map_err(err))),
-        ("CopyBatch graph", Box::new(|| dev.hip.graph_launch(&graph, &dev.stream).map_err(err))),
-        ("table upload (1920 B H2D) + CopyBatch launch", Box::new(|| {
-            dev.hip.memcpy_htod(&table_view, &table.bytes).map_err(err)?;
-            let mut blob = launch.kernarg.clone();
-            unsafe { dev.hip.launch_kernel_blob(&dev.batch, launch.grid, launch.block, 0, None, &mut blob) }.map_err(err)
-        })),
-        ("1 x CopyBatch launch, first entry only (launch + sync floor)", Box::new(|| unsafe {
-            dev.hip.launch_kernel_blob(&dev.batch, floor.grid, floor.block, 0, None, &mut floor_blob).map_err(err)
-        })),
+        (
+            "80 x hipMemcpyDtoD",
+            Box::new(|| copies.iter().try_for_each(|&(s, d, n)| dev.dtod(s, d, n))),
+        ),
+        (
+            "1 x CopyBatch launch",
+            Box::new(|| unsafe {
+                dev.hip
+                    .launch_kernel_blob(
+                        &dev.batch,
+                        launch.grid,
+                        launch.block,
+                        0,
+                        None,
+                        &mut batch_blob,
+                    )
+                    .map_err(err)
+            }),
+        ),
+        (
+            "80 x hipMemcpy D2D (memcpy_dtod_at)",
+            Box::new(|| {
+                copies
+                    .iter()
+                    .try_for_each(|&(s, d, n)| dev.hip_memcpy(s, d, n))
+            }),
+        ),
+        (
+            "80 x railgun_copy launch",
+            Box::new(|| {
+                copy_launches
+                    .iter()
+                    .zip(copy_blobs.iter_mut())
+                    .try_for_each(|(l, b)| unsafe {
+                        dev.hip
+                            .launch_kernel_blob(&dev.copy, l.grid, l.block, 0, None, b)
+                            .map_err(err)
+                    })
+            }),
+        ),
+        (
+            "graph of 80 memcpy nodes",
+            Box::new(|| {
+                dev.hip
+                    .graph_launch(&memcpy_graph, &dev.stream)
+                    .map_err(err)
+            }),
+        ),
+        (
+            "CopyBatch graph",
+            Box::new(|| dev.hip.graph_launch(&graph, &dev.stream).map_err(err)),
+        ),
+        (
+            "table upload (1920 B H2D) + CopyBatch launch",
+            Box::new(|| {
+                dev.hip
+                    .memcpy_htod(&table_view, &table.bytes)
+                    .map_err(err)?;
+                let mut blob = launch.kernarg.clone();
+                unsafe {
+                    dev.hip.launch_kernel_blob(
+                        &dev.batch,
+                        launch.grid,
+                        launch.block,
+                        0,
+                        None,
+                        &mut blob,
+                    )
+                }
+                .map_err(err)
+            }),
+        ),
+        (
+            "1 x CopyBatch launch, first entry only (launch + sync floor)",
+            Box::new(|| unsafe {
+                dev.hip
+                    .launch_kernel_blob(
+                        &dev.batch,
+                        floor.grid,
+                        floor.block,
+                        0,
+                        None,
+                        &mut floor_blob,
+                    )
+                    .map_err(err)
+            }),
+        ),
     ];
     // Primary: A B B A. Secondary: C D E F G H H G F E D C.
     let primary = [0usize, 1, 1, 0];
     let secondary = [2usize, 3, 4, 5, 6, 7, 7, 6, 5, 4, 3, 2];
     let mut per_arm: Vec<(Vec<f64>, Vec<f64>)> = vec![(Vec::new(), Vec::new()); arms.len()];
     let mut segments = Vec::new();
-    let plan: Vec<(usize, f64)> =
-        primary.iter().map(|&i| (i, secs)).chain(secondary.iter().map(|&i| (i, secs_secondary))).collect();
+    let plan: Vec<(usize, f64)> = primary
+        .iter()
+        .map(|&i| (i, secs))
+        .chain(secondary.iter().map(|&i| (i, secs_secondary)))
+        .collect();
     for (order, &(i, s)) in plan.iter().enumerate() {
         let (mut enq, mut total) = segment(dev, s, &mut arms[i].1)?;
         let seg = json!({ "order": order, "arm": arms[i].0, "seconds": s, "total": stats(&mut total), "enqueue": stats(&mut enq) });
-        eprintln!("timing {order}: {} median {:.2} us over {} cycles", arms[i].0, seg["total"]["median_us"].as_f64().unwrap_or(0.0), total.len());
+        eprintln!(
+            "timing {order}: {} median {:.2} us over {} cycles",
+            arms[i].0,
+            seg["total"]["median_us"].as_f64().unwrap_or(0.0),
+            total.len()
+        );
         segments.push(seg);
         per_arm[i].0.extend(enq);
         per_arm[i].1.extend(total);
@@ -1048,17 +1427,23 @@ fn timing(dev: &Dev, sc: &Scatter, secs: f64, secs_secondary: f64, failures: &mu
         .map(|((name, _), (enq, total))| json!({ "arm": name, "total": stats(total), "enqueue": stats(enq) }))
         .collect();
     drop(arms);
-    let expected = sc.space.expect(TARGET.0 as usize, &sc.poisons.host[0], &copies)?;
+    let expected = sc
+        .space
+        .expect(TARGET.0 as usize, &sc.poisons.host[0], &copies)?;
     let after = diff(&sc.space.read(dev, TARGET.0 as usize)?, &expected).0;
     if after != 0 {
-        failures.push(format!("timing: target differs from the expected image by {after} bytes after all arms"));
+        failures.push(format!(
+            "timing: target differs from the expected image by {after} bytes after all arms"
+        ));
     }
     dev.hip.graph_exec_destroy(graph).map_err(err)?;
     dev.hip.graph_exec_destroy(memcpy_graph).map_err(err)?;
-    Ok(json!({ "assignment": a.name, "copies": copies.len(), "bytes_per_cycle": copies.iter().map(|c| c.2).sum::<u64>(),
+    Ok(
+        json!({ "assignment": a.name, "copies": copies.len(), "bytes_per_cycle": copies.iter().map(|c| c.2).sum::<u64>(),
                "unit": "one cycle = issue + hipDeviceSynchronize, host wall clock", "batch_launch": { "grid": launch.grid, "block": launch.block },
                "primary_order": "ABBA", "secondary_order": "CDEFGHHGFEDC", "segments": segments, "pooled": pooled,
-               "target_mismatch_after": after }))
+               "target_mismatch_after": after }),
+    )
 }
 
 fn main() {
@@ -1081,10 +1466,19 @@ fn run() -> R<bool> {
     eprintln!("card: {card}");
     let (object, kernel) = compile(&a.arch, &a.out)?;
     let module = hip.module_load_data(&object).map_err(err)?;
-    let copy = hip.module_get_function(&module, copy::COPY_SYMBOL).map_err(err)?;
-    let batch = hip.module_get_function(&module, copy::BATCH_SYMBOL).map_err(err)?;
+    let copy = hip
+        .module_get_function(&module, copy::COPY_SYMBOL)
+        .map_err(err)?;
+    let batch = hip
+        .module_get_function(&module, copy::BATCH_SYMBOL)
+        .map_err(err)?;
     let stream = hip.stream_create().map_err(err)?;
-    let dev = Dev { hip, copy, batch, stream };
+    let dev = Dev {
+        hip,
+        copy,
+        batch,
+        stream,
+    };
     let mut failures = Vec::new();
     let mut report = json!({ "card": card, "kernel": kernel });
     let skip = |p: &str| a.skip.iter().any(|s| s == p);

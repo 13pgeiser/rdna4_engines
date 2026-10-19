@@ -42,15 +42,22 @@ struct Term {
 
 impl Term {
     fn leading(self) -> i32 {
-        if self.significand == 0 { EMPTY_EXP }
-        else { self.exponent + (63 - self.significand.leading_zeros()) as i32 }
+        if self.significand == 0 {
+            EMPTY_EXP
+        } else {
+            self.exponent + (63 - self.significand.leading_zeros()) as i32
+        }
     }
 
     fn magnitude(self, grid: i32) -> u64 {
         let shift = self.exponent - grid;
-        if self.significand == 0 || shift <= -64 { 0 }
-        else if shift < 0 { self.significand >> -shift }
-        else { self.significand << shift }
+        if self.significand == 0 || shift <= -64 {
+            0
+        } else if shift < 0 {
+            self.significand >> -shift
+        } else {
+            self.significand << shift
+        }
     }
 
     /// Floor-align a term to `grid`. A negative term with a discarded tail decrements by one unit. For the FP32
@@ -59,9 +66,12 @@ impl Term {
     /// non-zero" for a normal C, but a negative subnormal C whose grid sits far below it still floors to -1 unit.
     fn align_floor(self, grid: i32, accumulator: bool) -> i64 {
         let magnitude = self.magnitude(grid);
-        if !self.negative { return magnitude as i64; }
+        if !self.negative {
+            return magnitude as i64;
+        }
         let shift = self.exponent - grid;
-        let tail = self.significand != 0 && shift < 0
+        let tail = self.significand != 0
+            && shift < 0
             && (shift <= -64 || self.significand & ((1u64 << -shift) - 1) != 0);
         -(magnitude as i64) - i64::from(tail && (!accumulator || -shift <= 23))
     }
@@ -77,13 +87,22 @@ struct Factor {
 }
 
 fn factor(bits: u16, bf16: bool, gfx11: bool) -> Factor {
-    let (fraction_bits, bias, infinity) = if bf16 { (7, 127, 0x7f80) } else { (10, 15, 0x7c00) };
+    let (fraction_bits, bias, infinity) = if bf16 {
+        (7, 127, 0x7f80)
+    } else {
+        (10, 15, 0x7c00)
+    };
     let magnitude = bits & 0x7fff;
     let exponent = magnitude >> fraction_bits;
     let fraction = magnitude & ((1 << fraction_bits) - 1);
     Factor {
-        significand: if exponent != 0 { u64::from(fraction | (1 << fraction_bits)) }
-            else if bf16 && gfx11 { 0 } else { u64::from(fraction) },
+        significand: if exponent != 0 {
+            u64::from(fraction | (1 << fraction_bits))
+        } else if bf16 && gfx11 {
+            0
+        } else {
+            u64::from(fraction)
+        },
         alignment: i32::from(exponent.max(1)) - bias,
         negative: bits & 0x8000 != 0,
         nan: magnitude > infinity,
@@ -92,8 +111,12 @@ fn factor(bits: u16, bf16: bool, gfx11: bool) -> Factor {
 }
 
 fn round_even(value: u64, shift: i32) -> u64 {
-    if shift <= 0 { return value << -shift; }
-    if shift >= 64 { return 0; }
+    if shift <= 0 {
+        return value << -shift;
+    }
+    if shift >= 64 {
+        return 0;
+    }
     let tail = value & ((1u64 << shift) - 1);
     let halfway = 1u64 << (shift - 1);
     let head = value >> shift;
@@ -101,14 +124,20 @@ fn round_even(value: u64, shift: i32) -> u64 {
 }
 
 fn pack(units: i64, grid: i32, frame_negative: bool, gfx11: bool) -> u32 {
-    if units == 0 { return 0; }
+    if units == 0 {
+        return 0;
+    }
     let sign = u32::from((units < 0) != frame_negative) << 31;
     let magnitude = units.unsigned_abs();
     let top = (63 - magnitude.leading_zeros()) as i32;
     let mut exponent = top + grid;
     if !gfx11 && exponent < -126 {
         let fraction = round_even(magnitude, -149 - grid);
-        return if fraction == 0 { 0 } else { sign | fraction as u32 };
+        return if fraction == 0 {
+            0
+        } else {
+            sign | fraction as u32
+        };
     }
     let mut significand = round_even(magnitude, top - 23);
     if significand == 0x100_0000 {
@@ -117,8 +146,12 @@ fn pack(units: i64, grid: i32, frame_negative: bool, gfx11: bool) -> u32 {
     }
     // GFX11 normalizes/rounds before deciding to flush, rather than performing
     // IEEE gradual-underflow rounding and then flushing the converted result.
-    if exponent < -126 { return 0; }
-    if exponent > 127 { return sign | 0x7f80_0000; }
+    if exponent < -126 {
+        return 0;
+    }
+    if exponent > 127 {
+        return sign | 0x7f80_0000;
+    }
     sign | ((exponent + 127) as u32) << 23 | (significand as u32 & 0x7f_ffff)
 }
 
@@ -134,12 +167,17 @@ fn dot_step(a: &[u16], b: &[u16], acc: u32, bf16: bool, gfx11: bool) -> u32 {
         let right = factor(b[i], bf16, gfx11);
         // Check all factors before invalid products/C: a later factor NaN has
         // precedence over an earlier infinity-times-zero.
-        if left.nan || right.nan { return FACTOR_NAN; }
-        invalid |= (left.infinite && right.significand == 0)
-            || (right.infinite && left.significand == 0);
+        if left.nan || right.nan {
+            return FACTOR_NAN;
+        }
+        invalid |=
+            (left.infinite && right.significand == 0) || (right.infinite && left.significand == 0);
         if left.infinite || right.infinite {
-            if left.negative != right.negative { negative_inf = true; }
-            else { positive_inf = true; }
+            if left.negative != right.negative {
+                negative_inf = true;
+            } else {
+                positive_inf = true;
+            }
         }
         let significand = left.significand * right.significand;
         products[i] = Term {
@@ -147,32 +185,61 @@ fn dot_step(a: &[u16], b: &[u16], acc: u32, bf16: bool, gfx11: bool) -> u32 {
             exponent: left.alignment + right.alignment - 2 * fraction_bits,
             negative: left.negative != right.negative,
         };
-        if significand != 0 { grids[i] = left.alignment + right.alignment - 24; }
+        if significand != 0 {
+            grids[i] = left.alignment + right.alignment - 24;
+        }
     }
-    if invalid || (positive_inf && negative_inf) { return INVALID_NAN; }
-    if acc & 0x7fff_ffff > 0x7f80_0000 { return acc | 0x0040_0000; }
+    if invalid || (positive_inf && negative_inf) {
+        return INVALID_NAN;
+    }
+    if acc & 0x7fff_ffff > 0x7f80_0000 {
+        return acc | 0x0040_0000;
+    }
     positive_inf |= acc == 0x7f80_0000;
     negative_inf |= acc == 0xff80_0000;
     if positive_inf || negative_inf {
-        return if positive_inf && negative_inf { INVALID_NAN }
-            else if negative_inf { 0xff80_0000 } else { 0x7f80_0000 };
+        return if positive_inf && negative_inf {
+            INVALID_NAN
+        } else if negative_inf {
+            0xff80_0000
+        } else {
+            0x7f80_0000
+        };
     }
     let acc_exponent = ((acc >> 23) & 255) as i32;
     let c = Term {
-        significand: if acc_exponent != 0 { u64::from((acc & 0x7f_ffff) | 0x80_0000) }
-            else if gfx11 { 0 } else { u64::from(acc & 0x7f_ffff) },
-        exponent: if gfx11 { acc_exponent - 150 } else { acc_exponent.max(1) - 150 },
+        significand: if acc_exponent != 0 {
+            u64::from((acc & 0x7f_ffff) | 0x80_0000)
+        } else if gfx11 {
+            0
+        } else {
+            u64::from(acc & 0x7f_ffff)
+        },
+        exponent: if gfx11 {
+            acc_exponent - 150
+        } else {
+            acc_exponent.max(1) - 150
+        },
         negative: acc >> 31 != 0,
     };
     let product_grid = *grids[..a.len()].iter().max().unwrap();
     if gfx11 {
-        if c.significand | products[0].significand | products[1].significand == 0 { return 0; }
-        let leading = c.leading().max(products[0].leading()).max(products[1].leading());
+        if c.significand | products[0].significand | products[1].significand == 0 {
+            return 0;
+        }
+        let leading = c
+            .leading()
+            .max(products[0].leading())
+            .max(products[1].leading());
         let grid = product_grid.max(leading - 26);
         let mut total = 0;
         for term in [c, products[0], products[1]] {
             let magnitude = term.magnitude(grid) as i64;
-            total += if term.negative != c.negative { -magnitude - 1 } else { magnitude };
+            total += if term.negative != c.negative {
+                -magnitude - 1
+            } else {
+                magnitude
+            };
         }
         pack(total, grid, c.negative, true)
     } else {
@@ -182,8 +249,12 @@ fn dot_step(a: &[u16], b: &[u16], acc: u32, bf16: bool, gfx11: bool) -> u32 {
             let pair_grid = grids[i].max(grids[i + 1]);
             let pair = products[i].align_floor(pair_grid, false)
                 + products[i + 1].align_floor(pair_grid, false);
-            total += Term { significand: pair.unsigned_abs(), exponent: pair_grid, negative: pair < 0 }
-                .align_floor(grid, false);
+            total += Term {
+                significand: pair.unsigned_abs(),
+                exponent: pair_grid,
+                negative: pair < 0,
+            }
+            .align_floor(grid, false);
         }
         pack(total, grid, false, false)
     }
@@ -228,8 +299,11 @@ fn integer_dot<T: Copy + Into<i64>>(a: &[T], b: &[T], c: i32, clamp: bool) -> i3
     for (&left, &right) in a.iter().zip(b) {
         sum += Into::<i64>::into(left) * Into::<i64>::into(right);
     }
-    if clamp { sum.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32 }
-    else { sum as i32 }
+    if clamp {
+        sum.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+    } else {
+        sum as i32
+    }
 }
 
 /// Signed/sign-decoded IU4 dot: exact integer products and one final addition
@@ -254,7 +328,9 @@ pub fn wmma_i32_iu4(arch: Arch, a: &[i8], b: &[i8], c: i32, clamp: bool) -> i32 
 /// mismatches, per-4-K 372, per-product 1,291). GFX1151 CLAMP has no receipt and is refused.
 pub fn wmma_i32_iu8(arch: Arch, a: &[i16], b: &[i16], c: i32, clamp: bool) -> Result<i32, String> {
     if !matches!(arch, Arch::Gfx1151 | Arch::Gfx1201) {
-        return Err(format!("IU8 WMMA numerical model is not qualified for {arch:?}"));
+        return Err(format!(
+            "IU8 WMMA numerical model is not qualified for {arch:?}"
+        ));
     }
     assert_eq!(a.len(), 16, "IU8 K must be 16");
     if !clamp {
@@ -279,7 +355,6 @@ pub fn dot2_f32(arch: Arch, a: [u16; 2], b: [u16; 2], c: u32, bf16: bool) -> Res
     Ok(dot_step(&a, &b, c, bf16, false))
 }
 
-
 /// `v_dot4_i32_iu8` / `v_dot8_i32_iu4`: the ISA pseudocode sums every decoded product and `S2.i32` in a signed
 /// accumulator and wraps the dword. GFX1201 probe (0 mismatches over 402,304 full-grid evaluations plus 72,304
 /// per modifier set): the sum is exact and CLAMP is ONE final signed i32 saturation. GFX1151/GFX1100 have no probe
@@ -289,7 +364,9 @@ pub fn dot_i32(arch: Arch, a: &[i32], b: &[i32], c: i32, clamp: bool) -> Result<
         return Err(format!("integer dot is not defined for {arch:?}"));
     }
     if clamp && arch != Arch::Gfx1201 {
-        return Err(format!("CLAMP on an integer dot product is not measured on {arch:?}"));
+        return Err(format!(
+            "CLAMP on an integer dot product is not measured on {arch:?}"
+        ));
     }
     Ok(integer_dot(a, b, c, clamp))
 }
@@ -301,7 +378,10 @@ pub fn dot_i32(arch: Arch, a: &[i32], b: &[i32], c: i32, clamp: bool) -> Result<
 /// (groups of 1, 2, 4 and the other half-splits have 600-3,600 mismatches).
 pub fn swmmac_i32(arch: Arch, a: &[i16], b: &[i16], c: i32, clamp: bool) -> i32 {
     assert_eq!(arch, Arch::Gfx1201, "SWMMAC exists on GFX1201 only");
-    assert!(matches!(a.len(), 16 | 32), "integer SWMMAC has 16 or 32 compressed slots");
+    assert!(
+        matches!(a.len(), 16 | 32),
+        "integer SWMMAC has 16 or 32 compressed slots"
+    );
     if !clamp {
         return integer_dot(a, b, c, false);
     }
@@ -318,22 +398,54 @@ mod tests {
     // not expectations computed by this model or host IEEE arithmetic.
     #[test]
     fn published_gfx1151_cancellation_keeps_complement_deficit() {
-        assert_eq!(dot_step(&[0x3c00, 0x3c00], &[0x3c00, 0x3c00],
-                           0xc000_0000, false, true), 0x3400_0000);
+        assert_eq!(
+            dot_step(
+                &[0x3c00, 0x3c00],
+                &[0x3c00, 0x3c00],
+                0xc000_0000,
+                false,
+                true
+            ),
+            0x3400_0000
+        );
     }
 
     #[test]
     fn published_gfx1151_opposing_small_integer_sum_is_not_ieee() {
-        assert_eq!(dot_step(&[0x4200, 0x4800], &[0x4800, 0x4400],
-                           0xbf80_0000, false, true), 0x425c_0001);
+        assert_eq!(
+            dot_step(
+                &[0x4200, 0x4800],
+                &[0x4800, 0x4400],
+                0xbf80_0000,
+                false,
+                true
+            ),
+            0x425c_0001
+        );
     }
 
     #[test]
     fn published_gfx1151_signed_zero_accumulator_changes_result() {
-        assert_eq!(dot_step(&[0x3c00, 0x3c00], &[0x0000, 0x3c00],
-                           0x8000_0000, false, true), 0x3f80_0001);
-        assert_eq!(dot_step(&[0x3c00, 0x3c00], &[0x0000, 0x3c00],
-                           0x0000_0000, false, true), 0x3f80_0000);
+        assert_eq!(
+            dot_step(
+                &[0x3c00, 0x3c00],
+                &[0x0000, 0x3c00],
+                0x8000_0000,
+                false,
+                true
+            ),
+            0x3f80_0001
+        );
+        assert_eq!(
+            dot_step(
+                &[0x3c00, 0x3c00],
+                &[0x0000, 0x3c00],
+                0x0000_0000,
+                false,
+                true
+            ),
+            0x3f80_0000
+        );
     }
 
     // Raw gfx1201 BF16 WMMA discriminator (wmma-capture-gfx1201-v2.bf16, op 0x41): A = 16 x bf16 subnormal 0x0001,
@@ -345,6 +457,9 @@ mod tests {
         let mut b = [0u16; 16];
         b[0] = 0x4040;
         b[1] = 0x4100;
-        assert_eq!(wmma_f32_bf16(Arch::Gfx1201, &a, &b, 0x8000_0001), 0x000a_fffc);
+        assert_eq!(
+            wmma_f32_bf16(Arch::Gfx1201, &a, &b, 0x8000_0001),
+            0x000a_fffc
+        );
     }
 }

@@ -33,12 +33,22 @@ fn set_base(g: &Gen, p: usize) -> u8 {
     SET0 + p as u8 * g.set_len()
 }
 /// Code dword `c` of tensor `t` in set `p` (= chunk `c`; unpacked in place).
-fn raw(g: &Gen, p: usize, t: u8, c: u8) -> u8 { set_base(g, p) + 16 * t + c }
-fn xr(g: &Gen, p: usize) -> u8 { set_base(g, p) + 16 * g.t() }
-fn hr(g: &Gen, p: usize, t: u8) -> u8 { xr(g, p) + 16 + t }
-fn dr(g: &Gen, p: usize) -> u8 { xr(g, p) + 16 + g.t() }
+fn raw(g: &Gen, p: usize, t: u8, c: u8) -> u8 {
+    set_base(g, p) + 16 * t + c
+}
+fn xr(g: &Gen, p: usize) -> u8 {
+    set_base(g, p) + 16 * g.t()
+}
+fn hr(g: &Gen, p: usize, t: u8) -> u8 {
+    xr(g, p) + 16 + t
+}
+fn dr(g: &Gen, p: usize) -> u8 {
+    xr(g, p) + 16 + g.t()
+}
 /// Two unpack temporaries.
-fn tmp(g: &Gen) -> u8 { set_base(g, 2) }
+fn tmp(g: &Gen) -> u8 {
+    set_base(g, 2)
+}
 /// Byte of chunk `c` in the epoch's 48-byte group.
 fn chunk_off(c: u8) -> u32 {
     3 * u32::from(c)
@@ -83,7 +93,9 @@ pub(super) fn plan(g: &Gen) -> Result<RegPlan, String> {
         }
         p.v::<1>("d", dr(g, set), kernel())?;
     }
-    for i in 0..2u8 { p.v::<1>("unpack_tmp", tmp(g) + i, kernel())?; }
+    for i in 0..2u8 {
+        p.v::<1>("unpack_tmp", tmp(g) + i, kernel())?;
+    }
     // Epilogue registers over the dead K-loop ranges (the MQ4 gfx11 epilogue's).
     for i in 0..8u8 {
         p.v::<1>("rt_tmp", RT_TMP + i, epi())?;
@@ -455,8 +467,24 @@ fn prologue(wg: &mut Wg<Gfx1151>, g: &Gen, end: &End) -> Result<(), String> {
         },
     )?;
     load_set(b, g, 0)?;
-    for j in 0..8u8 { op(b, format!("v_mov_b32_e32 v{}, {}", MAGIC8 + j, lit(MAGIC)), &[v(MAGIC8 + j)], &[])?; }
-    for t in 0..g.t() { for j in 0..8u8 { op(b, format!("v_mov_b32_e32 v{}, 0", SUM + 8 * t + j), &[v(SUM + 8 * t + j)], &[])?; } }
+    for j in 0..8u8 {
+        op(
+            b,
+            format!("v_mov_b32_e32 v{}, {}", MAGIC8 + j, lit(MAGIC)),
+            &[v(MAGIC8 + j)],
+            &[],
+        )?;
+    }
+    for t in 0..g.t() {
+        for j in 0..8u8 {
+            op(
+                b,
+                format!("v_mov_b32_e32 v{}, 0", SUM + 8 * t + j),
+                &[v(SUM + 8 * t + j)],
+                &[],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -518,16 +546,40 @@ fn load_set(b: &mut Builder, g: &Gen, p: usize) -> Result<(), String> {
 /// dst ^= 0x88888888                                signed nibble `2c - 7`
 /// ```
 fn unpack(b: &mut Builder, dst: u8, code: u8, y: u8) -> Result<(), String> {
-    let bfi = |b: &mut Builder, d: u8, mask: u32, p: u8, q: u8| op(b, format!("v_bfi_b32 v{d}, {}, v{p}, v{q}", lit(mask)), &[v(d)], &[v(p), v(q)]);
-    let shl = |b: &mut Builder, d: u8, n: u8, sr: u8| op(b, format!("v_lshlrev_b32_e32 v{d}, {n}, v{sr}"), &[v(d)], &[v(sr)]);
+    let bfi = |b: &mut Builder, d: u8, mask: u32, p: u8, q: u8| {
+        op(
+            b,
+            format!("v_bfi_b32 v{d}, {}, v{p}, v{q}", lit(mask)),
+            &[v(d)],
+            &[v(p), v(q)],
+        )
+    };
+    let shl = |b: &mut Builder, d: u8, n: u8, sr: u8| {
+        op(
+            b,
+            format!("v_lshlrev_b32_e32 v{d}, {n}, v{sr}"),
+            &[v(d)],
+            &[v(sr)],
+        )
+    };
     shl(b, y, 4, code)?;
     bfi(b, y, 0xfff, code, y)?;
     shl(b, dst, 2, y)?;
     bfi(b, y, 0x003f_003f, y, dst)?;
     shl(b, dst, 1, y)?;
-    op(b, format!("v_lshl_or_b32 v{y}, v{y}, 2, 0x11111111"), &[v(y)], &[v(y)])?;
+    op(
+        b,
+        format!("v_lshl_or_b32 v{y}, v{y}, 2, 0x11111111"),
+        &[v(y)],
+        &[v(y)],
+    )?;
     bfi(b, dst, 0x0e0e_0e0e, dst, y)?;
-    op(b, format!("v_xor_b32_e32 v{dst}, {}, v{dst}", lit(REBIAS)), &[v(dst)], &[v(dst)])
+    op(
+        b,
+        format!("v_xor_b32_e32 v{dst}, {}, v{dst}", lit(REBIAS)),
+        &[v(dst)],
+        &[v(dst)],
+    )
 }
 
 /// Fold set `p` (one K128 epoch) into the sums.
@@ -790,7 +842,11 @@ mod tests {
                     .contains(&format!("{}{sfx}", spec(Arch::Gfx1151, kind).symbol())));
                 assert!(!e.s_text.contains("ttmp"));
                 assert!(!e.s_text.contains("v_wmma_i32_16x16x32_iu4"));
-                for (needle12, needle11) in [("v_wmma_i32_16x16x32_iu4", "v_wmma_i32_16x16x16_iu4"), ("0x88888888", "0x88888888"), ("0x88888888", "v_lshl_or_b32")] {
+                for (needle12, needle11) in [
+                    ("v_wmma_i32_16x16x32_iu4", "v_wmma_i32_16x16x16_iu4"),
+                    ("0x88888888", "0x88888888"),
+                    ("0x88888888", "v_lshl_or_b32"),
+                ] {
                     let (n12, n11) = (count(&w12.s_text, needle12), count(&e.s_text, needle11));
                     assert!(
                         n12 > 0 && n11 == 2 * n12,

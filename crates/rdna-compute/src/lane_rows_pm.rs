@@ -52,21 +52,49 @@ const Q8_K320: &str = "gemv_q8_0_k320_xbatch_pm";
 // S2 exact-wide exports of the same module and image (`[r16, r32]`): block 256 with
 // eight weight rows per workgroup (HC k8: block 512, two rows). The activations
 // are staged in bounded row tiles, every column keeps the 1-row DAG.
-pub(crate) const MQ6_WIDE: [&str; 2] = ["gemv_mq6g256v2_xbatch_wide_r16_pm", "gemv_mq6g256v2_xbatch_wide_r32_pm"];
-pub(crate) const MQ6_X4_WIDE: [&str; 2] =
-    ["gemv_mq6g256v2_x4_xbatch_wide_r16_pm", "gemv_mq6g256v2_x4_xbatch_wide_r32_pm"];
-pub(crate) const Q8_K8_WIDE: [&str; 2] = ["gemv_q8_0_k8_xbatch_wide_r16_pm", "gemv_q8_0_k8_xbatch_wide_r32_pm"];
-pub(crate) const Q8_K320_WIDE: [&str; 2] = ["gemv_q8_0_k320_xbatch_wide_r16_pm", "gemv_q8_0_k320_xbatch_wide_r32_pm"];
-pub(crate) const Q8_K2560_WIDE: [&str; 2] = ["gemv_q8_0_k2560_xbatch_wide_r16_pm", "gemv_q8_0_k2560_xbatch_wide_r32_pm"];
-pub(crate) const Q8_SMALL_WIDE: [&str; 2] = ["gemv_q8_0_wide_xbatch_wide_r16_pm", "gemv_q8_0_wide_xbatch_wide_r32_pm"];
-pub(crate) const Q8_K2560_X2_WIDE: [&str; 2] =
-    ["gemv_q8_0_k2560_x2_xbatch_wide_r16_pm", "gemv_q8_0_k2560_x2_xbatch_wide_r32_pm"];
+pub(crate) const MQ6_WIDE: [&str; 2] = [
+    "gemv_mq6g256v2_xbatch_wide_r16_pm",
+    "gemv_mq6g256v2_xbatch_wide_r32_pm",
+];
+pub(crate) const MQ6_X4_WIDE: [&str; 2] = [
+    "gemv_mq6g256v2_x4_xbatch_wide_r16_pm",
+    "gemv_mq6g256v2_x4_xbatch_wide_r32_pm",
+];
+pub(crate) const Q8_K8_WIDE: [&str; 2] = [
+    "gemv_q8_0_k8_xbatch_wide_r16_pm",
+    "gemv_q8_0_k8_xbatch_wide_r32_pm",
+];
+pub(crate) const Q8_K320_WIDE: [&str; 2] = [
+    "gemv_q8_0_k320_xbatch_wide_r16_pm",
+    "gemv_q8_0_k320_xbatch_wide_r32_pm",
+];
+pub(crate) const Q8_K2560_WIDE: [&str; 2] = [
+    "gemv_q8_0_k2560_xbatch_wide_r16_pm",
+    "gemv_q8_0_k2560_xbatch_wide_r32_pm",
+];
+pub(crate) const Q8_SMALL_WIDE: [&str; 2] = [
+    "gemv_q8_0_wide_xbatch_wide_r16_pm",
+    "gemv_q8_0_wide_xbatch_wide_r32_pm",
+];
+pub(crate) const Q8_K2560_X2_WIDE: [&str; 2] = [
+    "gemv_q8_0_k2560_x2_xbatch_wide_r16_pm",
+    "gemv_q8_0_k2560_x2_xbatch_wide_r32_pm",
+];
 /// The MQ6 symbols of the module's wide exports, for route closure.
-pub(crate) const MQ6_WIDE_SYMBOLS: [&str; 4] = [MQ6_WIDE[0], MQ6_WIDE[1], MQ6_X4_WIDE[0], MQ6_X4_WIDE[1]];
+pub(crate) const MQ6_WIDE_SYMBOLS: [&str; 4] =
+    [MQ6_WIDE[0], MQ6_WIDE[1], MQ6_X4_WIDE[0], MQ6_X4_WIDE[1]];
 /// The Q8 symbols of the module's wide exports, for route closure.
 pub(crate) const Q8_WIDE_SYMBOLS: [&str; 10] = [
-    Q8_K8_WIDE[0], Q8_K8_WIDE[1], Q8_K320_WIDE[0], Q8_K320_WIDE[1], Q8_K2560_WIDE[0], Q8_K2560_WIDE[1],
-    Q8_SMALL_WIDE[0], Q8_SMALL_WIDE[1], Q8_K2560_X2_WIDE[0], Q8_K2560_X2_WIDE[1],
+    Q8_K8_WIDE[0],
+    Q8_K8_WIDE[1],
+    Q8_K320_WIDE[0],
+    Q8_K320_WIDE[1],
+    Q8_K2560_WIDE[0],
+    Q8_K2560_WIDE[1],
+    Q8_SMALL_WIDE[0],
+    Q8_SMALL_WIDE[1],
+    Q8_K2560_X2_WIDE[0],
+    Q8_K2560_X2_WIDE[1],
 ];
 
 /// MQ6G256V2 bytes per 256-weight group.
@@ -85,9 +113,14 @@ static VERIFIED: LazyLock<Result<(), String>> = LazyLock::new(|| {
             "{MODULE}: QWEN4_LANE_ROWS_PM_GFX1151_SHA256 is not pinned; set it to the sha256sum of kernels/qwen4_lane_rows_pm_gfx1151.hxaco"
         ));
     }
-    let got: String = Sha256::digest(kernels::QWEN4_LANE_ROWS_PM_GFX1151).iter().map(|b| format!("{b:02x}")).collect();
+    let got: String = Sha256::digest(kernels::QWEN4_LANE_ROWS_PM_GFX1151)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     if got != want {
-        return Err(format!("{MODULE}: embedded image sha256 {got} is not the pinned {want}"));
+        return Err(format!(
+            "{MODULE}: embedded image sha256 {got} is not the pinned {want}"
+        ));
     }
     Ok(())
 });
@@ -139,7 +172,10 @@ fn q8_shape(m: usize, k: usize, batch: usize) -> bool {
 fn mq6_x4_shape(ms: [usize; 4], k: usize, batch: usize) -> bool {
     ms.iter().any(|&m| m > 0)
         && ms.iter().all(|&m| m == 0 || mq6_shape(m, k, batch))
-        && ms.iter().try_fold(0usize, |acc, &m| acc.checked_add(m.div_ceil(4))).is_some_and(|g| g <= u32::MAX as usize)
+        && ms
+            .iter()
+            .try_fold(0usize, |acc, &m| acc.checked_add(m.div_ceil(4)))
+            .is_some_and(|g| g <= u32::MAX as usize)
 }
 
 /// `gemv_mq6g256v2_xbatch_pm` admits `(m, k, batch)`.
@@ -200,7 +236,13 @@ pub(crate) fn q8_small_wide_admits(m: usize, k: usize, rows: usize) -> bool {
 
 fn need(name: &str, what: &str, tensor: &GpuTensor, bytes: usize) -> HipResult<()> {
     if tensor.buf.size() < bytes {
-        return Err(HipError::new(1, &format!("{name}: {what} view holds {} bytes, {bytes} required", tensor.buf.size())));
+        return Err(HipError::new(
+            1,
+            &format!(
+                "{name}: {what} view holds {} bytes, {bytes} required",
+                tensor.buf.size()
+            ),
+        ));
     }
     Ok(())
 }
@@ -227,19 +269,33 @@ impl Gpu {
     /// launch any export by name with raw blobs.
     pub fn ensure_lane_rows_pm_entry(&mut self, symbol: &str) -> HipResult<()> {
         if !self.arch_caps.is_gfx1151() {
-            return Err(refuse(symbol, "the lane-rows PM kernels are exact gfx1151 only"));
+            return Err(refuse(
+                symbol,
+                "the lane-rows PM kernels are exact gfx1151 only",
+            ));
         }
-        VERIFIED.clone().map_err(|reason| HipError::new(0, &reason))?;
+        VERIFIED
+            .clone()
+            .map_err(|reason| HipError::new(0, &reason))?;
         self.bind_thread()?;
         self.ensure_embedded_kernel(MODULE, kernels::QWEN4_LANE_ROWS_PM_GFX1151, symbol)
     }
 
     /// Verify the pinned image and load `symbol` of the module.
-    pub(crate) fn ensure_lane_rows_pm(&mut self, name: &str, symbol: &'static str) -> HipResult<()> {
+    pub(crate) fn ensure_lane_rows_pm(
+        &mut self,
+        name: &str,
+        symbol: &'static str,
+    ) -> HipResult<()> {
         if !self.arch_caps.is_gfx1151() {
-            return Err(refuse(name, "the lane-rows PM kernels are exact gfx1151 only"));
+            return Err(refuse(
+                name,
+                "the lane-rows PM kernels are exact gfx1151 only",
+            ));
         }
-        VERIFIED.clone().map_err(|reason| HipError::new(0, &reason))?;
+        VERIFIED
+            .clone()
+            .map_err(|reason| HipError::new(0, &reason))?;
         self.bind_thread()?;
         self.ensure_embedded_kernel(MODULE, kernels::QWEN4_LANE_ROWS_PM_GFX1151, symbol)
     }
@@ -280,16 +336,23 @@ impl Gpu {
             &k_val as *const _ as *mut c_void,
             &b_val as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(MQ6, [m.div_ceil(4) as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(a_ptr);
-            b.push_ptr(x_ptr);
-            b.push_ptr(y_ptr);
-            b.push_i32(m_val);
-            b.push_i32(k_val);
-            b.push_i32(b_val);
-            b
-        })
+        self.launch_maybe_blob(
+            MQ6,
+            [m.div_ceil(4) as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(b_val);
+                b
+            },
+        )
     }
 
     /// [`Gpu::gemv_mq6g256v2_xbatch_pm`] of up to four `(weight, y, m)`
@@ -338,22 +401,29 @@ impl Gpu {
         }
         params.push(&k_val as *const _ as *mut c_void);
         params.push(&b_val as *const _ as *mut c_void);
-        self.launch_maybe_blob(MQ6_X4, [grid as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            for p in a {
-                b.push_ptr(p);
-            }
-            b.push_ptr(x_ptr);
-            for p in y {
-                b.push_ptr(p);
-            }
-            for v in m {
-                b.push_i32(v);
-            }
-            b.push_i32(k_val);
-            b.push_i32(b_val);
-            b
-        })
+        self.launch_maybe_blob(
+            MQ6_X4,
+            [grid as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                for p in a {
+                    b.push_ptr(p);
+                }
+                b.push_ptr(x_ptr);
+                for p in y {
+                    b.push_ptr(p);
+                }
+                for v in m {
+                    b.push_i32(v);
+                }
+                b.push_i32(k_val);
+                b.push_i32(b_val);
+                b
+            },
+        )
     }
 
     /// `y[c] = epilogue(W · x[c])` for `c < batch` (<= [`LANE_ROWS_PM_MAX`])
@@ -399,18 +469,25 @@ impl Gpu {
             &scale as *const _ as *mut c_void,
             &hc_act as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(Q8_K8, [m.div_ceil(4) as u32, 1, 1], [256, 1, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(w_ptr);
-            b.push_ptr(x_ptr);
-            b.push_ptr(y_ptr);
-            b.push_i32(m_val);
-            b.push_i32(k_val);
-            b.push_i32(b_val);
-            b.push_f32(scale);
-            b.push_i32(hc_act);
-            b
-        })
+        self.launch_maybe_blob(
+            Q8_K8,
+            [m.div_ceil(4) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(w_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(b_val);
+                b.push_f32(scale);
+                b.push_i32(hc_act);
+                b
+            },
+        )
     }
 
     /// `y[c] = W · x[c]` for `c < batch` (<= [`LANE_ROWS_PM_MAX`]) over a
@@ -427,7 +504,10 @@ impl Gpu {
     ) -> HipResult<()> {
         const NAME: &str = "gemv_q8_0_k320_xbatch_pm";
         if !q8_k320_admits(m, K320, batch) {
-            return Err(refuse(NAME, &format!("batch {batch} in 1..=8, m {m} > 0 and 32-bit byte offsets required")));
+            return Err(refuse(
+                NAME,
+                &format!("batch {batch} in 1..=8, m {m} > 0 and 32-bit byte offsets required"),
+            ));
         }
         need(NAME, "weight", a_raw, m * (K320 / 32) * Q8_BLOCK_BYTES)?;
         need(NAME, "x", x, batch * K320 * 4)?;
@@ -444,15 +524,22 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &b_val as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(Q8_K320, [m.div_ceil(16) as u32, 1, 1], [64, 1, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(a_ptr);
-            b.push_ptr(x_ptr);
-            b.push_ptr(y_ptr);
-            b.push_i32(m_val);
-            b.push_i32(b_val);
-            b
-        })
+        self.launch_maybe_blob(
+            Q8_K320,
+            [m.div_ceil(16) as u32, 1, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(b_val);
+                b
+            },
+        )
     }
 }
 

@@ -152,7 +152,13 @@ fn f32_to_f16_rne(x: f32) -> u16 {
     let m = b & 0x7F_FFFF;
     if e == 255 {
         // Inf/NaN -> Inf/NaN
-        return s | 0x7C00 | if m == 0 { 0 } else { ((m >> 13) as u16) | 0x0200 };
+        return s
+            | 0x7C00
+            | if m == 0 {
+                0
+            } else {
+                ((m >> 13) as u16) | 0x0200
+            };
     }
     let e16 = e - 112; // unbiased f16 exponent + 15
     if e16 >= 31 {
@@ -210,7 +216,11 @@ fn e4m3_decode(b: u8) -> f32 {
         return if s == 1 { -v } else { v };
     }
     let v = (8 + m) as f32 / 8.0 * 2.0f32.powi(e as i32 - 7);
-    if s == 1 { -v } else { v }
+    if s == 1 {
+        -v
+    } else {
+        v
+    }
 }
 
 struct E4M3Table {
@@ -291,7 +301,11 @@ impl E4M3Table {
         } else {
             // tie: even means LSB of the 3-bit mantissa field is 0.
             let even0 = (b0 & 1) == 0;
-            if even0 { b0 } else { b1 }
+            if even0 {
+                b0
+            } else {
+                b1
+            }
         };
         // underflow-to-zero keeps the input sign (hardware vcvt behavior);
         // the grid dedupes -0, so restore it explicitly.
@@ -347,8 +361,8 @@ fn dyadic224_scale(row: &[f32]) -> f32 {
 }
 
 struct Prelude {
-    x8: Vec<u8>,    // [n,k]
-    sums: Vec<f32>, // [n*gpr*2]
+    x8: Vec<u8>,      // [n,k]
+    sums: Vec<f32>,   // [n*gpr*2]
     scales: Vec<f32>, // [n]
 }
 
@@ -425,11 +439,7 @@ fn pack_v2_split(w: &[f32], rows: usize, k: usize) -> Vec<u8> {
                     hi = hi.max(v);
                 }
                 let step = if hi > lo { (hi - lo) / 15.0 } else { 0.0 };
-                let sb = if hi == lo {
-                    0u16
-                } else {
-                    f32_to_f16_rne(step)
-                };
+                let sb = if hi == lo { 0u16 } else { f32_to_f16_rne(step) };
                 let zb = f32_to_f16_rne(lo);
                 blob[dst + h * 4..dst + h * 4 + 2].copy_from_slice(&sb.to_le_bytes());
                 blob[dst + h * 4 + 2..dst + h * 4 + 4].copy_from_slice(&zb.to_le_bytes());
@@ -486,8 +496,8 @@ fn decode_nibble(blob: &[u8], row: usize, g: usize, gpr: usize, idx: usize) -> f
 // ─── CPU f32 reference + f64 audit + §5.1 bounds ────────────────────────────
 
 struct RefOut {
-    y_f32: Vec<f32>, // [n*m]
-    y_f64: Vec<f64>, // audit, same order
+    y_f32: Vec<f32>,      // [n*m]
+    y_f64: Vec<f64>,      // audit, same order
     bound_emit: Vec<f64>, // Bacc+Bcpu(+Bres), per element
     bq: Vec<f64>,         // observed a·Σ|w|·|xhat−x| per element
 }
@@ -522,12 +532,8 @@ fn cpu_reference(
         let mut bec = b_emit.chunks_mut(chunk * rows);
         let mut bqc = bq_v.chunks_mut(chunk * rows);
         let mut ti = 0;
-        while let (Some(y32), Some(y64), Some(be), Some(bq)) = (
-            y32c.next(),
-            y64c.next(),
-            bec.next(),
-            bqc.next(),
-        )
+        while let (Some(y32), Some(y64), Some(be), Some(bq)) =
+            (y32c.next(), y64c.next(), bec.next(), bqc.next())
         {
             let t0 = ti;
             ti += chunk;
@@ -580,8 +586,7 @@ fn cpu_reference(
                                     for j in 0..HALF {
                                         let idx = base + j;
                                         let qq = decode_nibble(blob, r, g, gpr, idx);
-                                        let wgt =
-                                            (hw[hh].z + hw[hh].s * qq) as f64;
+                                        let wgt = (hw[hh].z + hw[hh].s * qq) as f64;
                                         let xhat = xh[idx] as f64;
                                         let x0 = xor[idx] as f64;
                                         q += wgt.abs() * (xhat - x0).abs();
@@ -681,7 +686,13 @@ fn compute_metrics(dev: &[f32], y_ref: &[f32], bound: &[f64]) -> Metrics {
     let mut viol = 0usize;
     for i in 0..n {
         let b = bound[i];
-        let ratio = if b > 0.0 { absv[i] / b } else if absv[i] == 0.0 { 0.0 } else { f64::INFINITY };
+        let ratio = if b > 0.0 {
+            absv[i] / b
+        } else if absv[i] == 0.0 {
+            0.0
+        } else {
+            f64::INFINITY
+        };
         worst_ratio = worst_ratio.max(ratio);
         if absv[i] > b {
             viol += 1;
@@ -708,9 +719,7 @@ fn fnv1a64(data: &[u8]) -> u64 {
     h
 }
 fn hash_f32(v: &[f32]) -> u64 {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4)
-    };
+    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
     fnv1a64(bytes)
 }
 
@@ -923,7 +932,9 @@ fn run_cpu_suite(tab: &E4M3Table) -> Vec<CpuTest> {
     {
         let (n, k, rows) = (256usize, 256usize, 64usize);
         let mut rng = 0x1234_5678_9ABC_DEF0u64;
-        let w: Vec<f32> = (0..rows * k).map(|_| prng_f32(&mut rng) * 4.0 - 2.0).collect();
+        let w: Vec<f32> = (0..rows * k)
+            .map(|_| prng_f32(&mut rng) * 4.0 - 2.0)
+            .collect();
         let blob = pack_v2_split(&w, rows, k);
         let mut x = vec![0.0f32; n * k];
         for t in 0..n {
@@ -959,7 +970,9 @@ fn run_cpu_suite(tab: &E4M3Table) -> Vec<CpuTest> {
     {
         let (n, k, rows) = (64usize, 512usize, 32usize);
         let mut rng = 0xDEAD_BEEFu64;
-        let w: Vec<f32> = (0..rows * k).map(|_| prng_f32(&mut rng) * 2.0 - 1.0).collect();
+        let w: Vec<f32> = (0..rows * k)
+            .map(|_| prng_f32(&mut rng) * 2.0 - 1.0)
+            .collect();
         let blob = pack_v2_split(&w, rows, k);
         let x: Vec<f32> = (0..n * k).map(|_| prng_f32(&mut rng) * 6.0 - 3.0).collect();
         let pre = cpu_prelude(&x, n, k, tab);
@@ -976,7 +989,9 @@ fn run_cpu_suite(tab: &E4M3Table) -> Vec<CpuTest> {
     {
         let (n, k, rows) = (64usize, 512usize, 32usize);
         let mut rng = 0x777u64;
-        let w: Vec<f32> = (0..rows * k).map(|_| prng_f32(&mut rng) * 2.0 - 1.0).collect();
+        let w: Vec<f32> = (0..rows * k)
+            .map(|_| prng_f32(&mut rng) * 2.0 - 1.0)
+            .collect();
         let blob = pack_v2_split(&w, rows, k);
         let x: Vec<f32> = (0..n * k).map(|_| prng_f32(&mut rng) * 6.0 - 3.0).collect();
         let pre = cpu_prelude(&x, n, k, tab);
@@ -1001,7 +1016,9 @@ fn run_cpu_suite(tab: &E4M3Table) -> Vec<CpuTest> {
     {
         let (n, k) = (64usize, 512usize);
         let mut rng = 0xE950u64;
-        let x: Vec<f32> = (0..n * k).map(|_| prng_f32(&mut rng) * 400.0 - 200.0).collect();
+        let x: Vec<f32> = (0..n * k)
+            .map(|_| prng_f32(&mut rng) * 400.0 - 200.0)
+            .collect();
         let pre = cpu_prelude(&x, n, k, tab);
         let mut worst_excess = 0.0f64;
         for t in 0..n {
@@ -1036,7 +1053,10 @@ fn run_cpu_suite(tab: &E4M3Table) -> Vec<CpuTest> {
         ok(
             "weights/zero-scale-half",
             pass,
-            format!("s0={} z0={} s1={} z1={}", hw[0].s, hw[0].z, hw[1].s, hw[1].z),
+            format!(
+                "s0={} z0={} s1={} z1={}",
+                hw[0].s, hw[0].z, hw[1].s, hw[1].z
+            ),
         );
     }
 
@@ -1235,7 +1255,16 @@ mod gpu {
                 let y_g = gpu.zeros(&[n * fam.splits[0]], DType::F32).unwrap();
                 let y_u = gpu.zeros(&[n * fam.splits[1]], DType::F32).unwrap();
                 gpu.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12(
-                    &a_g, &a_u, &d_x, &y_g, &y_u, fam.splits[0], fam.splits[1], k, n, 1,
+                    &a_g,
+                    &a_u,
+                    &d_x,
+                    &y_g,
+                    &y_u,
+                    fam.splits[0],
+                    fam.splits[1],
+                    k,
+                    n,
+                    1,
                 )
                 .unwrap();
                 gpu.hip.device_synchronize().unwrap();
@@ -1247,7 +1276,13 @@ mod gpu {
                 let a = gpu.upload_raw(&blobs[0], &[blobs[0].len()]).unwrap();
                 let y = gpu.upload_f32(&y_olds[0], &[n * fam.splits[0]]).unwrap();
                 gpu.gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8(
-                    &a, &d_x, &y, fam.splits[0], k, n, 1,
+                    &a,
+                    &d_x,
+                    &y,
+                    fam.splits[0],
+                    k,
+                    n,
+                    1,
                 )
                 .unwrap();
                 gpu.hip.device_synchronize().unwrap();
@@ -1265,8 +1300,22 @@ mod gpu {
                     .map(|&m| gpu.zeros(&[n * m], DType::F32).unwrap())
                     .collect();
                 gpu.gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8(
-                    &a[0], &a[1], &a[2], &a[3], &d_x, &y[0], &y[1], &y[2], &y[3],
-                    fam.splits[0], fam.splits[1], fam.splits[2], fam.splits[3], k, n, 1,
+                    &a[0],
+                    &a[1],
+                    &a[2],
+                    &a[3],
+                    &d_x,
+                    &y[0],
+                    &y[1],
+                    &y[2],
+                    &y[3],
+                    fam.splits[0],
+                    fam.splits[1],
+                    fam.splits[2],
+                    fam.splits[3],
+                    k,
+                    n,
+                    1,
                 )
                 .unwrap();
                 gpu.hip.device_synchronize().unwrap();
@@ -1286,8 +1335,19 @@ mod gpu {
                     .map(|&m| gpu.zeros(&[n * m], DType::F32).unwrap())
                     .collect();
                 gpu.gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8(
-                    &a[0], &a[1], &a[2], &d_x, &y[0], &y[1], &y[2],
-                    fam.splits[0], fam.splits[1], fam.splits[2], k, n, 1,
+                    &a[0],
+                    &a[1],
+                    &a[2],
+                    &d_x,
+                    &y[0],
+                    &y[1],
+                    &y[2],
+                    fam.splits[0],
+                    fam.splits[1],
+                    fam.splits[2],
+                    k,
+                    n,
+                    1,
                 )
                 .unwrap();
                 gpu.hip.device_synchronize().unwrap();
@@ -1349,7 +1409,10 @@ fn main() {
         .get("n")
         .map(|v| v.split(',').map(|s| s.parse().unwrap()).collect())
         .unwrap_or_else(|| vec![512]);
-    let repeats: usize = args.get("repeats").and_then(|v| v.parse().ok()).unwrap_or(3);
+    let repeats: usize = args
+        .get("repeats")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
     let quick = args.contains_key("quick");
     let expect_v2 = args.contains_key("expect-v2");
     let time_on = std::env::var("TIME").map(|v| v == "1").unwrap_or(false);
@@ -1361,9 +1424,18 @@ fn main() {
     // ── CPU suite (always) ──
     let cpu_tests = run_cpu_suite(&tab);
     let cpu_fail = cpu_tests.iter().filter(|t| !t.pass).count();
-    println!("CPU suite: {}/{} pass", cpu_tests.len() - cpu_fail, cpu_tests.len());
+    println!(
+        "CPU suite: {}/{} pass",
+        cpu_tests.len() - cpu_fail,
+        cpu_tests.len()
+    );
     for t in cpu_tests.iter() {
-        println!("  [{}] {} — {}", if t.pass { "ok" } else { "FAIL" }, t.name, t.detail);
+        println!(
+            "  [{}] {} — {}",
+            if t.pass { "ok" } else { "FAIL" },
+            t.name,
+            t.detail
+        );
     }
 
     // ── Resolved route: incumbent s2bt8, or the staged-tile v2 aspect ──
@@ -1401,7 +1473,10 @@ fn main() {
         };
         println!("GPU: arch={} ordinal={device}", gpu.arch);
         if gpu.arch != "gfx1201" {
-            eprintln!("non-gfx1201 arch {}: incumbent fp8 routes require exact gfx1201", gpu.arch);
+            eprintln!(
+                "non-gfx1201 arch {}: incumbent fp8 routes require exact gfx1201",
+                gpu.arch
+            );
             emit(&out_dir, &cpu_tests, &cases, &time_table, "wrong-arch", t0);
             std::process::exit(1);
         }
@@ -1409,7 +1484,11 @@ fn main() {
             run_bench_canonical(&mut gpu, &out_dir, repeats);
         }
         // Small-N sweep exercises BT4/BT8/BT12-exact/masked-BT12/S2BT8 tiles.
-        let sweep_ns: Vec<usize> = if quick { vec![512] } else { vec![64, 128, 192, 256, 320, 512] };
+        let sweep_ns: Vec<usize> = if quick {
+            vec![512]
+        } else {
+            vec![64, 128, 192, 256, 320, 512]
+        };
         for fam in canonical_shapes() {
             let small = fam.k.min(512);
             // A. small-M tile sweep (routing/masking coverage, all N tiles)
@@ -1421,7 +1500,15 @@ fn main() {
                     _ => vec![128],
                 };
                 run_gpu_case(
-                    &mut gpu, &fam, &ms, small, n, repeats, time_on, &tab, &mut cases,
+                    &mut gpu,
+                    &fam,
+                    &ms,
+                    small,
+                    n,
+                    repeats,
+                    time_on,
+                    &tab,
+                    &mut cases,
                     &mut time_table,
                 );
             }
@@ -1434,21 +1521,40 @@ fn main() {
                         continue;
                     }
                     run_gpu_case(
-                        &mut gpu, &fam, &fam.splits.clone(), fam.k, n, repeats, time_on,
-                        &tab, &mut cases, &mut time_table,
+                        &mut gpu,
+                        &fam,
+                        &fam.splits.clone(),
+                        fam.k,
+                        n,
+                        repeats,
+                        time_on,
+                        &tab,
+                        &mut cases,
+                        &mut time_table,
                     );
                 }
             } else {
                 run_gpu_case(
-                    &mut gpu, &fam, &fam.splits.clone(), fam.k, 512, repeats, time_on,
-                    &tab, &mut cases, &mut time_table,
+                    &mut gpu,
+                    &fam,
+                    &fam.splits.clone(),
+                    fam.k,
+                    512,
+                    repeats,
+                    time_on,
+                    &tab,
+                    &mut cases,
+                    &mut time_table,
                 );
             }
         }
         if time_on {
             if let Some(entries) = rdna_compute::profile::stop() {
                 for e in entries {
-                    time_table.entry(e.kernel.to_string()).or_default().push(e.time_us);
+                    time_table
+                        .entry(e.kernel.to_string())
+                        .or_default()
+                        .push(e.time_us);
                 }
             }
         }
@@ -1469,11 +1575,7 @@ fn main() {
             println!("  {k:60} median {med:10.1} n={}", v.len());
         }
     }
-    println!(
-        "GPU cases: {}/{} pass",
-        cases.len() - gpu_fail,
-        cases.len()
-    );
+    println!("GPU cases: {}/{} pass", cases.len() - gpu_fail, cases.len());
     for c in cases.iter() {
         println!(
             "  [{}] {:8} N={:<5} K={:<6} M={:<7} max_abs={:.3e} tail_mse={:.3e} bound_ratio={:.3} viol={} x8mm={} {}",
@@ -1576,7 +1678,11 @@ fn run_bench_canonical(gpu: &mut rdna_compute::Gpu, out_dir: &str, timed: usize)
         "timed_repeats": timed.max(1),
         "families": fams,
     });
-    std::fs::write(format!("{out_dir}/bench.json"), serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+    std::fs::write(
+        format!("{out_dir}/bench.json"),
+        serde_json::to_string_pretty(&doc).unwrap(),
+    )
+    .unwrap();
     println!("bench verdict: {}", if fail == 0 { "pass" } else { "FAIL" });
     std::process::exit(if fail == 0 { 0 } else { 1 });
 }
@@ -1657,7 +1763,9 @@ fn run_gpu_case(
     // CPU X8 byte-equality vs the emitted prelude; S within its tree bound.
     let pre_cpu = cpu_prelude(&x, n, k, tab);
     let mut x8mm = 0usize;
-    let dump_mm = std::env::var("HIPFIRE_ORACLE_DUMP").map(|v| v == "1").unwrap_or(false);
+    let dump_mm = std::env::var("HIPFIRE_ORACLE_DUMP")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     for i in 0..n * k {
         if pre_cpu.x8[i] != first.x8[i] {
             if dump_mm && x8mm < 20 {
@@ -1718,7 +1826,11 @@ fn run_gpu_case(
     let mut worst_orig_ratio = 0.0f64;
     let mut worst_orig_viol = 0usize;
     for (si, &m) in ms.iter().enumerate() {
-        let y_old = if fam.family == "residual" { Some(y_olds[si].as_slice()) } else { None };
+        let y_old = if fam.family == "residual" {
+            Some(y_olds[si].as_slice())
+        } else {
+            None
+        };
         // Reference from the EMITTED bytes (downloaded X8/S/a), not the
         // CPU-quantized copy, so prelude byte diffs don't double-count.
         let pre_emit = Prelude {
@@ -1818,7 +1930,10 @@ fn emit(
         let mut s = v.clone();
         s.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let med = if s.is_empty() { 0.0 } else { s[s.len() / 2] };
-        times.insert(k.clone(), serde_json::json!({"median_us": med, "n": s.len()}));
+        times.insert(
+            k.clone(),
+            serde_json::json!({"median_us": med, "n": s.len()}),
+        );
     }
     let (_, g_bm, g_bn, g_bk, g_wv) = active_v2_geom();
     let g_route = if v2_enabled() { "v2" } else { "s2bt8" };
@@ -1855,9 +1970,20 @@ fn emit(
     for c in cases {
         md.push_str(&format!(
             "| {} | {} | {} | {} | {:.3e} | {:.3e} | {:.3} | {} | {:.3} | {} | {} | {} | {} |\n",
-            c.family, c.n, c.k, c.m_total, c.max_abs, c.tail_mse, c.bound_ratio,
-            c.bound_viol, c.bound_orig_ratio, c.bound_orig_viol, c.x8_mismatch,
-            c.time_us.map(|t| format!("{t:.1}")).unwrap_or_else(|| "-".into()),
+            c.family,
+            c.n,
+            c.k,
+            c.m_total,
+            c.max_abs,
+            c.tail_mse,
+            c.bound_ratio,
+            c.bound_viol,
+            c.bound_orig_ratio,
+            c.bound_orig_viol,
+            c.x8_mismatch,
+            c.time_us
+                .map(|t| format!("{t:.1}"))
+                .unwrap_or_else(|| "-".into()),
             c.verdict
         ));
     }

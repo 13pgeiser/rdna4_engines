@@ -71,7 +71,10 @@ pub struct DelayFact {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DelayStatus {
-    Resolved { producers: [Option<InstId>; 2], consumers: [Option<InstId>; 2] },
+    Resolved {
+        producers: [Option<InstId>; 2],
+        consumers: [Option<InstId>; 2],
+    },
     Ambiguous,
 }
 
@@ -79,7 +82,11 @@ impl DelayFact {
     /// Constructor for the edit layer (C6): mark a hint ambiguous after a
     /// structural change without re-resolving.
     pub fn ambiguous(hint: InstId, block: BlockId) -> Self {
-        Self { hint, block, status: DelayStatus::Ambiguous }
+        Self {
+            hint,
+            block,
+            status: DelayStatus::Ambiguous,
+        }
     }
 
     pub fn is_ambiguous(&self) -> bool {
@@ -122,7 +129,9 @@ pub enum WindowError {
     NonMemoryMember { index: usize, member: usize },
     #[error("s_clause at layout index {index}: mixed memory classes at layout index {member}")]
     MixedClass { index: usize, member: usize },
-    #[error("s_clause at layout index {index}: wait inside clause window at layout index {member}")]
+    #[error(
+        "s_clause at layout index {index}: wait inside clause window at layout index {member}"
+    )]
     WaitInsideClause { index: usize, member: usize },
     #[error("s_endpgm inside s_clause window opened at layout index {index}")]
     EndPgmInsideClause { index: usize },
@@ -137,7 +146,13 @@ pub enum WindowError {
 fn is_valu(inst: &crate::inst::Inst) -> bool {
     matches!(
         inst.form,
-        Form::Vop1 | Form::Vop2 | Form::Vop3 | Form::Vop3p | Form::Vopd | Form::Vopc | Form::Vinterp
+        Form::Vop1
+            | Form::Vop2
+            | Form::Vop3
+            | Form::Vop3p
+            | Form::Vopd
+            | Form::Vopc
+            | Form::Vinterp
     )
 }
 
@@ -147,15 +162,33 @@ fn is_valu(inst: &crate::inst::Inst) -> bool {
 /// on VALU, `TRANSNum` on TRANS). KT48 pins it: `v_rcp_f32` sits between hipcc's
 /// `VALU_DEP_3` hints and the producers their consumers read.
 pub fn is_trans(inst: &crate::inst::Inst) -> bool {
-    const TRANS: [&str; 8] = ["v_exp_f", "v_log_f", "v_rcp_f", "v_rcp_iflag_f", "v_rsq_f", "v_sqrt_f", "v_sin_f", "v_cos_f"];
-    is_valu(inst) && inst.op.name(crate::inst::Arch::Gfx1201).is_some_and(|n| TRANS.iter().any(|t| n.starts_with(t)))
+    const TRANS: [&str; 8] = [
+        "v_exp_f",
+        "v_log_f",
+        "v_rcp_f",
+        "v_rcp_iflag_f",
+        "v_rsq_f",
+        "v_sqrt_f",
+        "v_sin_f",
+        "v_cos_f",
+    ];
+    is_valu(inst)
+        && inst
+            .op
+            .name(crate::inst::Arch::Gfx1201)
+            .is_some_and(|n| TRANS.iter().any(|t| n.starts_with(t)))
 }
 
 /// What `VALU_DEP_n` counts: issued VALUs other than TRANS.
-pub fn counts_for_valu_dep(inst: &crate::inst::Inst) -> bool { is_valu(inst) && !is_trans(inst) }
+pub fn counts_for_valu_dep(inst: &crate::inst::Inst) -> bool {
+    is_valu(inst) && !is_trans(inst)
+}
 
 fn is_salu(inst: &crate::inst::Inst) -> bool {
-    matches!(inst.form, Form::Sop1 | Form::Sop2 | Form::Sopc | Form::Sopk | Form::Sopp)
+    matches!(
+        inst.form,
+        Form::Sop1 | Form::Sop2 | Form::Sopc | Form::Sopk | Form::Sopp
+    )
 }
 
 /// What an INSTID value names: `None` = NO_DEP, the n-th previous non-TRANS VALU, the
@@ -221,20 +254,31 @@ pub fn check_windows(body: &Body) -> Result<WindowFacts, WindowError> {
                     if containing_block(body, member) != Some(block) {
                         return Err(WindowError::CrossesLeader { index: pos, len });
                     }
-                    let minst =
-                        body.insts.get(member).expect("layout references live insts");
+                    let minst = body
+                        .insts
+                        .get(member)
+                        .expect("layout references live insts");
                     if matches!(minst.effects.control, Control::EndPgm) {
                         return Err(WindowError::EndPgmInsideClause { index: pos });
                     }
                     if matches!(minst.effects.control, Control::Wait) {
-                        return Err(WindowError::WaitInsideClause { index: pos, member: mpos });
+                        return Err(WindowError::WaitInsideClause {
+                            index: pos,
+                            member: mpos,
+                        });
                     }
                     let Some(mem) = &minst.effects.mem else {
-                        return Err(WindowError::NonMemoryMember { index: pos, member: mpos });
+                        return Err(WindowError::NonMemoryMember {
+                            index: pos,
+                            member: mpos,
+                        });
                     };
                     if let Some(first) = class {
                         if mem.class != first {
-                            return Err(WindowError::MixedClass { index: pos, member: mpos });
+                            return Err(WindowError::MixedClass {
+                                index: pos,
+                                member: mpos,
+                            });
                         }
                     } else {
                         class = Some(mem.class);
@@ -249,9 +293,14 @@ pub fn check_windows(body: &Body) -> Result<WindowFacts, WindowError> {
                 });
             }
             Control::Delay => {
-                let hint = inst.mods.delay.ok_or(WindowError::HintMissing { index: pos })?;
+                let hint = inst
+                    .mods
+                    .delay
+                    .ok_or(WindowError::HintMissing { index: pos })?;
                 let block = containing_block(body, id).expect("inst is laid out in a block");
-                facts.delays.push(resolve_delay(body, id, block, pos, hint)?);
+                facts
+                    .delays
+                    .push(resolve_delay(body, id, block, pos, hint)?);
             }
             _ => {}
         }
@@ -329,7 +378,10 @@ fn back_search(body: &Body, block: BlockId, pos: usize, need: IdNeed) -> BackRes
     let (counts, need): (fn(&crate::inst::Inst) -> bool, usize) = match need {
         IdNeed::Valu(n) => (counts_for_valu_dep, n),
         IdNeed::Trans(n) => (is_trans, n),
-        IdNeed::Salu => (|i: &crate::inst::Inst| is_salu(i) && i.effects.control != Control::Delay, 1),
+        IdNeed::Salu => (
+            |i: &crate::inst::Inst| is_salu(i) && i.effects.control != Control::Delay,
+            1,
+        ),
         IdNeed::None | IdNeed::Unknown => return BackResult::Ambiguous,
     };
     let mut seen = 0usize;
@@ -343,7 +395,9 @@ fn back_search(body: &Body, block: BlockId, pos: usize, need: IdNeed) -> BackRes
             let candidate = body.layout[j];
             if counts(body.insts.get(candidate).expect("laid out")) {
                 seen += 1;
-                if seen == need { return BackResult::Found(candidate); }
+                if seen == need {
+                    return BackResult::Found(candidate);
+                }
             }
         }
         let preds = &body.blocks[cur.0].preds;
@@ -395,7 +449,11 @@ mod tests {
         for inst in insts {
             layout.push(arena.insert(inst));
         }
-        Body { insts: arena, blocks: Vec::new(), layout }
+        Body {
+            insts: arena,
+            blocks: Vec::new(),
+            layout,
+        }
     }
 
     fn mem(name: &str, form: Form, class: MemClass) -> Inst {
@@ -419,7 +477,11 @@ mod tests {
     fn delay_hint(instid0: u8, instskip: u8, instid1: u8) -> Inst {
         let mut inst = mk("s_delay_alu", Form::Sopp);
         inst.effects.control = Control::Delay;
-        inst.mods.delay = Some(DelayAluHint { instid0, instskip, instid1 });
+        inst.mods.delay = Some(DelayAluHint {
+            instid0,
+            instskip,
+            instid1,
+        });
         inst
     }
 
@@ -458,11 +520,21 @@ mod tests {
         let mut entry = mk("s_branch", Form::Sopp);
         entry.effects.control = Control::Jump;
         entry.operands.push(Operand::Imm(ImmField::Sopp(0)));
-        let mut body = body_of(vec![valu(), entry, valu(), delay_hint(2, 0, 0), valu(), endpgm()]);
+        let mut body = body_of(vec![
+            valu(),
+            entry,
+            valu(),
+            delay_hint(2, 0, 0),
+            valu(),
+            endpgm(),
+        ]);
         build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         assert_eq!(body.blocks.len(), 2);
         let facts = check_windows(&body).unwrap();
-        assert_eq!(facts.delays[0].producers(), Some([Some(body.layout[0]), None]));
+        assert_eq!(
+            facts.delays[0].producers(),
+            Some([Some(body.layout[0]), None])
+        );
     }
 
     #[test]
@@ -478,7 +550,10 @@ mod tests {
         let mut body = body_of(vec![delay_hint(0, 0, 0), valu(), valu(), back, endpgm()]);
         build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         assert_eq!(body.blocks[0].range, (0, 1));
-        assert_eq!(check_windows(&body), Err(WindowError::DelayCrossesLeader { index: 0 }));
+        assert_eq!(
+            check_windows(&body),
+            Err(WindowError::DelayCrossesLeader { index: 0 })
+        );
     }
     #[test]
     fn smem_clause_of_mixed_widths_validates() {
@@ -537,26 +612,39 @@ mod tests {
         build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         assert_eq!(
             check_windows(&body),
-            Err(WindowError::WaitInsideClause { index: 0, member: 2 })
+            Err(WindowError::WaitInsideClause {
+                index: 0,
+                member: 2
+            })
         );
         // Non-memory member.
         let mut body = body_of(vec![clause_opener(0), valu(), endpgm()]);
         build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         assert_eq!(
             check_windows(&body),
-            Err(WindowError::NonMemoryMember { index: 0, member: 1 })
+            Err(WindowError::NonMemoryMember {
+                index: 0,
+                member: 1
+            })
         );
         // Mixed classes.
         let mut body = body_of(vec![
             clause_opener(1),
             mem("s_load_b32", Form::Smem, MemClass::SmemLoad),
-            mem("global_load_b32", Form::Vmem(crate::inst::VmemForm::Global), MemClass::VmemLoad),
+            mem(
+                "global_load_b32",
+                Form::Vmem(crate::inst::VmemForm::Global),
+                MemClass::VmemLoad,
+            ),
             endpgm(),
         ]);
         build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         assert_eq!(
             check_windows(&body),
-            Err(WindowError::MixedClass { index: 0, member: 2 })
+            Err(WindowError::MixedClass {
+                index: 0,
+                member: 2
+            })
         );
         // s_endpgm inside.
         let mut body = body_of(vec![
@@ -574,13 +662,7 @@ mod tests {
     #[test]
     fn delay_resolves_producers_and_consumers_in_block() {
         // valu@0 valu@1 hint@2(VALU_DEP_1, SAME, VALU_DEP_1) consumer@3 endpgm@4.
-        let mut body = body_of(vec![
-            valu(),
-            valu(),
-            delay_hint(1, 0, 1),
-            valu(),
-            endpgm(),
-        ]);
+        let mut body = body_of(vec![valu(), valu(), delay_hint(1, 0, 1), valu(), endpgm()]);
         build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         let facts = check_windows(&body).unwrap();
         assert_eq!(facts.delays.len(), 1);
@@ -633,7 +715,9 @@ mod instid1_tests {
     use crate::operand::DelayAluHint;
     use crate::passes::cfg::build_blocks;
 
-    fn decoded(words: &[u32]) -> Inst { crate::codec::gfx12::decode(words).unwrap().0 }
+    fn decoded(words: &[u32]) -> Inst {
+        crate::codec::gfx12::decode(words).unwrap().0
+    }
 
     /// RDNA4 ISA §16.5 p270, `S_DELAY_ALU` example: INSTID1 counts back from the
     /// instruction INSTSKIP selects, so the skipped VALU is `VALU_DEP_1` of the third.
@@ -650,14 +734,29 @@ mod instid1_tests {
             decoded(&[0x1014_170d]), // v_mul_f32_e32 v10, v13, v11
             decoded(&[0xbfb0_0000]), // s_endpgm
         ];
-        assert_eq!(insts[3].mods.delay, Some(DelayAluHint { instid0: 3, instskip: 2, instid1: 1 }));
+        assert_eq!(
+            insts[3].mods.delay,
+            Some(DelayAluHint {
+                instid0: 3,
+                instskip: 2,
+                instid1: 1
+            })
+        );
         let mut arena: Arena<Inst> = Arena::new();
         let layout: Vec<_> = insts.into_iter().map(|i| arena.insert(i)).collect();
-        let mut body = Body { insts: arena, blocks: Vec::new(), layout };
+        let mut body = Body {
+            insts: arena,
+            blocks: Vec::new(),
+            layout,
+        };
         build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         let facts = check_windows(&body).unwrap();
         let l = &body.layout;
         assert_eq!(facts.delays[0].consumers(), Some([Some(l[4]), Some(l[6])]));
-        assert_eq!(facts.delays[0].producers(), Some([Some(l[0]), Some(l[5])]), "v_mov v3 for v_add; v_sub v11 for v_mul");
+        assert_eq!(
+            facts.delays[0].producers(),
+            Some([Some(l[0]), Some(l[5])]),
+            "v_mov v3 for v_add; v_sub v11 for v_mul"
+        );
     }
 }

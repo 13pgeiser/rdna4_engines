@@ -187,9 +187,7 @@ fn id_sets(rng: &mut Rng) -> Vec<Vec<u32>> {
 // (`embedding.rs:329`), grid [n], block 256. Pure widen: exact.
 fn embedding_bf16_batched(gpu: &mut Gpu) -> Result<String, String> {
     let table_bytes = fill_bf16_table(VOCAB, HIDDEN, 0xE0B0_0001);
-    let mut table = gpu
-        .upload_raw(&table_bytes, &[VOCAB, HIDDEN])
-        .map_err(e)?;
+    let mut table = gpu.upload_raw(&table_bytes, &[VOCAB, HIDDEN]).map_err(e)?;
     table.dtype = DType::BF16; // byte_size = 2 * numel = payload
     let mut rng = Rng::new(0xE001);
     let mut results = Vec::new();
@@ -210,7 +208,10 @@ fn embedding_bf16_batched(gpu: &mut Gpu) -> Result<String, String> {
             );
         }
         results.push(exact_f32(
-            &format!("embedding_bf16 n={n} ids[..2]={:?}", &ids[..ids.len().min(2)]),
+            &format!(
+                "embedding_bf16 n={n} ids[..2]={:?}",
+                &ids[..ids.len().min(2)]
+            ),
             &got,
             &want,
         ));

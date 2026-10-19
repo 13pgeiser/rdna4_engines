@@ -103,18 +103,32 @@ const GFX942: Caps = Caps {
 
 impl Arch {
     pub const ALL: &'static [Arch] = &[Arch::Gfx942];
-    pub fn caps(self) -> &'static Caps { match self { Arch::Gfx942 => &GFX942 } }
-    pub fn name(self) -> &'static str { self.caps().name }
-    pub fn has_mai(self, op: MaiOp) -> bool { self.caps().mai.contains(&op) }
+    pub fn caps(self) -> &'static Caps {
+        match self {
+            Arch::Gfx942 => &GFX942,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        self.caps().name
+    }
+    pub fn has_mai(self, op: MaiOp) -> bool {
+        self.caps().mai.contains(&op)
+    }
 }
 
 impl std::str::FromStr for Arch {
     type Err = String;
     fn from_str(s: &str) -> Result<Self> {
-        Arch::ALL.iter().copied().find(|a| a.name() == s).ok_or_else(|| format!("unsupported CDNA architecture {s}"))
+        Arch::ALL
+            .iter()
+            .copied()
+            .find(|a| a.name() == s)
+            .ok_or_else(|| format!("unsupported CDNA architecture {s}"))
     }
 }
 
 impl std::fmt::Display for Arch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.name()) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
 }

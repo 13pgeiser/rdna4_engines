@@ -291,9 +291,8 @@ mod tests {
 
     #[test]
     fn append_route_row_window_and_gates() {
-        let route = |prefill, arch, rows, pm| {
-            qwen4_append_wmma_route(true, prefill, arch, rows, 64, pm)
-        };
+        let route =
+            |prefill, arch, rows, pm| qwen4_append_wmma_route(true, prefill, arch, rows, 64, pm);
         assert!(!route(true, "gfx1151", 63, false));
         assert!(route(true, "gfx1151", 64, false));
         assert!(route(true, "gfx1151", 511, false));
@@ -347,7 +346,10 @@ mod tests {
                 "{arch}"
             );
         }
-        assert_eq!(mtp_k_default(5, qwen4_row_exact_verify_rows("gfx1151")), MTP_K_DEFAULT);
+        assert_eq!(
+            mtp_k_default(5, qwen4_row_exact_verify_rows("gfx1151")),
+            MTP_K_DEFAULT
+        );
     }
 }
 
@@ -377,12 +379,24 @@ mod wide_verify_tests {
         assert_eq!(wide_verify_rows_override_value(Some("")), None);
         assert_eq!(wide_verify_rows_override_value(Some("x")), None);
         assert_eq!(wide_verify_rows_override_value(Some("-3")), None);
-        assert_eq!(wide_verify_rows_override_value(Some("0")), Some(FEW_ROW_ROUTE_ROWS));
-        assert_eq!(wide_verify_rows_override_value(Some("5")), Some(FEW_ROW_ROUTE_ROWS));
+        assert_eq!(
+            wide_verify_rows_override_value(Some("0")),
+            Some(FEW_ROW_ROUTE_ROWS)
+        );
+        assert_eq!(
+            wide_verify_rows_override_value(Some("5")),
+            Some(FEW_ROW_ROUTE_ROWS)
+        );
         assert_eq!(wide_verify_rows_override_value(Some(" 16 ")), Some(16));
         assert_eq!(wide_verify_rows_override_value(Some("32")), Some(32));
-        assert_eq!(wide_verify_rows_override_value(Some("33")), Some(WIDE_VERIFY_MAX_ROWS));
-        assert_eq!(wide_verify_rows_override_value(Some("9999")), Some(WIDE_VERIFY_MAX_ROWS));
+        assert_eq!(
+            wide_verify_rows_override_value(Some("33")),
+            Some(WIDE_VERIFY_MAX_ROWS)
+        );
+        assert_eq!(
+            wide_verify_rows_override_value(Some("9999")),
+            Some(WIDE_VERIFY_MAX_ROWS)
+        );
     }
 
     #[test]
@@ -399,9 +413,15 @@ mod wide_verify_tests {
     fn runtime_override_clamps_and_clears() {
         // The runtime static is process-global: set, observe, clear.
         set_qwen4_wide_verify_rows_override(Some(4));
-        assert_eq!(QWEN4_WIDE_VERIFY_ROWS_RUNTIME.load(Ordering::Relaxed), FEW_ROW_ROUTE_ROWS);
+        assert_eq!(
+            QWEN4_WIDE_VERIFY_ROWS_RUNTIME.load(Ordering::Relaxed),
+            FEW_ROW_ROUTE_ROWS
+        );
         set_qwen4_wide_verify_rows_override(Some(999));
-        assert_eq!(QWEN4_WIDE_VERIFY_ROWS_RUNTIME.load(Ordering::Relaxed), WIDE_VERIFY_MAX_ROWS);
+        assert_eq!(
+            QWEN4_WIDE_VERIFY_ROWS_RUNTIME.load(Ordering::Relaxed),
+            WIDE_VERIFY_MAX_ROWS
+        );
         set_qwen4_wide_verify_rows_override(None);
         assert_eq!(QWEN4_WIDE_VERIFY_ROWS_RUNTIME.load(Ordering::Relaxed), 0);
     }
@@ -437,7 +457,9 @@ mod few_row_groups_tests {
         for rows in 1..=WIDE_VERIFY_MAX_ROWS {
             let groups: Vec<_> = few_row_groups(rows).collect();
             assert_eq!(groups.iter().map(|g| g.1).sum::<usize>(), rows);
-            assert!(groups.iter().all(|g| (1..=FEW_ROW_ROUTE_ROWS).contains(&g.1)));
+            assert!(groups
+                .iter()
+                .all(|g| (1..=FEW_ROW_ROUTE_ROWS).contains(&g.1)));
             assert!(groups.windows(2).all(|w| w[0].0 + w[0].1 == w[1].0));
         }
     }

@@ -95,8 +95,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 type Result<T, E = String> = std::result::Result<T, E>;
-fn err(e: impl std::fmt::Debug) -> String { format!("{e:?}") }
-fn sha256(b: &[u8]) -> String { format!("{:x}", Sha256::digest(b)) }
+fn err(e: impl std::fmt::Debug) -> String {
+    format!("{e:?}")
+}
+fn sha256(b: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(b))
+}
 
 const TENSOR_OPS_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq_fwht256.h"),
@@ -112,11 +116,17 @@ const SCORE_SCRATCH_BYTES: usize = 64 << 20;
 const POISON: u8 = 0xa5;
 
 fn snapshots(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    let mut entries: Vec<_> = std::fs::read_dir(dir).map_err(err)?.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .map_err(err)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
     entries.sort();
     for p in entries {
         if p.is_dir() {
-            if p.file_name().is_some_and(|n| n == "pre-prologue") { continue }
+            if p.file_name().is_some_and(|n| n == "pre-prologue") {
+                continue;
+            }
             snapshots(&p, out)?;
         } else if p.file_name().is_some_and(|n| n == "snapshot.json") {
             out.push(p);
@@ -126,20 +136,49 @@ fn snapshots(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Impl { Hipcc, Pm }
+enum Impl {
+    Hipcc,
+    Pm,
+}
 
-struct Pm { _module: Module, score: Option<Function>, score_bf16: Option<Function>, select: Option<Function> }
+struct Pm {
+    _module: Module,
+    score: Option<Function>,
+    score_bf16: Option<Function>,
+    select: Option<Function>,
+}
 
 /// One original select call's geometry.
 #[derive(Clone, Copy)]
-struct Call { rows: usize, stride: usize, block_count: usize, dim: usize, compress: usize, position_start: usize, budget: usize, capacity: usize }
-
-impl Call {
-    fn group(&self) -> usize { (SCORE_SCRATCH_BYTES / (self.block_count * 4) / 16 * 16).max(16).min(self.rows) }
-    fn row_blocks(&self, row: usize) -> usize { ((self.position_start + row + 1) / self.compress).min(self.block_count) }
+struct Call {
+    rows: usize,
+    stride: usize,
+    block_count: usize,
+    dim: usize,
+    compress: usize,
+    position_start: usize,
+    budget: usize,
+    capacity: usize,
 }
 
-struct Bufs { query: GpuTensor, pooled: GpuTensor, scores: GpuTensor, selected: GpuTensor, mirror: GpuTensor }
+impl Call {
+    fn group(&self) -> usize {
+        (SCORE_SCRATCH_BYTES / (self.block_count * 4) / 16 * 16)
+            .max(16)
+            .min(self.rows)
+    }
+    fn row_blocks(&self, row: usize) -> usize {
+        ((self.position_start + row + 1) / self.compress).min(self.block_count)
+    }
+}
+
+struct Bufs {
+    query: GpuTensor,
+    pooled: GpuTensor,
+    scores: GpuTensor,
+    selected: GpuTensor,
+    mirror: GpuTensor,
+}
 
 fn score_blob(c: &Call, b: &Bufs, g0: usize, n: usize) -> KernargBlob {
     let mut a = KernargBlob::new();
@@ -168,47 +207,98 @@ fn select_blob(c: &Call, b: &Bufs, g0: usize, n: usize, last: bool) -> KernargBl
     a.push_i32(c.compress as i32);
     a.push_i32((c.position_start + g0) as i32);
     a.push_i32(c.capacity as i32);
-    a.push_ptr(if last { b.mirror.buf.as_ptr() } else { std::ptr::null_mut() });
+    a.push_ptr(if last {
+        b.mirror.buf.as_ptr()
+    } else {
+        std::ptr::null_mut()
+    });
     a.pad_to(16);
     a
 }
 
-fn launch(gpu: &mut Gpu, pm: &Option<Pm>, which: Impl, score: bool, grid: [u32; 3], blob: &mut KernargBlob) -> Result<()> {
+fn launch(
+    gpu: &mut Gpu,
+    pm: &Option<Pm>,
+    which: Impl,
+    score: bool,
+    grid: [u32; 3],
+    blob: &mut KernargBlob,
+) -> Result<()> {
     match which {
         Impl::Hipcc => gpu
-            .launch_kernel_blob(if score { HIPCC_SCORE } else { HIPCC_SELECT }, grid, [256, 1, 1], 0, blob.as_mut_slice())
+            .launch_kernel_blob(
+                if score { HIPCC_SCORE } else { HIPCC_SELECT },
+                grid,
+                [256, 1, 1],
+                0,
+                blob.as_mut_slice(),
+            )
             .map_err(err),
         Impl::Pm => {
             let pm = pm.as_ref().ok_or("--pm-image required for a pm arm")?;
-            let f = if score { pm.score.as_ref() } else { pm.select.as_ref() }.ok_or("pm image lacks the symbol")?;
-            unsafe { gpu.hip.launch_kernel_blob(f, grid, [256, 1, 1], 0, None, blob.as_mut_slice()) }.map_err(err)
+            let f = if score {
+                pm.score.as_ref()
+            } else {
+                pm.select.as_ref()
+            }
+            .ok_or("pm image lacks the symbol")?;
+            unsafe {
+                gpu.hip
+                    .launch_kernel_blob(f, grid, [256, 1, 1], 0, None, blob.as_mut_slice())
+            }
+            .map_err(err)
         }
     }
 }
 
-struct Timing { score_ms: f64, select_ms: f64 }
+struct Timing {
+    score_ms: f64,
+    select_ms: f64,
+}
 
 /// The production pair over all groups. `keep` downloads each group's
 /// scratch after its score launch (rows x block_count, raw bytes).
-fn run_call(gpu: &mut Gpu, pm: &Option<Pm>, c: &Call, b: &Bufs, arms: (Impl, Impl), mut keep: Option<&mut Vec<u8>>,
-            events: Option<&[hip_bridge::Event; 3]>) -> Result<Timing> {
+fn run_call(
+    gpu: &mut Gpu,
+    pm: &Option<Pm>,
+    c: &Call,
+    b: &Bufs,
+    arms: (Impl, Impl),
+    mut keep: Option<&mut Vec<u8>>,
+    events: Option<&[hip_bridge::Event; 3]>,
+) -> Result<Timing> {
     let group = c.group();
     let (mut score_ms, mut select_ms) = (0.0f64, 0.0f64);
     let mut g0 = 0;
     while g0 < c.rows {
         let n = group.min(c.rows - g0);
         if keep.is_some() {
-            gpu.hip.memset(&b.scores.buf, POISON as i32, b.scores.byte_size()).map_err(err)?;
+            gpu.hip
+                .memset(&b.scores.buf, POISON as i32, b.scores.byte_size())
+                .map_err(err)?;
         }
         let mut blob = score_blob(c, b, g0, n);
-        if let Some(e) = events { gpu.hip.event_record(&e[0], None).map_err(err)?; }
-        launch(gpu, pm, arms.0, true, [c.block_count.div_ceil(256) as u32, n.div_ceil(16) as u32, 1], &mut blob)?;
-        if let Some(e) = events { gpu.hip.event_record(&e[1], None).map_err(err)?; }
+        if let Some(e) = events {
+            gpu.hip.event_record(&e[0], None).map_err(err)?;
+        }
+        launch(
+            gpu,
+            pm,
+            arms.0,
+            true,
+            [c.block_count.div_ceil(256) as u32, n.div_ceil(16) as u32, 1],
+            &mut blob,
+        )?;
+        if let Some(e) = events {
+            gpu.hip.event_record(&e[1], None).map_err(err)?;
+        }
         if let Some(k) = keep.as_deref_mut() {
             gpu.hip.device_synchronize().map_err(err)?;
             let mut bytes = vec![0u8; n * c.block_count * 4];
             let len = bytes.len();
-            gpu.hip.memcpy_dtoh(&mut bytes, &b.scores.buf.byte_view(0, len)).map_err(err)?;
+            gpu.hip
+                .memcpy_dtoh(&mut bytes, &b.scores.buf.byte_view(0, len))
+                .map_err(err)?;
             k.extend_from_slice(&bytes);
         }
         let mut blob = select_blob(c, b, g0, n, g0 + n == c.rows);
@@ -222,7 +312,10 @@ fn run_call(gpu: &mut Gpu, pm: &Option<Pm>, c: &Call, b: &Bufs, arms: (Impl, Imp
         g0 += n;
     }
     gpu.hip.device_synchronize().map_err(err)?;
-    Ok(Timing { score_ms, select_ms })
+    Ok(Timing {
+        score_ms,
+        select_ms,
+    })
 }
 
 fn download(gpu: &Gpu, t: &GpuTensor) -> Result<Vec<u8>> {
@@ -232,8 +325,12 @@ fn download(gpu: &Gpu, t: &GpuTensor) -> Result<Vec<u8>> {
 }
 
 fn poison_outputs(gpu: &Gpu, b: &Bufs) -> Result<()> {
-    gpu.hip.memset(&b.selected.buf, POISON as i32, b.selected.byte_size()).map_err(err)?;
-    gpu.hip.memset(&b.mirror.buf, POISON as i32, b.mirror.byte_size()).map_err(err)
+    gpu.hip
+        .memset(&b.selected.buf, POISON as i32, b.selected.byte_size())
+        .map_err(err)?;
+    gpu.hip
+        .memset(&b.mirror.buf, POISON as i32, b.mirror.byte_size())
+        .map_err(err)
 }
 
 // ------------------------------------------------------------ BF16 route
@@ -253,11 +350,24 @@ const LAB_SIG: &str = "extern \"C\" __global__ void qsa_bf16_batched_score_only_
     int* mirror, float* scores_global, int scores_stride) {";
 
 fn widen_bf16(bytes: &[u8]) -> Vec<f32> {
-    bytes.chunks_exact(2).map(|b| f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16)).collect()
+    bytes
+        .chunks_exact(2)
+        .map(|b| f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16))
+        .collect()
 }
 
-fn le_u32(bytes: &[u8]) -> Vec<u32> { bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect() }
-fn le_i32(bytes: &[u8]) -> Vec<i32> { bytes.chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect() }
+fn le_u32(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        .collect()
+}
+fn le_i32(bytes: &[u8]) -> Vec<i32> {
+    bytes
+        .chunks_exact(4)
+        .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+        .collect()
+}
 
 /// The appended lab kernel: the live source's `qsa_select_batched` body
 /// through its first `__syncthreads` (the -1 fill and every block score),
@@ -265,12 +375,19 @@ fn le_i32(bytes: &[u8]) -> Vec<i32> { bytes.chunks_exact(4).map(|b| i32::from_le
 /// pre-selection phase exactly.
 fn lab_source() -> Result<String> {
     let marker = "static __device__ __forceinline__ void qsa_select_batched(";
-    let start = TENSOR_OPS_SRC.find(marker).ok_or("qsa_select_batched not found in tensor_ops source")?;
+    let start = TENSOR_OPS_SRC
+        .find(marker)
+        .ok_or("qsa_select_batched not found in tensor_ops source")?;
     let after = &TENSOR_OPS_SRC[start + marker.len()..];
-    let open = after.find(") {").ok_or("qsa_select_batched signature end not found")?;
+    let open = after
+        .find(") {")
+        .ok_or("qsa_select_batched signature end not found")?;
     let rest = &after[open + 3..];
     let sync = "__syncthreads();";
-    let end = rest.find(sync).ok_or("qsa_select_batched first __syncthreads not found")? + sync.len();
+    let end = rest
+        .find(sync)
+        .ok_or("qsa_select_batched first __syncthreads not found")?
+        + sync.len();
     let mut s = String::from(TENSOR_OPS_SRC);
     s.push('\n');
     s.push_str(LAB_SIG);
@@ -281,35 +398,63 @@ fn lab_source() -> Result<String> {
 
 /// Production fused-launch geometry for shape bound `shape` plus its score
 /// scratch (global mode only).
-struct Fused { shape: usize, stride: usize, global: bool, scratch: Option<GpuTensor> }
+struct Fused {
+    shape: usize,
+    stride: usize,
+    global: bool,
+    scratch: Option<GpuTensor>,
+}
 
 impl Fused {
     fn new(gpu: &Gpu, shape: usize) -> Result<Fused> {
-        if shape == 0 { return Err("shape blocks must be > 0".into()) }
+        if shape == 0 {
+            return Err("shape blocks must be > 0".into());
+        }
         let global = shape * 4 + STATIC_LDS_BYTES > LDS_LIMIT_BYTES;
         let stride = shape.div_ceil(4) * 4;
         let scratch = if global {
             let bytes = GLOBAL_ROWS * stride * 4;
-            Some(gpu.upload_raw(&vec![POISON; bytes], &[bytes]).map_err(err)?)
-        } else { None };
-        Ok(Fused { shape, stride, global, scratch })
+            Some(
+                gpu.upload_raw(&vec![POISON; bytes], &[bytes])
+                    .map_err(err)?,
+            )
+        } else {
+            None
+        };
+        Ok(Fused {
+            shape,
+            stride,
+            global,
+            scratch,
+        })
     }
     /// `(first, rows)` launch groups: 256-row groups past the LDS row, else one.
     fn groups(&self, c: &Call) -> Vec<(usize, usize)> {
         if self.global && c.rows > GLOBAL_ROWS {
-            (0..c.rows).step_by(GLOBAL_ROWS).map(|first| (first, GLOBAL_ROWS.min(c.rows - first))).collect()
+            (0..c.rows)
+                .step_by(GLOBAL_ROWS)
+                .map(|first| (first, GLOBAL_ROWS.min(c.rows - first)))
+                .collect()
         } else {
             vec![(0, c.rows)]
         }
     }
     fn free(self, gpu: &mut Gpu) -> Result<()> {
-        match self.scratch { Some(s) => gpu.free_tensor(s).map_err(err), None => Ok(()) }
+        match self.scratch {
+            Some(s) => gpu.free_tensor(s).map_err(err),
+            None => Ok(()),
+        }
     }
 }
 
 /// Query/pooled/selected/mirror of one fused launch (selected/mirror may be
 /// guarded sub-views).
-struct Io<'a> { query: &'a GpuTensor, pooled: &'a GpuTensor, selected: &'a GpuTensor, mirror: &'a GpuTensor }
+struct Io<'a> {
+    query: &'a GpuTensor,
+    pooled: &'a GpuTensor,
+    selected: &'a GpuTensor,
+    mirror: &'a GpuTensor,
+}
 
 /// Production raw ABI: ptr(query, pooled, selected), i32(rows, stride,
 /// block_count, heads4, dim128, budget, compress, position_start, capacity),
@@ -319,7 +464,9 @@ fn fused_blob(c: &Call, io: &Io, f: &Fused, first: usize, rows: usize, last: boo
     let mut a = KernargBlob::new();
     a.push_ptr(unsafe { (io.query.buf.as_ptr() as *const f32).add(first * c.stride) } as *const _);
     a.push_ptr(io.pooled.buf.as_ptr());
-    a.push_ptr(unsafe { (io.selected.buf.as_ptr() as *const u8).add(first * c.capacity * 4) } as *const _);
+    a.push_ptr(
+        unsafe { (io.selected.buf.as_ptr() as *const u8).add(first * c.capacity * 4) } as *const _,
+    );
     a.push_i32(rows as i32);
     a.push_i32(c.stride as i32);
     a.push_i32(((c.position_start + first + rows) / c.compress) as i32);
@@ -329,8 +476,16 @@ fn fused_blob(c: &Call, io: &Io, f: &Fused, first: usize, rows: usize, last: boo
     a.push_i32(c.compress as i32);
     a.push_i32((c.position_start + first) as i32);
     a.push_i32(c.capacity as i32);
-    a.push_ptr(if last { io.mirror.buf.as_ptr() } else { std::ptr::null_mut() });
-    a.push_ptr(f.scratch.as_ref().map_or(std::ptr::null_mut(), |s| s.buf.as_ptr()));
+    a.push_ptr(if last {
+        io.mirror.buf.as_ptr()
+    } else {
+        std::ptr::null_mut()
+    });
+    a.push_ptr(
+        f.scratch
+            .as_ref()
+            .map_or(std::ptr::null_mut(), |s| s.buf.as_ptr()),
+    );
     a.push_i32(f.stride as i32);
     a.pad_to(16);
     a
@@ -340,12 +495,23 @@ fn fused_blob(c: &Call, io: &Io, f: &Fused, first: usize, rows: usize, last: boo
 /// the canonical `rows * block_count` layout (`canon` stays poison elsewhere)
 /// and report whether every scratch byte outside the causal extents, including
 /// every allocated row past `group_rows`, is still poison.
-fn extract_scores(scratch: &[u8], row_bytes: usize, group_rows: usize, first: usize, c: &Call, canon: &mut [u8]) -> bool {
+fn extract_scores(
+    scratch: &[u8],
+    row_bytes: usize,
+    group_rows: usize,
+    first: usize,
+    c: &Call,
+    canon: &mut [u8],
+) -> bool {
     let canon_row = c.block_count * 4;
     let mut ok = true;
     for r in 0..scratch.len() / row_bytes {
         let row = &scratch[r * row_bytes..(r + 1) * row_bytes];
-        let live = if r < group_rows { c.row_blocks(first + r) * 4 } else { 0 };
+        let live = if r < group_rows {
+            c.row_blocks(first + r) * 4
+        } else {
+            0
+        };
         ok &= row[live..].iter().all(|&x| x == POISON);
         if live > 0 {
             let at = (first + r) * canon_row;
@@ -355,14 +521,25 @@ fn extract_scores(scratch: &[u8], row_bytes: usize, group_rows: usize, first: us
     ok
 }
 
-struct FusedRun { ms: f64, canon: Option<Vec<u8>>, poison_ok: bool }
+struct FusedRun {
+    ms: f64,
+    canon: Option<Vec<u8>>,
+    poison_ok: bool,
+}
 
 /// The production fused launch(es) of `kernel` (the incumbent or the lab
 /// kernel, identical blob/grouping/dynamic LDS). `capture` (global mode only)
 /// poisons the scratch before every group, then extracts the group's scores.
 /// `ms` sums the per-group event times.
-fn run_fused(gpu: &mut Gpu, c: &Call, io: &Io, f: &Fused, kernel: &str, capture: bool, events: Option<&[hip_bridge::Event; 3]>)
-    -> Result<FusedRun> {
+fn run_fused(
+    gpu: &mut Gpu,
+    c: &Call,
+    io: &Io,
+    f: &Fused,
+    kernel: &str,
+    capture: bool,
+    events: Option<&[hip_bridge::Event; 3]>,
+) -> Result<FusedRun> {
     let capture = capture && f.global;
     let mut canon = capture.then(|| vec![POISON; c.rows * c.block_count * 4]);
     let (mut poison_ok, mut ms) = (true, 0.0f64);
@@ -371,11 +548,22 @@ fn run_fused(gpu: &mut Gpu, c: &Call, io: &Io, f: &Fused, kernel: &str, capture:
         let last = first + rows == c.rows;
         if capture {
             let s = f.scratch.as_ref().unwrap();
-            gpu.hip.memset(&s.buf, POISON as i32, s.byte_size()).map_err(err)?;
+            gpu.hip
+                .memset(&s.buf, POISON as i32, s.byte_size())
+                .map_err(err)?;
         }
         let mut blob = fused_blob(c, io, f, first, rows, last);
-        if let Some(e) = events { gpu.hip.event_record(&e[0], None).map_err(err)?; }
-        gpu.launch_kernel_blob(kernel, [rows as u32, 1, 1], [256, 1, 1], shared, blob.as_mut_slice()).map_err(err)?;
+        if let Some(e) = events {
+            gpu.hip.event_record(&e[0], None).map_err(err)?;
+        }
+        gpu.launch_kernel_blob(
+            kernel,
+            [rows as u32, 1, 1],
+            [256, 1, 1],
+            shared,
+            blob.as_mut_slice(),
+        )
+        .map_err(err)?;
         if let Some(e) = events {
             gpu.hip.event_record(&e[1], None).map_err(err)?;
             gpu.hip.event_synchronize(&e[1]).map_err(err)?;
@@ -384,17 +572,40 @@ fn run_fused(gpu: &mut Gpu, c: &Call, io: &Io, f: &Fused, kernel: &str, capture:
         if capture {
             gpu.hip.device_synchronize().map_err(err)?;
             let bytes = download(gpu, f.scratch.as_ref().unwrap())?;
-            poison_ok &= extract_scores(&bytes, f.stride * 4, rows, first, c, canon.as_mut().unwrap());
+            poison_ok &= extract_scores(
+                &bytes,
+                f.stride * 4,
+                rows,
+                first,
+                c,
+                canon.as_mut().unwrap(),
+            );
         }
     }
     gpu.hip.device_synchronize().map_err(err)?;
-    Ok(FusedRun { ms, canon, poison_ok })
+    Ok(FusedRun {
+        ms,
+        canon,
+        poison_ok,
+    })
 }
 
-fn launch_pm_score_bf16(gpu: &mut Gpu, pm: &Option<Pm>, grid: [u32; 3], blob: &mut KernargBlob) -> Result<()> {
+fn launch_pm_score_bf16(
+    gpu: &mut Gpu,
+    pm: &Option<Pm>,
+    grid: [u32; 3],
+    blob: &mut KernargBlob,
+) -> Result<()> {
     let pm = pm.as_ref().ok_or("--pm-image required for a pm arm")?;
-    let f = pm.score_bf16.as_ref().ok_or("pm image lacks the BF16 score symbol")?;
-    unsafe { gpu.hip.launch_kernel_blob(f, grid, [256, 1, 1], 0, None, blob.as_mut_slice()) }.map_err(err)
+    let f = pm
+        .score_bf16
+        .as_ref()
+        .ok_or("pm image lacks the BF16 score symbol")?;
+    unsafe {
+        gpu.hip
+            .launch_kernel_blob(f, grid, [256, 1, 1], 0, None, blob.as_mut_slice())
+    }
+    .map_err(err)
 }
 
 /// The candidate pair (BF16 PM score + PM or hipcc from_scores select) over
@@ -402,8 +613,15 @@ fn launch_pm_score_bf16(gpu: &mut Gpu, pm: &Option<Pm>, grid: [u32; 3], blob: &m
 /// before every score launch and, after it, downloads the WHOLE scratch:
 /// returns the canonical causal scores and whether everything outside the
 /// causal extents (incl. unused allocated rows) stayed poison.
-fn run_pm_bf16(gpu: &mut Gpu, pm: &Option<Pm>, c: &Call, b: &Bufs, arms: (Impl, Impl), capture: bool,
-               events: Option<&[hip_bridge::Event; 3]>) -> Result<(Timing, Option<(Vec<u8>, bool)>)> {
+fn run_pm_bf16(
+    gpu: &mut Gpu,
+    pm: &Option<Pm>,
+    c: &Call,
+    b: &Bufs,
+    arms: (Impl, Impl),
+    capture: bool,
+    events: Option<&[hip_bridge::Event; 3]>,
+) -> Result<(Timing, Option<(Vec<u8>, bool)>)> {
     let group = c.group();
     let (mut score_ms, mut select_ms) = (0.0f64, 0.0f64);
     let mut canon = capture.then(|| vec![POISON; c.rows * c.block_count * 4]);
@@ -411,15 +629,29 @@ fn run_pm_bf16(gpu: &mut Gpu, pm: &Option<Pm>, c: &Call, b: &Bufs, arms: (Impl, 
     let mut g0 = 0;
     while g0 < c.rows {
         let n = group.min(c.rows - g0);
-        if capture { gpu.hip.memset(&b.scores.buf, POISON as i32, b.scores.byte_size()).map_err(err)?; }
+        if capture {
+            gpu.hip
+                .memset(&b.scores.buf, POISON as i32, b.scores.byte_size())
+                .map_err(err)?;
+        }
         let mut blob = score_blob(c, b, g0, n);
-        if let Some(e) = events { gpu.hip.event_record(&e[0], None).map_err(err)?; }
-        launch_pm_score_bf16(gpu, pm, [c.block_count.div_ceil(256) as u32, n.div_ceil(16) as u32, 1], &mut blob)?;
-        if let Some(e) = events { gpu.hip.event_record(&e[1], None).map_err(err)?; }
+        if let Some(e) = events {
+            gpu.hip.event_record(&e[0], None).map_err(err)?;
+        }
+        launch_pm_score_bf16(
+            gpu,
+            pm,
+            [c.block_count.div_ceil(256) as u32, n.div_ceil(16) as u32, 1],
+            &mut blob,
+        )?;
+        if let Some(e) = events {
+            gpu.hip.event_record(&e[1], None).map_err(err)?;
+        }
         if capture {
             gpu.hip.device_synchronize().map_err(err)?;
             let bytes = download(gpu, &b.scores)?;
-            poison_ok &= extract_scores(&bytes, c.block_count * 4, n, g0, c, canon.as_mut().unwrap());
+            poison_ok &=
+                extract_scores(&bytes, c.block_count * 4, n, g0, c, canon.as_mut().unwrap());
         }
         let mut blob = select_blob(c, b, g0, n, g0 + n == c.rows);
         launch(gpu, pm, arms.1, false, [n as u32, 1, 1], &mut blob)?;
@@ -432,27 +664,58 @@ fn run_pm_bf16(gpu: &mut Gpu, pm: &Option<Pm>, c: &Call, b: &Bufs, arms: (Impl, 
         g0 += n;
     }
     gpu.hip.device_synchronize().map_err(err)?;
-    Ok((Timing { score_ms, select_ms }, canon.map(|v| (v, poison_ok))))
+    Ok((
+        Timing {
+            score_ms,
+            select_ms,
+        },
+        canon.map(|v| (v, poison_ok)),
+    ))
 }
 
 /// Full BF16 snapshot replay (see the module doc); returns whether the
 /// incumbent fused launch reproduced the snapshot bytes.
 #[allow(clippy::too_many_arguments)]
-fn replay_bf16(gpu: &mut Gpu, pm: &Option<Pm>, c: &Call, b: &Bufs, snap_sel: &[u8], snap_mirror: &[u8], qbytes: &[u8], pbytes: &[u8],
-               arms: (Impl, Impl), shape_flag: usize, timed: usize, cpu_stride: usize, screen: bool,
-               events: &[hip_bridge::Event; 3], rec: &mut Value, failures: &mut usize) -> Result<bool> {
-    if arms == (Impl::Hipcc, Impl::Pm) { return Err("BF16 route rejects --score hipcc --select pm".into()) }
+fn replay_bf16(
+    gpu: &mut Gpu,
+    pm: &Option<Pm>,
+    c: &Call,
+    b: &Bufs,
+    snap_sel: &[u8],
+    snap_mirror: &[u8],
+    qbytes: &[u8],
+    pbytes: &[u8],
+    arms: (Impl, Impl),
+    shape_flag: usize,
+    timed: usize,
+    cpu_stride: usize,
+    screen: bool,
+    events: &[hip_bridge::Event; 3],
+    rec: &mut Value,
+    failures: &mut usize,
+) -> Result<bool> {
+    if arms == (Impl::Hipcc, Impl::Pm) {
+        return Err("BF16 route rejects --score hipcc --select pm".into());
+    }
     if arms != (Impl::Hipcc, Impl::Hipcc) {
         let p = pm.as_ref().ok_or("--pm-image required for a pm arm")?;
         if p.score_bf16.is_none() || (arms.1 == Impl::Pm && p.select.is_none()) {
-            return Err("pm image lacks the BF16 score/select symbols".into())
+            return Err("pm image lacks the BF16 score/select symbols".into());
         }
     }
-    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, FUSED_BF16).map_err(err)?;
-    if shape_flag < c.block_count { return Err("--shape-blocks is below the active block count".into()) }
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, FUSED_BF16)
+        .map_err(err)?;
+    if shape_flag < c.block_count {
+        return Err("--shape-blocks is below the active block count".into());
+    }
     let shape = shape_flag;
     let fused = Fused::new(gpu, shape)?;
-    let io = Io { query: &b.query, pooled: &b.pooled, selected: &b.selected, mirror: &b.mirror };
+    let io = Io {
+        query: &b.query,
+        pooled: &b.pooled,
+        selected: &b.selected,
+        mirror: &b.mirror,
+    };
     rec["route"] = json!("bf16");
     rec["shape_blocks"] = json!(shape);
     rec["fused_score_scratch"] = json!(if fused.global { "global" } else { "lds" });
@@ -466,26 +729,49 @@ fn replay_bf16(gpu: &mut Gpu, pm: &Option<Pm>, c: &Call, b: &Bufs, snap_sel: &[u
     let baseline_exact = base_sel == snap_sel && base_mirror == snap_mirror;
     rec["baseline_selected_equal"] = json!(base_sel == snap_sel);
     rec["baseline_mirror_equal"] = json!(base_mirror == snap_mirror);
-    if !baseline_exact { *failures += 1; }
+    if !baseline_exact {
+        *failures += 1;
+    }
     if fused.global {
         rec["fused_scratch_outside_causal_poison_ok"] = json!(base.poison_ok);
-        if !base.poison_ok { *failures += 1; }
+        if !base.poison_ok {
+            *failures += 1;
+        }
     }
     if let Some(canon) = &base.canon {
         let score_keys = le_u32(canon);
-        let query: Vec<f32> = qbytes.chunks_exact(4).map(|x| f32::from_le_bytes(x.try_into().unwrap())).collect();
+        let query: Vec<f32> = qbytes
+            .chunks_exact(4)
+            .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+            .collect();
         let pooled = widen_bf16(pbytes);
         let hipcc_sel = le_i32(&base_sel);
         if screen || cpu_stride > 0 {
-            let (cpu, mut s) = cpu_checks(c, &query, &pooled, &score_keys, &hipcc_sel, cpu_stride.max(1), screen);
-            if cpu["cpu_selection_rows_differ"] != 0 || cpu["rescore_bits_differ"] != 0 { *failures += 1; }
+            let (cpu, mut s) = cpu_checks(
+                c,
+                &query,
+                &pooled,
+                &score_keys,
+                &hipcc_sel,
+                cpu_stride.max(1),
+                screen,
+            );
+            if cpu["cpu_selection_rows_differ"] != 0 || cpu["rescore_bits_differ"] != 0 {
+                *failures += 1;
+            }
             rec["cpu"] = cpu;
-            if screen { rec["screen"] = screen_json(&mut s); }
+            if screen {
+                rec["screen"] = screen_json(&mut s);
+            }
         }
     } else {
         let why = json!({"skipped":"lds_mode: fused scores live in LDS, no score capture; CPU rescoring/selection/screen not run"});
-        if screen || cpu_stride > 0 { rec["cpu"] = why.clone(); }
-        if screen { rec["screen"] = why; }
+        if screen || cpu_stride > 0 {
+            rec["cpu"] = why.clone();
+        }
+        if screen {
+            rec["screen"] = why;
+        }
     }
 
     // Experimental pair against the fused bytes.
@@ -501,14 +787,17 @@ fn replay_bf16(gpu: &mut Gpu, pm: &Option<Pm>, c: &Call, b: &Bufs, snap_sel: &[u
             "score_causal_bits_equal_fused":score_eq,
             "score_causal_comparison":if score_eq.is_some() {"performed"} else {"skipped_lds_mode_no_fused_score_capture"},
             "scratch_outside_causal_poison_ok":poison_ok});
-        if !(sel_eq && mir_eq && poison_ok && score_eq.unwrap_or(true)) { *failures += 1; }
+        if !(sel_eq && mir_eq && poison_ok && score_eq.unwrap_or(true)) {
+            *failures += 1;
+        }
     }
 
     if timed > 0 {
         let median = |v: &[f64]| v[v.len() / 2];
         if arms == (Impl::Hipcc, Impl::Hipcc) {
             let lab = lab_source()?;
-            gpu.ensure_kernel_public(LAB_MODULE, &lab, LAB_BF16).map_err(err)?;
+            gpu.ensure_kernel_public(LAB_MODULE, &lab, LAB_BF16)
+                .map_err(err)?;
             for _ in 0..2 {
                 run_fused(gpu, c, &io, &fused, FUSED_BF16, false, Some(events))?;
                 run_fused(gpu, c, &io, &fused, LAB_BF16, false, Some(events))?;
@@ -528,7 +817,9 @@ fn replay_bf16(gpu: &mut Gpu, pm: &Option<Pm>, c: &Call, b: &Bufs, snap_sel: &[u
                 "select_phase_ms_median":median(&se),"fused_ms":fu,"score_phase_ms":sc,"select_phase_ms":se,
                 "note":"fused_ms sums per-group launches; score_phase_ms is the appended lab kernel (fused pre-selection through the first __syncthreads, no static LDS); select_phase_ms = fused - score per rep"});
         } else {
-            for _ in 0..2 { run_pm_bf16(gpu, pm, c, b, arms, false, Some(events))?; }
+            for _ in 0..2 {
+                run_pm_bf16(gpu, pm, c, b, arms, false, Some(events))?;
+            }
             let (mut sc, mut se) = (Vec::new(), Vec::new());
             for _ in 0..timed {
                 let (t, _) = run_pm_bf16(gpu, pm, c, b, arms, false, Some(events))?;
@@ -547,23 +838,38 @@ fn replay_bf16(gpu: &mut Gpu, pm: &Option<Pm>, c: &Call, b: &Bufs, snap_sel: &[u
 
 /// An allocation `[guard | payload | guard]` of 0xa5 whose payload is exposed
 /// as a non-owning sub-view; only `alloc` is ever freed.
-struct Guarded { alloc: GpuTensor, view: GpuTensor, payload: usize }
+struct Guarded {
+    alloc: GpuTensor,
+    view: GpuTensor,
+    payload: usize,
+}
 
 impl Guarded {
     fn new(gpu: &Gpu, payload: usize) -> Result<Guarded> {
         let total = payload + 2 * GUARD_BYTES;
-        let alloc = gpu.upload_raw(&vec![POISON; total], &[total]).map_err(err)?;
+        let alloc = gpu
+            .upload_raw(&vec![POISON; total], &[total])
+            .map_err(err)?;
         let view = alloc.sub_offset(GUARD_BYTES, payload);
-        Ok(Guarded { alloc, view, payload })
+        Ok(Guarded {
+            alloc,
+            view,
+            payload,
+        })
     }
     /// Poison guards and payload alike.
     fn poison(&self, gpu: &Gpu) -> Result<()> {
-        gpu.hip.memset(&self.alloc.buf, POISON as i32, self.alloc.byte_size()).map_err(err)
+        gpu.hip
+            .memset(&self.alloc.buf, POISON as i32, self.alloc.byte_size())
+            .map_err(err)
     }
     /// (both guards unchanged, payload bytes).
     fn read(&self, gpu: &Gpu) -> Result<(bool, Vec<u8>)> {
         let all = download(gpu, &self.alloc)?;
-        let ok = all[..GUARD_BYTES].iter().all(|&x| x == POISON) && all[GUARD_BYTES + self.payload..].iter().all(|&x| x == POISON);
+        let ok = all[..GUARD_BYTES].iter().all(|&x| x == POISON)
+            && all[GUARD_BYTES + self.payload..]
+                .iter()
+                .all(|&x| x == POISON);
         Ok((ok, all[GUARD_BYTES..GUARD_BYTES + self.payload].to_vec()))
     }
 }
@@ -571,21 +877,43 @@ impl Guarded {
 /// `--tied-bf16-hipcc`: six all-tied fixtures through the fused launch (and
 /// the PM pair iff an image is supplied) against the CPU stable-order oracle,
 /// selected/mirror each inside 64 KiB guards.
-fn run_tied_bf16(gpu: &mut Gpu, pm: &Option<Pm>, shape_flag: usize, out_f: &mut std::fs::File, failures: &mut usize) -> Result<()> {
+fn run_tied_bf16(
+    gpu: &mut Gpu,
+    pm: &Option<Pm>,
+    shape_flag: usize,
+    out_f: &mut std::fs::File,
+    failures: &mut usize,
+) -> Result<()> {
     if let Some(p) = pm {
-        if p.score_bf16.is_none() || p.select.is_none() { return Err("--tied-bf16-hipcc with --pm-image needs the BF16 score and select symbols".into()) }
+        if p.score_bf16.is_none() || p.select.is_none() {
+            return Err(
+                "--tied-bf16-hipcc with --pm-image needs the BF16 score and select symbols".into(),
+            );
+        }
     }
-    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, FUSED_BF16).map_err(err)?;
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, FUSED_BF16)
+        .map_err(err)?;
     for blocks in [16384usize, 32768, 65536] {
         for vbits in [0x0000u16, 0x3f80] {
             let value = f32::from_bits((vbits as u32) << 16);
             let (rows, compress) = (3usize, 4usize);
             // The last row sees exactly `blocks` complete blocks plus a 3-token tail.
             let position_start = blocks * compress + 3 - rows;
-            let c = Call { rows, stride: 512, block_count: blocks, dim: 128, compress, position_start, budget: 512, capacity: 2051 };
+            let c = Call {
+                rows,
+                stride: 512,
+                block_count: blocks,
+                dim: 128,
+                compress,
+                position_start,
+                budget: 512,
+                capacity: 2051,
+            };
             let shape = blocks.max(shape_flag);
             let qbytes: Vec<u8> = (0..rows * 512).flat_map(|_| value.to_le_bytes()).collect();
-            let pbytes: Vec<u8> = (0..blocks * 128).flat_map(|_| vbits.to_le_bytes()).collect();
+            let pbytes: Vec<u8> = (0..blocks * 128)
+                .flat_map(|_| vbits.to_le_bytes())
+                .collect();
             let query = gpu.upload_raw(&qbytes, &[qbytes.len()]).map_err(err)?;
             let pooled = gpu.upload_raw(&pbytes, &[pbytes.len()]).map_err(err)?;
             let sel_g = Guarded::new(gpu, rows * c.capacity * 4)?;
@@ -593,7 +921,9 @@ fn run_tied_bf16(gpu: &mut Gpu, pm: &Option<Pm>, shape_flag: usize, out_f: &mut 
             let fused = Fused::new(gpu, shape)?;
 
             // CPU stable oracle over the (all-tied) scores.
-            let score_bits = cpu_score(&vec![value; 512], &vec![value; 128], 128).0.to_bits();
+            let score_bits = cpu_score(&vec![value; 512], &vec![value; 128], 128)
+                .0
+                .to_bits();
             let keys = vec![score_bits; blocks];
             let check = |sel: &[u8], mir: &[u8]| -> (bool, bool) {
                 let (got, mirror) = (le_i32(sel), le_i32(mir));
@@ -601,23 +931,36 @@ fn run_tied_bf16(gpu: &mut Gpu, pm: &Option<Pm>, shape_flag: usize, out_f: &mut 
                 for r in 0..rows {
                     let want = selection_row(&rank(&keys[..c.row_blocks(r)]), &c, r);
                     s_ok &= got[r * c.capacity..(r + 1) * c.capacity] == want[..];
-                    if r == rows - 1 { m_ok &= mirror == want; }
+                    if r == rows - 1 {
+                        m_ok &= mirror == want;
+                    }
                 }
                 (s_ok, m_ok)
             };
 
             sel_g.poison(gpu)?;
             mir_g.poison(gpu)?;
-            let io = Io { query: &query, pooled: &pooled, selected: &sel_g.view, mirror: &mir_g.view };
+            let io = Io {
+                query: &query,
+                pooled: &pooled,
+                selected: &sel_g.view,
+                mirror: &mir_g.view,
+            };
             let run = run_fused(gpu, &c, &io, &fused, FUSED_BF16, true, None)?;
             let (sel_guard, sel) = sel_g.read(gpu)?;
             let (mir_guard, mir) = mir_g.read(gpu)?;
             let (s_ok, m_ok) = check(&sel, &mir);
             let uniform = run.canon.as_ref().map_or(true, |canon| {
-                (0..rows).all(|r| le_u32(&canon[r * blocks * 4..r * blocks * 4 + c.row_blocks(r) * 4]).iter().all(|&k| k == score_bits))
+                (0..rows).all(|r| {
+                    le_u32(&canon[r * blocks * 4..r * blocks * 4 + c.row_blocks(r) * 4])
+                        .iter()
+                        .all(|&k| k == score_bits)
+                })
             });
             let fused_ok = s_ok && m_ok && sel_guard && mir_guard && run.poison_ok;
-            if !fused_ok { *failures += 1; }
+            if !fused_ok {
+                *failures += 1;
+            }
             let mut rec = json!({"tied_bf16":true,"route":"bf16","blocks":blocks,"value_bf16":format!("0x{vbits:04x}"),
                 "query_value":value,"rows":rows,"position_start":position_start,"shape_blocks":shape,
                 "fused_score_scratch":if fused.global {"global"} else {"lds"},
@@ -631,9 +974,16 @@ fn run_tied_bf16(gpu: &mut Gpu, pm: &Option<Pm>, shape_flag: usize, out_f: &mut 
                 mir_g.poison(gpu)?;
                 let group = c.group();
                 let sbytes = group * blocks * 4;
-                let scores = gpu.upload_raw(&vec![POISON; sbytes], &[sbytes]).map_err(err)?;
-                let b = Bufs { query: query.shallow_clone(), pooled: pooled.shallow_clone(), scores,
-                    selected: sel_g.view.shallow_clone(), mirror: mir_g.view.shallow_clone() };
+                let scores = gpu
+                    .upload_raw(&vec![POISON; sbytes], &[sbytes])
+                    .map_err(err)?;
+                let b = Bufs {
+                    query: query.shallow_clone(),
+                    pooled: pooled.shallow_clone(),
+                    scores,
+                    selected: sel_g.view.shallow_clone(),
+                    mirror: mir_g.view.shallow_clone(),
+                };
                 let (_, cap) = run_pm_bf16(gpu, pm, &c, &b, (Impl::Pm, Impl::Pm), true, None)?;
                 let (_, poison_ok) = cap.unwrap();
                 let Bufs { scores, .. } = b;
@@ -642,14 +992,18 @@ fn run_tied_bf16(gpu: &mut Gpu, pm: &Option<Pm>, shape_flag: usize, out_f: &mut 
                 let (mir_guard, mir) = mir_g.read(gpu)?;
                 let (s_ok, m_ok) = check(&sel, &mir);
                 let pm_ok = s_ok && m_ok && sel_guard && mir_guard && poison_ok;
-                if !pm_ok { *failures += 1; }
+                if !pm_ok {
+                    *failures += 1;
+                }
                 rec["pm"] = json!({"selected_equal_cpu_oracle":s_ok,"mirror_equal_cpu_oracle":m_ok,"selected_guards_ok":sel_guard,
                     "mirror_guards_ok":mir_guard,"scratch_outside_causal_poison_ok":poison_ok,"ok":pm_ok});
             }
             eprintln!("{rec}");
             writeln!(out_f, "{rec}").map_err(err)?;
             fused.free(gpu)?;
-            for t in [query, pooled, sel_g.alloc, mir_g.alloc] { gpu.free_tensor(t).map_err(err)?; }
+            for t in [query, pooled, sel_g.alloc, mir_g.alloc] {
+                gpu.free_tensor(t).map_err(err)?;
+            }
         }
     }
     Ok(())
@@ -658,18 +1012,26 @@ fn run_tied_bf16(gpu: &mut Gpu, pm: &Option<Pm>, shape_flag: usize, out_f: &mut 
 // ---------------------------------------------------------------- CPU side
 
 fn f16_round(x: f32) -> f32 {
-    if !x.is_finite() { return x; }
+    if !x.is_finite() {
+        return x;
+    }
     let a = x.abs();
     if a < 6.103_515_6e-5 {
         return (x * 16_777_216.0).round_ties_even() / 16_777_216.0;
     }
     let b = x.to_bits();
     let r = f32::from_bits((b + 0xfff + ((b >> 13) & 1)) & !0x1fff);
-    if r.abs() > 65504.0 { f32::INFINITY.copysign(x) } else { r }
+    if r.abs() > 65504.0 {
+        f32::INFINITY.copysign(x)
+    } else {
+        r
+    }
 }
 
 fn bf16_round(x: f32) -> f32 {
-    if !x.is_finite() { return x; }
+    if !x.is_finite() {
+        return x;
+    }
     let b = x.to_bits();
     f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff_0000)
 }
@@ -684,9 +1046,13 @@ fn cpu_score(q: &[f32], key: &[f32], dim: usize) -> (f32, u8) {
     for h in 0..4 {
         let qh = &q[h * dim..(h + 1) * dim];
         let mut dot = 0.0f32;
-        for d in 0..dim { dot = qh[d].mul_add(key[d], dot); }
+        for d in 0..dim {
+            dot = qh[d].mul_add(key[d], dot);
+        }
         let s = dot / scale;
-        if s > 0.0 { signs |= 1 << h; }
+        if s > 0.0 {
+            signs |= 1 << h;
+        }
         score += if s > 0.0 { s } else { 0.0 };
     }
     (score, signs)
@@ -706,12 +1072,16 @@ fn selection_row(order: &[u32], c: &Call, row: usize) -> Vec<i32> {
     for (slot, &block) in order.iter().take(chosen).enumerate() {
         for o in 0..c.compress {
             let (i, t) = (slot * c.compress + o, block as usize * c.compress + o);
-            if i < c.capacity && t < visible { out[i] = t as i32; }
+            if i < c.capacity && t < visible {
+                out[i] = t as i32;
+            }
         }
     }
     let mut i = chosen * c.compress;
     for t in blocks * c.compress..visible {
-        if i >= c.capacity { break; }
+        if i >= c.capacity {
+            break;
+        }
         out[i] = t as i32;
         i += 1;
     }
@@ -721,7 +1091,7 @@ fn selection_row(order: &[u32], c: &Call, row: usize) -> Vec<i32> {
 #[derive(Default, Clone)]
 struct Screen {
     rows: usize,
-    finish: [usize; 5],          // index 0: chosen == visible blocks (no refinement)
+    finish: [usize; 5], // index 0: chosen == visible blocks (no refinement)
     all_equal: usize,
     pad512: usize,
     pad1024: usize,
@@ -732,8 +1102,12 @@ struct Screen {
 /// Adaptive exact prefix selection replay over one row's keys.
 fn screen_row(keys: &[u32], chosen: usize, s: &mut Screen) {
     s.rows += 1;
-    let (mn, mx) = keys.iter().fold((u32::MAX, 0u32), |(a, b), &k| (a.min(k), b.max(k)));
-    if mn == mx { s.all_equal += 1; }
+    let (mn, mx) = keys
+        .iter()
+        .fold((u32::MAX, 0u32), |(a, b), &k| (a.min(k), b.max(k)));
+    if mn == mx {
+        s.all_equal += 1;
+    }
     if chosen == keys.len() {
         s.finish[0] += 1;
         s.pad512 += 1;
@@ -745,11 +1119,17 @@ fn screen_row(keys: &[u32], chosen: usize, s: &mut Screen) {
         let shift = 24 - 8 * pass;
         let high = if pass == 0 { 0 } else { !0u32 << (shift + 8) };
         let mut hist = [0usize; 256];
-        for &k in keys { if k & high == prefix { hist[((k >> shift) & 255) as usize] += 1; } }
+        for &k in keys {
+            if k & high == prefix {
+                hist[((k >> shift) & 255) as usize] += 1;
+            }
+        }
         let mut acc = 0usize;
         let mut digit = 255usize;
         loop {
-            if acc + hist[digit] >= need { break; }
+            if acc + hist[digit] >= need {
+                break;
+            }
             acc += hist[digit];
             digit -= 1;
         }
@@ -764,13 +1144,19 @@ fn screen_row(keys: &[u32], chosen: usize, s: &mut Screen) {
             done = true;
             s.finish[pass + 1] += 1;
             let final_cand = if pass == 3 { above + need } else { cand };
-            if final_cand <= 512 { s.pad512 += 1 } else { s.pad1024 += 1 }
+            if final_cand <= 512 {
+                s.pad512 += 1
+            } else {
+                s.pad1024 += 1
+            }
         }
     }
 }
 
 fn quant(v: &mut [usize]) -> Value {
-    if v.is_empty() { return Value::Null; }
+    if v.is_empty() {
+        return Value::Null;
+    }
     v.sort_unstable();
     let q = |p: f64| v[((v.len() - 1) as f64 * p).round() as usize];
     json!({"n":v.len(),"min":v[0],"p50":q(0.5),"p90":q(0.9),"p99":q(0.99),"max":v[v.len()-1]})
@@ -789,78 +1175,133 @@ fn screen_json(s: &mut Screen) -> Value {
 }
 
 #[derive(Default)]
-struct Diag { rows: usize, score_bits_differ: u64, scores: u64, relu_sign_changes: u64, ordered_rows_differ: usize, ordered_elems_differ: u64, set_rows_differ: usize, set_elems_differ: u64 }
+struct Diag {
+    rows: usize,
+    score_bits_differ: u64,
+    scores: u64,
+    relu_sign_changes: u64,
+    ordered_rows_differ: usize,
+    ordered_elems_differ: u64,
+    set_rows_differ: usize,
+    set_elems_differ: u64,
+}
 
 // ---------------------------------------------------------------- main
 
-fn cpu_checks(c: &Call, query: &[f32], pooled: &[f32], scores: &[u32], hipcc_sel: &[i32], cpu_stride: usize, screen: bool)
-    -> (Value, Screen) {
+fn cpu_checks(
+    c: &Call,
+    query: &[f32],
+    pooled: &[f32],
+    scores: &[u32],
+    hipcc_sel: &[i32],
+    cpu_stride: usize,
+    screen: bool,
+) -> (Value, Screen) {
     let bc = c.block_count;
     // Stable CPU selection over the hipcc scores, every row.
-    let sel_mismatch: Vec<usize> = (0..c.rows).into_par_iter().filter(|&r| {
-        let keys = &scores[r * bc..r * bc + c.row_blocks(r)];
-        selection_row(&rank(keys), c, r) != hipcc_sel[r * c.capacity..(r + 1) * c.capacity]
-    }).collect();
+    let sel_mismatch: Vec<usize> = (0..c.rows)
+        .into_par_iter()
+        .filter(|&r| {
+            let keys = &scores[r * bc..r * bc + c.row_blocks(r)];
+            selection_row(&rank(keys), c, r) != hipcc_sel[r * c.capacity..(r + 1) * c.capacity]
+        })
+        .collect();
     // Exact rescoring and WMMA operand-rounding diagnostic on sampled rows.
-    let sampled: Vec<usize> = (0..c.rows).filter(|r| r % cpu_stride == 0 || *r == c.rows - 1).collect();
-    let per_row: Vec<(u64, u64, [Diag; 2], f64)> = sampled.par_iter().map(|&r| {
-        let q = &query[r * c.stride..r * c.stride + 4 * c.dim];
-        let blocks = c.row_blocks(r);
-        let qs = [q.iter().map(|&x| f16_round(x)).collect::<Vec<_>>(), q.iter().map(|&x| bf16_round(x)).collect::<Vec<_>>()];
-        let mut exact = Vec::with_capacity(blocks);
-        let mut signs = Vec::with_capacity(blocks);
-        let mut alt = [Vec::with_capacity(blocks), Vec::with_capacity(blocks)];
-        let mut alt_signs = [Vec::with_capacity(blocks), Vec::with_capacity(blocks)];
-        let mut differ = 0u64;
-        for b in 0..blocks {
-            let key = &pooled[b * c.dim..(b + 1) * c.dim];
-            let (s, sg) = cpu_score(q, key, c.dim);
-            if s.to_bits() != scores[r * bc + b] { differ += 1; }
-            exact.push(s.to_bits());
-            signs.push(sg);
-            let k16: Vec<f32> = key.iter().map(|&x| f16_round(x)).collect();
-            for (v, (qv, kv)) in [(&qs[0], &k16), (&qs[1], &key.to_vec())].into_iter().enumerate() {
-                let (s, sg) = cpu_score(qv, kv, c.dim);
-                alt[v].push(s.to_bits());
-                alt_signs[v].push(sg);
+    let sampled: Vec<usize> = (0..c.rows)
+        .filter(|r| r % cpu_stride == 0 || *r == c.rows - 1)
+        .collect();
+    let per_row: Vec<(u64, u64, [Diag; 2], f64)> = sampled
+        .par_iter()
+        .map(|&r| {
+            let q = &query[r * c.stride..r * c.stride + 4 * c.dim];
+            let blocks = c.row_blocks(r);
+            let qs = [
+                q.iter().map(|&x| f16_round(x)).collect::<Vec<_>>(),
+                q.iter().map(|&x| bf16_round(x)).collect::<Vec<_>>(),
+            ];
+            let mut exact = Vec::with_capacity(blocks);
+            let mut signs = Vec::with_capacity(blocks);
+            let mut alt = [Vec::with_capacity(blocks), Vec::with_capacity(blocks)];
+            let mut alt_signs = [Vec::with_capacity(blocks), Vec::with_capacity(blocks)];
+            let mut differ = 0u64;
+            for b in 0..blocks {
+                let key = &pooled[b * c.dim..(b + 1) * c.dim];
+                let (s, sg) = cpu_score(q, key, c.dim);
+                if s.to_bits() != scores[r * bc + b] {
+                    differ += 1;
+                }
+                exact.push(s.to_bits());
+                signs.push(sg);
+                let k16: Vec<f32> = key.iter().map(|&x| f16_round(x)).collect();
+                for (v, (qv, kv)) in [(&qs[0], &k16), (&qs[1], &key.to_vec())]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let (s, sg) = cpu_score(qv, kv, c.dim);
+                    alt[v].push(s.to_bits());
+                    alt_signs[v].push(sg);
+                }
             }
-        }
-        let chosen = c.budget.min(blocks);
-        let order = rank(&exact);
-        let margin = if blocks > chosen && chosen > 0 {
-            let (a, b) = (f32::from_bits(exact[order[chosen - 1] as usize]), f32::from_bits(exact[order[chosen] as usize]));
-            ((a - b) / a.max(f32::MIN_POSITIVE)) as f64
-        } else { f64::NAN };
-        let mut diags = [Diag::default(), Diag::default()];
-        for v in 0..2 {
-            let d = &mut diags[v];
-            d.rows = 1;
-            d.scores = blocks as u64;
-            d.score_bits_differ = exact.iter().zip(&alt[v]).filter(|(a, b)| a != b).count() as u64;
-            d.relu_sign_changes = signs.iter().zip(&alt_signs[v]).map(|(a, b)| (a ^ b).count_ones() as u64).sum();
-            let ao = rank(&alt[v]);
-            let e = order[..chosen].iter().zip(&ao[..chosen]).filter(|(a, b)| a != b).count() as u64;
-            d.ordered_elems_differ = e;
-            d.ordered_rows_differ = usize::from(e > 0);
-            let es: std::collections::BTreeSet<u32> = order[..chosen].iter().copied().collect();
-            let miss = ao[..chosen].iter().filter(|x| !es.contains(x)).count() as u64;
-            d.set_elems_differ = miss;
-            d.set_rows_differ = usize::from(miss > 0);
-        }
-        (differ, blocks as u64, diags, margin)
-    }).collect();
+            let chosen = c.budget.min(blocks);
+            let order = rank(&exact);
+            let margin = if blocks > chosen && chosen > 0 {
+                let (a, b) = (
+                    f32::from_bits(exact[order[chosen - 1] as usize]),
+                    f32::from_bits(exact[order[chosen] as usize]),
+                );
+                ((a - b) / a.max(f32::MIN_POSITIVE)) as f64
+            } else {
+                f64::NAN
+            };
+            let mut diags = [Diag::default(), Diag::default()];
+            for v in 0..2 {
+                let d = &mut diags[v];
+                d.rows = 1;
+                d.scores = blocks as u64;
+                d.score_bits_differ =
+                    exact.iter().zip(&alt[v]).filter(|(a, b)| a != b).count() as u64;
+                d.relu_sign_changes = signs
+                    .iter()
+                    .zip(&alt_signs[v])
+                    .map(|(a, b)| (a ^ b).count_ones() as u64)
+                    .sum();
+                let ao = rank(&alt[v]);
+                let e = order[..chosen]
+                    .iter()
+                    .zip(&ao[..chosen])
+                    .filter(|(a, b)| a != b)
+                    .count() as u64;
+                d.ordered_elems_differ = e;
+                d.ordered_rows_differ = usize::from(e > 0);
+                let es: std::collections::BTreeSet<u32> = order[..chosen].iter().copied().collect();
+                let miss = ao[..chosen].iter().filter(|x| !es.contains(x)).count() as u64;
+                d.set_elems_differ = miss;
+                d.set_rows_differ = usize::from(miss > 0);
+            }
+            (differ, blocks as u64, diags, margin)
+        })
+        .collect();
     let rescore_differ: u64 = per_row.iter().map(|x| x.0).sum();
     let rescored: u64 = per_row.iter().map(|x| x.1).sum();
-    let mut margins: Vec<f64> = per_row.iter().map(|x| x.3).filter(|m| m.is_finite()).collect();
+    let mut margins: Vec<f64> = per_row
+        .iter()
+        .map(|x| x.3)
+        .filter(|m| m.is_finite())
+        .collect();
     margins.sort_by(f64::total_cmp);
     let mut wmma = Vec::new();
     for (v, name) in ["f16_operands", "bf16_operands"].iter().enumerate() {
         let mut t = Diag::default();
         for x in &per_row {
             let d = &x.2[v];
-            t.rows += d.rows; t.scores += d.scores; t.score_bits_differ += d.score_bits_differ;
-            t.relu_sign_changes += d.relu_sign_changes; t.ordered_rows_differ += d.ordered_rows_differ;
-            t.ordered_elems_differ += d.ordered_elems_differ; t.set_rows_differ += d.set_rows_differ; t.set_elems_differ += d.set_elems_differ;
+            t.rows += d.rows;
+            t.scores += d.scores;
+            t.score_bits_differ += d.score_bits_differ;
+            t.relu_sign_changes += d.relu_sign_changes;
+            t.ordered_rows_differ += d.ordered_rows_differ;
+            t.ordered_elems_differ += d.ordered_elems_differ;
+            t.set_rows_differ += d.set_rows_differ;
+            t.set_elems_differ += d.set_elems_differ;
         }
         wmma.push(json!({"variant":name,"rows":t.rows,"scores":t.scores,"score_bits_differ":t.score_bits_differ,
             "relu_sign_changes":t.relu_sign_changes,"rows_ordered_selection_differ":t.ordered_rows_differ,
@@ -868,24 +1309,46 @@ fn cpu_checks(c: &Call, query: &[f32], pooled: &[f32], scores: &[u32], hipcc_sel
     }
     let mut s = Screen::default();
     if screen {
-        let parts: Vec<Screen> = (0..c.rows).into_par_iter().fold(Screen::default, |mut s, r| {
-            let blocks = c.row_blocks(r);
-            let chosen = c.budget.min(blocks);
-            if chosen > 0 { screen_row(&scores[r * bc..r * bc + blocks], chosen, &mut s); }
-            s
-        }).collect();
+        let parts: Vec<Screen> = (0..c.rows)
+            .into_par_iter()
+            .fold(Screen::default, |mut s, r| {
+                let blocks = c.row_blocks(r);
+                let chosen = c.budget.min(blocks);
+                if chosen > 0 {
+                    screen_row(&scores[r * bc..r * bc + blocks], chosen, &mut s);
+                }
+                s
+            })
+            .collect();
         for p in parts {
-            s.rows += p.rows; s.all_equal += p.all_equal; s.pad512 += p.pad512; s.pad1024 += p.pad1024;
-            for i in 0..5 { s.finish[i] += p.finish[i]; }
-            for i in 0..4 { s.over1024_after[i].extend(&p.over1024_after[i]); s.boundary_after[i].extend(&p.boundary_after[i]); }
+            s.rows += p.rows;
+            s.all_equal += p.all_equal;
+            s.pad512 += p.pad512;
+            s.pad1024 += p.pad1024;
+            for i in 0..5 {
+                s.finish[i] += p.finish[i];
+            }
+            for i in 0..4 {
+                s.over1024_after[i].extend(&p.over1024_after[i]);
+                s.boundary_after[i].extend(&p.boundary_after[i]);
+            }
         }
     }
-    let m = |p: f64| if margins.is_empty() { f64::NAN } else { margins[((margins.len() - 1) as f64 * p) as usize] };
-    (json!({"cpu_selection_rows_differ":sel_mismatch.len(),"cpu_selection_first_differ":sel_mismatch.first(),
+    let m = |p: f64| {
+        if margins.is_empty() {
+            f64::NAN
+        } else {
+            margins[((margins.len() - 1) as f64 * p) as usize]
+        }
+    };
+    (
+        json!({"cpu_selection_rows_differ":sel_mismatch.len(),"cpu_selection_first_differ":sel_mismatch.first(),
         "rescored_rows":sampled.len(),"rescored_scores":rescored,"rescore_bits_differ":rescore_differ,
         "kth_rel_margin":{"min":m(0.0),"p10":m(0.1),"p50":m(0.5)},
         "wmma_cpu_emulation":wmma,
-        "wmma_note":"CPU emulation: F16/BF16 operand rounding with the incumbent serial F32 FMA chain kept; a real WMMA port also reassociates, so these are lower bounds"}), s)
+        "wmma_note":"CPU emulation: F16/BF16 operand rounding with the incumbent serial F32 FMA chain kept; a real WMMA port also reassociates, so these are lower bounds"}),
+        s,
+    )
 }
 
 fn main() -> Result<()> {
@@ -906,18 +1369,26 @@ fn main() -> Result<()> {
                 }
             }
             let out = out.ok_or("--out OUT.jsonl required")?;
-            return if cpu { filter_check::cpu_only(Path::new(&out)) }
-                else { filter_check::run(&dirs, Path::new(&out)) };
+            return if cpu {
+                filter_check::cpu_only(Path::new(&out))
+            } else {
+                filter_check::run(&dirs, Path::new(&out))
+            };
         }
         #[cfg(not(feature = "lab"))]
         return Err("--filter and --filter-cpu need --features lab".into());
     }
     let (mut dirs, mut out, mut timed, mut image) = (Vec::new(), None, 0usize, None::<PathBuf>);
-    let (mut arms, mut cpu_stride, mut screen, mut tied) = ((Impl::Hipcc, Impl::Hipcc), 64usize, true, false);
+    let (mut arms, mut cpu_stride, mut screen, mut tied) =
+        ((Impl::Hipcc, Impl::Hipcc), 64usize, true, false);
     let (mut g3, mut beta_src) = (false, None::<PathBuf>);
     let (mut shape_flag, mut tied_bf16, mut g3_bf16) = (65536usize, false, false);
     let parse_impl = |v: Option<String>| -> Result<Impl> {
-        match v.as_deref() { Some("hipcc") => Ok(Impl::Hipcc), Some("pm") => Ok(Impl::Pm), _ => Err("arm must be hipcc|pm".into()) }
+        match v.as_deref() {
+            Some("hipcc") => Ok(Impl::Hipcc),
+            Some("pm") => Ok(Impl::Pm),
+            _ => Err("arm must be hipcc|pm".into()),
+        }
     };
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
@@ -932,7 +1403,9 @@ fn main() -> Result<()> {
             "--tied" => tied = true,
             "--g3" => g3 = true,
             "--beta-src" => beta_src = Some(PathBuf::from(it.next().ok_or("--beta-src ABS_FILE")?)),
-            "--shape-blocks" => shape_flag = it.next().ok_or("--shape-blocks N")?.parse().map_err(err)?,
+            "--shape-blocks" => {
+                shape_flag = it.next().ok_or("--shape-blocks N")?.parse().map_err(err)?
+            }
             "--tied-bf16-hipcc" => tied_bf16 = true,
             "--g3-bf16" => g3_bf16 = true,
             _ => dirs.push(PathBuf::from(a)),
@@ -940,9 +1413,18 @@ fn main() -> Result<()> {
     }
     let out = out.ok_or("--out OUT.jsonl required")?;
     if g3_bf16 {
-        if g3 || beta_src.is_some() || image.is_some() || tied || tied_bf16 || timed > 0
-            || arms != (Impl::Hipcc, Impl::Hipcc) || cpu_stride != 64 || !screen || shape_flag != 65536 {
-            return Err("--g3-bf16 takes only SNAPSHOT_DIR... and --out (no --g3/--beta-src/--pm-image/--tied*/--time/--score/--select/--cpu-rows/--no-screen/--shape-blocks)".into())
+        if g3
+            || beta_src.is_some()
+            || image.is_some()
+            || tied
+            || tied_bf16
+            || timed > 0
+            || arms != (Impl::Hipcc, Impl::Hipcc)
+            || cpu_stride != 64
+            || !screen
+            || shape_flag != 65536
+        {
+            return Err("--g3-bf16 takes only SNAPSHOT_DIR... and --out (no --g3/--beta-src/--pm-image/--tied*/--time/--score/--select/--cpu-rows/--no-screen/--shape-blocks)".into());
         }
         #[cfg(feature = "lab")]
         return g3_bf16::run(&dirs, Path::new(&out));
@@ -956,98 +1438,227 @@ fn main() -> Result<()> {
         return Err("--g3 needs --features lab".into());
     }
     let mut paths = Vec::new();
-    for d in &dirs { snapshots(d, &mut paths)?; }
-    if paths.is_empty() && !tied && !tied_bf16 { return Err("no snapshot.json found".into()) }
+    for d in &dirs {
+        snapshots(d, &mut paths)?;
+    }
+    if paths.is_empty() && !tied && !tied_bf16 {
+        return Err("no snapshot.json found".into());
+    }
     let mut gpu = Gpu::init().map_err(err)?;
-    if gpu.arch != "gfx1151" { return Err(format!("gfx1151 only, got {}", gpu.arch)) }
-    for k in [HIPCC_SCORE, HIPCC_SELECT] { gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, k).map_err(err)?; }
+    if gpu.arch != "gfx1151" {
+        return Err(format!("gfx1151 only, got {}", gpu.arch));
+    }
+    for k in [HIPCC_SCORE, HIPCC_SELECT] {
+        gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, k)
+            .map_err(err)?;
+    }
     let pm = match &image {
         Some(p) => {
-            if !p.is_absolute() { return Err("--pm-image must be absolute".into()) }
+            if !p.is_absolute() {
+                return Err("--pm-image must be absolute".into());
+            }
             let bytes = std::fs::read(p).map_err(err)?;
             let module = gpu.hip.module_load_data(&bytes).map_err(err)?;
             let score = gpu.hip.module_get_function(&module, PM_SCORE).ok();
             let score_bf16 = gpu.hip.module_get_function(&module, PM_SCORE_BF16).ok();
             let select = gpu.hip.module_get_function(&module, PM_SELECT).ok();
-            eprintln!("pm image {} sha256 {} score={} score_bf16={} select={}", p.display(), sha256(&bytes), score.is_some(), score_bf16.is_some(), select.is_some());
-            Some(Pm { _module: module, score, score_bf16, select })
+            eprintln!(
+                "pm image {} sha256 {} score={} score_bf16={} select={}",
+                p.display(),
+                sha256(&bytes),
+                score.is_some(),
+                score_bf16.is_some(),
+                select.is_some()
+            );
+            Some(Pm {
+                _module: module,
+                score,
+                score_bf16,
+                select,
+            })
         }
         None => None,
     };
     let mut out_f = std::fs::File::create(&out).map_err(err)?;
-    let events = [gpu.hip.event_create().map_err(err)?, gpu.hip.event_create().map_err(err)?, gpu.hip.event_create().map_err(err)?];
+    let events = [
+        gpu.hip.event_create().map_err(err)?,
+        gpu.hip.event_create().map_err(err)?,
+        gpu.hip.event_create().map_err(err)?,
+    ];
     let mut failures = 0usize;
 
     for path in &paths {
         let root = path.parent().unwrap();
-        let header: Value = serde_json::from_slice(&std::fs::read(path).map_err(err)?).map_err(err)?;
-        if header["schema"] != "qsa-source-v1" { return Err(format!("{}: unsupported schema", path.display())) }
+        let header: Value =
+            serde_json::from_slice(&std::fs::read(path).map_err(err)?).map_err(err)?;
+        if header["schema"] != "qsa-source-v1" {
+            return Err(format!("{}: unsupported schema", path.display()));
+        }
         let sel = &header["identity"]["selector"];
-        if header["identity"]["arch"] != "gfx1151" { return Err("snapshot arch not gfx1151".into()) }
+        if header["identity"]["arch"] != "gfx1151" {
+            return Err("snapshot arch not gfx1151".into());
+        }
         let bf16 = sel["pooled_dtype"] == "BF16";
-        if !(sel["pooled_dtype"] == "F32" || bf16) || sel["projection_dtype"] != "F32" { return Err(format!("{}: not the F32/BF16 pooled route", path.display())) }
-        if sel["heads"] != 4 || sel["dim"] != 128 { return Err(format!("{}: uncovered selector geometry", path.display())) }
+        if !(sel["pooled_dtype"] == "F32" || bf16) || sel["projection_dtype"] != "F32" {
+            return Err(format!("{}: not the F32/BF16 pooled route", path.display()));
+        }
+        if sel["heads"] != 4 || sel["dim"] != 128 {
+            return Err(format!("{}: uncovered selector geometry", path.display()));
+        }
         let get = |name: &str| -> Result<Vec<u8>> {
             let b = std::fs::read(root.join(name)).map_err(err)?;
-            if header["files"][name]["sha256"] != sha256(&b) { return Err(format!("{}: hash mismatch {name}", path.display())) }
+            if header["files"][name]["sha256"] != sha256(&b) {
+                return Err(format!("{}: hash mismatch {name}", path.display()));
+            }
             Ok(b)
         };
         let g = &header["geometry"];
-        let n = |v: &Value, k: &str| v[k].as_u64().map(|x| x as usize).ok_or(format!("missing {k}"));
-        let (rows, position_start, compress) = (n(g, "rows")?, n(g, "position_start")?, n(g, "compress")?);
-        let c = Call { rows, stride: n(sel, "projection_stride")?, block_count: (position_start + rows) / compress, dim: 128,
-            compress, position_start, budget: n(g, "budget_blocks")?, capacity: n(g, "capacity")? };
-        if c.budget > 512 || c.block_count == 0 { return Err("uncovered budget/block count".into()) }
+        let n = |v: &Value, k: &str| {
+            v[k].as_u64()
+                .map(|x| x as usize)
+                .ok_or(format!("missing {k}"))
+        };
+        let (rows, position_start, compress) =
+            (n(g, "rows")?, n(g, "position_start")?, n(g, "compress")?);
+        let c = Call {
+            rows,
+            stride: n(sel, "projection_stride")?,
+            block_count: (position_start + rows) / compress,
+            dim: 128,
+            compress,
+            position_start,
+            budget: n(g, "budget_blocks")?,
+            capacity: n(g, "capacity")?,
+        };
+        if c.budget > 512 || c.block_count == 0 {
+            return Err("uncovered budget/block count".into());
+        }
         let pooled_capacity = n(sel, "pooled_capacity")?;
         let qbytes = get("index-projection.f32")?;
         let pbytes = get("pooled.source")?;
         let snap_sel = get("selected.i32")?;
         let snap_mirror = get("selected-mirror.i32")?;
         let pooled_elem = if bf16 { 2 } else { 4 };
-        if qbytes.len() != rows * c.stride * 4 || pbytes.len() != pooled_capacity * 128 * pooled_elem || snap_sel.len() != rows * c.capacity * 4
-            || snap_mirror.len() != c.capacity * 4 || c.block_count > pooled_capacity {
-            return Err(format!("{}: geometry/extent mismatch", path.display()))
+        if qbytes.len() != rows * c.stride * 4
+            || pbytes.len() != pooled_capacity * 128 * pooled_elem
+            || snap_sel.len() != rows * c.capacity * 4
+            || snap_mirror.len() != c.capacity * 4
+            || c.block_count > pooled_capacity
+        {
+            return Err(format!("{}: geometry/extent mismatch", path.display()));
         }
         let group = c.group();
         let bufs = Bufs {
             query: gpu.upload_raw(&qbytes, &[qbytes.len()]).map_err(err)?,
             pooled: gpu.upload_raw(&pbytes, &[pbytes.len()]).map_err(err)?,
-            scores: gpu.upload_raw(&vec![0u8; group * c.block_count * 4], &[group * c.block_count * 4]).map_err(err)?,
-            selected: gpu.upload_raw(&vec![0u8; snap_sel.len()], &[snap_sel.len()]).map_err(err)?,
-            mirror: gpu.upload_raw(&vec![0u8; snap_mirror.len()], &[snap_mirror.len()]).map_err(err)?,
+            scores: gpu
+                .upload_raw(
+                    &vec![0u8; group * c.block_count * 4],
+                    &[group * c.block_count * 4],
+                )
+                .map_err(err)?,
+            selected: gpu
+                .upload_raw(&vec![0u8; snap_sel.len()], &[snap_sel.len()])
+                .map_err(err)?,
+            mirror: gpu
+                .upload_raw(&vec![0u8; snap_mirror.len()], &[snap_mirror.len()])
+                .map_err(err)?,
         };
         let mut rec = json!({"snapshot":path.display().to_string(),"ctx":header["identity"]["ctx"],"layer":header["identity"]["layer"],
             "position_start":position_start,"rows":rows,"block_count":c.block_count,"group":group,
             "groups":rows.div_ceil(group),"budget_blocks":c.budget,"capacity":c.capacity,"stride":c.stride});
         if bf16 {
-            let exact = replay_bf16(&mut gpu, &pm, &c, &bufs, &snap_sel, &snap_mirror, &qbytes, &pbytes, arms, shape_flag, timed,
-                cpu_stride, screen, &events, &mut rec, &mut failures)?;
-            eprintln!("{} bf16 baseline_exact={} {}", path.display(), exact, rec.get("timing").map(|t| t.to_string()).unwrap_or_default());
+            let exact = replay_bf16(
+                &mut gpu,
+                &pm,
+                &c,
+                &bufs,
+                &snap_sel,
+                &snap_mirror,
+                &qbytes,
+                &pbytes,
+                arms,
+                shape_flag,
+                timed,
+                cpu_stride,
+                screen,
+                &events,
+                &mut rec,
+                &mut failures,
+            )?;
+            eprintln!(
+                "{} bf16 baseline_exact={} {}",
+                path.display(),
+                exact,
+                rec.get("timing").map(|t| t.to_string()).unwrap_or_default()
+            );
             writeln!(out_f, "{rec}").map_err(err)?;
             out_f.flush().map_err(err)?;
-            for t in [bufs.query, bufs.pooled, bufs.scores, bufs.selected, bufs.mirror] { gpu.free_tensor(t).map_err(err)?; }
+            for t in [
+                bufs.query,
+                bufs.pooled,
+                bufs.scores,
+                bufs.selected,
+                bufs.mirror,
+            ] {
+                gpu.free_tensor(t).map_err(err)?;
+            }
             continue;
         }
 
         // Baseline hipcc/hipcc against the captured bytes, keeping the scores.
         poison_outputs(&gpu, &bufs)?;
         let mut base_scores = Vec::new();
-        run_call(&mut gpu, &pm, &c, &bufs, (Impl::Hipcc, Impl::Hipcc), Some(&mut base_scores), None)?;
+        run_call(
+            &mut gpu,
+            &pm,
+            &c,
+            &bufs,
+            (Impl::Hipcc, Impl::Hipcc),
+            Some(&mut base_scores),
+            None,
+        )?;
         let base_sel = download(&gpu, &bufs.selected)?;
         let base_mirror = download(&gpu, &bufs.mirror)?;
         let baseline_exact = base_sel == snap_sel && base_mirror == snap_mirror;
         rec["baseline_selected_equal"] = json!(base_sel == snap_sel);
         rec["baseline_mirror_equal"] = json!(base_mirror == snap_mirror);
-        if !baseline_exact { failures += 1; }
-        let score_keys: Vec<u32> = base_scores.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
-        let query: Vec<f32> = qbytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
-        let pooled: Vec<f32> = pbytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
-        let hipcc_sel: Vec<i32> = base_sel.chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect();
+        if !baseline_exact {
+            failures += 1;
+        }
+        let score_keys: Vec<u32> = base_scores
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        let query: Vec<f32> = qbytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        let pooled: Vec<f32> = pbytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        let hipcc_sel: Vec<i32> = base_sel
+            .chunks_exact(4)
+            .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
         if screen || cpu_stride > 0 {
-            let (cpu, mut s) = cpu_checks(&c, &query, &pooled, &score_keys, &hipcc_sel, cpu_stride.max(1), screen);
-            if cpu["cpu_selection_rows_differ"] != 0 || cpu["rescore_bits_differ"] != 0 { failures += 1; }
+            let (cpu, mut s) = cpu_checks(
+                &c,
+                &query,
+                &pooled,
+                &score_keys,
+                &hipcc_sel,
+                cpu_stride.max(1),
+                screen,
+            );
+            if cpu["cpu_selection_rows_differ"] != 0 || cpu["rescore_bits_differ"] != 0 {
+                failures += 1;
+            }
             rec["cpu"] = cpu;
-            if screen { rec["screen"] = screen_json(&mut s); }
+            if screen {
+                rec["screen"] = screen_json(&mut s);
+            }
         }
 
         // Experimental arm: byte identity against the baseline.
@@ -1062,11 +1673,15 @@ fn main() -> Result<()> {
             let score_eq = arm_scores == base_scores;
             rec["arm"] = json!({"score":if arms.0==Impl::Pm {"pm"} else {"hipcc"},"select":if arms.1==Impl::Pm {"pm"} else {"hipcc"},
                 "selected_equal":sel_eq,"mirror_equal":mir_eq,"score_bytes_equal_incl_poison":score_eq});
-            if !(sel_eq && mir_eq && score_eq) { failures += 1; }
+            if !(sel_eq && mir_eq && score_eq) {
+                failures += 1;
+            }
         }
 
         if timed > 0 {
-            for _ in 0..2 { run_call(&mut gpu, &pm, &c, &bufs, arms, None, Some(&events))?; }
+            for _ in 0..2 {
+                run_call(&mut gpu, &pm, &c, &bufs, arms, None, Some(&events))?;
+            }
             let mut sc = Vec::new();
             let mut se = Vec::new();
             for _ in 0..timed {
@@ -1079,53 +1694,114 @@ fn main() -> Result<()> {
             rec["timing"] = json!({"reps":timed,"score_ms_median":sc[sc.len()/2],"select_ms_median":se[se.len()/2],
                 "score_ms":sc,"select_ms":se});
         }
-        eprintln!("{} baseline_exact={} {}", path.display(), baseline_exact, rec.get("timing").map(|t| t.to_string()).unwrap_or_default());
+        eprintln!(
+            "{} baseline_exact={} {}",
+            path.display(),
+            baseline_exact,
+            rec.get("timing").map(|t| t.to_string()).unwrap_or_default()
+        );
         writeln!(out_f, "{rec}").map_err(err)?;
         out_f.flush().map_err(err)?;
-        for t in [bufs.query, bufs.pooled, bufs.scores, bufs.selected, bufs.mirror] { gpu.free_tensor(t).map_err(err)?; }
+        for t in [
+            bufs.query,
+            bufs.pooled,
+            bufs.scores,
+            bufs.selected,
+            bufs.mirror,
+        ] {
+            gpu.free_tensor(t).map_err(err)?;
+        }
     }
 
     if tied {
-        if arms.1 != Impl::Pm { return Err("--tied runs the PM selector only (never the pre-fix hipcc arm)".into()) }
-        for (blocks, value) in [(16384usize, 1.0f32), (16384, 0.0), (32768, 1.0), (65536, 1.0), (65536, 0.0)] {
+        if arms.1 != Impl::Pm {
+            return Err("--tied runs the PM selector only (never the pre-fix hipcc arm)".into());
+        }
+        for (blocks, value) in [
+            (16384usize, 1.0f32),
+            (16384, 0.0),
+            (32768, 1.0),
+            (65536, 1.0),
+            (65536, 0.0),
+        ] {
             let compress = 4;
             let rows = 3usize;
             // The last row sees exactly `blocks` complete blocks plus a 3-token tail.
             let position_start = blocks * compress + 3 - rows;
-            let c = Call { rows, stride: 0, block_count: blocks, dim: 128, compress, position_start, budget: 512, capacity: 512 * compress + compress - 1 };
-            let scores: Vec<u8> = (0..rows * blocks).flat_map(|_| value.to_le_bytes()).collect();
+            let c = Call {
+                rows,
+                stride: 0,
+                block_count: blocks,
+                dim: 128,
+                compress,
+                position_start,
+                budget: 512,
+                capacity: 512 * compress + compress - 1,
+            };
+            let scores: Vec<u8> = (0..rows * blocks)
+                .flat_map(|_| value.to_le_bytes())
+                .collect();
             let sel_len = rows * c.capacity * 4;
             let b = Bufs {
                 query: gpu.upload_raw(&[0u8; 16], &[16]).map_err(err)?,
                 pooled: gpu.upload_raw(&[0u8; 16], &[16]).map_err(err)?,
                 scores: gpu.upload_raw(&scores, &[scores.len()]).map_err(err)?,
-                selected: gpu.upload_raw(&vec![0u8; sel_len], &[sel_len]).map_err(err)?,
-                mirror: gpu.upload_raw(&vec![0u8; c.capacity * 4], &[c.capacity * 4]).map_err(err)?,
+                selected: gpu
+                    .upload_raw(&vec![0u8; sel_len], &[sel_len])
+                    .map_err(err)?,
+                mirror: gpu
+                    .upload_raw(&vec![0u8; c.capacity * 4], &[c.capacity * 4])
+                    .map_err(err)?,
             };
             poison_outputs(&gpu, &b)?;
             let mut blob = select_blob(&c, &b, 0, rows, true);
-            launch(&mut gpu, &pm, Impl::Pm, false, [rows as u32, 1, 1], &mut blob)?;
+            launch(
+                &mut gpu,
+                &pm,
+                Impl::Pm,
+                false,
+                [rows as u32, 1, 1],
+                &mut blob,
+            )?;
             gpu.hip.device_synchronize().map_err(err)?;
-            let got: Vec<i32> = download(&gpu, &b.selected)?.chunks_exact(4).map(|x| i32::from_le_bytes(x.try_into().unwrap())).collect();
-            let mirror: Vec<i32> = download(&gpu, &b.mirror)?.chunks_exact(4).map(|x| i32::from_le_bytes(x.try_into().unwrap())).collect();
+            let got: Vec<i32> = download(&gpu, &b.selected)?
+                .chunks_exact(4)
+                .map(|x| i32::from_le_bytes(x.try_into().unwrap()))
+                .collect();
+            let mirror: Vec<i32> = download(&gpu, &b.mirror)?
+                .chunks_exact(4)
+                .map(|x| i32::from_le_bytes(x.try_into().unwrap()))
+                .collect();
             let keys = vec![value.to_bits(); blocks];
             let mut ok = true;
             for r in 0..rows {
                 let rb = c.row_blocks(r);
                 let want = selection_row(&rank(&keys[..rb]), &c, r);
                 ok &= got[r * c.capacity..(r + 1) * c.capacity] == want[..];
-                if r == rows - 1 { ok &= mirror == want; }
+                if r == rows - 1 {
+                    ok &= mirror == want;
+                }
             }
-            if !ok { failures += 1; }
+            if !ok {
+                failures += 1;
+            }
             let rec = json!({"tied":true,"blocks":blocks,"value":value,"rows":rows,"position_start":position_start,"pm_select_equal_cpu_oracle":ok});
             eprintln!("{rec}");
             writeln!(out_f, "{rec}").map_err(err)?;
-            for t in [b.query, b.pooled, b.scores, b.selected, b.mirror] { gpu.free_tensor(t).map_err(err)?; }
+            for t in [b.query, b.pooled, b.scores, b.selected, b.mirror] {
+                gpu.free_tensor(t).map_err(err)?;
+            }
         }
     }
-    if tied_bf16 { run_tied_bf16(&mut gpu, &pm, shape_flag, &mut out_f, &mut failures)?; }
-    for e in events { gpu.hip.event_destroy(e).map_err(err)?; }
-    if failures > 0 { return Err(format!("{failures} failing checks; see {out}")) }
+    if tied_bf16 {
+        run_tied_bf16(&mut gpu, &pm, shape_flag, &mut out_f, &mut failures)?;
+    }
+    for e in events {
+        gpu.hip.event_destroy(e).map_err(err)?;
+    }
+    if failures > 0 {
+        return Err(format!("{failures} failing checks; see {out}"));
+    }
     Ok(())
 }
 
@@ -1174,18 +1850,34 @@ mod g3 {
     const OOB: usize = 0x7fff_ff00;
 
     #[derive(Clone, Copy, PartialEq)]
-    enum RawImpl { Fixed, Beta, Pm }
-
-    struct Env {
-        _beta: Module, beta_score: Function, beta_select: Function,
-        _pm: Module, pm_score: Function, pm_select: Function,
+    enum RawImpl {
+        Fixed,
+        Beta,
+        Pm,
     }
 
-    struct Sink { f: std::fs::File, failures: usize, records: usize, cases: usize }
+    struct Env {
+        _beta: Module,
+        beta_score: Function,
+        beta_select: Function,
+        _pm: Module,
+        pm_score: Function,
+        pm_select: Function,
+    }
+
+    struct Sink {
+        f: std::fs::File,
+        failures: usize,
+        records: usize,
+        cases: usize,
+    }
     impl Sink {
         fn put(&mut self, mut rec: Value, ok: bool) -> Result<()> {
             rec["ok"] = json!(ok);
-            if !ok { self.failures += 1; eprintln!("FAIL {rec}"); }
+            if !ok {
+                self.failures += 1;
+                eprintln!("FAIL {rec}");
+            }
             self.records += 1;
             writeln!(self.f, "{rec}").map_err(err)?;
             self.f.flush().map_err(err)
@@ -1205,10 +1897,23 @@ mod g3 {
         beta_skip: Option<&'static str>,
     }
 
-    struct Out { sel: Vec<u8>, mirror: Vec<u8>, scores: Vec<u8>, canary: bool, persisted: Option<bool> }
-    fn same(a: &Out, b: &Out) -> bool { a.sel == b.sel && a.mirror == b.mirror && a.scores == b.scores && a.canary == b.canary }
+    struct Out {
+        sel: Vec<u8>,
+        mirror: Vec<u8>,
+        scores: Vec<u8>,
+        canary: bool,
+        persisted: Option<bool>,
+    }
+    fn same(a: &Out, b: &Out) -> bool {
+        a.sel == b.sel && a.mirror == b.mirror && a.scores == b.scores && a.canary == b.canary
+    }
 
-    struct Expect<'a> { mirror: bool, sel: &'a [u8], mirror_bytes: &'a [u8], snap: Option<&'a (Vec<u8>, Vec<u8>)> }
+    struct Expect<'a> {
+        mirror: bool,
+        sel: &'a [u8],
+        mirror_bytes: &'a [u8],
+        snap: Option<&'a (Vec<u8>, Vec<u8>)>,
+    }
 
     struct Rng(u64);
     impl Rng {
@@ -1221,46 +1926,103 @@ mod g3 {
         }
     }
 
-    fn f32_bytes(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
-    fn bytes_f32(b: &[u8]) -> Vec<f32> { b.chunks_exact(4).map(|x| f32::from_le_bytes(x.try_into().unwrap())).collect() }
+    fn f32_bytes(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+    fn bytes_f32(b: &[u8]) -> Vec<f32> {
+        b.chunks_exact(4)
+            .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+            .collect()
+    }
     fn word_diff(a: &[u8], b: &[u8]) -> u64 {
-        if a.len() != b.len() { return u64::MAX }
-        a.chunks_exact(4).zip(b.chunks_exact(4)).filter(|(x, y)| x != y).count() as u64
+        if a.len() != b.len() {
+            return u64::MAX;
+        }
+        a.chunks_exact(4)
+            .zip(b.chunks_exact(4))
+            .filter(|(x, y)| x != y)
+            .count() as u64
     }
 
     // ------------------------------------------------------------ launches
 
-    fn raw_launch(gpu: &mut Gpu, env: &Env, which: RawImpl, score: bool, grid: [u32; 3], blob: &mut KernargBlob) -> Result<()> {
+    fn raw_launch(
+        gpu: &mut Gpu,
+        env: &Env,
+        which: RawImpl,
+        score: bool,
+        grid: [u32; 3],
+        blob: &mut KernargBlob,
+    ) -> Result<()> {
         match which {
             RawImpl::Fixed => gpu
-                .launch_kernel_blob(if score { HIPCC_SCORE } else { HIPCC_SELECT }, grid, [256, 1, 1], 0, blob.as_mut_slice())
+                .launch_kernel_blob(
+                    if score { HIPCC_SCORE } else { HIPCC_SELECT },
+                    grid,
+                    [256, 1, 1],
+                    0,
+                    blob.as_mut_slice(),
+                )
                 .map_err(err),
             RawImpl::Beta => {
-                let f = if score { &env.beta_score } else { &env.beta_select };
-                unsafe { gpu.hip.launch_kernel_blob(f, grid, [256, 1, 1], 0, None, blob.as_mut_slice()) }.map_err(err)
+                let f = if score {
+                    &env.beta_score
+                } else {
+                    &env.beta_select
+                };
+                unsafe {
+                    gpu.hip
+                        .launch_kernel_blob(f, grid, [256, 1, 1], 0, None, blob.as_mut_slice())
+                }
+                .map_err(err)
             }
             RawImpl::Pm => {
                 let f = if score { &env.pm_score } else { &env.pm_select };
-                unsafe { gpu.hip.launch_kernel_blob(f, grid, [256, 1, 1], 0, None, blob.as_mut_slice()) }.map_err(err)
+                unsafe {
+                    gpu.hip
+                        .launch_kernel_blob(f, grid, [256, 1, 1], 0, None, blob.as_mut_slice())
+                }
+                .map_err(err)
             }
         }
     }
 
     /// The production pair over all groups with the given kernels (`keep`
     /// downloads each group's scratch after its score launch).
-    fn raw_call(gpu: &mut Gpu, env: &Env, which: RawImpl, c: &Call, b: &Bufs, mirror: bool, mut keep: Option<&mut Vec<u8>>) -> Result<()> {
+    fn raw_call(
+        gpu: &mut Gpu,
+        env: &Env,
+        which: RawImpl,
+        c: &Call,
+        b: &Bufs,
+        mirror: bool,
+        mut keep: Option<&mut Vec<u8>>,
+    ) -> Result<()> {
         let group = c.group();
         let mut g0 = 0;
         while g0 < c.rows {
             let n = group.min(c.rows - g0);
-            if keep.is_some() { gpu.hip.memset(&b.scores.buf, POISON as i32, b.scores.byte_size()).map_err(err)?; }
+            if keep.is_some() {
+                gpu.hip
+                    .memset(&b.scores.buf, POISON as i32, b.scores.byte_size())
+                    .map_err(err)?;
+            }
             let mut blob = score_blob(c, b, g0, n);
-            raw_launch(gpu, env, which, true, [c.block_count.div_ceil(256) as u32, n.div_ceil(16) as u32, 1], &mut blob)?;
+            raw_launch(
+                gpu,
+                env,
+                which,
+                true,
+                [c.block_count.div_ceil(256) as u32, n.div_ceil(16) as u32, 1],
+                &mut blob,
+            )?;
             if let Some(k) = keep.as_deref_mut() {
                 gpu.hip.device_synchronize().map_err(err)?;
                 let mut bytes = vec![0u8; n * c.block_count * 4];
                 let len = bytes.len();
-                gpu.hip.memcpy_dtoh(&mut bytes, &b.scores.buf.byte_view(0, len)).map_err(err)?;
+                gpu.hip
+                    .memcpy_dtoh(&mut bytes, &b.scores.buf.byte_view(0, len))
+                    .map_err(err)?;
                 k.extend_from_slice(&bytes);
             }
             let mut blob = select_blob(c, b, g0, n, mirror && g0 + n == c.rows);
@@ -1270,15 +2032,28 @@ mod g3 {
         gpu.hip.device_synchronize().map_err(err)
     }
 
-    fn read_out(gpu: &Gpu, b: &Bufs, c: &Call, scores: Vec<u8>, persisted: Option<bool>) -> Result<Out> {
+    fn read_out(
+        gpu: &Gpu,
+        b: &Bufs,
+        c: &Call,
+        scores: Vec<u8>,
+        persisted: Option<bool>,
+    ) -> Result<Out> {
         let sel_len = c.rows * c.capacity * 4;
         let mir_len = c.capacity * 4;
         let mut sel = download(gpu, &b.selected)?;
         let mut mirror = download(gpu, &b.mirror)?;
-        let canary = sel[sel_len..].iter().all(|&x| x == POISON) && mirror[mir_len..].iter().all(|&x| x == POISON);
+        let canary = sel[sel_len..].iter().all(|&x| x == POISON)
+            && mirror[mir_len..].iter().all(|&x| x == POISON);
         sel.truncate(sel_len);
         mirror.truncate(mir_len);
-        Ok(Out { sel, mirror, scores, canary, persisted })
+        Ok(Out {
+            sel,
+            mirror,
+            scores,
+            canary,
+            persisted,
+        })
     }
 
     fn arm_raw(gpu: &mut Gpu, env: &Env, which: RawImpl, case: &Case, b: &Bufs) -> Result<Out> {
@@ -1291,22 +2066,45 @@ mod g3 {
     fn params<'a>(case: &'a Case, b: &'a Bufs) -> IndexedAttentionSelectBatch<'a> {
         let c = &case.c;
         IndexedAttentionSelectBatch {
-            query: &b.query, pooled: &b.pooled, selected: &b.selected, rows: c.rows, query_row_stride: c.stride,
+            query: &b.query,
+            pooled: &b.pooled,
+            selected: &b.selected,
+            rows: c.rows,
+            query_row_stride: c.stride,
             pooled_bf16: None,
             pooled_bf16_valid_blocks: 0,
-            block_count: c.block_count, index_heads: 4, index_dim: c.dim, budget_blocks: c.budget, compress: c.compress,
-            position_start: c.position_start, capacity: c.capacity, shape_blocks: case.shape_blocks,
+            block_count: c.block_count,
+            index_heads: 4,
+            index_dim: c.dim,
+            budget_blocks: c.budget,
+            compress: c.compress,
+            position_start: c.position_start,
+            capacity: c.capacity,
+            shape_blocks: case.shape_blocks,
         }
     }
 
     /// `arm` Some: the lab helper with that arm; None: the live route.
-    fn arm_helper(gpu: &mut Gpu, case: &Case, b: &Bufs, arm: Option<QsaSelectPmArm>) -> Result<Out> {
+    fn arm_helper(
+        gpu: &mut Gpu,
+        case: &Case,
+        b: &Bufs,
+        arm: Option<QsaSelectPmArm>,
+    ) -> Result<Out> {
         poison_outputs(gpu, b)?;
         let p = params(case, b);
         let persisted = match arm {
-            Some(a) => indexed_attention_select_batch_pm_arm(gpu, &p, case.mirror.then_some(&b.mirror), a).map_err(err)?,
-            None if case.mirror => indexed_attention_select_batch_mirrored(gpu, &p, &b.mirror).map_err(err)?,
-            None => { indexed_attention_select_batch(gpu, &p).map_err(err)?; false }
+            Some(a) => {
+                indexed_attention_select_batch_pm_arm(gpu, &p, case.mirror.then_some(&b.mirror), a)
+                    .map_err(err)?
+            }
+            None if case.mirror => {
+                indexed_attention_select_batch_mirrored(gpu, &p, &b.mirror).map_err(err)?
+            }
+            None => {
+                indexed_attention_select_batch(gpu, &p).map_err(err)?;
+                false
+            }
         };
         gpu.hip.device_synchronize().map_err(err)?;
         read_out(gpu, b, &case.c, Vec::new(), Some(persisted))
@@ -1320,22 +2118,42 @@ mod g3 {
 
     // -------------------------------------------------------------- graph
 
-    struct GraphRun { stream: Stream, graph: Graph, exec: GraphExec, _blobs: Vec<Vec<u8>> }
+    struct GraphRun {
+        stream: Stream,
+        graph: Graph,
+        exec: GraphExec,
+        _blobs: Vec<Vec<u8>>,
+    }
 
     /// Capture the PM pair's raw launches (score+select per group, or select
     /// only for injected scores) on a private non-blocking stream.  All kernarg
     /// blobs are built before capture and owned by the result; nothing but
     /// kernel launches is issued inside the capture window.
-    fn build_graph(gpu: &mut Gpu, env: &Env, c: &Call, b: &Bufs, mirror: bool, with_score: bool) -> Result<GraphRun> {
+    fn build_graph(
+        gpu: &mut Gpu,
+        env: &Env,
+        c: &Call,
+        b: &Bufs,
+        mirror: bool,
+        with_score: bool,
+    ) -> Result<GraphRun> {
         let group = c.group();
         let mut items: Vec<(&Function, [u32; 3], Vec<u8>)> = Vec::new();
         let mut g0 = 0;
         while g0 < c.rows {
             let n = group.min(c.rows - g0);
             if with_score {
-                items.push((&env.pm_score, [c.block_count.div_ceil(256) as u32, n.div_ceil(16) as u32, 1], score_blob(c, b, g0, n).into_vec()));
+                items.push((
+                    &env.pm_score,
+                    [c.block_count.div_ceil(256) as u32, n.div_ceil(16) as u32, 1],
+                    score_blob(c, b, g0, n).into_vec(),
+                ));
             }
-            items.push((&env.pm_select, [n as u32, 1, 1], select_blob(c, b, g0, n, mirror && g0 + n == c.rows).into_vec()));
+            items.push((
+                &env.pm_select,
+                [n as u32, 1, 1],
+                select_blob(c, b, g0, n, mirror && g0 + n == c.rows).into_vec(),
+            ));
             g0 += n;
         }
         gpu.hip.device_synchronize().map_err(err)?;
@@ -1343,14 +2161,30 @@ mod g3 {
         gpu.hip.stream_begin_capture(&stream, 0).map_err(err)?;
         let mut launched = Ok(());
         for (f, grid, blob) in items.iter_mut() {
-            launched = unsafe { gpu.hip.launch_kernel_blob(f, *grid, [256, 1, 1], 0, Some(&stream), blob.as_mut_slice()) };
-            if launched.is_err() { break }
+            launched = unsafe {
+                gpu.hip.launch_kernel_blob(
+                    f,
+                    *grid,
+                    [256, 1, 1],
+                    0,
+                    Some(&stream),
+                    blob.as_mut_slice(),
+                )
+            };
+            if launched.is_err() {
+                break;
+            }
         }
         let graph = gpu.hip.stream_end_capture(&stream);
         launched.map_err(err)?;
         let graph = graph.map_err(err)?;
         let exec = gpu.hip.graph_instantiate(&graph).map_err(err)?;
-        Ok(GraphRun { stream, graph, exec, _blobs: items.into_iter().map(|x| x.2).collect() })
+        Ok(GraphRun {
+            stream,
+            graph,
+            exec,
+            _blobs: items.into_iter().map(|x| x.2).collect(),
+        })
     }
 
     fn replay(gpu: &Gpu, g: &GraphRun) -> Result<()> {
@@ -1371,11 +2205,19 @@ mod g3 {
     /// CPU stable-order selection of every row over the raw score bytes.
     fn oracle(c: &Call, scores: &[u8]) -> Vec<u8> {
         let bc = c.block_count;
-        let rows: Vec<Vec<u8>> = (0..c.rows).into_par_iter().map(|r| {
-            let keys: Vec<u32> = scores[r * bc * 4..(r * bc + c.row_blocks(r)) * 4]
-                .chunks_exact(4).map(|x| u32::from_le_bytes(x.try_into().unwrap())).collect();
-            selection_row(&rank(&keys), c, r).iter().flat_map(|v| v.to_le_bytes()).collect()
-        }).collect();
+        let rows: Vec<Vec<u8>> = (0..c.rows)
+            .into_par_iter()
+            .map(|r| {
+                let keys: Vec<u32> = scores[r * bc * 4..(r * bc + c.row_blocks(r)) * 4]
+                    .chunks_exact(4)
+                    .map(|x| u32::from_le_bytes(x.try_into().unwrap()))
+                    .collect();
+                selection_row(&rank(&keys), c, r)
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect()
+            })
+            .collect();
         rows.concat()
     }
 
@@ -1383,27 +2225,55 @@ mod g3 {
     /// of causal score words that differ from the GPU's.
     fn rescore_diff(c: &Call, q: &[f32], p: &[f32], scores: &[u8]) -> u64 {
         let bc = c.block_count;
-        (0..c.rows).into_par_iter().filter(|r| r % 61 == 0 || *r == c.rows - 1).map(|r| {
-            let qr = &q[r * c.stride..r * c.stride + 4 * c.dim];
-            (0..c.row_blocks(r)).filter(|&b| {
-                let (s, _) = cpu_score(qr, &p[b * c.dim..(b + 1) * c.dim], c.dim);
-                let o = (r * bc + b) * 4;
-                s.to_bits() != u32::from_le_bytes(scores[o..o + 4].try_into().unwrap())
-            }).count() as u64
-        }).sum()
+        (0..c.rows)
+            .into_par_iter()
+            .filter(|r| r % 61 == 0 || *r == c.rows - 1)
+            .map(|r| {
+                let qr = &q[r * c.stride..r * c.stride + 4 * c.dim];
+                (0..c.row_blocks(r))
+                    .filter(|&b| {
+                        let (s, _) = cpu_score(qr, &p[b * c.dim..(b + 1) * c.dim], c.dim);
+                        let o = (r * bc + b) * 4;
+                        s.to_bits() != u32::from_le_bytes(scores[o..o + 4].try_into().unwrap())
+                    })
+                    .count() as u64
+            })
+            .sum()
     }
 
-    fn judge(name: &str, arm: &str, e: &Expect, o1: &Out, o2: &Out, inputs_ok: bool, extra: Vec<(&str, Value)>, extra_ok: bool) -> (Value, bool) {
+    fn judge(
+        name: &str,
+        arm: &str,
+        e: &Expect,
+        o1: &Out,
+        o2: &Out,
+        inputs_ok: bool,
+        extra: Vec<(&str, Value)>,
+        extra_ok: bool,
+    ) -> (Value, bool) {
         let eq_oracle = o1.sel == e.sel;
         let eq_snap = e.snap.map(|s| o1.sel == s.0 && o1.mirror == s.1);
-        let mirror_ok = (if e.mirror { o1.mirror == e.mirror_bytes } else { o1.mirror.iter().all(|&x| x == POISON) })
-            && o1.persisted.is_none_or(|p| p == e.mirror);
+        let mirror_ok = (if e.mirror {
+            o1.mirror == e.mirror_bytes
+        } else {
+            o1.mirror.iter().all(|&x| x == POISON)
+        }) && o1.persisted.is_none_or(|p| p == e.mirror);
         let repeat = same(o1, o2);
         let mut rec = json!({"case":name,"arm":arm,"bytes_equal_oracle":eq_oracle,"mirror_ok":mirror_ok,
             "canary_ok":o1.canary,"inputs_unchanged":inputs_ok,"repeat_identical":repeat});
-        if let Some(s) = eq_snap { rec["bytes_equal_snapshot"] = json!(s); }
-        for (k, v) in extra { rec[k] = v; }
-        let ok = eq_oracle && eq_snap.unwrap_or(true) && mirror_ok && o1.canary && inputs_ok && repeat && extra_ok;
+        if let Some(s) = eq_snap {
+            rec["bytes_equal_snapshot"] = json!(s);
+        }
+        for (k, v) in extra {
+            rec[k] = v;
+        }
+        let ok = eq_oracle
+            && eq_snap.unwrap_or(true)
+            && mirror_ok
+            && o1.canary
+            && inputs_ok
+            && repeat
+            && extra_ok;
         (rec, ok)
     }
 
@@ -1427,17 +2297,26 @@ mod g3 {
     }
 
     fn free_bufs(gpu: &mut Gpu, b: Bufs) -> Result<()> {
-        for t in [b.query, b.pooled, b.scores, b.selected, b.mirror] { gpu.free_tensor(t).map_err(err)?; }
+        for t in [b.query, b.pooled, b.scores, b.selected, b.mirror] {
+            gpu.free_tensor(t).map_err(err)?;
+        }
         Ok(())
     }
 
     /// Whether the builder pair covers the call (mirrors the route's gate).
     fn covered(c: &Call) -> bool {
         let below = |n: Option<usize>| n.is_some_and(|x| x < OOB);
-        c.rows >= 512 && c.budget <= 512 && c.block_count > 0 && c.block_count <= PM_MAX_BLOCKS
+        c.rows >= 512
+            && c.budget <= 512
+            && c.block_count > 0
+            && c.block_count <= PM_MAX_BLOCKS
             && below(c.rows.checked_mul(c.stride).and_then(|n| n.checked_mul(4)))
             && below(c.block_count.checked_mul(128 * 4))
-            && below(c.rows.checked_mul(c.capacity).and_then(|n| n.checked_mul(4)))
+            && below(
+                c.rows
+                    .checked_mul(c.capacity)
+                    .and_then(|n| n.checked_mul(4)),
+            )
     }
 
     // -------------------------------------------------------------- cases
@@ -1451,35 +2330,73 @@ mod g3 {
         }
         let b = alloc_bufs(gpu, case)?;
         let (q, p) = (bytes_f32(&case.qbytes), bytes_f32(&case.pbytes));
-        eprintln!("case {} rows={} bc={} group={} compress={} budget={} capacity={} mirror={}", case.name, c.rows, c.block_count,
-            c.group(), c.compress, c.budget, c.capacity, case.mirror);
+        eprintln!(
+            "case {} rows={} bc={} group={} compress={} budget={} capacity={} mirror={}",
+            case.name,
+            c.rows,
+            c.block_count,
+            c.group(),
+            c.compress,
+            c.budget,
+            c.capacity,
+            case.mirror
+        );
 
         // raw-fixed: the oracle's scores.
         let (fx1, fx2) = twice(gpu, |g| arm_raw(g, env, RawImpl::Fixed, case, &b))?;
         let orc = oracle(c, &fx1.scores);
         let orc_mirror = orc[(c.rows - 1) * c.capacity * 4..].to_vec();
         let rescore = rescore_diff(c, &q, &p, &fx1.scores);
-        let exp = Expect { mirror: case.mirror, sel: &orc, mirror_bytes: &orc_mirror, snap: case.snap.as_ref() };
+        let exp = Expect {
+            mirror: case.mirror,
+            sel: &orc,
+            mirror_bytes: &orc_mirror,
+            snap: case.snap.as_ref(),
+        };
         let oracle_snap = case.snap.as_ref().map(|s| orc == s.0 && orc_mirror == s.1);
         let ok_in = inputs_unchanged(gpu, &b, &case.qh, &case.ph)?;
-        let (rec, ok) = judge(&case.name, "raw-fixed", &exp, &fx1, &fx2, ok_in,
-            vec![("cpu_rescore_bits_diff", json!(rescore)), ("oracle_equal_snapshot", json!(oracle_snap))],
-            rescore == 0 && oracle_snap.unwrap_or(true));
+        let (rec, ok) = judge(
+            &case.name,
+            "raw-fixed",
+            &exp,
+            &fx1,
+            &fx2,
+            ok_in,
+            vec![
+                ("cpu_rescore_bits_diff", json!(rescore)),
+                ("oracle_equal_snapshot", json!(oracle_snap)),
+            ],
+            rescore == 0 && oracle_snap.unwrap_or(true),
+        );
         sink.put(rec, ok)?;
 
         // raw-pm and raw beta: same score bits (incl. untouched poison) and bytes.
         for (which, arm) in [(RawImpl::Pm, "raw-pm"), (RawImpl::Beta, "beta")] {
             if which == RawImpl::Beta {
                 if let Some(reason) = case.beta_skip {
-                    sink.put(json!({"case":case.name,"arm":"beta","skipped":reason}), true)?;
+                    sink.put(
+                        json!({"case":case.name,"arm":"beta","skipped":reason}),
+                        true,
+                    )?;
                     continue;
                 }
             }
             let (o1, o2) = twice(gpu, |g| arm_raw(g, env, which, case, &b))?;
             let diff = word_diff(&o1.scores, &fx1.scores);
             let ok_in = inputs_unchanged(gpu, &b, &case.qh, &case.ph)?;
-            let (mut rec, mut ok) = judge(&case.name, arm, &exp, &o1, &o2, ok_in, vec![("score_bits_diff", json!(diff))], diff == 0);
-            if which == RawImpl::Beta { rec["beta_src"] = json!("pre-fix hipcc pair"); }
+            let (mut rec, mut ok) = judge(
+                &case.name,
+                arm,
+                &exp,
+                &o1,
+                &o2,
+                ok_in,
+                vec![("score_bits_diff", json!(diff))],
+                diff == 0,
+            );
+            if which == RawImpl::Beta {
+                rec["beta_src"] = json!("pre-fix hipcc pair");
+            }
             ok &= o1.scores.len() == fx1.scores.len();
             sink.put(rec, ok)?;
         }
@@ -1487,14 +2404,18 @@ mod g3 {
         // helper arms (production grouping / scratch / mirror persistence).
         let mut eager_pm: Option<Out> = None;
         for (arm, name) in [
-            (QsaSelectPmArm::Hipcc, "fixed"), (QsaSelectPmArm::Both, "pm"),
-            (QsaSelectPmArm::ScoreOnly, "pm-score-only"), (QsaSelectPmArm::SelectOnly, "pm-select-only"),
+            (QsaSelectPmArm::Hipcc, "fixed"),
+            (QsaSelectPmArm::Both, "pm"),
+            (QsaSelectPmArm::ScoreOnly, "pm-score-only"),
+            (QsaSelectPmArm::SelectOnly, "pm-select-only"),
         ] {
             let (o1, o2) = twice(gpu, |g| arm_helper(g, case, &b, Some(arm)))?;
             let ok_in = inputs_unchanged(gpu, &b, &case.qh, &case.ph)?;
             let (rec, ok) = judge(&case.name, name, &exp, &o1, &o2, ok_in, Vec::new(), true);
             sink.put(rec, ok)?;
-            if arm == QsaSelectPmArm::Both { eager_pm = Some(o1); }
+            if arm == QsaSelectPmArm::Both {
+                eager_pm = Some(o1);
+            }
         }
         let eager_pm = eager_pm.unwrap();
 
@@ -1504,7 +2425,9 @@ mod g3 {
             let mut outs = Vec::new();
             for _ in 0..2 {
                 poison_outputs(gpu, &b)?;
-                gpu.hip.memset(&b.scores.buf, POISON as i32, b.scores.byte_size()).map_err(err)?;
+                gpu.hip
+                    .memset(&b.scores.buf, POISON as i32, b.scores.byte_size())
+                    .map_err(err)?;
                 replay(gpu, &g)?;
                 outs.push(read_out(gpu, &b, c, Vec::new(), None)?);
             }
@@ -1513,7 +2436,16 @@ mod g3 {
             let o1 = outs.pop().unwrap();
             let ok_in = inputs_unchanged(gpu, &b, &case.qh, &case.ph)?;
             let eq_eager = o1.sel == eager_pm.sel && o1.mirror == eager_pm.mirror;
-            let (rec, ok) = judge(&case.name, "pm-graph", &exp, &o1, &o2, ok_in, vec![("equal_eager_pm", json!(eq_eager))], eq_eager);
+            let (rec, ok) = judge(
+                &case.name,
+                "pm-graph",
+                &exp,
+                &o1,
+                &o2,
+                ok_in,
+                vec![("equal_eager_pm", json!(eq_eager))],
+                eq_eager,
+            );
             sink.put(rec, ok)?;
         }
 
@@ -1522,7 +2454,16 @@ mod g3 {
             let (o1, o2) = twice(gpu, |g| arm_helper(g, case, &b, None))?;
             let ok_in = inputs_unchanged(gpu, &b, &case.qh, &case.ph)?;
             let eq_pm = o1.sel == eager_pm.sel && o1.mirror == eager_pm.mirror;
-            let (rec, ok) = judge(&case.name, "live", &exp, &o1, &o2, ok_in, vec![("equal_pm", json!(eq_pm))], eq_pm);
+            let (rec, ok) = judge(
+                &case.name,
+                "live",
+                &exp,
+                &o1,
+                &o2,
+                ok_in,
+                vec![("equal_pm", json!(eq_pm))],
+                eq_pm,
+            );
             sink.put(rec, ok)?;
         }
         free_bufs(gpu, b)
@@ -1530,48 +2471,117 @@ mod g3 {
 
     fn load_snapshot(path: &Path) -> Result<Case> {
         let root = path.parent().unwrap();
-        let header: Value = serde_json::from_slice(&std::fs::read(path).map_err(err)?).map_err(err)?;
-        if header["schema"] != "qsa-source-v1" { return Err(format!("{}: unsupported schema", path.display())) }
+        let header: Value =
+            serde_json::from_slice(&std::fs::read(path).map_err(err)?).map_err(err)?;
+        if header["schema"] != "qsa-source-v1" {
+            return Err(format!("{}: unsupported schema", path.display()));
+        }
         let sel = &header["identity"]["selector"];
-        if header["identity"]["arch"] != "gfx1151" { return Err("snapshot arch not gfx1151".into()) }
-        if sel["pooled_dtype"] != "F32" || sel["projection_dtype"] != "F32" { return Err(format!("{}: not the F32 pooled route", path.display())) }
-        if sel["heads"] != 4 || sel["dim"] != 128 { return Err(format!("{}: uncovered selector geometry", path.display())) }
+        if header["identity"]["arch"] != "gfx1151" {
+            return Err("snapshot arch not gfx1151".into());
+        }
+        if sel["pooled_dtype"] != "F32" || sel["projection_dtype"] != "F32" {
+            return Err(format!("{}: not the F32 pooled route", path.display()));
+        }
+        if sel["heads"] != 4 || sel["dim"] != 128 {
+            return Err(format!("{}: uncovered selector geometry", path.display()));
+        }
         let get = |name: &str| -> Result<Vec<u8>> {
             let b = std::fs::read(root.join(name)).map_err(err)?;
-            if header["files"][name]["sha256"] != sha256(&b) { return Err(format!("{}: hash mismatch {name}", path.display())) }
+            if header["files"][name]["sha256"] != sha256(&b) {
+                return Err(format!("{}: hash mismatch {name}", path.display()));
+            }
             Ok(b)
         };
         let g = &header["geometry"];
-        let n = |v: &Value, k: &str| v[k].as_u64().map(|x| x as usize).ok_or(format!("missing {k}"));
-        let (rows, position_start, compress) = (n(g, "rows")?, n(g, "position_start")?, n(g, "compress")?);
-        if compress == 0 { return Err(format!("{}: zero compress", path.display())) }
-        let c = Call { rows, stride: n(sel, "projection_stride")?, block_count: (position_start + rows) / compress, dim: 128,
-            compress, position_start, budget: n(g, "budget_blocks")?, capacity: n(g, "capacity")? };
-        if c.budget > 512 || c.block_count == 0 { return Err("uncovered budget/block count".into()) }
+        let n = |v: &Value, k: &str| {
+            v[k].as_u64()
+                .map(|x| x as usize)
+                .ok_or(format!("missing {k}"))
+        };
+        let (rows, position_start, compress) =
+            (n(g, "rows")?, n(g, "position_start")?, n(g, "compress")?);
+        if compress == 0 {
+            return Err(format!("{}: zero compress", path.display()));
+        }
+        let c = Call {
+            rows,
+            stride: n(sel, "projection_stride")?,
+            block_count: (position_start + rows) / compress,
+            dim: 128,
+            compress,
+            position_start,
+            budget: n(g, "budget_blocks")?,
+            capacity: n(g, "capacity")?,
+        };
+        if c.budget > 512 || c.block_count == 0 {
+            return Err("uncovered budget/block count".into());
+        }
         let pooled_capacity = n(sel, "pooled_capacity")?;
         let qbytes = get("index-projection.f32")?;
         let pbytes = get("pooled.source")?;
         let snap_sel = get("selected.i32")?;
         let snap_mirror = get("selected-mirror.i32")?;
-        if qbytes.len() != rows * c.stride * 4 || pbytes.len() != pooled_capacity * 128 * 4 || snap_sel.len() != rows * c.capacity * 4
-            || snap_mirror.len() != c.capacity * 4 || c.block_count > pooled_capacity {
-            return Err(format!("{}: geometry/extent mismatch", path.display()))
+        if qbytes.len() != rows * c.stride * 4
+            || pbytes.len() != pooled_capacity * 128 * 4
+            || snap_sel.len() != rows * c.capacity * 4
+            || snap_mirror.len() != c.capacity * 4
+            || c.block_count > pooled_capacity
+        {
+            return Err(format!("{}: geometry/extent mismatch", path.display()));
         }
-        let name = format!("{} ctx={} layer={}", path.display(), header["identity"]["ctx"], header["identity"]["layer"]);
-        Ok(Case { name, c, shape_blocks: pooled_capacity, qh: sha256(&qbytes), ph: sha256(&pbytes), qbytes, pbytes,
-            snap: Some((snap_sel, snap_mirror)), mirror: true,
-            beta_skip: (c.block_count >= BETA_MAX_BLOCKS).then_some("block_count >= 32768: pre-fix tie-count overflow range, beta never runs") })
+        let name = format!(
+            "{} ctx={} layer={}",
+            path.display(),
+            header["identity"]["ctx"],
+            header["identity"]["layer"]
+        );
+        Ok(Case {
+            name,
+            c,
+            shape_blocks: pooled_capacity,
+            qh: sha256(&qbytes),
+            ph: sha256(&pbytes),
+            qbytes,
+            pbytes,
+            snap: Some((snap_sel, snap_mirror)),
+            mirror: true,
+            beta_skip: (c.block_count >= BETA_MAX_BLOCKS).then_some(
+                "block_count >= 32768: pre-fix tie-count overflow range, beta never runs",
+            ),
+        })
     }
 
     // --------------------------------------------------------- synthetic
 
     #[derive(Clone, Copy)]
-    enum Tie { Dense, Sparse, Dup, Float, Zero, Same }
+    enum Tie {
+        Dense,
+        Sparse,
+        Dup,
+        Float,
+        Zero,
+        Same,
+    }
 
-    struct Spec { name: &'static str, compress: usize, bc: usize, rows: usize, tail: usize, budget: usize, cap_extra: usize, mirror: bool, tie: Tie }
+    struct Spec {
+        name: &'static str,
+        compress: usize,
+        bc: usize,
+        rows: usize,
+        tail: usize,
+        budget: usize,
+        cap_extra: usize,
+        mirror: bool,
+        tie: Tie,
+    }
 
-    fn int(r: &mut Rng) -> f32 { (r.next() % 3) as f32 - 1.0 }
-    fn flt(r: &mut Rng) -> f32 { (r.next() >> 40) as f32 / 8_388_608.0 - 1.0 }
+    fn int(r: &mut Rng) -> f32 {
+        (r.next() % 3) as f32 - 1.0
+    }
+    fn flt(r: &mut Rng) -> f32 {
+        (r.next() >> 40) as f32 / 8_388_608.0 - 1.0
+    }
 
     /// Deterministic case.  Query/pooled values are small integers (exact,
     /// order-independent dots: dense score ties) or floats; `Dup` draws every
@@ -1579,7 +2589,11 @@ mod g3 {
     /// last row's partial block, `position_start = bc*compress + tail - rows`.
     fn synth_case(idx: usize, s: &Spec) -> Case {
         let (compress, bc, rows) = (s.compress, s.bc, s.rows);
-        assert!(s.tail < compress && bc * compress + s.tail >= rows, "{}", s.name);
+        assert!(
+            s.tail < compress && bc * compress + s.tail >= rows,
+            "{}",
+            s.name
+        );
         let position_start = bc * compress + s.tail - rows;
         let capacity = s.budget * compress + compress - 1 + s.cap_extra;
         let stride = 640usize;
@@ -1588,37 +2602,101 @@ mod g3 {
         let float_mode = matches!(s.tie, Tie::Float);
         let mut q = Vec::with_capacity(rows * stride);
         for _ in 0..rows {
-            for d in 0..stride { q.push(if d < 512 && !float_mode { int(&mut rng) } else { flt(&mut rng) }); }
+            for d in 0..stride {
+                q.push(if d < 512 && !float_mode {
+                    int(&mut rng)
+                } else {
+                    flt(&mut rng)
+                });
+            }
         }
         let mut p = Vec::with_capacity(shape_blocks * 128);
         match s.tie {
-            Tie::Dense => for _ in 0..bc * 128 { p.push(int(&mut rng)); },
-            Tie::Float => for _ in 0..bc * 128 { p.push(flt(&mut rng)); },
-            Tie::Sparse => for _ in 0..bc * 128 {
-                let v = rng.next();
-                p.push(if v % 16 == 0 { if v & 16 == 0 { 1.0 } else { -1.0 } } else { 0.0 });
-            },
+            Tie::Dense => {
+                for _ in 0..bc * 128 {
+                    p.push(int(&mut rng));
+                }
+            }
+            Tie::Float => {
+                for _ in 0..bc * 128 {
+                    p.push(flt(&mut rng));
+                }
+            }
+            Tie::Sparse => {
+                for _ in 0..bc * 128 {
+                    let v = rng.next();
+                    p.push(if v % 16 == 0 {
+                        if v & 16 == 0 {
+                            1.0
+                        } else {
+                            -1.0
+                        }
+                    } else {
+                        0.0
+                    });
+                }
+            }
             Tie::Zero => p.resize(bc * 128, 0.0),
             Tie::Dup => {
-                let keys: Vec<Vec<f32>> = (0..40).map(|_| (0..128).map(|_| int(&mut rng)).collect()).collect();
-                for _ in 0..bc { let k = &keys[(rng.next() % 40) as usize]; p.extend_from_slice(k); }
+                let keys: Vec<Vec<f32>> = (0..40)
+                    .map(|_| (0..128).map(|_| int(&mut rng)).collect())
+                    .collect();
+                for _ in 0..bc {
+                    let k = &keys[(rng.next() % 40) as usize];
+                    p.extend_from_slice(k);
+                }
             }
             Tie::Same => {
                 let k: Vec<f32> = (0..128).map(|_| int(&mut rng)).collect();
-                for _ in 0..bc { p.extend_from_slice(&k); }
+                for _ in 0..bc {
+                    p.extend_from_slice(&k);
+                }
             }
         }
         // Blocks past the active count are never read: garbage the hash guards.
-        for _ in 0..(shape_blocks - bc) * 128 { p.push(flt(&mut rng)); }
+        for _ in 0..(shape_blocks - bc) * 128 {
+            p.push(flt(&mut rng));
+        }
         let (qbytes, pbytes) = (f32_bytes(&q), f32_bytes(&p));
-        let c = Call { rows, stride, block_count: bc, dim: 128, compress, position_start, budget: s.budget, capacity };
-        Case { name: format!("synthetic:{}", s.name), c, shape_blocks, qh: sha256(&qbytes), ph: sha256(&pbytes), qbytes, pbytes, snap: None, mirror: s.mirror,
-            beta_skip: (bc >= BETA_MAX_BLOCKS).then_some("block_count >= 32768: pre-fix tie-count overflow range, beta never runs") }
+        let c = Call {
+            rows,
+            stride,
+            block_count: bc,
+            dim: 128,
+            compress,
+            position_start,
+            budget: s.budget,
+            capacity,
+        };
+        Case {
+            name: format!("synthetic:{}", s.name),
+            c,
+            shape_blocks,
+            qh: sha256(&qbytes),
+            ph: sha256(&pbytes),
+            qbytes,
+            pbytes,
+            snap: None,
+            mirror: s.mirror,
+            beta_skip: (bc >= BETA_MAX_BLOCKS).then_some(
+                "block_count >= 32768: pre-fix tie-count overflow range, beta never runs",
+            ),
+        }
     }
 
     fn specs() -> Vec<Spec> {
         use Tie::*;
-        let s = |name, compress, bc, rows, tail, budget, cap_extra, mirror, tie| Spec { name, compress, bc, rows, tail, budget, cap_extra, mirror, tie };
+        let s = |name, compress, bc, rows, tail, budget, cap_extra, mirror, tie| Spec {
+            name,
+            compress,
+            bc,
+            rows,
+            tail,
+            budget,
+            cap_extra,
+            mirror,
+            tie,
+        };
         vec![
             // position % 4 residues (every row also walks all residues)
             s("c4-res0", 4, 700, 512, 0, 512, 0, true, Dense),
@@ -1628,7 +2706,17 @@ mod g3 {
             // visible blocks fewer / equal / more than the budget
             s("c4-fewer-than-budget", 4, 128, 512, 0, 512, 0, true, Dense),
             s("c4-equal-budget", 4, 512, 512, 1, 512, 0, true, Float),
-            s("c4-more-than-budget", 4, 1024, 1024, 0, 512, 0, false, Sparse),
+            s(
+                "c4-more-than-budget",
+                4,
+                1024,
+                1024,
+                0,
+                512,
+                0,
+                false,
+                Sparse,
+            ),
             // budgets 0 / 1 / 511
             s("c4-budget0", 4, 600, 600, 2, 0, 0, true, Dense),
             s("c4-budget1", 4, 2000, 700, 3, 1, 5, true, Dup),
@@ -1637,12 +2725,72 @@ mod g3 {
             s("c4-zero-keys", 4, 4096, 640, 3, 512, 0, true, Zero),
             s("c4-same-keys", 4, 4096, 640, 2, 512, 0, true, Same),
             // ragged groups (64 MiB scratch: group = 16 MiB / (4 bc) rounded to 16)
-            s("c4-ragged-1027-g1024+3", 4, 16384, 1027, 3, 512, 0, true, Dense),
-            s("c4-ragged-2020-g1024+996", 4, 16384, 2020, 0, 512, 0, true, Float),
-            s("c4-ragged-2051-g2048+3", 4, 8192, 2051, 1, 511, 0, false, Dup),
-            s("c4-ragged-1019-single-group", 4, 8192, 1019, 2, 512, 0, true, Sparse),
-            s("c4-ragged-2100-g1392+708", 4, 12000, 2100, 3, 1, 0, true, Dense),
-            s("c4-ragged-1668-g832x2+4", 4, 20000, 1668, 3, 512, 0, true, Dup),
+            s(
+                "c4-ragged-1027-g1024+3",
+                4,
+                16384,
+                1027,
+                3,
+                512,
+                0,
+                true,
+                Dense,
+            ),
+            s(
+                "c4-ragged-2020-g1024+996",
+                4,
+                16384,
+                2020,
+                0,
+                512,
+                0,
+                true,
+                Float,
+            ),
+            s(
+                "c4-ragged-2051-g2048+3",
+                4,
+                8192,
+                2051,
+                1,
+                511,
+                0,
+                false,
+                Dup,
+            ),
+            s(
+                "c4-ragged-1019-single-group",
+                4,
+                8192,
+                1019,
+                2,
+                512,
+                0,
+                true,
+                Sparse,
+            ),
+            s(
+                "c4-ragged-2100-g1392+708",
+                4,
+                12000,
+                2100,
+                3,
+                1,
+                0,
+                true,
+                Dense,
+            ),
+            s(
+                "c4-ragged-1668-g832x2+4",
+                4,
+                20000,
+                1668,
+                3,
+                512,
+                0,
+                true,
+                Dup,
+            ),
             // > 32768 blocks (beta never runs)
             s("c4-bc40000-g416x2+3", 4, 40000, 835, 1, 512, 0, true, Float),
             s("c4-bc65536-g64x8+3", 4, 65536, 515, 3, 512, 0, true, Dup),
@@ -1650,10 +2798,40 @@ mod g3 {
             s("c128-res0", 128, 16, 512, 0, 32, 0, true, Dense),
             s("c128-res1", 128, 16, 512, 1, 32, 0, false, Dense),
             s("c128-res63", 128, 16, 512, 63, 32, 3, true, Float),
-            s("c128-res127-fewer-than-budget", 128, 16, 512, 127, 512, 0, true, Dense),
-            s("c128-more-than-budget", 128, 600, 512, 64, 512, 0, true, Sparse),
+            s(
+                "c128-res127-fewer-than-budget",
+                128,
+                16,
+                512,
+                127,
+                512,
+                0,
+                true,
+                Dense,
+            ),
+            s(
+                "c128-more-than-budget",
+                128,
+                600,
+                512,
+                64,
+                512,
+                0,
+                true,
+                Sparse,
+            ),
             s("c128-budget0", 128, 64, 520, 9, 0, 0, true, Dense),
-            s("c128-ragged-1027-g1024+3", 128, 16384, 1027, 5, 64, 0, true, Dup),
+            s(
+                "c128-ragged-1027-g1024+3",
+                128,
+                16384,
+                1027,
+                5,
+                64,
+                0,
+                true,
+                Dup,
+            ),
         ]
     }
 
@@ -1662,30 +2840,58 @@ mod g3 {
     /// Scores injected directly (every score equal): select-only raw
     /// launches of the fixed hipcc / embedded PM / (16384 only) pre-fix hipcc
     /// select symbol, and the PM select captured into a graph.
-    fn run_tied(gpu: &mut Gpu, env: &Env, sink: &mut Sink, blocks: usize, value: f32) -> Result<()> {
+    fn run_tied(
+        gpu: &mut Gpu,
+        env: &Env,
+        sink: &mut Sink,
+        blocks: usize,
+        value: f32,
+    ) -> Result<()> {
         sink.cases += 1;
         let (compress, rows) = (4usize, 3usize);
         // Every row sees exactly `blocks` complete blocks plus a 1..3-token tail.
         let position_start = blocks * compress + 3 - rows;
-        let c = Call { rows, stride: 0, block_count: blocks, dim: 128, compress, position_start, budget: 512, capacity: 512 * compress + compress - 1 };
+        let c = Call {
+            rows,
+            stride: 0,
+            block_count: blocks,
+            dim: 128,
+            compress,
+            position_start,
+            budget: 512,
+            capacity: 512 * compress + compress - 1,
+        };
         let name = format!("tied:blocks={blocks}:value={value}");
-        let fill: Vec<u8> = (0..rows * blocks).flat_map(|_| value.to_le_bytes()).collect();
+        let fill: Vec<u8> = (0..rows * blocks)
+            .flat_map(|_| value.to_le_bytes())
+            .collect();
         let sel_len = rows * c.capacity * 4;
         let (sel_b, mir_b) = (sel_len + CANARY, c.capacity * 4 + CANARY);
         let b = Bufs {
             query: gpu.upload_raw(&[0u8; 16], &[16]).map_err(err)?,
             pooled: gpu.upload_raw(&[0u8; 16], &[16]).map_err(err)?,
             scores: gpu.upload_raw(&fill, &[fill.len()]).map_err(err)?,
-            selected: gpu.upload_raw(&vec![POISON; sel_b], &[sel_b]).map_err(err)?,
-            mirror: gpu.upload_raw(&vec![POISON; mir_b], &[mir_b]).map_err(err)?,
+            selected: gpu
+                .upload_raw(&vec![POISON; sel_b], &[sel_b])
+                .map_err(err)?,
+            mirror: gpu
+                .upload_raw(&vec![POISON; mir_b], &[mir_b])
+                .map_err(err)?,
         };
         let orc = oracle(&c, &fill);
         let orc_mirror = orc[(rows - 1) * c.capacity * 4..].to_vec();
-        let exp = Expect { mirror: true, sel: &orc, mirror_bytes: &orc_mirror, snap: None };
+        let exp = Expect {
+            mirror: true,
+            sel: &orc,
+            mirror_bytes: &orc_mirror,
+            snap: None,
+        };
         let fill_hash = sha256(&fill);
         let mut eager_pm: Option<Out> = None;
         let mut arms = vec![("fixed", Some(RawImpl::Fixed)), ("pm", Some(RawImpl::Pm))];
-        if blocks == 16384 { arms.push(("beta", Some(RawImpl::Beta))); } else {
+        if blocks == 16384 {
+            arms.push(("beta", Some(RawImpl::Beta)));
+        } else {
             sink.put(json!({"case":name,"arm":"beta","skipped":"block_count >= 32768: pre-fix tie-count overflow range, beta never runs"}), true)?;
         }
         arms.push(("pm-graph", None));
@@ -1712,16 +2918,25 @@ mod g3 {
                 (one(gpu, None)?, one(gpu, None)?, false)
             };
             let ok_in = sha256(&download(gpu, &b.scores)?) == fill_hash;
-            let mut extra = vec![("blocks", json!(blocks)), ("value", json!(value)), ("rows", json!(rows)), ("position_start", json!(position_start))];
+            let mut extra = vec![
+                ("blocks", json!(blocks)),
+                ("value", json!(value)),
+                ("rows", json!(rows)),
+                ("position_start", json!(position_start)),
+            ];
             let mut extra_ok = true;
             if graph_run {
-                let eq = eager_pm.as_ref().is_some_and(|p| p.sel == o1.sel && p.mirror == o1.mirror);
+                let eq = eager_pm
+                    .as_ref()
+                    .is_some_and(|p| p.sel == o1.sel && p.mirror == o1.mirror);
                 extra.push(("equal_eager_pm", json!(eq)));
                 extra_ok = eq;
             }
             let (rec, ok) = judge(&name, arm, &exp, &o1, &o2, ok_in, extra, extra_ok);
             sink.put(rec, ok)?;
-            if arm == "pm" { eager_pm = Some(o1); }
+            if arm == "pm" {
+                eager_pm = Some(o1);
+            }
         }
         free_bufs(gpu, b)
     }
@@ -1729,37 +2944,102 @@ mod g3 {
     // --------------------------------------------------------------- run
 
     fn load_env(gpu: &mut Gpu, beta_src: &Path) -> Result<Env> {
-        if !beta_src.is_absolute() { return Err("--beta-src must be absolute".into()) }
+        if !beta_src.is_absolute() {
+            return Err("--beta-src must be absolute".into());
+        }
         let src = std::fs::read_to_string(beta_src).map_err(err)?;
-        if !src.contains(HIPCC_SCORE) || !src.contains(HIPCC_SELECT) { return Err("--beta-src lacks the QSA select symbols".into()) }
-        if src == TENSOR_OPS_SRC { return Err("--beta-src equals the in-tree (fixed) source; the beta arm must be the pre-fix pair".into()) }
-        let mut compiler = rdna_compute::KernelCompiler::new(&gpu.arch, gpu.flags.hipcc_extra_flags.clone()).map_err(err)?;
-        let obj = compiler.compile_for_symbol(BETA_MODULE, &src, HIPCC_SCORE).map_err(err)?.to_path_buf();
-        let beta = gpu.hip.module_load(obj.to_str().ok_or("non-utf8 beta object path")?).map_err(err)?;
-        let beta_score = gpu.hip.module_get_function(&beta, HIPCC_SCORE).map_err(err)?;
-        let beta_select = gpu.hip.module_get_function(&beta, HIPCC_SELECT).map_err(err)?;
-        eprintln!("beta src {} sha256 {} object {}", beta_src.display(), sha256(src.as_bytes()), obj.display());
+        if !src.contains(HIPCC_SCORE) || !src.contains(HIPCC_SELECT) {
+            return Err("--beta-src lacks the QSA select symbols".into());
+        }
+        if src == TENSOR_OPS_SRC {
+            return Err("--beta-src equals the in-tree (fixed) source; the beta arm must be the pre-fix pair".into());
+        }
+        let mut compiler =
+            rdna_compute::KernelCompiler::new(&gpu.arch, gpu.flags.hipcc_extra_flags.clone())
+                .map_err(err)?;
+        let obj = compiler
+            .compile_for_symbol(BETA_MODULE, &src, HIPCC_SCORE)
+            .map_err(err)?
+            .to_path_buf();
+        let beta = gpu
+            .hip
+            .module_load(obj.to_str().ok_or("non-utf8 beta object path")?)
+            .map_err(err)?;
+        let beta_score = gpu
+            .hip
+            .module_get_function(&beta, HIPCC_SCORE)
+            .map_err(err)?;
+        let beta_select = gpu
+            .hip
+            .module_get_function(&beta, HIPCC_SELECT)
+            .map_err(err)?;
+        eprintln!(
+            "beta src {} sha256 {} object {}",
+            beta_src.display(),
+            sha256(src.as_bytes()),
+            obj.display()
+        );
         let pm = gpu.hip.module_load_data(PM_IMAGE).map_err(err)?;
         let pm_score = gpu.hip.module_get_function(&pm, PM_SCORE).map_err(err)?;
         let pm_select = gpu.hip.module_get_function(&pm, PM_SELECT).map_err(err)?;
         eprintln!("embedded pm image sha256 {}", sha256(PM_IMAGE));
-        for k in [HIPCC_SCORE, HIPCC_SELECT] { gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, k).map_err(err)?; }
-        Ok(Env { _beta: beta, beta_score, beta_select, _pm: pm, pm_score, pm_select })
+        for k in [HIPCC_SCORE, HIPCC_SELECT] {
+            gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, k)
+                .map_err(err)?;
+        }
+        Ok(Env {
+            _beta: beta,
+            beta_score,
+            beta_select,
+            _pm: pm,
+            pm_score,
+            pm_select,
+        })
     }
 
-    pub fn run(dirs: &[PathBuf], out: &Path, beta_src: Option<PathBuf>, pm_image_given: bool) -> Result<()> {
-        if pm_image_given { return Err("--pm-image is not used by --g3 (the embedded certified image is tested)".into()) }
-        let beta_src = beta_src.ok_or("--g3 requires --beta-src ABS_FILE (mq_fwht256.h + tensor_ops.hip of 060cadcd3b)")?;
-        for v in ["HIPFIRE_QWEN4_QSA_SCORE_PM", "HIPFIRE_QWEN4_QSA_SELECT_PM", "HIPFIRE_QWEN4_QSA_SELECT_EXACT"] {
-            if std::env::var_os(v).is_some() { return Err(format!("{v} is set: --g3 checks the live route with default flags") ) }
+    pub fn run(
+        dirs: &[PathBuf],
+        out: &Path,
+        beta_src: Option<PathBuf>,
+        pm_image_given: bool,
+    ) -> Result<()> {
+        if pm_image_given {
+            return Err(
+                "--pm-image is not used by --g3 (the embedded certified image is tested)".into(),
+            );
+        }
+        let beta_src = beta_src.ok_or(
+            "--g3 requires --beta-src ABS_FILE (mq_fwht256.h + tensor_ops.hip of 060cadcd3b)",
+        )?;
+        for v in [
+            "HIPFIRE_QWEN4_QSA_SCORE_PM",
+            "HIPFIRE_QWEN4_QSA_SELECT_PM",
+            "HIPFIRE_QWEN4_QSA_SELECT_EXACT",
+        ] {
+            if std::env::var_os(v).is_some() {
+                return Err(format!(
+                    "{v} is set: --g3 checks the live route with default flags"
+                ));
+            }
         }
         let mut paths = Vec::new();
-        for d in dirs { snapshots(d, &mut paths)?; }
-        if paths.is_empty() { return Err("no snapshot.json found".into()) }
+        for d in dirs {
+            snapshots(d, &mut paths)?;
+        }
+        if paths.is_empty() {
+            return Err("no snapshot.json found".into());
+        }
         let mut gpu = Gpu::init().map_err(err)?;
-        if gpu.arch != "gfx1151" { return Err(format!("gfx1151 only, got {}", gpu.arch)) }
+        if gpu.arch != "gfx1151" {
+            return Err(format!("gfx1151 only, got {}", gpu.arch));
+        }
         let env = load_env(&mut gpu, &beta_src)?;
-        let mut sink = Sink { f: std::fs::File::create(out).map_err(err)?, failures: 0, records: 0, cases: 0 };
+        let mut sink = Sink {
+            f: std::fs::File::create(out).map_err(err)?,
+            failures: 0,
+            records: 0,
+            cases: 0,
+        };
 
         for path in &paths {
             let case = load_snapshot(path)?;
@@ -1770,13 +3050,21 @@ mod g3 {
             run_case(&mut gpu, &env, &mut sink, &case)?;
         }
         for blocks in [16384usize, 32768, 65536, 70000] {
-            for value in [1.0f32, 0.0] { run_tied(&mut gpu, &env, &mut sink, blocks, value)?; }
+            for value in [1.0f32, 0.0] {
+                run_tied(&mut gpu, &env, &mut sink, blocks, value)?;
+            }
         }
         let summary = json!({"summary":true,"cases":sink.cases,"records":sink.records,"failures":sink.failures,"pass":sink.failures == 0});
         eprintln!("{summary}");
         writeln!(sink.f, "{summary}").map_err(err)?;
         sink.f.flush().map_err(err)?;
-        if sink.failures > 0 { return Err(format!("{} failing G3 records; see {}", sink.failures, out.display())) }
+        if sink.failures > 0 {
+            return Err(format!(
+                "{} failing G3 records; see {}",
+                sink.failures,
+                out.display()
+            ));
+        }
         Ok(())
     }
 }
@@ -1840,11 +3128,21 @@ mod g3_bf16 {
         ("default", None),
     ];
 
-    struct Sink { f: std::fs::File, failures: usize, records: usize, cases: usize }
+    struct Sink {
+        f: std::fs::File,
+        failures: usize,
+        records: usize,
+        cases: usize,
+    }
     impl Sink {
         fn put(&mut self, mut rec: Value, ok: bool) -> Result<()> {
             rec["ok"] = json!(ok);
-            if !ok { self.failures += 1; eprintln!("FAIL {rec}"); } else { eprintln!("{rec}"); }
+            if !ok {
+                self.failures += 1;
+                eprintln!("FAIL {rec}");
+            } else {
+                eprintln!("{rec}");
+            }
             self.records += 1;
             writeln!(self.f, "{rec}").map_err(err)?;
             self.f.flush().map_err(err)
@@ -1867,34 +3165,63 @@ mod g3_bf16 {
 
     /// Production tensors: F32 query, BF16 pooled, Raw selected / mirror with
     /// trailing canaries.
-    struct Dev { query: GpuTensor, pooled: GpuTensor, selected: GpuTensor, mirror: GpuTensor }
+    struct Dev {
+        query: GpuTensor,
+        pooled: GpuTensor,
+        selected: GpuTensor,
+        mirror: GpuTensor,
+    }
 
-    struct Out { sel: Vec<u8>, mirror: Vec<u8>, canary: bool, persisted: Option<bool> }
-    fn same(a: &Out, b: &Out) -> bool { a.sel == b.sel && a.mirror == b.mirror && a.canary == b.canary && a.persisted == b.persisted }
+    struct Out {
+        sel: Vec<u8>,
+        mirror: Vec<u8>,
+        canary: bool,
+        persisted: Option<bool>,
+    }
+    fn same(a: &Out, b: &Out) -> bool {
+        a.sel == b.sel && a.mirror == b.mirror && a.canary == b.canary && a.persisted == b.persisted
+    }
 
-    fn le_f32(b: &[u8]) -> Vec<f32> { b.chunks_exact(4).map(|x| f32::from_le_bytes(x.try_into().unwrap())).collect() }
+    fn le_f32(b: &[u8]) -> Vec<f32> {
+        b.chunks_exact(4)
+            .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+            .collect()
+    }
 
     fn alloc_dev(gpu: &mut Gpu, case: &Case) -> Result<Dev> {
         let c = &case.c;
         let q = le_f32(&case.qbytes);
         let query = gpu.upload_f32(&q, &[q.len()]).map_err(err)?;
-        let mut pooled = gpu.upload_raw(&case.pbytes, &[case.pbytes.len()]).map_err(err)?;
+        let mut pooled = gpu
+            .upload_raw(&case.pbytes, &[case.pbytes.len()])
+            .map_err(err)?;
         pooled.dtype = DType::BF16;
         pooled.shape = vec![case.pbytes.len() / 2];
         let (sel, mir) = (c.rows * c.capacity * 4 + CANARY, c.capacity * 4 + CANARY);
         let selected = gpu.upload_raw(&vec![POISON; sel], &[sel]).map_err(err)?;
         let mirror = gpu.upload_raw(&vec![POISON; mir], &[mir]).map_err(err)?;
-        Ok(Dev { query, pooled, selected, mirror })
+        Ok(Dev {
+            query,
+            pooled,
+            selected,
+            mirror,
+        })
     }
 
     fn free_dev(gpu: &mut Gpu, d: Dev) -> Result<()> {
-        for t in [d.query, d.pooled, d.selected, d.mirror] { gpu.free_tensor(t).map_err(err)?; }
+        for t in [d.query, d.pooled, d.selected, d.mirror] {
+            gpu.free_tensor(t).map_err(err)?;
+        }
         Ok(())
     }
 
     /// Poison the whole selected / mirror allocations (payload and canary).
     fn poison_dev(gpu: &Gpu, d: &Dev) -> Result<()> {
-        for t in [&d.selected, &d.mirror] { gpu.hip.memset(&t.buf, POISON as i32, t.byte_size()).map_err(err)?; }
+        for t in [&d.selected, &d.mirror] {
+            gpu.hip
+                .memset(&t.buf, POISON as i32, t.byte_size())
+                .map_err(err)?;
+        }
         Ok(())
     }
 
@@ -1903,52 +3230,108 @@ mod g3_bf16 {
         let (sel_len, mir_len) = (c.rows * c.capacity * 4, c.capacity * 4);
         let mut sel = download(gpu, &d.selected)?;
         let mut mirror = download(gpu, &d.mirror)?;
-        let canary = sel[sel_len..].iter().all(|&x| x == POISON) && mirror[mir_len..].iter().all(|&x| x == POISON);
+        let canary = sel[sel_len..].iter().all(|&x| x == POISON)
+            && mirror[mir_len..].iter().all(|&x| x == POISON);
         sel.truncate(sel_len);
         mirror.truncate(mir_len);
-        Ok(Out { sel, mirror, canary, persisted })
+        Ok(Out {
+            sel,
+            mirror,
+            canary,
+            persisted,
+        })
     }
 
     fn params<'a>(case: &'a Case, d: &'a Dev, shape: usize) -> IndexedAttentionSelectBatch<'a> {
         let c = &case.c;
         IndexedAttentionSelectBatch {
-            query: &d.query, pooled: &d.pooled, selected: &d.selected, rows: c.rows, query_row_stride: c.stride,
+            query: &d.query,
+            pooled: &d.pooled,
+            selected: &d.selected,
+            rows: c.rows,
+            query_row_stride: c.stride,
             pooled_bf16: None,
             pooled_bf16_valid_blocks: 0,
-            block_count: c.block_count, index_heads: 4, index_dim: c.dim, budget_blocks: c.budget, compress: c.compress,
-            position_start: c.position_start, capacity: c.capacity, shape_blocks: shape,
+            block_count: c.block_count,
+            index_heads: 4,
+            index_dim: c.dim,
+            budget_blocks: c.budget,
+            compress: c.compress,
+            position_start: c.position_start,
+            capacity: c.capacity,
+            shape_blocks: shape,
         }
     }
 
     /// One eager arm: `arm` Some = lab helper, None = the public route;
     /// `mirror` selects the mirrored / no-mirror entry.  `persisted` is the
     /// mirrored entry's return, null for no-mirror.
-    fn run_arm(gpu: &mut Gpu, case: &Case, d: &Dev, shape: usize, mirror: bool, arm: Option<QsaSelectPmArm>) -> Result<Out> {
+    fn run_arm(
+        gpu: &mut Gpu,
+        case: &Case,
+        d: &Dev,
+        shape: usize,
+        mirror: bool,
+        arm: Option<QsaSelectPmArm>,
+    ) -> Result<Out> {
         poison_dev(gpu, d)?;
         let p = params(case, d, shape);
         let r = match arm {
-            Some(a) => indexed_attention_select_batch_pm_arm(gpu, &p, mirror.then_some(&d.mirror), a).map_err(err)?,
-            None if mirror => indexed_attention_select_batch_mirrored(gpu, &p, &d.mirror).map_err(err)?,
-            None => { indexed_attention_select_batch(gpu, &p).map_err(err)?; false }
+            Some(a) => {
+                indexed_attention_select_batch_pm_arm(gpu, &p, mirror.then_some(&d.mirror), a)
+                    .map_err(err)?
+            }
+            None if mirror => {
+                indexed_attention_select_batch_mirrored(gpu, &p, &d.mirror).map_err(err)?
+            }
+            None => {
+                indexed_attention_select_batch(gpu, &p).map_err(err)?;
+                false
+            }
         };
         gpu.hip.device_synchronize().map_err(err)?;
         read_out(gpu, case, d, mirror.then_some(r))
     }
 
-    fn judge(case: &Case, mirror: bool, o: &Out, reference: Option<&Out>, repeat: Option<bool>) -> (Value, bool) {
+    fn judge(
+        case: &Case,
+        mirror: bool,
+        o: &Out,
+        reference: Option<&Out>,
+        repeat: Option<bool>,
+    ) -> (Value, bool) {
         let sel_ok = o.sel == case.sel;
-        let mirror_ok = if mirror { o.mirror == case.mirror } else { o.mirror.iter().all(|&x| x == POISON) };
+        let mirror_ok = if mirror {
+            o.mirror == case.mirror
+        } else {
+            o.mirror.iter().all(|&x| x == POISON)
+        };
         let persisted_ok = o.persisted.is_some() == mirror;
-        let eq_hipcc = reference.is_some_and(|r| o.sel == r.sel && o.mirror == r.mirror && o.persisted == r.persisted);
+        let eq_hipcc = reference
+            .is_some_and(|r| o.sel == r.sel && o.mirror == r.mirror && o.persisted == r.persisted);
         let repeat_ok = repeat.unwrap_or(true);
         let mut rec = json!({"selected_equal_expected":sel_ok,"persisted":o.persisted,"persisted_kind_ok":persisted_ok,
             "canary_ok":o.canary,"equal_hipcc_arm":eq_hipcc});
-        rec[if mirror { "mirror_equal_expected" } else { "mirror_untouched_poison" }] = json!(mirror_ok);
-        if let Some(r) = repeat { rec["repeat_identical"] = json!(r); }
-        (rec, sel_ok && mirror_ok && persisted_ok && o.canary && eq_hipcc && repeat_ok)
+        rec[if mirror {
+            "mirror_equal_expected"
+        } else {
+            "mirror_untouched_poison"
+        }] = json!(mirror_ok);
+        if let Some(r) = repeat {
+            rec["repeat_identical"] = json!(r);
+        }
+        (
+            rec,
+            sel_ok && mirror_ok && persisted_ok && o.canary && eq_hipcc && repeat_ok,
+        )
     }
 
-    struct Mode { rec: Value, ok: bool, hipcc: Option<Out>, default: Option<Out> }
+    struct Mode {
+        rec: Value,
+        ok: bool,
+        hipcc: Option<Out>,
+        default: Option<Out>,
+    }
 
     /// All four arms of one entry kind (mirrored or no-mirror).
     fn run_mode(gpu: &mut Gpu, case: &Case, d: &Dev, shape: usize, mirror: bool) -> Mode {
@@ -1956,7 +3339,8 @@ mod g3_bf16 {
         let (mut ok, mut hipcc, mut default) = (true, None::<Out>, None::<Out>);
         for (name, arm) in ARMS {
             let first = run_arm(gpu, case, d, shape, mirror, arm);
-            let second = (arm == Some(QsaSelectPmArm::Both)).then(|| run_arm(gpu, case, d, shape, mirror, arm));
+            let second = (arm == Some(QsaSelectPmArm::Both))
+                .then(|| run_arm(gpu, case, d, shape, mirror, arm));
             let (mut rec, arm_ok, out) = match first {
                 Err(e) => (json!({"error":e}), false, None),
                 Ok(o1) => {
@@ -1968,7 +3352,11 @@ mod g3_bf16 {
                     match repeat {
                         Err(e) => (json!({"error":format!("second run: {e}")}), false, Some(o1)),
                         Ok(rep) => {
-                            let reference = if name == "hipcc" { Some(&o1) } else { hipcc.as_ref() };
+                            let reference = if name == "hipcc" {
+                                Some(&o1)
+                            } else {
+                                hipcc.as_ref()
+                            };
                             let (rec, arm_ok) = judge(case, mirror, &o1, reference, rep);
                             (rec, arm_ok, Some(o1))
                         }
@@ -1978,9 +3366,18 @@ mod g3_bf16 {
             rec["ok"] = json!(arm_ok);
             ok &= arm_ok;
             arms.insert(name.to_string(), rec);
-            match name { "hipcc" => hipcc = out, "default" => default = out, _ => {} }
+            match name {
+                "hipcc" => hipcc = out,
+                "default" => default = out,
+                _ => {}
+            }
         }
-        Mode { rec: Value::Object(arms), ok, hipcc, default }
+        Mode {
+            rec: Value::Object(arms),
+            ok,
+            hipcc,
+            default,
+        }
     }
 
     // -------------------------------------------------------------- graph
@@ -1989,13 +3386,25 @@ mod g3_bf16 {
     /// mode with more than 256 rows, else one.
     fn expected_launches(rows: usize, shape: usize) -> usize {
         let global = shape * 4 + STATIC_LDS_BYTES > LDS_LIMIT_BYTES;
-        if global && rows > GLOBAL_ROWS { rows.div_ceil(GLOBAL_ROWS) } else { 1 }
+        if global && rows > GLOBAL_ROWS {
+            rows.div_ceil(GLOBAL_ROWS)
+        } else {
+            1
+        }
     }
 
-    fn replay_graph(gpu: &Gpu, case: &Case, d: &Dev, stream: &hip_bridge::Stream, persisted: bool) -> Result<Out> {
+    fn replay_graph(
+        gpu: &Gpu,
+        case: &Case,
+        d: &Dev,
+        stream: &hip_bridge::Stream,
+        persisted: bool,
+    ) -> Result<Out> {
         poison_dev(gpu, d)?;
         gpu.hip.device_synchronize().map_err(err)?;
-        gpu.graphs.graph_launch(&gpu.hip, gpu.device_id, stream).map_err(err)?;
+        gpu.graphs
+            .graph_launch(&gpu.hip, gpu.device_id, stream)
+            .map_err(err)?;
         gpu.hip.stream_synchronize(stream).map_err(err)?;
         read_out(gpu, case, d, Some(persisted))
     }
@@ -2003,13 +3412,26 @@ mod g3_bf16 {
     /// Capture the default mirrored production call, launch the instantiated
     /// graph and compare with the eager `default` / `hipcc` arms.  Eager arms of
     /// the same shape have already loaded the kernels and sized every scratch.
-    fn run_graph(gpu: &mut Gpu, case: &Case, d: &Dev, shape: usize, eager: &Out, hipcc: &Out) -> Result<(Value, bool)> {
-        if gpu.active_stream.is_some() || gpu.graphs.capture_mode { return Err("capture state not clean before graph".into()) }
+    fn run_graph(
+        gpu: &mut Gpu,
+        case: &Case,
+        d: &Dev,
+        shape: usize,
+        eager: &Out,
+        hipcc: &Out,
+    ) -> Result<(Value, bool)> {
+        if gpu.active_stream.is_some() || gpu.graphs.capture_mode {
+            return Err("capture state not clean before graph".into());
+        }
         poison_dev(gpu, d)?;
         gpu.hip.device_synchronize().map_err(err)?;
         let stream = gpu.hip.stream_create_non_blocking().map_err(err)?;
-        if let Err(e) = gpu.graphs.begin_graph_capture(&gpu.hip, gpu.device_id, &stream) {
-            gpu.graphs.abort_graph_capture(&gpu.hip, gpu.device_id, &stream);
+        if let Err(e) = gpu
+            .graphs
+            .begin_graph_capture(&gpu.hip, gpu.device_id, &stream)
+        {
+            gpu.graphs
+                .abort_graph_capture(&gpu.hip, gpu.device_id, &stream);
             let _ = gpu.hip.stream_destroy(stream);
             return Err(format!("begin capture: {}", err(e)));
         }
@@ -2020,15 +3442,25 @@ mod g3_bf16 {
         };
         let symbol = gpu.last_launched_kernel().map(str::to_string);
         let blobs = gpu.graphs.capture_blobs.len();
-        let stream = gpu.active_stream.take().ok_or("active stream vanished during capture")?;
+        let stream = gpu
+            .active_stream
+            .take()
+            .ok_or("active stream vanished during capture")?;
         let ended = match &called {
-            Ok(_) => gpu.graphs.end_graph_capture(&gpu.hip, gpu.device_id, &stream),
+            Ok(_) => gpu
+                .graphs
+                .end_graph_capture(&gpu.hip, gpu.device_id, &stream),
             Err(_) => Ok(()),
         };
         if called.is_err() || ended.is_err() {
-            gpu.graphs.abort_graph_capture(&gpu.hip, gpu.device_id, &stream);
+            gpu.graphs
+                .abort_graph_capture(&gpu.hip, gpu.device_id, &stream);
             let _ = gpu.hip.stream_destroy(stream);
-            return Err(format!("capture failed: call={:?} end={:?}", called.map_err(err), ended.map_err(err)));
+            return Err(format!(
+                "capture failed: call={:?} end={:?}",
+                called.map_err(err),
+                ended.map_err(err)
+            ));
         }
         let persisted = called.map_err(err)?;
         let state_restored = !gpu.graphs.capture_mode && gpu.active_stream.is_none();
@@ -2040,11 +3472,19 @@ mod g3_bf16 {
 
         let launches = expected_launches(case.c.rows, shape);
         let (sel_ok, mirror_ok) = (o.sel == case.sel, o.mirror == case.mirror);
-        let eq_eager = o.sel == eager.sel && o.mirror == eager.mirror && o.persisted == eager.persisted;
+        let eq_eager =
+            o.sel == eager.sel && o.mirror == eager.mirror && o.persisted == eager.persisted;
         let persisted_hipcc = o.persisted == hipcc.persisted;
         let symbol_ok = symbol.as_deref() == Some(FUSED_BF16);
         let launches_ok = blobs == launches;
-        let ok = sel_ok && mirror_ok && eq_eager && persisted_hipcc && o.canary && symbol_ok && launches_ok && state_restored;
+        let ok = sel_ok
+            && mirror_ok
+            && eq_eager
+            && persisted_hipcc
+            && o.canary
+            && symbol_ok
+            && launches_ok
+            && state_restored;
         let rec = json!({"captured_symbol":symbol,"captured_symbol_ok":symbol_ok,"captured_launches":blobs,
             "expected_launches":launches,"captured_launches_ok":launches_ok,"capture_state_restored":state_restored,
             "capture_persisted":persisted,"persisted":o.persisted,"persisted_equal_hipcc_arm":persisted_hipcc,
@@ -2055,10 +3495,19 @@ mod g3_bf16 {
 
     // -------------------------------------------------------------- cases
 
-    fn run_pass(gpu: &mut Gpu, sink: &mut Sink, case: &Case, d: &Dev, shape: usize, label: &str) -> Result<()> {
+    fn run_pass(
+        gpu: &mut Gpu,
+        sink: &mut Sink,
+        case: &Case,
+        d: &Dev,
+        shape: usize,
+        label: &str,
+    ) -> Result<()> {
         let c = &case.c;
-        eprintln!("case {} {label} shape_blocks={shape} rows={} bc={} compress={} budget={} capacity={}",
-            case.name, c.rows, c.block_count, c.compress, c.budget, c.capacity);
+        eprintln!(
+            "case {} {label} shape_blocks={shape} rows={} bc={} compress={} budget={} capacity={}",
+            case.name, c.rows, c.block_count, c.compress, c.budget, c.capacity
+        );
         let mut rec = json!({"case":case.name,"kind":case.kind,"pass":label,"shape_blocks":shape,"pooled_capacity":case.pooled_capacity,
             "rows":c.rows,"block_count":c.block_count,"compress":c.compress,"position_start":c.position_start,"budget_blocks":c.budget,
             "capacity":c.capacity,"projection_stride":c.stride,"heads":4,"dim":c.dim,"pooled_dtype":"BF16","projection_dtype":"F32",
@@ -2068,13 +3517,25 @@ mod g3_bf16 {
         let mut ok = mirrored.ok && plain.ok;
         rec["mirrored"] = mirrored.rec;
         rec["no_mirror"] = plain.rec;
-        if let Err(e) = gpu.hip.device_synchronize() { rec["sync_error"] = json!(err(e)); ok = false; }
+        if let Err(e) = gpu.hip.device_synchronize() {
+            rec["sync_error"] = json!(err(e));
+            ok = false;
+        }
         match (&mirrored.default, &mirrored.hipcc) {
             (Some(eager), Some(hipcc)) => match run_graph(gpu, case, d, shape, eager, hipcc) {
-                Ok((g, g_ok)) => { rec["graph"] = g; ok &= g_ok; }
-                Err(e) => { rec["graph"] = json!({"error":e,"ok":false}); ok = false; }
+                Ok((g, g_ok)) => {
+                    rec["graph"] = g;
+                    ok &= g_ok;
+                }
+                Err(e) => {
+                    rec["graph"] = json!({"error":e,"ok":false});
+                    ok = false;
+                }
             },
-            _ => { rec["graph"] = json!({"skipped":"mirrored hipcc/default arm failed","ok":false}); ok = false; }
+            _ => {
+                rec["graph"] = json!({"skipped":"mirrored hipcc/default arm failed","ok":false});
+                ok = false;
+            }
         }
         match (download(gpu, &d.query), download(gpu, &d.pooled)) {
             (Ok(q_back), Ok(p_back)) => {
@@ -2084,7 +3545,8 @@ mod g3_bf16 {
             }
             (q, p) => {
                 rec["inputs_unchanged"] = json!(false);
-                rec["input_download_error"] = json!(format!("query: {:?} pooled: {:?}", q.err(), p.err()));
+                rec["input_download_error"] =
+                    json!(format!("query: {:?} pooled: {:?}", q.err(), p.err()));
                 ok = false;
             }
         }
@@ -2095,48 +3557,112 @@ mod g3_bf16 {
         sink.cases += 1;
         let d = match alloc_dev(gpu, case) {
             Ok(d) => d,
-            Err(e) => return sink.put(json!({"case":case.name,"kind":case.kind,"arm":"*","error":format!("alloc: {e}")}), false),
+            Err(e) => return sink.put(
+                json!({"case":case.name,"kind":case.kind,"arm":"*","error":format!("alloc: {e}")}),
+                false,
+            ),
         };
         let mut passes = vec![(case.pooled_capacity, "pooled_capacity")];
-        if FIXED_SHAPE >= case.c.block_count { passes.push((FIXED_SHAPE, "shape_65536")); }
-        for (shape, label) in passes { run_pass(gpu, sink, case, &d, shape, label)?; }
+        if FIXED_SHAPE >= case.c.block_count {
+            passes.push((FIXED_SHAPE, "shape_65536"));
+        }
+        for (shape, label) in passes {
+            run_pass(gpu, sink, case, &d, shape, label)?;
+        }
         match free_dev(gpu, d) {
             Ok(()) => Ok(()),
-            Err(e) => sink.put(json!({"case":case.name,"kind":case.kind,"arm":"*","error":format!("free: {e}")}), false),
+            Err(e) => sink.put(
+                json!({"case":case.name,"kind":case.kind,"arm":"*","error":format!("free: {e}")}),
+                false,
+            ),
         }
     }
 
     fn load_snapshot(path: &Path) -> Result<Case> {
         let root = path.parent().unwrap();
-        let header: Value = serde_json::from_slice(&std::fs::read(path).map_err(err)?).map_err(err)?;
-        if header["schema"] != "qsa-source-v1" { return Err(format!("{}: unsupported schema", path.display())) }
+        let header: Value =
+            serde_json::from_slice(&std::fs::read(path).map_err(err)?).map_err(err)?;
+        if header["schema"] != "qsa-source-v1" {
+            return Err(format!("{}: unsupported schema", path.display()));
+        }
         let sel = &header["identity"]["selector"];
-        if header["identity"]["arch"] != "gfx1151" { return Err(format!("{}: snapshot arch not gfx1151", path.display())) }
-        if sel["pooled_dtype"] != "BF16" || sel["projection_dtype"] != "F32" { return Err(format!("{}: not the BF16 pooled / F32 projection route", path.display())) }
-        if sel["heads"] != 4 || sel["dim"] != 128 { return Err(format!("{}: uncovered selector geometry", path.display())) }
+        if header["identity"]["arch"] != "gfx1151" {
+            return Err(format!("{}: snapshot arch not gfx1151", path.display()));
+        }
+        if sel["pooled_dtype"] != "BF16" || sel["projection_dtype"] != "F32" {
+            return Err(format!(
+                "{}: not the BF16 pooled / F32 projection route",
+                path.display()
+            ));
+        }
+        if sel["heads"] != 4 || sel["dim"] != 128 {
+            return Err(format!("{}: uncovered selector geometry", path.display()));
+        }
         let get = |name: &str| -> Result<Vec<u8>> {
             let b = std::fs::read(root.join(name)).map_err(err)?;
-            if header["files"][name]["sha256"] != sha256(&b) { return Err(format!("{}: hash mismatch {name}", path.display())) }
+            if header["files"][name]["sha256"] != sha256(&b) {
+                return Err(format!("{}: hash mismatch {name}", path.display()));
+            }
             Ok(b)
         };
         let g = &header["geometry"];
-        let n = |v: &Value, k: &str| v[k].as_u64().map(|x| x as usize).ok_or(format!("missing {k}"));
-        let (rows, position_start, compress) = (n(g, "rows")?, n(g, "position_start")?, n(g, "compress")?);
-        if compress == 0 || rows == 0 { return Err(format!("{}: zero compress/rows", path.display())) }
-        let c = Call { rows, stride: n(sel, "projection_stride")?, block_count: (position_start + rows) / compress, dim: 128,
-            compress, position_start, budget: n(g, "budget_blocks")?, capacity: n(g, "capacity")? };
-        if c.budget > 512 || c.block_count == 0 || c.capacity == 0 || c.stride < 4 * c.dim { return Err(format!("{}: uncovered budget/block count/capacity/stride", path.display())) }
+        let n = |v: &Value, k: &str| {
+            v[k].as_u64()
+                .map(|x| x as usize)
+                .ok_or(format!("missing {k}"))
+        };
+        let (rows, position_start, compress) =
+            (n(g, "rows")?, n(g, "position_start")?, n(g, "compress")?);
+        if compress == 0 || rows == 0 {
+            return Err(format!("{}: zero compress/rows", path.display()));
+        }
+        let c = Call {
+            rows,
+            stride: n(sel, "projection_stride")?,
+            block_count: (position_start + rows) / compress,
+            dim: 128,
+            compress,
+            position_start,
+            budget: n(g, "budget_blocks")?,
+            capacity: n(g, "capacity")?,
+        };
+        if c.budget > 512 || c.block_count == 0 || c.capacity == 0 || c.stride < 4 * c.dim {
+            return Err(format!(
+                "{}: uncovered budget/block count/capacity/stride",
+                path.display()
+            ));
+        }
         let pooled_capacity = n(sel, "pooled_capacity")?;
         let qbytes = get("index-projection.f32")?;
         let pbytes = get("pooled.source")?;
         let snap_sel = get("selected.i32")?;
         let snap_mirror = get("selected-mirror.i32")?;
-        if qbytes.len() != rows * c.stride * 4 || pbytes.len() != pooled_capacity * 128 * 2 || snap_sel.len() != rows * c.capacity * 4
-            || snap_mirror.len() != c.capacity * 4 || c.block_count > pooled_capacity {
-            return Err(format!("{}: geometry/extent mismatch", path.display()))
+        if qbytes.len() != rows * c.stride * 4
+            || pbytes.len() != pooled_capacity * 128 * 2
+            || snap_sel.len() != rows * c.capacity * 4
+            || snap_mirror.len() != c.capacity * 4
+            || c.block_count > pooled_capacity
+        {
+            return Err(format!("{}: geometry/extent mismatch", path.display()));
         }
-        let name = format!("{} ctx={} layer={}", path.display(), header["identity"]["ctx"], header["identity"]["layer"]);
-        Ok(Case { name, kind: "snapshot", c, pooled_capacity, qh: sha256(&qbytes), ph: sha256(&pbytes), qbytes, pbytes, sel: snap_sel, mirror: snap_mirror })
+        let name = format!(
+            "{} ctx={} layer={}",
+            path.display(),
+            header["identity"]["ctx"],
+            header["identity"]["layer"]
+        );
+        Ok(Case {
+            name,
+            kind: "snapshot",
+            c,
+            pooled_capacity,
+            qh: sha256(&qbytes),
+            ph: sha256(&pbytes),
+            qbytes,
+            pbytes,
+            sel: snap_sel,
+            mirror: snap_mirror,
+        })
     }
 
     /// All-tied fixture: every BF16 key `vbits`, query 1.0 in every element.
@@ -2146,42 +3672,90 @@ mod g3_bf16 {
         let (rows, compress, stride, capacity) = (512usize, 4usize, 512usize, 2051usize);
         assert!(blocks * compress + 3 >= rows, "{tag}");
         let position_start = blocks * compress + 3 - rows;
-        let c = Call { rows, stride, block_count: blocks, dim: 128, compress, position_start, budget, capacity };
+        let c = Call {
+            rows,
+            stride,
+            block_count: blocks,
+            dim: 128,
+            compress,
+            position_start,
+            budget,
+            capacity,
+        };
         debug_assert_eq!((position_start + rows) / compress, blocks);
         let value = f32::from_bits((vbits as u32) << 16);
-        let qbytes: Vec<u8> = (0..rows * stride).flat_map(|_| 1.0f32.to_le_bytes()).collect();
-        let pbytes: Vec<u8> = (0..blocks * 128).flat_map(|_| vbits.to_le_bytes()).collect();
-        let key_bits = cpu_score(&vec![1.0f32; 4 * c.dim], &vec![value; c.dim], c.dim).0.to_bits();
-        let per_row: Vec<Vec<u8>> = (0..rows).into_par_iter().map(|r| {
-            let keys = vec![key_bits; c.row_blocks(r)];
-            selection_row(&rank(&keys), &c, r).iter().flat_map(|v| v.to_le_bytes()).collect()
-        }).collect();
+        let qbytes: Vec<u8> = (0..rows * stride)
+            .flat_map(|_| 1.0f32.to_le_bytes())
+            .collect();
+        let pbytes: Vec<u8> = (0..blocks * 128)
+            .flat_map(|_| vbits.to_le_bytes())
+            .collect();
+        let key_bits = cpu_score(&vec![1.0f32; 4 * c.dim], &vec![value; c.dim], c.dim)
+            .0
+            .to_bits();
+        let per_row: Vec<Vec<u8>> = (0..rows)
+            .into_par_iter()
+            .map(|r| {
+                let keys = vec![key_bits; c.row_blocks(r)];
+                selection_row(&rank(&keys), &c, r)
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect()
+            })
+            .collect();
         let sel = per_row.concat();
         let mirror = sel[(rows - 1) * capacity * 4..].to_vec();
-        Case { name: format!("synthetic:{tag}:blocks={blocks}:value=0x{vbits:04x}:budget={budget}"), kind: "synthetic", c, pooled_capacity: blocks,
-            qh: sha256(&qbytes), ph: sha256(&pbytes), qbytes, pbytes, sel, mirror }
+        Case {
+            name: format!("synthetic:{tag}:blocks={blocks}:value=0x{vbits:04x}:budget={budget}"),
+            kind: "synthetic",
+            c,
+            pooled_capacity: blocks,
+            qh: sha256(&qbytes),
+            ph: sha256(&pbytes),
+            qbytes,
+            pbytes,
+            sel,
+            mirror,
+        }
     }
 
     fn synthetic_cases() -> Vec<Case> {
         let mut v = Vec::new();
         for blocks in [16384usize, 32768, 65536] {
-            for vbits in [0x0000u16, 0x3f80] { v.push(synth_case(blocks, vbits, 512, "tied")); }
+            for vbits in [0x0000u16, 0x3f80] {
+                v.push(synth_case(blocks, vbits, 512, "tied"));
+            }
         }
         for budget in [0usize, 1, 511] {
-            for vbits in [0x0000u16, 0x3f80] { v.push(synth_case(16384, vbits, budget, "budget")); }
+            for vbits in [0x0000u16, 0x3f80] {
+                v.push(synth_case(16384, vbits, budget, "budget"));
+            }
         }
         // position_start 3: every row sees at most 128 blocks, fewer than the budget.
-        for vbits in [0x0000u16, 0x3f80] { v.push(synth_case(128, vbits, 512, "fewer-visible-than-budget")); }
+        for vbits in [0x0000u16, 0x3f80] {
+            v.push(synth_case(128, vbits, 512, "fewer-visible-than-budget"));
+        }
         v
     }
 
     pub fn run(dirs: &[PathBuf], out: &Path) -> Result<()> {
         let mut paths = Vec::new();
-        for d in dirs { snapshots(d, &mut paths)?; }
-        if !dirs.is_empty() && paths.is_empty() { return Err("no snapshot.json found".into()) }
+        for d in dirs {
+            snapshots(d, &mut paths)?;
+        }
+        if !dirs.is_empty() && paths.is_empty() {
+            return Err("no snapshot.json found".into());
+        }
         let mut gpu = Gpu::init().map_err(err)?;
-        if gpu.arch != "gfx1151" { return Err(format!("gfx1151 only, got {}", gpu.arch)) }
-        let mut sink = Sink { f: std::fs::File::create(out).map_err(err)?, failures: 0, records: 0, cases: 0 };
+        if gpu.arch != "gfx1151" {
+            return Err(format!("gfx1151 only, got {}", gpu.arch));
+        }
+        let mut sink = Sink {
+            f: std::fs::File::create(out).map_err(err)?,
+            failures: 0,
+            records: 0,
+            cases: 0,
+        };
         for path in &paths {
             match load_snapshot(path) {
                 Ok(case) => run_case(&mut gpu, &mut sink, &case)?,
@@ -2191,13 +3765,21 @@ mod g3_bf16 {
                 }
             }
         }
-        for case in synthetic_cases() { run_case(&mut gpu, &mut sink, &case)?; }
+        for case in synthetic_cases() {
+            run_case(&mut gpu, &mut sink, &case)?;
+        }
         let summary = json!({"summary":true,"mode":"g3-bf16","snapshots":paths.len(),"cases":sink.cases,"records":sink.records,
             "failures":sink.failures,"pass":sink.failures == 0});
         eprintln!("{summary}");
         writeln!(sink.f, "{summary}").map_err(err)?;
         sink.f.flush().map_err(err)?;
-        if sink.failures > 0 { return Err(format!("{} failing G3 BF16 records; see {}", sink.failures, out.display())) }
+        if sink.failures > 0 {
+            return Err(format!(
+                "{} failing G3 BF16 records; see {}",
+                sink.failures,
+                out.display()
+            ));
+        }
         Ok(())
     }
 }
@@ -2237,34 +3819,61 @@ mod filter_route {
     const MAX_BUDGET: usize = 512;
 
     #[derive(Clone, Copy, PartialEq)]
-    enum Knob { Default, Underfill, Overflow }
+    enum Knob {
+        Default,
+        Underfill,
+        Overflow,
+    }
     impl Knob {
         fn name(self) -> &'static str {
-            match self { Knob::Default => "default", Knob::Underfill => "underfill-t1", Knob::Overflow => "overflow-c600-t4096" }
+            match self {
+                Knob::Default => "default",
+                Knob::Underfill => "underfill-t1",
+                Knob::Overflow => "overflow-c600-t4096",
+            }
         }
         fn knobs(self) -> QsaFilterKnobs {
             match self {
                 Knob::Default => QsaFilterKnobs::default(),
-                Knob::Underfill => QsaFilterKnobs { target: 1, ..QsaFilterKnobs::default() },
-                Knob::Overflow => QsaFilterKnobs { target: 4096, cap: 600, ..QsaFilterKnobs::default() },
+                Knob::Underfill => QsaFilterKnobs {
+                    target: 1,
+                    ..QsaFilterKnobs::default()
+                },
+                Knob::Overflow => QsaFilterKnobs {
+                    target: 4096,
+                    cap: 600,
+                    ..QsaFilterKnobs::default()
+                },
             }
         }
     }
 
     #[derive(Clone, Copy, PartialEq)]
-    enum Arm { Hipcc, Score, Filter { score_pm: bool, knob: Knob } }
+    enum Arm {
+        Hipcc,
+        Score,
+        Filter { score_pm: bool, knob: Knob },
+    }
     impl Arm {
         fn name(self) -> String {
             match self {
                 Arm::Hipcc => "incumbent-hipcc".into(),
                 Arm::Score => "incumbent-score-pm".into(),
-                Arm::Filter { score_pm, knob } => format!("filter-score-{}-{}", if score_pm { "pm" } else { "hipcc" }, knob.name()),
+                Arm::Filter { score_pm, knob } => format!(
+                    "filter-score-{}-{}",
+                    if score_pm { "pm" } else { "hipcc" },
+                    knob.name()
+                ),
             }
         }
     }
 
     #[derive(Clone, PartialEq)]
-    struct Stat { threshold: u64, count: u32, repaired: bool }
+    struct Stat {
+        threshold: u64,
+        count: u32,
+        repaired: bool,
+    }
 
     struct Case {
         family: &'static str,
@@ -2283,15 +3892,39 @@ mod filter_route {
         sample: Option<usize>,
     }
 
-    struct Dev { query: GpuTensor, pooled: GpuTensor, scores: Option<GpuTensor>, sel: Guarded, mir: Guarded }
+    struct Dev {
+        query: GpuTensor,
+        pooled: GpuTensor,
+        scores: Option<GpuTensor>,
+        sel: Guarded,
+        mir: Guarded,
+    }
 
     #[derive(PartialEq)]
-    struct Out { sel: Vec<u8>, mirror: Vec<u8>, guards: bool, persisted: bool, stats: Option<Vec<Stat>> }
+    struct Out {
+        sel: Vec<u8>,
+        mirror: Vec<u8>,
+        guards: bool,
+        persisted: bool,
+        stats: Option<Vec<Stat>>,
+    }
 
-    fn bytes_f32(b: &[u8]) -> Vec<f32> { b.chunks_exact(4).map(|x| f32::from_le_bytes(x.try_into().unwrap())).collect() }
-    fn f32_bytes(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
+    fn bytes_f32(b: &[u8]) -> Vec<f32> {
+        b.chunks_exact(4)
+            .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+            .collect()
+    }
+    fn f32_bytes(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
 
-    fn group_of(c: &Call) -> usize { if c.block_count == 0 { 0 } else { c.group() } }
+    fn group_of(c: &Call) -> usize {
+        if c.block_count == 0 {
+            0
+        } else {
+            c.group()
+        }
+    }
 
     // ------------------------------------------------------------- device
 
@@ -2300,20 +3933,47 @@ mod filter_route {
         let q = bytes_f32(&case.qbytes);
         let query = gpu.upload_f32(&q, &[q.len()]).map_err(err)?;
         let (pooled, scores) = if case.bf16 {
-            let mut p = gpu.upload_raw(&case.pbytes, &[case.pbytes.len()]).map_err(err)?;
+            let mut p = gpu
+                .upload_raw(&case.pbytes, &[case.pbytes.len()])
+                .map_err(err)?;
             p.dtype = DType::BF16;
             p.shape = vec![case.pbytes.len() / 2];
             (p, None)
         } else {
             let p = bytes_f32(&case.pbytes);
-            let scratch = if c.block_count == 0 { 16 } else { c.group() * c.block_count * 4 };
-            (gpu.upload_f32(&p, &[p.len()]).map_err(err)?, Some(gpu.upload_raw(&vec![0u8; scratch], &[scratch]).map_err(err)?))
+            let scratch = if c.block_count == 0 {
+                16
+            } else {
+                c.group() * c.block_count * 4
+            };
+            (
+                gpu.upload_f32(&p, &[p.len()]).map_err(err)?,
+                Some(
+                    gpu.upload_raw(&vec![0u8; scratch], &[scratch])
+                        .map_err(err)?,
+                ),
+            )
         };
-        Ok(Dev { query, pooled, scores, sel: Guarded::new(gpu, c.rows * c.capacity * 4)?, mir: Guarded::new(gpu, c.capacity * 4)? })
+        Ok(Dev {
+            query,
+            pooled,
+            scores,
+            sel: Guarded::new(gpu, c.rows * c.capacity * 4)?,
+            mir: Guarded::new(gpu, c.capacity * 4)?,
+        })
     }
 
     fn free_dev(gpu: &mut Gpu, d: Dev) -> Result<()> {
-        for t in [Some(d.query), Some(d.pooled), d.scores, Some(d.sel.alloc), Some(d.mir.alloc)].into_iter().flatten() {
+        for t in [
+            Some(d.query),
+            Some(d.pooled),
+            d.scores,
+            Some(d.sel.alloc),
+            Some(d.mir.alloc),
+        ]
+        .into_iter()
+        .flatten()
+        {
             gpu.free_tensor(t).map_err(err)?;
         }
         Ok(())
@@ -2321,7 +3981,11 @@ mod filter_route {
 
     // ------------------------------------------------------------- oracle
 
-    struct Oracle { sel: Vec<u8>, score_diff: u64, sampled_rows: usize }
+    struct Oracle {
+        sel: Vec<u8>,
+        score_diff: u64,
+        sampled_rows: usize,
+    }
 
     fn score_blob2(c: &Call, d: &Dev, g0: usize, n: usize) -> KernargBlob {
         let scores = d.scores.as_ref().expect("F32 scores scratch");
@@ -2343,51 +4007,113 @@ mod filter_route {
     /// CPU stable (score desc, block asc) selection of every row over the
     /// incumbent's hipcc raw scores (64 MiB production grouping); optionally
     /// serial `cpu_score` rescoring of sampled rows against those scores.
-    fn oracle(gpu: &mut Gpu, case: &Case, d: &Dev, sample: Option<(usize, &[f32], &[f32])>) -> Result<Oracle> {
+    fn oracle(
+        gpu: &mut Gpu,
+        case: &Case,
+        d: &Dev,
+        sample: Option<(usize, &[f32], &[f32])>,
+    ) -> Result<Oracle> {
         let c = &case.c;
         if c.block_count == 0 {
-            let sel = (0..c.rows).flat_map(|r| selection_row(&[], c, r).into_iter().flat_map(|v| v.to_le_bytes())).collect();
-            return Ok(Oracle { sel, score_diff: 0, sampled_rows: 0 });
+            let sel = (0..c.rows)
+                .flat_map(|r| {
+                    selection_row(&[], c, r)
+                        .into_iter()
+                        .flat_map(|v| v.to_le_bytes())
+                })
+                .collect();
+            return Ok(Oracle {
+                sel,
+                score_diff: 0,
+                sampled_rows: 0,
+            });
         }
-        let scores = d.scores.as_ref().ok_or("oracle needs the F32 score scratch")?;
+        let scores = d
+            .scores
+            .as_ref()
+            .ok_or("oracle needs the F32 score scratch")?;
         let (group, bc) = (c.group(), c.block_count);
         let mut sel = Vec::with_capacity(c.rows * c.capacity * 4);
         let (mut diff, mut sampled, mut g0) = (0u64, 0usize, 0usize);
         while g0 < c.rows {
             let n = group.min(c.rows - g0);
-            gpu.hip.memset(&scores.buf, POISON as i32, scores.byte_size()).map_err(err)?;
+            gpu.hip
+                .memset(&scores.buf, POISON as i32, scores.byte_size())
+                .map_err(err)?;
             let mut blob = score_blob2(c, d, g0, n);
-            gpu.launch_kernel_blob(HIPCC_SCORE, [bc.div_ceil(256) as u32, n.div_ceil(16) as u32, 1], [256, 1, 1], 0, blob.as_mut_slice()).map_err(err)?;
+            gpu.launch_kernel_blob(
+                HIPCC_SCORE,
+                [bc.div_ceil(256) as u32, n.div_ceil(16) as u32, 1],
+                [256, 1, 1],
+                0,
+                blob.as_mut_slice(),
+            )
+            .map_err(err)?;
             gpu.hip.device_synchronize().map_err(err)?;
             let mut bytes = vec![0u8; n * bc * 4];
             let len = bytes.len();
-            gpu.hip.memcpy_dtoh(&mut bytes, &scores.buf.byte_view(0, len)).map_err(err)?;
-            let rows: Vec<Vec<u8>> = (0..n).into_par_iter().map(|r| {
-                let keys: Vec<u32> = bytes[r * bc * 4..(r * bc + c.row_blocks(g0 + r)) * 4]
-                    .chunks_exact(4).map(|x| u32::from_le_bytes(x.try_into().unwrap())).collect();
-                selection_row(&rank(&keys), c, g0 + r).iter().flat_map(|v| v.to_le_bytes()).collect()
-            }).collect();
-            for r in rows { sel.extend_from_slice(&r); }
+            gpu.hip
+                .memcpy_dtoh(&mut bytes, &scores.buf.byte_view(0, len))
+                .map_err(err)?;
+            let rows: Vec<Vec<u8>> = (0..n)
+                .into_par_iter()
+                .map(|r| {
+                    let keys: Vec<u32> = bytes[r * bc * 4..(r * bc + c.row_blocks(g0 + r)) * 4]
+                        .chunks_exact(4)
+                        .map(|x| u32::from_le_bytes(x.try_into().unwrap()))
+                        .collect();
+                    selection_row(&rank(&keys), c, g0 + r)
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect()
+                })
+                .collect();
+            for r in rows {
+                sel.extend_from_slice(&r);
+            }
             if let Some((stride, q, p)) = sample {
-                let pick: Vec<usize> = (0..n).filter(|r| (g0 + r) % stride == 0 || g0 + r == c.rows - 1).collect();
+                let pick: Vec<usize> = (0..n)
+                    .filter(|r| (g0 + r) % stride == 0 || g0 + r == c.rows - 1)
+                    .collect();
                 sampled += pick.len();
-                diff += pick.par_iter().map(|&r| {
-                    let row = g0 + r;
-                    let qr = &q[row * c.stride..row * c.stride + 4 * c.dim];
-                    (0..c.row_blocks(row)).filter(|&b| {
-                        let (s, _) = cpu_score(qr, &p[b * c.dim..(b + 1) * c.dim], c.dim);
-                        s.to_bits() != u32::from_le_bytes(bytes[(r * bc + b) * 4..(r * bc + b) * 4 + 4].try_into().unwrap())
-                    }).count() as u64
-                }).sum::<u64>();
+                diff += pick
+                    .par_iter()
+                    .map(|&r| {
+                        let row = g0 + r;
+                        let qr = &q[row * c.stride..row * c.stride + 4 * c.dim];
+                        (0..c.row_blocks(row))
+                            .filter(|&b| {
+                                let (s, _) = cpu_score(qr, &p[b * c.dim..(b + 1) * c.dim], c.dim);
+                                s.to_bits()
+                                    != u32::from_le_bytes(
+                                        bytes[(r * bc + b) * 4..(r * bc + b) * 4 + 4]
+                                            .try_into()
+                                            .unwrap(),
+                                    )
+                            })
+                            .count() as u64
+                    })
+                    .sum::<u64>();
             }
             g0 += n;
         }
-        Ok(Oracle { sel, score_diff: diff, sampled_rows: sampled })
+        Ok(Oracle {
+            sel,
+            score_diff: diff,
+            sampled_rows: sampled,
+        })
     }
 
     // ------------------------------------------------------------- launches
 
-    fn run_once(gpu: &mut Gpu, case: &Case, d: &Dev, arm: Arm, mirror_on: bool, splits: &[usize]) -> Result<Out> {
+    fn run_once(
+        gpu: &mut Gpu,
+        case: &Case,
+        d: &Dev,
+        arm: Arm,
+        mirror_on: bool,
+        splits: &[usize],
+    ) -> Result<Out> {
         let c = &case.c;
         d.sel.poison(gpu)?;
         d.mir.poison(gpu)?;
@@ -2396,22 +4122,59 @@ mod filter_route {
         for w in splits.windows(2) {
             let (first, end) = (w[0], w[1]);
             let last = end == c.rows;
-            let query = d.query.sub_offset(first * c.stride, d.query.numel() - first * c.stride);
-            let selected = d.sel.view.sub_offset(first * row_bytes, d.sel.payload - first * row_bytes);
+            let query = d
+                .query
+                .sub_offset(first * c.stride, d.query.numel() - first * c.stride);
+            let selected = d
+                .sel
+                .view
+                .sub_offset(first * row_bytes, d.sel.payload - first * row_bytes);
             let p = IndexedAttentionSelectBatch {
-                query: &query, pooled: &d.pooled, pooled_bf16: None, pooled_bf16_valid_blocks: 0, selected: &selected, rows: end - first,
-                query_row_stride: c.stride, block_count: (c.position_start + end) / c.compress, index_heads: 4,
-                index_dim: c.dim, budget_blocks: c.budget, compress: c.compress, position_start: c.position_start + first,
-                capacity: c.capacity, shape_blocks: case.shape_blocks,
+                query: &query,
+                pooled: &d.pooled,
+                pooled_bf16: None,
+                pooled_bf16_valid_blocks: 0,
+                selected: &selected,
+                rows: end - first,
+                query_row_stride: c.stride,
+                block_count: (c.position_start + end) / c.compress,
+                index_heads: 4,
+                index_dim: c.dim,
+                budget_blocks: c.budget,
+                compress: c.compress,
+                position_start: c.position_start + first,
+                capacity: c.capacity,
+                shape_blocks: case.shape_blocks,
             };
             let mirror = (mirror_on && last).then_some(&d.mir.view);
             persisted = match arm {
-                Arm::Hipcc => indexed_attention_select_batch_pm_arm(gpu, &p, mirror, QsaSelectPmArm::Hipcc).map_err(err)?,
-                Arm::Score => indexed_attention_select_batch_pm_arm(gpu, &p, mirror, QsaSelectPmArm::ScoreOnly).map_err(err)?,
+                Arm::Hipcc => {
+                    indexed_attention_select_batch_pm_arm(gpu, &p, mirror, QsaSelectPmArm::Hipcc)
+                        .map_err(err)?
+                }
+                Arm::Score => indexed_attention_select_batch_pm_arm(
+                    gpu,
+                    &p,
+                    mirror,
+                    QsaSelectPmArm::ScoreOnly,
+                )
+                .map_err(err)?,
                 Arm::Filter { score_pm, knob } => {
-                    let (b, s) = indexed_attention_select_batch_filter_arm(gpu, &p, mirror, score_pm, knob.knobs()).map_err(err)?;
-                    stats.get_or_insert_with(Vec::new)
-                        .extend(s.iter().map(|x| Stat { threshold: x.threshold, count: x.count, repaired: x.repaired }));
+                    let (b, s) = indexed_attention_select_batch_filter_arm(
+                        gpu,
+                        &p,
+                        mirror,
+                        score_pm,
+                        knob.knobs(),
+                    )
+                    .map_err(err)?;
+                    stats
+                        .get_or_insert_with(Vec::new)
+                        .extend(s.iter().map(|x| Stat {
+                            threshold: x.threshold,
+                            count: x.count,
+                            repaired: x.repaired,
+                        }));
                     b
                 }
             };
@@ -2419,11 +4182,19 @@ mod filter_route {
         gpu.hip.device_synchronize().map_err(err)?;
         let (sel_guard, sel) = d.sel.read(gpu)?;
         let (mir_guard, mirror) = d.mir.read(gpu)?;
-        Ok(Out { sel, mirror, guards: sel_guard && mir_guard, persisted, stats })
+        Ok(Out {
+            sel,
+            mirror,
+            guards: sel_guard && mir_guard,
+            persisted,
+            stats,
+        })
     }
 
     fn quant(v: &mut [u64]) -> Value {
-        if v.is_empty() { return Value::Null }
+        if v.is_empty() {
+            return Value::Null;
+        }
         v.sort_unstable();
         let n = v.len();
         json!({"min":v[0],"median":v[n / 2],"p99":v[(n * 99 / 100).min(n - 1)],"max":v[n - 1]})
@@ -2445,10 +4216,21 @@ mod filter_route {
     }
 
     fn row_diff(a: &[u8], b: &[u8], row_bytes: usize) -> Value {
-        if a.len() != b.len() { return json!({"length":[a.len(), b.len()]}) }
-        let bad: Vec<usize> = (0..a.len() / row_bytes).filter(|&r| a[r * row_bytes..(r + 1) * row_bytes] != b[r * row_bytes..(r + 1) * row_bytes]).collect();
+        if a.len() != b.len() {
+            return json!({"length":[a.len(), b.len()]});
+        }
+        let bad: Vec<usize> = (0..a.len() / row_bytes)
+            .filter(|&r| {
+                a[r * row_bytes..(r + 1) * row_bytes] != b[r * row_bytes..(r + 1) * row_bytes]
+            })
+            .collect();
         let first = bad.first().map(|&r| {
-            let j = (0..row_bytes / 4).find(|&j| a[r * row_bytes + j * 4..r * row_bytes + j * 4 + 4] != b[r * row_bytes + j * 4..r * row_bytes + j * 4 + 4]).unwrap_or(0);
+            let j = (0..row_bytes / 4)
+                .find(|&j| {
+                    a[r * row_bytes + j * 4..r * row_bytes + j * 4 + 4]
+                        != b[r * row_bytes + j * 4..r * row_bytes + j * 4 + 4]
+                })
+                .unwrap_or(0);
             (r, j)
         });
         json!({"rows_differ":bad.len(),"first_row":first.map(|x| x.0),"first_slot":first.map(|x| x.1)})
@@ -2456,33 +4238,63 @@ mod filter_route {
 
     /// One arm record: the call twice, every comparison. Returns (record,
     /// mismatching predicates, first run's stats).
-    fn eval(gpu: &mut Gpu, case: &Case, d: &Dev, stage: &str, arm: Arm, mirror_on: bool, splits: &[usize],
-            exp: (&[u8], &[u8]), single: &[(String, Vec<Stat>)]) -> Result<(Value, usize, Option<Vec<Stat>>)> {
+    fn eval(
+        gpu: &mut Gpu,
+        case: &Case,
+        d: &Dev,
+        stage: &str,
+        arm: Arm,
+        mirror_on: bool,
+        splits: &[usize],
+        exp: (&[u8], &[u8]),
+        single: &[(String, Vec<Stat>)],
+    ) -> Result<(Value, usize, Option<Vec<Stat>>)> {
         let c = &case.c;
         let o1 = run_once(gpu, case, d, arm, mirror_on, splits)?;
         let o2 = run_once(gpu, case, d, arm, mirror_on, splits)?;
         let sel_eq = o1.sel == exp.0;
-        let mir_eq = if mirror_on { o1.mirror == exp.1 } else { o1.mirror.iter().all(|&x| x == POISON) };
+        let mir_eq = if mirror_on {
+            o1.mirror == exp.1
+        } else {
+            o1.mirror.iter().all(|&x| x == POISON)
+        };
         let persisted_ok = o1.persisted == mirror_on;
         let repeat = o1 == o2;
         let stats_len_ok = o1.stats.as_ref().is_none_or(|s| s.len() == c.rows);
-        let fails = [!sel_eq, !mir_eq, !o1.guards, !persisted_ok, !repeat, !stats_len_ok];
+        let fails = [
+            !sel_eq,
+            !mir_eq,
+            !o1.guards,
+            !persisted_ok,
+            !repeat,
+            !stats_len_ok,
+        ];
         let m = fails.iter().filter(|&&x| x).count();
         let mut rec = json!({"arm":arm.name(),"stage":stage,"mirror":mirror_on,"partitions":splits.len() - 1,
             "selected_equal":sel_eq,"mirror_equal":mir_eq,"guards_ok":o1.guards,"persisted":o1.persisted,
             "persisted_ok":persisted_ok,"repeat_identical":repeat,"mismatches":m});
-        if !sel_eq { rec["selected_diff"] = row_diff(&o1.sel, exp.0, c.capacity * 4); }
+        if !sel_eq {
+            rec["selected_diff"] = row_diff(&o1.sel, exp.0, c.capacity * 4);
+        }
         if let Some(s) = &o1.stats {
             rec["stats_len_ok"] = json!(stats_len_ok);
             rec["filter"] = stats_json(s);
-            if let Some((_, r)) = single.iter().find(|(n, _)| *n == arm.name()) { rec["stats_equal_single_call"] = json!(s == r); }
+            if let Some((_, r)) = single.iter().find(|(n, _)| *n == arm.name()) {
+                rec["stats_equal_single_call"] = json!(s == r);
+            }
         }
         Ok((rec, m, o1.stats))
     }
 
     fn part_splits(c: &Call) -> Option<Vec<usize>> {
         let r = c.rows;
-        let s = if r >= 8 { vec![0, (r / 5) | 1, (r * 3 / 5) | 1, r] } else if r >= 2 { vec![0, r / 2, r] } else { return None };
+        let s = if r >= 8 {
+            vec![0, (r / 5) | 1, (r * 3 / 5) | 1, r]
+        } else if r >= 2 {
+            vec![0, r / 2, r]
+        } else {
+            return None;
+        };
         let ok = s.windows(2).all(|w| w[0] < w[1]);
         ok.then_some(s)
     }
@@ -2498,7 +4310,12 @@ mod filter_route {
             None
         } else {
             let (q, p) = (bytes_f32(&case.qbytes), bytes_f32(&case.pbytes));
-            Some(oracle(gpu, case, d, case.sample.map(|s| (s, &q[..], &p[..])))?)
+            Some(oracle(
+                gpu,
+                case,
+                d,
+                case.sample.map(|s| (s, &q[..], &p[..])),
+            )?)
         };
         let last_row = |sel: &[u8]| sel[(c.rows - 1) * c.capacity * 4..].to_vec();
         if let Some(o) = &o {
@@ -2518,7 +4335,10 @@ mod filter_route {
                 }
                 (s.clone(), m.clone())
             }
-            (None, Some(o)) => { let m = last_row(&o.sel); (o.sel, m) }
+            (None, Some(o)) => {
+                let m = last_row(&o.sel);
+                (o.sel, m)
+            }
             (None, None) => return Err("BF16 case without recorded bytes".into()),
         };
 
@@ -2526,21 +4346,33 @@ mod filter_route {
         let filt = |pm: bool, knob: Knob| Arm::Filter { score_pm: pm, knob };
         let mut plan: Vec<(&str, Arm, bool, Vec<usize>)> = Vec::new();
         let full = vec![0, c.rows];
-        for a in [hip, score] { plan.push(("mirror_on", a, true, full.clone())); }
-        for pm in [false, true] {
-            if case.bf16 && !pm { continue }
-            for k in [Knob::Default, Knob::Underfill, Knob::Overflow] { plan.push(("mirror_on", filt(pm, k), true, full.clone())); }
+        for a in [hip, score] {
+            plan.push(("mirror_on", a, true, full.clone()));
         }
-        for a in [hip, score] { plan.push(("mirror_off", a, false, full.clone())); }
         for pm in [false, true] {
-            if case.bf16 && !pm { continue }
+            if case.bf16 && !pm {
+                continue;
+            }
+            for k in [Knob::Default, Knob::Underfill, Knob::Overflow] {
+                plan.push(("mirror_on", filt(pm, k), true, full.clone()));
+            }
+        }
+        for a in [hip, score] {
+            plan.push(("mirror_off", a, false, full.clone()));
+        }
+        for pm in [false, true] {
+            if case.bf16 && !pm {
+                continue;
+            }
             plan.push(("mirror_off", filt(pm, Knob::Default), false, full.clone()));
         }
         match part_splits(c) {
             Some(s) => {
                 rec["partition_splits"] = json!(s);
                 plan.push(("partition", hip, true, s.clone()));
-                if !case.bf16 { plan.push(("partition", filt(false, Knob::Default), true, s.clone())); }
+                if !case.bf16 {
+                    plan.push(("partition", filt(false, Knob::Default), true, s.clone()));
+                }
                 plan.push(("partition", filt(true, Knob::Default), true, s.clone()));
                 plan.push(("partition", filt(true, Knob::Overflow), true, s));
             }
@@ -2550,26 +4382,49 @@ mod filter_route {
         let mut arms = Vec::new();
         let mut single: Vec<(String, Vec<Stat>)> = Vec::new();
         for (stage, arm, mirror_on, splits) in &plan {
-            let (r, m) = match eval(gpu, case, d, stage, *arm, *mirror_on, splits, (&exp_sel[..], &exp_mir[..]), &single) {
+            let (r, m) = match eval(
+                gpu,
+                case,
+                d,
+                stage,
+                *arm,
+                *mirror_on,
+                splits,
+                (&exp_sel[..], &exp_mir[..]),
+                &single,
+            ) {
                 Ok((r, m, stats)) => {
                     if *stage == "mirror_on" {
-                        if let Some(s) = stats { single.push((arm.name(), s)); }
+                        if let Some(s) = stats {
+                            single.push((arm.name(), s));
+                        }
                     }
-                    if *arm == filt(true, Knob::Default) && *stage == "mirror_on" { rec["filter_default"] = r["filter"].clone(); }
+                    if *arm == filt(true, Knob::Default) && *stage == "mirror_on" {
+                        rec["filter_default"] = r["filter"].clone();
+                    }
                     (r, m)
                 }
-                Err(e) => (json!({"arm":arm.name(),"stage":stage,"mirror":mirror_on,"error":e}), 1),
+                Err(e) => (
+                    json!({"arm":arm.name(),"stage":stage,"mirror":mirror_on,"error":e}),
+                    1,
+                ),
             };
             mism += m;
             arms.push(r);
         }
         // Score-source independence of the filter statistics (informational: the
         // selected/mirror bytes are the contract).
-        let stat_of = |pm: bool, k: Knob| single.iter().find(|(n, _)| *n == filt(pm, k).name()).map(|x| &x.1);
+        let stat_of = |pm: bool, k: Knob| {
+            single
+                .iter()
+                .find(|(n, _)| *n == filt(pm, k).name())
+                .map(|x| &x.1)
+        };
         if let (Some(a), Some(b)) = (stat_of(false, Knob::Default), stat_of(true, Knob::Default)) {
             rec["stats_equal_score_hipcc_vs_pm"] = json!(a == b);
         }
-        let inputs_ok = sha256(&download(gpu, &d.query)?) == case.qh && sha256(&download(gpu, &d.pooled)?) == case.ph;
+        let inputs_ok = sha256(&download(gpu, &d.query)?) == case.qh
+            && sha256(&download(gpu, &d.pooled)?) == case.ph;
         mism += !inputs_ok as usize;
         rec["inputs_unchanged"] = json!(inputs_ok);
         rec["arms"] = json!(arms);
@@ -2578,20 +4433,37 @@ mod filter_route {
 
     fn run_case(gpu: &mut Gpu, f: &mut File, case: &Case) -> Result<usize> {
         let c = &case.c;
-        eprintln!("filter-route {} {} rows={} bc={} group={} compress={} budget={} capacity={}",
-            case.family, case.name, c.rows, c.block_count, group_of(c), c.compress, c.budget, c.capacity);
+        eprintln!(
+            "filter-route {} {} rows={} bc={} group={} compress={} budget={} capacity={}",
+            case.family,
+            case.name,
+            c.rows,
+            c.block_count,
+            group_of(c),
+            c.compress,
+            c.budget,
+            c.capacity
+        );
         let d = alloc_dev(gpu, case)?;
         let (mut rec, mut mism) = match exec_case(gpu, case, &d) {
             Ok(x) => x,
             Err(e) => (json!({"error":e}), 1),
         };
-        if let Err(e) = free_dev(gpu, d) { rec["free_error"] = json!(e); mism += 1; }
+        if let Err(e) = free_dev(gpu, d) {
+            rec["free_error"] = json!(e);
+            mism += 1;
+        }
         rec["family"] = json!(case.family);
         rec["case"] = json!(case.name);
         rec["cases"] = json!(1);
         rec["mismatches"] = json!(mism);
         rec["ok"] = json!(mism == 0);
-        if mism > 0 { eprintln!("FAIL filter-route {} {}: {mism} mismatches", case.family, case.name); }
+        if mism > 0 {
+            eprintln!(
+                "FAIL filter-route {} {}: {mism} mismatches",
+                case.family, case.name
+            );
+        }
         writeln!(f, "{rec}").map_err(err)?;
         f.flush().map_err(err)?;
         Ok(mism)
@@ -2601,30 +4473,64 @@ mod filter_route {
 
     fn load_snapshot(path: &Path) -> Result<Case> {
         let root = path.parent().unwrap();
-        let header: Value = serde_json::from_slice(&std::fs::read(path).map_err(err)?).map_err(err)?;
-        if header["schema"] != "qsa-source-v1" { return Err(format!("{}: unsupported schema", path.display())) }
+        let header: Value =
+            serde_json::from_slice(&std::fs::read(path).map_err(err)?).map_err(err)?;
+        if header["schema"] != "qsa-source-v1" {
+            return Err(format!("{}: unsupported schema", path.display()));
+        }
         let sel = &header["identity"]["selector"];
-        if header["identity"]["arch"] != "gfx1151" { return Err(format!("{}: snapshot arch not gfx1151", path.display())) }
+        if header["identity"]["arch"] != "gfx1151" {
+            return Err(format!("{}: snapshot arch not gfx1151", path.display()));
+        }
         let bf16 = match sel["pooled_dtype"].as_str() {
             Some("F32") => false,
             Some("BF16") => true,
-            _ => return Err(format!("{}: pooled dtype is neither F32 nor BF16", path.display())),
+            _ => {
+                return Err(format!(
+                    "{}: pooled dtype is neither F32 nor BF16",
+                    path.display()
+                ))
+            }
         };
-        if sel["projection_dtype"] != "F32" { return Err(format!("{}: projection is not F32", path.display())) }
-        if sel["heads"] != 4 || sel["dim"] != 128 { return Err(format!("{}: uncovered selector geometry", path.display())) }
+        if sel["projection_dtype"] != "F32" {
+            return Err(format!("{}: projection is not F32", path.display()));
+        }
+        if sel["heads"] != 4 || sel["dim"] != 128 {
+            return Err(format!("{}: uncovered selector geometry", path.display()));
+        }
         let get = |name: &str| -> Result<Vec<u8>> {
             let b = std::fs::read(root.join(name)).map_err(err)?;
-            if header["files"][name]["sha256"] != sha256(&b) { return Err(format!("{}: hash mismatch {name}", path.display())) }
+            if header["files"][name]["sha256"] != sha256(&b) {
+                return Err(format!("{}: hash mismatch {name}", path.display()));
+            }
             Ok(b)
         };
         let g = &header["geometry"];
-        let n = |v: &Value, k: &str| v[k].as_u64().map(|x| x as usize).ok_or(format!("missing {k}"));
-        let (rows, position_start, compress) = (n(g, "rows")?, n(g, "position_start")?, n(g, "compress")?);
-        if compress == 0 || rows == 0 { return Err(format!("{}: zero compress/rows", path.display())) }
-        let c = Call { rows, stride: n(sel, "projection_stride")?, block_count: (position_start + rows) / compress, dim: 128,
-            compress, position_start, budget: n(g, "budget_blocks")?, capacity: n(g, "capacity")? };
+        let n = |v: &Value, k: &str| {
+            v[k].as_u64()
+                .map(|x| x as usize)
+                .ok_or(format!("missing {k}"))
+        };
+        let (rows, position_start, compress) =
+            (n(g, "rows")?, n(g, "position_start")?, n(g, "compress")?);
+        if compress == 0 || rows == 0 {
+            return Err(format!("{}: zero compress/rows", path.display()));
+        }
+        let c = Call {
+            rows,
+            stride: n(sel, "projection_stride")?,
+            block_count: (position_start + rows) / compress,
+            dim: 128,
+            compress,
+            position_start,
+            budget: n(g, "budget_blocks")?,
+            capacity: n(g, "capacity")?,
+        };
         if c.budget > MAX_BUDGET || c.block_count == 0 || c.capacity == 0 || c.stride < 4 * c.dim {
-            return Err(format!("{}: uncovered budget/block count/capacity/stride", path.display()))
+            return Err(format!(
+                "{}: uncovered budget/block count/capacity/stride",
+                path.display()
+            ));
         }
         let pooled_capacity = n(sel, "pooled_capacity")?;
         let qbytes = get("index-projection.f32")?;
@@ -2632,13 +4538,34 @@ mod filter_route {
         let snap_sel = get("selected.i32")?;
         let snap_mirror = get("selected-mirror.i32")?;
         let esize = if bf16 { 2 } else { 4 };
-        if qbytes.len() != rows * c.stride * 4 || pbytes.len() != pooled_capacity * 128 * esize || snap_sel.len() != rows * c.capacity * 4
-            || snap_mirror.len() != c.capacity * 4 || c.block_count > pooled_capacity {
-            return Err(format!("{}: geometry/extent mismatch", path.display()))
+        if qbytes.len() != rows * c.stride * 4
+            || pbytes.len() != pooled_capacity * 128 * esize
+            || snap_sel.len() != rows * c.capacity * 4
+            || snap_mirror.len() != c.capacity * 4
+            || c.block_count > pooled_capacity
+        {
+            return Err(format!("{}: geometry/extent mismatch", path.display()));
         }
-        let name = format!("{} ctx={} layer={}", path.display(), header["identity"]["ctx"], header["identity"]["layer"]);
-        Ok(Case { family: "real", name, real: true, bf16, c, shape_blocks: pooled_capacity, qh: sha256(&qbytes), ph: sha256(&pbytes),
-            qbytes, pbytes, snap: Some((snap_sel, snap_mirror)), sample: None })
+        let name = format!(
+            "{} ctx={} layer={}",
+            path.display(),
+            header["identity"]["ctx"],
+            header["identity"]["layer"]
+        );
+        Ok(Case {
+            family: "real",
+            name,
+            real: true,
+            bf16,
+            c,
+            shape_blocks: pooled_capacity,
+            qh: sha256(&qbytes),
+            ph: sha256(&pbytes),
+            qbytes,
+            pbytes,
+            snap: Some((snap_sel, snap_mirror)),
+            sample: None,
+        })
     }
 
     // ---------------------------------------------------------- synthetic
@@ -2653,13 +4580,34 @@ mod filter_route {
             z ^ (z >> 31)
         }
     }
-    fn int(r: &mut Rng) -> f32 { (r.next() % 3) as f32 - 1.0 }
-    fn flt(r: &mut Rng) -> f32 { (r.next() >> 40) as f32 / 8_388_608.0 - 1.0 }
+    fn int(r: &mut Rng) -> f32 {
+        (r.next() % 3) as f32 - 1.0
+    }
+    fn flt(r: &mut Rng) -> f32 {
+        (r.next() >> 40) as f32 / 8_388_608.0 - 1.0
+    }
 
     #[derive(Clone, Copy)]
-    enum Tie { Dense, Sparse, Dup, Float, Zero, Same }
+    enum Tie {
+        Dense,
+        Sparse,
+        Dup,
+        Float,
+        Zero,
+        Same,
+    }
 
-    struct Spec { family: &'static str, name: String, compress: usize, bc: usize, rows: usize, tail: usize, budget: usize, cap_extra: usize, tie: Tie }
+    struct Spec {
+        family: &'static str,
+        name: String,
+        compress: usize,
+        bc: usize,
+        rows: usize,
+        tail: usize,
+        budget: usize,
+        cap_extra: usize,
+        tie: Tie,
+    }
 
     /// Deterministic fixture; the last row sees `bc` complete blocks plus a
     /// `tail`-token partial block (`position_start = bc*compress + tail - rows`).
@@ -2668,7 +4616,11 @@ mod filter_route {
     /// garbage that must never be read.
     fn synth_case(idx: usize, s: &Spec) -> Case {
         let (compress, bc, rows) = (s.compress, s.bc, s.rows);
-        assert!(s.tail < compress && bc * compress + s.tail >= rows, "{}", s.name);
+        assert!(
+            s.tail < compress && bc * compress + s.tail >= rows,
+            "{}",
+            s.name
+        );
         let position_start = bc * compress + s.tail - rows;
         let capacity = s.budget * compress + compress - 1 + s.cap_extra;
         let stride = 640usize;
@@ -2677,84 +4629,353 @@ mod filter_route {
         let float_mode = matches!(s.tie, Tie::Float);
         let mut q = Vec::with_capacity(rows * stride);
         for _ in 0..rows {
-            for d in 0..stride { q.push(if d < 512 && !float_mode { int(&mut rng) } else { flt(&mut rng) }); }
+            for d in 0..stride {
+                q.push(if d < 512 && !float_mode {
+                    int(&mut rng)
+                } else {
+                    flt(&mut rng)
+                });
+            }
         }
         let mut p = Vec::with_capacity(shape_blocks * 128);
         match s.tie {
-            Tie::Dense => for _ in 0..bc * 128 { p.push(int(&mut rng)); },
-            Tie::Float => for _ in 0..bc * 128 { p.push(flt(&mut rng)); },
-            Tie::Sparse => for _ in 0..bc * 128 {
-                let v = rng.next();
-                p.push(if v % 16 == 0 { if v & 16 == 0 { 1.0 } else { -1.0 } } else { 0.0 });
-            },
+            Tie::Dense => {
+                for _ in 0..bc * 128 {
+                    p.push(int(&mut rng));
+                }
+            }
+            Tie::Float => {
+                for _ in 0..bc * 128 {
+                    p.push(flt(&mut rng));
+                }
+            }
+            Tie::Sparse => {
+                for _ in 0..bc * 128 {
+                    let v = rng.next();
+                    p.push(if v % 16 == 0 {
+                        if v & 16 == 0 {
+                            1.0
+                        } else {
+                            -1.0
+                        }
+                    } else {
+                        0.0
+                    });
+                }
+            }
             Tie::Zero => p.resize(bc * 128, 0.0),
             Tie::Dup => {
-                let keys: Vec<Vec<f32>> = (0..40).map(|_| (0..128).map(|_| int(&mut rng)).collect()).collect();
-                for _ in 0..bc { let k = &keys[(rng.next() % 40) as usize]; p.extend_from_slice(k); }
+                let keys: Vec<Vec<f32>> = (0..40)
+                    .map(|_| (0..128).map(|_| int(&mut rng)).collect())
+                    .collect();
+                for _ in 0..bc {
+                    let k = &keys[(rng.next() % 40) as usize];
+                    p.extend_from_slice(k);
+                }
             }
             Tie::Same => {
                 let k: Vec<f32> = (0..128).map(|_| int(&mut rng)).collect();
-                for _ in 0..bc { p.extend_from_slice(&k); }
+                for _ in 0..bc {
+                    p.extend_from_slice(&k);
+                }
             }
         }
-        for _ in 0..(shape_blocks - bc) * 128 { p.push(flt(&mut rng)); }
+        for _ in 0..(shape_blocks - bc) * 128 {
+            p.push(flt(&mut rng));
+        }
         let (qbytes, pbytes) = (f32_bytes(&q), f32_bytes(&p));
-        let c = Call { rows, stride, block_count: bc, dim: 128, compress, position_start, budget: s.budget, capacity };
+        let c = Call {
+            rows,
+            stride,
+            block_count: bc,
+            dim: 128,
+            compress,
+            position_start,
+            budget: s.budget,
+            capacity,
+        };
         // Serial CPU rescoring of sampled rows unless the full-depth FMA cost is large.
         let sample = (rows * bc <= 1 << 26).then_some(61);
-        Case { family: s.family, name: s.name.clone(), real: false, bf16: false, c, shape_blocks, qh: sha256(&qbytes), ph: sha256(&pbytes),
-            qbytes, pbytes, snap: None, sample }
+        Case {
+            family: s.family,
+            name: s.name.clone(),
+            real: false,
+            bf16: false,
+            c,
+            shape_blocks,
+            qh: sha256(&qbytes),
+            ph: sha256(&pbytes),
+            qbytes,
+            pbytes,
+            snap: None,
+            sample,
+        }
     }
 
     fn specs() -> Vec<Spec> {
         use Tie::*;
         let mut v = Vec::new();
         let mut add = |family, name: String, compress, bc, rows, tail, budget, cap_extra, tie| {
-            v.push(Spec { family, name, compress, bc, rows, tail, budget, cap_extra, tie });
+            v.push(Spec {
+                family,
+                name,
+                compress,
+                bc,
+                rows,
+                tail,
+                budget,
+                cap_extra,
+                tie,
+            });
         };
         // Boundary depths: below / at / above the budget and the 1024 / 2048 / 4096 sampling edges.
-        for (i, &(bc, rows, tail)) in [(1usize, 4usize, 3usize), (2, 8, 0), (3, 12, 1), (511, 512, 0), (512, 512, 1), (513, 512, 2), (514, 64, 3),
-            (1023, 256, 0), (1024, 256, 1), (1025, 256, 2), (2047, 128, 3), (2048, 128, 0), (2049, 128, 1), (4095, 64, 2), (4096, 64, 3),
-            (4097, 64, 0), (16383, 64, 1), (16384, 64, 2), (16385, 64, 3)].iter().enumerate() {
-            add("depth", format!("depth-bc{bc}"), 4, bc, rows, tail, 512, 0, if i % 2 == 0 { Dense } else { Float });
+        for (i, &(bc, rows, tail)) in [
+            (1usize, 4usize, 3usize),
+            (2, 8, 0),
+            (3, 12, 1),
+            (511, 512, 0),
+            (512, 512, 1),
+            (513, 512, 2),
+            (514, 64, 3),
+            (1023, 256, 0),
+            (1024, 256, 1),
+            (1025, 256, 2),
+            (2047, 128, 3),
+            (2048, 128, 0),
+            (2049, 128, 1),
+            (4095, 64, 2),
+            (4096, 64, 3),
+            (4097, 64, 0),
+            (16383, 64, 1),
+            (16384, 64, 2),
+            (16385, 64, 3),
+        ]
+        .iter()
+        .enumerate()
+        {
+            add(
+                "depth",
+                format!("depth-bc{bc}"),
+                4,
+                bc,
+                rows,
+                tail,
+                512,
+                0,
+                if i % 2 == 0 { Dense } else { Float },
+            );
         }
         // Ties and zeros.
         for bc in [4096usize, 8192] {
-            for (tag, tie) in [("dense", Dense), ("sparse", Sparse), ("dup", Dup), ("same", Same)] {
-                add("ties", format!("ties-{tag}-bc{bc}"), 4, bc, 640, 3, 512, 0, tie);
+            for (tag, tie) in [
+                ("dense", Dense),
+                ("sparse", Sparse),
+                ("dup", Dup),
+                ("same", Same),
+            ] {
+                add(
+                    "ties",
+                    format!("ties-{tag}-bc{bc}"),
+                    4,
+                    bc,
+                    640,
+                    3,
+                    512,
+                    0,
+                    tie,
+                );
             }
         }
-        for bc in [600usize, 16384, 40000] { add("zero", format!("zero-bc{bc}"), 4, bc, 64, 2, 512, 0, Zero); }
+        for bc in [600usize, 16384, 40000] {
+            add("zero", format!("zero-bc{bc}"), 4, bc, 64, 2, 512, 0, Zero);
+        }
         // Zero complete blocks (the whole call sees only the partial-block tail).
-        for (rows, tail) in [(1usize, 3usize), (3, 3)] { add("zero_blocks", format!("zero-blocks-rows{rows}"), 4, 0, rows, tail, 512, 0, Dense); }
+        for (rows, tail) in [(1usize, 3usize), (3, 3)] {
+            add(
+                "zero_blocks",
+                format!("zero-blocks-rows{rows}"),
+                4,
+                0,
+                rows,
+                tail,
+                512,
+                0,
+                Dense,
+            );
+        }
         // 65535 / 65536 blocks: the PM bound and the 16-bit-count edge.
         for bc in [65535usize, 65536] {
             for rows in [17usize, 256] {
                 for (tag, tie) in [("float", Float), ("dup", Dup)] {
-                    add("bound65536", format!("bound-bc{bc}-rows{rows}-{tag}"), 4, bc, rows, (rows + bc) % 4, 512, 0, tie);
+                    add(
+                        "bound65536",
+                        format!("bound-bc{bc}-rows{rows}-{tag}"),
+                        4,
+                        bc,
+                        rows,
+                        (rows + bc) % 4,
+                        512,
+                        0,
+                        tie,
+                    );
                 }
             }
         }
         // Duplicate and float keys.
-        add("duplicate", "dup-bc16384".into(), 4, 16384, 512, 1, 512, 0, Dup);
-        add("duplicate", "dup-bc65536".into(), 4, 65536, 515, 3, 512, 0, Dup);
-        add("float", "float-bc12000".into(), 4, 12000, 2100, 3, 511, 0, Float);
-        add("float", "float-bc40000".into(), 4, 40000, 835, 1, 512, 0, Float);
+        add(
+            "duplicate",
+            "dup-bc16384".into(),
+            4,
+            16384,
+            512,
+            1,
+            512,
+            0,
+            Dup,
+        );
+        add(
+            "duplicate",
+            "dup-bc65536".into(),
+            4,
+            65536,
+            515,
+            3,
+            512,
+            0,
+            Dup,
+        );
+        add(
+            "float",
+            "float-bc12000".into(),
+            4,
+            12000,
+            2100,
+            3,
+            511,
+            0,
+            Float,
+        );
+        add(
+            "float",
+            "float-bc40000".into(),
+            4,
+            40000,
+            835,
+            1,
+            512,
+            0,
+            Float,
+        );
         // Budgets.
-        for (b, bc, tie) in [(0usize, 2100usize, Dense), (1, 2100, Dup), (511, 2100, Dense), (512, 2100, Float)] {
-            add("budget", format!("budget{b}-bc{bc}"), 4, bc, 700, 3, b, 5, tie);
+        for (b, bc, tie) in [
+            (0usize, 2100usize, Dense),
+            (1, 2100, Dup),
+            (511, 2100, Dense),
+            (512, 2100, Float),
+        ] {
+            add(
+                "budget",
+                format!("budget{b}-bc{bc}"),
+                4,
+                bc,
+                700,
+                3,
+                b,
+                5,
+                tie,
+            );
         }
         // Ragged groups (64 MiB scratch): 2020 rows at 16384 blocks (1024 + 996), 1019 rows in one group.
-        add("ragged", "ragged-2020-float-bc16384".into(), 4, 16384, 2020, 0, 512, 0, Float);
-        add("ragged", "ragged-2020-dup-bc16384".into(), 4, 16384, 2020, 3, 512, 0, Dup);
-        add("ragged", "ragged-1019-sparse-bc8192".into(), 4, 8192, 1019, 2, 512, 0, Sparse);
-        add("ragged", "ragged-1019-float-bc8192".into(), 4, 8192, 1019, 1, 511, 37, Float);
+        add(
+            "ragged",
+            "ragged-2020-float-bc16384".into(),
+            4,
+            16384,
+            2020,
+            0,
+            512,
+            0,
+            Float,
+        );
+        add(
+            "ragged",
+            "ragged-2020-dup-bc16384".into(),
+            4,
+            16384,
+            2020,
+            3,
+            512,
+            0,
+            Dup,
+        );
+        add(
+            "ragged",
+            "ragged-1019-sparse-bc8192".into(),
+            4,
+            8192,
+            1019,
+            2,
+            512,
+            0,
+            Sparse,
+        );
+        add(
+            "ragged",
+            "ragged-1019-float-bc8192".into(),
+            4,
+            8192,
+            1019,
+            1,
+            511,
+            37,
+            Float,
+        );
         // compress 128.
-        add("compress128", "c128-bc16".into(), 128, 16, 512, 1, 32, 0, Dense);
-        add("compress128", "c128-bc600".into(), 128, 600, 512, 64, 512, 3, Float);
+        add(
+            "compress128",
+            "c128-bc16".into(),
+            128,
+            16,
+            512,
+            1,
+            32,
+            0,
+            Dense,
+        );
+        add(
+            "compress128",
+            "c128-bc600".into(),
+            128,
+            600,
+            512,
+            64,
+            512,
+            3,
+            Float,
+        );
         // 8192-row chunk at position_start 245760 (bc 63488, 32 groups of 256 rows).
-        add("chunk8192", "chunk8192-p245760-float".into(), 4, 63488, 8192, 0, 512, 0, Float);
-        add("chunk8192", "chunk8192-p245760-dup".into(), 4, 63488, 8192, 0, 512, 0, Dup);
+        add(
+            "chunk8192",
+            "chunk8192-p245760-float".into(),
+            4,
+            63488,
+            8192,
+            0,
+            512,
+            0,
+            Float,
+        );
+        add(
+            "chunk8192",
+            "chunk8192-p245760-dup".into(),
+            4,
+            63488,
+            8192,
+            0,
+            512,
+            0,
+            Dup,
+        );
         v
     }
 
@@ -2767,8 +4988,13 @@ mod filter_route {
             return Ok(0);
         }
         let mut paths = Vec::new();
-        for d in dirs { snapshots(d, &mut paths)?; }
-        for k in [HIPCC_SCORE, HIPCC_SELECT] { gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, k).map_err(err)?; }
+        for d in dirs {
+            snapshots(d, &mut paths)?;
+        }
+        for k in [HIPCC_SCORE, HIPCC_SELECT] {
+            gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, k)
+                .map_err(err)?;
+        }
         let mut total = 0usize;
         for path in &paths {
             let case = load_snapshot(path)?;
@@ -2842,7 +5068,9 @@ mod filter_check {
     const CAN: usize = 4096;
     const MAX_CHUNK_ELEMS: usize = 16 << 20;
     const MAX_CHUNK_ROWS: usize = 512;
-    const MATRIX_BLOCKS: [usize; 17] = [0, 1, 2, 511, 512, 513, 2047, 2048, 2049, 4095, 4096, 4097, 8191, 8192, 32768, 65535, 65536];
+    const MATRIX_BLOCKS: [usize; 17] = [
+        0, 1, 2, 511, 512, 513, 2047, 2048, 2049, 4095, 4096, 4097, 8191, 8192, 32768, 65535, 65536,
+    ];
     const MATRIX_ROWS: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 16, 17, 256];
     const RAGGED_BLOCKS: [usize; 2] = [2020, 1019];
     const SWEEP_BLOCKS: [usize; 7] = [511, 512, 513, 4095, 4096, 4097, 65536];
@@ -2858,8 +5086,15 @@ mod filter_check {
     const PART_H: usize = 7;
     const INPUTS: usize = 8;
     const ARM_NAMES: [&str; 9] = [
-        "cpu-reference", "filter-default", "filter-target1", "filter-cap600", "incumbent-hipcc", "incumbent-pm",
-        "partition-filter-default", "partition-incumbent-hipcc", "inputs-unchanged",
+        "cpu-reference",
+        "filter-default",
+        "filter-target1",
+        "filter-cap600",
+        "incumbent-hipcc",
+        "incumbent-pm",
+        "partition-filter-default",
+        "partition-incumbent-hipcc",
+        "inputs-unchanged",
     ];
 
     fn mix64(mut z: u64) -> u64 {
@@ -2867,19 +5102,38 @@ mod filter_check {
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^ (z >> 31)
     }
-    fn hsh(seed: u64, b: usize) -> u64 { mix64(seed.wrapping_add((b as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))) }
+    fn hsh(seed: u64, b: usize) -> u64 {
+        mix64(seed.wrapping_add((b as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)))
+    }
 
     /// Dense pseudo-random bijection of `[0, n)` (cycle-walked affine/xorshift
     /// rounds over the enclosing power of two).
-    struct Perm { n: usize, mask: u64, sh: u32, a1: u64, c1: u64, a2: u64, c2: u64 }
+    struct Perm {
+        n: usize,
+        mask: u64,
+        sh: u32,
+        a1: u64,
+        c1: u64,
+        a2: u64,
+        c2: u64,
+    }
     impl Perm {
         fn new(n: usize, seed: u64) -> Perm {
-            let bits = if n <= 1 { 1 } else { usize::BITS - (n - 1).leading_zeros() };
+            let bits = if n <= 1 {
+                1
+            } else {
+                usize::BITS - (n - 1).leading_zeros()
+            };
             let mask = (1u64 << bits) - 1;
             let s = mix64(seed ^ 0x51ED_270B);
             Perm {
-                n, mask, sh: bits.div_ceil(2).max(1),
-                a1: (mix64(s) | 1) & mask, c1: mix64(s ^ 1) & mask, a2: (mix64(s ^ 2) | 1) & mask, c2: mix64(s ^ 3) & mask,
+                n,
+                mask,
+                sh: bits.div_ceil(2).max(1),
+                a1: (mix64(s) | 1) & mask,
+                c1: mix64(s ^ 1) & mask,
+                a2: (mix64(s ^ 2) | 1) & mask,
+                c2: mix64(s ^ 3) & mask,
             }
         }
         /// Rank of block `b` (0 = best); `b < n`.
@@ -2890,22 +5144,52 @@ mod filter_check {
                 x ^= x >> self.sh;
                 x = x.wrapping_mul(self.a2).wrapping_add(self.c2) & self.mask;
                 x ^= x >> self.sh;
-                if (x as usize) < self.n { return x as usize }
+                if (x as usize) < self.n {
+                    return x as usize;
+                }
             }
         }
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Pat {
-        RandomDistinct, RandomTies, Equal, Zero, MostlyZero(i32, bool), InfFewer, InfEqual, InfMore,
-        BoundaryDup, UlpAdjacent, DenormalDistinct, DenormalTies, SinkRecency, AdvNonSampled, AdvSampledHigh,
+        RandomDistinct,
+        RandomTies,
+        Equal,
+        Zero,
+        MostlyZero(i32, bool),
+        InfFewer,
+        InfEqual,
+        InfMore,
+        BoundaryDup,
+        UlpAdjacent,
+        DenormalDistinct,
+        DenormalTies,
+        SinkRecency,
+        AdvNonSampled,
+        AdvSampledHigh,
     }
     const PATTERNS: [Pat; 20] = [
-        Pat::RandomDistinct, Pat::RandomTies, Pat::Equal, Pat::Zero,
-        Pat::MostlyZero(-1, false), Pat::MostlyZero(0, false), Pat::MostlyZero(1, false),
-        Pat::MostlyZero(-1, true), Pat::MostlyZero(0, true), Pat::MostlyZero(1, true),
-        Pat::InfFewer, Pat::InfEqual, Pat::InfMore, Pat::BoundaryDup, Pat::UlpAdjacent,
-        Pat::DenormalDistinct, Pat::DenormalTies, Pat::SinkRecency, Pat::AdvNonSampled, Pat::AdvSampledHigh,
+        Pat::RandomDistinct,
+        Pat::RandomTies,
+        Pat::Equal,
+        Pat::Zero,
+        Pat::MostlyZero(-1, false),
+        Pat::MostlyZero(0, false),
+        Pat::MostlyZero(1, false),
+        Pat::MostlyZero(-1, true),
+        Pat::MostlyZero(0, true),
+        Pat::MostlyZero(1, true),
+        Pat::InfFewer,
+        Pat::InfEqual,
+        Pat::InfMore,
+        Pat::BoundaryDup,
+        Pat::UlpAdjacent,
+        Pat::DenormalDistinct,
+        Pat::DenormalTies,
+        Pat::SinkRecency,
+        Pat::AdvNonSampled,
+        Pat::AdvSampledHigh,
     ];
     impl Pat {
         fn name(self) -> &'static str {
@@ -2944,17 +5228,28 @@ mod filter_check {
         }
     }
     /// (anchor rank, half width) of the duplicate group straddling the budget.
-    fn boundary(row: usize) -> (usize, usize) { ([512, 511, 1, 513][(row / 5) % 4], [1, 2, 7, 64, 300][row % 5]) }
+    fn boundary(row: usize) -> (usize, usize) {
+        (
+            [512, 511, 1, 513][(row / 5) % 4],
+            [1, 2, 7, 64, 300][row % 5],
+        )
+    }
     /// Whether block `b` is one of the filter's sample points `b_i = i*n/2048`.
     fn sampled(b: usize, n: usize) -> bool {
-        if n == 0 { return false }
+        if n == 0 {
+            return false;
+        }
         let i = (b * SAMPLES + n - 1) / n;
         i < SAMPLES && (i * n) / SAMPLES == b
     }
 
     fn row_seed(pid: u64, n: usize, row: usize) -> u64 {
-        mix64(pid.wrapping_mul(0xA24B_AED4_963E_E407) ^ (n as u64).wrapping_mul(0x9FB2_1C65_1E98_DF25)
-            ^ ((row % 100) as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93) ^ 0x5151)
+        mix64(
+            pid.wrapping_mul(0xA24B_AED4_963E_E407)
+                ^ (n as u64).wrapping_mul(0x9FB2_1C65_1E98_DF25)
+                ^ ((row % 100) as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93)
+                ^ 0x5151,
+        )
     }
 
     /// F32 bits of block `b` of a row with `n` live blocks.
@@ -2970,18 +5265,34 @@ mod filter_check {
             Pat::MostlyZero(d, eq) => {
                 let npos = (K as i64 + d as i64) as usize;
                 let rk = perm.at(b);
-                if rk < npos { if eq { 0x3f80_0000 } else { dist(rk) } } else { 0 }
+                if rk < npos {
+                    if eq {
+                        0x3f80_0000
+                    } else {
+                        dist(rk)
+                    }
+                } else {
+                    0
+                }
             }
             Pat::InfFewer | Pat::InfEqual | Pat::InfMore => {
                 let rk = perm.at(b);
-                if rk < ninf(pat, row) { INF } else { dist(rk) }
+                if rk < ninf(pat, row) {
+                    INF
+                } else {
+                    dist(rk)
+                }
             }
             Pat::BoundaryDup => {
                 let rk = perm.at(b);
                 let (a, g) = boundary(row);
-                if rk + g < a { 0x4100_0000 + (a - rk) as u32 }
-                else if rk <= a + g { 0x4000_0000 }
-                else { 0x3000_0000 + (n - rk) as u32 }
+                if rk + g < a {
+                    0x4100_0000 + (a - rk) as u32
+                } else if rk <= a + g {
+                    0x4000_0000
+                } else {
+                    0x3000_0000 + (n - rk) as u32
+                }
             }
             Pat::UlpAdjacent => {
                 let rk = perm.at(b);
@@ -2995,28 +5306,50 @@ mod filter_check {
             Pat::DenormalDistinct => (n - 1 - perm.at(b)) as u32,
             Pat::DenormalTies => (h % 64) as u32,
             Pat::SinkRecency => {
-                if b < 4 { 0x4000_0000 + b as u32 }
-                else if b + 64 >= n { 0x3f80_0000 + (h % 1024) as u32 }
-                else if h % 4 == 0 { 0x3f00_0000 } else { 0 }
+                if b < 4 {
+                    0x4000_0000 + b as u32
+                } else if b + 64 >= n {
+                    0x3f80_0000 + (h % 1024) as u32
+                } else if h % 4 == 0 {
+                    0x3f00_0000
+                } else {
+                    0
+                }
             }
-            Pat::AdvNonSampled => if sampled(b, n) { (h % 16) as u32 } else { dist(perm.at(b)) },
+            Pat::AdvNonSampled => {
+                if sampled(b, n) {
+                    (h % 16) as u32
+                } else {
+                    dist(perm.at(b))
+                }
+            }
             Pat::AdvSampledHigh => {
                 let rk = perm.at(b);
-                if sampled(b, n) { 0x4000_0000 + (n - 1 - rk) as u32 } else { dist(rk) }
+                if sampled(b, n) {
+                    0x4000_0000 + (n - 1 - rk) as u32
+                } else {
+                    dist(rk)
+                }
             }
         }
     }
 
     fn gen_chunk(geo: &Geo, pat: Pat, pid: u64, row0: usize, nrows: usize) -> Vec<f32> {
         let mut v = vec![0f32; nrows * geo.stride];
-        v.par_chunks_mut(geo.stride).enumerate().for_each(|(i, out)| {
-            let row = row0 + i;
-            let n = geo.rbc(row);
-            let seed = row_seed(pid, n, row);
-            let perm = Perm::new(n.max(1), seed);
-            for b in 0..n { out[b] = f32::from_bits(bits(pat, row, n, seed, &perm, b)); }
-            for w in &mut out[n..] { *w = f32::from_bits(INVALID); }
-        });
+        v.par_chunks_mut(geo.stride)
+            .enumerate()
+            .for_each(|(i, out)| {
+                let row = row0 + i;
+                let n = geo.rbc(row);
+                let seed = row_seed(pid, n, row);
+                let perm = Perm::new(n.max(1), seed);
+                for b in 0..n {
+                    out[b] = f32::from_bits(bits(pat, row, n, seed, &perm, b));
+                }
+                for w in &mut out[n..] {
+                    *w = f32::from_bits(INVALID);
+                }
+            });
         v
     }
 
@@ -3024,10 +5357,15 @@ mod filter_check {
 
     /// Independent composite-key top `min(512, n)`, descending.
     fn row_top(sc: &[f32]) -> Vec<u64> {
-        let mut keys: Vec<u64> = sc.iter().enumerate()
-            .map(|(b, x)| ((x.to_bits() as u64) << 32) | (0xFFFF_FFFFu64 - b as u64)).collect();
+        let mut keys: Vec<u64> = sc
+            .iter()
+            .enumerate()
+            .map(|(b, x)| ((x.to_bits() as u64) << 32) | (0xFFFF_FFFFu64 - b as u64))
+            .collect();
         let m = keys.len().min(K);
-        if m == 0 { return Vec::new() }
+        if m == 0 {
+            return Vec::new();
+        }
         if m < keys.len() {
             keys.select_nth_unstable_by(m - 1, |a, b| b.cmp(a));
             keys.truncate(m);
@@ -3038,43 +5376,80 @@ mod filter_check {
 
     /// Pattern-intent checks over a row's keys (block order) and `rank` order.
     fn props(pat: Pat, row: usize, n: usize, keys: &[u32], order: &[u32]) -> Option<String> {
-        if n == 0 { return None }
-        if keys.iter().any(|&k| k > INF) { return Some("generator produced a NaN/negative key".into()) }
-        let tied = |_: ()| order.windows(2).any(|w| keys[w[0] as usize] == keys[w[1] as usize]);
+        if n == 0 {
+            return None;
+        }
+        if keys.iter().any(|&k| k > INF) {
+            return Some("generator produced a NaN/negative key".into());
+        }
+        let tied = |_: ()| {
+            order
+                .windows(2)
+                .any(|w| keys[w[0] as usize] == keys[w[1] as usize])
+        };
         match pat {
             Pat::RandomDistinct | Pat::UlpAdjacent | Pat::DenormalDistinct => {
-                if tied(()) { return Some(format!("{} produced tied keys (row {row}, n {n})", pat.name())) }
+                if tied(()) {
+                    return Some(format!(
+                        "{} produced tied keys (row {row}, n {n})",
+                        pat.name()
+                    ));
+                }
             }
             Pat::Equal => {
-                if keys.iter().any(|&k| k != keys[0]) { return Some(format!("equal row {row} not constant")) }
+                if keys.iter().any(|&k| k != keys[0]) {
+                    return Some(format!("equal row {row} not constant"));
+                }
             }
             Pat::Zero => {
-                if keys.iter().any(|&k| k != 0) { return Some(format!("zero row {row} not zero")) }
+                if keys.iter().any(|&k| k != 0) {
+                    return Some(format!("zero row {row} not zero"));
+                }
             }
             Pat::MostlyZero(d, _) => {
                 let want = n.min((K as i64 + d as i64) as usize);
                 let got = keys.iter().filter(|&&k| k > 0).count();
-                if got != want { return Some(format!("{}: {got} positives, want {want} (row {row}, n {n})", pat.name())) }
+                if got != want {
+                    return Some(format!(
+                        "{}: {got} positives, want {want} (row {row}, n {n})",
+                        pat.name()
+                    ));
+                }
             }
             Pat::InfFewer | Pat::InfEqual | Pat::InfMore => {
                 let want = n.min(ninf(pat, row));
                 let got = keys.iter().filter(|&&k| k == INF).count();
-                if got != want { return Some(format!("{}: {got} infs, want {want} (row {row}, n {n})", pat.name())) }
+                if got != want {
+                    return Some(format!(
+                        "{}: {got} infs, want {want} (row {row}, n {n})",
+                        pat.name()
+                    ));
+                }
             }
             Pat::BoundaryDup => {
                 let (a, _) = boundary(row);
                 if n > a && keys[order[a - 1] as usize] != keys[order[a] as usize] {
-                    return Some(format!("boundary duplicates do not straddle rank {a} (row {row}, n {n})"))
+                    return Some(format!(
+                        "boundary duplicates do not straddle rank {a} (row {row}, n {n})"
+                    ));
                 }
             }
             Pat::AdvNonSampled => {
                 for b in 0..n {
-                    if sampled(b, n) != (keys[b] < 0x2000_0000) { return Some(format!("adversarial non-sampled: block {b} (row {row}, n {n})")) }
+                    if sampled(b, n) != (keys[b] < 0x2000_0000) {
+                        return Some(format!(
+                            "adversarial non-sampled: block {b} (row {row}, n {n})"
+                        ));
+                    }
                 }
             }
             Pat::AdvSampledHigh => {
                 for b in 0..n {
-                    if sampled(b, n) != (keys[b] >= 0x4000_0000) { return Some(format!("adversarial sampled-high: block {b} (row {row}, n {n})")) }
+                    if sampled(b, n) != (keys[b] >= 0x4000_0000) {
+                        return Some(format!(
+                            "adversarial sampled-high: block {b} (row {row}, n {n})"
+                        ));
+                    }
                 }
             }
             _ => {}
@@ -3083,7 +5458,12 @@ mod filter_check {
     }
 
     /// Per unique score row: composite top, `rank` order prefix, own checks.
-    struct RowRef { top: Vec<u64>, ord: Vec<u32>, bad: u64, first: Option<String> }
+    struct RowRef {
+        top: Vec<u64>,
+        ord: Vec<u32>,
+        bad: u64,
+        first: Option<String>,
+    }
 
     fn build_ref(pat: Pat, row: usize, n: usize, sc: &[f32]) -> RowRef {
         let keys: Vec<u32> = sc[..n].iter().map(|x| x.to_bits()).collect();
@@ -3095,7 +5475,10 @@ mod filter_check {
             let blk = 0xFFFF_FFFFu64 - (top[j] & 0xFFFF_FFFF);
             if blk != order[j] as u64 {
                 bad += 1;
-                first = Some(format!("rank order[{j}] = {} but composite top block {blk} (row {row}, n {n})", order[j]));
+                first = Some(format!(
+                    "rank order[{j}] = {} but composite top block {blk} (row {row}, n {n})",
+                    order[j]
+                ));
                 break;
             }
         }
@@ -3103,15 +5486,28 @@ mod filter_check {
             bad += 1;
             first.get_or_insert(m);
         }
-        RowRef { top, ord: order[..n.min(K)].to_vec(), bad, first }
+        RowRef {
+            top,
+            ord: order[..n.min(K)].to_vec(),
+            bad,
+            first,
+        }
     }
 
     #[derive(Default)]
     struct RefCache(Mutex<HashMap<(u64, usize, usize), Arc<RowRef>>>);
     impl RefCache {
-        fn get(&self, pid: u64, n: usize, row: usize, build: impl FnOnce() -> RowRef) -> (Arc<RowRef>, bool) {
+        fn get(
+            &self,
+            pid: u64,
+            n: usize,
+            row: usize,
+            build: impl FnOnce() -> RowRef,
+        ) -> (Arc<RowRef>, bool) {
             let key = (pid, n, row % 100);
-            if let Some(r) = self.0.lock().unwrap().get(&key) { return (r.clone(), false) }
+            if let Some(r) = self.0.lock().unwrap().get(&key) {
+                return (r.clone(), false);
+            }
             let r = Arc::new(build());
             self.0.lock().unwrap().insert(key, r.clone());
             (r, true)
@@ -3123,20 +5519,38 @@ mod filter_check {
     fn expand_i32(top: &[u64], geo: &Geo, row: usize, budget: usize) -> Vec<i32> {
         let (rbc, visible, comp) = (geo.rbc(row), geo.visible(row), geo.compress);
         let body = budget.min(rbc) * comp;
-        (0..geo.capacity).map(|i| {
-            if i < body {
-                let blk = 0xFFFF_FFFFu64 - (top[i / comp] & 0xFFFF_FFFF);
-                (blk as usize * comp + i % comp) as i32
-            } else {
-                let t = rbc * comp + (i - body);
-                if t < visible { t as i32 } else { -1 }
-            }
-        }).collect()
+        (0..geo.capacity)
+            .map(|i| {
+                if i < body {
+                    let blk = 0xFFFF_FFFFu64 - (top[i / comp] & 0xFFFF_FFFF);
+                    (blk as usize * comp + i % comp) as i32
+                } else {
+                    let t = rbc * comp + (i - body);
+                    if t < visible {
+                        t as i32
+                    } else {
+                        -1
+                    }
+                }
+            })
+            .collect()
     }
 
-    fn expected(geo: &Geo, row0: usize, nrows: usize, refs: &[Arc<RowRef>], budget: usize) -> Vec<u8> {
-        let rows: Vec<Vec<u8>> = (0..nrows).into_par_iter()
-            .map(|i| expand_i32(&refs[i].top, geo, row0 + i, budget).iter().flat_map(|v| v.to_le_bytes()).collect())
+    fn expected(
+        geo: &Geo,
+        row0: usize,
+        nrows: usize,
+        refs: &[Arc<RowRef>],
+        budget: usize,
+    ) -> Vec<u8> {
+        let rows: Vec<Vec<u8>> = (0..nrows)
+            .into_par_iter()
+            .map(|i| {
+                expand_i32(&refs[i].top, geo, row0 + i, budget)
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect()
+            })
             .collect();
         rows.concat()
     }
@@ -3144,12 +5558,28 @@ mod filter_check {
     /// CPU self-check of one chunk: cached per-row reference, then the
     /// existing `rank` + `selection_row` against the independent expansion
     /// for every budget.
-    fn cpu_check(cache: &RefCache, geo: &Geo, pat: Pat, pid: u64, row0: usize, nrows: usize, scores: &[f32])
-        -> (Vec<Arc<RowRef>>, u64, Option<String>) {
-        let calls: Vec<Call> = BUDGETS.iter().map(|&budget| Call {
-            rows: nrows, stride: geo.stride, block_count: geo.bc, dim: 128, compress: geo.compress,
-            position_start: geo.ps + row0, budget, capacity: geo.capacity,
-        }).collect();
+    fn cpu_check(
+        cache: &RefCache,
+        geo: &Geo,
+        pat: Pat,
+        pid: u64,
+        row0: usize,
+        nrows: usize,
+        scores: &[f32],
+    ) -> (Vec<Arc<RowRef>>, u64, Option<String>) {
+        let calls: Vec<Call> = BUDGETS
+            .iter()
+            .map(|&budget| Call {
+                rows: nrows,
+                stride: geo.stride,
+                block_count: geo.bc,
+                dim: 128,
+                compress: geo.compress,
+                position_start: geo.ps + row0,
+                budget,
+                capacity: geo.capacity,
+            })
+            .collect();
         let per: Vec<(Arc<RowRef>, u64, Option<String>)> = (0..nrows).into_par_iter().map(|i| {
             let row = row0 + i;
             let n = geo.rbc(row);
@@ -3177,7 +5607,9 @@ mod filter_check {
         let mut refs = Vec::with_capacity(nrows);
         for (r, b, f) in per {
             bad += b;
-            if first.is_none() { first = f; }
+            if first.is_none() {
+                first = f;
+            }
             refs.push(r);
         }
         (refs, bad, first)
@@ -3186,11 +5618,31 @@ mod filter_check {
     // ------------------------------------------------------------ geometry
 
     #[derive(Clone, Copy)]
-    struct Geo { kind: &'static str, bc: usize, tail: usize, rows: usize, compress: usize, ps: usize, stride: usize, capacity: usize }
+    struct Geo {
+        kind: &'static str,
+        bc: usize,
+        tail: usize,
+        rows: usize,
+        compress: usize,
+        ps: usize,
+        stride: usize,
+        capacity: usize,
+    }
     impl Geo {
-        fn new(kind: &'static str, bc: usize, tail: usize, rows: usize, compress: usize, capacity: Option<usize>) -> Geo {
+        fn new(
+            kind: &'static str,
+            bc: usize,
+            tail: usize,
+            rows: usize,
+            compress: usize,
+            capacity: Option<usize>,
+        ) -> Geo {
             Geo {
-                kind, bc, tail, rows, compress,
+                kind,
+                bc,
+                tail,
+                rows,
+                compress,
                 ps: (bc * compress + tail).saturating_sub(rows),
                 stride: bc + tail + usize::from(bc == 0),
                 capacity: capacity.unwrap_or(K * compress + 3),
@@ -3199,27 +5651,54 @@ mod filter_check {
         fn big() -> Geo {
             let (compress, ps) = (4usize, BIG_POSITION);
             let bc = (ps + BIG_ROWS) / compress;
-            Geo { kind: "big", bc, tail: (ps + BIG_ROWS) % compress, rows: BIG_ROWS, compress, ps, stride: bc, capacity: K * compress + 3 }
+            Geo {
+                kind: "big",
+                bc,
+                tail: (ps + BIG_ROWS) % compress,
+                rows: BIG_ROWS,
+                compress,
+                ps,
+                stride: bc,
+                capacity: K * compress + 3,
+            }
         }
-        fn rbc(&self, row: usize) -> usize { ((self.ps + row + 1) / self.compress).min(self.bc) }
-        fn visible(&self, row: usize) -> usize { self.ps + row + 1 }
+        fn rbc(&self, row: usize) -> usize {
+            ((self.ps + row + 1) / self.compress).min(self.bc)
+        }
+        fn visible(&self, row: usize) -> usize {
+            self.ps + row + 1
+        }
         /// Rows per call: at most 2^24 score words (64 MiB) and 512 rows.
-        fn chunk_rows(&self) -> usize { self.rows.min((MAX_CHUNK_ELEMS / self.stride).max(1)).min(MAX_CHUNK_ROWS) }
+        fn chunk_rows(&self) -> usize {
+            self.rows
+                .min((MAX_CHUNK_ELEMS / self.stride).max(1))
+                .min(MAX_CHUNK_ROWS)
+        }
     }
 
     fn geometries(cpu_extra: bool) -> Vec<Geo> {
         let mut v = Vec::new();
         for &bc in &MATRIX_BLOCKS {
-            for tail in 0..4 { for &rows in &MATRIX_ROWS { v.push(Geo::new("matrix", bc, tail, rows, 4, None)); } }
+            for tail in 0..4 {
+                for &rows in &MATRIX_ROWS {
+                    v.push(Geo::new("matrix", bc, tail, rows, 4, None));
+                }
+            }
         }
         for &bc in &RAGGED_BLOCKS {
-            for tail in 0..4 { for &rows in &MATRIX_ROWS { v.push(Geo::new("ragged", bc, tail, rows, 4, None)); } }
+            for tail in 0..4 {
+                for &rows in &MATRIX_ROWS {
+                    v.push(Geo::new("ragged", bc, tail, rows, 4, None));
+                }
+            }
         }
         v.push(Geo::big());
         for &bc in &[513usize, 4097, 65536] {
             for tail in 0..4 {
                 for &rows in &[1usize, 3, 17] {
-                    for &cap in &[1usize, 4, 5, 1025, 4099] { v.push(Geo::new("capacity", bc, tail, rows, 4, Some(cap))); }
+                    for &cap in &[1usize, 4, 5, 1025, 4099] {
+                        v.push(Geo::new("capacity", bc, tail, rows, 4, Some(cap)));
+                    }
                 }
             }
         }
@@ -3229,7 +5708,9 @@ mod filter_check {
                     let mut tails = vec![0usize, 3usize.min(comp - 1)];
                     tails.dedup();
                     for tail in tails {
-                        for &rows in &[1usize, 3, 17] { v.push(Geo::new("compress-sweep", bc, tail, rows, comp, None)); }
+                        for &rows in &[1usize, 3, 17] {
+                            v.push(Geo::new("compress-sweep", bc, tail, rows, comp, None));
+                        }
                     }
                 }
             }
@@ -3241,40 +5722,81 @@ mod filter_check {
         g.kind != "capacity" || [Pat::RandomDistinct, Pat::Equal, Pat::BoundaryDup].contains(&pat)
     }
     fn is_sweep(g: &Geo) -> bool {
-        g.kind == "capacity" || (g.kind == "matrix" && SWEEP_BLOCKS.contains(&g.bc) && SWEEP_ROWS.contains(&g.rows))
+        g.kind == "capacity"
+            || (g.kind == "matrix" && SWEEP_BLOCKS.contains(&g.bc) && SWEEP_ROWS.contains(&g.rows))
     }
     fn combos(sweep: bool, gi: usize, pi: usize) -> Vec<(usize, bool)> {
-        if sweep { return BUDGETS.iter().flat_map(|&b| [(b, true), (b, false)]).collect() }
+        if sweep {
+            return BUDGETS
+                .iter()
+                .flat_map(|&b| [(b, true), (b, false)])
+                .collect();
+        }
         let x = gi * 7 + pi * 3;
         vec![(BUDGETS[x % 4], (x / 4) % 2 == 0)]
     }
-    fn bidx(budget: usize) -> usize { BUDGETS.iter().position(|&b| b == budget).unwrap() }
+    fn bidx(budget: usize) -> usize {
+        BUDGETS.iter().position(|&b| b == budget).unwrap()
+    }
 
     fn knob(i: usize) -> QsaFilterKnobs {
         match i {
             0 => QsaFilterKnobs::default(),
-            1 => QsaFilterKnobs { samples: SAMPLES, target: 1, cap: 4096 },
-            _ => QsaFilterKnobs { samples: SAMPLES, target: 4096, cap: 600 },
+            1 => QsaFilterKnobs {
+                samples: SAMPLES,
+                target: 1,
+                cap: 4096,
+            },
+            _ => QsaFilterKnobs {
+                samples: SAMPLES,
+                target: 4096,
+                cap: 600,
+            },
         }
     }
 
     // ------------------------------------------------------------- device
 
     #[derive(Clone, Copy, PartialEq)]
-    enum Arm { Filter(usize), Hipcc, Pm }
-
-    struct Dev { gpu: Gpu, pm: bool, scores: GpuTensor, sel: GpuTensor, mir: GpuTensor }
-
-    struct RunOut {
-        sel: Vec<u8>, mir: Vec<u8>, canary: bool, stats: Vec<QsaFilterRowStat>,
-        mid_mirror: Option<Vec<u8>>, mid_poison: bool,
+    enum Arm {
+        Filter(usize),
+        Hipcc,
+        Pm,
     }
 
-    fn invoke(gpu: &mut Gpu, arm: Arm, p: &QsaFromScores<'_>, mirror: Option<&GpuTensor>) -> Result<Vec<QsaFilterRowStat>> {
+    struct Dev {
+        gpu: Gpu,
+        pm: bool,
+        scores: GpuTensor,
+        sel: GpuTensor,
+        mir: GpuTensor,
+    }
+
+    struct RunOut {
+        sel: Vec<u8>,
+        mir: Vec<u8>,
+        canary: bool,
+        stats: Vec<QsaFilterRowStat>,
+        mid_mirror: Option<Vec<u8>>,
+        mid_poison: bool,
+    }
+
+    fn invoke(
+        gpu: &mut Gpu,
+        arm: Arm,
+        p: &QsaFromScores<'_>,
+        mirror: Option<&GpuTensor>,
+    ) -> Result<Vec<QsaFilterRowStat>> {
         match arm {
-            Arm::Filter(k) => qsa_filter_select_from_scores_lab(gpu, p, mirror, knob(k)).map_err(err),
-            Arm::Hipcc => qsa_incumbent_select_from_scores_lab(gpu, p, mirror, false).map(|_| Vec::new()).map_err(err),
-            Arm::Pm => qsa_incumbent_select_from_scores_lab(gpu, p, mirror, true).map(|_| Vec::new()).map_err(err),
+            Arm::Filter(k) => {
+                qsa_filter_select_from_scores_lab(gpu, p, mirror, knob(k)).map_err(err)
+            }
+            Arm::Hipcc => qsa_incumbent_select_from_scores_lab(gpu, p, mirror, false)
+                .map(|_| Vec::new())
+                .map_err(err),
+            Arm::Pm => qsa_incumbent_select_from_scores_lab(gpu, p, mirror, true)
+                .map(|_| Vec::new())
+                .map_err(err),
         }
     }
 
@@ -3282,71 +5804,150 @@ mod filter_check {
         /// Buffers sized once for the largest chunk of `geos`; calls run on
         /// non-owning views.
         fn new(mut gpu: Gpu, geos: &[Geo]) -> Result<Dev> {
-            let max_el = geos.iter().map(|g| g.chunk_rows() * g.stride).max().unwrap_or(1) + PAD_E + 16;
-            let max_sel = geos.iter().map(|g| g.chunk_rows() * g.capacity * 4).max().unwrap_or(4) + 2 * CAN;
+            let max_el = geos
+                .iter()
+                .map(|g| g.chunk_rows() * g.stride)
+                .max()
+                .unwrap_or(1)
+                + PAD_E
+                + 16;
+            let max_sel = geos
+                .iter()
+                .map(|g| g.chunk_rows() * g.capacity * 4)
+                .max()
+                .unwrap_or(4)
+                + 2 * CAN;
             let max_mir = geos.iter().map(|g| g.capacity * 4).max().unwrap_or(4) + 2 * CAN;
-            let scores = gpu.upload_f32(&vec![f32::from_bits(INVALID); max_el], &[max_el]).map_err(err)?;
-            let sel = gpu.upload_raw(&vec![POISON; max_sel], &[max_sel]).map_err(err)?;
-            let mir = gpu.upload_raw(&vec![POISON; max_mir], &[max_mir]).map_err(err)?;
+            let scores = gpu
+                .upload_f32(&vec![f32::from_bits(INVALID); max_el], &[max_el])
+                .map_err(err)?;
+            let sel = gpu
+                .upload_raw(&vec![POISON; max_sel], &[max_sel])
+                .map_err(err)?;
+            let mir = gpu
+                .upload_raw(&vec![POISON; max_mir], &[max_mir])
+                .map_err(err)?;
             let pm = gpu.arch == "gfx1151";
-            Ok(Dev { gpu, pm, scores, sel, mir })
+            Ok(Dev {
+                gpu,
+                pm,
+                scores,
+                sel,
+                mir,
+            })
         }
 
         /// One poisoned call (or two split calls with `split` = first part's
         /// rows) over the chunk uploaded at `PAD_E`.
-        fn exec(&mut self, arm: Arm, geo: &Geo, row0: usize, nrows: usize, budget: usize, mirror: bool, split: Option<usize>) -> Result<RunOut> {
+        fn exec(
+            &mut self,
+            arm: Arm,
+            geo: &Geo,
+            row0: usize,
+            nrows: usize,
+            budget: usize,
+            mirror: bool,
+            split: Option<usize>,
+        ) -> Result<RunOut> {
             let cap_b = geo.capacity * 4;
             let payload = nrows * cap_b;
             let (sel_used, mir_used) = (2 * CAN + payload, 2 * CAN + cap_b);
-            self.gpu.hip.memset(&self.sel.buf, POISON as i32, sel_used).map_err(err)?;
-            self.gpu.hip.memset(&self.mir.buf, POISON as i32, mir_used).map_err(err)?;
+            self.gpu
+                .hip
+                .memset(&self.sel.buf, POISON as i32, sel_used)
+                .map_err(err)?;
+            self.gpu
+                .hip
+                .memset(&self.mir.buf, POISON as i32, mir_used)
+                .map_err(err)?;
             let mir_view = self.mir.sub_offset(CAN, cap_b);
-            let parts: Vec<(usize, usize)> = match split { None => vec![(0, nrows)], Some(k) => vec![(0, k), (k, nrows - k)] };
+            let parts: Vec<(usize, usize)> = match split {
+                None => vec![(0, nrows)],
+                Some(k) => vec![(0, k), (k, nrows - k)],
+            };
             let mut stats = Vec::new();
             let mut mid_mirror = None;
             let mut mid_poison = true;
             for (pi, &(r0, rn)) in parts.iter().enumerate() {
-                let sc = self.scores.sub_offset(PAD_E + r0 * geo.stride, rn * geo.stride);
+                let sc = self
+                    .scores
+                    .sub_offset(PAD_E + r0 * geo.stride, rn * geo.stride);
                 let sv = self.sel.sub_offset(CAN + r0 * cap_b, rn * cap_b);
                 let p = QsaFromScores {
-                    scores: &sc, score_stride: geo.stride, selected: &sv, rows: rn, block_count: geo.bc, budget_blocks: budget,
-                    compress: geo.compress, position_start: geo.ps + row0 + r0, capacity: geo.capacity,
+                    scores: &sc,
+                    score_stride: geo.stride,
+                    selected: &sv,
+                    rows: rn,
+                    block_count: geo.bc,
+                    budget_blocks: budget,
+                    compress: geo.compress,
+                    position_start: geo.ps + row0 + r0,
+                    capacity: geo.capacity,
                 };
                 stats.extend(invoke(&mut self.gpu, arm, &p, mirror.then_some(&mir_view))?);
                 if split.is_some() && pi == 0 {
                     self.gpu.hip.device_synchronize().map_err(err)?;
                     let mut m = vec![0u8; cap_b];
-                    self.gpu.hip.memcpy_dtoh(&mut m, &self.mir.buf.byte_view(CAN, cap_b)).map_err(err)?;
+                    self.gpu
+                        .hip
+                        .memcpy_dtoh(&mut m, &self.mir.buf.byte_view(CAN, cap_b))
+                        .map_err(err)?;
                     mid_mirror = Some(m);
                     let tail_len = (nrows - rn) * cap_b;
                     let mut t = vec![0u8; tail_len];
-                    self.gpu.hip.memcpy_dtoh(&mut t, &self.sel.buf.byte_view(CAN + rn * cap_b, tail_len)).map_err(err)?;
+                    self.gpu
+                        .hip
+                        .memcpy_dtoh(&mut t, &self.sel.buf.byte_view(CAN + rn * cap_b, tail_len))
+                        .map_err(err)?;
                     mid_poison = t.iter().all(|&x| x == POISON);
                 }
             }
             self.gpu.hip.device_synchronize().map_err(err)?;
             let mut s = vec![0u8; sel_used];
-            self.gpu.hip.memcpy_dtoh(&mut s, &self.sel.buf).map_err(err)?;
+            self.gpu
+                .hip
+                .memcpy_dtoh(&mut s, &self.sel.buf)
+                .map_err(err)?;
             let mut m = vec![0u8; mir_used];
-            self.gpu.hip.memcpy_dtoh(&mut m, &self.mir.buf).map_err(err)?;
-            let canary = s[..CAN].iter().all(|&x| x == POISON) && s[CAN + payload..].iter().all(|&x| x == POISON)
-                && m[..CAN].iter().all(|&x| x == POISON) && m[CAN + cap_b..].iter().all(|&x| x == POISON);
+            self.gpu
+                .hip
+                .memcpy_dtoh(&mut m, &self.mir.buf)
+                .map_err(err)?;
+            let canary = s[..CAN].iter().all(|&x| x == POISON)
+                && s[CAN + payload..].iter().all(|&x| x == POISON)
+                && m[..CAN].iter().all(|&x| x == POISON)
+                && m[CAN + cap_b..].iter().all(|&x| x == POISON);
             s.truncate(CAN + payload);
             s.drain(..CAN);
             m.truncate(CAN + cap_b);
             m.drain(..CAN);
-            Ok(RunOut { sel: s, mir: m, canary, stats, mid_mirror, mid_poison })
+            Ok(RunOut {
+                sel: s,
+                mir: m,
+                canary,
+                stats,
+                mid_mirror,
+                mid_poison,
+            })
         }
     }
 
     // ------------------------------------------------------------- records
 
     #[derive(Default)]
-    struct Rec { runs: u64, mismatches: u64, first: Option<String>, repaired: [u64; 4], surv: [Vec<u32>; 4] }
+    struct Rec {
+        runs: u64,
+        mismatches: u64,
+        first: Option<String>,
+        repaired: [u64; 4],
+        surv: [Vec<u32>; 4],
+    }
     impl Rec {
         fn fail(&mut self, n: u64, msg: String) {
             self.mismatches += n;
-            if self.first.is_none() { self.first = Some(msg); }
+            if self.first.is_none() {
+                self.first = Some(msg);
+            }
         }
     }
 
@@ -3357,12 +5958,16 @@ mod filter_check {
     }
 
     fn rec_json(r: &mut Rec, skip: &str, filter: bool) -> Value {
-        if r.runs == 0 && r.mismatches == 0 { return json!({"skipped":skip,"mismatches":0}) }
+        if r.runs == 0 && r.mismatches == 0 {
+            return json!({"skipped":skip,"mismatches":0});
+        }
         let mut v = json!({"runs":r.runs,"mismatches":r.mismatches,"first_mismatch":r.first});
         if filter {
             let mut pb = serde_json::Map::new();
             for bi in 0..4 {
-                if r.surv[bi].is_empty() { continue }
+                if r.surv[bi].is_empty() {
+                    continue;
+                }
                 pb.insert(BUDGETS[bi].to_string(), json!({"rows":r.surv[bi].len(),"repaired_rows":r.repaired[bi],"survivors":qstats(&mut r.surv[bi])}));
             }
             v["repaired_rows"] = json!(r.repaired.iter().sum::<u64>());
@@ -3372,7 +5977,9 @@ mod filter_check {
     }
 
     fn first_diff(a: &[u8], b: &[u8], cap_b: usize) -> String {
-        if a.len() != b.len() { return format!("length {} != {}", a.len(), b.len()) }
+        if a.len() != b.len() {
+            return format!("length {} != {}", a.len(), b.len());
+        }
         match (0..a.len() / 4).find(|&w| a[w * 4..w * 4 + 4] != b[w * 4..w * 4 + 4]) {
             Some(w) => {
                 let (row, slot) = (w * 4 / cap_b, (w * 4 % cap_b) / 4);
@@ -3384,30 +5991,66 @@ mod filter_check {
         }
     }
 
-    fn judge(rec: &mut Rec, tag: &str, out: &RunOut, exp: &[u8], exp_mir: &[u8], mirror: bool, cap_b: usize) {
+    fn judge(
+        rec: &mut Rec,
+        tag: &str,
+        out: &RunOut,
+        exp: &[u8],
+        exp_mir: &[u8],
+        mirror: bool,
+        cap_b: usize,
+    ) {
         let mut bad: Vec<String> = Vec::new();
-        if !out.canary { bad.push("output canary overwritten".into()) }
-        if out.sel != exp { bad.push(first_diff(&out.sel, exp, cap_b)) }
+        if !out.canary {
+            bad.push("output canary overwritten".into())
+        }
+        if out.sel != exp {
+            bad.push(first_diff(&out.sel, exp, cap_b))
+        }
         if mirror {
-            if out.mir != exp_mir { bad.push("mirror differs from the last row".into()) }
+            if out.mir != exp_mir {
+                bad.push("mirror differs from the last row".into())
+            }
         } else if out.mir.iter().any(|&x| x != POISON) {
             bad.push("mirror written while off".into());
         }
-        if !bad.is_empty() { rec.fail(bad.len() as u64, format!("{tag}: {}", bad.join("; "))) }
+        if !bad.is_empty() {
+            rec.fail(bad.len() as u64, format!("{tag}: {}", bad.join("; ")))
+        }
     }
 
     /// Stats length and certification (a non-repaired row must satisfy
     /// `chosen <= count <= cap`), then repaired / survivor accumulation.
-    fn filter_stats(rec: &mut Rec, stats: &[QsaFilterRowStat], geo: &Geo, row0: usize, nrows: usize, budget: usize, cap: usize, tag: &str, bi: usize, absorb: bool) {
+    fn filter_stats(
+        rec: &mut Rec,
+        stats: &[QsaFilterRowStat],
+        geo: &Geo,
+        row0: usize,
+        nrows: usize,
+        budget: usize,
+        cap: usize,
+        tag: &str,
+        bi: usize,
+        absorb: bool,
+    ) {
         if stats.len() != nrows {
-            rec.fail(1, format!("{tag}: {} row stats for {nrows} rows", stats.len()));
+            rec.fail(
+                1,
+                format!("{tag}: {} row stats for {nrows} rows", stats.len()),
+            );
             return;
         }
         for (i, s) in stats.iter().enumerate() {
             let chosen = budget.min(geo.rbc(row0 + i));
             let c = s.count as usize;
             if !s.repaired && !(c >= chosen && c <= cap) {
-                rec.fail(1, format!("{tag}: row {} not repaired but count {c} outside [{chosen}, {cap}]", row0 + i));
+                rec.fail(
+                    1,
+                    format!(
+                        "{tag}: row {} not repaired but count {c} outside [{chosen}, {cap}]",
+                        row0 + i
+                    ),
+                );
             }
         }
         if absorb {
@@ -3416,20 +6059,44 @@ mod filter_check {
         }
     }
 
-    fn gpu_chunk(d: &mut Dev, geo: &Geo, row0: usize, nrows: usize, scores: &[f32], refs: &[Arc<RowRef>],
-                 combos: &[(usize, bool)], recs: &mut [Rec]) -> Result<()> {
+    fn gpu_chunk(
+        d: &mut Dev,
+        geo: &Geo,
+        row0: usize,
+        nrows: usize,
+        scores: &[f32],
+        refs: &[Arc<RowRef>],
+        combos: &[(usize, bool)],
+        recs: &mut [Rec],
+    ) -> Result<()> {
         let cap_b = geo.capacity * 4;
-        let host: &[u8] = unsafe { std::slice::from_raw_parts(scores.as_ptr() as *const u8, scores.len() * 4) };
+        let host: &[u8] =
+            unsafe { std::slice::from_raw_parts(scores.as_ptr() as *const u8, scores.len() * 4) };
         let pad: Vec<u8> = (0..PAD_E).flat_map(|_| INVALID.to_le_bytes()).collect();
-        d.gpu.hip.memcpy_htod_offset(&d.scores.buf, 0, &pad).map_err(err)?;
-        d.gpu.hip.memcpy_htod_offset(&d.scores.buf, PAD_E * 4, host).map_err(err)?;
+        d.gpu
+            .hip
+            .memcpy_htod_offset(&d.scores.buf, 0, &pad)
+            .map_err(err)?;
+        d.gpu
+            .hip
+            .memcpy_htod_offset(&d.scores.buf, PAD_E * 4, host)
+            .map_err(err)?;
         let mut cache: [Option<Vec<u8>>; 4] = [None, None, None, None];
         for &(b, _) in combos {
             let bi = bidx(b);
-            if cache[bi].is_none() { cache[bi] = Some(expected(geo, row0, nrows, refs, b)); }
+            if cache[bi].is_none() {
+                cache[bi] = Some(expected(geo, row0, nrows, refs, b));
+            }
         }
-        let mut arms = vec![(F0, Arm::Filter(0)), (F0 + 1, Arm::Filter(1)), (F0 + 2, Arm::Filter(2)), (HIPCC, Arm::Hipcc)];
-        if d.pm { arms.push((PM, Arm::Pm)); }
+        let mut arms = vec![
+            (F0, Arm::Filter(0)),
+            (F0 + 1, Arm::Filter(1)),
+            (F0 + 2, Arm::Filter(2)),
+            (HIPCC, Arm::Hipcc),
+        ];
+        if d.pm {
+            arms.push((PM, Arm::Pm));
+        }
         for (ci, &(budget, mirror)) in combos.iter().enumerate() {
             let bi = bidx(budget);
             let exp = cache[bi].as_ref().unwrap();
@@ -3440,16 +6107,38 @@ mod filter_check {
                 rec.runs += 1;
                 let out = match d.exec(arm, geo, row0, nrows, budget, mirror, None) {
                     Ok(o) => o,
-                    Err(e) => { rec.fail(1, format!("{tag}: run error {e}")); continue }
+                    Err(e) => {
+                        rec.fail(1, format!("{tag}: run error {e}"));
+                        continue;
+                    }
                 };
                 judge(rec, &tag, &out, exp, exp_mir, mirror, cap_b);
-                if let Arm::Filter(k) = arm { filter_stats(rec, &out.stats, geo, row0, nrows, budget, knob(k).cap, &tag, bi, true); }
+                if let Arm::Filter(k) = arm {
+                    filter_stats(
+                        rec,
+                        &out.stats,
+                        geo,
+                        row0,
+                        nrows,
+                        budget,
+                        knob(k).cap,
+                        &tag,
+                        bi,
+                        true,
+                    );
+                }
                 if ci == 0 {
                     match d.exec(arm, geo, row0, nrows, budget, mirror, None) {
                         Err(e) => rec.fail(1, format!("{tag}: repeat run error {e}")),
-                        Ok(o2) => if o2.sel != out.sel || o2.mir != out.mir || o2.stats != out.stats || !o2.canary {
-                            rec.fail(1, format!("{tag}: repeat run differs"));
-                        },
+                        Ok(o2) => {
+                            if o2.sel != out.sel
+                                || o2.mir != out.mir
+                                || o2.stats != out.stats
+                                || !o2.canary
+                            {
+                                rec.fail(1, format!("{tag}: repeat run differs"));
+                            }
+                        }
                     }
                 }
             }
@@ -3471,11 +6160,29 @@ mod filter_check {
                         Err(e) => rec.fail(1, format!("{tag}: run error {e}")),
                         Ok(out) => {
                             judge(rec, &tag, &out, exp, exp_mir, true, cap_b);
-                            if !out.mid_poison { rec.fail(1, format!("{tag}: first part wrote past its rows")) }
-                            if out.mid_mirror.as_deref() != Some(&exp[(k - 1) * cap_b..k * cap_b]) {
-                                rec.fail(1, format!("{tag}: first part's mirror is not its last row"));
+                            if !out.mid_poison {
+                                rec.fail(1, format!("{tag}: first part wrote past its rows"))
                             }
-                            if let Arm::Filter(f) = arm { filter_stats(rec, &out.stats, geo, row0, nrows, budget, knob(f).cap, &tag, bi, false); }
+                            if out.mid_mirror.as_deref() != Some(&exp[(k - 1) * cap_b..k * cap_b]) {
+                                rec.fail(
+                                    1,
+                                    format!("{tag}: first part's mirror is not its last row"),
+                                );
+                            }
+                            if let Arm::Filter(f) = arm {
+                                filter_stats(
+                                    rec,
+                                    &out.stats,
+                                    geo,
+                                    row0,
+                                    nrows,
+                                    budget,
+                                    knob(f).cap,
+                                    &tag,
+                                    bi,
+                                    false,
+                                );
+                            }
                         }
                     }
                 }
@@ -3483,28 +6190,52 @@ mod filter_check {
         }
         d.gpu.hip.device_synchronize().map_err(err)?;
         let mut back = vec![0u8; (PAD_E + scores.len()) * 4];
-        d.gpu.hip.memcpy_dtoh(&mut back, &d.scores.buf).map_err(err)?;
+        d.gpu
+            .hip
+            .memcpy_dtoh(&mut back, &d.scores.buf)
+            .map_err(err)?;
         let r = &mut recs[INPUTS];
         r.runs += 1;
-        if back[..PAD_E * 4] != pad[..] || back[PAD_E * 4..] != *host { r.fail(1, "score words changed".into()) }
+        if back[..PAD_E * 4] != pad[..] || back[PAD_E * 4..] != *host {
+            r.fail(1, "score words changed".into())
+        }
         Ok(())
     }
 
     // --------------------------------------------------------------- cases
 
-    struct Tot { cases: u64, mismatches: u64, repaired: [u64; 3] }
-
-    fn skip_reason(ai: usize, geo: &Geo, has_dev: bool, pm: bool) -> &'static str {
-        if !has_dev && ai != CPU { "cpu-only mode (no Gpu)" }
-        else if ai == PM && !pm { "PM select requires gfx1151" }
-        else if (ai == PART_F || ai == PART_H) && geo.rows < 2 { "n/a rows=1 (nothing to split)" }
-        else { "not run" }
+    struct Tot {
+        cases: u64,
+        mismatches: u64,
+        repaired: [u64; 3],
     }
 
-    fn run_case(dev: Option<&mut Dev>, cache: &RefCache, geo: &Geo, pat: Pat, pid: u64, gi: usize) -> Result<(Value, u64, [u64; 3])> {
+    fn skip_reason(ai: usize, geo: &Geo, has_dev: bool, pm: bool) -> &'static str {
+        if !has_dev && ai != CPU {
+            "cpu-only mode (no Gpu)"
+        } else if ai == PM && !pm {
+            "PM select requires gfx1151"
+        } else if (ai == PART_F || ai == PART_H) && geo.rows < 2 {
+            "n/a rows=1 (nothing to split)"
+        } else {
+            "not run"
+        }
+    }
+
+    fn run_case(
+        dev: Option<&mut Dev>,
+        cache: &RefCache,
+        geo: &Geo,
+        pat: Pat,
+        pid: u64,
+        gi: usize,
+    ) -> Result<(Value, u64, [u64; 3])> {
         let sweep = is_sweep(geo);
         let combos = combos(sweep, gi, pid as usize);
-        let (has_dev, pm) = match &dev { Some(d) => (true, d.pm), None => (false, false) };
+        let (has_dev, pm) = match &dev {
+            Some(d) => (true, d.pm),
+            None => (false, false),
+        };
         let mut dev = dev;
         let mut recs: Vec<Rec> = (0..ARM_NAMES.len()).map(|_| Rec::default()).collect();
         let mut row0 = 0usize;
@@ -3514,16 +6245,31 @@ mod filter_check {
             let scores = gen_chunk(geo, pat, pid, row0, nrows);
             let (refs, bad, first) = cpu_check(cache, geo, pat, pid, row0, nrows, &scores);
             recs[CPU].runs += nrows as u64;
-            if bad > 0 { recs[CPU].fail(bad, first.unwrap_or_default()) }
-            if let Some(d) = dev.as_deref_mut() { gpu_chunk(d, geo, row0, nrows, &scores, &refs, &combos, &mut recs)?; }
+            if bad > 0 {
+                recs[CPU].fail(bad, first.unwrap_or_default())
+            }
+            if let Some(d) = dev.as_deref_mut() {
+                gpu_chunk(d, geo, row0, nrows, &scores, &refs, &combos, &mut recs)?;
+            }
             row0 += nrows;
             chunks += 1;
         }
         let mismatches: u64 = recs.iter().map(|r| r.mismatches).sum();
-        let repaired = [recs[F0].repaired.iter().sum::<u64>(), recs[F0 + 1].repaired.iter().sum::<u64>(), recs[F0 + 2].repaired.iter().sum::<u64>()];
+        let repaired = [
+            recs[F0].repaired.iter().sum::<u64>(),
+            recs[F0 + 1].repaired.iter().sum::<u64>(),
+            recs[F0 + 2].repaired.iter().sum::<u64>(),
+        ];
         let mut arms = serde_json::Map::new();
         for (ai, r) in recs.iter_mut().enumerate() {
-            arms.insert(ARM_NAMES[ai].to_string(), rec_json(r, skip_reason(ai, geo, has_dev, pm), (F0..F0 + 3).contains(&ai)));
+            arms.insert(
+                ARM_NAMES[ai].to_string(),
+                rec_json(
+                    r,
+                    skip_reason(ai, geo, has_dev, pm),
+                    (F0..F0 + 3).contains(&ai),
+                ),
+            );
         }
         let rec = json!({
             "family": pat.name(), "kind": geo.kind, "blocks": geo.bc, "tail": geo.tail, "rows": geo.rows,
@@ -3539,34 +6285,66 @@ mod filter_check {
     fn emit(f: &mut File, tot: &mut Tot, (rec, mism, rep): (Value, u64, [u64; 3])) -> Result<()> {
         tot.cases += 1;
         tot.mismatches += mism;
-        for k in 0..3 { tot.repaired[k] += rep[k]; }
-        if mism > 0 { eprintln!("FAIL {rec}"); }
+        for k in 0..3 {
+            tot.repaired[k] += rep[k];
+        }
+        if mism > 0 {
+            eprintln!("FAIL {rec}");
+        }
         writeln!(f, "{rec}").map_err(err)?;
         if tot.cases % 250 == 0 {
             f.flush().map_err(err)?;
-            eprintln!("filter_check: {} cases, {} mismatches", tot.cases, tot.mismatches);
+            eprintln!(
+                "filter_check: {} cases, {} mismatches",
+                tot.cases, tot.mismatches
+            );
         }
         Ok(())
     }
 
     /// All pattern x geometry cases; GPU arms iff `dev`.
     fn families(mut dev: Option<&mut Dev>, f: &mut File, geos: &[Geo]) -> Result<Tot> {
-        let mut tot = Tot { cases: 0, mismatches: 0, repaired: [0; 3] };
+        let mut tot = Tot {
+            cases: 0,
+            mismatches: 0,
+            repaired: [0; 3],
+        };
         for (pid, &pat) in PATTERNS.iter().enumerate() {
             let cache = RefCache::default();
-            let sel: Vec<(usize, &Geo)> = geos.iter().enumerate().filter(|(_, g)| pat_applies(pat, g)).collect();
+            let sel: Vec<(usize, &Geo)> = geos
+                .iter()
+                .enumerate()
+                .filter(|(_, g)| pat_applies(pat, g))
+                .collect();
             if dev.is_none() {
-                let outs: Vec<Result<(Value, u64, [u64; 3])>> =
-                    sel.par_iter().map(|&(gi, g)| run_case(None, &cache, g, pat, pid as u64, gi)).collect();
-                for o in outs { emit(f, &mut tot, o?)?; }
+                let outs: Vec<Result<(Value, u64, [u64; 3])>> = sel
+                    .par_iter()
+                    .map(|&(gi, g)| run_case(None, &cache, g, pat, pid as u64, gi))
+                    .collect();
+                for o in outs {
+                    emit(f, &mut tot, o?)?;
+                }
             } else {
-                for (gi, g) in sel { emit(f, &mut tot, run_case(dev.as_deref_mut(), &cache, g, pat, pid as u64, gi)?)?; }
+                for (gi, g) in sel {
+                    emit(
+                        f,
+                        &mut tot,
+                        run_case(dev.as_deref_mut(), &cache, g, pat, pid as u64, gi)?,
+                    )?;
+                }
             }
         }
         Ok(tot)
     }
 
-    fn finish(f: &mut File, tot: &Tot, mode: &str, route: usize, gpu: bool, out: &Path) -> Result<()> {
+    fn finish(
+        f: &mut File,
+        tot: &Tot,
+        mode: &str,
+        route: usize,
+        gpu: bool,
+        out: &Path,
+    ) -> Result<()> {
         let mut extra = 0u64;
         if gpu {
             // The forced-repair knobs must actually reach the repair path.
@@ -3574,7 +6352,9 @@ mod filter_check {
             extra += miss;
             let rec = json!({"family":"repair-coverage","cases":1,"mismatches":miss,"ok":miss == 0,
                 "repaired_rows":{"default":tot.repaired[0],"target1":tot.repaired[1],"cap600":tot.repaired[2]}});
-            if miss > 0 { eprintln!("FAIL {rec}"); }
+            if miss > 0 {
+                eprintln!("FAIL {rec}");
+            }
             writeln!(f, "{rec}").map_err(err)?;
         }
         let total = tot.mismatches + extra + route as u64;
@@ -3583,14 +6363,21 @@ mod filter_check {
         eprintln!("{summary}");
         writeln!(f, "{summary}").map_err(err)?;
         f.flush().map_err(err)?;
-        if total > 0 { return Err(format!("{total} filter mismatches; see {}", out.display())) }
+        if total > 0 {
+            return Err(format!("{total} filter mismatches; see {}", out.display()));
+        }
         Ok(())
     }
 
     /// `--filter`: score families on the GPU, then the full-route records.
     pub fn run(dirs: &[PathBuf], out: &Path) -> Result<()> {
         let gpu = Gpu::init().map_err(err)?;
-        if !gpu.arch_caps.has_gfx11_plus_simt() { return Err(format!("filter lab needs a gfx11+ SIMT GPU, got {}", gpu.arch)) }
+        if !gpu.arch_caps.has_gfx11_plus_simt() {
+            return Err(format!(
+                "filter lab needs a gfx11+ SIMT GPU, got {}",
+                gpu.arch
+            ));
+        }
         let geos = geometries(false);
         let mut f = File::create(out).map_err(err)?;
         let mut dev = Dev::new(gpu, &geos)?;

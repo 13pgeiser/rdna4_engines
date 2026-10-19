@@ -259,10 +259,7 @@ fn check_parts(
     scale_bits: &[u16],
 ) {
     if let Err(e) = mq_i4::tensor_bytes(profile, m, k) {
-        panic!(
-            "{who}: invalid {} shape [{m}, {k}]: {e}",
-            profile.name()
-        );
+        panic!("{who}: invalid {} shape [{m}, {k}]: {e}", profile.name());
     }
     assert_eq!(
         codes.len(),
@@ -280,13 +277,7 @@ fn check_parts(
     );
 }
 
-fn decode_checked(
-    who: &str,
-    profile: MqI4Profile,
-    m: usize,
-    k: usize,
-    bytes: &[u8],
-) -> MqI4Tensor {
+fn decode_checked(who: &str, profile: MqI4Profile, m: usize, k: usize, bytes: &[u8]) -> MqI4Tensor {
     mq_i4::decode_tensor(profile, m, k, bytes).unwrap_or_else(|e| {
         panic!(
             "{who}: decode_tensor({}, [{m}, {k}], {} bytes) failed: {e}",
@@ -315,7 +306,14 @@ pub fn dequant_rotated_f32_parts(
     codes: &[u8],
     scale_bits: &[u16],
 ) -> Vec<f32> {
-    check_parts("dequant_rotated_f32_parts", profile, m, k, codes, scale_bits);
+    check_parts(
+        "dequant_rotated_f32_parts",
+        profile,
+        m,
+        k,
+        codes,
+        scale_bits,
+    );
     let groups = k / GROUP;
     let mut out = Vec::with_capacity(m * k);
     for r in 0..m {
@@ -599,7 +597,13 @@ pub fn gemv_tree_f32_q(
         panic!("{WHO}: invalid {rotation:?} shape [{m}, {k}]: {e}");
     }
     let groups = k / GROUP;
-    assert_eq!(q.len(), m * k, "{WHO}: q length {} != m*k = {} for [{m}, {k}]", q.len(), m * k);
+    assert_eq!(
+        q.len(),
+        m * k,
+        "{WHO}: q length {} != m*k = {} for [{m}, {k}]",
+        q.len(),
+        m * k
+    );
     assert_eq!(
         d.len(),
         m * groups,
@@ -747,9 +751,7 @@ pub fn decode_moe_slots(
         let id = id as usize;
         let e = experts
             .get(id)
-            .unwrap_or_else(|| {
-                panic!("{WHO}: expert id {id} >= experts length {}", experts.len())
-            })
+            .unwrap_or_else(|| panic!("{WHO}: expert id {id} >= experts length {}", experts.len()))
             .as_ref()
             .unwrap_or_else(|| panic!("{WHO}: expert {id} has no tensor"));
         if owned[id].is_none() {
@@ -805,7 +807,10 @@ pub fn decode_moe_slots_parts(
     const WHO: &str = "decode_moe_slots_parts";
     let (out_rows, rotation) = match kind {
         DecodeKind::GateUp => {
-            assert!(m > 0 && m % 2 == 0, "{WHO}: GateUp requires even m > 0, got {m}");
+            assert!(
+                m > 0 && m % 2 == 0,
+                "{WHO}: GateUp requires even m > 0, got {m}"
+            );
             (m / 2, MqI4Rotation::R256)
         }
         DecodeKind::Down => {
@@ -824,13 +829,12 @@ pub fn decode_moe_slots_parts(
         let id = id as usize;
         let e = experts
             .get(id)
-            .unwrap_or_else(|| {
-                panic!("{WHO}: expert id {id} >= experts length {}", experts.len())
-            })
+            .unwrap_or_else(|| panic!("{WHO}: expert id {id} >= experts length {}", experts.len()))
             .as_ref()
             .unwrap_or_else(|| panic!("{WHO}: expert {id} has no tensor"));
         assert_eq!(
-            e.profile.rotation, rotation,
+            e.profile.rotation,
+            rotation,
             "{WHO}: expert {id} profile {} has the wrong rotation for {kind:?}",
             e.profile.name()
         );
@@ -843,7 +847,10 @@ pub fn decode_moe_slots_parts(
     let mut seen = vec![false; slot_limit];
     for &slot in slot_ids {
         let slot = slot as usize;
-        assert!(slot < slot_limit, "{WHO}: slot id {slot} >= 10*c = {slot_limit}");
+        assert!(
+            slot < slot_limit,
+            "{WHO}: slot id {slot} >= 10*c = {slot_limit}"
+        );
         assert!(!seen[slot], "{WHO}: duplicate slot id {slot}");
         seen[slot] = true;
     }
@@ -1025,11 +1032,9 @@ pub fn grouped_prefill_epilogue_with<I: EpilogueIntrinsics>(
         let s = &sums[row * m..(row + 1) * m];
         for i in 0..out_cols {
             let h = match kind {
-                DecodeKind::GateUp => silu_mul(
-                    intrinsics,
-                    round_f32(s[i]),
-                    round_f32(s[out_cols + i]),
-                ),
+                DecodeKind::GateUp => {
+                    silu_mul(intrinsics, round_f32(s[i]), round_f32(s[out_cols + i]))
+                }
                 DecodeKind::Down => s[i],
             };
             out[row * out_cols + i] = (bf16_rne_finite_passthrough_bits(h.to_bits()) >> 16) as u16;
@@ -1117,15 +1122,31 @@ mod tests {
         let w3_i8: [i8; 8] = [-7, -5, -3, -1, 1, 3, 5, 7];
         let w3_nib: [u8; 8] = [0x9, 0xB, 0xD, 0xF, 0x1, 0x3, 0x5, 0x7];
         for c in 0..8u8 {
-            assert_eq!(weight_i8(MqI4Codec::W3, c), w3_i8[c as usize], "W3 i8 c={c}");
-            assert_eq!(weight_nibble(MqI4Codec::W3, c), w3_nib[c as usize], "W3 nibble c={c}");
+            assert_eq!(
+                weight_i8(MqI4Codec::W3, c),
+                w3_i8[c as usize],
+                "W3 i8 c={c}"
+            );
+            assert_eq!(
+                weight_nibble(MqI4Codec::W3, c),
+                w3_nib[c as usize],
+                "W3 nibble c={c}"
+            );
         }
         // W2: 2c - 3, c = 0..3.
         let w2_i8: [i8; 4] = [-3, -1, 1, 3];
         let w2_nib: [u8; 4] = [0xD, 0xF, 0x1, 0x3];
         for c in 0..4u8 {
-            assert_eq!(weight_i8(MqI4Codec::W2, c), w2_i8[c as usize], "W2 i8 c={c}");
-            assert_eq!(weight_nibble(MqI4Codec::W2, c), w2_nib[c as usize], "W2 nibble c={c}");
+            assert_eq!(
+                weight_i8(MqI4Codec::W2, c),
+                w2_i8[c as usize],
+                "W2 i8 c={c}"
+            );
+            assert_eq!(
+                weight_nibble(MqI4Codec::W2, c),
+                w2_nib[c as usize],
+                "W2 nibble c={c}"
+            );
         }
     }
 
@@ -1195,7 +1216,7 @@ mod tests {
         // c = 0..7 -> 2c-7 = -7,-5,-3,-1,1,3,5,7
         let q: [f32; 8] = [-1.75, -1.25, -0.75, -0.25, 0.25, 0.75, 1.25, 1.75]; // x 0.25
         let one: [f32; 8] = [-7.0, -5.0, -3.0, -1.0, 1.0, 3.0, 5.0, 7.0]; // x 1
-        // 65504 x {7,5,3,1} = 458528, 327520, 196512, 65504 (all < 2^24, exact)
+                                                                          // 65504 x {7,5,3,1} = 458528, 327520, 196512, 65504 (all < 2^24, exact)
         let big: [f32; 8] = [
             -458_528.0, -327_520.0, -196_512.0, -65_504.0, 65_504.0, 196_512.0, 327_520.0,
             458_528.0,
@@ -1251,7 +1272,13 @@ mod tests {
             let top = f32::from(weight_i8(profile.codec, other));
             for j in 0..128 {
                 assert_eq!(out[j].to_bits(), 0, "{} zero-group col {j}", profile.name());
-                assert_eq!(out[128 + j].to_bits(), top.to_bits(), "{} col {}", profile.name(), 128 + j);
+                assert_eq!(
+                    out[128 + j].to_bits(),
+                    top.to_bits(),
+                    "{} col {}",
+                    profile.name(),
+                    128 + j
+                );
             }
         }
     }
@@ -1318,7 +1345,11 @@ mod tests {
         assert_eq!(b.s, -64); // 8 * sum(-8..=7)
         for lane in 0..16 {
             for byte in 0..4 {
-                assert_eq!(b.qs[4 * lane + byte], LANE_BYTE[lane], "lane {lane} byte {byte}");
+                assert_eq!(
+                    b.qs[4 * lane + byte],
+                    LANE_BYTE[lane],
+                    "lane {lane} byte {byte}"
+                );
             }
         }
     }
@@ -1413,7 +1444,10 @@ mod tests {
             *q = RAMP_BYTES[i % 8];
         }
         let blk = A4Block { d: 0.5, s: -64, qs };
-        assert_eq!(iu4_gemm_f32(P3_R128, 1, 128, &bytes, &[blk]), vec![168.0f32]);
+        assert_eq!(
+            iu4_gemm_f32(P3_R128, 1, 128, &bytes, &[blk]),
+            vec![168.0f32]
+        );
     }
 
     #[test]
@@ -1436,7 +1470,10 @@ mod tests {
         let mut pos = [0i8; 128];
         pos[..3].fill(1);
         let d1 = f32::from_bits(0x3F80_0001);
-        let x = [A4Block::from_values(1.0, &neg), A4Block::from_values(d1, &pos)];
+        let x = [
+            A4Block::from_values(1.0, &neg),
+            A4Block::from_values(d1, &pos),
+        ];
         let out = iu4_gemm_f32(P3_R256, 1, 256, &bytes, &x);
         assert_eq!(out[0].to_bits(), 0x34C0_0000, "fused literal");
 
@@ -1458,7 +1495,10 @@ mod tests {
         edits: &[(usize, u8)],
         xs: &[(usize, f32)],
     ) -> (f32, f64) {
-        let profile = MqI4Profile { codec: MqI4Codec::W3, rotation: rot };
+        let profile = MqI4Profile {
+            codec: MqI4Codec::W3,
+            rotation: rot,
+        };
         let mut codes = vec![4u8; k];
         for &(j, c) in edits {
             codes[j] = c;
@@ -1492,8 +1532,14 @@ mod tests {
         let bytes = enc(P3_R128, 4, 128, &codes, &scales);
         let want = vec![576.0f32, 2016.0, -1008.0, 2688.0];
         assert_eq!(decode_gemv_f32(P3_R128, 4, 128, &bytes, &x), want);
-        assert_eq!(decode_gemv_f32_parts(P3_R128, 4, 128, &codes, &scales, &x), want);
-        assert_eq!(gemv_f64(P3_R128, 4, 128, &bytes, &x), vec![576.0f64, 2016.0, -1008.0, 2688.0]);
+        assert_eq!(
+            decode_gemv_f32_parts(P3_R128, 4, 128, &codes, &scales, &x),
+            want
+        );
+        assert_eq!(
+            gemv_f64(P3_R128, 4, 128, &bytes, &x),
+            vec![576.0f64, 2016.0, -1008.0, 2688.0]
+        );
 
         // W2 (R128): row0 codes 3 (w=3), d=1 -> 3*576 = 1728; row1 codes 0 (w=-3), d=0.5
         // -> -1.5*576 = -864; row2 codes j%4 (w = -3,-1,1,3 repeating), d=2: per 8-block
@@ -1525,7 +1571,10 @@ mod tests {
         );
         // W2 R256: all codes 3 (w=3), scales (1,1): 3 * 1152 = 3456.
         let bytes = enc(P2_R256, 1, 256, &[3u8; 256], &[H_ONE, H_ONE]);
-        assert_eq!(decode_gemv_f32(P2_R256, 1, 256, &bytes, &x), vec![3456.0f32]);
+        assert_eq!(
+            decode_gemv_f32(P2_R256, 1, 256, &bytes, &x),
+            vec![3456.0f32]
+        );
     }
 
     /// Cases (x edits at weight +1; everything else 0) whose f32 result depends on the
@@ -1550,14 +1599,37 @@ mod tests {
         //    off 16: lane0 = 2^24 + 1 = 2^24 (1 lost); lane8 = -2^24 (+ lane24 = 0);
         //    off 8: 2^24 + -2^24 = 0. (A sequential or 8-before-16 order gives 1.)
         let cases: [(&str, [(usize, f32); 3], u32); 5] = [
-            ("A in-lane", [(0, TWO24), (1, 1.0), (2, -TWO24)], 0x0000_0000),
-            ("C off2 before off1", [(0, TWO24), (4, 1.0), (8, -TWO24)], 0x3F80_0000),
-            ("D off4 before off2", [(0, TWO24), (8, 1.0), (16, -TWO24)], 0x3F80_0000),
-            ("F off8 before off4", [(0, TWO24), (16, 1.0), (32, -TWO24)], 0x3F80_0000),
-            ("B off16 before off8", [(0, TWO24), (32, -TWO24), (64, 1.0)], 0x0000_0000),
+            (
+                "A in-lane",
+                [(0, TWO24), (1, 1.0), (2, -TWO24)],
+                0x0000_0000,
+            ),
+            (
+                "C off2 before off1",
+                [(0, TWO24), (4, 1.0), (8, -TWO24)],
+                0x3F80_0000,
+            ),
+            (
+                "D off4 before off2",
+                [(0, TWO24), (8, 1.0), (16, -TWO24)],
+                0x3F80_0000,
+            ),
+            (
+                "F off8 before off4",
+                [(0, TWO24), (16, 1.0), (32, -TWO24)],
+                0x3F80_0000,
+            ),
+            (
+                "B off16 before off8",
+                [(0, TWO24), (32, -TWO24), (64, 1.0)],
+                0x0000_0000,
+            ),
         ];
         // Down (R128, K128) and gate (R256, K256; data in group 0 -> acc0 only, so the same).
-        for (rot, k) in [(MqI4Rotation::R128, 128usize), (MqI4Rotation::R256, 256usize)] {
+        for (rot, k) in [
+            (MqI4Rotation::R128, 128usize),
+            (MqI4Rotation::R256, 256usize),
+        ] {
             for (name, xs, want_bits) in cases {
                 let (f, exact) = run_row(rot, k, &[], &xs);
                 assert_eq!(f.to_bits(), want_bits, "{name} {rot:?}: got {f}");
@@ -1572,7 +1644,10 @@ mod tests {
         // p = RN(-3*1) = -3. Then fma(3, 1+2^-23, -3) = 3*2^-23 exactly (see the IU4 fused
         // test) = bits 0x34C00000. Mul-then-add would give 2^-21 = 0x35000000.
         let x1 = f32::from_bits(0x3F80_0001);
-        for (rot, k) in [(MqI4Rotation::R128, 128usize), (MqI4Rotation::R256, 256usize)] {
+        for (rot, k) in [
+            (MqI4Rotation::R128, 128usize),
+            (MqI4Rotation::R256, 256usize),
+        ] {
             let (f, exact) = run_row(rot, k, &[(0, 2), (1, 5)], &[(0, 1.0), (1, x1)]);
             assert_eq!(f.to_bits(), 0x34C0_0000, "{rot:?}: got {f}");
             // exact value: -3 + 3(1+2^-23) = 3*2^-23 (a few f64 ulps never matter: exact in f64)
@@ -1674,7 +1749,11 @@ mod tests {
         let codes: Vec<u8> = (0..m * k).map(|_| rng.below(levels) as u8).collect();
         let scales: Vec<u16> = (0..m * (k / 128)).map(|_| rng.scale_bits()).collect();
         let bytes = enc(profile, m, k, &codes, &scales);
-        RandTensor { codes, scales, bytes }
+        RandTensor {
+            codes,
+            scales,
+            bytes,
+        }
     }
 
     fn widths(profile: MqI4Profile) -> [usize; 3] {
@@ -1706,8 +1785,9 @@ mod tests {
                             _ => rng.scale_bits(),
                         })
                         .collect();
-                    let x: Vec<f32> =
-                        (0..k).map(|_| if rng.below(16) == 0 { 0.0 } else { rng.x() }).collect();
+                    let x: Vec<f32> = (0..k)
+                        .map(|_| if rng.below(16) == 0 { 0.0 } else { rng.x() })
+                        .collect();
                     let groups = k / 128;
                     let want: Vec<f32> = (0..m)
                         .map(|r| {
@@ -1721,11 +1801,21 @@ mod tests {
                         })
                         .collect();
                     let got = decode_gemv_f32_parts(profile, m, k, &codes, &scales, &x);
-                    assert_eq!(bits32(&got), bits32(&want), "wrapper {} k={k}", profile.name());
+                    assert_eq!(
+                        bits32(&got),
+                        bits32(&want),
+                        "wrapper {} k={k}",
+                        profile.name()
+                    );
                     let q: Vec<i8> = codes.iter().map(|&c| weight_i8(profile.codec, c)).collect();
                     let d: Vec<f32> = scales.iter().map(|&b| scale_f32(b)).collect();
                     let direct = gemv_tree_f32_q(profile.rotation, m, k, &q, &d, &x);
-                    assert_eq!(bits32(&direct), bits32(&want), "helper {} k={k}", profile.name());
+                    assert_eq!(
+                        bits32(&direct),
+                        bits32(&want),
+                        "helper {} k={k}",
+                        profile.name()
+                    );
                     rows += m;
                 }
             }
@@ -1783,7 +1873,14 @@ mod tests {
                 let t = rand_tensor(&mut rng, profile, m, k);
                 let x: Vec<f32> = (0..k).map(|_| rng.x()).collect();
                 let groups = k / 128;
-                let n = 4 + groups + 5 + if profile.rotation == MqI4Rotation::R256 { 2 } else { 0 };
+                let n = 4
+                    + groups
+                    + 5
+                    + if profile.rotation == MqI4Rotation::R256 {
+                        2
+                    } else {
+                        0
+                    };
                 let oracle = f64_rows(profile, m, k, &t, &x);
 
                 // dequant is exact: bits == f32 of the exact f64 value
@@ -1792,8 +1889,14 @@ mod tests {
                 for r in 0..m {
                     for j in 0..k {
                         let d = f16::from_bits(t.scales[r * groups + j / 128]).to_f64();
-                        let want = (d * f64::from(2 * i32::from(t.codes[r * k + j]) - levels)) as f32;
-                        assert_eq!(dq[r * k + j].to_bits(), want.to_bits(), "dequant {} r={r} j={j}", profile.name());
+                        let want =
+                            (d * f64::from(2 * i32::from(t.codes[r * k + j]) - levels)) as f32;
+                        assert_eq!(
+                            dq[r * k + j].to_bits(),
+                            want.to_bits(),
+                            "dequant {} r={r} j={j}",
+                            profile.name()
+                        );
                     }
                 }
 
@@ -1812,7 +1915,11 @@ mod tests {
                     );
                     // gemv_f64 is an ascending f64 sum like the oracle: agree to the f64 bound.
                     let err64 = (f64_out[r] - s).abs();
-                    assert!(err64 <= 2.0 * gamma(k, u64_) * a, "{} gemv_f64 r={r}", profile.name());
+                    assert!(
+                        err64 <= 2.0 * gamma(k, u64_) * a,
+                        "{} gemv_f64 r={r}",
+                        profile.name()
+                    );
                 }
             }
         }
@@ -1850,7 +1957,8 @@ mod tests {
                         for g in 0..groups {
                             let mut dot = 0i64;
                             for j in 0..128 {
-                                let w = 2 * i64::from(t.codes[r * k + g * 128 + j]) - i64::from(levels);
+                                let w =
+                                    2 * i64::from(t.codes[r * k + g * 128 + j]) - i64::from(levels);
                                 dot += w * i64::from(vals[tk * groups + g][j]);
                             }
                             assert!(dot.abs() <= 7168);
@@ -1859,7 +1967,8 @@ mod tests {
                             s += term;
                             a += term.abs();
                         }
-                        let bound = gamma(groups + 1, 2.0f64.powi(-24)) * a + groups as f64 * 2.0f64.powi(-52) * a;
+                        let bound = gamma(groups + 1, 2.0f64.powi(-24)) * a
+                            + groups as f64 * 2.0f64.powi(-52) * a;
                         let err = (f64::from(out[tk * m + r]) - s).abs();
                         assert!(
                             err <= bound,
@@ -1961,9 +2070,24 @@ mod tests {
         //   slot 17 (expert 3, 512): gate [3584, -1792], up [2048, 192]
         // Every other cell keeps its sentinel (-77 in y0, -99 in y1).
         let (m, k, c) = (4usize, 256usize, 2usize);
-        let e0 = const_rows_expert(P3_R256, m, k, &[(1, H_ONE), (2, H_ONE), (3, H_ONE), (5, H_ONE)]);
-        let e2 = const_rows_expert(P2_R256, m, k, &[(3, H_ONE), (0, H_HALF), (1, H_TWO), (3, H_QUARTER)]);
-        let e3 = const_rows_expert(P3_R256, m, k, &[(7, H_ONE), (0, H_HALF), (4, H_FOUR), (5, H_EIGHTH)]);
+        let e0 = const_rows_expert(
+            P3_R256,
+            m,
+            k,
+            &[(1, H_ONE), (2, H_ONE), (3, H_ONE), (5, H_ONE)],
+        );
+        let e2 = const_rows_expert(
+            P2_R256,
+            m,
+            k,
+            &[(3, H_ONE), (0, H_HALF), (1, H_TWO), (3, H_QUARTER)],
+        );
+        let e3 = const_rows_expert(
+            P3_R256,
+            m,
+            k,
+            &[(7, H_ONE), (0, H_HALF), (4, H_FOUR), (5, H_EIGHTH)],
+        );
 
         let (x_stride, y_stride) = (260usize, 5usize);
         let mut x = vec![1.0e30f32; c * x_stride];
@@ -1987,16 +2111,36 @@ mod tests {
 
         // packed
         let experts = vec![
-            Some(ExpertTensor { profile: P3_R256, bytes: &e0 }),
+            Some(ExpertTensor {
+                profile: P3_R256,
+                bytes: &e0,
+            }),
             None,
-            Some(ExpertTensor { profile: P2_R256, bytes: &e2 }),
-            Some(ExpertTensor { profile: P3_R256, bytes: &e3 }),
+            Some(ExpertTensor {
+                profile: P2_R256,
+                bytes: &e2,
+            }),
+            Some(ExpertTensor {
+                profile: P3_R256,
+                bytes: &e3,
+            }),
         ];
         let mut y0 = vec![-77.0f32; 20 * y_stride];
         let mut y1 = vec![-99.0f32; 20 * y_stride];
         decode_moe_slots(
-            DecodeKind::GateUp, m, k, &experts, &ids, &offsets, &slots, c, &x, x_stride, y_stride,
-            &mut y0, Some(&mut y1[..]),
+            DecodeKind::GateUp,
+            m,
+            k,
+            &experts,
+            &ids,
+            &offsets,
+            &slots,
+            c,
+            &x,
+            x_stride,
+            y_stride,
+            &mut y0,
+            Some(&mut y1[..]),
         );
         assert_eq!(bits32(&y0), bits32(&want0), "packed y0");
         assert_eq!(bits32(&y1), bits32(&want1), "packed y1");
@@ -2006,16 +2150,39 @@ mod tests {
         let t2 = mq_i4::decode_tensor(P2_R256, m, k, &e2).unwrap();
         let t3 = mq_i4::decode_tensor(P3_R256, m, k, &e3).unwrap();
         let parts = vec![
-            Some(ExpertTensorParts { profile: P3_R256, codes: &t0.codes, scale_bits: &t0.scale_bits }),
+            Some(ExpertTensorParts {
+                profile: P3_R256,
+                codes: &t0.codes,
+                scale_bits: &t0.scale_bits,
+            }),
             None,
-            Some(ExpertTensorParts { profile: P2_R256, codes: &t2.codes, scale_bits: &t2.scale_bits }),
-            Some(ExpertTensorParts { profile: P3_R256, codes: &t3.codes, scale_bits: &t3.scale_bits }),
+            Some(ExpertTensorParts {
+                profile: P2_R256,
+                codes: &t2.codes,
+                scale_bits: &t2.scale_bits,
+            }),
+            Some(ExpertTensorParts {
+                profile: P3_R256,
+                codes: &t3.codes,
+                scale_bits: &t3.scale_bits,
+            }),
         ];
         let mut y0 = vec![-77.0f32; 20 * y_stride];
         let mut y1 = vec![-99.0f32; 20 * y_stride];
         decode_moe_slots_parts(
-            DecodeKind::GateUp, m, k, &parts, &ids, &offsets, &slots, c, &x, x_stride, y_stride,
-            &mut y0, Some(&mut y1[..]),
+            DecodeKind::GateUp,
+            m,
+            k,
+            &parts,
+            &ids,
+            &offsets,
+            &slots,
+            c,
+            &x,
+            x_stride,
+            y_stride,
+            &mut y0,
+            Some(&mut y1[..]),
         );
         assert_eq!(bits32(&y0), bits32(&want0), "parts y0");
         assert_eq!(bits32(&y1), bits32(&want1), "parts y1");
@@ -2053,28 +2220,64 @@ mod tests {
         }
 
         let experts = vec![
-            Some(ExpertTensor { profile: P2_R128, bytes: &ew2 }),
-            Some(ExpertTensor { profile: P3_R128, bytes: &ew3 }),
+            Some(ExpertTensor {
+                profile: P2_R128,
+                bytes: &ew2,
+            }),
+            Some(ExpertTensor {
+                profile: P3_R128,
+                bytes: &ew3,
+            }),
             None,
         ];
         let mut y0 = vec![-55.0f32; 20 * y_stride];
         decode_moe_slots(
-            DecodeKind::Down, m, k, &experts, &ids, &offsets, &slots, c, &x, x_stride, y_stride,
-            &mut y0, None,
+            DecodeKind::Down,
+            m,
+            k,
+            &experts,
+            &ids,
+            &offsets,
+            &slots,
+            c,
+            &x,
+            x_stride,
+            y_stride,
+            &mut y0,
+            None,
         );
         assert_eq!(bits32(&y0), bits32(&want), "packed");
 
         let t_w2 = mq_i4::decode_tensor(P2_R128, m, k, &ew2).unwrap();
         let t_w3 = mq_i4::decode_tensor(P3_R128, m, k, &ew3).unwrap();
         let parts = vec![
-            Some(ExpertTensorParts { profile: P2_R128, codes: &t_w2.codes, scale_bits: &t_w2.scale_bits }),
-            Some(ExpertTensorParts { profile: P3_R128, codes: &t_w3.codes, scale_bits: &t_w3.scale_bits }),
+            Some(ExpertTensorParts {
+                profile: P2_R128,
+                codes: &t_w2.codes,
+                scale_bits: &t_w2.scale_bits,
+            }),
+            Some(ExpertTensorParts {
+                profile: P3_R128,
+                codes: &t_w3.codes,
+                scale_bits: &t_w3.scale_bits,
+            }),
             None,
         ];
         let mut y0 = vec![-55.0f32; 20 * y_stride];
         decode_moe_slots_parts(
-            DecodeKind::Down, m, k, &parts, &ids, &offsets, &slots, c, &x, x_stride, y_stride,
-            &mut y0, None,
+            DecodeKind::Down,
+            m,
+            k,
+            &parts,
+            &ids,
+            &offsets,
+            &slots,
+            c,
+            &x,
+            x_stride,
+            y_stride,
+            &mut y0,
+            None,
         );
         assert_eq!(bits32(&y0), bits32(&want), "parts");
     }
@@ -2083,18 +2286,44 @@ mod tests {
     fn moe_empty_bucket_and_empty_slot_list_write_nothing() {
         let (m, k) = (4usize, 256usize);
         let e = const_rows_expert(P3_R256, m, k, &[(7, H_ONE); 4]);
-        let experts = vec![Some(ExpertTensor { profile: P3_R256, bytes: &e })];
+        let experts = vec![Some(ExpertTensor {
+            profile: P3_R256,
+            bytes: &e,
+        })];
         let x = vec![1.0f32; 256];
         let mut y0 = vec![-77.0f32; 50];
         let mut y1 = vec![-99.0f32; 50];
         // one expert, empty bucket
         decode_moe_slots(
-            DecodeKind::GateUp, m, k, &experts, &[0], &[0, 0], &[], 1, &x, 256, 5, &mut y0,
+            DecodeKind::GateUp,
+            m,
+            k,
+            &experts,
+            &[0],
+            &[0, 0],
+            &[],
+            1,
+            &x,
+            256,
+            5,
+            &mut y0,
             Some(&mut y1[..]),
         );
         // zero experts at all
         decode_moe_slots(
-            DecodeKind::GateUp, m, k, &experts, &[], &[0], &[], 1, &x, 256, 5, &mut y0, Some(&mut y1[..]),
+            DecodeKind::GateUp,
+            m,
+            k,
+            &experts,
+            &[],
+            &[0],
+            &[],
+            1,
+            &x,
+            256,
+            5,
+            &mut y0,
+            Some(&mut y1[..]),
         );
         assert!(y0.iter().all(|&v| v == -77.0));
         assert!(y1.iter().all(|&v| v == -99.0));
@@ -2104,11 +2333,26 @@ mod tests {
     #[should_panic(expected = "duplicate slot id 3")]
     fn moe_duplicate_slot_panics() {
         let e = const_rows_expert(P3_R128, 1, 128, &[(4, H_ONE)]);
-        let experts = vec![Some(ExpertTensor { profile: P3_R128, bytes: &e })];
+        let experts = vec![Some(ExpertTensor {
+            profile: P3_R128,
+            bytes: &e,
+        })];
         let x = vec![1.0f32; 10 * 128];
         let mut y0 = vec![0.0f32; 10];
         decode_moe_slots(
-            DecodeKind::Down, 1, 128, &experts, &[0], &[0, 2], &[3, 3], 1, &x, 128, 1, &mut y0, None,
+            DecodeKind::Down,
+            1,
+            128,
+            &experts,
+            &[0],
+            &[0, 2],
+            &[3, 3],
+            1,
+            &x,
+            128,
+            1,
+            &mut y0,
+            None,
         );
     }
 
@@ -2116,11 +2360,26 @@ mod tests {
     #[should_panic(expected = "slot id 10 >= 10*c")]
     fn moe_slot_outside_ten_c_panics() {
         let e = const_rows_expert(P3_R128, 1, 128, &[(4, H_ONE)]);
-        let experts = vec![Some(ExpertTensor { profile: P3_R128, bytes: &e })];
+        let experts = vec![Some(ExpertTensor {
+            profile: P3_R128,
+            bytes: &e,
+        })];
         let x = vec![1.0f32; 11 * 128];
         let mut y0 = vec![0.0f32; 11];
         decode_moe_slots(
-            DecodeKind::Down, 1, 128, &experts, &[0], &[0, 1], &[10], 1, &x, 128, 1, &mut y0, None,
+            DecodeKind::Down,
+            1,
+            128,
+            &experts,
+            &[0],
+            &[0, 1],
+            &[10],
+            1,
+            &x,
+            128,
+            1,
+            &mut y0,
+            None,
         );
     }
 
@@ -2128,11 +2387,26 @@ mod tests {
     #[should_panic(expected = "wrong rotation")]
     fn moe_down_rejects_r256_profile() {
         let e = const_rows_expert(P3_R256, 1, 256, &[(4, H_ONE)]);
-        let experts = vec![Some(ExpertTensor { profile: P3_R256, bytes: &e })];
+        let experts = vec![Some(ExpertTensor {
+            profile: P3_R256,
+            bytes: &e,
+        })];
         let x = vec![1.0f32; 10 * 256];
         let mut y0 = vec![0.0f32; 10];
         decode_moe_slots(
-            DecodeKind::Down, 1, 256, &experts, &[0], &[0, 1], &[0], 1, &x, 256, 1, &mut y0, None,
+            DecodeKind::Down,
+            1,
+            256,
+            &experts,
+            &[0],
+            &[0, 1],
+            &[0],
+            1,
+            &x,
+            256,
+            1,
+            &mut y0,
+            None,
         );
     }
 
@@ -2140,11 +2414,26 @@ mod tests {
     #[should_panic(expected = "y1 must be Some for GateUp")]
     fn moe_gate_up_requires_y1() {
         let e = const_rows_expert(P3_R256, 2, 256, &[(4, H_ONE), (4, H_ONE)]);
-        let experts = vec![Some(ExpertTensor { profile: P3_R256, bytes: &e })];
+        let experts = vec![Some(ExpertTensor {
+            profile: P3_R256,
+            bytes: &e,
+        })];
         let x = vec![1.0f32; 256];
         let mut y0 = vec![0.0f32; 10];
         decode_moe_slots(
-            DecodeKind::GateUp, 2, 256, &experts, &[0], &[0, 1], &[0], 1, &x, 256, 1, &mut y0, None,
+            DecodeKind::GateUp,
+            2,
+            256,
+            &experts,
+            &[0],
+            &[0, 1],
+            &[0],
+            1,
+            &x,
+            256,
+            1,
+            &mut y0,
+            None,
         );
     }
 
@@ -2162,18 +2451,53 @@ mod tests {
         let cases: [(f32, f32, u16, &str); 14] = [
             (1.0, 1.0, 0x3F3B, "silu(1)=0.7310586 -> 0.73046875"),
             (-1.0, 1.0, 0xBE8A, "silu(-1)=-0.2689414 -> -0.26953125"),
-            (2.0, -0.5, 0xBF61, "silu(2)=1.7615942, *-0.5 = -0.8807971 -> -0.87890625"),
-            (0.5, 3.0, 0x3F6F, "silu(.5)=0.3112297, *3 = 0.9336890 -> 0.93359375"),
-            (-3.0, 2.0, 0xBE92, "silu(-3)=-0.1422776, *2 = -0.2845552 -> -0.28515625"),
+            (
+                2.0,
+                -0.5,
+                0xBF61,
+                "silu(2)=1.7615942, *-0.5 = -0.8807971 -> -0.87890625",
+            ),
+            (
+                0.5,
+                3.0,
+                0x3F6F,
+                "silu(.5)=0.3112297, *3 = 0.9336890 -> 0.93359375",
+            ),
+            (
+                -3.0,
+                2.0,
+                0xBE92,
+                "silu(-3)=-0.1422776, *2 = -0.2845552 -> -0.28515625",
+            ),
             (10.0, 1.0, 0x4120, "silu(10)=9.99954602 -> 10.0"),
             (-10.0, 1.0, 0xB9EE, "silu(-10)=-4.5398e-4 -> -4.5395e-4"),
             (20.0, -1.0, 0xC1A0, "silu(20)=19.99999996, *-1 -> -20.0"),
             (-20.0, 1.0, 0xB331, "silu(-20)=-4.1223e-8 -> -4.1211e-8"),
-            (100.0, 0.5, 0x4248, "e^-100 ~ 3.7e-44 vanishes in 1+r; 100*0.5 = 50"),
-            (-100.0, 1.0, 0x8000, "g < -88.72: r = +inf, q = -100/inf = -0, -0*1 = -0"),
+            (
+                100.0,
+                0.5,
+                0x4248,
+                "e^-100 ~ 3.7e-44 vanishes in 1+r; 100*0.5 = 50",
+            ),
+            (
+                -100.0,
+                1.0,
+                0x8000,
+                "g < -88.72: r = +inf, q = -100/inf = -0, -0*1 = -0",
+            ),
             (104.0, 1.0, 0x42D0, "g > 103.28: r forced to 0, q = 104"),
-            (-0.25, 4.0, 0xBEE0, "silu(-.25)=-0.1094559, *4 = -0.4378235 -> -0.4375"),
-            (8.0, 2.0, 0x4180, "silu(8)=7.99731720, *2 = 15.9946344 -> 16.0"),
+            (
+                -0.25,
+                4.0,
+                0xBEE0,
+                "silu(-.25)=-0.1094559, *4 = -0.4378235 -> -0.4375",
+            ),
+            (
+                8.0,
+                2.0,
+                0x4180,
+                "silu(8)=7.99731720, *2 = 15.9946344 -> 16.0",
+            ),
         ];
         let mut sums = Vec::new();
         for &(g, u, _, _) in &cases {
@@ -2184,7 +2508,11 @@ mod tests {
         let out = grouped_prefill_epilogue(DecodeKind::GateUp, 2, &sums, &slots);
         assert_eq!(out.len(), cases.len());
         for (i, &(g, u, want, why)) in cases.iter().enumerate() {
-            assert_eq!(out[i], want, "g={g} u={u}: got {:#06x} want {want:#06x} ({why})", out[i]);
+            assert_eq!(
+                out[i], want,
+                "g={g} u={u}: got {:#06x} want {want:#06x} ({why})",
+                out[i]
+            );
         }
     }
 
@@ -2247,11 +2575,7 @@ mod tests {
         //   silu(1)*2    = 1.4621172  -> 0x3FBB
         //   silu(-1)*0.5 = -0.1344707 -> 0xBE0A
         let nan = f32::NAN;
-        let sums = [
-            nan, nan, nan, nan,
-            1.0, -1.0, 2.0, 0.5,
-            nan, nan, nan, nan,
-        ];
+        let sums = [nan, nan, nan, nan, 1.0, -1.0, 2.0, 0.5, nan, nan, nan, nan];
         let out = grouped_prefill_epilogue(DecodeKind::GateUp, 4, &sums, &[-1, 5, -1]);
         assert_eq!(out, vec![0x0000u16, 0x0000, 0x3FBB, 0xBE0A, 0x0000, 0x0000]);
     }
@@ -2270,13 +2594,23 @@ mod tests {
         //   0x00008000 tie, even 0x0000 stays        -> 0x0000
         //   +inf 0x7F800000 / -inf 0xFF800000 / NaN 0x7FC00000 -> high16 unchanged
         let vals: [u32; 13] = [
-            0x3F80_8000, 0x3F81_8000, 0xBF80_8000, 0xBF81_8000, 0x3F80_8001, 0x3F80_7FFF,
-            0x7F7F_FFFF, 0x0000_0001, 0x0001_8000, 0x0000_8000, 0x7F80_0000, 0xFF80_0000,
+            0x3F80_8000,
+            0x3F81_8000,
+            0xBF80_8000,
+            0xBF81_8000,
+            0x3F80_8001,
+            0x3F80_7FFF,
+            0x7F7F_FFFF,
+            0x0000_0001,
+            0x0001_8000,
+            0x0000_8000,
+            0x7F80_0000,
+            0xFF80_0000,
             0x7FC0_0000,
         ];
         let want: [u16; 13] = [
-            0x3F80, 0x3F82, 0xBF80, 0xBF82, 0x3F81, 0x3F80, 0x7F80, 0x0000, 0x0002, 0x0000,
-            0x7F80, 0xFF80, 0x7FC0,
+            0x3F80, 0x3F82, 0xBF80, 0xBF82, 0x3F81, 0x3F80, 0x7F80, 0x0000, 0x0002, 0x0000, 0x7F80,
+            0xFF80, 0x7FC0,
         ];
         let mut sums = vec![f32::NAN; 13]; // pad row first: garbage that must stay unread
         sums.extend(vals.iter().map(|&b| f32::from_bits(b)));
@@ -2294,7 +2628,9 @@ mod tests {
 
     impl Recorder {
         fn new() -> Self {
-            Self { calls: std::cell::RefCell::new(Vec::new()) }
+            Self {
+                calls: std::cell::RefCell::new(Vec::new()),
+            }
         }
     }
 
@@ -2305,11 +2641,15 @@ mod tests {
             1.5
         }
         fn ldexp(&self, x: f32, e: i32) -> f32 {
-            self.calls.borrow_mut().push(("ldexp", x.to_bits(), e as u32));
+            self.calls
+                .borrow_mut()
+                .push(("ldexp", x.to_bits(), e as u32));
             0.25
         }
         fn divide(&self, numerator: f32, denominator: f32) -> f32 {
-            self.calls.borrow_mut().push(("divide", numerator.to_bits(), denominator.to_bits()));
+            self.calls
+                .borrow_mut()
+                .push(("divide", numerator.to_bits(), denominator.to_bits()));
             0.375
         }
     }

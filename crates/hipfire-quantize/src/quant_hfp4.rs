@@ -3,10 +3,8 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-
-use crate::quant_fwht::cpu_fwht_256;
 use crate::dequant::e2m1_to_f32;
-
+use crate::quant_fwht::cpu_fwht_256;
 
 use hipfire_quantize::float16::{f16_to_f32, f32_to_f16};
 
