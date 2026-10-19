@@ -172,7 +172,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_FN_GDN_DENSE_SCAN` | **on** (exact gfx1201 FN prefill); `0` opts out | Flash-Next's admitted eager prefill uses the fused dense C64 GDN scan (`fn_gdn_dense`, `gdn_chunk_kkt_solve_batched` and `gdn_chunk_scan_bf16_mseg`) instead of the pipe128 recurrence. This route is KLD-gated, **not bit-exact** versus pipe128. It uses RNE exit Q8 quantization with no error-feedback (EF) residual. Short tails, decode, verify/capture and other declined calls keep the incumbent route; `0` restores pipe128 prefill. |
 | `HIPFIRE_DRAFT_MAX` | routes to active mech window | CLI |
 | `HIPFIRE_DRAFT_F16` | on unless `0` | RuntimeConfig |
-| `HIPFIRE_NGRAM_DRAFT` | `1` forces n-gram | Loader always honors |
+| `HIPFIRE_NGRAM_DRAFT` | **off**; `on`/`1`/`true` forces n-gram, `off`/`0`/`false` disables, `auto` arms it wherever the loader has an n-gram speculator | `speculation.ngram`: the CLI resolves it through the shared strict tri-state parser (`hipfire_config::parse_tri_state_alias`); an unrecognized value is a config error, never a silent off. Loader always honors |
 | `HIPFIRE_NGRAM_DRAFT_K` / `HIPFIRE_NGRAM_MIN_COUNT` | n-gram params | |
 | `HIPFIRE_NGRAM_LOOP_THRESHOLD` | default **0 (off)** | RuntimeConfig |
 | `HIPFIRE_NGRAM_WINDOW` | default 256 | RuntimeConfig |

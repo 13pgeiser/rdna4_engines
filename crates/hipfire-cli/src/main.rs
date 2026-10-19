@@ -4720,6 +4720,17 @@ fn with_loaded_kv_backend_fields(
     report
 }
 
+/// `speculation.ngram` → the typed `params.ngram_draft` flag. The schema keeps
+/// the authored spelling (`on`/`off`/`auto` and the `1`/`0` aliases), so the
+/// shared strict tri-state parser resolves it; an unrecognized spelling is a
+/// config error, never a silent off. `auto` arms the model-free speculator
+/// wherever the loader has one for the arch (unchanged).
+fn ngram_draft_param(mode: &str) -> Result<bool> {
+    let armed = hipfire_config::parse_tri_state_alias(mode)
+        .map_err(|error| anyhow!("speculation.ngram: {error}"))?;
+    Ok(armed.unwrap_or(true))
+}
+
 pub(crate) fn load_params(
     resolved: &hipfire_config::ResolvedConfig,
     entry: Option<&ModelEntry>,
@@ -4829,7 +4840,7 @@ pub(crate) fn load_params(
             hipfire_config::ConfigValue::Integer(k) => serde_json::json!(k),
             _ => serde_json::json!("auto"),
         },
-        "ngram_draft": matches!(config_string(resolved, "speculation.ngram")?.as_str(), "on" | "auto"),
+        "ngram_draft": ngram_draft_param(&config_string(resolved, "speculation.ngram")?)?,
         "ngram_k": config_u64(resolved, "speculation.ngram_k")?,
         "ngram_min_count": config_u64(resolved, "speculation.ngram_min_count")?,
         "ddtree_budget": config_u64(resolved, "speculation.ddtree_budget")?,
@@ -11098,6 +11109,81 @@ mod tests {
         assert_eq!(params["cask_sidecar"], sidecar_path.display().to_string());
         assert_eq!(params["prefill_compression"], "off");
         fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    fn ngram_draft_params_for(raw: &str) -> serde_json::Value {
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("speculation.ngram", raw).unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::LegacyEnv {
+                name: "HIPFIRE_NGRAM_DRAFT".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let model_path = PathBuf::from("/tmp/test-model.mq4");
+        load_params(
+            &resolved,
+            None,
+            model_path.parent().unwrap(),
+            &model_path,
+            64,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ngram_draft_one_and_on_arm_zero_and_off_disarm() {
+        // HIPFIRE_NGRAM_DRAFT=1 is preserved as the string "1"; it once
+        // lowered to `ngram_draft = false`, silently disabling the speculator.
+        for raw in ["1", "on", "true"] {
+            assert_eq!(ngram_draft_params_for(raw)["ngram_draft"], true, "{raw}");
+        }
+        for raw in ["0", "off", "false"] {
+            assert_eq!(ngram_draft_params_for(raw)["ngram_draft"], false, "{raw}");
+        }
+        // `auto` keeps arming where the loader has an n-gram speculator.
+        assert_eq!(ngram_draft_params_for("auto")["ngram_draft"], true);
+        // The built-in default stays off.
+        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let model_path = PathBuf::from("/tmp/test-model.mq4");
+        let params = load_params(
+            &defaults,
+            None,
+            model_path.parent().unwrap(),
+            &model_path,
+            64,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["ngram_draft"], false);
+    }
+
+    #[test]
+    fn ngram_draft_param_accepts_true_false_and_rejects_unknown_values() {
+        assert!(ngram_draft_param("true").unwrap());
+        assert!(!ngram_draft_param("false").unwrap());
+        for bad in ["", "maybe", "yes", "ON", "2", "enabled"] {
+            let error = ngram_draft_param(bad).unwrap_err().to_string();
+            assert!(error.contains("speculation.ngram"), "{bad:?}: {error}");
+            assert!(error.contains(&format!("{bad:?}")), "{bad:?}: {error}");
+        }
+        // The schema agrees: true/false are accepted, other spellings refused.
+        for raw in ["true", "false"] {
+            let mut layer = ConfigLayer::default();
+            layer.set_cli("speculation.ngram", raw).unwrap();
+        }
+        let mut layer = ConfigLayer::default();
+        assert!(layer.set_cli("speculation.ngram", "maybe").is_err());
     }
 
     #[test]

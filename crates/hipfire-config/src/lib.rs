@@ -2194,11 +2194,11 @@ pub static FIELDS: &[ConfigField] = &[
         Speculation,
         ModelLoad,
         DefaultValue::String("off"),
-        ValueRule::Enum(&["auto", "on", "off", "1", "0"]),
+        ValueRule::Enum(&["auto", "on", "off", "1", "0", "true", "false"]),
         true,
         false,
         Some("HIPFIRE_NGRAM_DRAFT"),
-        "Model-free n-gram speculation policy."
+        "Model-free n-gram speculation policy: on/1/true arms it, off/0/false (default) disables it, auto arms it wherever the loader has an n-gram speculator for the arch; any other value is a config error."
     ),
     field!(
         "speculation.ngram_k",
@@ -4617,6 +4617,25 @@ pub fn parse_tri_state(mode: &str) -> Option<bool> {
         "on" => Some(true),
         "off" => Some(false),
         _ => None,
+    }
+}
+/// Strict form of [`parse_tri_state`] for the speculation selectors the schema
+/// accepts with boolean aliases (`speculation.ngram`, `mtp_ngram`,
+/// `mtp_ngram_copy`): `on`/`1`/`true` → `Some(true)`, `off`/`0`/`false` →
+/// `Some(false)`, `auto` → `None` (defer). Any other spelling is an error, never
+/// a silent off — a typed consumer that matched only `"on"` once turned
+/// `HIPFIRE_NGRAM_DRAFT=1` into off. Exact, lower-case.
+pub fn parse_tri_state_alias(mode: &str) -> std::result::Result<Option<bool>, String> {
+    match mode {
+        "1" | "true" => Ok(Some(true)),
+        "0" | "false" => Ok(Some(false)),
+        "auto" => Ok(None),
+        other => match parse_tri_state(other) {
+            Some(value) => Ok(Some(value)),
+            None => Err(format!(
+                "invalid value {other:?}: expected on, 1, true, off, 0, false or auto"
+            )),
+        },
     }
 }
 /// The `on`/`off`/`auto` MTP selector the CLI lowers into `params.mtp_mode`.
@@ -7065,6 +7084,43 @@ mod tests {
         assert_eq!(table.get(&unset).cloned(), config.legacy_value(&unset));
     }
 
+    #[test]
+    fn ngram_schema_accepts_exactly_the_tri_state_alias_spellings() {
+        let field = field("speculation.ngram").expect("ngram schema field");
+        for raw in ["auto", "on", "off", "1", "0", "true", "false"] {
+            assert!(
+                field.validate(&ConfigValue::String(raw.into())).is_ok(),
+                "{raw}"
+            );
+            assert!(parse_tri_state_alias(raw).is_ok(), "{raw}");
+        }
+        for raw in ["", "maybe", "yes", "ON", "2"] {
+            assert!(
+                field.validate(&ConfigValue::String(raw.into())).is_err(),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn tri_state_alias_accepts_on_off_auto_spellings_and_rejects_the_rest() {
+        for on in ["on", "1", "true"] {
+            assert_eq!(parse_tri_state_alias(on), Ok(Some(true)), "{on:?}");
+        }
+        for off in ["off", "0", "false"] {
+            assert_eq!(parse_tri_state_alias(off), Ok(Some(false)), "{off:?}");
+        }
+        assert_eq!(parse_tri_state_alias("auto"), Ok(None));
+        for bad in [
+            "", " ", "ON", "Off", "yes", "no", "2", "-1", "01", "1 ", "maybe",
+        ] {
+            let error = parse_tri_state_alias(bad).unwrap_err();
+            assert!(
+                error.contains("expected on, 1, true, off, 0, false or auto"),
+                "{bad:?}: {error}"
+            );
+        }
+    }
     #[test]
     fn tri_state_truth_table() {
         // Only the exact lower-case modes force; everything else, including

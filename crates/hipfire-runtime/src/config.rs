@@ -234,9 +234,13 @@ impl RuntimeConfig {
             ngram_window: value("HIPFIRE_NGRAM_WINDOW")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(256),
+            // `auto` is not an explicit arm here (the daemon-direct fallback);
+            // on/1/true is, via the shared strict tri-state parser.
             ngram_draft: matches!(
-                value("HIPFIRE_NGRAM_DRAFT").as_deref(),
-                Some("1") | Some("on")
+                value("HIPFIRE_NGRAM_DRAFT")
+                    .as_deref()
+                    .map(hipfire_config::parse_tri_state_alias),
+                Some(Ok(Some(true)))
             ),
             ngram_k: value("HIPFIRE_NGRAM_DRAFT_K")
                 .and_then(|v| v.parse().ok())
