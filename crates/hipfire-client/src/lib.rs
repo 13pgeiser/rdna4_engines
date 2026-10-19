@@ -549,6 +549,12 @@ pub type Result<T> = std::result::Result<T, ClientError>;
 #[cfg(test)]
 type EofHook = Arc<dyn Fn() + Send + Sync>;
 
+// A fork can inherit another test's writable fixture FD until its exec closes
+// CLOEXEC descriptors. Exclude fixture writes from every test-process spawn,
+// not just spawns of that fixture. Never hold this gate over child I/O or waits.
+#[cfg(test)]
+static FIXTURE_PROCESS_GATE: Mutex<()> = Mutex::new(());
+
 struct Dispatch {
     pending: Arc<Mutex<HashMap<(String, u64), mpsc::Sender<Value>>>>,
     control: Arc<Mutex<Option<mpsc::Sender<Value>>>>,
@@ -633,10 +639,14 @@ impl Engine {
             .stdout(Stdio::piped())
             .stderr(stderr)
             .envs(environment);
+        #[cfg(test)]
+        let fixture_process_guard = FIXTURE_PROCESS_GATE.lock().unwrap();
         let mut child = command.spawn().map_err(|source| ClientError::Spawn {
             path: daemon.to_owned(),
             source,
         })?;
+        #[cfg(test)]
+        drop(fixture_process_guard);
         let stdin = child.stdin.take().ok_or(ClientError::MissingStdin)?;
         let stdout = child.stdout.take().ok_or(ClientError::MissingStdout)?;
         let pending: Arc<Mutex<HashMap<(String, u64), mpsc::Sender<Value>>>> =
@@ -2102,21 +2112,8 @@ mod tests {
             &root,
             "#!/bin/sh\necho 'npu-trunk: rows=1 route=gpu (diagnostic)' >&2\nwhile IFS= read -r line; do\n case \"$line\" in *'\"unload\"'*) echo '{\"type\":\"unloaded\"}'; exit 0 ;; esac\ndone\n",
         );
-        let mut engine = None;
-        for attempt in 0..8u64 {
-            match Engine::spawn_with_stderr(&daemon, &BTreeMap::new(), Stdio::piped()) {
-                Ok(e) => {
-                    engine = Some(e);
-                    break;
-                }
-                // Parallel tests can hold the freshly written script open for writing.
-                Err(ClientError::Spawn { source, .. }) if source.raw_os_error() == Some(26) => {
-                    std::thread::sleep(std::time::Duration::from_millis(5 * (1 + attempt)));
-                }
-                Err(err) => panic!("spawn_with_stderr: {err}"),
-            }
-        }
-        let mut engine = engine.expect("spawn_with_stderr retried out");
+        let mut engine =
+            Engine::spawn_with_stderr(&daemon, &BTreeMap::new(), Stdio::piped()).unwrap();
         let stderr = engine.take_stderr().expect("piped stderr");
         assert!(engine.take_stderr().is_none(), "stderr is taken once");
         let mut line = String::new();
@@ -2637,14 +2634,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn reset_ack_full_validation_via_fake_daemon() {
-        use std::os::unix::fs::PermissionsExt;
         let root = env::temp_dir().join(format!("hipfire-client-reset-ack-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        let daemon = root.join("daemon");
         // First reset: full valid ack. Second: type-only legacy (must fail).
         // Third: valid shape but wrong attempt echo.
-        fs::write(
-            &daemon,
+        let daemon = write_fake_daemon(
+            &root,
             r#"#!/bin/sh
 n=0
 while IFS= read -r line; do
@@ -2663,9 +2657,7 @@ while IFS= read -r line; do
  esac
 done
 "#,
-        )
-        .unwrap();
-        fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let mut engine = spawn_fake_engine(&daemon);
         engine.reset(5).unwrap();
         assert_eq!(engine.last_state_epoch(), Some(1));
@@ -2722,14 +2714,11 @@ done
     #[cfg(unix)]
     #[test]
     fn load_eligible_then_malformed_clears_and_fails() {
-        use std::os::unix::fs::PermissionsExt;
         let root = env::temp_dir().join(format!("hipfire-client-load-elig-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        let daemon = root.join("daemon");
         // First load: valid eligible=true. Second: omits field (must fail closed
         // and clear prior eligibility).
-        fs::write(
-            &daemon,
+        let daemon = write_fake_daemon(
+            &root,
             r#"#!/bin/sh
 n=0
 while IFS= read -r line; do
@@ -2746,9 +2735,7 @@ while IFS= read -r line; do
  esac
 done
 "#,
-        )
-        .unwrap();
-        fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let mut engine = spawn_fake_engine(&daemon);
         let loaded = engine
             .load(Path::new("/tmp/m.hfq"), serde_json::json!({}))
@@ -2812,69 +2799,28 @@ done
     #[cfg(unix)]
     fn write_fake_daemon(root: &std::path::Path, script: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        // Drop any prior root so we never truncate an inode still executing
-        // from a PID-reused parallel test (ETXTBSY).
+        let _guard = FIXTURE_PROCESS_GATE.lock().unwrap();
+        // Recreate stale fixture roots without truncating an existing inode.
         let _ = fs::remove_dir_all(root);
         fs::create_dir_all(root).unwrap();
         let daemon = root.join("daemon");
+        // fs::write closes its writable FD before returning, still under the gate.
         fs::write(&daemon, script).unwrap();
         fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
         daemon
     }
 
-    /// Test-only spawn with bounded ETXTBSY retry (parallel PID-reused scripts).
     #[cfg(unix)]
     fn spawn_fake_engine(daemon: &std::path::Path) -> Engine {
-        const ETXTBSY: i32 = 26;
-        const MAX_ATTEMPTS: usize = 8;
-        let mut last = None;
-        for attempt in 0..MAX_ATTEMPTS {
-            match Engine::spawn(daemon, &BTreeMap::new()) {
-                Ok(engine) => return engine,
-                Err(ClientError::Spawn { source, path })
-                    if source.raw_os_error() == Some(ETXTBSY) =>
-                {
-                    last = Some(ClientError::Spawn { path, source });
-                    std::thread::sleep(std::time::Duration::from_millis(
-                        5u64.saturating_mul(1 + attempt as u64),
-                    ));
-                }
-                Err(err) => panic!("spawn_fake_engine non-retryable: {err}"),
-            }
-        }
-        panic!(
-            "spawn_fake_engine exhausted ETXTBSY retries: {}",
-            last.map(|e| e.to_string()).unwrap_or_default()
-        );
+        Engine::spawn(daemon, &BTreeMap::new()).unwrap()
     }
 
-    /// Same bounded ETXTBSY retry as `spawn_fake_engine`, for the configured path.
     #[cfg(unix)]
     fn spawn_fake_engine_configured(
         daemon: &std::path::Path,
         config: &hipfire_config::ProcessConfig,
     ) -> Engine {
-        const ETXTBSY: i32 = 26;
-        const MAX_ATTEMPTS: usize = 8;
-        let mut last = None;
-        for attempt in 0..MAX_ATTEMPTS {
-            match Engine::spawn_configured(daemon, &BTreeMap::new(), config, None) {
-                Ok(engine) => return engine,
-                Err(ClientError::Spawn { source, path })
-                    if source.raw_os_error() == Some(ETXTBSY) =>
-                {
-                    last = Some(ClientError::Spawn { path, source });
-                    std::thread::sleep(std::time::Duration::from_millis(
-                        5u64.saturating_mul(1 + attempt as u64),
-                    ));
-                }
-                Err(err) => panic!("spawn_fake_engine_configured non-retryable: {err}"),
-            }
-        }
-        panic!(
-            "spawn_fake_engine_configured exhausted ETXTBSY retries: {}",
-            last.map(|e| e.to_string()).unwrap_or_default()
-        );
+        Engine::spawn_configured(daemon, &BTreeMap::new(), config, None).unwrap()
     }
 
     #[cfg(unix)]
@@ -3485,12 +3431,15 @@ done
         let engine = spawn_fake_engine(&daemon);
         let pid = engine.child_id();
         let pid_alive = |pid: u32| {
-            Command::new("kill")
-                .args(["-0", &pid.to_string()])
-                .stderr(Stdio::null())
-                .status()
-                .unwrap()
-                .success()
+            let mut child = {
+                let _guard = FIXTURE_PROCESS_GATE.lock().unwrap();
+                Command::new("kill")
+                    .args(["-0", &pid.to_string()])
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap()
+            };
+            child.wait().unwrap().success()
         };
         assert!(pid_alive(pid), "daemon runs before terminate");
         assert!(
@@ -4362,8 +4311,7 @@ done
 
     #[cfg(unix)]
     fn dummy_child() -> Child {
-        // A system executable avoids racing a prior test process that still
-        // has a generated script open, which can make spawn fail with ETXTBSY.
+        let _guard = FIXTURE_PROCESS_GATE.lock().unwrap();
         Command::new("cat")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -4374,6 +4322,7 @@ done
 
     #[cfg(not(unix))]
     fn dummy_child() -> Child {
+        let _guard = FIXTURE_PROCESS_GATE.lock().unwrap();
         Command::new("cmd")
             .args(["/C", "pause"])
             .stdin(Stdio::piped())
@@ -4386,22 +4335,28 @@ done
     fn dummy_stdin() -> ChildStdin {
         // Take from a short-lived child; Engine tests that only call
         // validate_reset_ack never write.
-        let mut child = Command::new("true")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("true");
+        let mut child = {
+            let _guard = FIXTURE_PROCESS_GATE.lock().unwrap();
+            Command::new("true")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("true")
+        };
         child.stdin.take().expect("stdin")
     }
 
     fn dummy_stdout() -> std::process::ChildStdout {
-        let mut child = Command::new("true")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("true");
+        let mut child = {
+            let _guard = FIXTURE_PROCESS_GATE.lock().unwrap();
+            Command::new("true")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("true")
+        };
         child.stdout.take().expect("stdout")
     }
 
