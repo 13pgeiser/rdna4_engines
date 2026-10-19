@@ -937,10 +937,13 @@ request run alone on the singleton route. **Default off, experimental.**
   per-lane policy; adaptive over `1..=min(lanes, 2 * stages)` under a shared
   policy; the developer variables `HIPFIRE_PP_LANE_GROUPS=<G>` and
   `HIPFIRE_FN_LANE_POLICY=<spec>` override group count and stage policy, see
-  [env-vars.md](env-vars.md)). On gfx1201 every row-local stage runs per lane
-  until grouped stages
-  are certified. The multi-card GPU gates and all performance figures are
-  **pending**; no throughput or speedup claim is made. Details:
+  [env-vars.md](env-vars.md)). Row-local stages run once over all lanes'
+  rows only where per-stage proof rows cover the bound routes (gfx1201: PP2
+  mq2 and EP2 mq4, byte-exact against the topology singleton); every other
+  stage runs per lane. Measured on 2x R9700 (16 prompts x 256 tokens, 3 fresh
+  processes per arm), aggregate output at C8 is 1.97x (PP2) and 1.83x (EP2)
+  the batching-off C1, and batching on costs C1 0.3% (PP2) and 2.2% (EP2).
+  Like the single-card route it stays default-off. Details:
   [multi-gpu.md](multi-gpu.md#flash-next-fn-lanes-continuous-batching-under-pp-and-ep).
 
 The loaded ack reports `continuous_batch_route: "fn-lanes"`,

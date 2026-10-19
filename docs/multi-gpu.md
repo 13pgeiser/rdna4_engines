@@ -963,10 +963,10 @@ The synthetic `hipfire bench --matrix` probes
 
 With `serve.vmm_batch` on, a Qwen4 load under `topology.pp` or `topology.ep`
 (`2..=8`) stages the same exact **AR fn-lanes** route as a single card
-(`continuous_batch_route = "fn-lanes"`, greedy-only lanes). The only evidence
-on this page is two byte-identity receipts (PP2 mq2, and EP2 mq4; see the
-stage-policy bullet below). No throughput, per-stream, latency or speedup
-figure is measured or claimed for these topologies by this page.
+(`continuous_batch_route = "fn-lanes"`, greedy-only lanes), default-off like
+the single-card route. Exactness rests on two byte-identity receipts (PP2 mq2,
+and EP2 mq4; see the stage-policy bullet below); the serve figures are in the
+**Measured** bullet at the end of this section.
 
 - **Staging and admission.** Lanes are staged after the weights, from each
   device's remaining free memory. The check is per device: every band (PP) or
@@ -1092,6 +1092,22 @@ figure is measured or claimed for these topologies by this page.
   arms, which forwards the configured `topology.pp` (load `params.pp`) and the
   configured `topology.ep` (daemon process config), so the sweep measures the
   PP/EP topology configured for the model.
+- **Measured (S1, 2x R9700 gfx1201, 2026-10-19).** Serve, greedy, thinking
+  off, 16 prompts x 256 tokens, `continuous_batch_size` 8, K closed-loop
+  clients, 3 fresh processes per arm (PP batching-off C1: 4), the
+  packet binaries against its parent with batching off. Output tok/s (mean);
+  ratios against the batching-off C1. Every cell's text equals the
+  batching-off text, and the stacked oracle cells on the same binaries passed
+  (PP2 K=1, 8; EP2 K=3, 5, 6, 7; ids and logits).
+
+  | topology | off C1 (parent) | off C1 | on C1 | on C4 | on C8 |
+  |---|---|---|---|---|---|
+  | PP2 mq2-xts | 50.01 | 49.90 (median 49.99 vs 49.95) | 49.88 (−0.3%) | 79.19 (1.58x) | 98.61 (1.97x) |
+  | EP2 mq4-xts | 45.80 | 45.46 (median 45.89 vs 45.82) | 44.78 (−2.2%) | 75.38 (1.65x) | 83.72 (1.83x) |
+
+  A global default flip of `serve.vmm_batch` still needs single-card
+  Flash-Next C1/C4/C8 with batching on (C1 no regression, C4/C8 above C1, 3
+  fresh processes per arm).
 
 #### Qualify a box: `fn-ep-gate` mode `pp`
 
