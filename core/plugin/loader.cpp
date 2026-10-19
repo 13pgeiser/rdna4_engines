@@ -234,6 +234,12 @@ int Registry::commit_(Staged& s, int order) {
         p.arch_video_pack =
             dl_fn<int64_t (*)(const RadVideoGeom*, const int32_t*, int32_t*, int64_t, float*,
                               int64_t)>(s.handle, "rad_arch_video_pack");
+        /* Optional: the merged modulation-group boundaries the norm reads (a subset of the pack's
+         * fine segment boundaries). Absent, the driver stages the fine table into the norm operand
+         * -- fine whenever nothing merges. */
+        p.arch_video_mod_segs =
+            dl_fn<int64_t (*)(const RadVideoGeom*, const int32_t*, int32_t*, int64_t)>(
+                s.handle, "rad_arch_video_mod_segs");
         /* Optional: the encode passes' geometry; absent means the driver runs no encode pass. */
         p.arch_encode_geom =
             dl_fn<int64_t (*)(int32_t, const int64_t*, int32_t*, int64_t)>(

@@ -294,6 +294,11 @@ VideoPackFn rad_tools_video_pack(const LoadedPlugins& lp) {
     return ap ? ap->arch_video_pack : nullptr;
 }
 
+VideoModSegsFn rad_tools_video_mod_segs(const LoadedPlugins& lp) {
+    const Plugin* ap = rad_tools_registry().plugin(lp.arch_plugin);
+    return ap ? ap->arch_video_mod_segs : nullptr;
+}
+
 EncodeGeomFn rad_tools_encode_geom(const LoadedPlugins& lp) {
     const Plugin* ap = rad_tools_registry().plugin(lp.arch_plugin);
     return ap ? ap->arch_encode_geom : nullptr;

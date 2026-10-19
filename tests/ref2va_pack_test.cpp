@@ -262,4 +262,89 @@ TEST(pack_ref_kinds_predicates) {
     CHECK(!ref2va_is_audio(kR2VRefImg) && !ref2va_is_img(kR2VRefAudio));
 }
 
+TEST(pack_mod_groups_images_collapse_to_four) {
+    /* Nine reference photos -- the reference-to-video workflow's request. Every photo is a
+     * video-pinned reference block sharing ONE modulation cell, so all nine merge into a single
+     * group: the sequence collapses to FOUR groups (prompt, all-photos, soundtrack, video) whatever
+     * the photo count. This merge is what lets a nine-photo request ride the fixed kMaxSegs-wide
+     * modulation table that its twelve fine segments would otherwise overrun. */
+    Ref2VAGeom g{ 2, 8, 8, 3 };
+    std::vector<Ref2VARef> refs(9, Ref2VARef{ kR2VRefImage, 6, 6, 1, 0 });
+    Ref2VAPack p;
+    CHECK_EQ(ref2va_build(7, g, {}, refs, &p), 0);
+    CHECK_EQ(p.segs.size(), 12u);                    /* text + 9 photos + audio + video */
+
+    const int64_t S = 24;
+    Ref2VAModGroups grp;
+    ref2va_mod_groups(p, S, &grp);
+    CHECK_EQ(grp.md.size(), 4u);
+    CHECK(grp.md == std::vector<int>({ 1, 0, 2, 0 }));        /* text, photos, audio, video */
+    /* Cells: text and the video target read the video schedule (r0 = 0); the photos read the
+     * video-PINNED block (2S); the soundtrack reads the audio schedule (S). */
+    CHECK(grp.r0 == std::vector<int64_t>({ 0, 2 * S, S, 0 }));
+    CHECK_EQ(grp.bound.size(), 5u);
+    CHECK_EQ(grp.bound.front(), 0);
+    CHECK_EQ(grp.bound.back(), p.rows);
+    /* The photo group's span is the whole run of reference rows: it starts where the prompt ends and
+     * ends where the soundtrack starts -- the two fine boundaries that survive the merge. */
+    const int64_t text_end = p.segs[0].end, audio_start = p.segs[p.segs.size() - 2].start;
+    CHECK_EQ(grp.bound[1], text_end);
+    CHECK_EQ(grp.bound[2], audio_start);
+}
+
+TEST(pack_mod_groups_invariants_over_the_goldens) {
+    /* For every golden pack: the merged boundaries span the sequence and are a strictly-increasing
+     * SUBSET of the fine segment boundaries (so no fine segment is ever split); every fine segment
+     * lies wholly inside one group whose modality is the segment's own tag; no two adjacent groups
+     * share a cell (the merge is maximal -- had they, they would have collapsed); and the merge is
+     * independent of the step count S -- the driver derives it at S = 1, the denoiser at the real S,
+     * so the boundaries must be identical for the two tables to line up. */
+    for (const char* name : { "t2va", "fl2va", "ref2va_all", "chain", "no_text" }) {
+        const Ref2VAPack p = build_case(golden()[name]);
+        Ref2VAModGroups a, b;
+        ref2va_mod_groups(p, 1, &a);
+        ref2va_mod_groups(p, 64, &b);
+        CHECK(a.bound == b.bound);
+        CHECK(!a.bound.empty());
+        CHECK_EQ(a.bound.front(), 0);
+        CHECK_EQ(a.bound.back(), p.rows);
+        for (size_t i = 0; i + 1 < a.bound.size(); ++i)
+            CHECK(a.bound[i] < a.bound[i + 1]);
+        /* every boundary is a fine boundary (a segment start, or the closing rows count) */
+        for (int64_t x : a.bound) {
+            bool found = (x == p.rows);
+            for (const Ref2VASeg& s : p.segs) if (s.start == x) found = true;
+            CHECK(found);
+        }
+        /* every fine segment sits whole in a group carrying its own modality */
+        for (const Ref2VASeg& s : p.segs) {
+            if (s.end <= s.start) continue;
+            size_t g = 0;
+            while (g + 1 < a.bound.size() && a.bound[g + 1] <= s.start) ++g;
+            CHECK(a.bound[g] <= s.start && s.end <= a.bound[g + 1]);
+            CHECK_EQ(a.md[g], ref2va_seg_tag(s.kind));
+        }
+        /* adjacent groups differ in (md, r0) -- merging left no mergeable neighbours */
+        for (size_t i = 0; i + 1 < a.md.size(); ++i)
+            CHECK(a.md[i] != a.md[i + 1] || a.r0[i] != a.r0[i + 1]);
+    }
+}
+
+TEST(pack_mod_groups_plain_equals_the_fine_table) {
+    /* A plain [text | audio | video] pack has three distinct cells -- no two share one -- so it
+     * merges to exactly the three fine groups and its boundaries equal the fine ones. That is why
+     * a driver with no mod-seg export can stage the fine table into the norm operand unchanged and
+     * reproduce the pre-merge output byte for byte. */
+    Ref2VAPack p;
+    Ref2VAGeom g{ 3, 8, 10, 4 };
+    CHECK_EQ(ref2va_build(5, g, {}, {}, &p), 0);
+    Ref2VAModGroups grp;
+    ref2va_mod_groups(p, 32, &grp);
+    CHECK_EQ(grp.md.size(), 3u);
+    CHECK(grp.md == std::vector<int>({ 1, 2, 0 }));              /* text, audio, video */
+    CHECK(grp.r0 == std::vector<int64_t>({ 0, 32, 0 }));         /* video sched, audio sched, video */
+    CHECK_EQ(grp.bound.size(), 4u);
+    CHECK(grp.bound == std::vector<int64_t>({ 0, 5, 13, 5 + 8 + 60 }));
+}
+
 RAD_TEST_MAIN()

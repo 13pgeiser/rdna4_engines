@@ -958,12 +958,17 @@ typedef struct RadVideoGenDecl {
      * denoiser reads `ref_tab`, so this flag is what makes staging and consumption flip together. */
     int32_t       ref_rows;
 
-    /* The largest segment count this generator's modulation table holds: its denoiser lays out one
-     * modulation cell per pack segment, and the table is sized `kMaxSegs` columns. A conditioned
-     * pack whose segments exceed this cannot be built -- the step would abort the engine. The driver
-     * refuses such a request at submit (it lays the pack out itself, so it knows the count before
-     * dispatch) rather than letting the arch fail mid-generation. 0 = no reference consumption, so
-     * no such limit. Trailing since ABI 23: an older plugin declares none and keeps the 0 default. */
+    /* The largest MODULATION-GROUP count this generator's modulation table holds -- its denoiser's
+     * `kMaxSegs`. A modulation cell is a pure function of a segment's KIND (its modality and its
+     * timestep-embedding block), so runs of consecutive segments that share a cell collapse into one
+     * group and the table is sized by the GROUP count, not the reference count: nine reference photos
+     * pack into four groups (prompt, all-photos, soundtrack, video). The attention still takes the
+     * FINE per-segment table (which may hold far more segments than this), so this is not a limit on
+     * how many references ride -- only on how many DISTINCT cells the sequence changes through. The
+     * driver refuses a request whose merged group count exceeds it at submit (it lays the pack out and
+     * merges it itself, via `rad_arch_video_mod_segs`, so it knows before dispatch) rather than letting
+     * the arch abort mid-generation. 0 = no reference consumption, so no such limit. Trailing since
+     * ABI 23: an older plugin declares none and keeps the 0 default. */
     int32_t       max_ref_segs;
 } RadVideoGenDecl;
 

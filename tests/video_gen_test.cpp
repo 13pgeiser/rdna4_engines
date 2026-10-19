@@ -214,10 +214,11 @@ struct VideoFixture {
     }
     int start_with_encode_gen(gen::VideoDriver::EncodeGeomFn enc) {
         return drv.init(prog, fake_positions, { gen::VideoDriver::RankIO{} }, nullptr, nullptr,
-                        enc);
+                        nullptr, enc);
     }
     int start_with_pack_encode(gen::VideoDriver::PackFn pack, gen::VideoDriver::EncodeGeomFn enc) {
-        return drv.init(prog, fake_positions, { gen::VideoDriver::RankIO{} }, nullptr, pack, enc);
+        return drv.init(prog, fake_positions, { gen::VideoDriver::RankIO{} }, nullptr, pack,
+                        nullptr, enc);
     }
     std::unique_ptr<gen::VideoRequest> req(int32_t chunks = 2, int32_t steps = 0) {
         auto r = std::make_unique<gen::VideoRequest>();

@@ -181,6 +181,7 @@ int64_t carve(const RadVideoGenDecl& d, int64_t max_tok, int64_t ep, int64_t pd,
         d.max_enc_frames * d.max_enc_side * d.max_enc_side * 3 * 4,   /* R_ENCPX: [f,h,w,3] f32 */
         d.max_enc_samples * d.audio_channels * 4,                     /* R_ENCSM: [ch,n] f32 */
         25 * 4,                        /* R_ENCG: rad_arch_encode_geom's 25 i32 (the video geom) */
+        kSegCap * 4,                   /* R_MOD: the merged modulation-group boundaries (<= R_SEG) */
     };
     int64_t off = 0;
     for (int r = 0; r < n; ++r) {
@@ -223,7 +224,7 @@ int64_t VideoDriver::device_bytes(const Program& prog) {
 
 int VideoDriver::init(const Program& prog, PositionsFn positions,
                       const std::vector<RankIO>& ranks, SegsFn segs, PackFn pack,
-                      EncodeGeomFn enc_geom) {
+                      ModSegsFn mod_segs, EncodeGeomFn enc_geom) {
     fini();
     if (!prog.is_video_generator()) return RAD_E_STATE;
     decl_  = prog.video_gen;
@@ -234,6 +235,7 @@ int VideoDriver::init(const Program& prog, PositionsFn positions,
     positions_ = positions;
     segs_ = segs;
     pack_ = pack;
+    mod_segs_ = mod_segs;
     enc_geom_ = enc_geom;
     max_tok_ = prog.ctx.max_tok;
     encoder_bounds(prog, &max_enc_, &patch_dim_);
@@ -430,18 +432,32 @@ int VideoDriver::submit(std::unique_ptr<VideoRequest> r, std::string* why) {
             return no("the reference conditioning layout has no closing segment boundary");
         j->seg.resize((size_t)nseg);
         j->nseg = nseg;
-        /* The denoiser lays out one modulation cell per segment and its table is a fixed width the
-         * arch declares; a pack wider than it would abort the step mid-generation and take the
-         * engine with it. Refuse here, at submit, where a clean answer is still possible. */
-        const int nsegs = nseg - 1;   /* `seg` is boundaries: one more than the segments */
-        if (d.max_ref_segs > 0 && nsegs > d.max_ref_segs) {
-            const int nrefs = j->ref_tab.empty() ? 0 : j->ref_tab[0];
-            const int64_t fit = (int64_t)d.max_ref_segs - (nsegs - nrefs);   /* the fixed non-ref cells */
-            return no("these references lay the conditioning out in " + std::to_string(nsegs) +
-                      " sequence segments but this deployment's conditioning table holds " +
-                      std::to_string(d.max_ref_segs) + ", so at most " +
-                      std::to_string(fit < 0 ? 0 : (int)fit) + " fit -- ask for fewer references");
+        /* The modulation groups. A modulation cell is fixed by a segment's kind, so the denoiser
+         * merges runs of consecutive same-cell segments and pitches its fixed-width table by the
+         * GROUP count, not the reference count -- which is how nine reference photos (four groups:
+         * prompt, all-photos, soundtrack, video) ride a table the fine layout (twelve segments)
+         * would overrun. The plugin merges for us (rad_arch_video_mod_segs); one that exports none
+         * merges nothing, so the group table is the fine one and the older per-segment ceiling
+         * applies. Refuse over-wide merges here, at submit, where a clean answer is still possible. */
+        int nmod = -1;
+        if (mod_segs_) {
+            j->mod_seg.assign((size_t)kSegCap, 0);
+            nmod = (int)mod_segs_(&j->geom, j->ref_tab.data(), j->mod_seg.data(), kSegCap);
+            if (nmod < 0 || nmod > kSegCap)
+                return no("the model could not merge the reference conditioning into its "
+                          "modulation groups");
+            j->mod_seg.resize((size_t)nmod);
+        } else {
+            nmod = nseg;                 /* nothing merges: the groups are the fine segments */
+            j->mod_seg = j->seg;
         }
+        j->nmod = nmod;
+        const int ngroups = nmod - 1;    /* `mod_seg` is boundaries: one more than the groups */
+        if (d.max_ref_segs > 0 && ngroups > d.max_ref_segs)
+            return no("these references change the conditioning's modulation cell " +
+                      std::to_string(ngroups) + " times, but this deployment's modulation table holds " +
+                      std::to_string(d.max_ref_segs) + " cells -- ask for references that share their "
+                      "modalities and target, or fewer of them");
         /* `rows` stays the plain text+audio+video count: every non-step pass (encode, decode,
          * audio, upscale) stages its own segment table and target counts from it and must see the
          * bytes it sees today. Only build_step runs at the widened `step_rows`. */
@@ -677,6 +693,18 @@ void VideoDriver::stage_geom(const Job& j, const RadVideoGeom& g0, int64_t rows,
         }
         reg_[R_SEG].used = 4 * 4;
     }
+    /* The norm's merged boundaries. On a widened step that is the plugin's merged group table (a
+     * subset of the fine one just staged into R_SEG); on the plain path and every non-step pass it
+     * is the fine table verbatim -- nothing merges there, so the norm reads the same bytes as the
+     * attention and the generated output is exactly what it was before this operand split. */
+    int32_t* mod = hptr<int32_t>(R_MOD);
+    if (wide && j.nmod > 0) {
+        std::memcpy(mod, j.mod_seg.data(), j.mod_seg.size() * sizeof(int32_t));
+        reg_[R_MOD].used = (int64_t)j.mod_seg.size() * 4;
+    } else {
+        std::memcpy(mod, seg, reg_[R_SEG].used);
+        reg_[R_MOD].used = reg_[R_SEG].used;
+    }
     int32_t* lat = hptr<int32_t>(R_LAT);
     lat[0] = 0;
     lat[1] = (int32_t)video_rows;
@@ -710,6 +738,7 @@ void VideoDriver::base_batches(const Job& j, const RadVideoGeom& g, int64_t n_to
         V.lane_d = dptr<int32_t>(ri, R_LANE);
         V.first_d = dptr<int32_t>(ri, R_FIRST);
         V.seg_cu = dptr<int32_t>(ri, R_SEG);
+        V.mod_cu = dptr<int32_t>(ri, R_MOD);
         V.lat_cu = dptr<int32_t>(ri, R_LAT);
         V.n_steps = j.sched.steps;
         V.t_video = dptr<float>(ri, R_TV);

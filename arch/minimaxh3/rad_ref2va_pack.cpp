@@ -271,6 +271,44 @@ int ref2va_mod_rows(const Ref2VAPack& p, double t_v, double t_a, std::vector<int
     return 0;
 }
 
+/* A kind's modulation cell, independent of the timesteps -- the single source shared with the arch's
+ * ref_cell_of. The blocks are [0,S) video schedule, [S,2S) audio schedule, [2S,3S) video-pinned,
+ * [3S,4S) audio-pinned; `r0` is a block's first row. The two target streams read their schedule;
+ * every reference block reads its modality's pinned block (filled with embed(max(t,pin))). */
+static void cell_of_kind(int kind, int64_t S, int* md, int64_t* r0) {
+    switch (kind) {
+        case kR2VAudio:     *md = 2; *r0 = S;     break;  /* audio schedule */
+        case kR2VCondAudio:
+        case kR2VRefAudio:  *md = 2; *r0 = 2 * S; break;  /* audio-pinned block */
+        case kR2VText:      *md = 1; *r0 = 0;     break;  /* video schedule */
+        case kR2VCond:
+        case kR2VRefImg:    *md = 0; *r0 = 2 * S; break;  /* video-pinned block */
+        default:            *md = 0; *r0 = 0;     break;  /* video target: video schedule */
+    }
+}
+
+void ref2va_mod_groups(const Ref2VAPack& p, int64_t S, Ref2VAModGroups* out) {
+    out->bound.clear(); out->md.clear(); out->r0.clear();
+    /* Walk the segments in sequence order, opening a new group whenever the cell changes or a gap
+     * would otherwise appear. Empty segments carry no rows: they neither extend nor split a group,
+     * so a run of photos with an empty cond between them still rides one cell. */
+    int cur_md = 0; int64_t cur_r0 = 0; bool open = false;
+    int64_t prev_end = 0;
+    for (const Ref2VASeg& s : p.segs) {
+        if (s.end <= s.start) continue;
+        int md; int64_t r0;
+        cell_of_kind(s.kind, S, &md, &r0);
+        if (!open || md != cur_md || r0 != cur_r0 || s.start != prev_end) {
+            if (open) out->bound.push_back(s.start);   /* close the previous group at this start */
+            else      out->bound.push_back(0);
+            cur_md = md; cur_r0 = r0; open = true;
+            out->md.push_back(md); out->r0.push_back(r0);
+        }
+        prev_end = s.end;
+    }
+    if (open) out->bound.push_back(p.rows);   /* the last group runs to the end of the sequence */
+}
+
 void ref2va_ada_cell(const Ref2VAPack& p, double t_v, double t_a, std::vector<int>* md,
                      std::vector<int>* trow) {
     md->resize(p.segs.size());

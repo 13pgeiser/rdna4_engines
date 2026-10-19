@@ -110,6 +110,12 @@ using VideoPackFn = int64_t (*)(const RadVideoGeom*, const int32_t*, int32_t*, i
                                 int64_t);
 VideoPackFn rad_tools_video_pack(const LoadedPlugins& plugins);
 
+/* The architecture plugin's merged modulation-group boundaries (rad_arch_video_mod_segs), or null
+ * when it exports none -- the driver then stages the fine segment table into the norm operand, which
+ * is correct for any pack that merges nothing (plain or single-reference). */
+using VideoModSegsFn = int64_t (*)(const RadVideoGeom*, const int32_t*, int32_t*, int64_t);
+VideoModSegsFn rad_tools_video_mod_segs(const LoadedPlugins& plugins);
+
 /* The architecture plugin's encode-pass geometry (rad_arch_encode_geom), or null when it
  * exports none -- the driver then runs no encode pass. */
 using EncodeGeomFn = int64_t (*)(int32_t, const int64_t*, int32_t*, int64_t);

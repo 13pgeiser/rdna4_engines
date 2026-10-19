@@ -108,6 +108,27 @@ enum Ref2VATRow { kR2VTVideo = 0, kR2VTAudio = 1, kR2VTPinVideo = 2, kR2VTPinAud
 void ref2va_ada_cell(const Ref2VAPack& p, double t_v, double t_a, std::vector<int>* md,
                      std::vector<int>* trow);
 
+/* ---- merged modulation groups ----
+ * The denoiser lays out one modulation cell per fine segment, but a cell is a pure function of a
+ * segment's KIND (see the arch's ref_cell_of: `md` the modality's ada projection, `r0` the
+ * timestep-embedding block), so every reference photo reads ONE cell, every reference soundtrack
+ * another, and so on -- independent of how many there are. The modulated-norm kernel reads a row's
+ * cell from a segment-boundary operand (its `cu`), used ONLY to select the modulation/gate row: it
+ * is not otherwise segment-sensitive. So runs of CONSECUTIVE segments that share a cell collapse
+ * into one group, and the norm is handed the coarser group boundaries while attention keeps the
+ * fine per-reference segments. The modulation table is then sized by the group count, not the
+ * reference count -- which is what lets a wide reference request (up to nine photos) ride a fixed
+ * table. Groups cover the whole sequence: boundaries start at 0 and end at `rows`. Empty segments
+ * (end <= start) carry no rows and open no boundary. `md`/`r0` are per group, for the table writer. */
+struct Ref2VAModGroups {
+    std::vector<int64_t> bound;   /* [count + 1]: cumulative row boundaries, [0 .. rows] */
+    std::vector<int> md;          /* [count]: the group's ada projection (0 video, 1 text, 2 audio) */
+    std::vector<int64_t> r0;      /* [count]: the timestep-embedding block the group's cell reads */
+};
+/* `S` is the sampler's step count (the embedding's per-schedule row span); it fixes the pinned
+ * blocks at [2S,3S) video / [3S,4S) audio, exactly as the arch's ref_cell_of does. */
+void ref2va_mod_groups(const Ref2VAPack& p, int64_t S, Ref2VAModGroups* out);
+
 /* Lay the sequence out. Returns 0, or -1 on a negative dimension (the driver has already bounded
  * media against the arch's ceilings; this only refuses nonsense). */
 int ref2va_build(int text_len, const Ref2VAGeom& g, const std::vector<Ref2VAKeyframe>& keyframes,

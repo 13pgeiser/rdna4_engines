@@ -39,15 +39,19 @@ public:
     using SegsFn      = int64_t (*)(const RadVideoGeom*, int32_t*, int64_t);
     using PackFn      = int64_t (*)(const RadVideoGeom*, const int32_t*, int32_t*, int64_t,
                                     float*, int64_t);
+    using ModSegsFn   = int64_t (*)(const RadVideoGeom*, const int32_t*, int32_t*, int64_t);
     using EncodeGeomFn = int64_t (*)(int32_t, const int64_t*, int32_t*, int64_t);
 
     /* `positions` is the plugin's rad_arch_video_positions; `segs`, optional, is its
      * rad_arch_video_segs (null = the driver stages the plain segment table itself); `pack`,
      * optional, is its rad_arch_video_pack (null = reference-conditioned sequences cannot be
-     * laid out and such requests are refused); `enc_geom`, optional, is its
+     * laid out and such requests are refused); `mod_segs`, optional, is its
+     * rad_arch_video_mod_segs (null = the driver stages the fine segment table into the norm's
+     * operand too, correct for any pack that merges nothing); `enc_geom`, optional, is its
      * rad_arch_encode_geom (null = no encode pass runs). */
     int  init(const Program& prog, PositionsFn positions, const std::vector<RankIO>& ranks,
-              SegsFn segs = nullptr, PackFn pack = nullptr, EncodeGeomFn enc_geom = nullptr);
+              SegsFn segs = nullptr, PackFn pack = nullptr, ModSegsFn mod_segs = nullptr,
+              EncodeGeomFn enc_geom = nullptr);
     void fini();
     ~VideoDriver() override { fini(); }
 
@@ -94,6 +98,13 @@ private:
         bool                 ref_wide = false;
         int32_t              nseg = 0;
         std::vector<int32_t> seg;
+        /* The same layout merged to modulation groups: consecutive segments sharing a cell collapse,
+         * so `mod_seg` holds a SUBSET of `seg`'s boundaries and `nmod` (its count) is what the
+         * modulation table -- `nmod - 1` cells -- is pitched by. The attention still runs on the fine
+         * `seg`; only the norm reads `mod_seg`. Empty on the plain path (there the driver stages the
+         * plain table into both operands). */
+        std::vector<int32_t> mod_seg;
+        int32_t              nmod = 0;
         int64_t              lat_v = 0, lat_a = 0;
         /* The denoising step's row count: the widened total once references ride, otherwise equal
          * to `rows`. Only build_step uses it -- the encode, decode, audio and upscale passes keep
@@ -144,9 +155,13 @@ private:
     /* R_ENCPX/R_ENCSM/R_ENCG stage one media item for a Vencode/Aencode pass: the encoder-ready
      * pixels ([frames,h,w,3] f32) or samples ([ch,n] f32) and the encode geometry the plugin's
      * rad_arch_encode_geom returned, staged verbatim as device i32 for the kernels to read. */
+    /* R_MOD is the norm's segment boundaries: the merged modulation-group table (a subset of
+     * R_SEG's), which the modulated norm reads for its per-cell modulation while the attention
+     * reads the fine R_SEG. The step stages the merged table; every other pass, and the plain
+     * path, stages R_SEG's bytes into it as well. */
     enum { R_TOK, R_POS, R_CU, R_ROPE, R_GEOM, R_SCHED, R_TV, R_TA, R_SEED, R_LANE, R_FIRST,
            R_SEG, R_LAT, R_UP, R_MMROW, R_ENCPIX, R_ENCCRD, R_ENCCU,
-           R_ENCPX, R_ENCSM, R_ENCG, R_N };
+           R_ENCPX, R_ENCSM, R_ENCG, R_MOD, R_N };
 
     template <class T> T* hptr(int r) const { return reinterpret_cast<T*>(host_ + reg_[r].off); }
     template <class T> T* dptr(int rank, int r) const {
@@ -182,6 +197,7 @@ private:
     PositionsFn         positions_ = nullptr;
     SegsFn              segs_ = nullptr;
     PackFn              pack_ = nullptr;
+    ModSegsFn           mod_segs_ = nullptr;
     EncodeGeomFn        enc_geom_ = nullptr;
     int64_t             max_tok_ = 0;
     /* The conditioning's encoder view: the tower's per-patch width and the patches one pass

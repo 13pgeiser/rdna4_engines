@@ -1518,7 +1518,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         auto d = std::make_unique<gen::VideoDriver>();
         RAD_TRY(d->init(ranks_[0]->program, rad_tools_video_positions(plugins_), gio,
                         rad_tools_video_segs(plugins_), rad_tools_video_pack(plugins_),
-                        rad_tools_encode_geom(plugins_)));
+                        rad_tools_video_mod_segs(plugins_), rad_tools_encode_geom(plugins_)));
         vid_gen_ = d.get();
         gen_ = std::move(d);
         RAD_TRY(rad_dev_set(ranks_[0]->device));

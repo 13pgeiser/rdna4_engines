@@ -506,6 +506,18 @@ typedef struct RadVideoGenBatch {
      * latent frames and its audio latents, 0 where the kind carries neither. A batch without
      * the field laid out is one an older engine built: no references. Trailing since ABI 23. */
     const int32_t*  ref_tab;
+
+    /* ---- The modulated-norm's segment boundaries, device i32. The denoiser's attention reads the
+     * FINE `seg_cu` -- one segment per reference block, which the block-sparse attention needs to
+     * give each reference its own prefix sink -- but the modulated norm reads a COARSER table:
+     * consecutive segments that share a modulation cell (the same modality and the same
+     * timestep-embedding block) merge into one, because a cell is a pure function of a segment's
+     * kind. This is that merged table's boundaries, a subset of `seg_cu`'s -- every fine boundary
+     * that is also a cell change. Sizing the modulation table by the GROUP count, not the reference
+     * count, is what lets a wide reference request (up to nine photos, which pack into four groups)
+     * ride a fixed table. On a plain request (or one that merges nothing) it is exactly `seg_cu`; a
+     * driver stages the same bytes into both. Trailing since ABI 23. */
+    const int32_t*  mod_cu;
 } RadVideoGenBatch;
 
 /* RadVideoGenBatch::enc_kind: which reference media an encode pass carries. A plugin's latent
