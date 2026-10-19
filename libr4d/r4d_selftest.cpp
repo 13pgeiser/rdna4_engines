@@ -4257,10 +4257,13 @@ static float mxfp4_act(int64_t i, int64_t k, uint32_t seed) {
  *
  * `ablk` passes the activation scale on the block-scaled fp8 grid, one f32 per (row, 128 of K), as
  * fused quantisers write it. Scales span two decades, and every eleventh block's is zero with zero
- * codes (an all-zero activation block), where the kernels carry their previous scale through. */
+ * codes (an all-zero activation block), where the kernels carry their previous scale through.
+ *
+ * The output starts as NaN, so a column a kernel never writes fails the check instead of reading
+ * as the zero a fresh allocation holds. `row0`, when given, receives the first row's bits. */
 static void mxfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_t N, int64_t K,
                             int tn, bool ablk = false, std::vector<RadParam> extra = {},
-                            int64_t pb1 = 0, int64_t pb2 = 0) {
+                            int64_t pb1 = 0, int64_t pb2 = 0, std::vector<uint16_t>* row0 = nullptr) {
     if (!sel(row)) return;
     /* Parts (ParoQuant): weight rows [0, pb1), [pb1, pb2), [pb2, N) each meet their own copy of
      * the activation, side by side in a row. `K` is one copy's width. */
@@ -4311,7 +4314,7 @@ static void mxfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_
             av[(size_t)(i * PK + k)] = rad_load_f32(ha.data(), RAD_F8E4M3, i * PK + k);
         }
     }
-    std::vector<uint16_t> hy((size_t)(M * N), 0);
+    std::vector<uint16_t> hy((size_t)(M * N), 0x7fc0);    /* bf16 NaN */
     void* d_a = dalloc(ha.size());
     void* d_s = dalloc(as.size() * 4);
     void* d_w = dalloc(wq.size());
@@ -4319,6 +4322,7 @@ static void mxfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_
     void* d_r = dalloc(wr.size());
     void* d_y = dalloc(hy.size() * 2);
     if (!d_a || !d_s || !d_w || !d_e || !d_r || !d_y) { ok(nm, false, "hipMalloc failed"); return; }
+    st_memcpy(d_y, hy.data(), hy.size() * 2, hipMemcpyHostToDevice);
     st_memcpy(d_a, ha.data(), ha.size(), hipMemcpyHostToDevice);
     st_memcpy(d_s, as.data(), as.size() * 4, hipMemcpyHostToDevice);
     st_memcpy(d_w, wq.data(), wq.size(), hipMemcpyHostToDevice);
@@ -4358,10 +4362,13 @@ static void mxfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_
         return;
     }
     st_memcpy(hy.data(), d_y, hy.size() * 2, hipMemcpyDeviceToHost);
+    if (row0) row0->assign(hy.begin(), hy.begin() + N);
 
     /* Every column for small N, a stride otherwise, always including the last column (the clamped
-     * tail of the tiled row's weight staging). */
-    const int64_t nstep = N > 96 ? N / 96 : 1;
+     * tail of the tiled row's weight staging). The stride is odd, so it walks through every
+     * position in a group of 2, 4 or 16 columns -- a kernel that gets one lane's column wrong in
+     * such a group cannot hide behind an even step. */
+    const int64_t nstep = N > 96 ? (N / 96) | 1 : 1;
     double num = 0, den = 0, worst = 0;
     for (int64_t i = 0; i < M; ++i)
         for (int64_t n = 0; n < N; n = (n + 1 == N) ? N : std::min(n + nstep, N - 1)) {
@@ -4383,6 +4390,28 @@ static void mxfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_
     char d[96];
     std::snprintf(d, sizeof d, "rel_l2 %.3e, worst %.3e", rel, worst);
     ok(nm, rel < 1e-2, d);
+}
+
+/* A row's output bits must not depend on how many rows ride with it: a verify step's first row
+ * then decodes exactly as the plain step would, and greedy text does not change with the draft
+ * depth. The first row of M = 1..8 (identical inputs, mxfp4a8_numeric's activations depend on the
+ * row index only) compared bit for bit. */
+static void mxfp4a8_m_invariant(const Plugin& pl, const char* row, int64_t N, int64_t K, bool ablk) {
+    if (!sel(row)) return;
+    char nm[160];
+    std::snprintf(nm, sizeof nm, "%s first row bit-identical at M = 1..8, N=%lld K=%lld%s", row,
+                  (long long)N, (long long)K, ablk ? " ascale=row x 128" : "");
+    std::vector<uint16_t> ref, got;
+    mxfp4a8_numeric(pl, row, 1, N, K, 0, ablk, {}, 0, 0, &ref);
+    for (int64_t M = 2; M <= 8; ++M) {
+        got.clear();
+        mxfp4a8_numeric(pl, row, M, N, K, 0, ablk, {}, 0, 0, &got);
+        if (ref.size() != (size_t)N || got != ref) {
+            ok(nm, false, "M=" + std::to_string(M) + " differs from M=1");
+            return;
+        }
+    }
+    ok(nm, true);
 }
 
 
@@ -12796,6 +12825,64 @@ static void perf_row(const Plugin& pl, const char* name, std::vector<RadTensor> 
         r->launch(&a, nullptr);
     }, iters, nullptr);
     std::printf("  %-22s %8.1f us   %6.1f GB/s\n", name, us, bytes / (us * 1e3));
+}
+
+/* --perfmx: every MXFP4 GEMM row at one shape, the weight streamed from DRAM (rotated copies), on
+ * the per-(row, 128) activation grid. A row that does not serve the shape says so. */
+static void mx_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iters) {
+    if (M < 1 || N < 16 || N % 16 || K < 64 || K % 64) {
+        std::printf("--perfmx: N must be a multiple of 16, K of 64, and M >= 1\n");
+        return;
+    }
+    const char* rows[] = { "gemm_mxfp4a8_gemv", "gemm_mxfp4a8_decode", "gemm_mxfp4a8_nt_m64",
+                           "gemm_mxfp4a8_tiled" };
+    for (const char* row : rows) {
+        dfree_all();
+        const RadKernelInfo* r = find(pl, row);
+        if (!r || !r->layout || !r->relayout) { std::printf("  %-22s row or hooks absent\n", row); continue; }
+        Planes p;
+        p.enc = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
+        p.size(N, K);
+        const int ic = p.find("codes"), is = p.find("scale");
+        mxfp4_fill(p, ic, is, N, K, 0x51u, true);
+        std::vector<RadParam> lp = { PI("N", N), PI("K", K), PI("group", 32) };
+        std::vector<uint8_t> wq, ws, wr;
+        if (stored(r, lp, 2, p, { "codes" }, &wq) != RAD_OK || stored(r, lp, 3, p, { "scale" }, &ws) != RAD_OK ||
+            stored(r, lp, 6, p, { "scale" }, &wr) != RAD_OK) {
+            std::printf("  %-22s relayout refused\n", row);
+            continue;
+        }
+        const int64_t nkb = (K + 127) / 128;
+        std::vector<uint8_t> ha((size_t)(M * K));
+        std::vector<float> as((size_t)(M * nkb));
+        for (int64_t i = 0; i < M; ++i) {
+            for (int64_t c = 0; c < nkb; ++c) as[(size_t)(i * nkb + c)] = 0.002f * (float)(1 + (i + c) % 97);
+            for (int64_t k = 0; k < K; ++k) rad_store_f32(ha.data(), RAD_F8E4M3, i * K + k, mxfp4_act(i, k, 0x3cu));
+        }
+        const int copies = (int)std::max<int64_t>(2, (256ll << 20) / (int64_t)wq.size() + 1);
+        void* d_a = dalloc(ha.size());
+        void* d_s = dalloc(as.size() * 4);
+        void* d_w = dalloc(wq.size() * (size_t)copies);
+        void* d_e = dalloc(ws.size());
+        void* d_r = dalloc(wr.size());
+        void* d_y = dalloc((size_t)(M * N * 2));
+        if (!d_a || !d_s || !d_w || !d_e || !d_r || !d_y) { std::printf("  %-22s hipMalloc failed\n", row); continue; }
+        st_memcpy(d_a, ha.data(), ha.size(), hipMemcpyHostToDevice);
+        st_memcpy(d_s, as.data(), as.size() * 4, hipMemcpyHostToDevice);
+        for (int c = 0; c < copies; ++c)
+            st_memcpy((uint8_t*)d_w + (size_t)c * wq.size(), wq.data(), wq.size(), hipMemcpyHostToDevice);
+        st_memcpy(d_e, ws.data(), ws.size(), hipMemcpyHostToDevice);
+        st_memcpy(d_r, wr.data(), wr.size(), hipMemcpyHostToDevice);
+        std::vector<RadTensor> ts = {
+            T(d_a, RAD_F8E4M3, { M, K }), T(d_s, RAD_F32, { M, nkb }),
+            T(d_w, RAD_U8, { (int64_t)wq.size() }), T(d_e, RAD_U8, { (int64_t)ws.size() }),
+            T(d_y, RAD_BF16, { M, N }), T(nullptr, RAD_F32, { 1 }), T(d_r, RAD_U8, { (int64_t)wr.size() }),
+        };
+        absent(ts[5]);
+        std::vector<RadParam> ps = { PI("M", M), PI("N", N), PI("K", K), PI("group", 32),
+                                     PS("dtype", "mxfp4a8") };
+        perf_row(pl, row, ts, ps, d_w, wq.size(), copies, (double)(wq.size() + ws.size()), iters);
+    }
 }
 
 
@@ -26796,6 +26883,31 @@ static void device_phase(const Plugin& pl) {
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 64, 512, 2560, 0, true);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 5, 1040, 576, 0, true);
         mxd_overlap_case(pl);
+        /* The gemv row (M <= 8). K a multiple of 128 takes the WMMA form at every M: one tile and
+         * one chunk with masked rows, the production shapes, both activation grids. K = 64 mod 128
+         * takes the dot form, every instantiation the launcher reaches: M = 1, 2, 3-4, 5-8 each at
+         * a tile count divisible by 4 (68), by 2 only (66) and odd (67), both grids, and one 64-K,
+         * 16-column minimum. Then the first row's bits against M, for both forms and the decode
+         * row. */
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv", 3, 16, 128, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv", 1, 272, 640, 0, false);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv", 1, 17408, 5120, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv", 2, 5120, 8704, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv", 4, 17408, 5120, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv", 5, 1072, 2560, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv", 7, 10288, 640, 0, false);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv", 8, 5120, 3072, 0, false);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv", 8, 5376, 10752, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv", 1, 16, 64, 0, true);
+        for (const int64_t m : { 1, 2, 3, 4, 5, 6, 7, 8 })
+            for (const int64_t n : { 1088, 1056, 1072 }) {
+                mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv", m, n, 576, 0, true);
+                mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv", m, n, 576, 0, false);
+            }
+        mxfp4a8_m_invariant(pl, "gemm_mxfp4a8_gemv", 5120, 5120, true);
+        mxfp4a8_m_invariant(pl, "gemm_mxfp4a8_gemv", 1088, 576, true);
+        mxfp4a8_m_invariant(pl, "gemm_mxfp4a8_gemv", 1056, 576, false);
+        mxfp4a8_m_invariant(pl, "gemm_mxfp4a8_decode", 5120, 5120, true);
         /* Parts (ParoQuant): each weight part against its own activation copy, with bounds off any
          * kernel's tile, two and three parts, at every band. */
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_nt_m64", 7, 400, 640, 0, true, {}, 144);
@@ -26803,6 +26915,11 @@ static void device_phase(const Plugin& pl) {
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 8, 400, 2560, 0, true, {}, 128);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 40, 512, 2560, 0, true, {}, 128, 384);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode", 4, 34816, 5120, 0, true, {}, 17408);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv", 1, 400, 640, 0, true, {}, 144);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv", 8, 400, 2560, 0, true, {}, 128);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv", 4, 34816, 5120, 0, true, {}, 17408);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv", 2, 400, 576, 0, true, {}, 144, 288);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv", 5, 512, 576, 0, true, {}, 128, 384);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 400, 640, 2, true, {}, 192);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 300, 400, 640, 4, true, {}, 96, 304);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_tiled", 2100, 512, 2560, 0, true, {}, 256);
@@ -28011,6 +28128,8 @@ static void usage(void) {
                 "             u64 at byte 0> + the tensor's own data_offsets[0].\n"
                 "  --perf N K M [iters]:  time the fp8 decode GEMMs at one shape and print the\n"
                 "             weight bandwidth each reaches.\n"
+                "  --perfmx N K M [iters]:  the MXFP4 GEMM rows (gemv, decode, skinny, tiled) at\n"
+                "             one shape, with the weight bandwidth each reaches.\n"
                 "  --perfbf16 N K M [iters]:  the bf16 skinny GEMM at every variant it has.\n"
                 "  --perff32 N K M [iters]:  gemm_nt_f32 at the tile form its rule picks, compared\n"
                 "             byte for byte with the host arithmetic, with GB/s and TFLOP/s.\n"
@@ -28123,7 +28242,7 @@ int main(int argc, char** argv) {
     const char* real_file = nullptr;
     long long real_woff = 0, real_soff = 0, real_n = 0, real_k = 0;
     long long perf_n = 0, perf_k = 0, perf_m = 0;
-    int perf_it = 50, perf_w2 = 0, perf_bf = 0, perf_w8 = 0, perf_f32 = 0, perf_q = 0;
+    int perf_it = 50, perf_w2 = 0, perf_bf = 0, perf_w8 = 0, perf_f32 = 0, perf_q = 0, perf_mx = 0;
     long long sop_m = 0, sop_k = 0;
     int sop_it = 2000;
     long long qsa_ctx = 0, qsa_m = 4, dsa_ctx = 0, dsa_m = 6;
@@ -28180,6 +28299,13 @@ int main(int argc, char** argv) {
             real_k    = std::strtoll(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perf")) {
             if (i + 3 >= argc) { usage(); return 2; }
+            perf_n = std::strtoll(argv[++i], nullptr, 0);
+            perf_k = std::strtoll(argv[++i], nullptr, 0);
+            perf_m = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != '-') perf_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfmx")) {
+            if (i + 3 >= argc) { usage(); return 2; }
+            perf_mx = 1;
             perf_n = std::strtoll(argv[++i], nullptr, 0);
             perf_k = std::strtoll(argv[++i], nullptr, 0);
             perf_m = std::strtoll(argv[++i], nullptr, 0);
@@ -28585,6 +28711,7 @@ int main(int argc, char** argv) {
 #ifdef RAD_HAVE_HIP
         if (perf_f32)     f32_forms(pl, perf_m, perf_n, perf_k, perf_it, true);
         else if (perf_q)  q_perf(pl, perf_n, perf_k, perf_m, perf_it);
+        else if (perf_mx) mx_perf(pl, perf_n, perf_k, perf_m, perf_it);
         else if (perf_bf) bf16_perf(pl, perf_n, perf_k, perf_m, perf_it);
         else if (perf_w8) w8_perf(pl, perf_n, perf_k, perf_m, perf_it);
         else if (perf_w2) w2_perf(pl, perf_n, perf_k, perf_m, perf_it);

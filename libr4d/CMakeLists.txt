@@ -148,6 +148,7 @@ set(R4D_UNITS
   "r4d_gemm_mxfp4a8_nt_m64|"
   "r4d_gemm_mxfp4a8_tiled|"
   "r4d_gemm_mxfp4a8_decode|"
+  "r4d_gemm_mxfp4a8_gemv|"
   # Block-scaled FP8 (the format Qwen3.8-27B-FP8 ships in). The 128x128 block is fixed by the
   # checkpoint, and the entry points reject a mismatch.
   "r4d_gemm_fp8a16_nt_m1|"

@@ -4798,9 +4798,16 @@ static const RadConstraint cGemmW4A8Tiled[] = {
 };
 /* r4d_gemm_mxfp4a8_decode. Entry point: M <= 128, N % 16, K % 64, and N up to its counter block's
  * 36864. Above the skinny row by priority, so it takes the decode band; the skinny row keeps the
- * wider N up to M = 64, the tiled row everything else. */
+ * wider N up to M = 64 (from M = 9: the gemv row below takes M <= 8 at any N), the tiled row
+ * everything else. */
 static const RadConstraint cGemmMxfp4A8Decode[] = {
     C_LE("M", 128), C_LE("N", 36864), C_DIV("K", 64), C_DIV("N", 16), C_IN("dtype", "mxfp4a8"),
+};
+/* r4d_gemm_mxfp4a8_gemv. Entry point: M <= 8, N % 16, K % 64, no N bound (no counters). Above the
+ * decode row by priority, so one stream's decode (M = 1 + the draft depth) takes it, at any N; the
+ * decode row keeps M = 9..128. */
+static const RadConstraint cGemmMxfp4A8Gemv[] = {
+    C_LE("M", 8), C_DIV("K", 64), C_DIV("N", 16), C_IN("dtype", "mxfp4a8"),
 };
 /* r4d_gemm_mxfp4a8_tiled. Entry point: N % 16 (the fragment-order weight), K % 64 (its narrowest
  * K slab), M >= 1. The decode and skinny rows outrank it in their bands by priority, so the band
@@ -7503,6 +7510,19 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   ROW(cGemmNtMxfp4A8), ROW(tGemmSkinny), r4d_tune_valid_gemm,
   nullptr, nullptr, r4d_rad_gemm_mxfp4a8_m64, nullptr, r4d_rad_layout_mxfp4,
   r4d_rad_relayout_mxfp4 },
+
+{ "gemm_mxfp4a8_gemv", "gemm_nt_q", "gemm",
+  "the OCP-MXFP4 GEMM for ONE TO EIGHT rows: the weight streamed straight to registers and folded "
+  "to e4m3 there, no LDS staging; WMMA when K is a multiple of 128, v_dot4 otherwise, chosen from "
+  "K alone so a row's bits do not depend on M",
+  "M <= 8; N a multiple of 16; K a multiple of 64; the skinny kernel's fragment-order weight, "
+  "[K/32][N] E8M0 exponents and per-row reference exponent",
+  "e4m3 A with an f32 scale per row or per (row, 128), e2m1 W with an E8M0 scale per 32 K folded "
+  "into the element against a per-row reference, bf16 C, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_MXGEMV,
+  ROW(cGemmMxfp4A8Gemv), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_mxfp4a8_gemv, nullptr,
+  r4d_rad_layout_mxfp4, r4d_rad_relayout_mxfp4 },
 
 { "gemm_mxfp4a8_decode", "gemm_nt_q", "gemm",
   "the OCP-MXFP4 GEMM for the DECODE band: split-K across workgroups with a fused last-arriver "
