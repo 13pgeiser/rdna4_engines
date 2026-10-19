@@ -190,21 +190,29 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
      *
      * The share is what the slab alone leaves off, the most a step can see: KV and arena loans only
      * add residency. A layer larger than its share stages what fits and streams the rest. */
+    bool stage_from_experts = false;
     if (layer_max > 0 && b.expert_ceiling > b.experts && cfg.placement != "all_vram" &&
         cfg.placement != "layer_offload") {
         const double f = (double)(b.expert_ceiling - b.experts) / (double)b.expert_ceiling;
         const int64_t one = ((int64_t)std::ceil(f * (double)layer_max) + RAD_ALIGN_UNIT - 1) /
                             RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
         if (b.lends) {
-            /* With a lending cache the cache pays: experts are at their floor, and the region is
-             * lent to the slab in small steps, as the cache would have lent it. */
-            if (b.kv - 2 * one >= kv_one) {
+            /* Expert residency above its host-pool floor pays first, so the cache keeps its
+             * configured coverage; otherwise the cache pays. Either way the region is lent to the
+             * slab in small steps. */
+            if (b.experts - 2 * one >= b.expert_floor) {
+                b.stage = 2 * one;
+                b.experts -= b.stage;
+                stage_from_experts = true;
+                b.weights = b.statics + b.experts;
+            } else if (b.kv - 2 * one >= kv_one) {
                 b.stage = 2 * one;
                 b.kv   -= b.stage;
             }
         } else if (2 * one < b.experts) {
             b.stage    = 2 * one;
             b.experts -= b.stage;
+            stage_from_experts = true;
             b.weights  = b.statics + b.experts;
         }
     }
@@ -312,7 +320,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
                   "non-resident experts,\n"
                   "                                  at the arena's top and lent back to the "
                   "slab while steps are small\n", humanb(b.stage).c_str(),
-                  b.lends ? "cache" : "experts").c_str()
+                  stage_from_experts ? "experts" : "cache").c_str()
             : "",
         humanb(cfg.vram_weights_mib * kMiB).c_str(), "static + experts",
         humanb(cfg.vram_kv_mib * kMiB).c_str(), "the cache's share",

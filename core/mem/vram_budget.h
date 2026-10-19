@@ -104,8 +104,9 @@ struct VramBudget {
     int64_t experts = 0, kv = 0;      /* the two shares, each capped at its ceiling */
     int64_t unusable = 0;             /* elastic neither side could take -- both were full */
     /* Prefill staging region: two buffers, each one layer's share of the experts left off the
-     * card, appended to the top of the activation arena (core/place/stager.h). Zero when every
-     * expert is resident or the placement cannot move any. */
+     * card, funded by cache slack or expert residency above the host-pool floor, appended to the
+     * top of the activation arena (core/place/stager.h). Zero when every expert is resident or the
+     * placement cannot move any. */
     int64_t stage = 0;
     int64_t weights = 0;              /* statics + experts: what vram_weights is set to */
     std::string report;       /* the block the engine prints at startup */

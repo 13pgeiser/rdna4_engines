@@ -385,6 +385,52 @@ TEST(the_cache_keeps_one_full_length_sequence_even_against_the_expert_floor) {
     CHECK_EQ(b2.experts, b2.elastic - g.kv_ceiling);
 }
 
+/* With a lending cache at its floor, the prefill staging region is paid by expert residency
+ * above the host pool's floor, and never by an expert that has no other home. */
+TEST(prefill_staging_can_borrow_expert_slack_when_the_cache_is_small) {
+    VramFacts f = big_moe_facts();
+    f.lends = true;
+    f.kv_one = f.kv_ceiling = 64LL << 20;
+    f.expert_floor = 16LL << 30;
+    f.expert_layer_max = 2LL << 30;
+    Config c = derive_config();
+    VramBudget b;
+    CHECK_OK(vram_budget_resolve(c, { f }, &b));
+    CHECK(b.stage > 0);
+    CHECK(b.report.find("out of the experts") != std::string::npos);
+    CHECK_EQ(b.kv, f.kv_one);
+    CHECK(b.experts >= f.expert_floor);
+    CHECK_EQ(b.weights, b.statics + b.experts);
+    CHECK_EQ(b.experts + b.kv + b.stage, b.elastic);
+
+    // With no host-pool slack, staging must not evict an expert that has no other home.
+    f.expert_floor = b.elastic - f.kv_one;
+    Config tight = derive_config();
+    VramBudget no_ring;
+    CHECK_OK(vram_budget_resolve(tight, { f }, &no_ring));
+    CHECK_EQ(no_ring.stage, 0ll);
+    CHECK_EQ(no_ring.kv, f.kv_one);
+    CHECK_EQ(no_ring.experts, f.expert_floor);
+}
+
+/* When experts can pay, the staging region leaves the cache at its full coverage. */
+TEST(prefill_staging_preserves_cache_coverage_when_experts_can_pay) {
+    VramFacts f = big_moe_facts();
+    f.lends = true;
+    f.kv_ceiling = 2LL << 30;
+    f.kv_one = 768LL << 20;
+    f.expert_floor = 16LL << 30;
+    f.expert_layer_max = 2LL << 30;
+    Config c = derive_config();
+    VramBudget b;
+    CHECK_OK(vram_budget_resolve(c, { f }, &b));
+    CHECK(b.stage > 0);
+    CHECK_EQ(b.kv, f.kv_ceiling);
+    CHECK(b.experts >= f.expert_floor);
+    CHECK(b.report.find("out of the experts") != std::string::npos);
+    CHECK_EQ(b.experts + b.kv + b.stage, b.elastic);
+}
+
 /* A hybrid model's recurrent and conv slots stay allocated with one request active, so the
  * one-sequence floor is the inverse of the live plan, not a separate one-sequence plan: that plan
  * drops the fixed state and falls short of max_ctx. */
