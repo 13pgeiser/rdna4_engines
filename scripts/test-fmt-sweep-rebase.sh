@@ -36,8 +36,10 @@ export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-16}"
 
 T=$(mktemp -d "${TMPDIR:-/tmp}/test-fmt-sweep-rebase.XXXXXX")
 trap 'rm -rf "$T"' EXIT
-# Isolate from the user's git config and keep scratch dirs inspectable.
+# Isolate from the user's git config and identity env (an exported identity overrides the fixture's
+# local config, which the committer cases assert), and keep scratch dirs inspectable.
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
 mkdir -p "$T/tmp"
 export TMPDIR="$T/tmp"
 
