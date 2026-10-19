@@ -510,11 +510,19 @@ impl Model {
         if hot_flags && s1_mode == hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::Force {
             return Err("HIPFIRE_QWEN4_SLOWLINK_PREFILL=1 excludes --ple-hot, --hotset and --hot-budget-mib".into());
         }
+        if pin.untiered.is_some()
+            && s1_mode == hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::Force
+        {
+            return Err("HIPFIRE_QWEN4_SLOWLINK_PREFILL=1 excludes --untiered".into());
+        }
         // The GPU arch drives `memory.ple_format = auto` and the S1 selector;
         // initialising it allocates no model memory, so admission still
         // precedes every upload.
         let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
-        if s1_mode != hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::Off && !hot_flags {
+        if s1_mode != hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::Off
+            && !hot_flags
+            && pin.untiered.is_none()
+        {
             if let Some(loaded) = hipfire_arch_qwen4::slowlink_load::slowlink_load_if_selected(
                 &mut gpu, path, n_ctx, None,
             )? {
@@ -534,6 +542,8 @@ impl Model {
                     vocab: loaded.vocab,
                     arch_id: loaded.arch_id,
                     tokenizer: loaded.tokenizer,
+                    // Explicit `--untiered` never enters this branch (gated above).
+                    untiered_receipt: None,
                 });
             }
         }

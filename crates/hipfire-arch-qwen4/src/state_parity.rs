@@ -2804,8 +2804,8 @@ pub fn slowlink_logit_rows_summary(
 }
 
 // The shared single-device load (admission-first placement, S1 profile attach)
-// lives in `crate::slowlink_load`, which is not feature-gated so the `lab`
-// examples use it too.
+// lives in `crate::slowlink_load`, tools-gated (`test` / `lab` /
+// `reference-parity`) like every S1 validation entry.
 pub use crate::slowlink_load::{slowlink_load_bundle, SlowlinkLoaded};
 
 /// One whole-prompt production prefill per repeat from a fresh state

@@ -120,6 +120,7 @@ const Q_ROW: usize = 2 * N_HEADS * HEAD_DIM;
 const OUT_ROW: usize = N_HEADS * HEAD_DIM;
 /// hg12 shape bound (QSA_ATTENTION_HG12_MAX_SELECTED = 9 * 256).
 const HG12_MAX_SELECTED: usize = 9 * 256;
+const _: () = assert!(CAPACITY <= HG12_MAX_SELECTED);
 const LONG_POS: usize = 32493;
 const SEED: u64 = 0x5153_4131_3248_4731; // "QSA12HG1"
 const WARMUP: usize = 3;
@@ -389,10 +390,7 @@ fn run_case(gpu: &mut Gpu, spec: &Spec, kv: &Kv) -> CaseOutcome {
         .collect();
     let sel_min = *lens.iter().min().unwrap();
     let sel_max = *lens.iter().max().unwrap();
-    assert!(
-        sel_max <= HG12_MAX_SELECTED && sel_max <= CAPACITY,
-        "selected_len above hg12 bound"
-    );
+    assert!(sel_max <= CAPACITY, "selected_len above hg12 bound");
 
     let mut selected = build_selected(&mut rng, rows, spec.position_start);
     let inject = spec

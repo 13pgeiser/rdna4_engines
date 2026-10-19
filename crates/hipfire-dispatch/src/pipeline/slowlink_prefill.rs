@@ -3294,6 +3294,7 @@ pub mod selftest {
     /// `canonical_combine_exact`: the production panel/pad combine kernels over the
     /// adversarial fixture and many partitions (within-expert splits included) equal the CPU
     /// canonical model and the monolithic GPU combine; reversed panel order differs.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn canonical_combine_exact(
         gpu: &mut Gpu,
         seed: u64,
@@ -3332,6 +3333,7 @@ pub mod selftest {
     /// split across panels by the production schedule; guard canaries after every panel's
     /// scratch spans stay intact, every panel respects the row bound, and the combine equals
     /// the CPU canonical model and the monolithic GPU combine over the actual GEMM rows.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn within_expert_panel_canary(
         gpu: &mut Gpu,
         call: &PreparedChunkCall<'_>,
@@ -3715,7 +3717,8 @@ pub mod selftest {
     /// cohort run per binding against masked ids, equals the incumbent K1 arithmetic; the K2
     /// rows are unaffected.  Aggregate route: `call` is a real row-0
     /// [`TileKind::AggregateF32Tail`] call and the cohort is its F32 routed tail
-    /// ([`f32_tail_scenario`]).
+    /// ([`f32_tail_scenario`]). Tools-only.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn k1_tail_cohort(
         gpu: &mut Gpu,
         call: &PreparedChunkCall<'_>,
@@ -3745,6 +3748,8 @@ pub mod selftest {
 
     /// Window rows the K2 anchor tile of [`decode_tail_cohort`] occupies: the caller builds
     /// the decode call's [`PreparedChunkCall`] with `row0` equal to this.
+    /// Tools-only.
+    #[cfg(any(test, feature = "test-utils"))]
     pub const DECODE_TAIL_ANCHOR_ROWS: usize = 64;
 
     /// `decode_tail_cohort`: the incumbent's REAL one-row decode call (built by the caller as
@@ -3757,6 +3762,8 @@ pub mod selftest {
     /// and per-binding cohort launches are what the real route needs.  The binding MUST hold
     /// every expert the decode call's router selects (the resident all-expert binding).
     /// `anchor` is any K2 prefill tile call of the layer (its scratch/geometry).
+    /// Tools-only.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn decode_tail_cohort(
         gpu: &mut Gpu,
         anchor: &PreparedChunkCall<'_>,
@@ -3998,6 +4005,8 @@ pub mod selftest {
     /// `zero_row_panel`: (a) a window where nothing routes yields exactly one zero-row
     /// combine-only panel owning every expert and an all +0 accumulator; (b) a K1-only
     /// window yields only zero-row K1 panels whose rows still equal the incumbent K1 path.
+    /// Tools-only.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn zero_row_panel(
         gpu: &mut Gpu,
         call: &PreparedChunkCall<'_>,

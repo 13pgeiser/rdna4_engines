@@ -2206,23 +2206,20 @@ fn load_qwen4_rank_scoped(
         let stage_env =
             hipfire_config::developer_var(hipfire_arch_qwen4::gpu_forward::QWEN4_EXPERT_STAGE_ENV)
                 .ok();
+        // Sealed layout/panel/codec/kernel verdicts admit before
+        // materialization (never the recipe name or a raw offload veto); an
+        // actually CPU-split sealed selection refuses at the dispatch gate.
         let shape = s1::LoadShape {
             arch: &ctx.gpu.arch,
             unified_memory: use_ranges,
             expert_parallel: ep.is_some() || expert_vram_layers.is_some(),
             pipeline_band: band.is_some(),
-            packed_mq4: matches!(
-                manifest.identity.recipe,
-                hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextPacked { .. }
-            ),
             routed_experts,
             expert_keep: config.expert_keep.is_some(),
             explicit_vram_layers: explicit.is_some(),
             hotset_sidecar: hotset_path.is_some(),
             whole_first: whole_first == hotsets::WholeFirstDecision::Active,
             stage_opt_out: stage_env.as_deref() == Some("0"),
-            cpu_offload: hipfire_config::memory::offload_exec()
-                != hipfire_config::memory::OffloadExec::Pcie,
             npu_trunk: s1::npu_trunk_selected(
                 &ctx.gpu.arch,
                 hipfire_arch_qwen4::npu_trunk::NpuTrunkMode::from_env()?,
@@ -7836,14 +7833,12 @@ mod qwen4_slowlink_tests {
             unified_memory: false,
             expert_parallel: false,
             pipeline_band: false,
-            packed_mq4: true,
             routed_experts: true,
             expert_keep: false,
             explicit_vram_layers: false,
             hotset_sidecar: false,
             whole_first: false,
             stage_opt_out: false,
-            cpu_offload: false,
             npu_trunk: false,
             chunk_rows_env: None,
             max_seq: 16640,
@@ -7985,9 +7980,12 @@ mod qwen4_slowlink_tests {
     }
 
     #[test]
-    fn slowlink_other_arches_never_probe_or_build_inputs() {
+    fn slowlink_arch_is_identity_and_still_probes_for_inputs() {
+        // No exact-arch allowlist: every arch probes once and builds inputs on
+        // a narrow link; only sealed capability verdicts refuse.
         for arch in [
-            "gfx906", "gfx942", "gfx1010", "gfx1030", "gfx1101", "gfx1151", "gfx1200", "gfx1201",
+            "gfx906", "gfx942", "gfx1010", "gfx1030", "gfx1100", "gfx1101", "gfx1151", "gfx1200",
+            "gfx1201",
         ] {
             let (probes, builds, outcome) = select(
                 s1::SlowlinkMode::Force,
@@ -7995,7 +7993,8 @@ mod qwen4_slowlink_tests {
                 HostLink::Discrete { gbps: 7.09 },
                 free_for(10),
             );
-            assert_eq!((probes, builds, outcome), (0, 0, Ok(None)), "{arch}");
+            assert_eq!((probes, builds), (1, 1), "{arch}");
+            assert!(outcome.unwrap().is_some(), "{arch}");
         }
     }
 

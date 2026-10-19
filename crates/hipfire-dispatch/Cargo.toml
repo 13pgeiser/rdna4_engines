@@ -17,8 +17,9 @@ rayon.workspace = true
 
 [features]
 default = []
-test-utils = []
-new-rotation = []
+# Tools-only S1 validation surface (CPU byte ledger): existing feature only,
+# never a new feature. The arch `lab` feature enables this.
+test-utils = ["rdna-compute/lab"]
 new-gemv = []
 new-gemm = []
 new-fused-qkv = []

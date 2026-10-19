@@ -67,7 +67,10 @@ pub mod reference_forward;
 #[cfg(any(test, feature = "reference-parity"))]
 pub mod reference_mtp;
 pub mod slowlink_admission;
-/// Admission-first single-device load shared by the S1 validation tools.
+/// Admission-first single-device load shared by the S1 validation tools ONLY
+/// (gated `test` / `lab` / `reference-parity`): the product carrier never
+/// routes through it, and it stays compiled out of product builds.
+#[cfg(any(test, feature = "lab", feature = "reference-parity"))]
 pub mod slowlink_load;
 mod slowlink_prefill;
 pub mod state;

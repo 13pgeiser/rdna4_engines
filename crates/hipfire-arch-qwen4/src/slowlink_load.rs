@@ -234,12 +234,10 @@ fn load_inner(
             &gpu.arch,
             false,
             s1::StructuralShape {
+                // Sealed layout/panel/codec/kernel verdicts admit (never the
+                // recipe name): unsupported modes refuse before materialization.
                 expert_parallel: false,
                 pipeline_band: false,
-                packed_mq4: matches!(
-                    recipe,
-                    crate::weights::Qwen4TierRecipe::FlashNextPacked { .. }
-                ),
                 routed_experts,
                 expert_keep: receipt.config.expert_keep.is_some(),
                 hotset_sidecar: false,

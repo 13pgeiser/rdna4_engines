@@ -48,10 +48,11 @@ use std::time::Duration;
 
 #[path = "session_pair.rs"]
 mod session_pair;
+#[cfg(any(test, feature = "lab", feature = "reference-parity"))]
+pub(crate) use session_pair::SlowlinkFailPoint;
+#[cfg(any(test, feature = "lab", feature = "reference-parity"))]
 pub use session_pair::SLOWLINK_PRIMITIVES;
-pub(crate) use session_pair::{
-    PairSessionStage, PromptTxn, SlowlinkFailPoint, SlowlinkOwner, SlowlinkScope,
-};
+pub(crate) use session_pair::{PairSessionStage, PromptTxn, SlowlinkOwner, SlowlinkScope};
 
 #[path = "bundle/pp.rs"]
 mod pp;

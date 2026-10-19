@@ -28,13 +28,15 @@ railgun = { path = "../railgun", features = ["npu"] }
 memmap2.workspace = true
 saddle-quant = { path = "../saddle-quant" }
 half.workspace = true
+hipfire-dispatch = { path = "../hipfire-dispatch", features = ["test-utils"] }
 
 [features]
 # Explicit developer build opt-in; never part of the default serving build.
 qwen4-dev-profiles = []
-reference-parity = ["rdna-compute/lab"]
-lab = []
-
+reference-parity = ["rdna-compute/lab", "hipfire-dispatch/test-utils"]
+# Tools-only S1 validation surface: the lab feature enables the S1
+# validation tools and gates (`slowlink_load`, injection, selftest facades).
+lab = ["hipfire-dispatch/test-utils"]
 [[example]]
 name = "qwen4_parity"
 required-features = ["reference-parity"]

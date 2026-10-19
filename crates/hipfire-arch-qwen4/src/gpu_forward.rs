@@ -1397,7 +1397,7 @@ impl Qwen4MoeLayerRuntime {
         }
         if self.cpu_deferred_experts
             || self.cpu_expert_owners.is_some()
-            || self.cpu_tier_owners.is_some()
+            || self.cpu_cold_owners.is_some()
             || self.cpu_split.is_some()
         {
             return Err("CPU expert splice");
@@ -8885,6 +8885,7 @@ impl Qwen4GpuForward {
             .sum()
     }
 
+    #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
     /// One named production-primitive check on this forward's admitted S1
     /// transport and dispatch owners (`Qwen4Bundle::slowlink_primitive_selftest`
     /// is the public facade). Returns exactly

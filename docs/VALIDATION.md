@@ -345,18 +345,17 @@ Use only when the claim class below names them. They are not universal.
 
 ### S1 slow-link layer-major prefill (claim-scoped)
 
-Scope: Flash-Next MQ4 packed on an exact gfx1100 behind a measured narrow
+Scope: Flash-Next MQ4 packed on the measured gfx1100 evidence host behind a measured narrow
 (<16 GB/s) discrete host link, `HIPFIRE_QWEN4_SLOWLINK_PREFILL`
-(`developer.qwen4_slowlink_prefill`), **default OFF**. Nothing here is a claim
+(`developer.qwen4_slowlink_prefill`): AUTO is the default selector (unset selects the candidate automatically from 1,537 rows: the first genuinely multi-chunk request, one row past the 1,536-row tile bound), `1` forces it as a shipping-path candidate (a capacity shortfall fails the load with its exact byte deficit instead of falling back), `0` is the kill switch. The selector is the sealed capability check, not a reintroduced exact-arch gate: an unqualified load is declined before any reserve or mutation. Nothing here is a claim
 about any other arch, codec or link: fast links, unified memory and an
-unmeasured link never select the route, and a fast-link GPU result is never
+unmeasured link never select the route under either selector, and a fast-link GPU result is never
 inferred from the XTX. H0's one-layer synthetic transfer evidence (copy-bound
 at ~99.9% of 7.09 GB/s) is a ceiling, and its 1,400+ tok/s pp16384 figure is a
-projection; only the fresh full-path receipts below can support a delivered
+historical projection; the measured base on the XTX at pp16384 is 1,738.9-1,750.2 tok/s (accepted release, ~1.87x beta), and only the fresh full-path receipts below support a delivered
 number. The 1,400 tok/s pp16384 figure was the original historical S1 gate
-floor and is not release acceptance. The release MQ4 target is 2,000 tok/s,
-and MQ2 must exceed MQ4 with decode at or above the MQ4 D2 decode; never infer
-either from raw bandwidth. Future D2 pair and MQ2 planning does not change the
+floor and is not release acceptance; 2,000 tok/s is not a release block, and no future MQ2 performance goal is promised here.
+Route-relative caps are long-context prefill teacher-forced ROUTE-vs-ROUTE caps, not a same-route decode claim: mean KL(beta4096||candidate) 16K 0.03206548313867323 against the benign-beta upper 0.03948458079446915, and 4K 0.024549946338726408 against 0.027284316982763658. Same-route repeats are the determinism criterion only (7/7 native bit-identical plus coherent decoded text; not beta-id equivalence, not a full-corpus teacher claim). The required followup stack (ordered placement + IU4 + QSA, thin 2054) is not promotion and not a base gate: QSA currently fails 4K (0.029107700567698017, excess +0.001823383584934359) and no waiver exists. No f32 GDN carry ships in base: the f32 carry is DROPPED entirely and is never resurrected; the inert Q8 WMMA trunk lever is removed. Future D2 pair and stack planning does not change the
 current S1 hold.
 
 Harness (CPU-testable parts run in `no-gpu` CI; GPU parts only inside a hipx
@@ -364,17 +363,17 @@ fabric hold):
 
 | Piece | What it proves |
 |---|---|
-| [`qwen4_slowlink_gate`](../crates/hipfire-arch-qwen4/examples/qwen4_slowlink_gate.rs) `--model ABS --fixture ABS.json --output ABS.json --mode primitives\|state\|product\|perf --route incumbent\|layer-major --manifest ABS.json` | `primitives`: production panel transport/dispatch/ordered combine on real host-expert sources (payload and table identity, repeated epochs at the same addresses, delayed readers, within-expert panels with canaries, exact canonical combine). `state`: per-prompt route receipts (>=10 resident layers, <=38 host layers, tile <=1,536 rows, no retained 8,192-row/full-prompt scratch, ring+lookahead reserve charged, one submitted payload sweep per window, exactly one window at 16,384 rows), same-route repeat digests of every fixed state and the final logits, launch-cut and resume chronology, session restore and divergent continuation at the fixture's boundaries, the four named failure injections (restore or contain, then a clean re-run), bounded head-row scoring (never N x vocab), and eager vs retained-body replay decode after the prefill. `product`: greedy ids plus decoded text per prompt (a human reads the text; the attractor heuristic is not a quality gate). `perf`: untimed warmup, pp512/pp8192/pp16384 timing and decode, with spans, the barrier cost and the cross-layer overlap evidence. `--route` is a force inside the one production selector and safety predicate, not another implementation. A required check that did not execute makes the run `incomplete`; only `pass` exits 0. The manifest pins source base/tip, binary SHA-256, model identity, PLE source/format/sidecars, kernel code-object hashes, host/device/link and the memory ledger; the binary hash and model size are re-observed and a mismatch fails before GPU work. |
-| [`qwen4_greedy_ids`](../crates/hipfire-arch-qwen4/examples/qwen4_greedy_ids.rs) `--receipt` | Exact full-`token_ids`/finish_reason/prompt-count equality between the beta autoregressive arm and the candidate over byte-identical id fixtures (512, 1536, 1537, 8192, 16384 rows plus a `resume_at` irregular resumed prefix). The ids file is unchanged by the receipt flag; the receipts name the route each record took. |
-| [`qwen4_kld`](../crates/hipfire-arch-qwen4/examples/qwen4_kld.rs) `s11ref --decode` then `pair` | The full 24-sequence, 6,120-row code24 decode corpus against the existing fp8 `code24` reference (`code24.fp8.s11ref`, md5 `56d93a4931631e306244e95ea64aecfc`; `code24.corpus.json`, md5 `6145e25c0858e31e08527c1e5278c074`; never regenerated). `pair` aggregates KL per corpus sequence, then the paired candidate-minus-beta 95% t interval; pass when `lo <= 0`, else `hi <= +0.010`. A partition, a partial corpus or a different reference/corpus/config is refused. The decode scorer prefills the unscored prefix and records whether each prefix took S1 (`slowlink_prefix_routes`); it does not by itself prove 16K prompt scoring, and the cold-prefill all-row scorer (N x vocab logits) never exercises S1. |
+| [`qwen4_slowlink_gate`](../crates/hipfire-arch-qwen4/examples/qwen4_slowlink_gate.rs) `--model ABS --fixture ABS.json --output ABS.json --mode primitives\|state\|product\|perf --route incumbent\|layer-major --manifest ABS.json` | `primitives`: production panel transport/dispatch/ordered combine on real host-expert sources (payload and table identity, repeated epochs at the same addresses, delayed readers, within-expert panels with canaries, exact canonical combine). `state`: per-prompt route receipts (the purpose profile's tile: 768 rows product, 512 rows primitive self-test; never the 8,192-row incumbent chunk and never a retained 8,192-row/full-prompt scratch; resident plus host layers close on the 48-layer trunk with a per-host-layer byte bound; ring+lookahead reserve charged, one submitted payload sweep per window, exactly one window at 16,384 rows), same-route repeat digests of every fixed state and the final logits, launch-cut and resume chronology, session restore and divergent continuation at the fixture's boundaries, the four named failure injections (restore or contain, then a clean re-run), bounded head-row scoring (never N x vocab), and eager vs retained-body replay decode after the prefill. `product`: greedy ids plus decoded text per prompt (a human reads the text; the attractor heuristic is not a quality gate). `perf`: untimed warmup, pp512/pp8192/pp16384 timing and decode, with spans, the barrier cost and the cross-layer overlap evidence. `--route` is a force inside the one production selector and safety predicate, not another implementation. A required check that did not execute makes the run `incomplete`; only `pass` exits 0. The manifest pins source base/tip, binary SHA-256, model identity, PLE source/format/sidecars, kernel code-object hashes, host/device/link and the memory ledger; the binary hash and model size are re-observed and a mismatch fails before GPU work. |
+| [`qwen4_greedy_ids`](../crates/hipfire-arch-qwen4/examples/qwen4_greedy_ids.rs) `--receipt` | **Historical/diagnostic, NOT S1 acceptance.** Exact full-`token_ids`/finish_reason/prompt-count equality between the beta autoregressive arm and the candidate over byte-identical id fixtures (512, 1536, 1537, 8192, 16384 rows plus a `resume_at` irregular resumed prefix). The ids file is unchanged by the receipt flag; the receipts name the route each record took. |
+| [`qwen4_kld`](../crates/hipfire-arch-qwen4/examples/qwen4_kld.rs) `s11ref --decode` then `pair` | **Historical/diagnostic, NOT S1 acceptance.** The full 24-sequence, 6,120-row code24 decode corpus (a teacher-paired tool row: shared-expert quantization error against the BF16 source teacher) against the existing fp8 `code24` reference (`code24.fp8.s11ref`, md5 `56d93a4931631e306244e95ea64aecfc`; `code24.corpus.json`, md5 `6145e25c0858e31e08527c1e5278c074`; never regenerated). `pair` aggregates KL per corpus sequence, then the paired candidate-minus-beta 95% t interval; pass when `lo <= 0`, else `hi <= +0.010`. A partition, a partial corpus or a different reference/corpus/config is refused. The decode scorer prefills the unscored prefix and records whether each prefix took S1 (`slowlink_prefix_routes`); it does not by itself prove 16K prompt scoring, and the cold-prefill all-row scorer (N x vocab logits) never exercises S1. |
 | [`qwen4_parity --mode slowlink-state`](../crates/hipfire-arch-qwen4/examples/qwen4_parity.rs) | Raw-byte SHA-256 digests of GDN/QSA/PLE state and a final-logit summary over repeated whole-prompt prefills; same-route determinism, one route per setting. |
 | [`slowlink_prefill_hw`](../crates/hipfire-arch-qwen4/tests/slowlink_prefill_hw.rs), the S1 test in [`session_cache_hw`](../crates/hipfire-arch-qwen4/tests/session_cache_hw.rs) | Focused hardware tests (primitives on the admitted profile, repeated epochs, injected failures, decode-after-prefill replay, session restore through the layer-major route). The un-ignored receipt/hold-guard tests are GPU-free. |
 
 Because S1's mixer tile (768 rows for the product profile, 512 for the primitive
 profile; never the 8,192-row incumbent chunk) differs from the incumbent's 8,192-row
 manifest, a layer-major result is never labelled bitwise-identical to the
-incumbent: exact greedy ids and the paired KLD verdict are the cross-route
-gates, and identical digests are required only between repeats of one route.
+incumbent: the historical cross-route gate sentence below is historical/diagnostic, NOT S1 acceptance (exact greedy ids and a paired KLD verdict were that gate's tools). The current S1 rule is the route-relative caps plus same-route determinism plus coherent text: long-context prefill teacher-forced ROUTE-vs-ROUTE mean KL(beta4096||candidate) within the benign-beta uppers, 7/7 same-route determinism, coherent decoded text. Identical digests are required only between repeats of one route.
+Selection truth: AUTO is the default selector (unset selects the candidate automatically from 1,537 rows; automatic and forced share that floor); `0` is the kill switch and forces the incumbent without probing the link; `1` forces the shipping-path candidate and a capacity shortfall fails the load with its exact byte deficit instead of falling back. Fast links (>=16 GB/s), unified memory and unmeasured links refuse under both selectors. S1 changes prefill routing only: decode and <=4-row verify keep their truth (the per-load measured D2 default or an explicit `memory.offload_exec`, unchanged by S1), and the CPU expert splice path is declined before any S1 reserve. Request and load shapes the selector refuses before any mutation (short context, no host layers, deficits, geometry) are a named incumbent bypass, never a silent fallback. The caps above are route-relative same-route caps, never teacher-paired; when the selector declines, the incumbent runs byte for byte as before with zero S1 charge.
 A receipt without a cross-layer event intersection (copy of layer L+1
 overlapping compute of layer L) cannot support an overlap claim. Decode after
 the S1 prefill is proved on Qwen4's retained-body replay (the only decode body
@@ -388,18 +387,21 @@ CPU commands (sequential, `ROCR_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1`):
 `python3 scripts/check-env-docs.py`. At most three XTX holds are budgeted
 (schedule correctness, matched full-path A/B with the baseline code24 row,
 candidate code24 and regression closure); any missing cell is `incomplete`,
-not a pass, and a failed promotion leaves the route default OFF.
+not a pass.
 
-Current status (claim-scoped; no pass is recorded). The last correctness hold
+Speed-evidence protocol (base, no 2000 block): the accepted base 1,738.9-1,750.2 tok/s at pp16384 (~1.87x beta) is an observed historical exception only (two fresh processes, six samples per arm); it claims no final base CI/serve PASS. A qualified new-stack claim needs ABBAAB with 3 fresh processes per arm after quality passes, flat all-nine candidate medians >= 2000 tok/s. Serve-kit disclosure: thinking-off battery requests derive the off sentinel cap 1 (None), never an explicit 0 that the daemon reads as uncapped on effort-carrying requests; corrected from `max_think_tokens=0` to `None`.
+
+Historical development receipts (NOT current acceptance; no final base CI/serve PASS is claimed). The last correctness hold
 (j1759) is **incomplete**: its primitive 80 s cap expired during the 82 s model
 load, so only `identity.manifest` passed and every other check was skipped.
 That hold supports no correctness, determinism, quality, memory or speed claim.
 Its cap covered the 80-110 s model load as well as the primitives; that was a
 harness budgeting error, not a finding about the route. The replacement hold is
 one correctness hold over all cases at the same 11 resident layers, route
-default OFF, with a 1,500 s maximum; no case, quality criterion or flag is
-narrowed or relaxed.
+with a 1,500 s maximum; no case, quality criterion or flag is
+narrowed or relaxed. [Historical plan text; the selector state above is current.]
 
+[Everything from "(j1759) is **incomplete**" through the `j1855` probe paragraph is one historical development-receipt block, NOT current acceptance.]
 The replacement hold (j1761) **failed**: identity and load passed (11 resident
 layers; 76 host-mapped entries as the load receipt records them), then the
 first payload primitive hit a real `hipMalloc` out-of-memory after about 110 s.
@@ -420,7 +422,7 @@ fabricated mismatch count), the batch continues past it, and the gate fails
 only that case with its own reason. A global start refusal is one
 `primitive.init` failure that leaves the seven cases unproved (missing), not
 seven cloned failures. Another hold is approved only after the admission proof
-passes on the CPU. The route stays default OFF.
+passes on the CPU. [Historical hold-gating text.]
 
 Memory acceptance for that hold (product state cells): the minimum observed
 free VRAM over the whole run MUST be at least 512 MiB (536,870,912 B), taken
@@ -486,8 +488,7 @@ bound of the approved named incumbent bypass for requests of at most 1,536 rows,
 which is unchanged. The `tile <=1,536 rows` in the gate table above is that
 generic bound, not the expected tile. No cut, repeat or case was removed.
 
-Hold 1 attempt 4 (`j1778`) corrected the proof, not the gates, and S1 stays
-default OFF. Its primitive cell passed, but the state cell failed S1
+Hold 1 attempt 4 (`j1778`, historical) corrected the proof, not the gates. Its primitive cell passed, but the state cell failed S1
 initialization on the route-region allocation and then ran the incumbent until
 the 720 s state cap expired, losing every in-memory timing and memory/cache
 observation; seconds cannot be apportioned from that run. The source fixes

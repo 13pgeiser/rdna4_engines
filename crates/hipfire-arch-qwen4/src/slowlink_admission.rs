@@ -19,16 +19,14 @@
 //! candidate (forced or automatic) is selected only when all of these hold,
 //! checked in this order, cheapest first:
 //!
-//! 1. exact `gfx1100`, a discrete device ([`preflight`]);
-//! 2. the qualified MQ4 packed recipe on a single-device, whole-model,
-//!    auto-placed load: no expert parallelism, bands, hot set, `whole-first`,
-//!    explicit expert layer count, `memory.offload_exec` splice, expert-keep
-//!    artifact, or `HIPFIRE_QWEN4_EXPERT_STAGE=0` opt-out;
-//! 3. a context long enough to hold a multi-chunk window;
-//! 4. the measured host link ([`link_verdict`]): discrete and **below**
+//! 1. a single-device, whole-model, auto-placed discrete load: no expert
+//!    parallelism, bands, hot set, `whole-first`, explicit expert layer count,
+//!    `HIPFIRE_QWEN4_EXPERT_STAGE=0` opt-out, or CPU expert splice;
+//! 2. a context long enough to hold a multi-chunk window;
+//! 3. the measured host link ([`link_verdict`]): discrete and **below**
 //!    16 GB/s. A fast link, unified memory and an unmeasured link never select
 //!    S1, whatever the selector says;
-//! 5. the joint placement ([`project_at_tile`], consumed by [`admit`]): the
+//! 4. the joint placement ([`project_at_tile`], consumed by [`admit`]): the
 //!    purpose's tile ([`purpose_tile_rows`]), the prompt arena, the expert
 //!    page store, the route storage and A4 sidecars, the HC arena and the
 //!    boundary state are all charged together against the ACTUAL
@@ -40,10 +38,12 @@
 //!    non-expert weights plus the whole reserve with zero resident layers is
 //!    refused, with its exact byte deficit ([`Deficit`]).
 //!
-//! Steps 1 to 3 are probe-free; only a load that passes them measures the host
-//! link, so no other arch and no non-candidate load pays for the probe, and a
-//! load that fails any step is the incumbent byte for byte with a zero S1
-//! charge ([`crate::expert_residency::PlacementCharges::slowlink`] is `0`).
+//! Probe-free checks run first; only a load that passes them measures the host
+//! link, and a load that fails any step is the incumbent byte for byte with a
+//! zero S1 charge ([`crate::expert_residency::PlacementCharges::slowlink`] is `0`).
+//! Sealed capability gates (panels, layout, codec, kernel, load decline and the
+//! preflight dry run) refuse before materialization; only an actually admitted
+//! sealed expert-slab or aggregate layout and its real native kernels run S1.
 
 use crate::host_link::{HostLink, NARROW_LINK_GBPS};
 use crate::Qwen4Config;
@@ -180,8 +180,9 @@ pub struct LoadShape<'a> {
     /// Expert-parallel mesh, or an agreed expert-parallel layer split.
     pub expert_parallel: bool,
     pub pipeline_band: bool,
-    /// The qualified MQ4 packed recipe (`FlashNextPacked`).
-    pub packed_mq4: bool,
+    /// Recipe, layout and kernel admission is by sealed verification
+    /// ([`window_route_of`], the panel/codec/kernel preflight and
+    /// [`crate::slowlink_prefill::bind_at_load`]), never by recipe name.
     pub routed_experts: bool,
     pub expert_keep: bool,
     /// `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` set explicitly.
@@ -191,8 +192,6 @@ pub struct LoadShape<'a> {
     pub whole_first: bool,
     /// `HIPFIRE_QWEN4_EXPERT_STAGE=0`: the staged-transport opt-out.
     pub stage_opt_out: bool,
-    /// `memory.offload_exec` is not `pcie` (CPU splice or pass-back).
-    pub cpu_offload: bool,
     /// The NPU trunk engine is selected (`HIPFIRE_QWEN4_NPU_TRUNK` resolved for
     /// this arch is not `off`: `auto` resolves to off outside gfx1151, an
     /// explicit `on`/`emulate` selects it anywhere). Read from the config
@@ -230,7 +229,6 @@ pub struct Deficit {
 pub enum SlowlinkDecline {
     /// `HIPFIRE_QWEN4_SLOWLINK_PREFILL=0`.
     KillSwitch,
-    UnqualifiedArch(String),
     UnifiedMemory,
     Unsupported(&'static str),
     /// `HIPFIRE_PREFILL_CHUNK_ROWS` asks for a chunk other than the admitted S1
@@ -270,7 +268,6 @@ impl fmt::Display for SlowlinkDecline {
         const MIB: u64 = 1 << 20;
         match self {
             Self::KillSwitch => write!(f, "{SLOWLINK_PREFILL_ENV}=0"),
-            Self::UnqualifiedArch(arch) => write!(f, "{arch} is not gfx1100"),
             Self::UnifiedMemory => write!(f, "unified memory has no link to stream over"),
             Self::Unsupported(what) => write!(f, "unsupported mode: {what}"),
             Self::ExplicitChunk { rows, tile: None } => write!(
@@ -330,19 +327,17 @@ pub fn preflight(mode: SlowlinkMode, shape: &LoadShape<'_>) -> Result<(), Slowli
     if mode == SlowlinkMode::Off {
         return Err(SlowlinkDecline::KillSwitch);
     }
-    if shape.arch != "gfx1100" {
-        return Err(SlowlinkDecline::UnqualifiedArch(shape.arch.to_string()));
-    }
+    // No arch allowlist, recipe-name or raw offload-exec gate: only an actually
+    // admitted sealed layout/panel/codec/kernel verdict admits, and the S1
+    // runtime declines unsupported modes before materialization. The unified
+    // memory check stays: there is no link to stream over.
+    let _ = shape.arch;
     if shape.unified_memory {
         return Err(SlowlinkDecline::UnifiedMemory);
     }
     let unsupported = [
         (shape.expert_parallel, "expert parallelism"),
         (shape.pipeline_band, "pipeline parallelism"),
-        (
-            !shape.packed_mq4,
-            "recipe is not the qualified MQ4 packed layout",
-        ),
         (!shape.routed_experts, "no routed experts"),
         (shape.expert_keep, "expert-keep artifact"),
         (
@@ -352,7 +347,6 @@ pub fn preflight(mode: SlowlinkMode, shape: &LoadShape<'_>) -> Result<(), Slowli
         (shape.hotset_sidecar, "ranked expert hot set"),
         (shape.whole_first, "whole-first placement policy"),
         (shape.stage_opt_out, "HIPFIRE_QWEN4_EXPERT_STAGE=0 opt-out"),
-        (shape.cpu_offload, "memory.offload_exec splice"),
         (shape.npu_trunk, "NPU trunk selected"),
     ];
     if let Some((_, what)) = unsupported.into_iter().find(|(hit, _)| *hit) {
@@ -401,6 +395,42 @@ pub fn window_route_of(weights: &[hipfire_runtime::weight_manifest::WeightEntry]
     } else {
         WindowRoute::Aggregate
     }
+}
+/// Whether the manifest's sourced routed-expert dtypes are a source-priced
+/// mixed MQ2-R2 / E8P pair: one gate/up or down projection declares an MQ2-I4
+/// slab dtype while another declares E8P-I4 (either R256 or R128 rung). Such an
+/// artifact never reaches the sealed panel/codec/kernel verdict: S1 declines
+/// pre-mutation even when incumbent kernels exist for each dtype alone.
+/// Aggregate (packed, non-slab) dtypes and uniform cold codecs stay untouched.
+pub fn mixed_source_priced_mq2r2_e8p(
+    weights: &[hipfire_runtime::weight_manifest::WeightEntry],
+    bytes_of: &dyn Fn(&hipfire_runtime::weight_manifest::WeightEntry) -> Option<u64>,
+) -> bool {
+    use rdna_compute::DType;
+    let mut saw_mq2 = false;
+    let mut saw_e8p = false;
+    for entry in weights {
+        if entry.residency.is_external() {
+            continue;
+        }
+        if bytes_of(entry).is_none() {
+            continue;
+        }
+        let gate_up = entry.name.ends_with(".mlp.experts.gate_up_proj");
+        let down = entry.name.ends_with(".mlp.experts.down_proj");
+        if !(gate_up || down) {
+            continue;
+        }
+        match entry.dtype {
+            DType::MQ2I4G128R256 | DType::MQ2I4G128R128 => saw_mq2 = true,
+            DType::E8PI4G128R256 | DType::E8PI4G128R128 => saw_e8p = true,
+            _ => {}
+        }
+        if saw_mq2 && saw_e8p {
+            return true;
+        }
+    }
+    false
 }
 
 /// The model dimensions the S1 layouts are sized from.
@@ -1917,6 +1947,11 @@ pub fn load_admission_inputs(
 ) -> Result<AdmissionInputs, SlowlinkDecline> {
     use crate::expert_residency as residency;
     let route = window_route_of(facts.weights);
+    if mixed_source_priced_mq2r2_e8p(facts.weights, facts.bytes_of) {
+        return Err(SlowlinkDecline::Geometry(
+            "source-priced mixed MQ2-R2/E8P routed experts are not an S1 layout: declined pre-mutation even with incumbent kernels".into(),
+        ));
+    }
     let geometry =
         ModelGeometry::from_config(facts.config, route).map_err(SlowlinkDecline::Geometry)?;
     let (non_expert, layer_expert_bytes) = residency::resident_split(facts.weights, facts.bytes_of)
@@ -2067,7 +2102,6 @@ pub fn select_load_profile<'a>(
 pub struct StructuralShape {
     pub expert_parallel: bool,
     pub pipeline_band: bool,
-    pub packed_mq4: bool,
     pub routed_experts: bool,
     pub expert_keep: bool,
     pub hotset_sidecar: bool,
@@ -2077,9 +2111,12 @@ pub struct StructuralShape {
 impl<'a> LoadShape<'a> {
     /// The shape of a load whose process-level controls are read from the
     /// config snapshot exactly as the product loader reads them: an explicit
-    /// `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`, the `HIPFIRE_QWEN4_EXPERT_STAGE=0`
-    /// opt-out and `memory.offload_exec`. `chunk_rows_env` is the raw
-    /// `HIPFIRE_PREFILL_CHUNK_ROWS` value, when set.
+    /// `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` and the `HIPFIRE_QWEN4_EXPERT_STAGE=0`
+    /// opt-out. Recipe, layout and kernel admission is by sealed verification
+    /// before materialization, never by recipe name or a raw offload-exec
+    /// veto; an actually CPU-split sealed selection refuses at the dispatch
+    /// gate. `chunk_rows_env` is the raw `HIPFIRE_PREFILL_CHUNK_ROWS` value,
+    /// when set.
     pub fn from_process(
         arch: &'a str,
         unified_memory: bool,
@@ -2095,15 +2132,12 @@ impl<'a> LoadShape<'a> {
             unified_memory,
             expert_parallel: structural.expert_parallel,
             pipeline_band: structural.pipeline_band,
-            packed_mq4: structural.packed_mq4,
             routed_experts: structural.routed_experts,
             expert_keep: structural.expert_keep,
             explicit_vram_layers: explicit.is_some(),
             hotset_sidecar: structural.hotset_sidecar,
             whole_first: structural.whole_first,
             stage_opt_out: stage.as_deref() == Some("0"),
-            cpu_offload: hipfire_config::memory::offload_exec()
-                != hipfire_config::memory::OffloadExec::Pcie,
             npu_trunk: npu_trunk_selected(
                 arch,
                 crate::npu_trunk::NpuTrunkMode::from_env()
@@ -2454,14 +2488,12 @@ mod tests {
             unified_memory: false,
             expert_parallel: false,
             pipeline_band: false,
-            packed_mq4: true,
             routed_experts: true,
             expert_keep: false,
             explicit_vram_layers: false,
             hotset_sidecar: false,
             whole_first: false,
             stage_opt_out: false,
-            cpu_offload: false,
             npu_trunk: false,
             chunk_rows_env: None,
             max_seq: 16640,
@@ -2592,21 +2624,19 @@ mod tests {
     }
 
     #[test]
-    fn slowlink_admission_arch_truth_table_is_exact_gfx1100_only() {
+    fn slowlink_admission_arch_is_identity_not_an_allowlist_gate() {
+        // The exact-arch name gate is removed: probe-free admission never
+        // refuses by arch string. Every arch value passes preflight; only the
+        // sealed panel/codec/kernel verdict before materialization admits.
         for arch in [
-            "gfx906", "gfx908", "gfx90a", "gfx942", "gfx1010", "gfx1030", "gfx1031", "gfx1101",
-            "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1200", "gfx1201", "gfx1100x", "",
+            "gfx906", "gfx908", "gfx90a", "gfx942", "gfx1010", "gfx1030", "gfx1031", "gfx1100",
+            "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+            "gfx1100x", "",
         ] {
             let load = LoadShape { arch, ..shape() };
-            assert_eq!(
-                preflight(SlowlinkMode::Force, &load),
-                Err(SlowlinkDecline::UnqualifiedArch(arch.to_string())),
-                "{arch}"
-            );
+            assert_eq!(preflight(SlowlinkMode::Force, &load), Ok(()), "{arch}");
         }
-        assert_eq!(preflight(SlowlinkMode::Force, &shape()), Ok(()));
-        // The arch gate precedes everything else, so no other arch is ever
-        // reported as anything but the arch.
+        // Unified memory still declines: there is no link to stream over.
         let load = LoadShape {
             arch: "gfx1201",
             unified_memory: true,
@@ -2615,7 +2645,7 @@ mod tests {
         };
         assert_eq!(
             preflight(SlowlinkMode::Force, &load),
-            Err(SlowlinkDecline::UnqualifiedArch("gfx1201".into()))
+            Err(SlowlinkDecline::UnifiedMemory)
         );
     }
 
@@ -2658,7 +2688,10 @@ mod tests {
 
     #[test]
     fn slowlink_admission_unsupported_modes_decline_before_any_probe() {
-        let cases: [(&str, LoadShape<'static>); 11] = [
+        // Recipe-name and raw offload-exec gates are removed: sealed
+        // panel/codec/kernel verdicts refuse before materialization. The
+        // remaining structural modes still decline probe-free.
+        let cases: [(&str, LoadShape<'static>); 9] = [
             (
                 "ep",
                 LoadShape {
@@ -2670,13 +2703,6 @@ mod tests {
                 "pp",
                 LoadShape {
                     pipeline_band: true,
-                    ..shape()
-                },
-            ),
-            (
-                "recipe",
-                LoadShape {
-                    packed_mq4: false,
                     ..shape()
                 },
             ),
@@ -2719,13 +2745,6 @@ mod tests {
                 "stage off",
                 LoadShape {
                     stage_opt_out: true,
-                    ..shape()
-                },
-            ),
-            (
-                "cpu",
-                LoadShape {
-                    cpu_offload: true,
                     ..shape()
                 },
             ),
@@ -2784,8 +2803,8 @@ mod tests {
         }
         assert!(npu_trunk_selected("gfx1151", Auto));
         assert!(!npu_trunk_selected("gfx1151", Off));
-        // A selected NPU is an incumbent decline on an otherwise qualified
-        // gfx1100 load, before any probe or reserve.
+        // A selected NPU is an incumbent decline on an otherwise admitted load,
+        // before any probe or reserve.
         let npu = |mode| LoadShape {
             npu_trunk: npu_trunk_selected("gfx1100", mode),
             ..shape()
@@ -2849,6 +2868,62 @@ mod tests {
         let profile = select("768").unwrap().expect("the purpose tile admits");
         assert_eq!(profile.tile_rows, S1_PRODUCT_TILE_ROWS);
         assert!(select("").unwrap().is_some());
+    }
+    #[test]
+    fn slowlink_admission_source_priced_mixed_mq2r2_e8p_declines_pre_mutation() {
+        use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
+        use rdna_compute::DType;
+        // Source-priced mixed MQ2-R2 / E8P routed experts (one gate/up MQ2-I4,
+        // one down E8P-I4) decline pre-mutation even though incumbent kernels
+        // exist for each dtype alone: the sealed panel/codec/kernel tables
+        // have no mixed route, and the decline names the layout, not a host.
+        let entry = |name: &str, dtype: DType| {
+            let mut entry = WeightEntry::model(
+                name.to_string(),
+                vec![512, 1280, 2560],
+                dtype,
+                hipfire_runtime::weight_manifest::ShardPolicy::Replicate,
+            );
+            entry.layer = Some(0);
+            entry.residency = WeightResidency::Resident;
+            entry
+        };
+        let weights = vec![
+            entry(
+                "model.language_model.layers.0.mlp.experts.gate_up_proj",
+                DType::MQ2I4G128R256,
+            ),
+            entry(
+                "model.language_model.layers.0.mlp.experts.down_proj",
+                DType::E8PI4G128R256,
+            ),
+        ];
+        let bytes_of = |_: &WeightEntry| Some(1_740_800u64);
+        assert!(mixed_source_priced_mq2r2_e8p(&weights, &bytes_of));
+        // Uniform dtypes (MQ4 only, or E8P only) are not a mixed pair: the
+        // sealed panel/codec/kernel verdict decides them, never this decline.
+        let uniform = vec![
+            entry(
+                "model.language_model.layers.0.mlp.experts.gate_up_proj",
+                DType::MQ4G256V2,
+            ),
+            entry(
+                "model.language_model.layers.0.mlp.experts.down_proj",
+                DType::MQ4G256V2,
+            ),
+        ];
+        assert!(!mixed_source_priced_mq2r2_e8p(&uniform, &bytes_of));
+        let e8p_only = vec![
+            entry(
+                "model.language_model.layers.0.mlp.experts.gate_up_proj",
+                DType::E8PI4G128R256,
+            ),
+            entry(
+                "model.language_model.layers.0.mlp.experts.down_proj",
+                DType::E8PI4G128R256,
+            ),
+        ];
+        assert!(!mixed_source_priced_mq2r2_e8p(&e8p_only, &bytes_of));
     }
 
     #[test]
@@ -4671,17 +4746,12 @@ mod tests {
             facts_built.set(true);
             Err("facts must not be built".to_string())
         };
-        // Killed, unqualified-auto and ineligible loads: no probe, no facts.
+        // Killed and structurally ineligible loads: no probe, no facts. Arch
+        // is identity only: an arch-named load still probes (only sealed
+        // verdicts refuse by capability).
         for (mode, load) in [
             (SlowlinkMode::Off, shape()),
             (SlowlinkMode::Auto, shape()),
-            (
-                SlowlinkMode::Force,
-                LoadShape {
-                    arch: "gfx1201",
-                    ..shape()
-                },
-            ),
             (
                 SlowlinkMode::Force,
                 LoadShape {

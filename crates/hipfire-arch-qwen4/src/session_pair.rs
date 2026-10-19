@@ -355,6 +355,7 @@ pub(crate) const SLOWLINK_RECEIPT_KEYS: [&str; 21] = [
 /// tuple `PairSessionStage::configure` takes.
 pub(crate) type QsaCommit = (usize, usize, usize, usize, usize);
 
+#[cfg(any(test, feature = "lab", feature = "reference-parity"))]
 /// Named failure points of the one-shot injection (`slowlink_inject_failure`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SlowlinkFailPoint {
@@ -364,6 +365,7 @@ pub(crate) enum SlowlinkFailPoint {
     BeforeCommit,
 }
 
+#[cfg(any(test, feature = "lab", feature = "reference-parity"))]
 impl SlowlinkFailPoint {
     pub(crate) fn parse(name: &str) -> Option<Self> {
         Some(match name {
@@ -757,7 +759,9 @@ pub(crate) struct SlowlinkOwner {
     receipt: Option<StoredReceipt>,
     receipt_fresh: bool,
     bypass: Option<std::borrow::Cow<'static, str>>,
+    #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
     injection: Option<SlowlinkFailPoint>,
+    #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
     injection_consumed: bool,
     /// Entry `pending` hidden of an MTP request, restored on failure.
     pending_save: Option<GpuTensor>,
@@ -889,15 +893,22 @@ impl Qwen4Bundle {
             }
         };
         if let Value::Object(map) = &mut receipt {
-            map.insert(
-                "injection_consumed".into(),
-                json!(self.slowlink.injection_consumed),
-            );
+            #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
+            let injection_consumed = self.slowlink.injection_consumed;
+            #[cfg(not(any(test, feature = "lab", feature = "reference-parity")))]
+            let injection_consumed = false;
+            map.insert("injection_consumed".into(), json!(injection_consumed));
         }
         Some(receipt)
     }
 
     /// Arm (or clear) the one-shot failure of the NEXT layer-major prompt.
+    /// Tools-only: gated `test` / `lab` / `reference-parity` like the rest of
+    /// the injection API (the type, fields, parse and take branches). The
+    /// one-shot failure is real rollback through the receipted transaction,
+    /// not a stub; outside tools the API is unavailable and non-lab receipts
+    /// truthfully report `injection_consumed: false`.
+    #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
     pub fn slowlink_inject_failure(&mut self, point: Option<&str>) -> Result<(), BundleError> {
         self.slowlink.injection = match point {
             None => None,
@@ -911,6 +922,7 @@ impl Qwen4Bundle {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
     /// Consume the armed injection when it names `point`.
     pub(crate) fn slowlink_take_injection(&mut self, point: SlowlinkFailPoint) -> bool {
         if self.slowlink.injection == Some(point) {
@@ -987,7 +999,8 @@ impl Qwen4Bundle {
     /// mismatch count. `Err` only for a global fault before any diagnostic
     /// work: an unknown/empty request, a load without an admitted profile, a
     /// bundle that cannot run it now (open window, other topology), or
-    /// missing forward ownership. Never a pass by default.
+    /// missing forward ownership. Never a pass by default. Tools-only.
+    #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
     pub fn slowlink_primitive_selftest(
         &mut self,
         gpu: &mut Gpu,
@@ -1029,7 +1042,10 @@ impl Qwen4Bundle {
     fn slowlink_begin_request(&mut self) {
         self.slowlink.receipt_fresh = false;
         self.slowlink.bypass = None;
-        self.slowlink.injection_consumed = false;
+        #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
+        {
+            self.slowlink.injection_consumed = false;
+        }
         self.slowlink.pending_saved = false;
         self.slowlink.pending_for = None;
     }
@@ -1769,6 +1785,7 @@ impl Qwen4Bundle {
             );
             return Err(self.slowlink_fail(gpu, live, &cause));
         }
+        #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
         if self.slowlink_take_injection(SlowlinkFailPoint::BeforeCommit) {
             return Err(self.slowlink_fail(gpu, live, "injected slow-link failure before commit"));
         }

@@ -44,12 +44,14 @@
 //! Tile `t` of a window is the incumbent chunk `t` of the same chronology: the
 //! tile row counts, the routing-row signature (`Gpu::route_rows`), the HC
 //! stream tag (BF16 or F32), the QSA/GDN positions and the PLE history are all
-//! per tile and equal the 1,536-row chunk-major run. Only the host layers'
-//! expert combine is the canonical panel combine instead of the per-chunk
-//! sealed call, so this route is validated by exact greedy ids and paired KLD,
-//! never labelled bitwise against the 8,192-row incumbent.
+//! per tile. Host expert panels use the canonical ordered combine.
+//! Cross-route qualification uses long-context route-relative KL at
+//! beta's own benign-route scale, same-route determinism and coherent text;
+//! it does not claim byte equality against the incumbent's row grouping.
 
-use crate::bundle::{PromptTxn, Qwen4Bundle, SlowlinkFailPoint};
+#[cfg(any(test, feature = "lab", feature = "reference-parity"))]
+use crate::bundle::SlowlinkFailPoint;
+use crate::bundle::{PromptTxn, Qwen4Bundle};
 use crate::config::Qwen4Config;
 use crate::gpu_forward::panel_stage::{
     ExpertGroupPlan, ExpertPanelRing, OverlapSummary, PanelBindingParts, PanelSchedule, PanelStats,
@@ -2312,12 +2314,11 @@ fn with_tile_frames<T>(
         .layer(layer_index)
         .ok_or_else(|| invalid(format!("layer {layer_index} is not owned by this band")))?;
     // The D2 executor gate (`cpu_split_executor`) sees only the row count, so
-    // the dry-run and execution frames bind the same selected-runtime view as
-    // the forward loop: the runtime this layer actually selected with no
-    // executor. S1 never runs expert parallel, so no balanced-live or EP-full
-    // runtime exists here and the selection is the static runtime; it is
-    // written through the shared selector so a future caller that does select
-    // another runtime cannot silently bind the wrong one.
+    // the dry-run and execution frames bind the same selected-runtime routed
+    // view as the forward loop: S1 never runs expert parallel, so no
+    // balanced-live or EP-full runtime exists here and the static runtime is
+    // the selection, through the shared selector. An actually CPU-split sealed
+    // selection refuses at the dispatch gate, never S1-routed.
     let layer_moe = crate::gpu_forward::select_layer_moe(
         None::<&crate::gpu_forward::Qwen4MoeLayerRuntime>,
         None,
@@ -2346,7 +2347,7 @@ fn with_tile_frames<T>(
     let descriptions = tiles
         .iter()
         .map(|tile| {
-            layer_desc(
+            let mut description = layer_desc(
                 &bundle.weights,
                 layer,
                 layer_moe,
@@ -2355,7 +2356,15 @@ fn with_tile_frames<T>(
                 tile.routing.route_rows,
                 geo.few_row_limit,
                 None,
-            )
+            )?;
+            if let Qwen4FfnBinding::Moe(moe) = &mut description.ffn {
+                moe.routed_experts = crate::gpu_forward::bind_routed_view(
+                    layer_moe,
+                    moe.routed_experts,
+                    |runtime| runtime.routed_view(false, tile.rows, tile.routing.route_rows),
+                );
+            }
+            Ok::<_, Qwen4GpuForwardError>(description)
         })
         .collect::<Result<Vec<_>, _>>()?;
     let ctx = DispatchCtx::new(gpu);
@@ -2523,6 +2532,7 @@ impl Run<'_, '_> {
                 )?;
             }
         }
+        #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
         if self
             .bundle
             .slowlink_take_injection(SlowlinkFailPoint::BeforeDma)
@@ -2551,6 +2561,7 @@ impl Run<'_, '_> {
                 self.resident_layer(w, layer, txn)?;
             }
             self.rt.ring.mark_layer_end(&*self.gpu, layer)?;
+            #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
             if layer == geo.band.start
                 && self
                     .bundle
@@ -2692,7 +2703,9 @@ impl Run<'_, '_> {
                 .expert_extent_bytes(layer, expert)
                 .unwrap_or(0) as u64;
         }
+        #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
         let first_bound = work.iter().position(|group| group.bound);
+        #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
         let inject = self
             .bundle
             .slowlink_take_injection(SlowlinkFailPoint::DuringPanel);
@@ -2806,6 +2819,7 @@ impl Run<'_, '_> {
                 walk_layer_groups(&mut ring, gpu, layer, &work, &mut |gpu, index, parts| {
                     let parts =
                         parts.ok_or_else(|| invalid("slow-link panel lease carries no binding"))?;
+                    #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
                     if inject && Some(index) == first_bound {
                         return Err(invalid("injected slow-link failure during a panel"));
                     }
@@ -3330,12 +3344,15 @@ pub(crate) fn try_run_prompt(
 
 /// Compute-stream delay (in repeats of the transport's delay kernel) that
 /// keeps each page's reader queued while the page refills.
+#[cfg(any(test, feature = "lab", feature = "reference-parity"))]
 const SELFTEST_DELAY_REPEATS: usize = 128;
+#[cfg(any(test, feature = "lab", feature = "reference-parity"))]
 const SELFTEST_SEED: u64 = 0x5eed_51ee_d5b0_0001;
 
 /// `{"name","status":"pass","mismatches":0,"detail"}` of one dispatch
 /// primitive that observed every check; a failed check is an `Err` carrying
 /// the whole raw report (no mismatch count is invented).
+#[cfg(any(test, feature = "lab", feature = "reference-parity"))]
 fn primitive_case_json(name: &str, report: &dsp::selftest::PrimitiveReport) -> R<Value> {
     let raw = report.to_json();
     if !report.ok {
@@ -3357,6 +3374,7 @@ fn primitive_case_json(name: &str, report: &dsp::selftest::PrimitiveReport) -> R
 /// The transport primitives, measured by the ring's own diagnostic driven
 /// through the same prime / enter / require / acquire / retire / pump path the
 /// prompt run uses, on as many real host layers as two full pool sweeps need.
+#[cfg(any(test, feature = "lab", feature = "reference-parity"))]
 fn transport_case(rt: &mut SlowlinkRuntime, gpu: &mut Gpu, name: &str) -> R<Value> {
     let pages = rt
         .ring
@@ -3434,6 +3452,7 @@ fn transport_case(rt: &mut SlowlinkRuntime, gpu: &mut Gpu, name: &str) -> R<Valu
 
 /// A dispatch primitive on a real sealed tile call and a real staged page
 /// binding of the first host layer.
+#[cfg(any(test, feature = "lab", feature = "reference-parity"))]
 fn dispatch_case(
     forward: &Qwen4GpuForward,
     bundle: &Qwen4Bundle,
@@ -3568,6 +3587,7 @@ fn dispatch_case(
 /// call (64 rows) and real decode call (1 row at window row 64), each sealed
 /// the way the model seals it, against the layer's resident all-expert binding
 /// (the router may select any expert, a staged 32-expert page cannot hold them).
+#[cfg(any(test, feature = "lab", feature = "reference-parity"))]
 fn decode_tail_case(
     forward: &Qwen4GpuForward,
     bundle: &Qwen4Bundle,
@@ -3683,6 +3703,7 @@ fn decode_tail_case(
 
 /// The first device-resident qualified expert layer of the band, the layer a
 /// resident all-expert binding check runs on (`what` names the check).
+#[cfg(any(test, feature = "lab", feature = "reference-parity"))]
 fn resident_check_layer(forward: &Qwen4GpuForward, geo: &RunGeo, what: &str) -> R<usize> {
     geo.band
         .clone()
@@ -3703,6 +3724,7 @@ fn resident_check_layer(forward: &Qwen4GpuForward, geo: &RunGeo, what: &str) -> 
 /// Rows of the two aggregate F32-tail calls the cohort check runs: 3 takes the
 /// incumbent's few-row indexed-down arm, 9 (one above the few-row limit of 8)
 /// its F32 grouped-down arm.
+#[cfg(any(test, feature = "lab", feature = "reference-parity"))]
 const F32_TAIL_CASE_ROWS: [usize; 2] = [3, 9];
 
 /// The aggregate route's F32-tail cohort: the dispatch crate's `k1_tail_cohort`
@@ -3712,6 +3734,7 @@ const F32_TAIL_CASE_ROWS: [usize; 2] = [3, 9];
 /// resident all-expert binding (the router may select any expert; a staged
 /// page cannot hold them all). Every call must be an F32-tail call whose
 /// routing rows land in its named arm.
+#[cfg(any(test, feature = "lab", feature = "reference-parity"))]
 fn f32_tail_case(
     forward: &Qwen4GpuForward,
     bundle: &Qwen4Bundle,
@@ -3807,6 +3830,7 @@ fn f32_tail_case(
 
 /// One named primitive check on the attached forward's real owners; the
 /// ring is drained and idle afterwards whatever the outcome.
+#[cfg(any(test, feature = "lab", feature = "reference-parity"))]
 pub(crate) fn primitive_selftest(
     forward: &mut Qwen4GpuForward,
     bundle: &mut Qwen4Bundle,
