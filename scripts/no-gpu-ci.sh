@@ -51,6 +51,7 @@ PYTEST_PATHS=(
     scripts/test_lmx_corpus.py scripts/test_ck_runtime_bundle.py
     scripts/test_check_changelog.py scripts/test_kernel_idproof.py
     scripts/test_agentic_gate_driver.py
+    scripts/test_post_land_smoke.py scripts/test_post_land_smoke_orchestrator.py
 )
 if python3 -c 'import pytest, numpy' 2>/dev/null; then
     python3 -m pytest "${PYTEST_PATHS[@]}"

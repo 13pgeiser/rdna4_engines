@@ -76,6 +76,7 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 | Registry models, VRAM, sampling, sidecars | [`docs/MODELS.md`](MODELS.md) | shipped / ref-pinned | Registry presence ≠ runtime admission. |
 | Serve HTTP API | [`docs/SERVE.md`](SERVE.md) | shipped / ref-pinned | |
 | Chat UX and daemon attach behavior | [`docs/CHAT.md`](CHAT.md) | shipped / ref-pinned | |
+| Post-land GPU smoke (cells, invariants, lanes, verdict and pin policy) | [`docs/post-land-smoke.md`](post-land-smoke.md) | shipped / ref-pinned | Orchestrator `scripts/post-land-smoke.sh`, runner `scripts/post_land_smoke.py`, plan `scripts/post-land-smoke/plan.json`. |
 | Open field faults (known issues) and what to capture | [`docs/KNOWN-ISSUES.md`](KNOWN-ISSUES.md) | measured | Dated observations with host versions; root causes unresolved unless stated. Not a default, workaround or admission. |
 | Crate layout and request lifecycle (overview) | [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) | shipped / ref-pinned | Runtime source wins on conflict. |
 | Architecture id table | [`docs/architecture-ids.md`](architecture-ids.md) | shipped / ref-pinned | |
