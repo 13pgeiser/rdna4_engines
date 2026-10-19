@@ -21,6 +21,15 @@ def out(obj):
 def echo_ids(req):
     return req.get("id"), req.get("attempt_id")
 
+
+def wait_fixture_control(kind, rid, aid):
+    # Test-only handshake: keep done or its side-channel log unpublished until
+    # the test has observed the admission state on the other side of the gate.
+    msg = json.loads(sys.stdin.readline())
+    log_req(msg)
+    if msg.get("type") != kind or echo_ids(msg) != (rid, aid):
+        raise RuntimeError("unexpected fixture control: " + repr(msg))
+
 def eligible_from_model():
     # Task 15: "ineligible" in model path/name => retry_reset_eligible false.
     blob = (MODEL_PATH or "").lower()
@@ -74,6 +83,7 @@ def scenario_from(req):
         "t11-stop-text",
         "t11-usage",
         "t11-long-nonstream",
+        "t11-gated-nonstream",
         "t11-open-think-stop",
         "t21-think-text",
     )
@@ -280,7 +290,7 @@ def handle_generate(req):
         success_stop(rid, aid)
         return
 
-    if scenario == "t11-long-nonstream":
+    if scenario in ("t11-long-nonstream", "t11-gated-nonstream"):
         # Delayed generation that stays stdin-responsive so a correlated abort
         # can land while no further tokens are produced (silent cancel path).
         ready_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixture-ready.log")
@@ -315,10 +325,13 @@ def handle_generate(req):
                 })
                 emit_correlated({"type": "aborted", "reason": "client_cancelled"}, rid, aid)
                 log_req({"type": "daemon_aborted", "id": rid, "attempt_id": aid})
-                # Deliberate drain lag so tests can observe done/aborted before
-                # AdmissionGuard release (inflight must not hit zero early).
-                time.sleep(0.3)
+                if scenario == "t11-gated-nonstream":
+                    wait_fixture_control("fixture_release_done", rid, aid)
+                else:
+                    time.sleep(0.3)
                 emit_correlated({"type": "done", "finish_reason": "aborted"}, rid, aid)
+                if scenario == "t11-gated-nonstream":
+                    wait_fixture_control("fixture_release_done_log", rid, aid)
                 log_req({"type": "daemon_done_aborted", "id": rid, "attempt_id": aid})
                 return
             if ty == "commit":

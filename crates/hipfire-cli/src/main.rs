@@ -17980,14 +17980,14 @@ effort = "high"
         );
     }
 
-    /// Silent non-stream client disconnect aborts the correlated daemon txn,
-    /// drains done/aborted before Admission releases, then admits a follow-up.
+    /// Silent non-stream disconnect holds admission until the correlated done
+    /// drains, independently of when the fixture writes its side-channel log.
     #[cfg(unix)]
     #[test]
     fn nonstream_client_disconnect_aborts_and_releases_admission() {
         let harness = Task11HttpHarness::spawn("ns-disconnect-abort");
         let port = harness.port();
-        let body = harness.base_body("t11-long-nonstream", false);
+        let body = harness.base_body("t11-gated-nonstream", false);
 
         assert_eq!(
             harness.shared.admission.inflight(),
@@ -18022,51 +18022,63 @@ effort = "high"
         // Client disconnect without ever reading an HTTP status line.
         drop(stream);
 
-        let poll_deadline = Instant::now() + Duration::from_secs(5);
-        let mut saw_abort = false;
-        let mut saw_done_aborted = false;
-        let mut inflight_hit_zero_before_done = false;
+        let correlated = |row: &serde_json::Value, kind: &str| {
+            row.get("type").and_then(|v| v.as_str()) == Some(kind)
+                && row.get("id") == Some(&gen_id)
+                && row.get("attempt_id").and_then(|v| v.as_u64()) == Some(gen_aid)
+        };
+        let wait_for_marker = |kind: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let log = harness.read_requests_log();
+                if log.iter().any(|row| correlated(row, kind)) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "missing {kind}; log={log:?}");
+                thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let release = |kind: &str| {
+            harness
+                .shared
+                .runtime
+                .lock()
+                .unwrap()
+                .engine
+                .send(&serde_json::json!({
+                    "type": kind,
+                    "id": gen_id,
+                    "attempt_id": gen_aid,
+                }))
+                .unwrap();
+        };
 
-        while Instant::now() < poll_deadline {
-            let log = harness.read_requests_log();
-            if !saw_abort {
-                saw_abort = log.iter().any(|row| {
-                    row.get("type").and_then(|v| v.as_str()) == Some("abort")
-                        && row.get("id") == Some(&gen_id)
-                        && row.get("attempt_id").and_then(|v| v.as_u64()) == Some(gen_aid)
-                });
-            }
-            if !saw_done_aborted {
-                saw_done_aborted = log.iter().any(|row| {
-                    row.get("type").and_then(|v| v.as_str()) == Some("daemon_done_aborted")
-                        && row.get("id") == Some(&gen_id)
-                        && row.get("attempt_id").and_then(|v| v.as_u64()) == Some(gen_aid)
-                });
-            }
-            let inflight = harness.shared.admission.inflight();
-            if inflight == 0 && !saw_done_aborted {
-                inflight_hit_zero_before_done = true;
-            }
-            if saw_abort && saw_done_aborted && inflight == 0 {
-                break;
-            }
+        wait_for_marker("abort");
+        wait_for_marker("daemon_aborted");
+        // The fixture cannot emit done until we release it. This checks the
+        // drain contract without racing two independently sampled observers.
+        assert_eq!(
+            harness.shared.admission.inflight(),
+            1,
+            "admission must remain held while done is withheld"
+        );
+        release("fixture_release_done");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while harness.shared.admission.inflight() != 0 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
-
+        assert_eq!(harness.shared.admission.inflight(), 0, "done must drain");
+        // Force the old false-positive schedule: the real done has drained,
+        // but the fixture's later side-channel marker is still withheld.
         assert!(
-            saw_abort,
-            "correlated abort{{id,attempt_id}} missing within poll bound; log={:?}",
-            harness.read_requests_log()
+            !harness
+                .read_requests_log()
+                .iter()
+                .any(|row| correlated(row, "daemon_done_aborted")),
+            "the fixture must still be holding its done log"
         );
-        assert!(
-            saw_done_aborted,
-            "daemon done/aborted marker missing; log={:?}",
-            harness.read_requests_log()
-        );
-        assert!(
-            !inflight_hit_zero_before_done,
-            "Admission inflight reached 0 before done/aborted drained"
-        );
+        release("fixture_release_done_log");
+        wait_for_marker("daemon_done_aborted");
         assert_eq!(
             harness.shared.admission.inflight(),
             0,
