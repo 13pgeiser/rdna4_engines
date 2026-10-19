@@ -2038,7 +2038,7 @@ order, not a slow one.
 |---|---|---|
 | `qsa_block_key` | `M`(range) `n` `ratio` `rotary_dim` `pos0`/opt `block_size`/opt `eps`:f64 `theta`:f64 `scale`:f64/opt `wadd`:f64/opt `dtype` `mode`/opt `sections`/opt `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt | `k`, `w`w, `page`?, `pos`? → `out` |
 | `qsa_score` | `M`(range) `n` `heads` `blocks` `seqs` `dtype` | `q`, `bk`, `bt`, `cu`, `nc` → `score` |
-| `qsa_select` | `M`(range) `blocks` `topk` `ratio` `seqs` | `score`, `bt`, `nc`, `pos`, `cu` → `sel`, `nsel`, `seqused` |
+| `qsa_select` | `M`(range) `blocks` `topk` `ratio` `seqs` `signed`/opt | `score`, `bt`, `nc`, `pos`, `cu` → `sel`, `nsel`, `seqused` |
 | `qsa_tail_store` | `M`(range) `n` `ratio` `ring` `seqs` `dtype` | `k`, `pos`, `cu`, `state`:inout, `sidx` |
 | `qsa_work` | `M`(range) `n` `ratio` `ring` `seqs` `work` `dtype` | `k`, `pos`, `cu`, `state`, `sidx`, `bt`, `rope`? → `stage`, `page`, `bpos`, `nc` |
 
@@ -2151,6 +2151,14 @@ with the partial page appended.
 - **Ties break to the lower block index, through a prefix count.** A block score is a sum of relus
   over a shared grid, so equal scores are ordinary, and a top-k placed by whichever atomic landed
   first would not reproduce across runs; the tree checks generated text byte for byte.
+- **`signed` chooses the ranking.** Absent or `0`, a block is live when its page id is `>= 0` and
+  its score `> -1e30`, and ranks by `max(score, 0)`: QSA's scores are sums of relus, so the clamp
+  changes no ranking there. `1` is for indexers whose scores can be negative (GLM's DSA weights
+  its heads by signed gates): a block is live when its page id is `>= 0` and its score finite, and
+  ranks by the score itself, `-0` tying `+0`. The two rankings pick different sets whenever a live
+  score is negative, so an architecture states the one its indexer needs. libr4d's
+  `qsa_select_bf16` serves both; the signed ranking keys a score by its float's total order over
+  all 32 bits.
 - **`seqused` is why QSA needs no new attention kernel.** `attn_paged` takes its block table and
   per-sequence length as ordinary operands, so the sparse attention is that op issued with `sel` in
   place of the sequence's table and this number in place of its length. The KV it walks is `nsel`

@@ -1161,6 +1161,10 @@ static const RadParamSpec pQsaSelect[] = {
     { "topk",   RAD_P_INT, RAD_REQUIRED },
     { "ratio",  RAD_P_INT, RAD_REQUIRED },
     { "seqs",   RAD_P_INT, RAD_REQUIRED },
+    /* The ranking: 0 (absent) ranks max(score, 0) with scores at or below -1e30 dead, the QSA
+     * indexer's scores being sums of relus; 1 ranks signed finite scores, nonfinite ones dead, for
+     * indexers whose head weights can be negative. */
+    { "signed", RAD_P_INT, RAD_OPTIONAL },
 };
 static const RadOperandSpec oQsaSelect[] = {
     { "score",   RAD_OPD_IN,  0 },
@@ -2878,7 +2882,8 @@ static const RadOpSchema kSchemas[] = {
            "complete block, which the query itself lives in -- is appended LAST and is never a "
            "candidate: last is what makes the attention's own causal bound mask inside it and "
            "nowhere else, so the effective query position is (nsel-1)*ratio + pos%ratio. Ties "
-           "break to the LOWER block index through a prefix count, never through atomic order."),
+           "break to the LOWER block index through a prefix count, never through atomic order. "
+           "`signed` 1 ranks signed finite scores; absent or 0 ranks max(score, 0)."),
     SCHEMA("qsa_score", pQsaScore, oQsaScore,
            "score[m][b] = (sum over heads of relu(q[m][h] . bk[bt[m][b]])) / sqrt(n). THE RELU IS "
            "PER (BLOCK, HEAD) AND THE SUM IS OVER HEADS, in that order -- four independent votes, "

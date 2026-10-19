@@ -12,9 +12,10 @@
  *               The keys are read once per tile, which at decode is once per sequence. The dots
  *               sum in vector order (libref's order at the scalar level); the heads in order.
  *   qsa_select  Linear time per row: an order key per block (the bits of max(score, 0) plus one,
- *               0 for a dead block), a histogram of the keys' top bits, an exact select among the
- *               keys in the bin that holds the topk-th largest, and one emitting pass in block
- *               order. The ids match libref's byte for byte.
+ *               0 for a dead block; with `signed` the float's total order over all 32 bits), a
+ *               histogram of the keys' top bits, an exact select among the keys in the bin that
+ *               holds the topk-th largest, and one emitting pass in block order. The ids match
+ *               libref's byte for byte.
  *   qsa_tail_store, qsa_work   Row copies through f32, as libref copies, so every value lands
  *               with the bits libref's would.
  *   dflash_conv Channels across lanes, in blocks of columns that walk their rows, so a block's base
@@ -290,25 +291,29 @@ AVX_KERNEL(qsa_score) {
 /* ================================================================== qsa_select */
 namespace {
 
-/* Bins of the first selection pass: the top 10 bits of a key, which is below 2^31. */
-enum { kBins = 1024, kBinShift = 21 };
+/* Bins of the first selection pass: the top 10 bits of a key, which is below 2^31 (a signed
+ * key uses all 32 bits, so its bins sit one bit higher). */
+enum { kBins = 1024, kBinShift = 21, kBinShiftSigned = 22 };
 
 struct SelJob {
     const RadTensor *sc, *bt, *nc, *po, *se, *ns, *su;
     const int64_t* seq;
     int64_t nb, topk, ratio;
     int64_t s_rs, s_cs, bt_rs, bt_cs, o_rs, o_cs;
+    bool sgn;                          /* the `signed` order */
 };
 
 /* The order key of each of the row's first `n` blocks: bits(max(score, 0)) + 1 for a live block
  * (page id >= 0 and score > -1e30), 0 for a dead one. Non-negative floats order as their bits, so
  * keys order as libref's values; max(score, 0) maps -0 to +0 as libref's `v > 0 ? v : 0` does.
- * Returns the live count. */
+ * The signed order makes a block with a finite score live and keys it by the float's total order
+ * (sign bit flipped for a positive value, every bit for a negative one), -0 keyed as +0, so keys
+ * order as libref's signed values; no finite score keys to 0. Returns the live count. */
 static int64_t order_keys(const SelJob& j, int64_t m, int64_t s, int64_t n, uint32_t* key) {
     const int64_t sb = m * j.s_rs, bb = s * j.bt_rs;
     int64_t live = 0, b = 0;
 #if AVX_LEVEL >= 2
-    if (j.sc->dtype == RAD_F32 && j.s_cs == 1 && j.bt->dtype == RAD_I32 && j.bt_cs == 1) {
+    if (!j.sgn && j.sc->dtype == RAD_F32 && j.s_cs == 1 && j.bt->dtype == RAD_I32 && j.bt_cs == 1) {
         const float* v = (const float*)j.sc->data + sb;
         const int32_t* p = (const int32_t*)j.bt->data + bb;
 #if AVX_LEVEL == 3
@@ -341,6 +346,17 @@ static int64_t order_keys(const SelJob& j, int64_t m, int64_t s, int64_t n, uint
 #endif
     }
 #endif
+    if (j.sgn) {
+        for (; b < n; ++b) {
+            const float v = ldt(j.sc, sb + b * j.s_cs);
+            if (ldi(j.bt, bb + b * j.bt_cs) < 0 || !std::isfinite(v)) { key[b] = 0; continue; }
+            uint32_t u = 0;
+            if (v != 0.0f) std::memcpy(&u, &v, 4);
+            key[b] = (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
+            ++live;
+        }
+        return live;
+    }
     for (; b < n; ++b) {
         const float v = ldt(j.sc, sb + b * j.s_cs);
         if (ldi(j.bt, bb + b * j.bt_cs) < 0 || !(v > -1e30f)) { key[b] = 0; continue; }
@@ -355,19 +371,21 @@ static int64_t order_keys(const SelJob& j, int64_t m, int64_t s, int64_t n, uint
 
 /* The topk-th largest key of a row with more than `topk` live keys, and how many keys are above
  * it. A histogram of the top bits finds the bin holding it; the keys in that bin are gathered and
- * the exact value taken among them. `cand` holds up to n keys. */
-static uint32_t threshold(const uint32_t* key, int64_t n, int64_t topk, uint32_t* hist,
+ * the exact value taken among them. `cand` holds up to n keys. `sgn`: the keys are signed-order
+ * keys, which use all 32 bits. */
+static uint32_t threshold(const uint32_t* key, int64_t n, int64_t topk, bool sgn, uint32_t* hist,
                           uint32_t* cand, int64_t* above_out) {
+    const int shift = sgn ? (int)kBinShiftSigned : (int)kBinShift;
     /* Four interleaved histograms, so runs of keys in one bin do not serialise on one counter. */
     std::memset(hist, 0, 4 * kBins * sizeof(uint32_t));
     int64_t b = 0;
     for (; b + 4 <= n; b += 4) {
-        ++hist[0 * kBins + (key[b] >> kBinShift)];
-        ++hist[1 * kBins + (key[b + 1] >> kBinShift)];
-        ++hist[2 * kBins + (key[b + 2] >> kBinShift)];
-        ++hist[3 * kBins + (key[b + 3] >> kBinShift)];
+        ++hist[0 * kBins + (key[b] >> shift)];
+        ++hist[1 * kBins + (key[b + 1] >> shift)];
+        ++hist[2 * kBins + (key[b + 2] >> shift)];
+        ++hist[3 * kBins + (key[b + 3] >> shift)];
     }
-    for (; b < n; ++b) ++hist[key[b] >> kBinShift];
+    for (; b < n; ++b) ++hist[key[b] >> shift];
     for (int i = 0; i < kBins; ++i)
         hist[i] += hist[kBins + i] + hist[2 * kBins + i] + hist[3 * kBins + i];
     /* Bin 0 is never counted: it is the last one left, and holds the dead keys (0) beside the
@@ -380,8 +398,8 @@ static uint32_t threshold(const uint32_t* key, int64_t n, int64_t topk, uint32_t
     }
     /* The keys of the bin, i.e. in [lo, hi], with key 0 (dead) left out of bin 0. Few keys fall in
      * one bin, so the vector forms test a vector and walk only its hits. */
-    const uint32_t lo = std::max<uint32_t>((uint32_t)bin << kBinShift, 1u);
-    const uint32_t hi = (((uint32_t)bin + 1u) << kBinShift) - 1u;
+    const uint32_t lo = std::max<uint32_t>((uint32_t)bin << shift, 1u);
+    const uint32_t hi = (((uint32_t)bin + 1u) << shift) - 1u;
     int64_t nc = 0;
     b = 0;
 #if AVX_LEVEL == 3
@@ -393,9 +411,10 @@ static uint32_t threshold(const uint32_t* key, int64_t n, int64_t topk, uint32_t
         nc += __builtin_popcount((unsigned)in);
     }
 #elif AVX_LEVEL == 2
-    /* Keys are below 2^31, so the signed compares order them. */
+    /* Keys are below 2^31, so the signed compares order them; signed-order keys take the scalar
+     * loop. */
     const __m256i vlo = _mm256_set1_epi32((int)lo - 1), vhi = _mm256_set1_epi32((int)hi + 1);
-    for (; b + 8 <= n; b += 8) {
+    for (; !sgn && b + 8 <= n; b += 8) {
         const __m256i k = _mm256_loadu_si256((const __m256i*)(key + b));
         const __m256i in = _mm256_and_si256(_mm256_cmpgt_epi32(k, vlo), _mm256_cmpgt_epi32(vhi, k));
         unsigned hit = (unsigned)_mm256_movemask_ps(_mm256_castsi256_ps(in));
@@ -439,9 +458,10 @@ static void emit(const SelJob& j, const uint32_t* key, int64_t n, int64_t s, uin
         }
     }
 #elif AVX_LEVEL == 2
-    /* Keys are below 2^31, so the signed compare orders them. */
+    /* Keys are below 2^31, so the signed compare orders them; signed-order keys take the scalar
+     * loop. */
     const __m256i vt = _mm256_set1_epi32((int)thr - 1);
-    for (; b + 8 <= n && (og < gt || ot < ties); b += 8) {
+    for (; !j.sgn && b + 8 <= n && (og < gt || ot < ties); b += 8) {
         const __m256i k = _mm256_loadu_si256((const __m256i*)(key + b));
         unsigned hit = (unsigned)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(k, vt)));
         while (hit) {
@@ -470,7 +490,7 @@ static void select_row(const SelJob& j, int64_t m) {
     } else {
         uint32_t* cand = (uint32_t*)scratch_f32_c((size_t)n);
         int64_t gt = 0;
-        const uint32_t thr = threshold(key, n, topk, hist, cand, &gt);
+        const uint32_t thr = threshold(key, n, topk, j.sgn, hist, cand, &gt);
         emit(j, key, n, s, thr, gt, topk - gt, row);
         out = topk;
     }
@@ -496,7 +516,7 @@ static void select_row(const SelJob& j, int64_t m) {
 /* ------------------------------------------------------------------ qsa_select */
 /* The page-id table the sparse attention reads (docs/OPS.md): over the query's complete blocks
  * n = min(nc[seq], (pos + 1) / ratio, width), the live ones (page id >= 0, score > -1e30) ranked
- * by max(score, 0). All of them when `topk` or fewer are live, else every block above the topk-th
+ * by max(score, 0), or with `signed` 1 those with a finite score, ranked by it. All of them when `topk` or fewer are live, else every block above the topk-th
  * largest value in block order, then the blocks equal to it in block order until topk are taken.
  * The partial page bt[n] follows when (pos + 1) % ratio != 0 and n < width, and -1 pads the row
  * to topk + 1. A row no sequence holds reads sequence 0, as libref's and libr4d's do. */
@@ -505,7 +525,9 @@ AVX_KERNEL(qsa_select) {
     const RadTensor *sc = &a->t[0], *bt = &a->t[1], *nc = &a->t[2], *po = &a->t[3];
     const RadTensor *cu = &a->t[4], *se = &a->t[5], *ns = &a->t[6], *su = &a->t[7];
     const int64_t topk = p_int(a, "topk", 0), ratio = p_int(a, "ratio", 0);
+    const int64_t sgn = p_int(a, "signed", 0);
     if (topk <= 0 || ratio <= 0) return RAD_E_SHAPE;
+    if (sgn != 0 && sgn != 1) return RAD_E_INVAL;
     if (sc->rank != 2 || bt->rank != 2 || se->rank != 2) return RAD_E_SHAPE;
     const int64_t M = sc->shape[0], nb = std::min(bt->shape[1], sc->shape[1]);
     const int64_t n_seq = numel(cu) - 1;
@@ -526,6 +548,7 @@ AVX_KERNEL(qsa_select) {
     j.s_rs = sc->stride[0]; j.s_cs = sc->stride[1];
     j.bt_rs = bt->stride[0]; j.bt_cs = bt->stride[1];
     j.o_rs = se->stride[0]; j.o_cs = se->stride[1];
+    j.sgn = sgn != 0;
     AVX_PARALLEL_FOR_IF(M * nb >= AVX_PAR_MIN && M > 1)
     for (int64_t m = 0; m < M; ++m) select_row(j, m);
     return RAD_OK;
