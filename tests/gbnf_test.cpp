@@ -1728,6 +1728,23 @@ TEST(json_schema_grammars_admit_exactly_their_instances) {
         { R"({"type":"string","pattern":"^[\\--z]$"})", { R"("-")", R"("a")" }, { R"("+")" } },
         { R"({"type":"string","pattern":"^[\\.]$"})", { R"(".")" }, { R"("a")" } },
         { R"({"type":"string","pattern":"a\\-b"})", { R"("xa-by")" }, { R"("ab")" } },
+        /* control-character escapes (0020): a JSON string holds a tab or a backspace only as an
+         * escape, so [\t] [\b] [\f] [\v] [\0] and \t outside a class match the escape, and an
+         * escaped space or non-ASCII character is itself. */
+        { R"({"type":"string","pattern":"^[\\b]$"})", { R"("\b")" }, { R"("b")", R"("\\")" } },
+        { R"({"type":"string","pattern":"^[a\\t]+$"})", { R"("a\ta")", R"("a")" }, { R"("t")", R"("a b")" } },
+        { R"({"type":"string","pattern":"^[\\f\\v]$"})", { R"("\f")", R"("\u000b")", R"("\u000B")" }, { R"("f")", R"("v")" } },
+        { R"({"type":"string","pattern":"^[\\0]$"})", { R"("\u0000")" }, { R"("0")" } },
+        { R"({"type":"string","pattern":"^a\\tb$"})", { R"("a\tb")" }, { R"("atb")" } },
+        { R"({"type":"string","pattern":"^[a\\ ]+$"})", { R"("a a")" }, { R"("ab")" } },
+        { R"({"type":"string","pattern":"^a\\ b$"})", { R"("a b")" }, { R"("ab")" } },
+        { R"({"type":"string","pattern":"^[\\s]$"})", { R"(" ")", R"("\n")" }, { R"("n")" } },
+        { R"({"type":"string","pattern":"^[^\\t]$"})", { R"("a")" }, { R"("")" } },
+        { R"({"type":"string","pattern":"^a\\t+b$"})", { R"("a\t\tb")" }, { R"("a\tttb")", R"("ab")" } },
+        { R"({"type":"string","pattern":"^x\\v{2}$"})", { R"("x\u000b\u000B")" }, { R"("x\u000b")" } },
+        { R"({"type":"string","pattern":"^[\\t]{2}$"})", { R"("\t\t")" }, { R"("\t")" } },
+        { R"({"type":"string","pattern":"^[^\\n]+$"})", { R"("ab")", R"("a\tb")" }, { R"("a\nb")" } },
+        { R"({"type":"string","pattern":"^[^\\s]+$"})", { R"("ab")" }, { R"("\t")", R"("a b")" } },
         { R"({"type":"string","pattern":"^(?:[A-Za-z0-9_'+\\-]+\\.)*[A-Za-z0-9_'+\\-]*[A-Za-z0-9_+-]@(?:[A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$"})",
           { R"("a.b@c.io")", R"("x-y@d-e.org")" }, { R"("a@b")", R"("a b@c.io")" } },
         { R"({"type":"array","items":{"type":"integer"},"minItems":1,"maxItems":3})",
@@ -1751,7 +1768,13 @@ TEST(json_schema_grammars_admit_exactly_their_instances) {
                         "on \"number\"\n");
     for (const char* schema : { R"({"type":"string","pattern":"^a|b"})",
                                 R"({"type":"string","pattern":"a|b$"})",
-                                R"({"type":"string","pattern":"^[a\\S]$"})" }) {
+                                R"({"type":"string","pattern":"^[a\\S]$"})",
+                                R"({"type":"string","pattern":"^[\\p{L}]$"})",
+                                R"({"type":"string","pattern":"^[\\cA]$"})",
+                                R"({"type":"string","pattern":"^[a\\1]$"})",
+                                R"({"type":"string","pattern":"^[\\01]$"})",
+                                R"({"type":"string","pattern":"^[\\xZ]$"})",
+                                R"({"type":"string","pattern":"^[\\u{41}]$"})" }) {
         std::string gbnf, err;
         CHECK(grammar_from_json_schema(schema, "root", &gbnf, &err) < 0);
     }

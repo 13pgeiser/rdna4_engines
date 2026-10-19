@@ -104,6 +104,7 @@ vendor/llama/common/regex-partial.{h,cpp}    <- llama.cpp common/*
                    patches/0017-json-schema-a-pattern-without-anchors-searches.patch
                    patches/0018-json-schema-shorthand-classes-are-written-out.patch
                    patches/0019-json-schema-identity-escapes-of-punctuation.patch
+                   patches/0020-json-schema-control-escapes-and-unloadable-class-escapes.patch
 
     On 0003: a `pattern` in a `response_format` reaches _visit_pattern() as client data, and three
     of its paths do not survive that. `front()`/`back()` run on an empty string; `seq.back()` runs
@@ -536,3 +537,20 @@ PATCH SERIES
       and inside a class it is written \xHH, so an escaped '-' or '^' cannot read as a range or
       a negation. gbnf_test covers "\/" and "\-" in literals, "\-" "\^" "\." in classes and as
       a range endpoint, an unanchored "a\-b", and zod's email pattern.
+
+  patches/0020-json-schema-control-escapes-and-unloadable-class-escapes.patch
+
+      Inside a class, escapes GBNF does not know (\b \f \v \0, an escaped space, \p{..}, \c, a
+      backreference) were copied raw and the grammar failed to load -- an internal error on a
+      schema the converter had accepted. A JSON string holds a control character only as an
+      escape, so \t \n \r \f \b \v \0 in a class, and \t \n \r \f \v \0 outside one, now
+      match that escape: a positive class gains them as alternatives ("[a\t]" reads
+      "(?:[a]|\\t)", and "[\s]" gains "\\[tnfr]" as 0018 gave the bare \s), and a negated class is
+      spelled as text that is neither a listed character nor one of those escapes ("[^\n]+" no
+      longer admits the escape \n). An outside escape is a group, so a quantifier takes all of it.
+      An escaped space or non-ASCII character is itself. \x and \u in a class need their hex
+      digits; "\0" before a digit (a legacy octal) is refused. Every other class escape is now
+      refused at conversion with a message naming it. Limits: a negated class still admits the
+      \u form of a character it leaves out (\u0009 for \t), and a positive class admits \t \n
+      \r \f \b only in their short form. gbnf_test covers each escape in and out of a class, quantified, and negated, and the
+      refusals.
