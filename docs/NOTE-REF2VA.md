@@ -147,11 +147,19 @@ as point 6 / point 4. Nothing here claims to match ComfyUI's timings.
    engine additionally regenerates a leading overlap window as target rows and then trims it; here the
    reference rows are fixed conditioning held outside the sampler and every output frame is new (no
    overlap to trim), so the net "continues from the tail" semantics match but the seam may differ
-   subtly. What remains unimplemented is the pack's *keyframe* rows (`kR2VCond` / `kR2VCondAudio`) — a
-   distinct exact-pin mechanism for FL2VA-style start/end-frame conditioning (which FL2VA itself
-   achieves with two image references — see §2 of the continuity brief). Seam frame-equality is the
-   wrong metric to gate on: the brief states it is imperfect **by construction**, because the first new
-   frame is the tail's temporal *successor*, not a replay of its last frame.
+   subtly. What is *not* wired is the **engine consumption** of the pack's *keyframe* rows
+   (`kR2VCond` / `kR2VCondAudio`) — a distinct exact-pin mechanism for FL2VA-style start/end-frame
+   conditioning (which FL2VA itself reaches with two image references — see §2 of the continuity brief).
+   **The pack layer is done and reference-verified**: `ref2va_build` emits `kR2VCond` / `kR2VCondAudio`
+   segments, and the golden `fl2va` (two keyframes) and `chain` (one keyframe) cases assert their
+   segment order, sizes, positions, `img_pos`/`audio_pos` and modulation rows **bit-exact** against the
+   reference (they re-baked byte-identical here). What remains is three engine pieces, none touching
+   the sampler (cond rows sit ahead of the targets, so the sampler ignores them by construction): the
+   driver never populates a keyframe row (its keyframe count stays 0 today), `step_dit` scatters the
+   reference rows but not the cond rows, and there is no continuation-tail *input* to persist a prior
+   clip's tail. Seam frame-equality is the wrong metric to gate on: the brief states it is imperfect
+   **by construction**, because the first new frame is the tail's temporal *successor*, not a replay of
+   its last frame.
 
 4. **Reference videos and audios steer the output — through the VAEs, not the text encoder.** A
    `ref_video_N` (mp4/mov), its soundtrack `ref_video_audio_N`, and a standalone `ref_audio_N`
@@ -182,14 +190,17 @@ as point 6 / point 4. Nothing here claims to match ComfyUI's timings.
    and read exactly the slot region the encode pass wrote this job — no stale-neighbor read.
 
    What remains is **strict numeric value-parity** of the encoder latents against the reference HF
-   encoder (a per-tensor golden), not *whether* the encoders are live. That golden is **environment-
-   blocked here**: this host has no `torch`, and every golden in the tree is a torch-baked `.h`, so no
-   value reference for the VAE / audio-VAE encoders can be produced locally. The genuine reference
-   sources are present (`MiniMax-H3-ref2va-src`, `MiniMax-H3/vae`, `MiniMax-H3/audio_vae`); generating a
-   value golden needs a torch-equipped box. Content-control + determinism + a bit-exact pack (see the
-   P3 pack note) is the strongest parity evidence obtainable on this machine; a published per-tensor
-   match is left open so that a change is never made merely to make latents *differ* when they could be
-   made *wrong*.
+   encoder (a per-tensor golden), not *whether* the encoders are live. **This is now actionable, not
+   environment-blocked**: a `torch` environment is present on the box (`comfyui-rocm10-venv`,
+   torch 2.13.0+rocm; it also re-bakes the pack `golden.json`, whose keyframe cases came out
+   byte-identical). The genuine reference sources are present (`MiniMax-H3-ref2va-src`, `MiniMax-H3/vae`,
+   `MiniMax-H3/audio_vae`), so a per-tensor encoder value golden *can* be produced here — it simply has
+   not been yet. The crux is matching preprocessing bit-for-bit (decode / resize / normalization /
+   frame-sampling), not the encoder weights, which the convert log already showed are real. The discipline
+   stands: content-control + determinism + a bit-exact pack is the strongest *parity* evidence produced so
+   far, and the per-tensor value match is left open rather than asserted, so a change is never made merely
+   to make latents *differ* when they could be made *wrong*. A clean parity number, once produced, should
+   start from the audio encoder (no spatial preprocessing to confound it) before the video VAE.
 
    What still differs from the DaSiWa reference (hence not pixel-for-pixel reproducible):
    - **The text encoder only *names* a moving picture; it never sees its pixels.** DaSiWa also shows
@@ -213,7 +224,8 @@ as point 6 / point 4. Nothing here claims to match ComfyUI's timings.
 
 6. **Numeric parity with the reference denoiser for the *conditioned* step is not yet published.**
    A per-tensor / perceptual match to ComfyUI's outputs for the wide step remains an open parity task
-   (and, for the encoder values specifically, is environment-blocked on a torch-less host — point 4).
+   (and, for the encoder values specifically, is now actionable rather than blocked — a `torch` env is
+   on the box, point 4 — but has not yet been produced).
    **All three** reference kinds — image, video and audio — are verified *active* and *content-sensitive*
    on-device with a warm-server fixed-seed content-control (see the checks below); each is also
    deterministic (a same-reference rerun is bit-identical). Strict *value* parity (the exact latents
