@@ -711,9 +711,9 @@ int64_t PrefixCache::retain(uint64_t session) {
     int64_t freed = 0;
     for (const auto& a : all) {
         if (std::binary_search(keep.begin(), keep.end(), a.first)) { kept.push_back(a.second); continue; }
-        /* Keep one handed out this step regardless of policy: its admission restores from the
-         * slot ahead of the step. */
-        if (handed(a.second)) { kept.push_back(a.second); continue; }
+        /* Keep one handed out this step or reserved and not yet committed regardless of policy:
+         * its admission restores from the slot ahead of the step, or the step's save lands in it. */
+        if (handed(a.second) || reserved(a.second)) { kept.push_back(a.second); continue; }
         auto e = ck_by_prefix_.find(a.second);
         if (e == ck_by_prefix_.end()) continue;
         /* And one a lookup resumed from since the session's tip was written. The policy places
@@ -754,6 +754,10 @@ int PrefixCache::reserve_checkpoint(uint64_t session, int64_t pos, const BlockHa
     if (existing != ck_by_prefix_.end()) {
         existing->second.used = ++clock_;
         existing->second.used_ns = rad_mono_ns();
+        /* Another session's snapshot, this step's save target: retention run by a later
+         * reservation in this step places its ladder from THAT session's tip and may not keep
+         * this position. Held until the save is committed. */
+        if (!reserved(prefix)) reserved_.push_back(prefix);
         *slot_out = existing->second.slot;
         return RAD_OK;
     }
@@ -768,20 +772,21 @@ int PrefixCache::reserve_checkpoint(uint64_t session, int64_t pos, const BlockHa
         for (uint64_t s : sessions) retain(s);
         if (kv_->alloc_checkpoint(&slot) < 0) {
             /* Evict the least recently used snapshot, where a use is its reservation or a lookup
-             * resuming from it, and never one handed out this step (its admission restores from
-             * the slot ahead of the step). A tip gets no protection beyond its recency: sessions
+             * resuming from it, and never one handed out or reserved this step (its admission
+             * restores from the slot ahead of the step; the save lands in it after). A tip gets
+             * no protection beyond its recency: sessions
              * are request ids, and a client that rewrites its last message leaves one tip per
              * turn that no later turn reaches, while the anchor every turn resumes from is used
              * each turn. */
             const Ckpt* victim = nullptr;
             for (const auto& kvp : ck_by_prefix_) {
-                if (handed(kvp.first)) continue;
+                if (handed(kvp.first) || reserved(kvp.first)) continue;
                 if (!victim || kvp.second.used < victim->used) victim = &kvp.second;
             }
             if (!victim) {
                 ++stats_.ckpt_refused;
                 RAD_DEBUG("prefix cache: no snapshot at %lld for session %llu: every one of the "
-                          "%lld slots was handed out this step", (long long)pos,
+                          "%lld slots was handed out this step or awaits its save", (long long)pos,
                           (unsigned long long)session, (long long)ck_by_prefix_.size());
                 return RAD_E_FULL;
             }
@@ -805,11 +810,17 @@ int PrefixCache::reserve_checkpoint(uint64_t session, int64_t pos, const BlockHa
     c.used_ns = rad_mono_ns();
     ck_by_prefix_.emplace(prefix, c);
     ck_by_session_[session].push_back(prefix);
+    /* A save target until committed: a lookup's take_over may index it under another session
+     * before the save, where retention run by a later reservation in this step would weigh it by
+     * that session's ladder. */
+    reserved_.push_back(prefix);
     *slot_out = slot;
     return RAD_OK;
 }
 
 void PrefixCache::commit_checkpoint(const BlockHash& prefix) {
+    /* The save has landed: the slot is a snapshot like any other from here. */
+    reserved_.erase(std::remove(reserved_.begin(), reserved_.end(), prefix), reserved_.end());
     auto it = ck_by_prefix_.find(prefix);
     if (it == ck_by_prefix_.end()) return;
     /* One that lost its slot since the reservation holds nothing to serve. */
@@ -915,12 +926,12 @@ int64_t PrefixCache::expire(uint64_t now_ns, uint64_t ttl_ns) {
         }
     }
 
-    /* ---- snapshots: skip uncommitted reservations and ones handed out this step. At most
-     * --checkpoint-slots of them, so walk the whole index. */
+    /* ---- snapshots: skip uncommitted reservations, ones handed out this step and ones a save
+     * is pending on. At most --checkpoint-slots of them, so walk the whole index. */
     std::vector<BlockHash> gone;
     for (const auto& kvp : ck_by_prefix_) {
         const Ckpt& c = kvp.second;
-        if (!c.valid || handed(kvp.first)) continue;
+        if (!c.valid || handed(kvp.first) || reserved(kvp.first)) continue;
         auto e = map_.find(kvp.first);
         const uint64_t used = std::max(c.used_ns, e == map_.end() ? 0 : e->second.used_ns);
         if (used < cutoff) gone.push_back(kvp.first);
