@@ -3749,7 +3749,6 @@ pub mod selftest {
     /// Window rows the K2 anchor tile of [`decode_tail_cohort`] occupies: the caller builds
     /// the decode call's [`PreparedChunkCall`] with `row0` equal to this.
     /// Tools-only.
-    #[cfg(any(test, feature = "test-utils"))]
     pub const DECODE_TAIL_ANCHOR_ROWS: usize = 64;
 
     /// `decode_tail_cohort`: the incumbent's REAL one-row decode call (built by the caller as
