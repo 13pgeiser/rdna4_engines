@@ -381,3 +381,47 @@ as point 6 / point 4. Nothing here claims to match ComfyUI's timings.
   denoise consumes the audio reference too, not just its count. Reproduction scripts: `refdet.sh`
   (video-ref determinism + content-control), `chain.sh` (tail-as-`ref_video` chaining), `fullshape.sh`
   (this max-shape control) under the build tree.
+
+## #14 video-encoder value-parity — localized, not fixed (2026-10-19)
+
+The video/image VAE encoder is **device-live, deterministic and content-sensitive** (all three reference
+kinds proven), but it is **not numerically equal to the ComfyUI fp16 reference**: for a 256×256 picture the
+folded latent sits at roughly **0.37× the reference's scale** with a large **structural** residual. This is
+the honest, still-open half of #14 (strict parity = #10/P6). This pass **localized** the gap and — finding no
+confined, golden-verifiable defect — stopped short of a fix, per the standing rule against blind-fixing the
+shared encoder kernels (they serve the live image and plain paths too).
+
+Method: **device-input-anchored** — feed the reference the device's own staged pixels (`encpx`), so
+preprocessing cancels, and read the device's own intermediates back through `R4D_ENC_SEL=all` f32 PERSIST
+shadows of the encoder tail (`trunk` = `v_lv[5].a`, `nout` = `v_lv[5].b`, `q48` = `conv_out` out, `q2` =
+`quant_conv` out). Harness: `tests/data/ref2va/ref_venc_parity.py` (`--evctrunk/--evcnout`, `--expand`,
+`--zeropad`). A 256×256 image encodes to `R[5]=tf[5]·PF[5]=5·256` trunk rows (the clip geometry keeps five
+temporal slots even for a single frame).
+
+What was **exonerated**, each against the reference on the device's own inputs:
+- **Input normalization** — the device's first op `(px/255 − mean)/std` is *identical* to the reference
+  `_normalize_pixels(px·2/255−1)`, and `kVaePixelMean/Std` equal `IMAGENET_MEAN/STD` byte-for-byte, so the
+  trunk comparison is clean (not a preprocessing artifact).
+- **`norm_out`** — faithful. Recomputing GroupNorm on the device trunk with the container's weight reproduces
+  the shadowed `nout` to `relFro 1.6e-3`; the gain is *already present in the trunk* it reads.
+- **GroupNorm extent (was task #20)** — the device is **already per-frame**, matching the reference's
+  `TemporalIsolatedGroupNorm`: per-frame statistics reproduce device `nout` (1.6e-3); whole-volume gives
+  1.457. Whole-volume-vs-per-frame is **not** the cause; no change needed.
+- **Temporal handling** — the reference's frame-0 trunk std is a flat **8.986** at clip lengths 1, 2, 5, 9,
+  17 under *both* frame-replication and zero-padding (a causal frame 0 sees only itself), while the device's
+  frame-0 trunk std is **4.40** and its last frame is exactly **0.0**. So the device's deficit is **not** a
+  temporal-expansion or zero-dilution effect; temporal staging is excluded.
+- **A single confined multiplicative gain** — ruled out: after per-group normalization removes every group
+  scale, device `nout` still differs from the reference by **0.57 non-affinely**, so the trunk gap is
+  **structural**, not one mis-scaled factor to undo.
+- **Weight precision** — ruled out: the video-encoder tensors were *not* in the convert log's worst-20
+  (those were all `aenc.*` at ~1.6e-3 relative Frobenius), so the encoder weights are correctly rounded.
+
+**Where it is.** A ~0.49× systematic, **structural** deviation on the deepest trunk activation, present at a
+*causally-isolated* frame (so independent of temporal extent), with correct weights and a faithful tail —
+i.e. in the **spatial** trunk (conv_in / resnet blocks / spatial downsampling) or its bf16 implicit-GEMM
+kernels. Pinpointing it further means dumping every level's trunk and auditing each spatial kernel against
+the reference — a multi-round device investigation whose fix would land in kernels shared by the live image
+and plain encode paths. That is exactly the blind-fix hazard the workflow rule forbids without a confined,
+golden-verifiable defect in hand, so it is left **open and precisely bounded**: #14-video = spatial-trunk
+value-parity, #20 closed (norm already per-frame), temporal/GN/norm-out/input-norm all excluded.

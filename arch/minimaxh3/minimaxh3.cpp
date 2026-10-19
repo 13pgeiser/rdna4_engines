@@ -520,6 +520,32 @@ struct Model {
     std::string ve_pix_mul, ve_pix_add, ve_fold_mul, ve_fold_add;   /* pixel and latent norms */
     rad_buf b_epix32 = 0, b_epix = 0, b_eq48 = 0, b_eq2 = 0, b_egn = 0;
     rad_buf b_evc = 0;               /* [kEncSlotsV * kEncSlotRowsV, kPatchVals] f32 PERSIST */
+    /* A persistent f32 twin of the quant_conv output (b_eq2), written by a debug-only cast op so the
+     * R4D_ENC stage readback can observe the RAW (pre-fold) encoder latent reliably. b_eq2 itself is
+     * bf16 arena scratch whose readback lags the pass (the audio b_ax2 lesson); an f32 PERSIST copy is
+     * not arena-recycled, so it reads back true -- exactly the role b_amb plays for the audio encoder.
+     * [kEncMaxSide-sized R[5], 48] f32 PERSIST. Debug-only, gated on R4D_ENC_SEL=q2. */
+    rad_buf b_evq2 = 0;
+    rad_op  op_ve_q2 = 0;
+    int64_t ve_q2_bytes = 0;
+    /* The same f32 shadow for the conv_out output (b_eq48), so a raw-latent gain can be split between
+     * conv_out (already present in b_eq48) and quant_conv (only in b_eq2). Debug-only, R4D_ENC_SEL=q48. */
+    rad_buf b_evq48 = 0;
+    rad_op  op_ve_q48 = 0;
+    int64_t ve_q48_bytes = 0;
+    /* The same f32 shadow for the norm_out output (v_lv[5].b), so a raw-latent gain can be split
+     * between norm_out's own weight (present here) and the convs after it. [R[5], dims[5]] f32. */
+    rad_buf b_vnout = 0;
+    rad_op  op_ve_noutdbg = 0;
+    int64_t ve_nout_bytes = 0;
+    /* The same f32 shadow for norm_out's INPUT (v_lv[5].a, the trunk the norm reads). With the norm
+     * output also shadowed, one request shows whether norm_out's statistics are whole-volume over
+     * every temporal slot (the reference's is per-frame, TemporalIsolatedGroupNorm): recompute the
+     * per-frame and whole-volume norms of this trunk and see which one the shadow of v_lv[5].b equals.
+     * Debug-only, R4D_ENC_SEL=all. */
+    rad_buf b_vtrunk = 0;
+    rad_op  op_ve_trunkdbg = 0;
+    int64_t ve_trunk_bytes = 0;
 
     /* ---- the audio VAE encoder, when the container carries it. f32 like its decoder: per
      * channel one sequence, conv_in and five strided blocks of three [snake, conv7, snake,
@@ -2302,6 +2328,40 @@ static int declare_venc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                 RAD_NOWEIGHTS),
                       { m.b_eq2 }, { m.b_evc });
     if (!m.op_ve_nout || !m.op_ve_cout || !m.op_ve_q || !m.op_ve_fold) return RAD_E_INVAL;
+    /* Debug-only f32 shadow of the raw (pre-fold) quant_conv output, so the generator can read the
+     * encoder's latent BEFORE the fixed-norm fold and tell whether a latent-scale gap enters above
+     * the fold (encoder convs) or is introduced by the fold itself. A cast, not a math change. */
+    m.b_evq2 = decl_b(b, nm.f("venc.q2dbg"), RAD_F32, { R[5], 48 }, RAD_BUF_PERSIST);
+    m.op_ve_q2 = rw(b, RAD_OP(b, "cast",
+                              RAD_PARAMS(RAD_RANGE("M", 1, R[5]), RAD_INT("n", 48),
+                                         RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
+                              RAD_NOWEIGHTS),
+                    { m.b_eq2 }, { m.b_evq2 });
+    m.b_evq48 = decl_b(b, nm.f("venc.q48dbg"), RAD_F32, { R[5], 48 }, RAD_BUF_PERSIST);
+    m.op_ve_q48 = rw(b, RAD_OP(b, "cast",
+                               RAD_PARAMS(RAD_RANGE("M", 1, R[5]), RAD_INT("n", 48),
+                                          RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
+                               RAD_NOWEIGHTS),
+                     { m.b_eq48 }, { m.b_evq48 });
+    if (!m.op_ve_q2 || !m.op_ve_q48) return RAD_E_INVAL;
+    m.ve_q2_bytes = m.ve_q48_bytes = (int64_t)R[5] * 48 * 4;
+    m.b_vnout = decl_b(b, nm.f("venc.noutdbg"), RAD_F32, { R[5], (int64_t)dims[5] }, RAD_BUF_PERSIST);
+    m.op_ve_noutdbg = rw(b, RAD_OP(b, "cast",
+                                   RAD_PARAMS(RAD_RANGE("M", 1, R[5]), RAD_INT("n", (int64_t)dims[5]),
+                                              RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
+                                   RAD_NOWEIGHTS),
+                         { m.v_lv[5].b }, { m.b_vnout });
+    if (!m.op_ve_noutdbg) return RAD_E_INVAL;
+    m.ve_nout_bytes = (int64_t)R[5] * (int64_t)dims[5] * 4;
+    /* The norm_out input, so its own statistics can be tested against the shadowed output. */
+    m.b_vtrunk = decl_b(b, nm.f("venc.trunkdbg"), RAD_F32, { R[5], (int64_t)dims[5] }, RAD_BUF_PERSIST);
+    m.op_ve_trunkdbg = rw(b, RAD_OP(b, "cast",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, R[5]), RAD_INT("n", (int64_t)dims[5]),
+                                               RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
+                                    RAD_NOWEIGHTS),
+                          { m.v_lv[5].a }, { m.b_vtrunk });
+    if (!m.op_ve_trunkdbg) return RAD_E_INVAL;
+    m.ve_trunk_bytes = (int64_t)R[5] * (int64_t)dims[5] * 4;
     return RAD_OK;
 }
 
@@ -2912,6 +2972,18 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             d.dbg_ae_mp_bytes = m.aenc ? (int64_t)(kEncSlotRowsA / kAudioCh) * kAudioC * 4 : 0;
             d.dbg_ae_pre = m.b_ax2;   /* bf16, hence the *2 */
             d.dbg_ae_pre_bytes = m.aenc ? (int64_t)(kEncSlotRowsA / kAudioCh) * kAudioC * 2 : 0;
+            /* The video encoder's RAW (pre-fold) latent: an f32 PERSIST twin of the bf16 quant_conv
+             * output b_eq2. Reading it back splits a latent-scale gap between the encoder convs
+             * (norm_out/conv_out/quant_conv) and the fixed-norm fold -- the video analogue of the
+             * audio dbg_ae_amb. R4D_ENC_SEL=q2 on the video pass selects it. Debug-only. */
+            d.dbg_ve_q2 = m.b_evq2;
+            d.dbg_ve_q2_bytes = m.venc ? m.ve_q2_bytes : 0;
+            d.dbg_ve_q48 = m.b_evq48;
+            d.dbg_ve_q48_bytes = m.venc ? m.ve_q48_bytes : 0;
+            d.dbg_ve_nout = m.b_vnout;
+            d.dbg_ve_nout_bytes = m.venc ? m.ve_nout_bytes : 0;
+            d.dbg_ve_trunk = m.b_vtrunk;
+            d.dbg_ve_trunk_bytes = m.venc ? m.ve_trunk_bytes : 0;
         }
         RAD_ARCH_TRY(rad_declare_video_generator(b, &d));
     }
@@ -3618,12 +3690,16 @@ static void step_venc(RadCtx* c, const RadBatch* batch, const Model& m) {
             }
         }
         const int64_t R5 = (int64_t)g[12] * g[13] * g[14];
+        RAD_ISSUE_N(c, m.op_ve_trunkdbg, R5, brows(m.v_lv[5].a, R5), brows(m.b_vtrunk, R5)); /* shadow */
         RAD_ISSUE_N(c, m.op_ve_nout, R5, brows(m.v_lv[5].a, R5), RAD_W(m.ve_now), RAD_W(m.ve_nob),
                     RAD_NONE, st, brows(m.v_lv[5].b, R5));
+        RAD_ISSUE_N(c, m.op_ve_noutdbg, R5, brows(m.v_lv[5].b, R5), brows(m.b_vnout, R5)); /* shadow */
         RAD_ISSUE_N(c, m.op_ve_cout, R5, brows(m.v_lv[5].b, R5), RAD_W(m.ve_coutw),
                     RAD_W(m.ve_coutb), gg[5], RAD_NONE, brows(m.b_eq48, R5));
         RAD_ISSUE_N(c, m.op_ve_q, R5, brows(m.b_eq48, R5), RAD_W(m.ve_qw), RAD_W(m.ve_qb), gg[5],
                     RAD_NONE, brows(m.b_eq2, R5));
+        RAD_ISSUE_N(c, m.op_ve_q2, R5, brows(m.b_eq2, R5), brows(m.b_evq2, R5));   /* debug shadow */
+        RAD_ISSUE_N(c, m.op_ve_q48, R5, brows(m.b_eq48, R5), brows(m.b_evq48, R5)); /* debug shadow */
         const int64_t flat = last ? short_last : full;
         RAD_ISSUE_N(c, m.op_ve_fold, flat * ppc,
                     bcol(m.b_eq2, 0, kC, flat * (H / kVaeRatio) * (W / kVaeRatio)),

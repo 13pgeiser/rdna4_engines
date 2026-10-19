@@ -1238,20 +1238,43 @@ const RadBatch* VideoDriver::build_encode(Job& j, int step) {
          * bf16 b_ax2 is arena-rotated scratch whose readback can lag the pass (b_amb2 is finite while
          * b_ax2 dumps ±1e38 -- a stale read), so the f32 b_amb is what to trust for the pre_block
          * value. The video pass and the default audio pass are untouched; only an env var selects. */
-        const char* sel = audio ? std::getenv("R4D_ENC_SEL") : nullptr;
-        const bool mp  = sel && std::strcmp(sel, "mp")  == 0 && decl_.dbg_ae_mp_bytes  > 0;
-        const bool amb = sel && std::strcmp(sel, "amb") == 0 && decl_.dbg_ae_amb_bytes > 0;
-        const bool pre = sel && std::strcmp(sel, "pre") == 0 && decl_.dbg_ae_pre_bytes > 0;
-        const rad_buf   h = mp  ? decl_.dbg_ae_mp : amb ? decl_.dbg_ae_amb : pre ? decl_.dbg_ae_pre
-                            : audio ? decl_.dbg_enca : decl_.dbg_evc;
-        const int64_t   n = mp  ? decl_.dbg_ae_mp_bytes : amb ? decl_.dbg_ae_amb_bytes
-                            : pre ? decl_.dbg_ae_pre_bytes
-                            : audio ? decl_.dbg_enca_bytes : decl_.dbg_evc_bytes;
-        enc_dbg_sel_ = mp ? "mp" : amb ? "amb" : pre ? "pre" : "";
+        const char* sel = std::getenv("R4D_ENC_SEL");
+        const bool mp  = sel &&  audio && std::strcmp(sel, "mp")  == 0 && decl_.dbg_ae_mp_bytes  > 0;
+        const bool amb = sel &&  audio && std::strcmp(sel, "amb") == 0 && decl_.dbg_ae_amb_bytes > 0;
+        const bool pre = sel &&  audio && std::strcmp(sel, "pre") == 0 && decl_.dbg_ae_pre_bytes > 0;
+        const bool q2  = sel && !audio && std::strcmp(sel, "q2")  == 0 && decl_.dbg_ve_q2_bytes  > 0;
+        const bool q48 = sel && !audio && std::strcmp(sel, "q48") == 0 && decl_.dbg_ve_q48_bytes > 0;
+        const bool nout = sel && !audio && std::strcmp(sel, "nout") == 0 && decl_.dbg_ve_nout_bytes > 0;
+        /* "all" reads the three video shadows back in ONE pass into one slab (nout | q48 | q2), so a
+         * single request localises a latent-scale gain across norm_out / conv_out / quant_conv. */
+        const bool all = sel && !audio && std::strcmp(sel, "all") == 0 &&
+                         decl_.dbg_ve_trunk_bytes > 0 && decl_.dbg_ve_nout_bytes > 0 &&
+                         decl_.dbg_ve_q48_bytes > 0 && decl_.dbg_ve_q2_bytes > 0;
         enc_dbg_used_ = 0;
-        if (h && n > 0) {
-            rb_.assign(1, Readback{h, n, enc_dbg_host_});
-            enc_dbg_used_ = n;
+        if (all && enc_dbg_bytes_ >= decl_.dbg_ve_trunk_bytes + decl_.dbg_ve_nout_bytes +
+                                    decl_.dbg_ve_q48_bytes + decl_.dbg_ve_q2_bytes) {
+            const int64_t nt = decl_.dbg_ve_trunk_bytes, nn = decl_.dbg_ve_nout_bytes;
+            const int64_t n48 = decl_.dbg_ve_q48_bytes, n2 = decl_.dbg_ve_q2_bytes;
+            char* p = enc_dbg_host_;
+            rb_.assign(4, Readback{decl_.dbg_ve_trunk, nt, p});
+            rb_[1] = Readback{decl_.dbg_ve_nout,  nn, p + nt};
+            rb_[2] = Readback{decl_.dbg_ve_q48,  n48, p + nt + nn};
+            rb_[3] = Readback{decl_.dbg_ve_q2,    n2, p + nt + nn + n48};
+            enc_dbg_sel_ = "all";
+            enc_dbg_used_ = nt + nn + n48 + n2;
+        } else {
+            const rad_buf h = mp ? decl_.dbg_ae_mp : amb ? decl_.dbg_ae_amb : pre ? decl_.dbg_ae_pre
+                                : nout ? decl_.dbg_ve_nout : q48 ? decl_.dbg_ve_q48 : q2 ? decl_.dbg_ve_q2
+                                : audio ? decl_.dbg_enca : decl_.dbg_evc;
+            const int64_t n = mp ? decl_.dbg_ae_mp_bytes : amb ? decl_.dbg_ae_amb_bytes
+                                : pre ? decl_.dbg_ae_pre_bytes : nout ? decl_.dbg_ve_nout_bytes
+                                : q48 ? decl_.dbg_ve_q48_bytes : q2 ? decl_.dbg_ve_q2_bytes
+                                : audio ? decl_.dbg_enca_bytes : decl_.dbg_evc_bytes;
+            enc_dbg_sel_ = mp ? "mp" : amb ? "amb" : pre ? "pre" : nout ? "nout" : q48 ? "q48" : q2 ? "q2" : "";
+            if (h && n > 0) {
+                rb_.assign(1, Readback{h, n, enc_dbg_host_});
+                enc_dbg_used_ = n;
+            }
         }
     }
     return &out_[0];
@@ -1269,7 +1292,18 @@ int VideoDriver::done() {
     case RAD_GEN_PASS_VENCODE:
     case RAD_GEN_PASS_AENCODE:
         /* The media's latents are now in the lane's slot rows; take the next reference, if any. */
-        if (enc_dbg_ && enc_dbg_used_ > 0) {
+        if (enc_dbg_ && enc_dbg_used_ > 0 && enc_dbg_sel_ && std::strcmp(enc_dbg_sel_, "all") == 0) {
+            /* Four shadows in one slab (trunk | nout | q48 | q2) -> four files. */
+            const int64_t nt = decl_.dbg_ve_trunk_bytes, nn = decl_.dbg_ve_nout_bytes;
+            const int64_t n48 = decl_.dbg_ve_q48_bytes, n2 = decl_.dbg_ve_q2_bytes;
+            char* p = enc_dbg_host_;
+            enc_dbg_dump_file("evctrunk", p, (size_t)nt);
+            enc_dbg_dump_file("evcnout",  p + nt, (size_t)nn);
+            enc_dbg_dump_file("evcq48",   p + nt + nn, (size_t)n48);
+            enc_dbg_dump_file("evcq2",    p + nt + nn + n48, (size_t)n2);
+            RAD_ERR("enc_dbg all: dumped trunk %lld + nout %lld + q48 %lld + q2 %lld bytes",
+                    (long long)nt, (long long)nn, (long long)n48, (long long)n2);
+        } else if (enc_dbg_ && enc_dbg_used_ > 0) {
             const int64_t nf = enc_dbg_used_ / 4;
             const float* z = reinterpret_cast<const float*>(enc_dbg_host_);
             uint64_t h = 1469598103934665603ULL;   /* FNV-1a over the readback bytes */
@@ -1284,8 +1318,9 @@ int VideoDriver::done() {
                 if (a > mx) mx = a;
                 sum += z[i];
             }
-            std::string tagstr = pass_.kind != RAD_GEN_PASS_AENCODE ? "evc"
-                               : *enc_dbg_sel_ ? std::string("enc") + enc_dbg_sel_ : std::string("enca");
+            std::string tagstr = pass_.kind != RAD_GEN_PASS_AENCODE
+                               ? (*enc_dbg_sel_ ? std::string("evc") + enc_dbg_sel_ : std::string("evc"))
+                               : (*enc_dbg_sel_ ? std::string("enc") + enc_dbg_sel_ : std::string("enca"));
             const char* tag = tagstr.c_str();
             RAD_ERR("enc_dbg %s: fnv %016llx floats %lld nonzero %lld maxabs %.6g "
                     "sum %.6g  head[%.6g %.6g %.6g %.6g]",

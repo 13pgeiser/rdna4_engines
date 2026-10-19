@@ -253,6 +253,215 @@ def do_parity(m, evc_f, encpx_f, encg_f, slot):
     return 0 if rf < floor else 1
 
 
+def ref_encoder_out(m, encpx, H, W, which):
+    """The reference RAW (pre-fold) latent values at a tail stage, as a value multiset (order-free).
+      'nout' -> the norm_out output (silu(GroupNorm(h))) at the last level, ALL dims[5]=1024 channels
+                (h, the conv_out input, is captured by a forward hook; conv_out applies pre_norm inside).
+      'q48'  -> the conv_out output (encoder(x)), 48ch; first 24 = mu.
+      'q2'   -> the quant_conv output (moments), 48ch; first 24 = raw mu.
+    Each is exactly what the corresponding device f32 shadow (b_vnout/b_evq48/b_evq2) holds, so a gain
+    that is already present at 'nout' points at norm_out itself, one that first appears at 'q48' points
+    at conv_out, and one that first appears at 'q2' points at quant_conv."""
+    px = torch.from_numpy(encpx).permute(2, 0, 1).unsqueeze(0).unsqueeze(2)   # [1,3,1,H,W]
+    x = px.float() * (2.0 / 255.0) - 1.0
+    cap = {}
+    def hook(mod, inp, out):
+        cap["h"] = inp[0]
+    hk = m.encoder.conv_out.register_forward_hook(hook)
+    try:
+        with torch.no_grad():
+            x = m._normalize_pixels(x)
+            out = m.encoder(x)                       # conv_out output, [1,48,1,H/16,W/16]
+            if which == "q2":
+                out = m.quant_conv(out)              # moments
+            if which == "trunk":
+                return cap["h"].float().reshape(-1).double().numpy()   # norm_out INPUT (level-5 stream)
+            if which == "nout":
+                h = cap["h"]                         # the level-5 stream feeding conv_out
+                no = m.encoder.norm_out
+                g = F.group_norm(h.float(), no.num_groups, no.weight.float(), no.bias.float(),
+                                 eps=no.eps)         # T==1: TemporalIsolated == plain GroupNorm
+                out = F.silu(g)                       # [1,1024,1,H/16,W/16]
+                return out.reshape(-1).double().numpy()
+    finally:
+        hk.remove()
+    out = out[:, :, -1:, :, :]                       # T==1 keep-last
+    mu = out.float()[:, :KC, ...]                    # first 24 channels = the latent mean
+    return mu.reshape(-1).double().numpy()
+
+
+def do_stage_raw(m, dev_f, encpx_f, encg_f, which):
+    """Compare a device f32 shadow against the reference RAW latent at the same stage, to localise
+    where the ~0.37 network gain enters."""
+    gd = np.fromfile(encg_f, dtype=np.int32)
+    H, W = int(gd[1]), int(gd[2])
+    short_last = int(gd[18])
+    if int(gd[23]) != 1:
+        sys.exit("these raw stages target a single reference IMAGE (T_pad=1)")
+    encpx = np.fromfile(encpx_f, dtype=np.float32).reshape(int(gd[23]), H, W, 3)
+    ref = ref_encoder_out(m, encpx[0], H, W, which)
+    rows = short_last * (H // KVAE_RATIO) * (W // KVAE_RATIO)   # real rows the device wrote
+    ncol = 1024 if which == "nout" else 48
+    sh = np.fromfile(dev_f, dtype=np.float32).reshape(-1, ncol)
+    dev = sh[:rows] if which == "nout" else sh[:rows, :KC]      # nout: all 1024; mu: first 24
+    if dev.size != ref.size:
+        sys.exit(f"device shadow region {dev.size} != reference {ref.size} (rows={rows}, ncol={ncol})")
+    rf, mx = rel_frobenius_sorted(dev.reshape(-1), ref)
+    sa, sb = np.sort(dev.reshape(-1)), np.sort(ref)
+    A = np.vstack([sb, np.ones_like(sb)]).T
+    (aa, bb), *_ = np.linalg.lstsq(A, sa, rcond=None)
+    resid = sa - (aa * sb + bb)
+    rf_aff = float(np.linalg.norm(resid)) / (float(np.linalg.norm(sb)) + 1e-12)
+    print(f"[{which}] device shadow vs reference: values={dev.size}")
+    print(f"  sorted relFro={rf:.3e}  maxabs={mx:.3e}  dev std={dev.std():.4f} ref std={ref.std():.4f}")
+    print(f"  affine dev ~ {aa:.4f}*ref {bb:+.4f}  residual-after-affine={rf_aff:.3e}  "
+          f"(gain {'PRESENT here' if abs(aa-1.0) > 0.1 else 'already ~1.0 here'})")
+
+
+def _gn_on(trunk, w, b, G, eps, per_frame_rows):
+    """GroupNorm over a [rows, C] trunk. per_frame_rows>0 -> recompute statistics every that many
+    rows (per temporal frame, the reference's TemporalIsolatedGroupNorm); 0 -> one whole-volume
+    statistic over all rows (what the device group_norm kernel does, M=ry over the full buffer)."""
+    t = torch.from_numpy(trunk).double()             # [rows, C]
+    rows, C = t.shape
+    w = torch.from_numpy(w).double(); b = torch.from_numpy(b).double()
+    cpg = C // G
+    tg = t.reshape(rows, G, cpg)                     # per row: G groups of cpg channels
+    if per_frame_rows:
+        nf = rows // per_frame_rows
+        # statistics over each frame's (per_frame_rows x cpg) block, per group
+        blocks = tg.reshape(nf, per_frame_rows, G, cpg)
+        mu = blocks.mean(dim=(1, 3), keepdim=True)
+        var = blocks.var(dim=(1, 3), unbiased=False, keepdim=True)
+        rstd = 1.0 / torch.sqrt(var + eps)
+        normed = (blocks - mu) * rstd
+        tg = normed.reshape(rows, G, cpg)
+    else:
+        mu = tg.mean(dim=(0, 2), keepdim=True)
+        var = tg.var(dim=(0, 2), unbiased=False, keepdim=True)
+        rstd = 1.0 / torch.sqrt(var + eps)
+        tg = (tg - mu) * rstd
+    y = tg.reshape(rows, C) * w + b
+    return (y * torch.sigmoid(y)).numpy()            # SiLU
+
+
+def do_gn_extent(m, trunk_f, nout_f, encpx_f, encg_f):
+    """Is the device norm_out whole-volume (over every temporal slot it materialises) while the
+    reference is per-frame? Dump the trunk (v_lv[5].a) AND its shadowed norm_out output, recompute
+    both statistics modes on the device's OWN trunk, and see which reproduces the device output --
+    and which reproduces the reference. Confines a T==1 latent-scale gain to the norm extent (#20)."""
+    gd = np.fromfile(encg_f, np.int32)
+    H, W = int(gd[1]), int(gd[2])
+    if int(gd[23]) != 1:
+        sys.exit("this test targets a single reference IMAGE (T_pad=1)")
+    C = 1024
+    PF = (H // KVAE_RATIO) * (W // KVAE_RATIO)       # rows per latent frame
+    trunk = np.fromfile(trunk_f, np.float32).reshape(-1, C)
+    nout = np.fromfile(nout_f, np.float32).reshape(-1, C)
+    nrow = trunk.shape[0]
+    ntf = nrow // PF                                # temporal frames the device materialised
+    no = m.encoder.norm_out
+    w = no.weight.float().double().detach().numpy(); b = no.bias.float().double().detach().numpy()
+    G = int(no.num_groups); eps = float(no.eps)
+    # reference trunk (norm_out input) -- reference processes 1 frame -> PF rows
+    encpx = np.fromfile(encpx_f, np.float32).reshape(1, H, W, 3)
+    ref_trunk = ref_encoder_out(m, encpx[0], H, W, "trunk")
+    ref_nout = ref_encoder_out(m, encpx[0], H, W, "nout")
+    print(f"device trunk rows={nrow} = {ntf} frames x PF={PF}; norm groups={G} eps={eps} C={C}")
+    rf_t, _ = rel_frobenius_sorted(trunk[:PF].reshape(-1), ref_trunk)
+    print(f"[A] device trunk frame0 vs reference trunk : relFro={rf_t:.3e}  "
+          f"(dev std={trunk[:PF].std():.4f} ref std={ref_trunk.std():.4f})")
+    pred_whole = _gn_on(trunk, w, b, G, eps, 0)
+    pred_frame = _gn_on(trunk[:PF], w, b, G, eps, 0)   # per-frame == whole on the single-frame slice
+    for name, pred, target in (("device nout", pred_whole[:PF], nout[:PF]),
+                               ("reference nout", pred_frame[:PF], ref_nout)):
+        rf, _ = rel_frobenius_sorted(pred.reshape(-1), target.reshape(-1))
+        print(f"[B] whole-volume-GN(trunk frame0) vs {name:14s}: relFro={rf:.3e}")
+    # and the per-frame reading of the device output: does the DEVICE output match a per-frame norm?
+    rf_dev_frame, _ = rel_frobenius_sorted(pred_frame.reshape(-1), nout[:PF].reshape(-1))
+    print(f"[C] per-frame-GN(trunk frame0) vs device nout frame0: relFro={rf_dev_frame:.3e}")
+    print("  reading: [B device nout ~0] => device norm is WHOLE-VOLUME over all "
+          f"{ntf} frames; [B reference nout ~0] => reference is PER-FRAME; if both, the fix is "
+          "per-frame norm statistics (matches TemporalIsolatedGroupNorm).")
+
+
+def do_expand_test(m, trunk_f, encpx_f, encg_f):
+    """Is the trunk divergence just the device's T==1->clip temporal EXPANSION (replicate the image
+    across the clip, temporal-downsample) rather than a trunk kernel/weight bug? Feed the reference the
+    image replicated to N frames; if its (per-frame-normed) trunk std drops to the device's, the whole
+    gap is the staging geometry, not the convs."""
+    gd = np.fromfile(encg_f, np.int32)
+    H, W = int(gd[1]), int(gd[2])
+    C = 1024
+    PF = (H // KVAE_RATIO) * (W // KVAE_RATIO)
+    trunk = np.fromfile(trunk_f, np.float32).reshape(-1, C)
+    ntf = trunk.shape[0] // PF
+    encpx = np.fromfile(encpx_f, np.float32).reshape(1, H, W, 3)[0]
+
+    def ref_trunk_std(nframes, keep):
+        px = torch.from_numpy(encpx).permute(2, 0, 1)                 # [3,H,W]
+        px = px.unsqueeze(0).unsqueeze(2).repeat(1, 1, nframes, 1, 1) # [1,3,nframes,H,W]
+        x = px.float() * (2.0 / 255.0) - 1.0
+        cap = {}
+        hk = m.encoder.conv_out.register_forward_hook(lambda md, i, o: cap.__setitem__("h", i[0]))
+        try:
+            with torch.no_grad():
+                x = m._normalize_pixels(x); m.encoder(x)
+        finally:
+            hk.remove()
+        h = cap["h"].float()                                          # [1,1024,T,H/16,W/16]
+        t = h.shape[2]
+        fr = h[:, :, (t - 1) if keep == "last" else 0, ...]           # one frame
+        return t, fr.reshape(-1).double().numpy()
+
+    dev_f0 = trunk[:PF]; dev_fl = trunk[-PF:]
+    print(f"device trunk: {ntf} frames x PF={PF}; frame0 std={dev_f0.std():.4f} "
+          f"last-frame std={dev_fl.std():.4f}")
+    for n in (1, 4, 8, 17):
+        for keep in ("first", "last"):
+            t, r = ref_trunk_std(n, keep)
+            rf0, _ = rel_frobenius_sorted(r, dev_f0.reshape(-1))
+            rfl, _ = rel_frobenius_sorted(r, dev_fl.reshape(-1))
+            print(f"  ref N={n:2d} -> T_out={t} keep={keep:5s}: std={r.std():.4f}  "
+                  f"relFro vs dev-frame0={rf0:.3e}  vs dev-last={rfl:.3e}")
+    print("  reading: if some (N,keep) gives relFro ~0 to the device frame, the trunk gap is purely "
+          "the T==1 clip EXPANSION (staging), not the convs.")
+
+
+def do_zeropad_test(m, trunk_f, encpx_f, encg_f):
+    """Confirm the single-frame trunk dilution: the device stages a picture as frame0 in a zero-padded
+    clip, so its temporal downsamplers average over ZERO future slots. Feed the reference a
+    [real,0,0,...] clip and see whether its frame0 trunk drops to the device's std / matches it.
+    Host-only; the decisive golden comparison for the temporal-padding root cause (no device change)."""
+    gd = np.fromfile(encg_f, np.int32)
+    H, W = int(gd[1]), int(gd[2])
+    C = 1024
+    PF = (H // KVAE_RATIO) * (W // KVAE_RATIO)
+    trunk = np.fromfile(trunk_f, np.float32).reshape(-1, C)
+    ntf = trunk.shape[0] // PF
+    encpx = np.fromfile(encpx_f, np.float32).reshape(1, H, W, 3)[0]
+    dev_f0 = trunk[:PF]
+    print(f"device trunk {ntf} frames x PF={PF}: frame0 std={dev_f0.std():.4f} last std={trunk[-PF:].std():.4f}")
+    px = torch.from_numpy(encpx).permute(2, 0, 1)                       # [3,H,W]
+    for n in (1, 2, 5, 9, 17):
+        clip = torch.zeros(1, 3, n, H, W)
+        clip[0, :, 0] = px.float() * (2.0 / 255.0) - 1.0                # real frame0, zeros after
+        cap = {}
+        hk = m.encoder.conv_out.register_forward_hook(lambda md, i, o: cap.__setitem__("h", i[0]))
+        try:
+            with torch.no_grad():
+                x = m._normalize_pixels(clip); m.encoder(x)
+        finally:
+            hk.remove()
+        h = cap["h"].float()                                            # [1,1024,T,H/16,W/16]
+        t = h.shape[2]
+        f0 = h[:, :, 0, ...].reshape(-1).double().numpy()
+        rf0, _ = rel_frobenius_sorted(f0, dev_f0.reshape(-1))
+        print(f"  ref clip N={n:2d} -> T_out={t}: frame0 std={f0.std():.4f}  relFro vs dev-frame0={rf0:.3e}")
+    print("  reading: a ~0 relFro / matching std means the reference on a zero-padded clip reproduces "
+          "the device => the gap is the single-frame temporal DILUTION (device averages zeros).")
+
+
 def do_selftest(m):
     """No device: build a 'device' region from the reference itself (perfect) and two corruptions
     (a dropped normalisation, and a spread-collapse), and confirm the sorted metric reads ~0 and gross.
@@ -283,13 +492,44 @@ def main():
     ap.add_argument("--encpx", help="staged enc_pixels readback (f32, [T_pad, H, W, 3])")
     ap.add_argument("--encg", help="staged enc_geom readback (i32, 25)")
     ap.add_argument("--slot", type=int, default=1)
+    ap.add_argument("--evcq2", help="device f32 shadow of the quant_conv output b_eq2 (R4D_ENC_SEL=q2)")
+    ap.add_argument("--evcq48", help="device f32 shadow of the conv_out output b_eq48 (R4D_ENC_SEL=q48)")
+    ap.add_argument("--evcnout", help="device f32 shadow of the norm_out output b_vnout (R4D_ENC_SEL=nout)")
+    ap.add_argument("--evctrunk", help="device f32 shadow of the norm_out input v_lv[5].a (R4D_ENC_SEL=all)")
+    ap.add_argument("--expand", action="store_true",
+                    help="with --evctrunk: test whether the trunk gap is just the T==1 clip expansion")
+    ap.add_argument("--zeropad", action="store_true",
+                    help="with --evctrunk: feed the reference a [real,0,...] clip to confirm temporal dilution")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     m = load_encoder()
     if a.selftest:
         sys.exit(do_selftest(m))
+    if a.zeropad:
+        if not (a.evctrunk and a.encpx and a.encg):
+            sys.exit("--zeropad needs --evctrunk, --encpx and --encg")
+        sys.exit(do_zeropad_test(m, a.evctrunk, a.encpx, a.encg))
+    if a.expand:
+        if not (a.evctrunk and a.encpx and a.encg):
+            sys.exit("--expand needs --evctrunk, --encpx and --encg")
+        sys.exit(do_expand_test(m, a.evctrunk, a.encpx, a.encg))
+    if a.evctrunk:
+        if not (a.evcnout and a.encpx and a.encg):
+            sys.exit("--evctrunk needs --evcnout, --encpx and --encg")
+        sys.exit(do_gn_extent(m, a.evctrunk, a.evcnout, a.encpx, a.encg))
+    if a.evcq2 or a.evcq48 or a.evcnout:
+        if not (a.encpx and a.encg):
+            sys.exit("raw-latent stages need --encpx and --encg too")
+        # print the tail chain in order so a gain's entry point is visible top-to-bottom
+        if a.evcnout:
+            do_stage_raw(m, a.evcnout, a.encpx, a.encg, "nout")
+        if a.evcq48:
+            do_stage_raw(m, a.evcq48, a.encpx, a.encg, "q48")
+        if a.evcq2:
+            do_stage_raw(m, a.evcq2, a.encpx, a.encg, "q2")
+        sys.exit(0)
     if not (a.evc and a.encpx and a.encg):
-        sys.exit("give --evc, --encpx and --encg (or --selftest)")
+        sys.exit("give --evc, --encpx and --encg (or --evcq2/--evcq48, or --selftest)")
     sys.exit(do_parity(m, a.evc, a.encpx, a.encg, a.slot))
 
 

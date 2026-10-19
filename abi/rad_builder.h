@@ -999,6 +999,26 @@ typedef struct RadVideoGenDecl {
      * body-scale gap between pre_block and mean_proj. Trailing since ABI 23 with the fields above. */
     rad_buf       dbg_ae_amb;
     int64_t       dbg_ae_amb_bytes;
+    /* The video encoder's RAW (pre-fold) latent: an f32 PERSIST twin of the bf16 quant_conv output
+     * b_eq2. Read with R4D_ENC_SEL=q2 on the video pass; splits a latent-scale gap between the
+     * encoder convs (norm_out/conv_out/quant_conv) and the fixed-norm fold -- the video analogue of
+     * dbg_ae_amb. Trailing since ABI 23 with the fields above. */
+    rad_buf       dbg_ve_q2;
+    int64_t       dbg_ve_q2_bytes;
+    /* The video encoder's conv_out output (b_eq48) as an f32 PERSIST twin, read with R4D_ENC_SEL=q48;
+     * splits a raw-latent gain between conv_out (present here) and quant_conv (only in dbg_ve_q2). */
+    rad_buf       dbg_ve_q48;
+    int64_t       dbg_ve_q48_bytes;
+    /* The video encoder's norm_out output (v_lv[5].b) as an f32 PERSIST twin, read with
+     * R4D_ENC_SEL=nout (or included in =all); splits a raw-latent gain between norm_out's own weight
+     * (present here) and the convs after it. */
+    rad_buf       dbg_ve_nout;
+    int64_t       dbg_ve_nout_bytes;
+    /* The video encoder's norm_out INPUT (v_lv[5].a, the trunk) as an f32 PERSIST twin, read with
+     * R4D_ENC_SEL=all; with dbg_ve_nout it lets the norm's statistics be tested whole-volume vs
+     * per-frame (the reference is TemporalIsolatedGroupNorm, per-frame). Trailing debug field. */
+    rad_buf       dbg_ve_trunk;
+    int64_t       dbg_ve_trunk_bytes;
 } RadVideoGenDecl;
 
 int rad_declare_video_generator(RadBuilder* b, const RadVideoGenDecl* d);
