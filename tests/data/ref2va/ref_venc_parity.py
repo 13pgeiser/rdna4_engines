@@ -268,6 +268,15 @@ def ref_encoder_out(m, encpx, H, W, which):
     def hook(mod, inp, out):
         cap["h"] = inp[0]
     hk = m.encoder.conv_out.register_forward_hook(hook)
+    if which == "cin":                                    # conv_in OUTPUT (first stage), T==1
+        hk.remove()
+        hk2 = m.encoder.conv_in.register_forward_hook(lambda md, i, o: cap.__setitem__("h", o))
+        try:
+            with torch.no_grad():
+                x = m._normalize_pixels(x); m.encoder(x)
+        finally:
+            hk2.remove()
+        return cap["h"].float().reshape(-1).double().numpy()
     try:
         with torch.no_grad():
             x = m._normalize_pixels(x)
@@ -462,6 +471,88 @@ def do_zeropad_test(m, trunk_f, encpx_f, encg_f):
           "the device => the gap is the single-frame temporal DILUTION (device averages zeros).")
 
 
+def do_cin(m, dev_f, encpx_f, encg_f):
+    """conv_in output (first stage), frame-0, vs the reference's conv_in output on the same pixels.
+    If the ~0.49x deficit is ALREADY here it is confined to the pixel/conv_in stage (fixable); if it
+    matches (~1.0) the deficit accumulates downstream in the resnet blocks / spatial downsamplers."""
+    gd = np.fromfile(encg_f, np.int32)
+    H, W = int(gd[1]), int(gd[2])
+    if int(gd[23]) != 1:
+        sys.exit("conv_in stage targets a single reference IMAGE (T_pad=1)")
+    encpx = np.fromfile(encpx_f, np.float32).reshape(int(gd[23]), H, W, 3)
+    ref = ref_encoder_out(m, encpx[0], H, W, "cin")
+    dev = np.fromfile(dev_f, np.float32).reshape(-1)     # frame-0: PF0 x dims0, all channels
+    if dev.size != ref.size:
+        sys.exit(f"conv_in shadow {dev.size} != reference {ref.size} (expect {H * W * 128}); "
+                 "dims0/dump size?")
+    rf, mx = rel_frobenius_sorted(dev, ref)
+    sa, sb = np.sort(dev), np.sort(ref)
+    A = np.vstack([sb, np.ones_like(sb)]).T
+    (aa, bb), *_ = np.linalg.lstsq(A, sa, rcond=None)
+    resid = sa - (aa * sb + bb)
+    rf_aff = float(np.linalg.norm(resid)) / (float(np.linalg.norm(sb)) + 1e-12)
+    print(f"[cin] conv_in output (frame0) device vs reference: values={dev.size}")
+    print(f"  sorted relFro={rf:.3e}  maxabs={mx:.3e}  dev std={dev.std():.4f} ref std={ref.std():.4f}")
+    print(f"  affine dev ~ {aa:.4f}*ref {bb:+.4f}  residual-after-affine={rf_aff:.3e}  "
+          f"(std ratio dev/ref={dev.std() / ref.std():.3f})")
+    print(f"  reading: std ratio ~1.0 => conv_in faithful, deficit accumulates downstream; "
+          f"~0.49 => the defect is at conv_in / pixel stage.")
+
+
+def ref_level_outs(m, encpx, H, W):
+    """Reference h captured AFTER each level's resnet block loop and BEFORE that level's downsample,
+    for levels 1..4 -- exactly what the device frame-0 shadows b_vl[1..4] hold (v_lv[L].a post-resnet).
+    Order-free, so the device's spatial-major layout vs the reference's channel-major layout is fine."""
+    px = torch.from_numpy(encpx).permute(2, 0, 1).unsqueeze(0).unsqueeze(2)   # [1,3,1,H,W]
+    x = px.float() * (2.0 / 255.0) - 1.0
+    outs = {}
+    with torch.no_grad():
+        x = m._normalize_pixels(x)
+        enc = m.encoder
+        h = enc.conv_in(x)
+        for i in range(enc.num_levels):
+            for b in enc.down[i].block:
+                h = b(h)
+            if 0 <= i <= 4:
+                outs[i] = h.float().reshape(-1).double().numpy()
+            if hasattr(enc.down[i], "downsample"):
+                h = enc.down[i].downsample(h)
+    return outs
+
+
+def do_levels(m, dev_files, encpx_f, encg_f):
+    """Per-level frame-0 device shadows (evcl1..evcl4) vs the reference level outputs on the SAME
+    pixels. The level where the std ratio first drops from ~1.0 toward 0.49 localises the structural
+    deficit to that level's resnet blocks or to the spatial downsample entering it."""
+    gd = np.fromfile(encg_f, np.int32)
+    H, W = int(gd[1]), int(gd[2])
+    if int(gd[23]) != 1:
+        sys.exit("level shadows target a single reference IMAGE (T_pad=1)")
+    encpx = np.fromfile(encpx_f, np.float32).reshape(int(gd[23]), H, W, 3)
+    refs = ref_level_outs(m, encpx[0], H, W)
+    print(f"[levels] frame-0 post-resnet, device vs reference (order-free)")
+    for L in range(0, 5):
+        f = dev_files[L]
+        if not f:
+            continue
+        dev = np.fromfile(f, np.float32).reshape(-1)
+        ref = refs[L]
+        if dev.size != ref.size:
+            print(f"  L{L}: SKIP size dev={dev.size} ref={ref.size}")
+            continue
+        rf, mx = rel_frobenius_sorted(dev, ref)
+        sa, sb = np.sort(dev), np.sort(ref)
+        A = np.vstack([sb, np.ones_like(sb)]).T
+        (aa, bb), *_ = np.linalg.lstsq(A, sa, rcond=None)
+        resid = sa - (aa * sb + bb)
+        rf_aff = float(np.linalg.norm(resid)) / (float(np.linalg.norm(sb)) + 1e-12)
+        ratio = dev.std() / (ref.std() + 1e-12)
+        print(f"  L{L}: n={dev.size}  std dev={dev.std():.4f} ref={ref.std():.4f} ratio={ratio:.3f}  "
+              f"relFro={rf:.3e} maxabs={mx:.3e}  affine {aa:.3f}*ref{bb:+.3f} resid={rf_aff:.3e}")
+    print("  reading: the FIRST level whose ratio drops below ~1.0 (relative to the one before it) is "
+          "where the deficit enters -- that level's resnet blocks, or the downsample feeding it.")
+
+
 def do_selftest(m):
     """No device: build a 'device' region from the reference itself (perfect) and two corruptions
     (a dropped normalisation, and a spread-collapse), and confirm the sorted metric reads ~0 and gross.
@@ -495,7 +586,13 @@ def main():
     ap.add_argument("--evcq2", help="device f32 shadow of the quant_conv output b_eq2 (R4D_ENC_SEL=q2)")
     ap.add_argument("--evcq48", help="device f32 shadow of the conv_out output b_eq48 (R4D_ENC_SEL=q48)")
     ap.add_argument("--evcnout", help="device f32 shadow of the norm_out output b_vnout (R4D_ENC_SEL=nout)")
+    ap.add_argument("--evccin", help="device f32 shadow of conv_in output frame0 b_vcin (R4D_ENC_SEL=cin)")
     ap.add_argument("--evctrunk", help="device f32 shadow of the norm_out input v_lv[5].a (R4D_ENC_SEL=all)")
+    ap.add_argument("--evcl0", help="device f32 shadow of level-0 post-resnet frame0 (R4D_ENC_SEL=all)")
+    ap.add_argument("--evcl1", help="device f32 shadow of level-1 post-resnet frame0 (R4D_ENC_SEL=all)")
+    ap.add_argument("--evcl2", help="device f32 shadow of level-2 post-resnet frame0 (R4D_ENC_SEL=all)")
+    ap.add_argument("--evcl3", help="device f32 shadow of level-3 post-resnet frame0 (R4D_ENC_SEL=all)")
+    ap.add_argument("--evcl4", help="device f32 shadow of level-4 post-resnet frame0 (R4D_ENC_SEL=all)")
     ap.add_argument("--expand", action="store_true",
                     help="with --evctrunk: test whether the trunk gap is just the T==1 clip expansion")
     ap.add_argument("--zeropad", action="store_true",
@@ -509,6 +606,15 @@ def main():
         if not (a.evctrunk and a.encpx and a.encg):
             sys.exit("--zeropad needs --evctrunk, --encpx and --encg")
         sys.exit(do_zeropad_test(m, a.evctrunk, a.encpx, a.encg))
+    if a.evcl0 or a.evcl1 or a.evcl2 or a.evcl3 or a.evcl4:
+        if not (a.encpx and a.encg):
+            sys.exit("level shadows need --encpx and --encg")
+        sys.exit(do_levels(m, {0: a.evcl0, 1: a.evcl1, 2: a.evcl2, 3: a.evcl3, 4: a.evcl4},
+                           a.encpx, a.encg))
+    if a.evccin:
+        if not (a.encpx and a.encg):
+            sys.exit("--evccin needs --encpx and --encg")
+        sys.exit(do_cin(m, a.evccin, a.encpx, a.encg))
     if a.expand:
         if not (a.evctrunk and a.encpx and a.encg):
             sys.exit("--expand needs --evctrunk, --encpx and --encg")

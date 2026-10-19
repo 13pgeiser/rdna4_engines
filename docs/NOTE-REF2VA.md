@@ -382,46 +382,50 @@ as point 6 / point 4. Nothing here claims to match ComfyUI's timings.
   (video-ref determinism + content-control), `chain.sh` (tail-as-`ref_video` chaining), `fullshape.sh`
   (this max-shape control) under the build tree.
 
-## #14 video-encoder value-parity — localized, not fixed (2026-10-19)
+## #14 video-encoder value-parity — **RESOLVED** (2026-10-19): shortcut-after-norm1 ordering bug
 
-The video/image VAE encoder is **device-live, deterministic and content-sensitive** (all three reference
-kinds proven), but it is **not numerically equal to the ComfyUI fp16 reference**: for a 256×256 picture the
-folded latent sits at roughly **0.37× the reference's scale** with a large **structural** residual. This is
-the honest, still-open half of #14 (strict parity = #10/P6). This pass **localized** the gap and — finding no
-confined, golden-verifiable defect — stopped short of a fix, per the standing rule against blind-fixing the
-shared encoder kernels (they serve the live image and plain paths too).
+The video/image VAE encoder was device-live and content-sensitive but its folded latent sat at roughly
+**0.49× the reference's scale** with a large structural residual. Root cause found and **fixed**: in
+`step_venc`, the shortcut convolution was issued **after** norm1, which normalizes the shortcut level's
+input **in place**. So on every shortcut level (a level whose `cout != cin` — levels 1 and 3 here) the
+residual was fed `silu(norm1(x))` instead of the **raw** `x` the reference uses
+(`ResnetBlock3D.forward`: `x = self.nin_shortcut(x)` before any norm, added to conv2's output). Feeding the
+normalized value into the 1×1 shortcut systematically shrank the residual term, giving the ~0.49× structural
+deficit that accumulated from the first shortcut level down the trunk. The fix reorders the issue so
+`op_sc` reads the raw `in` **before** `op_n1` overwrites it (`arch/minimaxh3/minimaxh3.cpp`, the `f0`
+branch of the level/block loop). This is an op *reorder*, not a kernel change, and it corrects the **shared**
+trunk — so it fixes the **image** encoder's fidelity too.
 
-Method: **device-input-anchored** — feed the reference the device's own staged pixels (`encpx`), so
-preprocessing cancels, and read the device's own intermediates back through `R4D_ENC_SEL=all` f32 PERSIST
-shadows of the encoder tail (`trunk` = `v_lv[5].a`, `nout` = `v_lv[5].b`, `q48` = `conv_out` out, `q2` =
-`quant_conv` out). Harness: `tests/data/ref2va/ref_venc_parity.py` (`--evctrunk/--evcnout`, `--expand`,
-`--zeropad`). A 256×256 image encodes to `R[5]=tf[5]·PF[5]=5·256` trunk rows (the clip geometry keeps five
-temporal slots even for a single frame).
+**Method that cracked it — a frame-0 per-level bisection.** Extended `R4D_ENC_SEL=all` to dump, in one pass,
+frame-0 f32 PERSIST shadows of *every* level's post-resnet output `v_lv[0..4].a` (fields `dbg_ve_l0..l4`)
+alongside the existing tail (`trunk/nout/q48/q2`). Frame-0 shrinks fast spatially so all four level shadows
+plus the trunk stay ~68 MB in one host slab. The reference side (`ref_level_outs`) captures `h` after each
+level's block loop and before its downsample, on the device's **own** staged pixels. The std ratio walked the
+deficit to its exact entry point:
 
-What was **exonerated**, each against the reference on the device's own inputs:
-- **Input normalization** — the device's first op `(px/255 − mean)/std` is *identical* to the reference
-  `_normalize_pixels(px·2/255−1)`, and `kVaePixelMean/Std` equal `IMAGENET_MEAN/STD` byte-for-byte, so the
-  trunk comparison is clean (not a preprocessing artifact).
-- **`norm_out`** — faithful. Recomputing GroupNorm on the device trunk with the container's weight reproduces
-  the shadowed `nout` to `relFro 1.6e-3`; the gain is *already present in the trunk* it reads.
-- **GroupNorm extent (was task #20)** — the device is **already per-frame**, matching the reference's
-  `TemporalIsolatedGroupNorm`: per-frame statistics reproduce device `nout` (1.6e-3); whole-volume gives
-  1.457. Whole-volume-vs-per-frame is **not** the cause; no change needed.
-- **Temporal handling** — the reference's frame-0 trunk std is a flat **8.986** at clip lengths 1, 2, 5, 9,
-  17 under *both* frame-replication and zero-padding (a causal frame 0 sees only itself), while the device's
-  frame-0 trunk std is **4.40** and its last frame is exactly **0.0**. So the device's deficit is **not** a
-  temporal-expansion or zero-dilution effect; temporal staging is excluded.
-- **A single confined multiplicative gain** — ruled out: after per-group normalization removes every group
-  scale, device `nout` still differs from the reference by **0.57 non-affinely**, so the trunk gap is
-  **structural**, not one mis-scaled factor to undo.
-- **Weight precision** — ruled out: the video-encoder tensors were *not* in the convert log's worst-20
-  (those were all `aenc.*` at ~1.6e-3 relative Frobenius), so the encoder weights are correctly rounded.
+| stage | pre-fix ratio | post-fix ratio |
+|---|---|---|
+| conv_in out (frame0) | 0.999 | 0.999 |
+| L0 post-resnet | 0.999 | 0.999 |
+| **L1 post-resnet** | **0.455** | **1.000** |
+| L2 | 0.466 | 1.000 |
+| L3 | 0.380 | 1.000 |
+| L4 | 0.331 | 1.000 |
+| norm_out / conv_out / quant_conv (raw mu) | ~0.49 | **1.000 / 1.000 / 0.998** |
 
-**Where it is.** A ~0.49× systematic, **structural** deviation on the deepest trunk activation, present at a
-*causally-isolated* frame (so independent of temporal extent), with correct weights and a faithful tail —
-i.e. in the **spatial** trunk (conv_in / resnet blocks / spatial downsampling) or its bf16 implicit-GEMM
-kernels. Pinpointing it further means dumping every level's trunk and auditing each spatial kernel against
-the reference — a multi-round device investigation whose fix would land in kernels shared by the live image
-and plain encode paths. That is exactly the blind-fix hazard the workflow rule forbids without a confined,
-golden-verifiable defect in hand, so it is left **open and precisely bounded**: #14-video = spatial-trunk
-value-parity, #20 closed (norm already per-frame), temporal/GN/norm-out/input-norm all excluded.
+conv_in and level-0 (no shortcut) stay faithful; the drop appears *exactly* at level 1 (first shortcut level)
+— pinpointing the shortcut as the culprit, not the downsample, not a spatial kernel, not bf16 GEMM (the trunk
+convs run **host-only** in this config anyway — `conv3d_ndhwc` resolves to a host kernel). Post-fix every
+stage matches the reference to the **bf16 precision floor** (`relFro ~3–4e-3`, affine `1.000·ref + 0.000`).
+
+What the earlier pass had already correctly **exonerated** (still true, and why the bisection was the right
+cut — the gap was upstream of all of them, at the shortcut): input normalization (byte-identical to
+`_normalize_pixels`); `norm_out` (GroupNorm on the device trunk reproduces `nout` to 1.6e-3); GroupNorm extent
+(was task #20 — device is **already per-frame**, matching `TemporalIsolatedGroupNorm`; no change); temporal
+staging (a causal frame-0 sees only itself — excluded); weight precision (venc not in the convert worst-20).
+The "structural spatial trunk / needs a golden box" read from the prior pass was wrong: it *was* structural,
+but confined to one op-order, and the frame-0 bisection made it golden-verifiable.
+
+**Verified device-live**: a single-image `ref2va` encode generated cleanly with the fix loaded, and all level
+shadows + the full tail now read ratio ~1.0 against the reference. Strict end-to-end numeric parity of the
+whole pipeline (benchmarks, multi-frame) remains #10/P6. #20 stays closed (norm already per-frame).

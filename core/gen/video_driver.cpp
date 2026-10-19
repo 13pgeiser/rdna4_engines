@@ -290,7 +290,13 @@ int VideoDriver::init(const Program& prog, PositionsFn positions,
      * decl_.dbg_* or touches enc_dbg_host_. */
     if (std::getenv("R4D_ENC_DEBUG") &&
         (decl_.dbg_enca_bytes > 0 || decl_.dbg_evc_bytes > 0)) {
-        enc_dbg_bytes_ = std::max(decl_.dbg_enca_bytes, decl_.dbg_evc_bytes);
+        /* The slab must hold the largest single shadow AND the full "all" multi-shadow slab. */
+        const int64_t all_sum = decl_.dbg_ve_trunk_bytes + decl_.dbg_ve_nout_bytes +
+                                decl_.dbg_ve_q48_bytes + decl_.dbg_ve_q2_bytes +
+                                decl_.dbg_ve_l0_bytes + decl_.dbg_ve_l1_bytes +
+                                decl_.dbg_ve_l2_bytes + decl_.dbg_ve_l3_bytes + decl_.dbg_ve_l4_bytes;
+        enc_dbg_bytes_ = std::max<std::int64_t>(
+            { decl_.dbg_enca_bytes, decl_.dbg_evc_bytes, decl_.dbg_ve_cin_bytes, all_sum });
         enc_dbg_host_ = static_cast<char*>(rad_dev_alloc(enc_dbg_bytes_, RAD_MEM_HOST_PINNED));
         enc_dbg_ = enc_dbg_host_ != nullptr;
         if (!enc_dbg_)
@@ -1245,32 +1251,46 @@ const RadBatch* VideoDriver::build_encode(Job& j, int step) {
         const bool q2  = sel && !audio && std::strcmp(sel, "q2")  == 0 && decl_.dbg_ve_q2_bytes  > 0;
         const bool q48 = sel && !audio && std::strcmp(sel, "q48") == 0 && decl_.dbg_ve_q48_bytes > 0;
         const bool nout = sel && !audio && std::strcmp(sel, "nout") == 0 && decl_.dbg_ve_nout_bytes > 0;
+        const bool cin  = sel && !audio && std::strcmp(sel, "cin")  == 0 && decl_.dbg_ve_cin_bytes  > 0;
         /* "all" reads the three video shadows back in ONE pass into one slab (nout | q48 | q2), so a
          * single request localises a latent-scale gain across norm_out / conv_out / quant_conv. */
         const bool all = sel && !audio && std::strcmp(sel, "all") == 0 &&
                          decl_.dbg_ve_trunk_bytes > 0 && decl_.dbg_ve_nout_bytes > 0 &&
-                         decl_.dbg_ve_q48_bytes > 0 && decl_.dbg_ve_q2_bytes > 0;
+                         decl_.dbg_ve_q48_bytes > 0 && decl_.dbg_ve_q2_bytes > 0 &&
+                         decl_.dbg_ve_l0_bytes > 0 && decl_.dbg_ve_l1_bytes > 0 &&
+                         decl_.dbg_ve_l2_bytes > 0 && decl_.dbg_ve_l3_bytes > 0 &&
+                         decl_.dbg_ve_l4_bytes > 0;
         enc_dbg_used_ = 0;
         if (all && enc_dbg_bytes_ >= decl_.dbg_ve_trunk_bytes + decl_.dbg_ve_nout_bytes +
-                                    decl_.dbg_ve_q48_bytes + decl_.dbg_ve_q2_bytes) {
-            const int64_t nt = decl_.dbg_ve_trunk_bytes, nn = decl_.dbg_ve_nout_bytes;
-            const int64_t n48 = decl_.dbg_ve_q48_bytes, n2 = decl_.dbg_ve_q2_bytes;
+                                    decl_.dbg_ve_q48_bytes + decl_.dbg_ve_q2_bytes +
+                                    decl_.dbg_ve_l0_bytes + decl_.dbg_ve_l1_bytes +
+                                    decl_.dbg_ve_l2_bytes + decl_.dbg_ve_l3_bytes + decl_.dbg_ve_l4_bytes) {
+            /* One slab, fixed order: trunk | nout | q48 | q2 | l0 | l1 | l2 | l3 | l4. */
+            const rad_buf  hh[9] = { decl_.dbg_ve_trunk, decl_.dbg_ve_nout, decl_.dbg_ve_q48,
+                                     decl_.dbg_ve_q2, decl_.dbg_ve_l0, decl_.dbg_ve_l1,
+                                     decl_.dbg_ve_l2, decl_.dbg_ve_l3, decl_.dbg_ve_l4 };
+            const int64_t  nn[9] = { decl_.dbg_ve_trunk_bytes, decl_.dbg_ve_nout_bytes,
+                                     decl_.dbg_ve_q48_bytes, decl_.dbg_ve_q2_bytes,
+                                     decl_.dbg_ve_l0_bytes, decl_.dbg_ve_l1_bytes,
+                                     decl_.dbg_ve_l2_bytes, decl_.dbg_ve_l3_bytes, decl_.dbg_ve_l4_bytes };
             char* p = enc_dbg_host_;
-            rb_.assign(4, Readback{decl_.dbg_ve_trunk, nt, p});
-            rb_[1] = Readback{decl_.dbg_ve_nout,  nn, p + nt};
-            rb_[2] = Readback{decl_.dbg_ve_q48,  n48, p + nt + nn};
-            rb_[3] = Readback{decl_.dbg_ve_q2,    n2, p + nt + nn + n48};
+            int64_t off = 0;
+            rb_.clear();
+            for (int i = 0; i < 9; ++i) { rb_.push_back(Readback{ hh[i], nn[i], p + off }); off += nn[i]; }
             enc_dbg_sel_ = "all";
-            enc_dbg_used_ = nt + nn + n48 + n2;
+            enc_dbg_used_ = off;
         } else {
             const rad_buf h = mp ? decl_.dbg_ae_mp : amb ? decl_.dbg_ae_amb : pre ? decl_.dbg_ae_pre
                                 : nout ? decl_.dbg_ve_nout : q48 ? decl_.dbg_ve_q48 : q2 ? decl_.dbg_ve_q2
+                                : cin ? decl_.dbg_ve_cin
                                 : audio ? decl_.dbg_enca : decl_.dbg_evc;
             const int64_t n = mp ? decl_.dbg_ae_mp_bytes : amb ? decl_.dbg_ae_amb_bytes
                                 : pre ? decl_.dbg_ae_pre_bytes : nout ? decl_.dbg_ve_nout_bytes
                                 : q48 ? decl_.dbg_ve_q48_bytes : q2 ? decl_.dbg_ve_q2_bytes
+                                : cin ? decl_.dbg_ve_cin_bytes
                                 : audio ? decl_.dbg_enca_bytes : decl_.dbg_evc_bytes;
-            enc_dbg_sel_ = mp ? "mp" : amb ? "amb" : pre ? "pre" : nout ? "nout" : q48 ? "q48" : q2 ? "q2" : "";
+            enc_dbg_sel_ = mp ? "mp" : amb ? "amb" : pre ? "pre" : nout ? "nout" : q48 ? "q48" : q2 ? "q2"
+                             : cin ? "cin" : "";
             if (h && n > 0) {
                 rb_.assign(1, Readback{h, n, enc_dbg_host_});
                 enc_dbg_used_ = n;
@@ -1293,16 +1313,21 @@ int VideoDriver::done() {
     case RAD_GEN_PASS_AENCODE:
         /* The media's latents are now in the lane's slot rows; take the next reference, if any. */
         if (enc_dbg_ && enc_dbg_used_ > 0 && enc_dbg_sel_ && std::strcmp(enc_dbg_sel_, "all") == 0) {
-            /* Four shadows in one slab (trunk | nout | q48 | q2) -> four files. */
-            const int64_t nt = decl_.dbg_ve_trunk_bytes, nn = decl_.dbg_ve_nout_bytes;
-            const int64_t n48 = decl_.dbg_ve_q48_bytes, n2 = decl_.dbg_ve_q2_bytes;
+            /* Nine shadows in one slab -> nine files. */
+            const char* nm8[9] = { "evctrunk", "evcnout", "evcq48", "evcq2",
+                                   "evcl0", "evcl1", "evcl2", "evcl3", "evcl4" };
+            const int64_t nn8[9] = { decl_.dbg_ve_trunk_bytes, decl_.dbg_ve_nout_bytes,
+                                     decl_.dbg_ve_q48_bytes, decl_.dbg_ve_q2_bytes,
+                                     decl_.dbg_ve_l0_bytes, decl_.dbg_ve_l1_bytes,
+                                     decl_.dbg_ve_l2_bytes, decl_.dbg_ve_l3_bytes, decl_.dbg_ve_l4_bytes };
             char* p = enc_dbg_host_;
-            enc_dbg_dump_file("evctrunk", p, (size_t)nt);
-            enc_dbg_dump_file("evcnout",  p + nt, (size_t)nn);
-            enc_dbg_dump_file("evcq48",   p + nt + nn, (size_t)n48);
-            enc_dbg_dump_file("evcq2",    p + nt + nn + n48, (size_t)n2);
-            RAD_ERR("enc_dbg all: dumped trunk %lld + nout %lld + q48 %lld + q2 %lld bytes",
-                    (long long)nt, (long long)nn, (long long)n48, (long long)n2);
+            int64_t off = 0;
+            for (int i = 0; i < 9; ++i) {
+                enc_dbg_dump_file(nm8[i], p + off, (size_t)nn8[i]);
+                off += nn8[i];
+            }
+            RAD_ERR("enc_dbg all: dumped %lld bytes across trunk/nout/q48/q2/l0/l1/l2/l3/l4",
+                    (long long)off);
         } else if (enc_dbg_ && enc_dbg_used_ > 0) {
             const int64_t nf = enc_dbg_used_ / 4;
             const float* z = reinterpret_cast<const float*>(enc_dbg_host_);

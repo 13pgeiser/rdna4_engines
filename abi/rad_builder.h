@@ -1019,6 +1019,24 @@ typedef struct RadVideoGenDecl {
      * per-frame (the reference is TemporalIsolatedGroupNorm, per-frame). Trailing debug field. */
     rad_buf       dbg_ve_trunk;
     int64_t       dbg_ve_trunk_bytes;
+    /* frame-0 of the video encoder's conv_in output (v_lv[0].a) as an f32 PERSIST twin, read with
+     * R4D_ENC_SEL=cin; tests whether the trunk deficit is already present at conv_in (confined to the
+     * pixel/conv_in stage) or accumulates across the spatial downsamplers. Trailing debug field. */
+    rad_buf       dbg_ve_cin;
+    int64_t       dbg_ve_cin_bytes;
+    /* frame-0 of each level's post-resnet output (v_lv[0..4].a) as an f32 PERSIST twin, read with
+     * R4D_ENC_SEL=all; with cin and trunk they bisect which stage introduces the trunk deficit.
+     * Trailing debug fields. */
+    rad_buf       dbg_ve_l0;
+    int64_t       dbg_ve_l0_bytes;
+    rad_buf       dbg_ve_l1;
+    int64_t       dbg_ve_l1_bytes;
+    rad_buf       dbg_ve_l2;
+    int64_t       dbg_ve_l2_bytes;
+    rad_buf       dbg_ve_l3;
+    int64_t       dbg_ve_l3_bytes;
+    rad_buf       dbg_ve_l4;
+    int64_t       dbg_ve_l4_bytes;
 } RadVideoGenDecl;
 
 int rad_declare_video_generator(RadBuilder* b, const RadVideoGenDecl* d);

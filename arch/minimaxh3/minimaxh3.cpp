@@ -546,6 +546,19 @@ struct Model {
     rad_buf b_vtrunk = 0;
     rad_op  op_ve_trunkdbg = 0;
     int64_t ve_trunk_bytes = 0;
+    /* The first stage only: frame-0 of the conv_in output (v_lv[0].a), cast to f32, to test whether the
+     * structural trunk deficit is already present at conv_in (=> confined to the pixel/conv_in stage) or
+     * accumulates across the spatial downsamplers (=> shared downsample kernels). A single frame, so
+     * [PF[0], dims[0]] f32 ~= 33 MB. Debug-only, R4D_ENC_SEL=cin. */
+    rad_buf b_vcin = 0;
+    rad_op  op_ve_cindbg = 0;
+    int64_t ve_cin_bytes = 0;
+    /* Frame-0 of each level's post-resnet output (v_lv[1..4].a), cast to f32, to bisect which spatial
+     * downsample introduces the trunk deficit (conv_in and the deepest trunk already pinned: 0.999 and
+     * 0.49). frame-0 shrinks fast spatially, so all four together stay small. Debug-only, R4D_ENC_SEL=all. */
+    rad_buf b_vl[6] = { 0 };
+    rad_op  op_ve_ldbg[6] = { 0 };
+    int64_t ve_l_bytes[6] = { 0 };
 
     /* ---- the audio VAE encoder, when the container carries it. f32 like its decoder: per
      * channel one sequence, conv_in and five strided blocks of three [snake, conv7, snake,
@@ -2362,6 +2375,30 @@ static int declare_venc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                           { m.v_lv[5].a }, { m.b_vtrunk });
     if (!m.op_ve_trunkdbg) return RAD_E_INVAL;
     m.ve_trunk_bytes = (int64_t)R[5] * (int64_t)dims[5] * 4;
+    /* conv_in's output, first frame only (the buffer is frame-major, so frame 0 is the first PF[0] rows). */
+    m.b_vcin = decl_b(b, nm.f("venc.cindbg"), RAD_F32, { PF[0], (int64_t)dims[0] }, RAD_BUF_PERSIST);
+    m.op_ve_cindbg = rw(b, RAD_OP(b, "cast",
+                                  RAD_PARAMS(RAD_RANGE("M", 1, PF[0]), RAD_INT("n", (int64_t)dims[0]),
+                                             RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
+                                  RAD_NOWEIGHTS),
+                        { m.v_lv[0].a }, { m.b_vcin });
+    if (!m.op_ve_cindbg) return RAD_E_INVAL;
+    m.ve_cin_bytes = (int64_t)PF[0] * (int64_t)dims[0] * 4;
+    /* Post-resnet output of each intermediate level (v_lv[1..4].a), first frame only. Frame 0 shrinks
+     * as the spatial map downsamples, so these stay small; together with the trunk and cin they bisect
+     * which spatial downsample introduces the trunk's ~0.49x deficit. */
+    for (int L = 0; L < 5; L++) {
+        char tag[32];
+        snprintf(tag, sizeof tag, "venc.l%ddbg", L);
+        m.b_vl[L] = decl_b(b, nm.f(tag), RAD_F32, { PF[L], (int64_t)dims[L] }, RAD_BUF_PERSIST);
+        m.op_ve_ldbg[L] = rw(b, RAD_OP(b, "cast",
+                                       RAD_PARAMS(RAD_RANGE("M", 1, PF[L]), RAD_INT("n", (int64_t)dims[L]),
+                                                  RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
+                                       RAD_NOWEIGHTS),
+                             { m.v_lv[L].a }, { m.b_vl[L] });
+        if (!m.op_ve_ldbg[L]) return RAD_E_INVAL;
+        m.ve_l_bytes[L] = (int64_t)PF[L] * (int64_t)dims[L] * 4;
+    }
     return RAD_OK;
 }
 
@@ -2984,6 +3021,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             d.dbg_ve_nout_bytes = m.venc ? m.ve_nout_bytes : 0;
             d.dbg_ve_trunk = m.b_vtrunk;
             d.dbg_ve_trunk_bytes = m.venc ? m.ve_trunk_bytes : 0;
+            d.dbg_ve_cin = m.b_vcin;
+            d.dbg_ve_cin_bytes = m.venc ? m.ve_cin_bytes : 0;
+            d.dbg_ve_l0 = m.b_vl[0]; d.dbg_ve_l0_bytes = m.venc ? m.ve_l_bytes[0] : 0;
+            d.dbg_ve_l1 = m.b_vl[1]; d.dbg_ve_l1_bytes = m.venc ? m.ve_l_bytes[1] : 0;
+            d.dbg_ve_l2 = m.b_vl[2]; d.dbg_ve_l2_bytes = m.venc ? m.ve_l_bytes[2] : 0;
+            d.dbg_ve_l3 = m.b_vl[3]; d.dbg_ve_l3_bytes = m.venc ? m.ve_l_bytes[3] : 0;
+            d.dbg_ve_l4 = m.b_vl[4]; d.dbg_ve_l4_bytes = m.venc ? m.ve_l_bytes[4] : 0;
         }
         RAD_ARCH_TRY(rad_declare_video_generator(b, &d));
     }
@@ -3659,6 +3703,8 @@ static void step_venc(RadCtx* c, const RadBatch* batch, const Model& m) {
         RAD_ISSUE_N(c, m.op_ve_pcast, R0, brows(m.b_epix32, R0), brows(m.b_epix, R0));
         RAD_ISSUE_N(c, m.op_ve_cin, R0, brows(m.b_epix, R0), RAD_W(m.ve_cinw), RAD_W(m.ve_cinb),
                     gg[0], RAD_NONE, brows(m.v_lv[0].a, R0));
+        RAD_ISSUE_N(c, m.op_ve_cindbg, (int64_t)g[1] * g[2],
+                    brows(m.v_lv[0].a, R0), brows(m.b_vcin, (int64_t)g[1] * g[2])); /* frame-0 shadow */
         for (int L = 0; L < 6; ++L) {
             const Model::VEncLevel& E = m.v_lv[(size_t)L];
             const int64_t R = (int64_t)g[kVOrg[L]] * g[kVOrg[L] + 1] * g[kVOrg[L] + 2];
@@ -3667,19 +3713,26 @@ static void step_venc(RadCtx* c, const RadBatch* batch, const Model& m) {
                 const Model::VEncBlock& B = E.blk[blk];
                 const bool f0 = blk == 0 && sc;
                 const rad_buf xa = f0 ? E.in : E.a, nb = f0 ? E.in : E.b;
-                /* norm1 over the whole volume, SiLU'd; on a shortcut level that is `in` itself,
-                 * in place, and the shortcut convolves the result into `a`. */
-                RAD_ISSUE_N(c, B.op_n1, R, brows(xa, R), RAD_W(B.n1w), RAD_W(B.n1b), RAD_NONE, st,
-                            brows(nb, R));
+                /* The shortcut convolves the RAW input -- the reference folds the channel change as
+                 * `x = nin_shortcut(x)` before any norm touches x, and adds that to conv2's output.
+                 * So it MUST be issued before norm1, which normalises `in` IN PLACE for conv1; issuing
+                 * the shortcut after norm1 fed it silu(norm1(x)) instead of x, shrinking the residual
+                 * term on every shortcut level (a ~0.45x trunk deficit, fixed here). */
                 if (f0)
                     RAD_ISSUE_N(c, E.op_sc, R, brows(E.in, R), RAD_W(E.scw), RAD_W(E.scb), gg[L],
                                 RAD_NONE, brows(E.a, R));
+                RAD_ISSUE_N(c, B.op_n1, R, brows(xa, R), RAD_W(B.n1w), RAD_W(B.n1b), RAD_NONE, st,
+                            brows(nb, R));
                 RAD_ISSUE_N(c, B.op_c1, R, brows(nb, R), RAD_W(B.c1w), RAD_W(B.c1b), gg[L],
                             RAD_NONE, brows(E.c, R));
                 RAD_ISSUE_N(c, B.op_n2, R, brows(E.c, R), RAD_W(B.n2w), RAD_W(B.n2b), RAD_NONE, st,
                             brows(E.b, R));
                 RAD_ISSUE_N(c, B.op_c2, R, brows(E.b, R), RAD_W(B.c2w), RAD_W(B.c2b), gg[L],
                             brows(E.a, R), brows(E.a, R));
+            }
+            if (L <= 4 && m.op_ve_ldbg[L]) {   /* frame-0 post-resnet shadow (levels 0..4) */
+                const int64_t pf = (int64_t)g[kVOrg[L] + 1] * g[kVOrg[L] + 2];
+                RAD_ISSUE_N(c, m.op_ve_ldbg[L], pf, brows(E.a, R), brows(m.b_vl[L], pf));
             }
             if (L < 4) {
                 const Model::VEncLevel& X = m.v_lv[(size_t)L + 1];
