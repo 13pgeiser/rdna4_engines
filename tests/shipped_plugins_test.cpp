@@ -89,8 +89,8 @@ TEST(the_shipped_architectures_load_with_distinct_selection_keys) {
     }
     const std::set<std::pair<std::string, std::string>> want = {
         { "breeze", "" }, { "embeddinggemma2", "" }, { "gemma3", "" }, { "gemma4", "" },
-        { "gemma4", "compressed-tensors" }, { "lfm2", "" }, { "llama", "" }, { "llama", "fp8_e4m3" },
-        { "qwen35", "" },
+        { "gemma4", "compressed-tensors" }, { "glm5next", "" }, { "lfm2", "" }, { "llama", "" },
+        { "llama", "fp8_e4m3" }, { "qwen35", "" },
         { "qwen35", "fp8_e4m3" }, { "qwen35", "w8a8_fwht128" }, { "qwen35moe", "fp8_e4m3" },
         { "qwen3asr", "" },
         { "minimaxh3", "" }, { "minimaxmusic3", "" }, { "qwen4exp", "" }, { "qwenimage21", "" } };
