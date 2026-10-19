@@ -37,6 +37,13 @@ sibling notes (`NOTE-P3-PACK.md`, `NOTE-P2-ENCODE.md`); this one is about capabi
   **bit-identical** (deterministic). The earlier "video / audio do not change the output" reading was a
   measurement error — raw-MP4-byte comparison plus a cold-start pair (see point 4); the encoders are
   content-live, not collapsed.
+- **Audio-encoder numeric value-parity — measured and now matched.** Against a device-input-anchored
+  fp32 reference, the audio latent used to sit at ~0.25–0.39× the reference spread. The cause was a
+  **pre_block `norm1`/`norm3` swap** (the projection branch read the wrong LayerNorm — see #14 below). After
+  the fix the pre_block output and the final latent both track the reference (ratio ~0.97 / ~0.93, R² 0.98–
+  0.99, no remaining systematic gain); the ~0.10 residual-after-affine is bounded by low-precision
+  execution (a full-bf16 reference itself moves 55% from its fp32). **The video / image encoder is a
+  separate, still-open divergence** — it has no pre_block, so this fix does not cover it.
 - **Continuity chaining — drivable today through the reference paths.** DaSiWa's scene-to-scene lead-in
   is the previous clip's tail fed back as a `ref_video_N` (+ `ref_video_audio_N`), not a special engine
   mode. Two requests reproduce it: generate clip A, cut its tail, request clip B with `ref_video_1` = the
@@ -191,7 +198,10 @@ as point 6 / point 4. Nothing here claims to match ComfyUI's timings.
 
    What remains is **strict numeric value-parity** of the encoder latents against the reference HF
    encoder (a per-tensor golden), not *whether* the encoders are live. **This has now been measured on
-   the audio path.** A device-input-anchored check — feed the reference HF audio VAE (fp32) the device's
+   the audio path.** *(The pre-fix numbers this and the next paragraph record — the ~0.37× under-gain —
+   have since been **root-caused to a pre_block `norm1`/`norm3` swap and fixed**; see the RESOLVED block
+   below. They are kept as the measured history that led there.)* A device-input-anchored check — feed the
+   reference HF audio VAE (fp32) the device's
    *own* staged `enc_samples`, then compare its latent to the device's `b_enca`; the reference and the
    container use byte-identical encoder weights and `latents_mean/std`, verified, so only the kernels
    can differ — gives a **relative Frobenius error ~0.79, correlation 0.67**, with the device latent's
@@ -211,7 +221,9 @@ as point 6 / point 4. Nothing here claims to match ComfyUI's timings.
    family** (`conv3d_ndhwc`) and have not yet been measured this way. Functional conditioning is
    unaffected — the DiT is internally consistent with the latents it is fed — but *numerical* fidelity to
    the reference encoder is not achieved on the audio path, so audio-reference output is not guaranteed to
-   match ComfyUI latent-for-latent. Reproduce: dump with `R4D_ENC_DEBUG=1 R4D_ENC_DUMPDIR=<dir>` over one
+   match ComfyUI latent-for-latent. *(This pre-fix claim is now **superseded**: the audio under-gain was
+   root-caused to a `norm1`/`norm3` swap and fixed, and the audio latent is now a near-identity map of the
+   reference — see the RESOLVED block below.)* Reproduce: dump with `R4D_ENC_DEBUG=1 R4D_ENC_DUMPDIR=<dir>` over one
    `ref_audio` request, then `ref_aenc_parity.py --enca enca.f32 --encsm encsm_4_1.f32 --kind audio
    --slot 1` (its `--selftest` validates the reshape / slot / metric logic with no device). The audio
    encoder is the cleanest first measurement because it has no spatial preprocessing to confound it.
@@ -239,45 +251,61 @@ as point 6 / point 4. Nothing here claims to match ComfyUI's timings.
    `encg_1_<slot>`, `evc`), then `ref_venc_parity.py --evc evc.f32 --encpx encpx_1_1.f32 --encg
    encg_1_1.f32 --slot 1` (`--selftest` validates the fold/norm/sorted model with no device).
 
-   **The decomposition that reframes #14 — the divergence is a near-pure UNDER-GAIN, not a conv bug.** Both
-   harnesses now fit a single global affine `dev_sorted ≈ a·ref_sorted + b` to the two value distributions:
+   **RESOLVED (audio): the audio under-gain was a pre_block `norm1`/`norm3` swap — a wiring bug, not a
+   norm-kernel scale fault.** An earlier block here attributed both families' ~0.37× to a *shared* final-
+   norm / norm-kernel attenuation. That is **wrong**, and stage-by-stage dumps now pin the audio cause
+   exactly. Method: dump the audio final chain one stage at a time on device (`R4D_ENC_SEL`) against the
+   reference module-by-module, device-input-anchored (same staged waveform both sides). The bf16 `b_ax2`
+   readback turned out to **lag the arena** (it dumped ±1e38/NaN while its own `mean_proj` output `b_amb2`
+   was finite — impossible for a linear map), so the harness gained `R4D_ENC_SEL=amb` to read `b_amb`
+   instead, the **f32 mean_proj *input*** (the pre_block output cast) — the reliable twin. Reading `b_amb`:
 
-   | family | a (scale) | b (offset) | R² | relFro raw → after-affine |
-   |---|---|---|---|---|
-   | audio (conv1d) | **0.385** | +0.009 | **0.975** | 0.79 → **0.062** |
-   | video/image (conv3d) | **0.369** | +0.159 | 0.912 | 0.65 → **0.114** |
+   - **pre_block output (`b_amb`): device std 1.65 vs reference 6.62 → ratio 0.25.** The collapse is already
+     at the pre_block output, so the fixed `(z-mean)/std` norm and `mean_proj` are both **innocent** (they
+     pass the value through: `b_amb2` was likewise 0.27×).
+   - The reference `AttnProjection.forward` (`comfy/ldm/minimax/audio_vae.py:267`) is
+     `proj(norm3(x)) + attn(norm1(x))` then `+ mlp(norm2(·))`. The **two 2048-wide LayerNorms are not
+     interchangeable**: `norm3` has affine |w|mean 0.60, `norm1` 0.27, so `proj` (the dominant branch,
+     std 6.6 via `norm3`) dwarfs the attention branch (std 0.4 via `norm1`). **The device had them wired
+     backwards** — it staged `norm1` into the projection and `norm3` into the attention (qkv). Feeding the
+     small-affine `norm1` to `proj` shrinks it from std 6.6 → 1.8, and the whole block, hence every latent
+     downstream, to ~0.25–0.27×. Measured: correct wiring `proj(norm3)+attn(norm1)` std 6.67; swapped
+     (device) `proj(norm1)+attn(norm3)` std 1.83 = 0.274×. Exactly the observed collapse.
 
-   Two *entirely different* encoder networks (strided conv1d vs `conv3d_ndhwc`) both reduce to **≈0.37× the
-   reference** with R² 0.91–0.98 — near-perfect linearity. That **overrules the "not a single scale" and
-   "suspect the strided conv1d temporal reduction" readings above**: a conv-reduction or structural transform
-   bug would *not* collapse to a clean global scale. The device encoders are computing the *right shape* of
-   latent, just damped to ~0.37× amplitude (video additionally carries a small positive offset and slightly
-   more tail-compression — its R² 0.912 and residual 0.114 are the structural remainder).
+   **The fix** (`arch/minimaxh3/minimaxh3.cpp`, pre_block issue sequence): stage `norm1` for the attention
+   (feeding `p_op_qkv`) and `norm3` for the projection (feeding `p_op_proj`), matching the reference. Both
+   LN ops are the *same* `ln(...,2048,b_apb→b_aln3)` kernel — only which consumer reads which norm changed,
+   so **no kernel touched, no re-convert** (weights already carry `norm1.*`/`norm3.*` correctly). This also
+   **kills the "shared encoder-norm-kernel scale fault" hypothesis**: the audio pre_block now matches the
+   reference using that *same* LayerNorm kernel, so the kernel is fine — the loss was pure wiring, and it
+   sat **upstream** of the final norm (the "final norm resets the body gain" reasoning was itself wrong:
+   `mean_proj` has no LayerNorm after it, and it faithfully passed the collapsed value through).
 
-   **Where the gain can and cannot be (architecture-narrowed).** A code sweep ruled the *body* out: both
-   encoders terminate in a **normalisation that re-writes the activation scale** before the latent is
-   emitted — video's last op before `conv_out`/`quant_conv` is `norm_out` (`venc_gn`,
-   `arch/minimaxh3/minimaxh3.cpp:2278`); the audio pre-block's `norm1/2/3` LayerNorms precede `proj`/
-   `mean_proj`. A GroupNorm/LayerNorm output has std ≈ its per-channel gamma *regardless of input
-   magnitude*, so **any gain accumulated in the encoder body is erased by that final norm — the earlier
-   "per-level attenuation compounding across depth" reading is therefore wrong** (it could not reach the
-   latent). The ~0.37 can only originate in the **final norm's affine application, or the final
-   conv/linear**: video `norm_out`(gamma `ve_now`)→`conv_out`→`quant_conv`; audio pre-block `norm3`(gamma)→
-   `proj`→`mean_proj`. The two families' scale differs slightly (0.385 vs 0.369) simply because those final
-   chains differ per arch.
+   **Verified device-side (seed=7 tone, container `minimax-h3-ref2va-fp8`, warm server):**
 
-   **Why encoder-only is consistent with the DiT generating correctly:** the DiT's norms are **RMSNorm**
-   (`rmsnorm_op`, `minimaxh3.cpp:638`), whereas the encoders use the **GroupNorm / LayerNorm** kernels
-   (`r4d_upscaler.hip`, shared with the latent upscaler). A defect in *those* kernels is invisible to the
-   DiT's RMSNorm path — so an encoder-norm-kernel scale fault remains the leading suspect, and a fix could
-   stay confined to the encoder/upscaler norm path. The **narrowed confirming step** (device, gated, read-
-   only — no math change): dump the **per-channel std of `norm_out`'s output and of `conv_out`/`quant_conv`'s
-   output** (and audio's pre-block `norm3` output and `mean_proj` output). If the *post-final-norm* std is
-   already ~0.37× the reference, the fault is the final affine / norm kernel; if it is ~1.0× and the collapse
-   appears only after `conv_out`/`quant_conv`, the fault is those final conv weights. **Not blind-fixed**
-   (those kernels are shared with the live image / plain encode paths and the upscaler; standing rule: never
-   ship a merely-*different* latent). Reproduce: `--evc/--encpx/--encg` or `--enca/--encsm` as above; each
-   harness now prints the `a`/`b`/R²/after-affine line alongside the raw sorted relFro.
+   | stage | pre-fix | post-fix | reference |
+   |---|---|---|---|
+   | pre_block out `b_amb` std | 1.65 (ratio 0.25) | **6.43 (ratio 0.97)** | 6.62 |
+   | final latent `b_enca` std | 0.23 (ratio 0.39) | **0.546 (ratio 0.93)** | 0.588 |
+   | final latent affine `a`,`R²` | 0.385, 0.975 | **0.923, 0.989** | (identity) |
+   | final latent relFro → after-affine | 0.79 → 0.062 | **0.302 → 0.099** | — |
+
+   The final latent is now a near-identity map of the reference (slope 0.92, intercept +0.03, R² 0.989) —
+   no remaining systematic gain, unlike the pre-fix 0.385×. **The ~0.10 residual-after-affine is
+   precision-bounded, not structural:** a *full-model bf16* run of the reference diverges **55%** (relFro
+   0.55) from its own fp32 latent, so a low-precision device cannot reach fp32; the device keeps fp32
+   accumulation and lands at 0.10 after removing the (now-gone) gain — well inside what the quantised
+   container allows. Reproduce: dump `R4D_ENC_SEL=amb` (pre_block out) and unset (final `enca`) over one
+   `ref_audio` request, then `ref_aenc_parity.py --stage amb --dev encamb.f32 --encsm encsm_4_1.f32`
+   (pre_block) and `--enca enca.f32 --encsm encsm_4_1.f32 --kind audio --slot 1` (final latent).
+
+   **The video / image (`conv3d`) encoder is NOT explained by this and remains open.** It has **no
+   `AttnProjection` / pre_block**, so its ~0.369 under-gain is a *different* cause — and since the shared
+   LayerNorm kernel is now demonstrably correct on the audio path, the "one norm kernel damps both
+   families" reading is dead. Localising the video gain needs its own stage dumps (`norm_out`→`conv_out`→
+   `quant_conv`), on kernels the live image / plain paths also run, and stays deliberately **not**
+   blind-fixed. Stacked on it is the GroupNorm-extent gap below (#20). Reproduce the video case:
+   `ref_venc_parity.py --evc evc.f32 --encpx encpx_1_1.f32 --encg encg_1_1.f32 --slot 1`.
 
    **Separate real fidelity gap found while localising (its own ticket, not the 0.37):** the device
    GroupNorm reduces statistics over a level's **whole clip volume** (one mean/rstd per group;
