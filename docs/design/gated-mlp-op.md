@@ -1,8 +1,10 @@
 # One `GatedMlp` op for the dense gated FFN forms (#666 follow-up)
 
-Status: **planned**. This is a design for maintainer review. No code changes until the note is accepted.
-Inputs: beta `1ee6815c5`; PR heads #795 `b45a9ef6c` (Qwen3.5), #877 `5be1920a4` (LFM2),
-#884 `e8828aa43` (MiniMax), #881 `a9483b4c9` and #886 `52ed1ace3` (Glimmer).
+Status: **deferred**. Kept as a reference; no implementation is scheduled. The first cut is a code
+move with no runtime change, so it is worth doing only together with a consumer: a tensor-parallel
+`SplitRule` for dense FFNs, or a ladder collapse (see "Collapse candidates").
+Inputs: beta `9077c8b06` (Qwen4, Gemma 4, LFM2 #877 and MiniMax #884 landed); PR heads #915
+`50353da63` (Qwen3.5 decode, replaces #795), #881 `a9483b4c9` and #886 `52ed1ace3` (Glimmer).
 
 ## Answer
 
@@ -14,7 +16,7 @@ one `OpKind`. It also fixes the stage order: optional pre-norm, gate/up, activat
 output epilogue. What it cannot unify is the kernel ladder that the batched rows take. The
 existing ladders give different bits for the same weight format:
 
-| Format, `rows > 1` | sandwich `Ladder::Wide` / `Route` (Gemma, Glimmer) | LFM2 lane batch (`batched_proj`) | Qwen3.5 rows (`SwigluFfnBatch`) |
+| Format, `rows > 1` | sandwich `Ladder::Wide` / `Route` (Gemma, Glimmer) | LFM2 lane batch (`batched_proj`) | Qwen3.5 rows (`batch_chunk_delta_net_ffn`) |
 |---|---|---|---|
 | MQ4G256 / HFQ4G256 | `gemm_hfq4g256_batched_lmhead`: FP16 WMMA on gfx11/gfx12, documented as not identical to the scalar GEMM | scalar `gemm_hfq4g256` (byte-exact with AR) | fused gate/up keys, IU4/A8/FP8 producers |
 | Q8_0 | `Wide`: gfx1151 4-warp WMMA from 64 rows. `Route`: `gemm_q8_0_batched_chunked` | `gemm_q8_0_batched_chunked` | `FusedGateUpQ8_0` when `q8_wmma_arch` |
@@ -26,7 +28,7 @@ which the constraint rules out. The ladder therefore stays a field. Each `MlpLad
 existing body, moved verbatim. Collapsing two ladders into one is separate work, done one pair at
 a time behind a parity gate (see "Collapse candidates").
 
-**Correction to the issue's inventory:** MiniMax (#884) has no dense gated FFN. Every MiniMax layer
+**Correction to the issue's inventory:** MiniMax (#884, on beta) has no dense gated FFN. Every MiniMax layer
 is attention + MoE. The gate/up → SiLU → down chains in `hipfire-arch-minimax/src/forward.rs` are
 routed-expert bodies: the EP hand MoE `minimax_moe_block_ep` and the `forward_batch` expert loops.
 They belong to sealed MoE (G14), not to `GatedMlp`.
@@ -75,7 +77,7 @@ Equation: `x = residual + post_norm(down(act(gate(n)) * up(n)))`, `n = pre_norm(
   combines with the routed experts itself.
 - **Rows:** `SandwichStream { rows, route: RowsRoute }`. The route alone picks decode or batched kernels.
 
-### 3. `hybrid::SwigluFfnOp` (#795 head only; beta keeps this code in `hipfire-arch-qwen35`)
+### 3. `hybrid::SwigluFfnOp` (#915 head: decode only; rows stay in `hipfire-arch-qwen35`)
 
 - **Users:** dense layers of the Qwen3.5/3.6/3.8 hybrids, the MTP head's dense FFN, and the
   super-op `ForwardBindings`. The super-op calls the stages separately: `PROJ_GATE_UP` → `project`,
@@ -87,7 +89,7 @@ Equation: `x = residual + post_norm(down(act(gate(n)) * up(n)))`, `n = pre_norm(
   - HFQ formats: `silu_mul_f32` + GEMV `WithResidual`;
   - everything else: `silu_mul_f32` + GEMV + `add_inplace_f32` on a per-call temporary;
   - a CPU-offload arm (`host_mapped_cpu_capable`).
-- **Rows (`SwigluFfnBatch`):**
+- **Rows (`batch_chunk_delta_net_ffn` in `qwen35/prefill.rs`, hand code):**
   - Norm producer ladder: A8, IU4, gfx12 fused quant, gfx12 FP8 stream, exact-F16 rotate, F32 fused
     norm + rotate.
   - Packed-MQ4 opt-in.
@@ -96,7 +98,7 @@ Equation: `x = residual + post_norm(down(act(gate(n)) * up(n)))`, `n = pre_norm(
   - `DenseBatchMath::SingletonWmma`: exact verify math.
   - Down: producers, then a residual GEMM or `BatchEpilogue::Partial` (tensor-parallel partial).
 
-### 4. LFM2 primitive chain (#877)
+### 4. LFM2 primitive chain (beta, `hipfire-arch-lfm2moe/src/program.rs` `ffn_steps`)
 
 - **Decode:** `RmsnormAutomatic(RotationPlan::None)`, `Gemv(Raw)` w1, `Gemv(Raw)` w3,
   `Step::SiluMul`, `Step::GemvResidual` w2. The input stays `Raw` on purpose: `Prerotated` admits the
@@ -237,7 +239,7 @@ GEMV + add arm. Declaring them is a follow-up.
 | Glimmer target: decode, prefill, DFlash verify | `Steps { shared_rotation, fused_silu_rotate }` (both env, default on) | `Some` | `Silu` / `F32` | `PostNorm { Some(post_feedforward_layernorm) }`, x/out ping-pong `stream` | as today |
 | Glimmer drafter | `Steps { false, false }` | `Some` | `Silu` / `F32` | `PostNorm { None, stream: None }` | as today |
 | Qwen3.5 dense layers + MTP head: decode | `Product(None)` | `Some(ffn_norm / attn_post_norm)` | `Silu` / `F32` | `Residual` | `plain` → `normed`, `x_rot`, `gate_ffn`/`up`/`ffn_hidden` |
-| Qwen3.5: prefill, DFlash chain verify, TP | `Product(Some(..))` | `Some` | `Silu` / `F32` | `Residual`, or `Partial` on TP | `ProductRows` from `SwigluFfnBatch` |
+| Qwen3.5: prefill, DFlash chain verify, TP | `Product(Some(..))` | `Some` | `Silu` / `F32` | `Residual`, or `Partial` on TP | `ProductRows` from the `batch_chunk_delta_net_ffn` arguments |
 | LFM2 decode (prefill and verify are per-token decode) | `Steps { false, false }` | `Some(ffn_norm)` | `Silu` / `F32` | `Residual` | `tmp` → `normed`, `dense_{gate,up,act}` |
 | LFM2 multi-lane batch (HIPF-75) | `Lanes` | `Some` | `Silu` / `F32` | `Residual` | `ffn_tmp`, `proj_rot`, `bf16_scratch` |
 
@@ -250,10 +252,10 @@ The launch-trace oracle below has to show it.
 
 ## Step graph and mesh split
 
-- Append `OpKind::GatedMlp` with the next free ID at landing time. Beta ends at 26; DS4 #883/#889
-  will take more IDs first.
-- `DenseFfn = 18` and `SandwichMlp = 20` are retired, never reused (frozen-ID rule in
-  `step_graph.rs`). `SwigluFfn` never had an ID: #795 predates the step graph.
+- Append `OpKind::GatedMlp` with the next free ID at landing time. Beta ends at 27 (`GatedShortConv`);
+  #915 takes 28–30 (`SwigluFfn = 30`), and DS4 #883/#889 may take more first.
+- `DenseFfn = 18`, `SandwichMlp = 20` and (once #915 lands) `SwigluFfn = 30` are retired, never
+  reused (frozen-ID rule in `step_graph.rs`).
 - `mesh_split.rs` tests that build `OpKind::DenseFfn` move to `GatedMlp`.
 - The `SplitRule` stays `Opaque`. A tensor-parallel rule is the natural next step and is the reason
   `Partial` is part of the op, but it is not part of this design. Under that rule, gate/up split by
@@ -265,8 +267,8 @@ The launch-trace oracle below has to show it.
 |---|---|---|
 | 1. Sandwich → `SandwichWide` / `Steps` | #881/#886 on beta | add `GatedMlpOp`, move `dense_mlp` / `steps_mlp` / `activate` / `post_norm_residual` arms; Gemma, Glimmer target and drafter, `ParallelMoeMlpOp` |
 | 2. Qwen4 → `Trunk` | slice 1 | move `execute_dense_ffn`; delete `DenseFfnOp`, `DenseFfnRecipe` |
-| 3. LFM2 decode → `Steps` + `Residual` | #877 on beta, slice 1 | add the decode `Residual` arm to `Steps`; replace `ffn_steps`' five dense steps |
-| 4. Qwen3.5 → `Product` | #795 rebased and on beta | move `SwigluFfnOp` decode + `execute_swiglu_ffn_batched`; delete `SwigluFfnOp`/`SwigluFfnBatch` |
+| 3. LFM2 decode → `Steps` + `Residual` | slice 1 | add the decode `Residual` arm to `Steps`; replace `ffn_steps`' five dense steps |
+| 4. Qwen3.5 → `Product` | #915 on beta | move `SwigluFfnOp` decode + `batch_chunk_delta_net_ffn`; delete `SwigluFfnOp` and `Step::SwigluFfn` |
 | 5. LFM2 lanes → `Lanes` | HIPF-75 | move `batched_proj`'s dense FFN use |
 
 ## Parity oracles a migration needs
@@ -310,7 +312,7 @@ No kernel, no launch count, no performance. The ladder count stays five. The gai
 
 1. Accept `ladder` as an op field that names today's ladders, rather than waiting until the ladders
    are collapsed?
-2. Retire `OpKind` 18/20 for one new `GatedMlp` ID?
+2. Retire `OpKind` 18/20 (and 30 after #915) for one new `GatedMlp` ID?
 3. LFM2 lanes are neither prefill nor verify. Should they get a `RowsRoute::Lanes`, or should the
    `Lanes` ladder only require `route.batched()`?
 4. Out of scope unless asked: Gemma's `PerLayerInput` (`gelu(gate(x)) · ple`, no up projection),
