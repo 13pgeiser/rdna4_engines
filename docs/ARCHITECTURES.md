@@ -14,6 +14,7 @@ plugin claims.
 | `arch/qwen35_w8a8` | `qwen35` | `w8a8_fwht128` | `qwen35_fp8` with an int8 trunk: i8 weights with a bf16 scale per 128 of K, rotated by a 128-wide Hadamard, against int8 activations under the same rotation (`data/recipes/q38-27b-w8a8-df2.recipe`) |
 | `arch/qwen35moe_fp8` | `qwen35moe` | `fp8_e4m3` | `qwen35_fp8` with the feed-forward routed |
 | `arch/qwen4exp_fp8` | `qwen4exp` | *(empty)* | Qwen4-Exp (Qwen3.8-Flash-Next), a bf16 checkpoint quantised at convert |
+| `arch/glm5next` | `glm5next` | *(empty)* | GLM-5.3-Flash from AMD's Quark MXFP4 export: four mHC residual streams over 34 KDA and 11 sparse latent-attention (MLA) layers with a DSA indexer, 288 MXFP4 experts at top-8 under sigmoid routing, block-FP8 attention and dense layers at f32 scales, each weight served as stored; its MTP layer is a serial drafter. Text only, bf16 KV |
 | `arch/lfm2_bf16` | `lfm2` | *(empty)* | LiquidAI's LFM2 and LFM2-VL, bf16, one rank |
 | `arch/embgemma2` | `embeddinggemma2` | *(empty)* | EmbeddingGemma 2: a bidirectional encoder with Gemma 4's vision tower and audio conformer, pooled to one vector |
 | `arch/gemma4_bf16` | `gemma4` | `compressed-tensors` | Gemma 4 31B dense with its vision tower: sliding-window and proportional-RoPE global (`attention_k_eq_v`) attention, GELU ffn, softcapped logits; int4 codes with an f16 scale per 128 from Google's CT-INT4 (QAT) release, served w4a8. Optional draft head: Google's assistant (`rad-convert --draft-model`), with no cache of its own (`rad_drafter_shared_kv`) |
@@ -372,6 +373,158 @@ that equality. `docs/QSA.md` is the decomposition.
 
 The vision tower is declared when the container carries one and `--mm-max-patches` is not 0
 (`arch/common/rad_block_vit.h`, `spec.md` §11).
+
+---
+
+# `glm5next`: GLM-5.3-Flash
+
+`arch/glm5next` serves the language model of GLM-5.3-Flash (`model_type: glm5_next`) from AMD's
+Quark export, `amd/GLM-5.3-Flash-Quark-MXFP4`. Quark is an import path, not an execution format:
+the plugin claims the empty descriptor and reads each weight's encoding from the container
+(`data/recipes/glm53-mxfp4.recipe` changes one weight a layer, below). The vision tower is not
+mapped, so never converted, and an image request fails its step. The reference is SGLang's
+`glm5_next.py` and `glm5_next_nextn.py` at AMD's pinned commit 654df43.
+
+```
+45 layers, hidden 4096, vocab 154880 (embedding and lm_head separate, bf16)
+mHC: 4 residual streams, a 16384-wide row; 20 Sinkhorn passes, hc_eps 1e-6; the embedding is
+  copied into every stream, and the mean of the streams feeds the final norm
+layers 3, 7, ..., 43 (l % 4 == 3): sparse MLA, no RoPE
+  q_a 4096 -> 1536, RMS-normed; kv_a 4096 -> 512, RMS-normed: the cached latent
+  64 heads, q/k and v head_dim 256: q_b 1536 -> 16384, kv_b 512 -> 64 x (256 + 256),
+    o 16384 -> 4096, scores scaled by 1/sqrt(256), absorbed (attention over the latent)
+  DSA indexer: 32 heads of 128 from the normed q latent (wq_b 1536 -> 4096); a key of 128
+    (LayerNorm, eps 1e-6, affine) and 128 pool-gate logits from the layer input; 4 keys
+    pooled to 1, Hadamard-rotated, E4M3; head gates f32 (32 x 4096), signed;
+    index_topk 2048 = 512 blocks of 4 tokens
+the other 34 layers: KDA, 64 heads of 128
+  q, k, v 4096 -> 3 x 8192, causal depthwise conv of width 4 + SiLU, q and k L2-normed,
+    scores scaled by 1/sqrt(128)
+  forget gate per channel through rank 128 (4096 -> 128 -> 8192), lower bound -5;
+    beta per head (4096 -> 64); output gate through rank 128, sigmoid-gated RMS norm per head
+feed-forward: layers 0-2 dense SwiGLU 2 x 12288; layers 3-44 MoE
+  288 routed experts of 2048 at top-8, sigmoid scores, correction bias (noaux_tc, one group),
+    weights normalized and scaled by 2.5; one shared expert of 2048 without a gate
+  every SwiGLU clamped at 10
+MTP: checkpoint layer 45 -- enorm, hnorm, eh_proj 8192 -> 4096, one MLA + indexer layer with
+  MoE, shared_head.norm; no mHC; the trunk's embedding and lm_head
+max_position_embeddings 1048576
+```
+
+Traps:
+
+- **`comb` is indexed `[source, destination]`.** Each connection's write is
+  `out[dst] = post[dst] * y + sum_src comb[src, dst] * h[src]`; the transpose has every shape
+  valid and is another model. `out` must be a separate buffer: each output stream reads every
+  input stream (`rad_block_mhc.h`).
+- **The router and the index head gates stay f32.** Both projections are f32 weights against a
+  bf16 activation with f32 results (`gemm_nt_f32`), and the routing weights reach the gather
+  as f32. Rounding any of them to bf16 changes which experts and which blocks are picked, and a
+  weight rounded before the gather's sum can cancel to 0 where f32 keeps 0.125 (the libref
+  fixture). The correction bias ranks the experts only; the mixture weights are the selected
+  unbiased sigmoids.
+- **The index scores are signed.** The ReLU comes before the head weighting, and a gate can be
+  negative, so a block's score can be. `qsa_select` runs with `signed` 1; QSA's ranking clamps
+  at zero and picks another set whenever a live score is negative (docs/OPS.md).
+- **The SwiGLU is clamped, asymmetrically.** The gate is clipped above at 10 before the SiLU and
+  not below; the up projection on both sides. The unclamped FP8 epilogue of the dense
+  feed-forward does not apply, and `MlpFP8` turns it off when a limit is given.
+- **Quark's excluded layers are block FP8, not bf16.** The export is MXFP4 globally and names
+  the attention and MTP layers in `layer_quant_config` as E4M3 with an f32 `weight_scale` per
+  128 x 128, multiplicative. Read as bf16-scaled `fp8a8`, a scale bf16 cannot hold would round;
+  they are served `fp8a8f32`. The importer accepts an override only if it is MXFP4 or this
+  block FP8 and refuses any other, a null or empty one included, by name.
+- **`head_dim` is 0 in the config.** The KDA and MLA widths come from their own keys; the
+  plugin fixes 128 and 256 and refuses a checkpoint whose hidden size, layer, vocabulary,
+  stream, expert, `index_topk` or MTP layer counts are not these.
+- **MTP concatenates the normalized embedding first,** the normalized previous hidden second.
+- **No RoPE anywhere** (`qk_rope_head_dim` 0); the indexer's only rotation is the Hadamard.
+
+**KV groups.** Five, all bf16 or wider; a `--kv-cache-dtype` other than bf16 is refused at
+declare.
+
+| group | kind | per layer | layers |
+|---|---|---|---|
+| `kv_latent` | `RAD_KV_FULL`, bf16, 1 head of 256, block 4 | the 512-wide normed latent, its two halves in the K and V slots | 11 MLA + MTP |
+| `kv_dsa_index` | `RAD_KV_FULL`, u8, block 4 | one page a pooled key: 128 E4M3 codes and their f32 scale (`dsa_pool`'s cache form) | 11 MLA + MTP |
+| `kv_index_tail` | `RAD_KV_LINEAR`, bf16, `[4 + spec, 256]` | the key and gate rows not yet pooled; the ring is wider by the draft depth so a rejected draft rolls back | 11 MLA + MTP |
+| `kv_kda` | `RAD_KV_LINEAR`, f32, 128 x 128 a head | the recurrent state, 64 / tp heads a rank | 34 KDA |
+| `kv_kda_conv` | `RAD_KV_CONV`, bf16, width 4 | the convolution history, 3 x 8192 / tp channels a rank | 34 KDA |
+
+The latent and the index are replicated: every rank keeps the whole latent cache. The model is a
+hybrid, so a prefix-cache hit is usable only from a state checkpoint at or below it, and
+`--checkpoint-interval` decides how much of a shared system prompt is reused.
+
+**Linears.** Each weight is served as the export stores it:
+
+| weights | stored | served |
+|---|---|---|
+| routed and shared experts, layers 3-44 | MXFP4: E2M1, an E8M0 scale per 32 | `moe_gemm_q` mxfp4a8, an E4M3 activation scaled per (row, 128) |
+| MLA q_a, kv_a, q_b, o (trunk and MTP); dense feed-forward, layers 0-2 | E4M3, an f32 scale per 128 x 128 | `gemm_nt_q` fp8a8f32 |
+| MTP layer's experts | E4M3, an f32 scale per 128 x 128 | `moe_gemm_q` fp8a8f32 |
+| MLA kv_b | quantised | decoded to bf16 by the recipe; `mla_project` absorbs and expands with it |
+| KDA's seven projections; indexer wq_b, wk with the pool gate | bf16 | `gemm_nt` |
+| router, index head gates, mHC projections | f32 | `gemm_nt_f32`, `mhc_pre` |
+| embedding, lm_head, MTP eh_proj | bf16 | `embed_lookup`, `logits_gemm`, `gemm_nt` |
+
+The container holds 25845 weights, 171.32 GiB; at eight ranks each card holds 22.06 GiB of them,
+19.67 GiB the routed experts.
+
+**MTP.** The plugin declares checkpoint layer 45 as a serial drafter (`RAD_DRAFT_SERIAL`), depth
+3 unless `--num-speculative-tokens` says otherwise (at most 31). Its history pass writes the draft
+layer's latent, index and tail for every row and runs its MoE on the proposal rows only.
+
+**Tensor parallelism.** At 1, 2, 4 or 8 ranks; declare refuses any other. `arch_test` declares and
+steps the whole plugin at 1, 4 and 8, and the connection, router and indexer splits at 1, 2, 4
+and 8.
+
+- The routed and the shared experts split their 2048 width into equal contiguous slices, 256 a
+  rank at eight; each rank computes its slice of every expert, and the block's all-reduce sums
+  them. The dense feed-forward splits its 12288 the same way.
+- MLA splits by whole heads: the rows of q_b and kv_b (8 heads a rank at eight) and the columns
+  of o. q_a, kv_a and the latent are replicated.
+- KDA splits its 64 heads, with them the q/k/v rows, the convolution taps and the state; the two
+  rank-128 projections into the gates are replicated.
+- The indexer is replicated whole.
+- The vocabulary is row-sharded, 19360 rows a rank at eight; the embedding's all-reduce is exact.
+- The f32 projections (the router's 288 x 4096, the index head gates' 32 x 4096, each
+  connection's mHC projection of 24 x 16384) are replicated. From a pass of
+  `RADIANCE_GLM_TP_SPLIT_ROWS` rows (default 256; 0 never), each rank computes a disjoint part
+  with the replicated kernel and an `all_gather` joins the parts, so every value is
+  bit-identical: the router and the head gates split their output columns, the mHC projection
+  its 16384-wide input into eight 2048-column chunks, whose partials `mhc_pre_finish` completes
+  on every rank. Below the threshold, as in decode, the collective costs more than it saves.
+
+**MoE decode fusions.** Three, each byte-identical to the launches it replaces, on unless its
+variable is `0`; any value but `0` or `1` refuses the start.
+
+| variable | one launch for | where it applies |
+|---|---|---|
+| `RADIANCE_GLM_ROUTER_FUSE` | `router_sigmoid_topk`, `moe_scatter` and the shared gate's `fill`: `router_sigmoid_topk_scatter` | passes of up to 128 rows (`M * top_k` <= 1024, one workgroup's sort); 84 launches fewer a trunk decode step, 2 a draft pass |
+| `RADIANCE_GLM_SWIGLU_QUANT` | `swiglu_clamped` and `quant_act_fp8`: `swiglu_clamped_quant_fp8` | the routed and shared arms and the three dense layers; 87 fewer a trunk step, 2 a draft pass |
+| `RADIANCE_GLM_GATHER_INVERSE` | none: the sort writes each slot's row (`moe_scatter_inv`) and the gather reads it (`moe_gather_inv`) instead of searching `sorted` | every MoE pass |
+
+With all three at `0` the graph and the launches are those
+`glm53_without_fusion_switches_is_the_pinned_graph_and_steps` pins. Paired on the eight R9700s
+below, greedy text at a fixed draft depth of 3 is identical with and without them, and eight
+agent streams decode 456 tok/s against 452, one 144 against 140.
+
+**Measured** on eight R9700s (gfx1201, 32 GB; four on PCIe Gen5 x16, four on Gen5 x8) at TP8 with
+the flags of `deploy/compose/glm53-flash.yaml` (32768 tokens of context, eight sequences, MTP with
+an adaptive window up to 5, reasoning effort low). BetterBench quick, temperature 0.7, cold
+prefix cache, and a load generator of agent turns (3.3k-token prompts, 400 tokens out):
+
+| measurement | result |
+|---|---|
+| prefill, 1511 / 5936 / 11829 / 22138 prompt tokens | 3474 / 3958 / 3951 / 3817 tok/s |
+| prefill, one 19861-token prompt | 5.0 s to the first token, 3982 tok/s |
+| decode, one stream, weighted over the categories | 166 tok/s, an update every 22.7 ms at p99 |
+| decode, 1 / 2 / 4 / 8 streams, aggregate | 145 / 221 / 316 / 426 tok/s |
+| agent load, 1 / 4 / 8 streams, aggregate | 146 / 347 / 506 tok/s, MTP acceptance 0.60 / 0.59 / 0.65 |
+
+A second agent run at eight streams after the same restart gave 482. The links count: with three
+of the x8 links fallen back to Gen4, the same build prefilled 3368 / 3664 / 3610 / 3512 tok/s at
+the four depths above.
 
 ---
 

@@ -479,6 +479,12 @@ rad-convert /srv/models/google/translategemma-27b-it \
 CALIB=/srv/calib/translategemma rad-convert /srv/models/google/translategemma-27b-it \
     --recipe data/recipes/translategemma-27b-mxfp4-gptq.recipe -o translategemma-27b-mxfp4-gptq.rad
 
+# GLM-5.3-Flash from AMD's Quark export: MXFP4 experts and block-FP8 attention kept as stored,
+# the latent attention's kv_b decoded to bf16; text only, the vision tower is not converted.
+# 171 GiB, served on eight 32 GB cards (docs/ARCHITECTURES.md)
+rad-convert /srv/models/amd/GLM-5.3-Flash-Quark-MXFP4 \
+    --recipe data/recipes/glm53-mxfp4.recipe -o glm53-flash-mxfp4.rad
+
 # unsloth's NVFP4 Qwen3.8-27B with the DFlash2 drafter: the NVFP4 MLPs and the FP8 linears beside
 # them made MXFP4 by one recipe, the head block fp8
 rad-convert /srv/models/unsloth/Qwen3.8-27B-NVFP4 --draft-model /srv/models/z-lab/Qwen3.8-27B-DFlash2 \
@@ -2748,6 +2754,8 @@ reductions running on fewer blocks: Qwen3.8-27B's 41k-token prefill 9.5 s uncapp
 | `RADIANCE_CALIB_DIR` | where an engine run writes calibration data for a recipe's `gptq calib=DIR` |
 | `RADIANCE_CALIB_TOKENS` | with `RADIANCE_CALIB_DIR`, the tokens the calibration tap accumulates before it writes and switches itself off (default 65536) |
 | `RADIANCE_G3_CALIB_LAYERS` | `lo:hi`: `arch/gemma3`'s calibration tap over layers lo to hi - 1 only, to take a large model's Grams in passes (docs/ARCHITECTURES.md) |
+| `RADIANCE_GLM_TP_SPLIT_ROWS` | `arch/glm5next` under tensor parallelism: the pass height from which the router, the index head gates and the mHC projection split their f32 work over the ranks and gather it, bit-identical to the replicated form (default 256; `0` or a value that does not parse never splits) |
+| `RADIANCE_GLM_ROUTER_FUSE`, `RADIANCE_GLM_SWIGLU_QUANT`, `RADIANCE_GLM_GATHER_INVERSE` | `arch/glm5next`'s MoE decode fusions, each byte-identical to the launches it replaces: unset, empty or `1` on, `0` off, any other value refuses the start. For comparing, not for deployment (docs/ARCHITECTURES.md) |
 | `RADIANCE_PROFILE_EVERY` | with `--profile-ops`, dump the per-op table every N steps (default 32) |
 | `RADIANCE_LOG_STEPS` | log one line per step: its phase, sequences, and each one's token count and context (§4.5) |
 | `RADIANCE_AR8_SHARD_WEIGHTS`, `RADIANCE_AR8_PIECES` | the eight-rank two-shot's shard weights (`auto`, the default, reads the PCIe links; `off`; or eight integers) and piece count, with `RADIANCE_AR8_SHARD_WEIGHTS_MIN_ELEMS` and `RADIANCE_AR8_PIECES_MIN_ELEMS` for the message size each starts at (§4.7) |
