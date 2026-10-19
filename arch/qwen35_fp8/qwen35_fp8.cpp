@@ -151,6 +151,8 @@ struct Model {
     ActFP8  a_eff{};
     rad_buf b_sgu = 0, b_sout = 0, b_sgate = 0;
     ActFP8  a_sff{};
+    /* Rotated codes of the expert input, for rotated four-bit experts (MoeFP8::Config::expert_rot). */
+    ActFP8  a_hr{};
 #endif
 
     /* The DFlash2 drafter, declared only when the container carries one and the deployment
@@ -713,6 +715,21 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                     (long long)mc.top_k, (long long)mc.n_expert);
             return RAD_E_INVAL;
         }
+        /* GPTQ calibration run (MoeFP8::Config::calib), on when the output directory is set. */
+        mc.calib = calib_dir() != nullptr ? 1 : 0;
+        /* The experts' stored format, read from layer 0's first expert as qwen4exp does, so a
+         * container with four-bit experts is served in that format. */
+        {
+            MoeFP8::Src ps{};
+            RAD_ARCH_TRY(moe_expert_sources(b, nm, "format",
+                                            "model.language_model.layers.0.mlp.experts", &ps));
+            RAD_ARCH_TRY(MoeFP8::probe(b, nm, 0, ps, &mc));
+        }
+        if (mc.expert_bf16) {
+            fprintf(stderr, "radiance: qwen35moe: plain bf16 experts are not served by this "
+                            "plugin; convert with a quantising recipe\n");
+            return RAD_E_UNSUPPORTED;
+        }
     }
     {
         /* The step's height for everything with one row per token, and a pass's height only for
@@ -743,6 +760,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             m.b_sout  = decl_b(b, nm.f("shexp_out"),     g.act_dtype, {R, g.n_embd});
             m.b_sgate = decl_b(b, nm.f("shexp_gate"),    g.act_dtype, {R, 1});
         }
+        if (mc.expert_rot) RAD_ARCH_TRY(m.a_hr.declare_qs(b, nm, g, "moe_hr", g.n_embd));
     }
 #else
     m.b_gate_up = decl_b(b, nm.f("gate_up"),  g.act_dtype, {g.max_tok, 2 * g.n_ff});
@@ -865,6 +883,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     mw.sorted = m.b_sorted;  mw.eoff = m.b_eoff; mw.ecnt = m.b_ecnt;
     mw.egu = m.b_egu; mw.eff = m.a_eff; mw.edn = m.b_edn; mw.moe = m.b_emoe;
     mw.sgu = m.b_sgu; mw.sff = m.a_sff; mw.sout = m.b_sout; mw.sgate = m.b_sgate;
+    mw.hr = m.a_hr;
 #else
     mw.x = m.b_x; mw.h = m.a_h; mw.gate_up = m.b_gate_up; mw.ffn = m.a_ffn;
 #endif
@@ -916,7 +935,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         ms.cfg         = m.moecfg;
         ms.norm        = nm.ckpt("%s.%lld.post_attention_layernorm.weight", pre, (long long)l);
         ms.router      = nm.ckpt("%s.%lld.mlp.gate.weight",                 pre, (long long)l);
-        ms.experts     = nm.ckpt("%s.%lld.mlp.experts",                     pre, (long long)l);
+        RAD_ARCH_TRY(moe_expert_sources(b, nm, "layer",
+                                        nm.ckpt("%s.%lld.mlp.experts", pre, (long long)l), &ms));
         if (m.moecfg.n_ff_shared > 0) {
             ms.shared      = nm.ckpt("%s.%lld.mlp.shared_expert",              pre, (long long)l);
             ms.shared_gate = nm.ckpt("%s.%lld.mlp.shared_expert_gate.weight",  pre, (long long)l);
@@ -1019,7 +1039,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          * MtpBlockFP8 is a template over the feed-forward. */
         ts.mlp.cfg     = m.moecfg;
         ts.mlp.router  = nm.ckpt("mtp.layers.0.mlp.gate.weight");
-        ts.mlp.experts = nm.ckpt("mtp.layers.0.mlp.experts");
+        RAD_ARCH_TRY(moe_expert_sources(b, nm, "mtp", nm.ckpt("mtp.layers.0.mlp.experts"),
+                                        &ts.mlp));
         if (m.moecfg.n_ff_shared > 0) {
             ts.mlp.shared      = nm.ckpt("mtp.layers.0.mlp.shared_expert");
             ts.mlp.shared_gate = nm.ckpt("mtp.layers.0.mlp.shared_expert_gate.weight");

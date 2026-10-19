@@ -9031,7 +9031,7 @@ struct ArchCases {
             nullptr, 7, { "ar_rmsnorm_quant_fp8" }, 0x2c00f131709dedcfull);
         add("qwen35moe_fp8 + MTP", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 3); return qwen35moe_fp8::declare(b, q35moe.meta(), &c); },
-            qwen35moe_fp8::step, 3, {}, 0x3157a986f13a9a72ull);
+            qwen35moe_fp8::step, 3, {}, 0x1bd3b53543cd06eeull);
         add("qwen4exp_fp8", [this](RadBuilder* b) {
                 auto c = q4_ctx(0, 1); return qwen4exp_fp8::declare(b, &q4, &c); },
             qwen4exp_fp8::step, 3, {}, 0xbe74d476c7fd04b8ull);
@@ -9811,8 +9811,8 @@ TEST(a_4096_budget_without_a_span_is_the_pinned_graph_and_steps) {
         { "qwen4exp_fp8", 4, 3, 0x6669aa0573931943ull, 0x36df57cac613c6cfull },
         { "qwen35_fp8", 1, 0, 0xcfc82ca915ec549dull, 0x4d6fca823d1e97efull },
         { "qwen35_fp8", 2, 1, 0x36da8d762194e24eull, 0xe4022daff02ec8bdull },
-        { "qwen35moe_fp8", 1, 0, 0xb7c4d121acb388b3ull, 0x3fcf71676e558d79ull },
-        { "qwen35moe_fp8", 2, 0, 0x5c02b2d6cd49ed0cull, 0x05e0778848bf416cull },
+        { "qwen35moe_fp8", 1, 0, 0x7fa7b015e1bc8873ull, 0x3fcf71676e558d79ull },
+        { "qwen35moe_fp8", 2, 0, 0xf60c9508dd197370ull, 0x05e0778848bf416cull },
     };
     for (const Case& cs : cases) {
         RadBuilder b;
