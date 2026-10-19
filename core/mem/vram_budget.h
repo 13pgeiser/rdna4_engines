@@ -75,7 +75,7 @@ struct VramFacts {
     /* Experts the pinned host pool cannot hold, plus the slab's spare slots: the expert slab's
      * floor when the cache lends (expert_vram_floor, core/place/planner.h). */
     int64_t expert_floor = 0;
-    int64_t kv_one     = 0;   /* the cache for one --max-model-len sequence: the least it may get */
+    int64_t kv_one     = 0;   /* all configured fixed state plus pages for one full-length context */
     /* The cache lends idle blocks to the expert slab: a placement that moves units (expert_tiered
      * or auto), not --deterministic, on a device with virtual memory management. A lending cache
      * can be sized for what live requests could need; a non-lending one would hold it empty. */

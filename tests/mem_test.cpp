@@ -385,6 +385,31 @@ TEST(the_cache_keeps_one_full_length_sequence_even_against_the_expert_floor) {
     CHECK_EQ(b2.experts, b2.elastic - g.kv_ceiling);
 }
 
+/* A hybrid model's recurrent and conv slots stay allocated with one request active, so the
+ * one-sequence floor is the inverse of the live plan, not a separate one-sequence plan: that plan
+ * drops the fixed state and falls short of max_ctx. */
+TEST(hybrid_context_floor_accounts_for_all_configured_state_slots) {
+    Config c = small_config();
+    c.max_seqs = 4;
+    c.max_ctx = 32768;
+    c.checkpoint_slots = 0;
+    auto groups = hybrid_groups();
+    KVManager actual, single;
+    CHECK_OK(actual.plan_groups(groups, c));
+    Config one = c;
+    one.max_seqs = 1;
+    CHECK_OK(single.plan_groups(groups, one));
+    // A one-sequence declaration drops fixed state that the live four-slot plan owns.
+    CHECK(actual.paged_tokens(single.ceiling(c.max_ctx)) < c.max_ctx);
+    constexpr int64_t MiB = 1ll << 20;
+    const int64_t ceiling_mib = (actual.ceiling(c.max_ctx) + MiB - 1) / MiB;
+    const int64_t floor_mib = actual.pool_mib_for_tokens(c.max_ctx, ceiling_mib);
+    CHECK(floor_mib > 0);
+    CHECK(actual.paged_tokens(floor_mib * MiB) >= c.max_ctx);
+    CHECK((floor_mib - 1) * MiB < actual.fixed_bytes() ||
+          actual.paged_tokens((floor_mib - 1) * MiB) < c.max_ctx);
+}
+
 TEST(neither_side_is_given_more_than_it_could_use) {
     /* A model that fits: 4 GiB of experts and a cache that can address 1.2 GiB cannot use a
      * 32 GiB card, so the remainder is reported unusable rather than allocated to an idle pool. */

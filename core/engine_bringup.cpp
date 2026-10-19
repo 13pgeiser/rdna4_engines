@@ -1373,18 +1373,6 @@ int Engine::plan() {
             ngram_bytes = std::max(ngram_bytes, wf.ngram);
             ngram_device = ngram_device || wf.ngram_device;
             ngram_host = ngram_host || wf.ngram_host;
-            /* One --max-model-len sequence's cache: the least a KV pool can hold and still serve
-             * every acceptable request (configure_kv warns below it). --ngram-placement auto puts
-             * the table on the card only if the pool stays above it. */
-            {
-                Config one = cfg_;
-                one.max_seqs = 1;
-                KVManager single;
-                if (single.plan_groups(r->program.kv_groups, one) == RAD_OK) {
-                    kv_floor = std::max(kv_floor, single.ceiling(ctx));
-                    f.kv_one = single.ceiling(ctx);
-                }
-            }
             /* The staging region is sized only where the arena lends its top: without smaller
              * levels nothing returns it to the slab at decode, and a deterministic plan moves
              * nothing. */
@@ -1397,6 +1385,13 @@ int Engine::plan() {
                 ck_slot += probe.checkpoint_bytes();
                 f.kv_ceiling = probe.ceiling(ctx);
                 f.kv_fixed   = probe.fixed_bytes();
+                /* One --max-model-len sequence's pool, as the inverse of the real plan: its
+                 * recurrent and conv slots stay allocated with one request active, which a
+                 * separate one-sequence plan would leave out. */
+                const int64_t MiB = 1ll << 20;
+                const int64_t need = probe.pool_mib_for_tokens(ctx, (f.kv_ceiling + MiB - 1) / MiB);
+                if (need >= 0) f.kv_one = need * MiB;
+                kv_floor = std::max(kv_floor, f.kv_one);
             }
             /* The step batch's device staging, reserved by the scheduler after this split: block
              * tables for max_seqs sequences at max_ctx, media staging for max_tok encoder rows.
