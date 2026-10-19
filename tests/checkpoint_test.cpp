@@ -128,6 +128,20 @@ TEST(the_metadata_names_the_architecture_and_the_quantisation) {
     CHECK_EQ(ck.dir(), dir);
 }
 
+TEST(routed_expert_metadata_accepts_the_deepseek_and_glm_config_spellings) {
+    const std::string dir = write_checkpoint({ bf16("x", {2, 2}, 0) },
+        "{\"model_type\":\"glm5_next\",\"text_config\":{\"hidden_size\":4096,"
+        "\"num_attention_heads\":64,\"head_dim\":0,\"n_routed_experts\":288,"
+        "\"n_shared_experts\":1,\"num_experts_per_tok\":8}}");
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    CHECK_EQ(ck.meta().arch, std::string("glm5next"));
+    CHECK_EQ(ck.meta().m.n_expert, (int64_t)288);
+    CHECK_EQ(ck.meta().m.n_expert_shared, (int64_t)1);
+    CHECK_EQ(ck.meta().m.n_expert_used, (int64_t)8);
+    CHECK_EQ(ck.meta().m.head_dim, (int64_t)0);
+}
+
 /* The descriptor derives from quant_method and fmt whoever set them, including rad-convert's
  * --set: a bf16 checkpoint converted to block fp8 states that format and selects the fp8 plugin,
  * so the container never names one format and selects another's plugin. */
@@ -610,6 +624,75 @@ TEST(a_quark_mxfp4_weight_is_its_codes_and_exponents) {
     CHECK_EQ(bad, 0);
     /* an excluded layer is a plain tensor */
     REQUIRE_EQ(ckpt_resolve(ck, prog, "n", false, &w, &why), RAD_OK);
+    CHECK(w.trivial && rad_enc_is(&w.enc, "plain"));
+}
+
+/* GLM-5.3-Flash's Quark export keeps excluded attention and MTP weights block-FP8, with F32
+ * `_scale` companions. They multiply the codes; reading the global MXFP4 scheme into these
+ * weights, or overlooking the scale because it is not called `_scale_inv`, corrupts the model. */
+TEST(quark_refuses_unsupported_or_incomplete_layer_weight_overrides) {
+    for (const char* override_config : {
+        "{\"p\":{\"weight\":{\"dtype\":\"fp8_e4m3\",\"qscheme\":\"per_block\",\"block_size\":[64,128]}}}",
+        "{\"p\":{\"weight\":{\"dtype\":\"int8\",\"qscheme\":\"per_block\",\"block_size\":[128,128]}}}",
+        "{\"p\":{\"weight\":null}}",
+        "{\"p\":{\"weight\":{\"dtype\":\"fp8_e4m3\",\"qscheme\":\"per_block\",\"block_size\":[128,128]}},"
+        "\"other\":{\"weight\":{\"qscheme\":\"per_block\"}}}" }) {
+        const std::string config = std::string("{\"quantization_config\":{\"quant_method\":\"quark\","
+            "\"global_quant_config\":{\"weight\":{\"dtype\":\"fp4\",\"qscheme\":\"per_group\","
+            "\"group_size\":32,\"scale_format\":\"e8m0\"}},\"layer_quant_config\":") +
+            override_config + "}}";
+        const std::string dir = write_checkpoint({ bf16("x", { 2, 2 }, 0) }, config.c_str());
+        Checkpoint ck;
+        REQUIRE_EQ(ck.open(dir), RAD_OK);
+        CHECK(ck.imports() != Checkpoint::Import::QuarkMx);
+        CHECK(!ck.import_refusal().empty());
+    }
+}
+
+TEST(a_quark_checkpoint_preserves_excluded_block_fp8_weights) {
+    T s{ "p.weight_scale", "F32", { 2, 2 }, std::vector<uint8_t>(4 * sizeof(float)) };
+    for (int i = 0; i < 4; ++i) rad_store_f32(s.bytes.data(), RAD_F32, i, 0.25f * (i + 1));
+    T bad = s;
+    bad.name = "bad.weight_scale";
+    bad.shape = { 1, 4 };  /* same number of scales, wrong block geometry */
+    const std::string dir = write_checkpoint(
+        { fp8("p.weight", { 256, 256 }), s, fp8("bad.weight", { 256, 256 }), bad,
+          bf16("norm.weight", { 4 }, 1.0f) },
+        "{\"model_type\":\"glm5_next\",\"quantization_config\":{\"quant_method\":\"quark\","
+        "\"global_quant_config\":{\"weight\":{\"dtype\":\"fp4\",\"qscheme\":\"per_group\","
+        "\"group_size\":32,\"scale_format\":\"e8m0\"}},"
+        "\"layer_quant_config\":{\"p\":{\"weight\":{\"dtype\":\"fp8_e4m3\","
+        "\"qscheme\":\"per_block\",\"block_size\":[128,128]}}}}}");
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    REQUIRE(ck.imports() == Checkpoint::Import::QuarkMx);
+    Program prog;
+    prog.name_map.push_back(map("p", RAD_MAP_COPY, { "p.weight" }));
+    prog.name_map.push_back(map("bad", RAD_MAP_COPY, { "bad.weight" }));
+    prog.name_map.push_back(map("norm", RAD_MAP_COPY, { "norm.weight" }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "p", false, &w, &why), RAD_OK);
+    REQUIRE(w.trivial);
+    REQUIRE_EQ(w.enc.n_planes, 2);
+    CHECK_EQ(w.enc.plane[0].dtype, (uint32_t)RAD_F8E4M3);
+    CHECK_EQ(w.enc.plane[1].dtype, (uint32_t)RAD_F32);
+    CHECK_EQ(w.enc.plane[1].block[0], (int64_t)128);
+    CHECK_EQ(w.enc.plane[1].block[1], (int64_t)128);
+    std::vector<float> f(256);
+    for (int64_t r : { (int64_t)0, (int64_t)129 }) {
+        REQUIRE_EQ(ckpt_rows_f32(w, r, 1, f.data(), &why), RAD_OK);
+        for (int64_t c : { (int64_t)0, (int64_t)127, (int64_t)128, (int64_t)255 })
+            CHECK_EQ(f[(size_t)c], ((float)((r * 256 + c) % 7) - 3.0f) *
+                                   (0.25f * (float)(r / 128 * 2 + c / 128 + 1)));
+    }
+    std::vector<uint8_t> scales(s.bytes.size());
+    REQUIRE_EQ(ckpt_plane_rows(w, 1, 0, 2, scales.data(), &why), RAD_OK);
+    CHECK_EQ(std::memcmp(scales.data(), s.bytes.data(), scales.size()), 0);
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "bad", false, &w, &why), RAD_OK);
+    CHECK(!w.trivial);
+    CHECK(w.why.find("scale plane") != std::string::npos);
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "norm", false, &w, &why), RAD_OK);
     CHECK(w.trivial && rad_enc_is(&w.enc, "plain"));
 }
 

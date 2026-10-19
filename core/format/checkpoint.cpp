@@ -60,6 +60,13 @@ static void flatten_json(const nlohmann::json& j, const std::string& prefix, Met
     for (auto it = j.begin(); it != j.end(); ++it) {
         const std::string key = prefix.empty() ? it.key() : prefix + "." + it.key();
         const nlohmann::json& v = it.value();
+        /* Retain otherwise invisible Quark weight overrides so import validation can reject
+         * null/empty schemes instead of accidentally inheriting global MXFP4 packing. */
+        if (key.rfind("quantization_config.layer_quant_config.", 0) == 0 &&
+            it.key() == "weight" && (v.is_null() || (v.is_object() && v.empty()))) {
+            out->kv(key, v.is_null() ? "null" : "{}");
+            continue;
+        }
         if (v.is_object())            flatten_json(v, key, out);
         else if (v.is_boolean())      out->kv(key, v.get<bool>() ? "1" : "0");
         else if (v.is_number_integer()) out->kv(key, fmt("%lld", (long long)v.get<int64_t>()));
@@ -230,9 +237,10 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
     m.n_ff        = gi("intermediate_size", gi("moe_intermediate_size", 0));
     m.n_vocab     = gi("vocab_size", 0);
     m.n_ctx_train = gi("max_position_embeddings", 0);
-    m.n_expert        = gi("num_experts", gi("num_local_experts", 0));
+    m.n_expert        = gi("num_experts", gi("num_local_experts", gi("n_routed_experts", 0)));
     m.n_expert_used   = gi("num_experts_per_tok", 0);
-    m.n_expert_shared = gi("shared_expert_intermediate_size", 0) ? 1 : 0;
+    m.n_expert_shared = gi("n_shared_experts", gi("num_shared_experts",
+                           gi("shared_expert_intermediate_size", 0) ? 1 : 0));
     m.rms_eps     = (float)gf("rms_norm_eps", gf("norm_eps", 1e-6));   /* LFM2: norm_eps */
     m.rope_theta  = (float)gf("rope_parameters.rope_theta", gf("rope_theta", 10000.0));
     /* Rotary scaling stays in the free-form keys with its type (arch/common/rad_arch.h,
@@ -703,13 +711,45 @@ void Checkpoint::detect_import() {
         else import_why_ = "GPTQ's checkpoint_format '" + cf + "' is not one this reads; 'gptq' is";
     } else if (qm == "quark") {
         const std::string w = "global_quant_config.weight.";
+        /* Quark can retain block-FP8 attention/MTP weights alongside MXFP4 experts.
+         * Validate every override rather than rejecting every nonempty override map.
+         * Keep a lookup here: large exports have tens of thousands of flattened fields. */
+        std::map<std::string, std::string> fields;
+        for (size_t i = 0; i < meta_.keys.size(); ++i) fields.emplace(meta_.keys[i], meta_.vals[i]);
+        const std::string lp = "quantization_config.layer_quant_config.";
+        const std::string suffix = ".weight.dtype";
+        std::map<std::string, bool> layers;
+        for (const auto& [k, v] : fields)
+            if (k.rfind(lp, 0) == 0 && k.size() > lp.size() + suffix.size() &&
+                k.compare(k.size() - suffix.size(), suffix.size(), suffix) == 0)
+                layers.emplace(k.substr(0, k.size() - suffix.size()) + ".", true);
+        bool overrides_ok = true;
+        for (const auto& [layer, unused] : layers) {
+            auto f = [&](const char* key) {
+                auto it = fields.find(layer + "weight." + key);
+                return it == fields.end() ? std::string() : it->second;
+            };
+            const bool mx = f("dtype") == "fp4" && f("qscheme") == "per_group" &&
+                            f("group_size") == "32" && f("scale_format") == "e8m0";
+            const bool fp8 = f("dtype") == "fp8_e4m3" && f("qscheme") == "per_block" &&
+                             f("block_size") == "128 128";
+            overrides_ok = overrides_ok && (mx || fp8);
+        }
+        /* A partial/null weight override must not disappear merely because it has no dtype. */
+        for (const auto& [k, v] : fields) if (k.rfind(lp, 0) == 0) {
+            bool covered = false;
+            for (size_t dot = k.rfind('.'); dot != std::string::npos;
+                 dot = dot ? k.rfind('.', dot - 1) : std::string::npos)
+                if (layers.count(k.substr(0, dot + 1))) { covered = true; break; }
+            overrides_ok = overrides_ok && covered;
+        }
         if (qc(w + "dtype") == "fp4" && qc(w + "qscheme") == "per_group" &&
             qc(w + "group_size") == "32" && qc(w + "scale_format") == "e8m0" &&
-            !any_under("layer_quant_config.") && !any_under("layer_type_quant_config."))
+            overrides_ok && !any_under("layer_type_quant_config."))
             import_ = Import::QuarkMx;
         else
-            import_why_ = "Quark's weight scheme here is not MXFP4 (fp4, per_group 32, e8m0 scales) "
-                          "throughout, which is the one this reads";
+            import_why_ = "Quark requires global MXFP4 (fp4, per_group 32, e8m0 scales), with "
+                          "only MXFP4 or 128x128 E4M3 block-FP8 layer overrides";
     } else if (qm == "compressed-tensors") {
         /* compressed-tensors states each scheme as a config group with a format. Three are read:
          *   pack-quantized        grouped int4, symmetric (e.g. Google's Gemma 4 QAT w4a16-ct)
