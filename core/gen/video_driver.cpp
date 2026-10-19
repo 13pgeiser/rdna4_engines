@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -1116,6 +1117,20 @@ const RadBatch* VideoDriver::build_chunk(Job& j, int step) {
     return &out_[0];
 }
 
+/* Debug-only raw dump (R4D_ENC_DEBUG + R4D_ENC_DUMPDIR): write the encoder's input / output bytes to
+ * a file so tests/data/ref2va/ref_aenc_parity.py can compare the device's encode kernels against the
+ * reference HF encoder on the SAME input. Inert unless both environment variables are set — a normal
+ * run never enters here. Part of the R4D_ENC_DEBUG scaffolding, stripped at PR time. */
+static void enc_dbg_dump_file(const std::string& tag, const void* p, size_t bytes) {
+    const char* dir = std::getenv("R4D_ENC_DUMPDIR");
+    if (!dir || !p || bytes == 0) return;
+    const std::string path = std::string(dir) + "/" + tag + ".f32";
+    if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+        std::fwrite(p, 1, bytes, f);
+        std::fclose(f);
+    }
+}
+
 /* One media item through its VAE encoder: stage its encoder-ready bytes and the encode geometry
  * the plugin's rad_arch_encode_geom derives from them, then name the pass's kind and slot so the
  * encoder folds the latents into the lane's fixed slot rows. The server sends the NATURAL decoded
@@ -1159,6 +1174,9 @@ const RadBatch* VideoDriver::build_encode(Job& j, int step) {
             std::memcpy(sm + (size_t)c * stage_samples, m.enc_samples.data() + (size_t)c * n,
                         (size_t)n * 4);
         reg_[R_ENCSM].used = stage_samples * ch * 4;
+        if (enc_dbg_)
+            enc_dbg_dump_file("encsm_" + std::to_string((int)it.kind) + "_" +
+                              std::to_string((int)it.slot), sm, (size_t)stage_samples * ch * 4);
     } else {
         const int64_t nf = m.enc_frames, H = m.enc_h, W = m.enc_w;
         if (nf <= 0 || H <= 0 || W <= 0)
@@ -1248,6 +1266,8 @@ int VideoDriver::done() {
                     pass_.kind == RAD_GEN_PASS_AENCODE ? "AENCA(b_enca)" : "VENCV(b_evc)",
                     (int)enc_dbg_used_, (unsigned long long)h, (long long)nf, (long long)nz,
                     (double)mx, sum, (double)z[0], (double)z[1], (double)z[2], (double)z[3]);
+            enc_dbg_dump_file(pass_.kind == RAD_GEN_PASS_AENCODE ? "enca" : "evc",
+                              enc_dbg_host_, (size_t)enc_dbg_used_);
         }
         ++j->enc_next;
         break;
