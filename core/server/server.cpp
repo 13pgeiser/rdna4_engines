@@ -211,8 +211,8 @@ void Server::note_ready(uint64_t begin_ns) {
     if (begin_ns == 0) return;
     const uint64_t now = rad_mono_ns();
     /* Only a start in the past is a duration. A stamp that arrives out of order is ignored rather
-     * than written as zero: the page divides by this figure, and a zero cost would price every
-     * restart as free. */
+     * than written as zero: a zero cost would price every restart as free in any payback formula
+     * that divides by it. */
     if (now <= begin_ns) return;
     startup_s_ = (int64_t)((now - begin_ns) / 1000000000ull);
 }

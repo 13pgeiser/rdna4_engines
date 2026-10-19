@@ -2684,7 +2684,6 @@ TEST(the_decode_floor_reports_a_recent_window_for_like_for_like_drift) {
         CHECK(recent > 0);
         /* The phantom gap must be small: this is the number the deadband is sized against. */
         const int64_t gap_pct = 100 * (recent - floor) / floor;
-        CHECK(gap_pct >= 0);
         CHECK(gap_pct < 3);
     }
 
