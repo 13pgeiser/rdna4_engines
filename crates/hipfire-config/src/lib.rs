@@ -1601,7 +1601,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_DFLASH_LOOKUP"),
-        "Request-local verbatim-copy lookup composed into the dense Qwen3.5-class DFlash2 singleton verify window: a Copy window (lookup candidates replace the learned candidates) or a Tail window (first K learned candidates plus a lookup tail, at most 16 verify rows), taken only when measured acceptance per measured window price pays; a request with no lookup proposal runs the incumbent window unchanged. on/1 arms it on a singleton DFlash2 selector chain (no DDTree, no retained-PM4 verify, no CACTUS); off/0 disables it; auto (default) is off. Developer `HIPFIRE_SPEC_LOOKUP_TAIL=0` disables only the Tail windows."
+        "Request-local verbatim-copy lookup composed into the dense Qwen3.5-class DFlash2 singleton verify window: a Copy window (lookup candidates replace the learned candidates) or a Tail window (first K learned candidates plus a lookup tail, at most 16 verify rows), taken only when measured acceptance per measured window price pays; a request with no lookup proposal runs the incumbent window unchanged. auto (default) and on/1 arm it on a singleton DFlash2 selector chain (no DDTree, no retained-PM4 verify, no CACTUS); off/0 disables it. Developer `HIPFIRE_SPEC_LOOKUP_TAIL=0` disables only the Tail windows."
     ),
     field!(
         "speculation.dflash",
@@ -5002,16 +5002,17 @@ fn mtp_ngram_copy_enabled_for_arch_value(
 }
 /// Dense Qwen3.5-class DFlash2 verbatim-copy lookup arming
 /// (`speculation.dflash_lookup`, env override `HIPFIRE_DFLASH_LOOKUP`).
-/// `on`/`1` arms it; `off`/`0` disables it; `auto` (the schema default; an
-/// unset key also resolves to `auto`) is off: the R9700 promotion gate
-/// failed on non-copy classes (CHANGELOG 0.4.3). This only resolves the user
-/// policy; the consumer (`DflashSpeculator`) additionally requires a
-/// singleton DFlash2 selector chain and reports the reason it declined.
+/// `auto` (the schema default; an unset key also resolves to `auto`) and
+/// `on`/`1` arm it; only `off`/`0` disables it (CHANGELOG 0.4.3: +39.8%
+/// copy-heavy decode on R9700; non-copy requests run the incumbent window).
+/// This only resolves the user policy; the consumer (`DflashSpeculator`)
+/// additionally requires a singleton DFlash2 selector chain and reports the
+/// reason it declined.
 pub fn dflash_lookup_enabled() -> bool {
     dflash_lookup_enabled_value(process_value("HIPFIRE_DFLASH_LOOKUP").as_deref())
 }
 fn dflash_lookup_enabled_value(value: Option<&str>) -> bool {
-    matches!(value, Some("1" | "on"))
+    !matches!(value, Some("0" | "off"))
 }
 /// Developer kill switch for the Tail windows of the DFlash lookup
 /// (`HIPFIRE_SPEC_LOOKUP_TAIL=0`, read through the `[developer]` namespace):
@@ -7376,21 +7377,21 @@ mod tests {
         }
         assert!(field.validate(&ConfigValue::String("yes".into())).is_err());
         assert!(field.validate(&ConfigValue::String("true".into())).is_err());
-        // auto/unset resolve OFF.
+        // Default on: only an explicit off/0 disables; anything else is the default.
         for (raw, expect) in [
             (Some("on"), true),
             (Some("1"), true),
             (Some("off"), false),
             (Some("0"), false),
-            (Some("auto"), false),
-            (Some(""), false),
-            (Some("yes"), false),
-            (None, false),
+            (Some("auto"), true),
+            (Some(""), true),
+            (Some("yes"), true),
+            (None, true),
         ] {
             assert_eq!(dflash_lookup_enabled_value(raw), expect, "{raw:?}");
         }
-        // The live (unset) snapshot resolves to the auto default: off.
-        assert!(!dflash_lookup_enabled());
+        // The live (unset) snapshot resolves to the auto default: on.
+        assert!(dflash_lookup_enabled());
     }
 
     #[test]
