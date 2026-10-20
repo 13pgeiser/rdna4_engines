@@ -24,8 +24,9 @@
 // 2^(Wref[n]-127) is applied in the epilogue (see r4d_gemm_mxfp4a8_nt_m64.hip).
 //
 // Tile: 8 waves as 4 (M) x 2 (N), each owning TM=4 x TN fragments, so a block covers BMF = 256
-// rows and BNF = 2*TN*16 columns. TN=4 halves the column-block count and only wins on long prompts
-// (crossover near M=2048 on a 17408x5120 weight), so tn=0 picks TN=4 from M >= 2048. The K slab is
+// rows and BNF = 2*TN*16 columns. TN=4 halves the column-block count and wins from M = 1024 on (a
+// rank's Qwen3.8 gate_up 17408x5120 -2 %, down 5120x8704 -3 %, TranslateGemma gate_up 21504x5376
+// -9 %, its down 5376x10752 +1 %; mixed below), so tn=0 picks TN=4 from M >= 1024. The K slab is
 // 128 at TN=2 (64 if K % 128 != 0) and 64 at TN=4, which holds twice the accumulators.
 //
 // Barriers fence LDS only: __syncthreads() also drains the global load counter, and nothing in
@@ -63,7 +64,7 @@
 #define R4D_MXT_NTHR  (R4D_MXT_WM * R4D_MXT_WN * 32)
 #define R4D_MXT_BMF   (R4D_MXT_WM * R4D_MXT_TM * 16)
 #define R4D_MXT_KUNIT 64        // the narrowest K slab, so K must be a multiple of it
-#define R4D_MXT_TN4_MIN_M 2048  // tn=0's crossover, see above
+#define R4D_MXT_TN4_MIN_M 1024  // tn=0's crossover, see above
 
 typedef int      mxt_v2i  __attribute__((ext_vector_type(2)));
 typedef unsigned mxt_u2   __attribute__((ext_vector_type(2)));
