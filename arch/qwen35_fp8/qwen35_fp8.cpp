@@ -88,6 +88,7 @@
 #include <arch/rad_block_dflash2.h>
 #include <arch/rad_block_vit.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -193,9 +194,27 @@ struct Model {
     MediaRows   mrows{};
 
     std::vector<Layer> layers;
+
+    /* The pipelined prefill (step_pipelined): on where declare allowed it; the bounds buffer it
+     * cuts a step by, rewritten by every pipelined step from the pinned table `pipe_tbl` of
+     * {0, pipe_rows(T), T} for every T, made once; and whether rank 0 has said it pipelines. */
+    bool      pipe_on = false;
+    rad_buf   b_pipe_cu = 0;
+    int32_t*  pipe_tbl = nullptr;
+    bool      pipe_tbl_tried = false;
+    bool      pipe_noted = false;
+    bool      pipe_serial_noted = false;
 };
 
 static Model g_model[MAX_RANKS];
+
+#if !QWEN35_MOE
+/* The narrowest step the pipelined prefill takes, and its first piece: half the step rounded up
+ * to 64 rows, so both pieces sit in one bucket band (core/runtime/ctx.h) and the second is never
+ * wider than the first. */
+static const int64_t kPipeMinRows = 1024;
+static int64_t pipe_rows(int64_t T) { return ((T + 1) / 2 + 63) / 64 * 64; }
+#endif
 
 /* Checks the container's statement of its format, since every mismatch is silent: a
  * `weight_block_size` of [64,64] against kernels that shift by 7 reads the right bytes with the
@@ -862,6 +881,27 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                           RAD_STR("dtype", g.dtype), RAD_INT("exact", 1)),
                                RAD_NOWEIGHTS),
                            {m.b_x}, {m.b_x});
+#if !QWEN35_MOE
+    /* The pipelined prefill (step_pipelined), at two ranks wherever a step can be wide enough;
+     * RADIANCE_QWEN35_PIPE=0 turns it off. Its second lane touches the residual stream, the normed
+     * input in both forms, the taps and the bounds, so those leave the sharing pool
+     * (Ctx::lane1_); the bounds also because no declared op reads them, which would leave a
+     * transient dead before the kernels that take them raw. */
+    {
+        const char* e = std::getenv("RADIANCE_QWEN35_PIPE");
+        m.pipe_on = g.world == 2 && g.max_tok >= kPipeMinRows && !(e && std::strcmp(e, "0") == 0);
+    }
+    if (m.pipe_on) {
+        RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_x));
+        RAD_ARCH_TRY(rad_buf_concurrent(b, m.a_h.x));
+        RAD_ARCH_TRY(rad_buf_concurrent(b, m.a_h.q));
+        RAD_ARCH_TRY(rad_buf_concurrent(b, m.a_h.s));
+        if (m.b_dfsrc) RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_dfsrc));
+        m.b_pipe_cu = decl_b(b, nm.f("pipe_cu"), RAD_I32, {4});
+        RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_pipe_cu));
+    }
+#endif
+
     /* ---- the layers. */
     /* The rope table's fill, declared before the layers that read it. If it does not resolve,
      * `aw.cos_sin` is cleared and every attention block uses its unfused norm + rope pair. Its band
@@ -904,6 +944,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     for (int64_t l = 0; l < m.n_main; ++l) {
         Layer& lay = m.layers[(size_t)l];
         lay.full = is_full_attention(l, interval) ? 1 : 0;
+#if !QWEN35_MOE
+        /* The pipelined prefill runs every block's all-reduce beside the other piece's work, so
+         * each declares its collective a second time at `overlap` 1, a launch that leaves the CUs
+         * to that work (the lane rows of libr4d/r4d_rows.cpp); the fused all-reduce and norm
+         * would hold the card while it waits on the link. */
+        lay.attn.ar_overlap = lay.gdn.ar_overlap = lay.mlp.ar_overlap = m.pipe_on ? 1 : 0;
+#endif
 
         const LayerFold f = layer_fold(g, l, m.n_main, m.tap_layer, m.n_taps, m.op_embed_ar != 0);
 
@@ -1138,6 +1185,206 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     return RAD_OK;
 }
 
+#if !QWEN35_MOE
+/* ============================== A prefill step in two pieces ==============================
+ *
+ * At two ranks every layer of a prefill chunk makes two all-reduces, each folded into the next
+ * block's norm (layer_fold) and each in a hard chain on one stream: block -> all-reduce + norm ->
+ * block. On a 2048-token chunk they are about a fifth of the step, nearly all of it the link, with
+ * nothing beside them.
+ *
+ * A step of one prefill sequence of at least kPipeMinRows tokens is cut into two pieces of about
+ * half (pipe_rows), each the chunk a narrower batch makes. Every block runs a piece at a time on
+ * the first lane, and the work between two blocks runs a piece at a time on the second: the
+ * block's all-reduce at `overlap` 1 (a narrow launch that leaves the CUs to the compute beside it;
+ * the fused all-reduce and norm would hold its blocks on the card while it waits on the link and
+ * slow the GEMM beside it by a third), then the next block's plain norm, and after a feed-forward
+ * that keeps its add, the add, the drafter taps and the final norm. Measured on Qwen3.8-27B at two
+ * R9700s: a 41k-token prompt 9.0 -> 8.4 s.
+ *
+ *   mixer     the delta net and the dense attention run whole a piece at a time and hand the
+ *             first piece off behind its out projection (ArPieces), so its boundary runs beside
+ *             the second piece's mixer;
+ *   ffn       its first piece runs beside the mixer's second boundary, its second beside its own
+ *             first boundary; the next mixer's first piece runs beside its second.
+ *
+ * A piece computes the bytes the narrower chunk does: every op is per row, both pieces sit in the
+ * band of a whole step (pipe_rows), the all-reduce reduces within a row, the delta net carries its
+ * state through the cache as between two chunks, and each attention piece sees the cache up to its
+ * own end. The narrow all-reduce and the plain norm write the fused op's bytes, so a pipelined
+ * step is bit for bit the serial one (Qwen's KL recordings compare equal).
+ *
+ * The second lane's requirements (Ctx::lane1_) hold: every collective of the step is on it, the
+ * embedding's included; none carries a device-wide arrival counter (the all-reduce's sequence
+ * counters order its own launches, which one lane keeps in order); and the buffers it touches left
+ * the sharing pool at declare. */
+
+template <class F>
+static void pipe_on1(RadCtx* c, const F& issue) {
+    rad_lane(c, 1);
+    rad_lane_join(c, 0, 1);
+    issue();
+    rad_lane(c, 0);
+}
+/* Lane 0 waits for everything issued on lane 1 so far. */
+static void pipe_wait1(RadCtx* c) { rad_lane_join(c, 1, 0); }
+
+/* The work after block `s` (2l the mixer of layer l, 2l + 1 its feed-forward) for rows
+ * [r0, r0 + n). */
+static void pipe_boundary(RadCtx* c, const Model& m, int64_t T, int64_t s, int64_t r0, int64_t n) {
+    const Geom& g = m.g;
+    const int64_t li = s / 2;
+    const Layer& l = m.layers[(size_t)li];
+    if (s % 2 == 0) {
+        if (l.full) l.attn.issue_ar(c, r0, n);
+        else        l.gdn.issue_ar(c, r0, n);
+        l.mlp.nq_h.step_plain(c, T, r0, n);
+        return;
+    }
+    l.mlp.issue_ar(c, r0, n);
+    if (l.mlp.op_add)
+        RAD_ISSUE_N(c, l.mlp.op_add, n, brow_slice(m.b_x, r0, n, g.n_embd),
+                    brow_slice(m.a_h.x, r0, n, g.n_embd), brow_slice(m.b_x, r0, n, g.n_embd));
+    for (int t = 0; t < m.n_taps; ++t) {
+        if (m.tap_layer[t] != (int)li) continue;
+        RAD_ISSUE_N(c, m.op_tap, n, brow_slice(m.b_x, r0, n, g.n_embd),
+                    bcol_at(m.b_dfsrc, r0, (int64_t)m.n_taps * g.n_embd, (int64_t)t * g.n_embd,
+                            g.n_embd, n));
+    }
+    if (li + 1 < (int64_t)m.layers.size()) {
+        const Layer& nx = m.layers[(size_t)li + 1];
+        (nx.full ? nx.attn.nq_h : nx.gdn.nq_h).step_plain(c, T, r0, n);
+    } else {
+        RAD_ISSUE_N(c, m.op_final_norm, n, brow_slice(m.b_x, r0, n, g.n_embd), RAD_W(m.w_out_norm),
+                    brow_slice(m.a_h.x, r0, n, g.n_embd));
+    }
+}
+
+/* A mixer's first piece is done (ArPieces): lane 0 takes the previous block's second boundary
+ * before the second piece, and lane 1 this block's first behind it. */
+struct PipeHand {
+    RadCtx*      c = nullptr;
+    const Model* m = nullptr;
+    int64_t      T = 0, s = 0;
+};
+static void pipe_hand(void* u, int64_t r0, int64_t n) {
+    const PipeHand& h = *(const PipeHand*)u;
+    pipe_wait1(h.c);
+    pipe_on1(h.c, [&] { pipe_boundary(h.c, *h.m, h.T, h.s, r0, n); });
+}
+
+/* The bounds of this step's pieces on the card, {0, pipe_rows(T), T}, if the step is pipelined;
+ * null for a serial step. Copied on the step's stream ahead of every layer from the pinned table,
+ * whose rows never change, so a captured step replays the same copy. */
+static const int32_t* pipe_ready(RadCtx* c, const RadBatch* batch, Model& m) {
+    const int64_t T = batch->n_tok;
+    if (!m.pipe_on || !m.b_pipe_cu || T < kPipeMinRows || T > m.g.max_tok ||
+        batch->phase != RAD_PHASE_PREFILL)
+        return nullptr;
+    /* A prefill step wide enough that runs serially says why, once, so a deployment that never
+     * pipelines does not look like one that gains nothing from it. */
+    auto serial = [&](const char* why) -> const int32_t* {
+        if (!m.pipe_serial_noted && m.g.rank == 0)
+            fprintf(stderr, "radiance: qwen35: a %lld-row prefill step runs serially: %s\n",
+                    (long long)T, why);
+        m.pipe_serial_noted = true;
+        return nullptr;
+    };
+    if (batch->n_seq != 1 || batch->n_seq_decode != 0) return serial("more than one sequence");
+    if (!batch->positions) return serial("no positions");
+    if (rope_mixed(batch) || batch->n_mm_rows > 0) return serial("media rows in the step");
+    if (dbg_resid_on()) return serial("residual debugging is on");
+    int32_t* d = (int32_t*)rad_buf_ptr(c, m.b_pipe_cu);
+    if (!d) return nullptr;
+    const int64_t R = pipe_rows(T);
+    ArPieces pc{};
+    pc.rows = R; pc.done = pipe_hand; pc.cu = d; pc.in_ready = true;
+    for (const Layer& l : m.layers) {
+        if (!(l.full ? l.attn.takes_pieces(batch, &pc) : l.gdn.takes_pieces(batch, &pc)))
+            return serial(l.full ? "an attention block cannot run in pieces"
+                                 : "a delta-net block cannot run in pieces");
+        /* Every boundary issues its block's all-reduce itself, narrow, then the plain norm. */
+        if (!(l.full ? l.attn.op_ar_ov : l.gdn.op_ar_ov) || !l.mlp.op_ar_ov)
+            return serial("a block declares no overlap all-reduce");
+    }
+    if (!m.pipe_tbl_tried) {
+        m.pipe_tbl_tried = true;
+        const int64_t n = m.g.max_tok + 1;
+        m.pipe_tbl = (int32_t*)rad_dev_alloc(3 * n * (int64_t)sizeof(int32_t), RAD_MEM_HOST_PINNED);
+        if (m.pipe_tbl) {
+            for (int64_t t = 0; t < n; ++t) {
+                m.pipe_tbl[3 * t]     = 0;
+                m.pipe_tbl[3 * t + 1] = (int32_t)pipe_rows(t);
+                m.pipe_tbl[3 * t + 2] = (int32_t)t;
+            }
+        }
+    }
+    if (!m.pipe_tbl) return serial("no pinned host memory for the piece bounds");
+    if (rad_memcpy_async(d, m.pipe_tbl + 3 * T, 3 * (int64_t)sizeof(int32_t), rad_stream(c)) !=
+        RAD_OK)
+        return nullptr;
+    return d;
+}
+
+static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu) {
+    const Geom& g = m.g;
+    const int64_t T = batch->n_tok, R = pipe_rows(T);
+    const int64_t L = (int64_t)m.layers.size();
+    if (!m.pipe_noted) {
+        m.pipe_noted = true;
+        if (g.rank == 0)
+            fprintf(stderr, "radiance: qwen35: prefill steps of one sequence from %lld rows are "
+                            "pipelined: two pieces, block boundaries on the second lane\n",
+                    (long long)kPipeMinRows);
+    }
+
+    RAD_ISSUE(c, m.op_embed,
+              praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_tok), brows(m.b_x, T));
+    /* The embedding's reduction and layer 0's norm over the whole step, on lane 1 with every
+     * other collective (the norm takes the reduction where the wire is exact). */
+    pipe_on1(c, [&] {
+        if (m.op_embed_ar && !ar_wire_is_exact(g, T))
+            RAD_ISSUE_N(c, m.op_embed_ar, T * g.n_embd, brows(m.b_x, T), RAD_NONE);
+        if (L > 0) (m.layers[0].full ? m.layers[0].attn.nq_h : m.layers[0].gdn.nq_h).step(c, T);
+    });
+    pipe_wait1(c);
+    if (m.op_rope_cs && T <= qk_fuse_rows(g) && !rope_mixed(batch))
+        RAD_ISSUE_N(c, m.op_rope_cs, T, rope_pos1(batch, T), RAD_B(m.b_rope_cs));
+
+    for (int64_t li = 0; li < L; ++li) {
+        const Layer& l = m.layers[(size_t)li];
+        PipeHand h{c, &m, T, 2 * li};
+        ArPieces pc{};
+        pc.rows = R; pc.done = pipe_hand; pc.u = &h; pc.cu = pcu; pc.in_ready = true;
+        if (l.full) l.attn.step(c, batch, false, &pc);
+        else        l.gdn.step(c, batch, false, &pc);
+        if (pc.handed != 1) {
+            rad_step_fail(c, "qwen35: a mixer did not run its two pieces in a pipelined prefill "
+                             "step (pipe_ready and the block's takes_pieces disagree)");
+            return;
+        }
+        pipe_wait1(c);
+        pipe_on1(c, [&] { pipe_boundary(c, m, T, 2 * li, R, T - R); });
+        l.mlp.body(c, T, 0, R);
+        pipe_wait1(c);
+        pipe_on1(c, [&] { pipe_boundary(c, m, T, 2 * li + 1, 0, R); });
+        l.mlp.body(c, T, R, T - R);
+        pipe_wait1(c);
+        pipe_on1(c, [&] { pipe_boundary(c, m, T, 2 * li + 1, R, T - R); });
+    }
+    pipe_wait1(c);
+
+    if (batch->n_out > 0) {
+        RAD_ISSUE_N(c, m.op_gather, batch->n_out,
+                    brows(m.a_h.x, T), praw(batch->out_ids, RAD_I32, batch->n_out),
+                    brows(m.b_hout, batch->n_out));
+        RAD_ISSUE_N(c, m.op_logits, batch->n_out,
+                    brows(m.b_hout, batch->n_out), RAD_W(m.w_lm_head),
+                    brows(m.b_logits, batch->n_out));
+    }
+}
+#endif
+
 static void step(RadCtx* c, const RadBatch* batch) {
     Model& m = g_model[rad_rank(c)];
 
@@ -1175,6 +1422,13 @@ static void step(RadCtx* c, const RadBatch* batch) {
         m.mtp.step(c, batch);
         return;
     }
+
+#if !QWEN35_MOE
+    if (const int32_t* pcu = pipe_ready(c, batch, m)) {
+        step_pipelined(c, batch, m, pcu);
+        return;
+    }
+#endif
 
     RAD_ISSUE(c, m.op_embed,
               praw(batch->token_ids, RAD_I32, batch->n_tok), RAD_W(m.w_tok),

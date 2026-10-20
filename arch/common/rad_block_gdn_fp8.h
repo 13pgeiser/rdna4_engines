@@ -139,6 +139,13 @@ struct GdnFP8 {
      * trailing add, which would read the delta before the reduction. */
     void step(RadCtx* c, const RadBatch* batch, bool own_ar = true,
               ArPieces* pieces = nullptr) const;
+    /* Whether step() with `own_ar` false runs the whole block a piece at a time over `pieces`
+     * (its piece path), asked by a caller that must know before it commits to a schedule. */
+    bool takes_pieces(const RadBatch* batch, const ArPieces* pieces) const {
+        return pieces && pieces->cu && pieces->cuts(batch->n_tok) &&
+               batch->n_tok <= 2 * pieces->rows && (ext_in || pieces->in_ready) && !op_add &&
+               batch->n_seq == 1 && batch->phase == RAD_PHASE_PREFILL;
+    }
     /* Whether a step of T rows issues the all-reduce itself, asked by a caller before taking it
      * over; and that all-reduce over rows [r0, r0 + rows) of the output. */
     bool issues_ar(int64_t T) const { return op_ar && !ar_taken(g, T, ar_out, ar_out_take); }
@@ -389,10 +396,10 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
      * piece the chunk a span of 1 makes (the projection over its rows; the convolution, solve and
      * scan over its bounds, with the state handed on through the cache; the gated norm, quantiser
      * and out projection), so the first piece's reduction runs beside all of the second piece's
-     * work. The second piece reads the history the first left in the convolution slot: a spanned
-     * step is past the prompt's first interval, so its context length is never zero. */
-    if (!own_ar && pieces && pieces->cu && pieces->cuts(T) && T <= 2 * pieces->rows && ext_in &&
-        !op_add && S == 1 && batch->phase == RAD_PHASE_PREFILL) {
+     * work. The second piece reads the history the first left in the convolution slot, so each
+     * piece passes its own context length, its first row's position: the step's would tell the
+     * second piece of a prompt's first chunk that it has none. */
+    if (!own_ar && takes_pieces(batch, pieces)) {
         const int64_t in_w = conv_dim + v_dim;
         for (int64_t p = 0; p < 2; ++p) {
             const int64_t r0 = p * pieces->rows;
@@ -405,7 +412,7 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                         bcol(w.in.x, 0, conv_dim, T), RAD_W(w_conv), RAD_NONE, RAD_W(w_a_log),
                         RAD_W(w_dt_bias), kv_cache(kv_conv, layer), praw(cu, RAD_I32, 2),
                         bcol(w.ab, 0, H, T), bcol(w.ab, H, H, T),
-                        praw(cv_idx, RAD_I32, 1), praw(batch->ctx_lens, RAD_I32, 1),
+                        praw(cv_idx, RAD_I32, 1), praw(batch->positions + r0, RAD_I32, 1),
                         brows(w.q, T), brows(w.k, T), brows(w.v, T),
                         brows(w.gdec, T), brows(w.beta, T));
             RAD_ISSUE_N(c, op_kkt, n,

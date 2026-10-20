@@ -9122,6 +9122,90 @@ TEST(a_4096_budget_without_a_span_is_the_pinned_graph_and_steps) {
     }
 }
 
+/* RADIANCE_QWEN35_PIPE=0 turns the pipelined prefill off: the two-rank build is then the serial
+ * one, graph and steps, as pinned before the pipeline existed. */
+TEST(qwen35_pipe_off_is_the_serial_graph_and_steps) {
+    MetaKV q35 = q35fp8_meta();
+    setenv("RADIANCE_QWEN35_PIPE", "0", 1);
+    RadBuilder b;
+    RadBuildCtx ctx = spec_ctx(1, 2, 3);
+    ctx.max_tok = 4096;
+    ctx.max_seqs = 8;
+    ctx.max_ctx = 200000;
+    const int rc = stderr_of_rc([&] { return qwen35_fp8::declare(&b, q35.meta(), &ctx); });
+    unsetenv("RADIANCE_QWEN35_PIPE");
+    REQUIRE_EQ(rc, RAD_OK);
+    CHECK(!qwen35_fp8::g_model[1].pipe_on);
+    CHECK_EQ(graph_hash(b), 0xc55656a96b3db1ceull);
+    CHECK_EQ(pinned_steps(b, qwen35_fp8::step, 1, 2), 0xc03bdef23d685cc5ull);
+}
+
+/* A Qwen3.5/3.8 prefill step of one sequence at two ranks runs in two pieces of 1024 rows
+ * (step_pipelined): every collective is on the second lane, the layers' all-reduces a piece at a
+ * time at `overlap` 1, the embedding's whole (standalone, or folded into layer 0's norm where the
+ * wire is exact, as this geometry's is); no other fused all-reduce + norm is issued; the delta net
+ * and the attention run twice, each piece over its own bounds; the DFlash2 taps are copied a piece
+ * at a time. A prompt's first chunk and a later one alike. One rank runs serially. */
+TEST(qwen35_a_wide_prefill_runs_in_two_pieces_with_its_boundaries_on_the_second_lane) {
+    MetaKV mk = with_dflash2(q35fp8_meta());
+    for (int world : { 1, 2 })
+        for (int rank = 0; rank < world; ++rank)
+            for (int32_t pctx : { 0, 4096 }) {
+                RadBuilder b;
+                RadBuildCtx ctx = spec_ctx(rank, world, 7);
+                ctx.max_tok = 2048;
+                REQUIRE_EQ(stderr_of_rc([&] { return qwen35_fp8::declare(&b, mk.meta(), &ctx); }),
+                           RAD_OK);
+                const qwen35_fp8::Model& m = qwen35_fp8::g_model[rank];
+                CHECK_EQ(m.pipe_on, world == 2);
+                CHECK(m.n_taps > 0);
+                const auto pf = kit(b, {}, { 2048 }, pctx);
+                const auto v = run_passes(b, qwen35_fp8::step, { pf.get() }, rank, world);
+                CHECK_PASSES(b, v);
+                const RadCtx& c = *v[0];
+                CHECK(c.step_fail.empty());
+                const int64_t E = m.g.n_embd, piece = 1024 * E;
+                int ar = 0, ar_lane0 = 0, ar_piece = 0, ar_overlap = 0, arn = 0, arn_lane0 = 0;
+                int conv = 0, attn = 0, wide_attn = 0, taps = 0, wide_taps = 0, gdn = 0;
+                for (const auto& l : m.layers) gdn += !l.full;
+                const int full = (int)m.layers.size() - gdn;
+                for (const RecIssue& i : c.issues) {
+                    const RecOp* o = b.op_of(i.op);
+                    if (!o) continue;
+                    if (o->op == "all_reduce") {
+                        ++ar;
+                        ar_lane0 += i.lane == 0;
+                        ar_piece += i.n == piece;
+                        ar_overlap += pint(o, "overlap") == 1;
+                    }
+                    if (o->op == "ar_rmsnorm_quant_fp8") { ++arn; arn_lane0 += i.lane == 0; }
+                    if (o->op == "gdn_conv_prep") ++conv;
+                    if (o->op == "attn_paged") { ++attn; wide_attn += i.n > 1024; }
+                    if (o->op == "cast") { ++taps; wide_taps += i.n > 1024; }
+                }
+                const int pieces = world == 2 ? 2 : 1;
+                CHECK(gdn > 0 && full > 0);
+                CHECK_EQ(conv, pieces * gdn);
+                CHECK_EQ(attn, pieces * full);
+                CHECK_EQ(taps, pieces * m.n_taps);
+                if (world == 1) {
+                    CHECK_EQ(ar + arn, 0);
+                    CHECK(c.joins.empty());
+                    CHECK_EQ(wide_attn, attn);
+                    continue;
+                }
+                CHECK_EQ(ar_lane0 + arn_lane0, 0);
+                /* Two blocks a layer, two pieces a block, and the embedding's whole. */
+                CHECK_EQ(ar + arn, 4 * (int)m.layers.size() + 1);
+                CHECK(arn <= 1);
+                CHECK_EQ(ar_piece, 4 * (int)m.layers.size());
+                CHECK_EQ(ar_overlap, 4 * (int)m.layers.size());
+                CHECK_EQ(wide_attn, 0);
+                CHECK_EQ(wide_taps, 0);
+                CHECK(!c.joins.empty());
+            }
+}
+
 /* Under a span a Flash-Next prefill of two intervals runs a pass at a time. At every world its
  * connection reads take a pass each and the indexer scores its pass-tall plane in windows, the MTP
  * head's pass included. At four ranks the step is pipelined (step_pipelined): every layer's

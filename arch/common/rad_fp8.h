@@ -290,6 +290,10 @@ struct ArPieces {
      * chunk a span of 1 makes, the state carried through the cache) and hand off the first
      * piece's reduction before the second piece's projection. Null for any other step. */
     const int32_t* cu = nullptr;
+    /* The caller normed each piece's input itself (qwen35_fp8's pipelined prefill, on the second
+     * lane behind the previous block's piece), so a block with its own norm takes the piece path
+     * as one with an external input does and skips that norm. */
+    bool in_ready = false;
     bool cuts(int64_t T) const { return done && rows > 0 && T > rows; }
     void hand(int64_t r0, int64_t n) { done(u, r0, n); ++handed; }
 };
@@ -389,6 +393,9 @@ struct NormQuantFP8 {
     }
     /* Asked by the preceding block before issuing its own collective. */
     bool takes_ar(int64_t T) const { return pick(T) != op; }
+    /* The plain op whatever the wire, for a caller that issued the preceding all-reduce itself
+     * (qwen35_fp8's pipelined prefill, which runs it narrow beside compute). */
+    void step_plain(RadCtx* c, int64_t T, int64_t r0 = 0, int64_t rows = 0) const;
 };
 
 inline int NormQuantFP8::declare(RadBuilder* b, const Geom& g, rad_weight gain, rad_buf x,
@@ -470,6 +477,15 @@ inline int NormQuantFP8::declare(RadBuilder* b, const Geom& g, rad_weight gain, 
  * `brows`). Slicing lets a block run in passes (the routed feed-forward). Each slice must land in
  * the same bucket-table band as the whole (core/runtime/ctx.h), or a different kernel with a
  * different summation order would run. */
+inline void NormQuantFP8::step_plain(RadCtx* c, int64_t T, int64_t r0, int64_t rows) const {
+    if (rows <= 0) rows = T - r0;
+    RAD_ISSUE_N(c, op, rows, brow_slice(src, r0, rows, n),
+                res ? brow_slice(res, r0, rows, n) : RAD_NONE, RAD_W(w),
+                brow_slice(a.q, r0, rows, n),
+                brow_slice(a.s, r0, rows, n / RAD_FP8_BLOCK),
+                brow_slice(a.x, r0, rows, n));
+}
+
 inline void NormQuantFP8::step(RadCtx* c, int64_t T, int64_t r0, int64_t rows) const {
     if (rows <= 0) rows = T - r0;
     RAD_ISSUE_N(c, pick(rows), rows, brow_slice(src, r0, rows, n),

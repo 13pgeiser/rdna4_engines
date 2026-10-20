@@ -75,6 +75,20 @@ struct MlpFP8 {
     void step_rows(RadCtx* c, int64_t T) const { slice(c, T, 0, T); }
     /* One row slice of the whole block; `rows <= 0` means the rest of the step. */
     void slice(RadCtx* c, int64_t T, int64_t r0, int64_t rows) const;
+    /* The slice in its parts, for a caller that runs the norm and the tail elsewhere (qwen35_fp8's
+     * pipelined prefill puts both on the second lane): the projections from the normed input to
+     * the delta in `w.h.x`, then the all-reduce and add this block issues itself. */
+    void body(RadCtx* c, int64_t T, int64_t r0, int64_t rows) const;
+    void tail(RadCtx* c, int64_t r0, int64_t rows) const;
+    /* The block's all-reduce over rows [r0, r0 + rows) of the output, at `overlap` where declared
+     * (a caller that runs it beside other work). */
+    void issue_ar(RadCtx* c, int64_t r0, int64_t rows) const {
+        RAD_ISSUE_N(c, op_ar_ov ? op_ar_ov : op_ar, rows * g.n_embd,
+                    brow_slice(w.h.x, r0, rows, g.n_embd), RAD_NONE);
+    }
+    /* Set before declare: the `overlap` issue_ar's collective is declared at, 0 for none. */
+    int    ar_overlap = 0;
+    rad_op op_ar_ov = 0;
 };
 
 inline int MlpFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Wire& wire,
@@ -129,6 +143,17 @@ inline int MlpFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, co
                                   RAD_INT("min_bytes", g.wire_min_bytes)),
                        RAD_NOWEIGHTS),
                    {w.h.x}, {w.h.x});
+    /* The same collective for a caller that runs it beside other work (issue_ar): at `overlap` 1
+     * it gets the rows that hold fewer CUs while waiting on the link. */
+    if (g.world > 1 && ar_overlap > 0)
+        op_ar_ov = rw(b, RAD_OP(b, "all_reduce",
+                          RAD_PARAMS(RAD_INT("world_size", g.world),
+                                     RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
+                                     RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
+                                     RAD_INT("min_bytes", g.wire_min_bytes),
+                                     RAD_INT("overlap", ar_overlap)),
+                          RAD_NOWEIGHTS),
+                      {w.h.x}, {w.h.x});
 
     /* Only when the next block's norm will not add (rad_fp8.h: NormQuantFP8). */
     if (add_out)
@@ -149,6 +174,11 @@ inline int MlpFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, co
 inline void MlpFP8::slice(RadCtx* c, int64_t T, int64_t r0, int64_t rows) const {
     if (rows <= 0) rows = T - r0;
     nq_h.step(c, T, r0, rows);
+    body(c, T, r0, rows);
+    tail(c, r0, rows);
+}
+
+inline void MlpFP8::body(RadCtx* c, int64_t T, int64_t r0, int64_t rows) const {
     if (op_gated && rows <= gated_rows) {
         RAD_ISSUE_N(c, op_gated, rows, brow_slice(w.h.q, r0, rows, g.n_embd),
                     brow_slice(w.h.s, r0, rows, g.n_embd / RAD_FP8_BLOCK), RAD_W(gate_up.w),
@@ -160,6 +190,9 @@ inline void MlpFP8::slice(RadCtx* c, int64_t T, int64_t r0, int64_t rows) const 
         gq_ffn.step(c, w.gate_up, T, r0, rows);
     }
     down.step(c, w.ffn, w.h.x, T, r0, rows);
+}
+
+inline void MlpFP8::tail(RadCtx* c, int64_t r0, int64_t rows) const {
     if (op_ar && !(ar_out && ar_fused_ok(g, rows)))
         RAD_ISSUE_N(c, op_ar, rows * g.n_embd, brow_slice(w.h.x, r0, rows, g.n_embd), RAD_NONE);
     if (op_add)
