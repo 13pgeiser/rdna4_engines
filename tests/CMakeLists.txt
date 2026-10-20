@@ -52,6 +52,8 @@ set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test r4d_ar_links_test)
 # test binaries can run from anywhere.
 set(RAD_CHAT_FIXTURES ${CMAKE_CURRENT_SOURCE_DIR}/data/chat)
 set(RAD_MEDIA_FIXTURES ${CMAKE_CURRENT_SOURCE_DIR}/data/media)
+# Checked-in golden blobs (tests/data/golden), read at test time (tests/uocr_resample_golden.h).
+set(RAD_GOLDEN_FIXTURES ${CMAKE_CURRENT_SOURCE_DIR}/data/golden)
 
 # libstdc++ before rad_core on every test's link line. lld extracts archive members to resolve a
 # shared library's imports too: ROCm 10.1's libamdhip64 imports std::string::reserve, which g++-14
@@ -191,7 +193,8 @@ foreach(t ${RAD_TESTS})
     target_link_libraries(${n} PRIVATE rad_legacy_toolparse)
   endif()
   target_compile_definitions(${n} PRIVATE RAD_CHAT_FIXTURES="${RAD_CHAT_FIXTURES}"
-                                          RAD_MEDIA_FIXTURES="${RAD_MEDIA_FIXTURES}")
+                                          RAD_MEDIA_FIXTURES="${RAD_MEDIA_FIXTURES}"
+                                          RAD_GOLDEN_FIXTURES="${RAD_GOLDEN_FIXTURES}")
   # Normally inherited from rad_core; tests that do not link it still need the ABI headers.
   target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/core ${CMAKE_SOURCE_DIR}/abi
                                           ${CMAKE_BINARY_DIR}/rad_include)

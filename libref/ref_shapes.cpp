@@ -1395,6 +1395,9 @@ int ref_sam_attn_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     const int64_t gw  = gi(p, n_p, "grid_w", 0);
     const int64_t win = gi(p, n_p, "window", 0);
     if (M <= 0 || hd <= 0 || nh <= 0 || gh <= 0 || gw <= 0 || win < 0) return RAD_E_UNSUPPORTED;
+    /* A shape hook answers "describe this geometry", so an unbuildable one spells E_UNSUPPORTED
+     * (the harness convention); the kernels' own launch checks report E_SHAPE for the same
+     * inputs. */
     const int64_t W = nh * hd;
     const int64_t S = n_seq_of(p, n_p);
     const int64_t maxd = win > 0 ? win : (gh > gw ? gh : gw);

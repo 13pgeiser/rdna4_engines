@@ -2590,6 +2590,10 @@ request (`ngram_ban_n`, `ngram_window`). It needs about 7 GiB on one card, so se
 compose file takes `RADIANCE_GPU` and the model file's VRAM, with the vision tower on the card and
 an fp8 KV cache.
 
+The reference's `infer` opens its prompt with the BOS the chat template omits, and the chat path
+supplies it; `/v1/completions` prompts are served exactly as sent (the reference has no
+completions entry point), so prompt parity with the reference is a chat-endpoint property.
+
 ## 6. Operation
 
 ### 6.1 The dashboard

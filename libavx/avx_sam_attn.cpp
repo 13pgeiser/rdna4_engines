@@ -11,11 +11,13 @@
  * values of their tile and take part in the softmax; `window` 0 is one tile over the segment.
  *
  * This is the same structure as libref's: one thread owns one output row and one head, the tile's
- * keys are walked jh-major so the q.Rh dot is computed once a tile row, the softmax subtracts the
- * tile maximum, and the output is rounded once. The dots are plain f32 loops over head_dim, which
- * LLVM vectorises at every level; the tile is small enough that no blocking is needed. The tables
- * are widened to f32 once a launch and resampled along dim 0 when a geometry's axes need it
- * (get_rel_pos's linear interpolation).
+ * keys are walked jh-major so the q.Rh dot is computed once a tile row and the q.Rw dots are
+ * hoisted per query row (the hip kernel's hoist, bit-identical reuse), the softmax subtracts the
+ * tile maximum, and the output is rounded once. The dots stay scalar f32 loops over head_dim on
+ * purpose: the x86 leg is the no-GPU/harness path, and a SIMD reduction would reassociate the f32
+ * accumulation and break bit-parity with the libref oracle. The tables are widened to f32 once a
+ * launch and resampled along dim 0 when a geometry's axes need it (get_rel_pos's linear
+ * interpolation).
  */
 #include "avx_vec.h"
 #include "avx_common.h"
@@ -114,14 +116,23 @@ AVX_KERNEL(sam_attn) {
             const int64_t qst = laststride(q);
             for (int64_t c = 0; c < hd; ++c) qt[c] = ldt(q, qbase + c * qst);
 
+            /* The w rel-pos dot depends on (lw, jw) alone, not on jh: dot it once per query
+             * row and reuse it through the tile rows. The same scalar loop in the same order,
+             * so every reused value is bit-identical to the per-(jh, jw) recompute. */
+            std::vector<float> wr((size_t)tw);
+            for (int64_t jw = 0; jw < tw; ++jw) {
+                const float* rwrow = &Rw[(size_t)((lw - jw + tw - 1) * hd)];
+                float wv = 0.0f;
+                for (int64_t c = 0; c < hd; ++c) wv += qt[c] * rwrow[c];
+                wr[(size_t)jw] = wv;
+            }
+
             for (int64_t jh = 0; jh < th; ++jh) {
                 const float* rhrow = &Rh[(size_t)((lh - jh + th - 1) * hd)];
                 float hr = 0.0f;
                 for (int64_t c = 0; c < hd; ++c) hr += qt[c] * rhrow[c];
                 for (int64_t jw = 0; jw < tw; ++jw) {
-                    const float* rwrow = &Rw[(size_t)((lw - jw + tw - 1) * hd)];
-                    float lgt = hr;
-                    for (int64_t c = 0; c < hd; ++c) lgt += qt[c] * rwrow[c];
+                    float lgt = hr + wr[(size_t)jw];
                     const int64_t kh = ty * th + jh, kw = tx * tw + jw;
                     if (kh < gh && kw < gw) {
                         const int64_t krow = base + kh * gw + kw;

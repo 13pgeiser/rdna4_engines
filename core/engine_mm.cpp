@@ -82,18 +82,19 @@ int Engine::run_encodes() {
         ip->embd.assign((size_t)(ip->n_rows() * e.n_embd), 0);
         /* Diagnostic: RADIANCE_DEBUG_MM_ROWS=<raw bf16 file> substitutes a reference encoder's
          * rows for the tower's, to tell a tower difference from a language-model one. */
-        if (const char* rp = std::getenv("RADIANCE_DEBUG_MM_ROWS")) {
-            if (FILE* rf = std::fopen(rp, "rb")) {
+        static const char* const rows_ref = std::getenv("RADIANCE_DEBUG_MM_ROWS");
+        if (rows_ref) {
+            if (FILE* rf = std::fopen(rows_ref, "rb")) {
                 const size_t want = ip->embd.size() * sizeof(uint16_t);
                 const size_t got = std::fread(ip->embd.data(), 1, want, rf);
                 std::fclose(rf);
                 if (got == want) {
                     ip->encoded = true;
-                    RAD_INFO("encoder: %zu row(s) taken from %s instead of the tower", 
-                             (size_t)ip->n_rows(), rp);
+                    RAD_INFO("encoder: %zu row(s) taken from %s instead of the tower",
+                             (size_t)ip->n_rows(), rows_ref);
                     continue;
                 }
-                RAD_ERR("encoder: %s holds %zu bytes, wanted %zu", rp, got, want);
+                RAD_ERR("encoder: %s holds %zu bytes, wanted %zu", rows_ref, got, want);
             }
         }
         if (dump_dir && *dump_dir) dump(*ip, ".pix.bf16", ip->pixels.data(), ip->pixels.size());
@@ -146,7 +147,11 @@ int Engine::run_encodes() {
                     if (!sep) seg_grid = g;
                 }
                 if (seg == first) {
-                    if (seg_grid == 0) seg_grid = it.seg_h(seg);   /* a lone oversized segment */
+                    /* Nothing of this item packed into the pass: its first segment did not fit
+                     * a pass that already has content (a segment larger than the whole pass was
+                     * refused above). `seg` addresses a real segment only below `it.n_seg`;
+                     * a degenerate zero-segment item leaves seg_grid alone. */
+                    if (seg_grid == 0 && seg < it.n_seg) seg_grid = it.seg_h(seg);
                     break;
                 }
                 parts.push_back({ &it, first, seg - first });

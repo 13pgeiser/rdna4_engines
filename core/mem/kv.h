@@ -271,7 +271,10 @@ public:
      *
      * A group that is not marked still accepts set_window() -- the caller then sizes the pool
      * itself, e.g. by declaring the group's window as the whole context -- and each sequence's
-     * capacity is checked at set_window()/ensure() against the blocks actually carved. */
+     * capacity is checked at set_window()/ensure() against the blocks actually carved. Once any
+     * group is marked, set_window() arms only marked groups: a plain fixed-window group beside a
+     * declared runtime window is refused, not silently converted (its pool is carved for the
+     * fixed window). */
     int declare_runtime_window(int32_t group, int64_t window_tokens);
 
     /* Give a sequence a runtime window with `visible_lo` (its prefill length, image tokens
@@ -281,7 +284,7 @@ public:
      * the reference is written linearly and no checkpoint can be reserved for it (a snapshot
      * would describe a window the sequence no longer has).
      *
-     * RAD_E_UNSUPPORTED  no windowed group;
+     * RAD_E_UNSUPPORTED  no windowed group, or the fixed/runtime-window mix above;
      * RAD_E_INVAL        a negative floor or a window of 0;
      * RAD_E_STATE        the sequence already holds tokens past the floor;
      * RAD_E_FULL         the reference plus the ring exceeds what this group carved. */

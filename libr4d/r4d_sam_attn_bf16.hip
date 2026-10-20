@@ -36,6 +36,11 @@ namespace {
 constexpr uint32_t kThreads = 128;
 constexpr float    kLog2e   = 1.4426950408889634f;
 
+/* Row loads stay scalar uint16: the operand contract allows any row pitch (the tower's q/k/v are
+ * column slices of one fused projection, and a tower may pad rows), so a 16-byte bf16x8 read
+ * would be misaligned for a pitch that is not a multiple of 8 elements. The register diet is the
+ * w-dot hoist below, not the load width. */
+
 /* q . row(d) of a rel_pos table as the reference resized it to `want` rows: linear interpolation
  * between the two source rows at align_corners=False's coordinate, clamped at the edges. With
  * rows == want the source is row d itself (f == 0), so the direct read is unchanged bit for bit. */
@@ -65,8 +70,88 @@ __device__ inline float tab_dot(const uint16_t* __restrict__ tab, int rows, int 
     return s;
 }
 
-template <int HD>
-__global__ __launch_bounds__(kThreads) void sam_attn_kernel(
+/* Eight bf16 of a q/k/v/out row as one 16-byte uint4. VEC is only instantiated when the caller
+ * proved every involved pointer is 16-byte aligned and every row pitch a multiple of 8 elements
+ * (launch_sam_attn); otherwise the scalar uint16 path below runs, because the operand contract
+ * allows any pitch (the tower's q/k/v are column slices and may carry a filler column). The
+ * element order is the scalar order, so both paths produce bit-identical dots. */
+__device__ inline void bf16x8_to_f32(uint4 u, float* f) {
+    const unsigned* w = (const unsigned*)&u;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        f[2 * i]     = bf16_to_f32((uint16_t)(w[i] & 0xffffu));
+        f[2 * i + 1] = bf16_to_f32((uint16_t)(w[i] >> 16));
+    }
+}
+
+template <bool VEC, int HD>
+__device__ inline void ld_row(const uint16_t* p, float* f) {
+    if (VEC) {
+        const uint4* u = (const uint4*)p;
+#pragma unroll
+        for (int c8 = 0; c8 < HD / 8; ++c8) bf16x8_to_f32(u[c8], f + c8 * 8);
+    } else {
+#pragma unroll
+        for (int c = 0; c < HD; ++c) f[c] = bf16_to_f32(p[c]);
+    }
+}
+
+template <bool VEC, int HD>
+__device__ inline void st_row(uint16_t* p, const float* f) {
+    if (VEC) {
+        uint4 u[HD / 8];
+        uint16_t* b = (uint16_t*)u;
+#pragma unroll
+        for (int c = 0; c < HD; ++c) b[c] = f32_to_bf16(f[c]);
+        uint4* o = (uint4*)p;
+#pragma unroll
+        for (int c8 = 0; c8 < HD / 8; ++c8) o[c8] = u[c8];
+    } else {
+#pragma unroll
+        for (int c = 0; c < HD; ++c) p[c] = f32_to_bf16(f[c]);
+    }
+}
+
+template <bool VEC, int HD>
+__device__ inline float dot_row(const uint16_t* p, const float* qf) {
+    float s = 0.0f;
+    if (VEC) {
+        const uint4* u = (const uint4*)p;
+#pragma unroll
+        for (int c8 = 0; c8 < HD / 8; ++c8) {
+            const unsigned* w = (const unsigned*)&u[c8];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                s += qf[c8 * 8 + 2 * i] * bf16_to_f32((uint16_t)(w[i] & 0xffffu));
+                s += qf[c8 * 8 + 2 * i + 1] * bf16_to_f32((uint16_t)(w[i] >> 16));
+            }
+        }
+    } else {
+#pragma unroll
+        for (int c = 0; c < HD; ++c) s += qf[c] * bf16_to_f32(p[c]);
+    }
+    return s;
+}
+
+template <bool VEC, int HD>
+__device__ inline void axpy_row(float* acc, const uint16_t* p, float pv) {
+    if (VEC) {
+        const uint4* u = (const uint4*)p;
+#pragma unroll
+        for (int c8 = 0; c8 < HD / 8; ++c8) {
+            float f8[8];
+            bf16x8_to_f32(u[c8], f8);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) acc[c8 * 8 + i] += pv * f8[i];
+        }
+    } else {
+#pragma unroll
+        for (int c = 0; c < HD; ++c) acc[c] += pv * bf16_to_f32(p[c]);
+    }
+}
+
+template <int HD, bool VEC>
+__device__ inline void sam_attn_body(
     const uint16_t* __restrict__ gq, const uint16_t* __restrict__ gk,
     const uint16_t* __restrict__ gv, uint16_t* __restrict__ go,
     const int* __restrict__ cu, const uint16_t* __restrict__ rh,
@@ -82,7 +167,18 @@ __global__ __launch_bounds__(kThreads) void sam_attn_kernel(
     const int seq  = b;
 
     const int s0 = cu[seq];
-    if (cu[seq + 1] - s0 != gh * gw) return;   // a segment is exactly one grid
+    if (cu[seq + 1] - s0 != gh * gw) {
+        // A segment that is not one grid is a tower bug, not a shape: the shim pre-checks the
+        // row count against the segment count, and this is the device-side guard. Write NaN over
+        // the segment's rows (the vit kernel's poison convention) so the corruption reaches the
+        // consumer -- a silent return would pass a garbage plane on as success.
+        const int n = cu[seq + 1] - s0;
+        for (int r = (int)threadIdx.x; r < n; r += (int)kThreads) {
+            uint16_t* op = go + (size_t)(s0 + r) * (size_t)o_ld + (size_t)head * HD;
+            for (int c = 0; c < HD; ++c) op[c] = (uint16_t)0x7fc0u;   // bf16 NaN, as vit poisons
+        }
+        return;
+    }
     const int keys = th * tw;
 
     for (int r = (int)threadIdx.x; r < keys; r += (int)kThreads) {
@@ -93,13 +189,21 @@ __global__ __launch_bounds__(kThreads) void sam_attn_kernel(
         const size_t qrow = (size_t)(s0 + ih * gw + iw);
         const uint16_t* qp = gq + qrow * (size_t)q_ld + (size_t)head * HD;
         float qf[HD];
-#pragma unroll
-        for (int c = 0; c < HD; ++c) qf[c] = bf16_to_f32(qp[c]);
+        ld_row<VEC, HD>(qp, qf);
 
         float acc[HD];
 #pragma unroll
         for (int c = 0; c < HD; ++c) acc[c] = 0.0f;
         float m = -INFINITY, l = 0.0f;
+
+        /* The w rel-pos dots depend on (lw, jw) only: computed once for the query row when the
+         * tile is narrow (the windowed tiles are 14 wide), recomputed per key otherwise (a
+         * whole-grid tile of 64 columns would cost more registers than the dots save). */
+        float wr[16];
+        const bool wr_hoist = tw <= 16;
+        if (wr_hoist)
+            for (int jw = 0; jw < tw; ++jw)
+                wr[jw] = tab_dot<HD>(rw, rw_rows, 2 * tw - 1, lw - jw + tw - 1, qf);
 
         for (int jh = 0; jh < th; ++jh) {
             const float hr = tab_dot<HD>(rh, rh_rows, 2 * th - 1, lh - jh + th - 1, qf);
@@ -107,7 +211,9 @@ __global__ __launch_bounds__(kThreads) void sam_attn_kernel(
             const int kh = ty * th + jh;
             const bool hreal = kh < gh;
             for (int jw = 0; jw < tw; ++jw) {
-                float s = hr + tab_dot<HD>(rw, rw_rows, 2 * tw - 1, lw - jw + tw - 1, qf);
+                float s = hr + (wr_hoist ? wr[jw]
+                                         : tab_dot<HD>(rw, rw_rows, 2 * tw - 1, lw - jw + tw - 1,
+                                                       qf));
 
                 const int kw = tx * tw + jw;
                 const bool real = hreal && kw < gw;
@@ -115,9 +221,7 @@ __global__ __launch_bounds__(kThreads) void sam_attn_kernel(
                 if (real) {
                     const size_t krow = (size_t)(s0 + kh * gw + kw);
                     const uint16_t* kp = gk + krow * (size_t)k_ld + (size_t)head * HD;
-                    float d = 0.0f;
-#pragma unroll
-                    for (int c = 0; c < HD; ++c) d += qf[c] * bf16_to_f32(kp[c]);
+                    const float d = dot_row<VEC, HD>(kp, qf);
                     s += scale * d;
                     vp = gv + krow * (size_t)v_ld + (size_t)head * HD;
                 }
@@ -132,18 +236,32 @@ __global__ __launch_bounds__(kThreads) void sam_attn_kernel(
                 }
                 const float p = ex2((s - m) * kLog2e);
                 l += p;
-                if (real) {
-#pragma unroll
-                    for (int c = 0; c < HD; ++c) acc[c] += p * bf16_to_f32(vp[c]);
-                }
+                if (real) axpy_row<VEC, HD>(acc, vp, p);
             }
         }
 
         const float inv = l > 0.0f ? 1.0f / l : 0.0f;
         uint16_t* op = go + qrow * (size_t)o_ld + (size_t)head * HD;
 #pragma unroll
-        for (int c = 0; c < HD; ++c) op[c] = f32_to_bf16(acc[c] * inv);
+        for (int c = 0; c < HD; ++c) acc[c] *= inv;
+        st_row<VEC, HD>(op, acc);
     }
+}
+
+template <int HD>
+__global__ __launch_bounds__(kThreads) void sam_attn_kernel(
+    const uint16_t* __restrict__ gq, const uint16_t* __restrict__ gk,
+    const uint16_t* __restrict__ gv, uint16_t* __restrict__ go,
+    const int* __restrict__ cu, const uint16_t* __restrict__ rh,
+    const uint16_t* __restrict__ rw, int rh_rows, int rw_rows,
+    int q_ld, int k_ld, int v_ld, int o_ld, int nhead, int gh, int gw, int th, int tw,
+    int nth, int ntw, int vec_rows, float scale) {
+    if (vec_rows)
+        sam_attn_body<HD, true>(gq, gk, gv, go, cu, rh, rw, rh_rows, rw_rows, q_ld, k_ld, v_ld,
+                                o_ld, nhead, gh, gw, th, tw, nth, ntw, scale);
+    else
+        sam_attn_body<HD, false>(gq, gk, gv, go, cu, rh, rw, rh_rows, rw_rows, q_ld, k_ld, v_ld,
+                                 o_ld, nhead, gh, gw, th, tw, nth, ntw, scale);
 }
 
 int launch_sam_attn(const uint16_t* q, const uint16_t* k, const uint16_t* v, uint16_t* o,
@@ -155,9 +273,16 @@ int launch_sam_attn(const uint16_t* q, const uint16_t* k, const uint16_t* v, uin
     const int nth = (gh + th - 1) / th, ntw = (gw + tw - 1) / tw;
     const size_t blocks = (size_t)nseq * nth * ntw * nhead;
     if (blocks == 0 || blocks > 0x7fffffff) return R4D_NO(RAD_E_SHAPE);
+    /* The 16-byte row loads are legal only when every q/k/v/out row starts on a 16-byte
+     * boundary: all four bases aligned, every row pitch a multiple of 8 bf16. The selftest's
+     * padded pitch and a slice with a filler column both fail this and take the scalar path. */
+    const uintptr_t addr_bits = (uintptr_t)q | (uintptr_t)k | (uintptr_t)v | (uintptr_t)o;
+    const bool vec_rows = (addr_bits & 15u) == 0 &&
+                          ((q_ld | k_ld | v_ld | o_ld) & 7) == 0;
     hipLaunchKernelGGL((sam_attn_kernel<64>), dim3((uint32_t)blocks), dim3(kThreads), 0,
                        (hipStream_t)stream, q, k, v, o, cu, rh, rw, rh_rows, rw_rows,
-                       q_ld, k_ld, v_ld, o_ld, nhead, gh, gw, th, tw, nth, ntw, scale);
+                       q_ld, k_ld, v_ld, o_ld, nhead, gh, gw, th, tw, nth, ntw,
+                       vec_rows ? 1 : 0, scale);
     return hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
 }
 
@@ -167,8 +292,10 @@ int launch_sam_attn(const uint16_t* q, const uint16_t* k, const uint16_t* v, uin
 //
 // The shim checks what the kernel assumes: bf16 operands, rank 2 with dense columns and any row
 // pitch (the tower's q/k/v are the three column slices of one fused projection), an i32 cu with one
-// entry a segment plus the terminator, tables of exactly 2*tile-1 rows, head_dim 64. The segment
-// lengths are the kernel's to check against cu (it cannot be read on the host at issue).
+// entry a segment plus the terminator, tables of exactly 2*tile-1 rows, head_dim 64. The shim
+// checks the row count against the segment count host-side; per-segment length is the kernel's to
+// check, and a malformed segment writes NaN over its rows (the vit kernel's poison convention)
+// so the corruption reaches the consumer instead of passing as success.
 
 #define R4D_NEED(x) do { const int _s = (x); if (_s != RAD_OK) return R4D_NO(_s); } while (0)
 
@@ -212,6 +339,10 @@ extern "C" int r4d_rad_sam_attn(const RadArgs* a, RadStream s) {
     if (cu->dtype != RAD_I32 || !r4d_contig(cu)) return R4D_NO(RAD_E_DTYPE);
     const long long nseq = r4d_numel(cu) - 1;
     if (nseq < 1) return R4D_NO(RAD_E_SHAPE);
+    /* The tower declares cu as one segment per grid, so the host-side row count pins the
+     * segment count. A mismatch is a malformed segment and fails at issue, not on the device
+     * (the kernel's per-segment guard poisons the visible rows for what this cannot see). */
+    if (qrows != nseq * gh * gw) return R4D_NO(RAD_E_SHAPE);
 
     // The tables: [2*tile-1, head_dim] when the geometry has its own, else the checkpoint's rows
     // (the 127-row global table at a 40 grid), resampled on read.

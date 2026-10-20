@@ -909,9 +909,12 @@ static int parse_sampling(const json& b, const OaiLimits& lim, OaiRequest* r, Ap
     i64 = r->sp.ngram_window;
     if (!get_any(b, { "ngram_window", "no_repeat_ngram_window_size" }, &i64, nullptr, err))
         return RAD_E_INVAL;
-    if (i64 > 131072) {
-        *err = err_bad("ngram_window", "must be at most 131072 tokens of history; 0 or less "
-                                       "searches the whole sequence");
+    if (i64 < 0 || i64 > 131072) {
+        /* The reference's negative window spelling belongs to generation_config, where it is
+         * normalized to 0; a request states the whole-sequence form as 0, matching the sampler's
+         * admission check (check_request refuses a negative window). */
+        *err = err_bad("ngram_window", "must be 0 (search the whole sequence) or a count of at "
+                                       "most 131072 history tokens");
         return RAD_E_INVAL;
     }
     r->sp.ngram_window = (int)i64;

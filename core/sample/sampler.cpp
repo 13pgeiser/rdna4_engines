@@ -943,10 +943,11 @@ int Sampler::build_greedy(int64_t n) {
     cur_stage_ = greedy_stage_;
     /* A drafter's rows run the argmax only, so the n-gram plane is cleared: `run` reads it from
      * the staging, and a stale pair from an earlier request's build must not issue the ban over
-     * history that was not staged this step. The exemption plane goes with it: cleared for the
-     * rows `run` would upload, so no build that does issue the ban reads a stale exemption. */
+     * history that was not staged this step. The exemption plane needs no clear: `run` uploads
+     * it only beside an issued ban, every row that runs the ban has its words rewritten in full
+     * by the build that staged the pair (build_step), and rows below a zeroed pair are skipped
+     * by the op before they read a word. */
     std::memset(ngram_stage_, 0, (size_t)cap * 2 * sizeof(int32_t));
-    std::memset(ngram_wl_stage_, 0, (size_t)n * mask_words_ * 4);
     if (greedy_ready_) return RAD_OK;
     for (int64_t i = 0; i < cap; ++i) {
         DeviceSampleParams& p = greedy_stage_[i];
@@ -977,6 +978,10 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
         any_penalty |= (p.flags & RAD_SP_PENALTY) != 0;
         any_dry     |= (p.flags & RAD_SP_DRY)     != 0;
         any_xtc     |= (p.flags & RAD_SP_XTC)     != 0;
+        /* The pair plane is read directly, not through cur_stage_: it is per-step staging the
+         * LAST builder filled (build_step writes a row's pair, build_greedy zeroes every pair),
+         * so it agrees with cur_stage_ by builder contract. A new builder must keep that
+         * contract: stage the pair with the params, zero it with the greedy ones. */
         any_ngram   |= ngram_stage_[2 * i] > 0;
         if (p.flags & RAD_SP_GREEDY) any_greedy = true;
         else {

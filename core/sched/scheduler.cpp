@@ -2157,7 +2157,10 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
          * so the host bounds it by all of them. A mid-prompt chunk verified nothing. */
         const int64_t vstart = (int64_t)e.ctx_len + e.n_tokens - 1 - e.n_spec;
         const int64_t head_max = vstart + e.n_spec;
-        bool can_draft = may_draft && e.produces_token;
+        /* A runtime-window (R-SWA) sequence is never drafted for: its rollback refuses (the ring
+         * rewrites slots KVManager::rollback cannot unwind), so a rejected draft would only warn
+         * and waste the draft compute. This is the gate kv.cpp's rollback comment states. */
+        bool can_draft = may_draft && e.produces_token && !kv_->has_runtime_window(r.id);
 
         /* Lookahead KV: round k writes the head's K and V at head + k - 1, past the committed end,
          * so blocks must exist up to the furthest head acceptance could leave. The next verify

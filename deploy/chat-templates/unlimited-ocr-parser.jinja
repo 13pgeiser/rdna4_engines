@@ -16,11 +16,23 @@
     {%- set ns.at = loop.index0 -%}
   {%- endif -%}
 {%- endfor -%}
-{%- if ns.last is not none and ns.last['content'] is string -%}
-  {%- for piece in ns.last['content'].split('<__media__>') -%}
-    {%- if not loop.last -%}{%- set ns.media = ns.media + 1 -%}{%- endif -%}
-    {%- if ((piece | replace('￼', '')) | trim) != '' -%}{%- set ns.text = true -%}{%- endif -%}
-  {%- endfor -%}
+{%- if ns.last is not none -%}
+  {%- if ns.last['content'] is string -%}
+    {%- for piece in ns.last['content'].split('<__media__>') -%}
+      {%- if not loop.last -%}{%- set ns.media = ns.media + 1 -%}{%- endif -%}
+      {%- if ((piece | replace('￼', '')) | trim) != '' -%}{%- set ns.text = true -%}{%- endif -%}
+    {%- endfor -%}
+  {%- else -%}
+    {#- The OpenAI parts form counts the same way: media from the marker parts, text from any
+        non-empty text part (a client's U+FFFC object placeholder is whitespace). -#}
+    {%- for part in ns.last['content'] -%}
+      {%- if part['type'] == 'media_marker' -%}
+        {%- set ns.media = ns.media + 1 -%}
+      {%- elif part['type'] == 'text' and ((part['text'] | default('', true) | replace('￼', '')) | trim) != '' -%}
+        {%- set ns.text = true -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
 {%- endif -%}
 {%- for message in messages -%}
   {%- set mi = loop.index0 -%}
@@ -41,7 +53,11 @@
     {%- endfor -%}
   {%- endif -%}
 {%- endfor -%}
-{%- if ns.last is not none and ns.last['content'] is string and not ns.text -%}
+{#- The instruction block serves both content forms: ns.media/ns.text above scanned the final
+    turn whichever it was. Output is whitespace-tight: every tag trims, the newline after
+    "Multi page parsing." is eaten by the next tag's `{%-`, and the rendered prompt ends with
+    the instruction verbatim -- keep the trims when reformatting this block. -#}
+{%- if ns.last is not none and not ns.text -%}
   {%- if ns.media > 1 -%}Multi page parsing.
   {%- elif ns.media == 1 -%}document parsing.
   {%- endif -%}

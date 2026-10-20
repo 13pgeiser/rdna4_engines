@@ -76,7 +76,7 @@ struct Model {
     /* the residual stream and the vocabulary edges */
     rad_buf b_x = 0, b_h = 0, b_hout = 0, b_logits = 0;
     /* attention */
-    rad_buf b_q = 0, b_k = 0, b_v = 0, b_attn = 0;
+    rad_buf b_qkv = 0, b_attn = 0;
     /* dense feed-forward (layer 0) */
     rad_buf b_gate_up = 0, b_ffn = 0;
     /* routing -- one row per token */
@@ -279,9 +279,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * serves. Prefix caching and speculation switch off for the group automatically (a runtime
      * window's KV before the prompt end is not reusable and a draft cannot know where the ring
      * starts). */
-    const int64_t win = rad_meta_geti(meta, "sliding_window_size", 0) > 0
-                            ? rad_meta_geti(meta, "sliding_window_size", 0)
-                            : rad_meta_geti(meta, "sliding_window", 0);
+    const int64_t sw_size = rad_meta_geti(meta, "sliding_window_size", 0);
+    const int64_t win = sw_size > 0 ? sw_size : rad_meta_geti(meta, "sliding_window", 0);
     RadKVGroupDecl fd{};
     fd.kind      = win > 0 ? RAD_KV_RING : RAD_KV_FULL;
     fd.dtype     = rad_kv_cache_dtype(ctx, RAD_BF16);
@@ -294,9 +293,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* ---- activation buffers. */
     m.b_x    = decl_b(b, nm.f("x"),      g.act_dtype, {g.max_tok, g.n_embd});
     m.b_h    = decl_b(b, nm.f("h"),      g.act_dtype, {g.max_tok, g.n_embd});
-    m.b_q    = decl_b(b, nm.f("attn_q"), g.act_dtype, {g.max_tok, g.q_dim()});
-    m.b_k    = decl_b(b, nm.f("attn_k"), g.act_dtype, {g.max_tok, g.kv_dim()});
-    m.b_v    = decl_b(b, nm.f("attn_v"), g.act_dtype, {g.max_tok, g.kv_dim()});
+    m.b_qkv  = decl_b(b, nm.f("attn_qkv"), g.act_dtype,
+                      {g.max_tok, g.q_dim() + 2 * g.kv_dim()});
     m.b_attn = decl_b(b, nm.f("attn_out"), g.act_dtype, {g.max_tok, g.q_dim()});
 
     m.b_gate_up = decl_b(b, nm.f("gate_up"), g.act_dtype, {g.max_tok, 2 * g.n_ff});
@@ -387,7 +385,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                      {m.b_x}, {m.b_x});
 
     AttnLlamaBF16::Wire aw{};
-    aw.x = m.b_x; aw.h = m.b_h; aw.q = m.b_q; aw.k = m.b_k; aw.v = m.b_v; aw.attn = m.b_attn;
+    aw.x = m.b_x; aw.h = m.b_h; aw.q = m.b_qkv; aw.k = m.b_qkv; aw.v = m.b_qkv;
+    aw.attn = m.b_attn;
 
     MlpBF16::Wire mw{};
     mw.x = m.b_x; mw.h = m.b_h; mw.gate_up = m.b_gate_up; mw.ffn = m.b_ffn;
@@ -474,8 +473,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     else
         rad_note(b, "R-SWA: the checkpoint states no sliding_window_size, so the KV group is a "
                     "plain full cache");
-    rad_note(b, "generation_config asks for SlidingWindowNoRepeatNgramProcessor n=35 -- the "
-                "plan's P5 sample_ngram_ban op; temp-0 parity checks run with it off");
+    /* Only when the container states the processor: gen-convert copies the checkpoint's
+     * generation_config into `generation.*`, so a checkpoint without it gets no note. */
+    const int64_t ng_n = rad_meta_geti(meta, "generation.no_repeat_ngram_size", 0);
+    if (ng_n > 0)
+        rad_note(b, "generation_config asks for SlidingWindowNoRepeatNgramProcessor n=%lld over "
+                    "the last %lld tokens -- served by the sample_ngram_ban stage, overridable "
+                    "per request (ngram_ban_n / ngram_window); temp-0 parity checks run with it off",
+                 (long long)ng_n,
+                 (long long)rad_meta_geti(meta, "generation.no_repeat_ngram_window_size", 0));
     return RAD_OK;
 }
 
@@ -540,6 +546,6 @@ static void step(RadCtx* c, const RadBatch* batch) {
 #ifndef RAD_ARCH_NO_EXPORTS
 RAD_ARCH_PLUGIN(unlimitedocr_bf16, "unlimitedocr", "", "0.1.0",
                 "baidu/Unlimited-OCR decoder: 12-layer Llama-MoE (64 experts top-6 + 2 shared), "
-                "bf16 weights and activations, full rotary MHA; text-only until the P2 vision "
-                "tower lands")
+                "bf16 weights and activations, full rotary MHA, with the DeepEncoder "
+                "(SAM ViT-B + CLIP ViT-L) vision tower")
 #endif

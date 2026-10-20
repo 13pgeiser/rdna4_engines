@@ -42,6 +42,10 @@ SamplingParams GenSampling::onto(SamplingParams base) const {
     return base;
 }
 
+/* The one-line statement of a served sampling configuration. The wording is pinned by
+ * gen_config_test.cpp (gen_config_reads_the_ngram_ban) -- change it there in the same change.
+ * It spells the values out for a log reader; `onto` fills the fields from defaults. The two
+ * share values, not logic, and the duplication of the ban clause is a string, not a rule. */
 std::string GenSampling::describe(const SamplingParams& sp) {
     char buf[320];
     std::snprintf(buf, sizeof buf, "temperature %.2f, top_k %d%s, top_p %.2f, min_p %.2f",
@@ -132,11 +136,14 @@ bool gen_sampling_parse(const std::string& json_text, const char* src, GenSampli
      * Values are warned about and dropped, like every other field here: an id is a vocabulary
      * coordinate, so a negative one is not a value at all. */
     it = j.find("no_repeat_ngram_whitelist");
-    if (it == j.end() || !it->is_array()) {
-        if (it != j.end())
+    if (it != j.end() && !it->is_array()) {
+        /* The legacy key is only a problem when nothing rescues it: a config that states a bad
+         * reference name beside a good sampler-spelled one reads the good one, silently. */
+        const auto own = j.find("ngram_whitelist");
+        if (own == j.end() || !own->is_array())
             RAD_WARN("%s states a no_repeat_ngram_whitelist that is not an array; ignoring it",
                      src);
-        it = j.find("ngram_whitelist");
+        it = own;
     }
     if (it != j.end() && it->is_array()) {
         for (const auto& v : *it) {

@@ -15,9 +15,11 @@
  *     the reference rotates the projections straight;
  *   * the rotary is FULL head_dim (rot = head_dim = 128) and NeoX-half (`rotate_half` in the
  *     reference), not partial, not mrope;
- *   * q, k and v are three [1280, 1280] projections kept as three GEMMs and three contiguous
- *     operands, exactly as rad_block_attn_gated.h argues: a fused [k|v] row is not expressible as
- *     an operand a head-wise reader can walk.
+ *   * q, k and v are three [1280, 1280] projections fused into ONE stacked-rows GEMM: the
+ *     rank-local q|k|v weight rows are staged once into a PERSIST plane, and q, k and v are
+ *     column views of one fused output plane (RadOperand::cols, abi/rad_runtime.h) that the
+ *     rope, kv_store and attention readers walk by row pitch -- the rad_block_attn_gated.h
+ *     argument against a fused [k|v] ROW no longer applies to the stacked-rows form.
  *
  * Everything the gated block gets right about paged KV is copied through unchanged: the attention
  * declared BEFORE the store so block_size derives from the resolved kernel, the ranged `q_len`
@@ -35,9 +37,10 @@ struct AttnLlamaBF16 {
     struct Wire {
         rad_buf x    = 0;   /* [max_tok, n_embd] the residual stream */
         rad_buf h    = 0;   /* [max_tok, n_embd] normed input, then the o output */
-        rad_buf q    = 0;   /* [max_tok, q_dim]   rotated */
-        rad_buf k    = 0;   /* [max_tok, kv_dim]  rotated */
-        rad_buf v    = 0;   /* [max_tok, kv_dim] */
+        rad_buf q    = 0;   /* [max_tok, q_dim + 2*kv_dim] fused q|k|v plane; q, k, v are the
+                             * column views [0, q_dim), [q_dim, q_dim+kv_dim), [q_dim+kv_dim, ...) */
+        rad_buf k    = 0;   /* the same plane: the rope/kv_store readers take the k columns */
+        rad_buf v    = 0;   /* the same plane: the v columns */
         rad_buf attn = 0;   /* [max_tok, q_dim] */
     };
 
@@ -55,8 +58,8 @@ struct AttnLlamaBF16 {
     rad_kvgroup kv    = 0;
     int64_t     n_rot = 0;
 
-    rad_weight w_norm = 0, w_q = 0, w_k = 0, w_v = 0, w_o = 0;
-    rad_op op_norm = 0, op_q = 0, op_k = 0, op_v = 0;
+    rad_weight w_norm = 0, w_qkv = 0, w_o = 0;
+    rad_op op_norm = 0, op_qkv = 0;
     rad_op op_rope_q = 0, op_rope_k = 0;
     rad_op op_attn = 0, op_kv_store = 0, op_o = 0, op_ar = 0, op_add = 0;
 
@@ -89,19 +92,18 @@ inline int AttnLlamaBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, in
     }
 
     RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_norm.weight", l), src.norm));
-    RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_q.weight", l),    src.q));
-    RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_k.weight", l),    src.k));
-    RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_v.weight", l),    src.v));
+    /* The convert-time q|k|v fusion, the gate_up form rad_block_mlp.h states: one weight, one
+     * GEMM, one movement unit; `row_parts` keeps the row-shard on q_local|k_local|v_local
+     * boundaries so the column views stay exact per rank. */
+    RAD_ARCH_TRY(map_concat(b, nm.f("blk.%d.attn_qkv.weight", l), { src.q, src.k, src.v }, 0));
     RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_output.weight", l), src.o));
 
     w_norm = decl_w(b, nm.f("blk.%d.attn_norm.weight", l),    RAD_F32,  {g.n_embd},
                     RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
-    w_q    = decl_w(b, nm.f("blk.%d.attn_q.weight", l),       RAD_BF16, {q_dim, g.n_embd},
-                    RAD_ACCESS_PER_TOKEN, RAD_SHARD_ROW,  grp_layer(l));
-    w_k    = decl_w(b, nm.f("blk.%d.attn_k.weight", l),       RAD_BF16, {kv_dim, g.n_embd},
-                    RAD_ACCESS_PER_TOKEN, RAD_SHARD_ROW,  grp_layer(l));
-    w_v    = decl_w(b, nm.f("blk.%d.attn_v.weight", l),       RAD_BF16, {kv_dim, g.n_embd},
-                    RAD_ACCESS_PER_TOKEN, RAD_SHARD_ROW,  grp_layer(l));
+    w_qkv  = decl_w(b, nm.f("blk.%d.attn_qkv.weight", l),     RAD_BF16,
+                    {q_dim + 2 * kv_dim, g.n_embd},
+                    RAD_ACCESS_PER_TOKEN, RAD_SHARD_ROW,  grp_layer(l), 0,
+                    {q_dim, kv_dim, kv_dim});
     w_o    = decl_w(b, nm.f("blk.%d.attn_output.weight", l),  RAD_BF16, {g.n_embd, q_dim},
                     RAD_ACCESS_PER_TOKEN, RAD_SHARD_COL,  grp_layer(l));
 
@@ -112,21 +114,14 @@ inline int AttnLlamaBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, in
                      RAD_WEIGHTS(w_norm)),
                  {w.x}, {w.h});
 
-    op_q = rw(b, RAD_OP(b, "gemm_nt",
-                  RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", q_dim),
-                             RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
-                  RAD_WEIGHTS(w_q)),
-              {w.h}, {w.q});
-    op_k = rw(b, RAD_OP(b, "gemm_nt",
-                  RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", kv_dim),
-                             RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
-                  RAD_WEIGHTS(w_k)),
-              {w.h}, {w.k});
-    op_v = rw(b, RAD_OP(b, "gemm_nt",
-                  RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", kv_dim),
-                             RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
-                  RAD_WEIGHTS(w_v)),
-              {w.h}, {w.v});
+    /* One GEMM over the fused [q|k|v] rows: N = q_dim + 2*kv_dim, the readers below take the
+     * q, k and v column views of `w.q`. Same K, same per-column tile as the three-GEMM form,
+     * so the bf16 outputs are bit-identical; the win is one launch, not arithmetic. */
+    op_qkv = rw(b, RAD_OP(b, "gemm_nt",
+                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", q_dim + 2 * kv_dim),
+                               RAD_INT("K", g.n_embd), RAD_STR("dtype", g.dtype)),
+                    RAD_WEIGHTS(w_qkv)),
+                {w.h}, {w.q});
 
     /* Full-head rotary, NeoX halves: the reference's rotate_half. The q call names n_head query
      * heads and no kv heads (the buffers are separate); the k call names the kv heads. */
@@ -136,8 +131,9 @@ inline int AttnLlamaBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, in
                    {w.k}, {w.k});
 
     /* Declared before kv_store so block_size derives from the resolved attention kernel (spec
-     * §7.2), pinned to RAD_KV_BLOCK for the same reason rad_arch.h states. P1 serves the plain
-     * causal rule; the R-SWA window is P4 and re-declares this op with its own rule. */
+     * §7.2), pinned to RAD_KV_BLOCK for the same reason rad_arch.h states. This op keeps the
+     * plain causal rule through the R-SWA ring: the ring's visible set is the block table's
+     * job (the runtime window prunes the table, not the kernel), so no re-declaration. */
     op_attn = rw(b, RAD_OP(b, "attn_paged",
                      RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
                                 RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1),
@@ -191,18 +187,20 @@ inline void AttnLlamaBF16::step(RadCtx* c, const RadBatch* batch) const {
     const int64_t T = batch->n_tok;
 
     RAD_ISSUE(c, op_norm, brows(w.x, T), RAD_W(w_norm), brows(w.h, T));
-    RAD_ISSUE(c, op_q,    brows(w.h, T), RAD_W(w_q),    brows(w.q, T));
-    RAD_ISSUE(c, op_k,    brows(w.h, T), RAD_W(w_k),    brows(w.k, T));
-    RAD_ISSUE(c, op_v,    brows(w.h, T), RAD_W(w_v),    brows(w.v, T));
+    RAD_ISSUE(c, op_qkv,   brows(w.h, T), RAD_W(w_qkv),   brows(w.q, T));
 
-    RAD_ISSUE(c, op_rope_q, brows(w.q, T), rope_posmc(g, batch, T));
-    RAD_ISSUE(c, op_rope_k, brows(w.k, T), rope_posmc(g, batch, T));
+    /* q, k and v are column views of the fused plane, walked by its row pitch: the rope,
+     * kv_store and attention kernels take the slice's pitch (r4d_rows_pitch). */
+    RAD_ISSUE(c, op_rope_q, bcol(w.q, 0, g.q_dim(), T), rope_posmc(g, batch, T));
+    RAD_ISSUE(c, op_rope_k, bcol(w.q, g.q_dim(), g.kv_dim(), T), rope_posmc(g, batch, T));
 
     RAD_ISSUE(c, op_kv_store,
-              brows(w.k, T), brows(w.v, T), praw(slot, RAD_I32, T), kv_cache(kv, layer));
+              bcol(w.q, g.q_dim(), g.kv_dim(), T),
+              bcol(w.q, g.q_dim() + g.kv_dim(), g.kv_dim(), T),
+              praw(slot, RAD_I32, T), kv_cache(kv, layer));
 
     RAD_ISSUE_N(c, op_attn, batch->max_q_len,
-                brows(w.q, T), kv_cache(kv, layer),
+                bcol(w.q, 0, g.q_dim(), T), kv_cache(kv, layer),
                 praw2(table, RAD_I32, batch->n_seq, kvb ? kvb->block_table_pitch : 0),
                 praw(used, RAD_I32, batch->n_seq),
                 RAD_NONE, RAD_NONE,

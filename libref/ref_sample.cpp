@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <unordered_map>
+#include <vector>
 
 using namespace ref;
 
@@ -315,13 +316,17 @@ int ref_sample_ngram_ban(const RadArgs* a, RadStream) {
             const uint32_t word = (uint32_t)ld_int(wl->dtype, wl->data, wb + (col / 32) * ws);
             return ((word >> (uint32_t)(col % 32)) & 1u) != 0u;
         };
-        /* n == 1 bans every token in the window: the prefix is empty, as in the reference. */
+        /* n == 1 bans every token in the window: the prefix is empty, as in the reference.
+         * The prefix is read once, not per search position: it is the same n-1 tokens
+         * compared at every idx, and the row's history is short (the staged span). */
         const int64_t plen = n - 1, p0 = hl - plen;
+        std::vector<int64_t> pref((size_t)plen);
+        for (int64_t j = 0; j < plen; ++j) pref[(size_t)j] = tok_at(p0 + j);
 
         for (int64_t idx = search_start; idx < search_end; ++idx) {
             bool match = true;
             for (int64_t j = 0; j < plen; ++j) {
-                if (tok_at(idx + j) != tok_at(p0 + j)) { match = false; break; }
+                if (tok_at(idx + j) != pref[(size_t)j]) { match = false; break; }
             }
             if (!match) continue;
             const int64_t tok = tok_at(idx + plen);

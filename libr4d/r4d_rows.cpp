@@ -2694,7 +2694,8 @@ static const RadOpSchema kSchemas[] = {
            "op, not gelu, because gated feed-forwards are trained with the tanh form and the "
            "unary gelu is the exact erf one."),
     SCHEMA("act_mul", pActMul, oBinary,
-           "y = act(a) * b, the activation (silu, gelu, gelu_tanh) rounded to y's dtype before "
+           "y = act(a) * b, the activation (silu, gelu, gelu_tanh, sigmoid or quick_gelu) rounded "
+           "to y's dtype before "
            "the product: silu_mul with its two halves in two operands."),
     SCHEMA("seg_mean", pSegMean, oSegMean,
            "Row s of y is the mean of x's rows [cu_seqlens[s], cu_seqlens[s+1]), summed in f64 "
@@ -3797,9 +3798,8 @@ static const RadConstraint cAttnDecodeH128G1Fp8[] = {
 static const RadConstraint cAttnDecodeH128G1Bf16[] = {
     C_EQ("window", 0), C_EQ("head_dim", 128), C_EQ("gqa", 1), C_EQ("block_size", 16),
     C_GE("causal", 0), C_LE("q_len", 64), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
-};/* KEY RENAME. libr4d writes C_IN("q_dtype","bf16") and C_IN("kv_dtype","bf16"); docs/OPS.md's
- * `attn_dense` has one `dtype` because nothing about a dense bf16 tower is mixed-precision. The
- * predicate -- "bf16, and nothing else" -- is unchanged. */
+};
+
 /* Two queries per KV head at head_dim 128 (Qwen3-1.7B, Qwen3-ASR's decoder): the gqa8 pair's
  * constraints with the ratio and the decode verify width changed together. A decode workgroup
  * holds 64 (query, head) rows, so q_len <= 32 at gqa 2. */
@@ -3862,6 +3862,9 @@ static const RadConstraint cCastNarrow[] = {
  * bidirectional with any window, or a text encoder's causal prompt. gqa 1 at 256 and 512 is
  * attn_dense_small_h256's and the wide kernel's. */
 /* Causal or not at head_dim 64: a vision tower's heads, and a codec's sliding causal layers. */
+/* KEY RENAME. libr4d writes C_IN("q_dtype","bf16") and C_IN("kv_dtype","bf16"); docs/OPS.md's
+ * `attn_dense` has one `dtype` because nothing about a dense bf16 tower is mixed-precision. The
+ * predicate -- "bf16, and nothing else" -- is unchanged. */
 static const RadConstraint cAttnDenseH64[] = {
     C_EQ("head_dim", 64), C_EQ("gqa", 1), C_IN("dtype", "bf16"),
 };

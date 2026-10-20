@@ -2,6 +2,7 @@
 #include "mem/kv.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cstring>
 
 namespace rad {
@@ -352,7 +353,12 @@ int KVManager::declare_runtime_window(int32_t g, int64_t window_tokens) {
     }
     runtime_decl_[g] = window_tokens;
     /* A plan built before the declaration (the engine's probes, or plan_groups() then declare)
-     * is updated in place; the next plan_groups() picks the declaration up on its own. */
+     * is updated in place; the next plan_groups() picks the declaration up on its own.
+     *
+     * A plan set shorter than `g` returns RAD_E_INVAL below with this store kept: deliberate.
+     * The declaration is the caller's standing intent (it survives forget(), whose vectors are
+     * emptied together and are not this map), and the short plan set is the probe ordering the
+     * declaration exists for -- the next plan_groups() applies it to a plan that has the group. */
     if (!plans_.empty()) {
         if (g >= (int32_t)plans_.size()) return RAD_E_INVAL;
         KVGroupPlan& q = plans_[(size_t)g];
@@ -364,6 +370,10 @@ int KVManager::declare_runtime_window(int32_t g, int64_t window_tokens) {
         fixed_ += align_up(max_seqs_ * q.ring_blocks_max() * q.bytes_per_block, RAD_ALIGN_UNIT);
         if (counted) {
             const int64_t was = q.window_blocks * q.bytes_per_block;
+            /* The plan counted this group's snapshot section, so both totals carry `was`.
+             * Saturating hides an accounting bug; surface it in debug builds. */
+            assert(window_ck_bytes_ >= was && checkpoint_bytes_ >= was &&
+                   "runtime window: snapshot byte totals below the section being removed");
             window_ck_bytes_ = window_ck_bytes_ > was ? window_ck_bytes_ - was : 0;
             checkpoint_bytes_ = checkpoint_bytes_ > was ? checkpoint_bytes_ - was : 0;
         }
@@ -975,6 +985,8 @@ int KVManager::preempt(uint64_t id) {
         for (int32_t b : s->blocks[g]) drop_block((int32_t)g, b);
         s->blocks[g].clear();
         s->first_block_pos[g] = 0;
+        /* The runtime window goes with the blocks: re-admission re-arms it at the prompt end
+         * (the scheduler's admission path calls set_window again before the KV grows). */
         s->win[g] = SeqWindow{};
         s->dirty_from[g] = 0;
         /* The recurrent state goes too (see preempt in kv.h, spec §7.1). */
@@ -994,8 +1006,9 @@ int KVManager::rollback(uint64_t id, int64_t n_tokens) {
     /* Nothing to free; RAD_OK so "every draft accepted" needs no special path in the caller. */
     if (n_tokens >= s->n_tokens) return RAD_OK;
     /* A runtime-windowed sequence unwinds nothing: the ring's slots are reused once it is full,
-     * so the slots a rejected verify wrote may already hold newer keys. Speculation stays off for
-     * these requests (the scheduler never drafts for them); this refuses rather than corrupt. */
+     * so the slots a rejected verify wrote may already hold newer keys. The scheduler gates
+     * drafting on has_runtime_window, so this refuses rather than corrupts, and only a caller
+     * that drafts beside a runtime window can reach it. */
     for (const SeqWindow& w : s->win)
         if (w.set) return RAD_E_UNSUPPORTED;
 
@@ -1042,9 +1055,22 @@ int KVManager::set_window(uint64_t id, int64_t visible_lo, int64_t window_tokens
         return RAD_E_STATE;
     }
     bool any = false;
+    /* With a declared runtime window in the program, arm exactly the declared groups: a plain
+     * fixed-window group beside them is carved for its fixed window, and arming it silently
+     * converts it. With none declared this is the caller-sizes-the-pool path kv.h states, and
+     * every windowed group arms as before. */
+    bool declared = false;
+    for (const KVGroupPlan& p : plans_)
+        if (p.kind == RAD_KV_WINDOW && p.runtime_win) declared = true;
     for (size_t g = 0; g < plans_.size(); ++g) {
         const KVGroupPlan& p = plans_[g];
         if (p.kind != RAD_KV_WINDOW) continue;
+        if (declared && !p.runtime_win) {
+            RAD_ERR("sequence %llu: set_window meets fixed-window group '%s' beside a declared "
+                    "runtime window; its pool is carved for its fixed window and the mix is not "
+                    "supported", (unsigned long long)id, p.name.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
         SeqWindow w;
         w.set        = true;
         w.window     = window_tokens;

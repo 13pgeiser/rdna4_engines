@@ -273,7 +273,8 @@ weight.
 **`act_mul`** is `silu_mul` with its halves in two operands, so the multiplier can be any tensor:
 two column slices of a fused `gate_up`, or a gate and a separate per-layer input (EmbeddingGemma 2's
 per-layer-embedding block multiplies `gelu_tanh(gate(x))` by one). `act` is `silu`, `gelu` (exact
-erf), `gelu_tanh` or `sigmoid` (a GLU: `a` the gate half, `b` the value half). The activation is
+erf), `gelu_tanh`, `sigmoid` (a GLU: `a` the gate half, `b` the value half) or `quick_gelu`
+(`sigmoid` of the bf16-rounded `1.702 a`, the CLIP tower's fused form). The activation is
 rounded to `y`'s dtype before the product, as the unfused pair stores it.
 
 **`seg_mean`** is mean pooling over a ragged batch: row `s` of `y` is the mean of `x`'s rows

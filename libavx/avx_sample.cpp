@@ -29,6 +29,7 @@
 #include "rad_sample.h"
 
 #include <cfloat>
+#include <vector>
 
 using namespace avx;
 
@@ -287,11 +288,14 @@ AVX_KERNEL(sample_ngram_ban) {
             return ((word >> (uint32_t)(col % 32)) & 1u) != 0u;
         };
         const int64_t plen = n - 1, p0 = hl - plen;
+        /* The prefix is the same n-1 tokens compared at every search position: read once. */
+        std::vector<int64_t> pref((size_t)plen);
+        for (int64_t j = 0; j < plen; ++j) pref[(size_t)j] = tok_at(p0 + j);
 
         for (int64_t idx = search_start; idx < search_end; ++idx) {
             bool match = true;
             for (int64_t j = 0; j < plen; ++j) {
-                if (tok_at(idx + j) != tok_at(p0 + j)) { match = false; break; }
+                if (tok_at(idx + j) != pref[(size_t)j]) { match = false; break; }
             }
             if (!match) continue;
             const int64_t tok = tok_at(idx + plen);

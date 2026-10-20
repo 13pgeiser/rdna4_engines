@@ -6,6 +6,7 @@
 #include "device/device.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cstring>
 #include <cstdlib>
 
@@ -689,6 +690,11 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
         }
 
         int64_t t = 0;
+        /* The group's ring block count, read off the first armed sequence: declare_runtime_window
+         * fixes one W per group, so every armed sequence computes the same count. Collected here,
+         * with the table walk that already opens each window, so the group header below needs no
+         * second pass over the plan. */
+        int32_t ring_blocks = 0;
         for (int64_t i = 0; i < n_seq; ++i) {
             const StepEntry& e = plan.e[(size_t)i];
 
@@ -703,6 +709,10 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
                 const std::vector<int32_t>& bt = kv.block_table(e.seq, (int32_t)gi);
                 first = kv.first_block_pos(e.seq, (int32_t)gi);
                 has_win = kv.runtime_window(e.seq, (int32_t)gi, &win);
+                if (has_win) {
+                    assert(!ring_blocks || ring_blocks == (int32_t)win.ring_blocks);
+                    ring_blocks = (int32_t)win.ring_blocks;
+                }
                 bt_len = (int64_t)bt.size();
                 table_end = bt_len * L.block_size;
                 for (int32_t j = 0; j < e.n_tokens; ++j) {
@@ -803,20 +813,12 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
             /* The runtime window (KVManager::set_window): the advance runs after this build and
              * overwrites `used` and the slots, so it must reproduce the ring's mapping rather
              * than the linear one (advance_impl.h). The floor and table length are per sequence
-             * (s.h_rpos / s.h_tlen), the ring's block count is the group's W. */
-            a.ring        = 0;
-            a.ring_blocks = 0;
+             * (s.h_rpos / s.h_tlen), the ring's block count is the group's W, collected with the
+             * table walk above. */
+            a.ring        = ring_blocks ? 1 : 0;
+            a.ring_blocks = ring_blocks;
             a.rpos_off    = (const char*)s.d_rpos - d0;
             a.tlen_off    = (const char*)s.d_tlen - d0;
-            for (int64_t i = 0; i < n_seq; ++i) {
-                const StepEntry& e = plan.e[(size_t)i];
-                SeqWindow w;
-                if (kv.runtime_window(e.seq, (int32_t)gi, &w)) {
-                    a.ring        = 1;
-                    a.ring_blocks = (int32_t)w.ring_blocks;
-                    break;
-                }
-            }
         }
 
         for (size_t r = 0; r < ranks_.size(); ++r) {

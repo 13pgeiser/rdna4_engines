@@ -1733,14 +1733,17 @@ TEST(unlimitedocr_runs_follow_the_reference_layout) {
  * antialias=True) on CPU fp32 (tests/resample_golden.py), so this pins the load-time position
  * table number for number: a resample off by a row or a tap serves a slightly shifted picture. */
 TEST(unlimitedocr_bicubic_antialias_resample_is_the_reference) {
+    uocr_golden::Golden gd;
+    std::string gerr;
+    if (!uocr_golden::load(&gd, &gerr)) ARTIFACT_MISSING(gerr);
     const int CH = 3;
     double worst_abs = 0.0, worst_rel = 0.0;
-    for (int k = 0; k < kResampleCases; ++k) {
-        const int ih = kResampleGeo[k][0], iw = kResampleGeo[k][1];
-        const int oh = kResampleGeo[k][2], ow = kResampleGeo[k][3];
+    for (int k = 0; k < gd.n_cases; ++k) {
+        const int ih = gd.geo[k][0], iw = gd.geo[k][1];
+        const int oh = gd.geo[k][2], ow = gd.geo[k][3];
         std::vector<float> out((size_t)oh * ow * CH);
-        rad::arch::resample_bicubic_aa(kResampleIn[k], ih, iw, oh, ow, CH, out.data());
-        const float* want = kResampleOut[k];
+        rad::arch::resample_bicubic_aa(gd.in[k].data(), ih, iw, oh, ow, CH, out.data());
+        const float* want = gd.out[k].data();
         double a = 0.0, r = 0.0;
         for (size_t i = 0; i < out.size(); ++i) {
             const double d = std::fabs((double)out[i] - (double)want[i]);
@@ -1782,18 +1785,17 @@ TEST(unlimitedocr_bicubic_antialias_resample_is_the_reference) {
 
     size_t sam_mism = 0;
     double sam_abs = 0.0;
-    bf16_case(kSamSrc, (int)kSamSrcDim[0], (int)kSamSrcDim[1], (int)kSamOutDim[0],
-              (int)kSamOutDim[1], (int)kSamSrcDim[2], kSamOut, 0, "sam 64->40 bf16", &sam_mism,
-              &sam_abs);
+    bf16_case(gd.sam_src.data(), 64, 64, 40, 40, 768, gd.sam_out.data(), 0, "sam 64->40 bf16",
+              &sam_mism, &sam_abs);
 
     /* CLIP: rows 1: as a 16x16 grid resampled to 10x10; the cls row (index 0) passes through in
      * front, so the golden's grid starts one channel-vector in. */
     size_t clip_mism = 0;
     double clip_abs = 0.0;
     {
-        const int CW = (int)kClipSrcDim[1];
-        const uint16_t* grid_bits = kClipSrc + CW;   /* skip the cls row */
-        bf16_case(grid_bits, 16, 16, 10, 10, CW, kClipOut, (size_t)CW, "clip 16->10 bf16",
+        const int CW = 1024;
+        const uint16_t* grid_bits = gd.clip_src.data() + CW;   /* skip the cls row */
+        bf16_case(grid_bits, 16, 16, 10, 10, CW, gd.clip_out.data(), (size_t)CW, "clip 16->10 bf16",
                   &clip_mism, &clip_abs);
     }
     /* The bf16 tables are a report, not a gate: bf16 carries ~3 decimal digits, so a last-bit

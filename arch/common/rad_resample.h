@@ -79,6 +79,10 @@ inline Axis make_axis(int in, int out) {
         if (xsize > in) xsize = in;
         xsize -= xmin;
         if (xsize < 0) xsize = 0;
+        /* ATen's own `xsize = min(xsize, n)`, kept for parity. It cannot bind here: with
+         * xmin > 0 the window spans 2*support + 1 taps, at most a.n = 2*ceil(support) + 1
+         * (the bound ATen sized the slots from), and with xmin == 0 it spans fewer. So the
+         * clamp is a no-op safety net, never a silent tap truncation. */
         if (xsize > a.n) xsize = a.n;
         int* idx = &a.idx[(size_t)i * (size_t)a.n];
         float* w = &a.w[(size_t)i * (size_t)a.n];

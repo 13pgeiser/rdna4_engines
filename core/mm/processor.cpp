@@ -485,7 +485,13 @@ int coeffs(int32_t in_size, int32_t out_size, std::vector<int32_t>* bounds,
 /* One pass over an axis. `horizontal` reads rows [y0, y0 + rows) of `src` and writes w columns;
  * `vertical` reads rows from `shift` on and writes h rows. Both accumulate in fixed point and
  * round each output to eight bits, as Pillow does -- the intermediate's rounding is part of the
- * function. */
+ * function.
+ *
+ * Perf note (review UNLIMITED-OCR-REVIEW, P med): these are scalar per-channel loops on a hot
+ * preprocessing path. The int32 fixed-point accumulation is order-stable per tap, so an AVX2
+ * implementation (stride-3 deinterleave + 8-lane int dot, in the libavx leg like the other
+ * bit-safe offloads) is bit-safe and pinned by the resample goldens -- a deliberate follow-up
+ * task, not a drive-by. The scalar order must not change. */
 static void pass_horizontal(const Frame& src, int32_t y0, int32_t rows, int32_t w,
                             const std::vector<int32_t>& bh, const std::vector<int32_t>& kh,
                             int32_t ksh, int prec, Frame* out) {
@@ -829,17 +835,34 @@ void lfm2_grid(int64_t h, int64_t w, int32_t min_tiles, int32_t max_tiles, int32
  * its `sorted(set(...), key=area)` visits after their wide transpose -- the order CPython's set
  * has for the 2..32-tile range the checkpoint states. It comes from the reference itself
  * (tests/mkuocrgolden.py dumps it); outside that range the wide side is taken as last. */
+static constexpr int8_t kTallLast[][2] = {
+    {1, 3},  {1, 4},  {1, 5},  {1, 6},  {1, 7},  {1, 9},  {1, 13}, {1, 14},
+    {1, 16}, {1, 18}, {1, 20}, {1, 22}, {1, 27}, {1, 29}, {2, 3},  {2, 4},
+    {2, 5},  {2, 6},  {2, 7},  {2, 8},  {2, 9},  {2, 14}, {2, 15}, {2, 16},
+    {3, 5},  {3, 7},  {3, 9},  {4, 5},  {4, 6},  {4, 7},  {4, 8},
+};
 bool uocr_tall_last(int32_t c, int32_t r) {
-    static const int8_t kTallLast[][2] = {
-        {1, 3},  {1, 4},  {1, 5},  {1, 6},  {1, 7},  {1, 9},  {1, 13}, {1, 14},
-        {1, 16}, {1, 18}, {1, 20}, {1, 22}, {1, 27}, {1, 29}, {2, 3},  {2, 4},
-        {2, 5},  {2, 6},  {2, 7},  {2, 8},  {2, 9},  {2, 14}, {2, 15}, {2, 16},
-        {3, 5},  {3, 7},  {3, 9},  {4, 5},  {4, 6},  {4, 7},  {4, 8},
-    };
     for (const auto& p : kTallLast)
         if (p[0] == c && p[1] == r) return true;
     return false;
 }
+
+/* One n defers at most its divisor pairs with c < n/c, at most the divisors below its square
+ * root. Over the 2..32-tile range the checkpoints state the table is built for, no n defers
+ * more than this; uocr_grid's deferred buffer is sized from it and the static_assert below
+ * keeps the bound checked against the table, not empirical. */
+static constexpr int32_t deferred_pairs_max(int32_t max_n) {
+    int32_t best = 0;
+    for (int32_t n = 2; n <= max_n; ++n) {
+        int32_t cnt = 0;
+        for (const auto& p : kTallLast)
+            if (p[0] < p[1] && (int32_t)p[0] * (int32_t)p[1] == n) ++cnt;
+        if (cnt > best) best = cnt;
+    }
+    return best;
+}
+static_assert(deferred_pairs_max(32) <= 8,
+              "uocr_grid's 8-slot deferred buffer must cover the stated 2..32 tile range");
 
 void uocr_grid(int64_t h, int64_t w, int32_t min_tiles, int32_t max_tiles, int32_t tile,
                int32_t* cols, int32_t* rows) {
@@ -863,6 +886,9 @@ void uocr_grid(int64_t h, int64_t w, int32_t min_tiles, int32_t max_tiles, int32
         for (int32_t c = 1; c <= n; ++c) {
             if (n % c) continue;
             if (c < n / c && uocr_tall_last(c, n / c)) {
+                /* Defensive: the static_assert proves 8 covers the stated 2..32 range. Beyond
+                 * it the reference's tie order is not guaranteed, and a drop is a last resort
+                 * against overflow, not a designed path. */
                 if (n_deferred < 8) deferred[n_deferred++] = c;
                 continue;
             }
@@ -1075,6 +1101,9 @@ int Processor::image_unlimitedocr(const Frame& f, const ImageMode& mode,
     if (crop) {
         pad_bicubic(f, base_size, base_size, 127, &global);
     } else if (image_size <= c.tile) {
+        /* The reference's multi-page path squares the page first, so a non-square page is
+         * aspect-distorted by this resize, and the pad below is a no-op by construction (the
+         * square already is the pad target). Square-first kept for reference parity. */
         Frame sq;
         resize_bicubic(f, image_size, image_size, &sq);
         pad_bicubic(sq, image_size, image_size, 127, &global);
@@ -1106,8 +1135,8 @@ int Processor::image_unlimitedocr(const Frame& f, const ImageMode& mode,
     /* One segment of `gh` x `gw` patches from (x0, y0) of `src`, of which the first `real_w`
      * patches a row carry pixels; the rest are the newline column. */
     auto append = [&](const Frame& src, int32_t x0, int32_t y0, int32_t gh, int32_t gw,
-                      int32_t real_w) {
-        it->segments.push_back({ gh, gw, it->n_patch, real_w == 0 });
+                      int32_t real_w, bool sep = false) {
+        it->segments.push_back({ gh, gw, it->n_patch, sep });
         it->seg_at.push_back((int32_t)seg_row);
         it->expand.insert(it->expand.end(), (size_t)(gh / M) * (size_t)(gw / M), c.tok_image);
         seg_row += (int64_t)(gh / M) * (gw / M);
@@ -1149,7 +1178,7 @@ int Processor::image_unlimitedocr(const Frame& f, const ImageMode& mode,
     }
     append(global, 0, 0, g, g + 4, g);
     /* The view separator: one output row, from a grid of exactly one merged cell and no pixels. */
-    append(global, 0, 0, M, M, 0);
+    append(global, 0, 0, M, M, 0, /*sep=*/true);
 
     it->n_seg = (int32_t)it->segments.size();
     it->grid_t = 1;

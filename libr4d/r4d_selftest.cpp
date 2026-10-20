@@ -18984,10 +18984,12 @@ static void sam_attn_case(const Plugin& pl) {
     if (!r) { ok(what, false, "row absent"); return; }
 
     /* tab_rows 0 means "2*tile-1, no resize". The third geometry is the production 40-grid global
-     * block: the checkpoint's 127-row tables serve the 79 rows that block wants. */
-    struct Geo { int64_t gh, gw, win, nh, hd, nseq, tab_rows; };
-    const Geo geos[3] = { { 16, 16, 14, 2, 64, 2, 0 }, { 16, 16, 0, 2, 64, 1, 0 },
-                          { 40, 40, 0, 2, 64, 1, 127 } };
+     * block: the checkpoint's 127-row tables serve the 79 rows that block wants. `pad` is the
+     * filler column in front of the row: 1 exercises any-pitch (scalar) rows, 0 a 16-byte-aligned
+     * dense pitch, which is what the kernel's uint4 row-load path requires -- both must agree. */
+    struct Geo { int64_t gh, gw, win, nh, hd, nseq, tab_rows, pad; };
+    const Geo geos[4] = { { 16, 16, 14, 2, 64, 2, 0, 1 }, { 16, 16, 14, 2, 64, 2, 0, 0 },
+                          { 16, 16, 0, 2, 64, 1, 0, 1 }, { 40, 40, 0, 2, 64, 1, 127, 1 } };
     int64_t checked = 0, bad_total = 0;
     float worst = 0.0f;
 
@@ -18995,8 +18997,9 @@ static void sam_attn_case(const Plugin& pl) {
         const int64_t W = g.nh * g.hd, R = g.gh * g.gw, M = g.nseq * R;
         const int64_t want = 2 * (g.win > 0 ? g.win : (g.gh > g.gw ? g.gh : g.gw)) - 1;
         const int64_t tab = g.tab_rows > 0 ? g.tab_rows : want;
-        /* One filler column, so the row pitch is W + 1: q/k/v/out are all slices. */
-        const int64_t ld = W + 1;
+        /* A filler column gives the row pitch W + 1 (q/k/v/out are all slices); pad 0 keeps the
+         * dense pitch W, aligned for the vector row path. */
+        const int64_t ld = W + g.pad;
         const float scale = 1.0f / std::sqrt((float)g.hd);
 
         std::vector<uint16_t> q((size_t)(M * ld)), k((size_t)(M * ld)), v((size_t)(M * ld));
@@ -23457,7 +23460,7 @@ static void device_phase(const Plugin& pl) {
         const RadKernelInfo* r = find(pl, "act_mul_bf16");
         if (!r) ok("act_mul_bf16", false, "row absent");
         else
-            for (const char* act : { "silu", "gelu", "gelu_tanh" }) {
+            for (const char* act : { "silu", "gelu", "gelu_tanh", "sigmoid", "quick_gelu" }) {
                 std::vector<RadTensor> ts = { T(nullptr, RAD_BF16, { 5, 645 }),
                                               T(nullptr, RAD_BF16, { 5, 645 }),
                                               T(nullptr, RAD_BF16, { 5, 645 }) };
@@ -23646,6 +23649,20 @@ static void device_phase(const Plugin& pl) {
             for (size_t i = 0; i < g.size(); ++i)
                 want[i] = h_bf16(h_to_bf16(1.0f / (1.0f + std::exp(-g[i])))) * u[i];
             check("act_mul_bf16 sigmoid numerics", down(dy, g.size()), want, 1e-2);
+
+            /* quick_gelu fuses mul-by-bf16(1.702) + sigmoid: the scale and the activation are
+             * both rounded to bf16 exactly as the unfused pair stored them. */
+            std::vector<RadParam> pq = { PI("M", M), PI("n", n), PS("act", "quick_gelu"),
+                                         PS("dtype", "bf16") };
+            if (r) run_case(r, ts, pq);
+            const float k1702 = h_bf16(h_to_bf16(1.702f));
+            std::vector<float> wantq(g.size());
+            for (size_t i = 0; i < g.size(); ++i) {
+                const float t = h_bf16(h_to_bf16(g[i] * k1702));
+                const float s = 1.0f / (1.0f + std::exp(-t));
+                wantq[i] = h_bf16(h_to_bf16(s)) * u[i];
+            }
+            check("act_mul_bf16 quick_gelu numerics", down(dy, g.size()), wantq, 1e-2);
         }
         if (sel("rmsnorm_bf16")) {
             const RadKernelInfo* r = find(pl, "rmsnorm_bf16");
