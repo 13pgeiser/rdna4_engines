@@ -607,43 +607,40 @@ fn down_nt8_stream_fold_census_and_split_epoch_advance() {
         }
     }
     let lines: Vec<&str> = text.lines().collect();
-    // Back-edge ledger regression: the stream drains outstanding loads at
-    // both loop boundaries (`G::settles_loads`, `Prefetch::<0>::wait_load`
-    // with WAIT=0), so the prologue's weight-plus-X pending set never leaks
-    // into the loop and the tail's pair-waited set never leaks out. Both are
-    // zero-count load waits (`s_wait_loadcnt 0x0` on gfx1201) in the bounded
-    // suffix immediately before `k_begin` and before the TRIPS decrement —
-    // not merely anywhere in the prologue, which may hold other zero waits.
+    // Scope the back-edge decrement to the K-loop basic blocks: the
+    // prologue also contains the exact same s44 -= 1 instruction while
+    // deriving the trip count. Both boundaries must end in a zero load
+    // wait after their final activation load, before the loop edge.
     let k_begin = lines
         .iter()
         .position(|l| l.trim() == ".Lq4s_down_nt8_k_begin:")
         .expect("down NT8 stream: k_begin label");
-    let trips_dec = lines
-        .iter()
-        .position(|l| l.contains("s_add_co_i32 s44, s44, -1"))
-        .expect("down NT8 stream: TRIPS decrement");
-    assert!(
-        lines[k_begin.saturating_sub(4)..k_begin]
-            .iter()
-            .any(|l| mnemonic(l) == "s_wait_loadcnt" && l.contains("0x0")),
-        "down NT8 stream: prologue drains loads immediately before k_begin"
-    );
-    let loop_tail = &lines[trips_dec.saturating_sub(8)..trips_dec];
-    assert!(
-        loop_tail
-            .iter()
-            .any(|l| mnemonic(l) == "s_wait_loadcnt" && l.contains("0x0")),
-        "down NT8 stream: loop end drains loads before the TRIPS decrement"
-    );
-    // Per-tile waits ride with the paired folds: each even tile's wait
-    // retires its pair's loads before either slot is overwritten. Check the
-    // pair-relevant window only where an emitted wait is needed: the first
-    // fold of iterations after the first may reuse the boundary drain, so
-    // only demand a wait between the previous fold's WMMA and each even
-    // tile's first WMMA when the prologue drain does not already cover it.
-    // In practice: every even-tile fold past the first fold group has its
-    // pair wait in-window; no assumption about epilogue waits after the
-    // last fold.
+    let loop_begin = lines.iter()
+        .position(|l| l.trim() == ".Lq4s_down_nt8_k_loop:")
+        .expect("down NT8 stream: loop header");
+    let loop_end = lines.iter()
+        .position(|l| l.trim() == ".Lq4s_down_nt8_k_loop_end:")
+        .expect("down NT8 stream: loop exit");
+    let decrements: Vec<_> = (loop_begin..loop_end)
+        .filter(|&i| lines[i].contains("s_add_co_i32 s44, s44, -1"))
+        .collect();
+    assert_eq!(decrements.len(), 1, "down NT8 stream: one back-edge decrement");
+    let trips_dec = decrements[0];
+    let zero_wait = |line: &str| line.trim() == "s_wait_loadcnt 0x0";
+    assert!(zero_wait(lines[k_begin - 1]),
+        "down NT8 stream: prologue drains loads immediately before k_begin");
+    let final_reload = (loop_begin..trips_dec)
+        .rfind(|&i| mnemonic(lines[i]).starts_with("buffer_load_"))
+        .expect("down NT8 stream: final loop reload");
+    assert!(final_reload < trips_dec - 1 && zero_wait(lines[trips_dec - 1]),
+        "down NT8 stream: zero drain after final reload and before back-edge decrement");
+    assert!(lines[trips_dec + 1..loop_end].iter()
+        .any(|l| l.trim() == "s_cbranch_scc1 .Lq4s_down_nt8_k_loop"),
+        "down NT8 stream: drained decrement controls back-edge");
+    // Tiles 2/4/6 always need their pair wait in every epoch. Tile 0
+    // needs one only in l1/t1, where a previous epoch reloaded the pair.
+    // l0/t0/t2 already have the zero-drained entry pair on their CFG path
+    // (t2 is the alternative odd-tail arm, not a successor of t1).
     let waits: Vec<usize> = lines
         .iter()
         .enumerate()
@@ -664,7 +661,7 @@ fn down_nt8_stream_fold_census_and_split_epoch_advance() {
         wmma_lines
             .chunks(4)
             .enumerate()
-            .filter(|(f, _)| *f >= 8 && f % 8 % 2 == 0)
+            .filter(|(f, _)| f % 2 == 0 && (f % 8 != 0 || matches!(f / 8, 1 | 3)))
             .all(|(_, chunk)| {
                 let start = chunk[0];
                 let prev_end = wmma_lines
@@ -675,7 +672,7 @@ fn down_nt8_stream_fold_census_and_split_epoch_advance() {
                     .unwrap_or(0);
                 waits.iter().any(|&w| prev_end < w && w < start)
             }),
-        "down NT8 stream: post-drain even folds have their pair wait in-window"
+        "down NT8 stream: every newly loaded pair has its wait in-window"
     );
     // Split epoch advance (`kloop` stream arm): the weight descriptor steps
     // one epoch (136, `0x88`) first, then X0 follows it, both before the
