@@ -197,11 +197,11 @@ docker run --name radiance_server --network host --init --ulimit memlock=-1 \
     -e RADIANCE_LOG=info \
     "${PRELOAD[@]}" \
     "$IMAGE" --model /models/"$MODEL_FILE" \
-    --host :: --port 9931 --tp 1 $EXTRA_FLAGS --kv-cache-dtype fp8 -vv --debug-selection --debug-placement
+    --host :: --port 9931 --tp 1 $EXTRA_FLAGS --kv-cache-dtype fp8 --debug-selection --debug-placement
 
 # qwen3.8-27b-mxfp4.rad
 # 
-# $ llm-bench run --openai-base-url http://localhost:9931/v1 --models openai:qwen3.8:27b-mq4-xts --prompts "Write a rust function to parse JSON safely."
+# llm-bench run --warmup 1 --concurrency 1 --openai-base-url http://localhost:9931/v1 --models openai:qwen3.8:27b-mq4-xts --prompts "Write a rust function to parse JSON safely."
 # → Benchmarking 1 model(s) × 1 prompt(s) × 3 run(s) = 3 total requests
 # 
 # Results: 3 succeeded, 0 failed (100% success rate)
@@ -209,18 +209,5 @@ docker run --name radiance_server --network host --init --ulimit memlock=-1 \
 # ╭──────────┬─────────────────────┬──────────┬──────────┬───────┬──────────┬────────────┬─────────╮
 # │ Provider │ Model               │ P50 (ms) │ P99 (ms) │ Tok/s │ Avg Cost │ Total Cost │ Success │
 # ├──────────┼─────────────────────┼──────────┼──────────┼───────┼──────────┼────────────┼─────────┤
-# │ openai   │ qwen3.8:27b-mq4-xts │    15525 │    22270 │  39.9 │      n/a │        n/a │    100% │
-# ╰──────────┴─────────────────────┴──────────┴──────────┴───────┴──────────┴────────────┴─────────╯
-
-# qwen3.8-next-flash-fp8-iq4r-moe.rad
-# 
-# $ llm-bench run --openai-base-url http://localhost:9931/v1 --models openai:qwen3.8:27b-mq4-xts --prompts "Write a rust function to parse JSON safely."
-# → Benchmarking 1 model(s) × 1 prompt(s) × 3 run(s) = 3 total requests
-# 
-# Results: 3 succeeded, 0 failed (100% success rate)
-# 
-# ╭──────────┬─────────────────────┬──────────┬──────────┬───────┬──────────┬────────────┬─────────╮
-# │ Provider │ Model               │ P50 (ms) │ P99 (ms) │ Tok/s │ Avg Cost │ Total Cost │ Success │
-# ├──────────┼─────────────────────┼──────────┼──────────┼───────┼──────────┼────────────┼─────────┤
-# │ openai   │ qwen3.8:27b-mq4-xts │    32722 │    47724 │  17.8 │      n/a │        n/a │    100% │
+# │ openai   │ qwen3.8:27b-mq4-xts │     6613 │     8175 │  73.5 │      n/a │        n/a │    100% │
 # ╰──────────┴─────────────────────┴──────────┴──────────┴───────┴──────────┴────────────┴─────────╯

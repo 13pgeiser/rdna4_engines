@@ -97,40 +97,13 @@ docker run --name hipfire_server --network host --device /dev/kfd --device /dev/
 
 # qwen3.8:27b-mq4-xts
 #
-# $ llm-bench run --openai-base-url http://localhost:9931/v1 --models openai:qwen3.8:27b-mq4-xts --prompts "Write a rust function to parse JSON safely."
-#→ Benchmarking 1 model(s) × 1 prompt(s) × 3 run(s) = 3 total requests
-#
-#Results: 3 succeeded, 0 failed (100% success rate)
-#
-#╭──────────┬─────────────────────┬──────────┬──────────┬───────┬──────────┬────────────┬─────────╮
-#│ Provider │ Model               │ P50 (ms) │ P99 (ms) │ Tok/s │ Avg Cost │ Total Cost │ Success │
-#├──────────┼─────────────────────┼──────────┼──────────┼───────┼──────────┼────────────┼─────────┤
-#│ openai   │ qwen3.8:27b-mq4-xts │    12246 │    17813 │  49.0 │      n/a │        n/a │    100% │
-#╰──────────┴─────────────────────┴──────────┴──────────┴───────┴──────────┴────────────┴─────────╯
-
-# ============ Serving Benchmark Result ============
-# Successful requests:                     100       
-# Failed requests:                         0         
-# Maximum request concurrency:             1         
-# Benchmark duration (s):                  383.00    
-# Total input tokens:                      107626    
-# Total generated tokens:                  12792     
-# Request throughput (req/s):              0.26      
-# Output token throughput (tok/s):         33.40     
-# Peak output token throughput (tok/s):    66.00     
-# Peak concurrent requests:                2.00      
-# Total token throughput (tok/s):          314.41    
-# ---------------Time to First Token----------------
-# Mean TTFT (ms):                          725.60    
-# Median TTFT (ms):                        664.28    
-# P99 TTFT (ms):                           769.68    
-# -----Time per Output Token (excl. 1st token)------
-# Mean TPOT (ms):                          24.46     
-# Median TPOT (ms):                        24.95     
-# P99 TPOT (ms):                           29.40     
-# ---------------Inter-token Latency----------------
-# Mean ITL (ms):                           24.11     
-# Median ITL (ms):                         0.01      
-# P99 ITL (ms):                            61.16     
-# ==================================================
-
+# llm-bench run --warmup 1 --concurrency 1 --openai-base-url http://localhost:9931/v1 --models openai:qwen3.8:27b-mq4-xts --prompts "Write a rust function to parse JSON safely."
+# → Benchmarking 1 model(s) × 1 prompt(s) × 3 run(s) = 3 total requests
+# 
+# Results: 3 succeeded, 0 failed (100% success rate)
+# 
+# ╭──────────┬─────────────────────┬──────────┬──────────┬───────┬──────────┬────────────┬─────────╮
+# │ Provider │ Model               │ P50 (ms) │ P99 (ms) │ Tok/s │ Avg Cost │ Total Cost │ Success │
+# ├──────────┼─────────────────────┼──────────┼──────────┼───────┼──────────┼────────────┼─────────┤
+# │ openai   │ qwen3.8:27b-mq4-xts │     6189 │     6308 │  83.4 │      n/a │        n/a │    100% │
+# ╰──────────┴─────────────────────┴──────────┴──────────┴───────┴──────────┴────────────┴─────────╯
