@@ -238,12 +238,18 @@ fn qwen36_27b_gfx1201_plans_match_frozen_recipe_manifests() {
         );
         let route = &fixture["routes"][route_key(spec)];
         let got = manifest(&plan);
-        // Recipe projection only: kind, flags, scheduler profile, symbols. The
-        // frozen `sha256` is the historical capture's source-text hash and is
-        // intentionally not compared (incidental wording drift).
+        // HIP source-text hashes are historical capture provenance, not current
+        // recipe identities. Embedded binary image hashes remain strict.
         let mut want: BTreeMap<String, (String, Value, Value, BTreeSet<String>)> =
             BTreeMap::new();
         for e in route["entries"].as_array().unwrap() {
+            if e["kind"].as_str() == Some("embedded") {
+                assert_eq!(
+                    got[e["module"].as_str().unwrap()].1.as_str(),
+                    e["sha256"].as_str().unwrap(),
+                    "{spec:?}: embedded image differs from the captured image"
+                );
+            }
             let symbols = e["symbols"]
                 .as_array()
                 .unwrap()
@@ -290,7 +296,7 @@ fn every_historical_route_symbol_is_planned_with_current_identity() {
         for o in observed {
             let module = o["module"].as_str().unwrap();
             let symbol = o["symbol"].as_str().unwrap();
-            let (kind, _, flags, profile, symbols) = got
+            let (kind, digest, flags, profile, symbols) = got
                 .get(module)
                 .unwrap_or_else(|| panic!("{spec:?}: observed module {module} not planned"));
             assert!(
@@ -298,11 +304,12 @@ fn every_historical_route_symbol_is_planned_with_current_identity() {
                 "{spec:?}: observed {module}:{symbol} not planned"
             );
             assert_eq!(kind, o["kind"].as_str().unwrap(), "{module}");
-            // `o["sha256"]` is the historical capture's source-text hash: identified
-            // as historical here and never compared against the current plan.
+            // Only HIP source text is incidental; embedded image identity is not.
             if kind == "hip" {
                 assert_eq!(flags, &o["flags"], "{module}: observed recipe flags differ");
                 assert_eq!(profile, &o["scheduler_profile"], "{module}");
+            } else {
+                assert_eq!(digest, o["sha256"].as_str().unwrap(), "{module}: embedded image differs");
             }
         }
     }
