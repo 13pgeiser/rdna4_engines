@@ -1,0 +1,21 @@
+# drama3-fp8.recipe -- Fish Audio drama-3 as its release ships it: block-scaled fp8 routed experts,
+# everything else of the language model and the codebook tower bf16.
+#
+#   rad-convert <fishaudio/drama-3 directory> \
+#       --recipe data/recipes/drama3-fp8.recipe -o drama3-fp8.rad
+#
+# The directory holds the model and codec.pth, its codec, which is read as checkpoint tensors
+# under `codec.` (core/format/torch_zip.h). The model is kept as stored. The codec ships f32:
+# its weight-normalised convolutions are folded here, and its linears, convolutions and
+# codebooks cast to bf16, the precision fish-speech decodes at, while its norms, layer scales,
+# ConvNeXt gains and snake parameters stay f32 -- read once a pass or less.
+
+codec.*.n1.weight                    cast dtype=f32
+codec.*.n2.weight                    cast dtype=f32
+codec.*.ls1.weight                   cast dtype=f32
+codec.*.ls2.weight                   cast dtype=f32
+codec.norm.weight                    cast dtype=f32
+codec.up*.ln.*                       cast dtype=f32
+codec.up*.gamma                      cast dtype=f32
+codec.*.alpha                        cast dtype=f32
+codec.*                              cast dtype=bf16
