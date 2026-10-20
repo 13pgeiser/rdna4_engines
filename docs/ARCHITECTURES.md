@@ -29,7 +29,7 @@ plugin claims.
 | `arch/qwen3asr_bf16` | `qwen3asr` | *(empty)* | Qwen3-ASR: a Whisper-style audio encoder over a dense Qwen3 decoder, speech to text |
 | `arch/minimaxmusic3` | `minimaxmusic3` | *(empty)* | MiniMax-Music3, songs from a description and lyrics: a Qwen3-8B frame model, a depth decoder, a flow-matching DiT and a DAC vocoder, from the diffusers pipeline directory, bf16 |
 | `arch/breeze` | `breeze` | *(empty)* | Breeze-TTS-2, speech from text and a description of the voice: a T5Gemma 2 text encoder, a Qwen3 backbone with a 16-codebook depth decoder and the Qwen3-TTS 12 Hz codec, from the release directory, bf16, one card |
-| `arch/fishomni` | `fishomni` | `bsgemm-moe` | Fish Audio drama-3, speech from text with speaker tags and inline direction: the Qwen3.5-35B-A3B backbone with its routed experts block fp8 at f32 scales and everything else bf16, a 13-layer codebook tower over the backbone's full-attention cache, and Fish S2's modified DAC (`codec.pth`, read as data); from the release directory, two cards |
+| `arch/fishomni` | `fishomni` | `bsgemm-moe` | Fish Audio drama-3, speech from text with speaker tags and inline direction, its voices cloned from reference clips: the Qwen3.5-35B-A3B backbone with its routed experts block fp8 at f32 scales and everything else bf16, a 13-layer codebook tower over the backbone's full-attention cache, and Fish S2's modified DAC, encoder and decoder (`codec.pth`, read as data); from the release directory, two cards |
 | `arch/minimaxh3` | `minimaxh3` | *(empty)* | MiniMax-H3, a video with its stereo soundtrack from text: Qwen3-VL-32B's language model as the text encoder, a 33B single-stream diffusion transformer, a tiled ViT video decoder and a BigVGAN audio decoder, from the diffusers pipeline directory; linears block fp8 (`data/recipes/minimax-h3-fp8.recipe`) |
 | `arch/ltx2` | `ltx2` | *(empty)* | LTX-2.5 (base and distilled), a video with its stereo soundtrack from text or from text and a first frame: Gemma 4's language model and two text connectors, the duration head, a dual-stream audio-video DiT with four-way guidance, the causal video VAE (tiled past the default canvas) or the diffusion decoder, the audio VAE with a BigVGAN vocoder and bandwidth extension, the x2 latent upsampler; bf16 or block fp8, one card |
 
@@ -1350,15 +1350,26 @@ codec     Fish S2's modified DAC decoder: ten raw codebook rows of 8 (one of 409
           conv k2 s2 and a ConvNeXt block; a causal conv k7 to 1536; four blocks of snake, a
           weight-normed causal transposed conv (8, 8, 4, 2) and three residual units (dilations
           1, 3, 9); snake and a conv k7 to one channel, tanh: 2048 samples a frame, 44.1 kHz mono
+encoder   the codec's, for a reference clip (mono 44.1 kHz, padded to whole frames): a causal
+          weight-normed conv k7 to 64; four blocks of three residual units (snake, conv k7 at
+          dilations 1, 3, 9, snake, conv k1) and a snake and a causal conv of kernel two strides
+          (2, 4, 8, 8), doubling the channels; after the last a 4-layer transformer (window 512
+          rows); snake, conv k3; twice a causal conv k2 s2 (plain weights) and a ConvNeXt block;
+          the 8-layer pre-quantiser transformer (window 128 frames); the semantic codebook's
+          nearest code by cosine, then nine residual steps (`vq_encode`): ten codes a frame
 ```
 
 The passes, which shift the tower by a row against the reference's loop:
 
 - **PROMPT** runs the backbone over the prompt and leaves its last row's final-norm hidden state in
   the lane, then runs the tower over every row, teacher-forced: each row's label is the row after
-  it, which in a prompt is text, so every layer's code embedding is zero (the concatenation's
-  embedding half is filled with zeros once). The last row's tower pass belongs to the first frame;
-  FRAME 0 writes its cache rows again.
+  it, which in a text prompt is text, so every layer's code embedding is zero (the
+  concatenation's embedding half is filled with zeros once). With references the codec's encoder
+  first turns the request's clips into frames, written into a code plane at the prompt rows that
+  name them (`RadAudioGenBatch::ref_frame`); a frame's row is embedded as a made frame's is, a row
+  before a frame is labelled with it, a frame's row carries its own codes 2..9, and the window of
+  main picks starts with the prompt's last 16 rows. The last row's tower pass belongs to the first
+  frame; FRAME 0 writes its cache rows again.
 - **FRAME j** draws the main token from the hidden state of the row before the frame's (the
   prompt's last for frame 0), runs the tower at THAT row's position, cache slot and context
   (`RadAudioGenBatch::prev_slot`, `prev_pos`, `prev_used`) drawing codes 1..9, stores the frame,
@@ -1383,6 +1394,13 @@ Traps (each still speaks, wrongly):
 - **The codec's residual codebooks have 1024 entries** and the heads 4096 outputs: codes are clamped
   at 1023 at decode (`rvq_embed`'s `clamp`). Its weight norm is per output channel for the convs
   and per INPUT channel for the transposed convs (`[in, out, k]`), folded at convert.
+- **The encoder's transformer window is 512 rows**, not the 128 frames of the quantiser's: the
+  window comes from `getattr` on a `functools.partial` config, which has no such attribute, so
+  fish-speech's default of 512 holds. Both its transformers and the codec's convolutions are
+  causal, so a clip right-padded to whole frames encodes its frames as the clip alone would.
+- **The reference prompt is tokenised a literal at a time**: the instruction's closing `:` and the
+  first header's `\n\n` are one token when the two are joined. A transcript's speaker tag must
+  follow `Text: ` directly, so white space before it moves behind it.
 - **The input is written as fish-speech's server writes it**: each speaker's turn
   `<|speaker:N|> ` and its text stripped, turns joined by a newline, untagged text speaker 0's.
   The same two turns joined by a space are spoken through far less often: for one two-line script,
@@ -1398,6 +1416,18 @@ argmax in 92.5% of frames); the nine heads' logits 1.35% (KL 0.007, the same arg
 over the 79 frames that are spoken. Through the codec, radiance's chunked bf16 decode is 35.4 dB SNR
 from the reference's whole-utterance bf16 decode of the same codes. Qwen3-ASR transcribes
 radiance's speech word for word.
+
+The encoder against fish-speech's codec encoding the same clip (11.6 s, 250 frames) on the CPU:
+radiance's bf16 encoder gives the f32 reference's semantic code in 99.2% of the frames, and its
+residual codes in 97.6% (the first) down to 81.2% (the ninth); fish-speech's own bf16 encode gives
+95.6% and 94.0% down to 71.2% against the same f32. The reference prompt's token ids are
+fish-speech's. Cloning, scored by median F0 and Qwen3-ASR over eight seeds a case, the reference
+clips drama-3's own takes of invented sentences: without a reference a sentence's eight takes are
+eight voices (116 to 251 Hz); with a reference of a 188 Hz voice they come out at 175 to 210 Hz,
+of a 200 Hz voice at 197 to 250 Hz, of a 108 Hz voice at 96 to 122 Hz; two references tagged as
+speakers 0 and 1 voice a two-line exchange's turns at 193 to 210 Hz and 109 to 140 Hz. Every take
+but one is transcribed word for word (the miss is "I'm" for "I am"). A 12 s clip adds 0.12 s
+before a stream's first audio.
 
 The sampling is not fish-speech's server's (temperature 0.7, top-p 0.7, top-k 30 for every draw).
 At those the model falls silent after a tag or a speaker's line and does not come back, the failure

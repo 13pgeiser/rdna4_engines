@@ -2460,6 +2460,11 @@ curl -s http://localhost:8000/v1/audio/speech -H 'Content-Type: application/json
 curl -s http://localhost:8000/v1/audio/speech -H 'Content-Type: application/json' -d '{
   "input": "<|speaker:0|> Did you lock the back door?\n<|speaker:1|> [sighs] I thought you did."}' \
   -o door.wav                                                        # 44.1 kHz mono, 16-bit
+curl -s http://localhost:8000/v1/audio/speech -H 'Content-Type: application/json' -d @- \
+  -o cloned.wav <<EOF                                                # the voice of voice.wav
+{"input": "The lighthouse keeper counted seven ships before the fog rolled in.",
+ "references": [{"audio": "$(base64 -w0 voice.wav)", "text": "What voice.wav says."}]}
+EOF
 ```
 
 - **`input`** is the script. Speakers are named in it, `<|speaker:0|>` to `<|speaker:15|>`, and
@@ -2471,10 +2476,20 @@ curl -s http://localhost:8000/v1/audio/speech -H 'Content-Type: application/json
   `<|im_end|>`, `<|voice|>`, `<|text|>`, `<|interleave|>`, `<|semantic:...|>`) are refused, and so
   is any other spelling of a speaker.
 - **`instructions` are refused**, the direction being the input's; `guidance_scale` must be 1 (the
-  model runs one branch). Each speaker's voice is the model's choice, the same within a take:
-  cloning a voice from a recording is not served yet.
+  model runs one branch). Without references each speaker's voice is the model's choice, the same
+  within a take.
+- **`references`** clone voices from recordings: an array of `{"audio": ..., "text": ...}`, the
+  clip a `data:` URL or the base64 of an audio file (anything ffmpeg reads, decoded to mono
+  44.1 kHz), its text what the clip says; at most 8 clips and 30 s of audio together. A
+  reference's voice is the speaker its transcript is tagged with, speaker 0 when untagged, so a
+  dialogue gives each speaker a clip: `"<|speaker:1|> ..."` as the second reference's text voices
+  the input's `<|speaker:1|>` turns. The clips are encoded by the codec's own encoder in the
+  request's first pass, in bf16 as fish-speech's server encodes them (a 12 s clip adds about
+  0.12 s before the first audio), and the prompt is fish-speech's with references:
+  `[Reference 1]`, its transcript and its frames, for each.
 - **The length** is `duration` in seconds or `max_new_tokens` in frames (21.5 a second), up to 95 s;
-  the model ends the speech at the end of the script. The prompt holds at most 2048 tokens.
+  the model ends the speech at the end of the script. The prompt holds at most 3072 tokens, a
+  reference adding 21.5 a second of its clip.
 - **Sampling** is SGLang-Omni's: temperature 1.0 and top-p 0.9 (Fish Audio's model card), the
   first code uncapped and each later code at top-k 30, with fish-speech's repetition-aware redraw
   of the first code. fish-speech's server samples at 0.7, 0.7 and 30, where the model often falls
@@ -2550,7 +2565,8 @@ is complete, so the first audio waits for the first sentence rather than the who
 
 - **`session.config`** takes the fields of `POST /v1/audio/speech` but `input` (`instructions`,
   `voice`, `seed`, `guidance_scale`, `max_new_tokens` or `duration` for each sentence, `speed`,
-  `num_inference_steps` where the model has a denoiser), checked as that route checks them, and
+  `num_inference_steps` where the model has a denoiser, `references` where it clones a voice),
+  checked as that route checks them, and
   four of its own: `response_format` `pcm` (the default) or `wav`; `stream_audio`, false (the
   default) for one binary message a sentence or true for the audio as the model makes it;
   `split_granularity`, `sentence` (the default), `clause` (also at commas and semicolons) or `none`
