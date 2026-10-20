@@ -472,6 +472,13 @@ h1 { margin:0; font-size:13.5px; font-weight:600; letter-spacing:-.005em; }
 .aside { font-family:var(--mono); font-size:11.5px; color:var(--dim); }
 .pbody { padding:14px 16px 16px; }
 
+/* The control vector's switch: a checkbox row with its explanation under it. The two need a gap
+   between them, because the explanation is set at the size every caption on this page uses, and a
+   line that sits flush under the one above it reads as that line's tail, not as a sentence. It is
+   inset a little too, so it does not start on the same edge as the row it belongs to. */
+.cvrow { display:flex; align-items:center; gap:8px; }
+#cvnote { margin-top:9px; padding-left:4px; }
+
 /* ------------------------------------------------ THE FIRST ROW IS FIXED, THE REST FIT THEIR CONTENT
    A card whose content changes LENGTH moves every card under it while it is being read, and one
    card here does that every poll: the list of requests gains and loses rows. So the first row --
@@ -1238,13 +1245,13 @@ nav button.on { color:var(--fg); background:var(--track); }
          reload, and every request that names its own choice overrides it. -->
     <section class="panel" id="cvpanel" hidden>
       <div class="phead">
-        <span class="cap">Control vectors</span>
+        <span class="cap">Control vector</span>
         <span class="aside" id="cvsum"></span>
       </div>
       <div class="pbody">
         <label class="cvrow">
           <input id="cvbox" type="checkbox">
-          <span id="cvlabel">Apply the control vector to new requests</span>
+          <span id="cvlabel">Remove safety behavior</span>
         </label>
         <div class="aside" id="cvnote"></div>
       </div>
@@ -3080,10 +3087,15 @@ async function loadControlVector() {
     $("cvpanel").hidden = false;
     $("cvbox").disabled = false;
     $("cvbox").checked = !!p.default;
-    $("cvsum").textContent = "layers " + p.first + "\u2013" + p.last + " \u00b7 " + p.mode +
-                               " \u00b7 scale " + p.scale;
-    $("cvnote").textContent = "Applies to new requests only; a request's own control_vector " +
-                               "field wins. It removes a safety behaviour.";
+    /* The family leads: it is the one term that says whether this file belongs to the model on the
+     * card at all, and it is the loader's own answer, not a label the page invents. */
+    $("cvsum").textContent = (p.arch ? p.arch + " \u00b7 " : "") + "layers " + p.first +
+                               "\u2013" + p.last + " \u00b7 " + p.mode + " \u00b7 scale " + p.scale;
+    /* New requests only, because a running request keeps the choice it was admitted with; and a
+     * session whose context already holds a refusal can repeat it, since the refusal is in the
+     * prompt the next turn reads. */
+    $("cvnote").textContent = "New requests only. A session with a refusal already in its " +
+                               "context may repeat it.";
   } catch (e) {
     $("cvpanel").hidden = false;
     $("cvbox").disabled = true;

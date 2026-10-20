@@ -1638,6 +1638,9 @@ std::string Engine::cvec_json() const {
     o["available"] = cvec_.loaded();
     o["default"]   = cvec_default_.load();
     if (cvec_.loaded()) {
+        /* The family the file was validated against, not a label the UI supplies: this is the same
+         * `meta_.arch_id` the loader compared against the file's own model_hint. */
+        o["arch"]    = meta_.arch_id ? meta_.arch_id : "";
         o["first"]   = cvec_.first;
         o["last"]    = cvec_.last;
         o["n_embd"]  = cvec_.n_embd;
