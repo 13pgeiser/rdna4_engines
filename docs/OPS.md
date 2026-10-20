@@ -1167,12 +1167,13 @@ libref function says which (`libref/ref_audio.cpp`).
 
 | op | params | operands |
 |---|---|---|
-| `conv1d` | `M`(range) `cin` `cout` `k` `dil` `act`/opt `dtype` `causal`/opt | `x`, `w`w, `cu_seqlens`, `res`? → `y`; `b`w? |
+| `conv1d` | `M`(range) `cin` `cout` `k` `dil` `act`/opt `dtype` `causal`/opt `stride`/opt `cu_div`/opt | `x`, `w`w, `cu_seqlens`, `res`? → `y`; `b`w? |
 | `conv_t1d` | `M`(range) `cin` `cout` `stride` `dtype` `pad`/opt `k`/opt | `x`, `w`w, `b`w, `cu_seqlens` → `y` |
 | `snake` | `M`(range) `n` `dtype` `log`/opt | `x`, `alpha`w → `y`; `beta`w? |
 | `snake_aa` | `M`(range) `n` `ratio` `k` `log`/opt `dtype` | `x`, `alpha`w, `beta`w, `f_up`w, `f_down`w, `cu_seqlens` → `y` |
 | `cfg_topk_sample` | `M`(range) `n_vocab` `k` `rep` `cond_k`/opt `cfg`:f64 `temp`:f64/opt `stream` `dtype` `sup_lo`/opt `sup_hi`/opt `penalty`:f64/opt `top_p`:f64/opt | `logits`, `seed`, `frame` → `ids`; `cfg`?, `lane`?, `hist`:inout? |
 | `rvq_embed` | `M`(range) `n_embd` `n_codes` `vocab` `off0` `scale`:f64 `dtype` `round`/opt `clamp`/opt | `codes`, `t0`w, `t1`w → `y` |
+| `vq_encode` | `M`(range) `n` `dim` `bins` `dtype` | `x`:inout, `in_w`w, `in_b`w, `cb`w, `out_w`w, `out_b`w → `codes` |
 | `frame_mix_store` | `M`(range) `n_embd` `L` `stride` `rep`/opt `dtype` | `hid`, `logits`w, `scale`w, `lane`, `frame`, `status`, `dst`:inout |
 | `end_status` | `M`(range) `end` `rep` | `ids`, `lane`, `status`:inout |
 | `ras_pick` | `M`(range) `win` `lo` `hi` `rep`/opt `clear`/opt | `first`, `alt`, `lane`, `hist`:inout → `ids` |
@@ -1219,6 +1220,14 @@ conditional first, then the unconditional) are consecutive rows, `rep` of them a
   With `clamp` n > 0 a code above `n - 1` reads row `n - 1` (before `off0` and the codebook's
   offset; a negative code still reads nothing): a codec whose codebooks are smaller than the heads
   that write its codes, as Fish Audio's 1024-entry residual codebooks under 4096-way heads.
+- `vq_encode`: one step of a residual vector quantiser with factorised, L2-normalised codes (DAC's,
+  as Fish Audio's codec encodes a reference): per row of `x` `[rows, n]`, `e = in_w x + in_b`
+  (`in_w` `[dim, n]`, a 1x1 convolution's weight); the code is the row of `cb` `[bins, dim]` of
+  greatest cosine with `e`, `(e / max(|e|, 1e-12)) . (cb_c / max(|cb_c|, 1e-12))`, the lower index
+  on a tie (0 when no score is above -inf), written to `codes[i]` at the operand's own stride; then
+  `x -= out_w cb[code] + out_b` (`out_w` `[n, dim]`, the raw codebook row), rounded once into `x`.
+  f32 arithmetic. A chain of these over a codec's codebooks, each quantising what the last left, is
+  its residual quantiser.
 - `frame_store`: `dst[(lane n_codes + k) stride + frame - skip] = codes[k, rep i]` for every `k`,
   when `frame >= skip` and `status[lane] >= 0`: a frame's codes into its lane's history, each
   codebook a row over the lane's frames, so a run of a lane's frames is a block of `n_codes`
@@ -1259,7 +1268,14 @@ input reads zero outside it.
 - `conv1d`: PyTorch's `[cout, cin, k]` weight, `k` odd, dilation `dil` and padding
   `dil (k - 1) / 2` a side, or with `causal` 1 (any `k`) `dil (k - 1)` on the left; `res` is added
   after the bias, then `act` `none`, `tanh` or `clamp`, `min(max(y, -1), 1)` (BigVGAN's output
-  clamp; a NaN stays NaN). f32 accumulation, one rounding.
+  clamp; a NaN stays NaN). f32 accumulation, one rounding. `stride` s > 1 (causal only, the reach
+  `dil (k - 1) + 1` at least s) pads `dil (k - 1) + 1 - s` on the left and keeps every s-th row:
+  output row `o` of a sequence reads input rows `o s - pad + t dil`, and sequence `e`'s rows
+  `[cu[e], cu[e+1])` become `[cu[e] / s, cu[e+1] / s)`, so every bound is a multiple of s; `res`
+  and `y` have the output's rows (a causal codec encoder's downsampling, as Fish Audio's).
+  `cu_div` reads the bounds in units that many input rows apart, as the other encoder ops do:
+  sequence `e` is input rows `[cu[e] / cu_div, cu[e+1] / cu_div)`, each bound a multiple of
+  `cu_div` times the stride, so one bounds array in samples serves every rate of an encoder.
 - `conv_t1d`: PyTorch's `[cin, cout, k]` transposed weight, any `k` of at least a stride (two
   strides by default), padding `pad` (`(k - stride) / 2` by default, which needs `k - stride` even;
   0 is the causal form, whose full output's last `k - stride` rows are dropped; it may exceed a

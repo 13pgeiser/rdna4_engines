@@ -683,7 +683,8 @@ static const RadOperandSpec oBweUp[] = { OPD("x"), OPD("res"), OUT("y") };
 /* ---- audio generation (avx_audio.cpp), as libref declares it ------------------------------ */
 static const RadParamSpec pConv1d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
                                         P_INT("dil"), P_STRO("act"), P_STR("dtype"),
-                                        P_INTO("causal") };
+                                        P_INTO("causal"), P_INTO("stride"),
+                                        P_INTO("cu_div") };
 static const RadOperandSpec oConv1d[] = { OPD("x"), WGT("w"), OPD("cu_seqlens"), OPD_O("res"),
                                           OUT("y"), WGT_O("b") };
 static const RadParamSpec pConvT1d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("stride"),
@@ -707,6 +708,10 @@ static const RadParamSpec pRvqEmbed[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_
                                           P_INT("vocab"), P_INT("off0"), P_F64("scale"),
                                           P_STR("dtype"), P_INTO("round"), P_INTO("clamp") };
 static const RadOperandSpec oRvqEmbed[] = { OPD("codes"), WGT("t0"), WGT("t1"), OUT("y") };
+static const RadParamSpec pVqEncode[] = { P_INT("M"), P_INT("n"), P_INT("dim"), P_INT("bins"),
+                                          P_STR("dtype") };
+static const RadOperandSpec oVqEncode[] = { INOUT("x"), WGT("in_w"), WGT("in_b"), WGT("cb"),
+                                            WGT("out_w"), WGT("out_b"), OUT("codes") };
 static const RadParamSpec pFrameMix[] = { P_INT("M"), P_INT("n_embd"), P_INT("L"), P_INT("stride"),
                                           P_INTO("rep"), P_STR("dtype") };
 static const RadOperandSpec oFrameMix[] = { OPD("hid"), WGT("logits"), WGT("scale"), OPD("lane"),
@@ -1186,6 +1191,9 @@ static const RadOpSchema kSchemas[] = {
   "libref's." },
 { "rvq_embed", ARR(pRvqEmbed), ARR(oRvqEmbed),
   "a frame's embedding from code-major residual codes, libref's roundings (`round` 1: one)." },
+{ "vq_encode", ARR(pVqEncode), ARR(oVqEncode),
+  "one residual vector quantiser step: the code of greatest cosine with in_w x + in_b, then "
+  "x -= out_w cb[code] + out_b; libref's arithmetic in another summation order." },
 { "frame_mix_store", ARR(pFrameMix), ARR(oFrameMix),
   "a frame's softmax-weighted mix of hidden planes, stored into its lane, bit for bit libref's." },
 { "end_status", ARR(pEndStatus), ARR(oEndStatus),
@@ -1718,6 +1726,8 @@ SIMPLE("avx_cfg_topk_sample", "cfg_topk_sample", "sample", "a guided top-k pick 
        L(cfg_topk_sample)),
 SIMPLE("avx_rvq_embed", "rvq_embed", "elem", "a frame's embedding from its residual codes",
        DT_FLOAT, L(rvq_embed)),
+SIMPLE("avx_vq_encode", "vq_encode", "elem",
+       "a residual quantiser's step: the nearest code by cosine", DT_FLOAT, L(vq_encode)),
 SIMPLE("avx_frame_mix_store", "frame_mix_store", "elem",
        "a frame's conditioning row into its lane", DT_FLOAT, L(frame_mix_store)),
 SIMPLE("avx_end_status", "end_status", "elem", "a frame's status from its first pick", DT_ANY,

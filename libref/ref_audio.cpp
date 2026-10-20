@@ -51,8 +51,13 @@ inline int64_t ldi(const RadTensor* t, int64_t i) {
  * them), outside of which the input reads zero (each sequence is padded on its own). w is
  * PyTorch's Conv1d weight [cout, cin, k], b [cout], `dil` the dilation and the padding
  * dil (k - 1) / 2 on each side (k odd), so a sequence keeps its length; with `causal` 1 all of it,
- * dil (k - 1), on the left (any k). `res`, when bound, is added after the bias; then `act` (none,
- * tanh, or clamp to [-1, 1], a vocoder's output clamp). f32 accumulation, one rounding. */
+ * dil (k - 1), on the left (any k). A `stride` s > 1 (causal only, a reach of at least s) keeps
+ * every s-th output row: the left pad is the reach less s, and a sequence of L rows (every bound a
+ * whole number of strides) gives L / s, y's and res's rows the input's over s. `cu_div` reads the
+ * bounds in units that many input rows apart: sequence e is input rows [cu[e] / cu_div,
+ * cu[e+1] / cu_div), each bound a multiple of cu_div stride. `res`, when bound, is added after the
+ * bias; then `act` (none, tanh, or clamp to [-1, 1], a vocoder's output clamp). f32
+ * accumulation, one rounding. */
 int ref_conv1d(const RadArgs* a, RadStream) {
     if (!have(a, 3)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *w = &a->t[1], *cu = &a->t[2];
@@ -60,29 +65,38 @@ int ref_conv1d(const RadArgs* a, RadStream) {
     if (!y->data) return RAD_E_INVAL;
     const int64_t cin = p_int(a, "cin", 0), cout = p_int(a, "cout", 0), k = p_int(a, "k", 0);
     const int64_t dil = p_int(a, "dil", 1), causal = p_int(a, "causal", 0);
+    const int64_t st = p_int(a, "stride", 1), cd = p_int(a, "cu_div", 1);
     const char* act = p_str(a, "act", "none");
     const bool tanh_out = act && !std::strcmp(act, "tanh");
     const bool clamp_out = act && !std::strcmp(act, "clamp");
     if (!tanh_out && !clamp_out && act && std::strcmp(act, "none")) return RAD_E_INVAL;
     if (cin <= 0 || cout <= 0 || k <= 0 || (!causal && (k & 1) == 0) || dil <= 0 ||
-        causal < 0 || causal > 1)
+        causal < 0 || causal > 1 || st < 1 || (st > 1 && (!causal || dil * (k - 1) + 1 < st)) ||
+        cd < 1)
         return RAD_E_SHAPE;
     const int64_t n_seq = numel(cu) - 1;
     if (n_seq <= 0) return RAD_E_SHAPE;
-    const int64_t r0 = cu_at(cu, 0), r1 = cu_at(cu, n_seq);
-    if (r0 < 0 || r1 <= r0 || rows_of(y, cout) < r1 || rows_of(x, cin) < r1) return RAD_E_SHAPE;
+    /* A stride takes each sequence of L rows to L / stride, so every bound is a whole number of
+     * strides (of cu_div units each). */
+    for (int64_t e = 0; e <= n_seq; ++e)
+        if (cu_at(cu, e) % (cd * st)) return RAD_E_SHAPE;
+    const int64_t r0 = cu_at(cu, 0) / cd, r1 = cu_at(cu, n_seq) / cd;
+    if (r0 < 0 || r1 <= r0 || rows_of(y, cout) < r1 / st || rows_of(x, cin) < r1)
+        return RAD_E_SHAPE;
     if (numel(w) < cout * cin * k || (b && numel(b) < cout)) return RAD_E_SHAPE;
-    if (res && rows_of(res, cout) < r1) return RAD_E_SHAPE;
-    const int64_t pad = causal ? dil * (k - 1) : dil * (k - 1) / 2;
-    REF_PAR_FOR((r1 - r0) * cout * cin * k)
-    for (int64_t r = r0; r < r1; ++r) {
-        const int64_t e = seq_of(cu, n_seq, r);
-        const int64_t s0 = cu_at(cu, e), s1 = cu_at(cu, e + 1);
+    if (res && rows_of(res, cout) < r1 / st) return RAD_E_SHAPE;
+    /* Causal: the reach is dil (k - 1) + 1 input rows and the left pad that less the stride, so
+     * output row o of a sequence reads input rows o stride - pad .. o stride + stride - 1. */
+    const int64_t pad = causal ? dil * (k - 1) + 1 - st : dil * (k - 1) / 2;
+    REF_PAR_FOR((r1 - r0) / st * cout * cin * k)
+    for (int64_t r = r0 / st; r < r1 / st; ++r) {
+        const int64_t e = seq_of(cu, n_seq, r * st * cd);
+        const int64_t s0 = cu_at(cu, e) / cd, s1 = cu_at(cu, e + 1) / cd;
         const int64_t yb = rowoff(y, r, cout), ys = laststride(y);
         for (int64_t co = 0; co < cout; ++co) {
             float acc = 0.0f;
             for (int64_t kk = 0; kk < k; ++kk) {
-                const int64_t ir = r + kk * dil - pad;
+                const int64_t ir = r * st + kk * dil - pad;
                 if (ir < s0 || ir >= s1) continue;
                 const int64_t xb = rowoff(x, ir, cin), xs = laststride(x);
                 for (int64_t ci = 0; ci < cin; ++ci)
@@ -413,6 +427,62 @@ int ref_rvq_embed(const RadArgs* a, RadStream) {
             const float s = round1 ? acc[(size_t)d]
                                    : rbf(ldt(t0, b0 + d * laststride(t0)) + rbf(acc[(size_t)d]));
             stt(y, yb + d * laststride(y), s * scale);
+        }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ vq_encode */
+/* One step of a residual vector quantiser with factorised, L2-normalised codes (DAC's
+ * VectorQuantize, as Fish Audio's codec encodes): per row of x [rows, n], e = in_w x + in_b
+ * (in_w [dim, n]); the code is the row of cb [bins, dim] of greatest cosine with e,
+ * (e / max(|e|, 1e-12)) . (cb_c / max(|cb_c|, 1e-12)), the lower index on a tie; then
+ * x -= out_w cb[code] + out_b (out_w [n, dim], the raw codebook row), rounded once into x. f32,
+ * every sum in index order. A chain of these over a codec's codebooks is its residual quantiser,
+ * each step quantising what the last left. */
+int ref_vq_encode(const RadArgs* a, RadStream) {
+    if (!have(a, 7)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *iw = &a->t[1], *ib = &a->t[2], *cb = &a->t[3];
+    const RadTensor *ow = &a->t[4], *ob = &a->t[5], *codes = &a->t[6];
+    const int64_t n = p_int(a, "n", 0), dim = p_int(a, "dim", 0), bins = p_int(a, "bins", 0);
+    if (n <= 0 || dim <= 0 || bins <= 0) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(x, n);
+    if (rows <= 0 || numel(codes) < rows || numel(iw) < dim * n || numel(ib) < dim ||
+        numel(cb) < bins * dim || numel(ow) < n * dim || numel(ob) < n)
+        return RAD_E_SHAPE;
+    /* The codebook normalised once, as F.normalize divides. */
+    std::vector<float> cn((size_t)(bins * dim));
+    for (int64_t c = 0; c < bins; ++c) {
+        float ss = 0.0f;
+        for (int64_t j = 0; j < dim; ++j) ss += ldt(cb, c * dim + j) * ldt(cb, c * dim + j);
+        const float nrm = std::max(std::sqrt(ss), 1e-12f);
+        for (int64_t j = 0; j < dim; ++j) cn[(size_t)(c * dim + j)] = ldt(cb, c * dim + j) / nrm;
+    }
+    REF_PAR_FOR(rows * (dim * n + bins * dim + n * dim))
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t xb = rowoff(x, r, n), xs = laststride(x);
+        std::vector<float> e((size_t)dim);
+        float ss = 0.0f;
+        for (int64_t j = 0; j < dim; ++j) {
+            float acc = 0.0f;
+            for (int64_t d = 0; d < n; ++d) acc += ldt(iw, j * n + d) * ldt(x, xb + d * xs);
+            e[(size_t)j] = acc + ldt(ib, j);
+            ss += e[(size_t)j] * e[(size_t)j];
+        }
+        const float nrm = std::max(std::sqrt(ss), 1e-12f);
+        for (int64_t j = 0; j < dim; ++j) e[(size_t)j] /= nrm;
+        int64_t best = 0;
+        float bs = -INFINITY;
+        for (int64_t c = 0; c < bins; ++c) {
+            float s = 0.0f;
+            for (int64_t j = 0; j < dim; ++j) s += e[(size_t)j] * cn[(size_t)(c * dim + j)];
+            if (s > bs) { bs = s; best = c; }
+        }
+        st_int(codes->dtype, codes->data, offlin(codes, r), best);
+        for (int64_t d = 0; d < n; ++d) {
+            float q = 0.0f;
+            for (int64_t j = 0; j < dim; ++j) q += ldt(ow, d * dim + j) * ldt(cb, best * dim + j);
+            stt(x, xb + d * xs, ldt(x, xb + d * xs) - (q + ldt(ob, d)));
         }
     }
     return RAD_OK;

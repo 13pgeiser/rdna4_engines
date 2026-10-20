@@ -2372,7 +2372,8 @@ static const RadOperandSpec oAttnPS[] = {
 /* ---- audio generation (r4d_audio.hip); the same specs as libref's (ref_registry.cpp). */
 static const RadParamSpec pConv1d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
                                         P_INT("dil"), P_STRO("act"), P_STR("dtype"),
-                                        P_INTO("causal") };
+                                        P_INTO("causal"), P_INTO("stride"),
+                                        P_INTO("cu_div") };
 static const RadOperandSpec oConv1d[] = {
     { "x", RAD_OPD_IN, 0 }, { "w", RAD_OPD_WEIGHT, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 },
     { "res", RAD_OPD_IN, 1 }, { "y", RAD_OPD_OUT, 0 }, { "b", RAD_OPD_WEIGHT, 1 },
@@ -2404,6 +2405,13 @@ static const RadParamSpec pRvqEmbed[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_
 static const RadOperandSpec oRvqEmbed[] = {
     { "codes", RAD_OPD_IN, 0 }, { "t0", RAD_OPD_WEIGHT, 0 }, { "t1", RAD_OPD_WEIGHT, 0 },
     { "y", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pVqEncode[] = { P_INT("M"), P_INT("n"), P_INT("dim"), P_INT("bins"),
+                                          P_STR("dtype") };
+static const RadOperandSpec oVqEncode[] = {
+    { "x", RAD_OPD_INOUT, 0 }, { "in_w", RAD_OPD_WEIGHT, 0 }, { "in_b", RAD_OPD_WEIGHT, 0 },
+    { "cb", RAD_OPD_WEIGHT, 0 }, { "out_w", RAD_OPD_WEIGHT, 0 }, { "out_b", RAD_OPD_WEIGHT, 0 },
+    { "codes", RAD_OPD_OUT, 0 },
 };
 static const RadParamSpec pFrameMix[] = { P_INT("M"), P_INT("n_embd"), P_INT("L"), P_INT("stride"),
                                           P_INTO("rep"), P_STR("dtype") };
@@ -3338,6 +3346,9 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("rvq_embed", pRvqEmbed, oRvqEmbed,
            "a frame's embedding from code-major residual codes, the first codebook's table and the "
            "others' stacked one, times `scale`; `round` 1 rounds the f32 sum once."),
+    SCHEMA("vq_encode", pVqEncode, oVqEncode,
+           "one residual vector quantiser step: the code of greatest cosine with in_w x + in_b "
+           "(the lower index on a tie), then x -= out_w cb[code] + out_b."),
     SCHEMA("frame_mix_store", pFrameMix, oFrameMix,
            "a frame's conditioning row (softmax-weighted planes times scale) into its lane."),
     SCHEMA("end_status", pEndStatus, oEndStatus,
@@ -4825,6 +4836,8 @@ static const RadConstraint cRmsMod[] = { C_IN("dtype", "bf16"), C_DIV("n", 8), C
 static const RadConstraint cRmsModQ[] = { C_IN("dtype", "bf16"), C_DIV("n", 128), C_LE("n", 8192),
                                           C_EQ("group", 128) };
 static const RadConstraint cGenF32[] = { C_IN("dtype", "f32") };
+/* vq_encode: e's sums staged in LDS, a codebook dimension of 32 at most. */
+static const RadConstraint cVqEncode[] = { C_IN("dtype", "bf16 f32"), C_LE("dim", 32) };
 static const RadConstraint cPatchUnfold[] = { C_IN("dtype", "f32"), C_LE("C", 64) };
 static const RadConstraint cGenAnyFloat[] = { C_IN("dtype", "bf16 f32") };
 static const RadConstraint cSnakeAa[] = { C_IN("dtype", "f32"), C_LE("k", 32) };
@@ -8288,6 +8301,13 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cGenBf16), NOTUNE,
   nullptr, nullptr, r4d_rad_rvq_embed },
+
+{ "vq_encode", "vq_encode", "elem",
+  "a residual quantiser's step: the nearest code by cosine", "a workgroup a row, dim <= 32",
+  "bf16 or f32 rows and weights, f32 arithmetic, the row rounded once",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cVqEncode), NOTUNE,
+  nullptr, nullptr, r4d_rad_vq_encode },
 
 { "frame_mix_store_bf16", "frame_mix_store", "elem",
   "a frame's conditioning row into its lane", "a workgroup a lane, L <= 16",

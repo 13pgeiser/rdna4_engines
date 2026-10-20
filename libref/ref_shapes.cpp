@@ -3112,16 +3112,20 @@ static int64_t two_seqs(int64_t M) { return M >= 4 ? 2 : 1; }
 int ref_conv1d_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), cin = gi(p, n_p, "cin", 0), cout = gi(p, n_p, "cout", 0);
     const int64_t k = gi(p, n_p, "k", 0), causal = gi(p, n_p, "causal", 0);
-    if (M <= 0 || cin <= 0 || cout <= 0 || k <= 0 || (!causal && (k & 1) == 0))
+    const int64_t st = gi(p, n_p, "stride", 1), dil = gi(p, n_p, "dil", 1);
+    if (M <= 0 || cin <= 0 || cout <= 0 || k <= 0 || (!causal && (k & 1) == 0) || st < 1 ||
+        (st > 1 && (!causal || dil * (k - 1) + 1 < st || M % st)) || gi(p, n_p, "cu_div", 1) != 1)
         return RAD_E_UNSUPPORTED;
     const uint32_t D = act_dt(p, n_p);
-    const int64_t S = two_seqs(M);
+    /* A strided convolution is described over one sequence: two would each need a whole number
+     * of strides. Bounds in coarser units (cu_div) are not drawn; ref_test checks them. */
+    const int64_t S = st > 1 ? 1 : two_seqs(M);
     Opd o;
     o.t(D, { M, cin });                                       /* x */
     o.t(D, { cout, cin, k });                                 /* w */
     o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);    /* cu_seqlens */
-    o.t(D, { M, cout });                                      /* res */
-    o.t(D, { M, cout });                                      /* y */
+    o.t(D, { M / st, cout });                                 /* res */
+    o.t(D, { M / st, cout });                                 /* y */
     o.t(D, { cout });                                         /* b */
     return o.finish("conv1d", operand, out);
 }
@@ -3197,6 +3201,22 @@ int ref_rvq_embed_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out
     o.t(B, { (K > 1 ? K - 1 : 1) * voc, D });                 /* t1 */
     o.t(act_dt(p, n_p), { M, D });                            /* y */
     return o.finish("rvq_embed", operand, out);
+}
+
+int ref_vq_encode_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t dim = gi(p, n_p, "dim", 0), bins = gi(p, n_p, "bins", 0);
+    if (M <= 0 || n <= 0 || dim <= 0 || bins <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t F = (uint32_t)RAD_F32;
+    Opd o;
+    o.t(act_dt(p, n_p), { M, n });                            /* x, INOUT */
+    o.t(F, { dim, n });                                       /* in_w */
+    o.t(F, { dim });                                          /* in_b */
+    o.t(F, { bins, dim });                                    /* cb */
+    o.t(F, { n, dim });                                       /* out_w */
+    o.t(F, { n });                                            /* out_b */
+    o.t_idx({ M }, bins, -1, 0);                              /* codes, OUT */
+    return o.finish("vq_encode", operand, out);
 }
 
 int ref_frame_mix_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

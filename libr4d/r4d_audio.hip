@@ -56,7 +56,7 @@ __device__ __forceinline__ uint64_t seed_of(const uint32_t* seed, int e) {
 
 // ---------------------------------------------------------------------------- conv1d
 // An implicit GEMM, r4d_gen.hip's conv_igemm_kernel cut to one dimension: y[row][cout] = sum
-// over (tap, cin) of x[row + tap * dil - pad][cin] * w[cout][tap][cin], the weight stored
+// over (tap, cin) of x[row * stride + tap * dil - pad][cin] * w[cout][tap][cin], the weight stored
 // tap-major (r4d_layout.cpp relayouts PyTorch's [cout][cin][k] at load), so a 64-wide K tile is
 // eight 16-byte reads of input rows. A chunk outside its row's sequence reads zeros, which is the
 // per-sequence padding. Eight waves, BP rows x BC output channels a block, the next K tile's
@@ -77,7 +77,8 @@ __global__ __launch_bounds__(256) void conv1d_igemm_kernel(
     const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
     const uint16_t* __restrict__ bias, const uint16_t* __restrict__ res,
     const int* __restrict__ cu, uint16_t* __restrict__ y, int n_seq, int r_beg, int r_end,
-    int cin, int cout, int k, int dil, int pad, int x_ld, int y_ld, int res_ld, int act) {
+    int cin, int cout, int k, int dil, int pad, int stride, int cdiv, int x_ld, int y_ld,
+    int res_ld, int act) {
     constexpr int BP = 2 * TP * 16, BC = 4 * TC * 16;
     constexpr int CPR = C1_BK / 8;
     constexpr int AL = BP * CPR / 256, WL = BC * CPR / 256;
@@ -99,9 +100,9 @@ __global__ __launch_bounds__(256) void conv1d_igemm_kernel(
         const int m = p0 + r;
         a_ok[i] = m < r_end;
         a_row[i] = a_ok[i] ? m : r_beg;
-        const int sq = seq_of(cu, n_seq, a_row[i]);
-        a_s0[i] = cu[sq];
-        a_s1[i] = cu[sq + 1];
+        const int sq = seq_of(cu, n_seq, a_row[i] * stride * cdiv);
+        a_s0[i] = cu[sq] / cdiv;
+        a_s1[i] = cu[sq + 1] / cdiv;
         a_t[i] = e / cin;
         a_ci[i] = e % cin;
         adst[i] = sA + r * C1_PITCH + e;
@@ -122,7 +123,7 @@ __global__ __launch_bounds__(256) void conv1d_igemm_kernel(
     const r4d_u32x4 zero = {0u, 0u, 0u, 0u};
     auto loadA = [&](int i) -> r4d_u32x4 {
         if (!a_ok[i] || a_t[i] >= k) return zero;
-        const int ir = a_row[i] + a_t[i] * dil - pad;
+        const int ir = a_row[i] * stride + a_t[i] * dil - pad;
         if (ir < a_s0[i] || ir >= a_s1[i]) return zero;
         return *(const r4d_u32x4*)(x + (size_t)ir * x_ld + a_ci[i]);
     };
@@ -214,17 +215,18 @@ __global__ __launch_bounds__(kT) void conv1d_direct_kernel(
     const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
     const uint16_t* __restrict__ bias, const uint16_t* __restrict__ res,
     const int* __restrict__ cu, uint16_t* __restrict__ y, int n_seq, int r_beg, int r_end,
-    int cin, int cout, int k, int dil, int pad, int x_ld, int y_ld, int res_ld, int act) {
+    int cin, int cout, int k, int dil, int pad, int stride, int cdiv, int x_ld, int y_ld,
+    int res_ld, int act) {
     const int64_t t = (int64_t)blockIdx.x * kT + threadIdx.x;
     const int64_t total = (int64_t)(r_end - r_beg) * cout;
     if (t >= total) return;
     const int co = (int)(t % cout);
     const int row = r_beg + (int)(t / cout);
-    const int sq = seq_of(cu, n_seq, row);
-    const int s0 = cu[sq], s1 = cu[sq + 1];
+    const int sq = seq_of(cu, n_seq, row * stride * cdiv);
+    const int s0 = cu[sq] / cdiv, s1 = cu[sq + 1] / cdiv;
     float acc = 0.0f;
     for (int kk = 0; kk < k; ++kk) {
-        const int ir = row + kk * dil - pad;
+        const int ir = row * stride + kk * dil - pad;
         if (ir < s0 || ir >= s1) continue;
         const uint16_t* xp = x + (size_t)ir * x_ld;
         const uint16_t* wp = w + ((size_t)co * k + kk) * cin;
@@ -384,14 +386,14 @@ __global__ __launch_bounds__(256) void conv_t1d_kernel(
 // the output channels, its K the (tap, channel) pairs, channel innermost. A thread stages one K
 // column a slab and steps it sixteen at a time, so no K index is divided after the first.
 
-// conv1d's A: output row m's tap t reads input row m + t dil - pad of m's own sequence, zero
-// outside it and past the last tap. As r4d_f32::RowsLoader, every load is issued at an address
-// clamped into x's first `r_end` rows and the zero selected after it.
+// conv1d's A: output row m's tap t reads input row m stride + t dil - pad of m's own sequence,
+// zero outside it and past the last tap. As r4d_f32::RowsLoader, every load is issued at an
+// address clamped into x's first `r_end` stride rows and the zero selected after it.
 template <int CNT>
 struct Conv1dRows {
     const float* x;
     const int* cu;
-    int n_seq, r_end, cin, k, dil, pad, x_ld;
+    int n_seq, r_end, cin, k, dil, pad, x_ld, stride, cdiv;
     int row[CNT], s0[CNT], s1[CNT];
     int t = 0, ci = 0;
     __device__ void init(int first_row, int kk) {
@@ -399,9 +401,9 @@ struct Conv1dRows {
         for (int j = 0; j < CNT; ++j) {
             const int m = first_row + 16 * j;
             row[j] = m < r_end ? m : -1;
-            const int sq = seq_of(cu, n_seq, m < r_end ? m : r_end - 1);
-            s0[j] = cu[sq];
-            s1[j] = cu[sq + 1];
+            const int sq = seq_of(cu, n_seq, (m < r_end ? m : r_end - 1) * stride * cdiv);
+            s0[j] = cu[sq] / cdiv;
+            s1[j] = cu[sq + 1] / cdiv;
         }
         t = kk / cin;
         ci = kk % cin;
@@ -409,9 +411,10 @@ struct Conv1dRows {
     __device__ void fetch(float (&v)[CNT]) const {
 #pragma unroll
         for (int j = 0; j < CNT; ++j) {
-            const int ir = row[j] + t * dil - pad;
+            const int ir = row[j] * stride + t * dil - pad;
             const bool live = row[j] >= 0 && t < k && ir >= s0[j] && ir < s1[j];
-            const int irc = ir < 0 ? 0 : (ir >= r_end ? r_end - 1 : ir);
+            const int x_rows = r_end * stride;
+            const int irc = ir < 0 ? 0 : (ir >= x_rows ? x_rows - 1 : ir);
             const float xv = x[(uint32_t)irc * (uint32_t)x_ld + (uint32_t)ci];
             v[j] = live ? xv : 0.0f;
         }
@@ -428,12 +431,13 @@ template <int TN>
 __global__ __launch_bounds__(r4d_f32::kThr) void conv1d_f32_kernel(
     const float* __restrict__ x, const float* __restrict__ w, const float* __restrict__ bias,
     const float* res, const int* __restrict__ cu, float* y, int n_seq, int rows, int cin,
-    int cout, int k, int dil, int pad, int x_ld, int y_ld, int res_ld, int act) {
+    int cout, int k, int dil, int pad, int stride, int cdiv, int x_ld, int y_ld, int res_ld,
+    int act) {
     constexpr int TM = 8, BM = 16 * TM, BN = 16 * TN;
     const int tid = threadIdx.x, tx = tid & 15, ty = tid >> 4;
     const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
     const int K = k * cin;
-    Conv1dRows<TM> la{ x, cu, n_seq, rows, cin, k, dil, pad, x_ld };
+    Conv1dRows<TM> la{ x, cu, n_seq, rows, cin, k, dil, pad, x_ld, stride, cdiv };
     r4d_f32::RowsLoader<TN> lw{ w, K, cout, K };
     la.init(m0 + ty, tx);
     lw.init(n0 + ty, tx);
@@ -458,16 +462,17 @@ __global__ __launch_bounds__(r4d_f32::kThr) void conv1d_f32_kernel(
 __global__ __launch_bounds__(kT) void conv1d_f32_direct_kernel(
     const float* __restrict__ x, const float* __restrict__ w, const float* __restrict__ bias,
     const float* res, const int* __restrict__ cu, float* y, int n_seq, int rows, int cin,
-    int cout, int k, int dil, int pad, int x_ld, int y_ld, int res_ld, int act) {
+    int cout, int k, int dil, int pad, int stride, int cdiv, int x_ld, int y_ld, int res_ld,
+    int act) {
     const int64_t t = (int64_t)blockIdx.x * kT + threadIdx.x;
     if (t >= (int64_t)rows * cout) return;
     const int co = (int)(t % cout);
     const int row = (int)(t / cout);
-    const int sq = seq_of(cu, n_seq, row);
-    const int s0 = cu[sq], s1 = cu[sq + 1];
+    const int sq = seq_of(cu, n_seq, row * stride * cdiv);
+    const int s0 = cu[sq] / cdiv, s1 = cu[sq + 1] / cdiv;
     float acc = 0.0f;
     for (int kk = 0; kk < k; ++kk) {
-        const int ir = row + kk * dil - pad;
+        const int ir = row * stride + kk * dil - pad;
         if (ir < s0 || ir >= s1) continue;
         const float* xp = x + (size_t)ir * x_ld;
         const float* wp = w + ((size_t)co * k + kk) * cin;
@@ -806,6 +811,86 @@ __global__ __launch_bounds__(kT) void rvq_embed_kernel(
     }
 }
 
+// One residual quantiser step (DAC's VectorQuantize), a workgroup a row of x. e = in_w x + in_b,
+// each of its `dim` sums split over the workgroup and reduced through LDS; each thread then scores
+// a strided run of the codebook against e normalised, every row normalised as it is read
+// (F.normalize's division), and the workgroup's argmax keeps the lower index on a tie; last the
+// chosen raw row's out-projection leaves x's row, rounded once. libref's arithmetic in another
+// summation order.
+constexpr int kVqMaxDim = 32;
+
+__global__ __launch_bounds__(kT) void vq_encode_kernel(
+    void* __restrict__ x, int x_f32, int x_ld, const void* __restrict__ iw, int iw_f32,
+    const void* __restrict__ ib, int ib_f32, const void* __restrict__ cb, int cb_f32,
+    const void* __restrict__ ow, int ow_f32, const void* __restrict__ ob, int ob_f32,
+    int* __restrict__ codes, int64_t code_st, int n, int dim, int bins) {
+    __shared__ float part[kT / 32][kVqMaxDim];
+    __shared__ float e[kVqMaxDim], eh[kVqMaxDim];
+    __shared__ float wbest[kT / 32];
+    __shared__ int wcode[kT / 32];
+    const int tid = threadIdx.x, wv = tid >> 5, ln = tid & 31;
+    const size_t xb = (size_t)blockIdx.x * x_ld;
+    auto ldx = [&](int d) {
+        return x_f32 ? ((const float*)x)[xb + d] : bf2f(((const uint16_t*)x)[xb + d]);
+    };
+    for (int j = 0; j < dim; ++j) {
+        float acc = 0.0f;
+        for (int d = tid; d < n; d += kT) acc += ldtab(iw, iw_f32, (size_t)j * n + d) * ldx(d);
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor(acc, o, 32);
+        if (ln == 0) part[wv][j] = acc;
+    }
+    __syncthreads();
+    if (tid < dim) {
+        float acc = 0.0f;
+        for (int w = 0; w < kT / 32; ++w) acc += part[w][tid];
+        e[tid] = acc + ldtab(ib, ib_f32, (size_t)tid);
+    }
+    __syncthreads();
+    if (tid < dim) {
+        float ss = 0.0f;
+        for (int j = 0; j < dim; ++j) ss += e[j] * e[j];
+        eh[tid] = e[tid] / fmaxf(sqrtf(ss), 1e-12f);
+    }
+    __syncthreads();
+    // Each thread's best over its rows, ascending, so its first maximum is kept; INT_MAX none.
+    float bs = -INFINITY;
+    int bc = 0x7fffffff;
+    for (int c = tid; c < bins; c += kT) {
+        float ss = 0.0f;
+        for (int j = 0; j < dim; ++j) {
+            const float v = ldtab(cb, cb_f32, (size_t)c * dim + j);
+            ss += v * v;
+        }
+        const float nrm = fmaxf(sqrtf(ss), 1e-12f);
+        float dot = 0.0f;
+        for (int j = 0; j < dim; ++j) dot += eh[j] * (ldtab(cb, cb_f32, (size_t)c * dim + j) / nrm);
+        if (dot > bs) { bs = dot; bc = c; }
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float os = __shfl_xor(bs, o, 32);
+        const int oc = __shfl_xor(bc, o, 32);
+        if (os > bs || (os == bs && oc < bc)) { bs = os; bc = oc; }
+    }
+    if (ln == 0) { wbest[wv] = bs; wcode[wv] = bc; }
+    __syncthreads();
+    float fs = wbest[0];
+    int fc = wcode[0];
+    for (int w = 1; w < kT / 32; ++w)
+        if (wbest[w] > fs || (wbest[w] == fs && wcode[w] < fc)) { fs = wbest[w]; fc = wcode[w]; }
+    const int code = fc == 0x7fffffff ? 0 : fc;   // no score above -inf: code 0, as libref
+    if (tid == 0) codes[(size_t)blockIdx.x * code_st] = code;
+    for (int d = tid; d < n; d += kT) {
+        float q = 0.0f;
+        for (int j = 0; j < dim; ++j)
+            q += ldtab(ow, ow_f32, (size_t)d * dim + j) * ldtab(cb, cb_f32, (size_t)code * dim + j);
+        const float v = ldx(d) - (q + ldtab(ob, ob_f32, (size_t)d));
+        if (x_f32) ((float*)x)[xb + d] = v;
+        else ((uint16_t*)x)[xb + d] = f32_to_bf16(v);
+    }
+}
+
 // dst[(lane n_codes + k) stride + frame - skip] = codes[k, rep i]; a thread a (lane, code). A lane
 // outside `status`, or a frame past `stride` or a lane past `dst`, stores nothing (libref refuses
 // the call).
@@ -1126,24 +1211,26 @@ extern "C" int r4d_rad_conv1d(const RadArgs* a, RadStream s) {
         return R4D_NO(RAD_E_DTYPE);
     const long long cin = r4d_geti_or(a, "cin", 0), cout = r4d_geti_or(a, "cout", 0);
     const long long k = r4d_geti_or(a, "k", 0), dil = r4d_geti_or(a, "dil", 1);
-    const long long causal = r4d_geti_or(a, "causal", 0);
+    const long long causal = r4d_geti_or(a, "causal", 0), st = r4d_geti_or(a, "stride", 1);
+    const long long cd = r4d_geti_or(a, "cu_div", 1);
     const int act = conv1d_act(r4d_gets(a, "act"));
     if (act < 0) return R4D_NO(RAD_E_INVAL);
     if (cin <= 0 || cout <= 0 || k <= 0 || (!causal && (k & 1) == 0) || dil <= 0 || causal < 0 ||
-        causal > 1)
+        causal > 1 || st < 1 || (st > 1 && (!causal || dil * (k - 1) + 1 < st)) || cd < 1)
         return R4D_NO(RAD_E_SHAPE);
     long long rx = 0, ry = 0, rr = 0;
     const long long xl = r4d_rows_pitch(x, cin, &rx), yl = r4d_rows_pitch(y, cout, &ry);
     const long long rl = res ? r4d_rows_pitch(res, cout, &rr) : 0;
     if (xl < 0 || yl < 0 || rl < 0) return R4D_NO(RAD_E_STRIDE);
     const long long n_seq = r4d_numel(cu) - 1;
-    if (n_seq <= 0 || ry <= 0 || rx < ry || (res && rr < ry) || r4d_numel(w) < cout * cin * k ||
-        (b && r4d_numel(b) < cout))
+    if (n_seq <= 0 || ry <= 0 || rx < ry * st || (res && rr < ry) ||
+        r4d_numel(w) < cout * cin * k || (b && r4d_numel(b) < cout))
         return R4D_NO(RAD_E_SHAPE);
     const uint16_t* bp = b ? (const uint16_t*)b->data : nullptr;
-    /* Both kernels read input row row + tap * dil - pad: half the reach a side, or all of it on
-     * the left for the causal form. */
-    const int pad = (int)(causal ? dil * (k - 1) : dil * (k - 1) / 2);
+    /* Both kernels read input row row * stride + tap * dil - pad: half the reach a side, or for
+     * the causal form all of it on the left less the stride (the sequences' bounds whole
+     * strides, as the op requires). */
+    const int pad = (int)(causal ? dil * (k - 1) + 1 - st : dil * (k - 1) / 2);
     const bool tiled = (cin % 8) == 0 && cout >= 16 && (xl % 8) == 0 &&
                        ((uintptr_t)x->data & 15) == 0 && ((uintptr_t)w->data & 15) == 0;
     const uint16_t* rp = res ? (const uint16_t*)res->data : nullptr;
@@ -1156,8 +1243,8 @@ extern "C" int r4d_rad_conv1d(const RadArgs* a, RadStream s) {
                                dim3(256), 0, (hipStream_t)s, (const uint16_t*)x->data,
                                (const uint16_t*)w->data, bp, rp,
                                (const int*)cu->data, (uint16_t*)y->data, (int)n_seq, 0, (int)ry,
-                               (int)cin, (int)cout, (int)k, (int)dil, pad, (int)xl, (int)yl,
-                               (int)rl, act);
+                               (int)cin, (int)cout, (int)k, (int)dil, pad, (int)st, (int)cd,
+                               (int)xl, (int)yl, (int)rl, act);
         } else {
             constexpr int TP = 4, TC = 1, BP = 128, BC = 64;
             hipLaunchKernelGGL((conv1d_igemm_kernel<TP, TC>),
@@ -1165,15 +1252,15 @@ extern "C" int r4d_rad_conv1d(const RadArgs* a, RadStream s) {
                                dim3(256), 0, (hipStream_t)s, (const uint16_t*)x->data,
                                (const uint16_t*)w->data, bp, rp,
                                (const int*)cu->data, (uint16_t*)y->data, (int)n_seq, 0, (int)ry,
-                               (int)cin, (int)cout, (int)k, (int)dil, pad, (int)xl, (int)yl,
-                               (int)rl, act);
+                               (int)cin, (int)cout, (int)k, (int)dil, pad, (int)st, (int)cd,
+                               (int)xl, (int)yl, (int)rl, act);
         }
     } else {
         hipLaunchKernelGGL(conv1d_direct_kernel, dim3(blocks_for(ry * cout)), dim3(kT), 0,
                            (hipStream_t)s, (const uint16_t*)x->data, (const uint16_t*)w->data,
                            bp, rp, (const int*)cu->data, (uint16_t*)y->data,
                            (int)n_seq, 0, (int)ry, (int)cin, (int)cout, (int)k, (int)dil, pad,
-                           (int)xl, (int)yl, (int)rl, act);
+                           (int)st, (int)cd, (int)xl, (int)yl, (int)rl, act);
     }
     return st_of(hipGetLastError());
 }
@@ -1237,11 +1324,12 @@ extern "C" int r4d_rad_conv1d_f32(const RadArgs* a, RadStream s) {
     if (!r4d_contig(w) || (b && !r4d_contig(b)) || !r4d_contig(cu)) return R4D_NO(RAD_E_STRIDE);
     const long long cin = r4d_geti_or(a, "cin", 0), cout = r4d_geti_or(a, "cout", 0);
     const long long k = r4d_geti_or(a, "k", 0), dil = r4d_geti_or(a, "dil", 1);
-    const long long causal = r4d_geti_or(a, "causal", 0);
+    const long long causal = r4d_geti_or(a, "causal", 0), st = r4d_geti_or(a, "stride", 1);
+    const long long cd = r4d_geti_or(a, "cu_div", 1);
     const int act = conv1d_act(r4d_gets(a, "act"));
     if (act < 0) return R4D_NO(RAD_E_INVAL);
     if (cin <= 0 || cout <= 0 || k <= 0 || (!causal && (k & 1) == 0) || dil <= 0 || causal < 0 ||
-        causal > 1)
+        causal > 1 || st < 1 || (st > 1 && (!causal || dil * (k - 1) + 1 < st)) || cd < 1)
         return R4D_NO(RAD_E_SHAPE);
     long long rx = 0, ry = 0, rr = 0;
     const long long xl = r4d_rows_pitch(x, cin, &rx), yl = r4d_rows_pitch(y, cout, &ry);
@@ -1249,18 +1337,19 @@ extern "C" int r4d_rad_conv1d_f32(const RadArgs* a, RadStream s) {
     if (xl < 0 || yl < 0 || rl < 0) return R4D_NO(RAD_E_STRIDE);
     const long long n_seq = r4d_numel(cu) - 1;
     /* The tile's loaders index x and w with 32-bit element offsets. */
-    if (n_seq <= 0 || ry <= 0 || rx < ry || (res && rr < ry) || r4d_numel(w) < cout * cin * k ||
-        (b && r4d_numel(b) < cout) || ry > 0x7fffffffll || (ry + 127) / 128 > 65535 ||
-        ry * xl >= (1ll << 32) || cout * cin * k >= (1ll << 32))
+    if (n_seq <= 0 || ry <= 0 || rx < ry * st || (res && rr < ry) ||
+        r4d_numel(w) < cout * cin * k || (b && r4d_numel(b) < cout) || ry > 0x7fffffffll ||
+        (ry + 127) / 128 > 65535 || ry * st * xl >= (1ll << 32) || cout * cin * k >= (1ll << 32))
         return R4D_NO(RAD_E_SHAPE);
-    const int pad = (int)(causal ? dil * (k - 1) : dil * (k - 1) / 2);
+    const int pad = (int)(causal ? dil * (k - 1) + 1 - st : dil * (k - 1) / 2);
     const float* bp = b ? (const float*)b->data : nullptr;
     const float* rp = res ? (const float*)res->data : nullptr;
     if (cout < 16) {
         hipLaunchKernelGGL(conv1d_f32_direct_kernel, dim3(blocks_for(ry * cout)), dim3(kT), 0,
                            (hipStream_t)s, (const float*)x->data, (const float*)w->data, bp, rp,
                            (const int*)cu->data, (float*)y->data, (int)n_seq, (int)ry, (int)cin,
-                           (int)cout, (int)k, (int)dil, pad, (int)xl, (int)yl, (int)rl, act);
+                           (int)cout, (int)k, (int)dil, pad, (int)st, (int)cd, (int)xl, (int)yl,
+                           (int)rl, act);
         return st_of(hipGetLastError());
     }
     const int tn = cout > 64 ? 8 : cout > 32 ? 4 : 2;
@@ -1269,7 +1358,8 @@ extern "C" int r4d_rad_conv1d_f32(const RadArgs* a, RadStream s) {
     hipLaunchKernelGGL((conv1d_f32_kernel<TN>), grid, dim3(r4d_f32::kThr), 0, (hipStream_t)s,      \
                        (const float*)x->data, (const float*)w->data, bp, rp,                       \
                        (const int*)cu->data, (float*)y->data, (int)n_seq, (int)ry, (int)cin,       \
-                       (int)cout, (int)k, (int)dil, pad, (int)xl, (int)yl, (int)rl, act)
+                       (int)cout, (int)k, (int)dil, pad, (int)st, (int)cd, (int)xl, (int)yl,      \
+                       (int)rl, act)
     if (tn == 8) C1F(8);
     else if (tn == 4) C1F(4);
     else C1F(2);
@@ -1430,6 +1520,37 @@ extern "C" int r4d_rad_rvq_embed(const RadArgs* a, RadStream s) {
                        y->data, y->dtype == RAD_F32 ? 1 : 0, (int)D, (int)K, (int)voc, (int)off0,
                        (int)(r4d_numel(t0) / D), (int)(r4d_numel(t1) / D), (float)scale, (int)yl,
                        (int)round1, (int)clamp);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_vq_encode(const RadArgs* a, RadStream s) {
+    const RadTensor *x = r4d_opt(a, 0), *iw = r4d_opt(a, 1), *ib = r4d_opt(a, 2);
+    const RadTensor *cb = r4d_opt(a, 3), *ow = r4d_opt(a, 4), *ob = r4d_opt(a, 5);
+    const RadTensor* codes = r4d_opt(a, 6);
+    if (!x || !iw || !ib || !cb || !ow || !ob || !codes) return R4D_NO(RAD_E_INVAL);
+    auto bf_or_f32 = [](const RadTensor* t) { return t->dtype == RAD_BF16 || t->dtype == RAD_F32; };
+    if (!is_i32(codes) || !bf_or_f32(x) || !bf_or_f32(iw) || !bf_or_f32(ib) || !bf_or_f32(cb) ||
+        !bf_or_f32(ow) || !bf_or_f32(ob))
+        return R4D_NO(RAD_E_DTYPE);
+    const long long n = r4d_geti_or(a, "n", 0), dim = r4d_geti_or(a, "dim", 0);
+    const long long bins = r4d_geti_or(a, "bins", 0);
+    if (n <= 0 || dim <= 0 || dim > kVqMaxDim || bins <= 0) return R4D_NO(RAD_E_SHAPE);
+    long long rx = 0;
+    const long long xl = r4d_rows_pitch(x, n, &rx);
+    if (xl < 0 || !r4d_contig(iw) || !r4d_contig(ib) || !r4d_contig(cb) || !r4d_contig(ow) ||
+        !r4d_contig(ob))
+        return R4D_NO(RAD_E_STRIDE);
+    if (rx <= 0 || r4d_numel(codes) < rx || r4d_numel(iw) < dim * n || r4d_numel(ib) < dim ||
+        r4d_numel(cb) < bins * dim || r4d_numel(ow) < n * dim || r4d_numel(ob) < n ||
+        rx > 0x7fffffffll)
+        return R4D_NO(RAD_E_SHAPE);
+    /* A code at the operand's own stride: a row of a code-major plane, or a column of one. */
+    const long long cs = codes->rank >= 1 ? codes->stride[codes->rank - 1] : 1;
+    auto f32 = [](const RadTensor* t) { return t->dtype == RAD_F32 ? 1 : 0; };
+    hipLaunchKernelGGL(vq_encode_kernel, dim3((unsigned)rx), dim3(kT), 0, (hipStream_t)s, x->data,
+                       f32(x), (int)xl, iw->data, f32(iw), ib->data, f32(ib), cb->data, f32(cb),
+                       ow->data, f32(ow), ob->data, f32(ob), (int*)codes->data, (int64_t)cs,
+                       (int)n, (int)dim, (int)bins);
     return st_of(hipGetLastError());
 }
 

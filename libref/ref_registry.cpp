@@ -884,7 +884,8 @@ static const RadOperandSpec oBweUp[] = { OPD("x"), OPD("res"), OUT("y") };
 /* ---- audio generation (ref_audio.cpp) */
 static const RadParamSpec pConv1d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
                                         P_INT("dil"), P_STRO("act"), P_STR("dtype"),
-                                        P_INTO("causal") };
+                                        P_INTO("causal"), P_INTO("stride"),
+                                        P_INTO("cu_div") };
 static const RadOperandSpec oConv1d[] = { OPD("x"), WGT("w"), OPD("cu_seqlens"), OPD_O("res"),
                                           OUT("y"), WGT_O("b") };
 static const RadParamSpec pConvT1d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("stride"),
@@ -908,6 +909,10 @@ static const RadParamSpec pRvqEmbed[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_
                                           P_INT("vocab"), P_INT("off0"), P_F64("scale"),
                                           P_STR("dtype"), P_INTO("round"), P_INTO("clamp") };
 static const RadOperandSpec oRvqEmbed[] = { OPD("codes"), WGT("t0"), WGT("t1"), OUT("y") };
+static const RadParamSpec pVqEncode[] = { P_INT("M"), P_INT("n"), P_INT("dim"), P_INT("bins"),
+                                          P_STR("dtype") };
+static const RadOperandSpec oVqEncode[] = { INOUT("x"), WGT("in_w"), WGT("in_b"), WGT("cb"),
+                                            WGT("out_w"), WGT("out_b"), OUT("codes") };
 static const RadParamSpec pFrameMix[] = { P_INT("M"), P_INT("n_embd"), P_INT("L"), P_INT("stride"),
                                           P_INTO("rep"), P_STR("dtype") };
 static const RadOperandSpec oFrameMix[] = { OPD("hid"), WGT("logits"), WGT("scale"), OPD("lane"),
@@ -1769,6 +1774,10 @@ static const RadOpSchema kSchemas[] = {
   "a frame's embedding from code-major residual codes [n_codes, rows]: t0[c0 + off0] plus the sum "
   "of t1[c_k + (k - 1) vocab], times `scale`, rounded as bf16(bf16(t0 + bf16(sum)) * scale), or "
   "with `round` 1 one f32 sum in codebook order times scale, rounded once." },
+{ "vq_encode", ARR(pVqEncode), ARR(oVqEncode),
+  "one residual vector quantiser step: e = in_w x + in_b, the code the row of cb of greatest "
+  "cosine with e (the lower index on a tie), then x -= out_w cb[code] + out_b; f32, x rounded "
+  "once." },
 { "frame_mix_store", ARR(pFrameMix), ARR(oFrameMix),
   "a frame's conditioning row: the softmax(logits)-weighted sum of hid's L planes times scale, "
   "stored at dst[lane * stride + frame - 1] for frame >= 1 and status[lane] >= 0." },
@@ -2345,6 +2354,8 @@ SIMPLE("ref_cfg_topk_sample", "cfg_topk_sample", "sample", "a guided top-k pick 
        DT_FLOAT, ref_cfg_topk_sample),
 SIMPLE("ref_rvq_embed", "rvq_embed", "elem", "a frame's embedding from its residual codes",
        DT_FLOAT, ref_rvq_embed),
+SIMPLE("ref_vq_encode", "vq_encode", "elem",
+       "a residual quantiser's step: the nearest code by cosine", DT_FLOAT, ref_vq_encode),
 SIMPLE("ref_frame_mix_store", "frame_mix_store", "elem", "a frame's conditioning row into its lane",
        DT_FLOAT, ref_frame_mix_store),
 SIMPLE("ref_end_status", "end_status", "elem", "a frame's status from its first pick", DT_ANY,

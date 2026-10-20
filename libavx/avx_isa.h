@@ -135,6 +135,7 @@ int         avx_par_force(int threads);
     X(resample_nearest)     X(fourier_embed)        X(win_input)            X(win_prep)           \
     X(win_finish)           X(chan_split)           X(interleave2)          X(iota)               \
     X(cu_repeat)            X(snake_aa)             X(int_affine)           X(ras_pick)           \
+    X(vq_encode)                                                                                  \
     /* ---- sampling, and the drafter's token walk */                                             \
     X(sample_penalties)     X(sample_dry)           X(sample_temp)          X(sample_topk)        \
     X(sample_topp)          X(sample_minp)          X(sample_typical)       X(sample_xtc)         \
