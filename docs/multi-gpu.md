@@ -1027,6 +1027,49 @@ token. The first decode token after load runs direct and the second captures
 `HIPFIRE_TP2_GRAPH_REPLAYS`) and with greedy transcript identity against
 `HIPFIRE_TP_FULL_GRAPH=0`.
 
+### Generic mesh executor: TP collectives (developer)
+
+`Gpus::provision_mesh_edges` admits pure PP meshes (TP = EP = 1) and pure TP
+meshes (PP = EP = 1). TP×PP and any EP axis are refused before anything is
+touched. For a pure TP mesh the executor runs the splitter's `AllReduceAdd`
+and `AllReduce` collectives over the group of every rank in rank order, with
+the hand dense-TP routes' numeric contract: `x + (p0 + p1 + …)` and
+`p0 + p1 + …`, the same bytes on every rank. The transport is chosen once at
+provisioning, with no runtime fallback:
+
+- **Peer** (the `Gpus` rooted rank-order fold): every rank pair is either one
+  device under `HIPFIRE_EMULATE_GPUS` or passes byte-qualified peer reads.
+- **RCCL**: otherwise, two ranks only, unless `hardware.tp_use_rccl = false`.
+  RCCL does not fix the order of a wider sum, so a wider group without peer
+  access is refused.
+
+Scratch, events and the RCCL communicator are allocated at provisioning. The
+whole epoch is validated before the first enqueue (group = every rank
+ascending, one occurrence per rank, F32 descriptors equal on every rank,
+no overlapping operands or targets, the replaced `Accumulate` not scheduled),
+and a failed drain quarantines the mesh exactly as for PP edges. Family
+bindings return the operand as `BoundaryIo::view`, the `AllReduceAdd` target
+as `BoundaryIo::into`, and `Gpus::mesh_tp_epoch()` as the descriptor epoch.
+
+Oracle (byte identity against the single-device rank-order sum over two
+undrained epochs, plus a TP×EP refusal); on one device:
+
+```sh
+cargo test -p hipfire-runtime --lib --no-run   # prints the unittests binary
+for n in 2 4; do HIPFIRE_EMULATE_GPUS=$n <binary> \
+  multi_gpu::executor::tests::tp_collectives_match_single_device_rank_order_sum \
+  --ignored --nocapture --test-threads=1; done
+```
+
+Physical runbook (gfx1201, not run on a single-device box): run the same test
+without `HIPFIRE_EMULATE_GPUS`; it uses every visible device as one rank.
+Run it with `HIP_VISIBLE_DEVICES` set to two and then four peer-capable cards
+(Peer transport). The RCCL
+transport is reached only with two cards whose peer qualification fails; on a
+box where every pair qualifies there is no RCCL arm to run. Record per arm the
+`TP<n> oracle` line (FNV-64 digests of `x` and `n`), the binary MD5 and
+`HIP_VISIBLE_DEVICES`.
+
 ### Architectural limits (current)
 
 - Homogeneous **exact arch string** by default (`ALLOW_MIXED_ARCH` is opt-in).
