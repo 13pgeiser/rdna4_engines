@@ -22,7 +22,7 @@
 //! wait with a generation store. Nothing may synchronize the stream between those
 //! two calls; every error between them stores the abort value first.
 
-use crate::cpu_exec::{self, CpuMoeExpert};
+use crate::cpu_exec::{self, CpuArmTrace, CpuMoeExpert};
 use crate::cpwait::{
     spin_until_ready, ArmId, Disarm, GatePort, JoinGate, JoinTarget, SpinOutcome, SystemClock,
     Watchdog, READY_SPIN_BUDGET,
@@ -251,6 +251,51 @@ fn input_wait(ready: D2Ready) -> InputWait {
     match ready {
         D2Ready::Sync => InputWait::StreamSync,
         D2Ready::Event => InputWait::EventSpin,
+    }
+}
+/// Fixed-size per-call join trace for the opt-in `HIPFIRE_CPU_SPLIT_TRACE`
+/// diagnostic (mapped + CP-wait successful joins only). Stack-owned; no
+/// allocation. The `cpu_exec` sub-record crosses the Rayon pool as the owned
+/// return of the crate-private timed entry. Inclusive totals overlap disjoint
+/// children by design (`join_total_ns` over resolve/prove/cpu_total/zero/
+/// publish/mark/release; `cpu_total_ns` over validate/pool_install;
+/// `pool_install_ns` over `pool_body_ns`; `pool_body_ns` over
+/// group/GU/middle/DN/scatter) — reconciliation is `child_sum <= inclusive`,
+/// except `gu/dn == prep + exec` exactly.
+#[derive(Clone, Copy, Default, Debug)]
+struct CpuJoinTrace {
+    resolve_ns: u64,
+    prove_ns: u64,
+    trace: CpuArmTrace,
+    zero_ns: u64,
+    zero_slots: u64,
+    publish_ns: u64,
+    mark_ns: u64,
+    release_ns: u64,
+    /// Enclosures in nanoseconds from the existing join trace-entry `Instant`.
+    /// Retirement encloses the existing HIP event-record call, not GPU time.
+    retirement_start_ns: Option<u64>,
+    retirement_end_ns: Option<u64>,
+    /// Encloses `JoinGate::release`, including its actual join-word store.
+    /// This is not the broader legacy `release_ns` bookkeeping duration.
+    release_start_ns: Option<u64>,
+    release_end_ns: Option<u64>,
+    join_word_device: usize,
+    /// Join entry through release; measured BEFORE the single log line, so no
+    /// logging cost is included.
+    join_total_ns: u64,
+}
+
+/// Numeric JSON or literal null, without allocation. A skipped CPU phase has
+/// no boundary; zero would falsely position it at the join-entry epoch.
+struct TraceNs(Option<u64>);
+
+impl std::fmt::Display for TraceNs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(value) => write!(f, "{value}"),
+            None => f.write_str("null"),
+        }
     }
 }
 
@@ -689,6 +734,16 @@ pub struct CpuSplitExecutor {
     ready_fallback_syncs: Cell<u64>,
     /// Why a requested CP-wait join was refused (host join kept).
     join_refusal: Option<String>,
+    /// Opt-in `HIPFIRE_CPU_SPLIT_TRACE=1`, read once at construction and
+    /// cached. Independent of `diag_on`/parity: it never enables them and they
+    /// never enable it. Disabled: no clock reads, records, or output.
+    cpu_trace: bool,
+}
+
+/// The single env value that enables the CPU-arm trace; every other setting
+/// (including unset) keeps the zero-overhead path.
+fn cpu_split_trace_enabled() -> bool {
+    hipfire_config::developer_var("HIPFIRE_CPU_SPLIT_TRACE").is_ok_and(|v| v == "1")
 }
 
 impl CpuSplitExecutor {
@@ -790,6 +845,7 @@ impl CpuSplitExecutor {
             ready_polls: Cell::new(0),
             ready_fallback_syncs: Cell::new(0),
             join_refusal: None,
+            cpu_trace: cpu_split_trace_enabled(),
         })
     }
 
@@ -1779,6 +1835,15 @@ impl CpuSplitExecutor {
         expanded: &GpuTensor,
         experts: &dyn RoutedExpertWeights,
     ) -> Result<(), DispatchError> {
+        // Trace-only entry clock: BEFORE gate/validation so `join_total_ns`
+        // spans the whole successful join. Existing parity `tj0` semantics
+        // unchanged (it still starts after the state checks).
+        // Every new *_start_ns / *_end_ns uses this SAME Instant origin and
+        // saturated nanosecond conversion as the existing CPU join trace.
+        // These are CPU clock enclosures; the retirement API's profiler
+        // interval constrains clock translation, never an assumed offset.
+        let trace_on = self.cpu_trace && self.cpwait.is_some();
+        let trace_entry = trace_on.then(Instant::now);
         self.gate(gpu, rows)?;
         let slots = rows * self.top_k;
         if expanded.buf.size() < slots * self.dim * 4 {
@@ -1815,6 +1880,7 @@ impl CpuSplitExecutor {
                     )
                     .ok_or_else(|| err("immutable cold payload disappeared"))?;
             }
+            let resolve_ns = trace_entry.map_or(0, |t| ns(t, Instant::now()));
             let Transaction {
                 input,
                 output,
@@ -1857,51 +1923,109 @@ impl CpuSplitExecutor {
                     .map_err(|_| err("mapped return buffer is in use"))?;
                 // `prepare` retired the previous consumer; prove it again
                 // before the first host store (no-op when already Retired).
+                let t_prove = trace_on.then(Instant::now);
                 self.prove_retired(gpu, &mut buf)?;
+                let prove_ns = t_prove.map_or(0, |t| ns(t, Instant::now()));
                 let mut write = buf.begin_write().map_err(err)?;
                 let all = write.f32_mut().map_err(err)?;
                 let rows_out = &mut all[..slots * self.dim];
-                let t_cpu = diag.then(Instant::now);
-                cpu_exec::moe_cpu_host_slot_outputs(
-                    self.dim,
-                    self.mi,
-                    rows,
-                    self.top_k,
-                    self.placement.len(),
-                    &ids[..slots],
-                    Some(&gpu_ids[..slots]),
-                    &host_slots[..*host_count],
-                    &resolved[..*host_count],
-                    x,
-                    false,
-                    rows_out,
-                )?;
+                let t_cpu = (diag || trace_on).then(Instant::now);
+                let arm = if trace_on {
+                    Some(cpu_exec::moe_cpu_host_slot_outputs_traced(
+                        self.dim,
+                        self.mi,
+                        rows,
+                        self.top_k,
+                        self.placement.len(),
+                        &ids[..slots],
+                        Some(&gpu_ids[..slots]),
+                        &host_slots[..*host_count],
+                        &resolved[..*host_count],
+                        x,
+                        false,
+                        rows_out,
+                        trace_entry.expect("trace_on supplies the join trace epoch"),
+                    )?)
+                } else {
+                    cpu_exec::moe_cpu_host_slot_outputs(
+                        self.dim,
+                        self.mi,
+                        rows,
+                        self.top_k,
+                        self.placement.len(),
+                        &ids[..slots],
+                        Some(&gpu_ids[..slots]),
+                        &host_slots[..*host_count],
+                        &resolved[..*host_count],
+                        x,
+                        false,
+                        rows_out,
+                    )?;
+                    None
+                };
                 // Slots owned by neither arm hold zero in the copy transport's
                 // expanded rows (masked zero stores); match those bytes.
+                let t_zero = trace_on.then(Instant::now);
                 zero_unwritten_slots(rows_out, self.dim, &host_slots[..*host_count]);
+                let (zero_ns, zero_slots) = match t_zero {
+                    Some(t) => (ns(t, Instant::now()), (slots - *host_count) as u64),
+                    None => (0, 0),
+                };
                 let cpu_ns = t_cpu.map_or(0, |t| ns(t, Instant::now()));
+                let t_publish = trace_on.then(Instant::now);
                 let published = write.publish();
+                let publish_ns = t_publish.map_or(0, |t| ns(t, Instant::now()));
                 if let Some(cp) = self.cpwait.as_ref() {
                     // The combine is already queued behind the wait: record its
                     // retirement event at the stream tail, publish the ledger
                     // transition, then release the wait with this generation.
+                    let t_mark = trace_on.then(Instant::now);
                     buf.mark_gpu_reading(&gpu.hip, published, gpu.active_stream.as_ref())
                         .map_err(err)?;
+                    let retirement_end_ns = trace_entry.map(|epoch| ns(epoch, Instant::now()));
+                    let mark_ns = t_mark.map_or(0, |t| ns(t, Instant::now()));
+                    // Release spans ALL ledger/watchdog/release bookkeeping
+                    // after the mark: joined_gated, the publication counter,
+                    // the wait release, and the join counter.
+                    let t_release = trace_on.then(Instant::now);
                     ret.joined_gated();
                     self.mapped_publications
                         .set(self.mapped_publications.get() + 1);
+                    let release_start_ns = trace_entry.map(|epoch| ns(epoch, Instant::now()));
                     cp.gate
                         .borrow_mut()
                         .release(&CpPort { cp, gpu: Some(gpu) })
                         .map_err(err)?;
+                    let release_end_ns = trace_entry.map(|epoch| ns(epoch, Instant::now()));
                     cp.joins.set(cp.joins.get() + 1);
-                    return Ok(cpu_ns);
+                    let release_ns = t_release.map_or(0, |t| ns(t, Instant::now()));
+                    let trace = arm.map(|t| CpuJoinTrace {
+                        resolve_ns,
+                        prove_ns,
+                        trace: t,
+                        zero_ns,
+                        zero_slots,
+                        publish_ns,
+                        mark_ns,
+                        release_ns,
+                        retirement_start_ns: trace_entry
+                            .zip(t_mark)
+                            .map(|(epoch, start)| ns(epoch, start)),
+                        retirement_end_ns,
+                        release_start_ns,
+                        release_end_ns,
+                        // The same non-owning device view used to queue the wait;
+                        // never the host-mapped address or an executor surrogate.
+                        join_word_device: cp.join_word.device_buffer().as_ptr() as usize,
+                        join_total_ns: trace_entry.map_or(0, |t| ns(t, Instant::now())),
+                    });
+                    return Ok((cpu_ns, trace));
                 }
                 *token = Some(published);
                 ret.published();
                 self.mapped_publications
                     .set(self.mapped_publications.get() + 1);
-                return Ok(cpu_ns);
+                return Ok((cpu_ns, None));
             }
             let out = unsafe {
                 std::slice::from_raw_parts_mut(
@@ -1949,11 +2073,11 @@ impl CpuSplitExecutor {
             if self.mapped.is_some() {
                 ret.bypassed();
             }
-            Ok(cpu_ns)
+            Ok((cpu_ns, None))
         })();
         st.ready = false;
         match result {
-            Ok(cpu_ns) => {
+            Ok((cpu_ns, arm)) => {
                 if let Some(tj0) = tj0 {
                     if self.recording.get() {
                         let now = Instant::now();
@@ -1975,6 +2099,60 @@ impl CpuSplitExecutor {
                                 mapped_retire_waits: self.mapped_retire_waits.get() - st.waits_base,
                             };
                         }
+                    }
+                }
+                // Opt-in diagnostic: exactly one numeric JSON line per mapped +
+                // CP-wait successful join, AFTER generation release and all
+                // publication bookkeeping above. Error/abort paths return early
+                // and emit nothing. No output while a generation is unreleased.
+                if let (true, Some(j)) = (trace_on, arm) {
+                    // EVERY successful mapped + CP-wait join, including a
+                    // zero-host-slot call (parser admits unique_experts == 0).
+                    if self.cpwait.is_some() {
+                        let t = &j.trace;
+                        eprintln!(
+                            "QWEN4_CPU_ARM {{\"rows\":{rows},\"dim\":{},\"top_k\":{},\"host_count\":{},\"unique_experts\":{},\"executor\":{},\"cpwait\":1,\"cp_gen\":{},\"cp_joins\":{},\"resolve_ns\":{},\"prove_ns\":{},\"cpu_total_ns\":{},\"validate_ns\":{},\"pool_install_ns\":{},\"pool_body_ns\":{},\"group_ns\":{},\"gu_ns\":{},\"gu_prep_ns\":{},\"gu_exec_ns\":{},\"middle_ns\":{},\"gather_ns\":{},\"silu_ns\":{},\"fwht_ns\":{},\"dn_ns\":{},\"dn_prep_ns\":{},\"dn_exec_ns\":{},\"scatter_ns\":{},\"zero_ns\":{},\"zero_slots\":{},\"publish_ns\":{},\"mark_ns\":{},\"release_ns\":{},\"join_total_ns\":{},\"middle_start_ns\":{},\"middle_end_ns\":{},\"scatter_start_ns\":{},\"scatter_end_ns\":{},\"retirement_start_ns\":{},\"retirement_end_ns\":{},\"release_start_ns\":{},\"release_end_ns\":{},\"join_word_device\":{}}}",
+                            self.dim,
+                            self.top_k,
+                            st.host_count,
+                            t.unique_experts,
+                            self as *const Self as usize,
+                            st.cp_gen,
+                            self.cpwait.as_ref().map_or(0, |cp| cp.joins.get()),
+                            j.resolve_ns,
+                            j.prove_ns,
+                            t.cpu_total_ns,
+                            t.validate_ns,
+                            t.pool_install_ns,
+                            t.pool_body_ns,
+                            t.group_ns,
+                            t.gu_ns,
+                            t.gu_prep_ns,
+                            t.gu_exec_ns,
+                            t.middle_ns,
+                            t.gather_ns,
+                            t.silu_ns,
+                            t.fwht_ns,
+                            t.dn_ns,
+                            t.dn_prep_ns,
+                            t.dn_exec_ns,
+                            t.scatter_ns,
+                            j.zero_ns,
+                            j.zero_slots,
+                            j.publish_ns,
+                            j.mark_ns,
+                            j.release_ns,
+                            j.join_total_ns,
+                            TraceNs(t.middle_start_ns),
+                            TraceNs(t.middle_end_ns),
+                            TraceNs(t.scatter_start_ns),
+                            TraceNs(t.scatter_end_ns),
+                            TraceNs(j.retirement_start_ns),
+                            TraceNs(j.retirement_end_ns),
+                            TraceNs(j.release_start_ns),
+                            TraceNs(j.release_end_ns),
+                            j.join_word_device,
+                        );
                     }
                 }
                 Ok(())

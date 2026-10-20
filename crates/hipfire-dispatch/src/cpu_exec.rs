@@ -1191,6 +1191,7 @@ fn moe_cpu_experts_host(
         scratch,
         timing,
         bf16_round_trip,
+        None,
     )?;
     // The down outputs are row-major per group, so a token's vector is strided:
     // `slot_group`/`slot_si` place each slot in its group's run, and the residual
@@ -1279,6 +1280,64 @@ fn validate_expert_spans(dim: usize, mi: usize, e: &CpuMoeExpert<'_>) -> Result<
     }
     Ok(())
 }
+/// Fixed-size per-call CPU-arm trace record for the opt-in
+/// `HIPFIRE_CPU_SPLIT_TRACE` diagnostic. Stack-owned; crosses the Rayon pool
+/// boundary as an owned return, never thread-local state. Inclusive totals
+/// (`cpu_total_ns`, `pool_install_ns`, `pool_body_ns`, `middle_ns`, `gu_ns`,
+/// `dn_ns`) overlap their disjoint children by design: reconciliation is
+/// `child_sum <= inclusive`, except `gu_ns == gu_prep_ns + gu_exec_ns` and
+/// `dn_ns == dn_prep_ns + dn_exec_ns` (exact: the traced GEMV measures its
+/// whole call as one outer span with `prep = total - exec`).
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct CpuArmTrace {
+    /// Same `Instant` origin as the split join's existing trace-entry clock.
+    /// Boundary fields are nanosecond offsets, not durations or GPU times.
+    trace_epoch: Option<Instant>,
+    /// Absent when no host slot reaches the corresponding phase.
+    pub middle_start_ns: Option<u64>,
+    pub middle_end_ns: Option<u64>,
+    pub scatter_start_ns: Option<u64>,
+    pub scatter_end_ns: Option<u64>,
+    /// Public-entry inclusive total (validation + pool install + return).
+    pub cpu_total_ns: u64,
+    /// Entry validation alone.
+    pub validate_ns: u64,
+    /// Pool install total (dispatch + body + return).
+    pub pool_install_ns: u64,
+    /// In-pool closure body total.
+    pub pool_body_ns: u64,
+    /// Grouping/scratch prep inside the grouped compute.
+    pub group_ns: u64,
+    pub gu_ns: u64,
+    pub gu_prep_ns: u64,
+    pub gu_exec_ns: u64,
+    pub middle_ns: u64,
+    pub gather_ns: u64,
+    pub silu_ns: u64,
+    pub fwht_ns: u64,
+    pub dn_ns: u64,
+    pub dn_prep_ns: u64,
+    pub dn_exec_ns: u64,
+    /// Output scatter of down values into the expanded layout.
+    pub scatter_ns: u64,
+    /// Distinct experts from the existing grouping (group count).
+    pub unique_experts: u32,
+}
+
+impl CpuArmTrace {
+    fn offset_ns(&self, stamp: Instant) -> Option<u64> {
+        self.trace_epoch.map(|epoch| {
+            stamp
+                .saturating_duration_since(epoch)
+                .as_nanos()
+                .min(u64::MAX as u128) as u64
+        })
+    }
+}
+
+fn elapsed_ns(start: Instant) -> u64 {
+    start.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
 
 /// The gate_up GEMV → SwiGLU → hidden rotation → down GEMV core shared by the
 /// full-residual splice ([`moe_cpu_experts_host`]) and the sparse per-slot
@@ -1304,8 +1363,10 @@ fn moe_slots_compute(
     scratch: &mut MoeScratch,
     timing: &mut MoeStepTiming,
     bf16_round_trip: bool,
+    mut trace: Option<&mut CpuArmTrace>,
 ) -> Result<(), DispatchError> {
     debug_assert_eq!(experts.len(), slots);
+    let t_group = trace.is_some().then(Instant::now);
     // Group the selected slots by expert id, in first-seen order, validating each
     // expert's spans as we go. A counting sort into the reusable index vectors
     // keeps each group's members contiguous in `order` without a per-group `Vec`:
@@ -1352,6 +1413,9 @@ fn moe_slots_compute(
         scratch.slot_si[s] = at as u32 - scratch.group_start[gi];
         scratch.group_off[gi] += 1;
     }
+    if let Some(t) = trace.as_mut().map(|t| &mut **t) {
+        t.unique_experts = scratch.group_id.len() as u32;
+    }
 
     // gate_up: one shared-weight projection per group, every group in one rayon
     // region. Output is row-major per group (`out[r * n + t]`), so a weight row's
@@ -1362,6 +1426,9 @@ fn moe_slots_compute(
     scratch.dn.resize(dim * slots, 0.0);
     scratch.group_off.resize(groups + 1, 0);
     fill_group_off(&scratch.group_start, &mut scratch.group_off, 2 * mi);
+    if let Some(t) = trace.as_mut().map(|t| &mut **t) {
+        t.group_ns = t_group.map_or(0, elapsed_ns);
+    }
     let gu_split = {
         let src = MoeJobSource {
             experts,
@@ -1378,10 +1445,18 @@ fn moe_slots_compute(
     timing.gu_ns = gu_split.total_ns;
     timing.gu_prep_ns = gu_split.prep_ns;
     timing.gu_exec_ns = gu_split.exec_ns;
+    if let Some(t) = trace.as_mut().map(|t| &mut **t) {
+        t.gu_ns = gu_split.total_ns;
+        t.gu_prep_ns = gu_split.prep_ns;
+        t.gu_exec_ns = gu_split.exec_ns;
+    }
     // SwiGLU + hidden rotation, per token. The gate/up pair sits at strided
     // indices in the row-major output, so gather it; the rotation is the *down*
     // projection's contract (its weights are stored post-rotation).
     let t_middle = Instant::now();
+    if let Some(t) = trace.as_mut().map(|t| &mut **t) {
+        t.middle_start_ns = t.offset_ns(t_middle);
+    }
     let mut gather_ns: u64 = 0;
     let mut silu_ns: u64 = 0;
     let mut fwht_ns: u64 = 0;
@@ -1425,10 +1500,19 @@ fn moe_slots_compute(
             }
         }
     }
+    if let Some(t) = trace.as_mut().map(|t| &mut **t) {
+        t.middle_end_ns = t.offset_ns(Instant::now());
+    }
     timing.middle_ns = t_middle.elapsed().as_nanos() as u64;
     timing.middle_gather_ns = gather_ns;
     timing.middle_silu_ns = silu_ns;
     timing.middle_fwht_ns = fwht_ns;
+    if let Some(t) = trace.as_mut().map(|t| &mut **t) {
+        t.middle_ns = timing.middle_ns;
+        t.gather_ns = gather_ns;
+        t.silu_ns = silu_ns;
+        t.fwht_ns = fwht_ns;
+    }
     scratch.group_off.resize(groups + 1, 0);
     fill_group_off(&scratch.group_start, &mut scratch.group_off, dim);
     let dn_split = {
@@ -1447,6 +1531,11 @@ fn moe_slots_compute(
     timing.dn_ns = dn_split.total_ns;
     timing.dn_prep_ns = dn_split.prep_ns;
     timing.dn_exec_ns = dn_split.exec_ns;
+    if let Some(t) = trace.as_mut().map(|t| &mut **t) {
+        t.dn_ns = dn_split.total_ns;
+        t.dn_prep_ns = dn_split.prep_ns;
+        t.dn_exec_ns = dn_split.exec_ns;
+    }
     Ok(())
 }
 
@@ -1704,10 +1793,92 @@ pub fn moe_cpu_host_slot_outputs(
         let scratch: &mut MoeScratch = &mut guard;
         in_splice_pool(|| {
             host_slot_outputs_core(
-                dim, mi, top_k, ids, host_slots, experts, x_rot, scratch, out,
+                dim, mi, top_k, ids, host_slots, experts, x_rot, scratch, out, None,
             )
         })
     })
+}
+/// Crate-private timed entry sharing the checked implementation of
+/// [`moe_cpu_host_slot_outputs`]: same validation, same core, same pool.
+/// Normal callers keep the public API; the CPU-split trace calls this so the
+/// fixed-size [`CpuArmTrace`] crosses the Rayon install as an owned return,
+/// never thread-local state. No allocation, no output; timing only.
+/// `trace_epoch` is the caller's existing join-entry `Instant`; all optional
+/// phase boundaries use nanosecond offsets from that same origin. An empty
+/// host set leaves boundaries absent rather than manufacturing zero stamps.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn moe_cpu_host_slot_outputs_traced(
+    dim: usize,
+    mi: usize,
+    rows: usize,
+    top_k: usize,
+    n_experts: usize,
+    ids: &[i32],
+    gpu_ids: Option<&[i32]>,
+    host_slots: &[u32],
+    experts: &[CpuMoeExpert<'_>],
+    x_rot: &[f32],
+    awq: bool,
+    out: &mut [f32],
+    trace_epoch: Instant,
+) -> Result<CpuArmTrace, DispatchError> {
+    let mut trace = CpuArmTrace {
+        trace_epoch: Some(trace_epoch),
+        ..CpuArmTrace::default()
+    };
+    let t_total = Instant::now();
+    let t_validate = Instant::now();
+    validate_moe_cpu_host_slot_outputs(
+        dim,
+        mi,
+        rows,
+        top_k,
+        n_experts,
+        ids,
+        gpu_ids,
+        host_slots,
+        experts,
+        x_rot.len(),
+        awq,
+        out.len(),
+    )?;
+    trace.validate_ns = elapsed_ns(t_validate);
+    if host_slots.is_empty() {
+        trace.cpu_total_ns = elapsed_ns(t_total);
+        return Ok(trace);
+    }
+    let t_install = Instant::now();
+    let result = MOE_SCRATCH.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let scratch: &mut MoeScratch = &mut guard;
+        // Owned fixed-size record across the Rayon install: the pool body
+        // timer runs INSIDE the install closure, so dispatch/return overhead
+        // stays in `pool_install_ns`, not `pool_body_ns`.
+        in_splice_pool(|| {
+            let t_body = Instant::now();
+            let result = host_slot_outputs_core(
+                dim,
+                mi,
+                top_k,
+                ids,
+                host_slots,
+                experts,
+                x_rot,
+                scratch,
+                out,
+                Some(&mut trace),
+            );
+            let body_ns = elapsed_ns(t_body);
+            (result, body_ns, trace)
+        })
+    });
+    let (result, body_ns, returned) = result;
+    trace = returned;
+    trace.pool_install_ns = elapsed_ns(t_install);
+    trace.pool_body_ns = body_ns;
+    result?;
+    trace.cpu_total_ns = elapsed_ns(t_total);
+    Ok(trace)
 }
 
 /// The validated arithmetic of [`moe_cpu_host_slot_outputs`], run in whatever
@@ -1723,6 +1894,7 @@ fn host_slot_outputs_core(
     x_rot: &[f32],
     scratch: &mut MoeScratch,
     out: &mut [f32],
+    mut trace: Option<&mut CpuArmTrace>,
 ) -> Result<(), DispatchError> {
     let mut timing = MoeStepTiming::default();
     moe_slots_compute(
@@ -1737,7 +1909,12 @@ fn host_slot_outputs_core(
         scratch,
         &mut timing,
         true,
+        trace.as_mut().map(|t| &mut **t),
     )?;
+    let t_scatter = trace.is_some().then(Instant::now);
+    if let (Some(t), Some(s0)) = (trace.as_mut(), t_scatter) {
+        t.scatter_start_ns = t.offset_ns(s0);
+    }
     for (a, &slot) in host_slots.iter().enumerate() {
         let gi = scratch.slot_group[a] as usize;
         let si = scratch.slot_si[a] as usize;
@@ -1747,6 +1924,12 @@ fn host_slot_outputs_core(
         for (r, o) in dst.iter_mut().enumerate() {
             *o = scratch.dn[base + r * n + si];
         }
+    }
+    if let Some(t) = trace.as_mut() {
+        t.scatter_end_ns = t.offset_ns(Instant::now());
+    }
+    if let (Some(t), Some(s0)) = (trace.as_mut(), t_scatter) {
+        t.scatter_ns = elapsed_ns(s0);
     }
     Ok(())
 }
@@ -3585,10 +3768,182 @@ mod moe_splice_tests {
                         x,
                         &mut scratch,
                         out,
+                        None,
                     )
                 })
             }
         }
+    }
+    /// The crate-private timed entry is byte-equal to the public entry and
+    /// rejects the same bad plans with the same errors, over the existing
+    /// fixture. Inclusive totals overlap their disjoint children by design:
+    /// GU/DN equal prep + exec exactly, every other child sum reconciles
+    /// against its inclusive total with slack.
+    #[test]
+    fn traced_host_slot_entry_is_byte_equal_and_validates_like_public() {
+        let (rows, top_k, n_exp) = (2usize, 3usize, 5usize);
+        let fx = host_fixture(n_exp);
+        let slots = rows * top_k;
+        let ids: Vec<i32> = vec![4, 1, 3, 1, 0, 2];
+        let host: Vec<u32> = vec![0, 2, 3, 5];
+        let gpu = masked_route(&ids, &host);
+        let experts = fx.spans(&ids, &host);
+        let x = x_of(rows * HS_DIM);
+        let mut out_plain = stale(slots * HS_DIM);
+        let mut out_traced = stale(slots * HS_DIM);
+        moe_cpu_host_slot_outputs(
+            HS_DIM,
+            HS_MI,
+            rows,
+            top_k,
+            n_exp,
+            &ids,
+            Some(&gpu),
+            &host,
+            &experts,
+            &x,
+            false,
+            &mut out_plain,
+        )
+        .unwrap();
+        let trace_epoch = Instant::now();
+        let trace = moe_cpu_host_slot_outputs_traced(
+            HS_DIM,
+            HS_MI,
+            rows,
+            top_k,
+            n_exp,
+            &ids,
+            Some(&gpu),
+            &host,
+            &experts,
+            &x,
+            false,
+            &mut out_traced,
+            trace_epoch,
+        )
+        .unwrap();
+        assert_eq!(
+            bits(&out_plain),
+            bits(&out_traced),
+            "traced entry bytes != public entry bytes"
+        );
+        assert_eq!(trace.gu_ns, trace.gu_prep_ns + trace.gu_exec_ns);
+        assert_eq!(trace.dn_ns, trace.dn_prep_ns + trace.dn_exec_ns);
+        assert!(trace.gather_ns + trace.silu_ns + trace.fwht_ns <= trace.middle_ns);
+        assert!(
+            trace.group_ns + trace.gu_ns + trace.middle_ns + trace.dn_ns + trace.scatter_ns
+                <= trace.pool_body_ns
+        );
+        assert!(trace.pool_body_ns <= trace.pool_install_ns);
+        assert!(trace.validate_ns + trace.pool_install_ns <= trace.cpu_total_ns);
+        let middle_start = trace.middle_start_ns.expect("nonempty middle start");
+        let middle_end = trace.middle_end_ns.expect("nonempty middle end");
+        let scatter_start = trace.scatter_start_ns.expect("nonempty scatter start");
+        let scatter_end = trace.scatter_end_ns.expect("nonempty scatter end");
+        assert!(middle_start <= middle_end);
+        assert!(middle_end <= scatter_start);
+        assert!(scatter_start <= scatter_end);
+        assert!(scatter_end <= elapsed_ns(trace_epoch));
+        // Host slots name experts {4, 3, 1, 2}: four distinct groups.
+        assert_eq!(trace.unique_experts, 4);
+        // The same bad plan fails the same way, leaving `out` untouched.
+        let dup = [0u32, 0];
+        let mut dup_plain = stale(slots * HS_DIM);
+        let mut dup_traced = stale(slots * HS_DIM);
+        let plain_err = moe_cpu_host_slot_outputs(
+            HS_DIM,
+            HS_MI,
+            rows,
+            top_k,
+            n_exp,
+            &ids,
+            Some(&gpu),
+            &dup,
+            &fx.spans(&ids, &dup),
+            &x,
+            false,
+            &mut dup_plain,
+        )
+        .map(|_| ())
+        .expect_err("duplicate host slot must fail");
+        let traced_err = moe_cpu_host_slot_outputs_traced(
+            HS_DIM,
+            HS_MI,
+            rows,
+            top_k,
+            n_exp,
+            &ids,
+            Some(&gpu),
+            &dup,
+            &fx.spans(&ids, &dup),
+            &x,
+            false,
+            &mut dup_traced,
+            Instant::now(),
+        )
+        .map(|_| ())
+        .expect_err("duplicate host slot must fail");
+        assert_eq!(format!("{plain_err}"), format!("{traced_err}"));
+        assert!(all_stale(&dup_plain) && all_stale(&dup_traced));
+        // Exact-single-slot unit case (no env, no global state): one host
+        // slot naming expert 2, one group, hierarchy exact where required.
+        let one_ids: Vec<i32> = vec![2, 0, 1, 0, 1, 2];
+        let one_host: Vec<u32> = vec![0];
+        let one_gpu = masked_route(&one_ids, &one_host);
+        let one_experts = fx.spans(&one_ids, &one_host);
+        let mut one_out = stale(slots * HS_DIM);
+        let one = moe_cpu_host_slot_outputs_traced(
+            HS_DIM,
+            HS_MI,
+            rows,
+            top_k,
+            n_exp,
+            &one_ids,
+            Some(&one_gpu),
+            &one_host,
+            &one_experts,
+            &x,
+            false,
+            &mut one_out,
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(one.unique_experts, 1);
+        assert_eq!(one.gu_ns, one.gu_prep_ns + one.gu_exec_ns);
+        assert_eq!(one.dn_ns, one.dn_prep_ns + one.dn_exec_ns);
+        // Empty host set: valid plan, writes nothing, zero child stages.
+        let empty_host: Vec<u32> = vec![];
+        let empty_experts: Vec<CpuMoeExpert<'_>> = vec![];
+        let mut empty_out = stale(slots * HS_DIM);
+        let empty = moe_cpu_host_slot_outputs_traced(
+            HS_DIM,
+            HS_MI,
+            rows,
+            top_k,
+            n_exp,
+            &ids,
+            Some(&ids),
+            &empty_host,
+            &empty_experts,
+            &x,
+            false,
+            &mut empty_out,
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(empty.unique_experts, 0);
+        assert_eq!(empty.group_ns, 0);
+        assert_eq!(empty.gu_ns, 0);
+        assert_eq!(empty.middle_ns, 0);
+        assert_eq!(empty.dn_ns, 0);
+        assert_eq!(empty.scatter_ns, 0);
+        assert_eq!(empty.pool_body_ns, 0);
+        assert_eq!(empty.middle_start_ns, None);
+        assert_eq!(empty.middle_end_ns, None);
+        assert_eq!(empty.scatter_start_ns, None);
+        assert_eq!(empty.scatter_end_ns, None);
+        assert!(all_stale(&empty_out));
     }
 
     /// Scalar per-slot reference: plain `gemv` projections with the GPU's BF16
