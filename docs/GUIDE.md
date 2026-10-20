@@ -1435,7 +1435,63 @@ radiance --model krea-2-turbo-fp8.rad --lora-dir /loras --lora film=/loras/film-
 - `POST /v1/load_lora_adapter {"lora_name": "x", "lora_path": "/file.safetensors"}` adds a file
   under a name; unload removes it and frees the slots of every combination using it.
 
-### 4.10 Every flag
+### 4.10 Control vectors
+
+A **control vector** is a small GGUF file holding one direction per layer; applied while the model
+runs, it moves every token's residual stream off that direction. radiance implements llama.cpp's
+`--cvec-mode project` operation for it (`hc_project`, `docs/OPS.md`), which is what the published
+package for Qwen3.8-Flash-Next was tuned for:
+
+**The switch is present whenever a compatible vector is there — there is nothing to pass on the
+command line.** The engine looks, in order, at:
+
+1. `<container without its extension>.control-vector.gguf` beside the model, and
+2. `control-vector.gguf` in the container's directory (one file serves a directory of quants of
+   the family), then
+3. `<home>/vectors/<architecture>-control-vector.gguf` for each `--radiance-home`, i.e.
+   `…/vectors/qwen4exp-control-vector.gguf`.
+
+So a deployment that drops the file beside its Flash-Next container offers the Model-view switch and
+the `control_vector` request field with nothing else to configure; every quantisation of the family
+shares it, because the file names the architecture and the width, not the quant. The operation's
+parameters come from the package's own JSON (`layer_range`, `scale`, `mode`), so there is no flag for
+them either: a file that does not fit this container is reported and skipped, never served. The
+default for *requests* stays off in all cases.
+
+- **Only a compatible container accepts it.** The file must be a GGUF `controlvector` whose
+  `controlvector.model_hint` (when present) is this model's architecture (`qwen4exp`), whose
+  directions are exactly the model's `--n-embd` wide, and whose range lies inside its layers.
+  Anything else stops startup with the reason: a direction from another model's residual basis
+  would move hidden states along a meaningless axis.
+- **It is off until a request asks for it.** The dashboard's Model view flips the default for
+  requests that name no choice, and a request's own `control_vector` field always wins. **No
+  switch reloads the model**: the directions are uploaded once at startup and each step carries a
+  per-request row mask.
+- **A request without it computes exactly what it computes with no vector loaded** — the op skips
+  a disabled row without reading or writing it.
+- **Conversations are partitioned.** Blocks and linear-state snapshots computed with the vector
+  on are keyed differently from those computed without it, so switching modes in one conversation
+  recomputes instead of reusing hidden states that belonged to the other mode. A runtime LoRA
+  adapter (§4.9.1) and a control vector are independent: both enter the prefix cache's key, so
+  neither's KV is ever shared with the other's.
+- Cost: 41 extra launches per trunk step at Flash-Next's 48 layers (range 4..44), each a dot
+  product and a subtract per residual stream. On two RX 9070s that is not measurable: prefill of a
+  7.9K-token prompt 2.09 s without the vector, 2.08 s with it; decode of 5,000-token answers
+  (three runs each, alternating, temperature 0, ignore_eos) medians 150.1 tok/s without it and
+  151.3 tok/s with it. The spread around those medians -- 139 to 154 tok/s -- is speculative
+  acceptance, which follows the text the model writes and not the vector, and a session's first run
+  reads lower still (91 tok/s at 17% acceptance) while the cold caches fill. The MTP draft head is
+  not steered; the trunk verifies every token, so the text is the vector's.
+- For the vector shipped for Qwen3.8-Flash-Next it is a refusal-direction projection: it removes a
+  safety behaviour, and the default stays off for that reason. With it on, a request that asks the
+  model for its system prompt gets it, and tone/policy refusals stop -- so a deployment that exposes
+  the API beyond one user should leave the default off and control who may set the field.
+
+The published vector, its JSON and the llama.cpp patches it was built against are at
+`huggingface.co/Cudecnik/Qwen3.8-Flash-Next-refusal-projection`; the operation and the range
+(`4..44`, scale `1.0`, per-layer) are the package's own selected configuration.
+
+### 4.11 Every flag
 
 `radiance --help` prints these. Grouped by purpose:
 
@@ -1447,6 +1503,7 @@ radiance --model krea-2-turbo-fp8.rad --lora-dir /loras --lora film=/loras/film-
 | `--download-dir DIR` | where a repo id is fetched to. Default `$XDG_CACHE_HOME/radiance/hf`, else `~/.cache/radiance/hf` |
 | `--radiance-home DIRS` | where `kernels/`, `architectures/` and `quantizers/` live; homes separated by `:` are searched in order, the first winning (§1.5) |
 | `--kernels LIST` | the kernel libraries to use, separated by `,` or `:`, first wins; a library not named is not loaded. Default: every library found |
+
 
 **Batch shape**
 
@@ -1976,6 +2033,7 @@ passes but not launches (the UNet runs once per image and branch), so two take t
 | `timings_per_token`, `return_progress` | llama-server's: `timings` on every chunk, and `prompt_progress` chunks while the prompt is read |
 | `samplers` | llama-server's sampler order, names or letters. A stage it leaves out is off. The chain here is penalties, DRY, top-k, top-p, min-p, typical, XTC, with temperature first (the default) or last (llama-server's default), so a list in either order is honoured and any other is refused by name |
 | `session_id` | OpenRouter's conversation id: labels the conversation on `/sessions` and the dashboard |
+| `control_vector` | `true` applies the control vector this deployment found to this request's steps, `false` leaves them on the stock model; absent takes the deployment's runtime default (off unless flipped in the dashboard's Model view). `experimental_speed_projection` is Strata's spelling of the same field and is accepted as an alias. A deployment with no vector refuses `true` by name. On a compatible container (Qwen3.8-Flash-Next), a refusal-direction vector makes the model decline far fewer requests -- that is a safety behaviour removed, and you own what it writes (§4.10, "Control vectors") |
 | `logprobs`, `top_logprobs`, `n_probs` | each generated token's logprob and up to 20 alternatives (§5.12). Chat: `logprobs: true` with `top_logprobs` alternatives (0 when absent); completions: `logprobs: N`; any endpoint: llama-server's `n_probs: N`, which wins. Not with `echo` (the prompt's logprobs are not computed) |
 | `tools`, `tool_choice`, `parallel_tool_calls` | chat only. `tool_choice` is `auto`, `none`, `required` or `{"type":"function","function":{"name":...}}`; the last two hold the whole reply to calls (after the reasoning block), the named form to that one function, and cannot be combined with `response_format` or `grammar` |
 | `add_generation_prompt`, `chat_template_kwargs` | chat only |

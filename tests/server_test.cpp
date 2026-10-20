@@ -4523,6 +4523,61 @@ int status_with(Fixture& f, const std::string& ep, const std::string& key, const
 
 }  /* namespace */
 
+/* The experimental speed projection: absent, the engine's default applies; an explicit `true` on a
+ * deployment with no vector is refused by name (serving the stock model while the client believes
+ * otherwise would be a silent lie), and on one with a vector it reaches the engine's request. */
+TEST(the_control_vector_field_overrides_the_default_or_is_refused) {
+    const json body = json::parse(R"({"messages":[{"role":"user","content":"hi"}],
+                                       "max_tokens":4,
+                                       "control_vector":true})");
+    {
+        /* No vector loaded: refused, naming the field. */
+        Fixture f;
+        HttpResponse r = f.post("/v1/chat/completions", body.dump());
+        if (r.streaming()) drain(r);
+        f.sched.join_all();
+        CHECK_EQ(r.status, 400);
+        CHECK(r.body.find("control_vector") != std::string::npos);
+    }
+    {
+        /* A vector loaded, default off: the request's own choice wins and reaches the engine. */
+        bool def = false;
+        Fixture f(Fixture::Tweak{ [&](ServerOptions&, Deps& d) {
+            d.control_vector.available   = [] { return true; };
+            d.control_vector.get_default = [&def] { return def; };
+            d.control_vector.set_default = [&def](bool on) { def = on; };
+            d.control_vector.json        = [&def] {
+                return std::string("{\"available\":true,\"default\":") +
+                       (def ? "true" : "false") + "}";
+            };
+        } });
+        HttpResponse r = f.post("/v1/chat/completions", body.dump());
+        if (r.streaming()) drain(r);
+        f.sched.join_all();
+        CHECK_EQ(r.status, 200);
+        CHECK(f.sched.last_sp.use_control_vector);
+
+        /* The same request naming nothing runs the default, which the admin route flips. */
+        def = true;
+        HttpResponse r2 = f.post("/v1/chat/completions",
+                                 R"({"messages":[{"role":"user","content":"hi"}],
+                                     "max_tokens":4})");
+        if (r2.streaming()) drain(r2);
+        f.sched.join_all();
+        CHECK_EQ(r2.status, 200);
+        CHECK(f.sched.last_sp.use_control_vector);
+
+        const HttpResponse g = f.get("/admin/control-vector");
+        CHECK_EQ(g.status, 200);
+        CHECK(g.body.find("\"default\":true") != std::string::npos);
+        const HttpResponse p = f.post("/admin/control-vector", R"({"enabled":false})");
+        CHECK_EQ(p.status, 200);
+        CHECK(!def);
+        /* Refuses a body that names no boolean rather than guessing. */
+        CHECK_EQ(f.post("/admin/control-vector", R"({"enabled":"yes"})").status, 400);
+    }
+}
+
 /* The policy oai.cpp's lists state, key by key, on every endpoint: a guarded key is served at its
  * neutral value and refused by name at any other (a 200 means every answer-changing field was
  * honoured); an inert key and an unknown one are accepted and ignored; an accepted key with a
@@ -4534,6 +4589,12 @@ TEST(every_request_key_is_served_refused_or_ignored_as_its_list_says) {
     Fixture f(Fixture::Tweak{ [&](ServerOptions& o, Deps& d) {
         d.embed = &emb;
         o.supports_logprobs = true;
+        /* This deployment has a control vector, so `control_vector: true` is served rather
+         * than refused; the refusal on a deployment without one is its own case below. */
+        d.control_vector.available   = [] { return true; };
+        d.control_vector.get_default = [] { return false; };
+        d.control_vector.set_default = [](bool) {};
+        d.control_vector.json        = [] { return std::string("{\"available\":true}"); };
     } });
     emb.tpl = &f.tmpl;
     f.sched.embedding = { 1.0f, 2.0f, 3.0f, 4.0f };
@@ -4639,6 +4700,11 @@ TEST(every_request_key_is_served_refused_or_ignored_as_its_list_says) {
         { "input", { "yo", none } }, { "encoding_format", { "base64", none } },
         { "dimensions", { 2, none } }, { "image_tokens", { 70, none } },
         { "prompt_name", { "query", none } },
+        /* The control vector is accepted by every text endpoint under its own name and under
+         * Strata's spelling; its semantic refusal (a deployment with no vector) happens at
+         * submission, not parsing, so a parse test sees 200 here. */
+        { "control_vector", { true, none } },
+        { "experimental_speed_projection", { true, none } },
     };
     /* logprobs is spelled per endpoint: true on chat, a count on completions. */
     auto value_for = [&](const std::string& key, const std::string& ep) -> Valid {

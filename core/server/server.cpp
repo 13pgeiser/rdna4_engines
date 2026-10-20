@@ -204,6 +204,12 @@ void Server::register_routes() {
     router_.get ("/stats",               [this](const HttpRequest& q) { return handle_stats(q); });
     router_.get ("/graph",               [this](const HttpRequest& q) { return handle_graph(q); });
     router_.get ("/sessions",            [this](const HttpRequest& q) { return handle_sessions(q); });
+    /* The control vector's switch, for the dashboard's Model view and for automation: a
+     * deployment with no vector found answers 404 here. */
+    router_.get ("/admin/control-vector",
+                 [this](const HttpRequest& q) { return handle_control_vector(q); });
+    router_.post("/admin/control-vector",
+                 [this](const HttpRequest& q) { return handle_control_vector(q); });
 }
 
 /* Workers beyond the admission ceiling. A generation holds its connection's worker for its whole
@@ -460,6 +466,25 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
         }
     }
 
+    /* The control vector: the request's own choice, else the deployment's runtime default. A
+     * deployment with no vector refuses the on state by name -- serving the stock model while the
+     * client believes it asked for the vector would be a silent lie about what produced the text.
+     * (Naming: `control_vector` is the field, `experimental_speed_projection` its alias.) */
+    bool projection_on = false;
+    {
+        const bool named = r.control_vector >= 0;
+        projection_on = named
+            ? (r.control_vector == 1)
+            : (deps_.control_vector.get_default && deps_.control_vector.get_default());
+        if (projection_on &&
+            !(deps_.control_vector.available && deps_.control_vector.available())) {
+            *err = err_bad("control_vector",
+                           "this deployment found no control vector for its model; the stock model "
+                           "is what it serves");
+            return RAD_E_INVAL;
+        }
+    }
+
     int idx = 0;
     std::vector<Request> rqs;
     rqs.reserve(r.prompts.size() * (size_t)r.n);
@@ -482,6 +507,7 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
             Request rq;
             rq.prompt = r.prompts[p].tokens;
             rq.sp = r.sp;
+            rq.sp.use_control_vector = projection_on;
             /* Distinct seeds per choice, or `n` identical completions. An offset suffices: the
              * sampler's stream is seeded, not chained. */
             rq.sp.seed = r.sp.seed + (uint64_t)k;

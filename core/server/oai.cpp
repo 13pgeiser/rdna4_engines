@@ -240,6 +240,7 @@ const char* kAcceptedCommon[] = {
     "dry_sequence_breakers", "samplers",
     "grammar", "json_schema", "priority", "logprobs", "ignore_eos",
     "timings_per_token", "return_progress", "session_id", "n_probs",
+    "control_vector", "experimental_speed_projection",
 };
 
 const char* kAcceptedChat[] = {
@@ -841,6 +842,17 @@ static int parse_sampling(const json& b, const OaiLimits& lim, OaiRequest* r, Ap
 
     /* ignore_eos: generate to max_tokens whatever the model emits. See Request::ignore_eos. */
     if (!get_bool(b, "ignore_eos", &r->ignore_eos, err)) return RAD_E_INVAL;
+
+    /* The control vector (core/cvec.h): an opt-in per request, and the only place an API client
+     * turns it on when the deployment's default is off. `control_vector` is the field's name;
+     * `experimental_speed_projection` is Strata's spelling of the same switch, kept as an alias so
+     * a client written against that reports what it means. */
+    for (const char* key : { "control_vector", "experimental_speed_projection" }) {
+        if (!b.contains(key)) continue;
+        bool on = false;
+        if (!get_bool(b, key, &on, err)) return RAD_E_INVAL;
+        r->control_vector = on ? 1 : 0;
+    }
 
     /* stop: a string or an array of strings. Bounded in count and length because every stop
      * string is searched in each piece of generated text (by the decoder and the server's scan),

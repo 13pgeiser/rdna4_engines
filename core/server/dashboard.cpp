@@ -30,6 +30,47 @@ namespace server {
  * Derived rates are the page's job: they are counter differences over wall time, and only the
  * browser holds both ends of its poll interval. Computing them here would need per-client state. */
 
+/* ------------------------------------------------------------------ /admin/control-vector
+ *
+ * The control vector's runtime switch (core/cvec.h). Turning it on for the next
+ * request costs a boolean: the direction table was uploaded at startup and the per-request mask
+ * is a derived buffer the core fills every step, so there is nothing to rebuild and nothing to
+ * reload. The engine's own log records the load; this records the flip, because a deployment's
+ * answer to "was that text produced with the vector" should not depend on a browser's memory.
+ *
+ * GET reports the state (and is what the Model view renders); POST takes {"enabled": true|false}
+ * and answers with the same object. A deployment with no vector loaded answers 404 on both: it has
+ * no such feature, and its requests refuse `control_vector: true` by name. */
+HttpResponse Server::handle_control_vector(const HttpRequest& req) {
+    const bool have = deps_.control_vector.available && deps_.control_vector.available();
+    if (!have)
+        return error_response(err_not_implemented(
+            "this deployment found no control vector for its model; there is nothing to switch"),
+            req.peer);
+
+    if (req.method == "POST") {
+        json body;
+        try {
+            body = json::parse(req.body.empty() ? "{}" : req.body);
+        } catch (const std::exception& e) {
+            return error_response(err_bad("body", std::string("not JSON: ") + e.what()), req.peer);
+        }
+        const auto it = body.find("enabled");
+        if (it == body.end() || !it->is_boolean())
+            return error_response(err_bad("enabled", "a boolean is required"), req.peer);
+        const bool on = it->get<bool>();
+        if (deps_.control_vector.set_default) deps_.control_vector.set_default(on);
+        RAD_INFO("control vector: default %s by an admin request%s", on ? "ON" : "OFF",
+                 req.peer.empty() ? "" : (" from " + req.peer).c_str());
+    } else if (req.method != "GET") {
+        return HttpResponse::json_body(405, err_bad("method", "GET or POST").dump());
+    }
+
+    metrics_.observe_http(200);
+    return HttpResponse::json_body(
+        200, deps_.control_vector.json ? deps_.control_vector.json() : std::string("{}"));
+}
+
 /* ------------------------------------------------------------------ /sessions
  *
  * A separate route, not a /stats field: /stats is polled every second, while a stored session
@@ -124,6 +165,16 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
     json o;
     o["model"]     = opt_.model_id;
     o["version"]   = opt_.version;
+    /* The control vector (core/cvec.h), when this deployment has one: `available` is what a UI
+     * tests before offering the control, `default` what a request that names no choice runs. The
+     * dashboard's own control asks /admin/control-vector, which also reports this. */
+    if (deps_.control_vector.json) {
+        try {
+            o["control_vector"] = json::parse(deps_.control_vector.json());
+        } catch (const std::exception&) {
+            /* A malformed snapshot is not worth failing /stats over; the field is omitted. */
+        }
+    }
     o["uptime_s"]  = unix_now() - started_at_;
     /* Seconds this process took to come up, the cost of a restart; 0 before the server listens. */
     o["startup_s"] = startup_s_;
@@ -643,7 +694,8 @@ th + th, td + td { padding-left:14px; }
    it as a dot, because on a server with long-lived agent clients the second group is most of the
    table and none of it needs reading to understand the first. */
 #view-sess .cell { height:auto; padding-bottom:12px; }
-#view-sess .panel + .panel { margin-top:14px; }
+/* Stacked panels in one view are 14px apart, the same gap the strip's own margin-bottom gives. */
+#view-sess .panel + .panel, #view-model .panel + .panel { margin-top:14px; }
 .stbl td, .stbl th { width:1%; }
 /* The two text columns take the slack and read left to right; the figures stay narrow. */
 .stbl .l { text-align:left; width:auto; }
@@ -1177,6 +1229,22 @@ nav button.on { color:var(--fg); background:var(--track); }
 
   <div id="view-model" hidden>
     <div class="strip" id="gstrip"></div>
+    <!-- The control vector (core/cvec.h): one direction per layer, projected out of the residual
+         stream at run time. Shown only on a deployment that found one; flipping it needs no
+         reload, and every request that names its own choice overrides it. -->
+    <section class="panel" id="cvpanel" hidden>
+      <div class="phead">
+        <span class="cap">Control vectors</span>
+        <span class="aside" id="cvsum"></span>
+      </div>
+      <div class="pbody">
+        <label class="cvrow">
+          <input id="cvbox" type="checkbox">
+          <span id="cvlabel">Apply the control vector to new requests</span>
+        </label>
+        <div class="aside" id="cvnote"></div>
+      </div>
+    </section>
     <section class="panel">
       <div class="phead">
         <span class="cap">Kernel libraries</span>
@@ -1232,6 +1300,10 @@ $("key").addEventListener("change", (e) => {
   e.target.hidden = true;
   identify();
   poll();
+  /* The Model view's controls are fetched on demand, so a key entered after the tab was opened
+   * has to re-ask: otherwise the control-vector panel stays in its "sign in" state until the
+   * tab is left and re-opened. */
+  loadControlVector();
 });
 const HIST = 120;                                    /* 60s of history at the 500ms poll */
 
@@ -2829,7 +2901,7 @@ function show(which) {
   $("tab-dash").className  = (model || sess) ? "" : "on";
   $("tab-sess").className  = sess ? "on" : "";
   $("tab-model").className = model ? "on" : "";
-  if (model) loadGraph();
+  if (model) { loadGraph(); loadControlVector(); }
   if (sess) loadSessions();
   window.scrollTo(0, 0);
   const h = model ? "#model" : sess ? "#sessions" : "#";
@@ -2984,6 +3056,59 @@ async function identify() {
     drafterName = sp ? e.speculation.drafter : "off";
   } catch (err) { /* the header simply keeps its placeholder */ }
 }
+
+/* THE SPEED PROJECTION, asked when the Model view opens. It is not a polled value: it changes only
+ * when this page (or an admin call) flips it, and a control that silently reverted under the
+ * reader would be worse than one that is a second old. A deployment without a control vector
+ * answers 404 and the panel stays hidden. */
+async function loadControlVector() {
+  /* THREE OUTCOMES, and only one of them hides the panel:
+   *   404  this deployment has no control vector -- there is no such control, so it is omitted;
+   *   200  the vector is loaded -- show the switch and its state;
+   *   anything else (most often 401, the page has no API key yet) -- the feature may well be
+   *        there, so SAY that instead of hiding the control. A control that silently disappears
+   *        because the page has not signed in reads exactly like a build without the feature. */
+  try {
+    const r = await api("admin/control-vector");
+    if (r.status === 404) { $("cvpanel").hidden = true; return; }
+    if (!r.ok) throw new Error(String(r.status));
+    const p = await r.json();
+    $("cvpanel").hidden = false;
+    $("cvbox").disabled = false;
+    $("cvbox").checked = !!p.default;
+    $("cvsum").textContent = "layers " + p.first + "\u2013" + p.last + " \u00b7 " + p.mode +
+                               " \u00b7 scale " + p.scale;
+    $("cvnote").textContent = "Applies to new requests only; a request's own control_vector " +
+                               "field wins. It removes a safety behaviour.";
+  } catch (e) {
+    $("cvpanel").hidden = false;
+    $("cvbox").disabled = true;
+    $("cvbox").checked = false;
+    $("cvsum").textContent = "";
+    $("cvnote").textContent =
+      "Sign in with the API key (the field in the header) to read or change this: the vector " +
+      "is present on this deployment, but its state needs the key.";
+  }
+}
+$("cvbox").addEventListener("change", async (e) => {
+  const want = e.target.checked;
+  e.target.disabled = true;
+  try {
+    const r = await fetch("admin/control-vector", {
+      method: "POST", cache: "no-store",
+      headers: Object.assign({ "Content-Type": "application/json" },
+                             apiKey ? { Authorization: "Bearer " + apiKey } : {}),
+      body: JSON.stringify({ enabled: want }),
+    });
+    if (!r.ok) throw new Error(String(r.status));
+    const p = await r.json();
+    $("cvbox").checked = !!p.default;
+  } catch (err) {
+    e.target.checked = !want;   // the server kept the old value
+  } finally {
+    e.target.disabled = false;
+  }
+});
 
 async function poll() {
   /* A background tab watches nothing, and neither does the Model view -- which is static. */

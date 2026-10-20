@@ -48,6 +48,19 @@ struct Deps {
      * (liveview.h), so the terminal and the web page agree. Absent, the dashboard shows only the
      * scheduler's metrics and omits the cards. */
     LiveView::Source  live;
+
+    /* The control vector (core/cvec.h), as the server sees it: whether the engine found one for
+     * this container, the runtime default for requests that name no choice, and the switch the
+     * admin endpoint flips. Absent (the function members null) means the feature does not exist on
+     * this deployment: a request that asks for it is refused by name, and the dashboard shows no
+     * control. Nothing here reloads the model. */
+    struct ControlVectorSwitch {
+        std::function<bool()>        available;
+        std::function<bool()>        get_default;
+        std::function<void(bool)>    set_default;
+        std::function<std::string()> json;
+    };
+    ControlVectorSwitch control_vector;
 };
 
 struct ServerOptions {
@@ -312,6 +325,10 @@ private:
     HttpResponse handle_stats(const HttpRequest& req);
     HttpResponse handle_graph(const HttpRequest& req);
     HttpResponse handle_sessions(const HttpRequest& req);
+    /* The control vector's runtime switch (dashboard.cpp): GET reports the state, POST
+     * {"enabled": bool} sets the default for requests that name no choice. Guarded by the API key
+     * like every other route but the health probes and the page. */
+    HttpResponse handle_control_vector(const HttpRequest& req);
 
     HttpResponse error_response(const ApiError& e, const std::string& peer,
                                 ApiShape shape = ApiShape::OpenAI);
