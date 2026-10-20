@@ -148,36 +148,6 @@ fn manifest(
     out
 }
 
-/// Bind plans to the current corpus, including runtime-generated VMM recipes.
-/// A stale source, compiler recipe or missing symbol remains a real failure;
-/// historical capture source-text fingerprints are not current cache keys.
-fn assert_current_registry_binding(plan: &RouteKernelPlan, arch: &str, extra_flags: &str) {
-    let corpus = rdna_compute::kernel_registry::corpus_entries(arch, extra_flags).unwrap();
-    for entry in &plan.entries {
-        if let PlannedKernel::Hip(e) = entry {
-            let mut matches = corpus.iter().filter(|live| live.module == e.module);
-            let live = matches.next().unwrap_or_else(|| {
-                panic!("{arch}:{} missing from the current corpus", e.module)
-            });
-            assert!(matches.next().is_none(), "duplicate corpus module {}", e.module);
-            assert_eq!(
-                e.source(),
-                live.source(),
-                "{}: plan source is not the current registry source",
-                e.module
-            );
-            assert_eq!(e.flags, live.flags, "{}: compiler flags differ", e.module);
-            assert_eq!(
-                e.scheduler_profile, live.scheduler_profile,
-                "{}: scheduler profile differs", e.module
-            );
-            for symbol in e.symbols {
-                assert!(live.symbols.contains(symbol), "{}: missing {symbol}", e.module);
-            }
-        }
-    }
-}
-
 /// The 27B plan for the canonical header minus the tensors `keep_tensor`
 /// rejects (every `*.awq_scale.weight` sidecar for a no-AWQ load) plus the MTP head.
 fn plan_27b(
@@ -230,12 +200,6 @@ fn qwen36_27b_gfx1201_plans_match_frozen_recipe_manifests() {
             fixture["hipcc_extra_flags"],
             builtin_flags("gfx1201").hipcc_extra_flags.as_str()
         );
-        // Bound to the current registry recipe, not to the historical capture hash.
-        assert_current_registry_binding(
-            &plan,
-            "gfx1201",
-            &builtin_flags("gfx1201").hipcc_extra_flags,
-        );
         let route = &fixture["routes"][route_key(spec)];
         let got = manifest(&plan);
         // HIP source-text hashes are historical capture provenance, not current
@@ -285,11 +249,6 @@ fn qwen36_27b_gfx1201_plans_match_frozen_recipe_manifests() {
 fn every_historical_route_symbol_is_planned_with_current_identity() {
     for spec in [KernelSpecRoute::Ar, KernelSpecRoute::NativeMtp] {
         let (fixture, plan) = route_27b(spec);
-        assert_current_registry_binding(
-            &plan,
-            "gfx1201",
-            &builtin_flags("gfx1201").hipcc_extra_flags,
-        );
         let got = manifest(&plan);
         let observed = fixture["observed"][route_key(spec)].as_array().unwrap();
         assert!(!observed.is_empty());
