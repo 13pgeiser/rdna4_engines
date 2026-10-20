@@ -1678,11 +1678,13 @@ mod nt {
         fn experimental(&self) -> bool {
             self.chains != 1 || !self.prefetch || self.grouped
         }
-        /// Schedules whose dead-tile guards join differently-shaped load
-        /// sets (`maybe` pendings): the prologue and every trip end settle all
-        /// loads, so the K loop's entry and back-edge ledgers are both empty.
+        /// Experimental guarded loads and the two-slot stream settle at
+        /// loop boundaries. Streaming consumes the prefetched weight set
+        /// while cycling X slots, so its pending set cannot match the
+        /// prologue's weight-plus-X pending set. Drain both boundaries;
+        /// pair-local waits still overlap tile reloads within each epoch.
         fn settles_loads(&self) -> bool {
-            self.experimental() && (self.chains != 1 || !self.prefetch)
+            self.stream_x() || (self.experimental() && (self.chains != 1 || !self.prefetch))
         }
         fn sum(&self, j: u8) -> u8 {
             SUM0 + 8 * j
