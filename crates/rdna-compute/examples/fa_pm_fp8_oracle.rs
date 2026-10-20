@@ -4045,7 +4045,7 @@ fn run() -> Result<bool> {
                 .map_or(true, |f| ic.name.contains(f.as_str()))
         })
         .collect();
-    if cells.is_empty() && ieee_selected.is_empty() {
+    if cells.is_empty() && ieee_selected.is_empty() && native_selected.is_empty() {
         return Err("--filter matched no cell".into());
     }
     // The arena always covers the independent extents (at most 8 rows / 66 contexts): with no
