@@ -62,14 +62,26 @@ def main():
             out.close()   # close() flushes; on a full disk the dirty buffer fails to land
         except OSError:
             pass          # those rows are already counted lost -- the fresh handle is the point
-        for i in range(4, 0, -1):
-            src = "%s.%d" % (a.out, i)
-            if os.path.exists(src):
-                os.replace(src, "%s.%d" % (a.out, i + 1))
-        os.replace(a.out, a.out + ".1")
-        out = open(a.out, "a")
-        rotated += 1
-        sys.stderr.write("statsdump: rotated %s (generation %d)\n" % (a.out, rotated))
+        try:
+            for i in range(4, 0, -1):
+                src = "%s.%d" % (a.out, i)
+                if os.path.exists(src):
+                    os.replace(src, "%s.%d" % (a.out, i + 1))
+            os.replace(a.out, a.out + ".1")
+            out = open(a.out, "a")
+            rotated += 1
+            sys.stderr.write("statsdump: rotated %s (generation %d)\n" % (a.out, rotated))
+        except OSError:
+            # The shift or the reopen failed (ENOSPC can bite when the directory must
+            # grow). out is CLOSED here -- and a closed handle raises ValueError on the
+            # next write, which the OSError handler does not catch (auditor ringer Q2).
+            # Reopen best-effort before re-raising: append-open needs no disk space, so
+            # this succeeds even on a full disk, and the poller keeps counting losses.
+            try:
+                out = open(a.out, "a")
+            except OSError:
+                pass
+            raise
     sys.stderr.write("statsdump: %s/stats every %.1fs -> %s\n" % (base, a.every, a.out))
     try:
         while True:
@@ -131,7 +143,10 @@ def main():
     except KeyboardInterrupt:
         sys.stderr.write("statsdump: interrupted\n")
     finally:
-        out.close()
+        try:
+            out.close()
+        except OSError:
+            pass   # a flush failing at exit must not eat the summary line below
     sys.stderr.write("statsdump: %d rows written, %d polls lost, %d rotations, %s\n"
                      % (ok, lost, rotated, a.out))
     # An empty file is a failure, not a quiet run: say so with the exit status, not only in prose.
