@@ -256,6 +256,9 @@ int ref_snake_aa(const RadArgs* a, RadStream) {
  * `cond_k` > 0 only the entries where c reaches its cond_k-th largest value are. Of the candidates
  * the `k` largest g (ties to the lower index) are kept, divided by `temp`, softmaxed in f32 and
  * drawn by inverse CDF in descending g with u = rad_philox_uniform_s(seed, 2^32 + frame, stream).
+ * With `top_p` < 1 the kept list is cut first where the cumulative probability of the whole
+ * candidate set's softmax over temp (summed in index order) passes top_p, as Fish Audio's sampler
+ * cuts it: a rank whose inclusive cumulative probability exceeds top_p is dropped, rank 0 never.
  * The pick is written to all of the lane's `rep` slots of `ids`. logits [rep n, n_vocab] f32 or
  * bf16; seed [n, 2]; frame [n]. */
 int ref_cfg_topk_sample(const RadArgs* a, RadStream) {
@@ -267,8 +270,10 @@ int ref_cfg_topk_sample(const RadArgs* a, RadStream) {
     const int64_t sup_lo = p_int(a, "sup_lo", 0), sup_hi = p_int(a, "sup_hi", 0);
     const float cfg = p_f32(a, "cfg", 1.0f), temp = p_f32(a, "temp", 1.0f);
     const float pen = p_f32(a, "penalty", 1.0f);
+    const double top_p = (double)p_f32(a, "top_p", 1.0f);
     if (V <= 0 || K <= 0 || K > V || rep < 1 || rep > 2 || ck < 0 || ck > V || !(temp > 0) ||
-        sup_lo < 0 || sup_hi < sup_lo || sup_hi > V || !(pen > 0) || (!hist != !lane))
+        sup_lo < 0 || sup_hi < sup_lo || sup_hi > V || !(pen > 0) || (!hist != !lane) ||
+        !(top_p >= 0))
         return RAD_E_SHAPE;
     const int64_t n = numel(ids) / rep;
     if (n <= 0 || rows_of(lg, V) < rep * n || numel(fr) < n || numel(seed) < 2 * n ||
@@ -319,13 +324,32 @@ int ref_cfg_topk_sample(const RadArgs* a, RadStream) {
                 if (open(j)) idx[(size_t)nc++] = j;
         }
         if (nc == 0) return RAD_E_SHAPE;
-        const int64_t kk = std::min(K, nc);
+        /* The whole candidate set's normaliser, in index order (idx still is), for top_p. */
+        double z = 0;
+        if (top_p < 1.0) {
+            float gm = g[(size_t)idx[0]];
+            for (int64_t t = 1; t < nc; ++t) gm = std::max(gm, g[(size_t)idx[(size_t)t]]);
+            const float m0 = gm / temp;
+            for (int64_t t = 0; t < nc; ++t)
+                z += std::exp((double)(g[(size_t)idx[(size_t)t]] / temp - m0));
+        }
+        int64_t kk = std::min(K, nc);
         std::partial_sort(idx.begin(), idx.begin() + kk, idx.begin() + nc,
                           [&](int64_t p, int64_t q) {
                               return g[(size_t)p] > g[(size_t)q] ||
                                      (g[(size_t)p] == g[(size_t)q] && p < q);
                           });
         const float m = g[(size_t)idx[0]] / temp;
+        if (top_p < 1.0) {
+            double cum = 0;
+            int64_t keep = 1;
+            for (int64_t t = 0; t < kk; ++t) {
+                cum += std::exp((double)(g[(size_t)idx[(size_t)t]] / temp - m)) / z;
+                if (t > 0 && cum > top_p) break;
+                keep = t + 1;
+            }
+            kk = keep;
+        }
         double tot = 0;
         std::vector<double> e((size_t)kk);
         for (int64_t t = 0; t < kk; ++t) {
@@ -433,6 +457,44 @@ int ref_frame_mix_store(const RadArgs* a, RadStream) {
                        ldt(hid, rowoff(hid, l * plane + rep * i, D) + d * laststride(hid));
             stt(dst, yb + d * laststride(dst), rbf(acc) * scale);
         }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ ras_pick */
+/* Fish Audio's repetition-aware sampling, the choice between two draws a lane: the first draw
+ * ids[rep i] = first[rep i], unless it lies in [lo, hi) and the lane's window (its last `win`
+ * picks, `hist` [lanes, win], oldest first, -1 empty) holds it, in which case the alternative
+ * draw alt[rep i] is taken. The pick then enters the window, its oldest entry leaving. `clear` 1
+ * empties the lane's window first (a piece's first pick). A pick outside [lo, hi) (Fish's end of
+ * speech) is never redrawn. */
+int ref_ras_pick(const RadArgs* a, RadStream) {
+    if (!have(a, 5)) return RAD_E_INVAL;
+    const RadTensor *first = &a->t[0], *alt = &a->t[1], *lane = &a->t[2], *hist = &a->t[3];
+    const RadTensor* ids = &a->t[4];
+    const int64_t W = p_int(a, "win", 0), lo = p_int(a, "lo", 0), hi = p_int(a, "hi", 0);
+    const int64_t rep = p_int(a, "rep", 1), clear = p_int(a, "clear", 0);
+    const int64_t n = numel(lane);
+    if (W <= 0 || lo < 0 || hi < lo || rep < 1 || clear < 0 || clear > 1 || n <= 0 ||
+        numel(first) < rep * n || numel(alt) < rep * n || numel(ids) < rep * n)
+        return RAD_E_SHAPE;
+    for (int64_t i = 0; i < n; ++i) {
+        const int64_t L = ldi(lane, i);
+        if (L < 0 || (L + 1) * W > numel(hist)) return RAD_E_SHAPE;
+    }
+    for (int64_t i = 0; i < n; ++i) {
+        const int64_t hb = ldi(lane, i) * W;
+        if (clear)
+            for (int64_t w = 0; w < W; ++w) st_int(hist->dtype, hist->data, offlin(hist, hb + w), -1);
+        const int64_t f = ldi(first, rep * i);
+        int64_t pick = f;
+        if (f >= lo && f < hi)
+            for (int64_t w = 0; w < W; ++w)
+                if (ldi(hist, hb + w) == f) { pick = ldi(alt, rep * i); break; }
+        for (int64_t r = 0; r < rep; ++r) st_int(ids->dtype, ids->data, offlin(ids, rep * i + r), pick);
+        for (int64_t w = 0; w + 1 < W; ++w)
+            st_int(hist->dtype, hist->data, offlin(hist, hb + w), ldi(hist, hb + w + 1));
+        st_int(hist->dtype, hist->data, offlin(hist, hb + W - 1), pick);
     }
     return RAD_OK;
 }

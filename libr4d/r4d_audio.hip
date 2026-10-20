@@ -622,6 +622,11 @@ __device__ uint32_t kth_key(F val, int j0, int j1, int kth, int* sh) {
 // [sup_lo, sup_hi) are optional. The kept values are divided by the temperature, as libref divides:
 // a multiply by its inverse rounds differently and can move a pick across a CDF boundary. A lane
 // with no candidate left writes -1.
+//
+// `top_p` < 1 cuts the kept list where the whole candidate set's cumulative probability passes it
+// (Fish Audio's draw). The normaliser is each thread's slice summed in index order, the slices
+// then summed by thread 0 in thread order: index order as libref sums, associated differently,
+// which in double moves a cut only for a cumulative within ~1e-16 of top_p.
 constexpr int kMaxK = 256;
 
 __global__ __launch_bounds__(kT) void cfg_topk_kernel(
@@ -629,9 +634,10 @@ __global__ __launch_bounds__(kT) void cfg_topk_kernel(
     const int* __restrict__ frame, int* __restrict__ ids, int V, int K, int rep, int cond_k,
     float cfg, float temp, uint64_t stream, const float* __restrict__ cfgs,
     const int* __restrict__ lane, int* __restrict__ hist, int n_hist, int sup_lo, int sup_hi,
-    float pen) {
+    float pen, float top_p) {
     __shared__ int sh[8];
     __shared__ int s_pre[kT];
+    __shared__ double s_z[kT];
     __shared__ float s_g[kMaxK];
     __shared__ int s_i[kMaxK];
     __shared__ float s_e[kMaxK];
@@ -721,8 +727,29 @@ __global__ __launch_bounds__(kT) void cfg_topk_kernel(
         s_pre[rank] = mi;
     }
     __syncthreads();
+    if (top_p < 1.f) {
+        const float m = s_e[0] / temp;
+        double z = 0;
+        for (int j = j0; j < j1; ++j)
+            if (cand(j)) z += exp((double)(gval(j) / temp - m));
+        s_z[tid] = z;
+    }
+    __syncthreads();
     if (tid == 0) {
         const float m = s_e[0] / temp;
+        int kp = kk;
+        if (top_p < 1.f) {
+            double z = 0;
+            for (int t = 0; t < kT; ++t) z += s_z[t];
+            double cum = 0;
+            kp = 1;
+            for (int t = 0; t < kk; ++t) {
+                cum += exp((double)(s_e[t] / temp - m)) / z;
+                if (t > 0 && cum > (double)top_p) break;
+                kp = t + 1;
+            }
+        }
+        const int kk = kp;
         double tot = 0;
         for (int t = 0; t < kk; ++t) tot += exp((double)(s_e[t] / temp - m));
         const double u = (double)rad_philox_uniform_s(seed_of(seed, ln),
@@ -818,6 +845,32 @@ __global__ __launch_bounds__(kT) void frame_mix_kernel(
         for (int l = 0; l < L; ++l) acc += w[l] * bf2f(hid[((size_t)l * plane + rep * i) * h_ld + d]);
         out[d] = f32_to_bf16(bfr(acc) * sc);
     }
+}
+
+// Fish Audio's repetition-aware choice between two draws, a thread a lane (libref's
+// ref_ras_pick): the alternative where the first draw is in [lo, hi) and in the lane's window of
+// its last `W` picks, the pick then entering the window. A lane whose window lies outside `hist`
+// takes the first draw and keeps no window.
+__global__ __launch_bounds__(kT) void ras_pick_kernel(
+    const int* __restrict__ first, const int* __restrict__ alt, const int* __restrict__ lane,
+    int* __restrict__ hist, int* __restrict__ ids, int n, int W, int lo, int hi, int rep,
+    int clear, long long n_hist) {
+    const int i = blockIdx.x * kT + threadIdx.x;
+    if (i >= n) return;
+    const int f = first[rep * i];
+    const long long L = lane[i];
+    int pick = f;
+    if (L >= 0 && (L + 1) * W <= n_hist) {
+        int* h = hist + L * W;
+        if (clear)
+            for (int w = 0; w < W; ++w) h[w] = -1;
+        if (f >= lo && f < hi)
+            for (int w = 0; w < W; ++w)
+                if (h[w] == f) { pick = alt[rep * i]; break; }
+        for (int w = 0; w + 1 < W; ++w) h[w] = h[w + 1];
+        h[W - 1] = pick;
+    }
+    for (int r = 0; r < rep; ++r) ids[rep * i + r] = pick;
 }
 
 __global__ __launch_bounds__(kT) void end_status_kernel(
@@ -1303,9 +1356,11 @@ extern "C" int r4d_rad_cfg_topk_sample(const RadArgs* a, RadStream s) {
     const long long sup_lo = r4d_geti_or(a, "sup_lo", 0), sup_hi = r4d_geti_or(a, "sup_hi", 0);
     const double cfg = r4d_getf(a, "cfg", 1.0), temp = r4d_getf(a, "temp", 1.0);
     const double pen = r4d_getf(a, "penalty", 1.0);
+    /* As f32, as libref and libavx read it, so all three cut at the same value. */
+    const float top_p = (float)r4d_getf(a, "top_p", 1.0);
     if (V <= 0 || K <= 0 || K > kMaxK || K > V || rep < 1 || rep > 2 || ck < 0 || ck > V ||
         !(temp > 0) || V > (1 << 16) * kT || sup_lo < 0 || sup_hi < sup_lo || sup_hi > V ||
-        !(pen > 0) || (!hist != !lane))
+        !(pen > 0) || (!hist != !lane) || !(top_p >= 0.f))
         return R4D_NO(RAD_E_SHAPE);
     long long rl = 0;
     const long long ll = r4d_rows_pitch(lg, V, &rl);
@@ -1321,7 +1376,30 @@ extern "C" int r4d_rad_cfg_topk_sample(const RadArgs* a, RadStream s) {
                        cfgs ? (const float*)cfgs->data : nullptr,
                        lane ? (const int*)lane->data : nullptr, hist ? (int*)hist->data : nullptr,
                        hist ? (int)(r4d_numel(hist) / V) : 0, (int)sup_lo, (int)sup_hi,
-                       (float)pen);
+                       (float)pen, top_p);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_ras_pick(const RadArgs* a, RadStream s) {
+    const RadTensor *first = r4d_opt(a, 0), *alt = r4d_opt(a, 1), *lane = r4d_opt(a, 2);
+    const RadTensor *hist = r4d_opt(a, 3), *ids = r4d_opt(a, 4);
+    if (!first || !alt || !lane || !hist || !ids) return R4D_NO(RAD_E_INVAL);
+    if (!is_i32(first) || !is_i32(alt) || !is_i32(lane) || !is_i32(hist) || !is_i32(ids))
+        return R4D_NO(RAD_E_DTYPE);
+    if (!r4d_contig(first) || !r4d_contig(alt) || !r4d_contig(lane) || !r4d_contig(hist) ||
+        !r4d_contig(ids))
+        return R4D_NO(RAD_E_STRIDE);
+    const long long W = r4d_geti_or(a, "win", 0), lo = r4d_geti_or(a, "lo", 0);
+    const long long hi = r4d_geti_or(a, "hi", 0), rep = r4d_geti_or(a, "rep", 1);
+    const long long clear = r4d_geti_or(a, "clear", 0);
+    const long long n = r4d_numel(lane);
+    if (W <= 0 || lo < 0 || hi < lo || rep < 1 || clear < 0 || clear > 1 || n <= 0 ||
+        r4d_numel(first) < rep * n || r4d_numel(alt) < rep * n || r4d_numel(ids) < rep * n)
+        return R4D_NO(RAD_E_SHAPE);
+    hipLaunchKernelGGL(ras_pick_kernel, dim3(blocks_for(n)), dim3(kT), 0, (hipStream_t)s,
+                       (const int*)first->data, (const int*)alt->data, (const int*)lane->data,
+                       (int*)hist->data, (int*)ids->data, (int)n, (int)W, (int)lo, (int)hi,
+                       (int)rep, (int)clear, (long long)r4d_numel(hist));
     return st_of(hipGetLastError());
 }
 

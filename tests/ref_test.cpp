@@ -970,6 +970,8 @@ TEST(op_vocabulary) {
         "conv1d", "conv_t1d", "snake", "cfg_topk_sample", "rvq_embed", "frame_mix_store",
         "end_status", "resample_nearest", "fourier_embed", "win_input", "win_prep", "win_finish",
         "chan_split", "interleave2", "iota", "cu_repeat", "int_affine", "frame_store",
+        /* Fish Audio drama-3's (arch/fishomni): the repetition-aware choice between two draws. */
+        "ras_pick",
         /* The video generator's (MiniMax-H3): its DiT's modulated norm and sampler step, its
          * decoder's patch unfold, tiles, stitch and positions, and the vocoder's alias-free
          * activation. */
@@ -8124,6 +8126,7 @@ std::vector<Geo> geometries() {
         G("frame_mix_store", "M", 2, a.i("M", R).i("n_embd", 8).i("L", 3).i("stride", 4)
                                      .i("rep", 2).s("dtype", "bf16")),
         G("end_status", "M", 2, a.i("M", R).i("end", 5).i("rep", 2)),
+        G("ras_pick", "M", 2, a.i("M", R).i("win", 4).i("lo", 1).i("hi", 9).i("rep", 1)),
         G("resample_nearest", "M", 6, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("fourier_embed", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("win_input", "M", 8, a.i("M", R).i("n_lat", 4).i("n_zero", 2).i("n_cond", 3)

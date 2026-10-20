@@ -202,6 +202,7 @@ int     r4d_rad_cfg_topk_sample       (const RadArgs*, RadStream);
 int     r4d_rad_rvq_embed             (const RadArgs*, RadStream);
 int     r4d_rad_frame_mix_store       (const RadArgs*, RadStream);
 int     r4d_rad_end_status            (const RadArgs*, RadStream);
+int     r4d_rad_ras_pick              (const RadArgs*, RadStream);
 int     r4d_rad_frame_store           (const RadArgs*, RadStream);
 int     r4d_rad_resample_nearest      (const RadArgs*, RadStream);
 int     r4d_rad_fourier_embed         (const RadArgs*, RadStream);

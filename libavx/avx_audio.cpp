@@ -590,8 +590,10 @@ AVX_KERNEL(cfg_topk_sample) {
     const int64_t sup_lo = p_int(a, "sup_lo", 0), sup_hi = p_int(a, "sup_hi", 0);
     const float cfg = p_f32(a, "cfg", 1.0f), temp = p_f32(a, "temp", 1.0f);
     const float pen = p_f32(a, "penalty", 1.0f);
+    const double top_p = (double)p_f32(a, "top_p", 1.0f);
     if (V <= 0 || K <= 0 || K > V || rep < 1 || rep > 2 || ck < 0 || ck > V || !(temp > 0) ||
-        sup_lo < 0 || sup_hi < sup_lo || sup_hi > V || !(pen > 0) || (!hist != !lane))
+        sup_lo < 0 || sup_hi < sup_lo || sup_hi > V || !(pen > 0) || (!hist != !lane) ||
+        !(top_p >= 0))
         return RAD_E_SHAPE;
     const int64_t n = numel(ids) / rep;
     if (n <= 0 || rows_of(lg, V) < rep * n || numel(fr) < n || numel(seed) < 2 * n ||
@@ -650,11 +652,29 @@ AVX_KERNEL(cfg_topk_sample) {
         } else {
             for (int64_t j = 0; j < V; ++j) if (open(j)) idx[nc++] = j;
         }
-        const int64_t kk = std::min(K, nc);
+        /* top_p's normaliser over every candidate in index order (idx still is), as libref. */
+        double z = 0;
+        if (top_p < 1.0) {
+            float gm = g[idx[0]];
+            for (int64_t t = 1; t < nc; ++t) gm = std::max(gm, g[idx[t]]);
+            const float m0 = gm / temp;
+            for (int64_t t = 0; t < nc; ++t) z += std::exp((double)(g[idx[t]] / temp - m0));
+        }
+        int64_t kk = std::min(K, nc);
         std::partial_sort(idx, idx + kk, idx + nc, [g](int64_t p, int64_t q) {
             return g[p] > g[q] || (g[p] == g[q] && p < q);
         });
         const float m = g[idx[0]] / temp;
+        if (top_p < 1.0) {
+            double cum = 0;
+            int64_t keep = 1;
+            for (int64_t t = 0; t < kk; ++t) {
+                cum += std::exp((double)(g[idx[t]] / temp - m)) / z;
+                if (t > 0 && cum > top_p) break;
+                keep = t + 1;
+            }
+            kk = keep;
+        }
         double tot = 0;
         for (int64_t t = 0; t < kk; ++t) {
             e[t] = std::exp((double)(g[idx[t]] / temp - m));
@@ -785,6 +805,42 @@ AVX_KERNEL(frame_mix_store) {
         narrow_row(RAD_BF16, acc, D, tmp);
         for (int64_t d = 0; d < D; ++d) acc[d] *= scale;
         out_row(dst, rowoff(dst, row, D), D, acc);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ ras_pick */
+/* libref's rule: the first draw unless it lies in [lo, hi) and the lane's window of its last `win`
+ * picks holds it, then the alternative; the pick enters the window. Lanes are checked before
+ * anything is written and run in order, as two entries may share a lane's window. */
+AVX_KERNEL(ras_pick) {
+    if (!rad_args_have(a, 5)) return RAD_E_INVAL;
+    const RadTensor *first = &a->t[0], *alt = &a->t[1], *lane = &a->t[2], *hist = &a->t[3];
+    const RadTensor* ids = &a->t[4];
+    const int64_t W = p_int(a, "win", 0), lo = p_int(a, "lo", 0), hi = p_int(a, "hi", 0);
+    const int64_t rep = p_int(a, "rep", 1), clear = p_int(a, "clear", 0);
+    const int64_t n = numel(lane);
+    if (W <= 0 || lo < 0 || hi < lo || rep < 1 || clear < 0 || clear > 1 || n <= 0 ||
+        numel(first) < rep * n || numel(alt) < rep * n || numel(ids) < rep * n)
+        return RAD_E_SHAPE;
+    for (int64_t i = 0; i < n; ++i) {
+        const int64_t L = at(lane, i);
+        if (L < 0 || (L + 1) * W > numel(hist)) return RAD_E_SHAPE;
+    }
+    for (int64_t i = 0; i < n; ++i) {
+        const int64_t hb = at(lane, i) * W;
+        if (clear)
+            for (int64_t w = 0; w < W; ++w) st_int_dt(hist->dtype, hist->data, offlin(hist, hb + w), -1);
+        const int64_t f = at(first, rep * i);
+        int64_t pick = f;
+        if (f >= lo && f < hi)
+            for (int64_t w = 0; w < W; ++w)
+                if (at(hist, hb + w) == f) { pick = at(alt, rep * i); break; }
+        for (int64_t r = 0; r < rep; ++r)
+            st_int_dt(ids->dtype, ids->data, offlin(ids, rep * i + r), pick);
+        for (int64_t w = 0; w + 1 < W; ++w)
+            st_int_dt(hist->dtype, hist->data, offlin(hist, hb + w), at(hist, hb + w + 1));
+        st_int_dt(hist->dtype, hist->data, offlin(hist, hb + W - 1), pick);
     }
     return RAD_OK;
 }

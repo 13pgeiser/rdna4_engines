@@ -3226,6 +3226,21 @@ int ref_end_status_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     return o.finish("end_status", operand, out);
 }
 
+int ref_ras_pick_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), rep = gi(p, n_p, "rep", 1), W = gi(p, n_p, "win", 0);
+    const int64_t hi = gi(p, n_p, "hi", 0);
+    if (M <= 0 || rep < 1 || W <= 0 || hi <= 0 || M > REF_LANES) return RAD_E_UNSUPPORTED;
+    Opd o;
+    /* Picks over a small band so the windows repeat them often enough to exercise the redraw. */
+    const int64_t band = std::min<int64_t>(hi + 2, 12);
+    o.t_idx({ rep * M }, band, -1, 0);                        /* first */
+    o.t_idx({ rep * M }, band, -1, 0);                        /* alt */
+    o.t_idx({ M }, REF_LANES, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);   /* lane */
+    o.t_idx({ REF_LANES * W }, band, -1, 0);                  /* hist, INOUT */
+    o.t_idx({ rep * M }, band, -1, 0);                        /* ids, OUT */
+    return o.finish("ras_pick", operand, out);
+}
+
 int ref_frame_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), K = gi(p, n_p, "n_codes", 0);
     const int64_t st = gi(p, n_p, "stride", 0), rep = gi(p, n_p, "rep", 1);

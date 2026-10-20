@@ -699,7 +699,8 @@ static const RadOperandSpec oSnakeAa[] = { OPD("x"), WGT("alpha"), WGT("beta"), 
 static const RadParamSpec pCfgTopk[] = { P_INT("M"), P_INT("n_vocab"), P_INT("k"), P_INT("rep"),
                                          P_INTO("cond_k"), P_F64("cfg"), P_F64O("temp"),
                                          P_INT("stream"), P_STR("dtype"), P_INTO("sup_lo"),
-                                         P_INTO("sup_hi"), P_F64O("penalty") };
+                                         P_INTO("sup_hi"), P_F64O("penalty"),
+                                         P_F64O("top_p") };
 static const RadOperandSpec oCfgTopk[] = { OPD("logits"), OPD("seed"), OPD("frame"), OUT("ids"),
                                            OPD_O("cfg"), OPD_O("lane"), INOUT_O("hist") };
 static const RadParamSpec pRvqEmbed[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_codes"),
@@ -712,6 +713,10 @@ static const RadOperandSpec oFrameMix[] = { OPD("hid"), WGT("logits"), WGT("scal
                                             OPD("frame"), OPD("status"), INOUT("dst") };
 static const RadParamSpec pEndStatus[] = { P_INT("M"), P_INT("end"), P_INT("rep") };
 static const RadOperandSpec oEndStatus[] = { OPD("ids"), OPD("lane"), INOUT("status") };
+static const RadParamSpec pRasPick[] = { P_INT("M"), P_INT("win"), P_INT("lo"), P_INT("hi"),
+                                         P_INTO("rep"), P_INTO("clear") };
+static const RadOperandSpec oRasPick[] = { OPD("first"), OPD("alt"), OPD("lane"), INOUT("hist"),
+                                           OUT("ids") };
 static const RadParamSpec pFrameStore[] = { P_INT("M"), P_INT("n_codes"), P_INT("stride"),
                                             P_INTO("rep"), P_INTO("skip") };
 static const RadOperandSpec oFrameStore[] = { OPD("codes"), OPD("lane"), OPD("frame"),
@@ -1185,6 +1190,9 @@ static const RadOpSchema kSchemas[] = {
   "a frame's softmax-weighted mix of hidden planes, stored into its lane, bit for bit libref's." },
 { "end_status", ARR(pEndStatus), ARR(oEndStatus),
   "status[lane[i]] = ids[rep i] == end ? -1 : ids[rep i]." },
+{ "ras_pick", ARR(pRasPick), ARR(oRasPick),
+  "repetition-aware sampling: the alternative draw where the first is in [lo, hi) and in the "
+  "lane's window of its last picks, else the first; the pick enters the window." },
 { "frame_store", ARR(pFrameStore), ARR(oFrameStore),
   "a frame's codes into its lane's history, code-major rows over the lane's frames." },
 { "resample_nearest", ARR(pMnD), ARR(oUnary),
@@ -1714,6 +1722,8 @@ SIMPLE("avx_frame_mix_store", "frame_mix_store", "elem",
        "a frame's conditioning row into its lane", DT_FLOAT, L(frame_mix_store)),
 SIMPLE("avx_end_status", "end_status", "elem", "a frame's status from its first pick", DT_ANY,
        L(end_status)),
+SIMPLE("avx_ras_pick", "ras_pick", "elem", "a repetition-aware choice between two draws a lane",
+       DT_ANY, L(ras_pick)),
 SIMPLE("avx_frame_store", "frame_store", "elem", "a frame's codes into its lane's history", DT_ANY,
        L(frame_store)),
 SIMPLE("avx_resample_nearest", "resample_nearest", "elem", "rows resampled nearest-neighbour",

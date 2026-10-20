@@ -2391,7 +2391,8 @@ static const RadOperandSpec oSnake[] = {
 static const RadParamSpec pCfgTopk[] = { P_INT("M"), P_INT("n_vocab"), P_INT("k"), P_INT("rep"),
                                          P_INTO("cond_k"), P_F64("cfg"), P_F64O("temp"),
                                          P_INT("stream"), P_STR("dtype"), P_INTO("sup_lo"),
-                                         P_INTO("sup_hi"), P_F64O("penalty") };
+                                         P_INTO("sup_hi"), P_F64O("penalty"),
+                                         P_F64O("top_p") };
 static const RadOperandSpec oCfgTopk[] = {
     { "logits", RAD_OPD_IN, 0 }, { "seed", RAD_OPD_IN, 0 }, { "frame", RAD_OPD_IN, 0 },
     { "ids", RAD_OPD_OUT, 0 }, { "cfg", RAD_OPD_IN, 1 }, { "lane", RAD_OPD_IN, 1 },
@@ -2414,6 +2415,12 @@ static const RadOperandSpec oFrameMix[] = {
 static const RadParamSpec pEndStatus[] = { P_INT("M"), P_INT("end"), P_INT("rep") };
 static const RadOperandSpec oEndStatus[] = {
     { "ids", RAD_OPD_IN, 0 }, { "lane", RAD_OPD_IN, 0 }, { "status", RAD_OPD_INOUT, 0 },
+};
+static const RadParamSpec pRasPick[] = { P_INT("M"), P_INT("win"), P_INT("lo"), P_INT("hi"),
+                                         P_INTO("rep"), P_INTO("clear") };
+static const RadOperandSpec oRasPick[] = {
+    { "first", RAD_OPD_IN, 0 }, { "alt", RAD_OPD_IN, 0 }, { "lane", RAD_OPD_IN, 0 },
+    { "hist", RAD_OPD_INOUT, 0 }, { "ids", RAD_OPD_OUT, 0 },
 };
 static const RadParamSpec pFrameStore[] = { P_INT("M"), P_INT("n_codes"), P_INT("stride"),
                                             P_INTO("rep"), P_INTO("skip") };
@@ -3335,6 +3342,9 @@ static const RadOpSchema kSchemas[] = {
            "a frame's conditioning row (softmax-weighted planes times scale) into its lane."),
     SCHEMA("end_status", pEndStatus, oEndStatus,
            "status[lane[i]] = ids[rep i] == end ? -1 : ids[rep i]."),
+    SCHEMA("ras_pick", pRasPick, oRasPick,
+           "repetition-aware sampling: the alternative draw where the first is in [lo, hi) and in "
+           "the lane's window of its last picks, else the first; the pick enters the window."),
     SCHEMA("frame_store", pFrameStore, oFrameStore,
            "a frame's codes into its lane's history: dst[(lane n_codes + k) stride + frame - skip] "
            "= codes[k, rep i] when frame >= skip and status[lane] >= 0."),
@@ -8291,6 +8301,12 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   nullptr, 0, NOTUNE,
   nullptr, nullptr, r4d_rad_end_status },
+
+{ "ras_pick", "ras_pick", "elem",
+  "a repetition-aware choice between two draws a lane", "a thread a lane", "i32",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  nullptr, 0, NOTUNE,
+  nullptr, nullptr, r4d_rad_ras_pick },
 
 { "frame_store", "frame_store", "elem",
   "a frame's codes into its lane's history", "a thread a (lane, code); dst contiguous", "i32",

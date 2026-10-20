@@ -5779,10 +5779,14 @@ void snake_cases(const Plugin& pl) {
     }
 }
 
+/* Picks whose nucleus ended inside the top k, so that a top_p case is known to test the cut. */
+int64_t g_topp_cuts = 0;
+
 /* ref_cfg_topk_sample's rule on the host, for one lane, over f32 logits. */
 int ref_pick(const std::vector<float>& lg, int64_t V, int64_t lane_row, int rep, float cfg,
              int64_t K, int64_t cond_k, float temp, int64_t sup_lo, int64_t sup_hi, float pen,
-             std::vector<int32_t>* hist, int64_t hb, uint64_t seed, int32_t frame, uint64_t stream) {
+             std::vector<int32_t>* hist, int64_t hb, uint64_t seed, int32_t frame, uint64_t stream,
+             float top_p = 1.0f) {
     std::vector<float> c((size_t)V), g((size_t)V);
     for (int64_t j = 0; j < V; ++j) c[(size_t)j] = lg[(size_t)(rep * lane_row * V + j)];
     if (rep == 2) {
@@ -5815,11 +5819,28 @@ int ref_pick(const std::vector<float>& lg, int64_t V, int64_t lane_row, int rep,
             if (open(j)) idx.push_back(j);
     }
     if (idx.empty()) return -1;
-    const int64_t kk = std::min<int64_t>(K, (int64_t)idx.size());
+    double z = 0;
+    if (top_p < 1.0f) {
+        float gm = g[(size_t)idx[0]];
+        for (const int64_t j : idx) gm = std::max(gm, g[(size_t)j]);
+        for (const int64_t j : idx) z += std::exp((double)(g[(size_t)j] / temp - gm / temp));
+    }
+    int64_t kk = std::min<int64_t>(K, (int64_t)idx.size());
     std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&](int64_t p, int64_t q) {
         return g[(size_t)p] > g[(size_t)q] || (g[(size_t)p] == g[(size_t)q] && p < q);
     });
     const float m = g[(size_t)idx[0]] / temp;
+    if (top_p < 1.0f) {
+        double cum = 0;
+        int64_t keep = 1;
+        for (int64_t t = 0; t < kk; ++t) {
+            cum += std::exp((double)(g[(size_t)idx[(size_t)t]] / temp - m)) / z;
+            if (t > 0 && cum > (double)top_p) break;
+            keep = t + 1;
+        }
+        if (keep < kk) ++g_topp_cuts;
+        kk = keep;
+    }
     double tot = 0;
     std::vector<double> e((size_t)kk);
     for (int64_t t = 0; t < kk; ++t) {
@@ -5844,16 +5865,26 @@ int ref_pick(const std::vector<float>& lg, int64_t V, int64_t lane_row, int rep,
 void cfg_topk_cases(const Plugin& pl) {
     const RadKernelInfo* r = find(pl, "cfg_topk_sample");
     if (!r) { ok("cfg_topk_sample", false, "row absent"); return; }
-    struct C { int64_t V; int rep; bool hist, cfgs; int64_t sup_lo, sup_hi, cond_k; float temp; };
+    struct C {
+        int64_t V; int rep; bool hist, cfgs; int64_t sup_lo, sup_hi, cond_k; float temp;
+        float top_p = 1.0f; int64_t K = 50;
+    };
+    /* The last two are Fish Audio's draws (arch/fishomni): its main pick over eos and 4096
+     * semantic ids at temperature 0.7, nucleus 0.7, top 30, and its repetition-aware redraw at 1.0,
+     * 0.95, 30. */
     for (const C& c : { C{ 2052, 2, true, true, 2048, 2051, 0, 0.9f },
                         C{ 2051, 1, true, false, 2048, 2051, 0, 0.9f },
                         C{ 2051, 2, false, true, 2048, 2051, 0, 0.9f },
-                        C{ 16385, 2, false, false, 0, 0, 50, 1.0f } }) {
-        const int64_t n = 3, lanes = 4, K = 50;
-        const std::string nm = fmt("cfg_topk_sample V %lld rep %d%s%s sup [%lld, %lld) cond_k %lld",
+                        C{ 16385, 2, false, false, 0, 0, 50, 1.0f },
+                        C{ 4097, 1, false, false, 0, 0, 0, 0.7f, 0.7f, 30 },
+                        C{ 4097, 1, false, false, 0, 0, 0, 1.0f, 0.95f, 30 } }) {
+        const int64_t n = 3, lanes = 4, K = c.K;
+        const std::string nm = fmt("cfg_topk_sample V %lld rep %d%s%s sup [%lld, %lld) cond_k %lld"
+                                   " top_p %g k %lld",
                                    (long long)c.V, c.rep, c.hist ? " hist" : "",
                                    c.cfgs ? " per-lane cfg" : "", (long long)c.sup_lo,
-                                   (long long)c.sup_hi, (long long)c.cond_k);
+                                   (long long)c.sup_hi, (long long)c.cond_k, (double)c.top_p,
+                                   (long long)K);
         std::vector<int32_t> lane = { 2, 0, 3 };
         std::vector<float> cfgv = { 1.0f, 3.0f, 4.0f };
         std::vector<uint32_t> seed = { 7u, 0u, 0x9e3779b9u, 1u, 0xdeadbeefu, 0x12345u };
@@ -5876,6 +5907,9 @@ void cfg_topk_cases(const Plugin& pl) {
             for (size_t i = 0; i < lg.size(); ++i) {
                 const float v = rnd() * 6.0f;
                 lg[i] = (i % 97 == 0) ? 5.95f : v;
+                /* About 19 peaks a row hold most of the mass, so the nucleus ends inside the top
+                 * 30 and the cut is what decides the pick. */
+                if (c.top_p < 1.0f && i % 211 == 5) lg[i] = 12.0f + 4.0f * rnd();
             }
             void* dlg = up_f32(lg);
             std::vector<int32_t> frame((size_t)n, f);
@@ -5888,7 +5922,7 @@ void cfg_topk_cases(const Plugin& pl) {
                                          PI("rep", c.rep), PI("cond_k", c.cond_k), PF("cfg", 1.5),
                                          PF("temp", c.temp), PI("stream", 3), PS("dtype", "f32"),
                                          PI("sup_lo", c.sup_lo), PI("sup_hi", c.sup_hi),
-                                         PF("penalty", 1.1) };
+                                         PF("penalty", 1.1), PF("top_p", c.top_p) };
             const int rc = launch(r, { T(dlg, RAD_F32, { c.rep * n, c.V }), T(dseed, RAD_U32, { n, 2 }),
                                        T(dfr, RAD_I32, { n }), T(dids, RAD_I32, { c.rep * n }), tcfg,
                                        tlane, thist },
@@ -5901,7 +5935,8 @@ void cfg_topk_cases(const Plugin& pl) {
                 const int want = ref_pick(lg, c.V, i, c.rep, c.cfgs ? cfgv[(size_t)i] : 1.5f, K,
                                           c.cond_k, c.temp, c.sup_lo, c.sup_hi, 1.1f,
                                           c.hist ? &hist : nullptr,
-                                          c.hist ? lane[(size_t)i] * c.V : -1, sd, f, 3);
+                                          c.hist ? lane[(size_t)i] * c.V : -1, sd, f, 3,
+                                          c.top_p);
                 for (int t = 0; t < c.rep; ++t)
                     if (got[(size_t)(c.rep * i + t)] != want) ++wrong;
             }
@@ -5909,10 +5944,62 @@ void cfg_topk_cases(const Plugin& pl) {
         }
         ok((nm + " picks").c_str(), wrong == 0, fmt("%lld of %lld picks differ", (long long)wrong,
                                                      (long long)(4 * c.rep * n)));
+        if (c.top_p < 1.0f) {
+            ok((nm + " cuts").c_str(), g_topp_cuts > 0, "the nucleus never ended inside the top k");
+            g_topp_cuts = 0;
+        }
         if (c.hist)
             ok((nm + " history").c_str(), hist_wrong == 0,
                fmt("%lld history entries differ", (long long)hist_wrong));
     }
+}
+
+/* ras_pick over four picks of three lanes, the first clearing their windows: the picks and the
+ * windows against libref's rule on the host, exactly. Draws repeat often (a band of 6 ids) so the
+ * redraw is exercised, and one is outside [lo, hi) (never redrawn). */
+void ras_pick_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "ras_pick");
+    if (!r) { ok("ras_pick", false, "row absent"); return; }
+    const int64_t n = 3, lanes = 4, W = 4, lo = 1, hi = 6;
+    std::vector<int32_t> lane = { 2, 0, 3 };
+    std::vector<int32_t> hist((size_t)(lanes * W), 5);
+    void* dlane = up_i32(lane);
+    void* dhist = up_i32(hist);
+    void* dids = dalloc((size_t)n * 4);
+    int64_t wrong = 0;
+    for (int step = 0; step < 4; ++step) {
+        std::vector<int32_t> first((size_t)n), alt((size_t)n);
+        for (int64_t i = 0; i < n; ++i) {
+            first[(size_t)i] = (int32_t)((step * 2 + i * 3) % 7);   /* 0 is outside [lo, hi) */
+            alt[(size_t)i] = (int32_t)(10 + step * 3 + i);
+        }
+        void* df = up_i32(first);
+        void* da = up_i32(alt);
+        const int clear = step == 0 ? 1 : 0;
+        std::vector<RadParam> ps = { PI("M", n), PI("win", W), PI("lo", lo), PI("hi", hi),
+                                     PI("rep", 1), PI("clear", clear) };
+        const int rc = launch(r, { T(df, RAD_I32, { n }), T(da, RAD_I32, { n }),
+                                   T(dlane, RAD_I32, { n }), T(dhist, RAD_I32, { lanes, W }),
+                                   T(dids, RAD_I32, { n }) },
+                              ps);
+        if (rc != RAD_OK) { ok("ras_pick", false, "rc " + std::to_string(rc)); return; }
+        const std::vector<int32_t> got = down_i32(dids, (size_t)n);
+        for (int64_t i = 0; i < n; ++i) {
+            int32_t* h = hist.data() + lane[(size_t)i] * W;
+            if (clear) for (int64_t w = 0; w < W; ++w) h[w] = -1;
+            int32_t pick = first[(size_t)i];
+            if (pick >= lo && pick < hi)
+                for (int64_t w = 0; w < W; ++w)
+                    if (h[w] == pick) { pick = alt[(size_t)i]; break; }
+            for (int64_t w = 0; w + 1 < W; ++w) h[w] = h[w + 1];
+            h[W - 1] = pick;
+            if (got[(size_t)i] != pick) ++wrong;
+        }
+    }
+    ok("ras_pick picks", wrong == 0, fmt("%lld of %lld picks differ", (long long)wrong,
+                                         (long long)(4 * n)));
+    ok("ras_pick windows", differ(down_i32(dhist, hist.size()), hist) == 0,
+       "the windows differ from libref's rule");
 }
 
 /* rvq_embed: libref's two roundings, the single rounding over bf16 and f32 tables into a bf16 or
@@ -24971,6 +25058,7 @@ static void device_phase(const Plugin& pl) {
     if (sel("conv_t1d_bf16")) au::conv_t1d_cases(pl);
     if (sel("snake_bf16")) au::snake_cases(pl);
     if (sel("cfg_topk_sample")) au::cfg_topk_cases(pl);
+    if (sel("ras_pick")) au::ras_pick_cases(pl);
     if (sel("rvq_embed_bf16")) au::rvq_embed_cases(pl);
     if (sel("frame_store")) au::frame_store_cases(pl);
     if (sel("iota")) au::iota_cases(pl);

@@ -1171,10 +1171,11 @@ libref function says which (`libref/ref_audio.cpp`).
 | `conv_t1d` | `M`(range) `cin` `cout` `stride` `dtype` `pad`/opt `k`/opt | `x`, `w`w, `b`w, `cu_seqlens` → `y` |
 | `snake` | `M`(range) `n` `dtype` `log`/opt | `x`, `alpha`w → `y`; `beta`w? |
 | `snake_aa` | `M`(range) `n` `ratio` `k` `log`/opt `dtype` | `x`, `alpha`w, `beta`w, `f_up`w, `f_down`w, `cu_seqlens` → `y` |
-| `cfg_topk_sample` | `M`(range) `n_vocab` `k` `rep` `cond_k`/opt `cfg`:f64 `temp`:f64/opt `stream` `dtype` `sup_lo`/opt `sup_hi`/opt `penalty`:f64/opt | `logits`, `seed`, `frame` → `ids`; `cfg`?, `lane`?, `hist`:inout? |
+| `cfg_topk_sample` | `M`(range) `n_vocab` `k` `rep` `cond_k`/opt `cfg`:f64 `temp`:f64/opt `stream` `dtype` `sup_lo`/opt `sup_hi`/opt `penalty`:f64/opt `top_p`:f64/opt | `logits`, `seed`, `frame` → `ids`; `cfg`?, `lane`?, `hist`:inout? |
 | `rvq_embed` | `M`(range) `n_embd` `n_codes` `vocab` `off0` `scale`:f64 `dtype` `round`/opt | `codes`, `t0`w, `t1`w → `y` |
 | `frame_mix_store` | `M`(range) `n_embd` `L` `stride` `rep`/opt `dtype` | `hid`, `logits`w, `scale`w, `lane`, `frame`, `status`, `dst`:inout |
 | `end_status` | `M`(range) `end` `rep` | `ids`, `lane`, `status`:inout |
+| `ras_pick` | `M`(range) `win` `lo` `hi` `rep`/opt `clear`/opt | `first`, `alt`, `lane`, `hist`:inout → `ids` |
 | `frame_store` | `M`(range) `n_codes` `stride` `rep`/opt `skip`/opt | `codes`, `lane`, `frame`, `status`, `dst`:inout |
 | `resample_nearest` | `M`(range) `n` `dtype` | `x` → `y` |
 | `fourier_embed` | `M`(range) `n` `round`/opt `dtype` | `t`, `w`w → `y` |
@@ -1198,8 +1199,17 @@ conditional first, then the unconditional) are consecutive rows, `rep` of them a
   `cond_k` > 0 only the entries where `c` reaches its `cond_k`-th largest value are. The `k`
   largest `g` (ties to the lower index) are kept, divided by `temp`, softmaxed in f32 and drawn by
   inverse CDF in descending `g`, `u = rad_philox_uniform_s(seed, 2^32 + frame, stream)`
-  (`abi/rad_philox.h`); the pick goes to every one of the lane's `rep` slots. `logits`
-  `[rep n, n_vocab]` f32 or bf16, `seed` `[n, 2]` u32 low word first, `frame` `[n]`.
+  (`abi/rad_philox.h`); the pick goes to every one of the lane's `rep` slots. With `top_p` < 1
+  (Fish Audio's draw) the kept list is cut first: over the softmax of every candidate's `g / temp`
+  (its normaliser summed in index order), a kept rank whose inclusive cumulative probability in
+  descending `g` exceeds `top_p` is dropped, rank 0 never, so the nucleus is taken over the whole
+  distribution and the `k` cut applies after it. `logits` `[rep n, n_vocab]` f32 or bf16, `seed`
+  `[n, 2]` u32 low word first, `frame` `[n]`.
+- `ras_pick`: Fish Audio's repetition-aware sampling, a choice between two draws of each lane:
+  `ids[rep i] = alt[rep i]` when `first[rep i]` is in `[lo, hi)` and the lane's window holds it,
+  else `first[rep i]`. The window `hist` `[lanes, win]` i32 is the lane's last `win` picks, oldest
+  first, -1 empty (`clear` 1 empties it first, for a piece's first pick); the pick then enters it
+  and the oldest leaves. A pick outside `[lo, hi)` (an end of speech) is never redrawn.
 - `end_status`: `status[lane[i]] = ids[rep i] == end ? -1 : ids[rep i]`.
 - `rvq_embed`: `codes` is code-major `[n_codes, rows]`, read at the operand's own strides (a block
   of a wider plane is a view);

@@ -998,6 +998,12 @@ std::vector<Case> build_cases() {
     add("cfg_topk_sample", { HI("M", 6), HI("n_vocab", 645), HI("k", 645), HI("rep", 2),
                              HF("cfg", 1.7), HF("temp", 0.8), HI("stream", 0),
                              HS("dtype", "f32") });
+    /* Fish Audio's draw: the nucleus over the whole candidate set's softmax, then the top-k cut;
+     * at a small top_p the head alone, and above 1 none. */
+    for (double tp : { 0.7, 0.05, 0.95 })
+        add("cfg_topk_sample", { HI("M", 4), HI("n_vocab", 645), HI("k", 30), HI("rep", 1),
+                                 HF("cfg", 1.0), HF("temp", 0.7), HI("stream", 2),
+                                 HF("top_p", tp), HS("dtype", "f32") });
     /* A speech model's backbone pick: reserved ids suppressed (the vocabulary's last class stays a
      * candidate), a temperature, the penalty idle without a history. */
     for (int rep : { 1, 2 })
@@ -1038,6 +1044,9 @@ std::vector<Case> build_cases() {
     }
     add("end_status", { HI("M", 2), HI("end", 5), HI("rep", 2) });
     add("end_status", { HI("M", 4), HI("end", 3), HI("rep", 1) });
+    add("ras_pick", { HI("M", 4), HI("win", 16), HI("lo", 1), HI("hi", 9), HI("rep", 1) });
+    add("ras_pick", { HI("M", 2), HI("win", 4), HI("lo", 0), HI("hi", 12), HI("rep", 2),
+                      HI("clear", 1) });
     add("frame_store", { HI("M", 2), HI("n_codes", 16), HI("stride", 9), HI("rep", 2),
                          HI("skip", 0) });
     add("frame_store", { HI("M", 4), HI("n_codes", 3), HI("stride", 5), HI("rep", 1),
