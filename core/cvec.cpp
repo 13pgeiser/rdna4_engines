@@ -254,7 +254,10 @@ int control_vector_load(const std::string& path, const std::string& arch, int64_
         float* dst = &out->dir[(size_t) (l * n_embd)];
         const float inv = (float) (1.0 / norm);
         for (int64_t i = 0; i < n_embd; ++i) dst[i] = d[i] * inv;
-        out->scales[(size_t) l] = (float) norm * scale;
+        /* Zero outside the range: a layer is steered exactly when its scale is nonzero
+         * (abi/rad_builder.h, RadControlVector), and a file carries directions for layers the
+         * package's JSON leaves out. The row is kept so a range change needs no new upload. */
+        out->scales[(size_t) l] = (l >= first && l <= last) ? (float) norm * scale : 0.0f;
 
         /* A layer inside the range with no direction would silently be unsteered. */
         if (l >= first && l <= last) worst = std::max(worst, std::fabs(norm - 1.0));

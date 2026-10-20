@@ -1510,6 +1510,11 @@ int Engine::plan() {
         const int64_t ck_cap = INT64_MAX / 8;
         const int64_t ck_store = !cfg_.prefix_cache || ck_slot <= 0 ? 0
                                  : ck_n > ck_cap / ck_slot ? ck_cap : ck_slot * ck_n;
+        /* The direction table was allocated in declare(); it is not part of the program, and
+         * claiming its bytes back keeps a deployment that offers a vector planning against the
+         * same card as one that does not (VramFacts::held_out). */
+        const int64_t cvec_bytes = cvec_.loaded() ? (int64_t) cvec_.dir.size() * 4 : 0;
+        for (VramFacts& f : facts) f.held_out = cvec_bytes;
         RAD_TRY(resolve_table_placement(facts, emb_bytes, wfs, kv_floor, ngram_bytes,
                                         ngram_device, ngram_host, ck_store + host_arenas));
         /* The n-gram table was counted off the card; on it, every rank holds the whole table. */

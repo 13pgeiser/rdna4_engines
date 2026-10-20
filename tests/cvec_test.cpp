@@ -146,10 +146,11 @@ TEST(the_published_shape_loads_and_is_normalised) {
             ss += (double) f.cv.dir[(size_t) (l * 2560 + i)] *
                   (double) f.cv.dir[(size_t) (l * 2560 + i)];
         CHECK_NEAR(std::sqrt(ss), 1.0, 1e-5);
-        /* Unit rows, so the stored norm -- what llama.cpp keeps as `scales[il]` -- is 1. */
-        CHECK_NEAR(f.cv.scales[(size_t) l], 1.0f, 1e-5);
+        /* Unit rows, so the stored norm -- what llama.cpp keeps as `scales[il]` -- is 1 where the
+         * range steers, and 0 outside it: the plugin declares an op exactly where it is nonzero. */
+        CHECK_NEAR(f.cv.scales[(size_t) l], (l >= 4 && l <= 44) ? 1.0f : 0.0f, 1e-5);
     }
-    /* Outside the range nothing is steered: the plugin declares no op there. */
+    /* Outside the range nothing is steered: no op, and the scale says so too. */
     CHECK_EQ(f.cv.covers(3), false);
     CHECK_EQ(f.cv.covers(4), true);
     CHECK_EQ(f.cv.covers(44), true);
@@ -211,6 +212,8 @@ TEST(the_packages_json_sets_the_range_and_scale) {
     CHECK_NEAR(a.cv.scales[(size_t) 8], 0.5f, 1e-5);
     CHECK_EQ(a.cv.covers(7), false);
     CHECK_EQ(a.cv.covers(21), false);
+    CHECK_EQ(a.cv.scales[(size_t) 7], 0.0f);
+    CHECK_EQ(a.cv.scales[(size_t) 21], 0.0f);
 
     /* Another mode is not implemented: the file's directions still load, with the defaults. */
     const Loaded b = load(make_vector(2560, 47), 2560, 48, "json-add.gguf",
