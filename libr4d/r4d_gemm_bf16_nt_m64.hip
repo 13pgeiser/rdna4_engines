@@ -19,6 +19,7 @@
 #include "r4d.h"
 #include "r4d_gemm_args.h"
 #include "r4d_gdn_wmma.h"
+#include "r4d_chain.h"
 #include <hip/hip_bf16.h>
 #include <cstdint>
 #include <stdexcept>
@@ -48,10 +49,13 @@ __device__ __forceinline__ v8bf fragU(r4d_gu2 p, int u) {
 // More amortises each weight fragment, fewer puts more blocks on the machine, so MT is tunable.
 // KU is the k-step unroll; see the loop.
 constexpr int KU = 8;
-template <int MT>
-__global__ __launch_bounds__(1024) void r4d_gemm_bf16_nt_m64_kernel(
+// CHAIN brackets the body with the chained launch's wait and add (r4d_chain.h); no block returns
+// early. r4d_gemm_bf16_nt_m64_kernel and r4dchain_gemm_bf16_nt_m64 below wrap it.
+template <int MT, bool CHAIN>
+__device__ __forceinline__ void r4d_gemm_bf16_nt_m64_body(
     const unsigned short* __restrict__ A, const unsigned short* __restrict__ W,
     __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK) {
+  if (CHAIN) r4d_chain_wait();
   extern __shared__ float red[];              // WV*SK*256 floats: one 16x16 tile per (column, split)
   const int tid = threadIdx.x, wave = tid / WAVE32, lane = tid % WAVE32;
   const int col_local = wave / SK, ksplit = wave % SK;
@@ -124,12 +128,33 @@ __global__ __launch_bounds__(1024) void r4d_gemm_bf16_nt_m64_kernel(
       if (n < N && m < M) C[(size_t)m * N + n] = (__hip_bfloat16)v;
     }
   }
+  if (CHAIN) r4d_chain_done();
+}
+
+template <int MT>
+__global__ __launch_bounds__(1024) void r4d_gemm_bf16_nt_m64_kernel(
+    const unsigned short* __restrict__ A, const unsigned short* __restrict__ W,
+    __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK) {
+  r4d_gemm_bf16_nt_m64_body<MT, false>(A, W, C, M, K, N, WV, SK);
+}
+template <int MT>
+__global__ __launch_bounds__(1024) void r4dchain_gemm_bf16_nt_m64(
+    const unsigned short* __restrict__ A, const unsigned short* __restrict__ W,
+    __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK) {
+  r4d_gemm_bf16_nt_m64_body<MT, true>(A, W, C, M, K, N, WV, SK);
 }
 
 // grid = ceil(ceil(N/16)/WV) x ceil(ceil(M/16)/MB) blocks; block = WV*SK waves. MT = MB is
 // compile-time so the accumulators are sized exactly.
+static void gemm_bf16_m64_launch(long a, long w, long c, int M, int K, int N, int WV, int SK,
+                                 int MB, long stream, bool chain);
 void r4d_gemm_bf16_nt_m64(long a, long w, long c, int M, int K, int N, int WV, int SK, int MB,
                           long stream) {
+  gemm_bf16_m64_launch(a, w, c, M, K, N, WV, SK, MB, stream, false);
+}
+/* `chain`: the chained form (r4d_rad_gemm_bf16_m64 passes the row's parameter; M <= 64 always). */
+static void gemm_bf16_m64_launch(long a, long w, long c, int M, int K, int N, int WV, int SK,
+                                 int MB, long stream, bool chain) {
   if (M < 1 || M > R4D_GEMM64_MAX_M) throw std::runtime_error("r4d gemm_bf16_nt_m64: M out of range");
   if (K % (SK * 16)) throw std::runtime_error("r4d gemm_bf16_nt_m64: K must be divisible by SK*16");
   if (WV * SK * WAVE32 > 1024) throw std::runtime_error("r4d gemm_bf16_nt_m64: threads/block > 1024");
@@ -140,8 +165,9 @@ void r4d_gemm_bf16_nt_m64(long a, long w, long c, int M, int K, int N, int WV, i
   auto Ap = (const unsigned short*)a; auto Wp = (const unsigned short*)w;
   auto Cp = (__hip_bfloat16*)c;
   hipStream_t st = (hipStream_t)stream;
-#define LAUNCH(MT) hipLaunchKernelGGL(r4d_gemm_bf16_nt_m64_kernel<MT>, grid, block, smem, st, \
-                                      Ap, Wp, Cp, M, K, N, WV, SK)
+#define LAUNCH(MT) hipLaunchKernelGGL((chain ? r4dchain_gemm_bf16_nt_m64<MT>                  \
+                                             : r4d_gemm_bf16_nt_m64_kernel<MT>),              \
+                                      grid, block, smem, st, Ap, Wp, Cp, M, K, N, WV, SK)
   switch (MB) {
     case 1: LAUNCH(1); break;
     case 2: LAUNCH(2); break;
@@ -166,9 +192,9 @@ extern "C" int r4d_rad_gemm_bf16_m64(const RadArgs* a, RadStream s) {
     rc = cfg_for(a, g.K, g.M, 16, BR_FLAT, &c, (g.N + 15) / 16);  /* "K divisible by SK*16" */
     if (rc != RAD_OK) return rc;
     R4D_TRY("gemm_bf16_nt_m64",
-        r4d_gemm_bf16_nt_m64(r4d_addr(g.a), r4d_addr(g.b), r4d_addr(g.y),
+        gemm_bf16_m64_launch(r4d_addr(g.a), r4d_addr(g.b), r4d_addr(g.y),
                              (int)g.M, (int)g.K, (int)g.N, c.wv, c.sk, c.mb,
-                             (long)(uintptr_t)s));
+                             (long)(uintptr_t)s, r4d_geti_or(a, "chain", 0) != 0));
     return RAD_OK;
 }
 

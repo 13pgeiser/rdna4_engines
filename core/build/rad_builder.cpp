@@ -1966,6 +1966,8 @@ void Builder::finish_layouts() {
                     const int st = ki->layout ? ki->layout(r.geom.params(), r.geom.n_params(),
                                                            operand, &w.enc, w.sel, t, w.n_sel, &L)
                                               : RAD_E_UNSUPPORTED;
+                    /* Reads the bytes uninterpreted (a prefetch): no claim (rad_abi.h). */
+                    if (st == RAD_LAYOUT_ANY) continue;
                     char enc[256];
                     rad_enc_format(&w.enc, enc, sizeof enc);
                     if (st == RAD_E_DTYPE) {
@@ -2352,6 +2354,8 @@ int rad_lora_alias(RadBuilder* b, const char* native, const char* from, const ch
     if (!b) return RAD_E_INVAL;
     return B(b)->lora_alias(native, from, to, from_lo, from_hi, to_lo);
 }
+
+int rad_chain_on(void) { return rad_dev_chain_enabled(); }
 
 int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d) {
     if (!b) return RAD_E_INVAL;

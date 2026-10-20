@@ -35,6 +35,7 @@
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_common.h"
+#include "r4d_chain.h"
 
 #include <cfloat>
 
@@ -140,7 +141,8 @@ __device__ __forceinline__ float block_max(float v, float* lds) {
 // ---------------------------------------------------------------------------- sample_temp
 // ref_sample_temp. temp <= 0 leaves the row alone: greedy is `sample_argmax`, and a temperature of
 // zero silently meaning something else would make the chain unreadable.
-__global__ __launch_bounds__(kThreads) void temp_kernel(
+// The body; the plain kernel and its chained form (r4d_chain.h) wrap it below.
+__device__ __forceinline__ void temp_body(
     float* __restrict__ lg, const SP* __restrict__ sp, uint32_t n_vocab, uint32_t lg_ld) {
     const uint32_t m = blockIdx.x;
     const float t = sp[m].temp;
@@ -149,6 +151,16 @@ __global__ __launch_bounds__(kThreads) void temp_kernel(
     float* __restrict__ row = lg + (size_t)m * lg_ld;
     for (uint32_t i = threadIdx.x + blockIdx.y * kThreads; i < n_vocab; i += kThreads * gridDim.y)
         row[i] *= inv;
+}
+__global__ __launch_bounds__(kThreads) void temp_kernel(
+    float* __restrict__ lg, const SP* __restrict__ sp, uint32_t n_vocab, uint32_t lg_ld) {
+    temp_body(lg, sp, n_vocab, lg_ld);
+}
+__global__ __launch_bounds__(kThreads) void r4dchain_sample_temp(
+    float* __restrict__ lg, const SP* __restrict__ sp, uint32_t n_vocab, uint32_t lg_ld) {
+    r4d_chain_wait();
+    temp_body(lg, sp, n_vocab, lg_ld);
+    r4d_chain_done();
 }
 
 // ---------------------------------------------------------------------------- sample_mask
@@ -461,7 +473,9 @@ __device__ uint32_t radix_select(const float* __restrict__ row, uint32_t n, uint
     return prefix;
 }
 
-__global__ __launch_bounds__(kTopkThreads) void topk_kernel(
+// The body; the plain kernel and its chained form (r4d_chain.h) wrap it below. A greedy row's whole
+// block returns early, together.
+__device__ __forceinline__ void topk_body(
     const float* __restrict__ lg, const SP* __restrict__ sp,
     int32_t* __restrict__ ci, float* __restrict__ cv, uint32_t* __restrict__ pr,
     uint32_t n_vocab, uint32_t n_cand, uint32_t lg_ld, uint32_t ci_ld, uint32_t cv_ld,
@@ -629,6 +643,22 @@ __global__ __launch_bounds__(kTopkThreads) void topk_kernel(
             op[2 * r + 1] = __builtin_bit_cast(uint32_t, val);
         }
     }
+}
+__global__ __launch_bounds__(kTopkThreads) void topk_kernel(
+    const float* __restrict__ lg, const SP* __restrict__ sp,
+    int32_t* __restrict__ ci, float* __restrict__ cv, uint32_t* __restrict__ pr,
+    uint32_t n_vocab, uint32_t n_cand, uint32_t lg_ld, uint32_t ci_ld, uint32_t cv_ld,
+    uint32_t pr_ld, int32_t vocab_off, uint32_t pad) {
+    topk_body(lg, sp, ci, cv, pr, n_vocab, n_cand, lg_ld, ci_ld, cv_ld, pr_ld, vocab_off, pad);
+}
+__global__ __launch_bounds__(kTopkThreads) void r4dchain_sample_topk(
+    const float* __restrict__ lg, const SP* __restrict__ sp,
+    int32_t* __restrict__ ci, float* __restrict__ cv, uint32_t* __restrict__ pr,
+    uint32_t n_vocab, uint32_t n_cand, uint32_t lg_ld, uint32_t ci_ld, uint32_t cv_ld,
+    uint32_t pr_ld, int32_t vocab_off, uint32_t pad) {
+    r4d_chain_wait();
+    topk_body(lg, sp, ci, cv, pr, n_vocab, n_cand, lg_ld, ci_ld, cv_ld, pr_ld, vocab_off, pad);
+    r4d_chain_done();
 }
 
 // ---------------------------------------------------------------------------- sample_logprobs
@@ -909,7 +939,9 @@ __global__ __launch_bounds__(kThreads) void narrow_kernel(
 // the comparison never chooses one, and the fallback must not either.
 //
 // A greedy row is not touched: its token is the argmax's, written before the chain ran.
-__global__ __launch_bounds__(kThreads) void pick_kernel(
+// The body; the plain kernel and its chained form (r4d_chain.h) wrap it below. Its returns are
+// a whole block's, or every thread but the walker's after the last barrier.
+__device__ __forceinline__ void pick_body(
     const int32_t* __restrict__ ci, const float* __restrict__ cv, const SP* __restrict__ sp,
     int32_t* __restrict__ tok, uint32_t n_cand, uint32_t ci_ld, uint32_t cv_ld) {
     __shared__ float red[kWaves];
@@ -947,6 +979,18 @@ __global__ __launch_bounds__(kThreads) void pick_kernel(
     }
     tok[m] = chosen >= 0 ? chosen : last;
 }
+__global__ __launch_bounds__(kThreads) void pick_kernel(
+    const int32_t* __restrict__ ci, const float* __restrict__ cv, const SP* __restrict__ sp,
+    int32_t* __restrict__ tok, uint32_t n_cand, uint32_t ci_ld, uint32_t cv_ld) {
+    pick_body(ci, cv, sp, tok, n_cand, ci_ld, cv_ld);
+}
+__global__ __launch_bounds__(kThreads) void r4dchain_sample_pick(
+    const int32_t* __restrict__ ci, const float* __restrict__ cv, const SP* __restrict__ sp,
+    int32_t* __restrict__ tok, uint32_t n_cand, uint32_t ci_ld, uint32_t cv_ld) {
+    r4d_chain_wait();
+    pick_body(ci, cv, sp, tok, n_cand, ci_ld, cv_ld);
+    r4d_chain_done();
+}
 
 // ---------------------------------------------------------------------------- sample_merge_topk
 // The vocab-parallel merge. Each rank runs top-k over its own lm_head shard and the candidate sets
@@ -956,7 +1000,8 @@ __global__ __launch_bounds__(kThreads) void pick_kernel(
 //
 // One block per row, with the top-k's packed (key, ~id) word, so descending order and the lower-id
 // tie rule come from the same code. n_in is world_size * n_cand, a few thousand.
-__global__ __launch_bounds__(kTopkThreads) void merge_topk_kernel(
+// The body; the plain kernel and its chained form (r4d_chain.h) wrap it below.
+__device__ __forceinline__ void merge_topk_body(
     const uint32_t* __restrict__ gt, const SP* __restrict__ sp,
     int32_t* __restrict__ ci, float* __restrict__ cv,
     uint32_t n_in, uint32_t n_cand, uint32_t gt_ld, uint32_t ci_ld, uint32_t cv_ld, uint32_t pad) {
@@ -1020,6 +1065,20 @@ __global__ __launch_bounds__(kTopkThreads) void merge_topk_kernel(
         ov[r] = __builtin_bit_cast(float, (key & 0x80000000u) ? (key & 0x7fffffffu) : ~key);
     }
 }
+__global__ __launch_bounds__(kTopkThreads) void merge_topk_kernel(
+    const uint32_t* __restrict__ gt, const SP* __restrict__ sp,
+    int32_t* __restrict__ ci, float* __restrict__ cv,
+    uint32_t n_in, uint32_t n_cand, uint32_t gt_ld, uint32_t ci_ld, uint32_t cv_ld, uint32_t pad) {
+    merge_topk_body(gt, sp, ci, cv, n_in, n_cand, gt_ld, ci_ld, cv_ld, pad);
+}
+__global__ __launch_bounds__(kTopkThreads) void r4dchain_sample_merge_topk(
+    const uint32_t* __restrict__ gt, const SP* __restrict__ sp,
+    int32_t* __restrict__ ci, float* __restrict__ cv,
+    uint32_t n_in, uint32_t n_cand, uint32_t gt_ld, uint32_t ci_ld, uint32_t cv_ld, uint32_t pad) {
+    r4d_chain_wait();
+    merge_topk_body(gt, sp, ci, cv, n_in, n_cand, gt_ld, ci_ld, cv_ld, pad);
+    r4d_chain_done();
+}
 
 }  // namespace
 
@@ -1031,12 +1090,13 @@ __global__ __launch_bounds__(kTopkThreads) void merge_topk_kernel(
 static uint32_t host_pow2(uint32_t v) { uint32_t p = 1; while (p < v) p <<= 1; return p; }
 
 static int r4d_sample_temp_f32(long lg, long params, int M, int n_vocab, int lg_ld,
-                                   long stream) {
+                                   long stream, bool chain = false) {
     if (!lg || !params) return R4D_NO(RAD_E_INVAL);
     if (M <= 0 || n_vocab <= 0) return R4D_NO(RAD_E_SHAPE);
     if (!lg_ld) lg_ld = n_vocab;
     const uint32_t gy = ((uint32_t)n_vocab + kThreads - 1) / kThreads;
-    hipLaunchKernelGGL(temp_kernel, dim3((uint32_t)M, gy > 256u ? 256u : gy), dim3(kThreads), 0,
+    hipLaunchKernelGGL((chain ? r4dchain_sample_temp : temp_kernel),
+                       dim3((uint32_t)M, gy > 256u ? 256u : gy), dim3(kThreads), 0,
                        (hipStream_t)stream, (float*)lg, (const SP*)params,
                        (uint32_t)n_vocab, (uint32_t)lg_ld);
     return hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
@@ -1120,7 +1180,7 @@ static int r4d_sample_logprobs_f32(long lg, long params, long stats, int M, int 
 static int r4d_sample_topk_f32(long lg, long params, long cand_idx, long cand_val, long pairs,
                                    int M, int n_vocab, int n_cand,
                                    int lg_ld, int ci_ld, int cv_ld, int pr_ld, int vocab_off,
-                                   long stream) {
+                                   long stream, bool chain = false) {
     if (!lg || !params || !cand_idx || !cand_val) return R4D_NO(RAD_E_INVAL);
     if (M <= 0 || n_vocab <= 0 || n_cand <= 0) return R4D_NO(RAD_E_SHAPE);
     if ((uint32_t)n_cand > kMaxCand) return R4D_NO(RAD_E_SHAPE);
@@ -1129,7 +1189,8 @@ static int r4d_sample_topk_f32(long lg, long params, long cand_idx, long cand_va
     if (!cv_ld) cv_ld = n_cand;
     if (!pr_ld) pr_ld = 2 * n_cand;
     const uint32_t pad = host_pow2((uint32_t)n_cand);
-    hipLaunchKernelGGL(topk_kernel, dim3((uint32_t)M), dim3(kTopkThreads),
+    hipLaunchKernelGGL((chain ? r4dchain_sample_topk : topk_kernel), dim3((uint32_t)M),
+                       dim3(kTopkThreads),
                        pad * sizeof(unsigned long long), (hipStream_t)stream,
                        (const float*)lg, (const SP*)params, (int32_t*)cand_idx, (float*)cand_val,
                        (uint32_t*)pairs,
@@ -1154,12 +1215,14 @@ static int r4d_sample_narrow_f32(long cand_idx, long cand_val, long params, int 
 }
 
 static int r4d_sample_pick_f32(long cand_idx, long cand_val, long params, long tok,
-                                   int M, int n_cand, int ci_ld, int cv_ld, long stream) {
+                                   int M, int n_cand, int ci_ld, int cv_ld, long stream,
+                                   bool chain = false) {
     if (!cand_idx || !cand_val || !params || !tok) return R4D_NO(RAD_E_INVAL);
     if (M <= 0 || n_cand <= 0) return R4D_NO(RAD_E_SHAPE);
     if (!ci_ld) ci_ld = n_cand;
     if (!cv_ld) cv_ld = n_cand;
-    hipLaunchKernelGGL(pick_kernel, dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)stream,
+    hipLaunchKernelGGL((chain ? r4dchain_sample_pick : pick_kernel), dim3((uint32_t)M),
+                       dim3(kThreads), 0, (hipStream_t)stream,
                        (const int32_t*)cand_idx, (const float*)cand_val, (const SP*)params,
                        (int32_t*)tok, (uint32_t)n_cand, (uint32_t)ci_ld, (uint32_t)cv_ld);
     return hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
@@ -1167,7 +1230,8 @@ static int r4d_sample_pick_f32(long cand_idx, long cand_val, long params, long t
 
 static int r4d_sample_merge_topk_f32(long gathered, long params, long cand_idx, long cand_val,
                                          int M, int n_in, int n_cand,
-                                         int gt_ld, int ci_ld, int cv_ld, long stream) {
+                                         int gt_ld, int ci_ld, int cv_ld, long stream,
+                                         bool chain = false) {
     if (!gathered || !params || !cand_idx || !cand_val) return R4D_NO(RAD_E_INVAL);
     if (M <= 0 || n_in <= 0 || n_cand <= 0) return R4D_NO(RAD_E_SHAPE);
     if ((uint32_t)n_in > kMaxCand) return R4D_NO(RAD_E_SHAPE);
@@ -1175,7 +1239,8 @@ static int r4d_sample_merge_topk_f32(long gathered, long params, long cand_idx, 
     if (!ci_ld) ci_ld = n_cand;
     if (!cv_ld) cv_ld = n_cand;
     const uint32_t pad = host_pow2((uint32_t)n_in);
-    hipLaunchKernelGGL(merge_topk_kernel, dim3((uint32_t)M), dim3(kTopkThreads),
+    hipLaunchKernelGGL((chain ? r4dchain_sample_merge_topk : merge_topk_kernel), dim3((uint32_t)M),
+                       dim3(kTopkThreads),
                        pad * sizeof(unsigned long long), (hipStream_t)stream,
                        (const uint32_t*)gathered, (const SP*)params,
                        (int32_t*)cand_idx, (float*)cand_val,
@@ -1243,8 +1308,10 @@ extern "C" int r4d_rad_sample_temp(const RadArgs* a, RadStream s) {
     R4D_NEED(logits_of(a, &lg, &M, &nv, &ld));
     const RadTensor* pr = r4d_opt(a, V_PARAMS);
     R4D_NEED(params_ok(pr, M));
+    /* The chained form at decode heights, where the row resolved with `chain`. */
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;
     return r4d_sample_temp_f32(r4d_addr(lg), r4d_addr(pr), (int)M, (int)nv, (int)ld,
-                               (long)(uintptr_t)s);
+                               (long)(uintptr_t)s, ch);
 }
 
 extern "C" int r4d_rad_sample_mask(const RadArgs* a, RadStream s) {
@@ -1378,10 +1445,11 @@ extern "C" int r4d_rad_sample_topk(const RadArgs* a, RadStream s) {
     }
     const long long voff = r4d_pgeti_or(a->p, a->n_p, "vocab_off", 0);
 
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;
     return r4d_sample_topk_f32(r4d_addr(lg), r4d_addr(pr), r4d_addr(ci), r4d_addr(cv),
                                pp ? r4d_addr(pp) : 0,
                                (int)M, (int)nv, (int)n_cand, (int)ld, (int)ci_ld, (int)cv_ld,
-                               (int)pr_ld, (int)voff, (long)(uintptr_t)s);
+                               (int)pr_ld, (int)voff, (long)(uintptr_t)s, ch);
 }
 
 /* ------------------------------------------------------------------ the narrowing stages */
@@ -1439,9 +1507,10 @@ extern "C" int r4d_rad_sample_pick(const RadArgs* a, RadStream s) {
     if (M <= 0 || Mv < M || r4d_numel(tok) < M) return R4D_NO(RAD_E_SHAPE);
     R4D_NEED(params_ok(pr, M));
 
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;
     return r4d_sample_pick_f32(r4d_addr(ci), r4d_addr(cv), r4d_addr(pr), r4d_addr(tok),
                                (int)M, (int)n_cand, (int)ci_ld, (int)cv_ld,
-                               (long)(uintptr_t)s);
+                               (long)(uintptr_t)s, ch);
 }
 
 /* ------------------------------------------------------------------ merge_topk */
@@ -1474,7 +1543,8 @@ extern "C" int r4d_rad_sample_merge_topk(const RadArgs* a, RadStream s) {
     const long long n_in = per_row / 2;
     if (n_in <= 0 || n_in > (int)kMaxCand) return R4D_NO(RAD_E_SHAPE);
 
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;
     return r4d_sample_merge_topk_f32(r4d_addr(gt), r4d_addr(pr), r4d_addr(ci), r4d_addr(cv),
                                      (int)M, (int)n_in, (int)n_cand, (int)per_row, (int)ci_ld,
-                                     (int)cv_ld, (long)(uintptr_t)s);
+                                     (int)cv_ld, (long)(uintptr_t)s, ch);
 }

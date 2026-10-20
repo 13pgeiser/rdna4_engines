@@ -79,6 +79,9 @@ struct R4DArgs {
     // rows of q_len * GQA: the 31B's DFlash drafter, gqa 8 at a block of 16, on the gqa-4 kernel.
     long q_ld;
     int  kv_rep;
+    // The engine's chained launch (RadKernelChainFn, r4d_chain.h): the decode path launches its
+    // chained forms. fill_paged sets it from the resolved `chain` parameter.
+    int  chain;
 };
 
 // Rows of q and out. The split-KV scratch is laid out by dense query row, so the host sizing hook
@@ -428,7 +431,7 @@ void r4d_ar_twoshot_4rank_exact(long peer_scratch0, long peer_scratch1, long pee
                                 long my_scratch, long my_flags, long seq_ctrs,
                                 long slot_stride16, long inp, long out, long n_elem, long dtype,
                                 long rank, long stream, long nblocks, long nthreads, long drain,
-                                long acq, long pub, long gate, long gate_ctr);
+                                long acq, long pub, long gate, long gate_ctr, long chain);
 void r4d_ar_twoshot_8rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                                 long peer_scratch3, long peer_scratch4, long peer_scratch5,
                                 long peer_scratch6, long peer_flags0, long peer_flags1,
@@ -799,7 +802,8 @@ int  r4d_ar_rmsnorm_quant_i8_4rank(long peer_scratch0, long peer_scratch1, long 
                                    int sc_f32, long y, long q, long s, int M, int n, float eps,
                                    float wadd, int w_f32, int r_ld, int y_ld, int rank,
                                    long stream, int nblocks, int drain, int acq, int pub,
-                                   long gate, long gate_ctr, long tail_ctr, int tail_nbt);
+                                   long gate, long gate_ctr, long tail_ctr, int tail_nbt,
+                                   int chain);
 
 // ---- sampling ----------------------------------------------------------------------------------
 //

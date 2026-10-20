@@ -112,6 +112,23 @@ inline double embed_scale(int64_t hidden) {
     return rad_bf16_to_f32(rad_f32_to_bf16((float)std::sqrt((double)hidden)));
 }
 
+/* prefetch where a library serves it: the 31B trunk reading the next GEMM's leading weight bytes
+ * into the on-die cache beside the all-reduce in front of that GEMM, at decode heights (on lane 0
+ * as a chained read, or on the second lane: rad_arch.h prefetch_lane0), and the DFlash2 drafter's
+ * reads likewise. It writes nothing the model reads. Each read takes a weight's first 20 MB. With
+ * the reads on lane 0 (two rounds on 4x R9700): 20 MB 391 / 391 code tok/s, 289 / 288 prose;
+ * 16 MB 386 / 384, 285 / 283; 24 MB 388 / 387; 12 MB 368 / 369. */
+constexpr int64_t kPrefetchBytes = (int64_t)20 << 20;
+
+/* down_proj's read, the trunk GEMM no other read covers: its first 9 MB, beside the attention. It
+ * took the place of o_proj's read there: the 31B at tp 4 on 4x R9700, two rounds, every reply
+ * identical, 380 / 281 / 203 tok/s against 367 / 271 / 196 with o_proj's 16 MB; 10, 11, 12, 14
+ * and 20 MB of down_proj 379, 377, 373, 373 and 362; down_proj beside o_proj's read, or beside the
+ * feed-forward reduction, slower than either alone. The reads beside a reduction are one queue,
+ * and a longer one beside the attention pushes gate_up's read past the reduction it should hide
+ * in. */
+constexpr int64_t kPrefetchDownBytes = (int64_t)9 << 20;
+
 /* Block fp8 as libr4d's fp8a8 GEMMs read it: fp8_e4m3 codes, a bf16 scale per 128x128 block, no
  * transform (a recipe's `rtn codes=fp8_e4m3 block=128x128 scale=bf16`). */
 inline bool block_fp8_128(const RadEncoding& e) {
@@ -149,25 +166,30 @@ inline long long dflash_block(const RadModelMeta* meta) {
 
 /* DFlash proposes its whole block in one pass, so its depth is the block it was trained at less
  * the anchor, and nothing else: 15 for z-lab's Gemma 4 drafters (block_size 16). True when the
- * container carries one and `out` now names its depth. */
+ * container carries one and `out` now names its depth. Chained launches measured a gain with it
+ * (the 26B-A4B's speculative step, +1% on 4x R9700), so the probe asks for them
+ * (RadArchProbe::chain_pays). */
 inline bool dflash_probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (dflash_kind(meta) != 1) return false;
     const long long bs = dflash_block(meta);
     if (bs <= 1) return false;
     out->draft_depth = (int)(bs - 1);
     out->draft_depth_fixed = 1;
+    out->chain_pays = 1;
     return true;
 }
 
 /* The same for a DFlash2 drafter, for a plugin that serves rad_block_dflash2.h (the 31B's): its
  * anchor predicts nothing either, so the depth is the trained block less one, 7 for RedHatAI's
- * gemma-4-31B-it-speculator.dflash2 (block_size 8). */
+ * gemma-4-31B-it-speculator.dflash2 (block_size 8). Chained launches measured a gain with it (the
+ * 31B's speculative step, +13% on 4x R9700), so the probe asks for them. */
 inline bool dflash2_probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (dflash_kind(meta) != 2) return false;
     const long long bs = dflash_block(meta);
     if (bs <= 1) return false;
     out->draft_depth = (int)(bs - 1);
     out->draft_depth_fixed = 1;
+    out->chain_pays = 1;
     return true;
 }
 

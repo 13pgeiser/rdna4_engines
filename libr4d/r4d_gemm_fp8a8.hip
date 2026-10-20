@@ -28,6 +28,7 @@
 #include "r4d.h"
 #include "r4d_fp8_args.h"
 #include "r4d_emit.h"
+#include "r4d_chain.h"
 #include "r4d_fp8_wmma.h"
 
 #include <algorithm>
@@ -176,10 +177,12 @@ constexpr uint32_t f8_waves(bool full, uint32_t nt, uint32_t mw, uint32_t fk, bo
 //
 // The narrow tile: MW waves a block, a wave one 16-row weight tile (A, fragments straight from the
 // plane into registers) against NT 16-token tiles (B, staged through LDS).
+/* The body. gemm_fp8a8_kernel and its chained form r4dchain_gemm_fp8a8 (r4d_chain.h) wrap it
+ * after it: its blocks return early (an empty K slice, the finisher's losers), and every block of
+ * a chained launch must still count itself in. */
 template <bool Full, uint32_t NT, uint32_t MW, uint32_t FK,
           bool GATED = false, bool I8 = false, bool BIAS = false>
-__global__ __launch_bounds__(MW * kWave) R4D_WAVES(f8_waves(Full, NT, MW, FK, I8))
-void gemm_fp8a8_kernel(
+__device__ __forceinline__ void gemm_fp8a8_body(
     const uint8_t* __restrict__ Ap, const void* __restrict__ Sa,
     const uint8_t* __restrict__ Bp, const void* __restrict__ Sb,
     void* __restrict__ Y, void* __restrict__ C, unsigned int* __restrict__ Ctr,
@@ -591,6 +594,42 @@ void gemm_fp8a8_kernel(
     }
 }
 
+#define R4D_F8K_ARGS Ap, Sa, Bp, Sb, Y, C, Ctr, rows, cols, nb, a_ld, b_ld, sa_ld, sb_ld, ck, Q,  \
+    Sc, Yb, q_ld, s_ld, y_ld, Bias, c_ld
+template <bool Full, uint32_t NT, uint32_t MW, uint32_t FK,
+          bool GATED = false, bool I8 = false, bool BIAS = false>
+__global__ __launch_bounds__(MW * kWave) R4D_WAVES(f8_waves(Full, NT, MW, FK, I8))
+void gemm_fp8a8_kernel(
+    const uint8_t* __restrict__ Ap, const void* __restrict__ Sa,
+    const uint8_t* __restrict__ Bp, const void* __restrict__ Sb,
+    void* __restrict__ Y, void* __restrict__ C, unsigned int* __restrict__ Ctr,
+    uint32_t rows, uint32_t cols, uint32_t nb,
+    uint32_t a_ld, uint32_t b_ld, uint32_t sa_ld, uint32_t sb_ld, uint32_t ck,
+    uint8_t* __restrict__ Q = nullptr, float* __restrict__ Sc = nullptr,
+    uint16_t* __restrict__ Yb = nullptr,
+    uint32_t q_ld = 0, uint32_t s_ld = 0, uint32_t y_ld = 0,
+    const uint16_t* __restrict__ Bias = nullptr, uint32_t c_ld = 0) {
+    gemm_fp8a8_body<Full, NT, MW, FK, GATED, I8, BIAS>(R4D_F8K_ARGS);
+}
+template <bool Full, uint32_t NT, uint32_t MW, uint32_t FK,
+          bool GATED = false, bool I8 = false, bool BIAS = false>
+__global__ __launch_bounds__(MW * kWave) R4D_WAVES(f8_waves(Full, NT, MW, FK, I8))
+void r4dchain_gemm_fp8a8(
+    const uint8_t* __restrict__ Ap, const void* __restrict__ Sa,
+    const uint8_t* __restrict__ Bp, const void* __restrict__ Sb,
+    void* __restrict__ Y, void* __restrict__ C, unsigned int* __restrict__ Ctr,
+    uint32_t rows, uint32_t cols, uint32_t nb,
+    uint32_t a_ld, uint32_t b_ld, uint32_t sa_ld, uint32_t sb_ld, uint32_t ck,
+    uint8_t* __restrict__ Q = nullptr, float* __restrict__ Sc = nullptr,
+    uint16_t* __restrict__ Yb = nullptr,
+    uint32_t q_ld = 0, uint32_t s_ld = 0, uint32_t y_ld = 0,
+    const uint16_t* __restrict__ Bias = nullptr, uint32_t c_ld = 0) {
+    r4d_chain_wait();
+    gemm_fp8a8_body<Full, NT, MW, FK, GATED, I8, BIAS>(R4D_F8K_ARGS);
+    r4d_chain_done();
+}
+#undef R4D_F8K_ARGS
+
 // Sum the split-K partials into bf16 C, in fixed z order with no atomics. Latency bound, so eight
 // loads are issued before their adds; the order of the adds is unchanged.
 __global__ void splitk_reduce_kernel(const float* __restrict__ ws, uint16_t* __restrict__ y,
@@ -931,7 +970,7 @@ extern "C" int r4d_gemm_fp8a8_block(void)          { return (int)kBlock; }
 static int gemm_fp8a8_nt_m16_emit(long a, long ascale, long wq, long ws, long c,
                                   int M, int K, int N, int a_ld, int sa_ld, int w_ld, int sw_ld,
                                   long scratch, long scratch_bytes, RadStream stream,
-                                  bool i8 = false, int split_n = 0);
+                                  bool i8 = false, int split_n = 0, bool chain = false);
 
 extern "C" int r4d_gemm_fp8a8_nt_m16(long a, long ascale, long wq, long ws, long c,
                                      int M, int K, int N, int a_ld, int sa_ld, int w_ld, int sw_ld,
@@ -990,7 +1029,7 @@ extern "C" long r4d_gemm_fp8a8_nt_m16_scratch(int M, int K, int N) {
 static int gemm_fp8a8_nt_m16_emit(long a, long ascale, long wq, long ws, long c,
                                   int M, int K, int N, int a_ld, int sa_ld, int w_ld, int sw_ld,
                                   long scratch, long scratch_bytes, RadStream stream, bool i8,
-                                  int split_n) {
+                                  int split_n, bool chain) {
     int emit_rc = RAD_OK;
     if (!a || !ascale || !wq || !ws || !c) return -1;
     if (M <= 0 || K <= 0 || N <= 0) return -2;
@@ -1034,7 +1073,9 @@ static int gemm_fp8a8_nt_m16_emit(long a, long ascale, long wq, long ws, long c,
         (ksplit > 1 && gx <= kMaxCtr) ? split_ctr(stream, (const void*)c) : nullptr;
 
 #define R4D_F8D(f, mw_, nt_, fk_, i8_)                                                         \
-    emit_rc = R4D_EMIT(stream, (gemm_fp8a8_kernel<f, nt_, mw_, fk_, false, i8_>),              \
+    emit_rc = R4D_EMIT(stream,                                                                 \
+                       (chain ? r4dchain_gemm_fp8a8<f, nt_, mw_, fk_, false, i8_>               \
+                              : gemm_fp8a8_kernel<f, nt_, mw_, fk_, false, i8_>),              \
                        grid, dim3(mw_ * kWave),                                                \
                        0, (const uint8_t*)wq, (const void*)ws,                                 \
                        (const uint8_t*)a, (const void*)ascale, dst, (void*)c, ctr,              \
@@ -1157,11 +1198,23 @@ extern "C" int r4d_gemm_fp8a8_bias_nt_m16(long a, long ascale, long wq, long ws,
 // The weight is the gate_up plane [2*nout][K], gate first, as the unfused GEMM reads it.
 extern "C" int r4d_gemm_fp8a8_gated_nt_m16_max_m(void) { return 64; }
 
+static int gemm_fp8a8_gated_launch(long a, long ascale, long wq, long ws, long q, long s,
+                                   long y, int act, int M, int K, int nout, int a_ld, int sa_ld,
+                                   int w_ld, int sw_ld, int q_ld, int s_ld, int y_ld, long stream,
+                                   bool chain);
 extern "C" int r4d_gemm_fp8a8_gated_nt_m16(long a, long ascale, long wq, long ws,
                                            long q, long s, long y, int act,
                                            int M, int K, int nout,
                                            int a_ld, int sa_ld, int w_ld, int sw_ld,
                                            int q_ld, int s_ld, int y_ld, long stream) {
+    return gemm_fp8a8_gated_launch(a, ascale, wq, ws, q, s, y, act, M, K, nout, a_ld, sa_ld,
+                                   w_ld, sw_ld, q_ld, s_ld, y_ld, stream, false);
+}
+/* `chain`: the chained form (r4d_rad_gemm_fp8a8_gated_m16 passes the row's parameter). */
+static int gemm_fp8a8_gated_launch(long a, long ascale, long wq, long ws, long q, long s,
+                                   long y, int act, int M, int K, int nout, int a_ld, int sa_ld,
+                                   int w_ld, int sw_ld, int q_ld, int s_ld, int y_ld, long stream,
+                                   bool chain) {
     if (!a || !ascale || !wq || !ws || !q || !s) return -1;
     if (M <= 0 || K <= 0 || nout <= 0) return -2;
     if (M > r4d_gemm_fp8a8_gated_nt_m16_max_m()) return -3;
@@ -1194,14 +1247,18 @@ extern "C" int r4d_gemm_fp8a8_gated_nt_m16(long a, long ascale, long wq, long ws
     const dim3 grid((uint32_t)(nout / 128), 1, 1);
 
 #define R4D_F8G_NT(f, nt_)                                                                     \
-    hipLaunchKernelGGL((gemm_fp8a8_kernel<f, nt_, kGmw, kFKNarrow, true>), grid,               \
+    hipLaunchKernelGGL((chain ? r4dchain_gemm_fp8a8<f, nt_, kGmw, kFKNarrow, true>             \
+                              : gemm_fp8a8_kernel<f, nt_, kGmw, kFKNarrow, true>), grid,       \
                        dim3(kGmw * kWave),                                                     \
                        0, (hipStream_t)stream, (const uint8_t*)wq, (const void*)ws,            \
                        (const uint8_t*)a, (const void*)ascale, nullptr, nullptr, nullptr,       \
                        (uint32_t)N, (uint32_t)K,                                                \
                        (uint32_t)M, (uint32_t)w_ld, (uint32_t)a_ld, (uint32_t)sw_ld,            \
                        (uint32_t)sa_ld, 0u, (uint8_t*)q, (float*)s, (uint16_t*)y,               \
-                       (uint32_t)q_ld, (uint32_t)s_ld, (uint32_t)y_ld)
+                       (uint32_t)q_ld, (uint32_t)s_ld, (uint32_t)y_ld,                          \
+                       /* the bias's two, spelled out: a kernel chosen through a pointer takes  \
+                        * no default arguments */                                               \
+                       (const uint16_t*)nullptr, 0u)
 #define R4D_F8G(f)                                                                             \
     do { if (nt == 4u)      R4D_F8G_NT(f, 4u);                                                 \
          else if (nt == 3u) R4D_F8G_NT(f, 3u);                                                 \
@@ -1289,7 +1346,7 @@ extern "C" int r4d_rad_gemm_fp8a8_m16(const RadArgs* a, RadStream stream) {
         r4d_addr(g.a), r4d_addr(g.ascale), r4d_addr(g.b), r4d_addr(g.bscale), r4d_addr(g.y),
         (int)g.M, (int)g.K, (int)g.N, (int)g.a_ld, (int)g.sa_ld, (int)g.w_ld, (int)g.sw_ld,
         (long)(uintptr_t)a->scratch, (long)a->scratch_bytes, stream, false,
-        (int)r4d_geti_or(a, "split_n", 0));
+        (int)r4d_geti_or(a, "split_n", 0), r4d_geti_or(a, "chain", 0) != 0);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 
@@ -1380,11 +1437,11 @@ extern "C" int r4d_rad_gemm_fp8a8_gated_m16(const RadArgs* a, RadStream s) {
     const char* act = r4d_gets(a, "act");
     if (!act || std::strcmp(act, "silu")) return R4D_NO(RAD_E_UNSUPPORTED);
 
-    const int e = r4d_gemm_fp8a8_gated_nt_m16(
+    const int e = gemm_fp8a8_gated_launch(
         r4d_addr(x), r4d_addr(xs), r4d_addr(w), r4d_addr(wsc),
         r4d_addr(q), r4d_addr(sc), y ? r4d_addr(y) : 0, 0,
         (int)M, (int)K, (int)nout, (int)ap, (int)asp, (int)wp, (int)wsp,
-        (int)qp, (int)sp, (int)yp, (long)(uintptr_t)s);
+        (int)qp, (int)sp, (int)yp, (long)(uintptr_t)s, r4d_geti_or(a, "chain", 0) != 0);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 
@@ -1404,7 +1461,7 @@ extern "C" int r4d_rad_gemm_i8a8_m16(const RadArgs* a, RadStream stream) {
         r4d_addr(g.a), r4d_addr(g.ascale), r4d_addr(g.b), r4d_addr(g.bscale), r4d_addr(g.y),
         (int)g.M, (int)g.K, (int)g.N, (int)g.a_ld, (int)g.sa_ld, (int)g.w_ld, (int)g.sw_ld,
         (long)(uintptr_t)a->scratch, (long)a->scratch_bytes, stream, true,
-        (int)r4d_geti_or(a, "split_n", 0));
+        (int)r4d_geti_or(a, "split_n", 0), r4d_geti_or(a, "chain", 0) != 0);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 

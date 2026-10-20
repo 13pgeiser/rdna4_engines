@@ -4,6 +4,7 @@
 #include <hip/hip_runtime.h>
 #include "r4d_gdn_args.h"
 #include "r4d_dflash_conv_body.h"
+#include "r4d_chain.h"
 
 #define DFC_THREADS 128
 #define DFC_VEC     8      // bf16 lanes per thread: one dwordx4 in and one out
@@ -19,15 +20,40 @@ __global__ __launch_bounds__(DFC_THREADS) void r4d_dflash_conv_kernel(
                                     blockmask, blockIdx.y, hv);
 }
 
+// The chained form (r4d_chain.h): the body returns for lanes past the row, the block still adds.
+template <int TAPS, int GROUP>
+__global__ __launch_bounds__(DFC_THREADS) void r4dchain_dflash_conv(
+    const r4d_u16* __restrict__ x, const r4d_u16* __restrict__ delta,
+    const r4d_u16* __restrict__ base, r4d_u16* __restrict__ out,
+    int H, int dpitch, int NG, int vpr, int blockmask)
+{
+  r4d_chain_wait();
+  const int hv = blockIdx.x * DFC_THREADS + threadIdx.x;
+  r4d_dflash_conv_body<TAPS, GROUP>(x, delta, base, out, H, dpitch, NG, vpr,
+                                    blockmask, blockIdx.y, hv);
+  r4d_chain_done();
+}
+
 // x     [T, H]        bf16, row pitch H
 // delta [T, taps, NG] bf16, row pitch dpitch: a slice of the [T, 2, taps, NG] kernel projection,
 //                     so dpitch is 2*taps*NG. The packed pitch (taps*NG) would silently read the
 //                     other half's coefficients.
 // base  [taps, H]     bf16, contiguous
 // out   [T, H]        bf16. Must not alias x: tap 1 of row t reads input row t-1.
+static int dflash_conv_launch(const void* x, const void* delta, const void* base, void* out,
+                              int T, int H, int dpitch, int NG, int taps, int group,
+                              int block_size, void* stream, bool chain);
 extern "C" int r4d_dflash_conv_t2_g16_bf16(
     const void* x, const void* delta, const void* base, void* out,
     int T, int H, int dpitch, int NG, int taps, int group, int block_size, void* stream)
+{
+  return dflash_conv_launch(x, delta, base, out, T, H, dpitch, NG, taps, group, block_size,
+                            stream, false);
+}
+/* `chain`: the chained form at decode heights (r4d_rad_dflash_conv passes the row's parameter). */
+static int dflash_conv_launch(const void* x, const void* delta, const void* base, void* out,
+                              int T, int H, int dpitch, int NG, int taps, int group,
+                              int block_size, void* stream, bool chain)
 {
   if (taps != 2 || group != 16) return -1;
   if (H % (group * DFC_VEC) || NG != H / group) return -1;
@@ -36,7 +62,9 @@ extern "C" int r4d_dflash_conv_t2_g16_bf16(
 
   const int vpr = H / DFC_VEC;
   dim3 grid((vpr + DFC_THREADS - 1) / DFC_THREADS, T), blk(DFC_THREADS);
-  hipLaunchKernelGGL((r4d_dflash_conv_kernel<2, 16>), grid, blk, 0, (hipStream_t)stream,
+  hipLaunchKernelGGL((chain && T <= 64 ? r4dchain_dflash_conv<2, 16>
+                                         : r4d_dflash_conv_kernel<2, 16>),
+                     grid, blk, 0, (hipStream_t)stream,
                      (const r4d_u16*)x, (const r4d_u16*)delta, (const r4d_u16*)base,
                      (r4d_u16*)out, H, dpitch, NG, vpr, block_size - 1);
   return (int)hipGetLastError();
@@ -79,7 +107,8 @@ extern "C" int r4d_rad_dflash_conv(const RadArgs* a, RadStream s) {
     if (bsz & (bsz - 1)) return R4D_NO(RAD_E_INVAL);
     if (dpitch != 2LL * taps * NG) return R4D_NO(RAD_E_STRIDE);
 
-    return R4D_RAW(r4d_dflash_conv_t2_g16_bf16(x->data, d->data, bs->data, o->data, (int)T,
-                                               (int)H, (int)dpitch, NG, taps, group, bsz, s));
+    return R4D_RAW(dflash_conv_launch(x->data, d->data, bs->data, o->data, (int)T,
+                                      (int)H, (int)dpitch, NG, taps, group, bsz, s,
+                                      r4d_geti_or(a, "chain", 0) != 0));
 }
 

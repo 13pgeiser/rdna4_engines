@@ -154,6 +154,7 @@ static inline int fill_paged_row(const RadArgs* a, R4DArgs* r, int expect_head_d
 
     /* Set by the caller from the tuned `splits`; 0 means libr4d's own split law. */
     r->splits = 0;
+    r->chain = r4d_geti_or(a, "chain", 0) != 0 ? 1 : 0;
     return RAD_OK;
 }
 

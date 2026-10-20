@@ -161,6 +161,9 @@ struct KernelRec {
     int32_t     hid[16];                      /* offset of each Hidden kind, or -1 */
     uint8_t     hid_size[16];
     std::string name;
+    /* A chained form (RadKernelChainFn): its name carries "r4dchain". Only such a kernel gets a
+     * chain record and may lose its barrier bit; a row's other kernels keep the bit. */
+    bool        chained = false;
 };
 
 struct ModuleImage {
@@ -509,6 +512,7 @@ KernelRec* resolve(Func* fn, int ord) {
     }
     auto k = std::make_unique<KernelRec>();
     k->name = fn->name;
+    k->chained = k->name.find("r4dchain") != std::string::npos;
     hsa_executable_symbol_get_info(s, HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT, &k->object);
     hsa_executable_symbol_get_info(s, HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_KERNARG_SEGMENT_SIZE,
                                    &k->kernarg_size);
@@ -596,6 +600,16 @@ struct Stream {
     std::atomic<int> fault{0};
     char*           bounce = nullptr;         /* pinned, for pageable copies */
     std::mutex      bounce_mu;
+    /* Chained launches (RadKernelChainFn): the completion counter every block of a chained kernel
+     * adds 1 to (in the slot after the argument ring), the blocks of chained kernels issued so
+     * far, and whether the last packet on the queue was a chained kernel. */
+    uint64_t*       chain_ctr = nullptr;
+    uint64_t        chain_issued = 0;
+    bool            prev_chained = false;
+    /* Whether a packet that adds nothing to the counter (a plain kernel) may still be running: one
+     * launched since the last packet whose barrier bit held it behind everything before. A chained
+     * kernel's wait covers only chained blocks, so while this is set the next one keeps its bit. */
+    bool            plain_inflight = false;
 
     void lock() {
         while (busy.exchange(true, std::memory_order_acquire))
@@ -955,6 +969,9 @@ struct TapeRec {
      * on the queue still run. Set only where the dispatch touches nothing those packets write
      * (tape_set_overlap). */
     uint8_t  overlap = 0;
+    /* A chained kernel (RadKernelChainFn): played from the queue's own argument slot with a chain
+     * record, and without the barrier bit behind another chained kernel. */
+    uint8_t  chain = 0;
 };
 
 struct Tape {
@@ -975,11 +992,12 @@ inline bool capturing() { return t_tape && t_tape_pause == 0; }
 
 /* A dispatch just written at `p` on `s`, with its argument block `ka`. */
 void tape_note_dispatch(Stream* s, const hsa_kernel_dispatch_packet_t* p, uint16_t setup,
-                        const unsigned char* ka, uint32_t n, uint8_t fence) {
+                        const unsigned char* ka, uint32_t n, uint8_t fence, bool chain) {
     Tape* t = t_tape;
     TapeRec r;
     r.kind = kTapeDispatch;
     r.fence = fence;
+    r.chain = chain ? 1 : 0;
     r.s = s;
     r.pkt = *p;
     r.pkt.header = 0;
@@ -1014,12 +1032,32 @@ inline int acquire_scope(Stream* s, uint64_t idx, bool forced) {
     return HSA_FENCE_SCOPE_AGENT;
 }
 
+/* The chain record of a chained launch (RadKernelChainFn) at `slot`: wait for every chained
+ * block issued before it on `s`. `on` false writes a record no kernel accepts. */
+inline void chain_record(Stream* s, char* slot, bool on) {
+    uint64_t rec[4];
+    rec[0] = on ? RAD_CHAIN_MAGIC : 0;
+    rec[1] = s->chain_issued;
+    rec[2] = (uint64_t)(uintptr_t)s->chain_ctr;
+    rec[3] = rec[0] ^ rec[1] ^ rec[2] ^ RAD_CHAIN_CHECK;
+    std::memcpy(slot + RAD_CHAIN_KARG_OFF, rec, sizeof rec);
+}
+inline uint64_t blocks_of(const hsa_kernel_dispatch_packet_t* p) {
+    auto n = [](uint32_t g, uint16_t b) { return b ? (uint64_t)((g + b - 1u) / b) : 1u; };
+    return n(p->grid_size_x, p->workgroup_size_x) * n(p->grid_size_y, p->workgroup_size_y) *
+           n(p->grid_size_z, p->workgroup_size_z);
+}
+static_assert(RAD_CHAIN_KARG_OFF >= kKargMax && RAD_CHAIN_KARG_OFF + RAD_CHAIN_REC_BYTES <= kKargSlot,
+              "the chain record sits in an argument slot's tail, past every kernel's arguments");
+
 int barrier(Stream* s, hsa_signal_t dep, hsa_signal_t done, int acq, int rel,
             uint64_t* out_idx = nullptr) {
     s->lock();
     uint64_t idx = 0;
     const int rc = reserve(s, &idx);
     if (rc < 0) { s->unlock(); return rc; }
+    s->prev_chained = false;
+    s->plain_inflight = false;
     if (out_idx) *out_idx = idx;
     auto* p = reinterpret_cast<hsa_barrier_and_packet_t*>(
         static_cast<hsa_kernel_dispatch_packet_t*>(s->q->base_address) + (idx & s->mask));
@@ -1079,7 +1117,11 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
     p->reserved2 = 0;
     p->completion_signal.handle = 0;
     constexpr uint16_t setup = 3u << HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS;
-    if (capturing()) tape_note_dispatch(s, p, setup, ka, n, fence);
+    /* A chained kernel (RadKernelChainFn, named r4dchain*): its record in the slot's tail. */
+    const bool chain = k->chained && rad_dev_chain_enabled() && s->chain_ctr &&
+                       n <= RAD_CHAIN_KARG_OFF;
+    if (k->chained) chain_record(s, slot, chain);
+    if (capturing()) tape_note_dispatch(s, p, setup, ka, n, fence, chain);
     /* Attach the ride after the tape copied the packet: a recorded packet carries no signal, and
      * a play attaches whichever ride is pending then (PlayRun::put). */
     if (s->ride.handle) {
@@ -1088,7 +1130,13 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
     }
     const int acq = acquire_scope(s, idx, (fence & kFenceAcquireSystem) != 0);
     const int rel = (fence & kFenceReleaseSystem) ? HSA_FENCE_SCOPE_SYSTEM : HSA_FENCE_SCOPE_AGENT;
-    publish(s, idx, header(HSA_PACKET_TYPE_KERNEL_DISPATCH, acq, rel), setup);
+    /* Behind another chained kernel a chained one waits in its prologue; a completion signal keeps
+     * the bit, since its completion must cover everything before it. */
+    const bool keep = !(chain && s->prev_chained && !s->plain_inflight && !p->completion_signal.handle);
+    publish(s, idx, header(HSA_PACKET_TYPE_KERNEL_DISPATCH, acq, rel, keep), setup);
+    if (chain) s->chain_issued += blocks_of(p);
+    s->prev_chained = chain;
+    s->plain_inflight = keep ? !chain : s->plain_inflight || !chain;
     s->unlock();
     return RAD_OK;
 }
@@ -1110,6 +1158,7 @@ constexpr int kPlayLeft = 8;
 thread_local PlayLeft t_left[kPlayLeft];
 
 struct PlayRun {
+    const Tape* tape = nullptr;   /* the tape played, for a chained record's argument bytes */
     Stream*  s = nullptr;
     uint64_t next = 0;        /* the write index after the last packet written */
     int      unrung = 0;
@@ -1167,16 +1216,38 @@ struct PlayRun {
             s->ride.handle = 0;
         }
         if (done.handle) p->completion_signal = done;
+        /* A chained record plays from this queue's own argument slot, where its chain record goes:
+         * the tape's copy is shared by every play, and the next step's play may be written while
+         * this one runs. */
+        bool chain = false;
+        if (r.chain && tape) {
+            char* slot = s->karg + (size_t)(idx & s->mask) * kKargSlot;
+            chain = s->chain_ctr && r.karg_len <= RAD_CHAIN_KARG_OFF;
+            if (chain) {
+                std::memcpy(slot, tape->karg_host.data() + r.karg_off, r.karg_len);
+                p->kernarg_address = slot;
+                chain_record(s, slot, true);
+            }
+        }
         const int acq = acquire_scope(s, idx, (r.fence & kFenceAcquireSystem) != 0);
         int rel = (r.fence & kFenceReleaseSystem) ? HSA_FENCE_SCOPE_SYSTEM : HSA_FENCE_SCOPE_AGENT;
         if (rel < rel_min) rel = rel_min;
         /* A dispatch carrying a record keeps the bit: its completion must cover everything before
-         * it on the queue, which an unordered dispatch's does not. */
-        const bool ordered = foreign || !r.overlap || done.handle;
+         * it on the queue, which an unordered dispatch's does not. A chained kernel behind another chained one
+         * on this queue waits in its prologue instead. */
+        bool ordered = foreign || !r.overlap || done.handle;
+        /* Not while a plain packet may still run: a played plain kernel the overlap analysis let
+         * start early (it touched nothing in flight) adds nothing to the counter, so a chained
+         * kernel that reads its output and sits behind a chained one (a cache read beside a
+         * collective, say) would wait for the chained blocks only. */
+        if (chain && s->prev_chained && !s->plain_inflight && !foreign && !done.handle) ordered = false;
         const uint16_t h = header(HSA_PACKET_TYPE_KERNEL_DISPATCH, acq, rel, ordered);
         __atomic_store_n(reinterpret_cast<uint32_t*>(p), (uint32_t)h | ((uint32_t)r.pkt.setup << 16),
                          __ATOMIC_RELEASE);
         foreign = false;
+        if (chain) s->chain_issued += blocks_of(p);
+        s->prev_chained = chain;
+        s->plain_inflight = ordered ? !chain : s->plain_inflight || !chain;
         s->wr = idx + 1;
         next = idx + 1;
         *out_idx = idx;
@@ -1423,7 +1494,7 @@ int a_stream_create(RadStream* out, int high_priority) {
     void* ka = nullptr;
     hsa_amd_memory_pool_t kpool = d.host_kargs ? G().host_fine : d.vram;
     hsa_agent_t kpeer = d.host_kargs ? d.agent : G().cpu;
-    if (hsa_amd_memory_pool_allocate(kpool, (size_t)(s->mask + 1) * kKargSlot, 0, &ka) !=
+    if (hsa_amd_memory_pool_allocate(kpool, (size_t)(s->mask + 2) * kKargSlot, 0, &ka) !=
             HSA_STATUS_SUCCESS ||
         hsa_amd_agents_allow_access(1, &kpeer, nullptr, ka) != HSA_STATUS_SUCCESS) {
         hsa_queue_destroy(s->q);
@@ -1432,6 +1503,9 @@ int a_stream_create(RadStream* out, int high_priority) {
         return RAD_E_DEVICE;
     }
     s->karg = static_cast<char*>(ka);
+    s->chain_ctr = reinterpret_cast<uint64_t*>(s->karg + (size_t)(s->mask + 1) * kKargSlot);
+    *reinterpret_cast<volatile uint64_t*>(s->chain_ctr) = 0;
+    _mm_sfence();
     void* bb = nullptr;
     if (hsa_amd_memory_pool_allocate(G().host_fine, kBounceBytes, 0, &bb) != HSA_STATUS_SUCCESS ||
         hsa_amd_agents_allow_access(1, &d.agent, nullptr, bb) != HSA_STATUS_SUCCESS) {
@@ -1441,7 +1515,7 @@ int a_stream_create(RadStream* out, int high_priority) {
         return RAD_E_NOMEM;
     }
     s->bounce = static_cast<char*>(bb);
-    note_alloc(ka, (int64_t)(s->mask + 1) * kKargSlot, -1);
+    note_alloc(ka, (int64_t)(s->mask + 2) * kKargSlot, -1);
     note_alloc(bb, kBounceBytes, -1);
     s->id = g_next_queue_id.fetch_add(1, std::memory_order_relaxed);
     if (s->id >= kMaxQueues) {
@@ -1802,9 +1876,12 @@ RadTape a_tape_end(int keep) {
     if (!t->karg_host.empty()) {
         const Dev& d = G().dev[(size_t)ord];
         void* ka = nullptr;
+        /* Padded by a slot: a chained kernel played from here reads its record's place
+         * (RAD_CHAIN_KARG_OFF) past its own arguments. */
         hsa_amd_memory_pool_t pool = d.host_kargs ? G().host_fine : d.vram;
         hsa_agent_t peer = d.host_kargs ? d.agent : G().cpu;
-        if (hsa_amd_memory_pool_allocate(pool, t->karg_host.size(), 0, &ka) != HSA_STATUS_SUCCESS ||
+        if (hsa_amd_memory_pool_allocate(pool, t->karg_host.size() + kKargSlot, 0, &ka) !=
+                HSA_STATUS_SUCCESS ||
             hsa_amd_agents_allow_access(1, &peer, nullptr, ka) != HSA_STATUS_SUCCESS) {
             if (ka) hsa_amd_memory_pool_free(ka);
             device_set_error("the pass cannot be recorded: %zu bytes of kernel arguments could "
@@ -1854,6 +1931,7 @@ int a_tape_play(RadTape rt, int from, int to) {
     ++t_tape_pause;
     int rc = RAD_OK;
     PlayRun run;
+    run.tape = t;
     for (int i = from; i < to && rc >= 0; ++i) {
         const TapeRec& r = t->rec[(size_t)i];
         if (r.kind == kTapeDispatch) {

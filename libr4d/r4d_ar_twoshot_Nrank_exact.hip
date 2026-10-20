@@ -30,6 +30,7 @@
 #include "r4d.h"
 #include "r4d_ar_wide.h"
 #include "r4d_ar_shards.h"
+#include "r4d_chain.h"
 #include <stdexcept>
 #include <string>
 
@@ -40,13 +41,16 @@ struct R4DArShardOff {
 };
 
 // PIECED false fixes pieces at 1, so the unpipelined launch keeps the straight-line kernel.
-template <typename T, int LANES, int WS, bool PIECED>
-__global__ void r4d_ar_twoshot_wide_exact_kernel(
+// CHAIN: the chained form's wait (before the sequence take, so a block of the next launch on the
+// instance never starts ahead of this one's) and add (r4d_chain.h); no block returns early.
+template <typename T, int LANES, int WS, bool PIECED, bool CHAIN>
+__device__ __forceinline__ void r4d_ar_twoshot_wide_exact_body(
     const int4* __restrict__ in4, R4DArWidePeers<int4, WS - 1> peers,
     const int4* __restrict__ my_base, unsigned int* __restrict__ my_flags,
     int4* __restrict__ out4, unsigned int* __restrict__ seq_ctrs, R4DArShardOff<WS> sh,
     int slot_stride16, int rank, int drain, int acq, int pub,
     long long* gate, unsigned int* gate_ctr, int pieces_arg) {
+  if (CHAIN) r4d_chain_wait();
   constexpr int NPEERS = WS - 1;
   const int pieces = PIECED ? pieces_arg : 1;
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
@@ -151,7 +155,26 @@ __global__ void r4d_ar_twoshot_wide_exact_kernel(
   assemble(pieces - 1);
 #undef R4D_TS_OFF
 #undef R4D_TS_LEN
+  if (CHAIN) r4d_chain_done();
 }
+
+#define R4D_ARTS_PARAMS const int4* __restrict__ in4, R4DArWidePeers<int4, WS - 1> peers,       \
+    const int4* __restrict__ my_base, unsigned int* __restrict__ my_flags,                      \
+    int4* __restrict__ out4, unsigned int* __restrict__ seq_ctrs, R4DArShardOff<WS> sh,         \
+    int slot_stride16, int rank, int drain, int acq, int pub, long long* gate,                  \
+    unsigned int* gate_ctr, int pieces_arg
+#define R4D_ARTS_ARGS in4, peers, my_base, my_flags, out4, seq_ctrs, sh, slot_stride16, rank,    \
+    drain, acq, pub, gate, gate_ctr, pieces_arg
+template <typename T, int LANES, int WS, bool PIECED>
+__global__ void r4d_ar_twoshot_wide_exact_kernel(R4D_ARTS_PARAMS) {
+  r4d_ar_twoshot_wide_exact_body<T, LANES, WS, PIECED, false>(R4D_ARTS_ARGS);
+}
+template <typename T, int LANES, int WS, bool PIECED>
+__global__ void r4dchain_ar_twoshot_wide_exact(R4D_ARTS_PARAMS) {
+  r4d_ar_twoshot_wide_exact_body<T, LANES, WS, PIECED, true>(R4D_ARTS_ARGS);
+}
+#undef R4D_ARTS_ARGS
+#undef R4D_ARTS_PARAMS
 
 // --- host side ---
 template <int WS>
@@ -160,7 +183,7 @@ static void ar_twoshot_launch(const long* peer_scratch, const long* peer_flags, 
                               long out, long n_elem, long dtype, long rank, long stream_i,
                               long nblocks, long nthreads, long drain, long acq, long pub,
                               long gate, long gate_ctr, const int* shard_weights,
-                              long pieces) {
+                              long pieces, bool chain = false) {
   constexpr int NPEERS = WS - 1;
   if (rank < 0 || rank >= WS)
     throw std::runtime_error("all_reduce: rank " + std::to_string(rank) +
@@ -238,7 +261,8 @@ static void ar_twoshot_launch(const long* peer_scratch, const long* peer_flags, 
 
   hipStream_t st = (hipStream_t)stream_i;
 #define R4D_AR_TS_LAUNCH_P(T, LN, P)                                                  \
-  r4d_ar_twoshot_wide_exact_kernel<T, LN, WS, P><<<nb, nt, 0, st>>>(                  \
+  (chain ? r4dchain_ar_twoshot_wide_exact<T, LN, WS, P>                               \
+         : r4d_ar_twoshot_wide_exact_kernel<T, LN, WS, P>)<<<nb, nt, 0, st>>>(        \
       (const int4*)inp, peers, (const int4*)my_scratch, (unsigned int*)my_flags,      \
       (int4*)out, (unsigned int*)seq_ctrs, sh, (int)slot_stride16,                    \
       (int)rank, (int)drain, (int)acq, (int)pub, (long long*)gate,                    \
@@ -274,12 +298,12 @@ void r4d_ar_twoshot_4rank_exact(long peer_scratch0, long peer_scratch1, long pee
                                 long my_scratch, long my_flags, long seq_ctrs,
                                 long slot_stride16, long inp, long out, long n_elem, long dtype,
                                 long rank, long stream, long nblocks, long nthreads, long drain,
-                                long acq, long pub, long gate, long gate_ctr) {
+                                long acq, long pub, long gate, long gate_ctr, long chain) {
   const long ps[3] = {peer_scratch0, peer_scratch1, peer_scratch2};
   const long pf[3] = {peer_flags0, peer_flags1, peer_flags2};
   ar_twoshot_launch<4>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, inp, out, n_elem,
                        dtype, rank, stream, nblocks, nthreads, drain, acq, pub, gate, gate_ctr,
-                       nullptr, 1L);
+                       nullptr, 1L, chain != 0);
 }
 
 void r4d_ar_twoshot_8rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,

@@ -587,6 +587,53 @@ inline rad_op rw(RadBuilder* b, rad_op h,
     return h;
 }
 
+/* ---- A weight read into the on-die cache beside a collective (libr4d `prefetch`, docs/OPS.md).
+ * At decode heights a GEMM streams its weight once from memory, and a collective in front of it
+ * leaves the card's memory idle for its round trip. prefetch_beside issues `op`, a `prefetch` of
+ * the next GEMM's weight `w`, behind the GEMM before the collective, so the two do not share the
+ * memory, and the next GEMM finds its leading bytes in the cache. Nothing it reads or writes is a
+ * model value, so on the second lane it keeps that lane's rules with no buffer named
+ * (core/runtime/ctx.h): it is no collective, keeps no counter and touches no arena byte.
+ *
+ * Only at decode and verify heights, up to kPrefetchRows rows: a DFlash2 verify's 8 a sequence, a
+ * z-lab DFlash verify's 16, a plain decode's one. With the ceiling at 64, a prompt's prefill steps
+ * (40 rows on the 31B's test prompt) took the reads too, and a freshly started 31B server's first
+ * greedy reply then differed on 4 of 6 starts (4x R9700, the cards' memory scribbled before each
+ * start); at 16, and with no reads at all, 0 of 6. Per-op output hashes later located that
+ * divergence at the prefill all-reduce's first reuse of a double-buffered slot: a race in the
+ * all-reduce, which its full fence on prefill-sized messages (libr4d) cures, not in anything the
+ * reads touch. The reads stay off prompt steps all the same. */
+constexpr int64_t kPrefetchRows = 16;
+/* The read goes on lane 0 itself, right after the GEMM, where its chained form (libr4d
+ * r4dchain_prefetch) waits for that GEMM and then reads beside the collective after it without
+ * holding the collective: no join between the lanes, so no record on the GEMM and no barrier bit
+ * on it, and the read starts as the GEMM's last block ends rather than ~10 us later on lane 1. On
+ * 4x R9700 (31B DFlash2, three rounds, every reply identical): code 385-386 tok/s against 363-365,
+ * prose 284-286 against 269-270, decode after a 6.4k prompt 580-583 against 538-541. Only where
+ * launches chain (rad_chain_on, the core's decision), since a plain launch would read in series
+ * there; elsewhere the read goes on lane 1, behind a join from lane 0. */
+inline bool prefetch_lane0() { return rad_chain_on() != 0; }
+inline void prefetch_beside(RadCtx* c, rad_op op, rad_weight w, int64_t T) {
+    if (!op || T > kPrefetchRows) return;
+    if (prefetch_lane0()) {
+        RAD_ISSUE(c, op, RAD_W(w));
+        return;
+    }
+    if (rad_lane_join(c, 0, 1) == RAD_OK && rad_lane(c, 1) == RAD_OK) RAD_ISSUE(c, op, RAD_W(w));
+    rad_lane(c, 0);
+}
+/* RADIANCE_PREFETCH=0 declares no reads at all (docs/GUIDE.md); read at declare. */
+inline bool prefetch_enabled() {
+    const char* e = std::getenv("RADIANCE_PREFETCH");
+    return !(e && !std::strcmp(e, "0"));
+}
+/* The `prefetch` of `w`'s first `bytes`, where a library serves it and the reads are on; 0
+ * otherwise. */
+inline rad_op decl_prefetch(RadBuilder* b, rad_weight w, int64_t bytes) {
+    if (!w || bytes <= 0 || !prefetch_enabled() || !rad_op_declared(b, "prefetch")) return 0;
+    return RAD_OP(b, "prefetch", RAD_PARAMS(RAD_INT("bytes", bytes)), RAD_WEIGHTS(w));
+}
+
 /* ================================================================== geometry */
 /* Dimensions come from model metadata, so one plugin covers every size in a family. Sharded
  * dimensions are already divided by world_size: the plugin declares divided dimensions and emits

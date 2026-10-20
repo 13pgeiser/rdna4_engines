@@ -743,6 +743,25 @@ static const RadOperandSpec oAddRmsNorm[] = {
     { "w", RAD_OPD_WEIGHT, 0 },
     { "y", RAD_OPD_OUT,    0 },
 };
+/* `kv_len_trim`: a batch's per-sequence context lengths less `trim` (docs/OPS.md). */
+static const RadParamSpec pKvLenTrim[] = {
+    { "trim",     RAD_P_INT, RAD_REQUIRED },
+    { "max_seqs", RAD_P_INT, RAD_REQUIRED },
+};
+/* `tail` is the rows past the slice (their positions); its extent is the trim, its values unread.
+ * A launch's `trim` is the band's upper bound, not the issued count (RadArgs.p). */
+static const RadOperandSpec oKvLenTrim[] = {
+    { "seqused", RAD_OPD_IN,  0 },
+    { "tail",    RAD_OPD_IN,  0 },
+    { "out",     RAD_OPD_OUT, 0 },
+};
+/* `prefetch` reads a weight's leading `bytes` into the cache and writes nothing (docs/OPS.md). */
+static const RadParamSpec pPrefetch[] = {
+    { "bytes", RAD_P_INT, RAD_REQUIRED },
+};
+static const RadOperandSpec oPrefetch[] = {
+    { "w", RAD_OPD_WEIGHT, 0 },
+};
 static const RadParamSpec pGemmNtQ[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "N",     RAD_P_INT, RAD_REQUIRED },
@@ -3150,6 +3169,13 @@ static const RadOpSchema kSchemas[] = {
            "x = x + a, then y = rmsnorm(x) * (w + wadd) * mult over the x written: a residual add "
            "and the next norm in one pass, byte-identical to add then rmsnorm. The norm is taken "
            "over the bf16 sum it stores; rmsnorm_add normalises the unrounded one."),
+    SCHEMA("kv_len_trim", pKvLenTrim, oKvLenTrim,
+           "out[s] = max(seqused[s] - trim, 0), trim the extent of `tail` (the rows past the "
+           "slice): the context a slice of a step's rows ends at, for an attention over that "
+           "slice alone."),
+    SCHEMA("prefetch", pPrefetch, oPrefetch,
+           "read a weight's leading bytes so they are in the cache when the next kernel streams "
+           "them; writes nothing."),
     SCHEMA("qkv_norm_rope", pQkvNormRope, oQkvNormRope,
            "per-head q and k RMS norms, the weightless v norm and the rotary of q and k over separate "
            "q, k and v projections, in one dispatch; v from the raw k under v_from_k. n_head 0 "
@@ -4553,6 +4579,12 @@ static const RadConstraint cRmsNormQuantI8[] = {
 static const RadConstraint cAddRmsNorm[] = {
     C_GE("n", 1), C_IN("dtype", "bf16"),
 };
+static const RadConstraint cKvLenTrim[] = {
+    C_GE("trim", 0), C_LE("max_seqs", 64),
+};
+static const RadConstraint cPrefetch[] = {
+    C_GE("bytes", 1),
+};
 static const RadConstraint cQkvNormRope[] = {
     C_GE("head_dim", 256), C_LE("head_dim", 512), C_DIV("head_dim", 256), C_IN("dtype", "bf16"),
 };
@@ -4969,6 +5001,13 @@ static const RadConstraint cLogitsGemmFp8[] = { C_DIV("n_embd", 128), C_IN("dtyp
 
 /* No tunable axes. */
 #define NOTUNE nullptr, 0, nullptr
+
+/* The prefetch's workgroups. It runs beside a collective or a latency-bound kernel and should fill
+ * that window's memory bandwidth without taking the compute units the other lane needs. */
+static const int64_t kPrefetchNb[] = { 64, 32, 128, 256, 16, 24, 48 };
+static const RadTunable tPrefetch[] = {
+  { "nb", kPrefetchNb, NELEM(kPrefetchNb), 64, "workgroups of 256 lanes reading the weight" },
+};
 
 /* ---- image generation ------------------------------------------------------------------- */
 /* Rows read 16 bytes at a time, so the widths are whole eights. */
@@ -7837,6 +7876,24 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   nullptr, nullptr, r4d_rad_add_rmsnorm, nullptr, nullptr, nullptr,
   r4d_shape_add_rmsnorm, nullptr, r4d_fuse_add_rmsnorm },
 
+{ "kv_len_trim", "kv_len_trim", "misc",
+  "a batch's per-sequence context lengths less a runtime trim, one workgroup",
+  "at most 64 sequences; the trim is the extent of `tail`",
+  "int32 in, int32 out, clamped at zero",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cKvLenTrim), NOTUNE,
+  nullptr, nullptr, r4d_rad_kv_len_trim, nullptr, nullptr, nullptr, nullptr, nullptr },
+
+/* Reads its weight's stored bytes, whatever form the weight's GEMM gave them (RAD_LAYOUT_ANY). */
+{ "prefetch", "prefetch", "misc",
+  "read a weight's leading bytes, 16 a lane over 64 workgroups, so the next kernel streaming the "
+  "weight finds them in the 64 MB on-die cache; meant for a second lane beside a collective",
+  "any weight, any stored form; `bytes` clamped to what the tensor states",
+  "any",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cPrefetch), ROW(tPrefetch), nullptr,
+  nullptr, nullptr, r4d_rad_prefetch, nullptr, r4d_rad_layout_any, nullptr, nullptr, nullptr },
+
 { "gelu_mul_quant_i8", "gelu_mul_quant_i8", "quant",
   "gelu(gate) * up, the tanh form, and quant_act_i8's quantiser in one pass over the row",
   "n a multiple of 16 and n*2 bytes within LDS; one workgroup per row",
@@ -9084,6 +9141,52 @@ extern "C" int rad_kernel_concurrent(int i) {
     return 1;
 }
 
+/* Which rows can chain (RadKernelChainFn, rad_abi.h): every kernel their launch emits has a
+ * chained form (r4d_chain.h) the launch selects from the `chain` parameter. A row joins this list
+ * only once all of its kernels have one. */
+extern "C" int rad_kernel_chain(int i) {
+    const RadKernelInfo* k = rad_kernel_at(i);
+    if (!k) return 0;
+    static const char* const kChained[] = {
+        "gemm_w4a8_nt_m64", "gelu_mul_quant_i8", "qkv_norm_rope_bf16",
+        "qkv_norm_rope_kv_store_fp8", "qkv_norm_rope_kv_store_bf16",
+        /* the split-KV decode and its merge (r4d_decode_launch_win); their prefill kernel stays
+         * plain, and the backend chains only the kernels named r4dchain* */
+        "attn_decode_h256_gqa2_fp8kv", "attn_decode_h256_gqa2_bf16kv",
+        "attn_qrow_decode_h256_gqa2_fp8kv", "attn_qrow_decode_h256_gqa2_bf16kv",
+        /* the fused junction: its tail form (the two-shot with the junction after it) only */
+        "ar_rmsnorm_quant_i8", "ar_rmsnorm_quant_i8_4rank",
+        /* the 31B's full layers: the windowed attention and its merge (r4d_attn_paged_window.hip,
+         * at decode heights) and the int8 quantiser before o_proj; h512 at every TP's gqa */
+        "attn_qrow_h512_gqa2_fp8kv", "attn_qrow_h512_gqa2_bf16kv",
+        "attn_qrow_h512_gqa4_fp8kv", "attn_qrow_h512_gqa4_bf16kv",
+        "attn_qrow_h512_gqa8_fp8kv", "attn_qrow_h512_gqa8_bf16kv",
+        "quant_act_i8",
+        /* DFlash2's query and context passes: the narrow fp8 GEMMs (the gated gate_up among
+         * them), the activation quantiser, the norms, the conv projection, the opening
+         * convolution and the verify-height reductions */
+        "gemm_fp8a8_nt_m16", "gemm_fp8a8_gated_nt_m16",
+        "gemm_i8a8_nt_m16", "quant_act_fp8", "rmsnorm_bf16", "add_rmsnorm_bf16",
+        "gemm_bf16_nt_m16", "gemm_bf16_nt_m64", "dflash_conv_t2_g16_bf16",
+        "ar_oneshot_4rank_exact", "ar_twoshot_4rank_exact",
+        /* the decode tail: the embedding, the sampled rows' gather, the lm_head's WMMA pass (the
+         * matvec below three rows stays plain) and the soft-cap */
+        "embed_lookup_bf16", "gather_rows_bf16", "logits_gemm_fp8", "logits_gemm_i8",
+        "logit_softcap_bf16", "logit_softcap_f32",
+        /* the vocab-parallel sampler's candidate chain (temperature, top-k, the gathered sets'
+         * merge, the pick) and its all-gather, and DFlash2's draft head, row top-k, merge and
+         * selector */
+        "sample_temp_f32", "sample_topk_f32", "sample_merge_topk_f32", "sample_pick_f32",
+        "ar_gather_4rank", "gemm_w8a8_nt_m64", "rowtopk_bf16", "rowtopk_merge",
+        "dflash_select_bf16",
+        /* the weight read beside a collective (its blocks add before reading, r4d_prefetch.hip) */
+        "prefetch",
+    };
+    for (const char* p : kChained)
+        if (std::strcmp(k->name, p) == 0) return 1;
+    return 0;
+}
+
 /* Which rows are collectives (rad_abi.h): every row whose init builds the all-reduce family's
  * exchange buffers, peer flags and handshake (standalone all-reduces and gathers, and norms and hc
  * writes with one folded in), plus each `_host` twin. Keyed on the init, since a cross-rank kernel
@@ -9220,6 +9323,9 @@ extern "C" void r4d_cfg_ar(const RadArgs* a, R4dArCfg* out) {
 }
 extern "C" int r4d_cfg_ar_tail(const RadArgs* a) {
     return TUNE(a, tArQ84, "tail");
+}
+extern "C" int r4d_cfg_prefetch_nb(const RadArgs* a) {
+    return TUNE(a, tPrefetch, "nb");
 }
 extern "C" long r4d_cfg_ar_ts_min(const RadArgs* a) {
     return (long)tune_i(a, tAr, NELEM(tAr), "ts_min");

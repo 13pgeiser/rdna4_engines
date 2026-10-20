@@ -9,14 +9,18 @@
 #include "r4d_args.h"
 #include "r4d_emit.h"
 #include "r4d_common.h"
+#include "r4d_chain.h"
 #include <cstdint>
 
 namespace {
 
-template <uint32_t THR>
-__global__ __launch_bounds__(THR) void gelu_mul_quant_i8_kernel(
+// CHAIN brackets the body with the chained launch's wait and add (r4d_chain.h); every block runs
+// to the end. The plain kernel and the chained one (r4dchain*) follow.
+template <uint32_t THR, bool CHAIN>
+__device__ __forceinline__ void gelu_mul_quant_i8_body(
     const uint16_t* __restrict__ gu, signed char* __restrict__ q, float* __restrict__ S,
     uint16_t* __restrict__ yo, uint32_t n, uint32_t gu_ld, uint32_t y_ld) {
+    if (CHAIN) r4d_chain_wait();
     extern __shared__ uint16_t ybuf[];
     __shared__ float lm[THR / 32];
     const uint32_t row = blockIdx.x;
@@ -49,6 +53,20 @@ __global__ __launch_bounds__(THR) void gelu_mul_quant_i8_kernel(
         const int t = __float2int_rn(bf16_to_f32(ybuf[src]) * inv);
         qr[i] = (signed char)(t < -128 ? -128 : (t > 127 ? 127 : t));
     }
+    if (CHAIN) r4d_chain_done();
+}
+
+template <uint32_t THR>
+__global__ __launch_bounds__(THR) void gelu_mul_quant_i8_kernel(
+    const uint16_t* __restrict__ gu, signed char* __restrict__ q, float* __restrict__ S,
+    uint16_t* __restrict__ yo, uint32_t n, uint32_t gu_ld, uint32_t y_ld) {
+    gelu_mul_quant_i8_body<THR, false>(gu, q, S, yo, n, gu_ld, y_ld);
+}
+template <uint32_t THR>
+__global__ __launch_bounds__(THR) void r4dchain_gelu_mul_quant_i8(
+    const uint16_t* __restrict__ gu, signed char* __restrict__ q, float* __restrict__ S,
+    uint16_t* __restrict__ yo, uint32_t n, uint32_t gu_ld, uint32_t y_ld) {
+    gelu_mul_quant_i8_body<THR, true>(gu, q, S, yo, n, gu_ld, y_ld);
 }
 
 }  // namespace
@@ -79,13 +97,17 @@ extern "C" int r4d_rad_gelu_mul_quant_i8(const RadArgs* a, RadStream stream) {
     const size_t lds = (size_t)n * sizeof(uint16_t);
     if (lds > 60 * 1024) return R4D_NO(RAD_E_SHAPE);
     const int thr = r4d_act_threads((int)M, (int)n);
-#define R4D_GMQ_T(T) emit_rc = R4D_EMIT(stream, (gelu_mul_quant_i8_kernel<T>), dim3((uint32_t)M), dim3(T), lds, \
+    const bool chain = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;   /* RadKernelChainFn, decode */
+#define R4D_GMQ_C(T, C) R4D_EMIT(stream, (C ? r4dchain_gelu_mul_quant_i8<T> : gelu_mul_quant_i8_kernel<T>), \
+    dim3((uint32_t)M), dim3(T), lds, \
     (const uint16_t*)r4d_p(gu), (signed char*)r4d_wp(q), (float*)r4d_wp(s), (uint16_t*)r4d_wp(y),           \
     (uint32_t)n, (uint32_t)gp, (uint32_t)yp)
+#define R4D_GMQ_T(T) emit_rc = chain ? R4D_GMQ_C(T, true) : R4D_GMQ_C(T, false)
     if (thr == 1024)     R4D_GMQ_T(1024);
     else if (thr == 512) R4D_GMQ_T(512);
     else if (thr == 256) R4D_GMQ_T(256);
     else return R4D_NO(RAD_E_INVAL);
 #undef R4D_GMQ_T
+#undef R4D_GMQ_C
     return emit_rc;
 }

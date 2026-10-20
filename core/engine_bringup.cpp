@@ -1026,6 +1026,25 @@ int Engine::declare() {
                cfg_.n_spec > 0 ? "the depth the drafter in this container states as its operating point"
                                : "this container carries no draft head");
     }
+    /* Chained launches pay on some speculative steps and cost plain decode (4x R9700: the 31B
+     * with DFlash2 +13%, the 26B-A4B with DFlash +1%, Qwen3.8-27B with DFlash2 even; the 31B with
+     * no drafter -6.5%), so they are on by default only where the model's plugin measured a gain
+     * with its speculative drafter (RadArchProbe::chain_pays) and that drafter decodes
+     * speculatively. */
+    {
+        RadArchProbe pb{};
+        (void)rad_tools_probe(plugins_, meta_, &pb);
+        rad_dev_chain_infer(cfg_.n_spec > 0 && pb.chain_pays);
+        const char* e = std::getenv("RADIANCE_CHAIN");
+        const bool on = rad_dev_chain_enabled() != 0;
+        const char* why = e && *e && std::strcmp(e, "auto") != 0
+                              ? (on || *e == '0' ? "RADIANCE_CHAIN says so" : "the backend does not chain")
+                          : on ? "the model's plugin measured a gain with its speculative drafter"
+                               : "no drafter whose plugin measured a gain with them decodes "
+                                 "speculatively, or the backend does not chain";
+        RAD_INFO("chained launches: %s -- %s", on ? "on" : "off", why);
+        decide("RADIANCE_CHAIN", on ? "1" : "0", why);
+    }
     /* The audio encoder's pass: the plugin's longest clip, when the model file carries an audio
      * encoder (`radiance.encoder` names one) and the deployment is not text-only. */
     if (cfg_.mm_audio_frames < 0) {

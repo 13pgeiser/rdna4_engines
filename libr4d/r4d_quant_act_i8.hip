@@ -11,13 +11,17 @@
 #include "r4d_args.h"
 #include "r4d_emit.h"
 #include "r4d_common.h"
+#include "r4d_chain.h"
 #include <hip/hip_bf16.h>
 #include <cstdint>
 
-template <int THR>
-__global__ __launch_bounds__(THR) void r4d_quant_act_i8_kernel(
+/* CHAIN: the chained form's wait and add (r4d_chain.h) around the same body; no block returns
+ * early. */
+template <int THR, bool CHAIN = false>
+__device__ __forceinline__ void r4d_quant_act_i8_body(
     const __hip_bfloat16* __restrict__ A, signed char* __restrict__ Q, float* __restrict__ S,
     int K) {
+  if (CHAIN) r4d_chain_wait();
   const int row = blockIdx.x;
   const __hip_bfloat16* a = A + (size_t)row * K;
   signed char* q = Q + (size_t)row * K;
@@ -47,6 +51,20 @@ __global__ __launch_bounds__(THR) void r4d_quant_act_i8_kernel(
     const int t = __float2int_rn(v);
     q[i] = (signed char)(t < -128 ? -128 : (t > 127 ? 127 : t));
   }
+  if (CHAIN) r4d_chain_done();
+}
+
+template <int THR>
+__global__ __launch_bounds__(THR) void r4d_quant_act_i8_kernel(
+    const __hip_bfloat16* __restrict__ A, signed char* __restrict__ Q, float* __restrict__ S,
+    int K) {
+  r4d_quant_act_i8_body<THR, false>(A, Q, S, K);
+}
+template <int THR>
+__global__ __launch_bounds__(THR) void r4dchain_quant_act_i8(
+    const __hip_bfloat16* __restrict__ A, signed char* __restrict__ Q, float* __restrict__ S,
+    int K) {
+  r4d_quant_act_i8_body<THR, true>(A, Q, S, K);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -126,9 +144,15 @@ extern "C" int r4d_rad_quant_act_i8(const RadArgs* args, RadStream stream) {
   const int thr = r4d_act_threads((int)M, (int)K);   // the workgroup width, from M
 
   if (!as) {
-#define R4D_QAI8_LAUNCH(T) emit_rc = R4D_EMIT(stream, (r4d_quant_act_i8_kernel<T>),             \
-    dim3((int)M), dim3(T), 0, (const __hip_bfloat16*)r4d_p(x), (signed char*)r4d_wp(q),           \
-    (float*)r4d_wp(sc), (int)K)
+    /* The chained form where the row resolved with `chain`, at decode heights. */
+    const bool chain = r4d_geti_or(args, "chain", 0) != 0 && M <= 64;
+#define R4D_QAI8_LAUNCH(T) emit_rc = chain                                                       \
+    ? R4D_EMIT(stream, (r4dchain_quant_act_i8<T>), dim3((int)M), dim3(T), 0,                     \
+               (const __hip_bfloat16*)r4d_p(x), (signed char*)r4d_wp(q), (float*)r4d_wp(sc),       \
+               (int)K)                                                                           \
+    : R4D_EMIT(stream, (r4d_quant_act_i8_kernel<T>), dim3((int)M), dim3(T), 0,                   \
+               (const __hip_bfloat16*)r4d_p(x), (signed char*)r4d_wp(q), (float*)r4d_wp(sc),       \
+               (int)K)
     switch (thr) {
       case 128:  R4D_QAI8_LAUNCH(128);  break;
       case 256:  R4D_QAI8_LAUNCH(256);  break;

@@ -455,6 +455,7 @@ int Ctx::check_domain_layout(rad_op h, int domain, std::string* why) const {
             const int st = ki->layout ? ki->layout(ip.args.p, ip.args.n_p, opd, &w.enc, w.sel, t,
                                                    w.n_sel, &L)
                                       : RAD_E_UNSUPPORTED;
+            if (st == RAD_LAYOUT_ANY) continue;   /* reads the bytes as they lie (rad_abi.h) */
             const std::string tag = st == RAD_OK ? (L.tag && *L.tag ? L.tag : ki->name)
                                                  : std::string();
             if (st >= 0 || st == RAD_E_UNSUPPORTED) {

@@ -28,6 +28,7 @@
 // pass reads its own writes back.
 //
 // Returns a negative code instead of throwing, for the reason given in r4d_gemm_fp8a8.hip.
+#include "r4d_chain.h"
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_emit.h"
@@ -468,8 +469,11 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_i8_wide_kernel(
 //
 // tail[0] counts the transport blocks done, tail[1] the junction blocks done; both start at zero
 // (the counter allocation is zeroed at init) and the last junction block returns them there.
+// The body: transport blocks return after their part, so the chained form (r4d_chain.h) wraps
+// it below. The last junction block resets the tail counters inside the body, before the chained
+// form's add, so the next launch on the instance never sees them mid-reset.
 template <bool WF32, bool RES, bool POST, bool SCL, uint32_t EPT, int WS>
-__global__ __launch_bounds__(1024) void ar_rmsnorm_quant_i8_tail_kernel(
+__device__ __forceinline__ void ar_rmsnorm_quant_i8_tail_body(
     uint16_t* __restrict__ x, uint16_t* __restrict__ res, const void* __restrict__ w,
     const void* __restrict__ wp, const void* __restrict__ sc, uint32_t sc_f32,
     signed char* __restrict__ q, float* __restrict__ S, uint16_t* __restrict__ yo,
@@ -584,6 +588,31 @@ __global__ __launch_bounds__(1024) void ar_rmsnorm_quant_i8_tail_kernel(
         }
     }
 }
+
+#define R4D_ARQ8T_PARAMS uint16_t* __restrict__ x, uint16_t* __restrict__ res,                    \
+    const void* __restrict__ w, const void* __restrict__ wp, const void* __restrict__ sc,          \
+    uint32_t sc_f32, signed char* __restrict__ q, float* __restrict__ S,                           \
+    uint16_t* __restrict__ yo, R4DArWidePeers<int4, WS - 1> peers,                                 \
+    const int4* __restrict__ my_base, unsigned int* __restrict__ my_flags,                         \
+    unsigned int* __restrict__ seq_ctrs, unsigned int* __restrict__ tail, int M, uint32_t n,       \
+    float eps, float wadd, uint32_t r_ld, uint32_t y_ld, int slot_stride16, int rank, int nbt,     \
+    int drain, int acq, int pub, long long* gate, unsigned int* gate_ctr
+#define R4D_ARQ8T_ARGS x, res, w, wp, sc, sc_f32, q, S, yo, peers, my_base, my_flags, seq_ctrs, tail, \
+    M, n, eps, wadd, r_ld, y_ld, slot_stride16, rank, nbt, drain, acq, pub, gate, gate_ctr
+// The plain kernel, and the chained one (r4dchain*): its wait comes before anything, the sequence
+// take included, so a block of the next launch on the instance never starts ahead of this one's.
+template <bool WF32, bool RES, bool POST, bool SCL, uint32_t EPT, int WS>
+__global__ __launch_bounds__(1024) void ar_rmsnorm_quant_i8_tail_kernel(R4D_ARQ8T_PARAMS) {
+    ar_rmsnorm_quant_i8_tail_body<WF32, RES, POST, SCL, EPT, WS>(R4D_ARQ8T_ARGS);
+}
+template <bool WF32, bool RES, bool POST, bool SCL, uint32_t EPT, int WS>
+__global__ __launch_bounds__(1024) void r4dchain_ar_rmsnorm_quant_i8_tail(R4D_ARQ8T_PARAMS) {
+    r4d_chain_wait();
+    ar_rmsnorm_quant_i8_tail_body<WF32, RES, POST, SCL, EPT, WS>(R4D_ARQ8T_ARGS);
+    r4d_chain_done();
+}
+#undef R4D_ARQ8T_ARGS
+#undef R4D_ARQ8T_PARAMS
 
 }  // namespace
 
@@ -742,7 +771,7 @@ extern "C" int r4d_ar_rmsnorm_quant_i8_4rank(long peer_scratch0, long peer_scrat
                                              float eps, float wadd, int w_f32, int r_ld, int y_ld,
                                              int rank, long stream, int nblocks, int drain, int acq,
                                              int pub, long gate, long gate_ctr,
-                                             long tail_ctr, int tail_nbt) {
+                                             long tail_ctr, int tail_nbt, int chain) {
     constexpr int WS = 4, NPEERS = WS - 1;
     const long ps[NPEERS] = { peer_scratch0, peer_scratch1, peer_scratch2 };
     const long pf[NPEERS] = { peer_flags0, peer_flags1, peer_flags2 };
@@ -803,7 +832,8 @@ extern "C" int r4d_ar_rmsnorm_quant_i8_4rank(long peer_scratch0, long peer_scrat
             return -8;
         }
 #define R4D_ARQ8T_K(WF, RS, PO, SC, E)                                                            \
-        hipLaunchKernelGGL((ar_rmsnorm_quant_i8_tail_kernel<WF, RS, PO, SC, E, WS>),              \
+        hipLaunchKernelGGL((chain ? r4dchain_ar_rmsnorm_quant_i8_tail<WF, RS, PO, SC, E, WS>       \
+                                  : ar_rmsnorm_quant_i8_tail_kernel<WF, RS, PO, SC, E, WS>),      \
                            dim3((uint32_t)(tail_nbt + M)), dim3(1024), lds, (hipStream_t)stream,  \
                            (uint16_t*)x, (uint16_t*)res, (const void*)w, (const void*)wp,         \
                            (const void*)sc, (uint32_t)sc_f32, (signed char*)q, (float*)s,         \

@@ -764,6 +764,7 @@ static void attn_case(const Plugin& pl, const char* name, int64_t head_dim, int6
     run_case(r, ts, ps);
 }
 
+
 static void gemm_case(const Plugin& pl, const char* name, const char* dtype, int64_t M,
                       int64_t N, int64_t K, uint32_t adt, int need_ascale, int need_asum,
                       int need_bref, int64_t wbytes, int64_t sbytes) {
@@ -938,6 +939,102 @@ static void attn_oracle_one(const uint16_t* qh, const uint8_t* kv, int kv_is_fp8
     }
     const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
     for (int64_t d = 0; d < head_dim; ++d) out[d] *= inv;
+}
+
+/* kv_len_trim takes its trim from `tail`'s extent: a launch sees the op's ranged parameter at its
+ * band's upper bound (RadArgs.p), so `trim` here is 4096 while the issued count, and `tail`'s
+ * extent, is 1024. 90ede42 read the parameter, trimmed a 2048-key context to 0, and the attention
+ * over slice A's rows wrote nothing. */
+static void kv_len_trim_case(const Plugin& pl) {
+    const char* name = "kv_len_trim";
+    if (!sel(name)) return;
+    const RadKernelInfo* r = find(pl, name);
+    if (!r) { ok(name, false, "row absent"); return; }
+    const std::vector<int32_t> used = { 2048, 1500, 1024, 7 };
+    void* d_out = dalloc(16);
+    if (!d_out) { ok(name, false, "hipMalloc failed"); return; }
+    std::vector<RadTensor> ts = {
+        TI32({ 4 }, used),
+        TI32({ 1024 }, iota_i32(1024)),
+        T(d_out, RAD_I32, { 4 }),
+    };
+    std::vector<RadParam> ps = { PI("trim", 4096), PI("max_seqs", 4) };
+    run_case(r, ts, ps);
+    int32_t h[4] = { -1, -1, -1, -1 };
+    st_memcpy(h, d_out, sizeof h, hipMemcpyDeviceToHost);
+    const bool good = h[0] == 1024 && h[1] == 476 && h[2] == 0 && h[3] == 0;
+    ok("kv_len_trim: the trim is tail's extent, not the collapsed parameter", good,
+       good ? std::string() : "out " + std::to_string(h[0]) + " " + std::to_string(h[1]) + " " +
+                              std::to_string(h[2]) + " " + std::to_string(h[3]) +
+                              ", want 1024 476 0 0");
+}
+
+/* An attention over a slice of a step's rows against the whole step's (the 31B's prefill overlap,
+ * attention per slice): one sequence, `nt` query rows ending a context of `ctx`, run whole and as
+ * rows [0, cut) with seqused ctx - (T - cut) and rows [cut, nt) with seqused ctx. Every output
+ * byte must match, since each row attends to the same keys. Reports the first differing row. */
+static void attn_slice_case(const Plugin& pl, const char* name, int64_t head_dim, int64_t gqa,
+                            int64_t kv_heads, int64_t nt, int64_t cut, int64_t ctx, int window) {
+    if (!sel(name) && !sel("attn_slice")) return;
+    const RadKernelInfo* r = find(pl, name);
+    if (!r) { ok(name, false, "row absent"); return; }
+    const int64_t bs = 16, q_heads = kv_heads * gqa;
+    const int64_t blocks = (ctx + bs - 1) / bs;
+    const bool fp8 = std::strstr(name, "fp8kv") != nullptr;
+    const uint32_t kvdt = fp8 ? RAD_F8E4M3 : RAD_BF16;
+    const int64_t ew = fp8 ? 1 : 2;
+    const int64_t qn = nt * q_heads * head_dim, kvn = blocks * kv_heads * bs * 2 * head_dim;
+    std::vector<uint16_t> hq((size_t)qn);
+    for (int64_t i = 0; i < qn; ++i) hq[(size_t)i] = st_rand_bf16((uint32_t)i);
+    std::vector<uint8_t> hkv((size_t)(kvn * ew));
+    if (fp8) for (int64_t i = 0; i < kvn; ++i) hkv[(size_t)i] = st_rand_e4m3((uint32_t)i);
+    else     for (int64_t i = 0; i < kvn; ++i) ((uint16_t*)hkv.data())[i] = st_rand_bf16((uint32_t)i + 7u);
+    void* d_q = dalloc((size_t)qn * 2);
+    void* d_kv = dalloc((size_t)(kvn * ew));
+    void* d_ow = dalloc((size_t)qn * 2);
+    void* d_os = dalloc((size_t)qn * 2);
+    if (!d_q || !d_kv || !d_ow || !d_os) { ok(name, false, "hipMalloc failed"); return; }
+    st_memcpy(d_q, hq.data(), hq.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_kv, hkv.data(), hkv.size(), hipMemcpyHostToDevice);
+    auto run = [&](int64_t r0, int64_t n, int32_t used, void* out) {
+        std::vector<RadTensor> ts = {
+            T((char*)d_q + (size_t)(r0 * q_heads * head_dim * 2), RAD_BF16, { n, q_heads, head_dim }),
+            T(d_kv, kvdt, { blocks, kv_heads, bs, 2 * head_dim }),
+            TI32({ 1, blocks }, iota_i32(blocks)),
+            TI32({ 1 }, rep_i32(1, used)),
+            TF32({ 1, kv_heads }, 1.0f),
+            TF32({ 1, kv_heads }, 1.0f),
+            T(nullptr, RAD_I32, { 2 }),
+            T((char*)out + (size_t)(r0 * q_heads * head_dim * 2), RAD_BF16, { n, q_heads, head_dim }),
+        };
+        if (!fp8) { absent(ts[4]); absent(ts[5]); }
+        absent(ts[6]);
+        std::vector<RadParam> ps = {
+            PI("q_len", n), PI("head_dim", head_dim), PI("gqa", gqa), PI("block_size", bs),
+            PI("causal", 1), PI("window", window), PS("q_dtype", "bf16"),
+            PS("kv_dtype", fp8 ? "fp8_e4m3" : "bf16"),
+        };
+        run_case(r, ts, ps);
+    };
+    st_memset(d_ow, 0, (size_t)qn * 2);
+    st_memset(d_os, 0, (size_t)qn * 2);
+    run(0, nt, (int32_t)ctx, d_ow);
+    run(0, cut, (int32_t)(ctx - (nt - cut)), d_os);
+    run(cut, nt - cut, (int32_t)ctx, d_os);
+    std::vector<uint16_t> ow((size_t)qn), os((size_t)qn);
+    st_memcpy(ow.data(), d_ow, ow.size() * 2, hipMemcpyDeviceToHost);
+    st_memcpy(os.data(), d_os, os.size() * 2, hipMemcpyDeviceToHost);
+    int64_t first = -1, ndiff = 0;
+    const int64_t rowsz = q_heads * head_dim;
+    for (int64_t i = 0; i < qn; ++i)
+        if (ow[(size_t)i] != os[(size_t)i]) { if (first < 0) first = i / rowsz; ++ndiff; }
+    std::string why;
+    if (ndiff)
+        why = std::to_string((long long)ndiff) + " elements differ, first at row " +
+              std::to_string((long long)first);
+    ok((std::string(name) + ": a slice's rows equal the whole step's, T " + std::to_string((long long)nt) +
+        " cut " + std::to_string((long long)cut) + " ctx " + std::to_string((long long)ctx)).c_str(),
+       ndiff == 0, why);
 }
 
 /* Numeric attention check: fill q and the paged k/v with avalanche-random data, run the row, and
@@ -23954,6 +24051,23 @@ static void device_phase(const Plugin& pl) {
     embed_lookup_q_case(pl);
     lora_case(pl);
 
+    /* --- a weight read into the cache (prefetch): it runs, and takes any stored form --- */
+    if (sel("prefetch")) {
+        const RadKernelInfo* r = find(pl, "prefetch");
+        if (!r) {
+            ok("prefetch", false, "row absent");
+        } else {
+            void* d = dalloc((size_t)1 << 20);
+            std::vector<RadTensor> ts = { T(d, RAD_U8, { (int64_t)1 << 20 }) };
+            std::vector<RadParam> ps = { PI("bytes", (int64_t)1 << 20) };
+            run_case(r, ts, ps);
+            RadLayout L{};
+            const int st = r->layout ? r->layout(nullptr, 0, 0, nullptr, nullptr, nullptr, 0, &L) : 0;
+            ok("prefetch's layout hook takes any stored form (RAD_LAYOUT_ANY)", st == RAD_LAYOUT_ANY,
+               "returned " + std::to_string(st));
+        }
+    }
+
     /* --- the paged cache's write side --- */
     kv_store_case(pl, "kv_store_bf16", "bf16");
     kv_store_case(pl, "kv_store_bf16", "bf16", true);
@@ -23997,6 +24111,14 @@ static void device_phase(const Plugin& pl) {
     /* Gemma 4 dense global: head_dim 512, full attention, on the windowed kernel (one row for every
      * q_len): a prefill-shaped launch (q_len 32) and a decode one (1); numeric checks follow. */
     attn_case(pl, "attn_window_h512_gqa8_fp8kv",  512, 8, 32, "fp8_e4m3", 1);
+    /* The 31B's prefill overlap at tp 4: sliding h256 gqa 2 (4 kv heads a rank, window 1024) and
+     * global h512 gqa 8 (1 kv head), a 2048-row chunk cut at 1024, first chunk and a later one. */
+    kv_len_trim_case(pl);
+    for (const int64_t ctx : { (int64_t)2048, (int64_t)4096 }) {
+        attn_slice_case(pl, "attn_prefill_h256_gqa2_fp8kv", 256, 2, 4, 2048, 1024, ctx, 1024);
+        attn_slice_case(pl, "attn_qrow_h512_gqa8_fp8kv",   512, 8, 1, 2048, 1024, ctx, 0);
+        attn_slice_case(pl, "attn_window_h512_gqa8_fp8kv", 512, 8, 1, 2048, 1024, ctx, 0);
+    }
     attn_case(pl, "attn_window_h512_gqa8_bf16kv", 512, 8, 32, "bf16",     1);
     attn_case(pl, "attn_window_h512_gqa8_fp8kv",  512, 8,  1, "fp8_e4m3", 0);
     attn_case(pl, "attn_window_h512_gqa8_bf16kv", 512, 8,  1, "bf16",     0);

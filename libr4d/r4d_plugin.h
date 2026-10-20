@@ -469,7 +469,11 @@ int64_t r4d_rad_moe_gather_scratch (const RadArgs*);
 /* -- quantisation, norms and the fusions (r4d_*quant*.hip, r4d_qk_norm_rope_gate.hip) -- */
 int r4d_rad_quant_act_i8          (const RadArgs*, RadStream);
 int r4d_rad_qkv_norm_rope         (const RadArgs*, RadStream);
+int r4d_rad_kv_len_trim           (const RadArgs*, RadStream);
 int r4d_rad_add_rmsnorm           (const RadArgs*, RadStream);
+int r4d_rad_prefetch              (const RadArgs*, RadStream);
+int r4d_rad_layout_any(const RadParam*, int, int, const RadEncoding*, const int*,
+                       const RadTensor*, int, RadLayout*);
 int r4d_rad_qkv_norm_rope_kv_store(const RadArgs*, RadStream);
 int r4d_rad_gelu_mul_quant_i8     (const RadArgs*, RadStream);
 int r4d_rad_ar_rmsnorm_quant_i8   (const RadArgs*, RadStream);

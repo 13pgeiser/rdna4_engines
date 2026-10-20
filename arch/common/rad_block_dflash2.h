@@ -127,6 +127,9 @@ struct Dflash2 {
         /* The target's embedding scale, applied to the query block as the drafter was trained
          * (dflash_config.input_embedding_scale): 1 for Qwen, sqrt(hidden) in bf16 for Gemma. */
         double  escale   = 1.0;
+        /* Bytes of the next GEMM's weight read into the cache beside each all-reduce of the query
+         * pass (prefetch_beside, rad_arch.h); 0 reads none. */
+        int64_t prefetch = 0;
         int64_t steps() const { return block - 1; }
         int64_t ng(int64_t n_embd) const { return group ? n_embd / group : 0; }
         /* The kernel projection emits [2, taps, NG] per token (prepare's set, then finish's);
@@ -264,6 +267,13 @@ struct Dflash2 {
      * op_aan[i] after layer i-1's feed-forward (layer i's attention norm, i >= 1), op_afinal after
      * the last layer's (the final norm). All or none. */
     rad_op op_afn[MAX_LAYERS] = {}, op_aan[MAX_LAYERS] = {}, op_afinal = 0;
+    /* The reads beside the query pass's all-reduces (cfg.prefetch), each the GEMMs that follow
+     * in their order: beside the attention's, the feed-forward's coefficient projection, then
+     * gate_up; beside the feed-forward's, the next layer's attention coefficient projection, then
+     * its q -- after the last layer, the draft head; and o's beside the attention itself. 0 where
+     * none is declared. */
+    rad_op     op_pfa[MAX_LAYERS][2] = {}, op_pff[MAX_LAYERS][2] = {}, op_pfo[MAX_LAYERS] = {};
+    rad_weight pfa_w[MAX_LAYERS][2] = {}, pff_w[MAX_LAYERS][2] = {}, pfo_w[MAX_LAYERS] = {};
 
     /* head and selector */
     rad_op op_gather = 0, op_dquant = 0, op_dlogits = 0, op_dtopk = 0;
@@ -900,6 +910,22 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                    RAD_WEIGHTS(w_pred, w_succ)),
                {w.cand, w.unary, w.hp}, {w.tokens});
 
+    /* The reads beside the all-reduces, after every weight they read is declared. */
+    if (op_ar && cfg.prefetch > 0)
+        for (int64_t l = 0; l < g.n_layer; ++l) {
+            const int i = (int)l;
+            pfa_w[i][0] = w_fcp[i];
+            pfa_w[i][1] = w_gu[i].w;
+            pff_w[i][0] = l + 1 < g.n_layer ? w_acp[i + 1] : w_dh;
+            pff_w[i][1] = l + 1 < g.n_layer ? w_q[i + 1].w : 0;
+            for (int j = 0; j < 2; ++j) {
+                op_pfa[i][j] = decl_prefetch(b, pfa_w[i][j], cfg.prefetch);
+                op_pff[i][j] = decl_prefetch(b, pff_w[i][j], cfg.prefetch);
+            }
+            pfo_w[i]  = w_o[i].w;
+            op_pfo[i] = decl_prefetch(b, pfo_w[i], cfg.prefetch);
+        }
+
     return RAD_OK;
 }
 
@@ -989,6 +1015,7 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
                     RAD_W(w_k[i].w), RAD_W(w_k[i].s), brows(w.k, T), RAD_NONE, w_k[i].bref());
         RAD_ISSUE_N(c, op_vp[i], T, brows(w.h2q, T), brows(w.h2s, T),
                     RAD_W(w_v[i].w), RAD_W(w_v[i].s), brows(w.v, T), RAD_NONE, w_v[i].bref());
+        prefetch_beside(c, op_pfo[i], pfo_w[i], T);
         if (op_qkr[i]) {
             RAD_ISSUE_N(c, op_qkr[i], T, brows(w.q, T), brows(w.k, T), brows(w.v, T),
                         praw(batch->positions, RAD_I32, T), RAD_W(w_qn[i]), RAD_W(w_kn[i]),
@@ -1012,6 +1039,7 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
         RAD_ISSUE_N(c, op_qat, T, brows(w.attn, T), brows(w.atq, T), brows(w.ats, T));
         RAD_ISSUE_N(c, op_op[i], T, brows(w.atq, T), brows(w.ats, T),
                     RAD_W(w_o[i].w), RAD_W(w_o[i].s), brows(w.h, T), RAD_NONE, w_o[i].bref());
+        for (int j = 0; j < 2; ++j) prefetch_beside(c, op_pfa[i][j], pfa_w[i][j], T);
         /* Reduce before the closing convolution. It is linear with coefficients from the
          * replicated norm, so either order gives the same result; reducing first keeps x's
          * update agreed across ranks. */
@@ -1038,6 +1066,7 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
         }
         RAD_ISSUE_N(c, op_dn[i], T, brows(w.ffq, T), brows(w.ffs, T),
                     RAD_W(w_dn[i].w), RAD_W(w_dn[i].s), brows(w.h, T), RAD_NONE, w_dn[i].bref());
+        for (int j = 0; j < 2; ++j) prefetch_beside(c, op_pff[i][j], pff_w[i][j], T);
         if (op_ar) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
         RAD_ISSUE_N(c, op_fconv[i], T, brows(w.h, T), bcol(w.coef, half, half, T),
                     wrow_slice(w_fcb[i], 1, 1, cfg.taps * g.n_embd), brows(w.h2, T));

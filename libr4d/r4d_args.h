@@ -362,6 +362,8 @@ int  r4d_cfg_ar_tail(const RadArgs*);
 /* The four-rank exact one-shot's size, in elements, from which it takes the exact two-shot instead
  * (0: never); the all-reduce rows' `ts_min` axis. */
 long r4d_cfg_ar_ts_min(const RadArgs*);
+/* The prefetch's workgroup count (the row's `nb` axis). */
+int  r4d_cfg_prefetch_nb(const RadArgs*);
 void r4d_cfg_topk   (const RadArgs*, struct R4dTopkCfg*);
 void r4d_cfg_mv     (const RadArgs*, struct R4dMvCfg*);
 /* rmsnorm_quant_i8's decode form: 1 the row's operands in registers before the reductions, 0 the

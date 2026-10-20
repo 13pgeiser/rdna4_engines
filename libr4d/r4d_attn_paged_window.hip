@@ -42,6 +42,7 @@
 
 #include "r4d_plugin.h"
 #include "r4d_launch.h"
+#include "r4d_chain.h"
 #include "rad_plugin.h"
 
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__AMDGCN_WAVEFRONT_SIZE) && __AMDGCN_WAVEFRONT_SIZE != 32
@@ -232,8 +233,10 @@ __device__ void find_tile(const int* cu, int n_seq, int tile, int* s_scan, int* 
 }
 
 /* ------------------------------------------------------------------ the attention kernel */
+/* The body; attn_kernel and its chained form r4dchain_attn_window (r4d_chain.h) wrap it below,
+ * since its blocks return early. */
 template <int HD, int GQA, bool KV8>
-__global__ __launch_bounds__(kThreads) void attn_kernel(AttnArgs A) {
+__device__ __forceinline__ void attn_body(AttnArgs A) {
     constexpr int R = Geo<HD>::R, BK = Geo<HD>::BK, RW = R / kWaves, BQ = R / GQA;
     constexpr int NC = HD / 128;                     /* 4-element chunks a lane holds of a row */
     constexpr int ESZ = KV8 ? 1 : 2;
@@ -830,7 +833,7 @@ __global__ __launch_bounds__(kWThreads) void attn_wmma_kernel(AttnArgs A) {
  * (kMaxSplit is 64), so the row max and denominator are one wave reduction each. Then one sweep
  * over the splits that saw a key, four at a time, each lane accumulating its 4 * NC dims. */
 template <int HD, int GQA>
-__global__ __launch_bounds__(kThreads) void merge_kernel(AttnArgs A) {
+__device__ __forceinline__ void merge_body(AttnArgs A) {
     constexpr int R = Geo<HD>::R, NC = HD / 128;
     static_assert(kMaxSplit <= 64, "two splits a lane");
     const int tile = (int)blockIdx.x, kh = (int)blockIdx.y;
@@ -962,6 +965,25 @@ static constexpr int64_t part_bytes() {
 template <int HD>
 static constexpr int64_t scratch_need() {
     return part_bytes<HD>() + (int64_t)kTinfoMax * 2 * (int64_t)sizeof(int);
+}
+
+/* The plain kernels and their chained forms (r4dchain*, RadKernelChainFn): the chained ones wait
+ * for the kernels before them on the queue in their prologue and count themselves in at the end. */
+template <int HD, int GQA, bool KV8>
+__global__ __launch_bounds__(kThreads) void attn_kernel(AttnArgs A) { attn_body<HD, GQA, KV8>(A); }
+template <int HD, int GQA, bool KV8>
+__global__ __launch_bounds__(kThreads) void r4dchain_attn_window(AttnArgs A) {
+    r4d_chain_wait();
+    attn_body<HD, GQA, KV8>(A);
+    r4d_chain_done();
+}
+template <int HD, int GQA>
+__global__ __launch_bounds__(kThreads) void merge_kernel(AttnArgs A) { merge_body<HD, GQA>(A); }
+template <int HD, int GQA>
+__global__ __launch_bounds__(kThreads) void r4dchain_merge_window(AttnArgs A) {
+    r4d_chain_wait();
+    merge_body<HD, GQA>(A);
+    r4d_chain_done();
 }
 
 template <int HD, int GQA, bool KV8>
@@ -1134,11 +1156,23 @@ static int launch_attn(const RadArgs* a, RadStream stream) {
     A.n_split = (int)ns;
 
     hipStream_t s = (hipStream_t)stream;
-    R4D_KLAUNCH(R4D_KNAME(attn_kernel<HD, GQA, KV8>), dim3((unsigned)nt, (unsigned)kvh, (unsigned)ns),
-               dim3(kThreads), s, A);
-    if (ns > 1)
-        R4D_KLAUNCH(R4D_KNAME(merge_kernel<HD, GQA>), dim3((unsigned)nt, (unsigned)kvh), dim3(kThreads),
-                   s, A);
+    /* The chained forms where the row resolved with `chain` (a chainable row, RADIANCE_CHAIN), at
+     * decode heights only: the 31B's full layers at a verify. */
+    const bool chain = rad_args_geti_or(a, "chain", 0) != 0 && rows <= 64;
+    if (chain)
+        R4D_KLAUNCH(R4D_KNAME(r4dchain_attn_window<HD, GQA, KV8>),
+                   dim3((unsigned)nt, (unsigned)kvh, (unsigned)ns), dim3(kThreads), s, A);
+    else
+        R4D_KLAUNCH(R4D_KNAME(attn_kernel<HD, GQA, KV8>),
+                   dim3((unsigned)nt, (unsigned)kvh, (unsigned)ns), dim3(kThreads), s, A);
+    if (ns > 1) {
+        if (chain)
+            R4D_KLAUNCH(R4D_KNAME(r4dchain_merge_window<HD, GQA>), dim3((unsigned)nt, (unsigned)kvh),
+                       dim3(kThreads), s, A);
+        else
+            R4D_KLAUNCH(R4D_KNAME(merge_kernel<HD, GQA>), dim3((unsigned)nt, (unsigned)kvh),
+                       dim3(kThreads), s, A);
+    }
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 

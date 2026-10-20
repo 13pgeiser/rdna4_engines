@@ -42,6 +42,7 @@
 #include "r4d_gemm_args.h"
 #include "r4d_common.h"
 #include "r4d_gdn_wmma.h"
+#include "r4d_chain.h"
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <cstdint>
@@ -95,12 +96,15 @@ __device__ __forceinline__ v8i mmai(v2i a, v2i b, v8i c) {
 // limit, so the host checks WV*SK against the same expression.
 #define R4D_W4A8_BOUNDS(NPW) ((NPW) >= 8 ? 256 : ((NPW) >= 4 ? 512 : 1024))
 
-template <int MT, int NPW, bool NT, bool ASYM>
-__global__ __launch_bounds__(R4D_W4A8_BOUNDS(NPW)) void r4d_gemm_w4a8_nt_m64_kernel(
+// CHAIN brackets the body with the chained launch's wait and add (r4d_chain.h); every block runs
+// to the end. The two kernels below are the plain form and the chained one (r4dchain*).
+template <int MT, int NPW, bool NT, bool ASYM, bool CHAIN>
+__device__ __forceinline__ void r4d_gemm_w4a8_nt_m64_body(
     const signed char* __restrict__ A, const float* __restrict__ Ascale,
     const unsigned* __restrict__ Wq, const unsigned* __restrict__ Ws,
     const float* __restrict__ Asum, __hip_bfloat16* __restrict__ C,
     int M, int K, int N, int WV, int SK) {
+  if (CHAIN) r4d_chain_wait();
   extern __shared__ float red[];
   const int tid = threadIdx.x, wave = tid / WAVE32, lane = tid % WAVE32;
   const int col_local = wave / SK, ksplit = wave % SK;
@@ -252,11 +256,25 @@ __global__ __launch_bounds__(R4D_W4A8_BOUNDS(NPW)) void r4d_gemm_w4a8_nt_m64_ker
       if (n < N && m < M) C[(size_t)m * N + n] = (__hip_bfloat16)(v * Ascale[m] * 0.0625f);
     }
   }
+  if (CHAIN) r4d_chain_done();
 }
+
+#define R4D_W4A8_PARAMS const signed char* __restrict__ A, const float* __restrict__ Ascale, \
+    const unsigned* __restrict__ Wq, const unsigned* __restrict__ Ws,                        \
+    const float* __restrict__ Asum, __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK
+template <int MT, int NPW, bool NT, bool ASYM>
+__global__ __launch_bounds__(R4D_W4A8_BOUNDS(NPW)) void r4d_gemm_w4a8_nt_m64_kernel(R4D_W4A8_PARAMS) {
+  r4d_gemm_w4a8_nt_m64_body<MT, NPW, NT, ASYM, false>(A, Ascale, Wq, Ws, Asum, C, M, K, N, WV, SK);
+}
+template <int MT, int NPW, bool NT, bool ASYM>
+__global__ __launch_bounds__(R4D_W4A8_BOUNDS(NPW)) void r4dchain_gemm_w4a8_nt_m64(R4D_W4A8_PARAMS) {
+  r4d_gemm_w4a8_nt_m64_body<MT, NPW, NT, ASYM, true>(A, Ascale, Wq, Ws, Asum, C, M, K, N, WV, SK);
+}
+#undef R4D_W4A8_PARAMS
 
 static void r4d_gemm_w4a8_impl(long a, long ascale, long wq, long ws, long asum, long c,
                                int M, int K, int N, int WV, int SK, int MB, int NPW, int NT,
-                               bool asym, long stream) {
+                               bool asym, long stream, bool chain = false) {
   if (M < 1 || M > R4D_GEMM_W4A8_MAX_M)
     throw std::runtime_error("r4d gemm_w4a8_nt_m64: M out of range");
   if (N % 16) throw std::runtime_error("r4d gemm_w4a8_nt_m64: N must be a multiple of 16");
@@ -279,8 +297,11 @@ static void r4d_gemm_w4a8_impl(long a, long ascale, long wq, long ws, long asum,
   auto Up = (const float*)asum;
   auto Cp = (__hip_bfloat16*)c;
   hipStream_t st = (hipStream_t)stream;
-#define LAUNCH(MT, NP, TT, AS) hipLaunchKernelGGL((r4d_gemm_w4a8_nt_m64_kernel<MT, NP, TT, AS>), \
-    grid, block, smem, st, Ap, Sp, Wp, Zp, Up, Cp, M, K, N, WV, SK)
+#define LAUNCH(MT, NP, TT, AS) do { if (chain) \
+    hipLaunchKernelGGL((r4dchain_gemm_w4a8_nt_m64<MT, NP, TT, AS>), \
+    grid, block, smem, st, Ap, Sp, Wp, Zp, Up, Cp, M, K, N, WV, SK); else \
+    hipLaunchKernelGGL((r4d_gemm_w4a8_nt_m64_kernel<MT, NP, TT, AS>), \
+    grid, block, smem, st, Ap, Sp, Wp, Zp, Up, Cp, M, K, N, WV, SK); } while (0)
 #define LAUNCH_MB(NP, TT, AS) switch (MB) { \
     case 1: LAUNCH(1, NP, TT, AS); break; \
     case 2: LAUNCH(2, NP, TT, AS); break; \
@@ -340,20 +361,22 @@ extern "C" int r4d_rad_gemm_w4a8_m64(const RadArgs* a, RadStream s) {
     rc = cfg_for(a, g.K, g.M, group, BR_NPW, &c);
     if (rc != RAD_OK) return rc;
 
+    /* the engine's chained launch (RadKernelChainFn), at decode heights only */
+    const bool chain = r4d_geti_or(a, "chain", 0) != 0 && g.M <= 64;
     if (is_asym(a)) {
         if (!g.asum) return R4D_NO(RAD_E_INVAL);      /* the entry point throws "asum is required" */
         R4D_TRY("gemm_w4a8_asym_nt_m64",
-            r4d_gemm_w4a8_asym_nt_m64(r4d_addr(g.a), r4d_addr(g.ascale), r4d_addr(g.b),
-                                      r4d_addr(g.bscale), r4d_addr(g.asum), r4d_addr(g.y),
-                                      (int)g.M, (int)g.K, (int)g.N, c.wv, c.sk, c.mb, c.npw,
-                                      c.nt, (long)(uintptr_t)s));
+            r4d_gemm_w4a8_impl(r4d_addr(g.a), r4d_addr(g.ascale), r4d_addr(g.b),
+                               r4d_addr(g.bscale), r4d_addr(g.asum), r4d_addr(g.y),
+                               (int)g.M, (int)g.K, (int)g.N, c.wv, c.sk, c.mb, c.npw,
+                               c.nt, true, (long)(uintptr_t)s, chain));
         return RAD_OK;
     }
     R4D_TRY("gemm_w4a8_nt_m64",
-        r4d_gemm_w4a8_nt_m64(r4d_addr(g.a), r4d_addr(g.ascale), r4d_addr(g.b),
-                             r4d_addr(g.bscale), r4d_addr(g.y),
-                             (int)g.M, (int)g.K, (int)g.N, c.wv, c.sk, c.mb, c.npw, c.nt,
-                             (long)(uintptr_t)s));
+        r4d_gemm_w4a8_impl(r4d_addr(g.a), r4d_addr(g.ascale), r4d_addr(g.b),
+                           r4d_addr(g.bscale), 0, r4d_addr(g.y),
+                           (int)g.M, (int)g.K, (int)g.N, c.wv, c.sk, c.mb, c.npw, c.nt,
+                           false, (long)(uintptr_t)s, chain));
     return RAD_OK;
 }
 

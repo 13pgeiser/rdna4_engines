@@ -286,6 +286,13 @@ struct Gemma4Attn {
      * the copies of k and v too, ahead of the unfused prologue, which reads them dense. */
     rad_op op_attn_row = 0, op_attn_dec = 0, op_lift_q = 0, op_lift_k = 0, op_lift_v = 0;
     int64_t dec_hi = 0;
+    /* the feed-forward's gate_up read into the cache beside this block's all-reduce, or 0 (see
+     * "Prefetch beside the reductions") */
+    rad_op     op_pf = 0;
+    rad_weight pf_w  = 0;
+    /* the feed-forward's down_proj read into the cache beside the attention itself, or 0 */
+    rad_op     op_pfd = 0;
+    rad_weight pfd_w  = 0;
 
     /* The linear whose int8 pair a junction writes, and whether every projection reads it. */
     const G4Linear& ln_in() const { return fused ? ln_qkv : ln_q; }
@@ -306,6 +313,13 @@ struct Gemma4Attn {
     void project(RadCtx* c, int64_t r0, int64_t n) const;
     void attend(RadCtx* c, const RadBatch* batch) const;
     void out_proj(RadCtx* c, int64_t r0, int64_t n) const;
+    /* The prologue and the attention over rows [r0, r0 + n) of a one-sequence step alone (the
+     * prefill overlap's slices), `used` the context the slice ends at (kv_len_trim for a slice
+     * that ends before the step does). Only with the one-launch prologue and a prefill-height
+     * attention that reads q dense or in the row (slicable). */
+    bool slicable() const { return op_qnr_kv && (op_attn_row || op_attn); }
+    void attend_rows(RadCtx* c, const RadBatch* batch, int64_t r0, int64_t n,
+                     RadOperand used) const;
 };
 
 int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const ClassGeom& cgeo,
@@ -575,6 +589,22 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
     return RAD_OK;
 }
 
+/* ---- Prefetch beside the reductions (prefetch_beside, rad_arch.h). The all-reduce in front of
+ * each GEMM leaves the card's memory idle for its round trip (~20 us at a DFlash2 verify's rows on
+ * 4x R9700), so the trunk reads the next GEMM's leading bytes in that window -- gate_up's after
+ * o_proj, the next layer's q|k|v after down_proj -- and the GEMM finds them in the 64 MB on-die
+ * cache. The attention leaves it mostly idle too at a verify's few rows and a chat's context, so
+ * down_proj's weight is read beside it, after q|k|v. On four cards (a microbenchmark of the
+ * two-shot and a GEMM-like stream of a cold 29 MB weight) 16 MB read beside the reduction took a
+ * layer from 84.0 us to 70.1; read on the same lane it gained nothing. */
+
+/* The height prefetch_beside judges a trunk step by: its rows on a decode step (decode and verify
+ * rows only), and none at all on one that carries a prompt's rows (rad_arch.h, kPrefetchRows): the
+ * row ceiling keeps long prefills out, and this keeps out the short ones it would let in. */
+static int64_t prefetch_height(const RadBatch* batch) {
+    return batch->phase == RAD_PHASE_DECODE ? batch->n_tok : INT64_MAX;
+}
+
 void Gemma4Attn::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool tail_fused,
                       bool ar_fused) const {
     const int64_t T = batch->n_tok;
@@ -593,9 +623,11 @@ void Gemma4Attn::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool ta
         ln_k.step(c, w.h, w.k, T);
         if (cls.has_v) ln_v.step(c, w.h, w.v, T);
     }
+    prefetch_beside(c, op_pfd, pfd_w, prefetch_height(batch));
     attend(c, batch);
 
     ln_o.step(c, w.attn, w.h, T);
+    prefetch_beside(c, op_pf, pf_w, prefetch_height(batch));
     /* The all-reduce comes before the post-norm: o_proj is column-sharded, so each rank holds a
      * partial sum, and the norm is of the whole output (sum_r rmsnorm(p_r) != rmsnorm(sum_r p_r)). */
     if (op_ar && !(tail_fused && ar_fused)) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
@@ -676,6 +708,37 @@ void Gemma4Attn::attend(RadCtx* c, const RadBatch* batch) const {
                 brows(w.attn, T));
 }
 
+/* A slice's rows see exactly the keys they see in the whole step: the cache holds the step's
+ * earlier rows (the slices run in order, each storing its own keys first), `used` ends the context
+ * at the slice's last row, the kernel counts each row's position back from there, and the key
+ * tiles start at the sequence's first key in both cases. The prologue is a row at a time. */
+void Gemma4Attn::attend_rows(RadCtx* c, const RadBatch* batch, int64_t r0, int64_t n,
+                             RadOperand used) const {
+    const RadKVGroupBatch* kvb = kv_batch(batch, kv);
+    const int32_t* slot  = kvb ? kvb->slot_mapping : nullptr;
+    const int32_t* table = kvb ? kvb->block_table  : nullptr;
+    const int64_t qd = cls.q_dim(), kvd = cls.kv_dim();
+    const int64_t qkvd = qd + kvd + (cls.has_v ? kvd : 0);
+    const bool row = fused && op_qnr;
+    const RadOperand Q = row ? bcol_at(w.qkv, r0, qkvd, 0, qd, n) : brow_slice(w.q, r0, n, qd);
+    const RadOperand K = row ? bcol_at(w.qkv, r0, qkvd, qd, kvd, n) : brow_slice(w.k, r0, n, kvd);
+    const RadOperand V = row && cls.has_v ? bcol_at(w.qkv, r0, qkvd, qd + kvd, kvd, n)
+                                          : brow_slice(w.v, r0, n, kvd);
+    RAD_ISSUE_N(c, op_qnr_kv, n, Q, K, V, praw(batch->positions + r0, RAD_I32, n), RAD_W(w_qn),
+                RAD_W(w_kn), praw(slot ? slot + r0 : nullptr, RAD_I32, n), kv_cache(kv, layer));
+    rad_op a_op = op_attn;
+    RadOperand a_q = brow_slice(w.q, r0, n, qd);
+    if (op_attn_row) {
+        a_op = op_attn_row;
+        a_q  = Q;
+    } else if (row) {
+        RAD_ISSUE_N(c, op_lift_q, n, Q, a_q);
+    }
+    RAD_ISSUE_N(c, a_op, n, a_q, kv_cache(kv, layer),
+                praw2(table, RAD_I32, 1, kvb ? kvb->block_table_pitch : 0), used,
+                RAD_NONE, RAD_NONE, RAD_NONE, brow_slice(w.attn, r0, n, qd));
+}
+
 /* ---- the feed-forward: GELU (not SwiGLU), with a second norm on the down-projection output. */
 struct Gemma4Mlp {
     struct Wire { rad_buf x = 0, h = 0, gu = 0, ffn = 0; };
@@ -688,6 +751,10 @@ struct Gemma4Mlp {
     rad_op op_norm = 0, op_act = 0, op_post = 0, op_ar = 0, op_add = 0;
     /* gelu_mul and down's quantiser as one, where it resolves (libr4d `gelu_mul_quant_i8`) */
     rad_op op_gq = 0;
+    /* the next layer's q|k|v read into the cache beside this block's all-reduce, or 0 (see
+     * "Prefetch beside the reductions") */
+    rad_op     op_pf = 0;
+    rad_weight pf_w  = 0;
 
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Wire& wire, const char* pre);
     void step(RadCtx* c, const RadBatch* batch, bool entry_done = false, bool tail_fused = false,
@@ -791,6 +858,7 @@ void Gemma4Mlp::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool tai
         RAD_ISSUE(c, op_act,   brows(w.gu, T),  brows(w.ffn, T));
         ln_down.step(c, w.ffn, w.h, T);
     }
+    prefetch_beside(c, op_pf, pf_w, prefetch_height(batch));
     /* The all-reduce before the post-norm, as in the attention block: down_proj is column-sharded. */
     if (op_ar && !(tail_fused && ar_fused)) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
     if (tail_fused) return;
@@ -1362,6 +1430,17 @@ struct Layer {
     G4Junction j_am{}, j_ma{};
     /* the DFlash drafter's tap: this layer's output into its column slice of `dflash_src` */
     rad_op     op_tap = 0;
+    /* The prefill overlap's reductions (trunk_overlap): attn.op_ar and mlp.op_ar at `overlap` 1,
+     * the narrow launch that leaves the CUs to the other slice's compute; 0 where not declared. */
+    rad_op     op_ar_att_ov = 0, op_ar_ff_ov = 0;
+};
+
+/* The prefill overlap's attention per slice (trunk_overlap): slice A's context end, one
+ * kv_len_trim a KV group the attention reads. */
+struct SliceTrim {
+    rad_kvgroup kv = 0;
+    rad_op      op = 0;
+    rad_buf     used = 0;   /* [max_seqs] int32 */
 };
 
 struct Model {
@@ -1417,6 +1496,10 @@ struct Model {
     Dflash2         df2{};
     Dflash2::Wire   df2w{};
     bool            have_df2 = false;
+    /* The prefill overlap runs attention per slice: a trim a KV group (sliding, global). */
+    SliceTrim       trim[2]{};
+    int             n_trim = 0;
+    bool            slice_attn = false;
 };
 
 static Model g_model[MAX_RANKS];
@@ -1483,6 +1566,7 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
     dc.group    = df2_geti(meta, "conv_group_size", 16);
     dc.sel_rank = df2_geti(meta, "selector_rank", 0);
     dc.sel_topk = df2_geti(meta, "selector_top_k", 0);
+    dc.prefetch = gemma4::kPrefetchBytes;
     if (dc.sel_rank <= 0 || dc.sel_topk <= 0) {
         fprintf(stderr, "radiance: gemma4: the DFlash2 drafter states no selector geometry (rank "
                         "%lld, top_k %lld)\n", (long long)dc.sel_rank, (long long)dc.sel_topk);
@@ -1881,6 +1965,32 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.ar_rows = ar ? rows : 0;
     }
 
+    /* ---- prefetch beside the reductions (see prefetch_beside): gate_up's first 20 MB beside the
+     * attention block's all-reduce and the next layer's q|k|v's (q alone, unfused; after the last
+     * layer, the lm_head's) beside the feed-forward's (gemma4::kPrefetchBytes), then down_proj's
+     * first 9 MB beside the attention (gemma4::kPrefetchDownBytes). Only at more than one rank,
+     * where there are reductions to sit beside. RADIANCE_PREFETCH=0 declares none
+     * (decl_prefetch). */
+    if (g.world > 1 && rad_op_declared(b, "prefetch")) {
+        for (size_t l = 0; l < m.layers.size(); ++l) {
+            Layer& lay = m.layers[l];
+            lay.attn.pf_w  = lay.mlp.ln_gu.w;
+            lay.attn.op_pf = decl_prefetch(b, lay.attn.pf_w, gemma4::kPrefetchBytes);
+            /* after the last layer the lm_head is the next weight streamed */
+            if (l + 1 < m.layers.size()) {
+                const Gemma4Attn& nx = m.layers[l + 1].attn;
+                lay.mlp.pf_w = nx.fused ? nx.ln_qkv.w : nx.ln_q.w;
+            } else {
+                lay.mlp.pf_w = m.w_lm;
+            }
+            lay.mlp.op_pf = decl_prefetch(b, lay.mlp.pf_w, gemma4::kPrefetchBytes);
+        }
+        for (Layer& lay : m.layers) {
+            lay.attn.pfd_w  = lay.mlp.ln_down.w;
+            lay.attn.op_pfd = decl_prefetch(b, lay.attn.pfd_w, gemma4::kPrefetchDownBytes);
+        }
+    }
+
     /* ---- the prefill overlap (trunk_overlap). It needs a reduction to hide, every junction fused
      * (the slices issue only the fused forms), and the exact wire, the one shown to give a slice
      * the bits it gives the whole. The buffer the second lane reduces in place is taken out of the
@@ -1892,6 +2002,64 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     for (const Layer& lay : m.layers)
         m.overlap = m.overlap && lay.attn.op_ar && lay.mlp.op_ar;
     if (m.overlap) RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_h));
+    /* The reductions the overlap runs on lane 1 are their own ops at `overlap` 1. Declared like
+     * op_ar, they resolve to the wide launch: the exact two-shot over every word of a 512- to
+     * 1024-row slice takes nb_for_shard's ceiling, 24 blocks of 1024 threads, each a whole CU
+     * spinning on a peer flag for the ~1 ms the link takes -- a third of the card held away from
+     * the other slice's GEMMs. At `overlap` 1 the row is ar_twoshot_4rank_exact_lane: the same
+     * entry and the same fold per word (the block count moves no byte), four blocks by default
+     * (tArTs4Lane). Its range starts at a slice, which is above every one-shot band. */
+    if (m.overlap) {
+        auto lane_ar = [&]() {
+            return rw(b, RAD_OP(b, "all_reduce",
+                         RAD_PARAMS(RAD_INT("world_size", g.world),
+                                    RAD_RANGE("numel", kOverlapRows * g.n_embd,
+                                              g.max_tok * g.n_embd),
+                                    RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
+                                    RAD_INT("min_bytes", g.wire_min_bytes),
+                                    RAD_INT("overlap", 1)),
+                         RAD_NOWEIGHTS),
+                      {m.b_h}, {m.b_h});
+        };
+        for (Layer& lay : m.layers) {
+            lay.op_ar_att_ov = lane_ar();
+            lay.op_ar_ff_ov  = lane_ar();
+        }
+    }
+    /* ...and with attention per slice. Run whole between the slices, a layer's attention leaves
+     * slice A's attention-side reduction only slice B's o_proj to hide behind, and slice B's
+     * feed-forward reduction only slice A's junction and q|k|v. Per slice (A's projection,
+     * prologue, attention and o_proj, then B's), each of the four reductions sits beside a whole
+     * block: on 4x R9700 the exact two-shot of a 1024-row slice takes ~1.05 ms alone and ~1.4x
+     * that beside any card-filling compute (a four-card microbenchmark, 2026-10-18). Slice A's
+     * attention reads its context end from kv_len_trim, one a KV group. A one-sequence step only
+     * (the slices' rows are then one sequence's), with the one-launch prologue and no
+     * multi-component rotary. Byte-identical: every greedy reply matches the whole attention's
+     * (4x R9700, two rounds, and 16 of 16 fresh starts on a 5310-token prompt); prefill +5%. */
+    if (m.overlap) {
+        bool ok = !g.rope_mc && rad_op_declared(b, "kv_len_trim");
+        for (const Layer& lay : m.layers) ok = ok && lay.attn.slicable();
+        for (const Layer& lay : m.layers) {
+            if (!ok) break;
+            int i = 0;
+            while (i < m.n_trim && m.trim[i].kv != lay.attn.kv) ++i;
+            if (i < m.n_trim) continue;
+            if (m.n_trim == 2) { ok = false; break; }
+            SliceTrim& t = m.trim[m.n_trim];
+            t.kv = lay.attn.kv;
+            t.used = decl_b(b, nm.f("slice_used_%d", m.n_trim), RAD_I32, {g.max_seqs});
+            ok = t.used && rad_buf_concurrent(b, t.used) == RAD_OK;
+            t.op = ok ? rw(b, RAD_OP(b, "kv_len_trim",
+                                RAD_PARAMS(RAD_RANGE("trim", 1, g.max_tok),
+                                           RAD_INT("max_seqs", g.max_seqs)),
+                                RAD_NOWEIGHTS),
+                           {}, {t.used})
+                      : 0;
+            ok = ok && t.op;
+            ++m.n_trim;
+        }
+        m.slice_attn = ok && m.n_trim > 0;
+    }
 
     /* ---- the tail: final norm, the sampled rows, the lm_head, and the soft-cap. */
     m.op_final = rw(b, RAD_OP(b, "rmsnorm",
@@ -2088,6 +2256,60 @@ static void trunk_overlap(RadCtx* c, const Model& m, const RadBatch* batch, int6
 
     m.j0.step(c, T);
     const size_t L = m.layers.size();
+    if (m.slice_attn && batch->n_seq == 1) {
+        /* Attention per slice (see Model::slice_attn): slice A's context end first, then each
+         * layer as A's attention block, B's beside A's attention-side reduction, A's feed-forward
+         * beside B's, B's feed-forward beside A's, and the next layer's A block beside B's. Each
+         * join is issued before the reduction it must not wait for, so it orders lane 0 behind
+         * exactly the ones issued so far; lane 1 always reduces rows of `h` lane 0 is not
+         * touching. */
+        auto used_of = [&](rad_kvgroup kv, bool slice_a) -> RadOperand {
+            if (slice_a)
+                for (int i = 0; i < m.n_trim; ++i)
+                    if (m.trim[i].kv == kv) return brows(m.trim[i].used, 1);
+            const RadKVGroupBatch* kvb = kv_batch(batch, kv);
+            return praw(kvb ? kvb->seqused : nullptr, RAD_I32, 1);
+        };
+        for (int i = 0; i < m.n_trim; ++i) {
+            const RadKVGroupBatch* kvb = kv_batch(batch, m.trim[i].kv);
+            /* the trim is `tail`'s extent, slice B's rows: a launch reads its ranged parameter
+             * as the band's upper bound, not as bn */
+            RAD_ISSUE_N(c, m.trim[i].op, bn, praw(kvb ? kvb->seqused : nullptr, RAD_I32, 1),
+                        praw(batch->positions + b0, RAD_I32, bn), brows(m.trim[i].used, 1));
+        }
+        for (size_t li = 0; li < L; ++li) {
+            const Layer& y = m.layers[li];
+            const rad_op ar_att = y.op_ar_att_ov ? y.op_ar_att_ov : y.attn.op_ar;
+            const rad_op ar_ff  = y.op_ar_ff_ov ? y.op_ar_ff_ov : y.mlp.op_ar;
+            if (li > 0) join_ff(li - 1, a0, an);     /* its reduction was waited for below */
+            y.attn.project(c, a0, an);
+            y.attn.attend_rows(c, batch, a0, an, used_of(y.attn.kv, true));
+            y.attn.out_proj(c, a0, an);
+            if (li > 0) join_back();                 /* the last layer's feed-forward, slice B */
+            reduce(ar_att, a0, an);
+            if (li > 0) join_ff(li - 1, b0, bn);
+            y.attn.project(c, b0, bn);
+            y.attn.attend_rows(c, batch, b0, bn, used_of(y.attn.kv, false));
+            y.attn.out_proj(c, b0, bn);
+            join_back();                             /* attention, slice A */
+            reduce(ar_att, b0, bn);
+            y.j_am.step_rows(c, E, a0, an);
+            y.mlp.arm(c, a0, an);
+            join_back();                             /* attention, slice B */
+            reduce(ar_ff, a0, an);
+            y.j_am.step_rows(c, E, b0, bn);
+            y.mlp.arm(c, b0, bn);
+            join_back();                             /* the feed-forward, slice A */
+            reduce(ar_ff, b0, bn);
+        }
+        join_ff(L - 1, a0, an);
+        join_back();                                 /* the last feed-forward, slice B */
+        join_ff(L - 1, b0, bn);
+        if (!lanes_ok)
+            rad_step_fail(c, "gemma4_bf16: the prefill overlap could not order its second lane "
+                             "against the first");
+        return;
+    }
     for (size_t li = 0; li < L; ++li) {
         const Layer& y = m.layers[li];
         if (li == 0) {
@@ -2101,19 +2323,21 @@ static void trunk_overlap(RadCtx* c, const Model& m, const RadBatch* batch, int6
             y.attn.project(c, b0, bn);
         }
         y.attn.attend(c, batch);
+        const rad_op ar_att = y.op_ar_att_ov ? y.op_ar_att_ov : y.attn.op_ar;
+        const rad_op ar_ff  = y.op_ar_ff_ov ? y.op_ar_ff_ov : y.mlp.op_ar;
         y.attn.out_proj(c, a0, an);
-        reduce(y.attn.op_ar, a0, an);
+        reduce(ar_att, a0, an);
         y.attn.out_proj(c, b0, bn);
         join_back();                         /* attention, slice A */
-        reduce(y.attn.op_ar, b0, bn);
+        reduce(ar_att, b0, bn);
         y.j_am.step_rows(c, E, a0, an);
         y.mlp.arm(c, a0, an);
         join_back();                         /* attention, slice B */
-        reduce(y.mlp.op_ar, a0, an);
+        reduce(ar_ff, a0, an);
         y.j_am.step_rows(c, E, b0, bn);
         y.mlp.arm(c, b0, bn);
         join_back();                         /* the feed-forward, slice A */
-        reduce(y.mlp.op_ar, b0, bn);
+        reduce(ar_ff, b0, bn);
     }
     join_ff(L - 1, a0, an);
     join_back();                             /* the last feed-forward, slice B */

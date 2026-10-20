@@ -20,6 +20,7 @@
 // the peer arrays.
 #include "r4d.h"
 #include "r4d_ar_wide.h"
+#include "r4d_chain.h"
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -40,7 +41,7 @@ extern "C" void r4d_ar_gather_4rank(long peer_scratch0, long peer_scratch1, long
                                     long slot_stride16, long inp, long out, long n_elem,
                                     long dtype, long rank, long row_elems, long stream,
                                     long nblocks, long nthreads, long drain, long acq, long pub,
-                                    long gate, long gate_ctr, long dpitch, long spitch);
+                                    long gate, long gate_ctr, long dpitch, long spitch, long chain);
 extern "C" void r4d_ar_gather_8rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                                     long peer_scratch3, long peer_scratch4, long peer_scratch5,
                                     long peer_scratch6, long peer_flags0, long peer_flags1,
@@ -70,8 +71,11 @@ __device__ __forceinline__ int r4d_g_src_ws(int k, int row16, int n16, int sp16)
 
 // Block b owns words [start,end) of the 16B-word space and drives its own handshake; no cross-block
 // sync, as in the all-reduce.
+// The body; the plain kernel and its chained form (r4d_chain.h) wrap it below. The chained form
+// waits before the sequence take, so a block of the next launch on the instance never starts
+// ahead of this one's; no block returns early.
 template <int WS>
-__global__ void r4d_ar_gather_wide_kernel(
+__device__ __forceinline__ void r4d_ar_gather_wide_body(
     const int4* __restrict__ in4, R4DArWidePeers<int4, WS - 1> peers,
     const int4* __restrict__ my_base, int4* __restrict__ out4,
     unsigned int* __restrict__ my_flags, unsigned int* __restrict__ seq_ctrs,
@@ -156,6 +160,28 @@ __global__ void r4d_ar_gather_wide_kernel(
     }
   }
 }
+template <int WS>
+__global__ void r4d_ar_gather_wide_kernel(
+    const int4* __restrict__ in4, R4DArWidePeers<int4, WS - 1> peers,
+    const int4* __restrict__ my_base, int4* __restrict__ out4,
+    unsigned int* __restrict__ my_flags, unsigned int* __restrict__ seq_ctrs,
+    int n16, int slot_stride16, int rank, int row16, int dp16, int sp16, int drain, int acq,
+    int pub, long long* gate, unsigned int* gate_ctr) {
+    r4d_ar_gather_wide_body<WS>(in4, peers, my_base, out4, my_flags, seq_ctrs, n16, slot_stride16,
+                                rank, row16, dp16, sp16, drain, acq, pub, gate, gate_ctr);
+}
+template <int WS>
+__global__ void r4dchain_ar_gather_wide(
+    const int4* __restrict__ in4, R4DArWidePeers<int4, WS - 1> peers,
+    const int4* __restrict__ my_base, int4* __restrict__ out4,
+    unsigned int* __restrict__ my_flags, unsigned int* __restrict__ seq_ctrs,
+    int n16, int slot_stride16, int rank, int row16, int dp16, int sp16, int drain, int acq,
+    int pub, long long* gate, unsigned int* gate_ctr) {
+    r4d_chain_wait();
+    r4d_ar_gather_wide_body<WS>(in4, peers, my_base, out4, my_flags, seq_ctrs, n16, slot_stride16,
+                                rank, row16, dp16, sp16, drain, acq, pub, gate, gate_ctr);
+    r4d_chain_done();
+}
 
 // --- host side ---
 // `row_elems` is the row width in elements, 0 for plain concatenation. The entry point checks it
@@ -165,7 +191,8 @@ static void ar_gather_wide_launch(const long* peer_scratch, const long* peer_fla
                                   long my_flags, long seq_ctrs, long slot_stride16, long inp,
                                   long out, long n_elem, long dtype, long rank, long row_elems,
                                   long stream_i, long nblocks, long nthreads, long drain, long acq,
-                                  long pub, long gate, long gate_ctr, long dpitch, long spitch) {
+                                  long pub, long gate, long gate_ctr, long dpitch, long spitch,
+                                  bool chain = false) {
   constexpr int NPEERS = WS - 1;
   static_assert(NPEERS <= R4D_AR_WIDE_MAX_PEERS, "npeers exceeds the peer bundle bound");
 
@@ -236,7 +263,7 @@ static void ar_gather_wide_launch(const long* peer_scratch, const long* peer_fla
   }
 
   hipStream_t st = (hipStream_t)stream_i;
-  r4d_ar_gather_wide_kernel<WS><<<nb, nt, 0, st>>>(
+  (chain ? r4dchain_ar_gather_wide<WS> : r4d_ar_gather_wide_kernel<WS>)<<<nb, nt, 0, st>>>(
       (const int4*)inp, peers, (const int4*)my_scratch, (int4*)out, (unsigned int*)my_flags,
       (unsigned int*)seq_ctrs, n16, (int)slot_stride16, (int)rank, row16, dp16, sp16, (int)drain,
       (int)acq, (int)pub, (long long*)gate, (unsigned int*)gate_ctr);
@@ -262,12 +289,12 @@ void r4d_ar_gather_4rank(long peer_scratch0, long peer_scratch1, long peer_scrat
                          long my_flags, long seq_ctrs, long slot_stride16, long inp, long out,
                          long n_elem, long dtype, long rank, long row_elems, long stream,
                          long nblocks, long nthreads, long drain, long acq, long pub, long gate,
-                         long gate_ctr, long dpitch, long spitch) {
+                         long gate_ctr, long dpitch, long spitch, long chain) {
   const long ps[3] = {peer_scratch0, peer_scratch1, peer_scratch2};
   const long pf[3] = {peer_flags0, peer_flags1, peer_flags2};
   ar_gather_wide_launch<4>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, inp, out, n_elem,
                            dtype, rank, row_elems, stream, nblocks, nthreads, drain, acq, pub,
-                           gate, gate_ctr, dpitch, spitch);
+                           gate, gate_ctr, dpitch, spitch, chain != 0);
 }
 
 void r4d_ar_gather_8rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,

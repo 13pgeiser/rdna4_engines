@@ -3515,15 +3515,19 @@ static std::vector<std::string> gemma4_w4_step(const std::set<std::string>& refu
 
 /* At two ranks the all-reduce before each junction is folded into it; only the embedding's and
  * the last feed-forward's (which feeds the final norm, not a quantiser) remain standalone. Without
- * the fused collective, junctions keep their preceding all-reduces. */
+ * the fused collective, junctions keep their preceding all-reduces. Beside each reduction a
+ * prefetch of the next GEMM's weight (the lm_head after the last), and down_proj's beside the
+ * attention (prefetch_beside). */
 TEST(a_gemma4_w4a8_step_at_two_ranks_folds_the_all_reduce_into_the_junction) {
     std::vector<std::string> want = { "embed_lookup", "all_reduce", "rmsnorm_quant_i8" };
     for (int l = 0; l < 12; ++l) {
         const bool global = (l + 1) % 6 == 0;
         for (int i = 0; i < (global ? 2 : 3); ++i) want.push_back("gemm_nt_q");
-        for (const char* s : { "qkv_norm_rope_kv_store", "attn_paged", "quant_act_i8", "gemm_nt_q",
-                               "ar_rmsnorm_quant_i8", "gemm_nt_q", "gelu_mul_quant_i8", "gemm_nt_q" })
+        for (const char* s : { "prefetch", "qkv_norm_rope_kv_store", "attn_paged", "quant_act_i8",
+                               "gemm_nt_q", "prefetch", "ar_rmsnorm_quant_i8", "gemm_nt_q",
+                               "gelu_mul_quant_i8", "gemm_nt_q" })
             want.push_back(s);
+        want.push_back("prefetch");
         if (l < 11) want.push_back("ar_rmsnorm_quant_i8");
         else for (const char* s : { "all_reduce", "rmsnorm", "add", "scale" }) want.push_back(s);
     }
@@ -3535,10 +3539,12 @@ TEST(a_gemma4_w4a8_step_at_two_ranks_folds_the_all_reduce_into_the_junction) {
     for (int l = 0; l < 12; ++l) {
         const bool global = (l + 1) % 6 == 0;
         for (int i = 0; i < (global ? 2 : 3); ++i) plain.push_back("gemm_nt_q");
-        for (const char* s : { "qkv_norm_rope_kv_store", "attn_paged", "quant_act_i8", "gemm_nt_q",
-                               "all_reduce", "rmsnorm_quant_i8", "gemm_nt_q", "gelu_mul_quant_i8",
-                               "gemm_nt_q", "all_reduce" })
+        for (const char* s : { "prefetch", "qkv_norm_rope_kv_store", "attn_paged", "quant_act_i8",
+                               "gemm_nt_q", "prefetch", "all_reduce", "rmsnorm_quant_i8", "gemm_nt_q",
+                               "gelu_mul_quant_i8", "gemm_nt_q" })
             plain.push_back(s);
+        plain.push_back("prefetch");
+        plain.push_back("all_reduce");
         if (l < 11) plain.push_back("rmsnorm_quant_i8");
         else for (const char* s : { "rmsnorm", "add", "scale" }) plain.push_back(s);
     }
@@ -3811,6 +3817,7 @@ TEST(gemma4_probe_names_the_heads_operating_depth) {
     CHECK_OK(gemma4_bf16::probe(&with, &p));
     CHECK_EQ(p.draft_depth, gemma4_bf16::kHeadDepth);
     CHECK_EQ(p.draft_depth_fixed, 0);
+    CHECK_EQ(p.chain_pays, 0);   /* chained launches never measured with the head */
     RadArchProbe q{};
     RadModelMeta without = gemma4_meta();
     CHECK_OK(gemma4_bf16::probe(&without, &q));
@@ -4033,6 +4040,7 @@ TEST(gemma4_probe_names_the_dflash_blocks_depth) {
     CHECK_OK(gemma4::probe(&meta, &p));
     CHECK_EQ(p.draft_depth, 15);
     CHECK_EQ(p.draft_depth_fixed, 1);
+    CHECK_EQ(p.chain_pays, 1);   /* chained launches measured a gain with DFlash */
 
     for (size_t i = 0; i < keys.size(); ++i)
         if (!std::strcmp(keys[i], "draft.architectures")) vals[i] = "[\"DFlash2DraftModel\"]";
@@ -4610,30 +4618,56 @@ TEST(a_gemma4_w4a8_step_at_four_ranks_folds_the_all_reduce_into_the_junction_at_
     const int L = 12;
     std::vector<std::string> folded = { "embed_lookup", "all_reduce", "rmsnorm_quant_i8" };
     std::vector<std::string> apart  = folded;
+    /* beside each reduction, up to a step of 16 rows: a prefetch (prefetch_beside) */
+    auto pf = [](std::vector<std::string>& v, std::vector<std::string> s, bool next) {
+        std::vector<std::string> out = { "prefetch" };   /* o_proj's, beside the attention */
+        for (const auto& x : s) {
+            if ((x == "ar_rmsnorm_quant_i8" || x == "all_reduce") && (next || &x != &s.back()))
+                out.push_back("prefetch");
+            out.push_back(x);
+        }
+        v.insert(v.end(), out.begin(), out.end());
+    };
+    std::vector<std::string> apart_tall = folded, folded_bare = folded;
     for (int l = 0; l < L; ++l) {
         const bool global = (l + 1) % 6 == 0;
-        for (int i = 0; i < (global ? 2 : 3); ++i) { folded.push_back("gemm_nt_q"); apart.push_back("gemm_nt_q"); }
-        for (const char* s : { "qkv_norm_rope_kv_store", "attn_paged", "quant_act_i8", "gemm_nt_q",
-                               "ar_rmsnorm_quant_i8", "gemm_nt_q", "gelu_mul_quant_i8", "gemm_nt_q" })
-            folded.push_back(s);
-        for (const char* s : { "qkv_norm_rope_kv_store", "attn_paged", "quant_act_i8", "gemm_nt_q",
-                               "all_reduce", "rmsnorm_quant_i8", "gemm_nt_q", "gelu_mul_quant_i8",
-                               "gemm_nt_q", "all_reduce" })
-            apart.push_back(s);
+        for (int i = 0; i < (global ? 2 : 3); ++i)
+            for (auto* v : { &folded, &apart, &apart_tall, &folded_bare }) v->push_back("gemm_nt_q");
+        const std::vector<std::string> fs = { "qkv_norm_rope_kv_store", "attn_paged", "quant_act_i8",
+                                              "gemm_nt_q", "ar_rmsnorm_quant_i8", "gemm_nt_q",
+                                              "gelu_mul_quant_i8", "gemm_nt_q" };
+        const std::vector<std::string> as = { "qkv_norm_rope_kv_store", "attn_paged", "quant_act_i8",
+                                              "gemm_nt_q", "all_reduce", "rmsnorm_quant_i8",
+                                              "gemm_nt_q", "gelu_mul_quant_i8", "gemm_nt_q",
+                                              "all_reduce" };
+        pf(folded, fs, true);
+        folded_bare.insert(folded_bare.end(), fs.begin(), fs.end());
+        pf(apart, as, true);
+        apart_tall.insert(apart_tall.end(), as.begin(), as.end());
         if (l < L - 1) {
+            folded.push_back("prefetch");
+            apart_tall.push_back("rmsnorm_quant_i8");
+            folded_bare.push_back("ar_rmsnorm_quant_i8");
             folded.push_back("ar_rmsnorm_quant_i8");
             apart.push_back("rmsnorm_quant_i8");
         } else {
-            for (const char* s : { "all_reduce", "rmsnorm", "add", "scale" }) folded.push_back(s);
-            for (const char* s : { "rmsnorm", "add", "scale" }) apart.push_back(s);
+            folded.push_back("prefetch");   /* the lm_head's */
+            for (const char* s : { "all_reduce", "rmsnorm", "add", "scale" }) {
+                folded.push_back(s);
+                folded_bare.push_back(s);
+            }
+            for (const char* s : { "rmsnorm", "add", "scale" }) {
+                apart.push_back(s);
+                apart_tall.push_back(s);
+            }
         }
     }
-    for (const char* s : { "rmsnorm", "gather_rows", "logits_gemm", "logit_softcap" }) {
-        folded.push_back(s);
-        apart.push_back(s);
-    }
+    for (const char* s : { "rmsnorm", "gather_rows", "logits_gemm", "logit_softcap" })
+        for (auto* v : { &folded, &apart, &apart_tall, &folded_bare }) v->push_back(s);
     /* a decode step folds */
     CHECK_EQ(join(gemma4_w4_step({}, 4)), join(folded));
+    /* where the library refuses `prefetch`, no reads */
+    CHECK_EQ(join(gemma4_w4_step({ "prefetch" }, 4)), join(folded_bare));
 
     auto declare4 = [](RadBuilder& b) {
         const RadEncoding w4 = rad_enc_affine(RAD_I4, RAD_F16, 1, 128);
@@ -4662,14 +4696,35 @@ TEST(a_gemma4_w4a8_step_at_four_ranks_folds_the_all_reduce_into_the_junction_at_
     CHECK_EQ(fold_hi(b, &n_ar), 16);
     CHECK_EQ(n_ar, 2 * L - 1);
 
-    /* a verify's height folds (libr4d's tail form) and a step past 16 rows issues the pair */
+    /* 20 MB of gate_up beside the attention's reduction and of the next layer's q beside the
+     * feed-forward's, and 9 MB of down_proj beside the attention */
+    int n_pf = 0, n_pf9 = 0;
+    for (const auto& o : b.ops)
+        if (o.op == "prefetch") {
+            ++n_pf;
+            if (pint(&o, "bytes") == (int64_t)9 << 20) ++n_pf9;
+            else CHECK_EQ(pint(&o, "bytes"), (int64_t)20 << 20);
+        }
+    CHECK_EQ(n_pf, 3 * L);
+    CHECK_EQ(n_pf9, (int)L);
+
+    /* a verify's height folds (libr4d's tail form) and a step past 16 rows issues the pair; the
+     * prefetches ride a decode step's (a verify's) 16 rows, never a prompt's rows and not a step
+     * past 16 */
     const int32_t out[1] = { 127 };
     for (int rows : { 16, 128 }) {
         RadBatch tall = one_prompt(rows, out);
         RadCtx c; c.b = &b; c.rank = 0; c.world = 4; c.batch = &tall;
         gemma4_bf16::step(&c, &tall);
         CHECK(c.step_fail.empty());
-        CHECK_EQ(join(issued_ops(b, c)), join(rows <= 16 ? folded : apart));
+        /* a prompt's rows: no reads */
+        CHECK_EQ(join(issued_ops(b, c)), join(rows <= 16 ? folded_bare : apart_tall));
+        /* the same rows as a decode step (a verify's) take them, up to 16 */
+        tall.phase = RAD_PHASE_DECODE;
+        RadCtx d; d.b = &b; d.rank = 0; d.world = 4; d.batch = &tall;
+        gemma4_bf16::step(&d, &tall);
+        CHECK(d.step_fail.empty());
+        CHECK_EQ(join(issued_ops(b, d)), join(rows <= 16 ? folded : apart_tall));
     }
 
 
@@ -4841,6 +4896,7 @@ TEST(gemma4_31b_declares_dflash_as_a_block_drafter_past_its_trunk) {
     CHECK_OK(gemma4_bf16::probe(&meta, &p));
     CHECK_EQ(p.draft_depth, 15);
     CHECK_EQ(p.draft_depth_fixed, 1);
+    CHECK_EQ(p.chain_pays, 1);
 
     /* no speculation: no drafter, no taps */
     RadBuilder b0;
@@ -5133,8 +5189,12 @@ TEST(a_gemma4_31b_prefill_step_runs_as_two_slices_with_its_reductions_on_the_sec
             RadBuilder b;
             CHECK_OK(model(b, false));
             CHECK(noted(b, "prefill overlap: a step of 1024 rows or more runs as two slices"));
-            REQUIRE(b.concurrent.size() == 1);
+            /* `h`, and slice A's context end a KV group the attention reads (per-slice
+             * attention: the sliding and the global class) */
+            REQUIRE(b.concurrent.size() == 3);
             CHECK_EQ(b.concurrent[0], (rad_buf)buf_named(b, "h"));
+            CHECK_EQ(b.concurrent[1], (rad_buf)buf_named(b, "slice_used_0"));
+            CHECK_EQ(b.concurrent[2], (rad_buf)buf_named(b, "slice_used_1"));
             RadBatch batch = one_prompt(k.T, out);
             RadCtx c;
             run(b, c, batch);
@@ -5148,8 +5208,13 @@ TEST(a_gemma4_31b_prefill_step_runs_as_two_slices_with_its_reductions_on_the_sec
                 if (i.lane != 1) continue;
                 const RecOp* o = b.op_of(i.op);
                 REQUIRE(o != nullptr);
-                if (o->op == "all_reduce") lane1.push_back(i.n);
-                else ++other1;
+                if (o->op == "all_reduce") {
+                    lane1.push_back(i.n);
+                    /* the narrow launch beside compute, not the wide one op_ar resolves to */
+                    CHECK_EQ(pint(o, "overlap"), 1);
+                } else {
+                    ++other1;
+                }
             }
             CHECK_EQ(other1, 0);
             if (k.cut == 0) {
@@ -5177,6 +5242,14 @@ TEST(a_gemma4_31b_prefill_step_runs_as_two_slices_with_its_reductions_on_the_sec
             CHECK(wc.step_fail.empty());
             for (const auto& i : wc.issues) CHECK_EQ(i.lane, 0);
             std::map<std::string, int64_t> sliced = rows_by_op(b, c, k.T), whole = rows_by_op(w, wc, k.T);
+            if (k.cut) {
+                /* attention once a slice, slice A's over its context end: one kv_len_trim a KV
+                 * group, which the whole step has no use for */
+                CHECK_EQ((int)ns_of(b, c, "kv_len_trim").size(), 2);
+                CHECK_EQ((int)ns_of(b, c, "attn_paged").size() + (int)ns_of(b, c, "attn_paged_qrow").size(),
+                         2 * (int)L);
+                sliced.erase("kv_len_trim");
+            }
             if (world == 2 && k.cut == 0) {
                 /* At two ranks on the exact wire a step that runs whole folds all but two of its
                  * reductions -- the embedding's and the last layer's feed-forward -- into its
@@ -5190,21 +5263,53 @@ TEST(a_gemma4_31b_prefill_step_runs_as_two_slices_with_its_reductions_on_the_sec
             CHECK_EQ((int)ns_of(b, c, "cast").size(), k.cut ? 6 : 3);   /* three taps, a slice each */
         }
 
-        /* a decode step runs whole: every reduction on lane 0, nothing on lane 1 */
-        RadBuilder b;
-        CHECK_OK(model(b, false));
-        RadBatch d = decode_batch();
-        RadCtx c;
-        run(b, c, d);
-        CHECK(c.step_fail.empty());
-        CHECK(c.joins.empty());
-        for (const auto& i : c.issues) CHECK_EQ(i.lane, 0);
-        /* folded where the plugin declares the fold at this rank count (two ranks; four with the
-         * four-rank junction), every junction but the last layer's feed-forward one */
-        bool fold = false;
-        for (const auto& o : b.ops) fold = fold || o.op == "ar_rmsnorm_quant_i8";
-        CHECK(fold || world == 4);
-        CHECK_EQ(count_issued(issued_ops(b, c), "ar_rmsnorm_quant_i8"), fold ? 2 * (int)L - 1 : 0);
+        /* a library without kv_len_trim: the slices keep each layer's attention whole between them,
+         * with only `h` out of the arena's sharing and the reductions still on lane 1 */
+        {
+            const int32_t out[1] = { 4095 };
+            RadBuilder b;
+            b.undeclared.insert("kv_len_trim");
+            CHECK_OK(model(b, false));
+            REQUIRE(b.concurrent.size() == 1);
+            CHECK_EQ(b.concurrent[0], (rad_buf)buf_named(b, "h"));
+            RadBatch batch = one_prompt(4096, out);
+            RadCtx c;
+            run(b, c, batch);
+            CHECK(c.step_fail.empty());
+            CHECK_EQ(races(b, c), 0);
+            CHECK(ns_of(b, c, "kv_len_trim").empty());
+            CHECK_EQ((int)ns_of(b, c, "attn_paged").size() + (int)ns_of(b, c, "attn_paged_qrow").size(),
+                     (int)L);
+            int lane1 = 0;
+            for (const auto& i : c.issues) lane1 += i.lane == 1;
+            CHECK_EQ(lane1, 4 * (int)L);
+        }
+
+        /* a decode step runs whole: every reduction on lane 0; the prefetches beside them
+         * (prefetch_beside) follow lane 0's GEMM before each -- on lane 0 itself where launches
+         * chain (prefetch_lane0), else on lane 1 behind a join from that GEMM */
+        for (const bool pf_lane0 : { false, true }) {
+            const ChainOn chain(pf_lane0);
+            RadBuilder b;
+            CHECK_OK(model(b, false));
+            RadBatch d = decode_batch();
+            RadCtx c;
+            run(b, c, d);
+            CHECK(c.step_fail.empty());
+            const std::vector<std::string> ops = issued_ops(b, c);
+            int n_pf = 0;
+            for (size_t i = 0; i < c.issues.size(); ++i) {
+                const bool pf = ops[i] == "prefetch";
+                CHECK_EQ(c.issues[i].lane, pf && !pf_lane0 ? 1 : 0);
+                if (!pf) continue;
+                ++n_pf;
+                CHECK(i > 0 && ops[i - 1] == "gemm_nt_q" && ordered(c, i - 1, i));
+            }
+            CHECK_EQ(n_pf, 3 * (int)L);
+            CHECK_EQ((int)c.joins.size(), pf_lane0 ? 0 : n_pf);
+            CHECK_EQ(races(b, c), 0);
+            CHECK_EQ(count_issued(ops, "ar_rmsnorm_quant_i8"), 2 * (int)L - 1);
+        }
     }
 
     /* the overlap needs the fused junctions: a bf16 trunk keeps its chain and runs whole */
@@ -5389,6 +5494,7 @@ TEST(gemma4_31b_declares_redhats_dflash2_from_the_speculators_layout) {
     CHECK_OK(gemma4_bf16::probe(&meta, &p));
     CHECK_EQ(p.draft_depth, 7);
     CHECK_EQ(p.draft_depth_fixed, 1);
+    CHECK_EQ(p.chain_pays, 1);   /* and with DFlash2 */
 
     for (int world : { 1, 4 })
     for (int head8 = 0; head8 < 2; ++head8) {
@@ -5514,6 +5620,74 @@ TEST(gemma4_31b_dflash2_folds_each_residual_add_into_the_next_norm) {
         CHECK_EQ(count_issued(ops, "add"), off ? 2 * L : 0);
         CHECK_EQ(count_issued(ops, "rmsnorm"), off ? 2 * L + 1 : 1);
     }
+}
+
+/* DFlash2's query pass reads the next GEMM's weight into the cache beside each of its all-reduces
+ * (prefetch_beside, rad_arch.h): the layer's gate_up beside the attention's, the next layer's q --
+ * after the last layer, the draft head -- beside the feed-forward's, and o's beside the attention,
+ * 20 MB each, after the GEMM before it: on lane 0 where launches chain (prefetch_lane0), else on
+ * lane 1 behind a join. One rank has no reduction to sit beside and declares none, and neither
+ * does a library without `prefetch`. */
+TEST(gemma4_31b_dflash2_query_pass_prefetches_beside_its_all_reduces) {
+    G431Df2 f;
+    const RadModelMeta meta = f.meta();
+    const int L = 5;
+    for (int world : { 1, 4 })
+        for (int k = 0; k < 4; ++k) {
+            const int off = k & 1, pf_lane = k < 2 ? 1 : 0;   /* lane 0 where launches chain */
+            const ChainOn chain(pf_lane == 0);
+            RadBuilder b;
+            g431df2_encs(b, true);
+            if (off) b.undeclared.insert("prefetch");
+            RadBuildCtx ctx = build_ctx(0, world);
+            ctx.max_tok = 2048;
+            ctx.max_spec = 7;
+            const int rc = gemma4_bf16::declare(&b, &meta, &ctx);
+            REQUIRE_EQ(rc, RAD_OK);
+            const auto qry = query_pass(b, 1, 8, 7);
+            const auto v = run_passes(b, gemma4_bf16::step, { qry.get() }, 0, world);
+            REQUIRE(steps_ok(v));
+            const RadCtx& c = *v[0];
+            const std::vector<std::string> ops = issued_ops(b, c);
+            std::vector<std::string> read;
+            for (size_t i = 0; i < c.issues.size(); ++i) {
+                if (ops[i] != "prefetch") {
+                    CHECK_EQ(c.issues[i].lane, 0);
+                    continue;
+                }
+                CHECK_EQ(c.issues[i].lane, pf_lane);
+                size_t g = i;   /* the GEMM before this read (and any read issued with it) */
+                while (g > 0 && ops[g - 1] == "prefetch") --g;
+                CHECK(g > 0 && ops[g - 1] == "gemm_nt_q" &&
+                      ordered(c, g - 1, i));
+                CHECK(i + 1 < ops.size() &&
+                      (ops[i + 1] == "all_reduce" || ops[i + 1] == "qkv_norm_rope_kv_store" ||
+                       ops[i + 1] == "prefetch"));
+                const RecOp* o = b.op_of(c.issues[i].op);
+                REQUIRE(o != nullptr && o->w.size() == 1);
+                CHECK_EQ(pint(o, "bytes"), (int64_t)20 << 20);
+                read.push_back(b.weights[o->w[0] - 1].name);
+            }
+            CHECK_EQ(races(b, c), 0);
+            if (world == 1 || off) {
+                CHECK(read.empty());
+                continue;
+            }
+            /* a layer: o; the feed-forward's coefficient projection and gate_up; the next
+             * layer's attention coefficient projection and q -- after the last, the draft head */
+            REQUIRE_EQ((int)read.size(), 5 * L - 1);
+            std::vector<std::string> want;
+            for (int l = 0; l < L; ++l) {
+                const std::string bl = "dflash.blk." + std::to_string(l) + ".";
+                const std::string nx = "dflash.blk." + std::to_string(l + 1) + ".";
+                for (const std::string& s : { bl + "attn_output", bl + "ffn_conv_proj",
+                                              bl + "ffn_gate_up" })
+                    want.push_back(s);
+                if (l + 1 < L) { want.push_back(nx + "attn_conv_proj"); want.push_back(nx + "attn_q"); }
+                else           want.push_back("dflash.draft_head");
+            }
+            for (size_t k = 0; k < want.size(); ++k) CHECK(read[k].find(want[k]) == 0);
+        }
 }
 
 /* Every engine step with RedHatAI's DFlash2 behind the trunk lints clean at one, two and four ranks:
@@ -6106,6 +6280,7 @@ TEST(qwen35_fp8_dflash2_drafter_takes_a_power_of_two_block) {
         CHECK_OK(qwen35_fp8::probe(mk.meta(), &p));
         CHECK_EQ(p.draft_depth, 7);
         CHECK_EQ(p.draft_depth_fixed, 1);
+        CHECK_EQ(p.chain_pays, 0);   /* chained launches measured even here */
     }
 }
 
@@ -6342,6 +6517,7 @@ TEST(gemma3_dflash2_drafter_taps_and_block) {
     CHECK_OK(gemma3::probe(mk.meta(), &p));
     CHECK_EQ(p.draft_depth, 7);
     CHECK_EQ(p.draft_depth_fixed, 1);
+    CHECK_EQ(p.chain_pays, 0);   /* a block drafter, but chained launches never measured */
     MetaKV plain = gemma3_meta();
     RadArchProbe q{};
     CHECK_OK(gemma3::probe(plain.meta(), &q));
@@ -6840,6 +7016,7 @@ TEST(llama_reads_its_drafters_taps_and_refuses_what_dspark_does_not_implement) {
     CHECK_OK(llama_fp8::probe(mk.meta(), &p));
     CHECK_EQ(p.draft_depth, 7);
     CHECK_EQ(p.draft_depth_fixed, 1);
+    CHECK_EQ(p.chain_pays, 0);
 }
 
 /* One graph, two descriptors: llama_dense_fp8 serves the dense checkpoint a recipe quantises
@@ -7934,7 +8111,9 @@ struct ArchCases {
             lfm2_bf16::step, 0, {}, 0x1775b188dc4a5120ull);
         /* The first three moved only by the attn_qkv name map each layer declares to ask whether
          * the container holds q, k and v as one linear: with those maps left out of the hash they
-         * are the earlier pins, 0xafc23087c634a537, 0x719fa07788f8b98a and 0x93b174ab52cc0d31. */
+         * are the earlier pins, 0xafc23087c634a537, 0x719fa07788f8b98a and 0x93b174ab52cc0d31.
+         * The two-rank ones moved with the weight reads beside the reductions (prefetch_beside;
+         * from 0xade9c0ccfad1fd47 and 0x8808d46c04f12205). */
         add("gemma4_bf16", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 0); return gemma4_bf16::declare(b, &g4, &c); },
             gemma4_bf16::step, 0, {}, 0x2ba2f4943031468full);
@@ -7943,13 +8122,13 @@ struct ArchCases {
             gemma4_bf16::step, 0, {}, 0x2e4c6e3235dd3802ull);
         add("gemma4_bf16, w4a8, two ranks", [this, sc, g4w4](RadBuilder* b) {
                 g4w4(b); auto c = sc(2, 0); return gemma4_bf16::declare(b, &g4, &c); },
-            nullptr, 0, {}, 0xade9c0ccfad1fd47ull);
+            nullptr, 0, {}, 0x3a160b13b3a80d4eull);
         add("gemma4_bf16, w4a8, fused qkv", [this, sc, g4qkv](RadBuilder* b) {
                 g4qkv(b); auto c = sc(1, 0); return gemma4_bf16::declare(b, &g4, &c); },
             gemma4_bf16::step, 0, {}, 0x3913aca59733d0e2ull);
         add("gemma4_bf16, w4a8, fused qkv, two ranks", [this, sc, g4qkv](RadBuilder* b) {
                 g4qkv(b); auto c = sc(2, 0); return gemma4_bf16::declare(b, &g4, &c); },
-            nullptr, 0, {}, 0x8a9935e773f546efull);
+            nullptr, 0, {}, 0x7be4844610b039d8ull);
         add("gemma4", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 0); return gemma4::declare(b, &g4m, &c); },
             gemma4::step, 0, {}, 0x0f227f5853b6488cull);

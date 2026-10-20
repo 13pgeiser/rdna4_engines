@@ -341,6 +341,14 @@ extern "C" int rad_drafter_shared_kv(RadBuilder* b, int pos_offset) {
     b->drafter_pos = pos_offset;
     return RAD_OK;
 }
+/* The core's chaining decision as the recorder answers it (it has no chaining backend): 0 unless a
+ * test holds a ChainOn, to see where a plugin places work when launches chain. */
+static int g_chain_on = 0;
+extern "C" int rad_chain_on(void) { return g_chain_on; }
+struct ChainOn {
+    explicit ChainOn(int on) { g_chain_on = on; }
+    ~ChainOn() { g_chain_on = 0; }
+};
 extern "C" int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d) {
     if (!b || !d || !d->name || !d->modalities) return RAD_E_INVAL;
     if (d->modalities == RAD_MM_AUDIO) {

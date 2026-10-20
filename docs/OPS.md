@@ -811,6 +811,32 @@ tiled rows over row tiles that outrank them: a WMMA shrink whose summation order
 and `R`, and an expand that stages `lora_b[s]` in LDS for a tile of rows and computes libref's
 bytes).
 
+### `kv_len_trim` (device-only)
+
+| op | params | operands |
+|---|---|---|
+| `kv_len_trim` | `trim` `max_seqs` | `seqused`, `tail` → `out` |
+
+`out[s] = max(seqused[s] - trim, 0)` for each of the batch's sequences, `trim` the extent of
+`tail`: the rows past the slice (their positions; the values are not read). A step's attention
+over a slice of its rows that ends `trim` rows before the step does takes `out` as its `seqused`:
+those rows then see exactly the keys they see in the whole step, and the positions the kernel
+counts back from the context's end are theirs. `trim` is the op's ranged parameter, issued at the
+count, but a launch sees every parameter collapsed to its band's upper bound, so the kernel takes
+the count from `tail`, as a GEMM takes its M from its operands.
+
+### `prefetch` (device-only)
+
+| op | params | operands |
+|---|---|---|
+| `prefetch` | `bytes` | `w`w |
+
+Reads the first `bytes` of a weight's stored form and writes nothing, so a kernel that streams the
+weight next finds those bytes in the on-die cache (64 MB on gfx1201). It is issued on the second
+lane beside a collective that leaves the card's memory idle (`rad_lane`); on the same lane it would
+only add its own time. Its layout hook answers RAD_LAYOUT_ANY (abi/rad_abi.h): it takes the bytes
+as the weight's GEMM stored them and claims no form. It changes no value.
+
 ## Attention
 
 | op | params | operands |

@@ -28,6 +28,7 @@
 #include "r4d_common.h"
 #include "rad_yarn.h"
 #include "r4d_fp8_wmma.h"
+#include "r4d_chain.h"
 
 #include <algorithm>
 #include <cmath>
@@ -61,7 +62,9 @@ __device__ __forceinline__ float block_sum(float v, float* lds) {
 // ids stay global, a rank subtracts the offset, and another rank's token takes the zero-row path.
 // Summing the ranks reconstructs x. `mult` scales every entry with one rounding (Gemma's
 // sqrt(hidden)); 1 is a plain copy.
-__global__ __launch_bounds__(kThreads) void embed_lookup_kernel(
+//
+// The body; embed_lookup_kernel and its chained form wrap it (its blocks return early).
+__device__ __forceinline__ void embed_lookup_body(
     const int32_t* __restrict__ tok, const uint16_t* __restrict__ wte, uint16_t* __restrict__ x,
     uint32_t n_embd, int32_t n_vocab, int32_t vocab_off, uint32_t x_ld, float mult) {
     const uint32_t m = blockIdx.x;
@@ -78,6 +81,19 @@ __global__ __launch_bounds__(kThreads) void embed_lookup_kernel(
     }
     for (uint32_t i = threadIdx.x; i < n_embd; i += kThreads) dst[i] = f32_to_bf16(bf16_to_f32(src[i]) * mult);
 }
+
+#define R4D_EL_PARAMS const int32_t* __restrict__ tok, const uint16_t* __restrict__ wte,         \
+    uint16_t* __restrict__ x, uint32_t n_embd, int32_t n_vocab, int32_t vocab_off, uint32_t x_ld, \
+    float mult
+__global__ __launch_bounds__(kThreads) void embed_lookup_kernel(R4D_EL_PARAMS) {
+    embed_lookup_body(tok, wte, x, n_embd, n_vocab, vocab_off, x_ld, mult);
+}
+__global__ __launch_bounds__(kThreads) void r4dchain_embed_lookup(R4D_EL_PARAMS) {
+    r4d_chain_wait();
+    embed_lookup_body(tok, wte, x, n_embd, n_vocab, vocab_off, x_ld, mult);
+    r4d_chain_done();
+}
+#undef R4D_EL_PARAMS
 
 // ---------------------------------------------------------------------------- embed_lookup_q
 // ref_embed_lookup_q. x[m] = bf16(wte[id] * scale), from a table of E4M3 codes with one scale (Q)
@@ -137,7 +153,9 @@ __global__ __launch_bounds__(kThreads) void embed_lookup_q_kernel(
 // ref_gather_rows. Like the embedding gather, with the same negative-index rule, but the source
 // row pitch is the caller's: it gathers from padded activation buffers (one logits row per
 // sequence out of a prefill chunk).
-__global__ __launch_bounds__(kThreads) void gather_rows_kernel(
+//
+// The body; gather_rows_kernel and its chained form wrap it (its blocks return early).
+__device__ __forceinline__ void gather_rows_body(
     const uint16_t* __restrict__ x, const int32_t* __restrict__ idx, uint16_t* __restrict__ y,
     uint32_t n, int32_t src_rows, uint32_t x_ld, uint32_t y_ld) {
     const uint32_t m = blockIdx.x;
@@ -150,6 +168,17 @@ __global__ __launch_bounds__(kThreads) void gather_rows_kernel(
     const uint16_t* __restrict__ src = x + (size_t)r * x_ld;
     for (uint32_t i = threadIdx.x; i < n; i += kThreads) dst[i] = src[i];
 }
+#define R4D_GR_PARAMS const uint16_t* __restrict__ x, const int32_t* __restrict__ idx,           \
+    uint16_t* __restrict__ y, uint32_t n, int32_t src_rows, uint32_t x_ld, uint32_t y_ld
+__global__ __launch_bounds__(kThreads) void gather_rows_kernel(R4D_GR_PARAMS) {
+    gather_rows_body(x, idx, y, n, src_rows, x_ld, y_ld);
+}
+__global__ __launch_bounds__(kThreads) void r4dchain_gather_rows(R4D_GR_PARAMS) {
+    r4d_chain_wait();
+    gather_rows_body(x, idx, y, n, src_rows, x_ld, y_ld);
+    r4d_chain_done();
+}
+#undef R4D_GR_PARAMS
 
 // ---------------------------------------------------------------- byte row gather / scatter
 //
@@ -206,8 +235,9 @@ __global__ __launch_bounds__(kThreads) void scatter_rows_u8_kernel(
 __device__ __forceinline__ float act_f32(uint16_t v) { return bf16_to_f32(v); }
 __device__ __forceinline__ float act_f32(float v) { return v; }
 
+// The body; rmsnorm_kernel and its chained form wrap it below (the cliff rows return early).
 template <bool WF32, uint32_t THR, typename TX = uint16_t>
-__global__ __launch_bounds__(THR) void rmsnorm_kernel(
+__device__ __forceinline__ void rmsnorm_body(
     const TX* __restrict__ x, const void* __restrict__ w, uint16_t* __restrict__ y,
     uint32_t n, float eps, float wadd, float mult, uint32_t x_ld, uint32_t y_ld, uint32_t M) {
     __shared__ float lds[THR / kWave];
@@ -226,13 +256,28 @@ __global__ __launch_bounds__(THR) void rmsnorm_kernel(
     }
 }
 
+#define R4D_RN_PARAMS const TX* __restrict__ x, const void* __restrict__ w,                       \
+    uint16_t* __restrict__ y, uint32_t n, float eps, float wadd, float mult, uint32_t x_ld,      \
+    uint32_t y_ld, uint32_t M
+template <bool WF32, uint32_t THR, typename TX = uint16_t>
+__global__ __launch_bounds__(THR) void rmsnorm_kernel(R4D_RN_PARAMS) {
+    rmsnorm_body<WF32, THR, TX>(x, w, y, n, eps, wadd, mult, x_ld, y_ld, M);
+}
+template <bool WF32, uint32_t THR, typename TX = uint16_t>
+__global__ __launch_bounds__(THR) void r4dchain_rmsnorm(R4D_RN_PARAMS) {
+    r4d_chain_wait();
+    rmsnorm_body<WF32, THR, TX>(x, w, y, n, eps, wadd, mult, x_ld, y_ld, M);
+    r4d_chain_done();
+}
+#undef R4D_RN_PARAMS
+
 // ---------------------------------------------------------------------------- add_rmsnorm
 // x = x + a, rounded as `add` rounds it, then y = rmsnorm(x) over the x just written, computed as
 // rmsnorm_kernel computes it: the same width (r4d_act_threads), the same columns a thread, the same
 // block_sum. A thread re-reads only the x it wrote itself, so no barrier separates the passes.
 // Byte-identical to `add` followed by `rmsnorm`, on x and on y.
 template <bool WF32, uint32_t THR>
-__global__ __launch_bounds__(THR) void add_rmsnorm_kernel(
+__device__ __forceinline__ void add_rmsnorm_body(
     uint16_t* __restrict__ x, const uint16_t* __restrict__ a, const void* __restrict__ w,
     uint16_t* __restrict__ y, uint32_t n, float eps, float wadd, float mult, uint32_t x_ld,
     uint32_t a_ld, uint32_t y_ld, uint32_t M) {
@@ -257,6 +302,21 @@ __global__ __launch_bounds__(THR) void add_rmsnorm_kernel(
         yr[i] = f32_to_bf16(bf16_to_f32(xr[i]) * s * (g + wadd) * mult);
     }
 }
+
+#define R4D_ARN_PARAMS uint16_t* __restrict__ x, const uint16_t* __restrict__ a,                  \
+    const void* __restrict__ w, uint16_t* __restrict__ y, uint32_t n, float eps, float wadd,     \
+    float mult, uint32_t x_ld, uint32_t a_ld, uint32_t y_ld, uint32_t M
+template <bool WF32, uint32_t THR>
+__global__ __launch_bounds__(THR) void add_rmsnorm_kernel(R4D_ARN_PARAMS) {
+    add_rmsnorm_body<WF32, THR>(x, a, w, y, n, eps, wadd, mult, x_ld, a_ld, y_ld, M);
+}
+template <bool WF32, uint32_t THR>
+__global__ __launch_bounds__(THR) void r4dchain_add_rmsnorm(R4D_ARN_PARAMS) {
+    r4d_chain_wait();
+    add_rmsnorm_body<WF32, THR>(x, a, w, y, n, eps, wadd, mult, x_ld, a_ld, y_ld, M);
+    r4d_chain_done();
+}
+#undef R4D_ARN_PARAMS
 
 // ---------------------------------------------------------------------------- rmsnorm_p
 // ref_rmsnorm_p: y = x * rsqrt(mean(x^2) + eps), rmsnorm with no gain. Gemma's attention applies
@@ -386,6 +446,30 @@ __global__ __launch_bounds__(kThreads) void logit_softcap_kernel_f32(
     float* __restrict__ yr = y + (size_t)m * y_ld;
     for (uint32_t i = blockIdx.y * kThreads + threadIdx.x; i < n; i += gridDim.y * kThreads)
         yr[i] = cap * tanhf(xr[i] / cap);
+}
+
+/* The chained forms of both legs (RadKernelChainFn): the same loop between the wait and the add. */
+__global__ __launch_bounds__(kThreads) void r4dchain_logit_softcap(
+    const uint16_t* __restrict__ x, uint16_t* __restrict__ y,
+    uint32_t n, float cap, uint32_t x_ld, uint32_t y_ld) {
+    r4d_chain_wait();
+    const uint32_t m = blockIdx.x;
+    const uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
+    uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
+    for (uint32_t i = blockIdx.y * kThreads + threadIdx.x; i < n; i += gridDim.y * kThreads)
+        yr[i] = f32_to_bf16(cap * tanhf(bf16_to_f32(xr[i]) / cap));
+    r4d_chain_done();
+}
+__global__ __launch_bounds__(kThreads) void r4dchain_logit_softcap_f32(
+    const float* __restrict__ x, float* __restrict__ y,
+    uint32_t n, float cap, uint32_t x_ld, uint32_t y_ld) {
+    r4d_chain_wait();
+    const uint32_t m = blockIdx.x;
+    const float* __restrict__ xr = x + (size_t)m * x_ld;
+    float* __restrict__ yr = y + (size_t)m * y_ld;
+    for (uint32_t i = blockIdx.y * kThreads + threadIdx.x; i < n; i += gridDim.y * kThreads)
+        yr[i] = cap * tanhf(xr[i] / cap);
+    r4d_chain_done();
 }
 
 /* Blocks per softcap row: eight elements a thread, at most 64 blocks. */
@@ -693,11 +777,13 @@ __global__ __launch_bounds__(kThreads) void kv_store_fp8v4_kernel(
 
 /* The plugin entry and r4d.h's long-stream entry share this body. */
 static int embed_lookup_bf16_emit(long tok, long wte, long x, int M, int n_embd, int n_vocab,
-                                  int vocab_off, int x_ld, float mult, RadStream stream) {
+                                  int vocab_off, int x_ld, float mult, RadStream stream,
+                                  bool chain = false) {
     if (!tok || !wte || !x) return -1;
     if (M <= 0 || n_embd <= 0 || n_vocab <= 0 || vocab_off < 0) return -2;
     if (!x_ld) x_ld = n_embd;
-    return R4D_EMIT(stream, embed_lookup_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
+    return R4D_EMIT(stream, (chain ? r4dchain_embed_lookup : embed_lookup_kernel),
+                    dim3((uint32_t)M), dim3(kThreads), 0,
                     (const int32_t*)tok, (const uint16_t*)wte,
                     (uint16_t*)x, (uint32_t)n_embd, (int32_t)n_vocab, (int32_t)vocab_off,
                     (uint32_t)x_ld, mult) == RAD_OK ? 0 : -4;
@@ -736,12 +822,13 @@ extern "C" int r4d_embed_lookup_bf16_scaled(long tok, long wte, long x, int M, i
 }
 
 static int gather_rows_bf16_emit(long x, long idx, long y, int M, int n, int src_rows,
-                                 int x_ld, int y_ld, RadStream stream) {
+                                 int x_ld, int y_ld, RadStream stream, bool chain = false) {
     if (!x || !idx || !y) return -1;
     if (M <= 0 || n <= 0 || src_rows <= 0) return -2;
     if (!x_ld) x_ld = n;
     if (!y_ld) y_ld = n;
-    return R4D_EMIT(stream, gather_rows_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
+    return R4D_EMIT(stream, (chain ? r4dchain_gather_rows : gather_rows_kernel),
+                    dim3((uint32_t)M), dim3(kThreads), 0,
                     (const uint16_t*)x, (const int32_t*)idx,
                     (uint16_t*)y, (uint32_t)n, (int32_t)src_rows,
                     (uint32_t)x_ld, (uint32_t)y_ld) == RAD_OK ? 0 : -4;
@@ -794,8 +881,18 @@ extern "C" int r4d_scatter_rows_u8(long v, long idx, long x, int M, int n, int d
 
 // `w_f32` selects an f32 or bf16 gain; a null `w` is a gain of one. `mult` scales the row before
 // its single rounding.
+/* `chain`: the chained form, at decode heights (r4d_rad_rmsnorm passes the row's resolved
+ * parameter; every other caller none). */
+static int rmsnorm_mult_launch(long x, long w, long y, int M, int n, float eps, float wadd,
+                               float mult, int w_f32, int x_ld, int y_ld, long stream,
+                               bool chain);
 extern "C" int r4d_rmsnorm_mult_bf16(long x, long w, long y, int M, int n, float eps, float wadd,
                                      float mult, int w_f32, int x_ld, int y_ld, long stream) {
+    return rmsnorm_mult_launch(x, w, y, M, n, eps, wadd, mult, w_f32, x_ld, y_ld, stream, false);
+}
+static int rmsnorm_mult_launch(long x, long w, long y, int M, int n, float eps, float wadd,
+                               float mult, int w_f32, int x_ld, int y_ld, long stream,
+                               bool chain) {
     if (!x || !y) return -1;
     if (M <= 0 || n <= 0) return -2;
     if (!x_ld) x_ld = n;
@@ -806,8 +903,10 @@ extern "C" int r4d_rmsnorm_mult_bf16(long x, long w, long y, int M, int n, float
     // to this one followed by the quantiser.
     const int thr = r4d_act_threads(M, n);
     // A drafter's 256-row head norm at 256 threads is exactly a full card; step past the cliff.
+    const bool ch = chain && M <= 64;
 #define R4D_RN_T(wf, T)                                                                         \
-    hipLaunchKernelGGL((rmsnorm_kernel<wf, T>), dim3(r4d_cliff_rows((uint32_t)M, 1, T / kWave)),  \
+    hipLaunchKernelGGL((ch ? r4dchain_rmsnorm<wf, T> : rmsnorm_kernel<wf, T>),                  \
+                       dim3(r4d_cliff_rows((uint32_t)M, 1, T / kWave)),                         \
                        dim3(T), 0,                                                              \
                        (hipStream_t)stream, (const uint16_t*)x, (const void*)w, (uint16_t*)y,   \
                        (uint32_t)n, eps, wadd, mult, (uint32_t)x_ld, (uint32_t)y_ld, (uint32_t)M)
@@ -910,14 +1009,16 @@ extern "C" int r4d_fill_f32(long y, int M, int n, int y_ld, float value, long st
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
-extern "C" int r4d_logit_softcap_bf16(long x, long y, int M, int n, float cap,
-                                      int x_ld, int y_ld, long stream) {
+/* `chain`: the chained form (the plugin entry, where the row resolved with `chain`). */
+static int logit_softcap_bf16_emit(long x, long y, int M, int n, float cap,
+                                   int x_ld, int y_ld, long stream, bool chain) {
     if (!x || !y) return -1;
     if (M <= 0 || n <= 0) return -2;
     if (!(cap > 0.0f)) return -3;
     if (!x_ld) x_ld = n;
     if (!y_ld) y_ld = n;
-    hipLaunchKernelGGL(logit_softcap_kernel, dim3((uint32_t)M, softcap_blocks_per_row(n)),
+    hipLaunchKernelGGL((chain ? r4dchain_logit_softcap : logit_softcap_kernel),
+                       dim3((uint32_t)M, softcap_blocks_per_row(n)),
                        dim3(kThreads), 0,
                        (hipStream_t)stream,
                        (const uint16_t*)x, (uint16_t*)y, (uint32_t)n, cap,
@@ -925,19 +1026,30 @@ extern "C" int r4d_logit_softcap_bf16(long x, long y, int M, int n, float cap,
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
-extern "C" int r4d_logit_softcap_f32(long x, long y, int M, int n, float cap,
-                                     int x_ld, int y_ld, long stream) {
+extern "C" int r4d_logit_softcap_bf16(long x, long y, int M, int n, float cap,
+                                      int x_ld, int y_ld, long stream) {
+    return logit_softcap_bf16_emit(x, y, M, n, cap, x_ld, y_ld, stream, false);
+}
+
+static int logit_softcap_f32_emit(long x, long y, int M, int n, float cap,
+                                  int x_ld, int y_ld, long stream, bool chain) {
     if (!x || !y) return -1;
     if (M <= 0 || n <= 0) return -2;
     if (!(cap > 0.0f)) return -3;
     if (!x_ld) x_ld = n;
     if (!y_ld) y_ld = n;
-    hipLaunchKernelGGL(logit_softcap_kernel_f32, dim3((uint32_t)M, softcap_blocks_per_row(n)),
+    hipLaunchKernelGGL((chain ? r4dchain_logit_softcap_f32 : logit_softcap_kernel_f32),
+                       dim3((uint32_t)M, softcap_blocks_per_row(n)),
                        dim3(kThreads), 0,
                        (hipStream_t)stream,
                        (const float*)x, (float*)y, (uint32_t)n, cap,
                        (uint32_t)x_ld, (uint32_t)y_ld);
     return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+extern "C" int r4d_logit_softcap_f32(long x, long y, int M, int n, float cap,
+                                     int x_ld, int y_ld, long stream) {
+    return logit_softcap_f32_emit(x, y, M, n, cap, x_ld, y_ld, stream, false);
 }
 
 extern "C" int r4d_scale_bf16(long x, long s, uint32_t s_dt, long y, int M, int n,
@@ -1199,9 +1311,11 @@ extern "C" int r4d_rad_embed_lookup(const RadArgs* a, RadStream stream) {
     if (M <= 0 || r4d_numel(tok) < M) return R4D_NO(RAD_E_SHAPE);
 
     const float mult = (float)r4d_getf(a, "mult", 1.0);
+    /* The chained form at decode heights, where the row resolved with `chain`. */
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;
     return embed_lookup_bf16_emit(r4d_addr(tok), r4d_addr(wte), r4d_addr(x),
                                   (int)M, (int)n_embd, (int)n_vocab, (int)voff, (int)x_ld,
-                                  mult, stream) == 0 ? RAD_OK : RAD_E_DEVICE;
+                                  mult, stream, ch) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
 
 /* ------------------------------------------------------------------ embed_lookup_q */
@@ -1264,9 +1378,10 @@ extern "C" int r4d_rad_gather_rows(const RadArgs* a, RadStream stream) {
     if (y_ld < 0 || x_ld < 0) return R4D_NO(RAD_E_STRIDE);
     if (M <= 0 || src <= 0 || r4d_numel(idx) < M) return R4D_NO(RAD_E_SHAPE);
 
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;
     return gather_rows_bf16_emit(r4d_addr(x), r4d_addr(idx), r4d_addr(y),
                                  (int)M, (int)n, (int)src, (int)x_ld, (int)y_ld,
-                                 stream) == 0 ? RAD_OK : RAD_E_DEVICE;
+                                 stream, ch) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
 
 /* ------------------------------------------------------------------ byte rows */
@@ -1421,10 +1536,11 @@ extern "C" int r4d_rad_rmsnorm(const RadArgs* a, RadStream s) {
         const long long y_ld = r4d_rows_pitch(y, n, &My);
         if (x_ld < 0 || y_ld < 0) return R4D_NO(RAD_E_STRIDE);
         if (M <= 0 || My < M) return R4D_NO(RAD_E_SHAPE);
-        return r4d_rmsnorm_mult_bf16(r4d_addr(x), 0, r4d_addr(y), (int)M, (int)n,
+        return rmsnorm_mult_launch(r4d_addr(x), 0, r4d_addr(y), (int)M, (int)n,
                                 (float)r4d_getf(a, "eps", 1e-6), 0.0f,
                                 (float)r4d_getf(a, "mult", 1.0), 0, (int)x_ld, (int)y_ld,
-                                (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
+                                (long)(uintptr_t)s, r4d_geti_or(a, "chain", 0) != 0) == 0
+                   ? RAD_OK : RAD_E_DEVICE;
     }
     if (!r4d_contig(w)) return R4D_NO(RAD_E_STRIDE);
     /* The gain may be f32 (as plugins declare norm gains) or bf16; its width is read off the
@@ -1446,10 +1562,10 @@ extern "C" int r4d_rad_rmsnorm(const RadArgs* a, RadStream s) {
         return rmsnorm_x_f32((const float*)x->data, w->data, (uint16_t*)y->data, (int)M, (int)n,
                              eps, wadd, (float)r4d_getf(a, "mult", 1.0), w_f32, (int)x_ld,
                              (int)y_ld, s);
-    return r4d_rmsnorm_mult_bf16(r4d_addr(x), r4d_addr(w), r4d_addr(y), (int)M, (int)n, eps, wadd,
+    return rmsnorm_mult_launch(r4d_addr(x), r4d_addr(w), r4d_addr(y), (int)M, (int)n, eps, wadd,
                             (float)r4d_getf(a, "mult", 1.0),
-                            w_f32, (int)x_ld, (int)y_ld, (long)(uintptr_t)s) == 0 ? RAD_OK
-                                                                                 : RAD_E_DEVICE;
+                            w_f32, (int)x_ld, (int)y_ld, (long)(uintptr_t)s,
+                            r4d_geti_or(a, "chain", 0) != 0) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
 
 /* ------------------------------------------------------------------ add_rmsnorm */
@@ -1482,12 +1598,20 @@ extern "C" int r4d_rad_add_rmsnorm(const RadArgs* a, RadStream s) {
     const float mult = (float)r4d_getf(a, "mult", 1.0);
     /* rmsnorm's width, from the same table (see r4d_rmsnorm_mult_bf16) */
     const int thr = r4d_act_threads((int)M, (int)n);
+    /* The chained form at decode heights, where the row resolved with `chain`. */
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;
 #define R4D_AN_T(wf, T)                                                                         \
-    emit_rc = R4D_EMIT(s, (add_rmsnorm_kernel<wf, T>),                                          \
-                       dim3(r4d_cliff_rows((uint32_t)M, 1, T / kWave)), dim3(T), 0,              \
-                       (uint16_t*)r4d_wp(x), (const uint16_t*)r4d_p(ad), r4d_p(w),              \
-                       (uint16_t*)r4d_wp(y), (uint32_t)n, eps, wadd, mult, (uint32_t)x_ld,       \
-                       (uint32_t)a_ld, (uint32_t)y_ld, (uint32_t)M)
+    emit_rc = ch                                                                                \
+        ? R4D_EMIT(s, (r4dchain_add_rmsnorm<wf, T>),                                            \
+                   dim3(r4d_cliff_rows((uint32_t)M, 1, T / kWave)), dim3(T), 0,                  \
+                   (uint16_t*)r4d_wp(x), (const uint16_t*)r4d_p(ad), r4d_p(w),                  \
+                   (uint16_t*)r4d_wp(y), (uint32_t)n, eps, wadd, mult, (uint32_t)x_ld,           \
+                   (uint32_t)a_ld, (uint32_t)y_ld, (uint32_t)M)                                 \
+        : R4D_EMIT(s, (add_rmsnorm_kernel<wf, T>),                                              \
+                   dim3(r4d_cliff_rows((uint32_t)M, 1, T / kWave)), dim3(T), 0,                  \
+                   (uint16_t*)r4d_wp(x), (const uint16_t*)r4d_p(ad), r4d_p(w),                  \
+                   (uint16_t*)r4d_wp(y), (uint32_t)n, eps, wadd, mult, (uint32_t)x_ld,           \
+                   (uint32_t)a_ld, (uint32_t)y_ld, (uint32_t)M)
 #define R4D_AN(wf)                                                                              \
     do { if (thr == 1024)     R4D_AN_T(wf, 1024);                                               \
          else if (thr == 512) R4D_AN_T(wf, 512);                                                \
@@ -1704,11 +1828,13 @@ extern "C" int r4d_rad_logit_softcap(const RadArgs* a, RadStream s) {
     if (x_ld < 0 || y_ld < 0) return R4D_NO(RAD_E_STRIDE);
     if (M <= 0 || My < M) return R4D_NO(RAD_E_SHAPE);
 
+    /* The chained form at decode heights, where the row resolved with `chain`. */
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;
     const int rc = leg_bf16
-        ? r4d_logit_softcap_bf16(r4d_addr(x), r4d_addr(y), (int)M, (int)n, cap,
-                                 (int)x_ld, (int)y_ld, (long)(uintptr_t)s)
-        : r4d_logit_softcap_f32(r4d_addr(x), r4d_addr(y), (int)M, (int)n, cap,
-                                (int)x_ld, (int)y_ld, (long)(uintptr_t)s);
+        ? logit_softcap_bf16_emit(r4d_addr(x), r4d_addr(y), (int)M, (int)n, cap,
+                                  (int)x_ld, (int)y_ld, (long)(uintptr_t)s, ch)
+        : logit_softcap_f32_emit(r4d_addr(x), r4d_addr(y), (int)M, (int)n, cap,
+                                 (int)x_ld, (int)y_ld, (long)(uintptr_t)s, ch);
     return rc == 0 ? RAD_OK : RAD_E_DEVICE;
 }
 

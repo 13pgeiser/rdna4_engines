@@ -30,6 +30,7 @@
 #include "r4d_args.h"
 #include "r4d_fp8_lm.h"
 #include "r4d_fp8_wmma.h"
+#include "r4d_chain.h"
 
 #include <algorithm>
 
@@ -479,8 +480,9 @@ constexpr uint32_t lm_waves(uint32_t mt, uint32_t fkb) {
     return fkb == 2u ? 6u : mt >= 4u ? 6u : mt == 3u ? 7u : mt == 2u ? 9u : 12u;
 }
 
-template <uint32_t MT, uint32_t FKB, bool I8 = false>
-__global__ __launch_bounds__(kDenseThreads) R4D_WAVES(lm_waves(MT, FKB)) void lm_wmma_kernel(
+// The body; lm_wmma_kernel and its chained form (RadKernelChainFn) wrap it.
+template <uint32_t MT, uint32_t FKB, bool I8>
+__device__ __forceinline__ void lm_wmma_body(
     const uint8_t* __restrict__ W, const uint16_t* __restrict__ A, uint32_t a_ld,
     float* __restrict__ C, uint32_t c_ld,
     uint32_t rows, uint32_t cols, uint32_t w_ld, uint32_t m_real) {
@@ -597,6 +599,23 @@ __global__ __launch_bounds__(kDenseThreads) R4D_WAVES(lm_waves(MT, FKB)) void lm
             }
     }
 }
+
+#define R4D_LMW_PARAMS const uint8_t* __restrict__ W, const uint16_t* __restrict__ A,           \
+    uint32_t a_ld, float* __restrict__ C, uint32_t c_ld, uint32_t rows, uint32_t cols,          \
+    uint32_t w_ld, uint32_t m_real
+template <uint32_t MT, uint32_t FKB, bool I8 = false>
+__global__ __launch_bounds__(kDenseThreads) R4D_WAVES(lm_waves(MT, FKB)) void lm_wmma_kernel(
+    R4D_LMW_PARAMS) {
+    lm_wmma_body<MT, FKB, I8>(W, A, a_ld, C, c_ld, rows, cols, w_ld, m_real);
+}
+template <uint32_t MT, uint32_t FKB, bool I8 = false>
+__global__ __launch_bounds__(kDenseThreads) R4D_WAVES(lm_waves(MT, FKB)) void r4dchain_lm_wmma(
+    R4D_LMW_PARAMS) {
+    r4d_chain_wait();
+    lm_wmma_body<MT, FKB, I8>(W, A, a_ld, C, c_ld, rows, cols, w_ld, m_real);
+    r4d_chain_done();
+}
+#undef R4D_LMW_PARAMS
 }  // namespace
 
 extern "C" int r4d_gemm_fp8a16_nt_m1_block(void) { return (int)kBlock; }
@@ -677,7 +696,7 @@ extern "C" int r4d_gemm_fp8a16_nt_mt(long a, long wq, long ws, long c,
 // core/build/rad_builder.cpp refuses such a split at declare time.
 template <bool I8>
 static int logits_gemm_8(long a, long wq, long c, int M, int K, int N, int a_ld, int c_ld,
-                         int w_ld, long stream);
+                         int w_ld, long stream, bool chain = false);
 
 extern "C" int r4d_logits_gemm_fp8(long a, long wq, long c, int M, int K, int N,
                                    int a_ld, int c_ld, int w_ld, long stream) {
@@ -691,9 +710,11 @@ extern "C" int r4d_logits_gemm_i8(long a, long wq, long c, int M, int K, int N,
     return logits_gemm_8<true>(a, wq, c, M, K, N, a_ld, c_ld, w_ld, stream);
 }
 
+/* `chain`: the WMMA pass's chained form (the plugin entry, where the row resolved with `chain`);
+ * the matvec below three rows stays plain. */
 template <bool I8>
 static int logits_gemm_8(long a, long wq, long c, int M, int K, int N, int a_ld, int c_ld,
-                         int w_ld, long stream) {
+                         int w_ld, long stream, bool chain) {
     if (!a || !wq || !c) return -1;
     if (M <= 0 || K <= 0 || N <= 0) return -2;
     if (K % (int)kBlock) return -4;
@@ -722,7 +743,8 @@ static int logits_gemm_8(long a, long wq, long c, int M, int K, int N, int a_ld,
             const uint16_t* ac = (const uint16_t*)a + (size_t)m0 * a_ld;
             float* cc = (float*)c + (size_t)m0 * c_ld;
 #define R4D_LMW2(MTV, FKV)                                                                  \
-    hipLaunchKernelGGL((lm_wmma_kernel<MTV, FKV, I8>), dim3(blocks), dim3(kDenseThreads), 0, \
+    hipLaunchKernelGGL((chain ? r4dchain_lm_wmma<MTV, FKV, I8> : lm_wmma_kernel<MTV, FKV, I8>), \
+                       dim3(blocks), dim3(kDenseThreads), 0,                                 \
                        (hipStream_t)stream, (const uint8_t*)wq, ac, (uint32_t)a_ld, cc,      \
                        (uint32_t)c_ld, rows, cols, (uint32_t)w_ld, (uint32_t)Mc)
 #define R4D_LMW(MTV) do { if (fkb == 2u) R4D_LMW2(MTV, 2); else R4D_LMW2(MTV, 1); } while (0)
@@ -836,9 +858,11 @@ static int rad_logits_gemm_8(const RadArgs* a, RadStream s, bool i8) {
     if (M <= 0 || My < M) return R4D_NO(RAD_E_SHAPE);
     if (!r4d_aligned(x->data, 16) || !r4d_aligned(w->data, 16)) return R4D_NO(RAD_E_ALIGN);
 
-    return (i8 ? r4d_logits_gemm_i8 : r4d_logits_gemm_fp8)(
+    /* The chained form at decode heights, where the row resolved with `chain`. */
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;
+    return (i8 ? logits_gemm_8<true> : logits_gemm_8<false>)(
                r4d_addr(x), r4d_addr(w), r4d_addr(y), (int)M, (int)n_embd, (int)n_vocab,
-               (int)x_ld, (int)y_ld, (int)stride, (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
+               (int)x_ld, (int)y_ld, (int)stride, (long)(uintptr_t)s, ch) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
 
 extern "C" int r4d_rad_logits_gemm_fp8(const RadArgs* a, RadStream s) {

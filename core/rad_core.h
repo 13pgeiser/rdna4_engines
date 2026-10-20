@@ -57,6 +57,8 @@ struct KernelRow {
     bool                 releases_link = false;
     /* The row's plugin declared itself a reference implementation (RadPluginReferenceFn). */
     bool                 reference = false;
+    /* rad_kernel_chain: its launches can wait in the kernel instead of behind the barrier bit. */
+    bool                 chain = false;
 };
 
 /* A kernel bound to one geometry, one domain and one variant, with init() already run. */

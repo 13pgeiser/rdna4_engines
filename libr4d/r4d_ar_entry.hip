@@ -675,6 +675,12 @@ static int nb_for(long words16, int max_nb) {
  * rows (2688 words, four blocks either way) the two rules agree (4x R9700, a four-card
  * microbenchmark of this kernel, 2026-10-17). The block count moves no byte: every word is folded
  * by one thread in ascending rank order whatever the grid. */
+/* The chained two-shot (r4d_chain.h) where the row resolved with `chain`, for a decode-sized
+ * message only (64 rows of an 8192-wide residual): DFlash2's verify-height reductions. */
+static long ar_chain(const RadArgs* a, long numel) {
+    return r4d_geti_or(a, "chain", 0) != 0 && numel <= 64L * 8192L ? 1L : 0L;
+}
+
 static int nb_for_shard(long shard16, int max_nb) {
     long nb = shard16 / 672;
     if (nb < 2) nb = 2;
@@ -752,7 +758,7 @@ extern "C" void r4d_ar_gather_4rank(long peer_scratch0, long peer_scratch1, long
                                     long slot_stride16, long inp, long out, long n_elem,
                                     long dtype, long rank, long row_elems, long stream,
                                     long nblocks, long nthreads, long drain, long acq, long pub,
-                                    long gate, long gate_ctr, long dpitch, long spitch);
+                                    long gate, long gate_ctr, long dpitch, long spitch, long chain);
 extern "C" void r4d_ar_gather_8rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                                     long peer_scratch3, long peer_scratch4, long peer_scratch5,
                                     long peer_scratch6, long peer_flags0, long peer_flags1,
@@ -876,7 +882,8 @@ extern "C" int r4d_rad_ar_gather_4rank(const RadArgs* a, RadStream s) {
                             in->my_scratch, in->my_flags, in->my_seq, in->slot16,
                             c.inp, c.out, c.numel, in->dtype, in->rank, (long)row,
                             (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq, c.pub,
-                            early, early ? in->gate_ctr : 0L, (long)dpitch, (long)spitch));
+                            early, early ? in->gate_ctr : 0L, (long)dpitch, (long)spitch,
+                            ar_chain(a, c.numel)));
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
 
@@ -1026,7 +1033,8 @@ extern "C" int r4d_rad_ar_oneshot_4rank_exact(const RadArgs* a, RadStream s) {
                                        in->my_scratch, in->my_flags, in->my_seq, in->slot16,
                                        c.inp, c.out, c.numel, in->dtype, in->rank,
                                        (long)(uintptr_t)s, nb, c.nthreads, c.drain, c.acq,
-                                       c.pub, early, early ? in->gate_ctr : 0L));
+                                       c.pub, early, early ? in->gate_ctr : 0L,
+                                       ar_chain(a, c.numel)));
         return early ? RAD_LINK_ENDED : RAD_OK;
     }
     /* The wide release, the two-rank family's rule: over P2P the kernel ends the engine's hold
@@ -1115,7 +1123,8 @@ extern "C" int r4d_rad_ar_twoshot_4rank_exact(const RadArgs* a, RadStream s) {
                                    in->my_scratch, in->my_flags, in->my_seq, in->slot16,
                                    c.inp, c.out, c.numel, in->dtype, in->rank,
                                    (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
-                                   c.pub, early, early ? in->gate_ctr : 0L));
+                                   c.pub, early, early ? in->gate_ctr : 0L,
+                                   ar_chain(a, c.numel)));
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
 
@@ -1549,7 +1558,8 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_i8_4rank(const RadArgs* a, RadStream s) 
         v.sl ? (v.sl->dtype == RAD_F32) : 0, r4d_addr(v.ob), r4d_addr(v.q), r4d_addr(v.sc),
         (int)v.M, (int)v.K, (float)r4d_getf(a, "eps", 1e-6), (float)r4d_getf(a, "wadd", 0.0),
         v.w->dtype == RAD_F32, (int)v.rp, (int)v.yp, (int)in->rank, (long)(uintptr_t)s, nblocks,
-        cfgv.drain, cfgv.acq, cfgv.pub, early, early ? in->gate_ctr : 0L, tail_ctr, tail_nbt);
+        cfgv.drain, cfgv.acq, cfgv.pub, early, early ? in->gate_ctr : 0L, tail_ctr, tail_nbt,
+        r4d_geti_or(a, "chain", 0) != 0 ? 1 : 0);
     if (e != 0) return RAD_E_SHAPE;
     return early ? RAD_LINK_ENDED : RAD_OK;
 }

@@ -15,6 +15,7 @@
 #include "r4d_common.h"
 #include "r4d_dt16.h"
 #include "r4d_q8.h"     // the gate quantiser's 8-bit codes: E4M3, or int8 (GQ == 2)
+#include "r4d_chain.h"
 #include <algorithm>
 #include <type_traits>
 
@@ -80,10 +81,12 @@ __host__ __device__ __forceinline__ int r4d_attn_used(int ctx, int tile, int spl
 
 // WIN enables a sliding window (a.window positions ending at each row's causal limit). As a
 // template parameter defaulting to 0, full attention compiles with no window code.
+// The body: its blocks return early (empty slots, tiles past the window), so the chained form
+// (r4d_chain.h) wraps it below rather than bracketing it in place.
 template<int NWARPS, int TILE, int HEAD_DIM, int GQA, int BS, int KVP, int OPT,
          int WIN = 0>
-__global__ __launch_bounds__(NWARPS * 32)
-void r4d_attn_decode_kernel(const R4DArgs a, int splits)
+__device__ __forceinline__
+void r4d_attn_decode_body(const R4DArgs& a, int splits)
 {
     constexpr int F16   = (OPT & O_F16)   ? 1 : 0;
     constexpr int MSKIP = (OPT & O_MSKIP) ? 1 : 0;
@@ -598,6 +601,24 @@ __device__ __forceinline__ uint16_t r4d_gq_gate(uint16_t gb, uint16_t xb) {
 }
 __device__ __forceinline__ float r4d_gq_clamp(float v) { return fminf(fmaxf(v, -448.0f), 448.0f); }
 
+// The plain decode kernel, and the chained one (r4dchain*, r4d_chain.h) over the same body.
+template<int NWARPS, int TILE, int HEAD_DIM, int GQA, int BS, int KVP, int OPT,
+         int WIN = 0>
+__global__ __launch_bounds__(NWARPS * 32)
+void r4d_attn_decode_kernel(const R4DArgs a, int splits)
+{
+    r4d_attn_decode_body<NWARPS, TILE, HEAD_DIM, GQA, BS, KVP, OPT, WIN>(a, splits);
+}
+template<int NWARPS, int TILE, int HEAD_DIM, int GQA, int BS, int KVP, int OPT,
+         int WIN = 0>
+__global__ __launch_bounds__(NWARPS * 32)
+void r4dchain_attn_decode(const R4DArgs a, int splits)
+{
+    r4d_chain_wait();
+    r4d_attn_decode_body<NWARPS, TILE, HEAD_DIM, GQA, BS, KVP, OPT, WIN>(a, splits);
+    r4d_chain_done();
+}
+
 // Vectorised merge, used by the h256 launcher whenever the split count fits a wave. Bit-identical
 // to splitkv_combine_body below; only the thread map differs. One wave owns one output row and
 // each lane HEAD_DIM/32 dims, so a segment is one 16-byte load per lane; a block carries JPB rows.
@@ -767,6 +788,15 @@ void r4d_attn_splitkv_combine_vec_kernel(const R4DArgs a, int splits, int tile)
     splitkv_combine_vec_body<HEAD_DIM, CHAINS, PF16, JPB, WIN, 0>(a, splits, tile,
                                                                    R4DGateQuant{});
 }
+template<int HEAD_DIM, int CHAINS, int PF16, int JPB, int WIN = 0>
+__global__ __launch_bounds__(32 * JPB)
+void r4dchain_attn_splitkv_combine_vec(const R4DArgs a, int splits, int tile)
+{
+    r4d_chain_wait();
+    splitkv_combine_vec_body<HEAD_DIM, CHAINS, PF16, JPB, WIN, 0>(a, splits, tile,
+                                                                   R4DGateQuant{});
+    r4d_chain_done();
+}
 template<int HEAD_DIM, int CHAINS, int PF16, int JPB, int WIN = 0, int GQ = 1>
 __global__ __launch_bounds__(32 * JPB)
 void r4d_attn_splitkv_combine_vec_gq_kernel(const R4DArgs a, int splits, int tile,
@@ -901,6 +931,14 @@ void r4d_attn_splitkv_combine_kernel(const R4DArgs a, int splits, int tile)
 {
     splitkv_combine_body<HEAD_DIM, CHAINS, PF16, WIN, 0>(a, splits, tile, R4DGateQuant{});
 }
+template<int HEAD_DIM, int CHAINS, int PF16, int WIN = 0>
+__global__ __launch_bounds__(HEAD_DIM)
+void r4dchain_attn_splitkv_combine(const R4DArgs a, int splits, int tile)
+{
+    r4d_chain_wait();
+    splitkv_combine_body<HEAD_DIM, CHAINS, PF16, WIN, 0>(a, splits, tile, R4DGateQuant{});
+    r4d_chain_done();
+}
 template<int HEAD_DIM, int CHAINS, int PF16, int WIN = 0, int GQ = 1>
 __global__ __launch_bounds__(HEAD_DIM)
 void r4d_attn_splitkv_combine_gq_kernel(const R4DArgs a, int splits, int tile,
@@ -978,9 +1016,13 @@ static int r4d_decode_launch_win(const R4DArgs* a, hipStream_t s) {
     if (rows > 64) return -4;
     const int nw = (rows + 15) / 16;
     const int splits = r4d_decode_splits_win(a, TILE);
-#define R4D_WIN_LAUNCH(NW)                                                                     \
+#define R4D_WIN_LAUNCH(NW) do { if (a->chain)                                                  \
+    hipLaunchKernelGGL((r4dchain_attn_decode<NW, TILE, HEAD_DIM, GQA, BS, KVP, OPT, 1>),        \
+                       dim3(splits, a->kv_heads, a->num_seqs), dim3(NW * 32), 0, s, *a, splits); \
+    else                                                                                      \
     hipLaunchKernelGGL((r4d_attn_decode_kernel<NW, TILE, HEAD_DIM, GQA, BS, KVP, OPT, 1>),      \
-                       dim3(splits, a->kv_heads, a->num_seqs), dim3(NW * 32), 0, s, *a, splits)
+                       dim3(splits, a->kv_heads, a->num_seqs), dim3(NW * 32), 0, s, *a, splits); \
+    } while (0)
     if      (nw == 1) R4D_WIN_LAUNCH(1);
     else if (nw == 2) R4D_WIN_LAUNCH(2);
     else if (nw == 3) R4D_WIN_LAUNCH(3);
@@ -990,9 +1032,15 @@ static int r4d_decode_launch_win(const R4DArgs* a, hipStream_t s) {
     if (e != hipSuccess) return -100 - (int)e;
 
     const int jobs3 = r4d_q_total(*a) * a->q_heads;
-    if (splits <= 64 && jobs3 >= VECMIN)
+    if (splits <= 64 && jobs3 >= VECMIN && a->chain)
+        hipLaunchKernelGGL((r4dchain_attn_splitkv_combine_vec<HEAD_DIM, 4, PF16, JPB, 1>),
+                           dim3((jobs3 + JPB - 1) / JPB), dim3(32 * JPB), 0, s, *a, splits, TILE);
+    else if (splits <= 64 && jobs3 >= VECMIN)
         hipLaunchKernelGGL((r4d_attn_splitkv_combine_vec_kernel<HEAD_DIM, 4, PF16, JPB, 1>),
                            dim3((jobs3 + JPB - 1) / JPB), dim3(32 * JPB), 0, s, *a, splits, TILE);
+    else if (a->chain)
+        hipLaunchKernelGGL((r4dchain_attn_splitkv_combine<HEAD_DIM, 4, PF16, 1>), dim3(jobs3),
+                           dim3(HEAD_DIM), splits * sizeof(float), s, *a, splits, TILE);
     else
         hipLaunchKernelGGL((r4d_attn_splitkv_combine_kernel<HEAD_DIM, 4, PF16, 1>), dim3(jobs3),
                            dim3(HEAD_DIM), splits * sizeof(float), s, *a, splits, TILE);

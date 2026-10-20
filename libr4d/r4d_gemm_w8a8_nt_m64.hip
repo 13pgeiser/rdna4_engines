@@ -28,6 +28,7 @@
 #include "r4d_gemm_args.h"
 #include "r4d_common.h"
 #include "r4d_gdn_wmma.h"
+#include "r4d_chain.h"
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <cstdint>
@@ -68,8 +69,10 @@ __device__ __forceinline__ v8i mmai8(v2i a, v2i b, v8i c) {
 // VGPRs. The bound is a hard launch limit, so the host checks WV*SK against the same expression.
 #define R4D_W8A8_BOUNDS(MT, NPW) ((MT) * (NPW) >= 8 ? 256 : ((MT) * (NPW) >= 4 ? 512 : 1024))
 
+// The body; the plain kernel and its chained form (r4d_chain.h) wrap it below. Its early returns
+// sit after its last barrier, so every block still reaches the wrapper's add.
 template <int MT, int NPW, bool NT>
-__global__ __launch_bounds__(R4D_W8A8_BOUNDS(MT, NPW)) void r4d_gemm_w8a8_nt_m64_kernel(
+__device__ __forceinline__ void r4d_gemm_w8a8_nt_m64_body(
     const signed char* __restrict__ A, const float* __restrict__ Ascale,
     const unsigned* __restrict__ Wq, const unsigned short* __restrict__ Ws,
     __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK) {
@@ -219,9 +222,34 @@ __global__ __launch_bounds__(R4D_W8A8_BOUNDS(MT, NPW)) void r4d_gemm_w8a8_nt_m64
     }
   }
 }
+template <int MT, int NPW, bool NT>
+__global__ __launch_bounds__(R4D_W8A8_BOUNDS(MT, NPW)) void r4d_gemm_w8a8_nt_m64_kernel(
+    const signed char* __restrict__ A, const float* __restrict__ Ascale,
+    const unsigned* __restrict__ Wq, const unsigned short* __restrict__ Ws,
+    __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK) {
+    r4d_gemm_w8a8_nt_m64_body<MT, NPW, NT>(A, Ascale, Wq, Ws, C, M, K, N, WV, SK);
+}
+template <int MT, int NPW, bool NT>
+__global__ __launch_bounds__(R4D_W8A8_BOUNDS(MT, NPW)) void r4dchain_gemm_w8a8_nt_m64(
+    const signed char* __restrict__ A, const float* __restrict__ Ascale,
+    const unsigned* __restrict__ Wq, const unsigned short* __restrict__ Ws,
+    __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK) {
+    r4d_chain_wait();
+    r4d_gemm_w8a8_nt_m64_body<MT, NPW, NT>(A, Ascale, Wq, Ws, C, M, K, N, WV, SK);
+    r4d_chain_done();
+}
+
+/* `chain`: the chained form (the plugin entry, where the row resolved with `chain`). */
+static void gemm_w8a8_m64_impl(long a, long ascale, long wq, long ws, long c, int M, int K, int N,
+                               int WV, int SK, int MB, int NPW, int NT, long stream, bool chain);
 
 void r4d_gemm_w8a8_nt_m64(long a, long ascale, long wq, long ws, long c, int M, int K, int N,
                           int WV, int SK, int MB, int NPW, int NT, long stream) {
+  gemm_w8a8_m64_impl(a, ascale, wq, ws, c, M, K, N, WV, SK, MB, NPW, NT, stream, false);
+}
+
+static void gemm_w8a8_m64_impl(long a, long ascale, long wq, long ws, long c, int M, int K, int N,
+                               int WV, int SK, int MB, int NPW, int NT, long stream, bool chain) {
   if (M < 1 || M > R4D_GEMM_W8A8_MAX_M)
     throw std::runtime_error("r4d gemm_w8a8_nt_m64: M out of range");
   if (N % 16) throw std::runtime_error("r4d gemm_w8a8_nt_m64: N must be a multiple of 16");
@@ -244,7 +272,8 @@ void r4d_gemm_w8a8_nt_m64(long a, long ascale, long wq, long ws, long c, int M, 
   auto Zp = (const unsigned short*)ws;
   auto Cp = (__hip_bfloat16*)c;
   hipStream_t st = (hipStream_t)stream;
-#define LAUNCH8(MT, NP, TT) hipLaunchKernelGGL((r4d_gemm_w8a8_nt_m64_kernel<MT, NP, TT>), \
+#define LAUNCH8(MT, NP, TT) hipLaunchKernelGGL((chain ? r4dchain_gemm_w8a8_nt_m64<MT, NP, TT>     \
+                                                   : r4d_gemm_w8a8_nt_m64_kernel<MT, NP, TT>), \
     grid, block, smem, st, Ap, Sp, Wp, Zp, Cp, M, K, N, WV, SK)
 // Only tiles with MT*NPW <= 8 are built: a tile costs about 16*MT*NPW + 40 VGPRs against the 256
 // cap.
@@ -293,11 +322,13 @@ extern "C" int r4d_rad_gemm_w8a8_m64(const RadArgs* a, RadStream s) {
     Cfg c;
     rc = cfg_for(a, g.K, g.M, group, BR_MBNPW, &c);
     if (rc != RAD_OK) return rc;
+    /* the engine's chained launch (RadKernelChainFn), at decode heights only */
+    const bool chain = r4d_geti_or(a, "chain", 0) != 0 && g.M <= 64;
     R4D_TRY("gemm_w8a8_nt_m64",
-        r4d_gemm_w8a8_nt_m64(r4d_addr(g.a), r4d_addr(g.ascale), r4d_addr(g.b),
-                             r4d_addr(g.bscale), r4d_addr(g.y),
-                             (int)g.M, (int)g.K, (int)g.N, c.wv, c.sk, c.mb, c.npw, c.nt,
-                             (long)(uintptr_t)s));
+        gemm_w8a8_m64_impl(r4d_addr(g.a), r4d_addr(g.ascale), r4d_addr(g.b),
+                           r4d_addr(g.bscale), r4d_addr(g.y),
+                           (int)g.M, (int)g.K, (int)g.N, c.wv, c.sk, c.mb, c.npw, c.nt,
+                           (long)(uintptr_t)s, chain));
     return RAD_OK;
 }
 

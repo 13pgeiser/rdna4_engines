@@ -34,6 +34,7 @@
 #include "r4d_args.h"
 #include "r4d_emit.h"
 #include "r4d_common.h"
+#include "r4d_chain.h"
 #include <cstdint>
 #include <algorithm>
 #include <cstring>
@@ -118,8 +119,10 @@ __device__ __forceinline__ void kv_put(void* __restrict__ kv, size_t off,
 // KV 1 or 2 also stores each k and v head into the paged cache [n_blocks, nkv, block_size, 2*HD]
 // at slot[m] (k at column 0, v at HD), for rows m < n_slot whose slot is in range; KV 0 stores
 // nothing and ignores the cache arguments.
+// The body: its blocks return early (rows past the cliff, value heads), so the chained form
+// (r4d_chain.h) wraps it below rather than bracketing it in place.
 template <uint32_t HD, bool WF32, bool VK, int KV>
-__global__ __launch_bounds__(HD) void qkv_norm_rope_kernel(
+__device__ __forceinline__ void qkv_norm_rope_body(
     uint16_t* __restrict__ q, uint16_t* __restrict__ k, uint16_t* __restrict__ v,
     const int32_t* __restrict__ pos, const void* __restrict__ qw, const void* __restrict__ kw,
     uint32_t nq, uint32_t nkv, uint32_t pq, uint32_t pk, uint32_t pv,
@@ -201,6 +204,29 @@ __global__ __launch_bounds__(HD) void qkv_norm_rope_kernel(
     }
 }
 
+#define R4D_QNR_PARAMS uint16_t* __restrict__ q, uint16_t* __restrict__ k, uint16_t* __restrict__ v, \
+    const int32_t* __restrict__ pos, const void* __restrict__ qw, const void* __restrict__ kw,        \
+    uint32_t nq, uint32_t nkv, uint32_t pq, uint32_t pk, uint32_t pv,                                \
+    uint32_t q_ld, uint32_t k_ld, uint32_t v_ld, float eps, float wadd,                              \
+    uint32_t rot, uint32_t nfreq, int den, float theta, float rscale, uint32_t n_pos,                \
+    uint32_t m_rows, const int32_t* __restrict__ slot, void* __restrict__ kvc, uint32_t n_slot,      \
+    uint32_t block_size, uint32_t n_blocks, float k_inv, float v_inv, uint32_t vnorm
+#define R4D_QNR_ARGS q, k, v, pos, qw, kw, nq, nkv, pq, pk, pv, q_ld, k_ld, v_ld, eps, wadd, rot, nfreq, \
+    den, theta, rscale, n_pos, m_rows, slot, kvc, n_slot, block_size, n_blocks, k_inv, v_inv, vnorm
+// The plain kernel, and the chained one (r4dchain*, r4d_chain.h) wrapping the same body.
+template <uint32_t HD, bool WF32, bool VK, int KV>
+__global__ __launch_bounds__(HD) void qkv_norm_rope_kernel(R4D_QNR_PARAMS) {
+    qkv_norm_rope_body<HD, WF32, VK, KV>(R4D_QNR_ARGS);
+}
+template <uint32_t HD, bool WF32, bool VK, int KV>
+__global__ __launch_bounds__(HD) void r4dchain_qkv_norm_rope(R4D_QNR_PARAMS) {
+    r4d_chain_wait();
+    qkv_norm_rope_body<HD, WF32, VK, KV>(R4D_QNR_ARGS);
+    r4d_chain_done();
+}
+#undef R4D_QNR_ARGS
+#undef R4D_QNR_PARAMS
+
 }  // namespace
 
 // ============================================================== the plugin ABI entry points
@@ -270,6 +296,7 @@ static int qkv_norm_rope_launch(const RadArgs* a, RadStream stream, bool store) 
     // A tp-4 verify of the 31B is 16 rows x 16 heads of 8 wavefronts: exactly a full card, the
     // cliff r4d_cliff_rows steps past with one idle row.
     const dim3 grid(r4d_cliff_rows((uint32_t)M, heads, (uint32_t)(hd / kWave)), heads);
+    const bool chain = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;   /* RadKernelChainFn, decode */
 
     // The store's geometry, checked as kv_store_geom checks it (r4d_model_bf16.hip).
     int kvw = 0;   // 0 none, 1 E4M3, 2 bf16
@@ -302,7 +329,8 @@ static int qkv_norm_rope_launch(const RadArgs* a, RadStream stream, bool store) 
         }
     }
 
-#define R4D_QNR_T(HD, WF, VK, KV) emit_rc = R4D_EMIT(stream, (qkv_norm_rope_kernel<HD, WF, VK, KV>), grid, dim3(HD), 0, \
+#define R4D_QNR_T(HD, WF, VK, KV) emit_rc = chain ? R4D_QNR_C(HD, WF, VK, KV, true) : R4D_QNR_C(HD, WF, VK, KV, false)
+#define R4D_QNR_C(HD, WF, VK, KV, CH) R4D_EMIT(stream, (CH ? r4dchain_qkv_norm_rope<HD, WF, VK, KV> : qkv_norm_rope_kernel<HD, WF, VK, KV>), grid, dim3(HD), 0, \
     (uint16_t*)r4d_wp(q), (uint16_t*)r4d_wp(k), (uint16_t*)r4d_wp(v), (const int32_t*)r4d_p(ps),           \
     r4d_p(qw), r4d_p(kw), (uint32_t)nq, (uint32_t)nkv, pq, pk, pv, (uint32_t)q_ld, (uint32_t)k_ld,          \
     (uint32_t)v_ld, eps, wadd, (uint32_t)rot_l, (uint32_t)nfreq, (int)den, theta, rsc, (uint32_t)Mp,        \
@@ -320,6 +348,7 @@ static int qkv_norm_rope_launch(const RadArgs* a, RadStream stream, bool store) 
 #undef R4D_QNR
 #undef R4D_QNR_KV
 #undef R4D_QNR_T
+#undef R4D_QNR_C
     return emit_rc;
 }
 

@@ -643,6 +643,15 @@ int rad_declare_drafter(RadBuilder* b, const RadDrafterDecl* d);
  * checkpoint was trained with is the plugin's to know. */
 int rad_drafter_shared_kv(RadBuilder* b, int pos_offset);
 
+/* Whether this engine's launches chain (RadKernelChainFn, abi/rad_abi.h): the core's decision, on
+ * the AQL backend only, which keeps a completion counter per queue -- by default where the model's
+ * plugin measured a gain with its speculative drafter (RadArchProbe::chain_pays) and that drafter
+ * decodes speculatively, or as RADIANCE_CHAIN says. A plugin that places work by whether a kernel
+ * waits in its prologue behind the one before it -- a weight read issued on lane 0 right after its
+ * GEMM -- asks this instead of reading the environment, so it follows that decision. Additive
+ * export; RAD_ABI_VERSION does not move. */
+int rad_chain_on(void);
+
 /* ================================================================== the encoder */
 /* A media encoder the plugin runs on an encoder pass (RadBatch::enc). The core drives the pass and
  * reads its result, so the plugin declares it. A plugin that declares none serves text only, and
@@ -1281,6 +1290,12 @@ typedef struct RadArchProbe {
      * libr4d has their rows for its attention geometry. A layout whose bit is clear is refused at
      * startup with the plugin named. */
     int32_t kv_quant_ok;
+    /* Nonzero when this plugin measured its speculative step faster with chained launches
+     * (RadKernelChainFn: a dependent kernel waits in its own prologue rather than behind the
+     * queue's barrier bit). With a drafter decoding speculatively on the AQL backend, the core
+     * then takes them by default; RADIANCE_CHAIN overrides either way. Zero keeps them off: plain
+     * decode measured slower chained, and a plugin that never measured them asks for nothing. */
+    int32_t chain_pays;
 } RadArchProbe;
 
 int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);

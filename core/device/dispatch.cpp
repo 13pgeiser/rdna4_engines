@@ -556,6 +556,29 @@ int  rad_event_sync(RadEvent e) {
     return dev()->event_sync(e);
 }
 void rad_dev_host_wrote(void)                     { dev()->host_wrote(); }
+
+/* Chaining's default, from the engine (rad_dev_chain_infer), and the answer once taken. Only
+ * where the backend chains: the AQL backend writes the record a chained form reads, while a HIP
+ * launch carries only the kernel's own arguments. */
+static std::atomic<int> g_chain_pays{0};
+static std::atomic<int> g_chain{-1};
+void rad_dev_chain_infer(int pays) {
+    g_chain_pays.store(pays ? 1 : 0, std::memory_order_relaxed);
+    g_chain.store(-1, std::memory_order_relaxed);
+}
+int rad_dev_chain_enabled(void) {
+    int on = g_chain.load(std::memory_order_relaxed);
+    if (on < 0) {
+        const char* e = std::getenv("RADIANCE_CHAIN");
+        const bool want = e && *e && std::strcmp(e, "auto") != 0
+                              ? *e != '0'
+                              : g_chain_pays.load(std::memory_order_relaxed) != 0;
+        on = want && std::strcmp(rad::device_backend_name(), "aql") == 0 ? 1 : 0;
+        g_chain.store(on, std::memory_order_relaxed);
+    }
+    return on;
+}
+
 int  rad_event_elapsed_ms(RadEvent a, RadEvent b, float* out) {
     return dev()->event_elapsed_ms(a, b, out);
 }

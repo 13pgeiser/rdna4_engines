@@ -161,6 +161,10 @@ set(R4D_UNITS
   "r4d_quant_act_i8|"
   "r4d_rmsnorm_quant_i8|"
   "r4d_qkv_norm_rope|"
+  # A batch's context lengths less a runtime trim (the 31B's per-slice prefill attention).
+  "r4d_kv_len_trim|"
+  # A weight read into the on-die cache beside a collective (the prefetch op).
+  "r4d_prefetch|"
   "r4d_gelu_mul_quant_i8|"
   "r4d_had_quant_act_i8|"
   "r4d_rmsnorm_had_quant_i8|"
