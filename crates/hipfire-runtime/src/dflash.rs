@@ -4699,6 +4699,10 @@ pub struct DflashCandidateProposal {
     /// Per-row probability of the selected token (entry of `probabilities` at
     /// the chosen index when temperature>0). `None` for greedy.
     pub selected_probabilities: Option<Vec<f32>>,
+    /// Per-row softmax (temperature 1) mass of the selected candidate over
+    /// the row's top-K selector scores, at every temperature (the draft's own
+    /// confidence; picks the DFlash2 verify depth).
+    pub confidence: Vec<f32>,
     pub top_k: usize,
 }
 
@@ -4826,6 +4830,7 @@ fn propose_inner(
     } else {
         None
     };
+    let mut confidence = Vec::with_capacity(rows);
     let mut pred = anchor;
     for r in 0..rows {
         let proj_off = r * rank;
@@ -4851,6 +4856,10 @@ fn propose_inner(
             }
             scores.push(unary + dot);
         }
+        // Softmax (temperature 1) mass of the selected candidate, at every
+        // request temperature: the draft's own confidence in this row.
+        let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let z: f32 = scores.iter().map(|&s| (s - max_s).exp()).sum();
         let sel_idx = if temperature == 0.0 {
             let mut best = 0usize;
             let mut best_s = scores[0];
@@ -4875,6 +4884,7 @@ fn propose_inner(
             }
             idx
         };
+        confidence.push((scores[sel_idx] - max_s).exp() / z);
         let cand_id = top_ids[id_off + sel_idx];
         tokens.push(cand_id);
         pred = cand_id;
@@ -4884,6 +4894,7 @@ fn propose_inner(
         candidates: top_ids.to_vec(),
         probabilities: all_probs,
         selected_probabilities: selected_probs,
+        confidence,
         top_k: k,
     })
 }
