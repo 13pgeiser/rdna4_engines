@@ -171,7 +171,7 @@ fn assert_current_registry_binding(plan: &RouteKernelPlan, arch: &str, extra_fla
                 e.scheduler_profile, live.scheduler_profile,
                 "{}: scheduler profile differs", e.module
             );
-            for symbol in &e.symbols {
+            for symbol in e.symbols {
                 assert!(live.symbols.contains(symbol), "{}: missing {symbol}", e.module);
             }
         }
