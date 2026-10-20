@@ -196,4 +196,48 @@ TEST(fishomni_writes_the_input_as_the_reference_server_does) {
     CHECK_EQ(std::string(buf), std::string(" calm "));
 }
 
+/* A reference's transcript as generate.py's build_drama3_prompt writes it after "Text: ": speaker
+ * 0's tag and a space before untagged text, which is otherwise kept as given; white space before a
+ * leading tag moved behind it. The input's rules refuse the same tokens. */
+TEST(fishomni_tags_a_reference_transcript_as_the_prompt_builder_does) {
+    Registry r;
+    const int st = r.load_dir(dir_of("architectures"), {});
+    if (st == RAD_E_IO && r.plugins().empty())
+        ARTIFACT_MISSING("the architecture plugins under " + dir_of("architectures"));
+    CHECK_OK(st);
+    const Plugin* p = r.plugin("fishomni");
+    REQUIRE(p != nullptr);
+    REQUIRE(p->arch_text_prepare != nullptr);
+    auto prep = [&](const char* in, std::string* out) {
+        char buf[512] = {};
+        const int64_t n = p->arch_text_prepare(RAD_TEXT_REFERENCE, in, buf, sizeof buf);
+        *out = buf;
+        return n;
+    };
+    const struct { const char* in; const char* want; } ok[] = {
+        { "We asked over twenty people.", "<|speaker:0|> We asked over twenty people." },
+        { " Two spaces  kept. ", "<|speaker:0|>  Two spaces  kept. " },
+        { "  <|speaker:1|>Hi there", "<|speaker:1|>  Hi there" },
+        { "<|speaker:3|> Hello. <|speaker:4|> Hi.", "<|speaker:3|> Hello. <|speaker:4|> Hi." },
+    };
+    for (const auto& c : ok) {
+        std::string got;
+        const int64_t n = prep(c.in, &got);
+        if (got != c.want) fprintf(stderr, "    '%s' -> '%s'\n", c.in, got.c_str());
+        CHECK_EQ(n, (int64_t)std::strlen(c.want));
+        CHECK_EQ(got, std::string(c.want));
+    }
+    const struct { const char* in; const char* why; } refused[] = {
+        { " \n ", "empty" },
+        { "Then <|im_start|> came", "<|im_start|>" },
+        { "<|speaker:20|> hi", "speaker tags" },
+    };
+    for (const auto& c : refused) {
+        std::string why;
+        CHECK(prep(c.in, &why) < 0);
+        if (why.find(c.why) == std::string::npos) fprintf(stderr, "    '%s': %s\n", c.in, why.c_str());
+        CHECK(why.find(c.why) != std::string::npos);
+    }
+}
+
 RAD_TEST_MAIN()
