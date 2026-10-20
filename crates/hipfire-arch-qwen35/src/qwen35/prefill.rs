@@ -18392,6 +18392,28 @@ mod tests {
             assert_eq!(gdn_moe_chunk_scan_resolve(None, qualified), qualified);
         }
     }
+    /// `HIPFIRE_PREFILL_IU4_PRODUCER_FUSED` admission truth table: unset follows the
+    /// exact-gfx1201 qualification and `0` is always off; `1` needs the capability
+    /// inventory of the arch; both need an MQ4G256V2 weight and the producer shape/eager
+    /// prerequisites.
+    #[test]
+    fn prefill_iu4_producer_fused_admission_truth_table() {
+        for arch in ["gfx1201", "gfx1200", "gfx1100", "gfx1151", "gfx942", ""] {
+            for explicit in [None, Some(false), Some(true)] {
+                for mask in 0u8..4 {
+                    let mq4v2 = mask & 1 != 0;
+                    let shape = mask & 2 != 0;
+                    let got = prefill_iu4_producer_fused_admitted(explicit, arch, mq4v2, shape);
+                    let on = match explicit {
+                        None => arch == "gfx1201",
+                        Some(explicit) => explicit,
+                    };
+                    let want = on && arch == "gfx1201" && mq4v2 && shape;
+                    assert_eq!(got, want, "arch={arch} explicit={explicit:?} mask={mask}");
+                }
+            }
+        }
+    }
 
     /// The resolver over the real capability table: for every architecture and
     /// explicit value, `gdn_moe_chunk_scan_resolve` fed the actual
