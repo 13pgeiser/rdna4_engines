@@ -1826,13 +1826,13 @@ mod tests {
         let x = b.act(4);
         let w = b.weight("gate", 0, vec![8, 4], ShardPolicy::ColumnShard { axis: 0 });
         let y = b.act(4);
-        let op = b.op(OpKind::DenseFfn, Some(0), SplitRule::Opaque, &[x, w], &[y]);
+        let op = b.op(OpKind::GatedMlp, Some(0), SplitRule::Opaque, &[x, w], &[y]);
         let plan = b.plan(&mesh, 1);
         assert_eq!(
             split_program(&b.g, &plan, &mesh).unwrap_err(),
             SplitError::UnsupportedOp {
                 op,
-                kind: OpKind::DenseFfn
+                kind: OpKind::GatedMlp
             }
         );
     }

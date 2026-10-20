@@ -116,14 +116,12 @@ pub enum Step<'a> {
     Project(crate::pipeline::layer_ops::ProjectOp<'a>),
     /// Per-row broadcast add of one activation row.
     BroadcastAdd(crate::pipeline::layer_ops::BroadcastAddOp<'a>),
-    /// Dense gated feed-forward block (gate/up projections, SiLU product,
-    /// down projection) with the source's BF16 storage boundaries.  Opaque to
-    /// fusion: no HC read/write pairing or epilogue fold crosses it.
-    DenseFfn(crate::pipeline::layer_ops::DenseFfnOp<'a>),
+    /// Dense gated MLP (optional pre-norm, gate/up, activation, down, output
+    /// epilogue) on its declared kernel ladder. Opaque to fusion: no HC
+    /// read/write pairing or epilogue fold crosses it.
+    GatedMlp(crate::pipeline::gated_mlp::GatedMlpOp<'a>),
     /// Sandwich-norm attention sublayer.
     SandwichAttention(crate::pipeline::sandwich::SandwichAttentionOp<'a>),
-    /// Sandwich-norm gated MLP sublayer.
-    SandwichMlp(crate::pipeline::sandwich::SandwichMlpOp<'a>),
     /// Parallel dense + routed-expert MLP sublayer.
     ParallelMoeMlp(crate::pipeline::sandwich::ParallelMoeMlpOp<'a>),
     /// Sandwich-norm per-layer-input branch.
@@ -165,10 +163,9 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
         | Step::Project(_)
         | Step::BroadcastAdd(_)
         | Step::Moe(_)
-        | Step::DenseFfn(_)
+        | Step::GatedMlp(_)
         | Step::MoeStage(..)
         | Step::SandwichAttention(_)
-        | Step::SandwichMlp(_)
         | Step::ParallelMoeMlp(_)
         | Step::PerLayerInput(_)
         | Step::Scale(_)
@@ -794,7 +791,7 @@ pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchE
             Step::HyperNorm(op) => op.validate_for_gpu(gpu)?,
             Step::Project(op) => op.validate_for_gpu(gpu)?,
             Step::BroadcastAdd(op) => op.validate_for_gpu(gpu)?,
-            Step::DenseFfn(op) => op.validate_for_gpu(gpu)?,
+            Step::GatedMlp(op) => op.validate_for_gpu(gpu)?,
             _ => {}
         }
     }
@@ -1708,13 +1705,12 @@ pub(crate) fn launch_op_rows(
         Step::HyperNorm(op) => crate::pipeline::layer_ops::execute_hyper_norm(gpu, op),
         Step::Project(op) => crate::pipeline::layer_ops::execute_project(gpu, op),
         Step::BroadcastAdd(op) => crate::pipeline::layer_ops::execute_broadcast_add(gpu, op),
-        Step::DenseFfn(op) => crate::pipeline::layer_ops::execute_dense_ffn(gpu, op),
+        Step::GatedMlp(op) => crate::pipeline::gated_mlp::execute_gated_mlp(gpu, ctx, op),
         Step::Moe(call) => sealed_moe::execute_sealed(gpu, call),
         Step::MoeStage(op, stage) => op.execute_stage(gpu, *stage),
         Step::SandwichAttention(op) => {
             crate::pipeline::sandwich::execute_sandwich_attention(gpu, ctx, op)
         }
-        Step::SandwichMlp(op) => crate::pipeline::sandwich::execute_sandwich_mlp(gpu, ctx, op),
         Step::ParallelMoeMlp(op) => {
             crate::pipeline::sandwich::execute_parallel_moe_mlp(gpu, ctx, op)
         }

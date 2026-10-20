@@ -19,7 +19,8 @@
 //! [`OpKind`] discriminants are part of the contract: one per [`Step`] variant
 //! (`1..`) plus hand-route ops (`1000..`); a hand-route op that later gains a
 //! `Step` variant keeps its ID (`Step::SiluMul` is `SiluMul = 1001`). Values
-//! are frozen — never renumber, never reuse, append only. The
+//! are frozen — never renumber, never reuse, append only. A retired ID stays
+//! retired (`18` `DenseFfn` and `20` `SandwichMlp`, both now `GatedMlp`). The
 //! `op_kind_ids_frozen` test pins every value.
 
 use super::steps::Step;
@@ -71,12 +72,10 @@ pub enum OpKind {
     Project = 16,
     /// [`Step::BroadcastAdd`].
     BroadcastAdd = 17,
-    /// [`Step::DenseFfn`].
-    DenseFfn = 18,
+    // 18: retired (`DenseFfn`, now `GatedMlp`); never reuse.
     /// [`Step::SandwichAttention`].
     SandwichAttention = 19,
-    /// [`Step::SandwichMlp`].
-    SandwichMlp = 20,
+    // 20: retired (`SandwichMlp`, now `GatedMlp`); never reuse.
     /// [`Step::ParallelMoeMlp`].
     ParallelMoeMlp = 21,
     /// [`Step::PerLayerInput`].
@@ -91,6 +90,8 @@ pub enum OpKind {
     MoeStage = 26,
     /// [`Step::GatedShortConv`] (#666 G10, LFM2).
     GatedShortConv = 27,
+    /// [`Step::GatedMlp`].
+    GatedMlp = 28,
     /// Hand-route ops with no `Step` variant yet (dense TP decode): residual add.
     ResidualAdd = 1000,
     /// [`Step::SiluMul`]; also the hand-route SiLU-mul.
@@ -120,9 +121,8 @@ pub fn op_kind_of(step: &Step<'_>) -> OpKind {
         Step::HyperNorm(..) => OpKind::HyperNorm,
         Step::Project(..) => OpKind::Project,
         Step::BroadcastAdd(..) => OpKind::BroadcastAdd,
-        Step::DenseFfn(..) => OpKind::DenseFfn,
+        Step::GatedMlp(..) => OpKind::GatedMlp,
         Step::SandwichAttention(..) => OpKind::SandwichAttention,
-        Step::SandwichMlp(..) => OpKind::SandwichMlp,
         Step::ParallelMoeMlp(..) => OpKind::ParallelMoeMlp,
         Step::PerLayerInput(..) => OpKind::PerLayerInput,
         Step::Scale(..) => OpKind::Scale,
@@ -483,9 +483,7 @@ mod tests {
             (OpKind::HyperNorm, 15),
             (OpKind::Project, 16),
             (OpKind::BroadcastAdd, 17),
-            (OpKind::DenseFfn, 18),
             (OpKind::SandwichAttention, 19),
-            (OpKind::SandwichMlp, 20),
             (OpKind::ParallelMoeMlp, 21),
             (OpKind::PerLayerInput, 22),
             (OpKind::Scale, 23),
@@ -493,6 +491,7 @@ mod tests {
             (OpKind::Moe, 25),
             (OpKind::MoeStage, 26),
             (OpKind::GatedShortConv, 27),
+            (OpKind::GatedMlp, 28),
             (OpKind::ResidualAdd, 1000),
             (OpKind::SiluMul, 1001),
             (OpKind::Argmax, 1002),

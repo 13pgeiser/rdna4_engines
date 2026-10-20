@@ -553,7 +553,7 @@ fn decode_step_body(
 
     // The caller staged `position` into `state.pos_buf`.
 
-    // Per-layer program: [SandwichAttention, SandwichMlp, PerLayerInput?, Scale?].
+    // Per-layer program: [SandwichAttention, GatedMlp, PerLayerInput?, Scale?].
     let ctx = DispatchCtx::new(gpu);
     let mut steps = Vec::with_capacity(4);
     for layer_idx in 0..cfg.n_layers {
