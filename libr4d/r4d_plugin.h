@@ -120,6 +120,8 @@ int64_t r4d_rad_attn_decode_h128_gqa2w_scratch(const RadArgs*);
 /* Paged attention at head_dim 256 and 512, 1/2/4/8 queries per KV head, any window, causal or not
  * (r4d_attn_paged_window.hip): one entry point per geometry and cache dtype, every q_len and any q
  * row pitch, so they serve both attn_paged and attn_paged_qrow. */
+int     r4d_rad_attn_window_h128_gqa1_bf16(const RadArgs*, RadStream);
+int     r4d_rad_attn_window_h128_gqa1_fp8 (const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h256_gqa1_bf16(const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h256_gqa1_fp8 (const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h256_gqa2_bf16(const RadArgs*, RadStream);
@@ -136,6 +138,7 @@ int     r4d_rad_attn_window_h512_gqa4_bf16(const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h512_gqa4_fp8 (const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h512_gqa8_bf16(const RadArgs*, RadStream);
 int     r4d_rad_attn_window_h512_gqa8_fp8 (const RadArgs*, RadStream);
+int64_t r4d_rad_attn_window_h128_scratch(const RadArgs*);
 int64_t r4d_rad_attn_window_h256_scratch(const RadArgs*);
 int64_t r4d_rad_attn_window_h512_scratch(const RadArgs*);
 /* The top-1 of a row of all-gathered (id, value) pairs, written one id a row: the vocab-sharded

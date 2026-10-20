@@ -107,6 +107,9 @@ struct DeepEncoder {
     static constexpr int64_t kNEmbd     = 1280;
     static constexpr int64_t kPatchDim  = 3 * kPatch * kPatch;        /* 768: a staged patch row */
     static constexpr int64_t kMerge     = kDown * kDown;              /* 16 patches a row */
+    /* Tiles one tower invocation batches. max_patches/kSamTok bounds a pass (10 at the 40 grid,
+     * 4 at 64 for the 16384-patch default); the cap keeps the activation set modest. */
+    static constexpr int64_t kBatchCap  = 8;
 
     static bool global_block(int64_t i) { return i == 2 || i == 5 || i == 8 || i == 11; }
 
@@ -173,26 +176,34 @@ struct DeepEncoder {
     /* ------------------------------------------------------------------ one tower a geometry
      * All of the tower's OPS and ACTIVATIONS; the weights live in DeepEncoder (one checkpoint
      * tensor a name, both geometries read the same planes). */
+    /* One staged tile of a pass: segment `patch0`/`gw`, tile `t` of `n` in it, its output row
+     * block, and whether this tile closes a line (the newline row follows its map). */
+    struct Tile {
+        int64_t patch0 = 0, gw = 0, t = 0, n = 0, rowbase = 0;
+        bool nl = false;
+    };
+
     template <typename G>
     struct Tower {
         std::vector<SamLayerT<G>>  sam;
         std::vector<ClipLayerT<G>> clip;
 
         /* pass constants */
-        rad_op op_cu_sam = 0, op_cu_clip = 0, op_cu_pad = 0;   /* {0, tokens} tables */
+        rad_op op_cu_sam = 0, op_cu_clip = 0, op_cu_pad = 0;   /* segment bounds tables */
         rad_buf b_cu_sam = 0, b_cu_clip = 0, b_cu_pad = 0;
 
         /* stem, neck, layout ops */
-        rad_op op_patch = 0, op_ids_sam = 0, op_sampos = 0, op_sampadd = 0;
+        rad_op op_patch = 0, op_sampos = 0, op_sampadd = 0;
         rad_op op_neck0 = 0, op_nk1 = 0, op_unf3 = 0, op_nk2 = 0, op_nk3 = 0;
         rad_op op_unf_net2 = 0, op_net2 = 0, op_unf_net3 = 0, op_net3 = 0;
-        rad_op op_cls = 0, op_cmap = 0, op_ids_clip = 0, op_cpos = 0, op_cadd = 0, op_playr = 0;
+        rad_op op_cls = 0, op_cmap = 0, op_cpos = 0, op_cadd = 0, op_playr = 0;
         rad_op op_ccopy = 0; /* pre_layrnorm output into the residual stream */
         rad_op op_fuse_clip = 0, op_fuse_sam = 0, op_proj = 0;
         rad_op op_dbg1024 = 0, op_dbg1280 = 0, op_dbg768 = 0, op_dbg256 = 0;
         rad_op op_newline = 0, op_sep = 0;
 
-        /* activations, one view's, reused by every view a pass carries. */
+        /* activations, one batched run's: `B` tiles, tile-major (tile t's rows at
+         * [t*kSamTok, (t+1)*kSamTok)). */
         rad_buf b_x = 0, b_h = 0, b_qkv = 0, b_att = 0, b_ff = 0, b_sampos = 0;
         rad_buf b_nlrow = 0;    /* the newline row, computed once, pitched into the layout */
         rad_buf b_pixstg = 0;   /* a tile's patch rows, packed for the single patch-embed GEMM */
@@ -219,7 +230,8 @@ struct DeepEncoder {
 
         int dbg = 0, dbg_row = 0;   /* RAD_UNLIMITEDOCR_DBG / _ROW: dump one stage, from a row */
         mutable uint32_t tabs_done = 0;   /* bit per rank: the resampled tables are staged */
-        mutable uint32_t ids_done = 0;    /* bit per rank: the window index tables are staged */
+        mutable uint32_t ids_done = 0;    /* bit per rank: the position/index tables are staged */
+        int64_t Bmax = 1;   /* tiles one invocation batches; every per-view plane is Bmax of them */
 
         static constexpr int64_t kGrid      = G::kGrid;
         static constexpr int64_t kMap       = G::kMap;
@@ -234,10 +246,10 @@ struct DeepEncoder {
         int declare(RadBuilder* b, Names& nm, DeepEncoder& w, rad_buf out,
                     rad_buf one, rad_buf one_c);
         void fill_tables(RadCtx* c, const DeepEncoder& w) const;
-    void view(RadCtx* c, const RadBatch* batch, int64_t patch0, int64_t gw, int64_t t,
-              int64_t n, int64_t rowbase, bool tap, const DeepEncoder& w) const;
-    void segment(RadCtx* c, const RadBatch* batch, int64_t patch0, int64_t gw, int64_t n,
-                 int64_t rowbase, bool nl, bool tap, const DeepEncoder& w);
+        void stage_ids(RadCtx* c) const;
+        /* One batched tower run over `nt` (<= Bmax) staged tiles. */
+        void batch(RadCtx* c, const RadBatch* batch, const Tile* tiles, int64_t nt,
+                   bool tap, const DeepEncoder& w);
     };
 
     Tower<Geom64> t64;
@@ -546,8 +558,14 @@ struct DeepEncoder {
             on = false;
             return RAD_OK;
         }
-        max_views64 = max_patches / Geom64::kSegView;
-        max_views40 = max_patches / Geom40::kSegView;
+        /* The towers size their activations for the tiles one invocation batches. A pass is
+         * max_patches/(G::kSamTok) whole tiles at most; kBatchCap keeps the set modest. */
+        max_views64 = max_patches / Geom64::kSamTok;
+        max_views40 = max_patches / Geom40::kSamTok;
+        if (max_views64 > kBatchCap) max_views64 = kBatchCap;
+        if (max_views40 > kBatchCap) max_views40 = kBatchCap;
+        if (max_views64 < 1) max_views64 = 1;
+        if (max_views40 < 1) max_views40 = 1;
         b_out = decl_b(b, "v.out", RAD_BF16, {max_patches / kMerge, kNEmbd});
         if (const char* e = getenv("RAD_UNLIMITEDOCR_DBG")) t64.dbg = t40.dbg = atoi(e);
         if (const char* e = getenv("RAD_UNLIMITEDOCR_DBG_ROW"))
@@ -620,7 +638,7 @@ struct DeepEncoder {
         /* Validate the pass: every view segment one grid, every separator exactly one merged
          * cell. A view row is a line chunk: n = w/h tiles, its last chunk carrying the line's
          * newline column (w = n*h + kDown), an earlier chunk not (w = n*h). */
-        int64_t tiles = 0;
+        int64_t n_tiles = 0;
         int32_t grid = 0;
         for (int64_t s = 0; s < n_seg; ++s) {
             const int32_t h = sh[s], w = sw[s];
@@ -645,9 +663,9 @@ struct DeepEncoder {
                                  "must break a pass at a geometry change");
                 return;
             }
-            tiles += w / h;
+            n_tiles += w / h;
         }
-        if (tiles > 0 && grid != Geom64::kGrid && grid != Geom40::kGrid) {
+        if (n_tiles > 0 && grid != Geom64::kGrid && grid != Geom40::kGrid) {
             char msg[192];
             std::snprintf(msg, sizeof msg,
                           "unlimitedocr: an encoder pass at a %d-patch grid the DeepEncoder "
@@ -658,28 +676,52 @@ struct DeepEncoder {
         /* Shared constants. */
         RAD_ISSUE(c, op_fill_one, RAD_B(b_one));
         RAD_ISSUE(c, op_fill_one_c, RAD_B(b_one_c));
-        /* Walk the segments, writing each one's output rows where the pass's row block puts it. */
-        const bool do_tap = !tapped_;
-        bool tapped_view = false;
+        /* Walk the segments into a flat tile list. Every view tile is batched with the pass's
+         * other tiles (chunked at the tower's Bmax); only the separator rows are issued on their
+         * own. */
+        std::vector<Tile> tiles;
+        std::vector<int64_t> sep_rows;
         int64_t pc = 0;
         for (int64_t s = 0; s < n_seg; ++s) {
             const int64_t h = sh[s], sw_ = sw[s];
             const int64_t rowbase = pc / kMerge;
             if (h == kDown && sw_ == kDown) {
-                /* One learned row; geometry-independent, so the 64 tower carries the op. */
-                RAD_ISSUE(c, t64.op_sep, RAD_B(b_one), RAD_W(w_sep),
-                          brow_slice(b_out, rowbase, 1, kNEmbd));
+                sep_rows.push_back(rowbase);
                 pc += h * sw_;
                 continue;
             }
             const int64_t n = sw_ / h;
             const bool nl = (sw_ % h) != 0;     /* the line's last chunk holds the newline col */
-            const bool tap0 = do_tap && !tapped_view;
-            if (h == Geom64::kGrid) t64.segment(c, batch, pc, sw_, n, rowbase, nl, tap0, *this);
-            else                    t40.segment(c, batch, pc, sw_, n, rowbase, nl, tap0, *this);
-            tapped_view = true;
+            for (int64_t t = 0; t < n; ++t) {
+                Tile tl;
+                tl.patch0 = pc;
+                tl.gw     = sw_;
+                tl.t      = t;
+                tl.n      = n;
+                tl.rowbase = rowbase;
+                tl.nl     = nl && t == n - 1;
+                tiles.push_back(tl);
+            }
             pc += h * sw_;
         }
+        const bool do_tap = !tapped_;
+        bool tapped_view = false;
+        for (size_t i = 0; i < tiles.size(); ) {
+            const int64_t bm = (grid == Geom64::kGrid) ? t64.Bmax : t40.Bmax;
+            int64_t nb = (int64_t)(tiles.size() - i);
+            if (nb > bm) nb = bm;
+            const bool tap0 = do_tap && !tapped_view;
+            if (grid == Geom64::kGrid)
+                t64.batch(c, batch, &tiles[i], nb, tap0, *this);
+            else
+                t40.batch(c, batch, &tiles[i], nb, tap0, *this);
+            tapped_view = true;
+            i += (size_t)nb;
+        }
+        /* One learned separator row; geometry-independent, so the 64 tower carries the op. */
+        for (int64_t rowbase : sep_rows)
+            RAD_ISSUE(c, t64.op_sep, RAD_B(b_one), RAD_W(w_sep),
+                      brow_slice(b_out, rowbase, 1, kNEmbd));
         if (tapped_view) tapped_ = true;
     }
 };
@@ -696,65 +738,73 @@ int DeepEncoder::Tower<G>::declare(RadBuilder* b, Names& nm, DeepEncoder& w, rad
     char bn[64];
 #define RAD_VN(fmtv) std::snprintf(bn, sizeof bn, fmtv, sfx)
 
-    /* ---- activations, one view's. */
-    RAD_VN("v%s.sam.x");     b_x   = decl_b(b, bn, RAD_BF16, {kSamTok, DeepEncoder::kSamW});
-    RAD_VN("v%s.sam.h");     b_h   = decl_b(b, bn, RAD_BF16, {kSamTok, DeepEncoder::kSamW});
-    RAD_VN("v%s.sam.qkv");   b_qkv = decl_b(b, bn, RAD_BF16, {kSamTok, 3 * DeepEncoder::kSamW});
-    RAD_VN("v%s.sam.att");   b_att = decl_b(b, bn, RAD_BF16, {kSamTok, DeepEncoder::kSamW});
-    RAD_VN("v%s.sam.ff");    b_ff  = decl_b(b, bn, RAD_BF16, {kSamTok, DeepEncoder::kSamFf});
-    RAD_VN("v%s.sam.pos");   b_sampos  = decl_b(b, bn, RAD_BF16, {kSamTok, DeepEncoder::kSamW});
-    RAD_VN("v%s.sam.ids");   b_ids_sam = decl_b(b, bn, RAD_I32,  {kSamTok});
-    RAD_VN("v%s.sam.hw");    b_hw    = decl_b(b, bn, RAD_BF16, {kSamTokP, DeepEncoder::kSamW});
-    RAD_VN("v%s.sam.qkvw");  b_qkvw  = decl_b(b, bn, RAD_BF16, {kSamTokP, 3 * DeepEncoder::kSamW});
-    RAD_VN("v%s.sam.attw");  b_attw  = decl_b(b, bn, RAD_BF16, {kSamTokP, DeepEncoder::kSamW});
-    RAD_VN("v%s.sam.idsp");  b_ids_pad  = decl_b(b, bn, RAD_I32, {kSamTokP}, RAD_BUF_PERSIST);
-    RAD_VN("v%s.sam.idsr");  b_ids_real = decl_b(b, bn, RAD_I32, {kSamTok}, RAD_BUF_PERSIST);
+    /* Tiles one invocation batches: the pass bound over this grid's tokens, capped. */
+    Bmax = w.max_patches / kSamTok;
+    if (Bmax < 1) Bmax = 1;
+    if (Bmax > DeepEncoder::kBatchCap) Bmax = DeepEncoder::kBatchCap;
+    const int64_t B = Bmax;
 
-    RAD_VN("v%s.n0");        b_n0   = decl_b(b, bn, RAD_BF16, {kSamTok, 256});
-    RAD_VN("v%s.n1");        b_n1   = decl_b(b, bn, RAD_BF16, {kSamTok, 256});
-    RAD_VN("v%s.nfu");       b_unf3 = decl_b(b, bn, RAD_BF16, {kSamTok, 256 * 9});
-    RAD_VN("v%s.n2");        b_n2   = decl_b(b, bn, RAD_BF16, {kSamTok, 256});
-    RAD_VN("v%s.n3");        b_n3   = decl_b(b, bn, RAD_BF16, {kSamTok, 256});
-    RAD_VN("v%s.n2u");       b_unf_2 = decl_b(b, bn, RAD_BF16, {kSamTok / 4, 256 * 9});
-    RAD_VN("v%s.m2");        b_map2  = decl_b(b, bn, RAD_BF16, {kSamTok / 4, 512});
-    RAD_VN("v%s.n3u");       b_unf_3 = decl_b(b, bn, RAD_BF16, {kMap * kMap, 512 * 9});
-    RAD_VN("v%s.map");       b_map   = decl_b(b, bn, RAD_BF16, {kMap * kMap, DeepEncoder::kClipW});
+    /* ---- activations, B tiles' worth, tile-major. */
+    RAD_VN("v%s.sam.x");     b_x   = decl_b(b, bn, RAD_BF16, {B * kSamTok, DeepEncoder::kSamW});
+    RAD_VN("v%s.sam.h");     b_h   = decl_b(b, bn, RAD_BF16, {B * kSamTok, DeepEncoder::kSamW});
+    RAD_VN("v%s.sam.qkv");   b_qkv = decl_b(b, bn, RAD_BF16, {B * kSamTok, 3 * DeepEncoder::kSamW});
+    RAD_VN("v%s.sam.att");   b_att = decl_b(b, bn, RAD_BF16, {B * kSamTok, DeepEncoder::kSamW});
+    RAD_VN("v%s.sam.ff");    b_ff  = decl_b(b, bn, RAD_BF16, {B * kSamTok, DeepEncoder::kSamFf});
+    RAD_VN("v%s.sam.pos");   b_sampos  = decl_b(b, bn, RAD_BF16, {B * kSamTok, DeepEncoder::kSamW});
+    RAD_VN("v%s.sam.ids");   b_ids_sam = decl_b(b, bn, RAD_I32,  {B * kSamTok}, RAD_BUF_PERSIST);
+    RAD_VN("v%s.sam.hw");    b_hw    = decl_b(b, bn, RAD_BF16, {B * kSamTokP, DeepEncoder::kSamW});
+    RAD_VN("v%s.sam.qkvw");  b_qkvw  = decl_b(b, bn, RAD_BF16, {B * kSamTokP, 3 * DeepEncoder::kSamW});
+    RAD_VN("v%s.sam.attw");  b_attw  = decl_b(b, bn, RAD_BF16, {B * kSamTokP, DeepEncoder::kSamW});
+    RAD_VN("v%s.sam.idsp");  b_ids_pad  = decl_b(b, bn, RAD_I32, {B * kSamTokP}, RAD_BUF_PERSIST);
+    RAD_VN("v%s.sam.idsr");  b_ids_real = decl_b(b, bn, RAD_I32, {B * kSamTok}, RAD_BUF_PERSIST);
 
-    RAD_VN("v%s.cx");        b_c   = decl_b(b, bn, RAD_BF16, {kClipTok, DeepEncoder::kClipW});
-    RAD_VN("v%s.ch");        b_ch  = decl_b(b, bn, RAD_BF16, {kClipTok, DeepEncoder::kClipW});
-    RAD_VN("v%s.cq");        b_cq  = decl_b(b, bn, RAD_BF16, {kClipTok, 3 * DeepEncoder::kClipW});
-    RAD_VN("v%s.ca");        b_ca  = decl_b(b, bn, RAD_BF16, {kClipTok, DeepEncoder::kClipW});
-    RAD_VN("v%s.cf");        b_cf  = decl_b(b, bn, RAD_BF16, {kClipTok, DeepEncoder::kClipFf});
-    RAD_VN("v%s.cg2");       b_cg2 = decl_b(b, bn, RAD_BF16, {kClipTok, DeepEncoder::kClipFf});
-    RAD_VN("v%s.ct");        b_ct  = decl_b(b, bn, RAD_BF16, {kClipTok, DeepEncoder::kClipW});
-    RAD_VN("v%s.cp");        b_cp  = decl_b(b, bn, RAD_BF16, {kClipTok, DeepEncoder::kClipW});
-    RAD_VN("v%s.cids");      b_ids_clip = decl_b(b, bn, RAD_I32, {kClipTok});
-    RAD_VN("v%s.cpos");      b_cpos = decl_b(b, bn, RAD_BF16, {kClipTok, DeepEncoder::kClipW});
+    RAD_VN("v%s.n0");        b_n0   = decl_b(b, bn, RAD_BF16, {B * kSamTok, 256});
+    RAD_VN("v%s.n1");        b_n1   = decl_b(b, bn, RAD_BF16, {B * kSamTok, 256});
+    RAD_VN("v%s.nfu");       b_unf3 = decl_b(b, bn, RAD_BF16, {B * kSamTok, 256 * 9});
+    RAD_VN("v%s.n2");        b_n2   = decl_b(b, bn, RAD_BF16, {B * kSamTok, 256});
+    RAD_VN("v%s.n3");        b_n3   = decl_b(b, bn, RAD_BF16, {B * kSamTok, 256});
+    RAD_VN("v%s.n2u");       b_unf_2 = decl_b(b, bn, RAD_BF16, {B * kSamTok / 4, 256 * 9});
+    RAD_VN("v%s.m2");        b_map2  = decl_b(b, bn, RAD_BF16, {B * kSamTok / 4, 512});
+    RAD_VN("v%s.n3u");       b_unf_3 = decl_b(b, bn, RAD_BF16, {B * kMap * kMap, 512 * 9});
+    RAD_VN("v%s.map");       b_map   = decl_b(b, bn, RAD_BF16, {B * kMap * kMap, DeepEncoder::kClipW});
 
-    RAD_VN("v%s.fuse");      b_fuse    = decl_b(b, bn, RAD_BF16, {kMap * kMap, DeepEncoder::kFused});
-    RAD_VN("v%s.proj");      b_projbuf = decl_b(b, bn, RAD_BF16, {kMap * kMap, DeepEncoder::kNEmbd});
+    RAD_VN("v%s.cx");        b_c   = decl_b(b, bn, RAD_BF16, {B * kClipTok, DeepEncoder::kClipW});
+    RAD_VN("v%s.ch");        b_ch  = decl_b(b, bn, RAD_BF16, {B * kClipTok, DeepEncoder::kClipW});
+    RAD_VN("v%s.cq");        b_cq  = decl_b(b, bn, RAD_BF16, {B * kClipTok, 3 * DeepEncoder::kClipW});
+    RAD_VN("v%s.ca");        b_ca  = decl_b(b, bn, RAD_BF16, {B * kClipTok, DeepEncoder::kClipW});
+    RAD_VN("v%s.cf");        b_cf  = decl_b(b, bn, RAD_BF16, {B * kClipTok, DeepEncoder::kClipFf});
+    RAD_VN("v%s.cg2");       b_cg2 = decl_b(b, bn, RAD_BF16, {B * kClipTok, DeepEncoder::kClipFf});
+    RAD_VN("v%s.ct");        b_ct  = decl_b(b, bn, RAD_BF16, {B * kClipTok, DeepEncoder::kClipW});
+    RAD_VN("v%s.cp");        b_cp  = decl_b(b, bn, RAD_BF16, {B * kClipTok, DeepEncoder::kClipW});
+    RAD_VN("v%s.cids");      b_ids_clip = decl_b(b, bn, RAD_I32, {B * kClipTok}, RAD_BUF_PERSIST);
+    RAD_VN("v%s.cpos");      b_cpos = decl_b(b, bn, RAD_BF16, {B * kClipTok, DeepEncoder::kClipW});
+
+    RAD_VN("v%s.fuse");      b_fuse    = decl_b(b, bn, RAD_BF16, {B * kMap * kMap, DeepEncoder::kFused});
+    RAD_VN("v%s.proj");      b_projbuf = decl_b(b, bn, RAD_BF16, {B * kMap * kMap, DeepEncoder::kNEmbd});
     RAD_VN("v%s.nlrow");     b_nlrow   = decl_b(b, bn, RAD_BF16, {1, DeepEncoder::kNEmbd});
-    RAD_VN("v%s.pixstg");    b_pixstg  = decl_b(b, bn, RAD_BF16, {kSamTok, DeepEncoder::kPatchDim});
+    RAD_VN("v%s.pixstg");    b_pixstg  = decl_b(b, bn, RAD_BF16, {B * kSamTok, DeepEncoder::kPatchDim});
 
-    /* One cu_seqlens table each, {0, tokens}, one segment: `iota` writes both entries. The three
-     * unfolds read b_cu_sam through their cu_div (kSamTok/kGrid rows a grid row; net_3's divides
-     * by 2*kGrid), so one table serves all of them. */
+    /* One cu_seqlens table each, a bound a tile: the batched SAM/CLIP attention reads B segments
+     * and the three unfolds divide by kGrid (net_3 by 2*kGrid). */
     RAD_VN("v%s.cus");
-    b_cu_sam = decl_b(b, bn, RAD_I32, {2});
+    b_cu_sam = decl_b(b, bn, RAD_I32, {B + 1});
     op_cu_sam = rw(b, RAD_OP(b, "iota",
-                     RAD_PARAMS(RAD_INT("M", 2), RAD_INT("start", 0), RAD_INT("step", kSamTok)),
+                     RAD_PARAMS(RAD_RANGE("M", 2, B + 1), RAD_INT("start", 0),
+                                RAD_INT("step", kSamTok)),
                      RAD_NOWEIGHTS),
                    {}, {b_cu_sam});
     RAD_VN("v%s.cuc");
-    b_cu_clip = decl_b(b, bn, RAD_I32, {2});
+    b_cu_clip = decl_b(b, bn, RAD_I32, {B + 1});
     op_cu_clip = rw(b, RAD_OP(b, "iota",
-                      RAD_PARAMS(RAD_INT("M", 2), RAD_INT("start", 0), RAD_INT("step", kClipTok)),
+                      RAD_PARAMS(RAD_RANGE("M", 2, B + 1), RAD_INT("start", 0),
+                                 RAD_INT("step", kClipTok)),
                       RAD_NOWEIGHTS),
                     {}, {b_cu_clip});
     RAD_VN("v%s.cup");
-    b_cu_pad = decl_b(b, bn, RAD_I32, {2});
+    b_cu_pad = decl_b(b, bn, RAD_I32, {B + 1});
     op_cu_pad = rw(b, RAD_OP(b, "iota",
-                     RAD_PARAMS(RAD_INT("M", 2), RAD_INT("start", 0), RAD_INT("step", kSamTokP)),
+                     RAD_PARAMS(RAD_RANGE("M", 2, B + 1), RAD_INT("start", 0),
+                                RAD_INT("step", kSamTokP)),
                      RAD_NOWEIGHTS),
                    {}, {b_cu_pad});
 
@@ -773,28 +823,24 @@ int DeepEncoder::Tower<G>::declare(RadBuilder* b, Names& nm, DeepEncoder& w, rad
      * stages kDown zero patch columns at the end of each row, skipped by the pitched pack into
      * `pixstg`), then the position table added in: a row gather, from the 64x64 plane at the 64
      * grid (exact, unchanged) and the staged 40x40 resample at 40. */
-    op_patch = rw(b, gemm_b(b, kSamTok, DeepEncoder::kSamW, DeepEncoder::kPatchDim, "none",
-                            w.w_patch, w.b_patch), {}, {b_x});
-    op_ids_sam = rw(b, RAD_OP(b, "iota",
-                     RAD_PARAMS(RAD_INT("M", kSamTok), RAD_INT("start", 0), RAD_INT("step", 1)),
-                     RAD_NOWEIGHTS),
-                    {}, {b_ids_sam});
+    op_patch = rw(b, gemm_b(b, B * kSamTok, DeepEncoder::kSamW, DeepEncoder::kPatchDim, "none",
+                            w.w_patch, w.b_patch), {b_pixstg}, {b_x});
     if (!is40)
         op_sampos = rw(b, RAD_OP(b, "embed_lookup",
-                         RAD_PARAMS(RAD_RANGE("M", 1, kSamTok),
+                         RAD_PARAMS(RAD_RANGE("M", 1, B * kSamTok),
                                     RAD_INT("n_embd", DeepEncoder::kSamW),
                                     RAD_INT("n_vocab", kSamTok), RAD_STR("dtype", "bf16")),
                          RAD_WEIGHTS(w.w_pos)),
                      {b_ids_sam}, {b_sampos});
     else
         op_sampos = rw(b, RAD_OP(b, "gather_rows",
-                         RAD_PARAMS(RAD_RANGE("M", 1, kSamTok),
+                         RAD_PARAMS(RAD_RANGE("M", 1, B * kSamTok),
                                     RAD_INT("n", DeepEncoder::kSamW),
                                     RAD_STR("dtype", "bf16")),
                          RAD_NOWEIGHTS),
                      {b_pos_tab, b_ids_sam}, {b_sampos});
     op_sampadd = rw(b, RAD_OP(b, "add",
-                              RAD_PARAMS(RAD_RANGE("M", 1, kSamTok),
+                              RAD_PARAMS(RAD_RANGE("M", 1, B * kSamTok),
                                          RAD_INT("n", DeepEncoder::kSamW),
                                          RAD_STR("dtype", "bf16")),
                               RAD_NOWEIGHTS),
@@ -802,22 +848,23 @@ int DeepEncoder::Tower<G>::declare(RadBuilder* b, Names& nm, DeepEncoder& w, rad
 
     for (size_t i = 0; i < sam.size(); ++i) {
         SamLayerT<G>& l = sam[i];
-        l.op_n1 = rw(b, lnorm(b, kSamTok, DeepEncoder::kSamW, 1e-6f, l.w_n1, l.b_n1), {b_x}, {b_h});
+        l.op_n1 = rw(b, lnorm(b, B * kSamTok, DeepEncoder::kSamW, 1e-6f, l.w_n1, l.b_n1),
+                     {b_x}, {b_h});
         /* The windowed path: `h` into window_partition's padded order with zero pad rows
          * (a negative gather index is a zero row), so the qkv linear gives the pad rows the
          * reference's bias -- deepencoder pads AFTER norm1 and runs the whole attention on the
          * padded window, so a pad key's k and v are the qkv bias, not zero. */
         l.op_gpad = rw(b, RAD_OP(b, "gather_rows",
-                         RAD_PARAMS(RAD_RANGE("M", 1, kSamTokP), RAD_INT("n", DeepEncoder::kSamW),
+                         RAD_PARAMS(RAD_RANGE("M", 1, B * kSamTokP), RAD_INT("n", DeepEncoder::kSamW),
                                     RAD_STR("dtype", "bf16")),
                          RAD_NOWEIGHTS),
                        {b_h, b_ids_pad}, {b_hw});
-        l.op_qkv = rw(b, gemm_b(b, kSamTok, 3 * DeepEncoder::kSamW, DeepEncoder::kSamW, "none",
+        l.op_qkv = rw(b, gemm_b(b, B * kSamTok, 3 * DeepEncoder::kSamW, DeepEncoder::kSamW, "none",
                                 l.w_qkv, l.b_qkv), {b_h}, {b_qkv});
-        l.op_qkvw = rw(b, gemm_b(b, kSamTokP, 3 * DeepEncoder::kSamW, DeepEncoder::kSamW, "none",
+        l.op_qkvw = rw(b, gemm_b(b, B * kSamTokP, 3 * DeepEncoder::kSamW, DeepEncoder::kSamW, "none",
                                  l.w_qkv, l.b_qkv), {b_hw}, {b_qkvw});
         l.op_attn = rw(b, RAD_OP(b, "sam_attn",
-                         RAD_PARAMS(RAD_RANGE("M", 1, kSamTok),
+                         RAD_PARAMS(RAD_RANGE("M", 1, B * kSamTok),
                                     RAD_INT("head_dim", DeepEncoder::kSamHd),
                                     RAD_INT("n_head", DeepEncoder::kSamHeads),
                                     RAD_INT("grid_h", kGrid), RAD_INT("grid_w", kGrid),
@@ -826,7 +873,7 @@ int DeepEncoder::Tower<G>::declare(RadBuilder* b, Names& nm, DeepEncoder& w, rad
                          RAD_WEIGHTS(l.w_rh, l.w_rw)),
                      {b_qkv, b_cu_sam}, {b_att});
         l.op_attnw = rw(b, RAD_OP(b, "sam_attn",
-                          RAD_PARAMS(RAD_RANGE("M", 1, kSamTokP),
+                          RAD_PARAMS(RAD_RANGE("M", 1, B * kSamTokP),
                                      RAD_INT("head_dim", DeepEncoder::kSamHd),
                                      RAD_INT("n_head", DeepEncoder::kSamHeads),
                                      RAD_INT("grid_h", kGridP), RAD_INT("grid_w", kGridP),
@@ -835,27 +882,28 @@ int DeepEncoder::Tower<G>::declare(RadBuilder* b, Names& nm, DeepEncoder& w, rad
                           RAD_WEIGHTS(l.w_rh, l.w_rw)),
                       {b_qkvw, b_cu_pad}, {b_attw});
         l.op_greal = rw(b, RAD_OP(b, "gather_rows",
-                         RAD_PARAMS(RAD_RANGE("M", 1, kSamTok), RAD_INT("n", DeepEncoder::kSamW),
+                         RAD_PARAMS(RAD_RANGE("M", 1, B * kSamTok), RAD_INT("n", DeepEncoder::kSamW),
                                     RAD_STR("dtype", "bf16")),
                          RAD_NOWEIGHTS),
                        {b_attw, b_ids_real}, {b_att});
-        l.op_proj = rw(b, gemm_b(b, kSamTok, DeepEncoder::kSamW, DeepEncoder::kSamW, "none",
+        l.op_proj = rw(b, gemm_b(b, B * kSamTok, DeepEncoder::kSamW, DeepEncoder::kSamW, "none",
                                  l.w_proj, l.b_proj), {b_att}, {b_h});
         /* deepencoder rounds the projection before adding the shortcut (`x + attn(norm(x))`
          * is two bf16 operations), so the residual add is its own op: fusing it into the
          * GEMM's f32 accumulator skips a rounding and drifts from the reference. */
         l.op_padd = rw(b, RAD_OP(b, "add",
-                         RAD_PARAMS(RAD_RANGE("M", 1, kSamTok), RAD_INT("n", DeepEncoder::kSamW),
+                         RAD_PARAMS(RAD_RANGE("M", 1, B * kSamTok), RAD_INT("n", DeepEncoder::kSamW),
                                     RAD_STR("dtype", "bf16")),
                          RAD_NOWEIGHTS),
                        {b_h, b_x}, {b_x});
-        l.op_n2 = rw(b, lnorm(b, kSamTok, DeepEncoder::kSamW, 1e-6f, l.w_n2, l.b_n2), {b_x}, {b_h});
-        l.op_l1 = rw(b, gemm_b(b, kSamTok, DeepEncoder::kSamFf, DeepEncoder::kSamW, "gelu",
+        l.op_n2 = rw(b, lnorm(b, B * kSamTok, DeepEncoder::kSamW, 1e-6f, l.w_n2, l.b_n2),
+                     {b_x}, {b_h});
+        l.op_l1 = rw(b, gemm_b(b, B * kSamTok, DeepEncoder::kSamFf, DeepEncoder::kSamW, "gelu",
                                l.w_l1, l.b_l1), {b_h}, {b_ff});
-        l.op_l2 = rw(b, gemm_b(b, kSamTok, DeepEncoder::kSamW, DeepEncoder::kSamFf, "none",
+        l.op_l2 = rw(b, gemm_b(b, B * kSamTok, DeepEncoder::kSamW, DeepEncoder::kSamFf, "none",
                                l.w_l2, l.b_l2), {b_ff}, {b_h});
         l.op_ladd = rw(b, RAD_OP(b, "add",
-                         RAD_PARAMS(RAD_RANGE("M", 1, kSamTok), RAD_INT("n", DeepEncoder::kSamW),
+                         RAD_PARAMS(RAD_RANGE("M", 1, B * kSamTok), RAD_INT("n", DeepEncoder::kSamW),
                                     RAD_STR("dtype", "bf16")),
                          RAD_NOWEIGHTS),
                        {b_h, b_x}, {b_x});
@@ -864,17 +912,17 @@ int DeepEncoder::Tower<G>::declare(RadBuilder* b, Names& nm, DeepEncoder& w, rad
     /* ---- neck. The 1x1 is a GEMM; the 3x3s are unfold + gemm because they carry no bias and
      * conv2d_nhwc's `b` is required. LayerNorm2d is a layernorm across a pixel's channels,
      * which are innermost. */
-    op_neck0 = rw(b, gemm_u(b, kSamTok, 256, DeepEncoder::kSamW, w.w_neck0), {b_x}, {b_n0});
-    op_nk1 = rw(b, lnorm(b, kSamTok, 256, 1e-6f, w.w_nk1, w.b_nk1), {b_n0}, {b_n1});
+    op_neck0 = rw(b, gemm_u(b, B * kSamTok, 256, DeepEncoder::kSamW, w.w_neck0), {b_x}, {b_n0});
+    op_nk1 = rw(b, lnorm(b, B * kSamTok, 256, 1e-6f, w.w_nk1, w.b_nk1), {b_n0}, {b_n1});
     op_unf3 = rw(b, unfold(b, kGrid, kGrid, 256, 1, kGrid), {b_n1, b_cu_sam}, {b_unf3});
-    op_nk2 = rw(b, gemm_u(b, kSamTok, 256, 256 * 9, w.w_nk2), {b_unf3}, {b_n2});
-    op_nk3 = rw(b, lnorm(b, kSamTok, 256, 1e-6f, w.w_nk3, w.b_nk3), {b_n2}, {b_n3});
+    op_nk2 = rw(b, gemm_u(b, B * kSamTok, 256, 256 * 9, w.w_nk2), {b_unf3}, {b_n2});
+    op_nk3 = rw(b, lnorm(b, B * kSamTok, 256, 1e-6f, w.w_nk3, w.b_nk3), {b_n2}, {b_n3});
     op_unf_net2 = rw(b, unfold(b, kGrid, kGrid, 256, 2, kGrid), {b_n3, b_cu_sam}, {b_unf_2});
-    op_net2 = rw(b, gemm_u(b, kSamTok / 4, 512, 256 * 9, w.w_net2), {b_unf_2}, {b_map2});
+    op_net2 = rw(b, gemm_u(b, B * kSamTok / 4, 512, 256 * 9, w.w_net2), {b_unf_2}, {b_map2});
     op_unf_net3 = rw(b, unfold(b, kGrid / 2, kGrid / 2, 512, 2, kGrid * 2),
                      {b_map2, b_cu_sam}, {b_unf_3});
-    op_net3 = rw(b, gemm_u(b, kMap * kMap, DeepEncoder::kClipW, 512 * 9, w.w_net3), {b_unf_3},
-                 {b_map});
+    op_net3 = rw(b, gemm_u(b, B * kMap * kMap, DeepEncoder::kClipW, 512 * 9, w.w_net3),
+                 {b_unf_3}, {b_map});
 
     /* ---- CLIP. The class row goes first and the map's rows below it: absolute position
      * pairs row for row, and attention is permutation-equivariant, so the class row's place
@@ -890,33 +938,28 @@ int DeepEncoder::Tower<G>::declare(RadBuilder* b, Names& nm, DeepEncoder& w, rad
                                       RAD_STR("from", "bf16"), RAD_STR("to", "bf16")),
                            RAD_NOWEIGHTS),
                     {b_map}, {b_c});
-    op_ids_clip = rw(b, RAD_OP(b, "iota",
-                               RAD_PARAMS(RAD_INT("M", kClipTok), RAD_INT("start", 0),
-                                          RAD_INT("step", 1)),
-                               RAD_NOWEIGHTS),
-                     {}, {b_ids_clip});
     if (!is40)
         op_cpos = rw(b, RAD_OP(b, "embed_lookup",
-                               RAD_PARAMS(RAD_RANGE("M", 1, kClipTok),
+                               RAD_PARAMS(RAD_RANGE("M", 1, B * kClipTok),
                                           RAD_INT("n_embd", DeepEncoder::kClipW),
                                           RAD_INT("n_vocab", kClipTok), RAD_STR("dtype", "bf16")),
                                RAD_WEIGHTS(w.w_cpos)),
                      {b_ids_clip}, {b_cpos});
     else
         op_cpos = rw(b, RAD_OP(b, "gather_rows",
-                               RAD_PARAMS(RAD_RANGE("M", 1, kClipTok),
+                               RAD_PARAMS(RAD_RANGE("M", 1, B * kClipTok),
                                           RAD_INT("n", DeepEncoder::kClipW),
                                           RAD_STR("dtype", "bf16")),
                                RAD_NOWEIGHTS),
                      {b_cpos_tab, b_ids_clip}, {b_cpos});
     op_cadd = rw(b, RAD_OP(b, "add",
-                           RAD_PARAMS(RAD_RANGE("M", 1, kClipTok),
+                           RAD_PARAMS(RAD_RANGE("M", 1, B * kClipTok),
                                       RAD_INT("n", DeepEncoder::kClipW),
                                       RAD_STR("dtype", "bf16")),
                            RAD_NOWEIGHTS),
                  {b_c, b_cpos}, {b_c});
-    op_playr = rw(b, lnorm(b, kClipTok, DeepEncoder::kClipW, 1e-5f, w.w_playr, w.b_playr), {b_c},
-                  {b_cp});
+    op_playr = rw(b, lnorm(b, B * kClipTok, DeepEncoder::kClipW, 1e-5f, w.w_playr, w.b_playr),
+                  {b_c}, {b_cp});
     /* deepencoder normalises the embedding once (pre_layrnorm) and the transformer's residual
      * stream starts there, not at the embedding: layer 0's norm1 and its residual add both
      * read the pre_layrnorm output. */
@@ -927,12 +970,12 @@ int DeepEncoder::Tower<G>::declare(RadBuilder* b, Names& nm, DeepEncoder& w, rad
                   {b_cp}, {b_c});
 
     for (ClipLayerT<G>& l : clip) {
-        l.op_n1 = rw(b, lnorm(b, kClipTok, DeepEncoder::kClipW, 1e-5f, l.w_n1, l.b_n1), {b_c},
-                     {b_ch});
-        l.op_qkv = rw(b, gemm_b(b, kClipTok, 3 * DeepEncoder::kClipW, DeepEncoder::kClipW, "none",
-                                l.w_qkv, l.b_qkv), {b_ch}, {b_cq});
+        l.op_n1 = rw(b, lnorm(b, B * kClipTok, DeepEncoder::kClipW, 1e-5f, l.w_n1, l.b_n1),
+                     {b_c}, {b_ch});
+        l.op_qkv = rw(b, gemm_b(b, B * kClipTok, 3 * DeepEncoder::kClipW, DeepEncoder::kClipW,
+                                "none", l.w_qkv, l.b_qkv), {b_ch}, {b_cq});
         l.op_attn = rw(b, RAD_OP(b, "attn_dense",
-                                 RAD_PARAMS(RAD_RANGE("M", 1, kClipTok),
+                                 RAD_PARAMS(RAD_RANGE("M", 1, B * kClipTok),
                                             RAD_INT("head_dim", DeepEncoder::kClipHd),
                                             RAD_INT("gqa", 1), RAD_INT("causal", 0),
                                             RAD_F64("scale", 1.0 / 8.0), RAD_INT("cu_div", 1),
@@ -940,32 +983,32 @@ int DeepEncoder::Tower<G>::declare(RadBuilder* b, Names& nm, DeepEncoder& w, rad
                                             RAD_STR("dtype", "bf16")),
                                  RAD_NOWEIGHTS),
                       {b_cq, b_cu_clip}, {b_ca});
-        l.op_out = rw(b, gemm_b(b, kClipTok, DeepEncoder::kClipW, DeepEncoder::kClipW, "none",
+        l.op_out = rw(b, gemm_b(b, B * kClipTok, DeepEncoder::kClipW, DeepEncoder::kClipW, "none",
                                 l.w_out, l.b_out), {b_ca}, {b_ct});
         l.op_cadd = rw(b, RAD_OP(b, "add",
-                                 RAD_PARAMS(RAD_RANGE("M", 1, kClipTok),
+                                 RAD_PARAMS(RAD_RANGE("M", 1, B * kClipTok),
                                             RAD_INT("n", DeepEncoder::kClipW),
                                             RAD_STR("dtype", "bf16")),
                                  RAD_NOWEIGHTS),
                        {b_ct, b_c}, {b_c});
-        l.op_n2 = rw(b, lnorm(b, kClipTok, DeepEncoder::kClipW, 1e-5f, l.w_n2, l.b_n2), {b_c},
-                     {b_ch});
-        l.op_fc1 = rw(b, gemm_b(b, kClipTok, DeepEncoder::kClipFf, DeepEncoder::kClipW, "none",
+        l.op_n2 = rw(b, lnorm(b, B * kClipTok, DeepEncoder::kClipW, 1e-5f, l.w_n2, l.b_n2),
+                     {b_c}, {b_ch});
+        l.op_fc1 = rw(b, gemm_b(b, B * kClipTok, DeepEncoder::kClipFf, DeepEncoder::kClipW, "none",
                                 l.w_fc1, l.b_fc1), {b_ch}, {b_cf});
         /* quick_gelu: fc1's output times sigmoid(1.702 * itself), fused into one act. The
          * kernel rounds the scaled value to bf16 before the sigmoid, which is exactly the
          * store the unfused mul did, so the fusion is bit-identical to the pair it replaces
          * (and saves a 257x4096 bf16 round-trip per layer x 24 layers x tile). */
         l.op_qg = rw(b, RAD_OP(b, "act_mul",
-                               RAD_PARAMS(RAD_RANGE("M", 1, kClipTok),
+                               RAD_PARAMS(RAD_RANGE("M", 1, B * kClipTok),
                                           RAD_INT("n", DeepEncoder::kClipFf),
                                           RAD_STR("act", "quick_gelu"), RAD_STR("dtype", "bf16")),
                                RAD_NOWEIGHTS),
                      {b_cf, b_cf}, {b_cg2});
-        l.op_fc2 = rw(b, gemm_b(b, kClipTok, DeepEncoder::kClipW, DeepEncoder::kClipFf, "none",
-                                l.w_fc2, l.b_fc2), {b_cg2}, {b_ct});
+        l.op_fc2 = rw(b, gemm_b(b, B * kClipTok, DeepEncoder::kClipW, DeepEncoder::kClipFf,
+                                "none", l.w_fc2, l.b_fc2), {b_cg2}, {b_ct});
         l.op_madd = rw(b, RAD_OP(b, "add",
-                                 RAD_PARAMS(RAD_RANGE("M", 1, kClipTok),
+                                 RAD_PARAMS(RAD_RANGE("M", 1, B * kClipTok),
                                             RAD_INT("n", DeepEncoder::kClipW),
                                             RAD_STR("dtype", "bf16")),
                                  RAD_NOWEIGHTS),
@@ -985,7 +1028,7 @@ int DeepEncoder::Tower<G>::declare(RadBuilder* b, Names& nm, DeepEncoder& w, rad
                                           RAD_STR("from", "bf16"), RAD_STR("to", "bf16")),
                                RAD_NOWEIGHTS),
                      {b_map}, {b_fuse});
-    op_proj = rw(b, gemm_b(b, kMap * kMap, DeepEncoder::kNEmbd, DeepEncoder::kFused, "none",
+    op_proj = rw(b, gemm_b(b, B * kMap * kMap, DeepEncoder::kNEmbd, DeepEncoder::kFused, "none",
                            w.w_proj, w.b_proj), {b_fuse}, {b_projbuf});
     /* Debug taps: one stage's 256 rows into the out buffer instead of the layout. */
     op_dbg1024 = rw(b, RAD_OP(b, "cast",
@@ -1015,7 +1058,7 @@ int DeepEncoder::Tower<G>::declare(RadBuilder* b, Names& nm, DeepEncoder& w, rad
                               RAD_PARAMS(RAD_INT("M", 1), RAD_INT("n", DeepEncoder::kNEmbd),
                                          RAD_STR("dtype", "bf16")),
                               RAD_WEIGHTS(w.w_newline)),
-                    {p_one}, {p_out});
+                    {p_one}, {b_nlrow});
     op_sep = rw(b, RAD_OP(b, "mul_weight",
                           RAD_PARAMS(RAD_INT("M", 1), RAD_INT("n", DeepEncoder::kNEmbd),
                                      RAD_STR("dtype", "bf16")),
@@ -1096,45 +1139,114 @@ void DeepEncoder::Tower<G>::fill_tables(RadCtx* c, const DeepEncoder& w) const {
     tabs_done |= (1u << rk);
 }
 
-/* ------------------------------------------------------------------ tower step / view */
+/* ------------------------------------------------------------------ tower batch step */
+/* The position and window tables do not depend on the pass: tile t reads its own copy of the
+ * same kSamTok (kClipTok) rows, so Bmax copies are staged once a rank and every batch run
+ * gathers the first B copies. The window tables carry the tile's own row offset. */
 template <typename G>
-void DeepEncoder::Tower<G>::view(RadCtx* c, const RadBatch* batch, int64_t patch0,
-                                 int64_t gw, int64_t t, int64_t n, int64_t rowbase,
-                                 bool tap, const DeepEncoder& w) const {
-    /* Tile t of a line: its patches are columns [t*kGrid, t*kGrid + kGrid) of the line's rows,
-     * each row `gw` patches wide (the last kDown columns are the newline column, never read). */
-    const char* pix = (const char*)batch->enc_pixels + (patch0 + t * kGrid) * DeepEncoder::kPatchDim * 2;
+void DeepEncoder::Tower<G>::stage_ids(RadCtx* c) const {
+    const int rk = rad_rank(c);
+    if (rk < 0 || rk >= 32 || (ids_done & (1u << rk))) return;
+    std::vector<int32_t> ids_s((size_t)(Bmax * kSamTok));
+    std::vector<int32_t> ids_c((size_t)(Bmax * kClipTok));
+    std::vector<int32_t> pad((size_t)(Bmax * kSamTokP), -1);
+    std::vector<int32_t> real((size_t)(Bmax * kSamTok));
+    for (int64_t t = 0; t < Bmax; ++t) {
+        for (int64_t r = 0; r < kSamTok; ++r)
+            ids_s[(size_t)(t * kSamTok + r)] = (int32_t)r;
+        for (int64_t r = 0; r < kClipTok; ++r)
+            ids_c[(size_t)(t * kClipTok + r)] = (int32_t)r;
+        for (int64_t r = 0; r < kGrid; ++r)
+            for (int64_t cc = 0; cc < kGrid; ++cc) {
+                pad[(size_t)(t * kSamTokP + r * kGridP + cc)] =
+                    (int32_t)(t * kSamTok + r * kGrid + cc);
+                real[(size_t)(t * kSamTok + r * kGrid + cc)] =
+                    (int32_t)(t * kSamTokP + r * kGridP + cc);
+            }
+    }
+    void* p_ids_s = rad_buf_ptr(c, b_ids_sam);
+    void* p_ids_c = rad_buf_ptr(c, b_ids_clip);
+    void* p_pad   = rad_buf_ptr(c, b_ids_pad);
+    void* p_real  = rad_buf_ptr(c, b_ids_real);
+    if (!p_ids_s || !p_ids_c || !p_pad || !p_real) {
+        rad_step_fail(c, "unlimitedocr: a staged index table of the DeepEncoder did not bind");
+        return;
+    }
+    if (rad_memcpy_async(p_ids_s, ids_s.data(), (int64_t)(ids_s.size() * sizeof(int32_t)),
+                         rad_stream(c)) < 0 ||
+        rad_memcpy_async(p_ids_c, ids_c.data(), (int64_t)(ids_c.size() * sizeof(int32_t)),
+                         rad_stream(c)) < 0 ||
+        rad_memcpy_async(p_pad, pad.data(), (int64_t)(pad.size() * sizeof(int32_t)),
+                         rad_stream(c)) < 0 ||
+        rad_memcpy_async(p_real, real.data(), (int64_t)(real.size() * sizeof(int32_t)),
+                         rad_stream(c)) < 0 ||
+        rad_stream_sync(rad_stream(c)) < 0) {
+        rad_step_fail(c, "unlimitedocr: the staged index tables of the DeepEncoder could not be "
+                         "filled");
+        return;
+    }
+    ids_done |= (1u << rk);
+}
 
-    /* The patch embed: one pitched copy packs the tile's grid rows out of the line's rows (the
-     * kDown zero patch columns at each row's end are the copy's dead space, skipped like the
-     * old per-row GEMMs skipped them), then ONE GEMM over M = kGrid*kGrid replaces the launch
-     * of kGrid M=kGrid GEMMs. The copy rides the pass's stream, ordered with the ops. */
+/* One batched tower run over `nt` staged tiles. Tile t's rows are [t*kSamTok, (t+1)*kSamTok) of
+ * every SAM plane (and its CLIP block at [t*kClipTok, (t+1)*kClipTok)); the segment-bounded ops
+ * read a B+1-entry cu table, so attention and the unfolds never see across a tile. */
+template <typename G>
+void DeepEncoder::Tower<G>::batch(RadCtx* c, const RadBatch* batch, const Tile* tiles,
+                                  int64_t nt, bool tap, const DeepEncoder& w) {
+    if (nt < 1 || nt > Bmax) {
+        rad_step_fail(c, "unlimitedocr: a DeepEncoder batch exceeded the declared tile bound");
+        return;
+    }
+    /* The 40 tower stages its resampled position tables once on the rank's first tile pass. */
+    if (b_pos_tab) fill_tables(c, w);
+    stage_ids(c);
+
+    const int64_t BT  = nt * kSamTok;
+    const int64_t BTP = nt * kSamTokP;
+    const int64_t BCT = nt * kClipTok;
+    const int64_t BM  = nt * kMap * kMap;
+
+    /* The patch embed: one pitched copy a tile packs its grid rows out of the line's rows (the
+     * kDown zero patch columns at each row's end are the copy's dead space), then ONE GEMM over
+     * all B tiles. The copies ride the pass's stream, ordered with the ops. */
     char* stg = (char*)rad_buf_ptr(c, b_pixstg);
     const int64_t rowb = kGrid * DeepEncoder::kPatchDim * 2;
-    if (!stg ||
-        rad_memcpy_2d_async(stg, rowb, pix, gw * DeepEncoder::kPatchDim * 2, rowb, kGrid,
-                            rad_stream(c)) < 0) {
+    if (!stg) {
         rad_step_fail(c, "unlimitedocr: the patch rows of the DeepEncoder could not be packed");
         return;
     }
-    RAD_ISSUE(c, op_patch,
-              RAD_P_T2(stg, RAD_BF16, kSamTok, DeepEncoder::kPatchDim),
-              RAD_W(w.w_patch), RAD_W(w.b_patch), RAD_NONE,
-              brow_slice(b_x, 0, kSamTok, DeepEncoder::kSamW));
+    for (int64_t t = 0; t < nt; ++t) {
+        const char* pix = (const char*)batch->enc_pixels +
+                          (tiles[t].patch0 + tiles[t].t * kGrid) * DeepEncoder::kPatchDim * 2;
+        char* dst = stg + t * kSamTok * DeepEncoder::kPatchDim * 2;
+        if (rad_memcpy_2d_async(dst, rowb, pix, tiles[t].gw * DeepEncoder::kPatchDim * 2,
+                                rowb, kGrid, rad_stream(c)) < 0) {
+            rad_step_fail(c, "unlimitedocr: the patch rows of the DeepEncoder could not be packed");
+            return;
+        }
+    }
+    RAD_ISSUE_N(c, op_patch, BT,
+                RAD_P_T2(stg, RAD_BF16, BT, DeepEncoder::kPatchDim),
+                RAD_W(w.w_patch), RAD_W(w.b_patch), RAD_NONE,
+                brow_slice(b_x, 0, BT, DeepEncoder::kSamW));
+
+    /* The pass's segment tables: B tiles, a bound each. */
+    RAD_ISSUE_N(c, op_cu_sam,  nt + 1, brows(b_cu_sam, nt + 1));
+    RAD_ISSUE_N(c, op_cu_clip, nt + 1, brows(b_cu_clip, nt + 1));
+    RAD_ISSUE_N(c, op_cu_pad,  nt + 1, brows(b_cu_pad, nt + 1));
 
     /* The position table, a row for a token (a gather, exact at 64 and from the staged
-     * resample at 40), added in. */
+     * resample at 40), added in. The ids repeat per tile, so every tile sees the same table. */
     if (tap) w.tap(c, "st_emb", b_x, 256, DeepEncoder::kSamW);
-    RAD_ISSUE(c, op_ids_sam, RAD_B(b_ids_sam));
     if (b_pos_tab)
-        RAD_ISSUE_N(c, op_sampos, kSamTok, RAD_B(b_pos_tab), RAD_B(b_ids_sam),
-                    brows(b_sampos, kSamTok));
+        RAD_ISSUE_N(c, op_sampos, BT, RAD_B(b_pos_tab), brows(b_ids_sam, BT),
+                    brows(b_sampos, BT));
     else
-        RAD_ISSUE_N(c, op_sampos, kSamTok, RAD_B(b_ids_sam), RAD_W(w.w_pos),
-                    brows(b_sampos, kSamTok));
+        RAD_ISSUE_N(c, op_sampos, BT, brows(b_ids_sam, BT), RAD_W(w.w_pos),
+                    brows(b_sampos, BT));
     if (tap) w.tap(c, "st_sampos", b_sampos, 256, DeepEncoder::kSamW);
-    RAD_ISSUE_N(c, op_sampadd, kSamTok, brows(b_x, kSamTok), brows(b_sampos, kSamTok),
-                brows(b_x, kSamTok));
+    RAD_ISSUE_N(c, op_sampadd, BT, brows(b_x, BT), brows(b_sampos, BT), brows(b_x, BT));
     if (tap) w.tap(c, "st_x0", b_x, 256, DeepEncoder::kSamW);
 
     if (dbg == 10) {
@@ -1145,32 +1257,32 @@ void DeepEncoder::Tower<G>::view(RadCtx* c, const RadBatch* batch, int64_t patch
 
     for (size_t li = 0; li < sam.size(); ++li) {
         const SamLayerT<G>& l = sam[li];
-        RAD_ISSUE_N(c, l.op_n1, kSamTok, brows(b_x, kSamTok), RAD_W(l.w_n1), RAD_W(l.b_n1),
-                    brows(b_h, kSamTok));
+        RAD_ISSUE_N(c, l.op_n1, BT, brows(b_x, BT), RAD_W(l.w_n1), RAD_W(l.b_n1),
+                    brows(b_h, BT));
         if (l.window > 0) {
             /* The reference's window path: pad the normed grid to a multiple of 14, run qkv
              * over the pad rows too (they carry the qkv bias), attend inside each 14x14 window,
              * and take the real rows back out. The pad rows take softmax mass with the bias as v. */
-            RAD_ISSUE_N(c, l.op_gpad, kSamTokP, brows(b_h, kSamTok), RAD_B(b_ids_pad),
-                        brows(b_hw, kSamTokP));
-            RAD_ISSUE_N(c, l.op_qkvw, kSamTokP, brows(b_hw, kSamTokP), RAD_W(l.w_qkv),
-                        RAD_W(l.b_qkv), RAD_NONE, brows(b_qkvw, kSamTokP));
-            RAD_ISSUE_N(c, l.op_attnw, kSamTokP,
-                        bcol(b_qkvw, 0, DeepEncoder::kSamW, kSamTokP),
-                        bcol(b_qkvw, DeepEncoder::kSamW, DeepEncoder::kSamW, kSamTokP),
-                        bcol(b_qkvw, 2 * DeepEncoder::kSamW, DeepEncoder::kSamW, kSamTokP),
-                        RAD_B(b_cu_pad), brows(b_attw, kSamTokP),
+            RAD_ISSUE_N(c, l.op_gpad, BTP, brows(b_h, BT), brows(b_ids_pad, BTP),
+                        brows(b_hw, BTP));
+            RAD_ISSUE_N(c, l.op_qkvw, BTP, brows(b_hw, BTP), RAD_W(l.w_qkv),
+                        RAD_W(l.b_qkv), RAD_NONE, brows(b_qkvw, BTP));
+            RAD_ISSUE_N(c, l.op_attnw, BTP,
+                        bcol(b_qkvw, 0, DeepEncoder::kSamW, BTP),
+                        bcol(b_qkvw, DeepEncoder::kSamW, DeepEncoder::kSamW, BTP),
+                        bcol(b_qkvw, 2 * DeepEncoder::kSamW, DeepEncoder::kSamW, BTP),
+                        brows(b_cu_pad, nt + 1), brows(b_attw, BTP),
                         RAD_W(l.w_rh), RAD_W(l.w_rw));
-            RAD_ISSUE_N(c, l.op_greal, kSamTok, brows(b_attw, kSamTokP), RAD_B(b_ids_real),
-                        brows(b_att, kSamTok));
+            RAD_ISSUE_N(c, l.op_greal, BT, brows(b_attw, BTP), brows(b_ids_real, BT),
+                        brows(b_att, BT));
         } else {
-            RAD_ISSUE_N(c, l.op_qkv, kSamTok, brows(b_h, kSamTok), RAD_W(l.w_qkv),
-                        RAD_W(l.b_qkv), RAD_NONE, brows(b_qkv, kSamTok));
-            RAD_ISSUE_N(c, l.op_attn, kSamTok,
-                        bcol(b_qkv, 0, DeepEncoder::kSamW, kSamTok),
-                        bcol(b_qkv, DeepEncoder::kSamW, DeepEncoder::kSamW, kSamTok),
-                        bcol(b_qkv, 2 * DeepEncoder::kSamW, DeepEncoder::kSamW, kSamTok),
-                        RAD_B(b_cu_sam), brows(b_att, kSamTok),
+            RAD_ISSUE_N(c, l.op_qkv, BT, brows(b_h, BT), RAD_W(l.w_qkv),
+                        RAD_W(l.b_qkv), RAD_NONE, brows(b_qkv, BT));
+            RAD_ISSUE_N(c, l.op_attn, BT,
+                        bcol(b_qkv, 0, DeepEncoder::kSamW, BT),
+                        bcol(b_qkv, DeepEncoder::kSamW, DeepEncoder::kSamW, BT),
+                        bcol(b_qkv, 2 * DeepEncoder::kSamW, DeepEncoder::kSamW, BT),
+                        brows(b_cu_sam, nt + 1), brows(b_att, BT),
                         RAD_W(l.w_rh), RAD_W(l.w_rw));
         }
         char tag[40];
@@ -1181,10 +1293,9 @@ void DeepEncoder::Tower<G>::view(RadCtx* c, const RadBatch* batch, int64_t patch
                       bcol(p_out, 0, DeepEncoder::kSamW, 256));
             return;
         }
-        RAD_ISSUE_N(c, l.op_proj, kSamTok, brows(b_att, kSamTok), RAD_W(l.w_proj),
-                    RAD_W(l.b_proj), RAD_NONE, brows(b_h, kSamTok));
-        RAD_ISSUE_N(c, l.op_padd, kSamTok, brows(b_h, kSamTok), brows(b_x, kSamTok),
-                    brows(b_x, kSamTok));
+        RAD_ISSUE_N(c, l.op_proj, BT, brows(b_att, BT), RAD_W(l.w_proj),
+                    RAD_W(l.b_proj), RAD_NONE, brows(b_h, BT));
+        RAD_ISSUE_N(c, l.op_padd, BT, brows(b_h, BT), brows(b_x, BT), brows(b_x, BT));
         std::snprintf(tag, sizeof tag, "st_pre%lld", (long long)li);
         if (tap) w.tap(c, tag, b_x, 256, DeepEncoder::kSamW);
         if (dbg >= 70 && dbg < 70 + (int)DeepEncoder::kSamDepth && dbg == 70 + (int)li) {
@@ -1192,14 +1303,13 @@ void DeepEncoder::Tower<G>::view(RadCtx* c, const RadBatch* batch, int64_t patch
                       bcol(p_out, 0, DeepEncoder::kSamW, 256));
             return;
         }
-        RAD_ISSUE_N(c, l.op_n2, kSamTok, brows(b_x, kSamTok), RAD_W(l.w_n2), RAD_W(l.b_n2),
-                    brows(b_h, kSamTok));
-        RAD_ISSUE_N(c, l.op_l1, kSamTok, brows(b_h, kSamTok), RAD_W(l.w_l1), RAD_W(l.b_l1),
-                    RAD_NONE, brows(b_ff, kSamTok));
-        RAD_ISSUE_N(c, l.op_l2, kSamTok, brows(b_ff, kSamTok), RAD_W(l.w_l2), RAD_W(l.b_l2),
-                    RAD_NONE, brows(b_h, kSamTok));
-        RAD_ISSUE_N(c, l.op_ladd, kSamTok, brows(b_h, kSamTok), brows(b_x, kSamTok),
-                    brows(b_x, kSamTok));
+        RAD_ISSUE_N(c, l.op_n2, BT, brows(b_x, BT), RAD_W(l.w_n2), RAD_W(l.b_n2),
+                    brows(b_h, BT));
+        RAD_ISSUE_N(c, l.op_l1, BT, brows(b_h, BT), RAD_W(l.w_l1), RAD_W(l.b_l1),
+                    RAD_NONE, brows(b_ff, BT));
+        RAD_ISSUE_N(c, l.op_l2, BT, brows(b_ff, BT), RAD_W(l.w_l2), RAD_W(l.b_l2),
+                    RAD_NONE, brows(b_h, BT));
+        RAD_ISSUE_N(c, l.op_ladd, BT, brows(b_h, BT), brows(b_x, BT), brows(b_x, BT));
         std::snprintf(tag, sizeof tag, "st_b%lld", (long long)li);
         if (tap) w.tap(c, tag, b_x, 256, DeepEncoder::kSamW);
         if (li < 3) {
@@ -1213,123 +1323,128 @@ void DeepEncoder::Tower<G>::view(RadCtx* c, const RadBatch* batch, int64_t patch
         }
     }
 
-    /* neck + net_2 + net_3. The 3x3s are a dense view of the map rows, unfolded. */
-    RAD_ISSUE_N(c, op_neck0, kSamTok, brows(b_x, kSamTok), RAD_W(w.w_neck0),
-                brows(b_n0, kSamTok));
+    /* neck + net_2 + net_3. The 3x3s are a dense view of the map rows, unfolded; the cu table
+     * gives each tile its own grid. */
+    RAD_ISSUE_N(c, op_neck0, BT, brows(b_x, BT), RAD_W(w.w_neck0), brows(b_n0, BT));
     if (tap) w.tap(c, "st_n0", b_n0, 256, 256);
     if (dbg == 30) {
         RAD_ISSUE(c, op_dbg256, brows(b_n0, 256), bcol(p_out, 0, 256, 256));
         return;
     }
-    RAD_ISSUE_N(c, op_nk1, kSamTok, brows(b_n0, kSamTok), RAD_W(w.w_nk1), RAD_W(w.b_nk1),
-                brows(b_n1, kSamTok));
+    RAD_ISSUE_N(c, op_nk1, BT, brows(b_n0, BT), RAD_W(w.w_nk1), RAD_W(w.b_nk1),
+                brows(b_n1, BT));
     if (tap) w.tap(c, "st_n1", b_n1, 256, 256);
     if (dbg == 31) {
         RAD_ISSUE(c, op_dbg256, brows(b_n1, 256), bcol(p_out, 0, 256, 256));
         return;
     }
     RAD_ISSUE(c, op_unf3,
-              RAD_P_T2(rad_buf_ptr(c, b_n1), RAD_BF16, kGrid, kGrid * 256),
-              RAD_B(b_cu_sam), RAD_NONE, brows(b_unf3, kSamTok));
-    RAD_ISSUE_N(c, op_nk2, kSamTok, brows(b_unf3, kSamTok), RAD_W(w.w_nk2),
-                brows(b_n2, kSamTok));
+              RAD_P_T2(rad_buf_ptr(c, b_n1), RAD_BF16, nt * kGrid, kGrid * 256),
+              brows(b_cu_sam, nt + 1), RAD_NONE, brows(b_unf3, BT));
+    RAD_ISSUE_N(c, op_nk2, BT, brows(b_unf3, BT), RAD_W(w.w_nk2), brows(b_n2, BT));
     if (tap) w.tap(c, "st_n2", b_n2, 256, 256);
     if (dbg == 32) {
         RAD_ISSUE(c, op_dbg256, brows(b_n2, 256), bcol(p_out, 0, 256, 256));
         return;
     }
-    RAD_ISSUE_N(c, op_nk3, kSamTok, brows(b_n2, kSamTok), RAD_W(w.w_nk3), RAD_W(w.b_nk3),
-                brows(b_n3, kSamTok));
+    RAD_ISSUE_N(c, op_nk3, BT, brows(b_n2, BT), RAD_W(w.w_nk3), RAD_W(w.b_nk3),
+                brows(b_n3, BT));
     if (tap) w.tap(c, "st_n3", b_n3, 256, 256);
     if (dbg == 33) {
         RAD_ISSUE(c, op_dbg256, brows(b_n3, 256), bcol(p_out, 0, 256, 256));
         return;
     }
     RAD_ISSUE(c, op_unf_net2,
-              RAD_P_T2(rad_buf_ptr(c, b_n3), RAD_BF16, kGrid, kGrid * 256),
-              RAD_B(b_cu_sam), RAD_NONE, brows(b_unf_2, kSamTok / 4));
+              RAD_P_T2(rad_buf_ptr(c, b_n3), RAD_BF16, nt * kGrid, kGrid * 256),
+              brows(b_cu_sam, nt + 1), RAD_NONE, brows(b_unf_2, nt * kSamTok / 4));
     if (dbg == 40) {
         RAD_ISSUE(c, op_dbg1024, brows(b_unf_2, 256), bcol(p_out, 0, DeepEncoder::kClipW, 256));
         return;
     }
-    RAD_ISSUE_N(c, op_net2, kSamTok / 4, brows(b_unf_2, kSamTok / 4), RAD_W(w.w_net2),
-                brows(b_map2, kSamTok / 4));
+    RAD_ISSUE_N(c, op_net2, nt * kSamTok / 4, brows(b_unf_2, nt * kSamTok / 4),
+                RAD_W(w.w_net2), brows(b_map2, nt * kSamTok / 4));
     if (tap) w.tap(c, "st_map2", b_map2, 256, 512);
     RAD_ISSUE(c, op_unf_net3,
-              RAD_P_T2(rad_buf_ptr(c, b_map2), RAD_BF16, kGrid / 2, (kGrid / 2) * 512),
-              RAD_B(b_cu_sam), RAD_NONE, brows(b_unf_3, kMap * kMap));
+              RAD_P_T2(rad_buf_ptr(c, b_map2), RAD_BF16, nt * kGrid / 2, (kGrid / 2) * 512),
+              brows(b_cu_sam, nt + 1), RAD_NONE, brows(b_unf_3, BM));
     if (dbg == 34) {
         RAD_ISSUE(c, op_dbg256, brows(b_map2, 256), bcol(p_out, 0, 256, 256));
         return;
     }
-    RAD_ISSUE_N(c, op_net3, kMap * kMap, brows(b_unf_3, kMap * kMap), RAD_W(w.w_net3),
-                brows(b_map, kMap * kMap));
+    RAD_ISSUE_N(c, op_net3, BM, brows(b_unf_3, BM), RAD_W(w.w_net3), brows(b_map, BM));
     if (tap) w.tap(c, "st_map", b_map, kMap * kMap, DeepEncoder::kClipW);
 
-    /* CLIP: the class row, the map, the absolute table. */
-    RAD_ISSUE(c, op_cls, RAD_B(p_one_c), RAD_W(w.w_cls), brow_slice(b_c, 0, 1, DeepEncoder::kClipW));
-    RAD_ISSUE(c, op_cmap, bcol(b_map, 0, DeepEncoder::kClipW, kMap * kMap),
-              brow_slice(b_c, 1, kMap * kMap, DeepEncoder::kClipW));
-    RAD_ISSUE(c, op_ids_clip, RAD_B(b_ids_clip));
+    /* CLIP: the class row and the map, tile by tile (each block's rows are strided in the
+     * tile-major plane), then the batched transformer and absolute table. */
+    for (int64_t t = 0; t < nt; ++t) {
+        RAD_ISSUE(c, op_cls, RAD_B(p_one_c), RAD_W(w.w_cls),
+                  brow_slice(b_c, t * kClipTok, 1, DeepEncoder::kClipW));
+        RAD_ISSUE(c, op_cmap,
+                  brow_slice(b_map, t * kMap * kMap, kMap * kMap, DeepEncoder::kClipW),
+                  brow_slice(b_c, t * kClipTok + 1, kMap * kMap, DeepEncoder::kClipW));
+    }
     if (b_cpos_tab)
-        RAD_ISSUE_N(c, op_cpos, kClipTok, RAD_B(b_cpos_tab), RAD_B(b_ids_clip),
-                    brows(b_cpos, kClipTok));
+        RAD_ISSUE_N(c, op_cpos, BCT, RAD_B(b_cpos_tab), brows(b_ids_clip, BCT),
+                    brows(b_cpos, BCT));
     else
-        RAD_ISSUE_N(c, op_cpos, kClipTok, RAD_B(b_ids_clip), RAD_W(w.w_cpos),
-                    brows(b_cpos, kClipTok));
-    RAD_ISSUE_N(c, op_cadd, kClipTok, brows(b_c, kClipTok), brows(b_cpos, kClipTok),
-                brows(b_c, kClipTok));
+        RAD_ISSUE_N(c, op_cpos, BCT, brows(b_ids_clip, BCT), RAD_W(w.w_cpos),
+                    brows(b_cpos, BCT));
+    RAD_ISSUE_N(c, op_cadd, BCT, brows(b_c, BCT), brows(b_cpos, BCT), brows(b_c, BCT));
     if (tap) w.tap(c, "clip_x", b_c, kClipTok, DeepEncoder::kClipW);
-    RAD_ISSUE_N(c, op_playr, kClipTok, brows(b_c, kClipTok), RAD_W(w.w_playr),
-                RAD_W(w.b_playr), brows(b_cp, kClipTok));
-    RAD_ISSUE_N(c, op_ccopy, kClipTok, brows(b_cp, kClipTok), brows(b_c, kClipTok));
+    RAD_ISSUE_N(c, op_playr, BCT, brows(b_c, BCT), RAD_W(w.w_playr),
+                RAD_W(w.b_playr), brows(b_cp, BCT));
+    RAD_ISSUE_N(c, op_ccopy, BCT, brows(b_cp, BCT), brows(b_c, BCT));
 
     for (size_t ci = 0; ci < clip.size(); ++ci) {
         const ClipLayerT<G>& l = clip[ci];
         char ctag[40];
-        RAD_ISSUE_N(c, l.op_n1, kClipTok, brows(b_c, kClipTok), RAD_W(l.w_n1),
-                    RAD_W(l.b_n1), brows(b_ch, kClipTok));
+        RAD_ISSUE_N(c, l.op_n1, BCT, brows(b_c, BCT), RAD_W(l.w_n1),
+                    RAD_W(l.b_n1), brows(b_ch, BCT));
         std::snprintf(ctag, sizeof ctag, "clip_pre%lld", (long long)ci);
         if (tap) w.tap(c, ctag, b_ch, kClipTok, DeepEncoder::kClipW);
-        RAD_ISSUE_N(c, l.op_qkv, kClipTok, brows(b_ch, kClipTok), RAD_W(l.w_qkv),
-                    RAD_W(l.b_qkv), RAD_NONE, brows(b_cq, kClipTok));
-        RAD_ISSUE_N(c, l.op_attn, kClipTok,
-                    bcol(b_cq, 0, DeepEncoder::kClipW, kClipTok),
-                    bcol(b_cq, DeepEncoder::kClipW, DeepEncoder::kClipW, kClipTok),
-                    bcol(b_cq, 2 * DeepEncoder::kClipW, DeepEncoder::kClipW, kClipTok),
-                    RAD_B(b_cu_clip), brows(b_ca, kClipTok));
+        RAD_ISSUE_N(c, l.op_qkv, BCT, brows(b_ch, BCT), RAD_W(l.w_qkv),
+                    RAD_W(l.b_qkv), RAD_NONE, brows(b_cq, BCT));
+        RAD_ISSUE_N(c, l.op_attn, BCT,
+                    bcol(b_cq, 0, DeepEncoder::kClipW, BCT),
+                    bcol(b_cq, DeepEncoder::kClipW, DeepEncoder::kClipW, BCT),
+                    bcol(b_cq, 2 * DeepEncoder::kClipW, DeepEncoder::kClipW, BCT),
+                    brows(b_cu_clip, nt + 1), brows(b_ca, BCT));
         std::snprintf(ctag, sizeof ctag, "clip_att%lld", (long long)ci);
         if (tap) w.tap(c, ctag, b_ca, kClipTok, DeepEncoder::kClipW);
-        RAD_ISSUE_N(c, l.op_out, kClipTok, brows(b_ca, kClipTok), RAD_W(l.w_out),
-                    RAD_W(l.b_out), RAD_NONE, brows(b_ct, kClipTok));
-        RAD_ISSUE_N(c, l.op_cadd, kClipTok, brows(b_ct, kClipTok), brows(b_c, kClipTok),
-                    brows(b_c, kClipTok));
+        RAD_ISSUE_N(c, l.op_out, BCT, brows(b_ca, BCT), RAD_W(l.w_out),
+                    RAD_W(l.b_out), RAD_NONE, brows(b_ct, BCT));
+        RAD_ISSUE_N(c, l.op_cadd, BCT, brows(b_ct, BCT), brows(b_c, BCT), brows(b_c, BCT));
         std::snprintf(ctag, sizeof ctag, "clip_h%lld", (long long)ci);
         if (tap) w.tap(c, ctag, b_c, kClipTok, DeepEncoder::kClipW);
-        RAD_ISSUE_N(c, l.op_n2, kClipTok, brows(b_c, kClipTok), RAD_W(l.w_n2),
-                    RAD_W(l.b_n2), brows(b_ch, kClipTok));
-        RAD_ISSUE_N(c, l.op_fc1, kClipTok, brows(b_ch, kClipTok), RAD_W(l.w_fc1),
-                    RAD_W(l.b_fc1), RAD_NONE, brows(b_cf, kClipTok));
-        RAD_ISSUE_N(c, l.op_qg, kClipTok, brows(b_cf, kClipTok), brows(b_cf, kClipTok),
-                    brows(b_cg2, kClipTok));
-        RAD_ISSUE_N(c, l.op_fc2, kClipTok, brows(b_cg2, kClipTok), RAD_W(l.w_fc2),
-                    RAD_W(l.b_fc2), RAD_NONE, brows(b_ct, kClipTok));
-        RAD_ISSUE_N(c, l.op_madd, kClipTok, brows(b_ct, kClipTok), brows(b_c, kClipTok),
-                    brows(b_c, kClipTok));
+        RAD_ISSUE_N(c, l.op_n2, BCT, brows(b_c, BCT), RAD_W(l.w_n2),
+                    RAD_W(l.b_n2), brows(b_ch, BCT));
+        RAD_ISSUE_N(c, l.op_fc1, BCT, brows(b_ch, BCT), RAD_W(l.w_fc1),
+                    RAD_W(l.b_fc1), RAD_NONE, brows(b_cf, BCT));
+        RAD_ISSUE_N(c, l.op_qg, BCT, brows(b_cf, BCT), brows(b_cf, BCT),
+                    brows(b_cg2, BCT));
+        RAD_ISSUE_N(c, l.op_fc2, BCT, brows(b_cg2, BCT), RAD_W(l.w_fc2),
+                    RAD_W(l.b_fc2), RAD_NONE, brows(b_ct, BCT));
+        RAD_ISSUE_N(c, l.op_madd, BCT, brows(b_ct, BCT), brows(b_c, BCT), brows(b_c, BCT));
         std::snprintf(ctag, sizeof ctag, "clip_b%lld", (long long)ci);
         if (tap) w.tap(c, ctag, b_c, kClipTok, DeepEncoder::kClipW);
     }
 
     if (tap) w.tap(c, "clip_out", b_c, kMap * kMap, DeepEncoder::kClipW, 1);
 
-    /* Fuse (CLIP's patch rows | the map) and project. */
-    RAD_ISSUE(c, op_fuse_clip, brow_slice(b_c, 1, kMap * kMap, DeepEncoder::kClipW),
-              bcol(b_fuse, 0, DeepEncoder::kClipW, kMap * kMap));
-    RAD_ISSUE(c, op_fuse_sam, bcol(b_map, 0, DeepEncoder::kClipW, kMap * kMap),
-              bcol(b_fuse, DeepEncoder::kClipW, DeepEncoder::kClipW, kMap * kMap));
+    /* Fuse (CLIP's patch rows | the map) and project, tile by tile into the tile-major fuse. */
+    for (int64_t t = 0; t < nt; ++t) {
+        RAD_ISSUE(c, op_fuse_clip,
+                  brow_slice(b_c, t * kClipTok + 1, kMap * kMap, DeepEncoder::kClipW),
+                  bcol_at(b_fuse, t * kMap * kMap, DeepEncoder::kFused, 0,
+                          DeepEncoder::kClipW, kMap * kMap));
+        RAD_ISSUE(c, op_fuse_sam,
+                  brow_slice(b_map, t * kMap * kMap, kMap * kMap, DeepEncoder::kClipW),
+                  bcol_at(b_fuse, t * kMap * kMap, DeepEncoder::kFused, DeepEncoder::kClipW,
+                          DeepEncoder::kClipW, kMap * kMap));
+    }
     if (tap) w.tap(c, "fuse", b_fuse, kMap * kMap, DeepEncoder::kFused);
-    RAD_ISSUE_N(c, op_proj, kMap * kMap, brows(b_fuse, kMap * kMap), RAD_W(w.w_proj),
-                RAD_W(w.b_proj), RAD_NONE, brows(b_projbuf, kMap * kMap));
+    RAD_ISSUE_N(c, op_proj, BM, brows(b_fuse, BM), RAD_W(w.w_proj),
+                RAD_W(w.b_proj), RAD_NONE, brows(b_projbuf, BM));
     if (tap) w.tap(c, "proj", b_projbuf, kMap * kMap, DeepEncoder::kNEmbd);
 
     if (dbg) {
@@ -1342,95 +1457,49 @@ void DeepEncoder::Tower<G>::view(RadCtx* c, const RadBatch* batch, int64_t patch
         return;
     }
 
-    /* The line's layout: tile t's map goes to columns [t*kMap, (t+1)*kMap) of every map row --
-     * a pitched copy of the projected tile into the plane (the layout pitch is the line's row
+    /* The layout: each tile's map goes to columns [t*kMap, (t+1)*kMap) of every map row -- a
+     * pitched copy of the projected tile into the plane (the layout pitch is the line's row
      * count plus the newline column), one copy replacing kMap cast-launches. The newline cell
-     * after the last tile belongs to the line, so segment() writes it once. */
+     * after a line's last tile belongs to the line and follows that tile's copy. */
     char* po = (char*)rad_buf_ptr(c, p_out);
+    const char* proj = (const char*)rad_buf_ptr(c, b_projbuf);
     const int64_t wbytes = kMap * DeepEncoder::kNEmbd * 2;
-    if (!po ||
-        rad_memcpy_2d_async(po + (rowbase + t * kMap) * DeepEncoder::kNEmbd * 2,
-                            (n * kMap + 1) * DeepEncoder::kNEmbd * 2,
-                            rad_buf_ptr(c, b_projbuf), wbytes, wbytes, kMap,
-                            rad_stream(c)) < 0) {
-        rad_step_fail(c, "unlimitedocr: the projected map of the DeepEncoder could not be laid "
-                         "out");
+    if (!po || !proj) {
+        rad_step_fail(c, "unlimitedocr: a layout plane of the DeepEncoder did not bind");
         return;
     }
-}
-
-template <typename G>
-void DeepEncoder::Tower<G>::segment(RadCtx* c, const RadBatch* batch, int64_t patch0,
-                                    int64_t gw, int64_t n, int64_t rowbase, bool nl, bool tap,
-                                    const DeepEncoder& w) {
-    /* The 40 tower stages its resampled position tables once on the rank's first tile pass. */
-    if (b_pos_tab) fill_tables(c, w);
-
-    /* One view's constants for the whole pass. */
-    RAD_ISSUE(c, op_cu_sam, RAD_B(b_cu_sam));
-    RAD_ISSUE(c, op_cu_clip, RAD_B(b_cu_clip));
-    RAD_ISSUE(c, op_cu_pad, RAD_B(b_cu_pad));
-
-    /* window_partition's two index tables: padded position (r*kGridP + c) holds real row
-     * r*kGrid + c, every other padded row is the pad (gather -1 = a zero row, which the qkv
-     * linear turns into the qkv bias). The values are compile-time constants and the planes are
-     * PERSIST, so each rank stages them once, on its first segment. */
-    static const std::vector<int32_t> pad_idx = [] {
-        std::vector<int32_t> v((size_t)kSamTokP, -1);
-        for (int64_t r = 0; r < kGrid; ++r)
-            for (int64_t cc = 0; cc < kGrid; ++cc)
-                v[(size_t)(r * kGridP + cc)] = (int32_t)(r * kGrid + cc);
-        return v;
-    }();
-    static const std::vector<int32_t> real_idx = [] {
-        std::vector<int32_t> v((size_t)kSamTok);
-        for (int64_t r = 0; r < kGrid; ++r)
-            for (int64_t cc = 0; cc < kGrid; ++cc)
-                v[(size_t)(r * kGrid + cc)] = (int32_t)(r * kGridP + cc);
-        return v;
-    }();
-    const int rk = rad_rank(c);
-    if (rk >= 0 && rk < 32 && !(ids_done & (1u << rk))) {
-        void* p_pad  = rad_buf_ptr(c, b_ids_pad);
-        void* p_real = rad_buf_ptr(c, b_ids_real);
-        if (!p_pad || !p_real) {
-            rad_step_fail(c, "unlimitedocr: the padded-grid index table of the DeepEncoder did not "
-                             "bind");
-            return;
-        }
-        if (rad_memcpy_async(p_pad, pad_idx.data(),
-                             (int64_t)(pad_idx.size() * sizeof(int32_t)),
-                             rad_stream(c)) < 0 ||
-            rad_memcpy_async(p_real, real_idx.data(),
-                             (int64_t)(real_idx.size() * sizeof(int32_t)),
-                             rad_stream(c)) < 0) {
-            rad_step_fail(c, "unlimitedocr: could not stage the DeepEncoder's padded-grid index "
-                             "table");
-            return;
-        }
-        ids_done |= (1u << rk);
-    }
-
-    for (int64_t t = 0; t < n; ++t) view(c, batch, patch0, gw, t, n, rowbase, tap && t == 0, w);
-
-    /* The line's newline cell closes each map line: one learned row after the last tile. Only
-     * the line's last chunk carries it; an earlier chunk ends at its last tile's map. The row
-     * is computed once and pitched to the line's map rows -- one launch, one copy. */
-    if (nl) {
-        char* nlrow = (char*)rad_buf_ptr(c, b_nlrow);
-        char* po    = (char*)rad_buf_ptr(c, p_out);
-        if (!nlrow || !po) {
-            rad_step_fail(c, "unlimitedocr: a layout plane of the DeepEncoder did not bind");
-            return;
-        }
-        RAD_ISSUE(c, op_newline, RAD_B(p_one), RAD_W(w.w_newline), RAD_B(b_nlrow));
-        if (rad_memcpy_2d_async(po + (rowbase + n * kMap) * DeepEncoder::kNEmbd * 2,
-                                (n * kMap + 1) * DeepEncoder::kNEmbd * 2, nlrow,
-                                DeepEncoder::kNEmbd * 2, DeepEncoder::kNEmbd * 2, kMap,
-                                rad_stream(c)) < 0) {
-            rad_step_fail(c, "unlimitedocr: the newline row of the DeepEncoder could not be "
+    for (int64_t t = 0; t < nt; ++t) {
+        const int64_t rowbase = tiles[t].rowbase;
+        const int64_t tt = tiles[t].t, n = tiles[t].n;
+        if (rad_memcpy_2d_async(po + (rowbase + tt * kMap) * DeepEncoder::kNEmbd * 2,
+                                (n * kMap + 1) * DeepEncoder::kNEmbd * 2,
+                                proj + t * kMap * kMap * DeepEncoder::kNEmbd * 2,
+                                wbytes, wbytes, kMap, rad_stream(c)) < 0) {
+            rad_step_fail(c, "unlimitedocr: the projected map of the DeepEncoder could not be "
                              "laid out");
             return;
+        }
+        if (tiles[t].nl) {
+            /* The reference expands image_newline over every map row of the line
+             * (modeling_unlimitedocr.py: `image_newline.expand(h, 1, n_dim)`), so the one
+             * learned row is replicated into each newline cell. Copy one cell at a time:
+             * b_nlrow is a single row, and a 2D copy with a zero source pitch is not a
+             * portable device operation. */
+            RAD_ISSUE(c, op_newline, RAD_B(p_one), RAD_W(w.w_newline), RAD_B(b_nlrow));
+            const char* nl = (const char*)rad_buf_ptr(c, b_nlrow);
+            if (!nl) {
+                rad_step_fail(c, "unlimitedocr: the newline row of the DeepEncoder did not bind");
+                return;
+            }
+            for (int64_t r = 0; r < kMap; ++r) {
+                char* dst = po + ((rowbase + n * kMap) + r * (n * kMap + 1)) *
+                                   DeepEncoder::kNEmbd * 2;
+                if (rad_memcpy_async(dst, nl, DeepEncoder::kNEmbd * 2, rad_stream(c)) < 0) {
+                    rad_step_fail(c, "unlimitedocr: the newline row of the DeepEncoder could "
+                                     "not be laid out");
+                    return;
+                }
+            }
         }
     }
 }

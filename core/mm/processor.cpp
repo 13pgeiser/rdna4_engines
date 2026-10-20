@@ -7,8 +7,16 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <sstream>
+#include <thread>
+
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64)
+#include <immintrin.h>
+#define RAD_MM_HAVE_AVX2 1
+#endif
 
 namespace rad {
 namespace mm {
@@ -482,6 +490,172 @@ int coeffs(int32_t in_size, int32_t out_size, std::vector<int32_t>* bounds,
 
 }  /* namespace */
 
+/* ================================================================== AVX2 resample helpers
+ *
+ * The two passes below are fixed-point int32 per tap. Integer addition is exact and associative at
+ * these magnitudes (the coefficients of one output sum to 1 << prec and 255 << prec is about
+ * 1.07e9, so no wrapper), so evaluating eight output pixels at once in any tap order is the same
+ * function as the scalar loop; the rounding is only the final shift and clip. The horizontal pass
+ * has variable tap counts and arbitrary stride-3 starts, so its lanes gather one 32-bit word per
+ * tap (the RGB bytes of a pixel) and mask off inactive taps; the vertical pass reads whole rows,
+ * where eight pixels are 24 contiguous bytes.
+ *
+ * Dispatch is local rather than through libavx: this file is core host code, and the AVX2 bodies
+ * are target-attributed so the baseline object they live in still cannot execute AVX2 before the
+ * check. RAD_MM_NO_AVX2 forces the scalar path (the bit-exactness test uses it). */
+
+static bool mm_use_avx2() {
+#ifdef RAD_MM_HAVE_AVX2
+    static const bool cpu = [] {
+        __builtin_cpu_init();
+        return __builtin_cpu_supports("avx2");
+    }();
+    const char* off = std::getenv("RAD_MM_NO_AVX2");
+    return cpu && !(off && *off && *off != '0');
+#else
+    return false;
+#endif
+}
+
+#if defined(RAD_MM_HAVE_AVX2)
+#define RAD_MM_AVX2 __attribute__((target("avx2")))
+#define RAD_MM_INLINE_AVX2 __attribute__((target("avx2"), always_inline)) inline
+#define RAD_MM_EXTRACT16(v) _mm256_extracti128_si256((v), 1)
+
+/* Eight RGB pixels from 24 contiguous bytes (bytes 0..23 of p). */
+RAD_MM_INLINE_AVX2 void load_rgb8(const uint8_t* p, __m256i* r, __m256i* g, __m256i* b) {
+    const __m128i a = _mm_loadu_si128((const __m128i*)p);
+    const __m128i c = _mm_loadl_epi64((const __m128i*)(p + 16));
+    const __m128i mr0 = _mm_setr_epi8(0, 3, 6, 9, 12, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m128i mg0 = _mm_setr_epi8(1, 4, 7, 10, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m128i mb0 = _mm_setr_epi8(2, 5, 8, 11, 14, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m128i mr1 = _mm_setr_epi8(2, 5, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m128i mg1 = _mm_setr_epi8(0, 3, 6, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m128i mb1 = _mm_setr_epi8(1, 4, 7, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m128i rb = _mm_or_si128(_mm_shuffle_epi8(a, mr0), _mm_slli_si128(_mm_shuffle_epi8(c, mr1), 6));
+    const __m128i gb = _mm_or_si128(_mm_shuffle_epi8(a, mg0), _mm_slli_si128(_mm_shuffle_epi8(c, mg1), 5));
+    const __m128i bb = _mm_or_si128(_mm_shuffle_epi8(a, mb0), _mm_slli_si128(_mm_shuffle_epi8(c, mb1), 5));
+    *r = _mm256_cvtepu8_epi32(rb);
+    *g = _mm256_cvtepu8_epi32(gb);
+    *b = _mm256_cvtepu8_epi32(bb);
+}
+
+/* Eight rounded, clipped int32 sums written as eight RGB triplets (exactly 24 bytes). */
+RAD_MM_INLINE_AVX2 void store_rgb8(uint8_t* o, __m256i s0, __m256i s1, __m256i s2, int prec) {
+    const __m256i sh = _mm256_set1_epi32(prec);
+    const __m256i v0 = _mm256_min_epi32(_mm256_max_epi32(_mm256_srav_epi32(s0, sh), _mm256_setzero_si256()),
+                                        _mm256_set1_epi32(255));
+    const __m256i v1 = _mm256_min_epi32(_mm256_max_epi32(_mm256_srav_epi32(s1, sh), _mm256_setzero_si256()),
+                                        _mm256_set1_epi32(255));
+    const __m256i v2 = _mm256_min_epi32(_mm256_max_epi32(_mm256_srav_epi32(s2, sh), _mm256_setzero_si256()),
+                                        _mm256_set1_epi32(255));
+    const __m128i r16 = _mm_packus_epi32(_mm256_castsi256_si128(v0), RAD_MM_EXTRACT16(v0));
+    const __m128i g16 = _mm_packus_epi32(_mm256_castsi256_si128(v1), RAD_MM_EXTRACT16(v1));
+    const __m128i b16 = _mm_packus_epi32(_mm256_castsi256_si128(v2), RAD_MM_EXTRACT16(v2));
+    const __m128i r8 = _mm_packus_epi16(r16, r16);
+    const __m128i g8 = _mm_packus_epi16(g16, g16);
+    const __m128i b8 = _mm_packus_epi16(b16, b16);
+    /* Layout [r0..r3 g0..g3 b0..b3] then shuffle to 12 RGB bytes; twice for eight pixels.
+     * Mask the low four bytes before shifting, or each shift would overwrite the previous
+     * channel's bytes. */
+    const __m128i low4 = _mm_set_epi64x(0, 0xffffffffll);
+    const __m128i m = _mm_setr_epi8(0, 4, 8, 1, 5, 9, 2, 6, 10, 3, 7, 11, -1, -1, -1, -1);
+    const __m128i lo = _mm_shuffle_epi8(
+        _mm_or_si128(_mm_or_si128(_mm_and_si128(r8, low4),
+                                  _mm_slli_si128(_mm_and_si128(g8, low4), 4)),
+                     _mm_slli_si128(_mm_and_si128(b8, low4), 8)),
+        m);
+    const __m128i hi = _mm_shuffle_epi8(
+        _mm_or_si128(_mm_or_si128(_mm_and_si128(_mm_srli_si128(r8, 4), low4),
+                                  _mm_slli_si128(_mm_and_si128(_mm_srli_si128(g8, 4), low4), 4)),
+                     _mm_slli_si128(_mm_and_si128(_mm_srli_si128(b8, 4), low4), 8)),
+        m);
+    _mm_storel_epi64((__m128i*)o, lo);
+    _mm_storeu_si32(o + 8, _mm_srli_si128(lo, 8));
+    _mm_storel_epi64((__m128i*)(o + 12), hi);
+    _mm_storeu_si32(o + 20, _mm_srli_si128(hi, 8));
+}
+
+/* One horizontal row, eight output pixels a step. plans is [group][tap] of eight (offset, coeff,
+ * mask) int32s. The gather reads four bytes at the last input pixel's B channel, so the caller
+ * keeps the buffer's final row on the scalar path. */
+RAD_MM_AVX2 void hpass_row(const uint8_t* row, uint8_t* o, int32_t ngroups, int32_t ksh,
+                           int prec, const int32_t* plans) {
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i round = _mm256_set1_epi32(1 << (prec - 1));
+    const __m256i mask8 = _mm256_set1_epi32(0xff);
+    for (int32_t g = 0; g < ngroups; ++g) {
+        __m256i s0 = round, s1 = round, s2 = round;
+        const int32_t* pl = plans + (size_t)g * (size_t)ksh * 24;
+        for (int32_t t = 0; t < ksh; ++t, pl += 24) {
+            const __m256i off = _mm256_loadu_si256((const __m256i*)pl);
+            const __m256i coef = _mm256_loadu_si256((const __m256i*)(pl + 8));
+            const __m256i msk = _mm256_loadu_si256((const __m256i*)(pl + 16));
+            const __m256i word = _mm256_mask_i32gather_epi32(zero, (const int*)row, off, msk, 1);
+            const __m256i r = _mm256_and_si256(word, mask8);
+            const __m256i gg = _mm256_and_si256(_mm256_srli_epi32(word, 8), mask8);
+            const __m256i bb = _mm256_and_si256(_mm256_srli_epi32(word, 16), mask8);
+            s0 = _mm256_add_epi32(s0, _mm256_mullo_epi32(r, coef));
+            s1 = _mm256_add_epi32(s1, _mm256_mullo_epi32(gg, coef));
+            s2 = _mm256_add_epi32(s2, _mm256_mullo_epi32(bb, coef));
+        }
+        store_rgb8(o + (size_t)g * 24, s0, s1, s2, prec);
+    }
+}
+
+/* One vertical row: every tap is a whole source row, eight output pixels at a time. */
+RAD_MM_AVX2 void vpass_row(const Frame& src, int32_t ymin, int32_t ymax, const int32_t* k,
+                           uint8_t* o, int prec) {
+    const __m256i round = _mm256_set1_epi32(1 << (prec - 1));
+    int32_t xx = 0;
+    for (; xx + 8 <= src.w; xx += 8) {
+        __m256i s0 = round, s1 = round, s2 = round;
+        for (int32_t y = 0; y < ymax; ++y) {
+            const uint8_t* p = src.rgb.data() + ((size_t)(y + ymin) * (size_t)src.w + xx) * 3;
+            __m256i r, g, b;
+            load_rgb8(p, &r, &g, &b);
+            const __m256i kk = _mm256_set1_epi32(k[y]);
+            s0 = _mm256_add_epi32(s0, _mm256_mullo_epi32(r, kk));
+            s1 = _mm256_add_epi32(s1, _mm256_mullo_epi32(g, kk));
+            s2 = _mm256_add_epi32(s2, _mm256_mullo_epi32(b, kk));
+        }
+        store_rgb8(o + (size_t)xx * 3, s0, s1, s2, prec);
+    }
+    for (; xx < src.w; ++xx) {
+        int32_t s0 = 1 << (prec - 1), s1 = s0, s2 = s0;
+        for (int32_t y = 0; y < ymax; ++y) {
+            const uint8_t* p = src.rgb.data() + ((size_t)(y + ymin) * (size_t)src.w + xx) * 3;
+            s0 += p[0] * k[y];
+            s1 += p[1] * k[y];
+            s2 += p[2] * k[y];
+        }
+        o[xx * 3 + 0] = clip8(s0, prec);
+        o[xx * 3 + 1] = clip8(s1, prec);
+        o[xx * 3 + 2] = clip8(s2, prec);
+    }
+}
+
+/* One patch row: for each channel, P strided source bytes through that channel's LUT. lut32 is
+ * the same LUT as 32-bit words, so one gather gets all three channels' table entries. */
+RAD_MM_AVX2 void patch_row(const uint8_t* row, uint16_t* dst, int32_t P, size_t chstride,
+                           const uint32_t* lut32, const uint16_t* lut) {
+    for (int32_t x = 0; x + 8 <= P; x += 8) {
+        __m256i r, g, b;
+        load_rgb8(row + (size_t)x * 3, &r, &g, &b);
+        const __m256i idx[3] = { r, g, b };
+        for (int ch = 0; ch < 3; ++ch) {
+            const __m256i ii = _mm256_add_epi32(idx[ch], _mm256_set1_epi32(ch * 256));
+            const __m256i v = _mm256_i32gather_epi32((const int*)lut32, ii, 4);
+            const __m128i h = _mm_packus_epi32(_mm256_castsi256_si128(v), RAD_MM_EXTRACT16(v));
+            _mm_storeu_si128((__m128i*)(dst + (size_t)ch * chstride + x), h);
+        }
+    }
+    for (int ch = 0; ch < 3; ++ch)
+        for (int32_t x = (P / 8) * 8; x < P; ++x)
+            dst[(size_t)ch * chstride + x] = lut[ch * 256 + row[(size_t)x * 3 + ch]];
+}
+#endif  /* RAD_MM_HAVE_AVX2 */
+
 /* One pass over an axis. `horizontal` reads rows [y0, y0 + rows) of `src` and writes w columns;
  * `vertical` reads rows from `shift` on and writes h rows. Both accumulate in fixed point and
  * round each output to eight bits, as Pillow does -- the intermediate's rounding is part of the
@@ -492,16 +666,50 @@ int coeffs(int32_t in_size, int32_t out_size, std::vector<int32_t>* bounds,
  * implementation (stride-3 deinterleave + 8-lane int dot, in the libavx leg like the other
  * bit-safe offloads) is bit-safe and pinned by the resample goldens -- a deliberate follow-up
  * task, not a drive-by. The scalar order must not change. */
+/* Both passes are row-independent: every output row reads only its own input rows and writes only
+ * its own output row, in the same per-tap order, so splitting the rows across threads is bit-exact
+ * (the goldens pin it). P2 in UNLIMITED-OCR-PERF.md: the scalar loop is ~20-30% of a picture's
+ * prefill now that the tower is fast. */
+static void run_rows(int32_t rows, const std::function<void(int32_t)>& row) {
+    unsigned hw = std::thread::hardware_concurrency();
+    const int32_t nt = (int32_t)std::min<int32_t>(rows, (int32_t)std::min<unsigned>(hw ? hw : 1, 8));
+    if (nt <= 1) {
+        for (int32_t y = 0; y < rows; ++y) row(y);
+        return;
+    }
+    std::vector<std::thread> ts;
+    ts.reserve((size_t)nt);
+    for (int32_t t = 0; t < nt; ++t)
+        ts.emplace_back([&row, t, nt, rows] { for (int32_t y = t; y < rows; y += nt) row(y); });
+    for (std::thread& th : ts) th.join();
+}
+
 static void pass_horizontal(const Frame& src, int32_t y0, int32_t rows, int32_t w,
                             const std::vector<int32_t>& bh, const std::vector<int32_t>& kh,
                             int32_t ksh, int prec, Frame* out) {
     out->w = w;
     out->h = rows;
     out->rgb.assign((size_t)w * (size_t)rows * 3, 0);
-    for (int32_t yy = 0; yy < rows; ++yy) {
-        const uint8_t* row = src.rgb.data() + (size_t)(yy + y0) * (size_t)src.w * 3;
-        uint8_t* o = out->rgb.data() + (size_t)yy * (size_t)w * 3;
-        for (int32_t xx = 0; xx < w; ++xx) {
+    const bool simd = mm_use_avx2();
+    const int32_t ngroups = simd ? w / 8 : 0;
+    std::vector<int32_t> plans;
+    if (ngroups) {
+        plans.resize((size_t)ngroups * (size_t)ksh * 24);
+        for (int32_t g = 0; g < ngroups; ++g)
+            for (int32_t t = 0; t < ksh; ++t) {
+                int32_t* p = plans.data() + ((size_t)g * (size_t)ksh + (size_t)t) * 24;
+                for (int32_t j = 0; j < 8; ++j) {
+                    const int32_t xx = g * 8 + j;
+                    const int32_t xmin = bh[(size_t)xx * 2], xmax = bh[(size_t)xx * 2 + 1];
+                    const bool on = t < xmax;
+                    p[j] = on ? (xmin + t) * 3 : 0;
+                    p[8 + j] = on ? kh[(size_t)xx * (size_t)ksh + (size_t)t] : 0;
+                    p[16 + j] = on ? -1 : 0;
+                }
+            }
+    }
+    auto scalar_row = [&](const uint8_t* row, uint8_t* o, int32_t x0) {
+        for (int32_t xx = x0; xx < w; ++xx) {
             const int32_t xmin = bh[(size_t)xx * 2], xmax = bh[(size_t)xx * 2 + 1];
             const int32_t* k = kh.data() + (size_t)xx * (size_t)ksh;
             int32_t s0 = 1 << (prec - 1), s1 = s0, s2 = s0;
@@ -515,7 +723,18 @@ static void pass_horizontal(const Frame& src, int32_t y0, int32_t rows, int32_t 
             o[xx * 3 + 1] = clip8(s1, prec);
             o[xx * 3 + 2] = clip8(s2, prec);
         }
-    }
+    };
+    run_rows(rows, [&](int32_t yy) {
+        const uint8_t* row = src.rgb.data() + (size_t)(yy + y0) * (size_t)src.w * 3;
+        uint8_t* o = out->rgb.data() + (size_t)yy * (size_t)w * 3;
+        /* The gather reads one byte past the row; that is harmless on every row but the buffer's
+         * last, which stays scalar. */
+        if (!ngroups || yy + y0 == src.h - 1) { scalar_row(row, o, 0); return; }
+#ifdef RAD_MM_HAVE_AVX2
+        hpass_row(row, o, ngroups, ksh, prec, plans.data());
+        scalar_row(row, o, ngroups * 8);
+#endif
+    });
 }
 
 static void pass_vertical(const Frame& src, int32_t shift, int32_t h,
@@ -524,10 +743,15 @@ static void pass_vertical(const Frame& src, int32_t shift, int32_t h,
     out->w = src.w;
     out->h = h;
     out->rgb.assign((size_t)src.w * (size_t)h * 3, 0);
-    for (int32_t yy = 0; yy < h; ++yy) {
+    const bool simd = mm_use_avx2();
+    run_rows(h, [&](int32_t yy) {
         const int32_t ymin = bv[(size_t)yy * 2] - shift, ymax = bv[(size_t)yy * 2 + 1];
         const int32_t* k = kv.data() + (size_t)yy * (size_t)ksv;
         uint8_t* o = out->rgb.data() + (size_t)yy * (size_t)src.w * 3;
+#ifdef RAD_MM_HAVE_AVX2
+        if (simd) { vpass_row(src, ymin, ymax, k, o, prec); return; }
+#endif
+        (void)simd;
         for (int32_t xx = 0; xx < src.w; ++xx) {
             int32_t s0 = 1 << (prec - 1), s1 = s0, s2 = s0;
             for (int32_t y = 0; y < ymax; ++y) {
@@ -540,7 +764,7 @@ static void pass_vertical(const Frame& src, int32_t shift, int32_t h,
             o[xx * 3 + 1] = clip8(s1, prec);
             o[xx * 3 + 2] = clip8(s2, prec);
         }
-    }
+    });
 }
 
 static void resize_bicubic_impl(const Frame& in, int32_t w, int32_t h, Frame* out, bool torch) {
@@ -1120,11 +1344,14 @@ int Processor::image_unlimitedocr(const Frame& f, const ImageMode& mode,
 
     /* ToTensor then Normalize, in f32: (u / 255 - mean) / std, rounded to bf16. */
     uint16_t lut[3][256];
+    uint32_t lut32[3 * 256];
     for (int ch = 0; ch < 3; ++ch)
         for (int v = 0; v < 256; ++v) {
             const float p = (float)v / 255.0f;
             lut[ch][v] = rad_f32_to_bf16((p - c.mean[ch]) / c.stdv[ch]);
+            lut32[ch * 256 + v] = lut[ch][v];
         }
+    const bool simd = mm_use_avx2();
 
     auto it = std::make_shared<Item>();
     it->kind = Kind::Image;
@@ -1144,17 +1371,30 @@ int Processor::image_unlimitedocr(const Frame& f, const ImageMode& mode,
         const size_t at = it->pixels.size();
         it->pixels.resize(at + (size_t)gh * (size_t)gw * (size_t)it->patch_dim, 0);
         uint16_t* dst = it->pixels.data() + at;
-        for (int32_t py = 0; py < gh; ++py)
+        /* Each patch row writes its own disjoint run of dst, in the same order, so splitting the
+         * rows across threads is bit-exact (P2's LUT staging half). */
+        run_rows(gh, [&](int32_t py) {
             for (int32_t px = 0; px < real_w; ++px) {
                 uint16_t* pp = dst + ((size_t)py * (size_t)gw + (size_t)px) * (size_t)it->patch_dim;
                 const int32_t py0 = y0 + py * P, px0 = x0 + px * P;
-                for (int ch = 0; ch < 3; ++ch)
-                    for (int y = 0; y < P; ++y) {
-                        const uint8_t* row = src.rgb.data() +
-                            ((size_t)(py0 + y) * (size_t)src.w + (size_t)px0) * 3 + (size_t)ch;
-                        for (int x = 0; x < P; ++x) *pp++ = lut[ch][row[x * 3]];
+                for (int y = 0; y < P; ++y) {
+                    const uint8_t* row = src.rgb.data() +
+                        ((size_t)(py0 + y) * (size_t)src.w + (size_t)px0) * 3;
+#ifdef RAD_MM_HAVE_AVX2
+                    if (simd) {
+                        patch_row(row, pp + (size_t)y * P, P, (size_t)P * P, lut32, &lut[0][0]);
+                        continue;
                     }
+#endif
+                    (void)simd;
+                    for (int ch = 0; ch < 3; ++ch) {
+                        const uint8_t* r = row + (size_t)ch;
+                        uint16_t* q = pp + ((size_t)ch * P + (size_t)y) * P;
+                        for (int x = 0; x < P; ++x) q[x] = lut[ch][r[(size_t)x * 3]];
+                    }
+                }
             }
+        });
     };
 
     if (tiled) {

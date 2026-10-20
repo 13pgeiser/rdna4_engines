@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -1803,6 +1804,68 @@ TEST(unlimitedocr_bicubic_antialias_resample_is_the_reference) {
      * the strict signal on the resample arithmetic. */
     (void)sam_mism;
     (void)clip_mism;
+}
+
+/* The AVX2 resample and patch-staging paths must be the scalar function, not an approximation:
+ * the goldens above pin the modelled result, and this pins the vector lanes against the scalar
+ * loop that produced them. RAD_MM_NO_AVX2 selects the scalar path (core/mm/processor.cpp), so the
+ * same input goes through both dispatches on this host. Sizes cover growth and shrink (different
+ * tap counts), both pass orders, odd widths/tails, and a 1-pixel side. */
+TEST(avx2_preprocessing_is_bit_identical_to_scalar) {
+    const struct { int32_t ih, iw, oh, ow; } cases[] = {
+        { 53, 67, 35, 40 },  { 53, 67, 55, 57 },  { 64, 64, 1024, 1024 },
+        { 1024, 1024, 640, 640 }, { 200, 100, 50, 200 }, { 97, 129, 96, 128 },
+        { 1, 1, 7, 5 },      { 71, 131, 70, 130 }, { 17, 31, 9, 8 },
+        { 300, 500, 299, 501 },
+    };
+    int seed = 11;
+    for (const auto& c : cases) {
+        Frame in = frame(seed++, c.ih, c.iw);
+        Frame sv, sm, tv, tm;
+        setenv("RAD_MM_NO_AVX2", "1", 1);
+        resize_bicubic(in, c.ow, c.oh, &sv);
+        resize_bicubic_torch(in, c.ow, c.oh, &tv);
+        unsetenv("RAD_MM_NO_AVX2");
+        resize_bicubic(in, c.ow, c.oh, &sm);
+        resize_bicubic_torch(in, c.ow, c.oh, &tm);
+        CHECK_EQ(sm.w, sv.w);
+        CHECK_EQ(sm.h, sv.h);
+        CHECK(sm.rgb == sv.rgb);
+        CHECK(tm.rgb == tv.rgb);
+        if (sm.rgb != sv.rgb) {
+            for (size_t i = 0; i < sv.rgb.size(); ++i)
+                if (sm.rgb[i] != sv.rgb[i]) {
+                    std::fprintf(stderr, "    %dx%d -> %dx%d: first byte %zu differs (%d vs %d)\n",
+                                 c.iw, c.ih, c.ow, c.oh, i, (int)sv.rgb[i], (int)sm.rgb[i]);
+                    break;
+                }
+        }
+    }
+
+    /* Patch/LUT staging (the Unlimited-OCR append path), through the whole processor so the
+     * segment order and both views are covered. */
+    Processor p;
+    REQUIRE_EQ(p.init(uocr_cfg(), [](const std::string&) { return std::vector<int32_t>{}; },
+                      uocr_marker), RAD_OK);
+    const struct { int32_t seed, h, w; } imgs[] = { { 3, 640, 640 }, { 4, 900, 1400 } };
+    for (const auto& g : imgs) {
+        Frame in = frame(g.seed, g.h, g.w);
+        for (int kind = 0; kind < 2; ++kind) {
+            ImageMode mode;
+            mode.kind = kind ? ImageMode::Base : ImageMode::Gundam;
+            std::shared_ptr<Item> a, b;
+            std::string why;
+            setenv("RAD_MM_NO_AVX2", "1", 1);
+            REQUIRE_EQ(p.image_from(in, &a, &why, mode), RAD_OK);
+            unsetenv("RAD_MM_NO_AVX2");
+            REQUIRE_EQ(p.image_from(in, &b, &why, mode), RAD_OK);
+            REQUIRE(a != nullptr);
+            REQUIRE(b != nullptr);
+            CHECK_EQ(b->n_patch, a->n_patch);
+            CHECK(b->pixels == a->pixels);
+            CHECK(b->expand == a->expand);
+        }
+    }
 }
 
 RAD_TEST_MAIN()

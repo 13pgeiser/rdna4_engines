@@ -3610,11 +3610,12 @@ static const RadConstraint cAttnPrefillH64G4Bf16[] = {
     C_EQ("window", 0), C_EQ("head_dim", 64), C_EQ("gqa", 4), C_EQ("block_size", 16),
     C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
 };
-/* The windowed kernels (r4d_attn_paged_window.hip): head_dim 256 and 512, 1/2/4/8 queries per KV
- * head, any window, causal or not. Gemma 4's sliding layers are h256/gqa2 with a 1024-token
- * window, its full layers h512 at gqa 8 (TP1/TP2), 4 (TP4) or 2 (TP8). One kernel serves every
- * q_len (splitting the key range when there are too few tiles to fill the card), so `q_len` cuts
- * no band. `causal` and `window` are runtime fields; block_size is derived: 16.
+/* The windowed kernels (r4d_attn_paged_window.hip): head_dim 128, 256 and 512, 1/2/4/8 queries per
+ * KV head, any window, causal or not. Gemma 4's sliding layers are h256/gqa2 with a 1024-token
+ * window, its full layers h512 at gqa 8 (TP1/TP2), 4 (TP4) or 2 (TP8); h128/gqa1 is Unlimited-OCR's
+ * MHA decoder. One kernel serves every q_len (splitting the key range when there are too few tiles
+ * to fill the card), so `q_len` cuts no band. `causal` and `window` are runtime fields; block_size
+ * is derived: 16.
  *
  * h256 at gqa 4 and 8 take a window only (C_GE 1), leaving the window-0 band to the gqa4 / gqa8
  * legs above. At h256/gqa2 these rows overlap the sliding leg's bands and rank below it
@@ -3624,6 +3625,7 @@ static const RadConstraint cAttnPrefillH64G4Bf16[] = {
         C_EQ("head_dim", HD), C_EQ("gqa", G), C_EQ("block_size", 16), C_GE("causal", 0),           \
         C_GE("window", WMIN), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", KV),                       \
     };
+R4D_WIN_C(cWinH128G1Bf16, 128, 1, "bf16", 0) R4D_WIN_C(cWinH128G1Fp8, 128, 1, "fp8_e4m3", 0)
 R4D_WIN_C(cWinH256G1Bf16, 256, 1, "bf16", 0) R4D_WIN_C(cWinH256G1Fp8, 256, 1, "fp8_e4m3", 0)
 R4D_WIN_C(cWinH256G2Bf16, 256, 2, "bf16", 0) R4D_WIN_C(cWinH256G2Fp8, 256, 2, "fp8_e4m3", 0)
 R4D_WIN_C(cWinH256G4Bf16, 256, 4, "bf16", 1) R4D_WIN_C(cWinH256G4Fp8, 256, 4, "fp8_e4m3", 1)
@@ -6027,6 +6029,7 @@ static const RadKernelInfo kKernels[] = {
 #define R4D_WIN_PAIR(HD, GQ)                                                                       \
     R4D_WIN_ROW(HD, GQ, bf16kv, bf16, cWinH##HD##G##GQ##Bf16, "bf16")                              \
     R4D_WIN_ROW(HD, GQ, fp8kv, fp8, cWinH##HD##G##GQ##Fp8, "fp8-e4m3 (per-(seq,head) descales)")
+R4D_WIN_PAIR(128, 1)
 R4D_WIN_PAIR(256, 1) R4D_WIN_PAIR(256, 2) R4D_WIN_PAIR(256, 4) R4D_WIN_PAIR(256, 8)
 R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512, 8)
 #undef R4D_WIN_PAIR

@@ -60,9 +60,10 @@ set(R4D_UNITS
   # gqa6, head_dim 256, 4-token page: the same QSA layers at four ranks, each KV head replicated
   # across a rank pair.
   "r4d_attn_paged_h256_gqa6_bs4|"
-  # head_dim 256 and 512 at 1, 2, 4 or 8 queries per KV head with any window: Gemma 4's sliding
-  # (h256/gqa2, window 1024) and full (h512, gqa 8 at TP1/TP2) layers. One kernel per geometry
-  # covers every q_len and reads q at any row pitch (attn_paged_qrow).
+  # head_dim 128/256 and 512 at 1, 2, 4 or 8 queries per KV head with any window: Gemma 4's sliding
+  # (h256/gqa2, window 1024) and full (h512, gqa 8 at TP1/TP2) layers and Unlimited-OCR's h128 MHA
+  # decoder. One kernel per geometry covers every q_len and reads q at any row pitch
+  # (attn_paged_qrow).
   "r4d_attn_paged_window|"
   # Two queries per KV head at head_dim 128 only (Qwen3-1.7B's 16 over 8, Qwen3-ASR's decoder):
   # the gqa8 body with the ratio set.

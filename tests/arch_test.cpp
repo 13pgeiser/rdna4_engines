@@ -437,6 +437,17 @@ extern "C" int rad_memcpy_async(void* dst, const void* src, int64_t bytes, RadSt
             c->copies.push_back({ c->issues.size(), h });
     return RAD_OK;
 }
+/* The pitched copy: recorded exactly as the 1-D one (its destination's first byte names the
+ * buffer); the unlimitedocr tower packs patch rows and lays out its map with it. */
+extern "C" int rad_memcpy_2d_async(void* dst, int64_t dpitch, const void* src, int64_t spitch,
+                                   int64_t width, int64_t height, RadStream s) {
+    (void)dpitch; (void)src; (void)spitch; (void)width; (void)height;
+    RadCtx* c = (RadCtx*)s;
+    if (c && c->b)
+        if (const rad_buf h = fake_buf_of(dst, c->b->bufs.size()))
+            c->copies.push_back({ c->issues.size(), h });
+    return RAD_OK;
+}
 extern "C" int rad_memset_async(void* dst, int value, int64_t bytes, RadStream s) {
     (void)dst; (void)value; (void)bytes; (void)s;
     return RAD_OK;
@@ -457,6 +468,8 @@ extern "C" int rad_memset_async(void* dst, int value, int64_t bytes, RadStream s
 #include "../arch/gemma4/gemma4.cpp"
 /* Qwen3-ASR: a Whisper-style audio tower over a dense Qwen3 decoder. */
 #include "../arch/qwen3asr_bf16/qwen3asr_bf16.cpp"
+/* Unlimited-OCR: the Llama-MoE decoder and its DeepEncoder tower (SAM + CLIP). */
+#include "../arch/unlimitedocr_bf16/unlimitedocr_bf16.cpp"
 /* The PLE block alone: no architecture here declares it, and what its step() hands the two
  * windowed ops is its own contract (rad_block_ple.h). */
 #include <arch/rad_block_ple.h>
@@ -9491,4 +9504,144 @@ TEST(flashnext_a_spanned_prefill_runs_a_pass_at_a_time_with_its_all_reduces_besi
             CHECK_EQ(ar_overlap, ar - 1);
             CHECK(!c.joins.empty());
         }
+}
+
+/* ============================ unlimitedocr: the DeepEncoder batch ============================= */
+
+namespace {
+
+const char* k_uocr_keys[] = {
+    "n_routed_experts", "num_experts_per_tok", "moe_intermediate_size", "n_shared_experts",
+    "first_k_dense_replace", "scoring_func", "routed_scaling_factor", "topk_group", "n_group",
+    "use_mla", "norm_topk_prob", "sliding_window_size",
+};
+const char* k_uocr_vals[] = { "64", "6", "896", "2", "1", "softmax", "1.0", "1", "1", "0", "0",
+                              "128" };
+
+RadModelMeta uocr_meta() {
+    RadModelMeta m{};
+    m.arch_id     = "unlimitedocr";
+    m.name        = "test-unlimitedocr";
+    m.quant       = "bf16";
+    m.n_layers    = 12;
+    m.n_embd      = 1280;
+    m.n_head      = 10;
+    m.n_head_kv   = 10;
+    m.head_dim    = 128;
+    m.n_ff        = 6848;
+    m.n_vocab     = 129280;
+    m.n_ctx_train = 32768;
+    m.rms_eps     = 1e-6f;
+    m.rope_theta  = 10000.0f;
+    m.n_kv        = (int)(sizeof(k_uocr_keys) / sizeof(k_uocr_keys[0]));
+    m.kv_key      = k_uocr_keys;
+    m.kv_val      = k_uocr_vals;
+    return m;
+}
+
+}  /* namespace */
+
+/* One encode pass of two 640 tile lines (four tiles): the tower batches every GEMM over the whole
+ * pass, and the segment-bounded ops carry one cu entry a tile. */
+TEST(unlimitedocr_batches_the_tower_across_tile_segments) {
+    RadBuilder b;
+    const RadEncoding plain = rad_enc_plain(RAD_BF16);
+    b.encs = { { "ffn_gate_up_exps", plain }, { "ffn_down_exps", plain } };
+    RadModelMeta meta = uocr_meta();
+    RadBuildCtx ctx = build_ctx();
+    ctx.max_enc_patches = 16384;
+    CHECK_OK(unlimitedocr_bf16::declare(&b, &meta, &ctx));
+
+    const int64_t q = 40, nseg = 2, n_patch = nseg * (2 * q + 4) * q;   /* two lines of two tiles */
+    std::vector<int32_t> sh((size_t)nseg, (int32_t)q), sw((size_t)nseg, (int32_t)(2 * q + 4));
+    std::vector<int32_t> cu = { 0, (int32_t)((2 * q + 4) * q), (int32_t)n_patch };
+    std::vector<uint16_t> pix((size_t)n_patch * 768, 0);
+    RadBatch batch{};
+    batch.enc         = RAD_MM_IMAGE;
+    batch.enc_n_patch = n_patch;
+    batch.enc_pixels  = pix.data();
+    batch.enc_n_seg   = nseg;
+    batch.enc_cu      = cu.data();
+    batch.enc_seg_h   = sh.data();
+    batch.enc_seg_w   = sw.data();
+    batch.enc_max_seg = (2 * q + 4) * q;
+    RadCtx c{ .b = &b, .batch = &batch };
+    unlimitedocr_bf16::step(&c, &batch);
+    CHECK(c.step_fail.empty());
+    CHECK_LINT(b, &c);
+
+    /* The batch bound is the pass bound over this grid's tokens, capped at 8 (10 tiles at 40,
+     * 4 at 64 for 16384 patches). */
+    const auto& enc = unlimitedocr_bf16::g_model[0].enc;
+    CHECK_EQ(enc.t40.Bmax, 8);
+    CHECK_EQ(enc.t64.Bmax, 4);
+
+    constexpr int64_t kTok40 = 1600, kTokP40 = 1764, kClip40 = 101;
+    /* One patch-embed GEMM over all four tiles, not four of one. */
+    const RecIssue* patch = issue_of(b, c, "gemm_nt_bias");
+    REQUIRE(patch != nullptr);
+    CHECK_EQ(patch->n, 4 * kTok40);
+    /* SAM's first attention is layer 0's windowed path over the padded grid. */
+    const RecIssue* sat = issue_of(b, c, "sam_attn");
+    REQUIRE(sat != nullptr);
+    CHECK_EQ(sat->n, 4 * kTokP40);
+    REQUIRE(sat->opd.size() > 4);
+    CHECK_EQ(sat->opd[3].rows, 5);
+    /* Layer 2 is the first global block: no padding, four kSamTok-row segments. */
+    const RecIssue* satg = issue_of(b, c, "sam_attn", 2);
+    REQUIRE(satg != nullptr);
+    CHECK_EQ(satg->n, 4 * kTok40);
+    CHECK_EQ(satg->opd[3].rows, 5);
+    /* CLIP's attention is one dense call over four kClipTok-row segments. */
+    const RecIssue* cat = issue_of(b, c, "attn_dense");
+    REQUIRE(cat != nullptr);
+    CHECK_EQ(cat->n, 4 * kClip40);
+    REQUIRE(cat->opd.size() > 4);
+    CHECK_EQ(cat->opd[3].rows, 5);
+    /* The unfold sees the four tiles as four kGrid-row segments. */
+    const RecIssue* unf = issue_of(b, c, "conv2d_unfold");
+    REQUIRE(unf != nullptr);
+    CHECK_EQ(unf->opd[0].rows, 4 * q);
+
+    /* The class row, the map cast, the fuse and the newline stay per tile: 4 / 4 / 4 / 2. */
+    int cls = 0, cmap = 0, fuse = 0, nl = 0;
+    for (const RecIssue& i : c.issues) {
+        if (i.op == enc.t40.op_cls) ++cls;
+        else if (i.op == enc.t40.op_cmap) ++cmap;
+        else if (i.op == enc.t40.op_fuse_clip) ++fuse;
+        else if (i.op == enc.t40.op_newline) ++nl;
+    }
+    CHECK_EQ(cls, 4);
+    CHECK_EQ(cmap, 4);
+    CHECK_EQ(fuse, 4);
+    CHECK_EQ(nl, nseg);
+
+    /* A one-tile pass is the same graph at B = 1. */
+    std::vector<int32_t> sh1 = { (int32_t)q }, sw1 = { (int32_t)(q + 4) };
+    std::vector<int32_t> cu1 = { 0, (int32_t)((q + 4) * q) };
+    std::vector<uint16_t> pix1((size_t)((q + 4) * q) * 768, 0);
+    RadBatch one{};
+    one.enc         = RAD_MM_IMAGE;
+    one.enc_n_patch = (q + 4) * q;
+    one.enc_pixels  = pix1.data();
+    one.enc_n_seg   = 1;
+    one.enc_cu      = cu1.data();
+    one.enc_seg_h   = sh1.data();
+    one.enc_seg_w   = sw1.data();
+    one.enc_max_seg = (q + 4) * q;
+    RadCtx c1{ .b = &b, .batch = &one };
+    unlimitedocr_bf16::step(&c1, &one);
+    CHECK(c1.step_fail.empty());
+    CHECK_LINT(b, &c1);
+    const RecIssue* p1 = issue_of(b, c1, "gemm_nt_bias");
+    REQUIRE(p1 != nullptr);
+    CHECK_EQ(p1->n, kTok40);
+    const RecIssue* s1 = issue_of(b, c1, "sam_attn");
+    REQUIRE(s1 != nullptr);
+    CHECK_EQ(s1->n, kTokP40);
+    REQUIRE(s1->opd.size() > 4);
+    CHECK_EQ(s1->opd[3].rows, 2);
+    const RecIssue* c_1 = issue_of(b, c1, "attn_dense");
+    REQUIRE(c_1 != nullptr);
+    CHECK_EQ(c_1->n, kClip40);
 }

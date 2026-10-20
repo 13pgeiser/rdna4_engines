@@ -42,7 +42,7 @@ struct Case {
 using Fn = int (*)(const RadArgs*, RadStream);
 static Fn pick(int hd, int gqa, bool fp8) {
 #define P(H, G) if (hd == H && gqa == G) return fp8 ? r4d_rad_attn_window_h##H##_gqa##G##_fp8 : r4d_rad_attn_window_h##H##_gqa##G##_bf16;
-    P(256, 1) P(256, 2) P(256, 4) P(256, 8) P(512, 1) P(512, 2) P(512, 4) P(512, 8)
+    P(128, 1) P(256, 1) P(256, 2) P(256, 4) P(256, 8) P(512, 1) P(512, 2) P(512, 4) P(512, 8)
 #undef P
     return nullptr;
 }
@@ -169,8 +169,19 @@ static int run(const Case& c) {
 }
 
 int main(int argc, char** argv) {
+    const int64_t s128 = r4d_rad_attn_window_h128_scratch(nullptr);
     const int64_t s256 = r4d_rad_attn_window_h256_scratch(nullptr), s512 = r4d_rad_attn_window_h512_scratch(nullptr);
     std::vector<Case> cases = {
+        /* Unlimited-OCR's decoder: h128 MHA, the fused q|k|v plane read at its pitch */
+        {"h128 gqa1 decode split", 128, 1, 1, false, true, false, false, 0, {1}, {700}, -1, 0, s128},
+        {"h128 gqa1 swa w64 verify16", 128, 1, 1, false, true, false, false, 64, {16}, {1100}},
+        {"h128 gqa1 noncausal full", 128, 1, 1, false, false, false, false, 0, {3}, {77}},
+        {"wmma h128 gqa1 prefill 200 of 900", 128, 1, 1, false, true, false, false, 0, {200}, {900},
+         -1, 0, 0, 0, 1},
+        {"wmma h128 gqa1 q-pitch slice", 128, 1, 1, false, true, false, false, 0, {96}, {150}, -1,
+         0, 0, 512, 1},
+        {"wmma h128 gqa1 swa w1024 ragged", 128, 1, 1, false, true, true, false, 1024, {150, 70},
+         {300, 70}, -1, 0, 0, 0, 1},
         /* Gemma 4 sliding: h256 gqa2, causal, windowed; a ragged mixed step */
         {"h256 gqa2 swa w64 ragged bf16", 256, 2, 2, false, true, true, false, 64, {1, 5, 40}, {200, 77, 140}},
         {"h256 gqa2 swa w64 ragged fp8+descale", 256, 2, 2, true, true, true, true, 64, {1, 5, 40}, {200, 77, 140}},

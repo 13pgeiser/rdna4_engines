@@ -235,9 +235,11 @@ int Engine::run_encodes() {
         it.pixels.shrink_to_fit();
         if (dump_dir && *dump_dir) dump(it, ".bf16", it.embd.data(), it.embd.size());
     }
-    RAD_DEBUG("encoder: %zu item(s) encoded in %.1f ms", items.size(),
-              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
-                  .count());
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0).count();
+    if (std::getenv("RADIANCE_DEBUG_MM_TIME"))
+        RAD_INFO("encoder: tower pass for %zu item(s) -> %.1f ms", items.size(), ms);
+    RAD_DEBUG("encoder: %zu item(s) encoded in %.1f ms", items.size(), ms);
     return RAD_OK;
 }
 

@@ -64,6 +64,7 @@ struct AttnLlamaBF16 {
     rad_op op_norm = 0, op_qkv = 0;
     rad_op op_rope_q = 0, op_rope_k = 0;
     rad_op op_qs = 0;                  /* cast: lift the fused plane's q slice into dense qs */
+    int    qrow = 0;                   /* attn_paged_qrow served: q is read in place at its pitch */
     rad_op op_attn = 0, op_kv_store = 0, op_o = 0, op_ar = 0, op_add = 0;
 
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l, rad_kvgroup group,
@@ -134,31 +135,41 @@ inline int AttnLlamaBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, in
                    {w.k}, {w.k});
 
     /* attn_paged's prefill kernels read q only contiguous, and here q is a column slice of the
-     * fused q|k|v plane (row pitch q_dim + 2*kv_dim), so the slice is lifted into a dense
-     * [T, q_dim] buffer first (gemma4.cpp's `q_s` cast when attn_paged_qrow is not served).
-     * attn_paged_qrow would read the pitch in place, but libr4d's qrow rows cover only head_dim
-     * 256/512 (r4d_rows.cpp R4D_WIN_PAIR), not this decoder's head_dim 128. */
+     * fused q|k|v plane (row pitch q_dim + 2*kv_dim). attn_paged_qrow reads that pitch in place
+     * (libr4d's qrow rows cover head_dim 128/256/512). It is a separate op so no `--kernels` order
+     * can hand the slice to a kernel that reads q only dense (gemma4.cpp:1001-1023). Where the op
+     * is not declared or does not resolve, the slice is lifted into dense qs first. The cast is
+     * always declared (qs stays planned as today) but issued only in the fallback. */
     op_qs = rw(b, RAD_OP(b, "cast",
                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", q_dim),
                                 RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
                      RAD_NOWEIGHTS),
                  {w.q}, {w.qs});
-
-    /* Declared before kv_store so block_size derives from the resolved attention kernel (spec
-     * §7.2), pinned to RAD_KV_BLOCK for the same reason rad_arch.h states. This op keeps the
-     * plain causal rule through the R-SWA ring: the ring's visible set is the block table's
-     * job (the runtime window prunes the table, not the kernel), so no re-declaration. */
-    op_attn = rw(b, RAD_OP(b, "attn_paged",
-                     RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
-                                RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1),
-                                RAD_INT("window", 0),
-                                RAD_INT("n_head", g.n_head),
-                                RAD_INT("block_size", RAD_KV_BLOCK),
-                                RAD_INT("max_seqs", g.max_seqs),
-                                RAD_INT("max_ctx", g.max_ctx),
-                                RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype)),
-                     RAD_NOWEIGHTS),
-                 {w.qs}, {w.attn});
+    auto declare_attn = [&](const char* op, rad_buf q) {
+        /* Declared before kv_store so block_size derives from the resolved attention kernel (spec
+         * §7.2), pinned to RAD_KV_BLOCK for the same reason rad_arch.h states. This op keeps the
+         * plain causal rule through the R-SWA ring: the ring's visible set is the block table's
+         * job (the runtime window prunes the table, not the kernel), so no re-declaration. */
+        return rw(b, RAD_OP(b, op,
+                    RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
+                               RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1),
+                               RAD_INT("window", 0),
+                               RAD_INT("n_head", g.n_head),
+                               RAD_INT("block_size", RAD_KV_BLOCK),
+                               RAD_INT("max_seqs", g.max_seqs),
+                               RAD_INT("max_ctx", g.max_ctx),
+                               RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype)),
+                    RAD_NOWEIGHTS),
+                {q}, {w.attn});
+    };
+    if (rad_op_declared(b, "attn_paged_qrow") != 0)
+        op_attn = declare_attn("attn_paged_qrow", w.q);
+    if (op_attn) {
+        qrow = 1;
+    } else {
+        qrow = 0;
+        op_attn = declare_attn("attn_paged", w.qs);
+    }
 
     op_kv_store = rw(b, RAD_OP(b, "kv_store",
                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
@@ -204,12 +215,13 @@ inline void AttnLlamaBF16::step(RadCtx* c, const RadBatch* batch) const {
     RAD_ISSUE(c, op_qkv,   brows(w.h, T), RAD_W(w_qkv),   brows(w.q, T));
 
     /* q, k and v are column views of the fused plane, walked by its row pitch: the rope and
-     * kv_store kernels take the slice's pitch (r4d_rows_pitch). Attention does not -- it needs
-     * q dense -- so the q slice is lifted into qs after rope and before the store. */
+     * kv_store kernels take the slice's pitch (r4d_rows_pitch). Attention reads the q slice in
+     * place when attn_paged_qrow is served; otherwise it needs q dense, so the slice is lifted
+     * into qs after rope and before the store. */
     RAD_ISSUE(c, op_rope_q, bcol(w.q, 0, g.q_dim(), T), rope_posmc(g, batch, T));
     RAD_ISSUE(c, op_rope_k, bcol(w.q, g.q_dim(), g.kv_dim(), T), rope_posmc(g, batch, T));
 
-    RAD_ISSUE(c, op_qs, bcol(w.q, 0, g.q_dim(), T), brows(w.qs, T));
+    if (op_qs) RAD_ISSUE(c, op_qs, bcol(w.q, 0, g.q_dim(), T), brows(w.qs, T));
 
     RAD_ISSUE(c, op_kv_store,
               bcol(w.q, g.q_dim(), g.kv_dim(), T),
@@ -217,7 +229,7 @@ inline void AttnLlamaBF16::step(RadCtx* c, const RadBatch* batch) const {
               praw(slot, RAD_I32, T), kv_cache(kv, layer));
 
     RAD_ISSUE_N(c, op_attn, batch->max_q_len,
-                brows(w.qs, T), kv_cache(kv, layer),
+                qrow ? bcol(w.q, 0, g.q_dim(), T) : brows(w.qs, T), kv_cache(kv, layer),
                 praw2(table, RAD_I32, batch->n_seq, kvb ? kvb->block_table_pitch : 0),
                 praw(used, RAD_I32, batch->n_seq),
                 RAD_NONE, RAD_NONE,

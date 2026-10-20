@@ -114,6 +114,7 @@ set(RAD_TEST_ENV ${RAD_TEST_CARD_ENV} "ROCR_VISIBLE_DEVICES=99")
 # cost comes down, so the tripwire stays tight.
 set(RAD_TEST_CPU_BUDGET_quant_ggml_test 25)  # llama.cpp's iq1_s and iq2_* grid searches, ~13 s
 set(RAD_TEST_CPU_BUDGET_tokenizer_test 20)  # the reference encoder over every corpus: ~3 s built by GCC 16, ~10.5 s by GCC 14 (the image's Ubuntu)
+set(RAD_TEST_CPU_BUDGET_arch_test 15)  # every plugin's graph declared; ~10.8 s with the batched-tower case
 
 # Binaries whose OpenMP team is busy for most of their run, so a parallel ctest counts them as a
 # team's worth of slots rather than one.

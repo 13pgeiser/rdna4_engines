@@ -157,15 +157,9 @@ __device__ inline void sam_attn_body(
     const int* __restrict__ cu, const uint16_t* __restrict__ rh,
     const uint16_t* __restrict__ rw, int rh_rows, int rw_rows,
     int q_ld, int k_ld, int v_ld, int o_ld, int nhead, int gh, int gw, int th, int tw,
-    int nth, int ntw, float scale) {
-    // blockIdx.x = ((seq * nth + ty) * ntw + tx) * nhead + head: heads adjacent, so the tile's k/v
-    // rows stay hot across them.
-    int b = blockIdx.x;
-    const int head = b % nhead; b /= nhead;
-    const int tx   = b % ntw;   b /= ntw;
-    const int ty   = b % nth;   b /= nth;
-    const int seq  = b;
-
+    int seq, int head, int ty, int tx, int row_lo, int row_hi, float scale) {
+    // The caller supplies the (segment, tile, head) block coordinates: the windowed kernel reads
+    // them from blockIdx.x's window-tile layout, the global one from its query-tile layout.
     const int s0 = cu[seq];
     if (cu[seq + 1] - s0 != gh * gw) {
         // A segment that is not one grid is a tower bug, not a shape: the shim pre-checks the
@@ -181,7 +175,7 @@ __device__ inline void sam_attn_body(
     }
     const int keys = th * tw;
 
-    for (int r = (int)threadIdx.x; r < keys; r += (int)kThreads) {
+    for (int r = row_lo + (int)threadIdx.x; r < row_hi; r += (int)kThreads) {
         const int lh = r / tw, lw = r % tw;
         const int ih = ty * th + lh, iw = tx * tw + lw;
         if (ih >= gh || iw >= gw) continue;    // a pad row: no output
@@ -197,13 +191,20 @@ __device__ inline void sam_attn_body(
         float m = -INFINITY, l = 0.0f;
 
         /* The w rel-pos dots depend on (lw, jw) only: computed once for the query row when the
-         * tile is narrow (the windowed tiles are 14 wide), recomputed per key otherwise (a
-         * whole-grid tile of 64 columns would cost more registers than the dots save). */
+         * tile is narrow (the windowed tiles are 14 wide), recomputed per key otherwise. For a
+         * whole-grid tile that is gw dots a query row instead of gw per key row, i.e. the same
+         * count as the q.k dots rather than gh times it; the array is spilled to local memory
+         * when the compiler runs out of registers, which is still far cheaper than the dot. */
         float wr[16];
+        float wr_all[64];
         const bool wr_hoist = tw <= 16;
+        const bool wr_wide  = !wr_hoist && tw <= 64;
         if (wr_hoist)
             for (int jw = 0; jw < tw; ++jw)
                 wr[jw] = tab_dot<HD>(rw, rw_rows, 2 * tw - 1, lw - jw + tw - 1, qf);
+        else if (wr_wide)
+            for (int jw = 0; jw < tw; ++jw)
+                wr_all[jw] = tab_dot<HD>(rw, rw_rows, 2 * tw - 1, lw - jw + tw - 1, qf);
 
         for (int jh = 0; jh < th; ++jh) {
             const float hr = tab_dot<HD>(rh, rh_rows, 2 * th - 1, lh - jh + th - 1, qf);
@@ -212,8 +213,9 @@ __device__ inline void sam_attn_body(
             const bool hreal = kh < gh;
             for (int jw = 0; jw < tw; ++jw) {
                 float s = hr + (wr_hoist ? wr[jw]
-                                         : tab_dot<HD>(rw, rw_rows, 2 * tw - 1, lw - jw + tw - 1,
-                                                       qf));
+                                         : (wr_wide ? wr_all[jw]
+                                                    : tab_dot<HD>(rw, rw_rows, 2 * tw - 1,
+                                                                  lw - jw + tw - 1, qf)));
 
                 const int kw = tx * tw + jw;
                 const bool real = hreal && kw < gw;
@@ -256,12 +258,47 @@ __global__ __launch_bounds__(kThreads) void sam_attn_kernel(
     const uint16_t* __restrict__ rw, int rh_rows, int rw_rows,
     int q_ld, int k_ld, int v_ld, int o_ld, int nhead, int gh, int gw, int th, int tw,
     int nth, int ntw, int vec_rows, float scale) {
+    // blockIdx.x = ((seq * nth + ty) * ntw + tx) * nhead + head: heads adjacent, so the tile's k/v
+    // rows stay hot across them.
+    int b = blockIdx.x;
+    const int head = b % nhead; b /= nhead;
+    const int tx   = b % ntw;   b /= ntw;
+    const int ty   = b % nth;   b /= nth;
+    const int seq  = b;
     if (vec_rows)
         sam_attn_body<HD, true>(gq, gk, gv, go, cu, rh, rw, rh_rows, rw_rows, q_ld, k_ld, v_ld,
-                                o_ld, nhead, gh, gw, th, tw, nth, ntw, scale);
+                                o_ld, nhead, gh, gw, th, tw, seq, head, ty, tx, 0, th * tw, scale);
     else
         sam_attn_body<HD, false>(gq, gk, gv, go, cu, rh, rw, rh_rows, rw_rows, q_ld, k_ld, v_ld,
-                                 o_ld, nhead, gh, gw, th, tw, nth, ntw, scale);
+                                 o_ld, nhead, gh, gw, th, tw, seq, head, ty, tx, 0, th * tw, scale);
+}
+
+/* The global path (window 0) is one tile over the whole segment, so the kernel above would launch
+ * nseq*nhead blocks with each thread walking rows/N-threads query rows in series (12-32 on a 40 or
+ * 64 grid): 60 blocks for a 5-tile page, far too few to fill the card. This variant keeps the same
+ * per-row math and key order but tiles the query rows, one block per (segment, query tile, head).
+ * Grid positions are the segment's row-major cells, so a tile is a contiguous row range. */
+template <int HD>
+__global__ __launch_bounds__(kThreads) void sam_attn_qtile_kernel(
+    const uint16_t* __restrict__ gq, const uint16_t* __restrict__ gk,
+    const uint16_t* __restrict__ gv, uint16_t* __restrict__ go,
+    const int* __restrict__ cu, const uint16_t* __restrict__ rh,
+    const uint16_t* __restrict__ rw, int rh_rows, int rw_rows,
+    int q_ld, int k_ld, int v_ld, int o_ld, int nhead, int gh, int gw,
+    int nqb, int qrows, int vec_rows, float scale) {
+    int b = blockIdx.x;
+    const int head = b % nhead; b /= nhead;
+    const int qblk = b % nqb;   b /= nqb;
+    const int seq  = b;
+    const int keys = gh * gw;
+    const int lo   = qblk * qrows;
+    const int hi   = keys < lo + qrows ? keys : lo + qrows;
+    if (vec_rows)
+        sam_attn_body<HD, true>(gq, gk, gv, go, cu, rh, rw, rh_rows, rw_rows, q_ld, k_ld, v_ld,
+                                o_ld, nhead, gh, gw, gh, gw, seq, head, 0, 0, lo, hi, scale);
+    else
+        sam_attn_body<HD, false>(gq, gk, gv, go, cu, rh, rw, rh_rows, rw_rows, q_ld, k_ld, v_ld,
+                                 o_ld, nhead, gh, gw, gh, gw, seq, head, 0, 0, lo, hi, scale);
 }
 
 int launch_sam_attn(const uint16_t* q, const uint16_t* k, const uint16_t* v, uint16_t* o,
@@ -271,14 +308,28 @@ int launch_sam_attn(const uint16_t* q, const uint16_t* k, const uint16_t* v, uin
                     int win, float scale, long stream) {
     const int th = win > 0 ? win : gh, tw = win > 0 ? win : gw;
     const int nth = (gh + th - 1) / th, ntw = (gw + tw - 1) / tw;
-    const size_t blocks = (size_t)nseq * nth * ntw * nhead;
-    if (blocks == 0 || blocks > 0x7fffffff) return R4D_NO(RAD_E_SHAPE);
     /* The 16-byte row loads are legal only when every q/k/v/out row starts on a 16-byte
      * boundary: all four bases aligned, every row pitch a multiple of 8 bf16. The selftest's
      * padded pitch and a slice with a filler column both fail this and take the scalar path. */
     const uintptr_t addr_bits = (uintptr_t)q | (uintptr_t)k | (uintptr_t)v | (uintptr_t)o;
     const bool vec_rows = (addr_bits & 15u) == 0 &&
                           ((q_ld | k_ld | v_ld | o_ld) & 7) == 0;
+    if (win == 0) {
+        /* One block per (segment, 128-row query tile, head): the whole-segment tile above would
+         * give each thread 12-32 query rows in series and launch only nseq*nhead blocks. */
+        const int qrows = 128;
+        const int keys  = gh * gw;
+        const int nqb   = (keys + qrows - 1) / qrows;
+        const size_t qblocks = (size_t)nseq * nqb * nhead;
+        if (qblocks == 0 || qblocks > 0x7fffffff) return R4D_NO(RAD_E_SHAPE);
+        hipLaunchKernelGGL((sam_attn_qtile_kernel<64>), dim3((uint32_t)qblocks),
+                           dim3(kThreads), 0, (hipStream_t)stream, q, k, v, o, cu, rh, rw,
+                           rh_rows, rw_rows, q_ld, k_ld, v_ld, o_ld, nhead, gh, gw, nqb, qrows,
+                           vec_rows ? 1 : 0, scale);
+        return hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
+    }
+    const size_t blocks = (size_t)nseq * nth * ntw * nhead;
+    if (blocks == 0 || blocks > 0x7fffffff) return R4D_NO(RAD_E_SHAPE);
     hipLaunchKernelGGL((sam_attn_kernel<64>), dim3((uint32_t)blocks), dim3(kThreads), 0,
                        (hipStream_t)stream, q, k, v, o, cu, rh, rw, rh_rows, rw_rows,
                        q_ld, k_ld, v_ld, o_ld, nhead, gh, gw, th, tw, nth, ntw,

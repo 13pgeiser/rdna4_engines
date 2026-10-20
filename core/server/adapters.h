@@ -28,6 +28,8 @@
 #include "text/chat.h"
 #include "text/chatfmt.h"
 #include "text/chatparse.h"
+#include <chrono>
+#include <cstdlib>
 #include "text/tokenizer.h"
 #include "mm/processor.h"
 
@@ -711,8 +713,18 @@ public:
         mode.kind = (int32_t)opts.image_mode;
         mode.base_size = opts.image_base_size;
         mode.image_size = opts.image_size;
-        return p_->image(bytes.data(), bytes.size(), opts.image_tokens, out, why,
-                         opts.max_pixels, mode);
+        /* G1 (UNLIMITED-OCR-PERF.md): the host-side decode/resample/LUT share of a picture,
+         * separate from the tower pass timed in engine_mm.cpp. RADIANCE_DEBUG_MM_TIME=1. */
+        static const bool mm_time = std::getenv("RADIANCE_DEBUG_MM_TIME") != nullptr;
+        const auto t0 = std::chrono::steady_clock::now();
+        const int rc = p_->image(bytes.data(), bytes.size(), opts.image_tokens, out, why,
+                                 opts.max_pixels, mode);
+        if (mm_time)
+            RAD_INFO("mm: host processor %lld bytes -> %.1f ms (rc %d)",
+                     (long long)bytes.size(),
+                     std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - t0).count(), rc);
+        return rc;
     }
 
     int32_t audio_rate() const override {
