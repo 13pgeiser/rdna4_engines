@@ -2041,8 +2041,9 @@ function update(s, dt) {
    * reads as a live measurement of a lane that drafted nothing. The lifetime ratio stays on
    * /stats and /metrics; what the tile answers is "what is it accepting now", and now, idle,
    * it is accepting nothing.
-   * THE SPARKLINE'S SCALE DIFFERS from the other tiles: its samples are 10 s drafting windows, not
-   * 500 ms polls, so this box spans up to 120 windows of actual drafting rather than 60 s. */
+   * THE SPARKLINE'S SCALE DIFFERS from the other tiles: it samples only polls that DRAFTED (the
+   * others sample every poll), so its 120 samples span 60 s of continuous drafting at the 500 ms
+   * poll -- and more wall-clock than that when drafting is intermittent. */
   if (!(s.draft_positions && s.draft_positions.length)) setMetric("accept", null, DASH);
   else if (awR != null) setMetric("accept", 100 * awR, pctn(awR, 0));
   else setMetric("accept", 0, pctn(0, 0));   /* drafted nothing this poll -> 0, the idle figure */
