@@ -10764,6 +10764,62 @@ static void fused_quant_fp8_numeric(const Plugin& pl) {
         }
     }
 
+    /* --- the rotated int8 twins, against their producer and had_quant_act_i8g ---
+     *
+     * For a trunk stored at i8a8h: the bf16 output must not move (it is unrotated), and codes and
+     * scales must equal had_quant_act_i8g's over it. K is whole 128s, as the rotation needs. */
+    if (const RadKernelInfo* qh = find(pl, "had_quant_act_i8g")) {
+        if (const RadKernelInfo* rh = find(pl, "rmsnorm_had_quant_i8g")) {
+            rc = launch_row(nrm, { T(d_x, RAD_BF16, { M, K }), T(d_w, RAD_F32, { K }),
+                                   T(d_y[0], RAD_BF16, { M, K }) },
+                            { PI("M", M), PI("n", K), PF("eps", eps), PS("dtype", "bf16"),
+                              PF("wadd", wadd) });
+            if (rc == RAD_OK)
+                rc = launch_row(qh, { T(d_y[0], RAD_BF16, { M, K }), T(d_q[0], RAD_I8, { M, K }),
+                                      T(d_s[0], RAD_F32, { M, nkb }) },
+                                { PI("M", M), PI("n", K), PI("group", 128), PS("dtype", "bf16") });
+            if (rc == RAD_OK)
+                rc = launch_row(rh, { T(d_x, RAD_BF16, { M, K }), T(nullptr, RAD_BF16, {}),
+                                      T(d_w, RAD_F32, { K }),
+                                      T(d_q[1], RAD_I8, { M, K }), T(d_s[1], RAD_F32, { M, nkb }),
+                                      T(d_y[1], RAD_BF16, { M, K }) },
+                                { PI("M", M), PI("n", K), PF("eps", eps), PI("group", 128),
+                                  PS("dtype", "bf16"), PF("wadd", wadd) });
+            if (rc != RAD_OK) ok("rmsnorm_had_quant_i8g vs rmsnorm + had_quant_act_i8g", false,
+                                 "rc=" + std::to_string(rc));
+            else same("rmsnorm_had_quant_i8g is byte-identical to rmsnorm + had_quant_act_i8g");
+
+            rc = launch_row(rh, { T(d_x, RAD_BF16, { M, K }), T(nullptr, RAD_BF16, {}),
+                                  T(d_w, RAD_F32, { K }),
+                                  T(d_q[1], RAD_F8E4M3, { M, K }), T(d_s[1], RAD_F32, { M, nkb }) },
+                            { PI("M", M), PI("n", K), PF("eps", eps), PI("group", 128),
+                              PS("dtype", "bf16"), PF("wadd", wadd) });
+            ok("rmsnorm_had_quant_i8g refuses E4M3 codes", rc != RAD_OK, "rc=" + std::to_string(rc));
+        }
+        if (const RadKernelInfo* gh = find(pl, "gated_had_quant_i8g")) {
+            rc = launch_row(smu, { T(d_gu, RAD_BF16, { M, 2 * K }), T(d_y[0], RAD_BF16, { M, K }) },
+                            { PI("M", M), PI("n", K), PS("dtype", "bf16") });
+            if (rc == RAD_OK)
+                rc = launch_row(qh, { T(d_y[0], RAD_BF16, { M, K }), T(d_q[0], RAD_I8, { M, K }),
+                                      T(d_s[0], RAD_F32, { M, nkb }) },
+                                { PI("M", M), PI("n", K), PI("group", 128), PS("dtype", "bf16") });
+            if (rc == RAD_OK)
+                rc = launch_row(gh, { T(d_gu, RAD_BF16, { M, 2 * K }), T(d_q[1], RAD_I8, { M, K }),
+                                      T(d_s[1], RAD_F32, { M, nkb }), T(d_y[1], RAD_BF16, { M, K }) },
+                                { PI("M", M), PI("n", K), PI("group", 128), PS("dtype", "bf16"),
+                                  PS("act", "silu") });
+            if (rc != RAD_OK) ok("gated_had_quant_i8g vs silu_mul + had_quant_act_i8g", false,
+                                 "rc=" + std::to_string(rc));
+            else same("gated_had_quant_i8g is byte-identical to silu_mul + had_quant_act_i8g");
+
+            rc = launch_row(gh, { T(d_gu, RAD_BF16, { M, 2 * K }), T(d_q[1], RAD_F8E4M3, { M, K }),
+                                  T(d_s[1], RAD_F32, { M, nkb }) },
+                            { PI("M", M), PI("n", K), PI("group", 128), PS("dtype", "bf16"),
+                              PS("act", "silu") });
+            ok("gated_had_quant_i8g refuses E4M3 codes", rc != RAD_OK, "rc=" + std::to_string(rc));
+        }
+    }
+
     /* --- add + rmsnorm + quant_act_fp8, against the same three fused ---
      *
      * The residual sum is f32, and the replaced pair rounds it to bf16 in `add`'s store before
@@ -10812,6 +10868,47 @@ static void fused_quant_fp8_numeric(const Plugin& pl) {
         int nd = 0;
         for (size_t i = 0; i < r0.size(); ++i) nd += r0[i] != r1[i];
         ok("rmsnorm_quant_fp8 leaves the same residual behind", nd == 0,
+           "differs " + std::to_string(nd));
+    }
+
+    /* --- add + rmsnorm + had_quant_act_i8g, against rmsnorm_had_quant_i8g's residual form --- */
+    const RadKernelInfo* qh = find(pl, "had_quant_act_i8g");
+    const RadKernelInfo* rh = find(pl, "rmsnorm_had_quant_i8g");
+    if (!qh || !rh) return;
+    st_memcpy(d_r[0], hr.data(), hr.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_r[1], hr.data(), hr.size() * 2, hipMemcpyHostToDevice);
+    rc = launch_row(ad, { T(d_r[0], RAD_BF16, { M, K }), T(d_x, RAD_BF16, { M, K }),
+                          T(d_r[0], RAD_BF16, { M, K }) },
+                    { PI("M", M), PI("n", K), PS("dtype", "bf16") });
+    if (rc == RAD_OK)
+        rc = launch_row(nrm, { T(d_r[0], RAD_BF16, { M, K }), T(d_w, RAD_F32, { K }),
+                               T(d_y[0], RAD_BF16, { M, K }) },
+                        { PI("M", M), PI("n", K), PF("eps", eps), PS("dtype", "bf16"),
+                          PF("wadd", wadd) });
+    if (rc == RAD_OK)
+        rc = launch_row(qh, { T(d_y[0], RAD_BF16, { M, K }), T(d_q[0], RAD_I8, { M, K }),
+                              T(d_s[0], RAD_F32, { M, nkb }) },
+                        { PI("M", M), PI("n", K), PI("group", 128), PS("dtype", "bf16") });
+    if (rc == RAD_OK)
+        rc = launch_row(rh, { T(d_x, RAD_BF16, { M, K }), T(d_r[1], RAD_BF16, { M, K }),
+                              T(d_w, RAD_F32, { K }),
+                              T(d_q[1], RAD_I8, { M, K }), T(d_s[1], RAD_F32, { M, nkb }),
+                              T(d_y[1], RAD_BF16, { M, K }) },
+                        { PI("M", M), PI("n", K), PF("eps", eps), PI("group", 128),
+                          PS("dtype", "bf16"), PF("wadd", wadd) });
+    if (rc != RAD_OK) {
+        ok("rmsnorm_had_quant_i8g residual vs add + rmsnorm + had_quant_act_i8g", false,
+           "rc=" + std::to_string(rc));
+        return;
+    }
+    same("rmsnorm_had_quant_i8g residual is byte-identical to add + rmsnorm + had_quant_act_i8g");
+    {
+        std::vector<uint16_t> r0((size_t)M * K), r1((size_t)M * K);
+        st_memcpy(r0.data(), d_r[0], r0.size() * 2, hipMemcpyDeviceToHost);
+        st_memcpy(r1.data(), d_r[1], r1.size() * 2, hipMemcpyDeviceToHost);
+        int nd = 0;
+        for (size_t i = 0; i < r0.size(); ++i) nd += r0[i] != r1[i];
+        ok("rmsnorm_had_quant_i8g leaves the same residual behind", nd == 0,
            "differs " + std::to_string(nd));
     }
 }
@@ -25849,7 +25946,8 @@ static void device_phase(const Plugin& pl) {
 
     /* The fused quantisers are checked against the kernels they replace, gated on their own
      * rows. */
-    if (sel("rmsnorm_quant_fp8") || sel("gated_quant_fp8") || sel("gate_quant_fp8")) {
+    if (sel("rmsnorm_quant_fp8") || sel("gated_quant_fp8") || sel("gate_quant_fp8") ||
+        sel("rmsnorm_had_quant_i8g") || sel("gated_had_quant_i8g")) {
         if (!g_case) std::printf("\nthe fp8 fusions, against the pair each one replaces\n");
         fused_quant_fp8_numeric(pl);
     }
@@ -25965,6 +26063,8 @@ static void device_phase(const Plugin& pl) {
     /* Also skipped: the norm half is rmsnorm_quant_fp8's device function, checked there, and the
      * handshake and reduced sum need a peer rank. */
     skip_pair("ar_rmsnorm_quant_fp8", "two-rank fusion: needs a peer rank");
+    /* The same for its rotated int8 twin, whose norm half is rmsnorm_had_quant_i8g's. */
+    skip_pair("ar_rmsnorm_had_quant_i8g", "two-rank fusion: needs a peer rank");
     skip_pair("ar_rmsnorm_quant_i8", "two-rank fusion: needs a peer rank");
 
     dfree_all();

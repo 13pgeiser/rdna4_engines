@@ -1178,6 +1178,24 @@ extern "C" int r4d_shape_ar_rmsnorm_quant_fp8(const RadParam* p, int n_p, int op
     R4D_PICK(l);
 }
 
+extern "C" int r4d_shape_ar_rmsnorm_had_quant_i8g(const RadParam* p, int n_p, int operand,
+                                                  RadOpdDesc* out) {
+
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const int64_t g = pi(p, n_p, "group", R4D_FP8_BLOCK);
+    if (g != R4D_FP8_BLOCK) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_BF16, M, n),      /* inout: the message and the input */
+        opd((uint32_t)RAD_BF16, M, n),
+        opd((uint32_t)RAD_F32,  n),         /* f32 or bf16; the shim reads the operand's own */
+        opd((uint32_t)RAD_I8, M, n),
+        opd((uint32_t)RAD_F32, M, (n + g - 1) / g),
+        opd((uint32_t)RAD_BF16, M, n),
+    };
+    R4D_PICK(l);
+}
+
 /* ==========================================================================================
  * GEMM, dequant and the row top-R (shims in the r4d_gemm_*.hip units, r4d_dequant_w4_bf16.hip and
  * r4d_rowtopk_bf16.hip).
@@ -1885,6 +1903,43 @@ extern "C" int r4d_shape_gated_quant_fp8(const RadParam* p, int n_p, int operand
     const RadOpdDesc l[] = {
         opd(D, M, 2 * n),                   /* gate then up in one buffer */
         opd((uint32_t)RAD_F8E4M3, M, n),
+        opd((uint32_t)RAD_F32, M, (n + g - 1) / g),
+        opd(D, M, n),
+    };
+    R4D_PICK(l);
+}
+
+/* The `_had_quant_i8g` twins: the same operands with int8 codes (had_quant_act_i8g's). */
+extern "C" int r4d_shape_rmsnorm_had_quant_i8g(const RadParam* p, int n_p, int operand,
+                                               RadOpdDesc* out) {
+
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const int64_t g = pi(p, n_p, "group", R4D_FP8_BLOCK);
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    if (g != R4D_FP8_BLOCK) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd(D, M, n),
+        opd(D, M, n),
+        opd((uint32_t)RAD_F32, n),
+        opd((uint32_t)RAD_I8, M, n),
+        opd((uint32_t)RAD_F32, M, (n + g - 1) / g),
+        opd(D, M, n),
+    };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_gated_had_quant_i8g(const RadParam* p, int n_p, int operand,
+                                             RadOpdDesc* out) {
+
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const int64_t g = pi(p, n_p, "group", R4D_FP8_BLOCK);
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    if (g != R4D_FP8_BLOCK) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd(D, M, 2 * n),                   /* gate then up in one buffer */
+        opd((uint32_t)RAD_I8, M, n),
         opd((uint32_t)RAD_F32, M, (n + g - 1) / g),
         opd(D, M, n),
     };

@@ -3070,6 +3070,11 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("rmsnorm_quant_fp8", pRmsNormQuantFp8, oRmsNormQuantFp8,
            "RMS norm and the fp8 activation quantiser in one pass over the row. The bf16 norm "
            "output the unfused pair wrote is still written, and the codes are taken over it."),
+    SCHEMA("rmsnorm_had_quant_i8g", pRmsNormQuantFp8, oRmsNormQuantFp8,
+           "rmsnorm_quant_fp8 with had_quant_act_i8g's quantiser on its pass: a `group`-wide "
+           "Hadamard of the bf16 norm output, then int8 codes per (row, `group`). `out_bf16` "
+           "receives the UNROTATED norm output. Pairs only with an i8 weight stored rotated "
+           "(dtype i8a8h); byte-identical to the norm and had_quant_act_i8g."),
     SCHEMA("rmsnorm_quant_i8", pRmsNormQuantI8, oRmsNormQuantI8,
            "RMS norm and the per-row int8 quantiser the w4a8 skinny GEMM reads, in one pass; with "
            "a residual the norm is of residual + x (+ a post-norm of x, x a scalar), stored back."),
@@ -3089,6 +3094,11 @@ static const RadOpSchema kSchemas[] = {
            "the rotation is a property of the quantised pair alone. Pairs with a weight stored at "
            "dtype w4a8h; substituting it for gated_quant_fp8, or the reverse, produces a model "
            "that runs and is wrong."),
+    SCHEMA("gated_had_quant_i8g", pGatedQuantFp8, oGatedQuantFp8,
+           "gated_had_quant_fp8 at int8 codes: silu(a)*b or sigmoid(a)*b, a `group`-wide Hadamard "
+           "and had_quant_act_i8g's quantiser, in one pass. `out_bf16` receives the UNROTATED "
+           "product. Pairs only with an i8 weight stored rotated (dtype i8a8h); byte-identical "
+           "to the product and had_quant_act_i8g."),
     SCHEMA("gemm_nt_q_gated", pGemmNtQGated, oGemmNtQGated,
            "gemm_nt_q over a [2n, K] gate_up plane with gated_quant_fp8's pass folded into the "
            "epilogue: the outputs are the quantiser's E4M3 codes, its scale per (row, `group` "
@@ -3206,6 +3216,9 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("ar_rmsnorm_quant_fp8", pArRmsNormQuantFp8, oArRmsNormQuantFp8,
            "the two-rank all-reduce and the residual add, RMS norm and block-scaled fp8 "
            "quantisation that always follow it, in one kernel. Both wires."),
+    SCHEMA("ar_rmsnorm_had_quant_i8g", pArRmsNormQuantFp8, oArRmsNormQuantFp8,
+           "the two-rank all-reduce of x and rmsnorm_had_quant_i8g after it, in one kernel; "
+           "either wire, as ar_rmsnorm_quant_fp8."),
     SCHEMA("ar_hc_write", pArHcWrite, oArHcWrite,
            "the all-reduce and the gated residual's write that follows it, in one kernel. Both "
            "wires at two ranks, the exact one at four."),
@@ -4365,6 +4378,16 @@ static const RadConstraint cRmsNormQuantFp8[] = {
  * the handshake is one peer flag per block (as cArLnHadQuantI8). */
 static const RadConstraint cArRmsNormQuantFp8[] = {
     C_DIV("n", 8), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
+    C_EQ("world_size", 2),
+    C_P2P,
+};
+/* The rotated int8 twins: `n DIV 128`, since a rotation block cannot straddle the end of a row
+ * (which also gives the all-reduce's 16B words). */
+static const RadConstraint cRmsNormHadQuantI8g[] = {
+    C_DIV("n", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cArRmsNormHadQuantI8g[] = {
+    C_DIV("n", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
     C_EQ("world_size", 2),
     C_P2P,
 };
@@ -7472,6 +7495,22 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   /* `add` + `rmsnorm` + `quant_act_fp8`, not `rmsnorm_add` (r4d_fuse.cpp). */
   r4d_fuse_rmsnorm_quant_fp8 },
 
+/* The rotated int8 twin, for a trunk of weights stored at i8a8h: the same kernel with
+ * had_quant_act_i8g's quantiser on its second pass. No fusion hook: the architecture declares it. */
+{ "rmsnorm_had_quant_i8g", "rmsnorm_had_quant_i8g", "quant",
+  "RMS norm, a 128-wide Hadamard and the per-(row, 128) int8 quantiser in one pass over the row, "
+  "plus the bf16 norm output",
+  "n a multiple of 128 -- a rotation block cannot straddle the end of a row; one workgroup per row "
+  "and two passes over it, as rmsnorm_quant_fp8; the gain is f32 or bf16; group 128, both the "
+  "rotation width and the scale's block width; an optional residual may ALIAS out_bf16",
+  "bf16 in, int8 out with an f32 scale per (row, 128 columns) and an optional bf16 out that "
+  "receives the UNROTATED norm output; the codes are taken over the rotated BF16-ROUNDED norm "
+  "output, byte-identical to rmsnorm + had_quant_act_i8g",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cRmsNormHadQuantI8g), NOTUNE,
+  nullptr, nullptr, r4d_rad_rmsnorm_had_quant_i8g, nullptr, nullptr, nullptr,
+  r4d_shape_rmsnorm_had_quant_i8g },
+
 { "gated_quant_fp8", "gated_quant_fp8", "quant",
   "an elementwise gated product and the fp8 activation quantiser in one pass; `act` silu is "
   "down_proj's input and sigmoid is a gated o_proj's",
@@ -7501,6 +7540,21 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   ROW(cGatedHadQuantFp8), NOTUNE,
   nullptr, nullptr, r4d_rad_gated_had_quant_fp8, nullptr, nullptr, nullptr,
   r4d_shape_gated_quant_fp8 },
+
+/* Its int8 twin, for a down projection whose weight is stored at i8a8h. */
+{ "gated_had_quant_i8g", "gated_had_quant_i8g", "quant",
+  "an elementwise gated product, a 128-wide Hadamard along n, and the per-(row, 128) int8 "
+  "quantiser, in one pass",
+  "n a multiple of 128 -- a rotation block cannot straddle the end of a row; the gated operand is "
+  "[M][2n], gate then up; no reduction across the row, so no barrier; group 128, both the "
+  "rotation width and the scale's block width; strides in elements",
+  "bf16 in, int8 out with an f32 scale per (row, 128 columns) and an optional bf16 out that "
+  "receives the UNROTATED product; the codes are taken over the rotated BF16-ROUNDED product, "
+  "byte-identical to the product + had_quant_act_i8g",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGatedHadQuantFp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_gated_had_quant_i8g, nullptr, nullptr, nullptr,
+  r4d_shape_gated_had_quant_i8g },
 
 { "gate_quant_fp8", "gate_quant_fp8", "quant",
   "an elementwise gated product and the fp8 activation quantiser in one pass, with the gate in "
@@ -7670,6 +7724,22 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   r4d_shape_ar_rmsnorm_quant_fp8, nullptr,
   /* `all_reduce` + `rmsnorm_quant_fp8`, both wires (r4d_fuse.cpp). */
   r4d_fuse_ar_rmsnorm_quant_fp8 },
+
+{ "ar_rmsnorm_had_quant_i8g", "ar_rmsnorm_had_quant_i8g", "quant",
+  "the two-rank all-reduce and the residual add, RMS norm, 128-wide Hadamard and per-(row, 128) "
+  "int8 quantisation that always follow it, in one kernel; the all-reduce's output is never read "
+  "back",
+  "exactly 2 ranks; n a multiple of 128 (a rotation block cannot straddle a row) and x unpitched; "
+  "group 128; a block owns whole ROWS, so the block count is clamped to M; either wire, chosen by "
+  "`wire` -- the rotated 6-bit payload additionally needs n to be a multiple of 512; residual and "
+  "out_bf16 may be null",
+  "bf16 in, int8 out with an f32 scale per (row, 128 columns) and an optional bf16 out of the "
+  "UNROTATED norm output; x and the residual are ar_rmsnorm_quant_fp8's bytes, and the codes "
+  "rmsnorm_had_quant_i8g's over the same norm output",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cArRmsNormHadQuantI8g), ROW(tAr), nullptr,
+  r4d_rad_ar_ln_init, r4d_rad_ar_fini, r4d_rad_ar_rmsnorm_had_quant_i8g, nullptr, nullptr, nullptr,
+  r4d_shape_ar_rmsnorm_had_quant_i8g },
 
 { "ar_rmsnorm_post_quant_fp8", "ar_rmsnorm_post_quant_fp8", "quant",
   "the two-rank all-reduce, a post-norm of the reduced sum, the residual add, RMS norm and "

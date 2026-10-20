@@ -713,6 +713,15 @@ int  r4d_rmsnorm_quant_fp8(long x, long res, long w, long y, long q, long s, int
                            int q_ld, int s_ld, long stream);
 int  r4d_gated_quant_fp8(long gu, long y, long q, long s, int M, int n, int mode,
                          int gu_ld, int y_ld, int q_ld, int s_ld, long stream);
+// The two above with had_quant_act_i8g's quantiser on the pass instead (the `_had_quant_i8g`
+// forms): the width-128 Hadamard, then int8 codes at amax / 127 per (row, 128), for a weight at
+// i8a8h. `q` is int8, `n` a multiple of 128, and `y` keeps the unrotated bf16 value. The codes
+// are the producer + had_quant_act_i8g pair's bytes.
+int  r4d_rmsnorm_had_quant_i8g(long x, long res, long w, long y, long q, long s, int M, int n,
+                               float eps, float wadd, int w_f32, int x_ld, int r_ld, int y_ld,
+                               int q_ld, int s_ld, long stream);
+int  r4d_gated_had_quant_i8g(long gu, long y, long q, long s, int M, int n, int mode,
+                             int gu_ld, int y_ld, int q_ld, int s_ld, long stream);
 // The activation is rounded to bf16 before the product, matching the unfused `sigmoid` then `mul`
 // pair with a bf16 buffer between them.
 // The same epilogue with the gate in a different buffer from what it scales, as in gated
@@ -738,6 +747,15 @@ int  r4d_ar_rmsnorm_quant_fp8(long peer_scratch, long my_scratch, long peer_flag
                               int nblocks, int nthreads, int drain, int acq, int wire,
                               long loc_pack, long loc_scale_off, long wp = 0);
 int  r4d_ar_rmsnorm_quant_fp8_chunk_elems(void);
+// Its rotated int8 form, as r4d_rmsnorm_had_quant_i8g: the reduction and the norm unchanged, the
+// norm's pass quantised by had_quant_act_i8g's rule. No post-norm.
+int  r4d_ar_rmsnorm_had_quant_i8g(long peer_scratch, long my_scratch, long peer_flags,
+                                  long my_flags, long seq_ctrs, long slot_stride16,
+                                  long x, long res, long w, long y, long q, long s,
+                                  int M, int n, float eps, float wadd, int w_f32,
+                                  int r_ld, int y_ld, int q_ld, int s_ld, long stream,
+                                  int nblocks, int nthreads, int drain, int acq, int wire,
+                                  long loc_pack, long loc_scale_off);
 
 // The same IPC with the sandwich-norm junction after it (r4d_rmsnorm_quant_i8.hip): post-norm of
 // the reduced `x` (`wp`), the residual add, the [1] scalar (`sc`), the norm (`w`) and the w4a8

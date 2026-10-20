@@ -1240,7 +1240,9 @@ extern "C" int r4d_rad_ar_ln_had_quant_i8(const RadArgs* a, RadStream s) {
  * chooses it as the standalone `all_reduce` row would (lossy wire allowed, group tiles the message,
  * size above --tp-wire-min-kb), and both ranks decide on the same T. A wire-6 chunk that would
  * straddle a row is refused as a shape. */
-extern "C" int r4d_rad_ar_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
+/* `hi8`: ar_rmsnorm_had_quant_i8g, the same with had_quant_act_i8g's quantiser on the norm's pass
+ * (int8 codes, K whole 128s, no post-norm). */
+static int rad_ar_rmsnorm_quant(const RadArgs* a, RadStream s, bool hi8) {
     const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
     if (!in) return RAD_E_STATE;
     if (in->world != 2) return RAD_E_SHAPE;
@@ -1252,9 +1254,11 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
     const RadTensor* sc = r4d_opt(a, AL_SCALE);
     const RadTensor* ob = r4d_opt(a, AL_OUTBF16);
     /* ar_rmsnorm_quant_fp8's optional post-norm (Gemma 3's sandwich); ar_ln_had_quant_i8 has no
-     * seventh operand, and this function serves only the fp8 op. */
+     * seventh operand, and this function serves only the fp8 op and its rotated int8 twin. */
     const RadTensor* wpo = r4d_opt(a, AL_WPOST);
     if (!x || !w || !q || !sc) return RAD_E_INVAL;
+    if (hi8 && q->dtype != RAD_I8) return RAD_E_DTYPE;
+    if (hi8 && wpo) return RAD_E_UNSUPPORTED;
     if (!r4d_contig(w)) return RAD_E_STRIDE;
     if (wpo && (!rs || !r4d_contig(wpo) || r4d_numel(wpo) != r4d_numel(w) || wpo->dtype != w->dtype))
         return RAD_E_SHAPE;
@@ -1272,6 +1276,7 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
     const long long grp = r4d_quant_act_fp8_group();
     const long long nkb = (K + grp - 1) / grp;
     if (r4d_geti_or(a, "group", grp) != grp) return RAD_E_SHAPE;
+    if (hi8 && K % grp) return RAD_E_SHAPE;
     if (r4d_numel(w) != K) return RAD_E_SHAPE;
     if (w->dtype != RAD_F32 && w->dtype != RAD_BF16) return RAD_E_DTYPE;
     if (q->shape[0] != M || q->shape[1] != K) return RAD_E_SHAPE;
@@ -1327,15 +1332,32 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
     if (nblocks > in->max_blocks) nblocks = in->max_blocks;
     if (nblocks < 1) nblocks = 1;
 
-    const int e = r4d_ar_rmsnorm_quant_fp8(
-        in->peer_scratch[0], in->my_scratch,
-        in->peer_flags[0], in->my_flags, in->my_seq,
-        in->slot16, r4d_addr(x), r4d_addr(rs), r4d_addr(w), r4d_addr(ob), r4d_addr(q),
-        r4d_addr(sc), (int)M, (int)K, eps, wadd, w_f32,
-        (int)rp, (int)yp, (int)qp, (int)sp,
-        (long)(uintptr_t)s, nblocks, nthreads, cfgv.drain, cfgv.acq, wire,
-        in->locpack, in->slot_bytes / 2, wpo ? r4d_addr(wpo) : 0);
+    const int e = hi8
+        ? r4d_ar_rmsnorm_had_quant_i8g(
+              in->peer_scratch[0], in->my_scratch,
+              in->peer_flags[0], in->my_flags, in->my_seq,
+              in->slot16, r4d_addr(x), r4d_addr(rs), r4d_addr(w), r4d_addr(ob), r4d_addr(q),
+              r4d_addr(sc), (int)M, (int)K, eps, wadd, w_f32,
+              (int)rp, (int)yp, (int)qp, (int)sp,
+              (long)(uintptr_t)s, nblocks, nthreads, cfgv.drain, cfgv.acq, wire,
+              in->locpack, in->slot_bytes / 2)
+        : r4d_ar_rmsnorm_quant_fp8(
+              in->peer_scratch[0], in->my_scratch,
+              in->peer_flags[0], in->my_flags, in->my_seq,
+              in->slot16, r4d_addr(x), r4d_addr(rs), r4d_addr(w), r4d_addr(ob), r4d_addr(q),
+              r4d_addr(sc), (int)M, (int)K, eps, wadd, w_f32,
+              (int)rp, (int)yp, (int)qp, (int)sp,
+              (long)(uintptr_t)s, nblocks, nthreads, cfgv.drain, cfgv.acq, wire,
+              in->locpack, in->slot_bytes / 2, wpo ? r4d_addr(wpo) : 0);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
+}
+
+extern "C" int r4d_rad_ar_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
+    return rad_ar_rmsnorm_quant(a, s, false);
+}
+
+extern "C" int r4d_rad_ar_rmsnorm_had_quant_i8g(const RadArgs* a, RadStream s) {
+    return rad_ar_rmsnorm_quant(a, s, true);
 }
 
 /* The all-reduce and the sandwich-norm junction after it, int8 out: exact `all_reduce` of `x`, then

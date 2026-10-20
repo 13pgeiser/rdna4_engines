@@ -635,12 +635,23 @@ copy.
 |---|---|---|
 | `had_quant_act_i8g` | `M` `n` `group` `dtype` | `x` → `q`, `scale` |
 | `gated_had_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate_up` → `q`, `scale`, `out_bf16`? |
+| `gated_had_quant_i8g` | `M` `n` `group` `dtype` `act`:str/opt | `gate_up` → `q`, `scale`, `out_bf16`? |
+| `rmsnorm_had_quant_i8g` | `M` `n` `eps`:f64 `group` `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `gate_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate`, `x` → `q`, `scale`, `out_bf16`? |
 | `rmsnorm_quant_i8` | `M` `n` `eps`:f64 `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
 | `gelu_mul_quant_i8` | `M` `n` `dtype` | `gate_up` → `q`, `scale`, `out_bf16`? |
 
 `gelu_mul_quant_i8` is `gelu_mul` with `rmsnorm_quant_i8`'s quantiser on its pass, byte-identical
 to the pair.
+
+`gated_had_quant_i8g` and `rmsnorm_had_quant_i8g` are `gated_quant_fp8` and `rmsnorm_quant_fp8`
+with `had_quant_act_i8g`'s quantiser on their pass: the `group`-wide rotation of the bf16-rounded
+value, then int8 codes per (row, `group`), byte-identical to the producer followed by
+`had_quant_act_i8g`. They feed a weight at `i8a8h` without the activation quantiser of its own:
+one launch for a norm read by three projections (q, k and v), and none between the gated product and
+the down projection. `out_bf16` receives the unrotated value, for a bf16 consumer. `n` is a
+multiple of `group`. A rotated code read as a plain one, or the reverse, gives a model that runs
+and is wrong, so these are separate ops, as `gated_had_quant_fp8` is.
 
 `rmsnorm_quant_i8` is `rmsnorm` with `quant_act_i8`'s quantiser on its pass: step-order int8 codes
 and one f32 scale per row, what `gemm_nt_q` reads at `dtype=w4a8` and `w8a8`. With `residual` the
@@ -2097,6 +2108,7 @@ device code.
 |---|---|---|
 | `ar_rmsnorm_quant_fp8` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `ar_rmsnorm_post_quant_fp8` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`:inout, `residual`:inout, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w |
+| `ar_rmsnorm_had_quant_i8g` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `ar_rmsnorm_quant_i8` | `M` `n` `eps`:f64 `world_size` `dtype` `wadd`:f64/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
 | `ar_hc_write` | `M`(range) `n` `hc` `world_size` `dtype` `wire`/opt | `y`:inout, `inj`, `h`:inout |
 | `ar_gather_hc_write` | `M`(range) `n` `hc` `top_k` `world_size` `dtype` `act`/opt `wire`/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`?, `y`:inout, `inj`, `h`:inout |
@@ -2106,6 +2118,8 @@ device code.
 `wire` is the payload width on the link: 0 is exact bf16, 6 the rotated six-bit form. It is a
 parameter for the same reason as `min_bytes`. `x` is inout on `ar_rmsnorm_quant_fp8`: it is both
 the message and the input, and the reduced sum lands in it.
+`ar_rmsnorm_had_quant_i8g` is `ar_rmsnorm_quant_fp8` with `rmsnorm_had_quant_i8g`'s quantiser:
+`x` and the residual are the same bytes, and the codes are int8 for a weight at `i8a8h`.
 
 The norm-carrying forms are two-rank only. `ar_hc_write` and `ar_gather_hc_write` also have an
 exact-wire four-rank form. At other widths the arch blocks issue the plain ops.
