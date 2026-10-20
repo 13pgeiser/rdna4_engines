@@ -885,8 +885,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                            {m.b_x}, {m.b_x});
 #if !QWEN35_MOE
     /* The pipelined prefill (step_pipelined), wherever a step can be wide enough, at the rank
-     * counts RADIANCE_PREFILL_PIPELINE allows (rad_prefill_pipe.h: two by default). Its second lane touches the residual stream, the normed
-     * input in both forms, the taps and the bounds, so those leave the sharing pool
+     * counts RADIANCE_PREFILL_PIPELINE allows (rad_prefill_pipe.h: two by default). Its second
+     * lane touches the residual stream, the normed input in both forms, the taps and the bounds,
+     * so those leave the sharing pool
      * (Ctx::lane1_); the bounds also because no declared op reads them, which would leave a
      * transient dead before the kernels that take them raw. */
     {

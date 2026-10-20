@@ -9299,15 +9299,19 @@ TEST(qwen35_a_wide_prefill_runs_in_two_pieces_with_its_boundaries_on_the_second_
             }
 }
 
-/* Past two ranks the pipelined prefill is opt-in (RADIANCE_PREFILL_PIPELINE=on): unset, the step is
- * serial; asked, a 2048-row step of one sequence runs in two pieces with every collective on the
- * second lane, the layers' all-reduces a piece at a time at `overlap` 1 (libr4d's narrow lane rows),
- * the embedding's whole, on every rank. At four and eight ranks. */
-static void four_rank_pipe_case(int world, bool gemma) {
+/* Past two ranks the pipelined prefill is opt-in (RADIANCE_PREFILL_PIPELINE=on, or 1, or true): unset,
+ * auto or an unknown value, the step is serial; asked, a 2048-row step of one sequence runs in two
+ * pieces with every collective on the second lane, the layers' all-reduces a piece at a time at
+ * `overlap` 1 (libr4d's narrow lane rows), the embedding's whole, on every rank. At four and eight
+ * ranks: neither test model's heads split three ways (nor do Qwen3.8's 4 or TranslateGemma's 16 KV
+ * heads); plugin_test checks that the three-rank lane rows resolve. */
+static void n_rank_pipe_case(int world, bool gemma) {
     const char* env = "RADIANCE_PREFILL_PIPELINE";
-    for (int ask : { 0, 1 })
+    const char* vals[] = { nullptr, "auto", "maybe", "on", "1", "true" };
+    for (const char* val : vals)
         for (int rank = 0; rank < world; ++rank) {
-            if (ask) setenv(env, "on", 1);
+            const int ask = val && (!strcmp(val, "on") || !strcmp(val, "1") || !strcmp(val, "true"));
+            if (val) setenv(env, val, 1);
             RadBuilder b;
             RadBuildCtx ctx = spec_ctx(rank, world, 7);
             ctx.max_tok = 2048;
@@ -9316,7 +9320,7 @@ static void four_rank_pipe_case(int world, bool gemma) {
             const int rc = stderr_of_rc([&] {
                 return gemma ? gemma3::declare(&b, mk.meta(), &ctx) : qwen35_fp8::declare(&b, mk.meta(), &ctx);
             });
-            if (ask) unsetenv(env);
+            if (val) unsetenv(env);
             REQUIRE_EQ(rc, RAD_OK);
             const bool on = gemma ? gemma3::g_model[rank].pipe_on : qwen35_fp8::g_model[rank].pipe_on;
             const int64_t L = gemma ? (int64_t)gemma3::g_model[rank].layers.size()
@@ -9344,10 +9348,26 @@ static void four_rank_pipe_case(int world, bool gemma) {
             CHECK(!c.joins.empty());
         }
 }
-TEST(qwen35_four_ranks_pipeline_only_when_asked) { four_rank_pipe_case(4, false); }
-TEST(gemma3_four_ranks_pipeline_only_when_asked) { four_rank_pipe_case(4, true); }
-TEST(qwen35_eight_ranks_pipeline_only_when_asked) { four_rank_pipe_case(8, false); }
-TEST(gemma3_eight_ranks_pipeline_only_when_asked) { four_rank_pipe_case(8, true); }
+TEST(qwen35_four_ranks_pipeline_only_when_asked) { n_rank_pipe_case(4, false); }
+TEST(gemma3_four_ranks_pipeline_only_when_asked) { n_rank_pipe_case(4, true); }
+TEST(qwen35_eight_ranks_pipeline_only_when_asked) { n_rank_pipe_case(8, false); }
+TEST(gemma3_eight_ranks_pipeline_only_when_asked) { n_rank_pipe_case(8, true); }
+
+/* At two ranks "off", "0" and "false" all run the pipelined prefill's step serially (the old switches
+ * took 0 for off; such a value must not leave it on). */
+TEST(two_ranks_pipeline_off_in_every_spelling) {
+    MetaKV mk = with_dflash2(q35fp8_meta());
+    for (const char* v : { "off", "0", "false" }) {
+        setenv("RADIANCE_PREFILL_PIPELINE", v, 1);
+        RadBuilder b;
+        RadBuildCtx ctx = spec_ctx(0, 2, 7);
+        ctx.max_tok = 2048;
+        const int rc = stderr_of_rc([&] { return qwen35_fp8::declare(&b, mk.meta(), &ctx); });
+        unsetenv("RADIANCE_PREFILL_PIPELINE");
+        REQUIRE_EQ(rc, RAD_OK);
+        CHECK(!qwen35_fp8::g_model[0].pipe_on);
+    }
+}
 
 /* Under a span a Flash-Next prefill of two intervals runs a pass at a time. At every world its
  * connection reads take a pass each and the indexer scores its pass-tall plane in windows, the MTP

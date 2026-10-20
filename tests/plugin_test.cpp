@@ -900,6 +900,31 @@ TEST(libr4d_resolves_the_all_reduce_by_message_size) {
              "8192:ar_oneshot_3rank_exact 524288:ar_oneshot_3rank_exact "
              "41943040:ar_twoshot_3rank_exact ");
 
+    /* At `overlap` 1 (a pipelined prefill's all-reduce beside compute) the two-shot band takes the
+     * narrow lane row at three, four and eight ranks, exact and, where it exists, lossy; the
+     * one-shot band has no lane row past two ranks. The lists split at the eight-rank one-shot edge
+     * as above; at eight ranks the band between it and the wide one-shot bound stays on the plain
+     * two-shot. */
+    auto lane = [&](int world, int exact) {
+        Geometry g;
+        g.set_i("world_size", world);
+        g.set_s("dtype", "bf16");
+        g.set_i("exact", exact);
+        g.set_i("min_bytes", 128 * 1024);
+        g.set_i("overlap", 1);
+        return r.build_bands("all_reduce", "numel", width, chunk * width, g);
+    };
+    CHECK_EQ(band_names(lane(3, 1)), "8192:ar_oneshot_3rank_exact 524288:ar_oneshot_3rank_exact "
+             "5242880:ar_twoshot_3rank_exact_lane ");
+    CHECK_EQ(band_names(lane(4, 1)), "8192:ar_oneshot_4rank_exact 524288:ar_oneshot_4rank_exact "
+             "5242880:ar_twoshot_4rank_exact_lane ");
+    CHECK_EQ(band_names(lane(8, 1)), "8192:ar_oneshot_8rank_exact 524288:ar_twoshot_8rank_exact "
+             "5242880:ar_twoshot_8rank_exact_lane ");
+    CHECK_EQ(band_names(lane(3, 0)), "8192:ar_twoshot_3rank_ti8_lane 524288:ar_twoshot_3rank_ti8_lane "
+             "5242880:ar_twoshot_3rank_ti8_lane ");
+    CHECK_EQ(band_names(lane(4, 0)), "8192:ar_twoshot_4rank_ti8_lane 524288:ar_twoshot_4rank_ti8_lane "
+             "5242880:ar_twoshot_4rank_ti8_lane ");
+
     /* Above the two-shot's bound the one-shot takes the message back. */
     CHECK_EQ(band_names(bands(4, 1, 131072)),
              "8192:ar_oneshot_4rank_exact 524288:ar_oneshot_4rank_exact "

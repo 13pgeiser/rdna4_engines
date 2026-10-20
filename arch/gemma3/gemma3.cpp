@@ -1190,10 +1190,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     /* The pipelined prefill (step_pipelined) wherever a step can be wide enough, on an MXFP4 trunk
      * with fused junctions (decided below), at the rank counts RADIANCE_PREFILL_PIPELINE allows
-     * (rad_prefill_pipe.h: two by default). Its
-     * second lane touches the stream, the branch output, the shared input pair, the taps and the
-     * bounds, so those leave the sharing pool (Ctx::lane1_); the pair is one for every block so
-     * that this costs one pair, not one a linear. */
+     * (rad_prefill_pipe.h: two by default). Its second lane touches the stream, the branch
+     * output, the shared input pair, the taps and the bounds, so those leave the sharing pool
+     * (Ctx::lane1_); the pair is one for every block so that this costs one pair, not one a
+     * linear. */
     {
         m.pipe_on = g.max_tok >= kPipeMinRows && !calib_dir() &&
                     rad::arch::prefill_pipeline(b, (int)g.world, "gemma3");
