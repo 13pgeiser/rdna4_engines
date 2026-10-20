@@ -5999,6 +5999,15 @@ static int launch_row(const RadKernelInfo* r, std::vector<RadTensor> ts,
     a.t = ts.data(); a.n_t = (int)ts.size();
     a.p = ps.data(); a.n_p = (int)ps.size();
     a.world_size = 1;
+    if (r->scratch) {
+        const int64_t need = r->scratch(&a);
+        if (need < 0) return (int)need;
+        if (need > 0) {
+            a.scratch = dalloc((size_t)need);
+            a.scratch_bytes = need;
+            if (!a.scratch) return RAD_E_NOMEM;
+        }
+    }
     const int rc = r->launch(&a, (RadStream)nullptr);
     if (rc != RAD_OK) return rc;
     return st_stream_sync(nullptr) == hipSuccess ? RAD_OK : RAD_E_STATE;
@@ -6181,9 +6190,14 @@ static void mxfp4a8_gated_case(const Plugin& pl, int64_t M, int64_t N, int64_t K
                               T(d_z[1], RAD_F32, { M, gkb }), none }, gp);
         st_memcpy(d_b[1], d_b[0], (size_t)(M * n * 2), hipMemcpyDeviceToDevice);
     }
-    if (rc == RAD_OK)
+    /* Twice into one output, cleared between: the split's arrival counters are keyed on the output,
+     * so the second launch reduces only if the first left them zero. */
+    for (int rep = 0; rep < 2 && rc == RAD_OK; ++rep) {
+        st_memset(d_q[2], 0, (size_t)(M * n));
+        st_memset(d_z[2], 0, (size_t)(M * gkb * 4));
         rc = launch_row(rg, { ta, tas, tw, te, tr, T(d_q[2], RAD_F8E4M3, { M, n }),
                               T(d_z[2], RAD_F32, { M, gkb }), none }, gp);
+    }
     if (rc != RAD_OK) { ok(nm, false, "the fold: rc=" + std::to_string(rc)); return; }
 
     std::vector<uint8_t> c[3];

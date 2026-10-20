@@ -460,6 +460,7 @@ int r4d_rad_gemm_mxfp4a8_decode(const RadArgs*, RadStream);
 int64_t r4d_rad_gemm_mxfp4a8_decode_scratch(const RadArgs*);
 int r4d_rad_gemm_mxfp4a8_gemv(const RadArgs*, RadStream);
 int r4d_rad_gemm_mxfp4a8_gated(const RadArgs*, RadStream);
+int64_t r4d_rad_gemm_mxfp4a8_gated_scratch(const RadArgs*);
 int r4d_rad_dequant_w4      (const RadArgs*, RadStream);
 int r4d_rad_rowtopk         (const RadArgs*, RadStream);
 int64_t r4d_rad_rowtopk_scratch(const RadArgs*);

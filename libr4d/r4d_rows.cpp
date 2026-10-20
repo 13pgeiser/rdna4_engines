@@ -7768,8 +7768,10 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
 
 { "gemm_mxfp4a8_gated_gemv", "gemm_nt_q_gated_mx", "gemm",
   "the gemv row's WMMA form over a gate_up weight with gated_quant_fp8's pass in its epilogue: a "
-  "block per 128-column group of the gated output, a wave per gate or up tile running all of that "
-  "form's K partials in its order, so the [M, 2n] bf16 product is never written",
+  "block per 16-column tile of the gated output, that form's eight K waves on the gate tile and "
+  "eight on the up tile, the block's bf16 product and row amaxes in the op's scratch and the last "
+  "of a 128-column group's blocks to arrive writing its codes and scales, so the [M, 2n] bf16 "
+  "product is never written",
   "M <= 8; K a multiple of 128; N a multiple of 256 (the gated width a multiple of the 128-column "
   "scale group); act silu, or gelu_tanh without out_bf16; the skinny kernel's fragment-order weight, [K/32][N] E8M0 "
   "exponents and per-row reference exponent, gate rows then up rows",
@@ -7779,7 +7781,7 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "and quant_act_fp8 (gelu_tanh)",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cGemmNtQGatedMx), NOTUNE,
-  nullptr, nullptr, r4d_rad_gemm_mxfp4a8_gated, nullptr,
+  nullptr, nullptr, r4d_rad_gemm_mxfp4a8_gated, r4d_rad_gemm_mxfp4a8_gated_scratch,
   r4d_rad_layout_mxfp4_gated, r4d_rad_relayout_mxfp4_gated, nullptr, nullptr,
   /* The byte-identity claim above, as a chain of two rows of this plugin (r4d_fuse.cpp). */
   r4d_fuse_gemm_nt_q_gated_mx },
@@ -9746,11 +9748,11 @@ extern "C" const RadKernelInfo* rad_kernel_at(int i) {
  *   every collective    the peer flags and exchange buffers the all-reduces own
  *
  * gemm_fp8a8_nt_m16's finisher counters are keyed on the stream and the output;
- * gemm_mxfp4a8_decode's (and gemm_mxfp4a8_decode_shortk's, the same entry) split partial is the
- * op's scratch and its arrival counters are keyed on the output alone;
- * router_gemm_topk_scatter_bf16's arrival counter belongs to its op instance (taken at init, one
- * per declared op and band). Concurrent launches never share these, so those four rows are
- * concurrent. A new row with stream-ordered state belongs in the list above.
+ * gemm_mxfp4a8_decode's (and gemm_mxfp4a8_decode_shortk's, the same entry) and
+ * gemm_mxfp4a8_gated_gemv's split partials are the op's scratch and their arrival counters are keyed
+ * on the output alone; router_gemm_topk_scatter_bf16's arrival counter belongs to its op instance
+ * (taken at init, one per declared op and band). Concurrent launches never share these, so those
+ * five rows are concurrent. A new row with stream-ordered state belongs in the list above.
  *
  *   lora_*              ordered on purpose: the core appends them behind the GEMM whose `y` they
  *                       update and refills the pools they read between steps with its own copies,
