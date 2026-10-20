@@ -607,7 +607,8 @@ another.
 
 `gemm_nt_q_gated_mx` is the same fold over an OCP-MXFP4 weight (`dtype` `mxfp4a8`, `group` 32), which
 `gemm_nt_q` reads with the per-row reference exponent `b_ref` after `b_scale`. A schema of its own
-because an op's operand count is fixed for the plugins built against it.
+because an op's operand count is fixed for the plugins built against it. `act` `gelu_tanh` is the
+GeGLU form, `gemm_nt_q` then `gelu_mul` then `quant_act_fp8`; it writes no `out_bf16`.
 
 `swiglu_clamped_quant_fp8` (device-only) is `swiglu_clamped` then `quant_act_fp8` over its
 product in one pass. The product is rounded to bf16 before the quantiser reads it, as the pair

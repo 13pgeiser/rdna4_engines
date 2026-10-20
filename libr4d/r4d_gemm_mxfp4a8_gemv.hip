@@ -363,7 +363,9 @@ extern "C" int r4d_rad_gemm_mxfp4a8_gemv(const RadArgs* a, RadStream s) {
 // Only one partial is live at a time, which is why the chunks are taken in that order rather than
 // in K order. The scaled sum is rounded to bf16 by the same conversion, and from there the arithmetic
 // is r4d_fused_quant_fp8.hip's gated_quant_fp8_kernel: silu(gate) * up rounded to bf16, the group's
-// amax, scale amax / 448, codes through q8_pack4.
+// amax, scale amax / 448, codes through q8_pack4. ACT 1 is the GeGLU form: gelu_mul's tanh GELU with
+// its constants (r4d_model_bf16.hip), the product rounded to bf16 as gelu_mul stores it, then
+// quant_act_fp8's quantiser, which is the same arithmetic as gated_quant_fp8's.
 namespace {
 __device__ __forceinline__ float mxg_bf2f(uint16_t h) { return __uint_as_float((uint32_t)h << 16); }
 __device__ __forceinline__ uint16_t mxg_f2bf(float f) {   // as r4d_fused_quant_fp8.hip's f2bf
@@ -372,7 +374,7 @@ __device__ __forceinline__ uint16_t mxg_f2bf(float f) {   // as r4d_fused_quant_
 }
 }  // namespace
 
-template <bool ABLK>
+template <bool ABLK, int ACT>
 __global__ __launch_bounds__(16 * 32)
 void r4d_gemm_mxfp4a8_gated_kernel(
     const unsigned char* __restrict__ A, const float* __restrict__ As,
@@ -447,7 +449,8 @@ void r4d_gemm_mxfp4a8_gated_kernel(
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
       const float g = mxg_bf2f(sG[t][m][cc + j]);
-      const float a = g / (1.0f + expf(-g));
+      const float a = ACT == 0 ? g / (1.0f + expf(-g))
+                               : 0.5f * g * (1.0f + tanhf(0.7978845608028654f * (g + 0.044715f * g * g * g)));
       const uint16_t h = mxg_f2bf(a * mxg_bf2f(sG[8 + t][m][cc + j]));
       if (Y) Y[(size_t)m * y_ld + gcol + j] = h;
       vq[j] = mxg_bf2f(h);
@@ -462,21 +465,19 @@ void r4d_gemm_mxfp4a8_gated_kernel(
 }
 
 namespace {
-void mxgg_launch(bool ablk, const void* a, const void* as, const void* w, const void* ws,
+void mxgg_launch(bool ablk, int act, const void* a, const void* as, const void* w, const void* ws,
                  const void* wr, void* q, void* s, void* y, int M, int K, int n, int as_rs, int lda,
                  int ldws, int q_ld, int s_ld, int y_ld, RadStream stream) {
   const dim3 grid((uint32_t)(n / 128)), block(16 * 32);
   hipStream_t st = (hipStream_t)stream;
-  if (ablk)
-    hipLaunchKernelGGL((r4d_gemm_mxfp4a8_gated_kernel<true>), grid, block, 0, st,
-                       (const unsigned char*)a, (const float*)as, (const unsigned char*)w,
-                       (const unsigned char*)ws, (const unsigned char*)wr, (uint8_t*)q, (float*)s,
-                       (uint16_t*)y, M, K, n, as_rs, lda, ldws, q_ld, s_ld, y_ld);
-  else
-    hipLaunchKernelGGL((r4d_gemm_mxfp4a8_gated_kernel<false>), grid, block, 0, st,
-                       (const unsigned char*)a, (const float*)as, (const unsigned char*)w,
-                       (const unsigned char*)ws, (const unsigned char*)wr, (uint8_t*)q, (float*)s,
-                       (uint16_t*)y, M, K, n, as_rs, lda, ldws, q_ld, s_ld, y_ld);
+#define MXGG_L(AB_, ACT_)                                                                         \
+  hipLaunchKernelGGL((r4d_gemm_mxfp4a8_gated_kernel<AB_, ACT_>), grid, block, 0, st,             \
+                     (const unsigned char*)a, (const float*)as, (const unsigned char*)w,          \
+                     (const unsigned char*)ws, (const unsigned char*)wr, (uint8_t*)q, (float*)s,  \
+                     (uint16_t*)y, M, K, n, as_rs, lda, ldws, q_ld, s_ld, y_ld)
+  if (act == 0) { if (ablk) MXGG_L(true, 0); else MXGG_L(false, 0); }
+  else          { if (ablk) MXGG_L(true, 1); else MXGG_L(false, 1); }
+#undef MXGG_L
 }
 }  // namespace
 
@@ -499,8 +500,13 @@ extern "C" int r4d_rad_gemm_mxfp4a8_gated(const RadArgs* a, RadStream s) {
     if (q->rank != 2 || sc->rank != 2 || x->rank < 2) return R4D_NO(RAD_E_SHAPE);
     if (y && y->rank != 2) return R4D_NO(RAD_E_SHAPE);
     if (r4d_geti_or(a, "group", 32) != 32) return R4D_NO(RAD_E_SHAPE);
+    /* silu (the SwiGLU MLP) or gelu_tanh (GeGLU, gelu_mul's). The GeGLU chain's bf16 plane is
+     * gelu_mul's output, which the fold's replaces-hook cannot hand to the optional `out_bf16`, so
+     * that form writes none. */
     const char* act = r4d_gets(a, "act");
-    if (!act || std::strcmp(act, "silu")) return R4D_NO(RAD_E_UNSUPPORTED);
+    const int actm = !act ? -1 : !std::strcmp(act, "silu") ? 0 : !std::strcmp(act, "gelu_tanh") ? 1 : -1;
+    if (actm < 0) return R4D_NO(RAD_E_UNSUPPORTED);
+    if (actm == 1 && y) return R4D_NO(RAD_E_UNSUPPORTED);
 
     /* The gated width from `q`, the buffer written; N and K from the op's parameters, since the
      * weight operands are packed bytes. */
@@ -531,7 +537,7 @@ extern "C" int r4d_rad_gemm_mxfp4a8_gated(const RadArgs* a, RadStream s) {
         return R4D_NO(RAD_E_ALIGN);
 
     R4D_TRY("gemm_mxfp4a8_gated",
-        mxgg_launch(ablk, x->data, xs->data, w->data, ws->data, wr->data, q->data, sc->data,
+        mxgg_launch(ablk, actm, x->data, xs->data, w->data, ws->data, wr->data, q->data, sc->data,
                     y ? y->data : nullptr, (int)M, (int)K, (int)nout, (int)as_rs, (int)lda, (int)N,
                     (int)qp, (int)sp, (int)yp, s));
     return RAD_OK;

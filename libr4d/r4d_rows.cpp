@@ -4830,7 +4830,7 @@ static const RadConstraint cGemmNtQGatedFp8[] = {
  * per 128-column group of the gated output (N/2 a multiple of 128). */
 static const RadConstraint cGemmNtQGatedMx[] = {
     C_LE("M", 8), C_DIV("K", 128), C_DIV("N", 256), C_EQ("group", 32), C_IN("dtype", "mxfp4a8"),
-    C_IN("act", "silu"),
+    C_IN("act", "silu gelu_tanh"),
 };
 static const RadConstraint cGateQuantFp8[] = {
     C_DIV("n", 4), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
@@ -7771,11 +7771,12 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "block per 128-column group of the gated output, a wave per gate or up tile running all of that "
   "form's K partials in its order, so the [M, 2n] bf16 product is never written",
   "M <= 8; K a multiple of 128; N a multiple of 256 (the gated width a multiple of the 128-column "
-  "scale group); act silu only; the skinny kernel's fragment-order weight, [K/32][N] E8M0 "
+  "scale group); act silu, or gelu_tanh without out_bf16; the skinny kernel's fragment-order weight, [K/32][N] E8M0 "
   "exponents and per-row reference exponent, gate rows then up rows",
   "e4m3 A with an f32 scale per row or per (row, 128), e2m1 W with an E8M0 scale per 32 K, and the "
   "QUANTISER's outputs: E4M3 codes, an f32 scale per (row, 128 columns) and an optional bf16 "
-  "product. Byte-identical to gemm_mxfp4a8_gemv followed by gated_quant_fp8",
+  "product. Byte-identical to gemm_mxfp4a8_gemv followed by gated_quant_fp8 (silu), or by gelu_mul "
+  "and quant_act_fp8 (gelu_tanh)",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cGemmNtQGatedMx), NOTUNE,
   nullptr, nullptr, r4d_rad_gemm_mxfp4a8_gated, nullptr,

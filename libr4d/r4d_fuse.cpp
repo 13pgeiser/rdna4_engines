@@ -518,7 +518,8 @@ extern "C" int r4d_fuse_gemm_nt_q_gated(const RadParam* p, int n_p, uint64_t pre
  *
  * The GEMM step is gemm_nt_q at dtype mxfp4a8 with `b_ref` in its last operand. `group` is the
  * weight's 32 on the GEMM and the activation's 128 on the quantiser, so the quantiser's is set, not
- * mirrored.
+ * mirrored. At act gelu_tanh the chain is three steps, gelu_mul into a second temporary and
+ * quant_act_fp8 over it; that form refuses `out_bf16` (the shim), so operand 7 is not wired.
  */
 extern "C" int r4d_fuse_gemm_nt_q_gated_mx(const RadParam* p, int n_p, uint64_t present, int step,
                                            RadFuseStep* out) {
@@ -528,16 +529,31 @@ extern "C" int r4d_fuse_gemm_nt_q_gated_mx(const RadParam* p, int n_p, uint64_t 
     if (M <= 0 || N <= 0 || K <= 0 || N % 2) return RAD_E_UNSUPPORTED;
     if (pi(p, n_p, "group", 32) != 32) return RAD_E_UNSUPPORTED;
     if (!dt || std::strcmp(dt, "mxfp4a8")) return RAD_E_UNSUPPORTED;
-    if (!act_is(p, n_p, "silu", "silu")) return RAD_E_UNSUPPORTED;
+    const bool gelu = act_is(p, n_p, "silu", "gelu_tanh");
+    if (!gelu && !act_is(p, n_p, "silu", "silu")) return RAD_E_UNSUPPORTED;
 
-    switch (step) {
-    case 0: {
+    if (step == 0) {
         Step s(out, "gemm_nt_q");
         s.mirror(p, n_p, "M").mirror(p, n_p, "N").mirror(p, n_p, "K")
          .mirror(p, n_p, "group").mirror(p, n_p, "dtype");
         /* a, a_scale, b, b_scale, y, a_sum, b_ref */
         return s.wire({ 0, 1, 2, 3, RAD_FUSE_TMP(0), RAD_FUSE_NONE, 4 });
     }
+    if (gelu) {
+        if (step == 1) {
+            Step s(out, "gelu_mul");
+            s.mirror(p, n_p, "M").pint("n", (long long)(N / 2)).pstr("dtype", "bf16");
+            return s.wire({ RAD_FUSE_TMP(0), RAD_FUSE_TMP(1) });   /* gate_up, y */
+        }
+        if (step == 2) {
+            Step s(out, "quant_act_fp8");
+            s.mirror(p, n_p, "M").pint("n", (long long)(N / 2)).pint("group", 128)
+             .pstr("dtype", "bf16");
+            return s.wire({ RAD_FUSE_TMP(1), 5, 6 });               /* x, q, scale */
+        }
+        return RAD_E_NOTFOUND;
+    }
+    switch (step) {
     case 1: {
         Step s(out, "gated_quant_fp8");
         s.mirror(p, n_p, "M").pint("n", (long long)(N / 2)).pint("group", 128)

@@ -6080,16 +6080,22 @@ static void w4a8_multi_user_exact(const Plugin& pl) {
  * gated row shares) and activation. Codes, scales and the bf16 product must be identical, and the
  * codes mostly non-zero (zeroed buffers compare equal). Run twice: with `out_bf16`, and without it,
  * where the codes and scales must still match. */
-static void mxfp4a8_gated_case(const Plugin& pl, int64_t M, int64_t N, int64_t K, bool ablk) {
+static void mxfp4a8_gated_case(const Plugin& pl, int64_t M, int64_t N, int64_t K, bool ablk,
+                               bool gelu = false) {
     const char* row = "gemm_mxfp4a8_gated_gemv";
     if (!sel(row)) return;
-    char nm[160];
-    std::snprintf(nm, sizeof nm, "%s byte-identical to gemv + gated_quant_fp8, M=%lld N=%lld K=%lld%s",
-                  row, (long long)M, (long long)N, (long long)K, ablk ? " ascale=row x 128" : "");
+    char nm[192];
+    std::snprintf(nm, sizeof nm, "%s byte-identical to gemv + %s, M=%lld N=%lld K=%lld%s", row,
+                  gelu ? "gelu_mul + quant_act_fp8" : "gated_quant_fp8", (long long)M, (long long)N,
+                  (long long)K, ablk ? " ascale=row x 128" : "");
     const RadKernelInfo* rg = find(pl, row);
     const RadKernelInfo* rv = find(pl, "gemm_mxfp4a8_gemv");
-    const RadKernelInfo* rq = find(pl, "gated_quant_fp8");
-    if (!rg || !rv || !rq || !rg->layout || !rg->relayout) { ok(nm, false, "row or hooks absent"); return; }
+    const RadKernelInfo* rq = find(pl, gelu ? "quant_act_fp8" : "gated_quant_fp8");
+    const RadKernelInfo* rm = find(pl, "gelu_mul_bf16");
+    if (!rg || !rv || !rq || (gelu && !rm) || !rg->layout || !rg->relayout) {
+        ok(nm, false, "row or hooks absent");
+        return;
+    }
 
     Planes p;
     p.enc = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
@@ -6145,15 +6151,23 @@ static void mxfp4a8_gated_case(const Plugin& pl, int64_t M, int64_t N, int64_t K
     absent(none);
     int rc = launch_row(rv, { ta, tas, tw, te, T(d_y, RAD_BF16, { M, N }), none, tr },
                         { PI("M", M), PI("N", N), PI("K", K), PI("group", 32), PS("dtype", "mxfp4a8") });
-    if (rc == RAD_OK)
+    if (rc == RAD_OK && !gelu)
         rc = launch_row(rq, { T(d_y, RAD_BF16, { M, N }), T(d_q[0], RAD_F8E4M3, { M, n }),
                               T(d_z[0], RAD_F32, { M, gkb }), T(d_b[0], RAD_BF16, { M, n }) },
                         { PI("M", M), PI("n", n), PI("group", 128), PS("dtype", "bf16"), PS("act", "silu") });
-    if (rc != RAD_OK) { ok(nm, false, "the pair: rc=" + std::to_string(rc)); return; }
+    if (rc == RAD_OK && gelu) {
+        rc = launch_row(rm, { T(d_y, RAD_BF16, { M, N }), T(d_b[0], RAD_BF16, { M, n }) },
+                        { PI("M", M), PI("n", n), PS("dtype", "bf16") });
+        if (rc == RAD_OK)
+            rc = launch_row(rq, { T(d_b[0], RAD_BF16, { M, n }), T(d_q[0], RAD_F8E4M3, { M, n }),
+                                  T(d_z[0], RAD_F32, { M, gkb }) },
+                            { PI("M", M), PI("n", n), PI("group", 128), PS("dtype", "bf16") });
+    }
+    if (rc != RAD_OK) { ok(nm, false, "the chain: rc=" + std::to_string(rc)); return; }
 
-    /* The fold, with and without the bf16 product. */
+    /* The fold, with and without the bf16 product (the GeGLU form refuses it, asserted). */
     const std::vector<RadParam> gp = { PI("M", M), PI("N", N), PI("K", K), PI("group", 32),
-                                       PS("dtype", "mxfp4a8"), PS("act", "silu") };
+                                       PS("dtype", "mxfp4a8"), PS("act", gelu ? "gelu_tanh" : "silu") };
     for (int v = 1; v <= 2; ++v) {
         st_memset(d_q[v], 0, (size_t)(M * n));
         st_memset(d_z[v], 0, (size_t)(M * gkb * 4));
@@ -6161,6 +6175,12 @@ static void mxfp4a8_gated_case(const Plugin& pl, int64_t M, int64_t N, int64_t K
     st_memset(d_b[1], 0, (size_t)(M * n * 2));
     rc = launch_row(rg, { ta, tas, tw, te, tr, T(d_q[1], RAD_F8E4M3, { M, n }),
                           T(d_z[1], RAD_F32, { M, gkb }), T(d_b[1], RAD_BF16, { M, n }) }, gp);
+    if (gelu) {
+        if (rc == RAD_OK) { ok(nm, false, "the GeGLU fold served out_bf16"); return; }
+        rc = launch_row(rg, { ta, tas, tw, te, tr, T(d_q[1], RAD_F8E4M3, { M, n }),
+                              T(d_z[1], RAD_F32, { M, gkb }), none }, gp);
+        st_memcpy(d_b[1], d_b[0], (size_t)(M * n * 2), hipMemcpyDeviceToDevice);
+    }
     if (rc == RAD_OK)
         rc = launch_row(rg, { ta, tas, tw, te, tr, T(d_q[2], RAD_F8E4M3, { M, n }),
                               T(d_z[2], RAD_F32, { M, gkb }), none }, gp);
@@ -27356,6 +27376,9 @@ static void device_phase(const Plugin& pl) {
         mxfp4a8_gated_case(pl, 8, 21504, 5376, true);
         mxfp4a8_gated_case(pl, 3, 256, 128, true);
         mxfp4a8_gated_case(pl, 5, 1024, 640, false);
+        for (const int64_t m : { 1, 4, 8 }) mxfp4a8_gated_case(pl, m, 21504, 5376, true, true);
+        mxfp4a8_gated_case(pl, 3, 256, 128, true, true);
+        mxfp4a8_gated_case(pl, 2, 1024, 640, false, true);
         /* Parts (ParoQuant): each weight part against its own activation copy, with bounds off any
          * kernel's tile, two and three parts, at every band. */
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_nt_m64", 7, 400, 640, 0, true, {}, 144);
