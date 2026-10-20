@@ -471,11 +471,38 @@ Two framings, both reported honestly:
 **§6 verdict:** the "one TP2 beats two single-card ComfyUI" claim is **MET against stock at every row** (or
 dead-heat at 12 s), and **MET against sol-attn below ~12 k tokens (≤5 s @ 512²)** but **NOT met at 6–12 s**,
 where sol's sparsity fully engages. The sol-attn gap at the 12 s production row is the honest weak point —
-and it is measured under a **215 W per-card power cap (default 300 W), powersave CPU governor, and a link
-cap**, all of which handicap Radiance precisely on the compute-heavy long rows; the sol baseline itself
-carries ±5 s reproducibility. Radiance's wall also includes ~2.2 s queue+prompt that the ComfyUI compute
-columns exclude (minor; both are post-submit processing). Harnesses: `build/tmp/bench.sh` (legacy) and
-`build/tmp/ex10/bench2.sh` (this matched battery; results in `build/tmp/ex10/bench/results.tsv`).
+and it is measured under a **215 W per-card power cap (default 300 W), a −75 mV undervolt, a powersave CPU
+governor, and a link cap**. The power/undervolt handicap was then A/B'd (see the power-cap subsection below)
+and found to be worth only **~5 % at the 12 s row** — so the cap is **not** the cause of the sol gap; the
+**link cap** is the heavier constraint. The sol baseline itself carries ±5 s reproducibility. Radiance's wall
+also includes ~2.2 s queue+prompt that the ComfyUI compute columns exclude (minor; both are post-submit
+processing). Harnesses: `build/tmp/bench.sh` (legacy) and `build/tmp/ex10/bench2.sh` (this matched battery;
+results in `build/tmp/ex10/bench/results.tsv`).
+
+**Power-cap A/B — the cap barely moves diffusion (2026-10-20).** The user removed the 215 W cap (→ 300 W
+default, confirmed `power1_cap=300 W`) and the −75 mV undervolt (→ `voltage offset 0 mV` in the startup
+report); P2P, `iommu=pt` and the gen4 x8 link cap were left unchanged. Re-ran `bench2.sh` (same shapes/config/
+seed) into `results_uncapped.tsv`, keeping the capped run as `results_215w.tsv`:
+
+| 512² row | 215 W / −75 mV | 300 W / 0 mV | Δ |
+|---|---|---|---|
+| 3 s | 42 | 41 | −1 (noise) |
+| 4 s | 62 | 61 | −1 (noise) |
+| 5 s | 72 | 72 | 0 |
+| 6 s | 95 | 93 | −2 (~2 %) |
+| **12 s** | 207 | **196** | **−11 (−5.3 %)** |
+| 256² · 3 s / 5 s | 13 / 21 | 13 / 20 | 0 / −1 |
+
+The gain is **monotone in duration but small**: ~0 below 6 s, ~2 % at 6 s, **~5 % at 12 s** — the only delta
+outside poll noise. `gpu_busy_percent` read **100 % on 519/528 samples**, so the cards are compute-saturated,
+yet a +40 % power budget plus the undervolt removal buys only ~5 %. This TP2 diffusion step is therefore **not
+SM-clock-bound**: much of that "busy" is the all-reduce waiting on the **gen4 x8 fabric** (and the embedding /
+encoder-tower reads streamed over the same link), which does not shrink with core clock. This **corrects the
+claim just above** that the cap was a major long-row handicap — the sol-attn gap at 12 s is **not** explained
+by the power cap; the link cap is the real ceiling. Practical: leaving the box at 215 W costs ≈5 % worst-case
+on diffusion, so the thermal/power saving is nearly free. (`power1_input` isn't exposed on this driver, so
+sustained watts weren't logged — `gpu_busy_percent` is the load signal. Uncapped logs:
+`build/tmp/ex10/{clock_sampler_300w.log,bench2_uncapped.log}`.)
 
 ## #8 kR2VCond keyframe-pin (FL2VA) — disposition: SHIPPED + device-verified (2026-10-19)
 
