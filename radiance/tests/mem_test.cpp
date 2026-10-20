@@ -385,6 +385,77 @@ TEST(the_cache_keeps_one_full_length_sequence_even_against_the_expert_floor) {
     CHECK_EQ(b2.experts, b2.elastic - g.kv_ceiling);
 }
 
+/* With a lending cache at its floor, the prefill staging region is paid by expert residency
+ * above the host pool's floor, and never by an expert that has no other home. */
+TEST(prefill_staging_can_borrow_expert_slack_when_the_cache_is_small) {
+    VramFacts f = big_moe_facts();
+    f.lends = true;
+    f.kv_one = f.kv_ceiling = 64LL << 20;
+    f.expert_floor = 16LL << 30;
+    f.expert_layer_max = 2LL << 30;
+    Config c = derive_config();
+    VramBudget b;
+    CHECK_OK(vram_budget_resolve(c, { f }, &b));
+    CHECK(b.stage > 0);
+    CHECK(b.report.find("out of the experts") != std::string::npos);
+    CHECK_EQ(b.kv, f.kv_one);
+    CHECK(b.experts >= f.expert_floor);
+    CHECK_EQ(b.weights, b.statics + b.experts);
+    CHECK_EQ(b.experts + b.kv + b.stage, b.elastic);
+
+    // With no host-pool slack, staging must not evict an expert that has no other home.
+    f.expert_floor = b.elastic - f.kv_one;
+    Config tight = derive_config();
+    VramBudget no_ring;
+    CHECK_OK(vram_budget_resolve(tight, { f }, &no_ring));
+    CHECK_EQ(no_ring.stage, 0ll);
+    CHECK_EQ(no_ring.kv, f.kv_one);
+    CHECK_EQ(no_ring.experts, f.expert_floor);
+}
+
+/* When experts can pay, the staging region leaves the cache at its full coverage. */
+TEST(prefill_staging_preserves_cache_coverage_when_experts_can_pay) {
+    VramFacts f = big_moe_facts();
+    f.lends = true;
+    f.kv_ceiling = 2LL << 30;
+    f.kv_one = 768LL << 20;
+    f.expert_floor = 16LL << 30;
+    f.expert_layer_max = 2LL << 30;
+    Config c = derive_config();
+    VramBudget b;
+    CHECK_OK(vram_budget_resolve(c, { f }, &b));
+    CHECK(b.stage > 0);
+    CHECK_EQ(b.kv, f.kv_ceiling);
+    CHECK(b.experts >= f.expert_floor);
+    CHECK(b.report.find("out of the experts") != std::string::npos);
+    CHECK_EQ(b.experts + b.kv + b.stage, b.elastic);
+}
+
+/* A hybrid model's recurrent and conv slots stay allocated with one request active, so the
+ * one-sequence floor is the inverse of the live plan, not a separate one-sequence plan: that plan
+ * drops the fixed state and falls short of max_ctx. */
+TEST(hybrid_context_floor_accounts_for_all_configured_state_slots) {
+    Config c = small_config();
+    c.max_seqs = 4;
+    c.max_ctx = 32768;
+    c.checkpoint_slots = 0;
+    auto groups = hybrid_groups();
+    KVManager actual, single;
+    CHECK_OK(actual.plan_groups(groups, c));
+    Config one = c;
+    one.max_seqs = 1;
+    CHECK_OK(single.plan_groups(groups, one));
+    // A one-sequence declaration drops fixed state that the live four-slot plan owns.
+    CHECK(actual.paged_tokens(single.ceiling(c.max_ctx)) < c.max_ctx);
+    constexpr int64_t MiB = 1ll << 20;
+    const int64_t ceiling_mib = (actual.ceiling(c.max_ctx) + MiB - 1) / MiB;
+    const int64_t floor_mib = actual.pool_mib_for_tokens(c.max_ctx, ceiling_mib);
+    CHECK(floor_mib > 0);
+    CHECK(actual.paged_tokens(floor_mib * MiB) >= c.max_ctx);
+    CHECK((floor_mib - 1) * MiB < actual.fixed_bytes() ||
+          actual.paged_tokens((floor_mib - 1) * MiB) < c.max_ctx);
+}
+
 TEST(neither_side_is_given_more_than_it_could_use) {
     /* A model that fits: 4 GiB of experts and a cache that can address 1.2 GiB cannot use a
      * 32 GiB card, so the remainder is reported unusable rather than allocated to an idle pool. */
@@ -1611,8 +1682,9 @@ TEST(checkpoint_retention_is_budgeted_and_keeps_the_tip) {
 
     auto prompt = tok_run(4242, 16 * 64);
     const std::vector<BlockHash> hs = chain_of(prompt);
-    /* Eight checkpoints at 64, 128, ... 512 fill the pool exactly. */
+    /* Eight checkpoints at 64, 128, ... 512 fill the pool exactly, one step each. */
     for (int i = 1; i <= 8; ++i) {
+        f.pc.begin_step();
         int32_t s = -1;
         CHECK_OK(f.pc.reserve_checkpoint(1, i * 64, hs[i * 4 - 1], &s));
     }
@@ -1621,6 +1693,7 @@ TEST(checkpoint_retention_is_budgeted_and_keeps_the_tip) {
 
     /* The ninth forces retention. Geometric backoff over {64..512} keeps 512, 448, 384, 256 and
      * 64 and releases the rest; the tip survives, as an appending agent transcript needs. */
+    f.pc.begin_step();
     int32_t s9 = -1;
     CHECK_OK(f.pc.reserve_checkpoint(1, 9 * 64, hs[9 * 4 - 1], &s9));
     auto held = f.pc.checkpoints(1);
@@ -1768,6 +1841,89 @@ TEST(a_snapshot_handed_out_this_step_is_not_evicted) {
     CHECK_OK(f.pc.reserve_checkpoint(1, 128, hs[7], &s2));
 }
 
+/* A reservation made this step is a save target: the engine copies the state into its slot
+ * after the step, and nothing checks the slot again before that copy. A later reservation in the
+ * same step that finds the store full runs retention over every session, and the policy, placing
+ * its ladder from each session's tip, may release the very slot just handed out -- a second
+ * request's reservation lands on a snapshot a first session already holds (the same prefix, so
+ * the same key), and that snapshot is below the first session's tip. Geometric backoff over
+ * {64..512} releases 192, so the shared reservation is made to land there. The save then faults
+ * ("the store does not hold that slot") and the step loop stops the engine. A reservation keeps
+ * its slot until its commit, or until the next step begins, as a handed-out snapshot does. */
+TEST(a_reservation_this_step_survives_retention) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/8));
+
+    const auto a = tok_run(4242, 16 * 33);
+    publish(f, 1, a, 16 * 32);
+    const std::vector<BlockHash> hs = chain_of(a);
+    std::vector<int32_t> slot_at(9, -1);
+    for (int i = 1; i <= 8; ++i) slot_at[(size_t)i] = ckpt_at(f, 1, hs, i * 64);
+    CHECK_EQ(f.kv.free_checkpoint_slots(), 0ll);
+
+    /* Session 2 prefilling the same prompt reserves at 192: the same key, so session 1's slot. */
+    f.pc.begin_step();
+    int32_t s2 = -1;
+    CHECK_OK(f.pc.reserve_checkpoint(2, 192, hs[11], &s2));
+    CHECK_EQ(s2, slot_at[3]);
+
+    /* The same step's next reservation finds the store full: retention runs over session 1,
+     * whose ladder does not keep 192. */
+    BlockHash other = hs[3];
+    other.lo ^= 0x5eedull;
+    int32_t s3 = -1;
+    CHECK_OK(f.pc.reserve_checkpoint(3, 64, other, &s3));
+    CHECK(s3 >= 0);
+    CHECK(s3 != s2);
+    CHECK(f.kv.checkpoint_held(s2));
+    bool kept_192 = false;
+    for (int64_t p : f.pc.checkpoints(1)) if (p == 192) kept_192 = true;
+    CHECK(kept_192);
+    CHECK(f.pc.stats().ckpt_retired >= 1ll);
+
+    /* The next step may release it again: an uncommitted reservation whose save was skipped (its
+     * request gone) must not hold a slot for good. (A committed one is a snapshot like any other
+     * from the commit on, tested below.) */
+    f.pc.begin_step();
+    for (int i = 0; i < 3; ++i) {
+        BlockHash fresh = hs[3];
+        fresh.lo ^= 0x1000ull + (uint64_t)i;
+        int32_t s = -1;
+        CHECK_OK(f.pc.reserve_checkpoint(10 + (uint64_t)i, 64, fresh, &s));
+    }
+    bool still_192 = false;
+    for (int64_t p : f.pc.checkpoints(1)) if (p == 192) still_192 = true;
+    CHECK(!still_192);
+}
+
+/* Eviction after retention skips it too. With one slot, the reservation is the only candidate,
+ * so a second reservation in the same step is refused instead of taking it; once committed, it
+ * is a snapshot like any other and the next step's reservation may take the slot. */
+TEST(a_reservation_this_step_is_not_evicted) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/1));
+    const auto a = tok_run(5151, 16 * 9);
+    const std::vector<BlockHash> hs = chain_of(a);
+
+    f.pc.begin_step();
+    int32_t s1 = -1;
+    CHECK_OK(f.pc.reserve_checkpoint(1, 64, hs[3], &s1));
+    CHECK(s1 >= 0);
+
+    BlockHash other = hs[3];
+    other.lo ^= 0x5eedull;
+    int32_t s2 = -1;
+    CHECK_EQ(f.pc.reserve_checkpoint(2, 64, other, &s2), RAD_E_FULL);
+    CHECK(f.kv.checkpoint_held(s1));
+    CHECK_EQ(f.pc.stats().ckpt_evictions, 0ll);
+    CHECK_EQ(f.pc.stats().ckpt_refused, 1ll);
+
+    f.pc.commit_checkpoint(hs[3]);
+    f.pc.begin_step();
+    CHECK_OK(f.pc.reserve_checkpoint(2, 64, other, &s2));
+    CHECK_EQ(s2, s1);
+}
+
 TEST(a_dead_sessions_tip_is_evictable_so_the_slot_pool_cannot_wedge) {
     /* One checkpoint each from more distinct sessions than slots, each its session's tip. If tips
      * were unevictable the pool would wedge and every later request get RAD_E_FULL. A session is a
@@ -1790,7 +1946,8 @@ TEST(a_dead_sessions_tip_is_evictable_so_the_slot_pool_cannot_wedge) {
     }
     CHECK_EQ(f.kv.free_checkpoint_slots(), 0ll);
 
-    /* The ninth session is served by retiring the least recently used tip. */
+    /* The ninth session, a step later, is served by retiring the least recently used tip. */
+    f.pc.begin_step();
     BlockHash fresh = hs[3];
     fresh.lo ^= 0x5eedull;
     int32_t s9 = -1;
@@ -1813,6 +1970,7 @@ TEST(a_sessions_index_entry_does_not_outlive_its_last_snapshot) {
     auto prompt = tok_run(313, 16 * 32);
     const std::vector<BlockHash> hs = chain_of(prompt);
     for (int i = 1; i <= 5; ++i) {
+        f.pc.begin_step();
         int32_t s = -1;
         CHECK_OK(f.pc.reserve_checkpoint(7, i * 64, hs[i * 4 - 1], &s));
     }
@@ -1821,8 +1979,10 @@ TEST(a_sessions_index_entry_does_not_outlive_its_last_snapshot) {
     CHECK_EQ((long long)f.pc.checkpoints(7).size(), 2ll);
     CHECK_EQ(f.pc.sessions_tracked(), 1ll);
 
-    /* Four more sessions, one snapshot each: session 7's tip is the LRU and is evicted. */
+    /* Four more sessions, one snapshot each, a step apart: session 7's tip is the LRU and is
+     * evicted. */
     for (uint64_t sess = 20; sess < 24; ++sess) {
+        f.pc.begin_step();
         BlockHash h = hs[9];
         h.lo ^= sess;
         int32_t s = -1;

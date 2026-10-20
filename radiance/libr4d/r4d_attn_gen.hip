@@ -69,7 +69,8 @@ __global__ __launch_bounds__(NQB * GQA * 32)
 void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restrict__ gk,
                         const int8_t* __restrict__ gk8, const float* __restrict__ gks,
                         const uint16_t* __restrict__ gv, uint16_t* __restrict__ go,
-                        const int* __restrict__ cu, int num_seqs, const int* __restrict__ used,
+                        const int* __restrict__ cu, const int* __restrict__ cuk, int num_seqs,
+                        const int* __restrict__ used,
                         const int* __restrict__ bt, int bt_pitch,
                         const uint16_t* __restrict__ kvc, int kv_heads,
                         float scale, int causal, int q_ld, int k_ld, int k8_ld, int ks_ld,
@@ -137,7 +138,10 @@ void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restr
     if (slen <= 0 || q0 >= slen) return;
     const int qlast = min(q0 + BQ, slen) - 1;
     const int P = used ? used[seq] : 0;
-    const int ke = causal ? qlast + 1 : slen;     // own keys any query here can see
+    // Own keys: beside the queries, or (`cuk`, attn_cross) a run of their own; a query sees key j
+    // of its run, counted from the run's start, when j <= its own row with `causal`.
+    const int ks0 = cuk ? cuk[seq] : s0, klen = cuk ? cuk[seq + 1] - ks0 : slen;
+    const int ke = causal ? min(qlast + 1, klen) : klen;   // own keys any query here can see
 
     const float mul = scale * 1.44269504089f;
     const int  qpos = q0 + qbi * 16 + c;
@@ -193,12 +197,12 @@ void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restr
 
     // The K row of key `kk` of the current source; its V row is `vrow`.
     auto krow = [&](bool pre, int kk) -> const uint16_t* {
-        if (!pre) return kbase + (long)(s0 + kk) * k_ld;
+        if (!pre) return kbase + (long)(ks0 + kk) * k_ld;
         const int blk = btrow[kk / BS];
         return kvc + ((long)(blk * kv_heads + kvh) * BS + (kk % BS)) * (2 * HD);
     };
     auto vrow = [&](bool pre, int kk) -> const uint16_t* {
-        if (!pre) return vbase + (long)(s0 + kk) * v_ld;
+        if (!pre) return vbase + (long)(ks0 + kk) * v_ld;
         const int blk = btrow[kk / BS];
         return kvc + ((long)(blk * kv_heads + kvh) * BS + (kk % BS)) * (2 * HD) + HD;
     };
@@ -222,12 +226,12 @@ void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restr
                 if ((TILE * K8G) % NTHR == 0 || i < TILE * K8G) {
                     const int key = i / K8G, gg = i % K8G;
                     const int kk = (k0 + key < klim) ? k0 + key : klim - 1;
-                    kr[p] = *(const uint4*)(gk8 + (long)(s0 + kk) * k8_ld + (long)kvh * HD + gg * 16);
+                    kr[p] = *(const uint4*)(gk8 + (long)(ks0 + kk) * k8_ld + (long)kvh * HD + gg * 16);
                 }
             }
             if (tid < TILE) {
                 const int kk = (k0 + tid < klim) ? k0 + tid : klim - 1;
-                ksr = gks[(long)(s0 + kk) * ks_ld + kvh];
+                ksr = gks[(long)(ks0 + kk) * ks_ld + kvh];
             }
         } else {
             #pragma unroll
@@ -243,7 +247,7 @@ void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restr
         if constexpr (PV8) {
             const int kk0 = k0 + (lgi / DG8) * 8 + vj;
             const int kk = (kk0 < klim) ? kk0 : klim - 1;
-            const uint8_t* v8 = (const uint8_t*)gv + (long)(s0 + kk) * v_ld + (long)kvh * HD;
+            const uint8_t* v8 = (const uint8_t*)gv + (long)(ks0 + kk) * v_ld + (long)kvh * HD;
             vr[0] = __builtin_bit_cast(uint4, load_tr_b128(v8 + (lgi % DG8) * 16));
         } else {
             #pragma unroll
@@ -597,7 +601,7 @@ void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restr
 
 template<int HD, int GQA, int NQB, int TILE, bool I8, bool PV8>
 static int r4d_attn_ps_launch(const void* q, const void* k, const void* k8, const float* ks,
-                              const void* v, void* o, const int* cu,
+                              const void* v, void* o, const int* cu, const int* cuk,
                               const int* used, const int* bt, int bt_pitch, const void* kvc,
                               int num_seqs, int max_q, int n_head_kv, float scale, int causal,
                               int q_ld, int k_ld, int k8_ld, int ks_ld, int v_ld, int o_ld,
@@ -609,14 +613,15 @@ static int r4d_attn_ps_launch(const void* q, const void* k, const void* k8, cons
     hipLaunchKernelGGL((r4d_attn_ps_kernel<HD, GQA, NQB, TILE, I8, PV8>), grid,
                        dim3(NQB * GQA * 32), 0, s,
                        (const uint16_t*)q, (const uint16_t*)k, (const int8_t*)k8, ks,
-                       (const uint16_t*)v, (uint16_t*)o, cu, num_seqs, used, bt, bt_pitch,
+                       (const uint16_t*)v, (uint16_t*)o, cu, cuk, num_seqs, used, bt, bt_pitch,
                        (const uint16_t*)kvc, n_head_kv, scale, causal, q_ld, k_ld, k8_ld, ks_ld,
                        v_ld, o_ld, vs);
     const hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -100 - (int)e;
 }
 
-/* head_dim 128 at gqa 1, 2, 4 and 8. Null `used`/`bt`/`kvc` means no prefix (the dense form).
+/* head_dim 128 at gqa 1, 2, 4 and 8, and 64 (an audio stream's heads) without a prefix or the
+ * int8 and fp8 forms. Null `used`/`bt`/`kvc` means no prefix (the dense form).
  * `max_q` is the total query rows over all sequences and bounds the flat grid. Non-null `k8`
  * selects the int8 Q.K form (own-key codes, `k8_ld` bytes per row; a scale per (row, head) in
  * `ks`, `ks_ld` floats per row), gqa 1 only. Non-null `vs` selects the fp8 P.V form (`v` as E4M3
@@ -626,16 +631,34 @@ static int r4d_attn_ps(const void* q, const void* k, const void* k8, const float
                        const int* used, const int* bt, int bt_pitch, const void* kvc,
                        int num_seqs, int max_q, int n_head, int n_head_kv, int head_dim,
                        float scale, int causal, int q_ld, int k_ld, int k8_ld, int ks_ld,
-                       int v_ld, int o_ld, hipStream_t s, const float* vs = nullptr)
+                       int v_ld, int o_ld, hipStream_t s, const float* vs = nullptr,
+                       const int* cuk = nullptr)
 {
     if (n_head <= 0 || n_head_kv <= 0 || n_head % n_head_kv) return -2;
     if ((q_ld | k_ld | v_ld | o_ld) & 7) return -3;
     if (k8 && ((k8_ld & 15) || ((uintptr_t)k8 & 15) || !ks)) return -3;
     if (num_seqs <= 0 || max_q <= 0) return 0;
     const int gqa = n_head / n_head_kv;
+    if (head_dim == 64) {
+        if (k8 || vs || used || bt || kvc) return -1;
+#define R4D_PS64(G, NQB)                                                                          \
+        return r4d_attn_ps_launch<64, G, NQB, 64, false, false>(q, k, k8, ks, v, o, cu, cuk, used, \
+                                                                bt, bt_pitch, kvc, num_seqs,      \
+                                                                max_q, n_head_kv, scale, causal,  \
+                                                                q_ld, k_ld, k8_ld, ks_ld, v_ld,   \
+                                                                o_ld, nullptr, s)
+        switch (gqa) {
+            case 1: R4D_PS64(1, 16);
+            case 2: R4D_PS64(2, 4);
+            case 4: R4D_PS64(4, 2);
+            case 8: R4D_PS64(8, 1);
+            default: return -1;
+        }
+#undef R4D_PS64
+    }
     if (head_dim != 128) return -1;
 #define R4D_PS(G, NQB, T, I8)                                                                     \
-    return r4d_attn_ps_launch<128, G, NQB, T, I8, false>(q, k, k8, ks, v, o, cu, used, bt,        \
+    return r4d_attn_ps_launch<128, G, NQB, T, I8, false>(q, k, k8, ks, v, o, cu, cuk, used, bt,   \
                                                          bt_pitch, kvc, num_seqs, max_q,          \
                                                          n_head_kv, scale, causal, q_ld, k_ld,    \
                                                          k8_ld, ks_ld, v_ld, o_ld, nullptr, s)
@@ -646,10 +669,10 @@ static int r4d_attn_ps(const void* q, const void* k, const void* k8, const float
         if (gqa != 1 || used || bt || kvc || (v_ld & 15) || ((uintptr_t)v & 15)) return -1;
         if (k8)
             return r4d_attn_ps_launch<128, 1, 16, 64, true, true>(
-                q, k, k8, ks, v, o, cu, used, bt, bt_pitch, kvc, num_seqs, max_q, n_head_kv,
+                q, k, k8, ks, v, o, cu, cuk, used, bt, bt_pitch, kvc, num_seqs, max_q, n_head_kv,
                 scale, causal, q_ld, k_ld, k8_ld, ks_ld, v_ld, o_ld, vs, s);
         return r4d_attn_ps_launch<128, 1, 16, 64, false, true>(
-            q, k, k8, ks, v, o, cu, used, bt, bt_pitch, kvc, num_seqs, max_q, n_head_kv, scale,
+            q, k, k8, ks, v, o, cu, cuk, used, bt, bt_pitch, kvc, num_seqs, max_q, n_head_kv, scale,
             causal, q_ld, k_ld, k8_ld, ks_ld, v_ld, o_ld, vs, s);
     }
     if (k8) {
@@ -791,8 +814,44 @@ extern "C" int r4d_rad_attn_dense_h128(const RadArgs* a, RadStream s) {
     return R4D_NO(e == -3 ? RAD_E_STRIDE : e <= -100 ? RAD_E_DEVICE : RAD_E_SHAPE);
 }
 
-// ============================================================== wide heads (attn_dense, h768 / h1152)
-// Image decoder mid-block attention: one head up to 1152 wide over every latent pixel (16384 rows
+/* attn_cross at head_dim 64 or 128: the dense kernel with each entry's keys a run of their own
+ * (`cu_k`), causal counting from each run's start. */
+extern "C" int r4d_rad_attn_cross(const RadArgs* a, RadStream s) {
+    const RadTensor* q  = r4d_opt(a, 0);
+    const RadTensor* k  = r4d_opt(a, 1);
+    const RadTensor* v  = r4d_opt(a, 2);
+    const RadTensor* cu = r4d_opt(a, 3);
+    const RadTensor* ck = r4d_opt(a, 4);
+    const RadTensor* o  = r4d_opt(a, 5);
+    if (!q || !k || !v || !cu || !ck || !o) return R4D_NO(RAD_E_INVAL);
+    if (!r4d_contig(cu) || cu->rank != 1 || cu->shape[0] < 2 || !r4d_contig(ck) ||
+        r4d_numel(ck) < cu->shape[0])
+        return R4D_NO(RAD_E_SHAPE);
+    const long long hd = r4d_geti_or(a, "head_dim", 0), gqa = r4d_geti_or(a, "gqa", 1);
+    if ((hd != 64 && hd != 128) || gqa <= 0) return R4D_NO(RAD_E_SHAPE);
+    long long total = 0, nh = 0, q_ld = 0, tk = 0, hk = 0, k_ld = 0, tv = 0, hv = 0, v_ld = 0;
+    long long to = 0, ho = 0, o_ld = 0;
+    if (!r4d_head_rows(q, hd, &total, &nh, &q_ld) ||
+        !r4d_head_rows(k, hd, &tk, &hk, &k_ld) ||
+        !r4d_head_rows(v, hd, &tv, &hv, &v_ld) ||
+        !r4d_head_rows(o, hd, &to, &ho, &o_ld))
+        return R4D_NO(RAD_E_STRIDE);
+    if (hk != hv || ho != nh || hk * gqa != nh || tk != tv || to < total) return R4D_NO(RAD_E_SHAPE);
+    const int num_seqs = (int)(cu->shape[0] - 1);
+    const float scale = (float)r4d_getf(a, "scale", 1.0 / std::sqrt((double)hd));
+    const int e = r4d_attn_ps(q->data, k->data, nullptr, nullptr, v->data, o->data,
+                              (const int*)cu->data, nullptr, nullptr, 0, nullptr, num_seqs,
+                              (int)total, (int)nh, (int)hk, (int)hd, scale,
+                              (int)r4d_geti_or(a, "causal", 0), (int)q_ld, (int)k_ld, 0, 0,
+                              (int)v_ld, (int)o_ld, (hipStream_t)s, nullptr,
+                              (const int*)ck->data);
+    if (e == -1 || e == -2) return R4D_NO(RAD_E_SHAPE);
+    if (e == 0) return RAD_OK;
+    return R4D_NO(e == -3 ? RAD_E_STRIDE : e <= -100 ? RAD_E_DEVICE : RAD_E_SHAPE);
+}
+
+// ============================================================== wide heads (attn_dense, h384 .. h1152)
+// Image decoder mid-block attention: one head 384 to 1152 wide over every latent pixel (16384 rows
 // at 2048 x 2048). A lane cannot hold a 1152-wide output row (576 accumulator VGPRs), so the head
 // is split across the workgroup's eight waves: a wave owns HD/8 dims of the 16-query block.
 //
@@ -945,7 +1004,8 @@ extern "C" int r4d_rad_attn_dense_wide(const RadArgs* a, RadStream s) {
     if (!q || !k || !v || !cu || !o) return R4D_NO(RAD_E_INVAL);
     if (!r4d_contig(cu) || cu->rank != 1 || cu->shape[0] < 2) return R4D_NO(RAD_E_SHAPE);
     const long long hd = r4d_geti_or(a, "head_dim", 0);
-    if ((hd != 768 && hd != 1152) || r4d_geti_or(a, "gqa", 1) != 1 || r4d_geti_or(a, "causal", 0) != 0 ||
+    if ((hd != 384 && hd != 512 && hd != 768 && hd != 1152) || r4d_geti_or(a, "gqa", 1) != 1 ||
+        r4d_geti_or(a, "causal", 0) != 0 ||
         r4d_geti_or(a, "window", 0) != 0 || r4d_geti_or(a, "block", 0) != 0 ||
         r4d_geti_or(a, "cu_div", 1) != 1)
         return R4D_NO(RAD_E_UNSUPPORTED);
@@ -967,8 +1027,10 @@ extern "C" int r4d_rad_attn_dense_wide(const RadArgs* a, RadStream s) {
                        (const uint16_t*)q->data, (const uint16_t*)k->data,                        \
                        (const uint16_t*)v->data, (uint16_t*)o->data, (const int*)cu->data,        \
                        num_seqs, scale, (int)q_ld, (int)k_ld, (int)v_ld, (int)o_ld)
-    if (hd == 768) R4D_WIDE(768);
-    else           R4D_WIDE(1152);
+    if (hd == 384)      R4D_WIDE(384);
+    else if (hd == 512) R4D_WIDE(512);
+    else if (hd == 768) R4D_WIDE(768);
+    else                R4D_WIDE(1152);
 #undef R4D_WIDE
     return hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
 }

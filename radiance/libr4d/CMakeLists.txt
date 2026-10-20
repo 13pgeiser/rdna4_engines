@@ -44,6 +44,8 @@ set(R4D_UNITS
   # Gemma 4 dense sliding window: head_dim 256, 2 queries per KV head, windowed decode and
   # prefill.
   "r4d_attn_paged_h256_gqa2|"
+  # Gemma 3 sliding window: head_dim 128, 2 queries per KV head, windowed decode and prefill.
+  "r4d_attn_paged_h128_gqa2w|"
   # Eight queries per KV head, one body instantiated at head_dim 256 (the routed 35B-A3B) and 128
   # (MiniCPM5-2B).
   "r4d_attn_paged_gqa8|"
@@ -79,6 +81,7 @@ set(R4D_UNITS
   # decoder's patch unfold, tiles, stitch and rotary positions, and the soundtrack decoder's
   # alias-free SnakeBeta.
   "r4d_video|"
+  "r4d_ltx|"
   # A video latent upscaler: the 3x3x3 convolution as an implicit GEMM over voxel rows, the group
   # norm, the temporal depthwise convolution, the per-frame bilinear resize, the patch fold and the
   # re-noise.
@@ -101,6 +104,13 @@ set(R4D_UNITS
   # launches behind one entry point: the mix depends on every column of the low-rank waist, so it
   # needs a grid-wide barrier.
   "r4d_hc_bf16|"
+  "r4d_mhc|"
+  "r4d_glm|"
+  "r4d_dsa|"
+  "r4d_mla|"
+  "r4d_kda|"
+  "r4d_moe_mxfp4|"
+  "r4d_fp8_f32scale|"
   "r4d_ngram_ids|"
   "r4d_ple_gate_bf16|"
   "r4d_ple_conv_bf16|"

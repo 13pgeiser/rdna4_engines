@@ -136,7 +136,10 @@ extern "C" int r4d_rad_qkv_norm_rope(const RadArgs* a, RadStream stream) {
     const long long nkv = r4d_geti_or(a, "n_head_kv", 0);
     const long long rot = r4d_geti_or(a, "rotary_dim", hd);
     const long long vk  = r4d_geti_or(a, "v_from_k", 0);
-    if (hd != 256 && hd != 512) return R4D_NO(RAD_E_SHAPE);
+    // v_norm 0: no value norm at all (Gemma 3); the v heads are left out of the grid.
+    const long long vn  = r4d_geti_or(a, "v_norm", 1);
+    if (hd != 128 && hd != 256 && hd != 512) return R4D_NO(RAD_E_SHAPE);
+    if (vk && !vn) return R4D_NO(RAD_E_INVAL);
     if (nq <= 0 || nkv <= 0 || rot <= 0 || rot > hd || (rot & 1)) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(qw) != hd || r4d_numel(kw) != hd) return R4D_NO(RAD_E_SHAPE);
     const char* mode = r4d_gets(a, "mode");
@@ -169,7 +172,7 @@ extern "C" int r4d_rad_qkv_norm_rope(const RadArgs* a, RadStream stream) {
     const float wadd  = (float)r4d_getf(a, "wadd", 0.0);
     const float theta = (float)r4d_getf(a, "theta", 10000.0);
     const float rsc   = (float)r4d_getf(a, "scale", 1.0);
-    const dim3 grid((uint32_t)M, (uint32_t)(nq + nkv + (vk ? 0 : nkv)));
+    const dim3 grid((uint32_t)M, (uint32_t)(nq + nkv + ((vk || !vn) ? 0 : nkv)));
 
 #define R4D_QNR_T(HD, WF, VK) emit_rc = R4D_EMIT(stream, (qkv_norm_rope_kernel<HD, WF, VK>), grid, dim3(HD), 0, \
     (uint16_t*)r4d_wp(q), (uint16_t*)r4d_wp(k), (uint16_t*)r4d_wp(v), (const int32_t*)r4d_p(ps),           \
@@ -178,8 +181,9 @@ extern "C" int r4d_rad_qkv_norm_rope(const RadArgs* a, RadStream stream) {
 #define R4D_QNR(HD)                                                                                     \
     do { if (qw->dtype == RAD_F32) { if (vk) R4D_QNR_T(HD, true, true);  else R4D_QNR_T(HD, true, false); } \
          else                      { if (vk) R4D_QNR_T(HD, false, true); else R4D_QNR_T(HD, false, false); } } while (0)
-    if (hd == 256) R4D_QNR(256);
-    else           R4D_QNR(512);
+    if (hd == 128)      R4D_QNR(128);
+    else if (hd == 256) R4D_QNR(256);
+    else                R4D_QNR(512);
 #undef R4D_QNR
 #undef R4D_QNR_T
     return emit_rc;

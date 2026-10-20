@@ -51,6 +51,12 @@ struct SchedMetrics {
     int64_t step_ns = 0;
     int64_t step_ns_decode = 0;
 
+    /* The single-sequence decode floor and the most recent window, nanoseconds: both window means
+     * of single-sequence decode steps (DecodeFloor), 0 until a gated window completes. A decode
+     * step at more sequences is a different measurement and does not count. */
+    int64_t step_ns_decode_best = 0;
+    int64_t step_ns_decode_recent = 0;
+
     /* Per KV group. `name` points into the Program, which outlives any scrape. */
     int n_kv_groups = 0;
     struct Group {
@@ -129,6 +135,58 @@ struct SchedMetrics {
     bool    draft_adaptive = false;
     float   draft_depth_adaptive = 0.0f;
     int64_t draft_verify_depth[RAD_METRICS_MAX_SPEC + 1] = {};
+};
+
+
+/* Estimator for the single-sequence decode floor (SchedMetrics::step_ns_decode_best): a min over
+ * window means, not over raw step brackets. A decode step issued ahead behind a step with long
+ * host work (a prefill chunk, a KV checkpoint save) has its forward pass finished before its own
+ * bracket opens, so the bracket holds only readback and commit, about a tenth of a real step; a
+ * raw min would latch that forever. Such brackets are rejected before they enter a window, and the
+ * window mean dilutes what remains. */
+struct DecodeFloor {
+    /* Steps averaged into one floor candidate: about what the dashboard's 500 ms poll spans at a
+     * single-sequence step, so the engine's floor and the page's are over comparable windows. */
+    static constexpr int kWindow = 32;
+    static constexpr int64_t kHorizon = 8 * kWindow;
+
+    void update(int64_t ns) {
+        /* A degenerate bracket is ~0.09 of a real step and a real one ~0.96 of the mean, so half
+         * the reference separates them. The reference is a running mean over every step, the
+         * rejected ones included, with a horizon of kHorizon steps: degenerates are rare enough to
+         * barely move it, and when the real step gets faster (a slow warm-up, a shorter context)
+         * it follows instead of rejecting every later step. No rejection until a window's worth
+         * of samples has been seen. */
+        ++seen_;
+        mean_ += (ns - mean_) / (double)(seen_ < kHorizon ? seen_ : kHorizon);
+        if (seen_ > kWindow && ns * 2 < mean_) return;
+        sum_ += ns;
+        if (++count_ < kWindow) return;
+        const int64_t mean = sum_ / count_;
+        /* The first window ran before the gate could judge and may carry degenerates, so it is
+         * recorded by neither side. */
+        if (warmed_) {
+            if (best_ == 0 || mean < best_) best_ = mean;
+            recent_ = mean;
+        }
+        warmed_ = true;
+        sum_ = 0;
+        count_ = 0;
+    }
+    /* The fastest window mean seen. */
+    int64_t best() const { return best_; }
+    /* The most recent completed window mean, from the same stream and window size as best();
+     * 0 until the first gated window completes. */
+    int64_t recent() const { return recent_; }
+
+private:
+    int64_t sum_      = 0;
+    int     count_    = 0;      /* samples in the window being accumulated */
+    int64_t best_     = 0;
+    int64_t recent_   = 0;
+    bool    warmed_   = false;  /* one window has completed */
+    int64_t seen_     = 0;      /* samples seen, rejected ones included */
+    double  mean_     = 0.0;    /* the rejection reference */
 };
 
 }  /* namespace rad */

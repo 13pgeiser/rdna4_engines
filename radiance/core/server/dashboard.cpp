@@ -125,6 +125,8 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
     o["model"]     = opt_.model_id;
     o["version"]   = opt_.version;
     o["uptime_s"]  = unix_now() - started_at_;
+    /* Seconds this process took to come up, the cost of a restart; 0 before the server listens. */
+    o["startup_s"] = startup_s_;
     o["in_flight"] = in_flight_.load(std::memory_order_relaxed);
     o["queue_cap"] = queue_depth_;
     o["now_ms"]    = (int64_t)std::time(nullptr) * 1000;
@@ -182,6 +184,8 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
          * covers idle time (see SchedMetrics::step_ns). */
         o["step_ns"]         = m.step_ns;
         o["step_ns_decode"]  = m.step_ns_decode;
+        o["step_ns_decode_best"] = m.step_ns_decode_best;
+        o["step_ns_decode_recent"] = m.step_ns_decode_recent;
         o["rows_unspec"]     = m.decode_rows_unspeculated;
 
         /* Conditional rate per position with its reach count: a rate of 0.0 over a reach of 3 is
@@ -1354,16 +1358,28 @@ for (const k of METRICS) {
 }
 /* The axis follows the WINDOW's own minimum and maximum, not zero. This is a sparkline: what it
  * is for is the variation, and the number above it already states the level -- scaled from zero
- * every steady state is a flat line on the floor. No variation draws down the middle. */
+ * every steady state is a flat line on the floor. No variation draws down the middle.
+ *
+ * The ends of the range are the 5th and 95th percentiles, not the extremes: on a min/max axis one
+ * rare spike owns the box and the typical variation is squeezed into a pixel. A spike past the
+ * 95th draws pinned to the top; the number above carries the level and the detail line the
+ * extremes. The stroke is 1.25 units wide, so a one-unit inset keeps it off the edge. */
 function spark(key, vals) {
   const s = M[key], w = 200, h = 22;
   if (vals.length < 3) { s.line.setAttribute("d", ""); return; }
-  const hi = Math.max(...vals), lo = Math.min(...vals), span = hi - lo;
+  const q = (sorted, p) => sorted[Math.min(sorted.length - 1, Math.floor(p * (sorted.length - 1)))];
+  const sorted = [...vals].sort((a, b) => a - b);
+  let lo = q(sorted, 0.05), hi = q(sorted, 0.95);
+  /* A window that is one value apart from rare spikes puts both percentiles on that value; the
+   * extremes then serve, so the spikes still show. */
+  if (!(hi > lo)) { lo = sorted[0]; hi = sorted[sorted.length - 1]; }
+  const span = hi - lo;
   const dx = w / (vals.length - 1);
   let d = "";
   for (let i = 0; i < vals.length; i++) {
-    const t = span > Math.abs(hi) * 1e-3 ? (vals[i] - lo) / span : 0.5;
-    d += (i ? "L" : "M") + (i * dx).toFixed(1) + "," + (h - 2 - (h - 5) * t).toFixed(1);
+    let t = span > Math.abs(hi) * 1e-3 ? (vals[i] - lo) / span : 0.5;
+    if (t < 0) t = 0; else if (t > 1) t = 1;
+    d += (i ? "L" : "M") + (i * dx).toFixed(1) + "," + (h - 1 - (h - 2) * t).toFixed(1);
   }
   s.line.setAttribute("d", d);
 }
@@ -1654,6 +1670,16 @@ function renderRequests(list, poolTokens) {
 let prev = null, prevAt = 0, bars = [], devs = [], layerBars = [];
 let lastStepMs = null, lastTps = null;
 
+/* The single-stream floor and the engine's most recent window, shown as two numbers with no
+ * verdict. The engine records the fastest single-sequence decode window it has measured
+ * (step_ns_decode_best) and its most recent one (step_ns_decode_recent). Their gap is not engine
+ * drift: on a healthy lane the recent window moves 3-11% above a flat floor with whatever else the
+ * lane is doing, so a restart priced against it would not pay back. Until the engine's first
+ * window completes, the fastest single-stream step this tab has seen stands in. */
+let c1hist = [];
+const C1CAP = 7200;                       /* an hour at 2 polls/s of single-stream samples */
+const bestAt = {};                        /* fastest step seen at each concurrency, this process */
+
 function update(s, dt) {
   $("ver").textContent = s.version + "  ·  up " + dur(s.uptime_s);
 
@@ -1672,6 +1698,31 @@ function update(s, dt) {
   const st = stepTime(lastStepMs);
   M.step.u.textContent = st.u;
   setMetric("step",    lastStepMs,    st.n);
+
+  /* Single-stream steps only: the floor is a single-sequence window, and a batched step read
+   * against it would report a batch arriving as a slowdown. */
+  if (s.running === 1 && stepMs != null) { c1hist.push(stepMs); if (c1hist.length > C1CAP) c1hist.shift(); }
+  const engBestMs = s.step_ns_decode_best > 0 ? s.step_ns_decode_best / 1e6 : 0;
+  const engRecentMs = s.step_ns_decode_recent > 0 ? s.step_ns_decode_recent / 1e6 : 0;
+  const floorMs = engBestMs > 0 ? engBestMs : (c1hist.length ? Math.min(...c1hist) : 0);
+  let det = "";
+  if (floorMs > 0) {
+    det = "best " + floorMs.toFixed(2) + "ms";
+    if (engRecentMs > 0) det += " · recent " + engRecentMs.toFixed(2) + "ms";
+  }
+  /* The step as a percentage of the fastest at this concurrency (`@cN` above one). `now` is a
+   * ~500 ms poll mean and `best` a 32-step window mean, so a short fast stretch can beat the
+   * floor; the figure is capped at 99 and shown as ~99, "at the best", rather than claiming a
+   * record the window cannot confirm. */
+  if (s.running > 0 && lastStepMs != null) {
+    const k = s.running;
+    if (!(k in bestAt) || lastStepMs < bestAt[k]) bestAt[k] = lastStepMs;
+    const ref = k === 1 && floorMs > 0 ? floorMs : bestAt[k];
+    const shown = ref > 0 ? Math.min(99, Math.round(100 * ref / lastStepMs)) : 0;
+    if (ref > 0) det += " · now " + (shown === 99 ? "~99" : shown) + "% of best" + (k === 1 ? "" : "@c" + k);
+  }
+  $("m-stepdet").textContent = det;
+
   setMetric("decode",  s.decode_tps,  tps(s.decode_tps));
   setMetric("prefill", s.prefill_tps, tps(s.prefill_tps));
   setMetric("flight",  s.in_flight,   String(s.in_flight));

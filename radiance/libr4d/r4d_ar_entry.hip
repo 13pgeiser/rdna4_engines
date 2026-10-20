@@ -20,6 +20,8 @@
 
 #include "r4d_args.h"
 #include "r4d.h"
+#include "r4d_ar_shards.h"
+#include "r4d_ar_links.h"
 
 #include <condition_variable>
 #include <cstdio>
@@ -33,6 +35,8 @@
 static_assert(R4D_AR_TWOSHOT_WIDE_MAX_ELEMS == 268435456,
               "r4d_rows.cpp restates this bound; libr4d changed it");
 static_assert(R4D_MAX_RANKS == 8, "the 8-rank entry point names exactly seven peers");
+static_assert((long long)R4D_AR8_MIN_ELEMS_MAX == (long long)R4D_AR_TWOSHOT_WIDE_MAX_ELEMS,
+              "r4d_ar_shards.h restates the two-shot band's top");
 
 /* ------------------------------------------------------------------ throw conversion
  *
@@ -68,6 +72,15 @@ struct Rendezvous {
     long flags  [R4D_MAX_RANKS] = { 0 };
     long seq    [R4D_MAX_RANKS] = { 0 };
     int  dev    [R4D_MAX_RANKS] = { 0 };
+    /* What each rank read for the eight-rank two-shot: settings that must agree, and its own
+     * card's link, which the weights are derived from. */
+    struct Ar8Seen {
+        int       mode = 0;
+        int       w[R4D_MAX_RANKS] = { 0 };
+        int       pieces = 0;
+        long long weights_min = 0, pieces_min = 0;
+        R4DArLink link;
+    } ar8[R4D_MAX_RANKS];
     int  failed = 0;
 };
 
@@ -111,6 +124,16 @@ struct ArInst {
      * each card reaches over its own link (see build). */
     int  host       = 0;
     long gate_ctr   = 0;      /* the blocks that have seen their peer's bytes land (r4d_ar_seq.h) */
+    /* The eight-rank two-shot's per-rank shard weights (r4d_ar_shards.h), fixed at build so the
+     * scratch was sized for them and a recorded launch keeps its table. */
+    int  shard_weighted = 0;
+    int  shard_w[R4D_MAX_RANKS] = { 0 };
+    /* Its piece count (RADIANCE_AR8_PIECES), 0 for the size rule (r4d_ar8_auto_pieces); a launch's
+     * `pieces` parameter overrides it. */
+    int  pieces = 0;
+    /* Messages under these sizes (elements) run even and in one piece, whatever is configured. */
+    long long weights_min = R4D_AR8_MIN_ELEMS_DEFAULT;
+    long long pieces_min  = R4D_AR8_MIN_ELEMS_DEFAULT;
 };
 
 /* A parameter that may be declared as a range: init gets one band's frozen geometry, and buffers
@@ -127,6 +150,159 @@ long long pgeti_hi(const RadParam* p, int n_p, const char* k, long long dflt) {
 
 long align16(long v) { return (v + 15) & ~15L; }
 
+/* RADIANCE_AR8_SHARD_WEIGHTS, read at every eight-rank build so a process can change it between
+ * instances: unset or "auto" derives the weights from the links, "off" keeps the shards even,
+ * eight integers set them. Anything else is "off", with one warning. */
+enum { AR8_EVEN = 0, AR8_SET = 1, AR8_AUTO = 2 };
+int ar8_weights_mode(int* w) {
+    const char* e = std::getenv(R4D_AR8_SHARD_WEIGHTS_ENV);
+    if (!e || !*e || !std::strcmp(e, "auto")) return AR8_AUTO;
+    if (!std::strcmp(e, "off")) return AR8_EVEN;
+    if (r4d_ar_shard_weights_parse(e, 8, w)) return AR8_SET;
+    static std::once_flag said;
+    std::call_once(said, [e] {
+        std::fprintf(stderr, "[r4d] %s=\"%s\" ignored (needs auto, off or eight non-negative "
+                     "integers, comma-separated, sum > 0); eight-rank two-shot shards stay even\n",
+                     R4D_AR8_SHARD_WEIGHTS_ENV, e);
+    });
+    return AR8_EVEN;
+}
+
+/* This rank's card's slowest PCIe hop, from sysfs by the runtime's bus id. */
+bool ar8_own_link(R4DArLink* l) {
+    int dev = 0;
+    char bus[64] = { 0 };
+    if (hipGetDevice(&dev) != hipSuccess ||
+        hipDeviceGetPCIBusId(bus, (int)sizeof bus, dev) != hipSuccess)
+        return false;
+    unsigned dom = 0, b = 0, d = 0, f = 0;
+    if (std::sscanf(bus, "%x:%x:%x.%x", &dom, &b, &d, &f) != 4) return false;
+    char bdf[32];
+    std::snprintf(bdf, sizeof bdf, "%04x:%02x:%02x.%x", dom, b, d, f);
+    return r4d_ar_link_bottleneck("", bdf, l);
+}
+
+/* RADIANCE_AR8_PIECES and the two size floors, read like the weights. */
+int ar8_pieces() {
+    const char* e = std::getenv(R4D_AR8_PIECES_ENV);
+    if (!e || !*e) return 0;
+    long long v = 0;
+    if (!r4d_ar_parse_count(e, R4D_AR_TS_MAX_PIECES, &v) || v < 1) {
+        static std::once_flag said;
+        std::call_once(said, [e] {
+            std::fprintf(stderr, "[r4d] %s=\"%s\" ignored (needs 1..%d); the eight-rank "
+                         "two-shot takes its piece count from the message size\n",
+                         R4D_AR8_PIECES_ENV, e, (int)R4D_AR_TS_MAX_PIECES);
+        });
+        return 0;
+    }
+    return (int)v;
+}
+
+long long ar8_min_elems(const char* name, std::once_flag* said) {
+    const char* e = std::getenv(name);
+    if (!e || !*e) return R4D_AR8_MIN_ELEMS_DEFAULT;
+    long long v = 0;
+    if (!r4d_ar_parse_count(e, R4D_AR8_MIN_ELEMS_MAX, &v)) {
+        std::call_once(*said, [name, e] {
+            std::fprintf(stderr, "[r4d] %s=\"%s\" ignored (needs 0..%d elements); using %d\n",
+                         name, e, (int)R4D_AR8_MIN_ELEMS_MAX,
+                         (int)R4D_AR8_MIN_ELEMS_DEFAULT);
+        });
+        return R4D_AR8_MIN_ELEMS_DEFAULT;
+    }
+    return v;
+}
+
+/* The eight-rank two-shot's choice for one message, a function of its size and the instance
+ * alone: a recorded launch keeps the table and piece count it was recorded with, and replays of
+ * the same size agree with it. */
+const int* ar8_weights_for(const ArInst* in, long numel) {
+    return in->shard_weighted && numel >= in->weights_min ? in->shard_w : nullptr;
+}
+long long ar8_pieces_for(const ArInst* in, long numel, long long asked) {
+    if (numel < in->pieces_min) return 1;
+    return asked > 0 ? asked : r4d_ar8_auto_pieces(numel);
+}
+
+/* The eight-rank two-shot's settings, agreed before anything is sized: each rank publishes what
+ * it read and its own card's link, and after one barrier every rank derives the same weights from
+ * the same eight entries. Settings that differ between ranks would cut the message at different
+ * words or take different handshake steps; all ranks compare the same entries, so all refuse
+ * together. */
+int ar8_settle(ArInst* in, int rank, int world) {
+    static std::once_flag said_w, said_p, said_links, said_unknown, said_set;
+    Rendezvous::Ar8Seen me;
+    me.mode = ar8_weights_mode(me.w);
+    me.pieces = ar8_pieces();
+    me.weights_min = ar8_min_elems(R4D_AR8_SHARD_WEIGHTS_MIN_ENV, &said_w);
+    me.pieces_min = ar8_min_elems(R4D_AR8_PIECES_MIN_ENV, &said_p);
+    if (me.mode == AR8_AUTO && !ar8_own_link(&me.link)) me.link = R4DArLink();
+    {
+        std::lock_guard<std::mutex> lk(g_rv.m);
+        g_rv.ar8[rank] = me;
+    }
+    const int rc = rv_barrier(world);
+    if (rc != RAD_OK) return rc;
+
+    const Rendezvous::Ar8Seen* all = g_rv.ar8;
+    for (int r = 0; r < world; ++r)
+        if (all[r].mode != me.mode || std::memcmp(all[r].w, me.w, sizeof(me.w)) ||
+            all[r].pieces != me.pieces || all[r].weights_min != me.weights_min ||
+            all[r].pieces_min != me.pieces_min) {
+            std::fprintf(stderr, "[r4d] ranks %d and %d read different eight-rank two-shot "
+                         "settings (%s, %s and their _MIN_ELEMS)\n", rank, r,
+                         R4D_AR8_SHARD_WEIGHTS_ENV, R4D_AR8_PIECES_ENV);
+            return RAD_E_STATE;
+        }
+    in->pieces = me.pieces;
+    in->weights_min = me.weights_min;
+    in->pieces_min = me.pieces_min;
+
+    int w[R4D_MAX_RANKS] = { 0 };
+    if (me.mode == AR8_SET) {
+        std::memcpy(w, me.w, sizeof(w));
+        std::call_once(said_set, [&w] {
+            std::fprintf(stderr, "[r4d] eight-rank two-shot shards weighted "
+                         "%d,%d,%d,%d,%d,%d,%d,%d (%s)\n", w[0], w[1], w[2], w[3], w[4], w[5],
+                         w[6], w[7], R4D_AR8_SHARD_WEIGHTS_ENV);
+        });
+    } else if (me.mode == AR8_AUTO) {
+        double gbs[R4D_MAX_RANKS] = { 0 };
+        for (int r = 0; r < world; ++r) gbs[r] = r4d_ar_link_gbs(all[r].link);
+        if (!r4d_ar_weights_from_rates(gbs, world, w)) {
+            std::call_once(said_unknown, [all, world] {
+                std::string who;
+                for (int r = 0; r < world; ++r)
+                    if (r4d_ar_link_gbs(all[r].link) <= 0.0) who += " " + std::to_string(r);
+                std::fprintf(stderr, "[r4d] eight-rank two-shot: no PCIe link speed in sysfs for "
+                             "rank%s; shards stay even\n", who.c_str());
+            });
+            return RAD_OK;
+        }
+        std::call_once(said_links, [all, world, &w] {
+            std::string l;
+            for (int r = 0; r < world; ++r) {
+                char one[96];
+                std::snprintf(one, sizeof one, "%s r%d %.1f GT/s x%d %.1f GB/s w%d",
+                              r ? "," : "", r, all[r].link.gts, all[r].link.width,
+                              r4d_ar_link_gbs(all[r].link), w[r]);
+                l += one;
+            }
+            std::fprintf(stderr, "[r4d] eight-rank two-shot shard weights from the slowest PCIe "
+                         "hop of each card:%s\n", l.c_str());
+        });
+        bool same = true;
+        for (int r = 1; r < world; ++r) same = same && w[r] == w[0];
+        if (same) return RAD_OK;   /* equal links: the even split, on the unweighted path */
+    } else {
+        return RAD_OK;
+    }
+    in->shard_weighted = 1;
+    std::memcpy(in->shard_w, w, sizeof(in->shard_w));
+    return RAD_OK;
+}
+
 /* Sequence counter allocation in words: 2 * nbw (r4d_ar_seq.h), then r4d_ar_link_landed's block
  * counter, padded to a cache line. */
 long kSeqWords(long nbw) { return 2L * nbw + 32; }
@@ -136,7 +312,9 @@ long kSeqWords(long nbw) { return 2L * nbw + 32; }
  * One sizing rule for the whole family: a slot holds a full message. The one-shots need exactly
  * that; the two-shot's two regions (2 * message / world_size) and the tiered-int8 wire's two
  * images (2 * ceil(shard/32) * 38 bytes) are smaller. RadInitFn is not told which row resolved,
- * so sizing for the maximum avoids reconstructing which kernel this instance serves.
+ * so sizing for the maximum avoids reconstructing which kernel this instance serves. The one
+ * exception is a weighted eight-rank two-shot whose largest weight is over half the sum: its two
+ * regions of the longest shard outgrow a message, and the slot grows to hold them.
  *
  * Cost: at a 4096-token chunk on a 5120-wide residual, 40 MiB a slot and 80 MiB for the pair. One
  * set serves every op with the same (rank, world, dtype, bound); see the cache below. */
@@ -153,6 +331,19 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
     in->max_numel = (long)max_numel;
     in->slot_bytes = align16((long)max_numel * in->esize);
     in->slot16 = in->slot_bytes / 16;
+    if (world == 8) {
+        const int rc8 = ar8_settle(in, rank, world);
+        if (rc8 != RAD_OK) return rc8;
+    }
+    if (in->shard_weighted) {
+        const long need16 =
+            2 * r4d_ar_shard_max_bound((long)max_numel * in->esize / 16, 8, in->shard_w);
+        /* Sized only if some message this instance carries is weighted. */
+        if (max_numel >= in->weights_min && need16 > in->slot16) {
+            in->slot16 = need16;
+            in->slot_bytes = need16 * 16;
+        }
+    }
 
     int maxb = 0, nb_design = 0, max_peers = 0;
     if (world == 2) {
@@ -163,11 +354,29 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
     }
     if (maxb <= 0) return RAD_E_DEVICE;
     in->max_blocks = maxb;
+    /* R4D_AR_MAX_BLOCKS: a ceiling on every collective's block count, for two engines sharing one
+     * set of cards. Each block of a collective spins until its twin on the peer card has pushed, and
+     * a prefill-sized ar_rmsnorm_quant_fp8 launches up to 256 blocks of 16 waves, twice what an
+     * R9700 holds. One engine survives that (both cards dispatch blocks in the same order, so the
+     * lowest unfinished block is resident on both); two engines do not: one engine's spinning blocks
+     * fill a card while their twins wait behind the other engine's kernel on the peer card, which
+     * waits for a slot on the full card. Not capped: the hyper-connection gathers of the MoE paths
+     * (r4d_ar_gather_hc_write without its inverse scratch, r4d_ar_hc_write_wht6), whose LDS table
+     * needs a minimum block count, which may exceed the ceiling (dense models do not use them).
+     * Two TP2 engines on two R9700s (Qwen3.8-27B and Gemma 3 27B) hung within a minute of
+     * concurrent prefill; MES then failed to evict the queues and the failed reset froze the
+     * host. Capped in both engines so that their spinners together cannot
+     * fill a card, the cycle cannot close. The flag and counter arrays keep their full size (maxb);
+     * only the launch counts shrink, and each element's sum is the same. Unset, nothing changes. */
+    if (const char* e = std::getenv("R4D_AR_MAX_BLOCKS")) {
+        const int cap = std::atoi(e);
+        if (cap > 0 && cap < in->max_blocks) in->max_blocks = cap;
+    }
     /* Launch ceilings: 24 at two ranks, the library's design count at width. The compressed
      * 2-rank wire uses up to 48, set at its own call site: it moves three eighths of the bytes, so
      * it needs more blocks to saturate the link. */
     in->nb_cap = (world == 2) ? 24 : (nb_design > 0 ? nb_design : maxb);
-    if (in->nb_cap > maxb) in->nb_cap = maxb;
+    if (in->nb_cap > in->max_blocks) in->nb_cap = in->max_blocks;
 
     /* Slots: one per (parity, source rank) at width; two at world 2, where there is one remote
      * writer. Flags: one word per (block, source rank) at width, one per block at world 2.
@@ -494,11 +703,19 @@ static int ar_setup(const RadArgs* a, ArCall* c, int shard_nb) {
     c->pub      = cfgv.pub;
 
     const long words16 = (long)n * in->esize / 16;
-    const long basis   = shard_nb ? words16 / in->world : words16;
+    long basis = shard_nb ? words16 / in->world : words16;
+    if (shard_nb && ar8_weights_for(in, n)) {
+        long off[R4D_MAX_RANKS + 1];
+        basis = r4d_ar_shard_table(words16, in->world, in->shard_w, off);
+    }
     /* The two-shots move shards, so they use the smaller basis and a tighter ceiling; the
      * full-message rule over-launches across the mid band. */
     int cap = in->nb_cap;
     if (shard_nb && cap > 24) cap = 24;
+    /* Every block handshakes with all seven peers at eight ranks; past eight blocks the extra
+     * flag rounds cost more than the added reduce bandwidth (8 against 16 blocks measured up to 3 %
+     * faster from 2097152 elements on). */
+    if (shard_nb && in->world == 8 && cap > 8) cap = 8;
     c->nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : nb_for(basis, cap);
     if (c->nblocks > in->max_blocks) c->nblocks = in->max_blocks;
     return RAD_OK;
@@ -838,10 +1055,18 @@ extern "C" int r4d_rad_ar_twoshot_8rank_exact(const RadArgs* a, RadStream s) {
     if (rc != RAD_OK) return rc;
     if (c.in->world != 8) return RAD_E_SHAPE;
     if (c.numel > R4D_AR_TWOSHOT_WIDE_MAX_ELEMS) return RAD_E_SHAPE;
-    const long words16 = c.numel * c.in->esize / 16;
-    if (words16 % c.in->world) return RAD_E_SHAPE;
-    if (2 * (c.numel * c.in->esize) / c.in->world > c.in->slot_bytes) return RAD_E_SCRATCH;
     const ArInst* in = c.in;
+    const int* weights = ar8_weights_for(in, c.numel);
+    /* Even shards keep the four-rank rule (whole words a rank); weighted ones are uneven anyway. */
+    const long words16 = c.numel * in->esize / 16;
+    if (!weights && words16 % in->world) return RAD_E_SHAPE;
+    long off[R4D_MAX_RANKS + 1];
+    const long sh_max = r4d_ar_shard_table(words16, in->world, weights, off);
+    if (2 * sh_max * 16 > in->slot_bytes) return RAD_E_SCRATCH;
+    /* Pieces only move the handshakes; the regions stay at 0 and sh_max, so scratch is as above. */
+    const long long asked = r4d_pgeti_or(a->p, a->n_p, "pieces", in->pieces);
+    if (asked < 0 || asked > R4D_AR_TS_MAX_PIECES) return RAD_E_INVAL;
+    const long long pieces = ar8_pieces_for(in, c.numel, asked);
     R4D_TRY("ar_twoshot_8rank_exact",
         r4d_ar_twoshot_8rank_exact(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
                                    in->peer_scratch[3], in->peer_scratch[4], in->peer_scratch[5],
@@ -852,7 +1077,7 @@ extern "C" int r4d_rad_ar_twoshot_8rank_exact(const RadArgs* a, RadStream s) {
                                    in->my_scratch, in->my_flags, in->my_seq, in->slot16,
                                    c.inp, c.out, c.numel, in->dtype, in->rank,
                                    (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
-                                   c.pub));
+                                   c.pub, weights, (long)pieces));
     return RAD_OK;
 }
 
@@ -932,7 +1157,7 @@ extern "C" int r4d_rad_ar_twoshot_4rank_ti8(const RadArgs* a, RadStream s) {
 
 /* ------------------------------------------------------------------ the fused all-reduce + norm */
 
-enum { AL_X = 0, AL_RESID, AL_W, AL_Q, AL_SCALE, AL_OUTBF16 };
+enum { AL_X = 0, AL_RESID, AL_W, AL_Q, AL_SCALE, AL_OUTBF16, AL_WPOST };
 
 extern "C" int r4d_rad_ar_ln_had_quant_i8(const RadArgs* a, RadStream s) {
     const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
@@ -985,6 +1210,7 @@ extern "C" int r4d_rad_ar_ln_had_quant_i8(const RadArgs* a, RadStream s) {
      * shim's count equal to the kernel's. */
     int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : nb_for(M * K * 2 / 16, in->max_blocks);
     if (nblocks > (int)M) nblocks = (int)M;
+    if (nblocks > in->max_blocks) nblocks = in->max_blocks;   // a tuned count under R4D_AR_MAX_BLOCKS too
     /* LDS floor on the block count. The compressed wire stages every row a block owns, so a count
      * chosen for the push alone can exceed LDS (at K = 5120, more than two rows per block). Raise
      * the count to the kernel's floor; refuse shapes no count within the flag capacity serves.
@@ -1025,8 +1251,13 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
     const RadTensor* q  = r4d_opt(a, AL_Q);
     const RadTensor* sc = r4d_opt(a, AL_SCALE);
     const RadTensor* ob = r4d_opt(a, AL_OUTBF16);
+    /* ar_rmsnorm_quant_fp8's optional post-norm (Gemma 3's sandwich); ar_ln_had_quant_i8 has no
+     * seventh operand, and this function serves only the fp8 op. */
+    const RadTensor* wpo = r4d_opt(a, AL_WPOST);
     if (!x || !w || !q || !sc) return RAD_E_INVAL;
     if (!r4d_contig(w)) return RAD_E_STRIDE;
+    if (wpo && (!rs || !r4d_contig(wpo) || r4d_numel(wpo) != r4d_numel(w) || wpo->dtype != w->dtype))
+        return RAD_E_SHAPE;
 
     /* Rank 2 everywhere, as in rmsnorm_quant_fp8: a norm has a gain per channel, so flattening
      * everything after dim 0 into the row would put one gain across several heads. */
@@ -1066,6 +1297,7 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
         /* This rank's packed-half side buffer exists for every bf16 instance; missing means a
          * broken init. */
         if (!in->locpack) return RAD_E_STATE;
+        if (wpo) return RAD_E_UNSUPPORTED;   // the post-norm is the exact wire's only
     }
 
     R4dArCfg cfgv;
@@ -1102,7 +1334,7 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
         r4d_addr(sc), (int)M, (int)K, eps, wadd, w_f32,
         (int)rp, (int)yp, (int)qp, (int)sp,
         (long)(uintptr_t)s, nblocks, nthreads, cfgv.drain, cfgv.acq, wire,
-        in->locpack, in->slot_bytes / 2);
+        in->locpack, in->slot_bytes / 2, wpo ? r4d_addr(wpo) : 0);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 

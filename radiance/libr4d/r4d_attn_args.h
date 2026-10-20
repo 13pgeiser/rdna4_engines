@@ -40,7 +40,9 @@ enum { AP_Q = 0, AP_KV, AP_BT, AP_SEQ, AP_KDS, AP_VDS, AP_CU, AP_OUT };
  * (q_len = total_q / num_seqs) only when it is not. In the ragged case q_len is the batch maximum,
  * taken from the parameter the arch block issued the op with (batch->max_q_len).
  */
-static inline int fill_paged(const RadArgs* a, R4DArgs* r, int expect_head_dim) {
+/* `row` is a token's bytes (elements for a 16-bit cache) in a (block, head) page: 2 * head_dim,
+ * or 25 * head_dim / 16 for the fp8_v4 cache (E4M3 K, int4 V, f16 group scales). */
+static inline int fill_paged_row(const RadArgs* a, R4DArgs* r, int expect_head_dim, long long row) {
     const RadTensor* q  = r4d_opt(a, AP_Q);
     const RadTensor* kv = r4d_opt(a, AP_KV);
     const RadTensor* bt = r4d_opt(a, AP_BT);
@@ -83,8 +85,8 @@ static inline int fill_paged(const RadArgs* a, R4DArgs* r, int expect_head_dim) 
      * Each (block, head) slot must be dense, because the kernel walks it with vector loads. */
     const long long block_size = kv->shape[2];
     if (kv->stride[3] != 1) return R4D_NO(RAD_E_STRIDE);
-    if (kv->stride[2] != 2 * head_dim) return R4D_NO(RAD_E_STRIDE);
-    if (kv->shape[3] != 2 * head_dim) return R4D_NO(RAD_E_SHAPE);
+    if (kv->stride[2] != row) return R4D_NO(RAD_E_STRIDE);
+    if (kv->shape[3] != row) return R4D_NO(RAD_E_SHAPE);
 
     /* 16-byte alignment for 128-bit loads. */
     if (!r4d_aligned(q->data, 16) || !r4d_aligned(o->data, 16) || !r4d_aligned(kv->data, 16))
@@ -149,5 +151,9 @@ static inline int split_of(const RadArgs* a) {
     return c.splits;
 }
 
+
+static inline int fill_paged(const RadArgs* a, R4DArgs* r, int expect_head_dim) {
+    return fill_paged_row(a, r, expect_head_dim, 2LL * expect_head_dim);
+}
 
 #endif  /* R4D_ATTN_ARGS_H */

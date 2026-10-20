@@ -1599,7 +1599,10 @@ const RadBatch* Scheduler::step() {
 /* ------------------------------------------------------------------ media */
 bool Scheduler::prefill_continues() const {
     std::lock_guard<std::mutex> lk(mu_);
-    if (stage_rows_ <= 0) return false;
+    /* Only the step being released has a plan to read. Between a commit and the next step (an
+     * encoder pass is prepared there) `plan_` is the committed step's, whose requests in_step() no
+     * longer holds: a cancel and reap may have released one (#127). */
+    if (stage_rows_ <= 0 || !step_open_) return false;
     /* The next step is held to decode rows (--prefill-interleave): experts staged for a chunk now
      * would be dropped by that step. */
     if (interleave_left_ > 0) return false;
@@ -2008,7 +2011,16 @@ void Scheduler::step_finished() {
     const int64_t ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(step_end - step_start_).count();
     m_.step_ns += ns;
-    if (plan_.phase == RAD_PHASE_DECODE) m_.step_ns_decode += ns;
+    if (plan_.phase == RAD_PHASE_DECODE) {
+        m_.step_ns_decode += ns;
+        /* The single-sequence floor over the step just timed (rad::DecodeFloor). A mixed step
+         * never counts: its decode row shares the step with a prefill chunk. */
+        if (plan_.n_seq_decode == 1) {
+            decode_floor_.update(ns);
+            m_.step_ns_decode_best  = decode_floor_.best();
+            m_.step_ns_decode_recent = decode_floor_.recent();
+        }
+    }
 
     const auto   from = step_start_ - last_step_at_ < std::chrono::milliseconds(500)
                             ? last_step_at_ : step_start_;

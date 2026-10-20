@@ -1,5 +1,5 @@
 #!/bin/sh
-# oot_plugins.sh BUILD SOURCE WORK [HIP_COMPILER HIP_TARGETS]
+# oot_plugins.sh BUILD SOURCE WORK [HIP_COMPILER HIP_TARGETS [VOPD_REPEATABLE]]
 #
 # THE PLUGINS RADIANCE SHIPS, BUILT THE WAY A THIRD PARTY BUILDS THEIRS. The tree's build is
 # installed into a prefix; then every plugin directory -- the kernel libraries, the quantisers,
@@ -19,13 +19,14 @@
 #      every host library implements (a norm, the fp8 activation quantiser, a gated activation)
 #      are enough;
 #   5. with HIP_COMPILER given, the device library the tree built (libr4d) is built out of tree
-#      too, for HIP_TARGETS, and compiles to the tree's device code. A replay of a device library
-#      needs a card, and this test must not touch one a server is using; the same instructions mean
-#      the tree's own GPU suite (ctest -L gpu) has already checked what the out-of-tree build
-#      produced.
+#      too, for HIP_TARGETS and at the tree's RAD_HIP_VOPD_REPEATABLE (VOPD_REPEATABLE, default
+#      OFF; on LLVM 24 it decides whether VOPD pairs, so it changes the code), and compiles to the
+#      tree's device code. A replay of a device library needs a card, and this test must not touch
+#      one a server is using; the same instructions mean the tree's own GPU suite (ctest -L gpu)
+#      has already checked what the out-of-tree build produced.
 set -eu
 B=$1; S=$2; W=$3
-HIPC=${4:-}; HIPT=${5:-}
+HIPC=${4:-}; HIPT=${5:-}; VOPD=${6:-OFF}
 GEN=${CMAKE_GENERATOR:-Ninja}
 J=${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc 2>/dev/null || echo 4)}
 
@@ -62,7 +63,8 @@ for d in $dirs; do
   n=$(basename "$d")
   say "building $d against the installed package"
   extra=""
-  is_dev "$n" && extra="-DCMAKE_HIP_COMPILER=$HIPC -DRAD_GPU_TARGETS=$HIPT"
+  is_dev "$n" && extra="-DCMAKE_HIP_COMPILER=$HIPC -DRAD_GPU_TARGETS=$HIPT
+                        -DRAD_HIP_VOPD_REPEATABLE=$VOPD"
   # shellcheck disable=SC2086
   run "$W/logs/$n.configure.log" cmake -S "$S/$d" -B "$W/b/$n" -G "$GEN" \
       -DCMAKE_PREFIX_PATH="$P" -DRAD_PLUGIN_INSTALL_HOME="$H" $extra

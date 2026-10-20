@@ -53,6 +53,9 @@
 // LDSB: an LDS-scoped barrier instead of __syncthreads() (lds_barrier() in r4d_common.h). The
 // default fence invalidates the vector cache twice per tile, though only LDS needs ordering.
 #define O_LDSB  2097152
+// O_V4: the fp8_v4 cache, O_V4 | O_K6 the k6_v4 cache (see r4d_attn_decode_h256_gqa6.hip).
+#define O_V4    33554432
+#define O_K6    67108864
 
 // bf16 dword -> 16-bit dword in the target format, optionally scaled. Used once per kernel on Q.
 template<class D, int FOLDQ, int F16>
@@ -77,7 +80,14 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     constexpr int SGB   = (OPT & O_SGB) ? 1 : 0;
     constexpr int DOT2  = ((OPT & O_DOT2) && (OPT & O_F16)) ? 1 : 0;
     constexpr int BTS   = (OPT & O_BTS)   ? 1 : 0;
-    constexpr int GPREV = (OPT & O_GPREV) ? 1 : 0;
+    constexpr int V4    = ((OPT & O_V4) && !KVP) ? 1 : 0;
+    constexpr int K6    = ((OPT & O_K6) && V4) ? 1 : 0;
+    // A token's row in a page, and where in it V's codes, V's scales and K's scales start.
+    constexpr int ROWB  = K6 ? HEAD_DIM * 22 / 16 : V4 ? HEAD_DIM * 25 / 16 : 2 * HEAD_DIM;
+    constexpr int VOFF  = K6 ? HEAD_DIM * 3 / 4 : HEAD_DIM;
+    constexpr int VSOFF = K6 ? HEAD_DIM * 21 / 16 : HEAD_DIM * 3 / 2;
+    constexpr int KSOFF = HEAD_DIM * 5 / 4;
+    constexpr int GPREV = ((OPT & O_GPREV) && !V4) ? 1 : 0;
     constexpr int LDSB  = (OPT & O_LDSB)  ? 1 : 0;
     constexpr int KWIDE = (OPT & O_KWIDE) ? 1 : 0;
     typedef DT16<F16> D;
@@ -100,6 +110,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     constexpr float PSHIFT = D::SHIFT;
     constexpr float PGROW  = D::GROW;
     static_assert(!KWIDE || KPASS == 1, "the wide K fetch is one straight-line pass");
+    static_assert(!K6 || KWIDE, "k6_v4 K is staged sixteen dims a thread");
 
     __shared__ uint16_t sK[TILE * KSTR];
     __shared__ uint16_t sV16[HEAD_DIM * VSTR];
@@ -173,6 +184,69 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     const int vg = lane >> 3, vj = lane & 7;
     uint4 kreg[KREGS], vreg[VREGS];
 
+    // ---- fp8_v4 / k6_v4: V is int4 in groups of 32 with an f16 scale (absmax / 7): 16 bytes of
+    // codes a group at VOFF (dim d at bits 4*(d%8) of word d/8), the group scales at VSOFF. A thread stages one key pair's 8 dims: two code words and the pair's scale,
+    // fetched a tile ahead like GPREV's V, so the loads are in flight across the m-tile loop. They
+    // widen into sV16 ([dim][key]) as a dword per dim holding both keys: with u = code ^ 8 (offset
+    // binary), 0x6400 | u is the f16 1024 + u, so (x - 1032) * s is the value times s, rounded
+    // once. Key pairs run fastest across lanes,
+    // which keeps the dword stores of one dim row in distinct banks.
+    static_assert(!V4 || F16, "fp8_v4 widens V to f16");
+    constexpr int NP4 = (TILE / 2) * (HEAD_DIM / 8);
+    constexpr int U4  = V4 ? (NP4 + NTHR - 1) / NTHR : 1;
+    uint32_t v4c[U4][2], v4s[U4];
+    auto fetchV4 = [&](int k0, const int* blks) {
+        #pragma unroll
+        for (int r = 0; r < U4; ++r) {
+            const int u = tid + r * NTHR;
+            if (NP4 % NTHR == 0 || u < NP4) {
+                const int kp = u % (TILE / 2), o = u / (TILE / 2);
+                uint32_t sc[2];
+                #pragma unroll
+                for (int j = 0; j < 2; ++j) {
+                    const int kk = min(k0 + 2 * kp + j, ctx - 1);
+                    const int bk = BTS ? blks[(kk - k0) / BS] : bt[kk / BS];
+                    const uint8_t* base = (const uint8_t*)a.kv + (size_t)bk * a.kv_block_stride
+                                        + (size_t)kvh * a.kv_head_stride + (size_t)(kk % BS) * ROWB;
+                    v4c[r][j] = *(const uint32_t*)(base + VOFF + o * 4);
+                    sc[j]     = *(const uint16_t*)(base + VSOFF + (o >> 2) * 2);
+                }
+                v4s[r] = sc[0] | (sc[1] << 16);
+            }
+        }
+    };
+    auto storeV4 = [&]() {
+        typedef _Float16 h2 __attribute__((ext_vector_type(2)));
+        #pragma unroll
+        for (int r = 0; r < U4; ++r) {
+            const int u = tid + r * NTHR;
+            if (NP4 % NTHR == 0 || u < NP4) {
+                const int kp = u % (TILE / 2), o = u / (TILE / 2);
+                // Codes are two's complement nibbles; ^ 8 makes them offset binary (value + 8).
+                const uint32_t n0 = (v4c[r][0] & 0x0F0F0F0Fu) ^ 0x08080808u;
+                const uint32_t m0 = ((v4c[r][0] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
+                const uint32_t n1 = (v4c[r][1] & 0x0F0F0F0Fu) ^ 0x08080808u;
+                const uint32_t m1 = ((v4c[r][1] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u;
+                const h2 s2 = __builtin_bit_cast(h2, v4s[r]);
+                const h2 bias = { (_Float16)1032.0f, (_Float16)1032.0f };
+                uint16_t* dst = &sV16[(o * 8) * VSTR + 2 * kp];
+                #pragma unroll
+                for (int b = 0; b < 4; ++b) {
+                    // Byte b of the first key's word low, of the second key's word in the high half:
+                    // perm selects source bytes 0-3 from its second operand, 4-7 from its first,
+                    // and 0x0c is a zero byte.
+                    const uint32_t sel = (uint32_t)b | 0x0c00u | ((uint32_t)(4 + b) << 16) | 0x0c000000u;
+                    const uint32_t lo = __builtin_amdgcn_perm(n1, n0, sel) | 0x64006400u;   // dim 2b
+                    const uint32_t hi = __builtin_amdgcn_perm(m1, m0, sel) | 0x64006400u;   // dim 2b+1
+                    const h2 vl = (__builtin_bit_cast(h2, lo) - bias) * s2;
+                    const h2 vh = (__builtin_bit_cast(h2, hi) - bias) * s2;
+                    *(uint32_t*)(dst + (2 * b) * VSTR)     = __builtin_bit_cast(uint32_t, vl);
+                    *(uint32_t*)(dst + (2 * b + 1) * VSTR) = __builtin_bit_cast(uint32_t, vh);
+                }
+            }
+        }
+    };
+
     auto fetchK = [&](int k0, const int* blks) {
         #pragma unroll
         for (int p = 0; p < KPASS; ++p) {
@@ -184,12 +258,18 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                 const int kk  = min(k0 + key, ctx - 1);
                 const int blk = BTS ? blks[(kk - k0) / BS] : bt[kk / BS];
                 const size_t o = (size_t)blk * a.kv_block_stride
-                               + (size_t)kvh * a.kv_head_stride + (size_t)(kk % BS) * (2 * HEAD_DIM);
+                               + (size_t)kvh * a.kv_head_stride + (size_t)(kk % BS) * ROWB;
                 if (KVP) {
                     const uint16_t* g = (const uint16_t*)a.kv + o + ch * KEL;
                     #pragma unroll
                     for (int q = 0; q < (KVP ? (KEL / 8) : 1); ++q)
                         kreg[p * (KEL / 8) + q] = *(const uint4*)(g + 8 * q);
+                } else if (K6) {
+                    // k6_v4: the chunk's sixteen low nibbles, its high-bit word, its group's scale.
+                    const uint8_t* rp = (const uint8_t*)a.kv + o;
+                    const uint2 lo = *(const uint2*)(rp + ch * 8);
+                    kreg[p] = make_uint4(lo.x, lo.y, *(const uint32_t*)(rp + HEAD_DIM / 2 + ch * 4),
+                                         *(const uint16_t*)(rp + KSOFF + (ch >> 1) * 2));
                 } else if (KWIDE) {
                     kreg[p] = *(const uint4*)((const uint8_t*)a.kv + o + ch * 16);
                 } else {
@@ -212,7 +292,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                 const int blk = BTS ? blks[(kk - k0) / BS] : bt[kk / BS];
                 const size_t o = (size_t)blk * a.kv_block_stride
                                + (size_t)kvh * a.kv_head_stride
-                               + (size_t)(kk % BS) * (2 * HEAD_DIM) + HEAD_DIM + d0;
+                               + (size_t)(kk % BS) * ROWB + HEAD_DIM + d0;
                 const void* p = KVP ? (const void*)((const uint16_t*)a.kv + o)
                                     : (const void*)((const uint8_t*)a.kv + o);
                 vreg[r] = __builtin_bit_cast(uint4, load_tr_b128(p));
@@ -238,7 +318,8 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                         w4[2] = D::from_bf16w(r.z); w4[3] = D::from_bf16w(r.w);
                     } else {
                         const uint4 r = kreg[p];
-                        fp8x8_to_16x4w<D>(q ? make_uint2(r.z, r.w) : make_uint2(r.x, r.y), w4);
+                        if constexpr (K6) k6x8_to_f16x4w(q ? r.y : r.x, r.z, q, r.w | (r.w << 16), w4);
+                        else fp8x8_to_16x4w<D>(q ? make_uint2(r.z, r.w) : make_uint2(r.x, r.y), w4);
                     }
                     *(uint2*)(kd + 8 * q)     = make_uint2(w4[0], w4[1]);
                     *(uint2*)(kd + 8 * q + 4) = make_uint2(w4[2], w4[3]);
@@ -296,6 +377,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     int blk[NB];
     if (BTS) load_bt(tstart * NB, blk);
     if (GPREV) fetchV(tstart * TILE, blk);
+    if (V4) fetchV4(tstart * TILE, blk);
 
     for (int ti = tstart; ti < ntiles; ++ti) {
         const int k0 = ti * TILE;
@@ -305,13 +387,14 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
         }
         if (LDSB) lds_barrier(); else __syncthreads();
         fetchK(k0, blk);
-        if (!GPREV) fetchV(k0, blk);
-        storeV();              // V first: already in registers, so it covers K's load latency
+        // V first: already in registers, so it covers K's load latency.
+        if constexpr (V4) { storeV4(); } else { if (!GPREV) fetchV(k0, blk); storeV(); }
         storeK();
         if (LDSB) lds_barrier(); else __syncthreads();
         // Issue the next tile's V loads before the WMMAs below; they are consumed after the next
         // barrier.
         if (GPREV && ti + 1 < ntiles) fetchV(k0 + TILE, blkn);
+        if (V4 && ti + 1 < ntiles) fetchV4(k0 + TILE, blkn);
 
         #pragma unroll 1
         for (int mt = 0; mt < MT; ++mt) {

@@ -1,0 +1,14 @@
+# ltx-2.5-bf16.recipe -- LTX-2.5 (the base or the distilled DiT) at the checkpoint's precision.
+#
+#   rad-convert <LTX-2.5 diffusers pipeline directory> --recipe data/recipes/ltx-2.5-bf16.recipe \
+#       -o ltx-2.5-bf16.rad
+#
+# The text encoder, the connectors, the DiT, both VAEs and the latent upsampler are kept bf16. The
+# vocoders run in f32 and a pipeline saved in bf16 holds them bf16, so they are cast here, once; the
+# spectrogram bases stay bf16.
+
+voc.conv_*                           cast dtype=f32
+voc.upsamplers.*                     cast dtype=f32
+voc.resnets.*                        cast dtype=f32
+voc.act_out.*                        cast dtype=f32
+bwe.*                                cast dtype=f32

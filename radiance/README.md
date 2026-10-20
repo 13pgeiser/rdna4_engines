@@ -23,16 +23,26 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | Qwen3.8-27B FP8, DFlash2 drafter, vision | `qwen3.8-27b-fp8.rad` (29 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.8-27b-fp8) | `qwen3.8-27b-fp8.yaml` |
 | Qwen3.8-27B MXFP4 (AMD Quark AWQ), DFlash2 drafter, vision | `qwen3.8-27b-mxfp4.rad` (19 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.8-27b-mxfp4) | `qwen3.8-27b-mxfp4.yaml` |
 | Qwen3.6-35B-A3B FP8, MTP | `qwen3.6-35b-a3b-fp8.rad` (35 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.6-35b-a3b-fp8) | `qwen3.6-35b-a3b.yaml` |
+| Ornith-1.5-35B-A3B FP8, MTP, vision | `ornith-1.5-35b-a3b-fp8.rad` (35 GiB) | [download](https://huggingface.co/keptn/ornith-1.5-35b-a3b-fp8) | `ornith-1.5-35b-a3b.yaml` |
 | MiniCPM5-2B FP8, DSpark drafter | `minicpm5-2b-fp8.rad` (3 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-fp8) | `minicpm5-2b.yaml` |
 | MiniCPM5-2B bf16, DSpark drafter | `minicpm5-2b-bf16.rad` (5 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-bf16) | `minicpm5-2b-bf16.yaml` |
 | Gemma 4 31B: GPTQ int4 trunk, int8 activations, MTP, vision | `gemma4-31b-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-w4a8) | `gemma4-31b-w4a8.yaml` |
+| Gemma 4 31B heretic-ara (refusals removed): GPTQ int4 trunk, int8 activations, MTP, vision | `gemma4-31b-heretic-ara-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-heretic-ara-w4a8) | `gemma4-31b-heretic-ara-w4a8.yaml` |
 | Qwen-Image 2.1 FP8: text to image and image edits | `qwen-image-2.1-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-fp8) | `qwen-image-2.1.yaml` |
 | Qwen-Image 2.1 Turbo FP8: the same in 8 steps | `qwen-image-2.1-turbo-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-turbo-fp8) | `qwen-image-2.1-turbo.yaml` |
+| Krea 2 Turbo FP8: text to image, one card | `krea-2-turbo-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/krea-2-turbo-radiance-fp8) | `krea-2-turbo.yaml` |
+| Krea 2 Raw FP8: the same, undistilled | `krea-2-raw-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/krea-2-raw-radiance-fp8) | `krea-2-raw.yaml` |
+| FLUX.3 [klein] FP8: text to image and edits from up to ten pictures, one card | `flux-3-klein-fp8.rad` (9.3 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-flux-3-klein-fp8) | `flux-3-klein.yaml` |
+| FLUX.3 [klein] base FP8 | `flux-3-klein-base-fp8.rad` (9.3 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-flux-3-klein-base-fp8) | `flux-3-klein.yaml` |
+| LTX-2.5 distilled FP8: video with its stereo soundtrack from text or a first frame, one card | `ltx-2.5-distilled-fp8.rad` (37 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-ltx-2.5-distilled-fp8) | `ltx-2.5.yaml` |
+| LTX-2.5 base FP8 | `ltx-2.5-fp8.rad` (37 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-ltx-2.5-fp8) | `ltx-2.5.yaml` |
 | MiniMax-H3 FP8: video with its stereo soundtrack from text | `minimax-h3-fp8.rad` (60 GiB) | [download](https://huggingface.co/StillDeadcode/minimax-h3-fp8) | `minimax-h3.yaml` |
 | FastH3 8-Step V2 FP8: the same in eight steps | `fasth3-8-step-v2-fp8.rad` (62 GiB) | [download](https://huggingface.co/StillDeadcode/fasth3-8-step-v2-fp8) | `fasth3.yaml` |
 | MiniMax-Music3 bf16: songs from lyrics and a description | `minimax-music3-bf16.rad` (20 GiB) | [download](https://huggingface.co/StillDeadcode/minimax-music3-bf16) | `minimax-music3.yaml` |
 | Breeze-TTS-2 bf16: speech, whole, streamed or live, one card | `breeze-tts2-bf16.rad` (5.5 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-breeze-tts2-bf16) | `breeze-tts2.yaml` |
 | Qwen3.8-27B ParoQuant int4, int5 or MXFP4 (learned rotations), DFlash2 drafter, vision | `qwen3.8-27b-paro-int4.rad` (19 GiB; int5 22 GiB) | [convert](#convert-a-checkpoint) | `qwen3.8-27b-paro.yaml` |
+| TranslateGemma 27B MXFP4 (GPTQ), translation; optional DFlash2 drafter | `translategemma-27b-mxfp4-gptq.rad` (17 GiB) | [convert](#convert-a-checkpoint) | `translategemma-27b.yaml` |
+| GLM-5.3-Flash: MXFP4 experts and block-FP8 attention (AMD Quark), MTP, eight cards | `glm53-flash-mxfp4.rad` (171 GiB) | [convert](#convert-a-checkpoint) | `glm53-flash.yaml` |
 | Qwen3.8-27B bf16 | `qwen3.8-27b-bf16.rad` (50 GiB) | [convert](#convert-a-checkpoint) | `qwen3.8-27b-bf16.yaml` |
 | Qwen3.8-Flash-Next bf16, a disk-streamed reference | `qwen3.8-flash-next-bf16.rad` (335 GiB) | [convert](#convert-a-checkpoint) | `flashnext-bf16.yaml` |
 | EmbeddingGemma 2 bf16: text, image, video and audio embeddings, one card | `embeddinggemma2-bf16.rad` (1.4 GiB) | [convert](#convert-a-checkpoint) | `embeddinggemma2.yaml` |
@@ -53,6 +63,24 @@ repository has the recipe and the calibration step. To convert Google's bf16 che
 with a scale search, bf16 lm_head); see [Convert a checkpoint](#convert-a-checkpoint). On two R9700s
 that container decodes at 103 tok/s on prose and 141 on code, against 112 and 150 for keptn42's,
 and accepts 0.46 of its drafts on prose against 0.50.
+
+TranslateGemma 27B is converted from Google's bf16 checkpoint in three steps: an int8 container to
+calibrate in, its Gram matrices over translation prompts, then MXFP4 with GPTQ
+(`data/recipes/translategemma-27b-*.recipe`, the steps in docs/ARCHITECTURES.md). On two R9700s it
+decodes 56 tok/s a stream (205 at four) and scores mean KL 0.042 against the bf16 model on held-out
+translations; with a DFlash2 drafter, 152 a stream. Its chat template takes structured turns
+naming the two languages and refuses the plain turn the server renders at startup, so
+`translategemma-27b.yaml` serves a plain Gemma 3 template (`deploy/compose/gemma3.jinja`) and a
+client sends on `/v1/completions` the prompt the checkpoint's template renders.
+
+GLM-5.3-Flash is converted from AMD's Quark export (`amd/GLM-5.3-Flash-Quark-MXFP4`) with
+`data/recipes/glm53-mxfp4.recipe`, which keeps every weight as stored except the latent
+attention's small kv_b, decoded to bf16. At 171 GiB it takes eight R9700s (`--tp 8`), every expert
+resident, and its own MTP layer drafts. On eight R9700s it prefills 3958 tok/s at 6k tokens,
+decodes 166 tok/s on one stream and 426 over eight, and 506 under eight streams of agent turns.
+It serves text only, with a bf16 KV cache. Its template knows the reasoning efforts `low` and
+`high` and renders any other as its maximum, so `glm53-flash.yaml` maps `medium` and `xhigh`
+to `high`.
 
 The ParoQuant containers keep the trunk exactly as the ParoQuant releases ship it, with the learned
 Givens rotations it was trained in. Convert int4 from `z-lab/Qwen3.8-27B-PARO`, int5 from

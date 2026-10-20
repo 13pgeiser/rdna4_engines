@@ -604,6 +604,8 @@ private:
      * covered, both decayed with the same time constant, so their ratio is tokens over time. */
     double  tps_win_prefill_ = 0.0, tps_win_decode_ = 0.0, tps_win_time_ = 0.0;
     bool    step_open_ = false;
+    /* The single-sequence decode floor (rad::DecodeFloor), fed by step_finished. */
+    DecodeFloor decode_floor_;
 
     /* arrival; mu_ held */
     int  add_locked(std::unique_ptr<Request> r);

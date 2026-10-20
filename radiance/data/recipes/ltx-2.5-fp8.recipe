@@ -1,0 +1,37 @@
+# ltx-2.5-fp8.recipe -- LTX-2.5 (the base or the distilled DiT) with block-scaled fp8 linears.
+#
+#   rad-convert <LTX-2.5 diffusers pipeline directory> --recipe data/recipes/ltx-2.5-fp8.recipe \
+#       -o ltx-2.5-fp8.rad
+#
+# Every linear of the text encoder (Gemma 4), of the two connectors and of the DiT's 48 blocks
+# becomes E4M3 codes with a bf16 scale a 128 x 128 block, read by the fp8a8 GEMMs over activations
+# quantised the same way; the biases stay bf16 and are added after. What stays bf16 is small or
+# read once a step: the attention gates' logits, the q and k norms, the patch projections, the
+# timestep MLPs and the tables, the connectors' registers, both VAEs and the latent upsampler.
+# The vocoders are cast to f32, which their convolutions and anti-aliased activations run in
+# (a pipeline saved in bf16 holds them bf16); the spectrogram bases stay bf16.
+
+te.blk.*.attn_q.weight               rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.attn_k.weight               rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.attn_v.weight               rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.attn_output.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.ffn_gate_up.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.ffn_down.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+conn.*.proj.weight                   rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+conn.*.blk.*.qkv.weight              rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+conn.*.blk.*.out.weight              rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+conn.*.blk.*.ff_up.weight            rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+conn.*.blk.*.ff_down.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.qkv.weight                 rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.q.weight                   rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.kv.weight                  rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.out.weight                 rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.ff_up.weight               rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.ff_down.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.audio_ff_up.weight         rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.audio_ff_down.weight       rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+voc.conv_*                           cast dtype=f32
+voc.upsamplers.*                     cast dtype=f32
+voc.resnets.*                        cast dtype=f32
+voc.act_out.*                        cast dtype=f32
+bwe.*                                cast dtype=f32

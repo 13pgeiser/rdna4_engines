@@ -65,13 +65,26 @@ static inline int lds_cap_of() {
     return v;
 }
 
+/* The order key, by the op's `signed` parameter: the unsigned order (Signed = false, the
+ * default) or the signed one. Key 0 means "no block" in both. */
+template <bool Signed> __device__ __forceinline__ uint32_t keyof(float v, int page);
+
 /* Order key. Scores are >= 0 or -inf, and non-negative float bit patterns order as unsigned.
  * `+1` keeps a live score of exactly zero above key 0, which means "no block". The clamp is a
  * select, not fmaxf: fmaxf(-0.0f, 0.0f) may return -0.0f, whose sign bit would rank it above
  * every positive score. */
-__device__ __forceinline__ uint32_t keyof(float v, int page) {
+template <> __device__ __forceinline__ uint32_t keyof<false>(float v, int page) {
     if (page < 0 || !(v > -1e30f)) return 0u;
     return __float_as_uint(v > 0.0f ? v : 0.0f) + 1u;
+}
+
+/* Signed order key, for indexers whose scores can be negative (GLM's head gates): the float's
+ * total order over all 32 bits. Absent pages and nonfinite scores are key 0, which no finite
+ * score maps to (only NaN bit patterns would); both signed zeros map to one key, so they tie. */
+template <> __device__ __forceinline__ uint32_t keyof<true>(float v, int page) {
+    if (page < 0 || !__builtin_isfinite(v)) return 0u;
+    const uint32_t bits = v == 0 ? 0u : __float_as_uint(v);
+    return (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
 }
 
 /* Scans run in registers on DPP (five steps per wave, r4d_common.h); only wave totals go through
@@ -115,6 +128,7 @@ __device__ __forceinline__ void counts_before(const uint32_t* wsum, int lane, in
  * block table and complete-block count. The per-query bound is (pos + 1) / ratio: block b is
  * entirely in the query's past when b * ratio + ratio - 1 <= pos. At decode this equals the
  * sequence's complete count. */
+template <bool Signed>
 __global__ __launch_bounds__(kThreads) void qsa_select_kernel(
     const float* __restrict__ score, const int32_t* __restrict__ bt,
     const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
@@ -153,7 +167,7 @@ __global__ __launch_bounds__(kThreads) void qsa_select_kernel(
     if (cached) {
         for (int b0 = 0; b0 < n; b0 += kThreads) {
             const int b = b0 + t;
-            if (b < n) sh_key[b] = keyof(sc[b], tb[b]);
+            if (b < n) sh_key[b] = keyof<Signed>(sc[b], tb[b]);
         }
         __syncthreads();
     }
@@ -168,7 +182,7 @@ __global__ __launch_bounds__(kThreads) void qsa_select_kernel(
             __syncthreads();
             const uint32_t mask = (shift == 24) ? 0u : (0xFFFFFFFFu << (shift + 8));
             for (int b = t; b < n; b += kThreads) {
-                const uint32_t k = cached ? sh_key[b] : keyof(sc[b], tb[b]);
+                const uint32_t k = cached ? sh_key[b] : keyof<Signed>(sc[b], tb[b]);
                 if (k != 0u && (k & mask) == (fixed & mask))
                     atomicAdd(&hist[(k >> shift) & 255u], 1u);
             }
@@ -214,7 +228,7 @@ __global__ __launch_bounds__(kThreads) void qsa_select_kernel(
     for (int b0 = 0; b0 < n; b0 += kThreads) {
         const int b = b0 + t;
         uint32_t k = 0;
-        if (b < n) k = cached ? sh_key[b] : keyof(sc[b], tb[b]);
+        if (b < n) k = cached ? sh_key[b] : keyof<Signed>(sc[b], tb[b]);
         const bool hi = k != 0u && (n <= topk || k > T);
         const bool eq = k != 0u && n > topk && k == T;
 
@@ -297,7 +311,14 @@ __global__ __launch_bounds__(kThreads) void qsa_select_kernel(
  * count) does not depend on the digit split, and the emit is the same. r4d_selftest compares the
  * two byte for byte. */
 constexpr int kWideBits    = 12;                     /* the first digit */
-constexpr int kWideShift   = 31 - kWideBits;         /* a key's bit 31 is clear: see keyof */
+/* The first digit's shift, by key order. */
+template <bool Signed> struct WideKey;
+template <> struct WideKey<false> {
+    static constexpr int kWideShift   = 31 - kWideBits;         /* a key's bit 31 is clear: see keyof */
+};
+template <> struct WideKey<true> {
+    static constexpr int kWideShift   = 32 - kWideBits;         /* the signed key uses all 32 bits */
+};
 constexpr int kWideBins    = 1 << kWideBits;
 constexpr int kWideCand    = kWideBins - kBins;      /* keys the second pass may collect */
 constexpr int kWidePer     = kWideBins / kThreads;   /* first-digit bins a thread scans */
@@ -377,6 +398,7 @@ __device__ __forceinline__ void lds_kth(const uint32_t* keys, int cnt, uint32_t 
     *need = want;
 }
 
+template <bool Signed>
 __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
     const float* __restrict__ score, const int32_t* __restrict__ bt,
     const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
@@ -402,6 +424,7 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
     const int m = blockIdx.x;
     const int t = threadIdx.x;
     const int lane = t & (kWave - 1), wave = t >> 5;
+    constexpr int kWideShift = WideKey<Signed>::kWideShift;
 
     if (t == 0) sh_seq = 0;
     __syncthreads();
@@ -426,7 +449,7 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
         for (int i = t; i < kSamp; i += kThreads) {
             const int  r = i / kSampRun, j = i % kSampRun;
             const long b = (long)r * (n - kSampRun) / (kSampRuns - 1) + j;
-            samp[i] = keyof(sc[b], tb[b]);
+            samp[i] = keyof<Signed>(sc[b], tb[b]);
         }
         __syncthreads();
         uint32_t ms = (uint32_t)(((uint64_t)topk * 2u * kSamp + (uint64_t)n - 1u) / (uint64_t)n) + 8u;
@@ -448,14 +471,14 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
             if (vec && bb + kPer <= n) {
                 const float4 s0 = *(const float4*)(sc + bb), s1 = *(const float4*)(sc + bb + 4);
                 const int4   p0 = *(const int4*)(tb + bb),   p1 = *(const int4*)(tb + bb + 4);
-                kk[0] = keyof(s0.x, p0.x); kk[1] = keyof(s0.y, p0.y);
-                kk[2] = keyof(s0.z, p0.z); kk[3] = keyof(s0.w, p0.w);
-                kk[4] = keyof(s1.x, p1.x); kk[5] = keyof(s1.y, p1.y);
-                kk[6] = keyof(s1.z, p1.z); kk[7] = keyof(s1.w, p1.w);
+                kk[0] = keyof<Signed>(s0.x, p0.x); kk[1] = keyof<Signed>(s0.y, p0.y);
+                kk[2] = keyof<Signed>(s0.z, p0.z); kk[3] = keyof<Signed>(s0.w, p0.w);
+                kk[4] = keyof<Signed>(s1.x, p1.x); kk[5] = keyof<Signed>(s1.y, p1.y);
+                kk[6] = keyof<Signed>(s1.z, p1.z); kk[7] = keyof<Signed>(s1.w, p1.w);
             } else {
 #pragma unroll
                 for (int e = 0; e < kPer; ++e)
-                    kk[e] = bb + e < n ? keyof(sc[bb + e], tb[bb + e]) : 0u;
+                    kk[e] = bb + e < n ? keyof<Signed>(sc[bb + e], tb[bb + e]) : 0u;
             }
             uint32_t mine = 0;
 #pragma unroll
@@ -514,7 +537,7 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
         for (int i = t; i < kWideBins; i += kThreads) wide[i] = 0;
         __syncthreads();
         for (int b = t; b < n; b += kThreads) {
-            const uint32_t k = keyof(sc[b], tb[b]);
+            const uint32_t k = keyof<Signed>(sc[b], tb[b]);
             if (k != 0u) atomicAdd(&wide[k >> kWideShift], 1u);
         }
         __syncthreads();
@@ -565,7 +588,7 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
                 uint32_t n_in = 0;
                 for (int b0 = 0; b0 < n; b0 += kThreads) {
                     const int b = b0 + t;
-                    const uint32_t k = b < n ? keyof(sc[b], tb[b]) : 0u;
+                    const uint32_t k = b < n ? keyof<Signed>(sc[b], tb[b]) : 0u;
                     const bool abv = k != 0u && (k >> kWideShift) > B;
                     const bool inb = k != 0u && (k >> kWideShift) == B;
                     const unsigned long long ma = __ballot(abv), mi = __ballot(inb);
@@ -594,7 +617,7 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
                 __syncthreads();
             } else if (inlds) {
                 for (int b = t; b < n; b += kThreads) {
-                    const uint32_t k = keyof(sc[b], tb[b]);
+                    const uint32_t k = keyof<Signed>(sc[b], tb[b]);
                     if (k != 0u && (k >> kWideShift) == B) cand[atomicAdd(&sh_cnt, 1u)] = k;
                 }
                 __syncthreads();
@@ -602,7 +625,7 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
             const int ncand = (merged || inlds) ? (int)sh_cnt : n;
             const uint32_t* const keys = merged ? mkey : cand;
 
-            /* ---- the other 19 bits: digits of 8, 8 and 3. */
+            /* ---- the other 19 bits: digits of 8, 8 and 3 (20 bits and 8, 8, 4 when signed). */
             const int shifts[3] = { kWideShift - 8, kWideShift - 16, 0 };
             const int widths[3] = { 8, 8, kWideShift - 16 };
 #pragma unroll
@@ -613,7 +636,7 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
                 for (int i = t; i < kBins; i += kThreads) hist[i] = 0;
                 __syncthreads();
                 for (int i = t; i < ncand; i += kThreads) {
-                    const uint32_t k = (merged || inlds) ? keys[i] : keyof(sc[i], tb[i]);
+                    const uint32_t k = (merged || inlds) ? keys[i] : keyof<Signed>(sc[i], tb[i]);
                     if (k != 0u && (k & hm) == (fixed & hm)) atomicAdd(&hist[(k >> shift) & dm], 1u);
                 }
                 __syncthreads();
@@ -687,7 +710,7 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
     for (int b0 = 0; b0 < ((merged || sampled) ? 0 : n); b0 += kThreads) {
         const int b = b0 + t;
         uint32_t k = 0;
-        if (b < n) k = keyof(sc[b], tb[b]);
+        if (b < n) k = keyof<Signed>(sc[b], tb[b]);
         const bool hi = k != 0u && (n <= topk || k > T);
         const bool eq = k != 0u && n > topk && k == T;
 
@@ -887,6 +910,7 @@ __device__ __forceinline__ ParTake par_take(ParEmit& e, uint32_t k, int lane, in
 }
 
 /* ---- pass one: every chunk's own top-k, as (key, block index) in block order. */
+template <bool Signed>
 __global__ __launch_bounds__(kLocalThreads) void qsa_local_kernel(
     const float* __restrict__ score, const int32_t* __restrict__ bt,
     const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
@@ -921,7 +945,7 @@ __global__ __launch_bounds__(kLocalThreads) void qsa_local_kernel(
 
     const float*   sc = score + (size_t)m * s_ld;
     const int32_t* tb = bt    + (size_t)seq * t_ld;
-    for (int i = t; i < cn; i += LT) sh_key[i] = keyof(sc[lo + i], tb[lo + i]);
+    for (int i = t; i < cn; i += LT) sh_key[i] = keyof<Signed>(sc[lo + i], tb[lo + i]);
     __syncthreads();
 
     ParEmit e{ wsum, &sh_hi, &sh_ord, 0u, 0u, 0u, cn <= topk };
@@ -955,6 +979,7 @@ __global__ __launch_bounds__(kLocalThreads) void qsa_local_kernel(
 }
 
 /* ---- pass two: merge the chunk lists and emit the page-id table. */
+template <bool Signed>
 __global__ __launch_bounds__(kMergeThreads) void qsa_merge_kernel(
     const uint32_t* __restrict__ ck, const int32_t* __restrict__ ci,
     const int32_t* __restrict__ cc, const int32_t* __restrict__ bt,
@@ -1071,6 +1096,8 @@ static inline int64_t par_scratch_bytes(long long topk) {
 //   cu    [nseq+1]       i32, cumulative query counts: which sequence a query row belongs to
 //   sel   [M][topk+1]    i32, `o_ld` elements a row (0 = topk+1); -1 padded
 //   nsel  [M]            i32
+// Signed selects the key order (keyof), from the op's `signed` parameter.
+template <bool Signed>
 static int r4d_qsa_select_bf16_emit(long score, long bt, long nc, long pos, long cu, long sel,
                                    long nsel, long seqused, int M, int nb, int topk, int ratio,
                                    int nseq, int s_ld, int t_ld, int o_ld,
@@ -1093,13 +1120,14 @@ static int r4d_qsa_select_bf16_emit(long score, long bt, long nc, long pos, long
         uint32_t* ck = (uint32_t*)scratch;
         int32_t*  ci = (int32_t*)(ck + (size_t)kParM * kParWMax * topk);
         int32_t*  cc = ci + (size_t)kParM * kParWMax * topk;
-        const int rc = R4D_EMIT(stream, qsa_local_kernel, dim3((unsigned)nchunk, (unsigned)M),
-                                dim3(kLocalThreads), (size_t)chunk * sizeof(uint32_t),
+        const int rc = R4D_EMIT(stream, qsa_local_kernel<Signed>,
+                                dim3((unsigned)nchunk, (unsigned)M), dim3(kLocalThreads),
+                                (size_t)chunk * sizeof(uint32_t),
                                 (const float*)score, (const int32_t*)bt, (const int32_t*)nc,
                                 (const int32_t*)pos, (const int32_t*)cu, ck, ci, cc, nb, topk,
                                 ratio, nseq, s_ld, t_ld, chunk);
         if (rc != RAD_OK) return rc;
-        return R4D_EMIT(stream, qsa_merge_kernel, dim3((unsigned)M), dim3(kMergeThreads),
+        return R4D_EMIT(stream, qsa_merge_kernel<Signed>, dim3((unsigned)M), dim3(kMergeThreads),
                         (size_t)nchunk * topk * sizeof(uint32_t), (const uint32_t*)ck,
                         (const int32_t*)ci, (const int32_t*)cc, (const int32_t*)bt,
                         (const int32_t*)nc, (const int32_t*)pos, (const int32_t*)cu,
@@ -1109,7 +1137,8 @@ static int r4d_qsa_select_bf16_emit(long score, long bt, long nc, long pos, long
 
     /* A wide launch (prefill chunk, key cache off) takes the wide kernel. */
     if (g_qsa_select_form == 2 || (g_qsa_select_form == 0 && M > kCacheMaxM)) {
-        return R4D_EMIT(stream, qsa_select_wide_kernel, dim3((unsigned)M), dim3(kThreads), 0,
+        return R4D_EMIT(stream, qsa_select_wide_kernel<Signed>, dim3((unsigned)M),
+                        dim3(kThreads), 0,
                         (const float*)score, (const int32_t*)bt, (const int32_t*)nc,
                         (const int32_t*)pos, (const int32_t*)cu, (int32_t*)sel,
                         (int32_t*)nsel, (int32_t*)seqused, nb, topk, ratio, nseq, s_ld, t_ld,
@@ -1119,7 +1148,7 @@ static int r4d_qsa_select_bf16_emit(long score, long bt, long nc, long pos, long
     /* Never more than the table width. */
     int cap = (M <= kCacheMaxM) ? lds_cap_of() : 0;
     if (cap > nb) cap = nb;
-    return R4D_EMIT(stream, qsa_select_kernel, dim3((unsigned)M), dim3(kThreads),
+    return R4D_EMIT(stream, qsa_select_kernel<Signed>, dim3((unsigned)M), dim3(kThreads),
                     (size_t)cap * sizeof(uint32_t), (const float*)score, (const int32_t*)bt,
                     (const int32_t*)nc, (const int32_t*)pos, (const int32_t*)cu,
                     (int32_t*)sel, (int32_t*)nsel,
@@ -1151,7 +1180,9 @@ extern "C" int r4d_rad_qsa_select(const RadArgs* a, RadStream stream) {
     if (sc->rank != 2 || bt->rank != 2 || se->rank != 2) return R4D_NO(RAD_E_SHAPE);
     const long long topk  = r4d_geti_or(a, "topk", 0);
     const long long ratio = r4d_geti_or(a, "ratio", 0);
+    const long long sgn   = r4d_geti_or(a, "signed", 0);
     if (topk <= 0 || ratio <= 0) return R4D_NO(RAD_E_INVAL);
+    if (sgn != 0 && sgn != 1) return R4D_NO(RAD_E_INVAL);
     /* nb = min of the two widths, as in r4d_qsa_score_bf16.hip. */
     const long long M = sc->shape[0];
     const long long nb = bt->shape[1] < sc->shape[1] ? bt->shape[1] : sc->shape[1];
@@ -1167,10 +1198,11 @@ extern "C" int r4d_rad_qsa_select(const RadArgs* a, RadStream stream) {
     const long long sp = r4d_row_pitch(sc), tp = r4d_row_pitch(bt), op = r4d_row_pitch(se);
     if (sp < 0 || tp < 0 || op < 0) return R4D_NO(RAD_E_STRIDE);
     /* Scratch is optional: without enough, the non-split kernels run. */
-    return r4d_qsa_select_bf16_emit(r4d_addr(sc), r4d_addr(bt), r4d_addr(nc), r4d_addr(po),
-                                    r4d_addr(cu), r4d_addr(se), r4d_addr(ns), r4d_addr(su),
-                                    (int)M, (int)nb, (int)topk, (int)ratio, (int)nseq,
-                                    (int)sp, (int)tp, (int)op, a->scratch, a->scratch_bytes,
-                                    stream);
+    auto* const emit = sgn ? r4d_qsa_select_bf16_emit<true> : r4d_qsa_select_bf16_emit<false>;
+    return emit(r4d_addr(sc), r4d_addr(bt), r4d_addr(nc), r4d_addr(po),
+                r4d_addr(cu), r4d_addr(se), r4d_addr(ns), r4d_addr(su),
+                (int)M, (int)nb, (int)topk, (int)ratio, (int)nseq,
+                (int)sp, (int)tp, (int)op, a->scratch, a->scratch_bytes,
+                stream);
 }
 

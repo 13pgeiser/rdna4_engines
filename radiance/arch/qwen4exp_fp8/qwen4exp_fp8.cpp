@@ -649,8 +649,36 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         fd.dtype     = rad_kv_cache_dtype(ctx, RAD_BF16);
         fd.n_head_kv = g.n_head_kv;
         fd.head_dim  = g.head_dim;
+        /* --kv-cache-dtype fp8_v4 / k6_v4 (RadBuildCtx::kv_quant): V as int4 in groups of 32 with
+         * f16 scales, K E4M3 as above or int6 the same way (libr4d's gqa12 and four-rank gqa6
+         * rows for these layers). A token's row is 25 or 22 * head_dim / 16 bytes instead of
+         * 2 * head_dim, so the group is declared at half that and the core sizes pages from it;
+         * only those kernels read the layout. The MTP head's layer shares this group. The engine
+         * asks only for a layout probe() offered. */
+        const int kvq = fd.dtype == RAD_F8E4M3 ? ctx->kv_quant : RAD_KVQ_NONE;
+        const char* kvq_name = kvq == RAD_KVQ_V4 ? "fp8_v4" : kvq == RAD_KVQ_K6V4 ? "k6_v4"
+                                                                                 : nullptr;
+        if (kvq != RAD_KVQ_NONE && !kvq_name) {
+            fprintf(stderr, "radiance: KV cache layout %d is not one this plugin knows\n", kvq);
+            return RAD_E_UNSUPPORTED;
+        }
+        /* A rank's ratio: twelve at one and two ranks, six at four (each KV head replicated
+         * across a rank pair). */
+        if (kvq_name && !(g.head_dim == 256 && (g.gqa() == 12 || g.gqa() == 6))) {
+            fprintf(stderr, "radiance: --kv-cache-dtype %s has libr4d rows at head_dim 256 and a "
+                            "rank's gqa 12 or 6 only; this rank is head_dim %lld, gqa %lld\n",
+                    kvq_name, (long long)g.head_dim, (long long)g.gqa());
+            return RAD_E_UNSUPPORTED;
+        }
+        const int64_t row16 = kvq == RAD_KVQ_V4 ? 25 : kvq == RAD_KVQ_K6V4 ? 22 : 32;
+        fd.head_dim = g.head_dim * row16 / 32;
         m.kv_full = rad_decl_kv_group(b, nm.f("kv_attn"), &fd);
-        g.kv_dtype = rad_dtype_name(fd.dtype);
+        g.kv_dtype = kvq_name ? kvq_name : rad_dtype_name(fd.dtype);
+        if (kvq_name)
+            rad_note(b, "kv cache %s: %s K, int4 V, in groups of 32 with f16 scales, %lld bytes a "
+                        "token and head instead of %lld", kvq_name,
+                     kvq == RAD_KVQ_V4 ? "E4M3" : "int6", (long long)(g.head_dim * row16 / 16),
+                     (long long)(2 * g.head_dim));
 
         RadKVGroupDecl sd{};
         sd.kind         = RAD_KV_LINEAR;
@@ -1622,6 +1650,16 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (meta_int2(meta, "qwen4exp.mtp_num_hidden_layers", "mtp_num_hidden_layers", 0) > 0)
         out->draft_depth = 3;
     out->shape_probe_ok = 1;      /* declare() writes scratch under shape_probe */
+    /* --kv-cache-dtype fp8_v4 / k6_v4: libr4d has their rows for the QSA layers' geometry
+     * (head_dim 256, twelve queries per KV head; gqa6 with 4-token pages at four ranks), so other
+     * geometries are refused at startup rather than in declare. */
+    {
+        const long long hd  = meta->head_dim ? meta->head_dim
+                                             : (meta->n_head ? meta->n_embd / meta->n_head : 0);
+        const long long nkv = meta->n_head_kv ? meta->n_head_kv : meta->n_head;
+        if (hd == 256 && nkv > 0 && meta->n_head == 12 * nkv)
+            out->kv_quant_ok = (1 << RAD_KVQ_V4) | (1 << RAD_KVQ_K6V4);
+    }
     return RAD_OK;
 }
 

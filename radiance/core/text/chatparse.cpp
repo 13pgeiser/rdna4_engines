@@ -726,7 +726,8 @@ struct ReplyFormat::Impl {
      * second, since models often write a call without its wrapper; a wrapper written without
      * its trailing whitespace is read too. */
     std::vector<std::string> openers;
-    std::string name_end;     /* what ends an argument name */
+    /* What ends an argument name: arg_name_suffix and arg_value_prefix, back to back. */
+    std::string name_end;
     /* The same two, whitespace-trimmed. A loose call is one the grammar never opened, so it was
      * written unconstrained; its argument tags, like its name and close, are read with their
      * surrounding whitespace optional. */
@@ -740,6 +741,9 @@ struct ReplyFormat::Impl {
     /* Object family. `object`: a call's arguments are one object. `ns_object`: the object's own
      * `{` ends the name (name_suffix empty), and ns_core is "{". */
     bool object = false, ns_object = false;
+    /* Tagged family, name_suffix empty: a call's name ends where arg_prefix or end_core begins,
+     * and that tag is the first of the call's body. */
+    bool name_open = false;
     /* Where a key or value may begin, besides the object's punctuation: the dialect string's
      * opener, and the call's close and end (written there by a reply that leaves its object
      * unclosed). Matched anchored, by first byte; chat_format_check keeps them distinct. */
@@ -788,8 +792,9 @@ int ReplyFormat::compile(const ChatFormat& f, std::shared_ptr<const ReplyFormat>
     split_ws(f.call_open, &m.co_core, &m.co_trail);
     if (f.call_open.empty()) m.openers = { f.name_prefix };
     else m.openers = { m.co_core, f.name_prefix };
-    m.name_end = f.arg_name_suffix.empty() ? f.arg_value_prefix : f.arg_name_suffix;
+    m.name_end = f.arg_name_suffix + f.arg_value_prefix;
     m.object = f.has_tools() && f.object_args();
+    m.name_open = f.has_tools() && !m.object && f.name_suffix.empty();
     if (m.object && f.name_suffix.empty()) {
         m.ns_object = true;
         m.ns_core = "{";
@@ -976,7 +981,15 @@ static int bind_tools(const ReplyFormat::Impl& F, const ojson& tools, ReplyParse
                 t.params.emplace(pname, p);
             }
             t.arms.insert(t.arms.end(), optional.begin(), optional.end());
-            if (t.name.find(F.ns_core) != std::string::npos ||
+            if (F.name_open) {
+                for (const std::string* d : { &F.f.arg_prefix, &F.end_core })
+                    if ((t.name + *d).find(*d) != t.name.size()) {
+                        *why = "tool '" + t.name + "' has a name running into '" + *d +
+                               "', which this model's tool-call format uses to end a function "
+                               "name";
+                        return RAD_E_INVAL;
+                    }
+            } else if (t.name.find(F.ns_core) != std::string::npos ||
                 (!F.ns_object &&
                  (t.name + F.f.name_suffix).find(F.f.name_suffix) != t.name.size())) {
                 *why = "tool '" + t.name + "' has a name containing '" + F.ns_core +
@@ -1053,7 +1066,8 @@ enum class St : uint8_t {
     OpenCoTail,   /* the whitespace that ends call_open, after its core */
     OpenWs,       /* after call_open: whitespace */
     OpenPrefix,   /* name_prefix, after call_open */
-    OpenName,     /* the function name, to the core of name_suffix */
+    OpenName,     /* the function name, to the core of name_suffix (or, without one, to the
+                     first argument or the call's end) */
     OpenTail,     /* the whitespace that ends name_suffix */
     OpenPeek,     /* a loose call's name is read: whitespace, then an argument or the close */
     OpenPeekArg,  /* ... and the first argument's name, which must close as a name */
@@ -1328,6 +1342,75 @@ struct ReplyStream::Impl {
             if (full.size() >= n.size() && full.compare(0, n.size(), n) == 0) return true;
         }
         return false;
+    }
+
+    /* A suffixless name (ReplyFormat::Impl::name_open) ends where arg_prefix or end_core begins.
+     * Returns which one ended it (0, 1), with *len the name's length before it; or -1, with *len
+     * the bytes that are the name's for certain, the rest possibly beginning either. */
+    int name_stop(size_t* len) const {
+        const std::string* const stops[] = { &F.f.arg_prefix, &F.end_core };
+        size_t pend = 0;
+        for (int i = 0; i < 2; ++i) {
+            const std::string& t = *stops[i];
+            if (name.size() >= t.size() && name.compare(name.size() - t.size(), t.size(), t) == 0) {
+                *len = name.size() - t.size();
+                return i;
+            }
+            for (size_t k = std::min(t.size() - 1, name.size()); k > pend; --k)
+                if (name.compare(name.size() - k, k, t, 0, k) == 0) { pend = k; break; }
+        }
+        *len = name.size() - pend;
+        return -1;
+    }
+
+    /* Could these bytes, after any leading whitespace, still be a function name? One holds no
+     * '<' and no whitespace before more text, unless a declared name does. Without a tag of its
+     * own to close it, a name read from prose that mentions the opener would otherwise be held
+     * up to kMaxLooseName bytes. */
+    bool name_plausible(std::string_view n) const {
+        size_t i = 0;
+        while (i < n.size() && is_ws((unsigned char)n[i])) ++i;
+        bool gap = false;
+        for (; i < n.size(); ++i) {
+            const unsigned char c = (unsigned char)n[i];
+            if (c == '<') return declared_prefix(n);
+            if (is_ws(c)) gap = true;
+            else if (gap) return declared_prefix(n);
+        }
+        return true;
+    }
+
+    /* OpenName for a suffixless name. The tag that ends it is read here, as the first of the
+     * call's body: an argument's opener, or the call's end. Whitespace around the name is
+     * dropped; before it, the grammar does not admit it. */
+    const char* open_name_byte(const char* p) {
+        size_t len = 0;
+        const int stop = name_stop(&len);
+        if (stop < 0) {
+            if (len > kMaxLooseName || !name_plausible(std::string_view(name).substr(0, len)))
+                fail_attempt();
+            return p + 1;
+        }
+        size_t a = 0;
+        while (a < len && is_ws((unsigned char)name[a])) ++a;
+        const std::string nm(trim_trailing_ws(std::string_view(name).substr(a, len - a)));
+        auto it = P.by_name.find(nm);
+        tool = it == P.by_name.end() ? -1 : (int)it->second;
+        if (tool < 0 && (nm.empty() || nm.find('<') != std::string::npos)) {
+            fail_attempt();
+            return p + 1;
+        }
+        name = nm;
+        begin_call(a == 0);
+        lpos = 0;
+        lhold.clear();
+        if (stop == 0) {
+            start_arg();
+        } else {
+            finish_call_strictness();
+            end_core_done();
+        }
+        return p + 1;
     }
 
     /* The call opener has matched at `att`; whether a call follows is decided below. */
@@ -1966,6 +2049,7 @@ struct ReplyStream::Impl {
             const char c = *p;
             att.push_back(c);
             name.push_back(c);
+            if (F.name_open) return open_name_byte(p);
             const size_t k = F.ns_core.size();
             if (name.size() >= k && name.compare(name.size() - k, k, F.ns_core) == 0) {
                 const std::string nm = name.substr(0, name.size() - k);
@@ -2640,8 +2724,12 @@ struct ReplyStream::Impl {
         case St::OpenWs:
         case St::OpenPrefix:
             return true;
-        case St::OpenName:
-            return declared_prefix(name);
+        case St::OpenName: {
+            if (!F.name_open) return declared_prefix(name);
+            size_t len = 0;
+            name_stop(&len);
+            return declared_prefix(std::string_view(name).substr(0, len));
+        }
         case St::OpenTail:
             return tool >= 0;
         default:

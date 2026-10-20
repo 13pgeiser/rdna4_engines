@@ -353,6 +353,156 @@ int ref_attn_dense(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ attn_cross */
+/* attn_dense with each entry's keys a run of their own: entry `s`'s queries are rows
+ * [cu[s], cu[s+1]) of `q` and its keys and values rows [cu_k[s], cu_k[s+1]) of `k` and `v`. With
+ * `causal` a query sees key j of its run when j <= its own index in its entry, both counted from
+ * the start: a video's rows reading its prompt (cross attention), or a padded prompt's rows of which
+ * the padding sees only the prompt. A query that sees no key is zero. */
+int ref_attn_cross(const RadArgs* a, RadStream) {
+    if (!have(a, 6)) return RAD_E_INVAL;
+    const RadTensor *q = &a->t[0], *k = &a->t[1], *v = &a->t[2], *cu = &a->t[3], *cuk = &a->t[4];
+    const RadTensor *o = &a->t[5];
+    const int64_t head_dim = p_int(a, "head_dim", q->rank >= 3 ? q->shape[q->rank - 1] : 0);
+    const int64_t gqa      = p_int(a, "gqa", 1);
+    const int     causal   = (int)p_int(a, "causal", 0);
+    if (head_dim <= 0 || gqa <= 0) return RAD_E_SHAPE;
+    if (head_dim > REF_HD_MAX) return RAD_E_UNSUPPORTED;
+    const int64_t q_heads = q->rank >= 3 ? q->shape[q->rank - 2]
+                          : (q->rank == 2 ? q->shape[1] / head_dim : 1);
+    const int64_t kv_heads = q_heads / gqa;
+    if (kv_heads <= 0 || q_heads % gqa != 0) return RAD_E_SHAPE;
+    const int64_t n_seq = numel(cu) - 1;
+    if (n_seq <= 0 || numel(cuk) < n_seq + 1) return RAD_E_SHAPE;
+    const int64_t total_q = numel(q) / (q_heads * head_dim);
+    const int64_t total_k = numel(k) / (kv_heads * head_dim);
+    if (total_q <= 0 || cu_at(cu, n_seq) <= cu_at(cu, 0)) return RAD_E_SHAPE;   /* zero rows */
+    if (numel(o) < total_q * q_heads * head_dim) return RAD_E_SHAPE;
+    for (int64_t s = 0; s < n_seq; ++s)
+        if (cu_at(cu, s + 1) < cu_at(cu, s) || cu_at(cuk, s + 1) < cu_at(cuk, s) ||
+            cu_at(cu, s + 1) > total_q || cu_at(cuk, s + 1) > total_k)
+            return RAD_E_SHAPE;
+
+    const int64_t q_ds = q->rank >= 2 ? q->stride[q->rank - 1] : 1;
+    const int64_t q_hs = q->rank >= 3 ? q->stride[q->rank - 2] : head_dim * q_ds;
+    const int64_t q_rs = row_stride(q, q_heads * head_dim);
+    const int64_t k_ds = k->rank >= 2 ? k->stride[k->rank - 1] : 1;
+    const int64_t k_hs = k->rank >= 3 ? k->stride[k->rank - 2] : head_dim * k_ds;
+    const int64_t k_rs = row_stride(k, kv_heads * head_dim);
+    const int64_t v_ds = v->rank >= 2 ? v->stride[v->rank - 1] : 1;
+    const int64_t v_hs = v->rank >= 3 ? v->stride[v->rank - 2] : head_dim * v_ds;
+    const int64_t v_rs = row_stride(v, kv_heads * head_dim);
+    const int64_t o_ds = o->rank >= 2 ? o->stride[o->rank - 1] : 1;
+    const int64_t o_hs = o->rank >= 3 ? o->stride[o->rank - 2] : head_dim * o_ds;
+    const int64_t o_rs = row_stride(o, q_heads * head_dim);
+    const float scale = p_f32(a, "scale", 1.0f / std::sqrt((float)head_dim));
+
+    REF_PAR_FOR(total_q * q_heads * head_dim * 64)
+    for (int64_t sh = 0; sh < n_seq * q_heads; ++sh) {
+        const int64_t s = sh / q_heads, h = sh % q_heads, kh = h / gqa;
+        const int64_t b0 = cu_at(cu, s), b1 = cu_at(cu, s + 1);
+        const int64_t k0 = cu_at(cuk, s), k1 = cu_at(cuk, s + 1);
+        for (int64_t i = b0; i < b1; ++i) {
+            const int64_t qb = i * q_rs + h * q_hs, ob = i * o_rs + h * o_hs;
+            const int64_t jend = causal ? std::min<int64_t>(k1, k0 + (i - b0) + 1) : k1;
+            float mx = -INFINITY;
+            for (int64_t j = k0; j < jend; ++j) {
+                const int64_t kb = j * k_rs + kh * k_hs;
+                float dot = 0.0f;
+                for (int64_t d = 0; d < head_dim; ++d)
+                    dot += ldt(q, qb + d * q_ds) * ldt(k, kb + d * k_ds);
+                dot *= scale;
+                if (dot > mx) mx = dot;
+            }
+            if (mx == -INFINITY) {
+                for (int64_t d = 0; d < head_dim; ++d) stt(o, ob + d * o_ds, 0.0f);
+                continue;
+            }
+            float acc[REF_HD_MAX];
+            for (int64_t d = 0; d < head_dim; ++d) acc[d] = 0.0f;
+            float sum = 0.0f;
+            for (int64_t j = k0; j < jend; ++j) {
+                const int64_t kb = j * k_rs + kh * k_hs, vb = j * v_rs + kh * v_hs;
+                float dot = 0.0f;
+                for (int64_t d = 0; d < head_dim; ++d)
+                    dot += ldt(q, qb + d * q_ds) * ldt(k, kb + d * k_ds);
+                const float w = ref_exp(dot * scale - mx);
+                sum += w;
+                for (int64_t d = 0; d < head_dim; ++d) acc[d] += w * ldt(v, vb + d * v_ds);
+            }
+            const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+            for (int64_t d = 0; d < head_dim; ++d) stt(o, ob + d * o_ds, acc[d] * inv);
+        }
+    }
+    return RAD_OK;
+}
+
+/* attn_na3d: 3-D neighborhood attention, NATTEN's na3d (LTX-2.5's diffusion decoder). The rows of
+ * q, k, v and out are the voxels of the volume geom = (T, H, W), i32 on the device, (t, i, j)
+ * row-major. A query attends the keys of a window `kt` x `kh` x `kw` (each extent at most its
+ * axis) centred on it and shifted inward at the border: along an axis of L and window n the
+ * window starts at clamp(c - n / 2, 0, L - n). Per head, in f32: each score the dot over d
+ * ascending times `scale` (default 1 / sqrt(head_dim)), the window's keys in raster order, the
+ * softmax as attn_cross takes it (the maximum, then the exponentials' sum), the output rounded to
+ * its dtype. Rows past T H W are not written. */
+int ref_attn_na3d(const RadArgs* a, RadStream) {
+    if (!have(a, 5)) return RAD_E_INVAL;
+    const RadTensor *q = &a->t[0], *k = &a->t[1], *v = &a->t[2], *G = &a->t[3], *o = &a->t[4];
+    const int64_t head_dim = p_int(a, "head_dim", 0);
+    const int64_t kt = p_int(a, "kt", 0), kh = p_int(a, "kh", 0), kw = p_int(a, "kw", 0);
+    if (head_dim <= 0 || kt <= 0 || kh <= 0 || kw <= 0 || numel(G) < 3 || q->rank != 2)
+        return RAD_E_SHAPE;
+    if (head_dim > REF_HD_MAX) return RAD_E_UNSUPPORTED;
+    const int64_t heads = q->shape[1] / head_dim;
+    const int64_t T = cu_at(G, 0), H = cu_at(G, 1), W = cu_at(G, 2);
+    if (heads <= 0 || q->shape[1] % head_dim || T <= 0 || H <= 0 || W <= 0) return RAD_E_SHAPE;
+    const int64_t N = std::min(q->shape[0], T * H * W);
+    if (N <= 0 || numel(k) < N * heads * head_dim || numel(v) < N * heads * head_dim ||
+        numel(o) < N * heads * head_dim)
+        return RAD_E_SHAPE;
+    const int64_t nt = std::min(kt, T), nh = std::min(kh, H), nw = std::min(kw, W);
+    const int64_t q_ds = q->stride[1], q_rs = row_stride(q, heads * head_dim);
+    const int64_t k_ds = k->rank >= 2 ? k->stride[k->rank - 1] : 1, k_rs = row_stride(k, heads * head_dim);
+    const int64_t v_ds = v->rank >= 2 ? v->stride[v->rank - 1] : 1, v_rs = row_stride(v, heads * head_dim);
+    const int64_t o_ds = o->rank >= 2 ? o->stride[o->rank - 1] : 1, o_rs = row_stride(o, heads * head_dim);
+    const float scale = p_f32(a, "scale", 1.0f / std::sqrt((float)head_dim));
+    auto start = [](int64_t c, int64_t n, int64_t L) {
+        return std::min(std::max<int64_t>(c - n / 2, 0), L - n);
+    };
+    REF_PAR_FOR(N * heads * nt * nh * nw * head_dim)
+    for (int64_t rh = 0; rh < N * heads; ++rh) {
+        const int64_t r = rh / heads, h = rh % heads;
+        const int64_t t = r / (H * W), i = (r / W) % H, j = r % W;
+        const int64_t t0 = start(t, nt, T), i0 = start(i, nh, H), j0 = start(j, nw, W);
+        const int64_t qb = r * q_rs + h * head_dim * q_ds, ob = r * o_rs + h * head_dim * o_ds;
+        auto score = [&](int64_t key) {
+            const int64_t kb = key * k_rs + h * head_dim * k_ds;
+            float dot = 0.0f;
+            for (int64_t d = 0; d < head_dim; ++d) dot += ldt(q, qb + d * q_ds) * ldt(k, kb + d * k_ds);
+            return dot * scale;
+        };
+        float mx = -INFINITY;
+        for (int64_t a1 = t0; a1 < t0 + nt; ++a1)
+            for (int64_t b1 = i0; b1 < i0 + nh; ++b1)
+                for (int64_t c1 = j0; c1 < j0 + nw; ++c1) mx = std::max(mx, score((a1 * H + b1) * W + c1));
+        float acc[REF_HD_MAX];
+        for (int64_t d = 0; d < head_dim; ++d) acc[d] = 0.0f;
+        float sum = 0.0f;
+        for (int64_t a1 = t0; a1 < t0 + nt; ++a1)
+            for (int64_t b1 = i0; b1 < i0 + nh; ++b1)
+                for (int64_t c1 = j0; c1 < j0 + nw; ++c1) {
+                    const int64_t key = (a1 * H + b1) * W + c1;
+                    const float w = ref_exp(score(key) - mx);
+                    sum += w;
+                    const int64_t vb = key * v_rs + h * head_dim * v_ds;
+                    for (int64_t d = 0; d < head_dim; ++d) acc[d] += w * ldt(v, vb + d * v_ds);
+                }
+        const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+        for (int64_t d = 0; d < head_dim; ++d) stt(o, ob + d * o_ds, acc[d] * inv);
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ kv_store */
 /* Writes this step's keys and values into the paged cache at `slot_mapping`. The cache is INOUT,
  * not OUT: only mapped slots are touched and every other slot must survive, which the buffer

@@ -15,6 +15,7 @@
 #include "ref_ops.h"
 
 #include <algorithm>
+#include <cmath>
 #include <vector>
 
 using namespace ref;
@@ -101,7 +102,8 @@ int ref_qsa_score(const RadArgs* a, RadStream) {
 /* ------------------------------------------------------------------ qsa_select */
 /* The page-id table the sparse attention reads (docs/OPS.md): over the query's complete blocks
  * n = min(nc[seq], (pos + 1) / ratio, width), the live ones (page id >= 0, score > -1e30) ranked
- * by max(score, 0). At most `topk` are taken: all of them when that many or fewer are live, else
+ * by max(score, 0); with `signed` 1 the live ones are those with a finite score, ranked by it (so
+ * -0 ties +0). At most `topk` are taken: all of them when that many or fewer are live, else
  * every block above the topk-th largest value in block order, then the blocks equal to it in block
  * order until topk are taken. The partial page bt[n] follows when (pos + 1) % ratio != 0 and
  * n < width, and -1 pads the row to topk + 1. nsel counts the entries, seqused is
@@ -112,7 +114,9 @@ int ref_qsa_select(const RadArgs* a, RadStream) {
     const RadTensor *sc = &a->t[0], *bt = &a->t[1], *nc = &a->t[2], *po = &a->t[3];
     const RadTensor *cu = &a->t[4], *se = &a->t[5], *ns = &a->t[6], *su = &a->t[7];
     const int64_t topk = p_int(a, "topk", 0), ratio = p_int(a, "ratio", 0);
+    const int64_t sgn = p_int(a, "signed", 0);
     if (topk <= 0 || ratio <= 0) return RAD_E_SHAPE;
+    if (sgn != 0 && sgn != 1) return RAD_E_INVAL;
     if (sc->rank != 2 || bt->rank != 2 || se->rank != 2) return RAD_E_SHAPE;
     const int64_t M = sc->shape[0], nb = std::min(bt->shape[1], sc->shape[1]);
     const int64_t n_seq = numel(cu) - 1;
@@ -136,8 +140,9 @@ int ref_qsa_select(const RadArgs* a, RadStream) {
         std::vector<int64_t> live;
         for (int64_t b = 0; b < n; ++b) {
             const float v = ldt(sc, m * s_rs + b * s_cs);
-            if (ldi(bt, s * bt_rs + b * bt_cs) < 0 || !(v > -1e30f)) continue;
-            val[(size_t)b] = v > 0.0f ? v : 0.0f;
+            if (ldi(bt, s * bt_rs + b * bt_cs) < 0) continue;
+            if (sgn ? !std::isfinite(v) : !(v > -1e30f)) continue;
+            val[(size_t)b] = sgn ? v : v > 0.0f ? v : 0.0f;
             live.push_back(b);
         }
         std::vector<int64_t> take;

@@ -51,7 +51,14 @@ std::string calib_resolve(const char* dir, const char* name, int64_t K);
 /* Every rank's file for `stem` in `dir`, each converted into `domain` (0, or the Hadamard width a
  * rotated grid quantises in), summed into `acc` (K x K, double, row-major). Returns the number of
  * files read, 0 when there are none. A file that exists but is unusable (wrong magic, wrong K,
- * short, or a domain that cannot be converted) is reported on stderr and skipped. */
+ * short, or a domain that cannot be converted) is reported on stderr and skipped.
+ *
+ * With no whole file, the parts: under tensor parallelism a column-split linear (an attention
+ * output or down projection) sees only its rank's K / world input columns, so each rank's tap
+ * writes the Gram of those as `<stem>.part` (gram.r<rank>.<stem>.part.bin). They are placed on
+ * the diagonal in rank order, the cross-rank products, never formed on one card, left zero. The
+ * parts must cover K exactly and be in domain 0 (a rotation of K does not keep the blocks); the
+ * result is then converted into `domain` like a whole file. */
 int calib_sum(const char* dir, const std::string& stem, int64_t K, int64_t domain,
               std::vector<double>* acc);
 

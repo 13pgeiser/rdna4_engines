@@ -144,6 +144,8 @@ struct FakeChatTemplate : IChatTemplate {
         if (!tools.empty()) s += "[tools:" + std::to_string(tools.size()) + "]";
         if (!opt.enable_thinking) s += "[nothink]";
         for (const auto& kv : opt.template_kwargs) s += "[" + kv.first + "=" + kv.second + "]";
+        if (!default_effort.empty() && !opt.template_kwargs.count("reasoning_effort"))
+            s += "[reasoning_effort=" + default_effort + "]";
         size_t n_msg = 0;
         int tool_msgs = 0;
         for (const auto& m : messages) {
@@ -203,6 +205,8 @@ struct FakeChatTemplate : IChatTemplate {
     std::string refusal;
     std::string refuse_kwarg;
     std::vector<std::string> efforts;   /* JSON text, as the template context carries them */
+    /* The effort a render naming none is written as, as Qwen3.8's template writes xhigh. */
+    std::string default_effort;
     /* The reasoning block a render reports. FakeTokenizer makes a one-byte marker one token. */
     std::string think_open, think_close;
     bool        think_starts_open = false;

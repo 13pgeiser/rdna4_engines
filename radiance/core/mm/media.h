@@ -77,5 +77,13 @@ int decode_video(const uint8_t* data, size_t n, SampleFn sample, const void* use
 int decode_audio(const uint8_t* data, size_t n, int32_t rate, int64_t max_samples,
                  std::vector<float>* out, std::string* why);
 
+/* `in` encoded as a one-frame H.264 stream at constant quality `crf` (libx264, preset veryfast,
+ * yuv420p) and decoded back, as a video model's reference pipeline does to a conditioning
+ * picture so it carries the compression of the footage the model was trained on. An odd width
+ * or height loses its last column or row first. Needs libx264. */
+int h264_roundtrip(const Frame& in, int32_t crf, Frame* out, std::string* why);
+/* Whether this build can run h264_roundtrip: its libavcodec has libx264. */
+bool h264_roundtrip_available();
+
 }  /* namespace mm */
 }  /* namespace rad */

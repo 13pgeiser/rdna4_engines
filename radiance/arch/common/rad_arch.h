@@ -450,6 +450,17 @@ inline int map_transpose(RadBuilder* b, const char* declared, const char* src) {
     return rad_decl_name_map(b, &m);
 }
 
+/* One index of one dimension of a checkpoint tensor (RAD_MAP_TAP): a causal 3-D convolution's
+ * last temporal tap is map_tap(b, name, src, 2, -1). */
+inline int map_tap(RadBuilder* b, const char* declared, const char* src, int dim, int index) {
+    RadNameMap m = map_base(declared, RAD_MAP_TAP);
+    m.n_src        = 1;
+    m.src[0]       = src;
+    m.src_index[0] = index;
+    m.concat_dim   = dim;
+    return rad_decl_name_map(b, &m);
+}
+
 /* An EMA codebook: the embedding sums over max(cluster usage, 1e-5), row by row (RAD_MAP_EMA). */
 inline int map_ema(RadBuilder* b, const char* declared, const char* sums, const char* usage) {
     RadNameMap m = map_base(declared, RAD_MAP_EMA);
@@ -1330,6 +1341,11 @@ inline int drafter_kv_group(RadBuilder* b, Names& nm, const RadBuildCtx* ctx, Ge
     extern "C" const RadAudioFormat* rad_arch_audio_format(const RadModelMeta* m) {            \
         return NS::audio_format(m);                                                            \
     }
+
+/* Optional: RAD_ARCH_SERVES_IMPORTS(0) keeps a family's second quantised plugin out of the pick for
+ * an imported checkpoint (rad_builder.h, rad_arch_serves_imports). */
+#define RAD_ARCH_SERVES_IMPORTS(V)                                                             \
+    extern "C" int rad_arch_serves_imports(void) { return V; }
 
 }  /* namespace arch */
 }  /* namespace rad */

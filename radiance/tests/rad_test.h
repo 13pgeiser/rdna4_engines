@@ -14,6 +14,8 @@
  *   RAD_TEST_TMPDIR      where tmpdir() is made, before $TMPDIR and /tmp
  *   RAD_TEST_CPU_BUDGET  seconds of process CPU time the binary may spend; over it, it fails
  * tests/CMakeLists.txt sets the last three for every ctest entry.
+ *   RAD_TEST_CPU_BUDGET_SCALE  a factor on that budget, for a host slower per thread than the
+ *                        one the budgets were set on; unset or 0 is 1
  *
  * Exit status: 1 when a check failed (an exception escaping a case is a failed check), 77 when
  * nothing failed and no check ran, 2 for a command line it does not understand, else 0. 77 is
@@ -288,7 +290,9 @@ inline int run_all(int argc, char** argv) {
      * so a slow case or a spinning thread pool is caught when it lands. CPU time rather than wall
      * time, so a loaded machine does not fail a correct binary. */
     if (const char* b = std::getenv("RAD_TEST_CPU_BUDGET")) {
-        const double budget = std::atof(b);
+        double budget = std::atof(b);
+        if (const char* s = std::getenv("RAD_TEST_CPU_BUDGET_SCALE"); s && std::atof(s) > 0)
+            budget *= std::atof(s);
         if (budget > 0 && cpu > budget && rc != 1) {
             fprintf(stderr, "  FAIL the binary spent %.2f s of CPU, over its budget of %g s "
                             "(RAD_TEST_CPU_BUDGET)\n", cpu, budget);

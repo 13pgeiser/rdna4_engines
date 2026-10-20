@@ -45,7 +45,8 @@ set(RAD_TESTS_WITH_LEGACY chatparse_test chatparse_gemma4_test)
 # relayout_parity_test checks each kernel library's relayout of libquant's planes against a
 # recorded hash of the stored bytes. libr4d's layout sources are host-only, so they are compiled in,
 # with -ffp-contract=off as libr4d uses, so scale conversions round identically.
-set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test)
+# r4d_ar_links_test checks libr4d's header-only link reader, so it needs only the include path.
+set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test r4d_ar_links_test)
 
 # Chat templates (copied from the model repositories) and media samples, passed by absolute path so
 # test binaries can run from anywhere.
@@ -356,14 +357,16 @@ endif()
 # ================================================================== libr4d's kernels, on the host
 #
 # Some libr4d ops (the sandwich-norm joins, expert_scale) have no libref oracle by design
-# (docs/OPS.md), so rad-kbench never checks them. r4d_emu runs the source of six units written
-# against r4d_launch.h on the host: the windowed paged attention, pair_argmax, the joins,
-# expert_scale, the QSA block selection, whose four kernels a card-less build otherwise never
-# runs, and the runtime-LoRA pair. emu/hip/hip_runtime.h supplies the HIP names, each GPU thread
-# is a fiber, and __syncthreads and cross-lane ops are barriers (one not reached uniformly is
-# reported as a deadlock). Checked against ports of libref's ref_attn_paged and ref_qsa_select,
-# the host arithmetic in ref_host.cpp, for the joins the unfused chain bit for bit, and for the
-# LoRA pair libref itself when the test can load it.
+# (docs/OPS.md), so rad-kbench never checks them. r4d_emu runs the source of thirteen units
+# written against r4d_launch.h on the host: the windowed paged attention, pair_argmax, the joins,
+# expert_scale, the QSA block selection, the runtime-LoRA pair, the F32 routing projection's tile
+# forms, GLM's mHC read with its chunk split, the F32-scale E4M3 GEMM's forms, GLM's KDA
+# recurrence, the MXFP4 expert GEMM's forms, the MLA matrix row's pairings and GLM's MoE decode
+# fusions, whose kernels a card-less build otherwise never runs. emu/hip/hip_runtime.h supplies the
+# HIP names, each GPU thread is a fiber, and __syncthreads and cross-lane ops are barriers (one not
+# reached uniformly is reported as a deadlock). Checked against ports of libref's ref_attn_paged and
+# ref_qsa_select, the host arithmetic in ref_host.cpp, for the joins the unfused chain bit for bit,
+# for the LoRA pair libref itself when the test can load it, and for KDA libref itself.
 #
 # Requires clang (ext_vector_type) and x86-64 (SysV fiber switch in inline assembly). With a clang
 # C++ compiler the .hip files build here as C++ (`-x c++`; the property is per directory, so
@@ -375,8 +378,10 @@ set(R4D_DIR ${CMAKE_SOURCE_DIR}/libr4d)
 set(R4D_EMU ${CMAKE_CURRENT_SOURCE_DIR}/r4d_emu)
 set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_f32.hip
                 ${R4D_DIR}/r4d_norm_join_bf16.hip ${R4D_DIR}/r4d_expert_scale_bf16.hip
-                ${R4D_DIR}/r4d_qsa_select_bf16.hip ${R4D_DIR}/r4d_lora_bf16.hip)
-set(R4D_EMU_TESTS attn pick norm escale qsa lora)
+                ${R4D_DIR}/r4d_qsa_select_bf16.hip ${R4D_DIR}/r4d_lora_bf16.hip ${R4D_DIR}/r4d_glm.hip
+                ${R4D_DIR}/r4d_mhc.hip ${R4D_DIR}/r4d_fp8_f32scale.hip ${R4D_DIR}/r4d_kda.hip
+                ${R4D_DIR}/r4d_moe_mxfp4.hip ${R4D_DIR}/r4d_mla.hip ${R4D_DIR}/r4d_quant_act_fp8.hip)
+set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
@@ -412,7 +417,10 @@ else()
     set(objs "")
     foreach(src ${R4D_EMU_HIP} ${R4D_EMU}/ref_host.cpp ${R4D_EMU}/emu/emu.cpp
                 ${R4D_EMU}/test_attn.cpp ${R4D_EMU}/test_pick.cpp ${R4D_EMU}/test_norm.cpp
-                ${R4D_EMU}/test_escale.cpp ${R4D_EMU}/test_qsa.cpp ${R4D_EMU}/test_lora.cpp)
+                ${R4D_EMU}/test_escale.cpp ${R4D_EMU}/test_qsa.cpp ${R4D_EMU}/test_lora.cpp
+                ${R4D_EMU}/test_f32.cpp ${R4D_EMU}/test_mhc.cpp ${R4D_EMU}/test_fp8f32.cpp
+                ${R4D_EMU}/test_kda.cpp ${R4D_EMU}/test_moemx.cpp ${R4D_EMU}/test_mla.cpp
+                ${R4D_EMU}/test_moefuse.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
       if(src MATCHES "\\.hip$")
@@ -429,7 +437,7 @@ else()
         list(APPEND objs ${dir}/${stem}.o)
       endif()
     endforeach()
-    # test_lora opens libref with dlopen to hold the emulated kernels to it.
+    # test_lora and test_kda open libref with dlopen to hold the emulated kernels to it.
     set(dl "")
     foreach(l ${CMAKE_DL_LIBS})
       list(APPEND dl -l${l})
@@ -449,7 +457,7 @@ else()
   endif()
 endif()
 if(R4D_EMU_BUILT)
-  foreach(t pick norm escale qsa lora)
+  foreach(t pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # The attention cases take about 11 s, 7 of them in the two long prefills on the WMMA kernel,
@@ -459,11 +467,12 @@ if(R4D_EMU_BUILT)
              COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_attn --shard ${k}/3)
   endforeach()
   set_tests_properties(r4d_emu_attn_shard0 r4d_emu_attn_shard1 r4d_emu_attn_shard2 r4d_emu_pick
-                       r4d_emu_norm r4d_emu_escale r4d_emu_qsa r4d_emu_lora
+                       r4d_emu_norm r4d_emu_escale r4d_emu_qsa r4d_emu_lora r4d_emu_mla r4d_emu_moefuse
                        PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   # The LoRA pair has a libref oracle, and the test holds the emulated kernels to it when it can
-  # load one -- expand bit for bit, shrink to its bound.
-  set_tests_properties(r4d_emu_lora PROPERTIES
+  # load one -- expand bit for bit, shrink to its bound. kda_update is held to libref's within
+  # rounding, and that test needs it.
+  set_tests_properties(r4d_emu_lora r4d_emu_kda PROPERTIES
                        ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
   # A seeded random sweep, mostly prefill shapes on the WMMA kernel, which the emulator runs at
   # about 2 s a case: `slow`. `r4d_emu_attn sweep 200` is a longer run by hand, a superset of it.
@@ -506,13 +515,13 @@ endif()
 # Installs the build into a prefix, then configures, builds and installs every plugin directory
 # standalone against it with find_package(radiance). The result must match the tree's plugins,
 # vocabulary and registration, and serve rad-kbench's fixture through the installed tools
-# (tests/oot_plugins.sh). libr4d is included when the tree built it, with the same HIP compiler and
-# targets. Labelled `oot`: it rebuilds every plugin and takes minutes.
+# (tests/oot_plugins.sh). libr4d is included when the tree built it, with the same HIP compiler,
+# targets and RAD_HIP_VOPD_REPEATABLE. Labelled `oot`: it rebuilds every plugin and takes minutes.
 set(RAD_OOT_HIP "")
 if(RAD_HIP_FOUND AND TARGET libr4d)
   get_target_property(RAD_OOT_R4D_ARCH libr4d HIP_ARCHITECTURES)
   string(REPLACE ";" "\\;" RAD_OOT_R4D_ARCH "${RAD_OOT_R4D_ARCH}")
-  set(RAD_OOT_HIP ${CMAKE_HIP_COMPILER} "${RAD_OOT_R4D_ARCH}")
+  set(RAD_OOT_HIP ${CMAKE_HIP_COMPILER} "${RAD_OOT_R4D_ARCH}" ${RAD_HIP_VOPD_REPEATABLE})
 endif()
 add_test(NAME oot_plugins
          COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/oot_plugins.sh

@@ -5,6 +5,7 @@
  * Separate from engine.cpp (the hot step loop), with which it shares only the Engine's fields.
  */
 #include "engine_priv.h"
+#include "rad_internal.h"
 #include "engine_hostmem.h"
 #include "gen/driver.h"
 #include "gen/audio_driver.h"
@@ -275,10 +276,11 @@ static void report_pool_refusal(int rank, int device, const Pools& pools, const 
 }
 
 /* ------------------------------------------------------------------ locked host memory */
-/* Host memory left free beside a table locked whole: the process's unpooled allocations, the
- * load's staging windows, and the page cache holding the container's hot pages. Without it the
- * kernel reclaims the files the engine reads, then the OOM killer runs. */
-static const int64_t kLockMargin = (int64_t)4 << 30;
+/* The margin (--host-headroom-mib, Engine::host_headroom_bytes): host memory left free beside a
+ * table locked whole -- the process's unpooled allocations, the load's staging windows, and the
+ * page cache holding the container's hot pages. Without it the kernel reclaims the files the
+ * engine reads, then the OOM killer runs. It is dead RAM by design; a host that can reclaim
+ * cheaply trades it for pool, cache or slots. */
 
 /* Every level of every memory cgroup the process is in, leaf first: `visit(dir, room)` until it
  * returns false (cgroup_levels). /proc/self/cgroup reads "0::/path" on v2 and "N:memory:/path"
@@ -309,12 +311,13 @@ static void memory_cgroups(const std::function<bool(const std::string&, int64_t)
 }
 
 /* Whether `need` more bytes fit in host memory after `still` more this process will allocate
- * first, or why not. Checks MemAvailable; every memory cgroup from the process's own up to the
- * visible root (Docker's --memory, enforced by the OOM killer); and, for an mlock()ed copy
- * (`mlocks`), RLIMIT_MEMLOCK unless the process has CAP_IPC_LOCK. Pinned memory a card reads is a
- * driver userptr mapping, which RLIMIT_MEMLOCK does not count. An unreadable limit is ignored,
- * never guessed. */
-static bool lockable_room(int64_t need, int64_t still, bool mlocks, std::string* why) {
+ * first and `margin` (--host-headroom-mib) stays free, or why not. Checks MemAvailable; every
+ * memory cgroup from the process's own up to the visible root (Docker's --memory, enforced by
+ * the OOM killer); and, for an mlock()ed copy (`mlocks`), RLIMIT_MEMLOCK unless the process has
+ * CAP_IPC_LOCK. Pinned memory a card reads is a driver userptr mapping, which RLIMIT_MEMLOCK
+ * does not count. An unreadable limit is ignored, never guessed. */
+static bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mlocks,
+                          std::string* why) {
     long long locked_kb = 0;
     unsigned long long caps = 0;
     {
@@ -334,43 +337,44 @@ static bool lockable_room(int64_t need, int64_t still, bool mlocks, std::string*
         return false;
     }
     if (const int64_t avail = meminfo_bytes("MemAvailable");
-        avail >= 0 && avail - still - kLockMargin < need) {
+        avail >= 0 && avail - still - margin < need) {
         *why = fmt("%s of memory is available, %s more is still to be allocated (the pinned host "
                    "pools, the prefix cache's host tier, the checkpoint slots and the host "
-                   "activation arenas), and this wants %s with %s to spare",
+                   "activation arenas), and this wants %s with %s to spare "
+                   "(--host-headroom-mib)",
                    humanb(avail).c_str(), humanb(still).c_str(), humanb(need).c_str(),
-                   humanb(kLockMargin).c_str());
+                   humanb(margin).c_str());
         return false;
     }
     bool fits = true;
     memory_cgroups([&](const std::string& dir, int64_t room) {
-        if (room - still - kLockMargin >= need) return true;
+        if (room - still - margin >= need) return true;
         *why = fmt("the memory cgroup at %s leaves %s, %s more is still to be allocated, "
-                   "and this wants %s with %s to spare", dir.c_str(),
+                   "and this wants %s with %s to spare (--host-headroom-mib)", dir.c_str(),
                    humanb(room).c_str(), humanb(still).c_str(), humanb(need).c_str(),
-                   humanb(kLockMargin).c_str());
+                   humanb(margin).c_str());
         fits = false;
         return false;
     });
     return fits;
 }
 
-/* The most lockable_room(need, still, false) admits, and in `limit` the bound that decides it.
- * INT64_MAX when no limit can be read. */
-static int64_t lockable_bytes(int64_t still, std::string* limit) {
+/* The most lockable_room(need, still, margin, false) admits, and in `limit` the bound that
+ * decides it. INT64_MAX when no limit can be read. */
+static int64_t lockable_bytes(int64_t still, int64_t margin, std::string* limit) {
     int64_t most = INT64_MAX;
     *limit = "no readable memory limit";
     if (const int64_t avail = meminfo_bytes("MemAvailable"); avail >= 0) {
-        most = avail - still - kLockMargin;
+        most = avail - still - margin;
         *limit = fmt("%s of memory available, less %s still to be allocated and %s to spare",
-                     humanb(avail).c_str(), humanb(still).c_str(), humanb(kLockMargin).c_str());
+                     humanb(avail).c_str(), humanb(still).c_str(), humanb(margin).c_str());
     }
     memory_cgroups([&](const std::string& dir, int64_t room) {
-        if (room - still - kLockMargin < most) {
-            most = room - still - kLockMargin;
+        if (room - still - margin < most) {
+            most = room - still - margin;
             *limit = fmt("the memory cgroup at %s, which leaves %s, less %s still to be allocated "
                          "and %s to spare", dir.c_str(), humanb(room).c_str(),
-                         humanb(still).c_str(), humanb(kLockMargin).c_str());
+                         humanb(still).c_str(), humanb(margin).c_str());
         }
         return true;
     });
@@ -470,7 +474,9 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
     const int64_t pools_still = (int64_t)cfg_.tp * cfg_.host_pool_mib * MiB +
                                 cfg_.prefix_cache_mib * MiB + host_late;
     std::string emb_room_why;
-    auto emb_room = [&]() { return lockable_room(emb_pin, pools_still, false, &emb_room_why); };
+    auto emb_room = [&]() {
+        return lockable_room(emb_pin, pools_still, host_headroom_bytes(), false, &emb_room_why);
+    };
     if (emb_max == 0) {
         if (emb == TablePlacement::Ram && emb_asked) {
             RAD_ERR("--embedding-placement ram: this model has no token embedding table that only "
@@ -525,7 +531,7 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
         std::string why;
         const int64_t pin = (int64_t)cfg_.tp * align_up(tower_max, (int64_t)MiB);
         if (!lockable_room(pin, pools_still + (int64_t)cfg_.tp * cfg_.embedding_host_mib * MiB,
-                           false, &why)) {
+                           host_headroom_bytes(), false, &why)) {
             RAD_ERR("--vision-tower-placement ram: the encoder towers (%s a rank, pinned on every "
                     "rank) cannot be held in host memory: %s. Use vram.", humanb(tower_max).c_str(),
                     why.c_str());
@@ -609,7 +615,8 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
     } else {
         std::string card_why, ram_why;
         const bool card = ng == TablePlacement::Auto && ngram_device && card_holds(&card_why);
-        const bool room = !card && lockable_room(need, still, !ngram_device, &ram_why);
+        const bool room =
+            !card && lockable_room(need, still, host_headroom_bytes(), !ngram_device, &ram_why);
         if (ng == TablePlacement::Ram) {
             if (!room) {
                 RAD_ERR("--ngram-placement ram: the n-gram table (%s) cannot be held in memory as "
@@ -875,7 +882,9 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     bc.tp_wire_lossy = cfg_.tp_wire_exact ? 0 : 1;
     /* The engine always states the KV dtype. RAD_DT_INVALID (zero) remains valid in the ABI for
      * other callers and means the plugin's default. */
-    bc.kv_dtype = cfg_.kv_cache_dtype == "fp8" ? RAD_F8E4M3 : RAD_BF16;
+    bc.kv_dtype = cfg_.kv_cache_dtype == "bf16" ? RAD_BF16 : RAD_F8E4M3;
+    bc.kv_quant = cfg_.kv_cache_dtype == "fp8_v4" ? RAD_KVQ_V4
+                : cfg_.kv_cache_dtype == "k6_v4"  ? RAD_KVQ_K6V4 : RAD_KVQ_NONE;
     bc.tp_wire_min_bytes = cfg_.tp_wire_min_kb * 1024;
     bc.scope      = "";
     bc.max_enc_patches = cfg_.mm_max_patches > 0 ? cfg_.mm_max_patches : 0;
@@ -979,6 +988,19 @@ int Engine::declare() {
             }
             if (cfg_.n_spec < 0) cfg_.n_spec = 0;
             cfg_.prefix_cache = false;
+        }
+    }
+    /* fp8_v4 and k6_v4 are layouts only the plugin and libr4d's rows for them know. A plugin that
+     * does not say it serves one (RadArchProbe::kv_quant_ok) would store plain E4M3 under a name
+     * that promised a smaller cache, so the flag is refused rather than ignored. */
+    if (cfg_.kv_cache_dtype == "fp8_v4" || cfg_.kv_cache_dtype == "k6_v4") {
+        const int q = cfg_.kv_cache_dtype == "fp8_v4" ? RAD_KVQ_V4 : RAD_KVQ_K6V4;
+        RadArchProbe pb{};
+        (void)rad_tools_probe(plugins_, meta_, &pb);
+        if (!(pb.kv_quant_ok & (1 << q))) {
+            RAD_ERR("--kv-cache-dtype %s: the '%s' plugin does not serve it for this model "
+                    "(fp8 does)", cfg_.kv_cache_dtype.c_str(), plugins_.arch_plugin.c_str());
+            return RAD_E_UNSUPPORTED;
         }
     }
     /* Resolved here, not at argument parsing: the plugin states its drafter's depth, and it is
@@ -1351,18 +1373,6 @@ int Engine::plan() {
             ngram_bytes = std::max(ngram_bytes, wf.ngram);
             ngram_device = ngram_device || wf.ngram_device;
             ngram_host = ngram_host || wf.ngram_host;
-            /* One --max-model-len sequence's cache: the least a KV pool can hold and still serve
-             * every acceptable request (configure_kv warns below it). --ngram-placement auto puts
-             * the table on the card only if the pool stays above it. */
-            {
-                Config one = cfg_;
-                one.max_seqs = 1;
-                KVManager single;
-                if (single.plan_groups(r->program.kv_groups, one) == RAD_OK) {
-                    kv_floor = std::max(kv_floor, single.ceiling(ctx));
-                    f.kv_one = single.ceiling(ctx);
-                }
-            }
             /* The staging region is sized only where the arena lends its top: without smaller
              * levels nothing returns it to the slab at decode, and a deterministic plan moves
              * nothing. */
@@ -1375,6 +1385,13 @@ int Engine::plan() {
                 ck_slot += probe.checkpoint_bytes();
                 f.kv_ceiling = probe.ceiling(ctx);
                 f.kv_fixed   = probe.fixed_bytes();
+                /* One --max-model-len sequence's pool, as the inverse of the real plan: its
+                 * recurrent and conv slots stay allocated with one request active, which a
+                 * separate one-sequence plan would leave out. */
+                const int64_t MiB = 1ll << 20;
+                const int64_t need = probe.pool_mib_for_tokens(ctx, (f.kv_ceiling + MiB - 1) / MiB);
+                if (need >= 0) f.kv_one = need * MiB;
+                kv_floor = std::max(kv_floor, f.kv_one);
             }
             /* The step batch's device staging, reserved by the scheduler after this split: block
              * tables for max_seqs sequences at max_ctx, media staging for max_tok encoder rows.
@@ -2763,7 +2780,7 @@ int Engine::size_checkpoint_store(int64_t slot, const char* what) {
     int64_t still = cfg_.prefix_cache_mib * ((int64_t)1 << 20);
     for (const auto& r : ranks_) still += arena_host_bytes(r->program);
     std::string limit;
-    int64_t room = lockable_bytes(still, &limit);
+    int64_t room = lockable_bytes(still, host_headroom_bytes(), &limit);
     if (!device_is_host()) {
         bool lifted = false;
         if (const int64_t cap = amdgpu_pin_cap(&lifted); cap > 0) {
@@ -2906,7 +2923,8 @@ int Engine::configure_kv() {
             };
             if (!sized) return refuse("no host has");
             std::string why;
-            if (!lockable_room(slot * n, 0, false, &why)) return refuse("does not fit: " + why);
+            if (!lockable_room(slot * n, 0, host_headroom_bytes(), false, &why))
+                return refuse("does not fit: " + why);
             if (ck_store_.open(slot, slot * n) != RAD_OK)
                 return refuse(std::string("the host did not pin: ") + rad_dev_last_error());
             if (!sized_auto)
@@ -3102,6 +3120,7 @@ int Engine::configure_kv() {
 
 /* ================================================================== start */
 int Engine::start() {
+    startup_begin_ns_ = rad_mono_ns();
     std::vector<int> devs;
     std::string inventory;
     std::string devnote;

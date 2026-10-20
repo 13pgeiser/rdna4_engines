@@ -3,6 +3,7 @@
 #include "lq_common.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -233,6 +234,58 @@ std::string calib_stem(const char* name) {
     return s;
 }
 
+/* The rank parts of `stem` (see calib_sum), block diagonal into `acc`; the number read. */
+int calib_sum_parts(const char* dir, const std::string& stem, int64_t K, int64_t domain,
+                    std::vector<double>* acc) {
+    std::vector<std::vector<float>> parts;
+    int64_t total = 0;
+    for (int r = 0; r < kMaxRanks; ++r) {
+        const std::string path = gram_path(dir, r, stem + ".part");
+        FILE* f = std::fopen(path.c_str(), "rb");
+        if (!f) break;
+        char hdr[kHdr];
+        uint32_t kk = 0, dom = 0;
+        bool ok = std::fread(hdr, 1, kHdr, f) == (size_t)kHdr && std::memcmp(hdr, "RADGRAM2", 8) == 0;
+        if (ok) { std::memcpy(&kk, hdr + 8, 4); std::memcpy(&dom, hdr + 24, 4); }
+        ok = ok && dom == 0 && kk > 0 && total + kk <= K;
+        std::vector<float> h;
+        if (ok) {
+            h.resize((size_t)kk * kk);
+            ok = std::fread(h.data(), 4, h.size(), f) == h.size();
+        }
+        std::fclose(f);
+        if (!ok) {
+            std::fprintf(stderr, "libquant: %s is not a usable part of the %lld-wide '%s' (a domain-0 "
+                                 "RADGRAM2 within K)\n", path.c_str(), (long long)K, stem.c_str());
+            return 0;
+        }
+        total += kk;
+        parts.push_back(std::move(h));
+    }
+    if (parts.empty()) return 0;
+    if (total != K) {
+        std::fprintf(stderr, "libquant: the %zu part(s) of '%s' cover %lld of K=%lld columns\n",
+                     parts.size(), stem.c_str(), (long long)total, (long long)K);
+        return 0;
+    }
+    std::vector<double> h((size_t)(K * K), 0.0);
+    int64_t off = 0;
+    for (const auto& p : parts) {
+        const int64_t k = (int64_t)std::llround(std::sqrt((double)p.size()));
+        for (int64_t i = 0; i < k; ++i)
+            for (int64_t j = 0; j < k; ++j)
+                h[(size_t)((off + i) * K + off + j)] = p[(size_t)(i * k + j)];
+        off += k;
+    }
+    if (domain != 0) {
+        rotate_gram(h, K, domain);
+        for (double& x : h) x = (double)(float)x;
+    }
+    if (acc->empty()) acc->assign(h.size(), 0.0);
+    for (size_t i = 0; i < h.size(); ++i) (*acc)[i] += h[i];
+    return (int)parts.size();
+}
+
 int calib_sum(const char* dir, const std::string& stem, int64_t K, int64_t domain,
               std::vector<double>* acc) {
     /* Sum every rank's file. Under expert parallelism a rank's `down` Hessian covers only tokens
@@ -242,6 +295,8 @@ int calib_sum(const char* dir, const std::string& stem, int64_t K, int64_t domai
     int found = 0;
     for (int r = 0; r < kMaxRanks; ++r)
         if (read_gram(gram_path(dir, r, stem), K, domain, acc)) ++found;
+    if (!found && (domain == 0 || (domain >= 2 && (domain & (domain - 1)) == 0 && K % domain == 0)))
+        found = calib_sum_parts(dir, stem, K, domain, acc);
     return found;
 }
 

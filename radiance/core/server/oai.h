@@ -109,6 +109,10 @@ struct OaiRequest {
     /* The Responses API request fields its response object echoes (instructions, tools,
      * tool_choice, text, reasoning, ...), as a JSON object; "" for the other shapes. */
     std::string     echo_json;
+    /* The Responses API's namespaced function tools, flattened for the chat path: the flattened
+     * name ("<namespace>__<name>") to its namespace and name, which a function_call item reports
+     * apart. Empty for the other shapes. */
+    std::map<std::string, std::pair<std::string, std::string>> tool_namespace;
     /* llama-server's native /completion: the generated token ids beside the text. */
     bool            return_tokens = false;
     /* The reasoning block's closer when the reply starts inside the block, else "": the stop
@@ -499,9 +503,11 @@ std::string anthropic_error_body(const ApiError& e);
 /* OpenAI's Responses API, translated into the equivalent chat request like Anthropic's. `*echo`
  * holds the request fields the response object repeats. previous_response_id needs server-side
  * storage and is refused; non-function tool types have no chat equivalent and are dropped, as
- * llama-server does. */
+ * llama-server does. A namespace's function tools are flattened to "<namespace>__<name>", and
+ * `*ns` (when given) maps each flattened name back for the reply's function_call items. */
 int responses_to_chat(const std::string& body, const OaiLimits& lim, std::string* chat,
-                      std::string* echo, ApiError* err);
+                      std::string* echo, ApiError* err,
+                      std::map<std::string, std::pair<std::string, std::string>>* ns = nullptr);
 std::string responses_body(const OaiRequest& r, const ChoiceOut& c, const UsageOut& u);
 
 /* Anthropic's stop_reason for a finish and the stop string that caused it. */

@@ -100,6 +100,12 @@ int  r4d_attn_prefill_h256_gqa2_bf16kv(const R4DArgs* a, hipStream_t stream);
 int  r4d_attn_decode_h256_gqa2_fp8kv  (const R4DArgs* a, hipStream_t stream);
 int  r4d_attn_decode_h256_gqa2_bf16kv (const R4DArgs* a, hipStream_t stream);
 long r4d_attn_decode_h256_gqa2_scratch_bytes(const R4DArgs* a);
+/* Gemma 3 sliding window (r4d_attn_paged_h128_gqa2w.hip): head_dim 128, gqa 2, window >= 1. */
+int  r4d_attn_prefill_h128_gqa2w_fp8kv (const R4DArgs* a, hipStream_t stream);
+int  r4d_attn_prefill_h128_gqa2w_bf16kv(const R4DArgs* a, hipStream_t stream);
+int  r4d_attn_decode_h128_gqa2w_fp8kv  (const R4DArgs* a, hipStream_t stream);
+int  r4d_attn_decode_h128_gqa2w_bf16kv (const R4DArgs* a, hipStream_t stream);
+long r4d_attn_decode_h128_gqa2w_scratch_bytes(const R4DArgs* a);
 // The geometry the attention kernels above are compiled for, so a caller can check a model
 // before the first launch.
 void r4d_attn_dims(int* head_dim, int* gqa, int* block_size, int* max_decode_rows);
@@ -230,7 +236,8 @@ int r4d_gdn_recurrent_update_k128_v128_bf16_fp32state(
 // zeroed words, a handshake and a slot-parity counter per block of capacity (r4d_ar_seq.h).
 enum { R4D_AR_HANDLE_BYTES = 64 };
 // IPC scratch helpers, startup-only: alloc returns the device pointer and writes the IPC handle
-// (up to HANDLE_BYTES) into out_handle.
+// (up to HANDLE_BYTES) into out_handle. A refused export (beside another engine on the same cards)
+// leaves it zeroed with *out_len 0: libr4d's ranks are threads of one process and share the pointer.
 long r4d_ar_ipc_alloc(long size, int finegrained, char* out_handle, int* out_len);
 // Strided peer (or local) device-to-device copy through the copy engines; pitches and width in
 // bytes, height in rows. Returns 0 or -100 - hipError_t.
@@ -380,11 +387,15 @@ void r4d_ar_wide_dims(int* max_blocks, int* nb_design, int* max_peers);
 // rank s (fp32, ascending rank order), then gathered. Sends 2*(ws-1)/ws*N bytes per rank in two
 // hops, for sizes where the one-shot's (ws-1)*N send is too heavy. Shards are as even as the word
 // count allows (the first n16 % ws take one more word), so the message need not divide by the
-// rank count. Regions A and B sit at 0 and the longest shard, so the slot stride must hold twice
-// that. Above the bound below the caller falls back to the one-shot; it only guards the kernel's
-// int word offsets (2^28 elements is 2^26 words at fp32). A lower bound would send large prefill
+// rank count. At 8 ranks `shard_weights` (8 ints, or null for the even split) sizes the shards per
+// rank instead (r4d_ar_shards.h); every rank must pass the same weights. Regions A and B sit at 0
+// and the longest shard, so the slot stride must hold twice that. `pieces` (8 ranks, 1 to
+// R4D_AR_TS_MAX_PIECES, the same on every rank) pipelines each block's words in that many runs so
+// phase 1 of one run and phase 2 of the previous share the link; 1 is the unpipelined kernel.
+// Above the bound below the caller falls back to the one-shot; it only guards the kernel's int
+// word offsets (2^28 elements is 2^26 words at fp32). A lower bound would send large prefill
 // chunks (e.g. 8192 tokens at Gemma 4's 2816 width, 23M-46M elements) to the one-shot.
-enum { R4D_AR_TWOSHOT_WIDE_MAX_ELEMS = 268435456 };
+enum { R4D_AR_TWOSHOT_WIDE_MAX_ELEMS = 268435456, R4D_AR_TS_MAX_PIECES = 16 };
 void r4d_ar_twoshot_3rank_exact(long peer_scratch0, long peer_scratch1, long peer_flags0,
                                 long peer_flags1, long my_scratch, long my_flags, long seq_ctrs,
                                 long slot_stride16, long inp, long out, long n_elem, long dtype,
@@ -403,7 +414,8 @@ void r4d_ar_twoshot_8rank_exact(long peer_scratch0, long peer_scratch1, long pee
                                 long peer_flags5, long peer_flags6, long my_scratch,
                                 long my_flags, long seq_ctrs, long slot_stride16, long inp,
                                 long out, long n_elem, long dtype, long rank, long stream,
-                                long nblocks, long nthreads, long drain, long acq, long pub);
+                                long nblocks, long nthreads, long drain, long acq, long pub,
+                                const int* shard_weights, long pieces);
 // The tiered int8 wire on both two-shot hops (r4d_ar_twoshot_Nrank_ti8.hip; codec in
 // r4d_ar_ti8.h), 3 or 4 ranks. Int8 groups of 32 with an fp16 scale and a per-group record
 // (T1 plain, T2 top-1-exact, T3 wht32), 38 bytes/group; tiering is deterministic and
@@ -631,6 +643,10 @@ void r4d_moe_gemm_pin_down_dec(int pin);
 // (refused likewise, and below 512 rows, whose scratch is not sized for their weight planes).
 // All bit-identical; r4d_selftest compares their bytes.
 void r4d_hc_read_pin_prefill(int form);
+// Test hook: pins the MLA matrix row's key load. 0 is the launcher's rule (sixteen-byte vectors
+// wherever the cache rows are aligned to them), 1 the element-wise load the rule falls back to.
+// Bit-identical; r4d_selftest compares them and --perfmla times both.
+void r4d_mla_matrix_pin_form(int form);
 // Test hook: records the function each launch dispatches into `fns[0..cap)`, in order, until the
 // next call, and returns how many launches the previous recording saw (which may exceed its cap).
 // Null `fns` stops recording. r4d_selftest uses it to show that a pinned form dispatches a kernel
@@ -720,7 +736,7 @@ int  r4d_ar_rmsnorm_quant_fp8(long peer_scratch, long my_scratch, long peer_flag
                               int M, int n, float eps, float wadd, int w_f32,
                               int r_ld, int y_ld, int q_ld, int s_ld, long stream,
                               int nblocks, int nthreads, int drain, int acq, int wire,
-                              long loc_pack, long loc_scale_off);
+                              long loc_pack, long loc_scale_off, long wp = 0);
 int  r4d_ar_rmsnorm_quant_fp8_chunk_elems(void);
 
 // The same IPC with the sandwich-norm junction after it (r4d_rmsnorm_quant_i8.hip): post-norm of
@@ -853,6 +869,7 @@ int r4d_binary_bf16(long a, long b, long y, int M, int n, int op,
                     int a_ld, int b_ld, int y_ld, long stream);
 int r4d_sigmoid_bf16(long x, long y, int M, int n, int x_ld, int y_ld, long stream);
 int r4d_fill_bf16(long y, int M, int n, int y_ld, float value, long stream);
+int r4d_fill_f32(long y, int M, int n, int y_ld, float value, long stream);
 // y[.., i] = silu(gu[.., i]) * gu[.., n + i]. The gate is the first half, the order rad-convert
 // fuses gate_proj and up_proj in.
 int r4d_silu_mul_bf16(long gu, long y, int M, int n, int gu_ld, int y_ld, long stream);

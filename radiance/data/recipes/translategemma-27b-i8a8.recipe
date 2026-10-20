@@ -1,0 +1,14 @@
+# translategemma-27b-i8a8.recipe -- TranslateGemma 27B (arch/gemma3) for calibration: every linear
+# int8 with a bf16 scale a 128 columns, served at i8a8 over an int8 activation scaled per (row, 128).
+# KL 0.003 against the bf16 model, and it fits two 32 GB cards with room for the tap's Grams.
+#
+#   rad-convert <translategemma-27b-it> --recipe data/recipes/translategemma-27b-i8a8.recipe \
+#       -o translategemma-27b-i8a8.rad
+
+blk.*.attn_q.weight       rtn  codes=i8 group=128 scale=bf16 clamp=sym
+blk.*.attn_k.weight       rtn  codes=i8 group=128 scale=bf16 clamp=sym
+blk.*.attn_v.weight       rtn  codes=i8 group=128 scale=bf16 clamp=sym
+blk.*.attn_o.weight       rtn  codes=i8 group=128 scale=bf16 clamp=sym
+blk.*.ffn_down.weight     rtn  codes=i8 group=128 scale=bf16 clamp=sym
+blk.*.ffn_gate_up.weight  rtn  codes=i8 group=128 scale=bf16 clamp=sym
+output.weight             rtn  codes=i8 group=128 scale=bf16 clamp=sym

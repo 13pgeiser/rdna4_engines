@@ -50,14 +50,14 @@ extern "C" void r4d_attn_dims(int* head_dim, int* gqa, int* block_size, int* max
 #define P_OPT    3954187
 
 // KVP: 0 = fp8 e4m3 cache, 1 = bf16 cache. Reached only through the two named wrappers below.
-template <int KVP>
+template <int KVP, int XOPT = 0>
 static int prefill_launch(const R4DArgs* a, hipStream_t s) {
     if (a->head_dim != A_HEAD_DIM || a->block_size != A_BLOCK_SIZE) return -1;
     if (a->q_heads / a->kv_heads != A_GQA) return -2;
     constexpr int BQ = (P_NWARPS * 16) / A_GQA;
     dim3 grid((a->q_len + BQ - 1) / BQ, a->kv_heads, a->num_seqs);
     hipLaunchKernelGGL((r4d_attn_prefill_kernel<P_NWARPS, P_TILE, A_HEAD_DIM, A_GQA, A_BLOCK_SIZE,
-                                                KVP, P_OPT>),
+                                                KVP, P_OPT | XOPT>),
                        grid, dim3(P_NWARPS * 32), 0, s, *a);
     CHK();
     return 0;
@@ -68,6 +68,12 @@ extern "C" int r4d_attn_prefill_h256_gqa6_fp8kv(const R4DArgs* a, hipStream_t s)
 }
 extern "C" int r4d_attn_prefill_h256_gqa6_bf16kv(const R4DArgs* a, hipStream_t s) {
     return prefill_launch<1>(a, s);
+}
+extern "C" int r4d_attn_prefill_h256_gqa6_fp8v4kv(const R4DArgs* a, hipStream_t s) {
+    return prefill_launch<0, O_V4>(a, s);
+}
+extern "C" int r4d_attn_prefill_h256_gqa6_k6v4kv(const R4DArgs* a, hipStream_t s) {
+    return prefill_launch<0, O_V4 | O_K6>(a, s);
 }
 
 // ---- decode ----------------------------------------------------------------------------------
@@ -90,7 +96,7 @@ extern "C" long r4d_attn_decode_h256_gqa6_scratch_bytes(const R4DArgs* a) {
     return r4d_decode_scratch(a, r4d_decode_splits(a, D_TILE), D_OPT);
 }
 
-template <int KVP>
+template <int KVP, int XOPT = 0>
 static int decode_launch(const R4DArgs* a, hipStream_t s) {
     if (a->head_dim != A_HEAD_DIM || a->block_size != A_BLOCK_SIZE) return -1;
     if (a->q_heads / a->kv_heads != A_GQA) return -2;
@@ -101,7 +107,7 @@ static int decode_launch(const R4DArgs* a, hipStream_t s) {
 
 #define D_LAUNCH(NW)                                                                          \
     hipLaunchKernelGGL((r4d_attn_decode_kernel<NW, D_TILE, A_HEAD_DIM, A_GQA, A_BLOCK_SIZE,    \
-                                               KVP, D_OPT>),                                  \
+                                               KVP, D_OPT | XOPT>),                           \
                        dim3(splits, a->kv_heads, a->num_seqs), dim3(NW * 32), 0, s, *a, splits)
     if      (nw == 1) D_LAUNCH(1);
     else if (nw == 2) D_LAUNCH(2);
@@ -137,6 +143,12 @@ extern "C" int r4d_attn_decode_h256_gqa6_fp8kv(const R4DArgs* a, hipStream_t s) 
 }
 extern "C" int r4d_attn_decode_h256_gqa6_bf16kv(const R4DArgs* a, hipStream_t s) {
     return decode_launch<1>(a, s);
+}
+extern "C" int r4d_attn_decode_h256_gqa6_fp8v4kv(const R4DArgs* a, hipStream_t s) {
+    return decode_launch<0, O_V4>(a, s);
+}
+extern "C" int r4d_attn_decode_h256_gqa6_k6v4kv(const R4DArgs* a, hipStream_t s) {
+    return decode_launch<0, O_V4 | O_K6>(a, s);
 }
 
 // ============================================================== the plugin ABI entry points
@@ -186,10 +198,11 @@ extern "C" int r4d_rad_attn_prefill_h256_bf16(const RadArgs* a, RadStream s) {
 static int64_t decode_scratch_bytes_of(const R4DArgs* r, int which) {
     if (which == 1) return (int64_t)r4d_attn_decode_h128_gqa4_scratch_bytes(r);
     if (which == 2) return (int64_t)r4d_attn_decode_h256_gqa2_scratch_bytes(r);
+    if (which == 3) return (int64_t)r4d_attn_decode_h128_gqa2w_scratch_bytes(r);
     return (int64_t)r4d_attn_decode_h256_gqa6_scratch_bytes(r);
 }
 
-static int64_t decode_scratch(const RadArgs* a, int head_dim, int which) {
+static int64_t decode_scratch(const RadArgs* a, int head_dim, int which, long long row = 0) {
     const int sp = split_of(a);
     if (sp < 0) return R4D_NO(RAD_E_INVAL);
 
@@ -219,7 +232,7 @@ static int64_t decode_scratch(const RadArgs* a, int head_dim, int which) {
         return worst;
     }
 
-    int rc = fill_paged(a, &r, head_dim);
+    int rc = fill_paged_row(a, &r, head_dim, row > 0 ? row : 2LL * head_dim);
     if (rc != RAD_OK) return rc;
     r.splits = sp;
     return decode_scratch_bytes_of(&r, which);
@@ -233,10 +246,10 @@ extern "C" int64_t r4d_rad_attn_decode_h128_scratch(const RadArgs* a) {
     return decode_scratch(a, 128, 1);
 }
 
-static int decode_common(const RadArgs* a, R4DArgs* r, int head_dim, int which) {
+static int decode_common(const RadArgs* a, R4DArgs* r, int head_dim, int which, long long row = 0) {
     const int sp = split_of(a);
     if (sp < 0) return R4D_NO(RAD_E_INVAL);
-    int rc = fill_paged(a, r, head_dim);
+    int rc = fill_paged_row(a, r, head_dim, row > 0 ? row : 2LL * head_dim);
     if (rc != RAD_OK) return rc;
     r->splits = sp;
     const int64_t need = decode_scratch_bytes_of(r, which);
@@ -251,6 +264,48 @@ extern "C" int r4d_rad_attn_decode_h256_fp8(const RadArgs* a, RadStream s) {
     if (rc != RAD_OK) return rc;
     /* Absent descales mean 1.0; see the prefill twin above. */
     return r4d_attn_decode_h256_gqa6_fp8kv(&r, (hipStream_t)s);
+}
+
+/* The fp8_v4 cache: a token's row is 25 * 256 / 16 = 400 bytes (E4M3 K, int4 V, f16 scales). */
+extern "C" int r4d_rad_attn_prefill_h256_fp8v4(const RadArgs* a, RadStream s) {
+    if (check_dims_once() != RAD_OK) return R4D_NO(RAD_E_SHAPE);
+    R4DArgs r;
+    int rc = fill_paged_row(a, &r, 256, 400);
+    if (rc != RAD_OK) return rc;
+    return r4d_attn_prefill_h256_gqa6_fp8v4kv(&r, (hipStream_t)s);
+}
+
+extern "C" int64_t r4d_rad_attn_decode_h256_v4_scratch(const RadArgs* a) {
+    return decode_scratch(a, 256, 0, 400);
+}
+
+extern "C" int r4d_rad_attn_decode_h256_fp8v4(const RadArgs* a, RadStream s) {
+    if (check_dims_once() != RAD_OK) return R4D_NO(RAD_E_SHAPE);
+    R4DArgs r;
+    int rc = decode_common(a, &r, 256, 0, 400);
+    if (rc != RAD_OK) return rc;
+    return r4d_attn_decode_h256_gqa6_fp8v4kv(&r, (hipStream_t)s);
+}
+
+/* The k6_v4 cache: a token's row is 22 * 256 / 16 = 352 bytes (int6 K, int4 V, f16 scales). */
+extern "C" int r4d_rad_attn_prefill_h256_k6v4(const RadArgs* a, RadStream s) {
+    if (check_dims_once() != RAD_OK) return R4D_NO(RAD_E_SHAPE);
+    R4DArgs r;
+    int rc = fill_paged_row(a, &r, 256, 352);
+    if (rc != RAD_OK) return rc;
+    return r4d_attn_prefill_h256_gqa6_k6v4kv(&r, (hipStream_t)s);
+}
+
+extern "C" int64_t r4d_rad_attn_decode_h256_k6_scratch(const RadArgs* a) {
+    return decode_scratch(a, 256, 0, 352);
+}
+
+extern "C" int r4d_rad_attn_decode_h256_k6v4(const RadArgs* a, RadStream s) {
+    if (check_dims_once() != RAD_OK) return R4D_NO(RAD_E_SHAPE);
+    R4DArgs r;
+    int rc = decode_common(a, &r, 256, 0, 352);
+    if (rc != RAD_OK) return rc;
+    return r4d_attn_decode_h256_gqa6_k6v4kv(&r, (hipStream_t)s);
 }
 
 extern "C" int r4d_rad_attn_decode_h256_bf16(const RadArgs* a, RadStream s) {
@@ -296,4 +351,24 @@ extern "C" int r4d_rad_attn_decode_h256_gqa2_bf16(const RadArgs* a, RadStream s)
     int rc = decode_common(a, &r, 256, 2);
     if (rc != RAD_OK) return rc;
     return r4d_attn_decode_h256_gqa2_bf16kv(&r, (hipStream_t)s);
+}
+
+/* Gemma 3 sliding window (head_dim 128, gqa 2, window 1024) decode; its prefill entry points
+ * are in r4d_attn_paged_h128_gqa2w.hip. */
+extern "C" int64_t r4d_rad_attn_decode_h128_gqa2w_scratch(const RadArgs* a) {
+    return decode_scratch(a, 128, 3);
+}
+
+extern "C" int r4d_rad_attn_decode_h128_gqa2w_fp8(const RadArgs* a, RadStream s) {
+    R4DArgs r;
+    int rc = decode_common(a, &r, 128, 3);
+    if (rc != RAD_OK) return rc;
+    return r4d_attn_decode_h128_gqa2w_fp8kv(&r, (hipStream_t)s);
+}
+
+extern "C" int r4d_rad_attn_decode_h128_gqa2w_bf16(const RadArgs* a, RadStream s) {
+    R4DArgs r;
+    int rc = decode_common(a, &r, 128, 3);
+    if (rc != RAD_OK) return rc;
+    return r4d_attn_decode_h128_gqa2w_bf16kv(&r, (hipStream_t)s);
 }

@@ -1746,6 +1746,23 @@ static Interleaved interleave_run(int64_t n, bool decoder, int steps) {
     return out;
 }
 
+/* Between a commit and the next step (where an encoder pass is prepared) the committed step's
+ * plan names a request the scheduler may already have released: a client cancelled it and the
+ * server reaped it. prefill_continues() reads only an open step's plan (#127). */
+TEST(prefill_continues_reads_no_committed_plan) {
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+    f.sch.set_stage_rows(64);
+    const uint64_t p = f.submit(2000, 4);
+    CHECK(f.sch.step() != nullptr);
+    CHECK(f.sch.prefill_continues());
+    f.commit_plain(12);
+    CHECK_OK(f.sch.cancel(p));
+    CHECK_OK(f.sch.reap(p));
+    CHECK(!f.sch.prefill_continues());
+}
+
 TEST(interleave_off_puts_a_chunk_in_every_step) {
     const Interleaved r = interleave_run(0, /*decoder=*/true, 8);
     CHECK_EQ(r.shape, std::string("CCCCCCCC"));
@@ -2546,6 +2563,309 @@ TEST(the_adaptive_window_times_its_steps_and_the_next_cycle_reads_them) {
 }
 
 /* ================================================================== the step path */
+/* The single-sequence decode floor the dashboard reads instead of a typed ruler. Timing is real
+ * wall clock, so the assertions are the ones that hold whatever the machine measured: a step of a
+ * shape that must not sample leaves the floor at zero (a min only ever goes down, so a wrongly
+ * sampled step could never be told apart later -- it has to be caught while the floor is still
+ * unset), and a single-sequence step sets it. */
+TEST(the_decode_floor_estimator_does_not_latch_a_degenerate_bracket) {
+    /* The estimator is tested on a SYNTHETIC stream because the defect is a property of the
+     * estimator, not of the scheduler's ability to produce a degenerate bracket: the fixture runs
+     * steps in microseconds and cannot manufacture a 1.34 ms bracket behind a 15 ms one. What the
+     * live lane showed -- floor 1.34 ms against a 15.70 ms mean -- is reproduced here directly. */
+    using Est = rad::DecodeFloor;
+
+    /* First, the OLD construction, shown to fail. A min over raw brackets latches the single
+     * degenerate sample and never recovers, no matter how many honest steps follow. This is the
+     * defect, encoded as a test so the fix is measured against it rather than asserted. */
+    {
+        int64_t best = 0;
+        const int64_t real = 15'000'000, degenerate = 1'340'000;
+        auto old_min = [&](int64_t ns) { if (best == 0 || ns < best) best = ns; };
+        old_min(degenerate);                       /* one degenerate, early */
+        for (int i = 0; i < 500; ++i) old_min(real);
+        CHECK_EQ(best, degenerate);                /* latched -- this is the bug */
+    }
+
+    /* The NEW construction: a min over WINDOW MEANS. The same single degenerate is diluted by
+     * the honest steps sharing its window, so the floor tracks the real floor instead. */
+    {
+        Est est;
+        const int64_t real = 15'000'000, degenerate = 1'340'000;
+        est.update(degenerate);                    /* same degenerate, same position */
+        for (int i = 0; i < 500; ++i) est.update(real);
+        const int64_t floor = est.best();
+        CHECK(floor > 0);
+        CHECK(floor > degenerate);                 /* did NOT latch the degenerate */
+        /* Within 25% of the real floor: the window mean is a faithful estimator. */
+        CHECK(floor >= real * 3 / 4 && floor <= real);
+    }
+
+    /* Robust to a HIGH rate of degenerates: the live lane's checkpoint interval (256 tokens)
+     * implies they recur. One in four here. The assertion is that the floor tracks the REAL step
+     * time, not merely that it beats the degenerate -- with the rejection gate in place the latter
+     * would be trivially true and prove nothing. */
+    {
+        Est est;
+        const int64_t real = 15'000'000, degenerate = 1'340'000;
+        for (int i = 0; i < 400; ++i) est.update((i % 4 == 0) ? degenerate : real);
+        const int64_t floor = est.best();
+        CHECK(floor >= real * 90 / 100);           /* tracks the real step, not the poison */
+        CHECK(floor <= real);
+    }
+
+    /* A steady stream with no degenerates: the floor equals the true floor. */
+    {
+        Est est;
+        const int64_t real = 14'500'000;
+        for (int i = 0; i < 200; ++i) est.update(real);
+        CHECK_EQ(est.best(), real);
+    }
+}
+
+TEST(the_decode_floor_rejects_degenerate_brackets_so_the_floor_is_the_true_floor) {
+    /* Window-averaging dilutes a LONE degenerate but not a RECURRENT one. At the live lane's
+     * observed ~1.4% degenerate rate (a decode step issued ahead behind a long host commit --
+     * prefill, or a KV checkpoint every 256 tokens), a min over hundreds of windows reliably
+     * catches a window holding two or three degenerates, and the floor lands ~10% below the true
+     * floor. That residual is phantom drift: a healthy engine reads "restart pays back" against a
+     * floor it can no longer reach because the floor was never reachable -- it was an artifact.
+     * So a candidate far below the running mean of accepted steps is rejected outright: the
+     * degenerates sit at ~9% of the mean, real single-sequence steps at ~96%, so the two
+     * populations are ~10x apart and any threshold between them separates them. 0.5 is the
+     * midpoint of that gap, not a value tuned to a single distribution. */
+    using Est = rad::DecodeFloor;
+    const int64_t true_floor = 14'400'000, typical = 15'000'000, degen = 1'340'000;
+
+    /* A realistic stream: ~1.4% degenerates, the rest jittered around the typical step, with the
+     * true floor occasionally reached. The floor must land near the TRUE floor, not near the
+     * degenerate-contaminated window mean. */
+    Est est;
+    uint32_t rng = 12345;
+    for (int i = 0; i < 400 * Est::kWindow; ++i) {
+        rng = rng * 1664525u + 1013904223u;
+        const bool d = ((rng >> 16) % 1000u) < 14u;                 /* ~1.4% */
+        int64_t ns;
+        if (d) ns = degen;
+        else {
+            rng = rng * 1664525u + 1013904223u;
+            ns = true_floor + (int64_t)((rng >> 8) % (typical - true_floor + 1));  /* floor..typical */
+        }
+        est.update(ns);
+    }
+    const int64_t floor = est.best();
+    /* Within 5% of the true floor. The un-rejected estimator lands ~10% low here, so this fails
+     * without the rejection gate. */
+    CHECK(floor >= true_floor * 95 / 100);
+    CHECK(floor <= true_floor * 115 / 100);
+
+    /* The bootstrap hole: the gate needs a window of accepted samples before it can judge one, so
+     * the first window is un-gated. A degenerate-heavy FIRST window must therefore be recorded by
+     * neither side, or the floor latches an unreachable value forever. */
+    {
+        Est est;
+        for (int i = 0; i < Est::kWindow; ++i) est.update(degen);   /* whole first window poisoned */
+        CHECK_EQ(est.best(), (int64_t)0);
+        CHECK_EQ(est.recent(), (int64_t)0);
+        for (int i = 0; i < 40 * Est::kWindow; ++i) est.update(typical);
+        CHECK(est.best() >= typical * 95 / 100);   /* floor came from a gated window, not bootstrap */
+    }
+
+    /* And the rejection must NOT eat real steps: a stream of only real steps (no degenerates)
+     * still records a floor equal to the true floor. */
+    Est clean;
+    for (int i = 0; i < 100 * Est::kWindow; ++i) clean.update(true_floor);
+    CHECK_EQ(clean.best(), true_floor);
+}
+
+TEST(the_decode_floor_reports_a_recent_window_for_like_for_like_drift) {
+    /* The advisory compares "how fast is it now" against "how fast has it ever been". If those two
+     * numbers come from different instruments -- the engine's floor versus the browser's per-poll
+     * mean -- they disagree by pure order statistics: a min over hundreds of windows sits below a
+     * min over the last sixty samples even on a perfectly flat engine. Measured live 2026-10-18:
+     * a 7.7% phantom gap on a lane that had not changed. So the engine reports BOTH sides of the
+     * comparison, from the same stream and the same window size. */
+    using Est = rad::DecodeFloor;
+    const int64_t base = 15'000'000;
+
+    /* A steady engine with realistic run-to-run jitter: the recent window and the floor are both
+     * window means of the same population, so they must agree closely. */
+    {
+        Est est;
+        for (int i = 0; i < 400 * Est::kWindow; ++i) {
+            const int64_t jitter = ((i % 7) - 3) * 200'000;      /* +/- 0.6 ms, deterministic */
+            est.update(base + jitter);
+        }
+        const int64_t floor = est.best(), recent = est.recent();
+        CHECK(floor > 0);
+        CHECK(recent > 0);
+        /* The phantom gap must be small: this is the number the deadband is sized against. */
+        const int64_t gap_pct = 100 * (recent - floor) / floor;
+        CHECK(gap_pct < 3);
+    }
+
+    /* A degraded engine: the recent window rises, the floor remembers the old best. The verdict
+     * must separate -- that is the whole point of the advisory. */
+    {
+        Est est;
+        for (int i = 0; i < 200 * Est::kWindow; ++i) est.update(base);
+        const int64_t floor = est.best();
+        for (int i = 0; i < 20 * Est::kWindow; ++i) est.update(base * 6 / 5);   /* 20% slower */
+        const int64_t recent = est.recent();
+        CHECK(recent > floor * 115 / 100);
+        /* The floor does not chase the degradation: a restart is exactly what would restore it. */
+        CHECK_EQ(est.best(), floor);
+    }
+
+    /* Before any window completes there is no recent reading -- the page must not divide by it. */
+    {
+        Est est;
+        for (int i = 0; i < Est::kWindow - 1; ++i) est.update(base);
+        CHECK_EQ(est.recent(), (int64_t)0);
+        est.update(base);                        /* completes window 1: the un-gated warmup */
+        CHECK_EQ(est.recent(), (int64_t)0);      /* warmup is recorded by neither side */
+        for (int i = 0; i < Est::kWindow; ++i) est.update(base);
+        CHECK(est.recent() > 0);
+    }
+}
+
+TEST(the_decode_floor_records_only_single_sequence_decode_steps) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64);
+    CHECK_OK(f.start());
+
+    /* A prefill step samples nothing. Budget 320 tokens: this test walks 1 prefill + one window,
+     * at most six windows until the floor is set and one more, 257 steps. */
+    uint64_t a = f.submit(160, 320, /*priority=*/0, /*ignore_eos=*/true);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    f.sch.step_finished();
+    CHECK_EQ(f.sch.metrics().step_ns_decode_best, (int64_t)0);
+
+    /* The floor is a min over WINDOW MEANS of single-sequence decode steps, so it stays 0 until a
+     * full window (DecodeFloor::kWindow) has run -- unlike the old raw min, which latched the very
+     * first bracket. One short of a window and the floor is still unset. */
+    for (int i = 1; i < rad::DecodeFloor::kWindow; ++i) {
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK_EQ(f.sch.plan().n_seq_decode, 1);
+        CHECK_EQ(f.sch.plan().phase, RAD_PHASE_DECODE);
+        f.commit_plain(12);
+        f.sch.step_finished();
+    }
+    CHECK_EQ(f.sch.metrics().step_ns_decode_best, (int64_t)0);
+
+    /* The step that completes the FIRST window leaves the floor unset: window 1 is the un-gated
+     * warmup (the rejection gate needs a window of accepted samples before it can judge one), so
+     * it is recorded by neither side. */
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(13);
+    f.sch.step_finished();
+    CHECK_EQ(f.sch.metrics().step_ns_decode_best, (int64_t)0);
+
+    /* The first gated window sets the floor: positive, and no larger than the cumulative decode
+     * time it was drawn from. The fixture's steps take microseconds and vary widely, so the gate
+     * may reject some and the window take more than kWindow steps to fill. */
+    for (int i = 0; i < 6 * rad::DecodeFloor::kWindow && !f.sch.metrics().step_ns_decode_best;
+         ++i) {
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(14);
+        f.sch.step_finished();
+    }
+    const int64_t floor1 = f.sch.metrics().step_ns_decode_best;
+    CHECK(floor1 > 0);
+    CHECK(floor1 <= f.sch.metrics().step_ns_decode);
+
+    /* A further full window can only lower the floor or leave it: it is a min over windows. */
+    for (int i = 0; i < rad::DecodeFloor::kWindow; ++i) {
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(15);
+        f.sch.step_finished();
+    }
+    const int64_t floor2 = f.sch.metrics().step_ns_decode_best;
+    CHECK(floor2 > 0);
+    CHECK(floor2 <= floor1);
+    (void)a;
+}
+
+TEST(the_decode_floor_ignores_a_decode_step_issued_behind_a_prefill) {
+    /* The decode step issued behind the prefill's host-side staging is a real single-sequence
+     * decode step: it is eligible, and the window mean dilutes its short bracket. Decode steps
+     * that begin with it produce a floor. The fixture's steps take microseconds and vary widely,
+     * so the gate may reject some and a window take more than kWindow steps to fill. */
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64);
+    CHECK_OK(f.start());
+
+    uint64_t a = f.submit(160, 256, /*priority=*/0, /*ignore_eos=*/true);
+    REQUIRE(f.sch.step() != nullptr);          /* prefill */
+    f.commit_plain(21);
+    f.sch.step_finished();
+
+    /* Window 1 (holding the prefill-following step) is the un-gated warmup, so the floor only
+     * appears once a gated window completes. */
+    for (int i = 0; i < 6 * rad::DecodeFloor::kWindow && !f.sch.metrics().step_ns_decode_best;
+         ++i) {
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK_EQ(f.sch.plan().phase, RAD_PHASE_DECODE);
+        CHECK_EQ(f.sch.plan().n_seq_decode, 1);
+        CHECK(f.sch.plan().n_tok_decode >= 1); /* a token DID advance; token count is not the guard */
+        f.commit_plain(22);
+        f.sch.step_finished();
+    }
+    /* The window filled, counting the prefill-following step: the floor is set. */
+    CHECK(f.sch.metrics().step_ns_decode_best > 0);
+    (void)a;
+}
+
+TEST(the_decode_floor_ignores_batched_and_mixed_steps) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64);
+    CHECK_OK(f.start());
+
+    /* Two requests prefilled, then decoding TOGETHER: every decode step here carries two rows, so
+     * the floor must still be unset at the end -- a batched step is a different measurement and
+     * keying the floor to it would report the batch arriving as drift. */
+    uint64_t a = f.submit(160, 64);
+    uint64_t b = f.submit(160, 64);
+    REQUIRE(f.sch.step() != nullptr);                  /* both prompts */
+    f.commit_plain(11);
+    f.sch.step_finished();
+    for (int i = 0; i < 4; ++i) {
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK_EQ(f.sch.plan().n_seq_decode, 2);
+        CHECK_EQ(f.sch.plan().phase, RAD_PHASE_DECODE);
+        f.commit_plain(12);
+        f.sch.step_finished();
+    }
+    CHECK(f.sch.metrics().steps_decode > 0);            /* decode steps really ran ... */
+    CHECK_EQ(f.sch.metrics().step_ns_decode_best, (int64_t)0);   /* ... and none of them sampled */
+    (void)a; (void)b;
+}
+
+TEST(the_decode_floor_ignores_a_lone_decode_row_inside_a_mixed_step) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64);
+    CHECK_OK(f.start());
+
+    /* The subtle case: a mixed step carrying exactly ONE decode row alongside a prefill chunk.
+     * n_seq_decode is 1, so a check on the row count alone would sample it -- but that row shared
+     * the step with a chunk an order of magnitude dearer, and its time is not the mechanical floor.
+     * The phase gate is what excludes it. */
+    uint64_t b = f.submit(1000, 64, /*priority=*/1);    /* several chunks */
+    uint64_t a = f.submit(160,  64, /*priority=*/0);    /* one chunk, then decodes */
+    REQUIRE(f.sch.step() != nullptr);                   /* both prompts */
+    f.commit_plain(11);
+    f.sch.step_finished();
+
+    REQUIRE(f.sch.step() != nullptr);                   /* a decodes, b still chunking */
+    CHECK_EQ(f.sch.plan().n_seq_decode, 1);
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+    f.commit_plain(12);
+    f.sch.step_finished();
+    CHECK_EQ(f.sch.metrics().step_ns_decode_best, (int64_t)0);
+    (void)a; (void)b;
+}
+
 TEST(the_step_path_does_not_allocate) {
     Fixture f;
     f.build(/*blocks=*/4096, /*states=*/64);

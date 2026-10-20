@@ -1,0 +1,23 @@
+# krea-2-bf16.recipe -- Krea 2 (Raw or Turbo) at bf16.
+#
+#   rad-convert <Krea-2-Raw or -Turbo pipeline directory> --recipe data/recipes/krea-2-bf16.recipe \
+#       -o krea-2-bf16.rad
+#
+# Every linear stays as the release holds it (bf16). The language model's layers past its last tap
+# (35 of 36) are not carried. The first matching rule decides.
+
+# The release stores its norms, modulation tables, embedders, projector and output layer f32.
+# diffusers keeps every norm f32 and runs the rest bf16. Here the text fusion's norms, the q/k norms
+# and txt_in's norm stay f32; the DiT's norm1, norm2 and final norm are bf16, the fused modulation
+# kernel's operand, with the rest.
+fuse.*.norm1.weight                  cast dtype=f32
+fuse.*.norm2.weight                  cast dtype=f32
+fuse.*.q_norm.weight                 cast dtype=f32
+fuse.*.k_norm.weight                 cast dtype=f32
+dit.blk.*.q_norm.weight              cast dtype=f32
+dit.blk.*.k_norm.weight              cast dtype=f32
+txt.norm.weight                      cast dtype=f32
+fuse.*                               cast dtype=bf16
+txt.*                                cast dtype=bf16
+dit.*                                cast dtype=bf16
+vae.*                                cast dtype=bf16

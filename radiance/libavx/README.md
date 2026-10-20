@@ -78,7 +78,7 @@ Every `RAD_E_UNSUPPORTED` a libavx kernel returns, beside libref's answer to the
 | `rope` | YaRN with `axial` or a position scale | the same |
 | `rope` | Llama 3 scaling beside YaRN, with `axial`, or over multi-component positions | the same |
 | `rope` | a rotary half-width over 1024 | the same |
-| `had_quant_act_i8`, `had_quant_act_fp8`, `rmsnorm_had_quant_i8`, `gated_had_quant_i8`, `hc_read` | a Hadamard group over 4096 | the same (`REF_HAD_MAX`) |
+| `had_quant_act_i8`, `had_quant_act_fp8`, `had_quant_act_i8g`, `rmsnorm_had_quant_i8`, `gated_had_quant_i8`, `hc_read` | a Hadamard group over 4096 | the same (`REF_HAD_MAX`) |
 | `gdn_conv_prep`, `gdn_conv_update` | a convolution history over 16 | the same |
 | `gdn_recurrent_update` | a `state_form` other than `per_candidate` or `anchor` | the same |
 | `ple_conv`, `causal_conv1d` | a history over 64 | the same |

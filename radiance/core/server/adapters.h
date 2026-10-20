@@ -138,6 +138,8 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.steps_held = m.steps_held;
     o.decode_rows_unspeculated = m.decode_rows_unspeculated;
     o.step_ns = m.step_ns;  o.step_ns_decode = m.step_ns_decode;
+    o.step_ns_decode_best = m.step_ns_decode_best;
+    o.step_ns_decode_recent = m.step_ns_decode_recent;
     return o;
 }
 

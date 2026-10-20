@@ -1,0 +1,58 @@
+diff --git a/common/json-schema-to-grammar.cpp b/common/json-schema-to-grammar.cpp
+index 4664833..92561c4 100644
+--- a/common/json-schema-to-grammar.cpp
++++ b/common/json-schema-to-grammar.cpp
+@@ -4,6 +4,7 @@
+ #include <nlohmann/json.hpp>
+ 
+ #include <algorithm>
++#include <cctype>
+ #include <map>
+ #include <regex>
+ #include <sstream>
+@@ -336,7 +337,12 @@ static std::string anchor_pattern(const std::string & p) {
+ // carry escaped, and admit any JSON escape instead, so a match never runs past the closing quote;
+ // \s adds the escapes \t \n \f \r for the same reason. In a class a positive shorthand becomes its
+ // ranges and [\s\S] and its kin become any text; a negated one mixed into a class has no spelling,
+-// so false is returned and the pattern refused.
++// so false is returned and the pattern refused. Identity escapes of punctuation, which JavaScript
++// writes freely ("\/" in a path, "\-" in a class), become characters GBNF can read.
++static bool is_identity_punct(char c) {
++    return c > ' ' && c < 0x7F && c != '\\' && !std::isalnum(static_cast<unsigned char>(c));
++}
++
+ static bool expand_shorthands(const std::string & p, std::string & out) {
+     static const std::string sp = " \\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\uFEFF";
+     static const std::string esc = "\\\\(?:[\"\\\\/bfnrt]|u[0-9A-Fa-f]{4})";
+@@ -354,7 +360,16 @@ static bool expand_shorthands(const std::string & p, std::string & out) {
+                 case 'D': out += negated("0-9"); break;
+                 case 'W': out += negated("A-Za-z0-9_"); break;
+                 case 'S': out += negated(sp); break;
+-                default: out += c; out += n; break;
++                default:
++                    // An identity escape of punctuation GBNF has no escape for ("\/", "\-") is the
++                    // bare character; regex syntax characters and '"' keep their backslash.
++                    if (is_identity_punct(n) && std::string("^$.[](){}|*+?\"").find(n) == std::string::npos) {
++                        out += n;
++                    } else {
++                        out += c;
++                        out += n;
++                    }
++                    break;
+             }
+             continue;
+         }
+@@ -387,6 +402,13 @@ static bool expand_shorthands(const std::string & p, std::string & out) {
+                 else if (n == 'w') cls += "A-Za-z0-9_";
+                 else if (n == 's') cls += sp;
+                 else if (n == 'D' || n == 'W' || n == 'S') return false;
++                else if (is_identity_punct(n) && n != '"' && n != '[' && n != ']') {
++                    // "\-" "\." "\^" and the like: GBNF has no such escape, and bare they could
++                    // read as a range or a negation, so they are written as \xHH.
++                    cls += "\\x";
++                    cls += "0123456789ABCDEF"[(n >> 4) & 0xF];
++                    cls += "0123456789ABCDEF"[n & 0xF];
++                }
+                 else { cls += '\\'; cls += n; }
+             } else {
+                 cls += body[k];

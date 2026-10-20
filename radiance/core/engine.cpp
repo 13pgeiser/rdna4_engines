@@ -8,6 +8,7 @@
 #include "gen/video_driver.h"
 #include "kld.h"
 #include "mm/processor.h"
+#include "mm/media.h"
 
 #include "build/startup.h"
 #include "build/rad_build.h"
@@ -2375,8 +2376,11 @@ int Engine::run_server() {
         in.size_multiple = gd.size_multiple;
         in.pixel_channels = gd.pixel_channels;
         in.max_tokens = gd.max_tokens;
-        /* Edits need the conditioning network to read pictures. */
-        in.max_refs = mm_proc ? gd.max_refs : 0;
+        /* Edits need the conditioning network to read pictures, unless only the generator's
+         * own encoder reads them. */
+        in.refs_encoder_only = gd.layout == RAD_GEN_LAYOUT_JOINT_STEP;
+        in.max_refs = mm_proc || in.refs_encoder_only ? gd.max_refs : 0;
+        in.ref_shrink_only = gd.ref_shrink_only != 0;
         in.ref_area = gd.ref_area;
         in.default_width = gd.default_width;
         in.default_height = gd.default_height;
@@ -2386,6 +2390,9 @@ int Engine::run_server() {
         in.fixed_schedule = !pg.gen_str.sigmas.empty();
         in.fixed_steps = (int64_t)pg.gen_str.sigmas.size();
         in.default_cfg = gd.default_cfg;
+        in.cfg_original = gd.cfg_original != 0;
+        in.has_default_negative = pg.gen_str.has_default_negative;
+        in.default_negative = pg.gen_str.default_negative;
         image_bridge.drv = img_gen_;
         image_bridge.proc = mm_proc.get();
         d.images = &image_bridge;
@@ -2497,6 +2504,19 @@ int Engine::run_server() {
         in.fixed_steps = vd.n_rungs > 0;
         in.upscale_max = vd.upscale_max;
         in.upscale_refine = vd.upscale_refine;
+        in.step_evals = vd.sched_kind == 1;
+        in.guidance = vd.guidance != 0;
+        for (int i = 0; i < 8; ++i) in.guidance_default[i] = vd.guidance_default[i];
+        in.default_negative = pg.vgen_str.default_negative;
+        in.image_cond = vd.image_cond != 0;
+        in.image_crf = vd.image_crf;
+        in.length_head = vd.duration_out != RAD_NULL_HANDLE;
+        in.decoders = pg.vgen_str.decoders;
+        in.decoder_max_area = pg.vgen_str.decoder_max_area;
+        if (in.image_cond && in.image_crf > 0 && !mm::h264_roundtrip_available())
+            RAD_WARN("video: '%s' prepares a first frame with an H.264 round trip at crf %d, which "
+                     "needs libx264; this build's libavcodec has none, so input_reference is "
+                     "refused", in.name.c_str(), (int)in.image_crf);
         in.max_lanes = vd.max_lanes;
         video_bridge.drv = vid_gen_;
         d.videos = &video_bridge;
@@ -2555,6 +2575,12 @@ int Engine::run_server() {
             RAD_INFO("chat: the template takes reasoning_effort %s, and none or minimal turn "
                      "thinking off%s%s", list.c_str(), mapped.empty() ? "" : "; mapped: ",
                      mapped.c_str());
+            /* What a request naming no effort gets, which a client cannot see: Qwen3.8's template
+             * renders xhigh into a system prompt (#113). */
+            const std::string& dflt = srv.template_default_effort();
+            if (cfg_.reasoning_effort.empty() && !dflt.empty())
+                RAD_INFO("chat: a request naming no reasoning_effort renders as '%s', the "
+                         "template's own default (--reasoning-effort sets another)", dflt.c_str());
         } else if (!mapped.empty()) {
             RAD_INFO("chat: reasoning_effort mapped: %s", mapped.c_str());
         }
@@ -2629,6 +2655,7 @@ int Engine::run_server() {
 
     /* Startup ends here; a quiet server from now on is an idle one. */
     startup_watch_.reset();
+    srv.note_ready(startup_begin_ns_);
     const int rc = srv.run();
     /* The watcher tests `watching` first, so clearing it ends the thread without a second stop;
      * run() has already torn the transport down. Joining costs up to one sleep interval. */

@@ -357,20 +357,30 @@ int ref_vtile_stitch(const RadArgs* a, RadStream) {
  * terms outside the volume zero. acc is f32, the taps in (dt, kh, kw) order and each tap's
  * channels ascending; rd is y's dtype. With `res` the convolution's output is rounded before the
  * residual is added, as a residual block's skip(x) + h adds two bf16 tensors. `res` may be y
- * itself: each output element reads its own residual before its write, and no other. */
+ * itself: each output element reads its own residual before its write, and no other.
+ *
+ * `tpad` sets the frames' padding (rows and columns stay zero-padded): `zero` (the default),
+ * `replicate` (the edge frame repeated, kt/2 a side: LTX-2's decoder) or `causal` (the first
+ * frame repeated kt - 1 times in front, nothing after: LTX-2's encoder). With `causal`, `tpre`
+ * more copies of the first frame stand in front of those, and y has T + tpre frames (LTX-2's
+ * temporal downsampler, which prepends its first frame before its convolution). */
 int ref_conv3d_ndhwc(const RadArgs* a, RadStream) {
     if (a->n_t < 6 || !have(a, 4) || !t_in(a, 5)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *w = &a->t[1], *b = &a->t[2], *geom = &a->t[3];
     const RadTensor *res = t_in(a, 4), *y = &a->t[5];
     const int64_t cin = p_int(a, "cin", 0), cout = p_int(a, "cout", 0);
-    const int64_t k = p_int(a, "k", 0), kt = p_int(a, "kt", 0);
-    if (cin <= 0 || cout <= 0 || k <= 0 || kt <= 0 || !(k & 1) || !(kt & 1) || numel(geom) < 3)
+    const int64_t k = p_int(a, "k", 0), kt = p_int(a, "kt", 0), tpre = p_int(a, "tpre", 0);
+    static const char* const kPads[] = { "zero", "replicate", "causal" };
+    const int tpad = p_enum(a, "tpad", kPads, 3, 0);
+    if (tpad < 0 || (tpre && tpad != 2)) return RAD_E_INVAL;
+    if (cin <= 0 || cout <= 0 || k <= 0 || kt <= 0 || !(k & 1) || !(kt & 1) || tpre < 0 ||
+        numel(geom) < 3)
         return RAD_E_SHAPE;
     const int64_t T = ldi(geom, 0), H = ldi(geom, 1), W = ldi(geom, 2);
     if (T <= 0 || H <= 0 || W <= 0) return RAD_E_SHAPE;
-    const int64_t rows = T * H * W, taps = kt * k * k;
-    if (rows_of(y, cout) < rows || rows_of(x, cin) < rows || (res && rows_of(res, cout) < rows) ||
-        numel(w) < cout * cin * taps || numel(b) < cout)
+    const int64_t rows = (T + tpre) * H * W, taps = kt * k * k;
+    if (rows_of(y, cout) < rows || rows_of(x, cin) < T * H * W ||
+        (res && rows_of(res, cout) < rows) || numel(w) < cout * cin * taps || numel(b) < cout)
         return RAD_E_SHAPE;
     const int64_t pz = kt / 2, ps = k / 2, xs = laststride(x), ys = laststride(y);
     const int64_t rs = res ? laststride(res) : 0;
@@ -382,7 +392,11 @@ int ref_conv3d_ndhwc(const RadArgs* a, RadStream) {
         for (int64_t o = 0; o < cout; ++o) {
             float acc = 0.0f;
             for (int64_t dz = 0; dz < kt; ++dz) {
-                const int64_t tz = t + dz - pz;
+                /* The frame tap dz reads: zero pads, the edge frame repeated, or causal (the first
+                 * frame repeated in front, `tpre` more copies of it before those). */
+                int64_t tz = t + dz - pz;
+                if (tpad == 1) tz = std::min<int64_t>(std::max<int64_t>(tz, 0), T - 1);
+                else if (tpad == 2) tz = std::max<int64_t>(t + dz - (kt - 1) - tpre, 0);
                 if (tz < 0 || tz >= T) continue;
                 for (int64_t kh = 0; kh < k; ++kh) {
                     const int64_t iy = i + kh - ps;

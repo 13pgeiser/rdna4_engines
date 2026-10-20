@@ -4,6 +4,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <map>
 #include <regex>
 #include <sstream>
@@ -291,6 +292,210 @@ static inline bool is_gbnf_escape(char c) {
             return false;
     }
 }
+
+// RADIANCE: a JSON Schema `pattern` is unanchored (ECMA-262 search semantics, JSON Schema
+// validation 6.3.3): "[0-9]+" admits any string holding a digit. _visit_pattern() reads only
+// ^...$, so a missing anchor is written out as "any string text" on that side. That filler is
+// not ".*": '.' here matches '"', and the string would run on past its closing quote. A
+// one-sided anchor beside a top-level '|' binds to one branch only, so that pattern is
+// returned as it came and refused.
+static std::string anchor_pattern(const std::string & p) {
+    static const std::string any = "(?:[^\"\\\\]|\\\\.)*";
+    const bool starts = !p.empty() && p.front() == '^';
+    size_t slashes = 0; // backslashes before a final '$': an odd count makes it a literal
+    if (!p.empty() && p.back() == '$') {
+        for (size_t k = p.size() - 1; k > 0 && p[k - 1] == '\\'; --k) slashes++;
+    }
+    const bool ends = p.size() > (starts ? 1u : 0u) && p.back() == '$' && slashes % 2 == 0;
+    if (starts && ends) {
+        return p;
+    }
+    const size_t from = starts ? 1 : 0;
+    const std::string core = p.substr(from, p.size() - from - (ends ? 1 : 0));
+    if (core.empty()) {
+        return "^" + any + "$";
+    }
+    if (starts != ends) {
+        int depth = 0;
+        bool in_class = false;
+        for (size_t k = 0; k < core.size(); ++k) {
+            const char c = core[k];
+            if (c == '\\') { ++k; continue; }
+            if (in_class) { if (c == ']') in_class = false; continue; }
+            if (c == '[') in_class = true;
+            else if (c == '(') depth++;
+            else if (c == ')') depth--;
+            else if (c == '|' && depth == 0) return p;
+        }
+    }
+    return "^" + (starts ? "" : any) + "(?:" + core + ")" + (ends ? "" : any) + "$";
+}
+
+// RADIANCE: \d \w \s and their negations, which GBNF cannot spell, written out as the classes
+// ECMA-262 gives them, before the scanner reads the pattern. A JSON string holds text, not raw
+// bytes: the negated forms leave out '"', '\' and the control characters, which a string can only
+// carry escaped, and admit any JSON escape instead, so a match never runs past the closing quote;
+// \s adds the escapes \t \n \f \r for the same reason. In a class a positive shorthand becomes its
+// ranges and [\s\S] and its kin become any text; a negated one mixed into a class has no spelling,
+// so false is returned and the pattern refused. Identity escapes of punctuation, which JavaScript
+// writes freely ("\/" in a path, "\-" in a class), become characters GBNF can read. \t \n \r \f
+// \b (in a class) \v \0 are control characters, which a JSON string carries only as escapes, so
+// they match the escape. Any other escape in a class (\p{..}, \c, a backreference) has no GBNF
+// spelling: `bad` names it and false is returned, rather than copying it into a grammar that
+// would then fail to load.
+static bool is_identity_punct(char c) {
+    return c > ' ' && c < 0x7F && c != '\\' && !std::isalnum(static_cast<unsigned char>(c));
+}
+
+// The JSON escape for the control character a regex escape names, or "" if it names none.
+static std::string json_control_escape(char n) {
+    switch (n) {
+        case 't': case 'n': case 'r': case 'f': case 'b': return std::string("\\\\") + n;
+        case 'v': return "\\\\u000[bB]";
+        case '0': return "\\\\u0000";
+        default: return "";
+    }
+}
+
+static std::string hex_escape(char n) {
+    std::string s = "\\x";
+    s += "0123456789ABCDEF"[(n >> 4) & 0xF];
+    s += "0123456789ABCDEF"[n & 0xF];
+    return s;
+}
+
+static bool expand_shorthands(const std::string & p, std::string & out, char & bad) {
+    static const std::string sp = " \\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\uFEFF";
+    static const std::string esc = "\\\\(?:[\"\\\\/bfnrt]|u[0-9A-Fa-f]{4})";
+    static const std::string raw = "\"\\\\\\x00-\\x1F";
+    auto negated = [&](const std::string & cls) { return "(?:[^" + cls + raw + "]|" + esc + ")"; };
+    out.clear();
+    for (size_t i = 0; i < p.size(); ++i) {
+        const char c = p[i];
+        if (c == '\\' && i + 1 < p.size()) {
+            const char n = p[++i];
+            switch (n) {
+                case 'd': out += "[0-9]"; break;
+                case 'w': out += "[A-Za-z0-9_]"; break;
+                case 's': out += "(?:[" + sp + "]|\\\\[tnfr])"; break;
+                case 'D': out += negated("0-9"); break;
+                case 'W': out += negated("A-Za-z0-9_"); break;
+                case 'S': out += negated(sp); break;
+                default:
+                    // An identity escape of punctuation GBNF has no escape for ("\/", "\-") is the
+                    // bare character; regex syntax characters and '"' keep their backslash.
+                    if (is_identity_punct(n) && std::string("^$.[](){}|*+?\"").find(n) == std::string::npos) {
+                        out += n;
+                    } else if (n != 'b' && !json_control_escape(n).empty()) {
+                        // A group, so a following quantifier takes the whole escape. Outside a class
+                        // \b is a word boundary, which the scanner refuses.
+                        out += "(?:" + json_control_escape(n) + ")";
+                    } else if (n == ' ' || static_cast<unsigned char>(n) >= 0x80) {
+                        out += n;
+                    } else {
+                        out += c;
+                        out += n;
+                    }
+                    break;
+            }
+            continue;
+        }
+        if (c != '[') {
+            out += c;
+            continue;
+        }
+        // The class runs to the first unescaped ']', as the scanner reads it.
+        size_t j = i + 1;
+        std::string body;
+        while (j < p.size() && p[j] != ']') {
+            if (p[j] == '\\' && j + 1 < p.size()) {
+                body += p.substr(j, 2);
+                j += 2;
+            } else {
+                body += p[j++];
+            }
+        }
+        if (body == "\\s\\S" || body == "\\S\\s" || body == "\\d\\D" || body == "\\D\\d" ||
+            body == "\\w\\W" || body == "\\W\\w") {
+            out += "(?:[^" + raw + "]|" + esc + ")";
+            i = j;
+            continue;
+        }
+        std::string cls = "[";
+        // A positive class's control characters can only appear as JSON escapes, which are two
+        // or six characters long, so they become alternatives beside the class.
+        std::vector<std::string> escapes;
+        const bool negated_cls = !body.empty() && body[0] == '^';
+        std::string excluded;  // the control characters a negated class leaves out, by escape letter
+        for (size_t k = 0; k < body.size(); ++k) {
+            if (body[k] == '\\' && k + 1 < body.size()) {
+                const char n = body[++k];
+                if (n == 'd') cls += "0-9";
+                else if (n == 'w') cls += "A-Za-z0-9_";
+                else if (n == 's') {
+                    cls += sp;
+                    if (!negated_cls) escapes.push_back("\\\\[tnfr]");
+                    else excluded += "tnfr";
+                }
+                else if (n == 'D' || n == 'W' || n == 'S') { bad = n; return false; }
+                else if (!json_control_escape(n).empty()) {
+                    if (n == '0' && k + 1 < body.size() && std::isdigit(static_cast<unsigned char>(body[k + 1]))) {
+                        bad = n;  // "\01" is a legacy octal escape
+                        return false;
+                    }
+                    if (negated_cls) excluded += n;
+                    else escapes.push_back(json_control_escape(n));
+                }
+                else if (is_identity_punct(n) && n != '"' && n != '[' && n != ']') {
+                    // "\-" "\." "\^" and the like: GBNF has no such escape, and bare they could
+                    // read as a range or a negation, so they are written as \xHH.
+                    cls += hex_escape(n);
+                }
+                else if (n == 'x' || n == 'u') {
+                    // Copied for GBNF to read, so the hex digits must be there.
+                    const size_t len = n == 'x' ? 2 : 4;
+                    for (size_t h = 1; h <= len; ++h) {
+                        if (k + h >= body.size() || !std::isxdigit(static_cast<unsigned char>(body[k + h]))) {
+                            bad = n;
+                            return false;
+                        }
+                    }
+                    cls += '\\';
+                    cls += n;
+                }
+                else if (std::string("\"[]\\").find(n) != std::string::npos) { cls += '\\'; cls += n; }
+                else if (n == ' ' || static_cast<unsigned char>(n) >= 0x80) cls += n;
+                else { bad = n; return false; }
+            } else {
+                cls += body[k];
+            }
+        }
+        if (j < p.size()) {
+            cls += ']';
+        }
+        if (negated_cls && !excluded.empty() && j < p.size()) {
+            // A string holds those characters only as escapes, so the class becomes text that is
+            // neither a listed character nor one of those escapes. Their \u forms (\u0009 for \t)
+            // are still admitted.
+            std::string letters;
+            for (char e : std::string("bfnrt")) {
+                if (excluded.find(e) == std::string::npos) letters += e;
+            }
+            out += "(?:[^" + cls.substr(2, cls.size() - 3) + raw + "]|\\\\(?:[\"\\\\/" + letters +
+                   "]|u[0-9A-Fa-f]{4}))";
+        } else if (!escapes.empty() && j < p.size()) {
+            out += "(?:";
+            if (cls != "[]") out += cls + "|";
+            for (size_t e = 0; e < escapes.size(); ++e) out += (e ? "|" : "") + escapes[e];
+            out += ")";
+        } else {
+            out += cls;
+        }
+        i = j;
+    }
+    return true;
+}
+
 static std::unordered_set<char> ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS = {'^', '$', '.', '[', ']', '(', ')', '|', '{', '}', '*', '+', '?'};
 
 static std::string replacePattern(const std::string & input, const std::regex & regex, const std::function<std::string(const std::smatch  &)> & replacement) {
@@ -357,7 +562,15 @@ private:
         return string_join(rules, " | ");
     }
 
-    std::string _visit_pattern(const std::string & pattern, const std::string & name) {
+    std::string _visit_pattern(const std::string & client_pattern, const std::string & name) {
+        std::string expanded;
+        char bad = 0;
+        if (!expand_shorthands(client_pattern, expanded, bad)) {
+            _errors.push_back(std::string("Unsupported regex escape '\\") + bad +
+                              "' inside a character class: GBNF cannot spell it");
+            return "";
+        }
+        const std::string pattern = anchor_pattern(expanded);
         // RADIANCE: front()/back() on an empty string is UB, and `pattern` is client data straight
         // off the wire. The size test has to come first.
         if (pattern.size() < 2 || !(pattern.front() == '^' && pattern.back() == '$')) {

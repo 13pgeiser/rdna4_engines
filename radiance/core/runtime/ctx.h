@@ -205,6 +205,8 @@ public:
     /* ---------------------------------------------------------- run-phase queries */
     const RadBatch* batch()      const { return batch_; }
     int             rank()       const { return rank_; }
+    /* Whether repeated passes are recorded and played back (prepare() says when they are not). */
+    bool            records_passes() const { return tape_on_; }
     int             world_size() const { return world_size_; }
     RadStream       stream()     const { return stream_; }
     Program*        program()    const { return program_; }

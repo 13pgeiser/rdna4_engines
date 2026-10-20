@@ -1108,11 +1108,12 @@ TEST(json_schema_refuses_what_it_cannot_actually_enforce) {
               "{\"$ref\":\"https://example.com/s.json#/x\"}", "root", &gbnf, &err) < 0);
     CHECK(!err.empty());
 
-    /* GBNF cannot spell \d. Copying it through would succeed here and produce a grammar that
-     * fails to load, an internal error on a schema we accepted. */
+    /* GBNF cannot spell \b. Copying it through would succeed here and produce a grammar that
+     * fails to load, an internal error on a schema we accepted. (\d and its kin are written out
+     * as classes since vendor patch 0018.) */
     err.clear();
     CHECK(grammar_from_json_schema(
-              "{\"type\":\"string\",\"pattern\":\"^\\\\d+$\"}", "root", &gbnf, &err) < 0);
+              "{\"type\":\"string\",\"pattern\":\"^a\\\\bb$\"}", "root", &gbnf, &err) < 0);
     CHECK(!err.empty());
 
     /* A stray ']' is in NON_LITERAL_SET but claimed by no arm of the pattern scanner, so the
@@ -1123,10 +1124,11 @@ TEST(json_schema_refuses_what_it_cannot_actually_enforce) {
               "{\"type\":\"string\",\"pattern\":\"^a]$\"}", "root", &gbnf, &err) < 0);
     CHECK(!err.empty());
 
-    /* An empty pattern would run front()/back() on an empty string. */
+    /* An empty pattern would run front()/back() on an empty string. Unanchored, as JSON Schema
+     * reads it, it now matches every string and never reaches them (vendor patch 0017). */
     err.clear();
-    CHECK(grammar_from_json_schema(
-              "{\"type\":\"string\",\"pattern\":\"\"}", "root", &gbnf, &err) < 0);
+    CHECK_OK(grammar_from_json_schema(
+                 "{\"type\":\"string\",\"pattern\":\"\"}", "root", &gbnf, &err));
 
     /* A leading quantifier would run back() on an empty vector. */
     err.clear();
@@ -2096,6 +2098,46 @@ TEST(a_greedy_row_over_a_split_vocabulary_is_staged_as_a_chain_row) {
     p = s.staged_params(&n);
     CHECK_EQ(p[1].flags & RAD_SP_GREEDY, 0);
     CHECK_EQ(p[1].top_k, 1);
+}
+
+/* Over a split vocabulary the merge holds every rank's candidates in one workgroup, 4096 pairs at
+ * most (kSampleMergeCandidates, libr4d's sample_merge_topk). At two and four ranks the default
+ * width of 1024 a rank fits; at eight it would ask 8192 and the step's merge would find no kernel,
+ * so declare narrows it to 512 and admission refuses a wider top_k instead. */
+TEST(the_candidate_width_over_a_split_vocabulary_is_what_the_merge_holds) {
+    Registry reg;
+    (void)reg.load_plugin(home() + "/kernels/libref.so", 0);
+    for (int world : { 2, 4, 8 }) {
+        RadModelMeta meta{};
+        meta.arch_id = "sampler_split";
+        meta.name = "sampler_split";
+        RadBuildCtx bc{};
+        bc.world_size = world;
+        bc.max_seqs = 2;
+        bc.max_tok = 2;
+        bc.max_ctx = 64;
+        bc.scope = "";
+        Builder b(reg, meta, bc);
+        Sampler s;
+        SamplerConfig cfg;
+        cfg.n_vocab = 2048 * (int64_t)world;
+        cfg.n_vocab_local = 2048;
+        cfg.max_seqs = 2;
+        cfg.world_size = world;
+        cfg.rank = world - 1;
+        cfg.vocab_off = 2048 * (int64_t)(world - 1);
+        cfg.max_hist = 16;
+        CHECK_OK(s.declare(&b, cfg));
+
+        const int64_t width = world == 8 ? 512 : kSampleCandidates;
+        SamplingParams sp = greedy_params();
+        std::string why;
+        sp.top_k = (int)width;
+        CHECK_OK(s.check_request(sp, &why));
+        sp.top_k = (int)width + 1;
+        CHECK_EQ(s.check_request(sp, &why), RAD_E_INVAL);
+        CHECK(why.find("candidate width of " + std::to_string(width)) != std::string::npos);
+    }
 }
 
 /* Triggers are resolved at admission, with special tokens recognised: a one-token word becomes an

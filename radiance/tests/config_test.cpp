@@ -417,7 +417,8 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--max-num-seqs", { "4" } },
         { "--max-model-len", { "4096" } }, { "--rope-scaling", { "yarn:4" } },
         { "--gpu-headroom-mib", { "128" } }, { "--kv-cache-dtype", { "fp8" } },
-        { "--host-pool-mib", { "1024" } }, { "--embedding-placement", { "vram" } },
+        { "--host-pool-mib", { "1024" } }, { "--host-headroom-mib", { "2048" } },
+        { "--embedding-placement", { "vram" } },
         { "--vision-tower-placement", { "ram" } }, { "--ngram-placement", { "disk" } },
         { "--prefix-cache-mib", { "256" } }, { "--prefix-cache-ttl", { "60" } },
         { "--placement", { "all_vram" } }, { "--checkpoint-interval", { "256" } },
@@ -620,16 +621,21 @@ TEST(the_p2p_mode_is_one_of_three_names) {
     CHECK_EQ(parse({ "--p2p", "OFF" }, &c), RAD_E_INVAL);
 }
 
-TEST(the_kv_cache_dtype_is_one_of_two_names) {
+TEST(the_kv_cache_dtype_is_one_of_four_names) {
     Config c;
     CHECK_EQ(parse({ "--kv-cache-dtype", "bf16" }, &c), RAD_OK);
     CHECK_EQ(c.kv_cache_dtype, std::string("bf16"));
     CHECK_EQ(parse({ "--kv-cache-dtype", "fp8" }, &c), RAD_OK);
     CHECK_EQ(c.kv_cache_dtype, std::string("fp8"));
-    /* Two values only: an "auto" resolving to bf16 would be a second name for the default, and
+    CHECK_EQ(parse({ "--kv-cache-dtype", "fp8_v4" }, &c), RAD_OK);
+    CHECK_EQ(c.kv_cache_dtype, std::string("fp8_v4"));
+    CHECK_EQ(parse({ "--kv-cache-dtype", "k6_v4" }, &c), RAD_OK);
+    CHECK_EQ(c.kv_cache_dtype, std::string("k6_v4"));
+    /* Four values only: an "auto" resolving to bf16 would be a second name for the default, and
      * each value should be unambiguous in a log. */
     CHECK_EQ(parse({ "--kv-cache-dtype", "auto" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--kv-cache-dtype", "fp16" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--kv-cache-dtype", "v4" }, &c), RAD_E_INVAL);
 
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);

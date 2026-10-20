@@ -208,6 +208,9 @@ int Registry::commit_(Staged& s, int order) {
          * container, which "" means. */
         if (auto q_fn = dl_fn<const char* (*)(void)>(s.handle, "rad_arch_quant"))
             p.arch_quant = or_empty(q_fn());
+        /* Optional: absent means the plugin may serve an imported quantisation (startup.h). */
+        if (auto i_fn = dl_fn<int (*)(void)>(s.handle, "rad_arch_serves_imports"))
+            p.arch_serves_imports = i_fn() != 0;
 
         /* Optional: answers what the core needs before it builds the RadBuildCtx for declare.
          * Absent means every answer is zero (rad_builder.h). */

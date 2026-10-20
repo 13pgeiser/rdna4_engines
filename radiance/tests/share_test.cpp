@@ -300,4 +300,20 @@ TEST(a_unit_inner_dimension_is_sharded_as_the_matrix_it_leaves) {
     CHECK_EQ(weight_share(w, e, 3, stack, 2, 0, s, &why), RAD_E_SHAPE);
 }
 
+TEST(glm_kda_tp4_takes_each_head_shard_from_all_three_convolution_parts) {
+    const auto e = rad_enc_plain(RAD_BF16);
+    const auto w = decl(e, { 0 }, 3 * 8192, 4, RAD_SHARD_ROW, 4, { 2048, 2048, 2048 });
+    const int64_t shape[] = { 3 * 8192, 1, 4 };
+    for (int rank = 0; rank < 4; ++rank) {
+        PlaneShare s[RAD_ENC_MAX_PLANES];
+        REQUIRE_EQ(weight_share(w, e, 3, shape, 4, rank, s, nullptr), RAD_OK);
+        REQUIRE_EQ(s[0].rects.size(), (size_t)3);
+        for (int part = 0; part < 3; ++part) {
+            CHECK_EQ(s[0].rects[part].row0, (int64_t)(part * 8192 + rank * 2048));
+            CHECK_EQ(s[0].rects[part].rows, (int64_t)2048);
+            CHECK_EQ(s[0].rects[part].bytes, (int64_t)8);
+        }
+    }
+}
+
 RAD_TEST_MAIN()

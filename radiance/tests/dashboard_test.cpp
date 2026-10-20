@@ -8,6 +8,7 @@
  * groups, where summing or picking the wrong group goes wrong silently.
  */
 #include "server_fakes.h"
+#include "rad_internal.h"   /* rad_mono_ns: a synthetic bringup start */
 
 #include <set>
 
@@ -246,6 +247,30 @@ TEST(sessions_lists_each_conversation_and_what_the_tiers_did) {
 /* Every field the page's script reads from /stats (in its update and the request table) and from
  * /sessions (its loader and the session rows) is one the routes emit for a populated engine. A
  * rename on either side otherwise blanks a panel and reports nothing. */
+/* The price of a restart, measured rather than guessed: whatever decides whether a restart is
+ * worth suffering needs this figure, and a guessed cost would decide the answer by itself. The
+ * page stopped consuming it on 2026-10-18, when the payback clause it fed was withdrawn -- the
+ * field stays because it is the missing half of that decision made downstream, by a human or a
+ * tool. A test runs in microseconds, so a real note_ready() would compute 0 -- indistinguishable
+ * from "never called". Passing a synthetic start exercises the arithmetic through the real route. */
+TEST(stats_reports_how_long_bringup_took_once_the_server_listens) {
+    Dash d(false);
+    /* Before the server has listened, there is no measured cost to report. */
+    CHECK_EQ(d.get("/stats").value("startup_s", (int64_t)-1), (int64_t)0);
+
+    d.srv->note_ready(rad_mono_ns() - 47ull * 1000000000ull);
+    CHECK_EQ(d.get("/stats").value("startup_s", (int64_t)-1), (int64_t)47);
+
+    /* A start in the future is not a negative cost: the figure is a duration, and a page that
+     * divided by it would otherwise be handed a sign flip. */
+    d.srv->note_ready(rad_mono_ns() + 10ull * 1000000000ull);
+    CHECK_EQ(d.get("/stats").value("startup_s", (int64_t)-1), (int64_t)47);
+
+    /* 0 means "not yet", so it must not overwrite a measured figure. */
+    d.srv->note_ready(0);
+    CHECK_EQ(d.get("/stats").value("startup_s", (int64_t)-1), (int64_t)47);
+}
+
 TEST(every_field_the_page_reads_is_one_the_routes_emit) {
     Dash d(false);
     HttpResponse page = d.srv->router().call("GET", "/");

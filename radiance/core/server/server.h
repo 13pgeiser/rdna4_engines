@@ -181,6 +181,9 @@ public:
      * also takes a nonsense word it takes any word, and the result is empty. Used to refuse words
      * outside the set and for /server_info; called once, before run(). */
     std::vector<std::string> probe_reasoning_efforts();
+    /* The effort the template applies to a request that names none, found by the probe above as
+     * the one whose render is the same; "" when none matches or the probe found no set. */
+    const std::string& template_default_effort() const { return template_default_effort_; }
     /* Renders each --reasoning-effort-map target as a request's effort. Empty when the template
      * takes all of them; otherwise the first refusal, naming the target. */
     std::string check_reasoning_effort_map() const;
@@ -191,7 +194,14 @@ public:
     /* The admission ceiling as resolved: ServerOptions::queue_depth, or 8 x max_seqs for 0. */
     int64_t  queue_cap() const { return queue_depth_; }
 
+    /* Records how long bringup took, called by Engine::serve just before it starts listening
+     * (the same moment the startup watch ends). `begin_ns` is rad_mono_ns from the top of
+     * Engine::start(); 0 leaves the figure unset. run() blocks serving forever, so the value is
+     * handed in rather than taken inside it. */
+    void note_ready(uint64_t begin_ns);
+
 private:
+    std::string template_default_effort_;
     struct Generation;
     struct TranscriptionJob;   /* speech.cpp */
     struct RealtimeSession;    /* realtime.cpp */
@@ -351,6 +361,9 @@ private:
     std::atomic<int64_t> speech_sessions_{0};
     std::atomic<bool>    stopping_{false};
     int64_t              started_at_ = 0;
+    /* Seconds from the top of Engine::start() to the moment the server began listening; 0 until
+     * note_ready(). */
+    int64_t              startup_s_ = 0;
 
     /* Sinks whose HTTP side is gone but whose engine side may still be mid-step. Held until the
      * scheduler reports the request terminal, because Request::sink is a raw pointer and freeing

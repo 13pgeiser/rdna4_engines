@@ -64,6 +64,7 @@ vendor/llama/common/jinja/                   <- llama.cpp common/jinja/
     llama.h, no common.h -- which is why it lifts cleanly and chat.cpp did not.
 
     LOCAL CHANGES: patches/0015-jinja-print-a-list-or-a-dict-as-its-repr.patch
+                   patches/0021-jinja-a-dotted-integer-is-an-index.patch
 
 vendor/llama/common/chat.{h,cpp}
 vendor/llama/common/chat-auto-parser.h
@@ -101,6 +102,10 @@ vendor/llama/common/regex-partial.{h,cpp}    <- llama.cpp common/*
                    patches/0013-json-schema-a-count-past-int-is-no-bound.patch
                    patches/0014-json-schema-a-not-of-every-type-is-never.patch
                    patches/0016-chat-analyse-a-template-once.patch
+                   patches/0017-json-schema-a-pattern-without-anchors-searches.patch
+                   patches/0018-json-schema-shorthand-classes-are-written-out.patch
+                   patches/0019-json-schema-identity-escapes-of-punctuation.patch
+                   patches/0020-json-schema-control-escapes-and-unloadable-class-escapes.patch
 
     On 0003: a `pattern` in a `response_format` reaches _visit_pattern() as client data, and three
     of its paths do not survive that. `front()`/`back()` run on an empty string; `seq.back()` runs
@@ -487,3 +492,75 @@ PATCH SERIES
       from it per request is unchanged: the prompt, grammar, triggers, preserved tokens, stops and
       PEG parser of 32 requests through each shipped template hash the same with and without the
       cache, and a render took 1.4-1.6 ms with it against 10-13 ms without (one loaded machine).
+
+  patches/0017-json-schema-a-pattern-without-anchors-searches.patch
+
+      _visit_pattern() read only ^...$ and refused every other `pattern` with "Pattern must
+      start with '^' and end with '$'". JSON Schema patterns are unanchored (ECMA-262 search,
+      validation 6.3.3), and tool schemas send them bare: an opencode agent's tool list drew
+      twelve of these refusals, so every request it made failed. A bare pattern on array items
+      is refused, since a tool call's JSON arguments reach this converter. (A top-level string
+      argument is written raw under the XML call formats and never reaches it, which is why a
+      bare pattern there passed.) A missing anchor is now written out as any string text on that
+      side, (?:[^"\\]|\\.)*, before the old check, which then refuses only what that cannot
+      spell: a one-sided anchor beside a top-level '|', where the anchor binds to one branch. The
+      filler is not ".*": '.' matches '"' here, and on array items ["1","x"] then read as one
+      string "1\",\"x" holding a digit. An empty pattern now matches every string rather than
+      being refused (tests/sample_test.cpp updated). A final '$' after an odd run of
+      backslashes is a literal and does not count as an anchor. tests/gbnf_test.cpp
+      (json_schema_grammars_admit_exactly_their_instances) holds the converter to the search
+      reading, on plain strings and on array items, and pins the refusal.
+
+  patches/0018-json-schema-shorthand-classes-are-written-out.patch
+
+      \d \w \s and their negations were refused in a literal ("Unsupported regex escape") and
+      copied raw inside a class, where GBNF cannot load them. Tool schemas use them freely:
+      oh-my-pi's workpool tool carries "\S" thirteen times, so with 0017 the request got past
+      the anchors and was refused here instead. Each shorthand is now written out before the
+      scanner reads the pattern, as the class ECMA-262 gives it: \d [0-9], \w [A-Za-z0-9_], \s the
+      ECMA-262 space characters. A JSON string holds text, so the negated forms leave out '"',
+      '\' and the control characters and admit any JSON escape instead -- a match cannot run past
+      the closing quote -- and \s also admits the escapes \t \n \f \r. In a class a positive
+      shorthand becomes its ranges ([\w-], [\da-f]) and [\s\S] and its kin become any text; a
+      negated shorthand mixed into a class has no GBNF spelling and is refused with a message
+      that says so. The escapes are judged on the encoded text, so \D admits an escape such as
+      \u0031 that decodes to a digit. sample_test's "cannot spell" case moves from \d to \b,
+      which is still refused; gbnf_test covers \S on strings and array items, \d dates and
+      decimals, [\w-], \s with an escaped tab, [\s\S] and \D, and the refused [a\S].
+
+  patches/0019-json-schema-identity-escapes-of-punctuation.patch
+
+      Patterns written in JavaScript escape punctuation that needs no escape: "\/" in a path,
+      "\-" in a class (zod's email pattern carries both "[A-Za-z0-9_'+\-]" and "[A-Za-z0-9\-]").
+      Outside a class these were refused ("Unsupported regex escape"); inside one they were copied
+      raw and the grammar failed to load. Outside a class such an escape is now the bare
+      character -- regex syntax characters and '"' keep their backslash and go the old way --
+      and inside a class it is written \xHH, so an escaped '-' or '^' cannot read as a range or
+      a negation. gbnf_test covers "\/" and "\-" in literals, "\-" "\^" "\." in classes and as
+      a range endpoint, an unanchored "a\-b", and zod's email pattern.
+
+  patches/0020-json-schema-control-escapes-and-unloadable-class-escapes.patch
+
+      Inside a class, escapes GBNF does not know (\b \f \v \0, an escaped space, \p{..}, \c, a
+      backreference) were copied raw and the grammar failed to load -- an internal error on a
+      schema the converter had accepted. A JSON string holds a control character only as an
+      escape, so \t \n \r \f \b \v \0 in a class, and \t \n \r \f \v \0 outside one, now
+      match that escape: a positive class gains them as alternatives ("[a\t]" reads
+      "(?:[a]|\\t)", and "[\s]" gains "\\[tnfr]" as 0018 gave the bare \s), and a negated class is
+      spelled as text that is neither a listed character nor one of those escapes ("[^\n]+" no
+      longer admits the escape \n). An outside escape is a group, so a quantifier takes all of it.
+      An escaped space or non-ASCII character is itself. \x and \u in a class need their hex
+      digits; "\0" before a digit (a legacy octal) is refused. Every other class escape is now
+      refused at conversion with a message naming it. Limits: a negated class still admits the
+      \u form of a character it leaves out (\u0009 for \t), and a positive class admits \t \n \r \f
+      \b only in their short form. gbnf_test covers each escape in and out of a class, quantified,
+      and negated, and the refusals.
+
+  patches/0021-jinja-a-dotted-integer-is-an-index.patch
+
+      llama.cpp's ae9afff8 ("jinja : support dot property integer literals (#28817)"), after the
+      lifted commit; drop it on the next refresh. jinja2 reads `obj.0` as `obj[0]`; the engine
+      threw "Static member property must be an identifier". GLM-5's template tests a tool result
+      with `m.content.0.type`, and since the probe swallows the throw the template came back as
+      tools=0 tool_calls=0, as 0006 describes: every request with `tools` was refused.
+      tests/chat_test.cpp (a_dotted_integer_is_an_index_as_in_jinja2).

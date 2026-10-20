@@ -10,6 +10,7 @@
 #include "server_fakes.h"
 
 #include "gen/video.h"
+#include "mm/media.h"
 
 #include <chrono>
 #include <thread>
@@ -65,6 +66,13 @@ struct FakeVideoGen : IVideoGen {
             t.refine = r->refine > 0 ? r->refine : (int32_t)inf.upscale_refine;
         }
         if (finish_status == RAD_OK) {
+            /* A request that named no length learns the one the model chose first. */
+            if (r->chunks == 0) {
+                gen::VideoEvent l;
+                l.kind = gen::VideoEvent::LENGTH;
+                l.n = 3;
+                t.push(std::move(l));
+            }
             for (int s = 1; s <= 2; ++s) {
                 gen::VideoEvent e;
                 e.kind = gen::VideoEvent::STEP;
@@ -209,6 +217,57 @@ TEST(the_generator_gets_the_size_the_chunks_and_the_steps) {
     v.wait(str_at(json::parse(r.body, nullptr, false), "id"));
 }
 
+/* A model with a length head chooses the length of a request that names none or says "auto": the
+ * generator gets 0 chunks, the video object says "auto" until the model has chosen and then the
+ * length chosen. A length named is as for any model; without a head, none named is the default. */
+TEST(a_length_head_chooses_the_length_of_a_request_that_names_none) {
+    Videos v;
+    HttpResponse r = v.create(Videos::body());
+    REQUIRE_EQ(r.status, 200);
+    CHECK_EQ(v.gen.last().chunks, 7);
+    v.wait(str_at(json::parse(r.body, nullptr, false), "id"));
+
+    v.gen.inf.length_head = true;
+    for (const json& b : { Videos::body(), Videos::body({ { "seconds", "auto" } }) }) {
+        r = v.create(b);
+        REQUIRE_EQ(r.status, 200);
+        CHECK_EQ(v.gen.last().chunks, 0);
+        json o = json::parse(r.body, nullptr, false);
+        CHECK_EQ(str_at(o, "seconds"), std::string("auto"));
+        o = v.wait(str_at(o, "id"));
+        CHECK_EQ(str_at(o, "status"), std::string("completed"));
+        CHECK_EQ(str_at(o, "seconds"), std::string("0.12"));    /* 3 frames at 24 a second */
+    }
+    r = v.create(Videos::body({ { "seconds", "8" } }));
+    REQUIRE_EQ(r.status, 200);
+    CHECK_EQ(v.gen.last().chunks, 11);
+    v.wait(str_at(json::parse(r.body, nullptr, false), "id"));
+}
+
+/* A model with more than one decoder takes `decoder` by name, the default first: the generator gets
+ * its index, the video object names a decoder other than the default, an unknown name or a frame
+ * over the decoder's area is a 400 naming the field. A model with one decoder takes no name. */
+TEST(a_decoder_is_named_and_held_to_its_area) {
+    Videos v;
+    CHECK_EQ(v.refused(Videos::body({ { "decoder", "vae" } })), std::string("decoder"));
+    v.gen.inf.decoders = { "vae", "diffusion" };
+    v.gen.inf.decoder_max_area = { 1344 * 768, 512 * 256 };
+    HttpResponse r = v.create(Videos::body({ { "decoder", "diffusion" }, { "size", "512x256" } }));
+    REQUIRE_EQ(r.status, 200);
+    CHECK_EQ(v.gen.last().decoder, 1);
+    json o = json::parse(r.body, nullptr, false);
+    CHECK_EQ(str_at(o, "decoder"), std::string("diffusion"));
+    v.wait(str_at(o, "id"));
+    r = v.create(Videos::body({ { "decoder", "vae" } }));
+    REQUIRE_EQ(r.status, 200);
+    CHECK_EQ(v.gen.last().decoder, 0);
+    CHECK(!json::parse(r.body, nullptr, false).contains("decoder"));
+    v.wait(str_at(json::parse(r.body, nullptr, false), "id"));
+    CHECK_EQ(v.refused(Videos::body({ { "decoder", "magic" } })), std::string("decoder"));
+    CHECK_EQ(v.refused(Videos::body({ { "decoder", "diffusion" }, { "size", "768x512" } })),
+             std::string("decoder"));
+}
+
 /* Latent upscaling: refused by a model without an upscaler; with one, the factor and the refine
  * steps reach the generator, a factor of 1 is none, and the refine steps need a factor. */
 TEST(latent_upscale_reaches_the_generator_where_the_model_has_an_upscaler) {
@@ -338,6 +397,165 @@ TEST(the_video_routes_are_501_without_a_video_model) {
     Fixture f;
     CHECK_EQ(f.post("/v1/videos", Videos::body().dump()).status, 501);
     CHECK_EQ(f.get("/v1/videos").status, 501);
+}
+
+namespace {
+
+/* A PNG of w x h, every pixel (r, g, b). */
+std::string png_rgb(int32_t w, int32_t h, uint8_t r, uint8_t g, uint8_t b) {
+    std::vector<uint8_t> px;
+    for (int64_t i = 0; i < (int64_t)w * h; ++i) px.insert(px.end(), { r, g, b });
+    std::vector<uint8_t> file;
+    std::string why;
+    if (mm::encode_image(px.data(), w, h, 3, "png", 0, &file, &why) < 0) return std::string();
+    return std::string(file.begin(), file.end());
+}
+
+std::string png_url(const std::string& bytes) {
+    return "data:image/png;base64," + base64_encode(bytes.data(), bytes.size());
+}
+
+/* A guided model that starts from a picture, as LTX-2.5's dev weights. */
+void guided(Videos& v, int32_t crf) {
+    VideoGenInfo& in = v.gen.inf;
+    in.guidance = true;
+    const double d[8] = { 3.0, 1.0, 3.0, 0.7, 7.0, 1.0, 3.0, 0.7 };
+    std::copy(d, d + 8, in.guidance_default);
+    in.default_negative = "ugly";
+    in.image_cond = true;
+    in.image_crf = crf;
+    in.step_evals = true;
+    in.upscale_max = 2.0;
+    in.upscale_refine = 3;
+}
+
+std::string text_of(const std::vector<int32_t>& ids) {
+    std::string s;
+    for (int32_t c : ids) s += (char)c;
+    return s;
+}
+
+}  /* namespace */
+
+/* Guidance terms and the negative prompt: refused by a model without guidance; on a guided one the
+ * named terms reach the generator (the rest NaN, the model's default), the negative prompt is
+ * rendered in the template (the model's own when none is named), and the video object reports the
+ * resolved terms. Steps count evaluations there, from 1. */
+TEST(guidance_and_the_negative_prompt_reach_a_guided_model) {
+    {
+        Videos v;
+        CHECK_EQ(v.refused(Videos::body({ { "negative_prompt", "x" } })),
+                 std::string("negative_prompt"));
+        CHECK_EQ(v.refused(Videos::body({ { "stg_scale", 1 } })), std::string("stg_scale"));
+    }
+    Videos v;
+    guided(v, 0);
+    CHECK_EQ(v.refused(Videos::body({ { "guidance_rescale", 1.5 } })),
+             std::string("guidance_rescale"));
+    CHECK_EQ(v.refused(Videos::body({ { "audio_guidance_scale", -1 } })),
+             std::string("audio_guidance_scale"));
+    CHECK_EQ(v.refused(Videos::body({ { "negative_prompt", 3 } })), std::string("negative_prompt"));
+    HttpResponse r = v.create(Videos::body({ { "guidance_scale", 5 }, { "audio_stg_scale", "0" },
+                                             { "negative_prompt", "blurry" },
+                                             { "num_inference_steps", 1 } }));
+    REQUIRE_EQ(r.status, 200);
+    const gen::VideoRequest& q = v.gen.last();
+    CHECK_EQ(q.guidance[0], 5.0);
+    CHECK_EQ(q.guidance[5], 0.0);
+    CHECK(std::isnan(q.guidance[1]) && std::isnan(q.guidance[4]));
+    CHECK(q.has_neg);
+    CHECK_EQ(text_of(q.neg_tokens), std::string("<v>blurry"));
+    CHECK_EQ(q.steps, 1);
+    json o = json::parse(r.body, nullptr, false);
+    CHECK_EQ(o["guidance_scale"].get<double>(), 5.0);
+    CHECK_EQ(o["guidance_rescale"].get<double>(), 0.7);
+    CHECK_EQ(o["audio_guidance_scale"].get<double>(), 7.0);
+    CHECK_EQ(str_at(o, "negative_prompt"), std::string("blurry"));
+    v.wait(str_at(o, "id"));
+
+    r = v.create(Videos::body());
+    REQUIRE_EQ(r.status, 200);
+    CHECK(!v.gen.last().has_neg);
+    CHECK_EQ(text_of(v.gen.last().neg_tokens), std::string("<v>ugly"));
+    v.wait(str_at(json::parse(r.body, nullptr, false), "id"));
+
+    /* Both scales 1: unguided, so the object names no negative prompt. */
+    r = v.create(Videos::body({ { "guidance_scale", 1 }, { "audio_guidance_scale", 1 } }));
+    REQUIRE_EQ(r.status, 200);
+    o = json::parse(r.body, nullptr, false);
+    CHECK(!o.contains("negative_prompt"));
+    v.wait(str_at(o, "id"));
+}
+
+/* input_reference: refused by a text-only model; on a model that starts from a picture, a data URL
+ * in JSON or a file in a form becomes the first frame at the size the first steps run at (the
+ * small size under latent upscaling), an even colour staying that colour; task i2va goes with it. */
+TEST(input_reference_becomes_the_first_frame_at_the_first_steps_size) {
+    const std::string pic = png_rgb(300, 170, 200, 40, 90);
+    {
+        Videos v;
+        CHECK_EQ(v.refused(Videos::body({ { "input_reference", png_url(pic) } })),
+                 std::string("input_reference"));
+    }
+    Videos v;
+    guided(v, 0);
+    CHECK_EQ(v.refused(Videos::body({ { "input_reference", "data:image/png;base64,AAAA" } })),
+             std::string("input_reference"));
+    CHECK_EQ(v.refused(Videos::body({ { "input_reference", png_url(pic) }, { "task", "t2va" } })),
+             std::string("task"));
+    HttpResponse r = v.create(Videos::body({ { "input_reference", { { "image_url", png_url(pic) } } },
+                                             { "task", "i2va" } }));
+    REQUIRE_EQ(r.status, 200);
+    const gen::VideoRequest& q = v.gen.last();
+    REQUIRE_EQ(q.image.size(), (size_t)256 * 256 * 3);
+    CHECK_EQ((int)q.image[0], 200);
+    CHECK_EQ((int)q.image[1], 40);
+    CHECK_EQ((int)q.image[q.image.size() - 1], 90);
+    json o = json::parse(r.body, nullptr, false);
+    CHECK(o.value("input_reference", false));
+    v.wait(str_at(o, "id"));
+
+    r = v.create(Videos::body({ { "input_reference", png_url(pic) }, { "size", "512x512" },
+                                { "latent_upscale", 2 } }));
+    REQUIRE_EQ(r.status, 200);
+    CHECK_EQ(v.gen.last().image.size(), (size_t)256 * 256 * 3);
+    v.wait(str_at(json::parse(r.body, nullptr, false), "id"));
+
+    HttpRequest f;
+    f.method = "POST";
+    f.path = "/v1/videos";
+    f.form = { FormPart{ "prompt", "", "", "a boat" }, FormPart{ "size", "", "", "512x256" },
+               FormPart{ "input_reference", "boat.png", "image/png", pic } };
+    r = v.f->srv->router().dispatch(f);
+    REQUIRE_EQ(r.status, 200);
+    CHECK_EQ(v.gen.last().image.size(), (size_t)512 * 256 * 3);
+    v.wait(str_at(json::parse(r.body, nullptr, false), "id"));
+}
+
+/* With the model's H.264 quality the picture goes through the round trip first: an even colour
+ * comes back within a few levels (yuv420p's rounding), an odd size losing its last column. */
+TEST(input_reference_takes_the_models_h264_round_trip) {
+    Videos v;
+    guided(v, 18);
+    const std::string pic = png_rgb(301, 171, 200, 40, 90);
+    HttpResponse r = v.create(Videos::body({ { "input_reference", png_url(pic) } }));
+    if (r.status == 503) return;   /* a build without libx264 refuses it, as it should */
+    REQUIRE_EQ(r.status, 200);
+    const gen::VideoRequest& q = v.gen.last();
+    REQUIRE_EQ(q.image.size(), (size_t)256 * 256 * 3);
+    const int want[3] = { 200, 40, 90 };
+    for (size_t i = 0; i < q.image.size(); i += 997)
+        CHECK(std::abs((int)q.image[i] - want[i % 3]) <= 3);
+    v.wait(str_at(json::parse(r.body, nullptr, false), "id"));
+
+    mm::Frame in, out;
+    in.w = 7;
+    in.h = 5;
+    in.rgb.assign(7 * 5 * 3, 128);
+    std::string why;
+    REQUIRE_EQ(mm::h264_roundtrip(in, 18, &out, &why), (int)RAD_OK);
+    CHECK_EQ(out.w, 6);
+    CHECK_EQ(out.h, 4);
 }
 
 RAD_TEST_MAIN()

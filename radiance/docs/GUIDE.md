@@ -268,6 +268,7 @@ and runs.
 | `llama_fp8`, `llama_dense_fp8` | LLaMA-shaped decoders: MiniCPM5, Llama 3, anything reporting `model_type: llama` |
 | `qwen35_bf16` | Qwen3.5 / 3.6 / 3.8 dense (0.8B–27B), bf16 |
 | `qwen35_fp8` | the same, block-scaled fp8 |
+| `qwen35_w8a8` | the same, an int8 trunk rotated by a 128-wide Hadamard |
 | `qwen35moe_fp8` | Qwen3.5 / 3.6 MoE (35B-A3B), 256 experts, 8 a token |
 | `qwen4exp_fp8` | Qwen4-Exp / Qwen3.8-Flash-Next: hybrid Gated DeltaNet + gated attention, 512 experts |
 | `gemma4` | Gemma 4 text decoders (26B-A4B MoE and the dense members): bf16 trunk, routed experts bf16 or block fp8, and the DFlash drafter |
@@ -275,9 +276,13 @@ and runs.
 | `lfm2_bf16` | LiquidAI LFM2 and LFM2-VL in bf16, including d1 (§5.13) |
 | `embgemma2` | EmbeddingGemma 2, an embedding model (§5.6) |
 | `qwenimage21` | Qwen-Image 2.1 and 2.1-Turbo, an image model (§5.6) |
+| `krea2` | Krea 2 Raw and Turbo, an image model from text (§5.6) |
+| `flux3`, `flux3distilled` | FLUX.3 [klein] and its base, an image model that also edits (§5.6); one plugin under the two names the releases give themselves |
 | `qwen3asr_bf16` | Qwen3-ASR, speech to text from the checkpoint as it ships (§5.14) |
 | `minimaxmusic3` | MiniMax-Music3, songs from a description and lyrics (§5.15) |
 | `breeze` | Breeze-TTS-2, speech from text and an optional description of the voice (§5.15) |
+| `minimaxh3` | MiniMax-H3 and FastH3, video with its stereo soundtrack from text (§5.16) |
+| `ltx2` | LTX-2.5, video with its stereo soundtrack from text or a first frame (§5.16) |
 
 **4. Falling back to the reference library is fatal.** If any op resolves to `libref`, the engine
 refuses to start and names the ops, because serving from it is orders of magnitude slower with nothing
@@ -392,6 +397,27 @@ rad-convert /srv/models/Qwen/Qwen-Image-2.1 -o qwen-image-2.1-fp8.rad \
 rad-convert /srv/models/Qwen/Qwen-Image-2.1-Turbo -o qwen-image-2.1-turbo-fp8.rad \
     --recipe data/recipes/qwen-image-2.1-fp8.recipe
 
+# Krea 2 Raw or Turbo, and FLUX.3 [klein] or its base, image models (§5.6): the diffusers pipeline
+# directory; fp8 blocks for the text encoder and the DiT. Krea 2 takes a recipe either way (or
+# krea-2-bf16.recipe), since the release stores its embedders and modulations f32
+rad-convert /srv/models/krea/Krea-2-Turbo -o krea-2-turbo-fp8.rad \
+    --recipe data/recipes/krea-2-fp8.recipe
+rad-convert /srv/models/black-forest-labs/flux-3-image-klein -o flux-3-klein-fp8.rad \
+    --recipe data/recipes/flux-3-klein-fp8.recipe
+
+# LTX-2.5, video with sound (§5.16): the diffusers pipeline directory, latent_upsampler/ included
+# for the distilled release's two-stage recipe; fp8 blocks for the text encoder, the connectors and
+# the DiT, or bf16 (both recipes keep the vocoders f32, which they run in)
+rad-convert /srv/models/Lightricks/LTX-2.5-Diffusers -o ltx-2.5-fp8.rad \
+    --recipe data/recipes/ltx-2.5-fp8.recipe
+# Its full (SFT) DiT, transformer_full/, is guided and takes the base schedule back: a folder whose
+# transformer/ links to it, and the scheduler's shifting turned on as the release's README does
+mkdir ltx-2.5-full && ln -s /srv/models/Lightricks/LTX-2.5-Diffusers/* ltx-2.5-full/
+rm ltx-2.5-full/transformer ltx-2.5-full/transformer_full
+ln -s /srv/models/Lightricks/LTX-2.5-Diffusers/transformer_full ltx-2.5-full/transformer
+rad-convert ltx-2.5-full -o ltx-2.5-full-fp8.rad --recipe data/recipes/ltx-2.5-fp8.recipe \
+    --set scheduler.use_dynamic_shifting=1 --set scheduler.shift_terminal=0.1
+
 # MiniMax-Music3, songs (§5.15): the diffusers pipeline directory is the checkpoint (language model,
 # depth decoder, condition encoder, DiT, vocoder, tokenizer); bf16 throughout (21 GB, one card or two)
 rad-convert /srv/models/MiniMaxAI/MiniMax-Music3 -o minimax-music3-bf16.rad \
@@ -469,6 +495,20 @@ rad-convert /srv/models/MisterSnrub/Qwen3.8-27B-PARO-MXFP4-v2 --draft-model /srv
 # ParoQuant int5 (Launch80/Qwen3.8-27B-PARO-int5) and z-lab's int4 (z-lab/Qwen3.8-27B-PARO): same recipe
 rad-convert /srv/models/Launch80/Qwen3.8-27B-PARO-int5 --draft-model /srv/models/z-lab/Qwen3.8-27B-DFlash2 \
     --recipe data/recipes/q38-27b-paro-mxfp4-df2.recipe -o q38-27b-paro-int5-df2.rad
+
+# TranslateGemma 27B from Google's bf16 checkpoint: an int8 container to calibrate in, its Grams
+# (serve it with RADIANCE_CALIB_DIR set and push translation prompts through prefill, see
+# docs/ARCHITECTURES.md), then MXFP4 + GPTQ; with a DFlash2 drafter, the -df2 recipe and --draft-model
+rad-convert /srv/models/google/translategemma-27b-it \
+    --recipe data/recipes/translategemma-27b-i8a8.recipe -o translategemma-27b-i8a8.rad
+CALIB=/srv/calib/translategemma rad-convert /srv/models/google/translategemma-27b-it \
+    --recipe data/recipes/translategemma-27b-mxfp4-gptq.recipe -o translategemma-27b-mxfp4-gptq.rad
+
+# GLM-5.3-Flash from AMD's Quark export: MXFP4 experts and block-FP8 attention kept as stored,
+# the latent attention's kv_b decoded to bf16; text only, the vision tower is not converted.
+# 171 GiB, served on eight 32 GB cards (docs/ARCHITECTURES.md)
+rad-convert /srv/models/amd/GLM-5.3-Flash-Quark-MXFP4 \
+    --recipe data/recipes/glm53-mxfp4.recipe -o glm53-flash-mxfp4.rad
 
 # unsloth's NVFP4 Qwen3.8-27B with the DFlash2 drafter: the NVFP4 MLPs and the FP8 linears beside
 # them made MXFP4 by one recipe, the head block fp8
@@ -685,7 +725,8 @@ GiB a card at `--tp 2`. Under `ram` each rank pins its own shard in host memory 
 `--host-pool-mib`, and the lookup reads a step's rows over the link, so the table costs no VRAM. The
 table is the model-level weight only `embed_lookup` reads. A model whose head is tied to it keeps it
 on the card (the head's GEMM would stream it whole every step), and so does a host that cannot pin
-it (available memory and memory cgroups, after the pools, with 4 GiB to spare); startup says which.
+it (available memory and memory cgroups, after the pools, with `--host-headroom-mib` to spare,
+default 4 GiB); startup says which.
 An explicit `ram` turns either case into a refusal. `disk` is refused: the lookup writes activations
 the card reads, which a host kernel reading the container cannot do.
 
@@ -711,11 +752,12 @@ from the container through a row cache with direct reads on the host; about half
 are first-seen, so steps wait on the drive. `ram` copies the table into host memory at load (12 to
 40 s more startup, depending on the page cache) and the card's gather kernel reads the pinned copy,
 so a step has no host work. `vram` puts all of it on every card. `ram` needs the table's size free
-after the pinned host pools and the prefix cache's host tier, with 4 GiB to spare, under every
-memory cgroup the process sits in, and refuses the start otherwise. `auto` takes the first of `vram`,
-`ram` and `disk` that holds the table. Without a device kernel for the gather (no libr4d) the table is
-read on the host: `vram` is refused, and `ram` is a copy in locked huge pages, which also needs a
-memlock limit that large (`--ulimit memlock=-1` in Docker, `LimitMEMLOCK=infinity` under systemd).
+after the pinned host pools and the prefix cache's host tier, with `--host-headroom-mib` to spare
+(default 4 GiB), under every memory cgroup the process sits in, and refuses the start otherwise.
+`auto` takes the first of `vram`, `ram` and `disk` that holds the table. Without a device kernel
+for the gather (no libr4d) the table is read on the host: `vram` is refused, and `ram` is a copy in
+locked huge pages, which also needs a memlock limit that large (`--ulimit memlock=-1` in Docker,
+`LimitMEMLOCK=infinity` under systemd).
 
 **`--weights-disk-tier`** serves a model larger than the card and the host pool together, with every
 step paced by the drive. A routed expert that fits neither lives only in the container. Before each
@@ -772,6 +814,25 @@ changes the output slightly, so it is only ever set explicitly. Every architectu
 widths, and the flag sets every attention cache of the deployment, a drafter's (DSpark, DFlash2)
 included. The delta-net state and the QSA indexer's key tail are recurrent state and keep their own
 widths.
+
+`fp8_v4` and `k6_v4` narrow the trunk's attention cache further, in groups of 32 dimensions with an
+f16 scale each: `fp8_v4` keeps K in E4M3 and stores V as int4, `k6_v4` stores K as int6 too. A token
+then costs 25/32 or 22/32 of what fp8 costs, and a drafter's cache stays fp8. libr4d has their
+kernels for Qwen3.8-27B's attention (head_dim 256, gqa 6) and Qwen3.8-Flash-Next's (head_dim 256,
+gqa 12 over 4-token pages, gqa 6 a rank at four ranks), so `qwen35_fp8` and `qwen4exp_fp8` offer
+them there and the server refuses them, naming the plugin, anywhere else. Flash-Next's QSA indexer
+keeps its own key cache, so its share of a token does not shrink. On two R9700s at the serve flags of
+`qwen3.8-27b-mxfp4.yaml` with `--max-num-batched-tokens 2048` and 12 GiB a card left to another
+engine, against the bf16 model on 17 long log-analysis documents (60 368 scored positions):
+
+| `--kv-cache-dtype` | KV pool | mean KL | top-1 | 41k-token prefill | decode, 1 / 16 streams |
+|---|---|---|---|---|---|
+| `fp8` | 518 800 tokens | 0.039963 | 94.03% | 9.76 s | 134-140 / 550-555 tok/s |
+| `fp8_v4` | 664 400 (+28%) | 0.040076 | 94.03% | 9.76 s | 130-139 / 553-557 |
+| `k6_v4` | 755 184 (+46%) | 0.039965 | 94.06% | 9.84 s | 136-138 / 553-561 |
+
+The decode spread is run to run; the three are the same speed there. Each layout's row and the
+kernels that read it are in [OPS.md](OPS.md#the-kv-cache-operand).
 
 **Many sequences.** Every model here serves `--max-num-seqs` up to 32. A sequence holds only the
 blocks its tokens occupy, but two costs exist per sequence regardless:
@@ -999,9 +1060,10 @@ prefill.
 At three and four ranks `wht6` selects tiered int8 over a two-shot all-reduce, both hops quantised
 (at three ranks the shards are whole 32-element groups, one uneven where the message does not
 divide), with the same floor. Eight ranks have no lossy wire; `--tp 8 --tp-wire wht6` stops at
-startup naming the all-reduce it found no kernel for, and `--tp-wire exact`. The exact wire at three,
-four and eight ranks is one-shot up to 1 MiB a message and two-shot above it, which sends
-2·(ranks−1)/ranks of the message per rank instead of (ranks−1) times it, with the same bits.
+startup naming the all-reduce it found no kernel for, and `--tp-wire exact`. The exact wire at three
+and four ranks is one-shot up to 1 MiB a message and two-shot above it, which sends
+2·(ranks−1)/ranks of the message per rank instead of (ranks−1) times it, with the same bits. At
+eight ranks the one-shot's seven copies lose early, and it ends at 8192 elements (16 KiB of bf16).
 
 On a model with a gated residual (Qwen3.8-Flash-Next) the all-reduce runs inside the residual's
 write, with the MoE gather in front of it. At two ranks the rotated forms of `ar_hc_write` and
@@ -1026,6 +1088,51 @@ link pay more.
 `--p2p` overrides the driver. `off` takes the host-memory path even where the driver reports peer
 access, for a board where peer traffic is broken or slow. `on` requires peer access and stops at
 startup, naming the pairs, if the driver refuses any. `auto`, the default, trusts the driver.
+
+**Eight cards on unequal links.** In the two-shot rank r reduces shard r of the message, and every
+rank's link carries at least the whole message each way whatever its shard, so the slowest link
+sets the time of every prefill all-reduce. On a board whose slots differ (here eight R9700s: four
+at Gen5 x16, two at Gen5 x8, two links that trained at Gen4 x8) the eight-rank two-shot does two
+things from 262144 elements (512 KiB of bf16) up:
+
+- it weights the shards by link: a rank on a slow link reduces a short shard, or none;
+- it runs the message in pieces, so one piece's second hop shares the link with the next piece's
+  first, both directions at once: 2 pieces under 1048576 elements, 4 under 4194304, 8 above.
+
+Every word is still folded in fp32 in ascending rank order whoever reduces it, so the bits are
+those of the even split. Below that size a decode step's message runs even and in one piece: there
+the extra handshakes cost more than the link time they save.
+
+The weights come from the links. At startup each rank reads its card's PCIe path in sysfs from the
+root port down and takes the slowest hop (the R9700's on-card switch reports full speed in any
+slot, so a degraded slot shows only at the root port); its weight is round(4·(rate/fastest)²), so
+x16 is 4, half the rate 1 and a quarter 0. Equal links give equal weights and the unweighted
+kernel. One line names what was read:
+
+```
+[r4d] eight-rank two-shot shard weights from the slowest PCIe hop of each card: r0 32.0 GT/s x16
+63.0 GB/s w4, r1 32.0 GT/s x8 31.5 GB/s w1, r2 16.0 GT/s x8 15.8 GB/s w0, ...
+```
+
+`r4d_selftest --perfar8 0` prints the same weights and times both rows at every piece count, each
+checked against the fold (warm, the slowest rank):
+
+| message (bf16) | even, one piece | weights 4,1,0,4,0,1,4,4 |
+|---|---|---|
+| 196608 elements (384 KiB) | 73 µs | below 262144: even, one piece |
+| 524288 (1 MiB) | 214 µs | 166 µs in 2 pieces |
+| 2097152 (4 MiB) | 699 µs | 531 µs in 4 pieces |
+| 8388608 (16 MiB, a 2048-token chunk at 4096 wide) | 2841 µs | 1636 µs in 8 pieces |
+
+With the two Gen4 links retrained to Gen5 x8 the weights read 4,1,1,4,1,1,4,4 and the 16 MiB
+message takes 1360 µs.
+
+The links are read once, at startup: a link that drops to a lower speed while the server runs
+keeps its weight until the next start. `RADIANCE_AR8_SHARD_WEIGHTS` overrides them: `off` keeps
+the shards even, eight comma-separated integers set them, unset or `auto` reads the links.
+`RADIANCE_AR8_PIECES` (1 to 16) fixes the piece count, and `RADIANCE_AR8_SHARD_WEIGHTS_MIN_ELEMS`
+and `RADIANCE_AR8_PIECES_MIN_ELEMS` move the two sizes they start at. Every rank must read the
+same values; where they differ, every rank stops at startup.
 
 ### 4.8 Host tier for finished conversations
 
@@ -1072,8 +1179,9 @@ running or not, and a conversation without a snapshot under its next prompt reus
 backoff keeps 9 for a 200K-token conversation at the default 2048-token interval, so 10 a sequence,
 80 at `--max-num-seqs 8`. The store is pinned for the life of the server, so `auto` takes at most an
 eighth of host memory (and never less than 8 slots where the host can pin them), and never more than
-the host can pin after the host pools, the host tier and the activation arenas. The startup log says
-what it chose; Flash-Next at `--tp 2 --max-num-seqs 8` on a host with 128 GB of RAM:
+the host can pin after the host pools, the host tier, the activation arenas and
+`--host-headroom-mib`. The startup log says what it chose; Flash-Next at `--tp 2
+--max-num-seqs 8` on a host with 128 GB of RAM:
 
 ```
 checkpoint slots: auto: 80 linear-state snapshot(s) of 113.50 MiB in pinned host memory (8.87 GiB),
@@ -1148,6 +1256,13 @@ radiance --model m.rad --chat-template-kwargs @template-vars.json
 - At startup a one-message chat is rendered with the variables; a value the template refuses stops
   startup with the template's message.
 - `/tokenize` renders `messages` with the same variables.
+
+**System messages.** Many templates raise unless a conversation has one system message, first; the
+Chat Completions API allows any number anywhere. A conversation the template refuses that has a
+system message after the first message, or more than one, is rendered again with its system
+messages merged, in order and separated by a blank line, into one at the head; the first such
+request logs a warning. Anything else a template refuses is a 400 on `messages` in the template's
+own words.
 
 **`--reasoning-effort`** is the default for chat requests that set none, passed to the chat template
 verbatim, so the legal set is the template's. Qwen3.8 takes `xhigh|medium|low` and defaults to
@@ -1265,8 +1380,9 @@ still verified by the adapter, so output is exact and only the acceptance rate c
 | flag | default | |
 |---|---|---|
 | `--gpu-headroom-mib N` | 96 | VRAM left unclaimed on every card |
-| `--kv-cache-dtype T` | bf16 | `bf16` or `fp8` |
+| `--kv-cache-dtype T` | bf16 | `bf16`, `fp8`, or on Qwen3.8-27B and Qwen3.8-Flash-Next `fp8_v4` or `k6_v4` (§4.4) |
 | `--host-pool-mib N` | 0 | pinned host tier (weights) |
+| `--host-headroom-mib N` | 4096 | host RAM left free for the system when startup pins host memory — kept for the unpooled allocations, staging and page cache (§4.3) |
 | `--embedding-placement WHERE` | ram | `ram` or `vram`: the token embedding pinned in host memory beside `--host-pool-mib` and read in place, or on the card (§4.3) |
 | `--ngram-placement WHERE` | auto | `auto`, `vram`, `ram` or `disk`: an n-gram table on the card, as a copy in RAM made at load and read by the card, or read from the container (§4.3) |
 | `--vision-tower-placement WHERE` | vram | `vram` or `ram`: the encoder towers (vision, and audio where a model has one) on the card, or pinned in host memory beside `--host-pool-mib` and read in place once an image (§4.3) |
@@ -1640,7 +1756,7 @@ becomes up to 280 tokens by default (`--image-tokens`, or a request's `image_tok
 `document`, `Retrieval-query`, `STS`, ...) and applies to text and content-part inputs; a model that
 states a default prompt applies it when the request names none.
 
-**An image model** (Qwen-Image 2.1 or 2.1-Turbo) serves OpenAI's images API only; completions, chat
+**An image model** (Qwen-Image 2.1 or 2.1-Turbo, Krea 2, FLUX.3 [klein]) serves OpenAI's images API only; completions, chat
 and embeddings answer 501. OpenAI images clients (Open WebUI, the OpenAI SDKs) work unchanged; the
 picture always comes back in the response. The engine sizes the step, batch and context for an image
 model itself (`--max-num-batched-tokens` and `--max-model-len` from the model's largest pass,
@@ -1703,6 +1819,15 @@ area (its latent rows replace its vision tokens). One card holds the fp8 contain
 20256 rows: four pictures with their prompt. Two cards hold all ten the model takes, and the bf16
 container. A request the cache can never hold is a 400 naming the rows it needed. The models are
 under Qwen's research license, non-commercial.
+
+**Krea 2 and FLUX.3 [klein]** take the same fields with their own defaults. Both make RGB pictures
+(`background: transparent` is a 400), 1024x1024 by default, sides rounded down to multiples of 16,
+up to 2048x2048 (16384 latent tokens). Krea 2 Raw runs 28 steps at guidance 4.5 against an empty
+negative prompt and Turbo 8 steps unguided; Krea 2 reads only text, so `/v1/images/edits` answers
+501. FLUX.3 [klein] runs 16 steps unguided and its base 50 at guidance 3.5; both edit from up to ten
+pictures, each shrunk to 1024x1024 of area when larger. The guidance scale is `guidance_scale` or
+`true_cfg_scale` (one of them), in the model card's terms. FLUX.3's pipeline can rewrite a prompt
+with a separate language model first; radiance reads the prompt as given.
 
 ### 5.7 Request fields
 
@@ -1831,8 +1956,12 @@ llama-server (`chat_template_kwargs`, `top_k`, ...). The answer is a response ob
 stream with every event's `output_index`, `content_index` and `sequence_number`, opening with
 `response.created` and `response.in_progress` at once, as OpenAI's and vLLM's do: they report the
 response object, not output. A reply cut at
-`max_output_tokens` is `incomplete`. Function tools are offered to the model; built-in tools (web
-search, file search, computer use) and freeform custom tools are left out, as in llama-server.
+`max_output_tokens` is `incomplete`. Function tools are offered to the model, and so are the
+function tools a `namespace` groups (Codex sends every MCP server's tools that way), named
+`<namespace>__<name>`: the reply's `function_call` item carries `namespace` and `name` apart, and a
+`function_call` input item or a `tool_choice` naming a namespace is joined back the same way. Two
+tools that would share a name are refused. Built-in tools (web search, file search, computer use)
+and freeform custom tools are left out, as in llama-server.
 Responses are not stored, so `previous_response_id` is refused: send the conversation as `input`.
 What a response object cannot carry is refused: `n` other than 1, and logprobs (`include` naming
 `message.output_text.logprobs`, `top_logprobs`, `logprobs`, `n_probs`), which
@@ -2281,7 +2410,7 @@ and the session goes on.
 
 ### 5.16 Video: `/v1/videos`
 
-A video generation model (MiniMax-H3) answers OpenAI's video jobs: `POST /v1/videos` queues a video
+A video generation model (MiniMax-H3, LTX-2.5) answers OpenAI's video jobs: `POST /v1/videos` queues a video
 with its stereo soundtrack and answers at once with the video object; `GET /v1/videos/{id}` reports
 its `status` (`queued`, `in_progress`, `completed`, `failed`) and `progress` (0 to 100);
 `GET /v1/videos/{id}/content` downloads the MP4 once it is completed (`?variant=thumbnail` gives the
@@ -2346,6 +2475,54 @@ The MP4 holds H.264 video (yuv420p, BT.709) and AAC audio at 32 kHz stereo. A fi
 for an hour (`expires_at`), at most 32 of them. MiniMax-H3's license excludes use in the EU, the UK,
 the Republic of Korea and the USA without a separate license from MiniMax.
 
+**LTX-2.5** takes the same jobs with its own limits, and starts from a picture as well as from text:
+
+```sh
+radiance --model ltx-2.5-fp8.rad --vision-tower-placement ram
+
+# image to video: the picture is the first frame (a file in the form, or a data: URL in JSON)
+curl -s http://localhost:8000/v1/videos -F 'prompt=the fox turns and runs into the trees' \
+  -F 'size=768x512' -F 'seconds=5' -F 'input_reference=@fox.png'
+```
+
+- **`prompt`** is read as written (no template), at most 1024 tokens; **`negative_prompt`** is
+  what guidance steers away from, empty by default.
+- **`seconds`** is rounded up to steps of 8 frames at 24 a second, from 17 frames (0.71 s) to 161
+  (6.7 s). Left out (or `"auto"`), the release's duration head chooses the length the prompt
+  implies, as diffusers does when `num_frames` is omitted: its prediction held to 1 to 20 seconds,
+  rounded to frames and down to the 8-frame steps, then to the 161 frames this server makes. The
+  video object says `"seconds": "auto"` until the prompt is read, then the length chosen. A
+  container without the head makes 121 frames (5.04 s). **`size`**: both sides multiples of 32 from 256, at most
+  1920 x 1088 pixels of area, at most 3:1; 960x544 by default, the release's own. A step carries at
+  most 121 frames at 1920x1088 (a longer video at that size is refused). Up to 960 x 544 of area
+  the VAE decodes each frame whole, as the pipeline does by default; a larger frame is decoded in
+  diffusers' tiles (`vae.enable_tiling()`: 512 pixels every 448) and blended where they overlap,
+  as the release's two-stage README does at 1920x1088.
+- **`input_reference`** is the first frame, resized and cropped to `size` and put through H.264
+  at CRF 18 first, as the model was trained.
+- **`decoder`** picks how the latents become frames: `vae` (the default, the convolutional VAE that
+  diffusers' LTX2Pipeline decodes with) or `diffusion`, the release's diffusion decoder (the
+  README's "Decode with the diffusion decoder"): four stages of neighborhood-attention blocks, then
+  one denoising step from noise over 4 x 4 pixel patches, run in its own tiles (768 pixels every
+  704, 80 frames every 56) as diffusers' `enable_tiling()` runs it. It draws its noise from the
+  request's seed, so a seed repeats its video. Frames of at most 960 x 544 of area.
+- The base model runs 30 steps (`num_inference_steps`, at most 64), each up to four evaluations:
+  **`guidance_scale`** against the negative prompt, **`stg_scale`** against the model with block
+  28's self-attentions bypassed, **`modality_scale`** against the model without its cross-modal
+  attentions, and **`guidance_rescale`**, by default 3, 1, 3 and 0.7 for the video. The
+  soundtrack's own four are the same fields prefixed `audio_` (7, 1, 3, 0.7). A scale of 1 (0 for
+  `stg_scale`) drops its evaluation, so `{"guidance_scale": 1, "stg_scale": 0, "modality_scale":
+  1, ...}` runs one evaluation a step.
+- The distilled release runs its 8 trained steps unguided, and only those; with its latent
+  upsampler in the container, **`latent_upscale`** 2 (sides multiples of 64) runs them at half the
+  size, enlarges the clean latent, re-noises it and refines at the full size in 3 more. `size` is
+  the output's: the release's README recipe is `"size": "1920x1088", "latent_upscale": 2` (its first
+  stage at 960x544).
+
+The MP4's soundtrack is 48 kHz stereo. LTX-2.5 runs on one card; `--tp` above 1 is refused. Its
+Gemma 4 text encoder (13 GiB in fp8) does not fit a 32 GB card beside the DiT: serve it with
+`--vision-tower-placement ram`, which keeps it in pinned host memory and reads it once a prompt.
+
 ## 6. Operation
 
 ### 6.1 The dashboard
@@ -2368,6 +2545,49 @@ The full-strength segment is context running requests are reading; the dim segme
 finished turns kept for reuse, which gives way the moment a live request needs it. A large kept
 figure with a high hit rate is the cache working, not a leak. Both segments take their warning colour
 from the total fill, since a full pool causes preemption.
+
+The decode step tile carries two figures and a percentage under the big number:
+
+```
+best 14.79ms · recent 15.21ms · now 97% of best
+```
+
+Both are window means of single-sequence decode steps, measured by the engine:
+`best` is the fastest window of 32 consecutive single-stream steps this process
+has run, `recent` its most recent one. Individual steps vary a lot — a step that
+saves a KV checkpoint, or finishes while other engine work is committing, can
+take twice as long as its neighbour — so nothing is compared until 32 have been
+averaged. A single slow step moves neither figure.
+
+The percentage, `now X% of best`, is the page's own live window read against the
+floor: the mean of the steps that completed in the last poll (~500 ms) as a
+fraction of `best`, so a step at 80% of the floor's speed reads "80% of best". A
+fast stretch shorter than a window can beat the 32-step floor without being a new
+record, so the figure is capped and the fastest reads `~99%`. At higher
+concurrency it is keyed to that concurrency (`@c8`) and read against the fastest
+step seen there, because a batched step is a different measurement and would
+report a batch arriving as a slowdown.
+
+The gap between them is normal, and it is not degradation. `best` is the most
+favorable moment the lane has hit; `recent` is what it is doing now. On a healthy
+lane sharing the card with other work the gap moves between 3% and 11% while the
+engine is in good shape: it tracks what else the machine is doing, and it freezes
+when the lane goes idle, because no new window is completing. "Recent is 8% above
+best" is not "8% degraded", and it is not a reason to restart.
+
+What is worth acting on is `best` itself getting worse across days — the engine
+no longer reaching the speeds it used to. That is a hardware, driver, or
+configuration question rather than a restart question, and the honest check is
+comparing `best` across restarts against a known-good value for the machine.
+
+Both figures are per-process and reset when the engine restarts, so a freshly
+restarted lane has not yet seen its own best moment and will report a `best` that
+later improves. `/stats` carries the raw values as `step_ns_decode_best` and
+`step_ns_decode_recent` (nanoseconds; 0 until the first window completes), plus
+`startup_s` — how long bringup took on this machine, which is the real cost of a
+restart if one is decided on. The estimator is `rad::DecodeFloor` in
+`core/sched/metrics.h`; `docs/DEVLOG-decode-floor.md` is the log of how these
+figures came to be shown without a verdict attached.
 
 **Sessions**: one row per stored conversation: how many tokens, which tier it is in, and whether its
 linear half is still reachable. Sizes overlap and cannot be added: two sessions sharing a system
@@ -2528,7 +2748,7 @@ is the part of a log to paste into an issue. Its sections:
   warning is also printed as a `W` line of its own.
 
 ```
-I STARTUP REPORT -- radiance 1.8.1
+I STARTUP REPORT -- radiance 1.9.0
 I CONFIGURATION -- every option, the value in force, and where it came from
 I   --model                            /models/flashnext.rad                       [command line]
 I   --tp                               2                                           [command line]
@@ -2602,6 +2822,20 @@ rad-kbench --home $RADIANCE_HOME --max-cases 1   # are the kernels correct?
 | `ROCM_PATH` | where ROCm lives, if not `/opt/rocm` (build time) |
 | `HF_TOKEN` | for `scripts/hfget.sh` and `--model <owner/name>` on a gated or private repo |
 | `XDG_CACHE_HOME` | where `--model <owner/name>` fetches to without `--download-dir` (`$XDG_CACHE_HOME/radiance/hf`, else `~/.cache/radiance/hf`) |
+| `R4D_AR_MAX_BLOCKS` | a ceiling on libr4d's collective block counts, for two tensor-parallel engines on one set of cards; set it in both (below). The MoE models' hyper-connection gathers keep the minimum their LDS table needs. Unset, nothing changes |
+
+**Two engines on one set of cards.** Every block of a libr4d collective spins until its twin on the
+peer card has pushed, and a prefill-sized fused all-reduce launches more blocks than a card holds at
+once. One engine is safe: both cards dispatch its blocks in the same order. Two tensor-parallel
+engines on the same cards can deadlock: one engine's spinners fill a card while their twins wait
+behind the other engine's kernel on the peer, which waits for a slot on the full card. On two R9700s
+(Qwen3.8-27B and a Gemma 3 27B, both `--tp 2`) that hung within a minute of concurrent prefill, and
+the driver's attempt to evict the queues froze the host. With `R4D_AR_MAX_BLOCKS` in both engines
+low enough that their spinners together leave part of a card free, the cycle cannot close: 64 for
+Qwen3.8-27B (its decode at 16 sequences x 4 rows stays uncapped) and 16 for the Gemma ran 15
+minutes of concurrent long prompts on both without a stall. The ceiling costs prefill time, the
+reductions running on fewer blocks: Qwen3.8-27B's 41k-token prefill 9.5 s uncapped, 9.8 s at 64,
+10.3 s at 32. Give the engine started first its `--gpu-headroom-mib` for the second.
 
 **Tooling**
 
@@ -2610,8 +2844,10 @@ rad-kbench --home $RADIANCE_HOME --max-cases 1   # are the kernels correct?
 | `RADIANCE_TUNE` | pin a kernel's tunable axes instead of reading the tune cache: `op:key=value[,key=value][;op:...]`. For comparing tunings, not for deployment |
 | `RADIANCE_CALIB_DIR` | where an engine run writes calibration data for a recipe's `gptq calib=DIR` |
 | `RADIANCE_CALIB_TOKENS` | with `RADIANCE_CALIB_DIR`, the tokens the calibration tap accumulates before it writes and switches itself off (default 65536) |
+| `RADIANCE_G3_CALIB_LAYERS` | `lo:hi`: `arch/gemma3`'s calibration tap over layers lo to hi - 1 only, to take a large model's Grams in passes (docs/ARCHITECTURES.md) |
 | `RADIANCE_PROFILE_EVERY` | with `--profile-ops`, dump the per-op table every N steps (default 32) |
 | `RADIANCE_LOG_STEPS` | log one line per step: its phase, sequences, and each one's token count and context (§4.5) |
+| `RADIANCE_AR8_SHARD_WEIGHTS`, `RADIANCE_AR8_PIECES` | the eight-rank two-shot's shard weights (`auto`, the default, reads the PCIe links; `off`; or eight integers) and piece count, with `RADIANCE_AR8_SHARD_WEIGHTS_MIN_ELEMS` and `RADIANCE_AR8_PIECES_MIN_ELEMS` for the message size each starts at (§4.7) |
 
 Engine development has its own instruments: `RADIANCE_DEBUG_*` (residual probes, routing and issue
 dumps), `RADIANCE_OP_ORACLE*` (named ops checked against `libref` on the operands the model issued;

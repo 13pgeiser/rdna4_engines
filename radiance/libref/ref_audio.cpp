@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -709,6 +710,39 @@ int ref_iota(const RadArgs* a, RadStream) {
     if (n <= 0 || period < 0) return RAD_E_SHAPE;
     for (int64_t i = 0; i < n; ++i)
         st_int(y->dtype, y->data, offlin(y, i), start + (period ? i % period : i) * step);
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ int_affine */
+/* y[j] = (src[j] < 0 ? 0 : x[src[j]]) * mul[j] + add[j], the three lists space-separated integers
+ * of one length: shapes and sequence bounds a model derives from a pass's device geometry (a
+ * decoder's volume at each of its scales). y holds at least the lists' length. */
+static int parse_ints(const char* s, int64_t* v, int cap) {
+    int n = 0;
+    while (s && *s) {
+        char* e = nullptr;
+        const long long x = std::strtoll(s, &e, 10);
+        if (e == s) break;
+        if (n == cap) return -1;
+        v[n++] = x;
+        s = e;
+    }
+    return n;
+}
+
+int ref_int_affine(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *y = &a->t[1];
+    int64_t src[16], mul[16], add[16];
+    const int n = parse_ints(p_str(a, "src", ""), src, 16);
+    if (n <= 0 || parse_ints(p_str(a, "mul", ""), mul, 16) != n ||
+        parse_ints(p_str(a, "add", ""), add, 16) != n || numel(y) < n)
+        return RAD_E_SHAPE;
+    for (int j = 0; j < n; ++j) {
+        if (src[j] >= numel(x)) return RAD_E_SHAPE;
+        const int64_t v = src[j] < 0 ? 0 : ld_int(x->dtype, x->data, offlin(x, src[j]));
+        st_int(y->dtype, y->data, offlin(y, j), v * mul[j] + add[j]);
+    }
     return RAD_OK;
 }
 

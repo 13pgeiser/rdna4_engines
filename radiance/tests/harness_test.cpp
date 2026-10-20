@@ -23,7 +23,7 @@ struct Run {
  * inherited from ctest. */
 Run fixture(const std::string& args, const std::string& env = "") {
     const std::string cmd = "env -u RAD_TEST_FILTER -u RAD_TEST_STRICT -u RAD_TEST_LEVEL "
-                            "-u RAD_TEST_CPU_BUDGET " + env + " '" RAD_HARNESS_FIXTURE "' " +
+                            "-u RAD_TEST_CPU_BUDGET -u RAD_TEST_CPU_BUDGET_SCALE " + env + " '" RAD_HARNESS_FIXTURE "' " +
                             args + " 2>&1";
     Run r;
     FILE* p = popen(cmd.c_str(), "r");
@@ -193,6 +193,12 @@ TEST(a_binary_over_its_cpu_budget_fails) {
     CHECK(has(r.out, "  ok   burns_cpu ("));
     CHECK(has(r.out, "slowest: burns_cpu "));
     r = fixture("passes_one", "RAD_TEST_CPU_BUDGET=60");
+    CHECK_EQ(r.status, 0);
+    /* A slower host scales every budget by one factor. */
+    r = fixture("burns_cpu passes_one", "RAD_TEST_CPU_BUDGET=0.05 RAD_TEST_CPU_BUDGET_SCALE=2");
+    CHECK_EQ(r.status, 1);
+    CHECK(has(r.out, "over its budget of 0.1 s"));
+    r = fixture("burns_cpu passes_one", "RAD_TEST_CPU_BUDGET=0.05 RAD_TEST_CPU_BUDGET_SCALE=100");
     CHECK_EQ(r.status, 0);
 }
 

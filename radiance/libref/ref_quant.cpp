@@ -360,8 +360,11 @@ int ref_quant_cols_fp8(const RadArgs* a, RadStream) {
  * ~0.2% error per group (a fifth of the int4 grid's own error).
  *
  * The output is not interchangeable with quant_act_fp8's: only a weight plane stored as w4a8h
- * carries the matching rotation and /g. */
-int ref_had_quant_act_fp8(const RadArgs* a, RadStream) {
+ * carries the matching rotation and /g.
+ *
+ * had_quant_act_i8g is the same at int8 codes (`top` 127), for the i8a8h weight, whose scale
+ * carries the /g the same way. */
+static int had_quant_act_q8(const RadArgs* a, float top) {
     if (!have(a, 3)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *q = &a->t[1], *s = &a->t[2];
     const int64_t n = p_int(a, "n", 0);
@@ -383,12 +386,20 @@ int ref_had_quant_act_fp8(const RadArgs* a, RadStream) {
             const int64_t k0 = gi * g;
             for (int64_t i = 0; i < g; ++i) buf[i] = ldt(x, xb + (k0 + i) * xs);
             fwht(buf, g);
-            const float sc = q8_group([&](int64_t i) { return buf[i]; }, g, 448.0f, q,
+            const float sc = q8_group([&](int64_t i) { return buf[i]; }, g, top, q,
                                       qb + k0 * qs, qs);
             stt(s, rowoff(s, r, ngrp) + gi * laststride(s), sc);
         }
     }
     return RAD_OK;
+}
+
+int ref_had_quant_act_fp8(const RadArgs* a, RadStream) {
+    return had_quant_act_q8(a, 448.0f);
+}
+
+int ref_had_quant_act_i8g(const RadArgs* a, RadStream) {
+    return had_quant_act_q8(a, 127.0f);
 }
 
 /* ------------------------------------------------------------- givens_rotate */

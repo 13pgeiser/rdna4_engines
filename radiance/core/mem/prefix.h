@@ -284,9 +284,10 @@ public:
     void hold(uint64_t req, const std::vector<int32_t>& tokens, const std::vector<MMContentKey>& mm);
     void release(uint64_t req);
     /* Start of a step's admissions. Snapshots the previous step's lookups handed out have been
-     * read by its forward by now; until this call they keep their slots against retention,
-     * reserve_checkpoint's eviction and expiry. */
-    void begin_step() { handed_.clear(); }
+     * read by its forward by now, and the ones it reserved have been saved into (the engine
+     * issues the save before the next step is planned); until this call they keep their slots
+     * against retention, reserve_checkpoint's eviction and expiry. */
+    void begin_step() { handed_.clear(); reserved_.clear(); }
 
     /* ---------------- expiry ----------------
      *
@@ -307,8 +308,11 @@ public:
     /* Reserve a snapshot slot for `session` at `pos`. When the store is full, applies the
      * retention policy, then evicts the least recently used snapshot (a use is its reservation or
      * a lookup resuming from it), a tip like any other. A snapshot handed out this step is never
-     * evicted: its admission restores from the slot ahead of the step. RAD_E_FULL when nothing
-     * can be given up. */
+     * released, by retention or eviction: its admission restores from the slot ahead of the step.
+     * Nor is one this call reserved and commit_checkpoint has not yet committed: the engine saves
+     * into the slot after the step, and a later reservation in the same step must not run
+     * retention over a save target (a second request reserving a snapshot a first session holds
+     * below its tip). RAD_E_FULL when nothing can be given up. */
     int  reserve_checkpoint(uint64_t session, int64_t pos, const BlockHash& prefix,
                             int32_t* slot_out);
     /* The state for `prefix` is now in its slot; lookup() offers it only after this (Ckpt::valid). */
@@ -420,6 +424,13 @@ private:
     mutable std::vector<BlockHash> handed_;
     bool handed(const BlockHash& h) const {
         return std::find(handed_.begin(), handed_.end(), h) != handed_.end();
+    }
+    /* Snapshots reserve_checkpoint reserved and commit_checkpoint has not committed: the step's
+     * save targets, kept in their slots until the commit, or until the next step begins when the
+     * save was skipped (its request gone). */
+    mutable std::vector<BlockHash> reserved_;
+    bool reserved(const BlockHash& h) const {
+        return std::find(reserved_.begin(), reserved_.end(), h) != reserved_.end();
     }
     mutable uint64_t clock_ = 0;
     std::unique_ptr<CheckpointPolicy> policy_;

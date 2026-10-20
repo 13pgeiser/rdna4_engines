@@ -333,6 +333,7 @@ them by that spelling.
 ```c
 const char* rad_arch_id(void);          /* "llama" -- what a container's header names */
 const char* rad_arch_quant(void);       /* optional: "" unquantised, or the descriptor served */
+int         rad_arch_serves_imports(void);  /* optional: 0 declines an imported quantisation */
 int         rad_arch_declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx);
 void        rad_arch_step(struct RadCtx* c, const struct RadBatch* batch);
 int         rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);          /* optional */
@@ -345,6 +346,11 @@ at two weight formats is two plugins. A checkpoint's id is its `config.json` `mo
 underscores; `rad-convert --arch ID` overrides it. Every configuration key reaches the plugin in
 `RadModelMeta`, and the plugin's name map says which checkpoint tensor each declared weight comes
 from, so `rad-convert` needs no knowledge of the model.
+
+A checkpoint whose quantisation was imported weight by weight (GUIDE §3.2: Quark, ParoQuant, GPTQ,
+NVFP4) names its producing tool, which no plugin claims; it goes to the family's one quantised
+plugin, and two are refused by name. A second quantised plugin that reads only its own containers
+says so with `RAD_ARCH_SERVES_IMPORTS(0)` (`qwen35_w8a8` does), and imports keep their plugin.
 
 - **Ops from `docs/OPS.md` run on any library.** An op libref implements has a host fallback, an
   oracle and a specification to check kernel libraries against. An op you invent runs only on a

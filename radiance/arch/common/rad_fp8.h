@@ -474,6 +474,15 @@ inline void NormQuantFP8::step(RadCtx* c, int64_t T, int64_t r0, int64_t rows) c
 struct GateQuantFP8 {
     ActFP8 a{};
     rad_op op = 0;
+    /* The swiglu_clamped path (`limit` > 0): `op` writes the clamped bf16 product and `op_quant`
+     * quantises it into the codes; with `clamped_fused`, `op` is `swiglu_clamped_quant_fp8` doing
+     * both and `op_quant` is unset. */
+    rad_op op_quant = 0;
+    bool clipped = false;
+    /* Set before declare: serve the clamped path as one `swiglu_clamped_quant_fp8` where a loaded
+     * library declares it and it resolves (E4M3 codes only). Byte-identical to the pair. */
+    bool fuse_clamped = false;
+    bool clamped_fused = false;
     /* Whether the bf16 product is written. A consumer of the bf16 value must request it
      * (docs/OPS.md), but a block-fp8 down_proj reads only codes and scales; only one that reads
      * the bf16 plane (LinearFP8::reads_x) needs it. Skipping it saves [T, n_ff] per layer (18.2 GB
@@ -491,7 +500,7 @@ struct GateQuantFP8 {
 
     int  declare(RadBuilder* b, const Geom& g, rad_buf gate_up, const ActFP8& act, int64_t n,
                  const char* act_name = "silu", int64_t max_rows = 0, bool bf16_out = true,
-                 bool rot = false);
+                 bool rot = false, double limit = 0);
     void step(RadCtx* c, rad_buf gate_up, int64_t T, int64_t r0 = 0, int64_t rows = 0) const;
 };
 
@@ -500,13 +509,55 @@ struct GateQuantFP8 {
  * bf16 output is unrotated either way. */
 inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, const ActFP8& act,
                                  int64_t n, const char* act_name, int64_t max_rows,
-                                 bool bf16_out, bool rot) {
+                                 bool bf16_out, bool rot, double limit) {
     a = act;
     want_x = bf16_out;
+    op_quant = 0;
     this->n = n;
     /* bf16 linears read the product itself: `silu_mul` into the bf16 plane only, and no
      * rotation. */
     bf16 = g.w_bf16;
+    clipped = limit > 0;
+    clamped_fused = false;
+    if (!std::isfinite(limit) || limit < 0) return RAD_E_INVAL;
+    if (clipped) {
+        if (!gate_up || !a.x || n <= 0 || rot || std::strcmp(act_name, "silu")) return RAD_E_INVAL;
+        const int64_t rows = max_rows > 0 ? max_rows : g.max_tok;
+        if (fuse_clamped && !bf16 && !a.q8_fed && a.cq() && a.cs() &&
+            rad_op_declared(b, "swiglu_clamped_quant_fp8")) {
+            op =
+                RAD_OP(b, "swiglu_clamped_quant_fp8",
+                       RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("limit", limit),
+                                  RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype)),
+                       RAD_NOWEIGHTS);
+            if (op) {
+                const rad_buf wr[3] = { a.cq(), a.cs(), a.x };
+                rad_op_reads(b, op, &gate_up, 1);
+                rad_op_writes(b, op, wr, want_x ? 3 : 2);
+                clamped_fused = true;
+                return RAD_OK;
+            }
+        }
+        want_x = true;
+        op = rw(b,
+                RAD_OP(b, "swiglu_clamped",
+                       RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("limit", limit),
+                                  RAD_STR("dtype", g.dtype)),
+                       RAD_NOWEIGHTS),
+                { gate_up }, { a.x });
+        if (!bf16) {
+            if (!a.cq() || !a.cs()) return RAD_E_INVAL;
+            op_quant =
+                rw(b,
+                   RAD_OP(b, a.q8_fed ? "quant_act_i8g" : "quant_act_fp8",
+                          RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
+                                     RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype)),
+                          RAD_NOWEIGHTS),
+                   { a.x }, { a.cq(), a.cs() });
+            if (!op_quant) return RAD_E_INVAL;
+        }
+        return op?RAD_OK:RAD_E_INVAL;
+    }
     if (bf16) {
         if (!gate_up || !a.x || n <= 0 || rot || std::strcmp(act_name, "silu") != 0) {
             fprintf(stderr, "radiance: a bf16 gate is silu over [gate|up] into a bf16 plane; "
@@ -555,6 +606,22 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
 inline void GateQuantFP8::step(RadCtx* c, rad_buf gate_up, int64_t T, int64_t r0,
                                int64_t rows) const {
     if (rows <= 0) rows = T - r0;
+    if (clamped_fused) {
+        RAD_ISSUE_N(c, op, rows, brow_slice(gate_up, r0, rows, 2 * n),
+                    brow_slice(a.cq(), r0, rows, n),
+                    brow_slice(a.cs(), r0, rows, n / RAD_FP8_BLOCK),
+                    want_x ? brow_slice(a.x, r0, rows, n) : RAD_NONE);
+        return;
+    }
+    if (clipped) {
+        RAD_ISSUE_N(c, op, rows, brow_slice(gate_up, r0, rows, 2 * n),
+                    brow_slice(a.x, r0, rows, n));
+        if (op_quant)
+            RAD_ISSUE_N(c, op_quant, rows, brow_slice(a.x, r0, rows, n),
+                        brow_slice(a.cq(), r0, rows, n),
+                        brow_slice(a.cs(), r0, rows, n / RAD_FP8_BLOCK));
+        return;
+    }
     if (bf16 || op_q) {
         RAD_ISSUE_N(c, op, rows, brow_slice(gate_up, r0, rows, 2 * n), brow_slice(a.x, r0, rows, n));
         if (op_q)
@@ -607,6 +674,9 @@ struct LinearFP8 {
     /* Plain bf16 weight read by `gemm_nt` over the bf16 activation (Geom::w_bf16): no scale plane,
      * no quantiser. */
     bool       bf16 = false;
+    /* Block-fp8 weight whose scale plane is f32 rather than bf16 (GLM's checkpoints), read by
+     * `gemm_nt_q` at dtype fp8a8f32. Read from the weight's encoding. */
+    bool       f32_scale = false;
     /* Int8 weight read by `gemm_nt_q` at dtype i8a8: i8 codes with a bf16 scale per row per 128 of
      * K (libquant `codes=i8 group=128 scale=bf16`), against an i8 activation with an f32 scale per
      * (row, 128). A quarter of E4M3's error at the same bytes, and iu8 WMMA runs at the fp8 rate.
@@ -762,6 +832,17 @@ inline bool linear_is_w8(const RadEncoding& e) {
            sc->block[0] == 1 && sc->block[1] == RAD_FP8_BLOCK;
 }
 
+/* The same planes rotated by the unnormalised 128-wide Hadamard along K, the 1/128 in the scale
+ * (libquant's `transform=fwht128`), served at i8a8h behind had_quant_act_i8g. */
+inline bool linear_is_w8h(const RadEncoding& e) {
+    if (!rad_enc_is(&e, "affine") || e.n_planes != 2 ||
+        std::strncmp(e.transform, "fwht128", RAD_ENC_STR) != 0)
+        return false;
+    const RadEncPlane* sc = rad_enc_plane(&e, "scale");
+    return e.plane[0].dtype == RAD_I8 && e.plane[0].block[1] == 1 && sc && sc->dtype == RAD_BF16 &&
+           sc->block[0] == 1 && sc->block[1] == RAD_FP8_BLOCK;
+}
+
 /* The OCP-MXFP4 weight LinearFP8 serves at mxfp4a8: e2m1 codes and an E8M0 exponent per [1 x 32],
  * no transform (libr4d's MXFP4 layout hook). */
 enum { RAD_MX_GROUP = 32 };
@@ -823,7 +904,7 @@ inline int LinearFP8::probe(RadBuilder* b, Names& nm, const Geom& g, const char*
     const bool known = weight_enc(b, wn, &enc);
     const bool plain = known && rad_enc_is(&enc, "plain") && enc.n_planes == 1 &&
                        enc.plane[0].dtype == RAD_BF16;
-    probed_i8 = known && linear_is_w8(enc);
+    probed_i8 = known && (linear_is_w8(enc) || linear_is_w8h(enc));
     /* A rotated weight rotates and quantises the bf16 plane itself; a 4-bit one casts or
      * quantises it. */
     const bool rotated = known && (linear_is_paro_mxfp4(enc) || linear_is_paro_w5(enc));
@@ -981,9 +1062,18 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
     /* ---- int8 weight, `gemm_nt_q` at i8a8 over the input's `a.q8` / `a.s8`. The scale plane is
      * one bf16 per row per 128 of K: row parts and row slices apply as is, column slices in groups
      * of 128. The codes come from the producer (ActFP8::q8_fed) or from op_q over `a.x` (probe()
-     * set reads_x). The model must have declared the pair (ActFP8::declare_qs's `i8`). */
-    i8 = known && linear_is_w8(enc);
+     * set reads_x). The model must have declared the pair (ActFP8::declare_qs's `i8`).
+     *
+     * A rotated weight (i8a8h) takes had_quant_act_i8g instead, so it always quantises its own
+     * input: a producer's codes are unrotated. */
+    const bool rot8 = known && linear_is_w8h(enc);
+    i8 = known && (linear_is_w8(enc) || rot8);
     if (i8) {
+        if (rot8 && a.q8_fed) {
+            fprintf(stderr, "radiance: '%s' is a rotated int8 weight and its input is fed codes "
+                            "its producer wrote unrotated\n", wn);
+            return RAD_E_DTYPE;
+        }
         if (!a.x || !a.q8 || !a.s8) {
             fprintf(stderr, "radiance: '%s' is an int8 weight and its input lacks the bf16 plane "
                             "or the int8 code pair (the model declared its input before learning "
@@ -1018,14 +1108,15 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
         }
         const int64_t hi = max_rows > 0 ? max_rows : g.max_tok;
         if (!a.q8_fed)
-            op_q = rw(b, RAD_OP(b, "quant_act_i8g",
+            op_q = rw(b, RAD_OP(b, rot8 ? "had_quant_act_i8g" : "quant_act_i8g",
                      RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("n", K),
                                 RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "bf16")),
                      RAD_NOWEIGHTS),
                   { a.x }, { a.q8, a.s8 });
         op = rw(b, RAD_OP(b, "gemm_nt_q",
                    RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
-                              RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "i8a8")),
+                              RAD_INT("group", RAD_FP8_BLOCK),
+                              RAD_STR("dtype", rot8 ? "i8a8h" : "i8a8")),
                    RAD_WEIGHTS(w, ws)),
                { a.q8, a.s8 }, { y });
         return (op_q || a.q8_fed) && op ? RAD_OK : RAD_E_INVAL;
@@ -1247,12 +1338,13 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
     if (known) {
         const RadEncPlane* sc = rad_enc_plane(&enc, "scale");
         if (!rad_enc_is(&enc, "affine") || enc.n_planes != 2 || enc.transform[0] ||
-            enc.plane[0].dtype != RAD_F8E4M3 || !sc || sc->dtype != RAD_BF16 ||
+            enc.plane[0].dtype != RAD_F8E4M3 || !sc ||
+            (sc->dtype != RAD_BF16 && sc->dtype != RAD_F32) ||
             sc->block[0] != RAD_FP8_BLOCK || sc->block[1] != RAD_FP8_BLOCK) {
             char en[256];
             rad_enc_format(&enc, en, sizeof en);
             fprintf(stderr, "radiance: '%s' is %s, which this model's linears do not read; they "
-                            "read bf16, fp8_e4m3*bf16[128x128], i8*bf16[1x128], "
+                            "read bf16, fp8_e4m3*bf16[128x128] or *f32[128x128], i8*bf16[1x128], "
                             "fp4_e2m1*e8m0[1x32], u4*f16[1x128]-u4[1x128] (or a u8 zero) and the "
                             "ParoQuant forms. A recipe rule stores the weight in one of them "
                             "(docs/TOOLS.md, the import rule for a shipped int4 grid)\n", wn, en);
@@ -1278,13 +1370,15 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
     RAD_ARCH_TRY(rp.set(row_parts, RAD_FP8_BLOCK, RAD_FP8_BLOCK, base, "scale blocks"));
 
     const char* sn = nm.f("%s.scale",  base);
+    const auto* fp8_scale = known ? rad_enc_plane(&enc, "scale") : nullptr;
+    f32_scale = fp8_scale && fp8_scale->dtype == RAD_F32;
     /* One stored weight, two operands: the codes and scale plane of `<base>.weight`, block fp8 in
      * the checkpoint or made so by rad-convert's recipe. */
     w  = decl_view(b, wn, nullptr, "codes", RAD_F8E4M3, { N, K },
                    access, shard, grp, rp.w, rp.n);
     ws_row_div = RAD_FP8_BLOCK;
-    ws = decl_view(b, sn, wn, "scale", RAD_BF16, { fp8_blocks(N), fp8_blocks(K) },
-                   access, shard, grp, rp.s, rp.n);
+    ws = decl_view(b, sn, wn, "scale", f32_scale ? RAD_F32 : RAD_BF16,
+                   { fp8_blocks(N), fp8_blocks(K) }, access, shard, grp, rp.s, rp.n);
     if (!w || !ws) return RAD_E_INVAL;
     /* An uneven slice; the scale plane takes the same slice in blocks. */
     if (span_hi > 0) {
@@ -1305,7 +1399,7 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
     const int64_t hi = max_rows > 0 ? max_rows : g.max_tok;
     op = rw(b, RAD_OP(b, "gemm_nt_q",
                RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
-                          RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "fp8a8")),
+                          RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", f32_scale?"fp8a8f32":"fp8a8")),
                RAD_WEIGHTS(w, ws)),
            { a.q, a.s }, { y });
     return RAD_OK;

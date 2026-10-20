@@ -300,10 +300,18 @@ long r4d_ar_ipc_alloc(long size, int finegrained, char* out_handle, int* out_len
   // The zeroes must land before the pointer reaches a peer, or its first push or flag store could
   // race the queued memset.
   HIPOK(hipStreamSynchronize(nullptr));
+  // The handle is for an out-of-process peer. libr4d's ranks are threads of one process and share
+  // the pointer itself (r4d_ar_entry.hip), so a refused export is not fatal: beside another engine
+  // on the same cards hipIpcGetMemHandle answers invalid argument while the allocation is fine.
   hipIpcMemHandle_t h;
-  HIPOK(hipIpcGetMemHandle(&h, p));
-  std::memcpy(out_handle, &h, sizeof(h));
-  *out_len = (int)sizeof(h);
+  if (hipIpcGetMemHandle(&h, p) == hipSuccess) {
+    std::memcpy(out_handle, &h, sizeof(h));
+    *out_len = (int)sizeof(h);
+  } else {
+    (void)hipGetLastError();
+    std::memset(out_handle, 0, R4D_AR_HANDLE_BYTES);
+    *out_len = 0;
+  }
   return (long)p;
 }
 // r4d_p2p_copy2d as a kernel with a bounded workgroup count.

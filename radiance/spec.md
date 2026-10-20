@@ -894,6 +894,7 @@ utilisation fraction:
 |---|---|
 | `--gpu-headroom-mib` | VRAM left unclaimed on every card (default 96) |
 | `--host-pool-mib` | the pinned host tier |
+| `--host-headroom-mib` | host RAM left free for the system at startup (default 4096) |
 | `--weights-disk-tier` | the file tier for weights, read from the container; needs `O_DIRECT` |
 | `--max-model-len`, `--max-num-seqs` | the KV cache's bound |
 
