@@ -3050,7 +3050,7 @@ fn resolve_route_plan(
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| hipfire_runtime::config::get().kv_mode.clone());
-    let native_eligible = kv_mode::qwen35_native_eligible(
+    let auto_native = kv_mode::qwen35_native_auto_eligible(
         gpu.arch.as_str(),
         config.n_heads,
         config.n_kv_heads,
@@ -3060,7 +3060,7 @@ fn resolve_route_plan(
         false,
     );
     let policy =
-        kv_mode::qwen35_policy_for_native(&kv_mode::QWEN35_HFQ_POLICY, &mode_raw, native_eligible);
+        kv_mode::qwen35_policy_for_native(&kv_mode::QWEN35_HFQ_POLICY, &mode_raw, auto_native);
     let pair = kv_mode::resolve_kv_pair(
         &mode_raw,
         req.kv_k_override.filter(|s| !s.is_empty()),

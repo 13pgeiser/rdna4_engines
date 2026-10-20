@@ -21421,7 +21421,7 @@ mod tests {
     /// and native-eligibility rule) resolves to for this model on `arch`.
     fn installed_default_kv(config: &Qwen35Config, arch: &str) -> KvTierFlags {
         use hipfire_runtime::kv_mode;
-        let native = kv_mode::qwen35_native_eligible(
+        let auto_native = kv_mode::qwen35_native_auto_eligible(
             arch,
             config.n_heads,
             config.n_kv_heads,
@@ -21430,7 +21430,7 @@ mod tests {
             false,
             false,
         );
-        let policy = kv_mode::qwen35_policy_for_native(&kv_mode::QWEN35_HFQ_POLICY, "auto", native);
+        let policy = kv_mode::qwen35_policy_for_native(&kv_mode::QWEN35_HFQ_POLICY, "auto", auto_native);
         let pair = kv_mode::resolve_kv_pair("auto", None, None, &policy, arch, true)
             .expect("default kv pair");
         kv_tier_flags_for_pair(pair)

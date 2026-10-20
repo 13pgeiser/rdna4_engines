@@ -4635,7 +4635,7 @@ impl Carrier for Qwen35Carrier {
                     .iter()
                     .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
                     .collect();
-                let native_eligible = hipfire_runtime::kv_mode::qwen35_native_eligible(
+                let auto_native = hipfire_runtime::kv_mode::qwen35_native_auto_eligible(
                     ctx.gpu.arch.as_str(),
                     config.n_heads,
                     config.n_kv_heads,
@@ -4647,7 +4647,7 @@ impl Carrier for Qwen35Carrier {
                 let policy = hipfire_runtime::kv_mode::qwen35_policy_for_native(
                     &hipfire_runtime::kv_mode::QWEN35_PARO_POLICY,
                     &kv_mode_from_ctx(ctx),
-                    native_eligible,
+                    auto_native,
                 );
                 let pair = resolve_qwen_kv_pair(ctx, &policy)?;
                 let mode = pair.k();
