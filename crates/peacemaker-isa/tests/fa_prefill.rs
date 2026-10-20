@@ -62,6 +62,7 @@ const PRE_KERNARG: u32 = 40;
 const DIRECT_BLOCK: u32 = 160;
 const PRE_BLOCK: u32 = 128;
 const DIRECT_LDS: u32 = 65_536;
+const FP8_DIRECT_LDS: u32 = 32_768;
 /// Bytes per position of one K or V allocation: 2 KV heads x 8 blocks x 34 B.
 const POS_STRIDE: usize = 544;
 const HEAD_STRIDE: usize = 272;
@@ -351,7 +352,7 @@ fn check_resources(
             "{symbol}: argument {en}"
         );
     }
-    // Wave32, WGP mode, fixed LDS 0 (the 65,536 B is launch dynamic), no scratch / private / spills.
+    // Wave32, WGP mode, fixed LDS 0 (codec-specific LDS is launch dynamic), no scratch / private / spills.
     assert!(has("wavefront_size32 1"), "{symbol}: wave32");
     assert!(
         text.contains(".wavefront_size: 32\n"),
@@ -1031,14 +1032,16 @@ const POISON: u32 = 0x7fc0_beef;
 struct Rig {
     program: peacemaker_ir::Program,
     symbol: &'static str,
+    dynamic_lds: u32,
 }
 impl Rig {
     fn new() -> Self {
-        let (_, text, _) = fa_prefill::emit_module(ARCH, &spec()).unwrap();
-        Self::from_text(&text, DIRECT)
+        let (entries, text, _) = fa_prefill::emit_module(ARCH, &spec()).unwrap();
+        assert_eq!(entries[1].shape.next_free_vgpr, 256);
+        Self::from_text(&text, DIRECT, DIRECT_LDS)
     }
 
-    fn from_text(text: &str, symbol: &'static str) -> Self {
+    fn from_text(text: &str, symbol: &'static str, dynamic_lds: u32) -> Self {
         let elf = native::assemble(text, ARCH).unwrap();
         let lifted = peacemaker_lift::lift_object(
             &elf,
@@ -1050,6 +1053,7 @@ impl Rig {
         Rig {
             program: lifted.program,
             symbol,
+            dynamic_lds,
         }
     }
 }
@@ -1120,7 +1124,7 @@ fn run_direct(
                 kernarg_ptr: E_KARG,
                 workgroup: *wg,
                 block: [DIRECT_BLOCK, 1, 1],
-                dynamic_lds: DIRECT_LDS,
+                dynamic_lds: rig.dynamic_lds,
             },
             &mut mem,
         )?;
@@ -1669,8 +1673,11 @@ fn emitted_fp8_and_q8_share_preconvert_abi_and_exact_staged_attention() {
         &DIRECT_ARGS,
     );
     let contract = fa_prefill::fp8_contract(ARCH, &entries[0]);
-    assert_eq!(contract["launch_dynamic_lds_bytes"], DIRECT_LDS);
-    let fp8_rig = Rig::from_text(&text, fp8_symbol);
+    assert_eq!(contract["launch_dynamic_lds_bytes"], FP8_DIRECT_LDS);
+    assert_eq!(contract["vgpr_max"], 224);
+    assert_eq!(entries[0].shape.next_free_vgpr, 224);
+    assert_eq!(q8_rig.dynamic_lds, DIRECT_LDS);
+    let fp8_rig = Rig::from_text(&text, fp8_symbol, FP8_DIRECT_LDS);
     let positions = vec![0, 15, 16, 31, 32, 63, 64, 65, 1];
     let mut q8 = winner_case(9, positions, 1.0, 1.0, 2);
     let npos = q8.k.len() / POS_STRIDE;
