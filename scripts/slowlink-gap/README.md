@@ -74,8 +74,17 @@ The current gather key `HIPFIRE_QWEN4_QSA_WMMA_GATHER` is pinned `0`; the histor
 commands verify those hashes; launch, run-phase and scoring cannot substitute another harness. Determinism consumes
 the native `hipfire.qwen4.slowlink_quality.determinism.v1` schema: `finish_reason` must be a two-string equal pair
 (there is no native `finish_equal` field). Token equality and logit bit identity remain separately reported.
-Route evidence is phase-aware: s1a still requires both primary teacher layer-major receipts; s1b requires all plan
-determinism cases and validates their eligible layer-major calls and short incumbent calls, plus PLACE/IU4/QSA evidence.
+Kernel-pack binding is fail-closed on actual runtime evidence, never the sealed stage manifest alone: each
+`run-phase` installs the sealed pack at the resolver's `~/.hipfire/bin/kernels` lookup (the existing gap-cell
+private-`HOME/bin/kernels` pattern; no global compiler change) and records the install link plus a per-phase
+`pack_binding` verdict in `run-record.json`. The verdict requires the `pre-compiled kernels:` cold-lookup line to
+name the sealed pack dir (or the phase-private kernel cache), a nonempty set of `indexed package verified:` hits
+each resolving under the sealed pack dir and verifying against its sealed `<module>.index.json` module/object SHA
+(plus the sealed campaign manifest when present), a live-rescanned empty phase-private `kcache` (recorded names
+must match the rescan; any `.hsaco` there is a runtime JIT/pack miss), and no
+compiler-fallback markers (`packaged object rejected`, `falling back to JIT`, stale/unverified image lines) in
+stderr. `report` re-checks the same evidence per phase, carries `pack_ok` per arm, and folds it into
+`mechanical_pass`; any runtime JIT, fallback or unbound used-code identity fails the phase and the report.
 
 For an explicitly versioned, CPU-only correction of historical reports, retain the original campaign and harness
 checkout unchanged and use the new reporter with:
@@ -92,4 +101,3 @@ records old source pins and hashes separately from the new reporter's commit, tr
 is accepted only by `report`, requires an explicit fresh absolute output directory and does not change any original
 campaign, phase, score or report. `--out-dir` also permits fresh per-arm reports for new campaigns. Manual decoded-text
 review remains required; a mechanical report is not final qualification. Prepare remaining GPU arms as a new campaign
-under the fixed harness, declaring the unchanged binary-build commit separately from the harness commit.

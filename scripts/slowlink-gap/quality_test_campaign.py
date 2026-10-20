@@ -528,6 +528,7 @@ class RouteEvidence(unittest.TestCase):
         leaked = qc.route_evidence("off", cells(), LOAD_FRONT + QSA_PACK_LINE, [])
         self.assertFalse(leaked["qsa"]["ok"])
 
+
     def test_common_route_problems(self):
         ev = qc.route_evidence("off", cells(status="aborted: x"), LOAD_FRONT, [])
         self.assertFalse(ev["common"]["ok"])
@@ -582,6 +583,103 @@ class RouteEvidence(unittest.TestCase):
         self.assertFalse(qc.route_evidence("place", cs, LOAD_FRONT, [], phase="s1b", expected_cases=cases)["ok"])
         self.assertFalse(qc.route_evidence("iu4", cs, LOAD_FRONT, [], phase="s1b", expected_cases=cases)["ok"])
         self.assertFalse(qc.route_evidence("qsa", cs, LOAD_FRONT, [], phase="s1b", expected_cases=cases)["ok"])
+
+class PackBinding(unittest.TestCase):
+    SEALED = "/s/bin/kernels/compiled/gfx1100"
+    HOT = "/r/kcache"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.sealed = os.path.join(self.tmp.name, "kernels", "compiled", "gfx1100")
+        self.hot = os.path.join(self.tmp.name, "kcache")
+        os.makedirs(self.sealed)
+        os.makedirs(self.hot)
+        self.obj_bytes = b"fake-hsaco-bytes"
+        self.obj_sha = qc.sha256_bytes(self.obj_bytes)
+        idx = {"module": "add", "object_sha256": self.obj_sha}
+        self.idx_bytes = json.dumps(idx).encode()
+        with open(os.path.join(self.sealed, "add.hsaco"), "wb") as f:
+            f.write(self.obj_bytes)
+        with open(os.path.join(self.sealed, "add.index.json"), "wb") as f:
+            f.write(self.idx_bytes)
+        self.files = [{"rel": "add.hsaco", "size": len(self.obj_bytes), "sha256": self.obj_sha},
+                      {"rel": "add.index.json", "size": len(self.idx_bytes),
+                       "sha256": qc.sha256_bytes(self.idx_bytes)}]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def stderr(self, lookup=None, hits=("add",)):
+        lookup = self.sealed if lookup is None else lookup
+        lines = ["  pre-compiled kernels: %s" % lookup]
+        for m in hits:
+            lines.append("  %s: indexed package verified: %s/%s.hsaco" % (m, self.sealed, m))
+        return "\n".join(lines) + "\n"
+
+    def ev(self, stderr_text, kcache=(), pack_files="sealed"):
+        return qc.pack_binding_evidence(stderr_text, list(kcache), self.sealed, self.hot,
+                                        self.files if pack_files == "sealed" else pack_files)
+
+    def test_indexed_hits_bound_to_sealed_index_and_object_pass(self):
+        ev = self.ev(self.stderr())
+        self.assertTrue(ev["ok"], ev)
+        self.assertEqual((ev["pack_hits"], ev["pack_verified"]), (1, 1))
+
+    def test_zero_hits_fails_closed(self):
+        ev = self.ev("  pre-compiled kernels: %s\n" % self.sealed)
+        self.assertFalse(ev["ok"])
+
+    def test_missing_lookup_line_fails(self):
+        ev = self.ev("  add: indexed package verified: %s/add.hsaco\n" % self.sealed)
+        self.assertFalse(ev["ok"])
+
+    def test_hit_outside_sealed_dir_fails(self):
+        ev = self.ev(self.stderr() + "  x: indexed package verified: /tmp/x.hsaco\n")
+        self.assertFalse(ev["ok"])
+
+    def test_missing_index_fails(self):
+        os.unlink(os.path.join(self.sealed, "add.index.json"))
+        self.assertFalse(self.ev(self.stderr())["ok"])
+
+    def test_object_sha_mismatch_fails(self):
+        with open(os.path.join(self.sealed, "add.hsaco"), "wb") as f:
+            f.write(b"tampered")
+        self.assertFalse(self.ev(self.stderr())["ok"])
+
+    def test_sealed_manifest_mismatch_fails(self):
+        bad = [dict(self.files[0], sha256="0" * 64), self.files[1]]
+        self.assertFalse(self.ev(self.stderr(), pack_files=bad)["ok"])
+
+    def test_live_kcache_object_fails_closed(self):
+        with open(os.path.join(self.hot, "add.abcdef.hsaco"), "wb") as f:
+            f.write(b"jit")
+        ev = self.ev(self.stderr())
+        self.assertFalse(ev["ok"])
+        self.assertEqual(len(ev["jit_objects"]), 1)
+
+    def test_recorded_names_must_match_live_rescan(self):
+        with open(os.path.join(self.hot, "add.abcdef.hsaco"), "wb") as f:
+            f.write(b"jit")
+        ev = qc.pack_binding_evidence(self.stderr(), [], self.sealed, self.hot, self.files)
+        self.assertFalse(ev["ok"])
+
+    def test_fallback_markers_fail_closed(self):
+        ev = self.ev(self.stderr() + "  add: packaged object rejected (stale); falling back to JIT\n")
+        self.assertFalse(ev["ok"])
+
+    def test_foreign_lookup_dir_fails(self):
+        ev = self.ev(self.stderr(lookup="/tmp/evil"))
+        self.assertFalse(ev["ok"])
+
+    def test_private_home_cold_lookup_symlink_layout(self):
+        home = os.path.join(self.tmp.name, "home", ".hipfire")
+        os.makedirs(os.path.join(home, "bin"))
+        kernels_root = os.path.dirname(os.path.dirname(self.sealed))
+        link = os.path.join(home, "bin", "kernels")
+        os.symlink(kernels_root, link)
+        self.assertEqual(os.path.realpath(link), os.path.realpath(kernels_root))
+        self.assertEqual(os.path.realpath(os.path.join(link, "compiled", "gfx1100")),
+                         os.path.realpath(self.sealed))
 
 
 class Determinism(unittest.TestCase):

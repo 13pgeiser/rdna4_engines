@@ -1002,6 +1002,14 @@ def run_phase(args, host=None):
     with open(camp["config"]["path"], "rb") as f:
         write_new(os.path.join(hh, "config.toml"), f.read())
     os.symlink(os.path.dirname(os.path.realpath(camp["model"]["path"])), os.path.join(hh, "models"))
+    pack_kernels_root = os.path.dirname(os.path.dirname(camp["pack"]["dir"]))
+    pack_link = os.path.join(hh, "bin", "kernels")
+    os.mkdir(os.path.join(hh, "bin"))
+    os.symlink(pack_kernels_root, pack_link)
+    if os.path.realpath(pack_link) != os.path.realpath(pack_kernels_root):
+        raise Refusal("private HOME cold-lookup symlink %s does not resolve to the sealed kernels root" % pack_link)
+    if os.path.realpath(os.path.join(pack_link, "compiled", "gfx1100")) != os.path.realpath(camp["pack"]["dir"]):
+        raise Refusal("private HOME cold-lookup symlink does not expose the sealed pack dir")
     env, unset, applied = process_env(env_h, arm, run_dir)
     if applied != json.load(open(ent["manifest"]["path"]))["launch"]["env"]["set"]:
         raise Refusal("applied env differs from the manifest launch.env.set")
@@ -1081,6 +1089,11 @@ def run_phase(args, host=None):
     for d, _s, ns in os.walk(os.path.join(run_dir, "kcache")):
         kfiles += [os.path.relpath(os.path.join(d, n), run_dir) for n in ns]
     problems = verify_phase_dir(camp, arm, phase) if rc == 0 and not device_lost else ["phase not verified (child failed)"]
+    pack_ev = pack_binding_evidence(open(os.path.join(run_dir, "stderr.log"), "r", errors="replace").read(),
+                                    kfiles, camp["pack"]["dir"], os.path.join(run_dir, "kcache"),
+                                    camp["pack"].get("files"))
+    if rc == 0 and not device_lost:
+        problems += ["pack binding: " + p for p in pack_ev["problems"]]
     if rc == 0 and not device_lost and problems:
         failures += ["phase output: " + p for p in problems]
     status = "INCOMPLETE" if device_lost else ("OK" if not failures else "FAILED")
@@ -1089,13 +1102,15 @@ def run_phase(args, host=None):
            "env": {"set": applied, "unset": unset}, "fabric_job": env_h.get("FABRIC_JOB"),
            "wall_seconds": host.monotonic() - t0, "vram_after": drained, "end_unix": time.time(),
            "stderr_sha256": sha256_file(os.path.join(run_dir, "stderr.log")),
-           "kcache_files": sorted(kfiles), "retry": "never; a failed or INCOMPLETE phase is not rerun automatically"}
+           "kcache_files": sorted(kfiles), "pack_install": {"link": pack_link, "target": pack_kernels_root},
+           "pack_binding": {k: pack_ev[k] for k in ("cold_lookup_dirs", "pack_hits", "pack_verified", "jit_objects",
+                                                    "fallback_markers", "ok")},
+           "retry": "never; a failed or INCOMPLETE phase is not rerun automatically"}
     write_new(os.path.join(run_dir, "run-record.json"), pretty(rec))
     if device_lost:
         write_new(os.path.join(run_dir, "INCOMPLETE"), b"device disappeared; stop, no retry\n")
     print(json.dumps({k: rec[k] for k in ("id", "status", "exit_code", "failures")}, sort_keys=True))
     return 0 if status == "OK" else (3 if device_lost else 1)
-
 
 # -------------------------------------------------------------- score / report
 
@@ -1186,6 +1201,9 @@ RE_QSA_MAPPED = re.compile(r"qwen4 QSA context mapped for (\d+) tokens: .*?, (\d
 RE_QSA_PROFILE = re.compile(r"QSA workspace (\d+) KiB")
 QSA_MODULE = "indexed_attention_gathered_wmma"
 RE_QSA_MODULE_LINE = re.compile(r"^\s*indexed_attention_gathered_wmma: indexed package verified: (\S+)", re.M)
+RE_PACK_HIT = re.compile(r"^\s*([A-Za-z0-9_]+): indexed package verified: (\S+)", re.M)
+RE_PRECOMPILED_DIR = re.compile(r"^\s*pre-compiled kernels: (\S+)", re.M)
+RE_PACK_FALLBACK = re.compile(r"packaged object rejected|falling back to JIT|falling back to install dir reads|hot-path seed failed|no cached build matches; recompiling|index missing for installed object|no usable cached kernel image|unverified kernel image|JIT worker panicked|the cached kernel image is invalid")
 IU4_ROUTE = "aggregate-sym-iu4"
 
 
@@ -1197,6 +1215,85 @@ def layer_major_receipts(cells):
                 out.append((c.get("cell"), r))
     return out
 
+
+def pack_binding_evidence(stderr_text, kcache_files, sealed_pack_dir, kcache_dir, pack_files=None):
+    """Fail-closed runtime kernel-pack binding of one phase: every kernel object the phase actually
+    resolved must be an indexed pack hit under the sealed pack dir, bound by the sealed index/object
+    SHA, with a nonempty hit set; any runtime JIT, compiler fallback or unbound identity fails.
+    Sealed stage-manifest equality alone never passes this. `pack_files` is the sealed campaign
+    `pack.files` list (rel/size/sha256); `kcache_files` should be a live rescan of the private
+    kernel cache, not trusted recorded names alone."""
+    sealed = os.path.realpath(sealed_pack_dir)
+    hot = os.path.realpath(kcache_dir)
+    sealed_by_rel = {}
+    if pack_files:
+        for f in pack_files:
+            sealed_by_rel[f["rel"]] = f
+    problems = []
+    lookups = RE_PRECOMPILED_DIR.findall(stderr_text)
+    if not lookups:
+        problems.append("no `pre-compiled kernels:` lookup line in stderr: the cold lookup path is unproven")
+    for d in lookups:
+        if os.path.realpath(d) not in (sealed, hot):
+            problems.append("cold lookup dir %r is neither the sealed pack dir nor the phase-private kernel cache" % d)
+    hits = RE_PACK_HIT.findall(stderr_text)
+    if not hits:
+        problems.append("no `indexed package verified:` hits in stderr: no used-code pack identity was proven")
+    verified = 0
+    for mod, p in hits:
+        real = os.path.realpath(p)
+        if os.path.dirname(real) != sealed:
+            problems.append("indexed pack hit outside the sealed pack dir: %s" % p)
+            continue
+        want = (mod + ".hsaco", mod + ".index.json")
+        if os.path.basename(real) != want[0]:
+            problems.append("indexed pack hit %s is not the module object %s" % (p, want[0]))
+            continue
+        idx_path = os.path.join(sealed, want[1])
+        try:
+            with open(idx_path, "r", encoding="utf-8") as f:
+                idx = json.load(f)
+        except (OSError, ValueError) as e:
+            problems.append("%s unreadable: %s" % (want[1], e))
+            continue
+        if idx.get("module") != mod:
+            problems.append("%s names module %r, expected %r" % (want[1], idx.get("module"), mod))
+            continue
+        try:
+            digest = sha256_file(real)
+        except OSError as e:
+            problems.append("pack object %s unreadable: %s" % (want[0], e))
+            continue
+        if digest != idx.get("object_sha256"):
+            problems.append("pack object %s sha256 %s != index object_sha256 %s" % (want[0], digest, idx.get("object_sha256")))
+            continue
+        if pack_files is not None:
+            for name, got, field in ((want[0], digest, "object"), (want[1], sha256_file(idx_path), "index")):
+                ent = sealed_by_rel.get(name)
+                if ent is None:
+                    problems.append("sealed pack manifest has no %s entry for reported module %s" % (field, mod))
+                elif ent["sha256"] != got:
+                    problems.append("sealed %s %s sha256 %s != live %s" % (field, name, ent["sha256"], got))
+        verified += 1
+    if hits and not verified:
+        problems.append("no reported indexed hit verified against its sealed index/object SHA")
+    live_jits = []
+    try:
+        for d, _s, ns in os.walk(kcache_dir):
+            live_jits += [os.path.relpath(os.path.join(d, n), kcache_dir) for n in ns if n.endswith(".hsaco")]
+    except OSError as e:
+        problems.append("private kernel cache unreadable: %s" % e)
+    rec_jits = sorted({f for f in (kcache_files or []) if f.endswith(".hsaco")})
+    if sorted(live_jits) != rec_jits:
+        problems.append("recorded kcache names %r != live rescan %r" % (rec_jits[:8], sorted(live_jits)[:8]))
+    if live_jits:
+        problems.append("phase-private kernel cache holds %d compiled object(s) (runtime JIT/pack miss): %s"
+                        % (len(live_jits), ", ".join(sorted(live_jits)[:8])))
+    fb = sorted(set(RE_PACK_FALLBACK.findall(stderr_text)))
+    if fb:
+        problems.append("runtime compiler fallback markers in stderr: %s" % "; ".join(fb[:8]))
+    return {"cold_lookup_dirs": lookups[:4], "pack_hits": len(hits), "pack_verified": verified,
+            "jit_objects": sorted(live_jits)[:8], "fallback_markers": fb[:8], "ok": not problems, "problems": problems}
 
 def route_evidence(arm, cells, stderr_text, kcache_files, *, phase="s1a", expected_cases=()):
     """ACTUAL route evidence of one phase from raw receipts, the loader log and the private kernel cache.
@@ -1490,6 +1587,10 @@ def report(args):
             ev[ph] = route_evidence(arm, cells, stderr, rr[ph].get("kcache_files", []),
                                     phase=ph, expected_cases=expected_cases)
             ev[ph]["run_status"] = rr[ph]["status"]
+            pack_ev = pack_binding_evidence(stderr, rr[ph].get("kcache_files", []), camp["pack"]["dir"],
+                                            os.path.join(a["runs"][ph]["run_dir"], "kcache"), camp["pack"].get("files"))
+            ev[ph]["pack_binding"] = pack_ev
+            probs += ["%s pack binding: %s" % (ph, p) for p in pack_ev["problems"]]
             if rr[ph]["status"] != "OK":
                 probs.append("%s run-record status %s" % (ph, rr[ph]["status"]))
         det = read_json(os.path.join(root, "score", arm, "determinism.json"))
@@ -1505,6 +1606,7 @@ def report(args):
             absolute, gate = {"status": "invalid", "error": str(e)}, None
         entry = {"arm": arm, "levers_on": list(ARMS[arm]), "phase_problems": probs, "absolute_kl_vs_beta": absolute,
                  "kl_gate": gate, "route_ok": ev["s1a"]["ok"] and ev["s1b"]["ok"], "determinism_ok": dr["ok"],
+                 "pack_ok": ev["s1a"]["pack_binding"]["ok"] and ev["s1b"]["pack_binding"]["ok"],
                  "text_auto_flag_cells": te["auto_flag_cells"], "text_manual_review_required": True,
                  "native_kl_summary_raw": summaries[arm],
                  "run_wall_seconds": {ph: rr[ph]["wall_seconds"] for ph in PHASES}}
@@ -1514,7 +1616,6 @@ def report(args):
             except qs.Invalid as e:
                 entry["delta_diagnostic_vs_off"] = {"status": "invalid", "error": str(e)}
         per_arm[arm] = entry
-        write_new(os.path.join(outdir, arm, "arm-report.json"), pretty(entry))
     summary = {"schema": "hipfire.qwen4.slowlink_quality_campaign.report.v1", "campaign_sha256": args.expect_campaign_sha256,
                "reporter": {"harness_dir": HERE, "hashes": harness_hashes(HERE),
                             "source_commit": subprocess.check_output(["git", "-C", HERE, "rev-parse", "HEAD"], text=True).strip(),
@@ -1536,13 +1637,14 @@ def report(args):
         g, ab = e["kl_gate"], e["absolute_kl_vs_beta"]
         summary["arms"][arm] = {
             "levers_on": e["levers_on"], "route_ok": e["route_ok"], "determinism_ok": e["determinism_ok"],
+            "pack_ok": e["pack_ok"],
             "phase_problems": e["phase_problems"], "text_auto_flag_cells": e["text_auto_flag_cells"],
             "absolute_raw_means": ({"ctx16k": ab["contexts"]["ctx16k"]["raw_mean_kl_nats"],
                                     "ctx4k": ab["contexts"]["ctx4k"]["raw_mean_kl_nats"],
                                     "pooled": ab["pooled"]["raw_mean_kl_nats"]} if ab.get("status") == "ok" else None),
             "kl_gate": g,
             "mechanical_pass": bool(g and g["pass"] and identity_ok and e["route_ok"] and e["determinism_ok"]
-                                    and not e["phase_problems"]),
+                                    and e["pack_ok"] and not e["phase_problems"]),
             "text_review": "required (human) before any qualification claim",
         }
     write_new(os.path.join(outdir, "summary.json"), pretty(summary))

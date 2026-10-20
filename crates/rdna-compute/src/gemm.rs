@@ -48945,8 +48945,26 @@ static QWEN4_MOE_SYM_DOWN_RR: LazyLock<Result<usize, String>> = LazyLock::new(||
 /// Builder GEMMs divide `slot / x_row_div` through an f32 reciprocal that is
 /// exact (after two integer corrections) only for slots below 2^22.
 const QWEN4_MOE_SYM_PM_MAX_SLOTS: usize = 1 << 22;
-const QWEN4_MOE_GROUP_MODULE: &str = "qwen4_moe_scatter_stable_top10";
-const QWEN4_MOE_GROUP_MODULE_GFX1100: &str = "qwen4_moe_scatter_stable_top10_gfx1100";
+/// Module key and source the serving [`Gpu::moe_scatter_stable_top10`] binds on
+/// `arch`: gfx1100 binds the already-registered canonical twin module
+/// `qwen4_moe_scatter_stable_top10_gfx1100` (same three symbols, source minus
+/// only the exact arch guard), since the installed pack ships no bare-module
+/// object there; every other arch binds the bare module.
+fn qwen4_moe_group_module_src(arch: &str) -> (&'static str, &'static str) {
+    const QWEN4_MOE_GROUP_MODULE: &str = "qwen4_moe_scatter_stable_top10";
+    const QWEN4_MOE_GROUP_MODULE_GFX1100: &str = "qwen4_moe_scatter_stable_top10_gfx1100";
+    if arch == "gfx1100" {
+        (
+            QWEN4_MOE_GROUP_MODULE_GFX1100,
+            kernels::qwen4_moe_scatter_stable_top10_gfx1100_src(),
+        )
+    } else {
+        (
+            QWEN4_MOE_GROUP_MODULE,
+            kernels::QWEN4_MOE_SCATTER_STABLE_TOP10_SRC,
+        )
+    }
+}
 const QWEN4_MOE_ROTATE128_I4: &str = "qwen4_moe_rotate128_i4";
 
 static QWEN4_TRUNK_IU4_RAGGED: LazyLock<bool> = LazyLock::new(|| {
@@ -49545,7 +49563,10 @@ impl Gpu {
     /// [`Gpu::moe_scatter_fused_top10`] (padded counts, offsets `[E+1]`,
     /// sorted slots with -1 padding and tail, tile ids with -1 tail,
     /// inverse permutation), in a deterministic order. Three launches, no
-    /// atomics, no pre-clear.
+    /// atomics, no pre-clear. Module/source selection lives in
+    /// [`qwen4_moe_group_module_src`]: gfx1100 binds the already-registered
+    /// canonical twin ([`kernels::qwen4_moe_scatter_stable_top10_gfx1100_src`]);
+    /// every other arch binds the bare module.
     #[allow(clippy::too_many_arguments)]
     pub fn moe_scatter_stable_top10(
         &mut self,
@@ -49567,9 +49588,10 @@ impl Gpu {
         if self.arch != "gfx942" && !crate::moe::ep_tile_pm_arch(&self.arch) {
             self.qwen4_moe_sym_require("moe_scatter_stable_top10")?;
         }
+        let (module, src) = qwen4_moe_group_module_src(self.arch.as_str());
         self.moe_scatter_stable_top10_with(
-            QWEN4_MOE_GROUP_MODULE,
-            kernels::QWEN4_MOE_SCATTER_STABLE_TOP10_SRC,
+            module,
+            src,
             [topk, counts, offsets, sorted, tiles, inverse],
             [total_slots, experts, grouped_rows],
         )
@@ -49597,12 +49619,15 @@ impl Gpu {
             Some("gfx1201" | "gfx1151") => self.moe_scatter_stable_top10(
                 topk, counts, offsets, sorted, tiles, inverse, total_slots, experts, grouped_rows,
             ),
-            Some(_) => self.moe_scatter_stable_top10_with(
-                QWEN4_MOE_GROUP_MODULE_GFX1100,
-                kernels::qwen4_moe_scatter_stable_top10_gfx1100_src(),
-                [topk, counts, offsets, sorted, tiles, inverse],
-                [total_slots, experts, grouped_rows],
-            ),
+            Some(_) => {
+                let (module, src) = qwen4_moe_group_module_src(self.arch.as_str());
+                self.moe_scatter_stable_top10_with(
+                    module,
+                    src,
+                    [topk, counts, offsets, sorted, tiles, inverse],
+                    [total_slots, experts, grouped_rows],
+                )
+            }
             None => Err(hip_bridge::HipError::new(
                 0,
                 &format!("moe_scatter_stable_top10_slab: the sealed expert-slab route is gfx1100/gfx1151/gfx1201-only, got {}", self.arch),
@@ -53647,6 +53672,56 @@ mod route_selector_tests {
         assert!(
             gfx1151.default_requested && gfx1201.default_requested && !gfx1100.default_requested
         );
+    }
+    /// The serving scatter binds the registered canonical gfx1100 twin (and its
+    /// factory source) on gfx1100, where the installed pack ships no
+    /// bare-module object; every other arch keeps the bare module binding.
+    #[test]
+    fn qwen4_moe_group_module_src_binds_registered_twin_on_gfx1100() {
+        use crate::kernel_registry::entries;
+        let (module, src) = qwen4_moe_group_module_src("gfx1100");
+        assert_eq!(module, "qwen4_moe_scatter_stable_top10_gfx1100");
+        assert_eq!(
+            src,
+            kernels::qwen4_moe_scatter_stable_top10_gfx1100_src(),
+            "gfx1100 binds the canonical factory source by contents"
+        );
+        let registered = entries("gfx1100", "")
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.module == module)
+            .expect("registered gfx1100 scatter twin");
+        assert_eq!(
+            registered.symbols,
+            [
+                "qwen4_moe_group_ranks",
+                "qwen4_moe_group_prefix",
+                "qwen4_moe_group_scatter"
+            ]
+        );
+        assert_eq!(registered.source(), src, "registered twin source contents");
+        // The twin is the bare source minus only the exact arch guard.
+        assert_eq!(
+            src,
+            kernels::QWEN4_MOE_SCATTER_STABLE_TOP10_SRC.replacen(
+                kernels::QWEN4_MOE_SCATTER_STABLE_TOP10_ARCH_GUARD,
+                "",
+                1
+            )
+        );
+        for arch in ["gfx1151", "gfx1201", "gfx942"] {
+            let (module, src) = qwen4_moe_group_module_src(arch);
+            assert_eq!(module, "qwen4_moe_scatter_stable_top10");
+            assert_eq!(
+                src,
+                kernels::QWEN4_MOE_SCATTER_STABLE_TOP10_SRC,
+                "{arch} binds the bare source"
+            );
+        }
+        assert!(entries("gfx1100", "")
+            .unwrap()
+            .iter()
+            .all(|entry| entry.module != "qwen4_moe_scatter_stable_top10"));
     }
 }
 
