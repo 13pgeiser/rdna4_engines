@@ -1,6 +1,7 @@
-// r4d_gemm_mxfp4a8_gemv.hip - r4d_gemm_mxfp4a8_gemv: the OCP-MXFP4 x fp8 GEMM for one to eight rows,
-// gfx1201. C[M,N] = A[M,K] @ dequant(Wq)[N,K]^T with the operands, weight layout and fold of
-// r4d_gemm_mxfp4a8_decode (and _nt_m64, _tiled).
+// r4d_gemm_mxfp4a8_gemv.hip - r4d_gemm_mxfp4a8_gemv: the OCP-MXFP4 x fp8 GEMM for one to eight rows
+// (and, its WMMA form alone, up to 64: the gemv_wide row), gfx1201. C[M,N] = A[M,K] @
+// dequant(Wq)[N,K]^T with the operands, weight layout and fold of r4d_gemm_mxfp4a8_decode (and
+// _nt_m64, _tiled).
 //
 // At one stream's decode (M = 1, or 1 + the draft depth) the GEMM is a pure weight stream, and the
 // decode kernel's WMMA tile spends its time staging the weight through LDS between two barriers a
@@ -13,9 +14,10 @@
 // step carries (a verify step's first row is bit-identical to a plain decode of it):
 //
 // - K a multiple of 128: the WMMA form. One 16-column tile a block, eight waves on its K in chunks
-//   of one 128 block. A lane loads its own B-fragment word of each k-step straight from the
-//   fragment-order weight (the order is the fragment's), the rows sit in the A fragment (rows >= M
-//   zero), and v_wmma_f32_16x16x16_fp8_fp8 multiplies. The per-(row, 128) activation scale is
+//   of one 128 block, and up to four 16-row tiles (M <= 64), each weight word multiplied with every
+//   tile's fragment once it is loaded. A lane loads its own B-fragment word of each k-step straight
+//   from the fragment-order weight (the order is the fragment's), the rows sit in the A fragments
+//   (rows >= M zero), and v_wmma_f32_16x16x16_fp8_fp8 multiplies. The per-(row, 128) activation scale is
 //   applied to each chunk's partial. At M = 1 the WMMA does sixteen times the work it needs, which
 //   costs nothing next to the weight stream; from M = 2 up it is what keeps the kernel on the
 //   stream (the dot form pays a dot per row).
@@ -38,6 +40,7 @@
 #include <stdexcept>
 
 #define R4D_MXG_MAX_M 8
+#define R4D_MXG_WMMA_MAX_M 64   // the WMMA form's bound: four 16-row tiles a wave
 #define R4D_MXG_KW 8     // waves on a block's K, both forms; a constant, so the sum order is too
 
 typedef unsigned mxg_u4 __attribute__((ext_vector_type(4)));
@@ -150,9 +153,11 @@ void r4d_gemm_mxfp4a8_gemv_kernel(
   }
 }
 
-// The WMMA form: one 16-column tile a block. Needs K % 128 == 0 (a chunk is a whole 128 block; a
-// tail would be dropped) and M <= 8 (sP holds eight rows); the launcher guarantees both.
-template <bool ABLK>
+// The WMMA form: one 16-column tile a block, RT 16-row tiles (M <= 16 RT). Needs K % 128 == 0 (a
+// chunk is a whole 128 block; a tail would be dropped); the launcher guarantees it and picks RT. A wave
+// loads each weight word of a chunk once and runs one WMMA chain per row tile over it, so the weight
+// streams once whatever M is, and a row's sum is its tile's chain alone -- the same at every RT.
+template <bool ABLK, int RT>
 __global__ __launch_bounds__(R4D_MXG_KW * 32)
 void r4d_gemm_mxfp4a8_gemvw_kernel(
     const unsigned char* __restrict__ A, const float* __restrict__ As,
@@ -160,17 +165,17 @@ void r4d_gemm_mxfp4a8_gemvw_kernel(
     const unsigned char* __restrict__ Wref, __hip_bfloat16* __restrict__ C, int M, int K,
     int as_rs, int lda, int ldws, int ldc) {
   constexpr int KW = R4D_MXG_KW;
-  __shared__ float sP[KW][R4D_MXG_MAX_M][16];
+  __shared__ float sP[KW][16 * RT][16];
   const int lane = threadIdx.x & 31;
   const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x >> 5);
   const int nt = blockIdx.x;
   const int col = lane & 15, khalf = lane >> 4;  // B fragment: this lane's column and k half
-  const int row = col;                           // A fragment: this lane's row
-  const bool live = row < M;
   const int ksteps = K >> 4, chunks = K >> 7;
   const unsigned* __restrict__ Wp = (const unsigned*)W;
   const int ref = (int)Wref[nt * 16 + col];
-  mxg_v8f tot = (mxg_v8f)(0.f);
+  mxg_v8f tot[RT];
+#pragma unroll
+  for (int r = 0; r < RT; ++r) tot[r] = (mxg_v8f)(0.f);
   for (int ch = wave; ch < chunks; ch += KW) {
     unsigned wv[8];
 #pragma unroll
@@ -179,36 +184,42 @@ void r4d_gemm_mxfp4a8_gemvw_kernel(
     int e8[4];
 #pragma unroll
     for (int q = 0; q < 4; ++q) e8[q] = (int)Ws[(size_t)(ch * 4 + q) * ldws + nt * 16 + col];
-    mxg_v2i af[8];
-#pragma unroll
-    for (int s = 0; s < 8; ++s) {
-      if (live) {
-        const unsigned* pa = (const unsigned*)(A + (size_t)row * lda + (ch * 8 + s) * 16 + khalf * 8);
-        af[s][0] = (int)pa[0]; af[s][1] = (int)pa[1];
-      } else {
-        af[s][0] = 0; af[s][1] = 0;
-      }
-    }
-    mxg_v8f acc = (mxg_v8f)(0.f);
+    mxg_v2i wf[8];
 #pragma unroll
     for (int s = 0; s < 8; ++s) {
       unsigned lo, hi;
       r4d_mxfp4_unpack8(wv[s], r4d_mxfp4_fold_d(ref, e8[s >> 1]), &lo, &hi);
-      mxg_v2i wf;
-      wf[0] = (int)lo; wf[1] = (int)hi;
-      acc = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(wf, af[s], acc);
+      wf[s][0] = (int)lo; wf[s][1] = (int)hi;
     }
-    // acc[e]: row (lane & 15), column (lane >> 4) * 8 + e of the tile -- as the decode epilogue reads it.
-    const float sc = ABLK ? (live ? As[(size_t)row * as_rs + ch] : 0.f) : 1.f;
 #pragma unroll
-    for (int e = 0; e < 8; ++e) tot[e] = fmaf(acc[e], sc, tot[e]);
-  }
-  if (row < R4D_MXG_MAX_M) {
+    for (int r = 0; r < RT; ++r) {
+      const int row = r * 16 + col;               // A fragment: this lane's row in tile r
+      const bool live = row < M;
+      mxg_v2i af[8];
 #pragma unroll
-    for (int e = 0; e < 8; ++e) sP[wave][row][khalf * 8 + e] = tot[e];
+      for (int s = 0; s < 8; ++s) {
+        if (live) {
+          const unsigned* pa = (const unsigned*)(A + (size_t)row * lda + (ch * 8 + s) * 16 + khalf * 8);
+          af[s][0] = (int)pa[0]; af[s][1] = (int)pa[1];
+        } else {
+          af[s][0] = 0; af[s][1] = 0;
+        }
+      }
+      mxg_v8f acc = (mxg_v8f)(0.f);
+#pragma unroll
+      for (int s = 0; s < 8; ++s) acc = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(wf[s], af[s], acc);
+      // acc[e]: row (lane & 15) of tile r, column (lane >> 4) * 8 + e -- as the decode epilogue reads it.
+      const float sc = ABLK ? (live ? As[(size_t)row * as_rs + ch] : 0.f) : 1.f;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) tot[r][e] = fmaf(acc[e], sc, tot[r][e]);
+    }
   }
+#pragma unroll
+  for (int r = 0; r < RT; ++r)
+#pragma unroll
+    for (int e = 0; e < 8; ++e) sP[wave][r * 16 + col][khalf * 8 + e] = tot[r][e];
   __syncthreads();
-  for (int idx = threadIdx.x; idx < R4D_MXG_MAX_M * 16; idx += KW * 32) {
+  for (int idx = threadIdx.x; idx < 16 * RT * 16; idx += KW * 32) {
     const int m = idx >> 4, c = idx & 15;
     if (m < M) {
       float sum = 0.f;
@@ -224,7 +235,8 @@ void r4d_gemm_mxfp4a8_gemvw_kernel(
 namespace {
 void mxg_launch(long a, long ascale, long wq, long ws, long wref, long c, int M, int K, int N,
                 int as_group, int as_rs, long stream, int lda, int ldws, int ldc) {
-  if (M < 1 || M > R4D_MXG_MAX_M) throw std::runtime_error("r4d gemm_mxfp4a8_gemv: M must be 1..8");
+  if (M < 1 || M > (K % 128 == 0 ? R4D_MXG_WMMA_MAX_M : R4D_MXG_MAX_M))
+    throw std::runtime_error("r4d gemm_mxfp4a8_gemv: M must be 1..8, or 1..64 when K % 128 == 0");
   if (N < 16 || N % 16) throw std::runtime_error("r4d gemm_mxfp4a8_gemv: N must be a multiple of 16");
   if (K < 64 || K % 64) throw std::runtime_error("r4d gemm_mxfp4a8_gemv: K must be a multiple of 64");
   if (as_group != 0 && as_group != 128)
@@ -240,12 +252,13 @@ void mxg_launch(long a, long ascale, long wq, long ws, long wref, long c, int M,
   auto Cp = (__hip_bfloat16*)c;
   const dim3 block(R4D_MXG_KW * 32);
   if (K % 128 == 0) {
-    if (ablk)
-      hipLaunchKernelGGL((r4d_gemm_mxfp4a8_gemvw_kernel<true>), dim3(tiles), block, 0, st, Ap, Sp, Wp, Zp,
-                         Rp, Cp, M, K, as_rs, lda, ldws, ldc);
-    else
-      hipLaunchKernelGGL((r4d_gemm_mxfp4a8_gemvw_kernel<false>), dim3(tiles), block, 0, st, Ap, Sp, Wp, Zp,
-                         Rp, Cp, M, K, as_rs, lda, ldws, ldc);
+    const int rt = (M + 15) / 16;
+#define MXW_L(AB_, RT_) hipLaunchKernelGGL((r4d_gemm_mxfp4a8_gemvw_kernel<AB_, RT_>), dim3(tiles), block, 0, \
+                                           st, Ap, Sp, Wp, Zp, Rp, Cp, M, K, as_rs, lda, ldws, ldc)
+#define MXW_AB(RT_) { if (ablk) MXW_L(true, RT_); else MXW_L(false, RT_); }
+    if (rt <= 1) MXW_AB(1) else if (rt == 2) MXW_AB(2) else if (rt == 3) MXW_AB(3) else MXW_AB(4)
+#undef MXW_AB
+#undef MXW_L
     return;
   }
   // Tiles a block carries: enough to amortise the activation loads at several rows, the widest that
@@ -282,7 +295,7 @@ extern "C" int r4d_rad_gemm_mxfp4a8_gemv(const RadArgs* a, RadStream s) {
     rc = mx_parts(a, &g, &mp);
     if (rc != RAD_OK) return rc;
     if (g.K % 64) return R4D_NO(RAD_E_SHAPE);
-    if (g.M > R4D_MXG_MAX_M) return R4D_NO(RAD_E_SHAPE);
+    if (g.M > (g.K % 128 == 0 ? R4D_MXG_WMMA_MAX_M : R4D_MXG_MAX_M)) return R4D_NO(RAD_E_SHAPE);
     int as_group = 0, as_rs = 1;
     rc = mx_ascale_grid(g, &as_group, &as_rs, mp.n);
     if (rc != RAD_OK) return rc;

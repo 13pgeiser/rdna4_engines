@@ -4263,8 +4263,9 @@ static float mxfp4_act(int64_t i, int64_t k, uint32_t seed) {
  * as the zero a fresh allocation holds. `row0`, when given, receives the first row's bits. */
 static void mxfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_t N, int64_t K,
                             int tn, bool ablk = false, std::vector<RadParam> extra = {},
-                            int64_t pb1 = 0, int64_t pb2 = 0, std::vector<uint16_t>* row0 = nullptr) {
-    if (!sel(row)) return;
+                            int64_t pb1 = 0, int64_t pb2 = 0, std::vector<uint16_t>* row0 = nullptr,
+                            bool any_row = false) {
+    if (!any_row && !sel(row)) return;
     /* Parts (ParoQuant): weight rows [0, pb1), [pb1, pb2), [pb2, N) each meet their own copy of
      * the activation, side by side in a row. `K` is one copy's width. */
     const PartCut cut(N, pb1, pb2);
@@ -4399,13 +4400,20 @@ static void mxfp4a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_
 static void mxfp4a8_m_invariant(const Plugin& pl, const char* row, int64_t N, int64_t K, bool ablk) {
     if (!sel(row)) return;
     char nm[160];
-    std::snprintf(nm, sizeof nm, "%s first row bit-identical at M = 1..8, N=%lld K=%lld%s", row,
+    std::snprintf(nm, sizeof nm, "%s first row bit-identical at M = 1..%s, N=%lld K=%lld%s", row,
+                  !std::strcmp(row, "gemm_mxfp4a8_gemv") && K % 128 == 0 ? "64 (gemv_wide past 8)" : "8",
                   (long long)N, (long long)K, ablk ? " ascale=row x 128" : "");
     std::vector<uint16_t> ref, got;
-    mxfp4a8_numeric(pl, row, 1, N, K, 0, ablk, {}, 0, 0, &ref);
-    for (int64_t M = 2; M <= 8; ++M) {
+    mxfp4a8_numeric(pl, row, 1, N, K, 0, ablk, {}, 0, 0, &ref, true);
+    /* With K % 128 == 0 the gemv row's WMMA form continues in gemv_wide to 64 rows: the first row
+     * must keep its bits there too (every tile count). Run under this check's own selection, so the
+     * wide row runs here whichever row the process was started for. */
+    const bool wide = !std::strcmp(row, "gemm_mxfp4a8_gemv") && K % 128 == 0;
+    for (const int64_t M : { 2, 3, 4, 5, 6, 7, 8, 9, 16, 17, 32, 33, 48, 64 }) {
+        if (M > 8 && !wide) break;
         got.clear();
-        mxfp4a8_numeric(pl, row, M, N, K, 0, ablk, {}, 0, 0, &got);
+        mxfp4a8_numeric(pl, M > 8 ? "gemm_mxfp4a8_gemv_wide" : row, M, N, K, 0, ablk, {}, 0, 0, &got,
+                        true);
         if (ref.size() != (size_t)N || got != ref) {
             ok(nm, false, "M=" + std::to_string(M) + " differs from M=1");
             return;
@@ -26904,6 +26912,15 @@ static void device_phase(const Plugin& pl) {
                 mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv", m, n, 576, 0, true);
                 mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv", m, n, 576, 0, false);
             }
+        /* gemv_wide: the WMMA form over two to four 16-row tiles, both grids, a tile partly
+         * live, and parts. */
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv_wide", 9, 5120, 5120, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv_wide", 17, 1072, 2560, 0, false);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv_wide", 32, 17408, 5120, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv_wide", 40, 5376, 10752, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv_wide", 64, 10288, 640, 0, false);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv_wide", 33, 16, 128, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv_wide", 24, 34816, 5120, 0, true, {}, 17408);
         mxfp4a8_m_invariant(pl, "gemm_mxfp4a8_gemv", 5120, 5120, true);
         mxfp4a8_m_invariant(pl, "gemm_mxfp4a8_gemv", 1088, 576, true);
         mxfp4a8_m_invariant(pl, "gemm_mxfp4a8_gemv", 1056, 576, false);
