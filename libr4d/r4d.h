@@ -65,6 +65,20 @@ struct R4DArgs {
     // null.
     const int* cu_q;            // (num_seqs+1,) int32 device, or null for a uniform q_len
     int  total_q;               // rows of q/out; ignored unless cu_q is set
+
+    // ---- Views the split-KV decode kernel reads (r4d_attn_decode_h256_gqa6.hip); every other
+    // kernel leaves them at zero and reads q dense with one cache head per query group.
+    //
+    // `q_ld` is the element distance between q rows, 0 for dense (q_heads * head_dim): the q part
+    // of a fused [q|k|v] projection read where it lies (attn_paged_qrow). A multiple of 4.
+    //
+    // `kv_rep` maps query groups onto cache heads: group g (q heads g*GQA .. g*GQA+GQA-1) reads
+    // cache head g / kv_rep, and the descales are per cache head. kv_heads then counts the groups
+    // (q_heads / GQA) and the cache holds kv_heads / kv_rep heads. 0 or 1 is one head a group. It
+    // runs a gqa of GQA * kv_rep on the kernel compiled for GQA, whose workgroup holds at most 64
+    // rows of q_len * GQA: the 31B's DFlash drafter, gqa 8 at a block of 16, on the gqa-4 kernel.
+    long q_ld;
+    int  kv_rep;
 };
 
 // Rows of q and out. The split-KV scratch is laid out by dense query row, so the host sizing hook
@@ -89,6 +103,9 @@ int  r4d_attn_decode_h256_gqa6_bf16kv (const R4DArgs* a, hipStream_t stream);
 int  r4d_attn_decode_h128_gqa4_fp8kv  (const R4DArgs* a, hipStream_t stream);
 int  r4d_attn_decode_h128_gqa4_bf16kv (const R4DArgs* a, hipStream_t stream);
 long r4d_attn_decode_h128_gqa4_scratch_bytes(const R4DArgs* a);
+// ...with R4DArgs::kv_rep and q_ld read: a gqa of 4 * kv_rep over a cache of kv_heads / kv_rep.
+int  r4d_attn_decode_h128_gqa4_rep_fp8kv  (const R4DArgs* a, hipStream_t stream);
+int  r4d_attn_decode_h128_gqa4_rep_bf16kv (const R4DArgs* a, hipStream_t stream);
 // Bytes of split-KV partial buffer one decode launch of this shape needs. Independent of the cache
 // dtype: the partials are f16 either way.
 long r4d_attn_decode_h256_gqa6_scratch_bytes(const R4DArgs* a);
@@ -106,6 +123,9 @@ int  r4d_attn_prefill_h128_gqa2w_bf16kv(const R4DArgs* a, hipStream_t stream);
 int  r4d_attn_decode_h128_gqa2w_fp8kv  (const R4DArgs* a, hipStream_t stream);
 int  r4d_attn_decode_h128_gqa2w_bf16kv (const R4DArgs* a, hipStream_t stream);
 long r4d_attn_decode_h128_gqa2w_scratch_bytes(const R4DArgs* a);
+// ...with q at R4DArgs::q_ld (attn_paged_qrow).
+int  r4d_attn_decode_h256_gqa2_qld_fp8kv  (const R4DArgs* a, hipStream_t stream);
+int  r4d_attn_decode_h256_gqa2_qld_bf16kv (const R4DArgs* a, hipStream_t stream);
 // The geometry the attention kernels above are compiled for, so a caller can check a model
 // before the first launch.
 void r4d_attn_dims(int* head_dim, int* gqa, int* block_size, int* max_decode_rows);

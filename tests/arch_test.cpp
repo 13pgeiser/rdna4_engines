@@ -3235,7 +3235,9 @@ TEST(declare_is_a_gemma4_trunk) {
 
     /* 12 layers: 10 sliding + 2 global (layers 5 and 11). */
     CHECK_EQ(count_op(b, "attn_paged"),  12);
-    CHECK_EQ(count_op(b, "kv_store"),    12);
+    /* the cache store rides the fused prologue where it resolves (qkv_norm_rope_kv_store) */
+    CHECK_EQ(count_op(b, "qkv_norm_rope_kv_store"), 12);
+    CHECK_EQ(count_op(b, "kv_store"),     0);
     CHECK_EQ(count_op(b, "rmsnorm_p"),   12);   /* weightless value norm, one per layer */
     CHECK_EQ(count_op(b, "rope"),        24);   /* q + k */
     CHECK_EQ(count_op(b, "gelu_mul"),    12);   /* Gemma's FFN activation, not SwiGLU */
@@ -3446,6 +3448,7 @@ TEST(gemma4_every_weight_has_a_name_map) {
 TEST(a_gemma4_decode_step_runs_both_classes_in_order) {
     RadBuilder b;
     b.refuse.insert("qkv_norm_rope");   /* force the unfused prologue; fused is checked below */
+    b.refuse.insert("qkv_norm_rope_kv_store");
     RadModelMeta meta = gemma4_meta();
     RadBuildCtx  ctx  = build_ctx();
     CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
@@ -3518,7 +3521,7 @@ TEST(a_gemma4_w4a8_step_at_two_ranks_folds_the_all_reduce_into_the_junction) {
     for (int l = 0; l < 12; ++l) {
         const bool global = (l + 1) % 6 == 0;
         for (int i = 0; i < (global ? 2 : 3); ++i) want.push_back("gemm_nt_q");
-        for (const char* s : { "qkv_norm_rope", "kv_store", "attn_paged", "quant_act_i8", "gemm_nt_q",
+        for (const char* s : { "qkv_norm_rope_kv_store", "attn_paged", "quant_act_i8", "gemm_nt_q",
                                "ar_rmsnorm_quant_i8", "gemm_nt_q", "gelu_mul_quant_i8", "gemm_nt_q" })
             want.push_back(s);
         if (l < 11) want.push_back("ar_rmsnorm_quant_i8");
@@ -3532,7 +3535,7 @@ TEST(a_gemma4_w4a8_step_at_two_ranks_folds_the_all_reduce_into_the_junction) {
     for (int l = 0; l < 12; ++l) {
         const bool global = (l + 1) % 6 == 0;
         for (int i = 0; i < (global ? 2 : 3); ++i) plain.push_back("gemm_nt_q");
-        for (const char* s : { "qkv_norm_rope", "kv_store", "attn_paged", "quant_act_i8", "gemm_nt_q",
+        for (const char* s : { "qkv_norm_rope_kv_store", "attn_paged", "quant_act_i8", "gemm_nt_q",
                                "all_reduce", "rmsnorm_quant_i8", "gemm_nt_q", "gelu_mul_quant_i8",
                                "gemm_nt_q", "all_reduce" })
             plain.push_back(s);
@@ -3549,7 +3552,7 @@ TEST(a_gemma4_w4a8_step_fuses_its_residual_junctions) {
     for (int l = 0; l < 12; ++l) {
         const bool global = (l + 1) % 6 == 0;
         for (int i = 0; i < (global ? 2 : 3); ++i) want.push_back("gemm_nt_q");
-        for (const char* s : { "qkv_norm_rope", "kv_store",
+        for (const char* s : { "qkv_norm_rope_kv_store",
                                "attn_paged", "quant_act_i8", "gemm_nt_q", "rmsnorm_quant_i8",
                                "gemm_nt_q", "gelu_mul_quant_i8", "gemm_nt_q" })
             want.push_back(s);
@@ -3576,7 +3579,8 @@ TEST(a_gemma4_w4a8_step_without_the_fused_ops_keeps_the_chain_and_one_qkv_quanti
     }
     for (const char* s : { "rmsnorm", "gather_rows", "logits_gemm", "logit_softcap" })
         want.push_back(s);
-    CHECK_EQ(join(gemma4_w4_step({ "rmsnorm_quant_i8", "qkv_norm_rope", "gelu_mul_quant_i8" })), join(want));
+    CHECK_EQ(join(gemma4_w4_step({ "rmsnorm_quant_i8", "qkv_norm_rope", "qkv_norm_rope_kv_store",
+                                   "gelu_mul_quant_i8" })), join(want));
 }
 
 /* =============================== gemma4: the assistant (MTP) head =============================== */
@@ -3644,7 +3648,7 @@ TEST(gemma4_assistant_is_a_serial_head_with_no_cache_of_its_own) {
 
     /* Four head attention layers beside the trunk's twelve, none storing. */
     CHECK_EQ(count_op(b, "attn_paged"), 16);
-    CHECK_EQ(count_op(b, "kv_store"), 12);
+    CHECK_EQ(count_op(b, "kv_store") + count_op(b, "qkv_norm_rope_kv_store"), 12);
     CHECK_EQ(count_op(b, "logit_softcap"), 1);    /* trunk only; head logits are not capped */
     CHECK_EQ(count_op(b, "logits_gemm"), 2);
 
@@ -4609,10 +4613,10 @@ TEST(a_gemma4_w4a8_step_at_four_ranks_folds_the_all_reduce_into_the_junction_at_
     for (int l = 0; l < L; ++l) {
         const bool global = (l + 1) % 6 == 0;
         for (int i = 0; i < (global ? 2 : 3); ++i) { folded.push_back("gemm_nt_q"); apart.push_back("gemm_nt_q"); }
-        for (const char* s : { "qkv_norm_rope", "kv_store", "attn_paged", "quant_act_i8", "gemm_nt_q",
+        for (const char* s : { "qkv_norm_rope_kv_store", "attn_paged", "quant_act_i8", "gemm_nt_q",
                                "ar_rmsnorm_quant_i8", "gemm_nt_q", "gelu_mul_quant_i8", "gemm_nt_q" })
             folded.push_back(s);
-        for (const char* s : { "qkv_norm_rope", "kv_store", "attn_paged", "quant_act_i8", "gemm_nt_q",
+        for (const char* s : { "qkv_norm_rope_kv_store", "attn_paged", "quant_act_i8", "gemm_nt_q",
                                "all_reduce", "rmsnorm_quant_i8", "gemm_nt_q", "gelu_mul_quant_i8",
                                "gemm_nt_q", "all_reduce" })
             apart.push_back(s);
@@ -4763,8 +4767,10 @@ rad_kvgroup kv_named(const RadBuilder& b, const char* name) {
 TEST(gemma4_31b_declares_dflash_as_a_block_drafter_past_its_trunk) {
     G431Df f;
     const RadModelMeta meta = f.meta();
+    for (const bool served : { true, false }) {
     RadBuilder b;
     g431df_encs(b, false, false);
+    if (!served) b.refuse.insert("attn_paged_qrow");
     RadBuildCtx ctx = build_ctx();
     ctx.max_spec = 15;
     CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
@@ -4782,23 +4788,29 @@ TEST(gemma4_31b_declares_dflash_as_a_block_drafter_past_its_trunk) {
     REQUIRE(kvd != 0);
     CHECK_EQ((int)b.kv_groups[kvd - 1].d.kind, (int)RAD_KV_FULL);
     CHECK_EQ(b.kv_groups[kvd - 1].d.head_dim, 128);
-    /* 64 heads over 8 kv heads is gqa 8, and libr4d's head-128 attention takes 4 queries per kv
-     * head at a block of 16: the cache holds each kv head twice, the projections stay 8 heads
-     * wide, and every attention and cache write of the drafter sees 16 kv heads at gqa 4. */
-    CHECK_EQ(b.kv_groups[kvd - 1].d.n_head_kv, 16);
+    /* 64 heads over 8 kv heads is gqa 8. Where a card serves it under attn_paged_qrow (libr4d's
+     * head-128 kernel with two query groups a kv head), the cache holds each kv head once and
+     * attention runs at gqa 8. Where not, libr4d's head-128 attention takes 4 queries per kv head
+     * at a block of 16: the cache holds each kv head twice, the projections stay 8 heads wide, and
+     * every attention and cache write of the drafter sees 16 kv heads at gqa 4. */
+    const int64_t heads = served ? 8 : 16;
+    CHECK_EQ(b.kv_groups[kvd - 1].d.n_head_kv, heads);
     CHECK_EQ(b.bufs[buf_named(b, "df_k") - 1].d.shape[1], 8 * 128);
-    CHECK_EQ(b.bufs[buf_named(b, "df_k4") - 1].d.shape[1], 16 * 128);
+    if (served) CHECK_EQ(buf_named(b, "df_k4"), 0);
+    else        CHECK_EQ(b.bufs[buf_named(b, "df_k4") - 1].d.shape[1], 16 * 128);
     {
         int n_attn = 0, n_store = 0;
         for (const auto& o : b.ops) {
-            if (o.op == "attn_paged" && pint(&o, "head_dim") == 128) {
+            /* the asking ops (qrow_serves) name no buffer */
+            if (o.op == (served ? "attn_paged_qrow" : "attn_paged") && pint(&o, "head_dim") == 128 &&
+                !o.reads.empty()) {
                 ++n_attn;
-                CHECK_EQ(pint(&o, "gqa"), 4);
+                CHECK_EQ(pint(&o, "gqa"), served ? 8 : 4);
                 CHECK_EQ(pint(&o, "n_head"), 64);
             }
             if (o.op == "kv_store" && pint(&o, "head_dim") == 128) {
                 ++n_store;
-                CHECK_EQ(pint(&o, "n_head_kv"), 16);
+                CHECK_EQ(pint(&o, "n_head_kv"), heads);
             }
         }
         CHECK_EQ(n_attn, 2);    /* the sliding layers' and the full layer's */
@@ -4844,6 +4856,7 @@ TEST(gemma4_31b_declares_dflash_as_a_block_drafter_past_its_trunk) {
     RadBuildCtx c4 = build_ctx();
     c4.max_spec = 4;
     CHECK_EQ(gemma4_bf16::declare(&b4, &meta, &c4), RAD_E_UNSUPPORTED);
+    }
 }
 
 /* The taps on the w4a8 trunk are declared in the layer they copy, so `dflash_src` is live from its
@@ -4917,10 +4930,10 @@ TEST(gemma4_31b_dflash_passes_run_the_drafter_and_nothing_else) {
             CHECK_EQ(ops.front(), std::string("quant_act_fp8"));
             const RecOp* o = b.op_of(c.issues.front().op);
             CHECK(std::find(o->reads.begin(), o->reads.end(), (rad_buf)src) != o->reads.end());
-            CHECK_EQ(count_issued(ops, "attn_paged"), 0);
+            CHECK_EQ(count_issued(ops, "attn_paged") + count_issued(ops, "attn_paged_qrow"), 0);
         } else {
             CHECK_EQ(ops.front(), std::string("embed_lookup"));
-            CHECK_EQ(count_issued(ops, "attn_paged"), 5);
+            CHECK_EQ(count_issued(ops, "attn_paged") + count_issued(ops, "attn_paged_qrow"), 5);
             CHECK_EQ(count_writes_to(b, c, tok), 1);
         }
     }
@@ -5052,21 +5065,26 @@ TEST(gemma4_31b_dflash_head_reads_the_int8_copy_where_the_container_holds_one) {
 TEST(gemma4_31b_dflash_at_four_ranks) {
     G431Df f;
     const RadModelMeta meta = f.meta();
-    for (int i8 = 0; i8 < 2; ++i8) {
+    for (int i8 = 0; i8 < 2; ++i8)
+    for (const bool served : { true, false }) {
         RadBuilder b;
         g431df_encs(b, i8 == 1, true);
+        if (!served) b.refuse.insert("attn_paged_qrow");
         RadBuildCtx ctx = build_ctx(1, 4);
         ctx.max_spec = 15;
         CHECK_OK(gemma4_bf16::declare(&b, &meta, &ctx));
         const rad_kvgroup kvd = kv_named(b, "kv_draft");
         REQUIRE(kvd != 0);
-        /* two kv heads a rank, each held twice: gqa 4 over the cache (the declares test says why) */
-        CHECK_EQ(b.kv_groups[kvd - 1].d.n_head_kv, 4);
+        /* two kv heads a rank: once at gqa 8 where attn_paged_qrow serves it, else each held twice
+         * at gqa 4 (the declares test says why) */
+        CHECK_EQ(b.kv_groups[kvd - 1].d.n_head_kv, served ? 2 : 4);
         CHECK_EQ(b.bufs[buf_named(b, "df_q") - 1].d.shape[1], 16 * 128);
         CHECK_EQ(b.bufs[buf_named(b, "df_k") - 1].d.shape[1], 2 * 128);
         CHECK(buf_named(b, "df_dgath") > 0);
         for (const auto& o : b.ops)
-            if (o.op == "attn_paged" && pint(&o, "head_dim") == 128) CHECK_EQ(pint(&o, "gqa"), 4);
+            if ((o.op == "attn_paged" || o.op == "attn_paged_qrow") && pint(&o, "head_dim") == 128 &&
+                !o.reads.empty())
+                CHECK_EQ(pint(&o, "gqa"), served ? 8 : 4);
 
         RadCtx c; c.b = &b; c.rank = 1; c.world = 4;
         RadBatch batch = decode_batch();
@@ -5079,8 +5097,8 @@ TEST(gemma4_31b_dflash_at_four_ranks) {
         CHECK_EQ(count_issued(ops, "all_gather"), 1);
         /* the embedding's reduction and two a layer */
         CHECK_EQ(count_issued(ops, "all_reduce"), 1 + 2 * 5);
-        /* k and v into the cache's layout: two heads, two copies each, a layer */
-        CHECK_EQ(count_issued(ops, "cast"), 5 * 2 * (2 * 2));
+        /* k and v into the cache's layout: two heads, two copies each, a layer -- or none */
+        CHECK_EQ(count_issued(ops, "cast"), served ? 0 : 5 * 2 * (2 * 2));
     }
 }
 
@@ -5231,7 +5249,7 @@ TEST(gemma4_31b_without_libr4d_declares_the_chains_and_asks_for_no_undeclared_op
             RadBuilder b;
             g431df_encs(b, i8 == 1, true);
             for (const char* op : { "rmsnorm_quant_i8", "gelu_mul_quant_i8", "qkv_norm_rope",
-                                    "ar_rmsnorm_quant_i8" })
+                                    "qkv_norm_rope_kv_store", "ar_rmsnorm_quant_i8" })
                 b.undeclared.insert(op);
             RadBuildCtx ctx = build_ctx(0, world);
             ctx.max_spec = 15;
@@ -5429,6 +5447,75 @@ TEST(gemma4_31b_declares_redhats_dflash2_from_the_speculators_layout) {
     }
 }
 
+/* DFlash2's two passes each run their attention prologue as one launch a layer where
+ * qkv_norm_rope_kv_store resolves: the query pass with its q heads (8 a rank at four ranks; v_norm
+ * 0), the context pass with none (n_head 0: the keys alone, q passed as k's buffer, which it does
+ * not read). With the fold refused, both chains return: the norms, the rotaries and kv_store. */
+TEST(gemma4_31b_dflash2_folds_both_passes_prologues) {
+    G431Df2 f;
+    const RadModelMeta meta = f.meta();
+    const int L = 5;
+    for (int off = 0; off < 2; ++off) {
+        RadBuilder b;
+        g431df2_encs(b, true);
+        if (off) b.refuse.insert("qkv_norm_rope_kv_store");
+        RadBuildCtx ctx = build_ctx(0, 4);
+        ctx.max_tok = 2048;
+        ctx.max_spec = 7;
+        REQUIRE_EQ(gemma4_bf16::declare(&b, &meta, &ctx), RAD_OK);
+        const auto ver = kit(b, { 8 }, {});
+        const auto ctxp = context_pass(b, *ver);
+        const auto qry = query_pass(b, 1, 8, 7);
+        const auto v = run_passes(b, gemma4_bf16::step, { ctxp.get(), qry.get() }, 0, 4);
+        REQUIRE(steps_ok(v));
+        for (int p = 0; p < 2; ++p) {
+            const RadCtx& c = *v[(size_t)p];
+            int fused = 0;
+            for (const RecIssue& is : c.issues) {
+                const RecOp* o = b.op_of(is.op);
+                if (!o || o->op != "qkv_norm_rope_kv_store") continue;
+                ++fused;
+                CHECK_EQ(pint(o, "n_head"), p == 0 ? 0 : 8);
+                CHECK_EQ(pint(o, "v_norm"), 0);
+                if (p == 0) {
+                    REQUIRE(is.opd.size() >= 2);
+                    CHECK_EQ(is.opd[0].handle, is.opd[1].handle);
+                }
+            }
+            const std::vector<std::string> ops = issued_ops(b, c);
+            CHECK_EQ(fused, off ? 0 : L);
+            CHECK_EQ(count_issued(ops, "kv_store"), off ? L : 0);
+            CHECK_EQ(count_issued(ops, "rope"), off ? (p == 0 ? L : 2 * L) : 0);
+        }
+    }
+}
+
+/* DFlash2's query pass issues each residual add with the norm after it, as one add_rmsnorm where it
+ * resolves: after every attention (the feed-forward norm) and every feed-forward (the next layer's
+ * attention norm, after the last the final norm), ten on the 31B's five layers, no add left and
+ * one plain norm (layer 0's, after the embedding). With add_rmsnorm refused, the pairs. */
+TEST(gemma4_31b_dflash2_folds_each_residual_add_into_the_next_norm) {
+    G431Df2 f;
+    const RadModelMeta meta = f.meta();
+    const int L = 5;
+    for (int off = 0; off < 2; ++off) {
+        RadBuilder b;
+        g431df2_encs(b, true);
+        if (off) b.refuse.insert("add_rmsnorm");
+        RadBuildCtx ctx = build_ctx(0, 4);
+        ctx.max_tok = 2048;
+        ctx.max_spec = 7;
+        REQUIRE_EQ(gemma4_bf16::declare(&b, &meta, &ctx), RAD_OK);
+        const auto qry = query_pass(b, 1, 8, 7);
+        const auto v = run_passes(b, gemma4_bf16::step, { qry.get() }, 0, 4);
+        REQUIRE(steps_ok(v));
+        const std::vector<std::string> ops = issued_ops(b, *v[0]);
+        CHECK_EQ(count_issued(ops, "add_rmsnorm"), off ? 0 : 2 * L);
+        CHECK_EQ(count_issued(ops, "add"), off ? 2 * L : 0);
+        CHECK_EQ(count_issued(ops, "rmsnorm"), off ? 2 * L + 1 : 1);
+    }
+}
+
 /* Every engine step with RedHatAI's DFlash2 behind the trunk lints clean at one, two and four ranks:
  * decode, a mixed step, a prefill chunk, and a verify step with the drafter's context and query
  * passes behind it (block 8). */
@@ -5574,19 +5661,38 @@ TEST(gemma4_31b_takes_q_k_and_v_as_one_linear_where_the_container_holds_them_so)
             CHECK_EQ((int)qkv->d.n_row_parts, global ? 2 : 3);
         }
 
-        for (const int q : { 1, 16 }) {
+        for (const int q : { 1, 16, 40 }) {
             const auto k = kit(b, { q }, {});
             const auto v = run_passes(b, gemma4_bf16::step, { k.get() }, 0, world);
             CHECK_PASSES(b, v);
             const std::vector<std::string> ops = issued_ops(b, *v[0]);
             CHECK_EQ(count_issued(ops, "gemm_nt_q"), (int)(4 * L));
-            CHECK_EQ(count_issued(ops, "attn_paged_qrow"), 2);
-            CHECK_EQ(count_issued(ops, "attn_paged"), 10);
+            /* the sliding layers read the row up to 32 rows a sequence (gqa 2), copy q out above */
+            const bool dec = q <= 32;
+            CHECK_EQ(count_issued(ops, "attn_paged_qrow"), dec ? 12 : 2);
+            CHECK_EQ(count_issued(ops, "attn_paged"), dec ? 0 : 10);
             CHECK_EQ(count_issued(ops, "quant_act_i8"), (int)L);   /* o_proj's input only */
-            CHECK_EQ(count_writes_to(b, *v[0], buf_named(b, "attn_qs")), q == 1 ? 0 : 10);
+            CHECK_EQ(count_writes_to(b, *v[0], buf_named(b, "attn_qs")), dec ? 0 : 10);
             /* the GEMM, then qkv_norm_rope in place */
             CHECK_EQ(count_writes_to(b, *v[0], buf_named(b, "attn_qkvs")), 2 * 10);
             CHECK_EQ(count_writes_to(b, *v[0], buf_named(b, "attn_qkvg")), 2 * 2);
+        }
+
+        /* Where attn_paged_qrow is not served: attn_paged everywhere, q in the row at one row and
+         * copied out above it. */
+        RadBuilder r;
+        g431df_encs(r, false, true, true);
+        r.refuse.insert("attn_paged_qrow");
+        REQUIRE_EQ(gemma4_bf16::declare(&r, &meta, &ctx), RAD_OK);
+        for (const int q : { 1, 16 }) {
+            const auto k = kit(r, { q }, {});
+            const auto v = run_passes(r, gemma4_bf16::step, { k.get() }, 0, world);
+            CHECK_PASSES(r, v);
+            const std::vector<std::string> ops = issued_ops(r, *v[0]);
+            CHECK_EQ(count_issued(ops, "attn_paged_qrow"), 0);
+            CHECK_EQ(count_issued(ops, "attn_paged"), 12);
+            CHECK_EQ(count_writes_to(r, *v[0], buf_named(r, "attn_qs")), q == 1 ? 0 : 10);
+            CHECK_EQ(count_writes_to(r, *v[0], buf_named(r, "attn_qg")), q == 1 ? 0 : 2);
         }
     }
 }
@@ -6008,6 +6114,23 @@ TEST(qwen35_fp8_dflash2_drafter_takes_a_power_of_two_block) {
 TEST(qwen35_fp8_steps_lint_clean_with_a_dflash2_drafter) {
     MetaKV mk = with_dflash2(q35fp8_meta());
     lint_qwen35_fp8_family(qwen35_fp8::declare, qwen35_fp8::step, mk.meta(), 7, true, 8);
+}
+
+/* Qwen3.8's DFlash2 drafter has head_dim 128, outside every qkv_norm_rope_kv_store a library serves
+ * (libr4d's: 256 to 512), and an op declared for a shape that resolves to no device kernel refuses
+ * startup whether or not it is issued. So the block declares no prologue fold for it, and each pass
+ * keeps its norm, rope and kv_store chain; the residual adds, which add_rmsnorm serves at n_embd,
+ * still fold, two a layer. */
+TEST(qwen35_fp8_dflash2_head_128_drafter_declares_no_prologue_fold) {
+    MetaKV mk = with_dflash2(q35fp8_meta());
+    RadBuilder b;
+    RadBuildCtx ctx = spec_ctx(0, 1, 7);
+    REQUIRE_EQ(qwen35_fp8::declare(&b, mk.meta(), &ctx), RAD_OK);
+    int folds_128 = 0;
+    for (const auto& o : b.ops)
+        if (o.op == "qkv_norm_rope_kv_store" && pint(&o, "head_dim") == 128) ++folds_128;
+    CHECK_EQ(folds_128, 0);
+    CHECK_EQ(count_op(b, "add_rmsnorm"), 2 * 2);
 }
 
 /* =============================== gemma3: TranslateGemma 27B's trunk =========================== */
@@ -7783,13 +7906,13 @@ struct ArchCases {
             nullptr, 3, { "ar_rmsnorm_quant_fp8" }, 0x1c28909125c12f52ull);
         add("qwen35_fp8 + DFlash2", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 7); return qwen35_fp8::declare(b, q35df.meta(), &c); },
-            qwen35_fp8::step, 7, {}, 0xb5691456a0ce7e9dull);
+            qwen35_fp8::step, 7, {}, 0x76bc2f92b452df49ull);
         add("qwen35_w8a8 + DFlash2", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 7); return w8a8_declare(b, q35w8df.meta(), &c); },
-            qwen35_w8a8::step, 7, {}, 0xed8219da9fcc0ceaull);
+            qwen35_w8a8::step, 7, {}, 0x5570932de623edcaull);
         add("qwen35_w8a8 + DFlash2, two ranks", [this, sc](RadBuilder* b) {
                 auto c = sc(2, 7); return w8a8_declare(b, q35w8df.meta(), &c); },
-            nullptr, 7, { "ar_rmsnorm_quant_fp8" }, 0x2c00f131709dedcfull);
+            nullptr, 7, { "ar_rmsnorm_quant_fp8" }, 0xec1ca3ad670311bbull);
         add("qwen35moe_fp8 + MTP", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 3); return qwen35moe_fp8::declare(b, q35moe.meta(), &c); },
             qwen35moe_fp8::step, 3, {}, 0x1bd3b53543cd06eeull);
@@ -7814,19 +7937,19 @@ struct ArchCases {
          * are the earlier pins, 0xafc23087c634a537, 0x719fa07788f8b98a and 0x93b174ab52cc0d31. */
         add("gemma4_bf16", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 0); return gemma4_bf16::declare(b, &g4, &c); },
-            gemma4_bf16::step, 0, {}, 0x174e157911e121a9ull);
+            gemma4_bf16::step, 0, {}, 0x2ba2f4943031468full);
         add("gemma4_bf16, w4a8", [this, sc, g4w4](RadBuilder* b) {
                 g4w4(b); auto c = sc(1, 0); return gemma4_bf16::declare(b, &g4, &c); },
-            gemma4_bf16::step, 0, {}, 0x4bf536b78c6b11eeull);
+            gemma4_bf16::step, 0, {}, 0x2e4c6e3235dd3802ull);
         add("gemma4_bf16, w4a8, two ranks", [this, sc, g4w4](RadBuilder* b) {
                 g4w4(b); auto c = sc(2, 0); return gemma4_bf16::declare(b, &g4, &c); },
-            nullptr, 0, {}, 0xed7ccbb0c6aecfebull);
+            nullptr, 0, {}, 0xade9c0ccfad1fd47ull);
         add("gemma4_bf16, w4a8, fused qkv", [this, sc, g4qkv](RadBuilder* b) {
                 g4qkv(b); auto c = sc(1, 0); return gemma4_bf16::declare(b, &g4, &c); },
-            gemma4_bf16::step, 0, {}, 0x0ae60e16d6b6424cull);
+            gemma4_bf16::step, 0, {}, 0x3913aca59733d0e2ull);
         add("gemma4_bf16, w4a8, fused qkv, two ranks", [this, sc, g4qkv](RadBuilder* b) {
                 g4qkv(b); auto c = sc(2, 0); return gemma4_bf16::declare(b, &g4, &c); },
-            nullptr, 0, {}, 0xcc58bb53457bca11ull);
+            nullptr, 0, {}, 0x8a9935e773f546efull);
         add("gemma4", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 0); return gemma4::declare(b, &g4m, &c); },
             gemma4::step, 0, {}, 0x0f227f5853b6488cull);
@@ -8218,8 +8341,8 @@ TEST(gemma4_assistant_head_engine_step_lints_clean) {
  * fingerprints above). */
 TEST(gemma4_bf16_without_the_fused_ops_declares_the_chains_and_asks_for_no_undeclared_op) {
     const RadEncoding w4 = rad_enc_affine(RAD_I4, RAD_F16, 1, 128);
-    const std::set<std::string> fused = { "qkv_norm_rope", "rmsnorm_quant_i8", "gelu_mul_quant_i8",
-                                          "ar_rmsnorm_quant_i8" };
+    const std::set<std::string> fused = { "qkv_norm_rope", "qkv_norm_rope_kv_store", "rmsnorm_quant_i8",
+                                          "gelu_mul_quant_i8", "ar_rmsnorm_quant_i8" };
     for (int world : { 1, 2 }) {
         std::vector<std::string> seq[2];
         for (int undeclared = 0; undeclared < 2; ++undeclared) {

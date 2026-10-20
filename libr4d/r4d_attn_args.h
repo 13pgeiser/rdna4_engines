@@ -39,10 +39,14 @@ enum { AP_Q = 0, AP_KV, AP_BT, AP_SEQ, AP_KDS, AP_VDS, AP_CU, AP_OUT };
  * would abort the engine. So cu_seqlens is used whenever present, and the uniform arithmetic
  * (q_len = total_q / num_seqs) only when it is not. In the ragged case q_len is the batch maximum,
  * taken from the parameter the arch block issued the op with (batch->max_q_len).
+ *
+ * `q_pitched`: q may be a column slice of a wider row (attn_paged_qrow), its pitch in r->q_ld. Only
+ * the split-KV decode kernel reads q_ld; every other caller leaves this off.
  */
 /* `row` is a token's bytes (elements for a 16-bit cache) in a (block, head) page: 2 * head_dim,
  * or 25 * head_dim / 16 for the fp8_v4 cache (E4M3 K, int4 V, f16 group scales). */
-static inline int fill_paged_row(const RadArgs* a, R4DArgs* r, int expect_head_dim, long long row) {
+static inline int fill_paged_row(const RadArgs* a, R4DArgs* r, int expect_head_dim, long long row,
+                                 bool q_pitched = false) {
     const RadTensor* q  = r4d_opt(a, AP_Q);
     const RadTensor* kv = r4d_opt(a, AP_KV);
     const RadTensor* bt = r4d_opt(a, AP_BT);
@@ -74,8 +78,16 @@ static inline int fill_paged_row(const RadArgs* a, R4DArgs* r, int expect_head_d
     }
 
     /* q and out are indexed as one dense [total_q, q_heads, head_dim] block; the kernel has no
-     * pitch argument for either. */
-    if (!r4d_contig(q) || !r4d_contig(o)) return R4D_NO(RAD_E_STRIDE);
+     * pitch argument for either -- except q under q_pitched, whose rows may be apart: dense inside
+     * a row, a pitch in whole 8-byte loads (the kernel reads q four elements at a time). */
+    long long q_ld = 0;
+    if (q_pitched && !r4d_contig(q)) {
+        q_ld = r4d_row_pitch(q);
+        if (q_ld < q_heads * head_dim || q_ld % 4) return R4D_NO(RAD_E_STRIDE);
+    } else if (!r4d_contig(q)) {
+        return R4D_NO(RAD_E_STRIDE);
+    }
+    if (!r4d_contig(o)) return R4D_NO(RAD_E_STRIDE);
     if (o->shape[0] != total_q || r4d_numel(o) != total_q * q_heads * head_dim)
         return R4D_NO(RAD_E_SHAPE);
     if (su->shape[0] != num_seqs) return R4D_NO(RAD_E_SHAPE);
@@ -104,6 +116,7 @@ static inline int fill_paged_row(const RadArgs* a, R4DArgs* r, int expect_head_d
     r->k_descale   = kds ? (const float*)kds->data : nullptr;
     r->v_descale   = vds ? (const float*)vds->data : nullptr;
     r->q_descale   = nullptr;                 /* the query is bf16 in every variant */
+    r->q_ld        = (long)q_ld;              /* 0: dense */
     r->scratch     = a->scratch;
     r->num_seqs    = (int)num_seqs;
     r->cu_q        = ragged ? (const int*)cu->data : nullptr;
@@ -152,8 +165,9 @@ static inline int split_of(const RadArgs* a) {
 }
 
 
-static inline int fill_paged(const RadArgs* a, R4DArgs* r, int expect_head_dim) {
-    return fill_paged_row(a, r, expect_head_dim, 2LL * expect_head_dim);
+static inline int fill_paged(const RadArgs* a, R4DArgs* r, int expect_head_dim,
+                             bool q_pitched = false) {
+    return fill_paged_row(a, r, expect_head_dim, 2LL * expect_head_dim, q_pitched);
 }
 
 #endif  /* R4D_ATTN_ARGS_H */

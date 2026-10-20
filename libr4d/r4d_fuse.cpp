@@ -587,6 +587,71 @@ extern "C" int r4d_fuse_qk_norm_rope_gate_kv_store(const RadParam* p, int n_p, u
 }
 
 /* ==========================================================================================
+ * qkv_norm_rope_kv_store -- qkv_norm_rope, then kv_store of its finished k and v.
+ * (rows: qkv_norm_rope_kv_store_fp8 and _bf16; kernel: libr4d/r4d_qkv_norm_rope.hip,
+ * qkv_norm_rope_kernel under KV)
+ *
+ * Operands: [0] q  [1] k  [2] v  [3] positions  [4] q_w  [5] k_w  [6] slot_mapping  [7] kv_cache
+ *
+ * No temporaries: the prologue rewrites q, k and v in place and the store reads k and v as the
+ * prologue left them, which is what the kernel stores. */
+extern "C" int r4d_fuse_qkv_norm_rope_kv_store(const RadParam* p, int n_p, uint64_t present,
+                                               int step, RadFuseStep* out) {
+    (void)present;
+    if (!out) return RAD_E_INVAL;
+    switch (step) {
+    case 0: {
+        Step s(out, "qkv_norm_rope");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "head_dim").mirror(p, n_p, "n_head")
+         .mirror(p, n_p, "n_head_kv").mirror(p, n_p, "theta").mirror(p, n_p, "eps")
+         .mirror_opt(p, n_p, "scale").mirror_opt(p, n_p, "mode").mirror_opt(p, n_p, "rotary_dim")
+         .mirror_opt(p, n_p, "ladder").mirror_opt(p, n_p, "wadd").mirror_opt(p, n_p, "v_from_k")
+         .mirror(p, n_p, "dtype").mirror_opt(p, n_p, "v_norm");
+        return s.wire({ 0, 1, 2, 3, 4, 5 });
+    }
+    case 1: {
+        Step s(out, "kv_store");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "head_dim").mirror(p, n_p, "n_head_kv")
+         .mirror(p, n_p, "block_size").mirror(p, n_p, "kv_dtype")
+         .mirror_opt(p, n_p, "k_scale").mirror_opt(p, n_p, "v_scale");
+        /* k, v, slot_mapping, kv_cache */
+        return s.wire({ 1, 2, 6, 7 });
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+/* ==========================================================================================
+ * add_rmsnorm -- add (x += a), then rmsnorm of the x it wrote.
+ * (row: add_rmsnorm_bf16; kernel: libr4d/r4d_model_bf16.hip, add_rmsnorm_kernel)
+ *
+ * Operands: [0] x  [1] a  [2] w  [3] y
+ *
+ * No temporaries: the add writes x in place and the norm reads it. */
+extern "C" int r4d_fuse_add_rmsnorm(const RadParam* p, int n_p, uint64_t present, int step,
+                                    RadFuseStep* out) {
+    (void)present;
+    if (!out) return RAD_E_INVAL;
+    switch (step) {
+    case 0: {
+        Step s(out, "add");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "dtype");
+        /* a = x, b = the addend, y = x */
+        return s.wire({ 0, 1, 0 });
+    }
+    case 1: {
+        Step s(out, "rmsnorm");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "eps").mirror(p, n_p, "dtype")
+         .mirror_opt(p, n_p, "wadd").mirror_opt(p, n_p, "mult");
+        return s.wire({ 0, 2, 3 });
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+/* ==========================================================================================
  * attn_paged_gate_quant -- attn_paged, then gate_quant_fp8 over its output.
  * (row: attn_decode_gq_h256_gqa12_fp8kv; kernels: libr4d/r4d_attn_decode_h256_gqa6.hip, the
  * `_gq` split-KV merges)

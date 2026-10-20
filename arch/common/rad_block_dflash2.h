@@ -233,6 +233,9 @@ struct Dflash2 {
     rad_op op_cfc = 0, op_cnorm = 0, op_crope = 0, op_cstore = 0;
     rad_op op_cgath = 0;   /* the split fc's all-gather */
     rad_op op_ck[MAX_LAYERS] = {}, op_cv[MAX_LAYERS] = {}, op_cknorm[MAX_LAYERS] = {};
+    /* The k norm, the k rotary and the cache store as one launch a layer (qkv_norm_rope_kv_store
+     * with n_head 0 and v_norm 0), issued in place of those three where it resolves. */
+    rad_op op_cqkr[MAX_LAYERS] = {};
 
     /* Activation quantisers, one per activation that feeds a linear. Weightless, so one declaration
      * serves every layer; ops with weights are per layer because a weight's prefetch interval
@@ -248,11 +251,19 @@ struct Dflash2 {
     rad_op op_qp[MAX_LAYERS] = {}, op_kp[MAX_LAYERS] = {}, op_vp[MAX_LAYERS] = {};
     rad_op op_op[MAX_LAYERS] = {};
     rad_op op_qn[MAX_LAYERS] = {}, op_kn[MAX_LAYERS] = {};
+    /* The q and k norms, both rotaries and the cache store as one launch a layer
+     * (qkv_norm_rope_kv_store with v_norm 0), issued in place of those five where it resolves. */
+    rad_op op_qkr[MAX_LAYERS] = {};
     rad_op op_gu[MAX_LAYERS] = {}, op_dn[MAX_LAYERS] = {};
     rad_op op_gug[MAX_LAYERS] = {};   /* the gate_up|silu|quant fold; 0 when nothing serves it */
     rad_op op_aconv[MAX_LAYERS] = {}, op_fconv[MAX_LAYERS] = {};
     rad_op op_qrope = 0, op_krope = 0, op_store = 0, op_attn = 0;
     rad_op op_act = 0, op_ar = 0, op_add = 0, op_final = 0;
+    /* The residual add folded into the norm after it (add_rmsnorm), issued in place of op_add and
+     * that norm where it resolves: op_afn[i] after layer i's attention (its feed-forward norm),
+     * op_aan[i] after layer i-1's feed-forward (layer i's attention norm, i >= 1), op_afinal after
+     * the last layer's (the final norm). All or none. */
+    rad_op op_afn[MAX_LAYERS] = {}, op_aan[MAX_LAYERS] = {}, op_afinal = 0;
 
     /* head and selector */
     rad_op op_gather = 0, op_dquant = 0, op_dlogits = 0, op_dtopk = 0;
@@ -684,6 +695,62 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                                 RAD_STR("kv_dtype", g.kv_dtype)),
                      RAD_NOWEIGHTS),
                  {w.k, w.v}, {});
+    /* The query pass's q/k norms, rotaries and store as one launch a layer where a library
+     * serves it: qkv_norm_rope_kv_store with v_norm 0 (v stored as it is), byte-identical to the
+     * two rmsnorms, the two ropes and kv_store (docs/OPS.md), which stay declared beside it for
+     * a library that does not. No YaRN (the fold takes none). */
+    {
+        /* Only for a shape a library serves: an op declared for one that resolves to no device
+         * kernel is a hole that refuses startup (Program::device_holes), whether or not it is
+         * issued, so the block asks within libr4d's span for the fold (head_dim 256 to 512 in
+         * steps of 256, bf16 rows, an fp8 or bf16 cache). Qwen3.8's DFlash2 drafter (head_dim
+         * 128) keeps the chain. */
+        const bool fold_shape = g.head_dim >= 256 && g.head_dim <= 512 && g.head_dim % 256 == 0 &&
+                                !std::strcmp(g.dtype, "bf16") &&
+                                (!std::strcmp(g.kv_dtype, "fp8_e4m3") ||
+                                 !std::strcmp(g.kv_dtype, "bf16"));
+        if (fold_shape && g.yarn.factor == 0.0f &&
+            rad_op_declared(b, "qkv_norm_rope_kv_store")) {
+            const int64_t bsz = rad_kv_block_size(b, kv);
+            for (int64_t l = 0; l < g.n_layer; ++l) {
+                const int i = (int)l;
+                op_qkr[i] = RAD_OP(b, "qkv_norm_rope_kv_store",
+                               RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("head_dim", g.head_dim),
+                                          RAD_INT("n_head", g.n_head),
+                                          RAD_INT("n_head_kv", g.n_head_kv),
+                                          RAD_F64("theta", g.theta), RAD_F64("eps", g.eps),
+                                          RAD_F64("scale", g.rope_scale), RAD_STR("mode", "neox"),
+                                          RAD_F64("wadd", g.wadd_qk), RAD_STR("dtype", g.dtype),
+                                          RAD_INT("v_norm", 0), RAD_INT("block_size", bsz),
+                                          RAD_STR("kv_dtype", g.kv_dtype)),
+                               RAD_WEIGHTS(w_qn[i], w_kn[i]));
+                if (!op_qkr[i] || !rad_op_resolved(b, op_qkr[i])) {
+                    for (int j = 0; j <= i; ++j) op_qkr[j] = 0;
+                    break;
+                }
+                op_qkr[i] = rw(b, op_qkr[i], {w.q, w.k, w.v}, {w.q, w.k, w.v});
+            }
+            /* The context pass's keys the same way: no q (n_head 0, `q` passed as k's buffer and
+             * `q_w` as k's norm, neither read), the context rows' slots. */
+            for (int64_t l = 0; op_qkr[0] && l < g.n_layer; ++l) {
+                const int i = (int)l;
+                op_cqkr[i] = RAD_OP(b, "qkv_norm_rope_kv_store",
+                                RAD_PARAMS(RAD_RANGE("M", 1, crows), RAD_INT("head_dim", g.head_dim),
+                                           RAD_INT("n_head", 0), RAD_INT("n_head_kv", g.n_head_kv),
+                                           RAD_F64("theta", g.theta), RAD_F64("eps", g.eps),
+                                           RAD_F64("scale", g.rope_scale), RAD_STR("mode", "neox"),
+                                           RAD_F64("wadd", g.wadd_qk), RAD_STR("dtype", g.dtype),
+                                           RAD_INT("v_norm", 0), RAD_INT("block_size", bsz),
+                                           RAD_STR("kv_dtype", g.kv_dtype)),
+                                RAD_WEIGHTS(w_kn[i], w_kn[i]));
+                if (!op_cqkr[i] || !rad_op_resolved(b, op_cqkr[i])) {
+                    for (int j = 0; j <= i; ++j) op_cqkr[j] = 0;
+                    break;
+                }
+                op_cqkr[i] = rw(b, op_cqkr[i], {w.ck, w.cv}, {w.ck});
+            }
+        }
+    }
     op_act = rw(b, RAD_OP(b, "silu_mul",
                    RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n", g.n_ff),
                               RAD_STR("dtype", g.dtype)),
@@ -708,6 +775,30 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                                 RAD_STR("dtype", g.dtype)),
                      RAD_WEIGHTS(w_norm)),
                  {w.x}, {w.h});
+    /* Each residual add and the norm after it as one launch where a library serves add_rmsnorm
+     * (byte-identical to the pair: the norm is taken over the bf16 sum it stores), taken only
+     * where every handle resolves (rad_op_resolved), all or none; the pairs declared beside it run
+     * otherwise. */
+    if (rad_op_declared(b, "add_rmsnorm")) {
+        auto an = [&](rad_weight wt) -> rad_op {
+            const rad_op h = RAD_OP(b, "add_rmsnorm",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n", g.n_embd),
+                                               RAD_F64("eps", g.eps), RAD_F64("wadd", g.wadd),
+                                               RAD_STR("dtype", g.dtype)),
+                                    RAD_WEIGHTS(wt));
+            return h && rad_op_resolved(b, h) ? rw(b, h, {w.x, w.h2}, {w.x, w.h}) : (rad_op)0;
+        };
+        bool all = true;
+        for (int64_t l = 0; all && l < g.n_layer; ++l) {
+            const int i = (int)l;
+            op_afn[i] = an(w_fnorm[i]);
+            if (l > 0) op_aan[i] = an(w_anorm[i]);
+            all = op_afn[i] && (l == 0 || op_aan[i]);
+        }
+        op_afinal = all ? an(w_norm) : 0;
+        if (!op_afinal)
+            for (int i = 0; i < MAX_LAYERS; ++i) op_afn[i] = op_aan[i] = 0;
+    }
 
     /* ---------------------------------------------------------------- the head and the selector
      *
@@ -839,6 +930,12 @@ inline void Dflash2::context(RadCtx* c, const RadBatch* batch) const {
                     RAD_W(w_k[i].w), RAD_W(w_k[i].s), brows(w.ck, T), RAD_NONE, w_k[i].bref());
         RAD_ISSUE_N(c, op_cv[i], T, brows(w.cq, T), brows(w.cs, T),
                     RAD_W(w_v[i].w), RAD_W(w_v[i].s), brows(w.cv, T), RAD_NONE, w_v[i].bref());
+        if (op_cqkr[i]) {
+            RAD_ISSUE_N(c, op_cqkr[i], T, brows(w.ck, T), brows(w.ck, T), brows(w.cv, T),
+                        praw(batch->positions, RAD_I32, T), RAD_W(w_kn[i]), RAD_W(w_kn[i]),
+                        praw(slot, RAD_I32, T), kv_cache(kv, first_layer + i));
+            continue;
+        }
         RAD_ISSUE_N(c, op_cknorm[i], T * g.n_head_kv,
                     brows(w.ck, T), RAD_W(w_kn[i]), brows(w.ck, T));
         RAD_ISSUE_N(c, op_crope, T, brows(w.ck, T), praw(batch->positions, RAD_I32, T));
@@ -864,11 +961,23 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
     if (op_embed_ar)
         RAD_ISSUE_N(c, op_embed_ar, (int64_t)T * g.n_embd, brows(w.x, T), RAD_NONE);
 
+    /* x += h2 waits for the norm after it, which takes it in (add_rmsnorm) where declared */
+    bool add_pending = false;
+    auto norm = [&](rad_op plain, rad_op folded, rad_weight wt) {
+        if (add_pending && folded) {
+            RAD_ISSUE_N(c, folded, T, brows(w.x, T), brows(w.h2, T), RAD_W(wt), brows(w.h, T));
+        } else {
+            if (add_pending) RAD_ISSUE_N(c, op_add, T, brows(w.x, T), brows(w.h2, T), brows(w.x, T));
+            RAD_ISSUE_N(c, plain, T, brows(w.x, T), RAD_W(wt), brows(w.h, T));
+        }
+        add_pending = false;
+    };
+
     for (int64_t l = 0; l < g.n_layer; ++l) {
         const int i = (int)l;
 
         /* ---- attention, wrapped in the two halves of one convolution */
-        RAD_ISSUE_N(c, op_anorm[i], T, brows(w.x, T), RAD_W(w_anorm[i]), brows(w.h, T));
+        norm(op_anorm[i], op_aan[i], w_anorm[i]);
         RAD_ISSUE_N(c, op_acoef[i], T, brows(w.h, T), RAD_W(w_acp[i]), brows(w.coef, T));
         RAD_ISSUE_N(c, op_aconv[i], T, brows(w.h, T), bcol(w.coef, 0, half, T),
                     wrow_slice(w_acb[i], 0, 1, cfg.taps * g.n_embd), brows(w.h2, T));
@@ -880,13 +989,19 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
                     RAD_W(w_k[i].w), RAD_W(w_k[i].s), brows(w.k, T), RAD_NONE, w_k[i].bref());
         RAD_ISSUE_N(c, op_vp[i], T, brows(w.h2q, T), brows(w.h2s, T),
                     RAD_W(w_v[i].w), RAD_W(w_v[i].s), brows(w.v, T), RAD_NONE, w_v[i].bref());
-        RAD_ISSUE_N(c, op_qn[i], T * g.n_head, brows(w.q, T), RAD_W(w_qn[i]), brows(w.q, T));
-        RAD_ISSUE_N(c, op_kn[i], T * g.n_head_kv,
-                    brows(w.k, T), RAD_W(w_kn[i]), brows(w.k, T));
-        RAD_ISSUE_N(c, op_qrope, T, brows(w.q, T), praw(batch->positions, RAD_I32, T));
-        RAD_ISSUE_N(c, op_krope, T, brows(w.k, T), praw(batch->positions, RAD_I32, T));
-        RAD_ISSUE_N(c, op_store, T, brows(w.k, T), brows(w.v, T),
-                    praw(slot, RAD_I32, T), kv_cache(kv, first_layer + i));
+        if (op_qkr[i]) {
+            RAD_ISSUE_N(c, op_qkr[i], T, brows(w.q, T), brows(w.k, T), brows(w.v, T),
+                        praw(batch->positions, RAD_I32, T), RAD_W(w_qn[i]), RAD_W(w_kn[i]),
+                        praw(slot, RAD_I32, T), kv_cache(kv, first_layer + i));
+        } else {
+            RAD_ISSUE_N(c, op_qn[i], T * g.n_head, brows(w.q, T), RAD_W(w_qn[i]), brows(w.q, T));
+            RAD_ISSUE_N(c, op_kn[i], T * g.n_head_kv,
+                        brows(w.k, T), RAD_W(w_kn[i]), brows(w.k, T));
+            RAD_ISSUE_N(c, op_qrope, T, brows(w.q, T), praw(batch->positions, RAD_I32, T));
+            RAD_ISSUE_N(c, op_krope, T, brows(w.k, T), praw(batch->positions, RAD_I32, T));
+            RAD_ISSUE_N(c, op_store, T, brows(w.k, T), brows(w.v, T),
+                        praw(slot, RAD_I32, T), kv_cache(kv, first_layer + i));
+        }
         RAD_ISSUE_N(c, op_attn, batch->max_q_len,
                     brows(w.q, T), kv_cache(kv, first_layer + i),
                     praw2(table, RAD_I32, batch->n_seq, kvb ? kvb->block_table_pitch : 0),
@@ -903,10 +1018,10 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
         if (op_ar) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
         RAD_ISSUE_N(c, op_aconv[i], T, brows(w.h, T), bcol(w.coef, half, half, T),
                     wrow_slice(w_acb[i], 1, 1, cfg.taps * g.n_embd), brows(w.h2, T));
-        RAD_ISSUE_N(c, op_add, T, brows(w.x, T), brows(w.h2, T), brows(w.x, T));
+        add_pending = true;
 
         /* ---- the feed-forward, wrapped in the other convolution */
-        RAD_ISSUE_N(c, op_fnorm[i], T, brows(w.x, T), RAD_W(w_fnorm[i]), brows(w.h, T));
+        norm(op_fnorm[i], op_afn[i], w_fnorm[i]);
         RAD_ISSUE_N(c, op_fcoef[i], T, brows(w.h, T), RAD_W(w_fcp[i]), brows(w.coef, T));
         RAD_ISSUE_N(c, op_fconv[i], T, brows(w.h, T), bcol(w.coef, 0, half, T),
                     wrow_slice(w_fcb[i], 0, 1, cfg.taps * g.n_embd), brows(w.h2, T));
@@ -926,10 +1041,10 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
         if (op_ar) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h, T), RAD_NONE);
         RAD_ISSUE_N(c, op_fconv[i], T, brows(w.h, T), bcol(w.coef, half, half, T),
                     wrow_slice(w_fcb[i], 1, 1, cfg.taps * g.n_embd), brows(w.h2, T));
-        RAD_ISSUE_N(c, op_add, T, brows(w.x, T), brows(w.h2, T), brows(w.x, T));
+        add_pending = true;
     }
 
-    RAD_ISSUE_N(c, op_final, T, brows(w.x, T), RAD_W(w_norm), brows(w.h, T));
+    norm(op_final, op_afinal, w_norm);
 
     /* The predicting rows, `steps` per sequence, named by the scheduler through out_ids. */
     const int64_t S = batch->n_out;

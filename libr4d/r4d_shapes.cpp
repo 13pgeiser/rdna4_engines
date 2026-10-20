@@ -340,6 +340,20 @@ extern "C" int r4d_shape_rmsnorm(const RadParam* p, int n_p, int operand,
     R4D_PICK(l);
 }
 
+/* add_rmsnorm -- rmsnorm's operands with the addend after x. */
+extern "C" int r4d_shape_add_rmsnorm(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, n),
+        opd(D, M, n),
+        opd((uint32_t)RAD_F32, n),
+        opd(D, M, n),
+    };
+    R4D_PICK(l);
+}
+
 /* ---- the vision tower's (r4d_vit_bf16.hip). Every optional operand is passed: the norm's bias and
  * the GEMM's residual are the same code with a branch taken, so this covers both forms. */
 extern "C" int r4d_shape_layernorm(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
@@ -1070,6 +1084,48 @@ extern "C" int r4d_shape_qk_norm_rope_gate_kv_store(const RadParam* p, int n_p, 
         opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(),
         opd_none(), opd_none(),
         opd((uint32_t)RAD_BF16, M, kvh, hd),
+        opd_idx(M, 0, nb * bs, -1, RAD_OPD_F_IDX_UNIQUE),
+        opd(KV, nb, kvh, bs, 2 * hd),
+    };
+    R4D_PICK(l);
+}
+
+/* qkv_norm_rope -- separate q [M, n_head * head_dim], k and v [M, n_head_kv * head_dim] (dense
+ * here; the shim also takes each as a slice of a wider row), the positions, and the q and k gains,
+ * f32 as every architecture plugin declares them (shim in r4d_qkv_norm_rope.hip). As for `rope`,
+ * a position is not a lookup: the kernel takes sincos of position x frequency, so it is drawn over
+ * a context's range, where the angles a decode step sees are, not over the band's rows. */
+extern "C" int r4d_shape_qkv_norm_rope(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M   = pi(p, n_p, "M");
+    const int64_t hd  = pi(p, n_p, "head_dim");
+    const int64_t nq  = pi(p, n_p, "n_head");
+    const int64_t nkv = pi(p, n_p, "n_head_kv");
+    const RadOpdDesc l[] = {
+        /* at n_head 0 the kernel reads no q; it is passed as k's buffer, so drawn like k */
+        opd((uint32_t)RAD_BF16, M, (nq ? nq : nkv) * hd),
+        opd((uint32_t)RAD_BF16, M, nkv * hd),
+        opd((uint32_t)RAD_BF16, M, nkv * hd),
+        opd_idx(M, 0, 32768),
+        opd((uint32_t)RAD_F32, hd),
+        opd((uint32_t)RAD_F32, hd),
+    };
+    R4D_PICK(l);
+}
+
+/* qkv_norm_rope_kv_store -- qkv_norm_rope's six, then kv_store's slot mapping (unique slots, as
+ * the engine hands them) and its paged cache, sized as kv_store's description sizes it. */
+extern "C" int r4d_shape_qkv_norm_rope_kv_store(const RadParam* p, int n_p, int operand,
+                                                RadOpdDesc* out) {
+    if (operand < 6) return r4d_shape_qkv_norm_rope(p, n_p, operand, out);
+    const int64_t M   = pi(p, n_p, "M");
+    const int64_t hd  = pi(p, n_p, "head_dim");
+    const int64_t kvh = pi(p, n_p, "n_head_kv");
+    const int64_t bs  = pi(p, n_p, "block_size");
+    const uint32_t KV = dt_act(p, n_p, "kv_dtype");
+    if (M <= 0 || bs <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t nb = (M + bs - 1) / bs + 2;
+    const RadOpdDesc l[] = {
+        opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(),
         opd_idx(M, 0, nb * bs, -1, RAD_OPD_F_IDX_UNIQUE),
         opd(KV, nb, kvh, bs, 2 * hd),
     };

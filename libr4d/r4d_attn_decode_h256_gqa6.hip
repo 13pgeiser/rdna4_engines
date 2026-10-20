@@ -56,6 +56,13 @@
 // k6_v4 cache (int6 K, int4 V); a token's row layout is RadBuildCtx::kv_quant's (abi/rad_builder.h).
 #define O_V4    33554432
 #define O_K6    67108864
+// The two views of R4DArgs (r4d.h), compiled in only where a row asks for them, since the h256
+// instances sit at the 256-VGPR bound and a runtime pitch and head map spill there:
+//   QLD    q rows at R4DArgs::q_ld (attn_paged_qrow), not dense.
+//   KVREP  query group g reads cache head g / R4DArgs::kv_rep, descales per cache head.
+// Neither changes the arithmetic.
+#define O_QLD   134217728
+#define O_KVREP 268435456
 __host__ __device__ __forceinline__ int r4d_attn_tiles(int ctx, int tile) { return (ctx + tile - 1) / tile; }
 __host__ __device__ __forceinline__ int r4d_attn_tps(int ctx, int tile, int splits) {
     int t = r4d_attn_tiles(ctx, tile); return (t + splits - 1) / splits;
@@ -103,6 +110,8 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
     static_assert(!K6 || (!KLDS && (OPT & O_CONTIG) && !KRAW),
                   "k6_v4 K is widened from the paged cache, a lane's eight dims contiguous");
     static_assert(!V4 || (OPT & O_F16), "fp8_v4 widens to f16");
+    constexpr int QLD   = (OPT & O_QLD)   ? 1 : 0;
+    constexpr int KVREP = (OPT & O_KVREP) ? 1 : 0;
     typedef DT16<F16> D;
     typedef typename D::frag frag16;
 
@@ -133,6 +142,8 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
     const int c = lane & 15, h = lane >> 4;
 
     const int sp = blockIdx.x, kvh = blockIdx.y, seq = blockIdx.z;
+    // kvh is the query group; under KVREP the cache head it reads is kvh / kv_rep
+    const int kvc = KVREP ? kvh / a.kv_rep : kvh;
     const int ctx = a.seqused_k[seq];
     if (ctx <= 0) return;
 
@@ -161,13 +172,17 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
     const int qhead = kvh * GQA + hi;
 
     const int* __restrict__ bt = a.block_table + (size_t)seq * a.max_blocks;
-    const float kdesc = a.k_descale ? a.k_descale[seq * a.kv_heads + kvh] : 1.0f;
+    const float kdesc = a.k_descale
+                      ? a.k_descale[seq * (KVREP ? a.kv_heads / a.kv_rep : a.kv_heads) + kvc]
+                      : 1.0f;
     const float mul   = a.scale * kdesc * 1.44269504089f;
 
     frag16 qf[NKS];
     {
-        const uint16_t* qp = (const uint16_t*)a.q
-                           + ((size_t)(qoff + qrow) * a.q_heads + qhead) * HEAD_DIM;
+        const uint16_t* qp = QLD ? (const uint16_t*)a.q + (size_t)(qoff + qrow) * a.q_ld
+                                                        + (size_t)qhead * HEAD_DIM
+                                 : (const uint16_t*)a.q
+                                   + ((size_t)(qoff + qrow) * a.q_heads + qhead) * HEAD_DIM;
         #pragma unroll
         for (int t = 0; t < NKS; ++t) {
             const uint2 l0 = *(const uint2*)(qp + 16 * t + (CTG ? 8 * h : 4 * h));
@@ -267,7 +282,7 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
                 const int d0 = dg * (KVP ? 32 : 64) + vg * (KVP ? 8 : 16);
                 const int blk = BTS ? blks[(kk - k0) / BS] : bt[kk / BS];
                 const size_t o = (size_t)blk * a.kv_block_stride
-                               + (size_t)kvh * a.kv_head_stride
+                               + (size_t)kvc * a.kv_head_stride
                                + (size_t)(kk % BS) * ROWB + HEAD_DIM + d0;
                 const void* p = KVP ? (const void*)((const uint16_t*)a.kv + o)
                                     : (const void*)((const uint8_t*)a.kv + o);
@@ -345,7 +360,7 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
                 if (WIN && kk < wlo0) kk = wlo0;
                 const int kb = BTS ? blk[(kk - k0) / BS] : bt[kk / BS];
                 const size_t o = (size_t)kb * a.kv_block_stride
-                               + (size_t)kvh * a.kv_head_stride + (size_t)(kk % BS) * ROWB;
+                               + (size_t)kvc * a.kv_head_stride + (size_t)(kk % BS) * ROWB;
                 uint16_t* kd = &sK[key * KSTR];
                 uint32_t w4[4];
                 if (KVP) {
@@ -372,7 +387,7 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
                 if (WIN && kk < wlo0) kk = wlo0;
                 const int kb = BTS ? blk[(kk - k0) / BS] : bt[kk / BS];
                 grow = (const uint8_t*)a.kv + ((size_t)kb * a.kv_block_stride
-                     + (size_t)kvh * a.kv_head_stride + (size_t)(kk % BS) * ROWB)
+                     + (size_t)kvc * a.kv_head_stride + (size_t)(kk % BS) * ROWB)
                      * (KVP ? 2 : 1);
             }
             // A fragment's raw K: 8 elements of 1 byte (fp8) or 2 (bf16).
@@ -730,8 +745,9 @@ void splitkv_combine_vec_body(const R4DArgs& a, int splits, int tile, const R4DG
         }
     }
 
-    const int kvh = (job % a.q_heads) / (a.q_heads / a.kv_heads);
-    const float vd = a.v_descale ? a.v_descale[seq * a.kv_heads + kvh] : 1.0f;
+    const int kvh = (job % a.q_heads) / (a.q_heads / a.kv_heads);   /* the query group */
+    const int krep = a.kv_rep > 1 ? a.kv_rep : 1;                    /* its cache head: kvh / krep */
+    const float vd = a.v_descale ? a.v_descale[seq * (a.kv_heads / krep) + kvh / krep] : 1.0f;
     uint16_t ob[DPL];
     #pragma unroll
     for (int j = 0; j < DPL; ++j) {
@@ -873,8 +889,9 @@ void splitkv_combine_body(const R4DArgs& a, int splits, int tile, const R4DGateQ
     #pragma unroll
     for (int i = 0; i < CHAINS; ++i) av += ch[i];
 
-    const int kvh = (job % a.q_heads) / (a.q_heads / a.kv_heads);
-    const float vd = a.v_descale ? a.v_descale[seq * a.kv_heads + kvh] : 1.0f;
+    const int kvh = (job % a.q_heads) / (a.q_heads / a.kv_heads);   /* the query group */
+    const int krep = a.kv_rep > 1 ? a.kv_rep : 1;                    /* its cache head: kvh / krep */
+    const float vd = a.v_descale ? a.v_descale[seq * (a.kv_heads / krep) + kvh / krep] : 1.0f;
     finish(f32_to_bf16(tot > 0.0f ? av * vd / tot : 0.0f));
 }
 

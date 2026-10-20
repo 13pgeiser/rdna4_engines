@@ -764,13 +764,22 @@ The grid's groups never cross a row, so the codes are those of three separate ru
 the replies are too. On libr4d the skinny GEMM picks its in-block K split from N (k and v alone
 split K in two, the fused GEMM does not), so k and v can round differently in the last bit and a
 long greedy reply can part from the old container's late. `qkv_norm_rope` and `kv_store` work on
-the row's column slices in place. A global layer's
-attention reads q in the row (`attn_paged_qrow`, the windowed kernel that serves head_dim 512 under
-`attn_paged` too); a sliding layer's reads it there in a one-row step, and a taller step copies q
-out with a `cast` for libr4d's h256/gqa2 kernels, which take 0.26-0.71 of the windowed kernel's
-time. Without `qkv_norm_rope` (a CPU-only engine) q, k and v are copied out for the unfused
-prologue. A container that holds the three apart serves as before: the plugin asks the weight's
-encoding, which rad-convert answers from the recipe and a container from its entries.
+the row's column slices in place. Attention reads q in the row through `attn_paged_qrow`: a global
+layer at every height (the windowed kernel, which serves head_dim 512 under `attn_paged` too), a
+sliding layer up to 32 query rows a sequence (libr4d's h256/gqa2 split-KV decode with q at a pitch,
+so a verify step included); a taller sliding step (a prefill) copies q out with a `cast` for the
+h256/gqa2 prefill kernel, which takes 0.43-0.67 of the windowed kernel's time. Without
+`qkv_norm_rope` (a CPU-only engine) q, k and v are copied out for the unfused prologue. A container
+that holds the three apart serves as before: the plugin asks the weight's encoding, which
+rad-convert answers from the recipe and a container from its entries.
+
+**The 31B's drafter at gqa 8.** z-lab's 31B drafter is 64 heads over 8 kv heads. Where a card
+serves `attn_paged_qrow` at head_dim 128, gqa 8 and q_len 16 (libr4d's gqa-4 split-KV decode with
+each kv head read by two query groups), the drafter's cache holds each kv head once and attention
+runs at gqa 8. The op has no host rows, so the plugin asks it before the drafter's KV group, whose
+head count follows the answer. Elsewhere the cache holds each kv head twice and attention runs at
+gqa 4, the kv heads copied into place with a `cast` a head and copy (80 launches a draft step at
+tp 4).
 
 **The 31B with a DFlash2 drafter.** RedHatAI's `gemma-4-31B-it-speculator.dflash2` is z-lab's
 DFlash2 architecture trained with vLLM's speculators library: five Qwen3-shaped layers at 5376 (32

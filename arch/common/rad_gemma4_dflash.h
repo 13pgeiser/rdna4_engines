@@ -219,20 +219,44 @@ struct Dflash1 {
         int     full[MAX_LAYERS] = {};   /* 1: a full-attention (non-causal, unwindowed) layer */
         double  escale = 1.0;    /* the target's embedding scale, rounded as the target holds it */
         int64_t kv_rep = 1;      /* how many times the cache holds each kv head (kv_rep_for) */
+        bool    qrow = false;    /* attention at the drafter's own gqa via attn_paged_qrow */
         int64_t steps() const { return block - 1; }
     };
 
     /* The attention's queries per kv head. libr4d serves the drafter's head-128 attention, causal
      * over a window and non-causal alike, on one kernel that takes 4 queries per kv head and
      * q_len * gqa <= 64, so a block of 16 at 4. The 26B's drafter is gqa 4. The 31B's is 64 heads
-     * over 8 kv heads, gqa 8 at every rank count, which no kernel serves at a block of 16: its
-     * cache holds each kv head twice, and attention sees 4 queries per copy. That is exact (query
-     * head q still reads kv head q / 8), and costs a copy of k and v per layer and a cache twice the
-     * size, a few MiB at the drafter's width. */
+     * over 8 kv heads, gqa 8 at every rank count, which no attn_paged kernel serves at a block of
+     * 16: unless attn_paged_qrow does (qrow_serves), its cache holds each kv head twice, and
+     * attention sees 4 queries per copy. That is exact (query head q still reads kv head q / 8),
+     * and costs a copy of k and v per head and layer and a cache twice the size, a few MiB at the
+     * drafter's width. */
     static constexpr int64_t kAttnGqa = 4;
     static int64_t kv_rep_for(const Geom& g) {
         const int64_t gqa = g.gqa();
         return gqa > kAttnGqa && gqa % kAttnGqa == 0 ? gqa / kAttnGqa : 1;
+    }
+    /* libr4d also serves gqa 8 at head_dim 128 under attn_paged_qrow: that kernel with each kv head
+     * read by two query groups, so the cache holds each head once and nothing is copied. No host
+     * library declares attn_paged_qrow, so it resolves only to a card's kernel; asked first, it
+     * decides the cache's head count (declare_drafter). The asking ops take no buffers and are not
+     * issued; the attention the drafter issues is declared after its KV group, which takes its
+     * block size from it. */
+    static bool qrow_serves(RadBuilder* b, const Geom& g, const Config& c) {
+        bool any_full = false, any_swa = false;
+        for (int64_t l = 0; l < g.n_layer; ++l) (c.full[l] ? any_full : any_swa) = true;
+        auto ask = [&](int causal, int64_t window) {
+            const rad_op h = RAD_OP(b, "attn_paged_qrow",
+                     RAD_PARAMS(RAD_RANGE("q_len", 1, c.block), RAD_INT("head_dim", g.head_dim),
+                                RAD_INT("gqa", g.gqa()), RAD_INT("causal", causal),
+                                RAD_INT("window", window), RAD_INT("n_head", g.n_head),
+                                RAD_INT("block_size", RAD_KV_BLOCK),
+                                RAD_INT("max_seqs", g.max_seqs), RAD_INT("max_ctx", g.max_ctx),
+                                RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype)),
+                     RAD_NOWEIGHTS);
+            return h != RAD_NULL_HANDLE && rad_op_resolved(b, h);
+        };
+        return (!any_swa || ask(1, c.window)) && (!any_full || ask(0, 0));
     }
 
     /* What the trunk hands the drafter (declare_drafter). */
@@ -577,8 +601,17 @@ inline int Dflash1::declare_drafter(RadBuilder* b, const RadModelMeta* meta,
      * position. The sliding layers bound themselves with their attention op's `window`, so the
      * declared drafter window is 0 and the core stages the whole context. A separate window group
      * for the sliding layers would save memory. */
-    /* The cache holds kv_rep copies of each of this rank's kv heads (kv_rep_for). */
+    /* The cache holds kv_rep copies of each of this rank's kv heads (kv_rep_for), or each once where
+     * a card serves the drafter's own gqa (qrow_serves). */
     dc.kv_rep = kv_rep_for(dg);
+    if (dc.kv_rep > 1 && rad_op_declared(b, "attn_paged_qrow")) {
+        Geom pg = dg;
+        pg.kv_dtype = rad_dtype_name(rad_kv_cache_dtype(ctx, RAD_BF16));   /* as the group takes it */
+        if (qrow_serves(b, pg, dc)) {
+            dc.kv_rep = 1;
+            dc.qrow = true;
+        }
+    }
     {
         Geom cg = dg;
         cg.n_head_kv     *= dc.kv_rep;
@@ -628,6 +661,10 @@ inline int Dflash1::declare_drafter(RadBuilder* b, const RadModelMeta* meta,
                     "kernel serves at a block of %lld (gqa %lld otherwise)",
                  (long long)dg.n_head_kv, (long long)dc.kv_rep, (long long)kAttnGqa,
                  (long long)dg.head_dim, (long long)dc.block, (long long)dg.gqa());
+    else if (dc.qrow)
+        rad_note(b, "the DFlash drafter attends at %lld queries per kv head through attn_paged_qrow, "
+                    "its cache holding each of its %lld kv head(s) a rank once",
+                 (long long)dg.gqa(), (long long)dg.n_head_kv);
     return RAD_OK;
 }
 
@@ -778,7 +815,7 @@ inline int Dflash1::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
      * Declared before either kv_store, which reads `block_size` back from the resolved kernel.
      * Both read the one KV group, so whichever resolves first answers for it. */
     auto attn = [&](int causal, int64_t window) {
-        return rw(b, RAD_OP(b, "attn_paged",
+        return rw(b, RAD_OP(b, cfg.qrow ? "attn_paged_qrow" : "attn_paged",
                      RAD_PARAMS(RAD_RANGE("q_len", 1, cfg.block), RAD_INT("head_dim", g.head_dim),
                                 RAD_INT("gqa", g.gqa() / rep), RAD_INT("causal", causal),
                                 RAD_INT("window", window), RAD_INT("n_head", g.n_head),

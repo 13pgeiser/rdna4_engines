@@ -226,6 +226,38 @@ __global__ __launch_bounds__(THR) void rmsnorm_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------- add_rmsnorm
+// x = x + a, rounded as `add` rounds it, then y = rmsnorm(x) over the x just written, computed as
+// rmsnorm_kernel computes it: the same width (r4d_act_threads), the same columns a thread, the same
+// block_sum. A thread re-reads only the x it wrote itself, so no barrier separates the passes.
+// Byte-identical to `add` followed by `rmsnorm`, on x and on y.
+template <bool WF32, uint32_t THR>
+__global__ __launch_bounds__(THR) void add_rmsnorm_kernel(
+    uint16_t* __restrict__ x, const uint16_t* __restrict__ a, const void* __restrict__ w,
+    uint16_t* __restrict__ y, uint32_t n, float eps, float wadd, float mult, uint32_t x_ld,
+    uint32_t a_ld, uint32_t y_ld, uint32_t M) {
+    __shared__ float lds[THR / kWave];
+    const uint32_t m = blockIdx.x;
+    if (m >= M) return;   // a row the launch added past the full-card cliff (r4d_cliff_rows)
+    uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
+    const uint16_t* __restrict__ ar = a + (size_t)m * a_ld;
+    uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
+
+    float ss = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += THR) {
+        const uint16_t h = f32_to_bf16(bf16_to_f32(xr[i]) + bf16_to_f32(ar[i]));
+        xr[i] = h;
+        const float v = bf16_to_f32(h);
+        ss += v * v;
+    }
+    ss = block_sum<THR / kWave>(ss, lds);
+    const float s = rsqrtf(ss / (float)n + eps);
+    for (uint32_t i = threadIdx.x; i < n; i += THR) {
+        const float g = !w ? 1.0f : WF32 ? ((const float*)w)[i] : bf16_to_f32(((const uint16_t*)w)[i]);
+        yr[i] = f32_to_bf16(bf16_to_f32(xr[i]) * s * (g + wadd) * mult);
+    }
+}
+
 // ---------------------------------------------------------------------------- rmsnorm_p
 // ref_rmsnorm_p: y = x * rsqrt(mean(x^2) + eps), rmsnorm with no gain. Gemma's attention applies
 // it to V (llama.cpp's ggml_rms_norm(V, eps)), which has no checkpoint gain. Accumulates exactly as
@@ -1418,6 +1450,53 @@ extern "C" int r4d_rad_rmsnorm(const RadArgs* a, RadStream s) {
                             (float)r4d_getf(a, "mult", 1.0),
                             w_f32, (int)x_ld, (int)y_ld, (long)(uintptr_t)s) == 0 ? RAD_OK
                                                                                  : RAD_E_DEVICE;
+}
+
+/* ------------------------------------------------------------------ add_rmsnorm */
+
+enum { AN_X = 0, AN_A, AN_W, AN_Y };
+
+extern "C" int r4d_rad_add_rmsnorm(const RadArgs* a, RadStream s) {
+    int emit_rc = RAD_OK;
+    const RadTensor* x  = r4d_opt(a, AN_X);
+    const RadTensor* ad = r4d_opt(a, AN_A);
+    const RadTensor* w  = r4d_opt(a, AN_W);
+    const RadTensor* y  = r4d_opt(a, AN_Y);
+    if (!x || !ad || !w || !y) return R4D_NO(RAD_E_INVAL);
+    R4D_NEED(dt_bf16(x));
+    R4D_NEED(dt_bf16(ad));
+    R4D_NEED(dt_bf16(y));
+    if (!r4d_contig(w)) return R4D_NO(RAD_E_STRIDE);
+    if (w->dtype != RAD_F32 && w->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    const bool w_f32 = w->dtype == RAD_F32;
+    const long long n = r4d_geti_or(a, "n", r4d_dim(w, (int)w->rank - 1));
+    if (n <= 0 || r4d_numel(w) < n) return R4D_NO(RAD_E_SHAPE);
+    long long M = 0, Ma = 0, My = 0;
+    const long long x_ld = r4d_rows_pitch(x, n, &M);
+    const long long a_ld = r4d_rows_pitch(ad, n, &Ma);
+    const long long y_ld = r4d_rows_pitch(y, n, &My);
+    if (x_ld < 0 || a_ld < 0 || y_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (M <= 0 || Ma < M || My < M) return R4D_NO(RAD_E_SHAPE);
+    const float eps  = (float)r4d_getf(a, "eps", 1e-6);
+    const float wadd = (float)r4d_getf(a, "wadd", 0.0);
+    const float mult = (float)r4d_getf(a, "mult", 1.0);
+    /* rmsnorm's width, from the same table (see r4d_rmsnorm_mult_bf16) */
+    const int thr = r4d_act_threads((int)M, (int)n);
+#define R4D_AN_T(wf, T)                                                                         \
+    emit_rc = R4D_EMIT(s, (add_rmsnorm_kernel<wf, T>),                                          \
+                       dim3(r4d_cliff_rows((uint32_t)M, 1, T / kWave)), dim3(T), 0,              \
+                       (uint16_t*)r4d_wp(x), (const uint16_t*)r4d_p(ad), r4d_p(w),              \
+                       (uint16_t*)r4d_wp(y), (uint32_t)n, eps, wadd, mult, (uint32_t)x_ld,       \
+                       (uint32_t)a_ld, (uint32_t)y_ld, (uint32_t)M)
+#define R4D_AN(wf)                                                                              \
+    do { if (thr == 1024)     R4D_AN_T(wf, 1024);                                               \
+         else if (thr == 512) R4D_AN_T(wf, 512);                                                \
+         else                 R4D_AN_T(wf, 256); } while (0)
+    if (w_f32) R4D_AN(true);
+    else       R4D_AN(false);
+#undef R4D_AN
+#undef R4D_AN_T
+    return emit_rc;
 }
 
 /* ------------------------------------------------------------------ rmsnorm_p */

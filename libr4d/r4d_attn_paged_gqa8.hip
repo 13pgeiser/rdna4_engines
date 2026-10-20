@@ -106,7 +106,7 @@ extern "C" long GQ_SYM(r4d_attn_decode_gqa, _scratch_bytes)(const R4DArgs* a) {
 }
 
 template <int HEAD_DIM, int KVP, int XOPT = 0>
-/* Two dispatches: the attention kernel and the split-KV combine. R4DArgs is passed by value (168
+/* Two dispatches: the attention kernel and the split-KV combine. R4DArgs is passed by value (184
  * bytes) like any other kernel argument. Non-null `gq` adds the output gate and quantiser to the
  * combine (attn_paged_gate_quant; R4DGateQuant in r4d_attn_decode_h256_gqa6.hip). `XOPT` adds
  * option bits to the attention kernel's (O_V4, O_K6: the cache layout). */

@@ -449,7 +449,11 @@ dense block by a `cast`. It has its own name because other `attn_paged` kernels 
 (libr4d's with `RAD_E_STRIDE`, at the first step), and under `attn_paged` the first library in
 `--kernels` wins the op, an order the architecture cannot see. Asked for by name, the op resolves to
 a library that reads the pitch or to nothing, and the architecture copies `q` for `attn_paged` in
-the second case.
+the second case. In libr4d the windowed kernels serve it at every height; the split-KV decode kernel
+serves it at h256/gqa2 over its decode band (q_len up to 32, ahead of the windowed rows there), and
+at h128/gqa8 up to q_len 16 by reading each kv head for two query groups of 4 (a drafter's cache
+then holds each kv head once). Since no host library declares the op, a plugin that asks for it
+learns whether a card serves the geometry.
 
 libref has no row for any of them, deliberately. An architecture asks for a fusion and declares
 the chain where it does not resolve (`rad_op_resolved`); a reference row would make it resolve
@@ -821,6 +825,7 @@ bytes).
 | `rope_table` | `M`(range) `rot` `theta`:f64 `scale`:f64 `dtype` `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `head_dim`/opt `ladder`/opt | `positions` → `cos_sin` |
 | `qk_norm_rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `wadd`:f64/opt `v_norm`/opt `sections`/opt `comps`/opt | `qkv`:inout, `positions`?, `q_w`w?, `k_w`w? |
 | `qkv_norm_rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `ladder`/opt `wadd`:f64/opt `v_from_k`/opt `v_norm`/opt `dtype` | `q`:inout, `k`:inout, `v`:inout, `positions`, `q_w`w, `k_w`w |
+| `qkv_norm_rope_kv_store` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `ladder`/opt `wadd`:f64/opt `v_from_k`/opt `dtype` `v_norm`/opt `block_size` `kv_dtype` `k_scale`:f64/opt `v_scale`:f64/opt | `q`:inout, `k`:inout, `v`:inout, `positions`, `q_w`w, `k_w`w, `slot_mapping`, `kv_cache`:inout |
 
 **`attn_paged`**'s band is `q_len`, not `M`: one query row at decode, `1 + n_spec` at a speculative
 verify, thousands in a prefill chunk, and libr4d has a different kernel for each band.
@@ -937,9 +942,19 @@ the same reason: its angles must stay `rope`'s exactly.
 
 **`qkv_norm_rope`** (device-only) is the same prologue over separate `q`, `k` and `v` projections
 (Gemma 4's text attention, three GEMMs): the q and k norms, the unit-gain value norm and the rotary
-in one dispatch. `v_from_k` 1 takes v from the raw k before the k norm (the k == v global class).
+in one dispatch. `v_from_k` 1 takes v from the raw k before the k norm (the k == v global class);
+`v_norm` 0 leaves v unnormed (a Qwen3-shaped layer: two norms and two rotaries). `n_head` 0 is the
+k (and v) heads alone, `q` and `q_w` passed but neither read nor written: a pass that writes only
+keys and values (a block drafter's context pass).
 The rotary parameters are `rope`'s, `ladder` included. Byte-identical to `rmsnorm_p`, two
-`rmsnorm`s and two `rope`s.
+`rmsnorm`s and two `rope`s (one each at `n_head` 0).
+
+**`qkv_norm_rope_kv_store`** (device-only) is `qkv_norm_rope` followed by `kv_store` in one launch:
+the block of each k head (and of each v head, or under `v_from_k` the k head's block for both) ends
+holding its token's finished head, so it also writes it into the paged cache at the token's slot.
+Its parameters are the two ops' own, its operands the prologue's followed by `slot_mapping` and
+`kv_cache`. Byte-identical to the pair at either cache width: the store converts each element as
+`kv_store` does, and q, k and v are still written in place as the prologue leaves them.
 
 | op | params | operands |
 |---|---|---|
@@ -2828,6 +2843,17 @@ Blocks are `block_size` rows starting at row 0, so a tap never reaches into the 
 `delta` is `[T, taps, NG]` read at its own row pitch: the architecture passes a slice of the
 `[T, 2, taps, NG]` coefficient projection. `out` must not alias `x`. libr4d's kernel serves
 `taps` 2, `group_size` 16 and a power-of-two `block_size`; libref and libavx any.
+
+`add_rmsnorm` (device-only) is the drafter's residual add and the norm after it in one pass:
+
+| op | params | operands |
+|---|---|---|
+| `add_rmsnorm` | `M`(range) `n` `eps`:f64 `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`:inout, `a`, `w`w → `y` |
+
+It writes `x + a` into `x`, rounded as `add` rounds it, then `y = rmsnorm(x) * (w + wadd) * mult`
+over the `x` it wrote, at `rmsnorm`'s width and column partition: byte-identical to `add` followed
+by `rmsnorm`, on both outputs. That is where it differs from `rmsnorm_add`, which normalises the
+unrounded sum: a drafter whose trained graph is the pair keeps its bits.
 
 `dflash_select` is the greedy walk over the candidate lattice: `cand`/`unary` are `row_topk`'s two
 output planes at one row per draft position, `hp` the selector's rank-256 query, and `anchor` the

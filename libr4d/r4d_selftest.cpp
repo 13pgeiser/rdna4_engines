@@ -943,9 +943,11 @@ static void attn_oracle_one(const uint16_t* qh, const uint8_t* kv, int kv_is_fp8
 /* Numeric attention check: fill q and the paged k/v with avalanche-random data, run the row, and
  * compare the bf16 output against the oracle above. A negative control corrupts part of the
  * reference and requires the comparison to fail. */
+/* `q_extra` > 0: q is a column slice of rows q_extra elements wider than its heads (an
+ * attn_paged_qrow row reads it at that pitch, as from a fused q|k|v projection). */
 static void attn_numeric_case(const Plugin& pl, const char* name, int64_t head_dim, int64_t gqa,
                               int64_t q_len, const char* kv_dtype, int window, int64_t ctx = 64,
-                              int64_t bs = 16) {
+                              int64_t bs = 16, int64_t q_extra = 0) {
     if (!sel(name)) return;
     const RadKernelInfo* r = find(pl, name);
     if (!r) { ok(name, false, "row absent"); return; }
@@ -992,8 +994,16 @@ static void attn_numeric_case(const Plugin& pl, const char* name, int64_t head_d
         }
     const std::vector<int32_t> bt = iota_i32(max_blocks);
 
-    void* d_q  = dalloc((size_t)total_q * q_heads * head_dim * 2);
-    st_memcpy(d_q, qh.data(), qh.size() * 2, hipMemcpyHostToDevice);
+    const int64_t q_ld = q_heads * head_dim + q_extra;
+    void* d_q  = dalloc((size_t)total_q * q_ld * 2);
+    {
+        /* the slice's rows at the pitch, the rest of each row a value no head holds */
+        std::vector<uint16_t> qp((size_t)total_q * q_ld, h_to_bf16(9.0f));
+        for (int64_t t = 0; t < total_q; ++t)
+            std::memcpy(&qp[(size_t)(t * q_ld)], &qh[(size_t)(t * q_heads * head_dim)],
+                        (size_t)(q_heads * head_dim) * 2);
+        st_memcpy(d_q, qp.data(), qp.size() * 2, hipMemcpyHostToDevice);
+    }
     void* d_kv = dalloc(kv.size());
     st_memcpy(d_kv, kv.data(), kv.size(), hipMemcpyHostToDevice);
     void* d_out = dalloc((size_t)total_q * q_heads * head_dim * 2);
@@ -1008,6 +1018,7 @@ static void attn_numeric_case(const Plugin& pl, const char* name, int64_t head_d
         T(nullptr, RAD_I32,  { seqs + 1 }),
         T(d_out, RAD_BF16, { total_q, q_heads, head_dim }),
     };
+    ts[0].stride[0] = q_ld;
     if (kvdt == RAD_BF16) { absent(ts[4]); absent(ts[5]); }
     absent(ts[6]);
     std::vector<RadParam> ps = {
@@ -10977,10 +10988,16 @@ static void qkv_norm_rope_numeric(const Plugin& pl) {
     const RadKernelInfo* rp  = find(pl, "rope_bf16");
     const RadKernelInfo* fz  = find(pl, "qkv_norm_rope_bf16");
     if (!np || !nrm || !rp || !fz) { ok("qkv_norm_rope vs its five", false, "rows absent"); return; }
+    /* vn false: no value norm (Gemma 3's prologue, and a Qwen3-shaped layer such as the DFlash2
+     * drafter's), q and k normed and v not, so the chain is four ops and v must come out as it went
+     * in; nq 0 as well: that layer's keys alone (the drafter's context pass), the chain a k norm and
+     * a k rope, q passed as k's buffer */
     struct Cls { int64_t hd, nq, nkv, rot; const char* ladder; double theta; bool vk, vn; };
     for (const Cls& cl : { Cls{ 256, 16, 8, 256, "rotary", 10000.0, false, true },
                            Cls{ 512, 16, 2, 128, "head", 1000000.0, true, true },
-                           Cls{ 128, 16, 8, 128, "rotary", 10000.0, false, false } }) {
+                           Cls{ 128, 16, 8, 128, "rotary", 10000.0, false, false },
+                           Cls{ 256, 8, 4, 256, "rotary", 10000.0, false, false },
+                           Cls{ 256, 0, 4, 256, "rotary", 10000.0, false, false } }) {
         /* 8 rows of the head-256 class are 8 x 32 workgroups of 8 wavefronts, a full card: the
          * launch adds an idle row past the cliff (r4d_cliff_rows), which must not change a byte. */
         for (const int64_t M : { (int64_t)1, (int64_t)4, (int64_t)8, (int64_t)40 }) {
@@ -10996,9 +11013,11 @@ static void qkv_norm_rope_numeric(const Plugin& pl) {
                 hkw[(size_t)c] = h_to_bf16(0.5f + 0.005f * (float)((c * 11) % 47));
             }
             for (int64_t m = 0; m < M; ++m) hp[(size_t)m] = (int32_t)(1000 + 7 * m);
-            void* dq[2] = { dalloc(hq.size() * 2), dalloc(hq.size() * 2) };
+            void* dq[2] = { nullptr, nullptr };
             void* dk[2] = { dalloc(hk.size() * 2), dalloc(hk.size() * 2) };
             void* dv[2] = { dalloc(hv.size() * 2), dalloc(hv.size() * 2) };
+            for (int j = 0; j < 2; ++j) dq[j] = cl.nq ? dalloc(hq.size() * 2) : dk[j];
+            const int64_t QW = cl.nq ? QD : KD;   /* q's width as passed (k's buffer at nq 0) */
             void* dqw = dalloc(hqw.size() * 2);
             void* dkw = dalloc(hkw.size() * 2);
             void* dp  = dalloc(hp.size() * 4);
@@ -11016,26 +11035,28 @@ static void qkv_norm_rope_numeric(const Plugin& pl) {
             int rc = !cl.vn ? RAD_OK
                    : launch_row(np, { T(cl.vk ? dk[0] : dv[0], RAD_BF16, { M * cl.nkv, cl.hd }), T(dv[0], RAD_BF16, { M * cl.nkv, cl.hd }) },
                                 { PI("M", M * cl.nkv), PI("n", cl.hd), PF("eps", eps), PS("dtype", "bf16") });
-            if (rc == RAD_OK)
+            if (rc == RAD_OK && cl.nq)
                 rc = launch_row(nrm, { T(dq[0], RAD_BF16, { M * cl.nq, cl.hd }), T(dqw, RAD_BF16, { cl.hd }), T(dq[0], RAD_BF16, { M * cl.nq, cl.hd }) },
                                 { PI("M", M * cl.nq), PI("n", cl.hd), PF("eps", eps), PS("dtype", "bf16"), PF("wadd", wadd) });
             if (rc == RAD_OK)
                 rc = launch_row(nrm, { T(dk[0], RAD_BF16, { M * cl.nkv, cl.hd }), T(dkw, RAD_BF16, { cl.hd }), T(dk[0], RAD_BF16, { M * cl.nkv, cl.hd }) },
                                 { PI("M", M * cl.nkv), PI("n", cl.hd), PF("eps", eps), PS("dtype", "bf16"), PF("wadd", wadd) });
-            for (int j = 0; j < 2 && rc == RAD_OK; ++j)
+            for (int j = cl.nq ? 0 : 1; j < 2 && rc == RAD_OK; ++j)
                 rc = launch_row(rp, { T(j ? dk[0] : dq[0], RAD_BF16, { M, (j ? cl.nkv : cl.nq) * cl.hd }), T(dp, RAD_I32, { M }) },
                                 { PI("M", M), PI("head_dim", cl.hd), PI("n_head", j ? cl.nkv : cl.nq), PI("n_head_kv", 0),
                                   PF("theta", cl.theta), PF("scale", 1.0), PS("mode", "neox"), PI("rotary_dim", cl.rot),
                                   PS("ladder", cl.ladder) });
             /* --- the one --- */
             if (rc == RAD_OK)
-                rc = launch_row(fz, { T(dq[1], RAD_BF16, { M, QD }), T(dk[1], RAD_BF16, { M, KD }), T(dv[1], RAD_BF16, { M, KD }),
+                rc = launch_row(fz, { T(dq[1], RAD_BF16, { M, QW }), T(dk[1], RAD_BF16, { M, KD }), T(dv[1], RAD_BF16, { M, KD }),
                                       T(dp, RAD_I32, { M }), T(dqw, RAD_BF16, { cl.hd }), T(dkw, RAD_BF16, { cl.hd }) },
                                 { PI("M", M), PI("head_dim", cl.hd), PI("n_head", cl.nq), PI("n_head_kv", cl.nkv),
                                   PF("theta", cl.theta), PF("eps", eps), PF("scale", 1.0), PS("mode", "neox"),
                                   PI("rotary_dim", cl.rot), PS("ladder", cl.ladder), PF("wadd", wadd),
                                   PI("v_from_k", cl.vk ? 1 : 0), PI("v_norm", cl.vn ? 1 : 0), PS("dtype", "bf16") });
-            const std::string what = std::string("qkv_norm_rope hd=") + std::to_string(cl.hd) + " M=" + std::to_string(M);
+            const std::string what = std::string("qkv_norm_rope hd=") + std::to_string(cl.hd) +
+                                     (cl.nq ? "" : " n_head=0") + (cl.vn ? "" : " v_norm=0") +
+                                     " M=" + std::to_string(M);
             if (rc != RAD_OK) { ok((what + " vs its five").c_str(), false, "rc=" + std::to_string(rc)); continue; }
             int nd = 0, moved = 0;
             for (int t = 0; t < 3; ++t) {
@@ -11047,10 +11068,147 @@ static void qkv_norm_rope_numeric(const Plugin& pl) {
                 const std::vector<uint16_t>& h0 = t == 0 ? hq : (t == 1 ? hk : hv);
                 for (size_t i = 0; i < n; ++i) { nd += a[i] != b[i]; moved += b[i] != h0[i]; }
             }
-            ok((what + " is byte-identical to rmsnorm_p + rmsnorm x2 + rope x2").c_str(), nd == 0 && moved > 0,
+            ok((what + (cl.nq ? " is byte-identical to rmsnorm_p + rmsnorm x2 + rope x2"
+                              : " is byte-identical to rmsnorm + rope over k")).c_str(),
+               nd == 0 && moved > 0,
                "differs " + std::to_string(nd) + ", changed from the input " + std::to_string(moved));
+
+            /* --- and with kv_store folded in (qkv_norm_rope_kv_store): the pair (the prologue's
+             * output above, then kv_store) against the one launch from the same inputs, at both
+             * cache widths. Slots are unique with one row's negative (padding, which stores
+             * nothing), and the caches start marked, so a stray or a missing store shows. --- */
+            for (const bool f8 : { true, false }) {
+                const RadKernelInfo* ks = find(pl, f8 ? "kv_store_fp8" : "kv_store_bf16");
+                const RadKernelInfo* fk = find(pl, f8 ? "qkv_norm_rope_kv_store_fp8"
+                                                      : "qkv_norm_rope_kv_store_bf16");
+                const std::string w2 = what + (f8 ? " + kv_store_fp8" : " + kv_store_bf16");
+                if (!ks || !fk) { ok(w2.c_str(), false, "rows absent"); continue; }
+                const int64_t bs = 16, nb = (M + bs - 1) / bs + 2, esz = f8 ? 1 : 2;
+                const size_t cb = (size_t)(nb * cl.nkv * bs * 2 * cl.hd * esz);
+                std::vector<int32_t> hs((size_t)M);
+                for (int64_t m = 0; m < M; ++m) hs[(size_t)m] = (int32_t)((m * 37 + 3) % (nb * bs));
+                if (M > 1) hs[1] = -1;
+                void* dsl = dalloc(hs.size() * 4);
+                void* dc[2] = { dalloc(cb), dalloc(cb) };
+                void* d3[3] = { nullptr, dalloc(hk.size() * 2), dalloc(hv.size() * 2) };
+                d3[0] = cl.nq ? dalloc(hq.size() * 2) : d3[1];
+                if (!dsl || !dc[0] || !dc[1] || !d3[0] || !d3[1] || !d3[2]) {
+                    ok(w2.c_str(), false, "hipMalloc failed");
+                    continue;
+                }
+                st_memcpy(dsl, hs.data(), hs.size() * 4, hipMemcpyHostToDevice);
+                st_memset(dc[0], 0x5A, cb);
+                st_memset(dc[1], 0x5A, cb);
+                st_memcpy(d3[0], hq.data(), hq.size() * 2, hipMemcpyHostToDevice);
+                st_memcpy(d3[1], hk.data(), hk.size() * 2, hipMemcpyHostToDevice);
+                st_memcpy(d3[2], hv.data(), hv.size() * 2, hipMemcpyHostToDevice);
+                const uint32_t kvdt = f8 ? RAD_F8E4M3 : RAD_BF16;
+                const char* kvn = f8 ? "fp8_e4m3" : "bf16";
+                int r2 = launch_row(ks, { T(dk[1], RAD_BF16, { M, KD }), T(dv[1], RAD_BF16, { M, KD }),
+                                          T(dsl, RAD_I32, { M }),
+                                          T(dc[0], kvdt, { nb, cl.nkv, bs, 2 * cl.hd }) },
+                                    { PI("M", M), PI("head_dim", cl.hd), PI("n_head_kv", cl.nkv),
+                                      PI("block_size", bs), PS("kv_dtype", kvn) });
+                if (r2 == RAD_OK)
+                    r2 = launch_row(fk, { T(d3[0], RAD_BF16, { M, QW }), T(d3[1], RAD_BF16, { M, KD }),
+                                          T(d3[2], RAD_BF16, { M, KD }), T(dp, RAD_I32, { M }),
+                                          T(dqw, RAD_BF16, { cl.hd }), T(dkw, RAD_BF16, { cl.hd }),
+                                          T(dsl, RAD_I32, { M }),
+                                          T(dc[1], kvdt, { nb, cl.nkv, bs, 2 * cl.hd }) },
+                                    { PI("M", M), PI("head_dim", cl.hd), PI("n_head", cl.nq),
+                                      PI("n_head_kv", cl.nkv), PF("theta", cl.theta), PF("eps", eps),
+                                      PF("scale", 1.0), PS("mode", "neox"), PI("rotary_dim", cl.rot),
+                                      PS("ladder", cl.ladder), PF("wadd", wadd),
+                                      PI("v_from_k", cl.vk ? 1 : 0), PS("dtype", "bf16"),
+                                      PI("v_norm", cl.vn ? 1 : 0),
+                                      PI("block_size", bs), PS("kv_dtype", kvn) });
+                if (r2 != RAD_OK) { ok(w2.c_str(), false, "rc=" + std::to_string(r2)); continue; }
+                std::vector<uint8_t> c0(cb), c1(cb);
+                st_memcpy(c0.data(), dc[0], cb, hipMemcpyDeviceToHost);
+                st_memcpy(c1.data(), dc[1], cb, hipMemcpyDeviceToHost);
+                size_t ncd = 0, written = 0;
+                for (size_t i = 0; i < cb; ++i) { ncd += c0[i] != c1[i]; written += c1[i] != 0x5A; }
+                size_t nrow = 0;
+                for (int t = 0; t < 3; ++t) {
+                    void* const pr = t == 0 ? dq[1] : (t == 1 ? dk[1] : dv[1]);
+                    const size_t n = t == 0 ? hq.size() : hk.size();
+                    std::vector<uint16_t> a(n), b(n);
+                    st_memcpy(a.data(), pr, n * 2, hipMemcpyDeviceToHost);
+                    st_memcpy(b.data(), d3[t], n * 2, hipMemcpyDeviceToHost);
+                    for (size_t i = 0; i < n; ++i) nrow += a[i] != b[i];
+                }
+                ok((w2 + " folded into one launch is byte-identical to the pair").c_str(),
+                   ncd == 0 && nrow == 0 && written > 0,
+                   "cache bytes differ " + std::to_string(ncd) + ", q/k/v differ " +
+                       std::to_string(nrow) + ", cache bytes written " + std::to_string(written));
+            }
         }
     }
+}
+
+/* ---- add_rmsnorm, against add then rmsnorm --------------------------------------------------
+ *
+ * x = x + a, then rmsnorm of the x written: a DFlash2 drafter's residual add and its next norm.
+ * Byte-identical on x and on y at every r4d_act_threads width (a query pass's rows, a prefill
+ * chunk's), with an f32 gain (as plugins declare) and a bf16 one, with and without Gemma's `1 +`. */
+static void add_rmsnorm_numeric(const Plugin& pl) {
+    const RadKernelInfo* ad  = find(pl, "add_bf16");
+    const RadKernelInfo* nrm = find(pl, "rmsnorm_bf16");
+    const RadKernelInfo* fz  = find(pl, "add_rmsnorm_bf16");
+    if (!ad || !nrm || !fz) { ok("add_rmsnorm vs add + rmsnorm", false, "rows absent"); return; }
+    const int64_t K = 5376;
+    for (const int64_t M : { (int64_t)1, (int64_t)8, (int64_t)16, (int64_t)40, (int64_t)300 })
+        for (int form = 0; form < 3; ++form) {
+            const bool f32 = form != 1;
+            const double wadd = form == 2 ? 1.0 : 0.0;
+            std::vector<uint16_t> hx((size_t)M * K), ha((size_t)M * K), hwb((size_t)K);
+            std::vector<float> hwf((size_t)K);
+            for (int64_t r = 0; r < M; ++r)
+                for (int64_t c = 0; c < K; ++c) {
+                    hx[(size_t)r * K + c] = h_to_bf16(0.029f * (float)((r * 31 + c * 17) % 73) - 1.1f);
+                    ha[(size_t)r * K + c] = h_to_bf16(0.013f * (float)((r * 11 + c * 23) % 61) - 0.4f);
+                }
+            for (int64_t c = 0; c < K; ++c) {
+                hwf[(size_t)c] = 0.7f + 0.0031f * (float)((c * 19) % 53);
+                hwb[(size_t)c] = h_to_bf16(hwf[(size_t)c]);
+            }
+            const size_t nb = (size_t)M * K * 2;
+            void* dx[2] = { dalloc(nb), dalloc(nb) };
+            void* dy[2] = { dalloc(nb), dalloc(nb) };
+            void* da = dalloc(nb);
+            void* dw = dalloc((size_t)K * 4);
+            if (!dx[1] || !dy[1] || !da || !dw) { ok("add_rmsnorm alloc", false, "hipMalloc failed"); return; }
+            for (int j = 0; j < 2; ++j) st_memcpy(dx[j], hx.data(), nb, hipMemcpyHostToDevice);
+            st_memcpy(da, ha.data(), nb, hipMemcpyHostToDevice);
+            if (f32) st_memcpy(dw, hwf.data(), (size_t)K * 4, hipMemcpyHostToDevice);
+            else     st_memcpy(dw, hwb.data(), (size_t)K * 2, hipMemcpyHostToDevice);
+            const uint32_t wdt = f32 ? RAD_F32 : RAD_BF16;
+            const double eps = 1e-6;
+            int rc = launch_row(ad, { T(dx[0], RAD_BF16, { M, K }), T(da, RAD_BF16, { M, K }), T(dx[0], RAD_BF16, { M, K }) },
+                                { PI("M", M), PI("n", K), PS("dtype", "bf16") });
+            if (rc == RAD_OK)
+                rc = launch_row(nrm, { T(dx[0], RAD_BF16, { M, K }), T(dw, wdt, { K }), T(dy[0], RAD_BF16, { M, K }) },
+                                { PI("M", M), PI("n", K), PF("eps", eps), PS("dtype", "bf16"), PF("wadd", wadd) });
+            if (rc == RAD_OK)
+                rc = launch_row(fz, { T(dx[1], RAD_BF16, { M, K }), T(da, RAD_BF16, { M, K }), T(dw, wdt, { K }),
+                                      T(dy[1], RAD_BF16, { M, K }) },
+                                { PI("M", M), PI("n", K), PF("eps", eps), PS("dtype", "bf16"), PF("wadd", wadd) });
+            const std::string what = std::string("add_rmsnorm M=") + std::to_string(M) +
+                                     (f32 ? " f32 gain" : " bf16 gain") + (wadd != 0.0 ? " wadd=1" : "");
+            if (rc != RAD_OK) { ok(what.c_str(), false, "rc=" + std::to_string(rc)); continue; }
+            size_t ndx = 0, ndy = 0, moved = 0;
+            for (int t = 0; t < 2; ++t) {
+                std::vector<uint16_t> u((size_t)M * K), v((size_t)M * K);
+                st_memcpy(u.data(), t ? dy[0] : dx[0], nb, hipMemcpyDeviceToHost);
+                st_memcpy(v.data(), t ? dy[1] : dx[1], nb, hipMemcpyDeviceToHost);
+                for (size_t i = 0; i < u.size(); ++i) {
+                    (t ? ndy : ndx) += u[i] != v[i];
+                    if (!t) moved += v[i] != hx[i];
+                }
+            }
+            ok((what + " is byte-identical to add + rmsnorm").c_str(), ndx == 0 && ndy == 0 && moved > 0,
+               "x differs " + std::to_string(ndx) + ", y differs " + std::to_string(ndy));
+        }
 }
 
 /* ---- rmsnorm_quant_i8, against the chain it replaces ------------------------------------------
@@ -23810,6 +23968,20 @@ static void device_phase(const Plugin& pl) {
     attn_case(pl, "attn_decode_h256_gqa6_bf16kv",  256, 6,  1, "bf16",     0);
     attn_case(pl, "attn_decode_h128_gqa4_fp8kv",   128, 4,  1, "fp8_e4m3", 0);
     attn_case(pl, "attn_decode_h128_gqa4_bf16kv",  128, 4,  1, "bf16",     0);
+    /* attn_paged_qrow on the split-KV decode kernel: head_dim 128 at gqa 8 (two query groups a kv
+     * head, R4DArgs::kv_rep) at the drafter's block of 16, windowed and not, and the h256/gqa2
+     * decode with q as a slice of a wider row, at one row and at a verify's sixteen. */
+    for (const char* kvd : { "fp8_e4m3", "bf16" }) {
+        const bool f8 = !std::strcmp(kvd, "bf16") ? false : true;
+        const char* r128 = f8 ? "attn_qrow_h128_gqa8_fp8kv" : "attn_qrow_h128_gqa8_bf16kv";
+        const char* r256 = f8 ? "attn_qrow_decode_h256_gqa2_fp8kv" : "attn_qrow_decode_h256_gqa2_bf16kv";
+        attn_numeric_case(pl, r128, 128, 8, 16, kvd, 0, 256);
+        attn_numeric_case(pl, r128, 128, 8, 16, kvd, 48, 256);
+        attn_numeric_case(pl, r128, 128, 8, 1, kvd, 0, 256, 16, 2048);
+        attn_numeric_case(pl, r256, 256, 2, 1, kvd, 0, 256, 16, 2048);
+        attn_numeric_case(pl, r256, 256, 2, 16, kvd, 0, 256, 16, 2048);
+        attn_numeric_case(pl, r256, 256, 2, 16, kvd, 64, 256);
+    }
     attn_case(pl, "attn_prefill_h64_gqa4_bf16kv",   64, 4, 32, "bf16",     1);
     attn_case(pl, "attn_prefill_h64_gqa4_bf16kv",   64, 4,  1, "bf16",     1);
     /* Gemma 4 dense sliding window, decode, with the model's window of 1024: exercises the
@@ -26131,13 +26303,19 @@ static void device_phase(const Plugin& pl) {
         if (!g_case) std::printf("\ngelu_mul_quant_i8, against the pair it replaces\n");
         gelu_mul_quant_i8_numeric(pl);
     }
-    if (sel("qkv_norm_rope_bf16")) {
-        if (!g_case) std::printf("\nqkv_norm_rope, against the five ops it replaces\n");
+    if (sel("qkv_norm_rope_bf16") || sel("qkv_norm_rope_kv_store_fp8") ||
+        sel("qkv_norm_rope_kv_store_bf16")) {
+        if (!g_case) std::printf("\nqkv_norm_rope, and with kv_store folded in, against the ops it "
+                                 "replaces\n");
         qkv_norm_rope_numeric(pl);
     }
     if (sel("rmsnorm_quant_i8")) {
         if (!g_case) std::printf("\nrmsnorm_quant_i8, against the chain it replaces\n");
         rmsnorm_quant_i8_numeric(pl);
+    }
+    if (sel("add_rmsnorm_bf16")) {
+        if (!g_case) std::printf("\nadd_rmsnorm, against add then rmsnorm\n");
+        add_rmsnorm_numeric(pl);
     }
 
     /* The MTP head's fc is K=10240; the DFlash2 drafter's is 25600, the largest K any shape asks

@@ -728,6 +728,21 @@ static const RadOperandSpec oGemmNt[] = {
  * (w5a16, w4a16_asym, w4a8i8_asym, w5a8i8): weight rows [0, pb1), [pb1, pb2) and [pb2, N) each
  * meet their own copy of the activation, side by side in a row of `a` ([M, parts * K]). 0 leaves a
  * bound out. Absent on other grids, where a fused projection has one activation. */
+/* `add_rmsnorm` is `add` (x += a) followed by `rmsnorm` of the x it wrote (docs/OPS.md). */
+static const RadParamSpec pAddRmsNorm[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "n",     RAD_P_INT, RAD_REQUIRED },
+    P_F64("eps"),
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+    P_F64O("wadd"),
+    P_F64O("mult"),
+};
+static const RadOperandSpec oAddRmsNorm[] = {
+    { "x", RAD_OPD_INOUT,  0 },
+    { "a", RAD_OPD_IN,     0 },
+    { "w", RAD_OPD_WEIGHT, 0 },
+    { "y", RAD_OPD_OUT,    0 },
+};
 static const RadParamSpec pGemmNtQ[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "N",     RAD_P_INT, RAD_REQUIRED },
@@ -1404,6 +1419,7 @@ static const RadParamSpec pQkvNormRope[] = {
     { "ladder",     RAD_P_STR, RAD_OPTIONAL },
     P_F64O("wadd"),
     { "v_from_k",   RAD_P_INT, RAD_OPTIONAL },
+    /* 0 leaves v unnormed (Gemma 3; a Qwen3-shaped layer); absent, 1 */
     { "v_norm",     RAD_P_INT, RAD_OPTIONAL },
     { "dtype",      RAD_P_STR, RAD_REQUIRED },
 };
@@ -1414,6 +1430,39 @@ static const RadOperandSpec oQkvNormRope[] = {
     { "positions", RAD_OPD_IN,     0 },
     { "q_w",       RAD_OPD_WEIGHT, 0 },
     { "k_w",       RAD_OPD_WEIGHT, 0 },
+};
+/* `qkv_norm_rope_kv_store` is qkv_norm_rope followed by kv_store in one launch: the prologue's
+ * operands, then kv_store's slot mapping and paged cache; every parameter is one of the two ops'.
+ * Byte-identical to the pair (docs/OPS.md). */
+static const RadParamSpec pQkvNormRopeKv[] = {
+    { "M",          RAD_P_INT, RAD_REQUIRED },
+    { "head_dim",   RAD_P_INT, RAD_REQUIRED },
+    { "n_head",     RAD_P_INT, RAD_REQUIRED },
+    { "n_head_kv",  RAD_P_INT, RAD_REQUIRED },
+    P_F64("theta"),
+    P_F64("eps"),
+    P_F64O("scale"),
+    { "mode",       RAD_P_STR, RAD_OPTIONAL },
+    { "rotary_dim", RAD_P_INT, RAD_OPTIONAL },
+    { "ladder",     RAD_P_STR, RAD_OPTIONAL },
+    P_F64O("wadd"),
+    { "v_from_k",   RAD_P_INT, RAD_OPTIONAL },
+    { "dtype",      RAD_P_STR, RAD_REQUIRED },
+    { "v_norm",     RAD_P_INT, RAD_OPTIONAL },
+    { "block_size", RAD_P_INT, RAD_REQUIRED },
+    { "kv_dtype",   RAD_P_STR, RAD_REQUIRED },
+    P_F64O("k_scale"),
+    P_F64O("v_scale"),
+};
+static const RadOperandSpec oQkvNormRopeKv[] = {
+    { "q",            RAD_OPD_INOUT,  0 },
+    { "k",            RAD_OPD_INOUT,  0 },
+    { "v",            RAD_OPD_INOUT,  0 },
+    { "positions",    RAD_OPD_IN,     0 },
+    { "q_w",          RAD_OPD_WEIGHT, 0 },
+    { "k_w",          RAD_OPD_WEIGHT, 0 },
+    { "slot_mapping", RAD_OPD_IN,     0 },
+    { "kv_cache",     RAD_OPD_INOUT,  0 },
 };
 
 /* `gelu_mul_quant_i8` is `gelu_mul` with quant_act_i8's quantiser on its pass: the down projection
@@ -3097,9 +3146,17 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("rmsnorm_quant_i8", pRmsNormQuantI8, oRmsNormQuantI8,
            "RMS norm and the per-row int8 quantiser the w4a8 skinny GEMM reads, in one pass; with "
            "a residual the norm is of residual + x (+ a post-norm of x, x a scalar), stored back."),
+    SCHEMA("add_rmsnorm", pAddRmsNorm, oAddRmsNorm,
+           "x = x + a, then y = rmsnorm(x) * (w + wadd) * mult over the x written: a residual add "
+           "and the next norm in one pass, byte-identical to add then rmsnorm. The norm is taken "
+           "over the bf16 sum it stores; rmsnorm_add normalises the unrounded one."),
     SCHEMA("qkv_norm_rope", pQkvNormRope, oQkvNormRope,
            "per-head q and k RMS norms, the weightless v norm and the rotary of q and k over separate "
-           "q, k and v projections, in one dispatch; v from the raw k under v_from_k."),
+           "q, k and v projections, in one dispatch; v from the raw k under v_from_k. n_head 0 "
+           "leaves q unread (the k and v heads alone)."),
+    SCHEMA("qkv_norm_rope_kv_store", pQkvNormRopeKv, oQkvNormRopeKv,
+           "qkv_norm_rope, then kv_store of the finished k and v heads into the paged cache, in one "
+           "launch."),
     SCHEMA("gelu_mul_quant_i8", pGeluMulQuantI8, oGeluMulQuantI8,
            "gelu(gate) * up (tanh form) and the per-row int8 quantiser the w4a8 skinny GEMM reads, in "
            "one pass."),
@@ -3547,6 +3604,19 @@ static const RadConstraint cAttnDecodeH256Gqa2Fp8[] = {
 static const RadConstraint cAttnDecodeH256Gqa2Bf16[] = {
     C_GE("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 2), C_EQ("block_size", 16),
     C_GE("causal", 0), C_LE("q_len", 32), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
+};
+/* Head_dim 128 at 8 queries per kv head under attn_paged_qrow: the gqa-4 kernel above with each kv
+ * head mapped onto two query groups (R4DArgs::kv_rep), so q_len * 4 <= 64 bounds it where gqa 8's
+ * own decode (q_len <= 8, no window) stops at 8. The 31B's DFlash drafter: 64 heads over 8 kv heads,
+ * sliding layers over 2048 and a full non-causal one, at a block of 16. Under attn_paged_qrow, which
+ * no host library declares, so a drafter asking for it learns whether a card serves it. */
+static const RadConstraint cAttnQrowH128G8Fp8[] = {
+    C_GE("window", 0), C_EQ("head_dim", 128), C_EQ("gqa", 8), C_EQ("block_size", 16),
+    C_GE("causal", 0), C_LE("q_len", 16), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
+};
+static const RadConstraint cAttnQrowH128G8Bf16[] = {
+    C_GE("window", 0), C_EQ("head_dim", 128), C_EQ("gqa", 8), C_EQ("block_size", 16),
+    C_GE("causal", 0), C_LE("q_len", 16), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
 };
 /* Gemma 4 dense sliding-window prefill (r4d_attn_paged_h256_gqa2.hip): the decode leg's geometry
  * without a q_len bound, serving q_len > 32. The kernel's WIN bit masks the window and skips tiles
@@ -4480,12 +4550,23 @@ static const RadConstraint cRmsNormQuantI8[] = {
     C_DIV("n", 16), C_LE("n", 30720), C_IN("dtype", "bf16"),
 };
 /* head_dim 256 or 512: a workgroup is one head, a thread one channel. */
+static const RadConstraint cAddRmsNorm[] = {
+    C_GE("n", 1), C_IN("dtype", "bf16"),
+};
 static const RadConstraint cQkvNormRope[] = {
     C_GE("head_dim", 256), C_LE("head_dim", 512), C_DIV("head_dim", 256), C_IN("dtype", "bf16"),
 };
 /* Gemma 3's prologue (arch/gemma3): head_dim 128, usually with v_norm 0. */
 static const RadConstraint cQkvNormRopeH128[] = {
     C_EQ("head_dim", 128), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cQkvNormRopeKv[] = {
+    C_GE("head_dim", 256), C_LE("head_dim", 512), C_DIV("head_dim", 256), C_IN("dtype", "bf16"),
+    C_GE("block_size", 1), C_IN("kv_dtype", "fp8_e4m3"),
+};
+static const RadConstraint cQkvNormRopeKvBf16[] = {
+    C_GE("head_dim", 256), C_LE("head_dim", 512), C_DIV("head_dim", 256), C_IN("dtype", "bf16"),
+    C_GE("block_size", 1), C_IN("kv_dtype", "bf16"),
 };
 static const RadConstraint cGeluMulQuantI8[] = {
     C_DIV("n", 16), C_LE("n", 30720), C_IN("dtype", "bf16"),
@@ -5902,6 +5983,52 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_attn_decode_h128_gqa2w_bf16, r4d_rad_attn_decode_h128_gqa2w_scratch,
   nullptr, nullptr,
   r4d_shape_attn_paged },
+/* The same decode under attn_paged_qrow, reading q at its own row pitch: Gemma 4 31B's sliding
+ * layers read q in the fused q|k|v row. It outranks the windowed qrow rows (R4D_PRIO_ONLY) in its
+ * band, as attn_paged's does, since it takes 0.26-0.71 of their time there; above q_len 32 the
+ * windowed kernel serves the op alone. No opd_shape, as for every qrow row: libref has none. */
+{ "attn_qrow_decode_h256_gqa2_fp8kv", "attn_paged_qrow", "attn",
+  "paged attention reading q at its own row pitch, sliding window, split-KV (decode / verify)",
+  "head_dim 256, 2 queries per kv head, paged block 16, q_len*gqa <= 64, "
+  "window taken from the launch argument (0 = full attention)",
+  "bf16 query (any row pitch, a multiple of 4), fp8-e4m3 kv cache with per-(seq,head) descales, "
+  "bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnDecodeH256Gqa2Fp8), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_qrow_decode_h256_gqa2_fp8,
+  r4d_rad_attn_qrow_decode_h256_gqa2_scratch,
+  nullptr, nullptr, nullptr },
+
+{ "attn_qrow_decode_h256_gqa2_bf16kv", "attn_paged_qrow", "attn",
+  "paged attention reading q at its own row pitch, sliding window, split-KV (decode / verify)",
+  "head_dim 256, 2 queries per kv head, paged block 16, q_len*gqa <= 64, "
+  "window taken from the launch argument (0 = full attention)",
+  "bf16 query (any row pitch, a multiple of 4), bf16 kv cache, bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnDecodeH256Gqa2Bf16), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_qrow_decode_h256_gqa2_bf16,
+  r4d_rad_attn_qrow_decode_h256_gqa2_scratch,
+  nullptr, nullptr, nullptr },
+
+/* Head_dim 128 at gqa 8 under attn_paged_qrow (cAttnQrowH128G8Fp8 says why). */
+{ "attn_qrow_h128_gqa8_fp8kv", "attn_paged_qrow", "attn",
+  "paged attention, any window, causal or not, split-KV (draft block); q at any row pitch",
+  "head_dim 128, 8 queries per kv head as two groups of 4 a kv head, paged block 16, q_len <= 16",
+  "bf16 query (any row pitch, a multiple of 4), fp8-e4m3 kv cache with per-(seq,head) descales, "
+  "bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnQrowH128G8Fp8), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_qrow_h128_gqa8_fp8, r4d_rad_attn_qrow_h128_gqa8_scratch,
+  nullptr, nullptr, nullptr },
+
+{ "attn_qrow_h128_gqa8_bf16kv", "attn_paged_qrow", "attn",
+  "paged attention, any window, causal or not, split-KV (draft block); q at any row pitch",
+  "head_dim 128, 8 queries per kv head as two groups of 4 a kv head, paged block 16, q_len <= 16",
+  "bf16 query (any row pitch, a multiple of 4), bf16 kv cache, bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnQrowH128G8Bf16), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_qrow_h128_gqa8_bf16, r4d_rad_attn_qrow_h128_gqa8_scratch,
+  nullptr, nullptr, nullptr },
 
 { "attn_prefill_h256_gqa8_fp8kv", "attn_paged", "attn",
   "paged causal attention, query-tiled (prefill / chunked prefill)",
@@ -7662,7 +7789,7 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "rope x2, each norm taken by its standalone kernel's partition",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cQkvNormRope), NOTUNE,
-  nullptr, nullptr, r4d_rad_qkv_norm_rope },
+  nullptr, nullptr, r4d_rad_qkv_norm_rope, nullptr, nullptr, nullptr, r4d_shape_qkv_norm_rope },
 
 { "qkv_norm_rope_h128_bf16", "qkv_norm_rope", "attn",
   "per-head RMS norms of separate q and k projections, the weightless norm of v unless v_norm is 0, "
@@ -7674,6 +7801,41 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cQkvNormRopeH128), NOTUNE,
   nullptr, nullptr, r4d_rad_qkv_norm_rope },
+
+/* The prologue and the cache store in one launch: a k (or v) head's block ends holding its token's
+ * finished head, so it writes it into the cache too, converted as kv_store converts it. Saves the
+ * store's launch a layer, which at decode is most of its cost. */
+{ "qkv_norm_rope_kv_store_fp8", "qkv_norm_rope_kv_store", "attn",
+  "qkv_norm_rope, and kv_store into an E4M3 paged cache from the same launch",
+  "qkv_norm_rope's shapes; cache exactly [n_blocks, n_head_kv, block_size, 2*head_dim], one slot "
+  "a row; a negative or out-of-range slot stores nothing",
+  "bf16 q/k/v and gains (or f32 gains), i32 positions and slots, fp8-e4m3 cache, scalar "
+  "k_scale / v_scale descales; byte-identical to qkv_norm_rope + kv_store_fp8",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQkvNormRopeKv), NOTUNE,
+  nullptr, nullptr, r4d_rad_qkv_norm_rope_kv_store, nullptr, nullptr, nullptr,
+  r4d_shape_qkv_norm_rope_kv_store, nullptr, r4d_fuse_qkv_norm_rope_kv_store },
+
+/* The same into a bf16 cache: the store is the values kv_store_bf16 copies. */
+{ "qkv_norm_rope_kv_store_bf16", "qkv_norm_rope_kv_store", "attn",
+  "qkv_norm_rope, and kv_store into a bf16 paged cache from the same launch",
+  "qkv_norm_rope's shapes; cache exactly [n_blocks, n_head_kv, block_size, 2*head_dim], one slot "
+  "a row; a negative or out-of-range slot stores nothing",
+  "bf16 q/k/v, gains, cache; i32 positions and slots; byte-identical to qkv_norm_rope + "
+  "kv_store_bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQkvNormRopeKvBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_qkv_norm_rope_kv_store, nullptr, nullptr, nullptr,
+  r4d_shape_qkv_norm_rope_kv_store, nullptr, r4d_fuse_qkv_norm_rope_kv_store },
+
+{ "add_rmsnorm_bf16", "add_rmsnorm", "norm",
+  "x += a, then the root-mean-square norm of the x written, one workgroup a row as rmsnorm_bf16",
+  "any n; rmsnorm_bf16's width and column partition, so the sum of squares folds as it does",
+  "bf16 x / a / y, f32 or bf16 gain, fp32 reduction; byte-identical to add_bf16 + rmsnorm_bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cAddRmsNorm), NOTUNE,
+  nullptr, nullptr, r4d_rad_add_rmsnorm, nullptr, nullptr, nullptr,
+  r4d_shape_add_rmsnorm, nullptr, r4d_fuse_add_rmsnorm },
 
 { "gelu_mul_quant_i8", "gelu_mul_quant_i8", "quant",
   "gelu(gate) * up, the tanh form, and quant_act_i8's quantiser in one pass over the row",

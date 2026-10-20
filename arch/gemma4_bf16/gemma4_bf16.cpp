@@ -276,11 +276,16 @@ struct Gemma4Attn {
            op_rq = 0, op_rk = 0, op_attn = 0, op_kv = 0, op_post = 0, op_ar = 0, op_add = 0;
     /* the five prologue ops (v norm, q norm, k norm, two rotaries) as one, where it resolves */
     rad_op op_qnr = 0;
+    /* ...and that with kv_store folded in (qkv_norm_rope_kv_store), issued in place of op_qnr and
+     * op_kv where it resolves; op_kv is then not declared */
+    rad_op op_qnr_kv = 0;
     /* Fused only: attention reading q where it lies in the row (attn_paged_qrow), where it resolves
-     * to the kernel attn_paged would take anyway; else the copy of q into its own rows (`cast`) that
-     * a step of more than one row issues ahead of attn_paged. Without qkv_norm_rope the copies of
-     * k and v too, ahead of the unfused prologue, which reads them dense. */
-    rad_op op_attn_row = 0, op_lift_q = 0, op_lift_k = 0, op_lift_v = 0;
+     * to the kernel attn_paged would take anyway -- at every height (op_attn_row), or at decode
+     * heights up to dec_hi query rows a sequence (op_attn_dec); else the copy of q into its own rows
+     * (`cast`) that a step of more than one row issues ahead of attn_paged. Without qkv_norm_rope
+     * the copies of k and v too, ahead of the unfused prologue, which reads them dense. */
+    rad_op op_attn_row = 0, op_attn_dec = 0, op_lift_q = 0, op_lift_k = 0, op_lift_v = 0;
+    int64_t dec_hi = 0;
 
     /* The linear whose int8 pair a junction writes, and whether every projection reads it. */
     const G4Linear& ln_in() const { return fused ? ln_qkv : ln_q; }
@@ -426,9 +431,10 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
     /* Gemma 4 scores Q.K without the 1/sqrt(head_dim) factor (HF Gemma4TextAttention and vLLM
      * use scaling = 1.0; the q/k norm gains absorb it). attn_paged defaults to 1/sqrt(head_dim),
      * so 1.0 is passed explicitly. */
-    auto attn = [&](const char* op, std::initializer_list<rad_buf> rd) {
+    auto attn = [&](const char* op, std::initializer_list<rad_buf> rd, int64_t q_hi = 0) {
         return rw(b, RAD_OP(b, op,
-                     RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok), RAD_INT("head_dim", cls.head_dim),
+                     RAD_PARAMS(RAD_RANGE("q_len", 1, q_hi > 0 ? q_hi : g.max_tok),
+                                RAD_INT("head_dim", cls.head_dim),
                                 RAD_INT("gqa", cls.gqa()), RAD_INT("causal", 1),
                                 RAD_INT("window", cls.window), RAD_INT("n_head", cls.n_head),
                                 RAD_INT("block_size", RAD_KV_BLOCK),
@@ -445,6 +451,14 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
      * keeps the five, as does an engine whose libraries do not declare it (CPU-only), where asking
      * for it would stop the declare. It reads q, k and v at their own row pitches, so on a fused
      * layer it works in place on the row's column slices. */
+    /* What the prologue reads and writes, either form. A k_eq_v class derives v from the raw k:
+     * v is written, never read. */
+    auto qnr_rw = [&](rad_op op) {
+        if (fused)
+            return cls.has_v ? rw(b, op, {w.qkv}, {w.qkv}) : rw(b, op, {w.qkv}, {w.qkv, w.v});
+        return cls.has_v ? rw(b, op, {w.q, w.k, w.v}, {w.q, w.k, w.v})
+                         : rw(b, op, {w.q, w.k}, {w.q, w.k, w.v});
+    };
     auto decl_qnr = [&]() {
         if (g.rope_mc || g.yarn.factor != 0.0f || !rad_op_declared(b, "qkv_norm_rope")) return;
         op_qnr = RAD_OP(b, "qkv_norm_rope",
@@ -457,13 +471,7 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
                                  RAD_F64("wadd", g.wadd_qk), RAD_INT("v_from_k", cls.has_v ? 0 : 1),
                                  RAD_STR("dtype", g.dtype)),
                       RAD_WEIGHTS(w_qn, w_kn));
-        /* A k_eq_v class derives v from the raw k: v is written, never read. */
-        if (fused)
-            op_qnr = cls.has_v ? rw(b, op_qnr, {w.qkv}, {w.qkv})
-                               : rw(b, op_qnr, {w.qkv}, {w.qkv, w.v});
-        else
-            op_qnr = cls.has_v ? rw(b, op_qnr, {w.q, w.k, w.v}, {w.q, w.k, w.v})
-                               : rw(b, op_qnr, {w.q, w.k}, {w.q, w.k, w.v});
+        op_qnr = qnr_rw(op_qnr);
     };
 
     /* A column slice of the fused row copied into its own rows (`cast`, bf16 to bf16, which every
@@ -489,29 +497,60 @@ int Gemma4Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
         }
         /* With it attention reads q in the row where that costs nothing. libr4d's dedicated paged
          * kernels stop at head_dim 256; at 512 (the global class) attn_paged takes the windowed
-         * kernel, which is the kernel attn_paged_qrow takes, so the row is read in place. At 256 the
-         * dedicated h256 kernels serve attn_paged in 0.26-0.71 of the windowed kernel's time
-         * (libr4d/r4d_plugin.h, R4D_PRIO_ATTN_WINDOW), so the sliding class keeps attn_paged: a step
-         * of one row reads q in place (one row of a slice is dense), a taller one copies q out. */
-        if (op_qnr && cls.head_dim > 256 && rad_op_declared(b, "attn_paged_qrow"))
+         * kernel, which is the kernel attn_paged_qrow takes, so the row is read in place at every
+         * height. At 256 the dedicated h256 kernels serve attn_paged in 0.26-0.71 of the windowed
+         * kernel's time (libr4d/r4d_plugin.h, R4D_PRIO_ATTN_WINDOW). Their split-KV decode reads q
+         * at a pitch under attn_paged_qrow too, over its band (q_len * gqa <= 64: 32 query rows a
+         * sequence at the sliding class's gqa 2), so the sliding class reads the row there -- a
+         * verify step included -- and keeps attn_paged above it, a prefill copying q out first. */
+        const bool qrow = op_qnr && rad_op_declared(b, "attn_paged_qrow");
+        if (qrow && cls.head_dim > 256) {
             op_attn_row = attn("attn_paged_qrow", {w.qkv});
+        } else if (qrow) {
+            dec_hi = std::min<int64_t>(g.max_tok, 64 / cls.gqa());
+            op_attn_dec = attn("attn_paged_qrow", {w.qkv}, dec_hi);
+            if (!op_attn_dec) dec_hi = 0;
+        }
         if (!op_attn_row) {
             op_lift_q = lift(qd, w.q);
             op_attn = attn("attn_paged", {w.q, w.qkv});
         }
     }
 
+    /* With the cache store folded into the prologue where a library serves it
+     * (qkv_norm_rope_kv_store: the same prologue, then kv_store of the finished k and v from the
+     * same launch, byte for byte), one launch a layer fewer. Declared after the attention ops,
+     * since its block_size comes off the resolved attention kernel (rad_kv_block_size), and
+     * issued in place of op_qnr and op_kv. */
+    if (op_qnr && rad_op_declared(b, "qkv_norm_rope_kv_store")) {
+        op_qnr_kv = RAD_OP(b, "qkv_norm_rope_kv_store",
+                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", cls.head_dim),
+                                 RAD_INT("n_head", cls.n_head), RAD_INT("n_head_kv", cls.n_head_kv),
+                                 RAD_F64("theta", cls.theta), RAD_F64("eps", g.eps),
+                                 RAD_F64("scale", cls.scale), RAD_STR("mode", "neox"),
+                                 RAD_INT("rotary_dim", cls.n_rot),
+                                 RAD_STR("ladder", cls.head_ladder ? "head" : "rotary"),
+                                 RAD_F64("wadd", g.wadd_qk), RAD_INT("v_from_k", cls.has_v ? 0 : 1),
+                                 RAD_STR("dtype", g.dtype),
+                                 RAD_INT("block_size", rad_kv_block_size(b, kv)),
+                                 RAD_STR("kv_dtype", g.kv_dtype)),
+                      RAD_WEIGHTS(w_qn, w_kn));
+        if (op_qnr_kv) op_qnr_kv = qnr_rw(op_qnr_kv);
+    }
     /* On a fused layer with the one-op prologue, k and v are stored from the row (kv_store takes
-     * them at their own pitches); a k_eq_v class's v is its own buffer either way. */
-    op_kv = RAD_OP(b, "kv_store",
-                RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", cls.head_dim),
-                           RAD_INT("n_head_kv", cls.n_head_kv),
-                           RAD_INT("block_size", rad_kv_block_size(b, kv)),
-                           RAD_STR("kv_dtype", g.kv_dtype)),
-                RAD_NOWEIGHTS);
-    if (!(fused && op_qnr)) op_kv = rw(b, op_kv, {w.k, w.v}, {});
-    else if (cls.has_v)     op_kv = rw(b, op_kv, {w.qkv}, {});
-    else                    op_kv = rw(b, op_kv, {w.qkv, w.v}, {});
+     * them at their own pitches); a k_eq_v class's v is its own buffer either way. Not declared
+     * where the prologue stores them itself. */
+    if (!op_qnr_kv) {
+        op_kv = RAD_OP(b, "kv_store",
+                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", cls.head_dim),
+                               RAD_INT("n_head_kv", cls.n_head_kv),
+                               RAD_INT("block_size", rad_kv_block_size(b, kv)),
+                               RAD_STR("kv_dtype", g.kv_dtype)),
+                    RAD_NOWEIGHTS);
+        if (!(fused && op_qnr)) op_kv = rw(b, op_kv, {w.k, w.v}, {});
+        else if (cls.has_v)     op_kv = rw(b, op_kv, {w.qkv}, {});
+        else                    op_kv = rw(b, op_kv, {w.qkv, w.v}, {});
+    }
 
     /* o_proj is column-sharded: the rank's partial sum is reduced first, then normed. */
     if (g.world > 1)
@@ -593,7 +632,10 @@ void Gemma4Attn::attend(RadCtx* c, const RadBatch* batch) const {
     const RadOperand K = row ? bcol(w.qkv, qd, kvd, T) : brows(w.k, T);
     const RadOperand V = row && cls.has_v ? bcol(w.qkv, qd + kvd, kvd, T) : brows(w.v, T);
 
-    if (op_qnr) {
+    if (op_qnr_kv) {
+        RAD_ISSUE(c, op_qnr_kv, Q, K, V, rope_posmc(g, batch, T), RAD_W(w_qn), RAD_W(w_kn),
+                  praw(slot, RAD_I32, T), kv_cache(kv, layer));
+    } else if (op_qnr) {
         RAD_ISSUE(c, op_qnr, Q, K, V, rope_posmc(g, batch, T), RAD_W(w_qn), RAD_W(w_kn));
     } else {
         if (fused) {   /* the unfused five read q, k and v dense */
@@ -610,13 +652,16 @@ void Gemma4Attn::attend(RadCtx* c, const RadBatch* batch) const {
         RAD_ISSUE(c, op_rk, brows(w.k, T), rope_posmc(g, batch, T));
     }
 
-    RAD_ISSUE(c, op_kv, K, V, praw(slot, RAD_I32, T), kv_cache(kv, layer));
+    if (op_kv) RAD_ISSUE(c, op_kv, K, V, praw(slot, RAD_I32, T), kv_cache(kv, layer));
 
     /* attn_paged reads q dense: one row of the row's slice is, a taller step copies q out. */
     rad_op a_op = op_attn;
     RadOperand a_q = brows(w.q, T);
     if (op_attn_row) {
         a_op = op_attn_row;
+        a_q  = Q;
+    } else if (op_attn_dec && batch->max_q_len <= dec_hi) {
+        a_op = op_attn_dec;
         a_q  = Q;
     } else if (row) {
         if (T == 1) a_q = Q;
@@ -1934,15 +1979,18 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              (long long)(g.n_layer - n_global), (long long)sliding_win,
               (long long)g.n_head, (long long)g.head_dim, (long long)g.n_head, (long long)head_g);
     {
-        int64_t n_fused = 0, n_row = 0;
+        int64_t n_fused = 0, n_row = 0, n_dec = 0, dec_hi = 0;
         for (const Layer& lay : m.layers) {
             n_fused += lay.attn.fused ? 1 : 0;
             n_row   += lay.attn.op_attn_row ? 1 : 0;
+            if (lay.attn.op_attn_dec) { ++n_dec; dec_hi = lay.attn.dec_hi; }
         }
         if (n_fused)
             rad_note(b, "q, k and v as one linear (blk.*.attn_qkv) on %lld of %lld layers; attention "
-                        "reads q in the row on %lld, copies it out above one row on the rest",
-                     (long long)n_fused, (long long)m.layers.size(), (long long)n_row);
+                        "reads q in the row at every height on %lld, up to %lld query rows a "
+                        "sequence on %lld, and copies it out above that or one row",
+                     (long long)n_fused, (long long)m.layers.size(), (long long)n_row,
+                     (long long)dec_hi, (long long)n_dec);
         else
             rad_note(b, "q, k and v as three linears (a container converted before attn_qkv, or "
                         "bf16 weights): convert with a recipe naming blk.*.attn_qkv.weight for one");

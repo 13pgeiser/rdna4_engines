@@ -117,6 +117,14 @@ int     r4d_rad_attn_prefill_h128_gqa2w_bf16 (const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_h128_gqa2w_fp8   (const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_h128_gqa2w_bf16  (const RadArgs*, RadStream);
 int64_t r4d_rad_attn_decode_h128_gqa2w_scratch(const RadArgs*);
+/* attn_paged_qrow on the split-KV decode kernel: the h256/gqa2 decode with q at its own pitch, and
+ * head_dim 128 at gqa 8 as the gqa-4 kernel with two query groups a kv head (R4DArgs::kv_rep). */
+int     r4d_rad_attn_qrow_decode_h256_gqa2_fp8   (const RadArgs*, RadStream);
+int     r4d_rad_attn_qrow_decode_h256_gqa2_bf16  (const RadArgs*, RadStream);
+int64_t r4d_rad_attn_qrow_decode_h256_gqa2_scratch(const RadArgs*);
+int     r4d_rad_attn_qrow_h128_gqa8_fp8   (const RadArgs*, RadStream);
+int     r4d_rad_attn_qrow_h128_gqa8_bf16  (const RadArgs*, RadStream);
+int64_t r4d_rad_attn_qrow_h128_gqa8_scratch(const RadArgs*);
 /* Paged attention at head_dim 256 and 512, 1/2/4/8 queries per KV head, any window, causal or not
  * (r4d_attn_paged_window.hip): one entry point per geometry and cache dtype, every q_len and any q
  * row pitch, so they serve both attn_paged and attn_paged_qrow. */
@@ -461,6 +469,8 @@ int64_t r4d_rad_moe_gather_scratch (const RadArgs*);
 /* -- quantisation, norms and the fusions (r4d_*quant*.hip, r4d_qk_norm_rope_gate.hip) -- */
 int r4d_rad_quant_act_i8          (const RadArgs*, RadStream);
 int r4d_rad_qkv_norm_rope         (const RadArgs*, RadStream);
+int r4d_rad_add_rmsnorm           (const RadArgs*, RadStream);
+int r4d_rad_qkv_norm_rope_kv_store(const RadArgs*, RadStream);
 int r4d_rad_gelu_mul_quant_i8     (const RadArgs*, RadStream);
 int r4d_rad_ar_rmsnorm_quant_i8   (const RadArgs*, RadStream);
 int r4d_rad_ar_rmsnorm_quant_i8_4rank(const RadArgs*, RadStream);
@@ -781,6 +791,9 @@ int r4d_shape_attn_paged        (const RadParam*, int, int operand, RadOpdDesc*)
 int r4d_shape_attn_paged_gate_quant(const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qk_norm_rope_gate (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_qk_norm_rope_gate_kv_store(const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_qkv_norm_rope     (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_qkv_norm_rope_kv_store(const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_add_rmsnorm(const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_rope_table        (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_gdn_gated_rmsnorm (const RadParam*, int, int operand, RadOpdDesc*);
 
@@ -853,6 +866,8 @@ int r4d_fuse_gate_quant_fp8      (const RadParam*, int, uint64_t, int, RadFuseSt
 int r4d_fuse_gemm_nt_q_gated     (const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_gdn_conv_recurrent_update(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_qk_norm_rope_gate_kv_store(const RadParam*, int, uint64_t, int, RadFuseStep*);
+int r4d_fuse_qkv_norm_rope_kv_store(const RadParam*, int, uint64_t, int, RadFuseStep*);
+int r4d_fuse_add_rmsnorm(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_ar_rmsnorm_quant_fp8(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_ar_gather_hc_write  (const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_attn_paged_gate_quant(const RadParam*, int, uint64_t, int, RadFuseStep*);
