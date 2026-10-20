@@ -2471,8 +2471,9 @@ int Engine::run_server() {
                     std::string* why) const override {
             const int s = rad_tools_text_prepare(*plugins, field, in, out);
             if (s < 0 && why)
-                *why = s == RAD_E_INVAL ? "the model cannot take this text"
-                                        : std::string(rad_strerror(s));
+                *why = !out->empty()       ? *out
+                       : s == RAD_E_INVAL ? "the model cannot take this text"
+                                          : std::string(rad_strerror(s));
             return s;
         }
         int submit(std::unique_ptr<gen::AudioRequest> r, std::string* why) override {

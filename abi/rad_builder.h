@@ -902,7 +902,8 @@ typedef struct RadAudioGenDecl {
     /* The prompt, as text the core tokenises: `{instructions}` is replaced by the request's
      * instructions (a piece's description, a voice's) and `{input}` by its input text (lyrics, the
      * words to speak), each first rewritten by the plugin's rad_arch_text_prepare when it exports
-     * one. Special tokens are spelled as text. */
+     * one. Special tokens are spelled as text. NULL for a model that takes no instructions, which
+     * then declares `tmpl_plain` and has a request's instructions refused. */
     const char* tmpl;
     /* The unconditional branch is the conditional prompt with every token but the first
      * `neg_keep_head` and the last `neg_keep_tail` replaced by `neg_token`, so the two branches
@@ -1430,8 +1431,9 @@ const RadAudioFormat* rad_arch_audio_format(const RadModelMeta* meta);
  *
  * `field` is RAD_TEXT_*, `in` NUL-terminated UTF-8. Writes at most `cap` bytes, the NUL included,
  * and returns the length the whole result needs without its NUL (call again with more room when
- * it is >= cap), or a negative status for text the model cannot take. Called on HTTP threads, so
- * it keeps no state. */
+ * it is >= cap), or a negative status for text the model cannot take, with the reason in `out`
+ * (NUL-terminated within `cap`) when it has one to give the caller. Called on HTTP threads, so it
+ * keeps no state. */
 enum { RAD_TEXT_INSTRUCTIONS = 1, RAD_TEXT_INPUT = 2 };
 int64_t rad_arch_text_prepare(int field, const char* in, char* out, int64_t cap);
 

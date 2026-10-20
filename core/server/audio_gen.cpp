@@ -110,6 +110,9 @@ int Server::speech_request(const json& body, const std::string& text,
         return fail(err_bad("instructions", "this model needs instructions, as a non-empty "
                                             "string: for a song its genre, mood, vocals and "
                                             "instruments"));
+    if (!inst.empty() && info.tmpl.empty())
+        return fail(err_unsupported("instructions", "this model takes no instructions; its "
+                                                    "direction is written in the input"));
     if (body.contains("speed") && !body["speed"].is_null() &&
         !(body["speed"].is_number() && body["speed"].get<double>() == 1.0))
         return fail(err_unsupported("speed", "this model keeps its own tempo; the instructions "

@@ -189,6 +189,11 @@ TEST(a_model_that_asks_has_its_input_read_with_special_tokens_and_one_branch_has
     CHECK_EQ(s.refused({ { "input", "hi" }, { "guidance_scale", 2.0 } }),
              std::string("guidance_scale"));
     CHECK_EQ(s.post({ { "input", "hi" }, { "guidance_scale", 1.0 } }).status, 200);
+    /* A model that declares no template with instructions refuses them by name. */
+    s.gen.inf.tmpl.clear();
+    CHECK_EQ(s.refused({ { "input", "hi" }, { "instructions", "calm" } }),
+             std::string("instructions"));
+    CHECK_EQ(s.post({ { "input", "hi" } }).status, 200);
     Speech m;
     m.gen.inf.tmpl_plain = "<s>{input}";
     m.gen.inf.default_steps = 0;

@@ -1361,7 +1361,12 @@ int Builder::declare_audio_generator(const RadAudioGenDecl* d) {
                 : prog_.generator.layout != 0 ? "an image generator" : "a video generator");
         return RAD_E_STATE;
     }
-    if (!d->tmpl || !std::strstr(d->tmpl, "{input}") || !std::strstr(d->tmpl, "{instructions}")) {
+    if (!d->tmpl && !d->tmpl_plain) {
+        err(RAD_E_INVAL, "declare_audio_generator '%s': no prompt template (tmpl or tmpl_plain)",
+            nm);
+        return RAD_E_INVAL;
+    }
+    if (d->tmpl && (!std::strstr(d->tmpl, "{input}") || !std::strstr(d->tmpl, "{instructions}"))) {
         err(RAD_E_INVAL, "declare_audio_generator '%s': tmpl needs {instructions} and {input}", nm);
         return RAD_E_INVAL;
     }
@@ -1460,7 +1465,7 @@ int Builder::declare_audio_generator(const RadAudioGenDecl* d) {
         !buf_ok(d->audio_out, RAD_F32, win_samples * d->channels, "audio_out"))
         return RAD_E_INVAL;
     prog_.agen_str.name = nm;
-    prog_.agen_str.tmpl = d->tmpl;
+    prog_.agen_str.tmpl = d->tmpl ? d->tmpl : "";
     prog_.agen_str.tmpl_plain = d->tmpl_plain ? d->tmpl_plain : "";
     prog_.agen_str.neg_tmpl = d->neg_tmpl ? d->neg_tmpl : "";
     prog_.audio_gen = *d;
