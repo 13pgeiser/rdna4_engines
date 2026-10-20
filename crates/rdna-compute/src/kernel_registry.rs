@@ -5233,16 +5233,19 @@ pub struct WalkedRoutePlan {
     pub rows: Vec<WalkedRouteRow>,
 }
 
-/// One walked module of one spec route: the symbols the dispatch bound and the
-/// SHA-256 of the effective HIP source or embedded image it loaded. `sha256`
-/// is historical provenance only, recorded by
-/// `scripts/route_plan_build.py` at walk time and kept byte-identical in the
-/// checked-in TSVs: the constructor below never compares it. The emitted plan
-/// always carries the current registry module/source/cache identity
-/// (`found.source`/`found.flags`/`found.scheduler_profile`, embedded runtime
-/// images unchanged), after validating unique module recipes and that the
-/// registry still exports every walked symbol with its current flags, profile,
-/// header, ABI, capture and shape bindings.
+/// One walked module of one spec route and the symbols the dispatch bound.
+/// For HIP rows, `sha256` is historical effective-source provenance; current
+/// plans bind the registry's source, flags and scheduler profile after checking
+/// the walked symbols and admission policy. Embedded rows retain strict
+/// equality with the recorded binary image SHA-256.
+#[derive(Debug)]
+pub struct WalkedRouteRow {
+    pub native_mtp: bool,
+    pub embedded: bool,
+    pub module: &'static str,
+    pub symbols: Vec<&'static str>,
+    pub sha256: &'static str,
+}
 
 fn parse_walked_route_plan(text: &'static str) -> Result<WalkedRoutePlan, String> {
     let mut directive = std::collections::HashMap::new();
