@@ -1463,7 +1463,7 @@ still verified by the adapter, so output is exact and only the acceptance rate c
 | `--port N` | 8000 | listen port |
 | `--api-key KEY` | none | require `Authorization: Bearer KEY` or `X-Api-Key: KEY` on every request but `/health`, `/v1/health`, `/ping` and the dashboard page (§6.6) |
 | `--served-model-name NAME` | container's name | the model id `/v1/models` lists, the metrics carry and a response names when its request named none. A request may name any model; the loaded one serves it |
-| `--mm-max-patches N` | auto | patches one vision-encoder pass carries, and so the largest image (a patch is 16x16 pixels). `auto` is 16384 when the container carries a vision tower; 0 serves text only and keeps the tower off the card |
+| `--mm-max-patches N` | auto | patches one vision-encoder pass carries, and so the largest image (a patch is 16x16 pixels). `auto` is 16384 when the container carries a vision tower; 0 serves text only and keeps the tower off the card. A pass is not one tower invocation: inside it the tower batches at most 8 tiles per weight read, and the pass size may reduce that (4 tiles at the 64-pixel grid with the default 16384 patches); a picture contributes a separate pass per grid. See the concurrency notes for Unlimited-OCR (§5.17) |
 | `--override-chat-template PATH` | container's | a Jinja chat template file served in place of the container's. The reply format (reasoning markers, tool calls) is derived from it too, unless the architecture plugin declares one. An unreadable or empty file stops startup |
 | `--max-queued-requests N` | 8 × `--max-num-seqs` | requests admitted and unfinished at once; past it, 429 |
 | `--http-threads N` | one per hardware thread, at least 4 | HTTP workers kept while idle |
@@ -2548,7 +2548,9 @@ Gemma 4 text encoder (13 GiB in fp8) does not fit a 32 GB card beside the DiT: s
 
 ### 5.17 Documents: Unlimited-OCR
 
-`unlimited-ocr` (baidu/Unlimited-OCR, bf16; `deploy/compose/unlimited-ocr-bf16.yaml`) parses
+`unlimited-ocr` (baidu/Unlimited-OCR, bf16; the converted container is
+[Aijuus/unlimited-ocr-bf16](https://huggingface.co/Aijuus/unlimited-ocr-bf16), with its recipe;
+`deploy/compose/unlimited-ocr-bf16.yaml`) parses
 pictures of documents through the ordinary chat endpoint. It is a single-shot parser, not a
 conversation: one user message holds the picture(s) and the instruction, and the reply is the
 layout. The picture part comes **before** the text part (the reference prompt is `<image>` then
@@ -2589,6 +2591,34 @@ requests excluded from prefix reuse) and the 35-gram/128-token no-repeat ban, bo
 request (`ngram_ban_n`, `ngram_window`). It needs about 7 GiB on one card, so serve it alone; the
 compose file takes `RADIANCE_GPU` and the model file's VRAM, with the vision tower on the card and
 an fp8 KV cache.
+
+**Concurrency and tuning.** Encoding is a stop-the-world step: while one encode pass runs no
+request decodes, and a picture's TTFT is the passes queued ahead of it plus its own. On the mixed
+697/1517-token ladder the measured TTFT p50 is 355 / 717 / 1449 / 2786 ms at 1 / 2 / 4 / 8
+concurrent pages — linear in the queued **pass count**, not in tokens.
+
+A picture contributes one pass per encoder geometry: its 40-pixel line segments first, then its
+64-pixel global view and separator. A pass carries at most `--mm-max-patches` patches, ends at a
+geometry change, and items are packed in arrival order, so pages do not share a pass. A
+1024-pixel picture (four 640 tiles plus the global view) is 10,768 patches — two passes; a
+1000x1400 picture (~12 tiles) has 19,200 patches in its 40-pixel part, so that part splits into
+two passes: three in all.
+
+`--mm-max-patches` bounds a pass, not one tower invocation. Within a pass the tower batches at
+most `kBatchCap` (8) tiles per weight read, and the pass size can lower that: at the default
+16384 patches it is 8 at the 40-pixel grid but 4 at 64. So a 10-tile pass still runs as 8+2
+batched invocations, and raising the flag past 8 tiles does not reduce the 40-grid weight reads
+(it does lift the 64-grid batch to 8). The batch changes the tower's activation set: about
+0.47 GiB at 8 tiles (40 grid), 0.61 GiB at 4 and about 1.2 GiB at 8 (64 grid), before the planner
+aliases buffers. The order that helps most is smaller page geometry (fewer tiles, fewer passes);
+then a higher `--mm-max-patches` for a picture whose 40-pixel part is split and to let several
+same-grid segments share a pass. The `kBatchCap` ceiling itself is a build-time constant, not a
+flag.
+
+Decode batching is separate: a step amortises the head, attention and shared-expert weights
+across the batch but not the routed-expert reads, which are per token, so aggregate decode roughly
+doubles at batch 8 rather than scaling with it. Encoding and decoding do not overlap yet, so
+mixed image+text traffic sees every encode pass as a decode stall.
 
 The reference's `infer` opens its prompt with the BOS the chat template omits, and the chat path
 supplies it; `/v1/completions` prompts are served exactly as sent (the reference has no
