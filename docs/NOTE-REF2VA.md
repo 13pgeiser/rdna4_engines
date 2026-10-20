@@ -504,6 +504,21 @@ on diffusion, so the thermal/power saving is nearly free. (`power1_input` isn't 
 sustained watts weren't logged — `gpu_busy_percent` is the load signal. Uncapped logs:
 `build/tmp/ex10/{clock_sampler_300w.log,bench2_uncapped.log}`.)
 
+**Can we dodge the link by forcing the embedding into VRAM? No — it doesn't start (2026-10-20).** The natural
+follow-up to the link-bound finding is `--embedding-placement vram`: take the 1.45 GiB/rank embedding read off
+the link. At this box's TP2 config it is **not viable**. The table does resolve to VRAM (`placement: token
+embedding (1.45 GiB a rank) vram: as asked`), but then the weight-budget resolver leaves the **static
+(non-expert) weights filling the entire per-card weight budget**, so *"every expert streams from host memory
+and the KV cache gets nothing"*: `vram_kv resolved to 0 MiB`, and Radiance **aborts at startup** (`E startup
+stopped: invalid argument`; the resolver's own advice: *"use more cards or a smaller --max-num-batched-tokens"*).
+So the shipped `ram` default is **not a naïve inefficiency — it is the trade that leaves VRAM for the KV cache
++ expert residency**. Forcing it to VRAM trades a *small* streaming cost (the embedding) for a *catastrophic*
+one (all MoE experts streamed + zero KV cache). The two link-traffic sources (embedding reads, expert streaming)
+trade against each other through the VRAM budget, and the balanced point is the default. The process aborted
+before any VRAM was claimed (cards stayed at 61 MB), so no benchmark rows were produced; a reduced
+`--max-num-batched-tokens` might coax it up, but that changes the batch config and is no longer apples-to-apples
+with the 215 W baseline. Log: `build/tmp/ex10/server_vemb.log`.
+
 ## #8 kR2VCond keyframe-pin (FL2VA) — disposition: SHIPPED + device-verified (2026-10-19)
 
 **Supersedes the earlier "left optional, not wired" disposition.** The user elevated FL2VA from optional to a
