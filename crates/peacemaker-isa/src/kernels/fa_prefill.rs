@@ -636,11 +636,11 @@ fn plan_direct(fp8: bool) -> Result<RegPlan, String> {
             p.v::<1>("spare", n, w())?;
         }
     }
+    // Both codecs use v16..v47 as prologue temporaries before their tile lifetimes.
+    for i in 0..4u8 {
+        p.v::<8>("prologue_temp", S0 + 8 * i, pro())?;
+    }
     if fp8 {
-        // Prologue temporaries (v16..v47).
-        for i in 0..4u8 {
-            p.v::<8>("prologue_temp", S0 + 8 * i, pro())?;
-        }
         // K-fill only: codes 16..47, scales 64..67, output ring 68..71, temps 72..79.
         for i in 0..4u8 {
             p.v::<8>("fill_k_codes", FK8 + 8 * i, kfill())?;

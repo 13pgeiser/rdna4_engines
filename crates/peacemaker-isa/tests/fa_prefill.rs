@@ -478,6 +478,67 @@ fn kernarg_layout_and_resources_match_contract() {
     assert_eq!(entries[1].s_text, direct.s_text);
 }
 
+// ------------------------------------------------------------------------------------------------ 3a. Q8 prologue ownership
+/// The Q8 direct kernel declares its four common prologue temporaries (`v16..v48`, four `v8` blocks) live
+/// from the entry block to the tile loop head: the tile phase reuses the same registers for scores, so an
+/// FP8-only declaration leaves `v16` with no unique live owner at entry and `emit_module` validation fails.
+/// Pins the per-byte owners, the live window and the Q8 launch resources (65,536 dynamic LDS bytes, 256 VGPRs).
+#[test]
+fn q8_prologue_temps_own_v16_through_v47_before_tile_loop() {
+    use peacemaker_isa::reg::{Kind, Live};
+    let direct = fa_prefill::emit(ARCH, &spec()).unwrap();
+    const TILE: &str = ".Lfapd_tile";
+    assert!(
+        direct.s_text.contains(TILE),
+        "direct: tile loop head {TILE} present"
+    );
+    for v in 16..48u8 {
+        let owners: Vec<_> = direct
+            .proof
+            .reg_plan
+            .iter()
+            .filter(|r| {
+                r.kind == Kind::V
+                    && u16::from(r.base) <= u16::from(v)
+                    && u16::from(v) < u16::from(r.base) + u16::from(r.len)
+                    && matches!(&r.live, Live::Between(start, end) if start == "entry" && end == TILE)
+            })
+            .collect();
+        assert_eq!(
+            owners.len(),
+            1,
+            "direct: v{v} must have exactly one live owner at entry"
+        );
+        assert_eq!(owners[0].name.as_ref(), "prologue_temp", "direct: v{v} owner");
+        assert_eq!(
+            (owners[0].base, owners[0].len),
+            (16 + (v - 16) / 8 * 8, 8),
+            "direct: v{v} prologue block"
+        );
+    }
+    // Entry-live per-launch state and the Q8 launch resources.
+    let tid: Vec<_> = direct
+        .proof
+        .reg_plan
+        .iter()
+        .filter(|r| {
+            r.kind == Kind::V
+                && r.base == 0
+                && r.len == 1
+                && matches!(&r.live, Live::Between(start, end) if start == "entry" && end == TILE)
+        })
+        .collect();
+    assert_eq!(tid.len(), 1, "direct: v0 tid live entry -> tile loop");
+    assert_eq!(tid[0].name.as_ref(), "tid", "direct: v0 owner");
+    assert_eq!(direct.shape.next_free_vgpr, 256, "direct: VGPR budget");
+    assert_eq!(direct.proof.next_free_vgpr, 256, "direct: proof VGPRs");
+    assert_eq!(
+        fa_prefill::contract(ARCH, &direct)["launch_dynamic_lds_bytes"],
+        serde_json::json!(DIRECT_LDS),
+        "direct: dynamic LDS bytes"
+    );
+}
+
 // ------------------------------------------------------------------------------------------------ 4. fragment layout
 /// The lab's half-element fragment offsets (`fa_a3b_fa2.hip` `fa2_koff` / `fa2_voff`), written here independently.
 fn koff(sub: usize, dc: usize, lane: usize, j: usize) -> usize {
