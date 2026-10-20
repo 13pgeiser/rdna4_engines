@@ -1,0 +1,16 @@
+# Fish Audio drama-3 (fishaudio/drama-3) as released, its routed experts block-scaled fp8: speech on
+# /v1/audio/speech, whole or streamed, and text spoken as it is written over the
+# /v1/audio/speech/stream WebSocket. Speakers are named in the input (<|speaker:0|> to
+# <|speaker:15|>) and so is the direction ([laughs], [whispering], a bracketed style). Two cards.
+# Under the Fish Audio Community License, research, non-commercial use and small commercial use are
+# free; a service that lets others generate speech (an API, a TTS site) needs a licence from Fish
+# Audio, and so does imitating a real person's voice without their consent.
+name: radiance-drama3
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-drama3
+    command: >
+      --model /models/drama3-fp8.rad
+      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --tp 2

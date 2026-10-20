@@ -282,6 +282,7 @@ and runs.
 | `qwen3asr_bf16` | Qwen3-ASR, speech to text from the checkpoint as it ships (§5.14) |
 | `minimaxmusic3` | MiniMax-Music3, songs from a description and lyrics (§5.15) |
 | `breeze` | Breeze-TTS-2, speech from text and an optional description of the voice (§5.15) |
+| `fishomni` | Fish Audio drama-3, speech from text with speaker tags and inline direction (§5.15) |
 | `minimaxh3` | MiniMax-H3 and FastH3, video with its stereo soundtrack from text (§5.16) |
 | `ltx2` | LTX-2.5, video with its stereo soundtrack from text or a first frame (§5.16) |
 
@@ -458,6 +459,12 @@ rad-convert /srv/models/MiniMaxAI/MiniMax-Music3 -o minimax-music3-bf16.rad \
 # bf16 (6 GB, one card)
 rad-convert /srv/models/BreezeBlue/Breeze-TTS-2 -o breeze-tts2-bf16.rad \
     --recipe data/recipes/breeze-tts2-bf16.recipe
+
+# Fish Audio drama-3, speech (§5.15): the release directory, its codec in codec.pth read with it
+# (a torch.save checkpoint read as data, never unpickled); the experts stay block fp8 as shipped,
+# the codec is cast to bf16 (39 GB, two cards)
+rad-convert /srv/models/fishaudio/drama-3 -o drama3-fp8.rad \
+    --recipe data/recipes/drama3-fp8.recipe
 ```
 
 A checkpoint directory's `model.safetensors.index.json` decides which shard each tensor is read
@@ -1611,7 +1618,7 @@ a model that takes no images or video. A Qwen-VL container that states none uses
 | `POST /v1/systemone` | LiquidAI d1's decisions over a state: named yes/no, choice and score questions answered as probabilities, nothing generated; needs a container converted as d1, else 501 (§5.13) |
 | `POST /v1/audio/transcriptions` | OpenAI's speech to text, for a model whose plugin transcribes (Qwen3-ASR), else 501 (§5.14) |
 | `GET /v1/realtime` (WebSocket) | OpenAI's realtime transcription session: audio streamed in, the words back as they are spoken (§5.14) |
-| `POST /v1/audio/speech` | OpenAI's speech API, whole or streamed: speech from a speech model (Breeze-TTS-2), `instructions` describing the voice; songs from a music model (MiniMax-Music3), `input` the lyrics and `instructions` the song; else 501 (§5.15) |
+| `POST /v1/audio/speech` | OpenAI's speech API, whole or streamed: speech from a speech model (Breeze-TTS-2, `instructions` describing the voice; drama-3, speakers and direction in the input); songs from a music model (MiniMax-Music3), `input` the lyrics and `instructions` the song; else 501 (§5.15) |
 | `GET /v1/audio/speech/stream` (WebSocket) | vLLM-Omni's realtime speech session: text streamed in, each sentence's audio streamed out as soon as the sentence is complete; needs an audio generation model (§5.15) |
 | `POST /v1/videos`, `GET /v1/videos[/:id[/content]]`, `DELETE /v1/videos/:id` | OpenAI's video jobs: a video with its soundtrack from a prompt, made in the background and downloaded as MP4; needs a video model (MiniMax-H3), else 501 (§5.16) |
 | `POST /v1/messages`, `POST /v1/messages/count_tokens` | Anthropic's Messages API, for Claude Code and the Anthropic SDKs (§5.9, §5.11) |
@@ -2410,10 +2417,11 @@ socket.
 
 ### 5.15 Speech and music: `/v1/audio/speech`
 
-An audio generation model answers OpenAI's `POST /v1/audio/speech`: a speech model (Breeze-TTS-2)
-speaks `input`, in a voice `instructions` may describe; a music model (MiniMax-Music3) sings `input`
-as lyrics, as `instructions` describe the song (SGLang-Omni's reading of the route). Both are
-converted from their release directories (§3.2).
+An audio generation model answers OpenAI's `POST /v1/audio/speech`: a speech model speaks `input`,
+in a voice `instructions` may describe (Breeze-TTS-2) or with its speakers and direction written in
+the input itself (drama-3); a music model (MiniMax-Music3) sings `input` as lyrics, as
+`instructions` describe the song (SGLang-Omni's reading of the route). Each is converted from its
+release directory (§3.2).
 
 #### Speech: Breeze-TTS-2
 
@@ -2441,6 +2449,44 @@ as it is spoken. On one R9700 a sentence is made at 0.6 of the time it plays (5.
 3.1 s), and a stream's first audio comes 0.21 s after the request; four speak at once at about the
 speed they play (43 s of speech in 12.1 s). Breeze-TTS-2 is licensed for research and
 non-commercial use only, and BreezeBlue counts hosting it as an API as commercial.
+
+#### Speech: drama-3
+
+```sh
+radiance --model drama3-fp8.rad --tp 2                               # two cards
+
+curl -s http://localhost:8000/v1/audio/speech -H 'Content-Type: application/json' -d '{
+  "input": "The lighthouse keeper counted seven ships before the fog rolled in."}' -o ships.wav
+curl -s http://localhost:8000/v1/audio/speech -H 'Content-Type: application/json' -d '{
+  "input": "<|speaker:0|> Did you lock the back door?\n<|speaker:1|> [sighs] I thought you did."}' \
+  -o door.wav                                                        # 44.1 kHz mono, 16-bit
+```
+
+- **`input`** is the script. Speakers are named in it, `<|speaker:0|>` to `<|speaker:15|>`, and
+  text before any tag is speaker 0's; each speaker's turn is written as Fish Audio's server writes
+  it (the tag, a space, the turn's text stripped, each turn on a line of its own), so the turns may
+  be given on one line. The direction is written in the text too: point tags such as `[laughs]`,
+  `[sighs]` or `[pause]`, a bracketed style before a line (`[with bright eager excitement] We
+  won!`), `<whisper>...</whisper>`. The tokens only the prompt is built from (`<|im_start|>`,
+  `<|im_end|>`, `<|voice|>`, `<|text|>`, `<|interleave|>`, `<|semantic:...|>`) are refused, and so
+  is any other spelling of a speaker.
+- **`instructions` are refused**, the direction being the input's; `guidance_scale` must be 1 (the
+  model runs one branch). Each speaker's voice is the model's choice, the same within a take:
+  cloning a voice from a recording is not served yet.
+- **The length** is `duration` in seconds or `max_new_tokens` in frames (21.5 a second), up to 95 s;
+  the model ends the speech at the end of the script. The prompt holds at most 2048 tokens.
+- **Sampling** is fish-speech's server's: temperature 0.7, top-p 0.7, top-k 30, with its
+  repetition-aware redraw of the first code. A take sometimes stops after its first line or falls
+  silent until its length runs out (the model's own failure, more often with several speakers);
+  another `seed` usually speaks the whole script.
+- **`seed`**, **`response_format`**, **`speed`** and **`voice`** are read as for music below.
+
+Speech is played sixteen frames (0.74 s) at a time as it is made. On two R9700s a sentence is made
+at 0.30 of the time it plays (3.67 s of speech in 1.08 s) and a stream's first audio comes 0.23 s
+after the request; four paragraphs at once make 50.4 s of speech in 5.15 s. drama-3 is under the
+Fish Audio Community License: research, non-commercial and small commercial use are free; a
+service that lets others generate speech needs a licence from Fish Audio, and so does imitating a
+real person's voice without their consent.
 
 #### Music: MiniMax-Music3
 

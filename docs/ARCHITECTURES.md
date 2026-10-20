@@ -29,6 +29,7 @@ plugin claims.
 | `arch/qwen3asr_bf16` | `qwen3asr` | *(empty)* | Qwen3-ASR: a Whisper-style audio encoder over a dense Qwen3 decoder, speech to text |
 | `arch/minimaxmusic3` | `minimaxmusic3` | *(empty)* | MiniMax-Music3, songs from a description and lyrics: a Qwen3-8B frame model, a depth decoder, a flow-matching DiT and a DAC vocoder, from the diffusers pipeline directory, bf16 |
 | `arch/breeze` | `breeze` | *(empty)* | Breeze-TTS-2, speech from text and a description of the voice: a T5Gemma 2 text encoder, a Qwen3 backbone with a 16-codebook depth decoder and the Qwen3-TTS 12 Hz codec, from the release directory, bf16, one card |
+| `arch/fishomni` | `fishomni` | `bsgemm-moe` | Fish Audio drama-3, speech from text with speaker tags and inline direction: the Qwen3.5-35B-A3B backbone with its routed experts block fp8 at f32 scales and everything else bf16, a 13-layer codebook tower over the backbone's full-attention cache, and Fish S2's modified DAC (`codec.pth`, read as data); from the release directory, two cards |
 | `arch/minimaxh3` | `minimaxh3` | *(empty)* | MiniMax-H3, a video with its stereo soundtrack from text: Qwen3-VL-32B's language model as the text encoder, a 33B single-stream diffusion transformer, a tiled ViT video decoder and a BigVGAN audio decoder, from the diffusers pipeline directory; linears block fp8 (`data/recipes/minimax-h3-fp8.recipe`) |
 | `arch/ltx2` | `ltx2` | *(empty)* | LTX-2.5 (base and distilled), a video with its stereo soundtrack from text or from text and a first frame: Gemma 4's language model and two text connectors, the duration head, a dual-stream audio-video DiT with four-way guidance, the causal video VAE (tiled past the default canvas) or the diffusion decoder, the audio VAE with a BigVGAN vocoder and bandwidth extension, the x2 latent upsampler; bf16 or block fp8, one card |
 
@@ -1307,6 +1308,105 @@ another code at 323 of 1168 picks, all near-ties: the code radiance drew had a m
 the reference's own pick's probability, and the first code differed once in 73 frames. Through
 the codec alone, radiance's bf16 audio is 38.4 dB SNR from the reference's f32 decode of the same
 codes. Whisper large-v3 transcribes radiance's speech word for word.
+
+---
+
+# `fishomni`: Fish Audio drama-3, speech
+
+`arch/fishomni` declares an audio generator in its chunked form with one branch a request
+(`rad_declare_audio_generator`, `branches` 1, `voc_chunk`): PROMPT runs the backbone over the
+whole prompt and the codebook tower over every prompt row, FRAME draws one frame of every speech in
+flight and runs the backbone over its embedding, VOCODE plays a lane's newest frames, sixteen at
+most. It is served on `/v1/audio/speech` and `/v1/audio/speech/stream` ([GUIDE §5.15](GUIDE.md)),
+on two cards. The checkpoint is the release directory; its codec, `codec.pth`, is read with it as
+checkpoint tensors under `codec.` (a `torch.save` archive, read as data and never unpickled:
+`core/format/torch_zip.h`).
+
+```
+backbone  Qwen3.5-35B-A3B's language model, unchanged: 40 layers of 2048, three gated delta-net
+          layers to one gated attention layer (16 q / 2 kv heads of 256, NeoX rotary on 64 dims
+          at theta 1e7), 256 experts of 512 at top-8 and a gated shared expert of 512, (1 + w)
+          norms but the delta net's output norm. Only the routed experts are fp8 (E4M3 at an f32
+          scale a 128 x 128 block, `quant_method: bsgemm-moe`); the rest is bf16. A prompt row is
+          a token; a frame's row is bf16(bf16(E_lm[248099 + c0] + E_cb[4096 + c1]) / sqrt 2):
+          code 0 through its semantic token, code 1 through section 1 of the codebook table
+head      the main token over 4097 candidates only, the end of speech (248046) and the 4096
+          semantic tokens in id order: the lm_head's rows for them, replicated (the full head is
+          never declared)
+tower     13 layers bound as layers 40..52 of the backbone's full-attention KV group, causal over
+          the whole sequence at the backbone's positions: 4 shared layers that inject code 0, then
+          one a codebook, layer k injecting code k - 1 and its head drawing code k (4096 outputs).
+          A layer is m = eh_proj([enorm(e); hnorm(h)]), a pre-norm block (q, gate, k, v from
+          wqkv's rows [Q 4096 | G 4096 | K 512 | V 512], (1 + w) q/k norms, GPT-J rotary on 64
+          dims at 1e7, attention * sigmoid(gate), SwiGLU 6144), a final (1 + w) norm. The first
+          shared layer also adds the input frame's codes 2..9, embedded and summed in f32
+sampling  fish-speech's server defaults: temperature 0.7, top-p 0.7 over the whole candidate set,
+          then top-k 30, for the main token and every head; a semantic first draw among the
+          lane's last 16 picks is redrawn at 1.0 / 0.95 / 30 (`ras_pick`)
+codec     Fish S2's modified DAC decoder: ten raw codebook rows of 8 (one of 4096, nine of 1024,
+          codes 1..9 clamped to 1023), each through its own weight-normed 1x1 projection to 1024
+          and summed; 8 layers of 1024 (16 heads of 64, GPT-J rotary on all 64 at theta 1e4,
+          causal over 128 frames, plain RMS norms at 1e-5, layer scales); twice a transposed
+          conv k2 s2 and a ConvNeXt block; a causal conv k7 to 1536; four blocks of snake, a
+          weight-normed causal transposed conv (8, 8, 4, 2) and three residual units (dilations
+          1, 3, 9); snake and a conv k7 to one channel, tanh: 2048 samples a frame, 44.1 kHz mono
+```
+
+The passes, which shift the tower by a row against the reference's loop:
+
+- **PROMPT** runs the backbone over the prompt and leaves its last row's final-norm hidden state in
+  the lane, then runs the tower over every row, teacher-forced: each row's label is the row after
+  it, which in a prompt is text, so every layer's code embedding is zero (the concatenation's
+  embedding half is filled with zeros once). The last row's tower pass belongs to the first frame;
+  FRAME 0 writes its cache rows again.
+- **FRAME j** draws the main token from the hidden state of the row before the frame's (the
+  prompt's last for frame 0), runs the tower at THAT row's position, cache slot and context
+  (`RadAudioGenBatch::prev_slot`, `prev_pos`, `prev_used`) drawing codes 1..9, stores the frame,
+  and runs the backbone over its embedding at the frame's own row.
+
+Traps (each still speaks, wrongly):
+
+- **The experts' scale planes are f32**, not the bf16 of Qwen3.6-35B-A3B-FP8: the expert format is
+  read per layer (`MoeFP8::probe`), served as fp8a8f32.
+- **The tower's wqkv is blocked, `[Q | G | K | V]`**, not the backbone's per-head `[q_h | gate_h]`
+  pairs; its rotary is GPT-J's adjacent pairs, not the backbone's halves; its q/k norms run with
+  `(1 + w)` although its config says `attention_qk_norm: false` (the exporter never wrote it).
+- **`eh_proj` reads `[enorm(e); hnorm(h)]`**, the embedding half first.
+- **Two masks.** A layer's code embedding is the label frame's, zero when the label is text; the
+  input frame's codes 2..9 go into the first shared layer only, zero when the input row is text.
+  The layers that inject code 0 read it by candidate, with the table's row 0 again in front: the
+  end of speech's code 0 is clamped to 0, as fish-speech clamps it.
+- **The tower attends over the whole sequence**, prompt rows included, from 13 caches of its own;
+  it is not an 11-position depth decoder (`max_seq_len` 11 is left over from S2).
+- **The candidates' softmax is over the 4097 only**, top-p over all of them and the top-k cut after
+  it; a full-vocabulary softmax keeps a different nucleus.
+- **The codec's residual codebooks have 1024 entries** and the heads 4096 outputs: codes are clamped
+  at 1023 at decode (`rvq_embed`'s `clamp`). Its weight norm is per output channel for the convs
+  and per INPUT channel for the transposed convs (`[in, out, k]`), folded at convert.
+- **The input is written as fish-speech's server writes it**: each speaker's turn
+  `<|speaker:N|> ` and its text stripped, turns joined by a newline, untagged text speaker 0's.
+  The same two turns joined by a space are spoken through far less often: for one two-line script,
+  one seed in six spoke both lines, against seven in ten with the newline.
+
+Against fish-speech's own PyTorch code (the CPU path: experts fp8, dequantised per forward, so
+W8A16 where radiance runs W8A8), teacher-forced with radiance's codes over a 34-row prompt and 80
+frames: the prompt's token ids are identical; the backbone's hidden state is 5.3% from the
+reference's (relative L2, median over the frames; cosine at least 0.993), the experts' fp8
+activations most of it; the main token's candidate logits 3.6% (KL 0.013 nats a frame, the same
+argmax in 92.5% of frames); the nine heads' logits 1.35% (KL 0.007, the same argmax 93% of the time)
+over the 79 frames that are spoken. Through the codec, radiance's chunked bf16 decode is 35.4 dB SNR
+from the reference's whole-utterance bf16 decode of the same codes. Qwen3-ASR transcribes
+radiance's speech word for word.
+
+The model's own failure is to stop after the first line of a script, or to fall silent until the
+length runs out (vLLM-Omni's recipe and SGLang-Omni's notes describe it). Over 20 seeds of two
+invented two-speaker lines, the second speaker was spoken in 14 and 17 of 20, and 2 and 3 takes ran
+past 8 s; at a main top-k of 256 instead of 30 it was 14 and 15, with 5 long takes each, so the
+reference's 30 stays.
+
+On two R9700s a sentence is made at 0.30 of the time it plays (3.67 s of speech in 1.08 s, 13.5 ms
+a frame with the codec), a paragraph at 0.29 (11.6 s in 3.34 s); a stream's first audio comes
+0.23 s after the request; four paragraphs at once make 50.4 s of speech in 5.15 s.
 
 ---
 
