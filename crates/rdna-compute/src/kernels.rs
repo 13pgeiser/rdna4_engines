@@ -8416,6 +8416,8 @@ pub const ATTENTION_FLASH_FP8_E4M3_TILE_BATCHED_SRC: &str = concat!(
 );
 pub const ATTENTION_FLASH_Q8_0_TILE_ROWS_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_q8_0_tile_rows.hip");
+pub const ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_asym_reduce_batched.hip");
 /// VerifyAttn Stage 0 (gfx1201): `attention_verify_gqa_{q8,fp8}_gfx1201`, the
 /// GQA-shared split-K twins of the batched Q8_0 / fp8 flash tiles (one KV scan
 /// per kv head for 8 query rows x 6 q heads, fixed context-independent grid),
