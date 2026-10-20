@@ -58,6 +58,18 @@ Engine::Readback::~Readback() {
 }
 
 Engine::~Engine() {
+    /* The control vector's per-rank direction copies. Uploaded at declare, outside any arena, so
+     * nothing else frees them; each rank's copy is freed with that rank's device bound, since the
+     * allocator is per device. */
+    for (const auto& r : ranks_) {
+        if (!r || (size_t) r->index >= cvec_views_.size()) continue;
+        const float* d = cvec_views_[(size_t) r->index].dir;
+        if (!d) continue;
+        if (rad_dev_set(r->device) < 0) continue;
+        rad_dev_free((void*) d, RAD_MEM_DEVICE);
+        cvec_views_[(size_t) r->index].dir = nullptr;
+    }
+    cvec_views_.clear();
     /* --profile-ops prints its final table here, the last point where the program still holds
      * the op table the rows name. */
     if (cfg_.profile_ops) for (auto& r : ranks_) r->ctx.dump_profile();
@@ -1444,6 +1456,11 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
 
     kv_iface_ = std::make_unique<KVBinding<KVManager>>(&ranks_[0]->kv);
     pc_iface_ = std::make_unique<PCBinding<PrefixCache>>(&ranks_[0]->prefix);
+    /* The control vector's identity partitions the block cache (PCBinding::salt_id): a request
+     * that runs with the projection on never adopts a block or a linear-state snapshot produced
+     * without it, or the other way round. Zero with no vector loaded, and then every chain hashes
+     * exactly as it did before the feature existed. */
+    static_cast<PCBinding<PrefixCache>*>(pc_iface_.get())->salt_id = cvec_salt_;
     /* The restore path, installed only when the tiers are on. The scheduler calls it before the
      * admission lookup without knowing about tiers, so it is a callable rather than an include in
      * core/sched.
@@ -1460,7 +1477,8 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
             PrefixCache& pc = ranks_[0]->prefix;
             std::vector<MMContentKey> mk;
             media_keys(req, &mk);
-            const std::vector<BlockHash> want = pc.restorable_from(req.prompt, mk);
+            const std::vector<BlockHash> want =
+                pc.restorable_from(req.prompt, mk, cvec_salt_for(req.sp.use_control_vector));
             if (want.empty()) return;
             /* The whole chain in one restore. With 4-token blocks a long conversation is tens of
              * thousands of entries; batched, it is one launch per (group, layer) per staging batch
@@ -1615,6 +1633,25 @@ bool Engine::state_slots_of(uint64_t seq, std::vector<int32_t>* out) const {
 /* The engine's part of /server_info: model, cards, KV, drafting and wire, for a running process.
  * The server holds only interfaces, so the engine renders this object and the server splices it in
  * verbatim. */
+/* The experimental speed projection, for /stats, /v1/models and /server_info. `available` is
+ * what a client should test before sending the field: without a loaded vector a request that asks
+ * for it is refused, so a UI can hide the control rather than offer a switch that fails. */
+std::string Engine::cvec_json() const {
+    nlohmann::ordered_json o;
+    o["available"] = cvec_.loaded();
+    o["default"]   = cvec_default_.load();
+    if (cvec_.loaded()) {
+        o["first"]   = cvec_.first;
+        o["last"]    = cvec_.last;
+        o["n_embd"]  = cvec_.n_embd;
+        o["n_layers"] = cvec_.n_layers > 0 ? cvec_.n_layers - 1 : 0;
+        o["scale"]   = cvec_.user_scale;
+        o["file"]    = cvec_.path;
+        o["mode"]    = "project";
+    }
+    return o.dump();
+}
+
 std::string Engine::engine_info() const {
     nlohmann::ordered_json e;
     e["arch"]        = meta_.arch_id ? meta_.arch_id : "";
@@ -1638,6 +1675,7 @@ std::string Engine::engine_info() const {
     e["vision_tower_placement"] = { { "asked", table_placement_name(cfg_.tower_placement) },
                                     { "resolved", table_placement_name(cfg_.tower_resolved) } };
     e["prefix_cache"]           = cfg_.prefix_cache;
+    e["control_vector"]         = nlohmann::ordered_json::parse(cvec_json());
     e["checkpoint_slots"]       = cfg_.checkpoint_slots;
     e["deterministic"]          = cfg_.deterministic;
 
@@ -1992,6 +2030,15 @@ int Engine::run_server() {
     d.tok   = &tok_bridge;
     d.grammar = &grammar_bridge;
     d.live  = snap;
+    /* The experimental speed projection, when a vector was loaded. The admin endpoint flips the
+     * default through this; nothing rebuilds a graph, so a toggle takes effect on the next request
+     * and leaves the running ones alone. */
+    if (cvec_.loaded()) {
+        d.control_vector.available  = [this] { return cvec_loaded(); };
+        d.control_vector.get_default = [this] { return cvec_default_on(); };
+        d.control_vector.set_default = [this](bool on) { set_cvec_default(on); };
+        d.control_vector.json        = [this] { return cvec_json(); };
+    }
 
     /* An embedding model serves /v1/embeddings and no chat. Its named prompts are the checkpoint's
      * sentence-transformers configuration (`sentence_transformers.prompts.*`); a `messages` input

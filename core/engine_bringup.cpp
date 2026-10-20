@@ -895,6 +895,12 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     /* Under --prefill-span every step but a lone prefill is planned at the shared budget
      * (Scheduler::step), so a wider step is one sequence; 0 without a span. */
     bc.max_mixed_tok = cfg_.prefill_span > 1 ? std::min(max_tok, prefill_shared_tok(cfg_)) : 0;
+    /* The control vector, when one is loaded: this rank's view, or null. A plugin reads it at
+     * declare only (the direction table never changes); the per-request switch rides the derived
+     * mask, not this struct. */
+    if (cvec_.loaded() && rank >= 0 && rank < (int) cvec_views_.size() &&
+        cvec_views_[(size_t) rank].dir)
+        bc.cvec = &cvec_views_[(size_t) rank];
     return bc;
 }
 
@@ -1063,6 +1069,52 @@ int Engine::declare() {
      * a serial loop times out. Registry::select() and init_instance() share a mutex for this. Each
      * thread binds its device first, because the current device is thread-local and the init
      * allocates on it. */
+    /* Control vectors are resolved here, before any rank declares: the plugin reads the direction
+     * table from RadBuildCtx, so a table that failed validation must stop the server before a graph
+     * is built around it.
+     *
+     * There is nothing to configure. A vector is a property of the model family, so the engine
+     * looks for one beside the container (or in the directory, or in $RADIANCE_HOME/vectors) and
+     * uses it if it is compatible with this container; its operation parameters come from the
+     * package's own JSON. A file that does not fit is reported and skipped -- a sidecar must never
+     * stop a server nobody pointed at it -- while the switch itself stays off until a request (or
+     * the dashboard) asks for it. */
+    const std::string arch = meta_.arch_id ? meta_.arch_id : "";
+    if (!arch.empty()) {
+        std::string proj_path, tried;
+        (void) control_vector_discover(cfg_.model, arch, cfg_.radiance_home, &proj_path, &tried);
+        if (proj_path.empty()) {
+            RAD_INFO("control vectors: none found (%s)", tried.c_str());
+        } else if (arch != "qwen4exp") {
+            RAD_WARN("control vectors: %s is for this family only (qwen4exp, whose gated residual "
+                     "carries the projection op); this container is '%s' -- ignoring it",
+                     proj_path.c_str(), arch.c_str());
+        } else {
+            std::string why;
+            const int rc = control_vector_load(proj_path, arch, meta_.n_embd, meta_.n_layers,
+                                               &cvec_, &why);
+            if (rc != RAD_OK) {
+                RAD_WARN("%s -- serving without it", why.c_str());
+                cvec_ = ControlVector{};
+            }
+        }
+    }
+    if (cvec_.loaded()) {
+        cvec_views_.assign(ranks_.size(), RadControlVector{});
+        cvec_salt_ = control_vector_salt(cvec_);
+        cvec_default_.store(false);
+        RAD_INFO("control vectors: %s: %lld directions of %lld, layers %d..%d, scale %.3f -- "
+                 "off until a request asks for it (the dashboard's switch, or a request's `control_vector` "
+                 "field)",
+                 cvec_.path.c_str(), (long long) (cvec_.n_layers > 0 ? cvec_.n_layers - 1 : 0),
+                 (long long) cvec_.n_embd, cvec_.first, cvec_.last, (double) cvec_.user_scale);
+        decide("control vectors", cvec_.path,
+               "found beside the container, in its directory, or in $RADIANCE_HOME/vectors; "
+               "requests opt in");
+    } else {
+        cvec_default_.store(false);
+    }
+
     std::vector<int>         st(ranks_.size(), RAD_OK);
     std::vector<std::thread> th;
     th.reserve(ranks_.size());
@@ -1075,6 +1127,17 @@ int Engine::declare() {
                 RAD_ERR("rank %d: could not bind device %d to declare on", ri, r->device);
                 st[(size_t)ri] = RAD_E_DEVICE;
                 return;
+            }
+            /* This rank's copy of the control vector's directions, on the device the thread has
+             * just bound. Uploaded outside the program's arena: it is not a weight (it is not in
+             * the container) and not an activation (it lives for the deployment). */
+            if (cvec_.loaded()) {
+                const float* d = control_vector_upload(cvec_, ri);
+                if (!d) {
+                    st[(size_t)ri] = RAD_E_DEVICE;
+                    return;
+                }
+                cvec_views_[(size_t)ri] = control_vector_view(cvec_, d);
             }
             const RadBuildCtx bc = build_ctx(ri, cfg_.max_tok);
             LoraDeclare ld;

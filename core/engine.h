@@ -19,6 +19,7 @@
  */
 #pragma once
 #include "rad_core.h"
+#include "cvec.h"
 #include <map>
 #include <set>
 #include "build/startup.h"
@@ -87,6 +88,24 @@ public:
      * serving cards' power-management files (hardware_facts). */
     std::string diagnostics_json() const;
     bool startup_report_printed() const { return report_printed_; }
+
+    /* ---- the control vector's public surface (core/cvec.h).
+     *
+     * `cvec_loaded` is whether a vector was found and validated for this container; a request
+     * asking for the feature on a deployment without one is refused by name rather than silently
+     * served unprojected. `cvec_default_on` is the runtime default for requests that name no
+     * choice, and the setter is what POST /admin/control-vector calls: it flips a flag, builds
+     * nothing, reloads nothing, and leaves every running request alone. */
+    bool cvec_loaded() const { return cvec_.loaded(); }
+    bool cvec_default_on() const { return cvec_default_.load(); }
+    void set_cvec_default(bool on) { cvec_default_.store(on); }
+    /* {available, default, mode, first, last, n_embd, n_layers, scale, file} for /stats, the
+     * admin route and the dashboard. */
+    std::string cvec_json() const;
+    /* The value the block cache is keyed by for a step with this mode: the vector's identity when
+     * on, 0 when off. Zero with no vector loaded, so a deployment without the feature hashes
+     * exactly as before. */
+    uint64_t cvec_salt_for(bool on) const { return on ? cvec_salt_ : 0; }
 
 private:
     /* One thread per tensor-parallel rank, each owning one device. Ranks share the address
@@ -463,6 +482,20 @@ private:
     std::string p2p_blocked_;
     bool        has_ngram_ = false;  /* the model carries an n-gram table */
     std::string prefix_off_why_;     /* why the engine itself turned prefix caching off, or "" */
+
+    /* ---- the experimental speed projection (core/cvec.h). `cvec_` is the host table, loaded
+     * once at bringup and empty when the feature is off; `cvec_views_` is, per rank, that table
+     * uploaded to the rank's card and the ABI view build_ctx hands to a declaring plugin (the
+     * view's `dir` is the allocation, so one vector holds both). `cvec_salt_` partitions the
+     * prefix cache between the mode on and off, so a conversation's KV and linear state are never
+     * reused by a step that would compute different hidden states from the same tokens. */
+    ControlVector                  cvec_;
+    std::vector<RadControlVector>  cvec_views_;
+    uint64_t                       cvec_salt_ = 0;
+    /* Runtime default for requests that name no choice (flippable through
+     * POST /admin/control-vector). Atomic: the server's admin thread writes it while
+     * request threads read it; nothing about the graph changes with it. */
+    std::atomic<bool>              cvec_default_{false};
     std::vector<std::string> env_set_;   /* the RADIANCE_* names set when the engine was made */
     bool        report_printed_ = false;
     /* Runtime device identity (PCI address, name, integrated flag, runtime version), read once in

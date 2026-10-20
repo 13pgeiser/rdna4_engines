@@ -614,6 +614,14 @@ struct SamplingParams {
      * scheduler thread where every other request's step waits; held here, starting is a lookup.
      * Null for a request not admitted through the server; the sampler then compiles. */
     std::shared_ptr<const GbnfProgram> grammar_program;
+
+    /* The control vector (core/cvec.h): whether this request's steps project the vector found for
+     * this deployment out of the residual stream. The server sets it from the request's
+     * `control_vector` field (`experimental_speed_projection` is Strata's spelling of the same
+     * switch), or from the deployment's runtime default when the request names none; it needs no
+     * reload and leaves the graph untouched. A deployment with no vector refuses `true` at
+     * admission rather than serving the stock model. */
+    bool   use_control_vector = false;
 };
 
 /* Raw logits at chosen vocabulary ids at the prompt's last position, for a caller that answers

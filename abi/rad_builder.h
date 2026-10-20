@@ -173,7 +173,47 @@ typedef struct RadBuildCtx {
      *
      * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
     int      kv_quant;
+
+    /* A control vector loaded from a GGUF `controlvector` file (--speed-projection), or null.
+     *
+     * The engine loads and validates it once, at bringup, and the plugin only reads it: the
+     * direction table lives in device memory on every rank, in the activations' own float form,
+     * and a per-request switch reaches the step through a derived buffer the plugin declares
+     * itself (a row mask, `projection_on_rows`). Nothing is reloaded to turn the feature on or
+     * off, and with the mask zero the model computes what it computes without a vector.
+     *
+     * The plugin decides where in its own graph the projection applies; for the gated-residual
+     * architectures that is after each block's write into the wide stream, which is the point
+     * llama.cpp's control-vector hook uses for `qwen4exp`. A plugin that does not declare an op
+     * reading this table ignores it.
+     *
+     * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
+    const struct RadControlVector* cvec;
 } RadBuildCtx;
+
+/* ================================================================== control vectors */
+/* A direction per layer, in the shape llama.cpp's `--cvec-mode project` applies it:
+ *
+ *     h <- h - s_l (h . v_l) v_l            v_l = d_l / |d_l|, s_l = |d_l| (times the user scale)
+ *
+ * with `v_l` unit and `s_l` the norm the file stored (so a unit vector's scale is 1). The engine
+ * normalises the rows when it uploads them, so a kernel reads `dir` as the unit direction and
+ * takes `s` from `scales`; a zero scale means "this layer is not steered".
+ *
+ * `dir` is [n_layers, n_embd] f32, row `l` that layer's direction, row 0 unused (layer 0 has no
+ * direction in the format). Each rank has its own copy: the pointer a plugin receives is that
+ * rank's, and the residual stream is replicated, so no collective is involved.
+ *
+ * `n_layers` is the model's layer count, which may be longer than the file's (the published
+ * Flash-Next vector carries 47 of 48 rows). The steered range is not a separate field: a layer is
+ * steered exactly when its `scales` entry is nonzero, so a plugin asks that and cannot disagree
+ * with the loader. */
+typedef struct RadControlVector {
+    const float* dir;        /* device, [n_layers, n_embd] f32, unit rows */
+    const float* scales;     /* host,    [n_layers]     f32, |d_l| * user scale; 0 = not steered */
+    int64_t      n_embd;
+    int64_t      n_layers;
+} RadControlVector;
 
 /* ================================================================== weights */
 /* Access class, declared per weight because only the architecture plugin knows it. It tells the
