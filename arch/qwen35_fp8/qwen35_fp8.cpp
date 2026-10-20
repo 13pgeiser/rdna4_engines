@@ -87,6 +87,7 @@
 #include <arch/rad_block_mtp_fp8.h>
 #include <arch/rad_block_dflash2.h>
 #include <arch/rad_block_vit.h>
+#include <arch/rad_prefill_pipe.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -883,14 +884,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                RAD_NOWEIGHTS),
                            {m.b_x}, {m.b_x});
 #if !QWEN35_MOE
-    /* The pipelined prefill (step_pipelined), at two ranks wherever a step can be wide enough;
-     * RADIANCE_QWEN35_PIPE=0 turns it off. Its second lane touches the residual stream, the normed
+    /* The pipelined prefill (step_pipelined), wherever a step can be wide enough, at the rank
+     * counts RADIANCE_PREFILL_PIPELINE allows (rad_prefill_pipe.h: two by default). Its second lane touches the residual stream, the normed
      * input in both forms, the taps and the bounds, so those leave the sharing pool
      * (Ctx::lane1_); the bounds also because no declared op reads them, which would leave a
      * transient dead before the kernels that take them raw. */
     {
-        const char* e = std::getenv("RADIANCE_QWEN35_PIPE");
-        m.pipe_on = g.world == 2 && g.max_tok >= kPipeMinRows && !(e && std::strcmp(e, "0") == 0);
+        m.pipe_on = g.max_tok >= kPipeMinRows && rad::arch::prefill_pipeline(b, (int)g.world, "qwen35");
     }
     if (m.pipe_on) {
         RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_x));
@@ -1329,8 +1329,8 @@ static const int32_t* pipe_ready(RadCtx* c, const RadBatch* batch, Model& m, boo
         rad_memcpy_async(d, m.pipe_tbl + 3 * T, 3 * (int64_t)sizeof(int32_t), rad_stream(c)) !=
             RAD_OK) {
         rad_step_fail(c, "qwen35: the pipelined prefill's piece bounds could not be put on the card "
-                         "(no pinned host memory, or the copy failed); RADIANCE_QWEN35_PIPE=0 runs "
-                         "prefill serially");
+                         "(no pinned host memory, or the copy failed); RADIANCE_PREFILL_PIPELINE=off "
+                         "runs prefill serially");
         *failed = true;
         return nullptr;
     }

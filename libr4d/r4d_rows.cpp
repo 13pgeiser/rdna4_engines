@@ -4205,6 +4205,20 @@ static const RadConstraint cArTsExact8[] = {
     C_LE("numel", R4D_AR_TWOSHOT_WIDE_MAX_ELEMS),
     C_P2P,
 };
+/* The three- and eight-rank two-shots at `overlap` 1, as cArTsExact4Lane: a pipelined prefill's
+ * all-reduce beside the other piece's compute. Their narrow launch takes the four-rank lane's
+ * defaults; neither has been tuned on three or eight cards. */
+static const RadConstraint cArTsExact3Lane[] = {
+    C_EQ("world_size", 3), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
+    C_GE("numel", R4D_AR_WIDE_ONESHOT_MAX_ELEMS + 1), C_LE("numel", R4D_AR_TWOSHOT_WIDE_MAX_ELEMS),
+    C_EQ("overlap", 1), C_P2P,
+};
+static const RadConstraint cArTsExact8Lane[] = {
+    C_EQ("world_size", 8), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
+    C_DIV("numel", 64), C_GE("numel", R4D_AR_WIDE_ONESHOT_MAX_ELEMS + 1),
+    C_LE("numel", R4D_AR_TWOSHOT_WIDE_MAX_ELEMS),
+    C_EQ("overlap", 1), C_P2P,
+};
 static const RadConstraint cArWht6[] = {
     C_EQ("world_size", 2), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 64),
     C_P2P,
@@ -4222,6 +4236,11 @@ static const RadConstraint cArWht6Lane[] = {
 static const RadConstraint cArTi8Ts3[] = {
     C_EQ("world_size", 3), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 32),
     C_P2P,
+};
+/* The same at `overlap` 1 (tArTs4Lane, untuned at three ranks). */
+static const RadConstraint cArTi8Ts3Lane[] = {
+    C_EQ("world_size", 3), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 32),
+    C_EQ("overlap", 1), C_P2P,
 };
 static const RadConstraint cArTi8Ts4[] = {
     C_EQ("world_size", 4), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 128),
@@ -7093,6 +7112,21 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_twoshot_3rank_exact, nullptr, nullptr, nullptr,
   r4d_shape_all_reduce },
 
+/* The row above at `overlap` 1: the same entry point and the same arithmetic, the four-rank lane's
+ * narrow launch (tArTs4Lane; not tuned on three cards). */
+{ "ar_twoshot_3rank_exact_lane", "all_reduce", "ar",
+  "all-reduce (sum), reduce-scatter + all-gather over P2P IPC scratch; narrow launch beside "
+  "compute",
+  "exactly 3 ranks, all peer-accessible, overlap 1; messages above "
+  R4D_XSTR(R4D_AR_WIDE_ONESHOT_MAX_ELEMS) " elements; shards as even as the word count allows; "
+  "in place; cudagraph-safe",
+  "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical across ranks "
+  "and to the wide row",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_TWOSHOT + 1,
+  ROW(cArTsExact3Lane), ROW(tArTs4Lane), nullptr,
+  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_twoshot_3rank_exact, nullptr, nullptr, nullptr,
+  r4d_shape_all_reduce },
+
 { "ar_twoshot_4rank_exact", "all_reduce", "ar",
   "all-reduce (sum), reduce-scatter + all-gather over P2P IPC scratch, per-block pipelined "
   "handshake",
@@ -7129,6 +7163,21 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical across ranks",
   RAD_DOMAIN_DEVICE, R4D_PRIO_AR_TWOSHOT,
   ROW(cArTsExact8), ROW(tAr), nullptr,
+  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_twoshot_8rank_exact, nullptr, nullptr, nullptr,
+  r4d_shape_all_reduce },
+
+/* The row above at `overlap` 1: the same entry point and the same arithmetic, the four-rank lane's
+ * narrow launch (tArTs4Lane; not tuned on eight cards). */
+{ "ar_twoshot_8rank_exact_lane", "all_reduce", "ar",
+  "all-reduce (sum), reduce-scatter + all-gather over P2P IPC scratch; narrow launch beside "
+  "compute",
+  "exactly 8 ranks, all peer-accessible, overlap 1; messages above "
+  R4D_XSTR(R4D_AR_WIDE_ONESHOT_MAX_ELEMS) " elements; message must shard evenly over the ranks; "
+  "in place; cudagraph-safe",
+  "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical across ranks "
+  "and to the wide row",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_TWOSHOT + 1,
+  ROW(cArTsExact8Lane), ROW(tArTs4Lane), nullptr,
   r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_twoshot_8rank_exact, nullptr, nullptr, nullptr,
   r4d_shape_all_reduce },
 
@@ -7256,6 +7305,20 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "ascending rank order, bit-identical across ranks",
   RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
   ROW(cArTi8Ts3), ROW(tAr), nullptr,
+  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_twoshot_3rank_ti8, nullptr, nullptr, nullptr,
+  r4d_shape_all_reduce },
+
+/* The row above at `overlap` 1: the same entry point and the same arithmetic, the four-rank lane's
+ * narrow launch (tArTs4Lane; not tuned on three cards). */
+{ "ar_twoshot_3rank_ti8_lane", "all_reduce", "ar",
+  "all-reduce (sum), reduce-scatter + all-gather on the tiered-int8 wire -- lossy; narrow launch "
+  "beside compute",
+  "exactly 3 ranks, all peer-accessible, overlap 1; groups of 32, split over the shards as evenly as "
+  "they divide; under min_bytes the exact one-shot; cudagraph-safe",
+  "bf16 / fp16 payload, int8 + fp16 scale + u32 record per group on the wire, fp32 accumulate in "
+  "ascending rank order, bit-identical across ranks and to the wide row",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT + 1,
+  ROW(cArTi8Ts3Lane), ROW(tArTs4Lane), nullptr,
   r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_twoshot_3rank_ti8, nullptr, nullptr, nullptr,
   r4d_shape_all_reduce },
 

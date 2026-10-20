@@ -21,6 +21,7 @@
 #include <arch/rad_arch.h>
 #include <arch/rad_fp8.h>
 #include <arch/rad_block_dflash2.h>
+#include <arch/rad_prefill_pipe.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -1187,15 +1188,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                RAD_NOWEIGHTS),
                           {m.b_x}, {m.b_x});
 
-    /* The pipelined prefill (step_pipelined) at two ranks wherever a step can be wide enough, on an
-     * MXFP4 trunk with fused junctions (decided below; RADIANCE_GEMMA3_PIPE=0 turns it off). Its
+    /* The pipelined prefill (step_pipelined) wherever a step can be wide enough, on an MXFP4 trunk
+     * with fused junctions (decided below), at the rank counts RADIANCE_PREFILL_PIPELINE allows
+     * (rad_prefill_pipe.h: two by default). Its
      * second lane touches the stream, the branch output, the shared input pair, the taps and the
      * bounds, so those leave the sharing pool (Ctx::lane1_); the pair is one for every block so
      * that this costs one pair, not one a linear. */
     {
-        const char* e = std::getenv("RADIANCE_GEMMA3_PIPE");
-        m.pipe_on = g.world == 2 && g.max_tok >= kPipeMinRows && !calib_dir() &&
-                    !(e && std::strcmp(e, "0") == 0);
+        m.pipe_on = g.max_tok >= kPipeMinRows && !calib_dir() &&
+                    rad::arch::prefill_pipeline(b, (int)g.world, "gemma3");
     }
     if (m.pipe_on) {
         m.pipe_in.mx = true;
@@ -1489,8 +1490,8 @@ static const int32_t* pipe_ready(RadCtx* c, const RadBatch* batch, Model& m, boo
         rad_memcpy_async(d, m.pipe_tbl + 4 * T, 4 * (int64_t)sizeof(int32_t), rad_stream(c)) !=
             RAD_OK) {
         rad_step_fail(c, "gemma3: the pipelined prefill's piece bounds could not be put on the card "
-                         "(no pinned host memory, or the copy failed); RADIANCE_GEMMA3_PIPE=0 runs "
-                         "prefill serially");
+                         "(no pinned host memory, or the copy failed); RADIANCE_PREFILL_PIPELINE=off "
+                         "runs prefill serially");
         *failed = true;
         return nullptr;
     }
