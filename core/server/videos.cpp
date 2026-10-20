@@ -3,7 +3,8 @@
  *
  * A video takes minutes, so it is a job, as OpenAI's API has it: POST /v1/videos queues one and
  * answers with the video object at once, GET /v1/videos/{id} reports its status and progress, and
- * GET /v1/videos/{id}/content downloads the MP4 once it is completed (`variant` thumbnail gives
+ * GET /v1/videos/{id}/content downloads the finished file once it is completed -- an MP4 unless the
+ * request asked `format` webm (VP9) or webm-av1 (AV1); `variant` thumbnail gives
  * the first frame as WebP). GET /v1/videos lists the jobs, newest first, and DELETE removes one,
  * cancelling it when it is still running. A finished video is kept for `video_ttl_s` seconds
  * (`expires_at`), at most `max_videos` of them.
@@ -35,7 +36,7 @@
 
 #include "gen/video.h"
 #include "mm/media.h"
-#include "mm/mp4.h"
+#include "mm/video_out.h"
 #include "rad_internal.h"
 
 #include <nlohmann/json.hpp>
@@ -66,7 +67,8 @@ struct Server::VideoJob {
     int64_t     completed_at = 0, expires_at = 0;
     bool        failed = false;
     std::string err_code, err_message;
-    std::string mp4;
+    std::string blob;   /* the finished file, in `fmt`'s container */
+    mm::VideoFormat fmt = mm::VideoFormat::Mp4;
     std::vector<uint8_t> first;   /* the first frame, RGB, for the thumbnail */
     /* Reference conditioning: the reference parts' names in conditioning order, empty for a
      * text-only job. */
@@ -88,6 +90,15 @@ std::string new_video_id() {
     std::string id = "video_";
     for (int i = 0; i < 32; ++i) id.push_back(hex[rd() & 15]);
     return id;
+}
+
+/* The `format` name a VideoFormat maps back to, for the object and the download's filename. */
+const char* format_name(mm::VideoFormat f) {
+    switch (f) {
+    case mm::VideoFormat::WebmVp9: return "webm";
+    case mm::VideoFormat::WebmAv1: return "webm-av1";
+    default: return "mp4";
+    }
 }
 
 /* "1344x768" -> (1344, 768); false for anything else. */
@@ -257,6 +268,9 @@ void Server::video_caps(json& caps, const IVideoGen* gen) {
     caps["video_max_ref_images"] = std::min(kMaxRefImages, (int32_t)info.max_ref_images);
     caps["video_max_ref_videos"] = std::min(kMaxRefVideos, (int32_t)info.max_ref_videos);
     caps["video_max_ref_audios"] = std::min(kMaxRefAudios, (int32_t)info.max_ref_audios);
+    /* The containers `format` accepts; mp4 is the default and always available, the webm codecs
+     * only when this build's libavcodec has the encoder and muxer for them. */
+    caps["video_formats"] = json::array({ "mp4", "webm", "webm-av1" });
 }
 
 HttpResponse Server::handle_video_create(const HttpRequest& req) {
@@ -328,7 +342,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     }
     static const char* kKnown[] = {
         "model", "prompt", "seconds", "size", "input_reference", "seed", "num_inference_steps",
-        "task", "target", "conditions", "user", "latent_upscale", "upscale_refine_steps",
+        "task", "target", "conditions", "user", "latent_upscale", "upscale_refine_steps", "format",
     };
     for (auto it = body.begin(); it != body.end(); ++it) {
         bool known = false;
@@ -381,6 +395,22 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
             e.supported = takes_refs
                 ? std::vector<std::string>{ "t2va", "ref2va", "i2va", "l2va", "fl2va" }
                 : std::vector<std::string>{ "t2va", "i2va", "l2va", "fl2va" };
+            return error_response(e, req.peer);
+        }
+    }
+    /* The output container and codec. mp4 (H.264 + AAC) is the default; webm is VP9 + Opus and
+     * webm-av1 is AV1 + Opus. Whether this build's libavcodec actually has the encoder and muxer is
+     * checked when the video is written, so an accepted name here can still fail to encode. */
+    mm::VideoFormat fmt = mm::VideoFormat::Mp4;
+    if (has(body, "format")) {
+        const std::string f = body["format"].is_string() ? body["format"].get<std::string>() : "";
+        if (f == "mp4") fmt = mm::VideoFormat::Mp4;
+        else if (f == "webm") fmt = mm::VideoFormat::WebmVp9;
+        else if (f == "webm-av1") fmt = mm::VideoFormat::WebmAv1;
+        else {
+            ApiError e = err_unsupported("format", "the output is mp4 (H.264), webm (VP9) or "
+                                                   "webm-av1 (AV1)");
+            e.supported = { "mp4", "webm", "webm-av1" };
             return error_response(e, req.peer);
         }
     }
@@ -740,6 +770,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     j->size = std::to_string(W) + "x" + std::to_string(H);
     j->created_at = unix_now();
     j->seed = r->seed;
+    j->fmt = fmt;
     for (const gen::VideoRefMedia& m : r->refs) j->refs.push_back(m.name);
     j->ticket = std::make_shared<gen::VideoTicket>();
     r->ticket = j->ticket;
@@ -782,10 +813,10 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
 void Server::video_work(std::shared_ptr<VideoJob> j) {
     gen::VideoTicket& t = *j->ticket;
     const VideoGenInfo& info = deps_.videos->info();
-    mm::Mp4Writer mp4;
+    mm::VideoWriter vw;
     std::string why;
-    int st = mp4.open(t.width, t.height, info.fps_num, info.fps_den, t.sample_rate, t.channels,
-                      &why);
+    int st = vw.open(t.width, t.height, info.fps_num, info.fps_den, t.sample_rate, t.channels,
+                     &why, j->fmt);
     int32_t frames = 0;
     bool aborted = false;
     while (st >= 0) {
@@ -806,7 +837,7 @@ void Server::video_work(std::shared_ptr<VideoJob> j) {
             j->progress = t.steps > 0 ? (int)(90LL * e.steps_done / t.steps) : 0;
         } else if (e.kind == gen::VideoEvent::AUDIO) {
             if (t.channels > 0)
-                st = mp4.add_audio(e.samples.data(), (int64_t)e.samples.size() / t.channels, &why);
+                st = vw.add_audio(e.samples.data(), (int64_t)e.samples.size() / t.channels, &why);
         } else if (e.kind == gen::VideoEvent::FRAMES) {
             if (e.first == 0 && e.n > 0) {
                 std::lock_guard<std::mutex> lk(videos_m_);
@@ -814,7 +845,7 @@ void Server::video_work(std::shared_ptr<VideoJob> j) {
                 j->w = t.width;
                 j->h = t.height;
             }
-            st = mp4.add_frames(e.rgb.data(), e.n, &why);
+            st = vw.add_frames(e.rgb.data(), e.n, &why);
             frames += e.n;
             std::lock_guard<std::mutex> lk(videos_m_);
             j->progress = 90 + (t.frames > 0 ? (int)(10LL * frames / t.frames) : 0);
@@ -823,7 +854,7 @@ void Server::video_work(std::shared_ptr<VideoJob> j) {
     if (st < 0) t.cancel.store(true);
     std::string file;
     if (st >= 0 && !aborted && t.status() >= 0 && frames == t.frames)
-        st = mp4.finish(&file, &why);
+        st = vw.finish(&file, &why);
     release(1);
 
     std::lock_guard<std::mutex> lk(videos_m_);
@@ -833,7 +864,7 @@ void Server::video_work(std::shared_ptr<VideoJob> j) {
         j->progress = 100;
         j->completed_at = now;
         j->expires_at = now + opt_.video_ttl_s;
-        j->mp4 = std::move(file);
+        j->blob = std::move(file);
         auto sec = [](int64_t a, int64_t b) { return (double)(b - a) / 1e9; };
         const std::string steps = t.t_upscaled_ns > 0
             ? rad::fmt("small steps %.1f s, upscale %.2f s, full steps %.1f s",
@@ -841,8 +872,8 @@ void Server::video_work(std::shared_ptr<VideoJob> j) {
                        sec(t.t_upscaled_ns, t.t_denoised_ns))
             : rad::fmt("steps %.1f s", sec(t.t_cond_ns, t.t_denoised_ns));
         RAD_INFO("video %s: completed, %.1f MB (%s), %.1f s: queue and prompt %.1f s, %s, "
-                 "decode %.1f s", j->id.c_str(), (double)j->mp4.size() / 1e6,
-                 mp4.video_encoder().c_str(), sec(t.t_submit_ns, t.t_done_ns),
+                 "decode %.1f s", j->id.c_str(), (double)j->blob.size() / 1e6,
+                 vw.video_encoder().c_str(), sec(t.t_submit_ns, t.t_done_ns),
                  sec(t.t_submit_ns, t.t_cond_ns), steps.c_str(), sec(t.t_denoised_ns, t.t_done_ns));
     } else {
         j->status = "failed";
@@ -923,6 +954,7 @@ json Server::video_json(const VideoJob& j) {
     o["seconds"] = j.seconds;
     o["size"] = j.size;
     o["seed"] = j.seed;
+    o["format"] = format_name(j.fmt);   /* what /content will return */
     if (j.refine > 0) {
         o["latent_upscale"] = j.upscale;
         o["upscale_refine_steps"] = j.refine;
@@ -1062,8 +1094,11 @@ HttpResponse Server::handle_video_content(const HttpRequest& req) {
                                                     (j->failed ? ": " + j->err_message : "")),
                                   req.peer);
         HttpResponse res;
-        res.content_type = "video/mp4";
-        res.body = j->mp4;
+        const bool webm = j->fmt != mm::VideoFormat::Mp4;   /* both webm variants share .webm */
+        res.content_type = webm ? "video/webm" : "video/mp4";
+        res.set_header("Content-Disposition",
+                       std::string("attachment; filename=\"") + j->id + (webm ? ".webm\"" : ".mp4\""));
+        res.body = j->blob;
         return res;
     }
     ApiError e = err_bad("id", "no video '" + id + "'; it may have expired");
