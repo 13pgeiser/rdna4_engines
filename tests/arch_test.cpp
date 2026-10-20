@@ -6550,6 +6550,41 @@ TEST(gemma3_steps_lint_clean_at_one_and_two_ranks) {
         }
 }
 
+/* Under a lossy --tp-wire the fused all-reduce junction of the MXFP4 trunk, which sends the exact
+ * wire only, still serves the steps whose message goes out exact anyway: a decode step's few rows
+ * fold every junction's all-reduce in, while a prefill chunk above --tp-wire-min-kb keeps the
+ * lossy all-reduce, unfused. */
+TEST(gemma3_under_a_lossy_wire_small_steps_keep_the_fused_junction) {
+    MetaKV mk = gemma3_meta();
+    const RadEncoding mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, rad::arch::RAD_MX_GROUP);
+    for (int rank = 0; rank < 2; ++rank) {
+        RadBuilder b;
+        b.encs = { { "attn_", mx }, { "ffn_", mx } };
+        RadBuildCtx ctx = build_ctx(rank, 2);
+        ctx.tp_wire_lossy = 1;
+        ctx.tp_wire_min_bytes = 128 * 1024;
+        REQUIRE_EQ(gemma3::declare(&b, mk.meta(), &ctx), RAD_OK);
+        CHECK(gemma3::g_model[rank].fuse_mx && gemma3::g_model[rank].fuse_mx_ar);
+        auto issued = [&](const RadCtx& c, std::initializer_list<const char*> names) {
+            int n = 0;
+            for (const RecIssue& i : c.issues)
+                if (const RecOp* o = b.op_of(i.op))
+                    for (const char* nm : names) n += o->op == nm;
+            return n;
+        };
+        const auto dec = kit(b, { 1 }, {});
+        const auto pre = kit(b, {}, { 64 });           /* 64 x 5376 x 2 bytes, above the floor */
+        const auto v = run_passes(b, gemma3::step, { dec.get(), pre.get() }, rank, 2);
+        CHECK_PASSES(b, v);
+        const int fused_dec = issued(*v[0], { "ar_rmsnorm_quant_i8", "ar_rmsnorm_post_quant_fp8" });
+        const int fused_pre = issued(*v[1], { "ar_rmsnorm_quant_i8", "ar_rmsnorm_post_quant_fp8" });
+        CHECK(fused_dec > 0);
+        CHECK_EQ(fused_pre, 0);
+        /* Every junction the decode step fused is an all-reduce the prefill step issues alone. */
+        CHECK_EQ(issued(*v[1], { "all_reduce" }), issued(*v[0], { "all_reduce" }) + fused_dec);
+    }
+}
+
 /* The DFlash2 drafter: a block of 8 (depth 7, fixed), taps copied out after the named layers into
  * one column-sliced buffer, the mask token from the config, and the drafter's own KV group after
  * the trunk's two. Its input_embedding_scale must be the trunk's sqrt(hidden) held in bf16

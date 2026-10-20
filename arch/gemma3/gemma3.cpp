@@ -651,7 +651,7 @@ struct G3Junction {
         const rad_buf wr[3] = { q8, s8, res };
         rad_op_reads (b, op, rd, res ? 2 : 1);
         rad_op_writes(b, op, wr, res ? 3 : 2);
-        if (res && g.world == 2 && g.wire_exact && rad_op_declared(b, "ar_rmsnorm_quant_i8")) {
+        if (res && g.world == 2 && rad_op_declared(b, "ar_rmsnorm_quant_i8")) {
             const RadParam pa[] = { RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                                     RAD_F64("eps", g.eps), RAD_INT("world_size", g.world),
                                     RAD_STR("dtype", g.dtype), RAD_F64("wadd", g.wadd) };
@@ -678,8 +678,11 @@ struct G3Junction {
  * embedding stream. */
 struct G3JunctionFP8 {
     rad_op     op = 0;
-    /* At two ranks on the exact wire: the branch's all-reduce and post-norm folded in front
-     * (ar_rmsnorm_post_quant_fp8), `x` then being this rank's partial sum. One launch. */
+    /* At two ranks: the branch's all-reduce and post-norm folded in front
+     * (ar_rmsnorm_post_quant_fp8), `x` then being this rank's partial sum. One launch. The kernel
+     * sends the exact wire only, so under --tp-wire it is declared all the same and taken by the
+     * steps whose message goes out exact anyway (ar_wire_is_exact: a decode step of a few rows,
+     * under --tp-wire-min-kb); a wider step keeps the lossy all-reduce, unfused. */
     rad_op     op_ar = 0;
     rad_buf    x = 0, res = 0, q = 0, s = 0;
     rad_weight w = 0, wp = 0;
@@ -700,7 +703,7 @@ struct G3JunctionFP8 {
         const rad_buf wr[3] = { q, s, res };
         rad_op_reads (b, op, rd, res ? 2 : 1);
         rad_op_writes(b, op, wr, res ? 3 : 2);
-        if (res && wp && g.world == 2 && g.wire_exact && rad_op_declared(b, "ar_rmsnorm_post_quant_fp8")) {
+        if (res && wp && g.world == 2 && rad_op_declared(b, "ar_rmsnorm_post_quant_fp8")) {
             const rad_weight ws[2] = { w, wp };
             const RadParam pa[] = { RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", n), RAD_F64("eps", g.eps),
                                     RAD_INT("group", RAD_FP8_BLOCK), RAD_INT("world_size", g.world),
@@ -1217,7 +1220,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
         for (size_t li = 0; li < m.layers.size(); ++li) {
             const Layer& l = m.layers[li];
             const bool last = li + 1 == m.layers.size();
-            const bool far = m.fuse_mx_ar;
+            /* Per step: the fused junction sends the exact wire only (G3JunctionFP8::op_ar). */
+            const bool far = m.fuse_mx_ar && ar_wire_is_exact(m.g, T);
             l.attn.step(c, batch, true, true, far);
             if (!far) l.attn.post(c, T);
             l.jf_am.step(c, T, far);
@@ -1233,10 +1237,11 @@ static void step(RadCtx* c, const RadBatch* batch) {
     for (size_t li = 0; !m.fuse_mx && li < m.layers.size(); ++li) {
         const Layer& l = m.layers[li];
         const bool last = li + 1 == m.layers.size();
-        l.attn.step(c, batch, m.fuse, m.fuse, m.fuse_ar);
-        if (m.fuse) l.j_am.step(c, T, m.fuse_ar);
-        l.mlp.step(c, batch, m.fuse, m.fuse && !last, m.fuse_ar);
-        if (m.fuse && !last) l.j_ma.step(c, T, m.fuse_ar);
+        const bool ar = m.fuse_ar && ar_wire_is_exact(m.g, T);   /* exact wire only, as above */
+        l.attn.step(c, batch, m.fuse, m.fuse, ar);
+        if (m.fuse) l.j_am.step(c, T, ar);
+        l.mlp.step(c, batch, m.fuse, m.fuse && !last, ar);
+        if (m.fuse && !last) l.j_ma.step(c, T, ar);
         tap(li);
     }
     /* With fused junctions the last layer's tail ran unfused (tail_fused false), so the stream is
