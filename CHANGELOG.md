@@ -10,6 +10,7 @@
 
 ## Unreleased (0.4.3)
 
+- **Fixed: the native tiled MoE oracle runs invalid-descriptor guards for unsharded full ranges.** `--guards-only` executes the unchanged guard family without repeating positive numerical cases, and receipts explicitly identify guard-only mode and coverage.
 - **Developer tooling: added a standalone tiled MoE numerical oracle behind the existing `lab` feature.** `pm_moe_cn_tiled_numeric_oracle` compares externally selected candidate and independent K1 code objects with VMM guards and dual output poisons, and provides a host-only `--selfcheck`. It does not change production routing, row admission, or defaults.
 - **Fixed: PeaceMaker emulation recognizes the existing unsigned-compare and VCC-branch handlers.** Registers `v_cmp_le_u32_e32` and `s_cbranch_vccnz` so those instructions are dispatched instead of rejected as unsupported; handler math and kernel defaults are unchanged.
 - **Fixed: PeaceMaker definedness checks cover every execution-mask group and solve loop flow in reverse postorder.** ROBDD predicates preserve group-wise lane coverage, and reverse-postorder iteration handles backedges without changing kernel or serving defaults.
