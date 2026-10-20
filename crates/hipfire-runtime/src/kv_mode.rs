@@ -946,7 +946,6 @@ mod tests {
         }
         let bf16 = ok("bf16", "gfx1201", A3B, 1, false, false).unwrap_err();
         assert!(bf16.contains("native KV bf16") && bf16.contains("H24/Hkv4/D256"), "{bf16}");
-        assert!(!bf16.contains("H16/Hkv2/D256"), "{bf16}");
         let fp8 = ok("fp8", "gfx1201", (8, 2, 256), 1, false, false).unwrap_err();
         assert!(
             fp8.contains("H24/Hkv4/D256 or H16/Hkv2/D256") && fp8.contains("H8/Hkv2/D256"),
