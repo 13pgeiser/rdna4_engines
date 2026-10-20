@@ -432,6 +432,17 @@ void r4d_ar_twoshot_4rank_exact(long peer_scratch0, long peer_scratch1, long pee
                                 long slot_stride16, long inp, long out, long n_elem, long dtype,
                                 long rank, long stream, long nblocks, long nthreads, long drain,
                                 long acq, long pub, long gate, long gate_ctr, long chain);
+// The four-rank exact two-shot with both pushes coded losslessly at ~12.2 bits a bf16 value (the
+// same bytes out; r4d_ar_twoshot_Nrank_exact.hip). r4d_ar_twoshot_coded_ok says whether a message
+// and slot fit the coded form: bf16, shards of whole 256-value waves, two coded regions a slot.
+int r4d_ar_twoshot_coded_ok(long n_elem, long dtype, long world, long slot_stride16);
+void r4d_ar_twoshot_4rank_exact_coded(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                                      long peer_flags0, long peer_flags1, long peer_flags2,
+                                      long my_scratch, long my_flags, long seq_ctrs,
+                                      long slot_stride16, long inp, long out, long n_elem,
+                                      long rank, long stream, long nblocks, long nthreads,
+                                      long drain, long acq, long pub, long gate, long gate_ctr,
+                                      long chain);
 void r4d_ar_twoshot_8rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                                 long peer_scratch3, long peer_scratch4, long peer_scratch5,
                                 long peer_scratch6, long peer_flags0, long peer_flags1,
@@ -794,7 +805,9 @@ int  r4d_ar_rmsnorm_quant_i8(long peer_scratch, long my_scratch, long peer_flags
 // arguments (peers in ascending rank, this rank's own, the counters, the slot stride), `pub`, the
 // engine's link gate with the instance's landed counter (0 for none; r4d_ar_seq.h), and, with
 // `tail_nbt` blocks (positive), the standalone two-shot on that many with the junction as its tail,
-// counting on the two words at `tail_ctr` (ar_rmsnorm_quant_i8_tail_kernel).
+// counting on the two words at `tail_ctr` (ar_rmsnorm_quant_i8_tail_kernel). With `sp` 1 or 2 the
+// all-reduce split around the junction instead (ar_rmsnorm_quant_i8_sp_kernel): q and S on every
+// row, the residual on this rank's rows (every row at 2), `x` left as it came.
 int  r4d_ar_rmsnorm_quant_i8_4rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                                    long peer_flags0, long peer_flags1, long peer_flags2,
                                    long my_scratch, long my_flags, long seq_ctrs,
@@ -803,7 +816,7 @@ int  r4d_ar_rmsnorm_quant_i8_4rank(long peer_scratch0, long peer_scratch1, long 
                                    float wadd, int w_f32, int r_ld, int y_ld, int rank,
                                    long stream, int nblocks, int drain, int acq, int pub,
                                    long gate, long gate_ctr, long tail_ctr, int tail_nbt,
-                                   int chain);
+                                   int chain, int sp);
 
 // ---- sampling ----------------------------------------------------------------------------------
 //

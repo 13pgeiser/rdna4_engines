@@ -614,6 +614,212 @@ __global__ __launch_bounds__(1024) void r4dchain_ar_rmsnorm_quant_i8_tail(R4D_AR
 #undef R4D_ARQ8T_ARGS
 #undef R4D_ARQ8T_PARAMS
 
+// ---------------------------------------------------------------------------------------------
+// The junction with the all-reduce split around it (`sp`): reduce-scatter, the junction on the rows
+// this rank owns, all-gather of what the next GEMM reads. Rank r owns rows [r0(r), r0(r) + nr(r)),
+// M split as evenly as the rank order allows, and block b serves local row b of every rank:
+//
+//   1. it pushes this rank's partial sums of each peer's local row b into that peer's slot (bf16,
+//      the two-shot's first hop) and takes the handshake;
+//   2. on its own row it folds the four partials in rank order -- r4d_ar_to_f, f32, rank 0 first,
+//      r4d_ar_from_f, the standalone exact all-reduce's fold, so the same bf16 sum -- and runs the
+//      junction on it in the register form at the standalone norm's width (r4d_act_threads), each
+//      thread holding the columns the standalone's does, so every sum is the standalone's; it
+//      stores the residual row and pushes the row's int8 codes and scale (and with `gres` the
+//      residual row) into every peer's slot past the first hop's region, then takes the handshake;
+//   3. it copies the peers' local row b of codes and scales (and residual) into place.
+//
+// So every rank leaves q and S on every row, byte for byte the chain's (all_reduce, then
+// rmsnorm_quant_i8), and the residual on its own rows only -- on every row with `gres`. `x` keeps
+// this rank's partial sums: nothing past the junction reads the reduced branch output. Against the
+// tail form the second hop carries int8 instead of bf16 and no block waits beside the transport;
+// one launch at a time on 4x R9700 (2026-10-19) it took 22.9 against 24.5 us at 8 rows of 5376,
+// 30.8 against 34.9 at 16, 72.3 against 89.2 at 64, and 19.8 against the one-shot's 21.9 at 4.
+template <uint32_t EPT, uint32_t THR, int WS>
+__device__ __forceinline__ void ar_rmsnorm_quant_i8_sp_body(
+    const uint16_t* __restrict__ x, uint16_t* __restrict__ res, const void* __restrict__ w,
+    const void* __restrict__ wp, const void* __restrict__ sc, uint32_t sc_f32, uint32_t wf32,
+    uint32_t gres, signed char* __restrict__ q, float* __restrict__ S,
+    R4DArWidePeers<int4, WS - 1> peers, const int4* __restrict__ my_base,
+    unsigned int* __restrict__ my_flags, unsigned int* __restrict__ seq_ctrs, int M, uint32_t n,
+    float eps, float wadd, uint32_t r_ld, int slot_stride16, int rank, int drain, int acq, int pub,
+    long long* gate, unsigned int* gate_ctr) {
+    constexpr int NPEERS = WS - 1;
+    extern __shared__ uint16_t ybuf[];
+    signed char* const cbuf = (signed char*)(ybuf + n);
+    __shared__ float l1[THR / kWave], l2[THR / kWave], lm[THR / kWave];
+    __shared__ unsigned int s_seq, s_slot;
+    const int b = (int)blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    const long long gate_word = r4d_ar_link_word(gate, tid);
+    r4d_ar_seq_take(seq_ctrs, R4D_AR_WIDE_MAX_BLOCKS, s_seq, s_slot);
+    const unsigned int s = s_seq;
+    const int parity = (int)s_slot;
+    const int base = M / WS, rem = M % WS;
+#define R4D_SP_R0(r) ((r) * base + ((r) < rem ? (r) : rem))
+#define R4D_SP_NR(r) (base + ((r) < rem ? 1 : 0))
+    const int n16 = (int)(n >> 3), c16 = (int)(n >> 4);
+    const size_t offB = (size_t)(base + (rem ? 1 : 0)) * n16;   /* past the first hop's rows */
+    const size_t rowB = (size_t)c16 + 1 + (gres ? n16 : 0);    /* codes, a scale word, residual */
+    const size_t my_slot = ((size_t)parity * WS + rank) * (size_t)slot_stride16;
+
+    // ---- the first hop: this rank's partials of each peer's local row b
+    for (int p = 0; p < NPEERS; ++p) {
+        const int d = peers.rank[p];
+        if (b >= R4D_SP_NR(d)) continue;
+        const int4* src = (const int4*)(x + (size_t)(R4D_SP_R0(d) + b) * n);
+        int4* dst = peers.scratch[p] + my_slot + (size_t)b * n16;
+        for (int k = (int)tid; k < n16; k += (int)THR) dst[k] = src[k];
+    }
+    r4d_ar_handshake<WS>(peers, my_flags, b, rank, 2u * s - 1u, drain, acq, pub);
+
+    if (b < R4D_SP_NR(rank)) {
+        const int row = R4D_SP_R0(rank) + b;
+        const __hip_bfloat16* srcs[WS];
+#pragma unroll
+        for (int r = 0; r < WS; ++r)
+            srcs[r] = r == rank ? (const __hip_bfloat16*)(x + (size_t)row * n)
+                                : (const __hip_bfloat16*)(my_base + ((size_t)parity * WS + r) *
+                                                          (size_t)slot_stride16 + (size_t)b * n16);
+        uint16_t* const rr = res + (size_t)row * r_ld;
+        uint16_t xv[EPT], rv[EPT];
+        float gp[EPT], gw[EPT];
+#pragma unroll
+        for (uint32_t e = 0; e < EPT; ++e) {
+            const uint32_t i = tid + e * THR;
+            xv[e] = 0; rv[e] = 0; gp[e] = 0.0f; gw[e] = 0.0f;
+            if (i < n) {
+                float acc = 0.0f;
+#pragma unroll
+                for (int r = 0; r < WS; ++r) acc += r4d_ar_to_f(srcs[r][i]);
+                __hip_bfloat16 o;
+                r4d_ar_from_f(acc, o);
+                __builtin_memcpy(&xv[e], &o, 2);
+                rv[e] = rr[i];
+                gp[e] = gain(wp, i, wf32) + wadd;
+                gw[e] = gain(w, i, wf32) + wadd;
+            }
+        }
+        const float sv = sc ? scalar_of(sc, sc_f32) : 1.0f;
+
+        // ---- junction_reg_row's passes over the folded row: the post-norm's sum of squares,
+        // the post-norm, add and scalar with the norm's sum of squares, the norm and its absmax
+        float ss = 0.0f;
+#pragma unroll
+        for (uint32_t e = 0; e < EPT; ++e)
+            if (tid + e * THR < n) { const float v = bf2f(xv[e]); ss += v * v; }
+        const float s1 = rsqrtf(block_sum<THR / kWave>(ss, l1) / (float)n + eps);
+        float ss2 = 0.0f;
+#pragma unroll
+        for (uint32_t e = 0; e < EPT; ++e) {
+            const uint32_t i = tid + e * THR;
+            if (i < n) {
+                uint16_t v = f32_to_bf16(bf2f(xv[e]) * s1 * gp[e]);
+                v = f32_to_bf16(bf2f(rv[e]) + bf2f(v));
+                if (sc) v = f32_to_bf16(bf2f(v) * sv);
+                rr[i] = v;
+                xv[e] = v;
+                const float f = bf2f(v);
+                ss2 += f * f;
+            }
+        }
+        const float s2 = rsqrtf(block_sum<THR / kWave>(ss2, l2) / (float)n + eps);
+        float m = 0.0f;
+#pragma unroll
+        for (uint32_t e = 0; e < EPT; ++e) {
+            const uint32_t i = tid + e * THR;
+            if (i < n) {
+                const uint16_t y = f32_to_bf16(bf2f(xv[e]) * s2 * gw[e]);
+                ybuf[i] = y;
+                m = fmaxf(m, fabsf(bf2f(y)));
+            }
+        }
+        m = r4d_wave_max(m);
+        if ((tid & 31) == 0) lm[tid >> 5] = m;
+        __syncthreads();   // also publishes ybuf to every thread
+        m = lm[0];
+#pragma unroll
+        for (uint32_t i = 1; i < THR / kWave; i++) m = fmaxf(m, lm[i]);
+        const float scale = fmaxf(m, 1e-8f) / 127.f;
+        const float inv = 1.f / scale;
+        // ---- the codes, in junction_row's fragment order, into LDS
+        for (uint32_t i = tid; i < n; i += THR) {
+            const uint32_t sg = i >> 4, j = i & 15;
+            const uint32_t src = (sg << 4) + 8 * ((j & 7) >> 2) + 4 * (j >> 3) + (j & 3);
+            const int t = __float2int_rn(bf2f(ybuf[src]) * inv);
+            cbuf[i] = (signed char)(t < -128 ? -128 : (t > 127 ? 127 : t));
+        }
+        __syncthreads();   // the codes, and this block's residual row in memory, whole
+        // ---- the second hop: the row's codes and scale (and residual) to every peer, and here
+        const int4* const c4 = (const int4*)cbuf;
+        int4* const q4 = (int4*)(q + (size_t)row * n);
+        int4* dB[NPEERS];
+#pragma unroll
+        for (int p = 0; p < NPEERS; ++p) dB[p] = peers.scratch[p] + my_slot + offB + (size_t)b * rowB;
+        for (int k = (int)tid; k < c16; k += (int)THR) {
+            const int4 v = c4[k];
+            q4[k] = v;
+#pragma unroll
+            for (int p = 0; p < NPEERS; ++p) dB[p][k] = v;
+        }
+        if (gres) {
+            const int4* const r4 = (const int4*)rr;
+            for (int k = (int)tid; k < n16; k += (int)THR) {
+                const int4 v = r4[k];
+#pragma unroll
+                for (int p = 0; p < NPEERS; ++p) dB[p][c16 + 1 + k] = v;
+            }
+        }
+        if (tid == 0) {
+            S[row] = scale;
+            const int4 sw = make_int4(__float_as_int(scale), 0, 0, 0);
+#pragma unroll
+            for (int p = 0; p < NPEERS; ++p) dB[p][c16] = sw;
+        }
+    }
+    r4d_ar_handshake<WS>(peers, my_flags, b, rank, 2u * s, drain, acq, pub);
+    r4d_ar_link_landed(gate, gate_word, gate_ctr, gridDim.x, tid);
+    // ---- the peers' local row b, codes and scale (and residual), into place
+    for (int p = 0; p < NPEERS; ++p) {
+        const int sr = peers.rank[p];
+        if (b >= R4D_SP_NR(sr)) continue;
+        const int4* const src = my_base + ((size_t)parity * WS + sr) * (size_t)slot_stride16 + offB +
+                                (size_t)b * rowB;
+        const int row = R4D_SP_R0(sr) + b;
+        int4* const q4 = (int4*)(q + (size_t)row * n);
+        for (int k = (int)tid; k < c16; k += (int)THR) q4[k] = src[k];
+        if (gres) {
+            int4* const r4 = (int4*)(res + (size_t)row * r_ld);
+            for (int k = (int)tid; k < n16; k += (int)THR) r4[k] = src[c16 + 1 + k];
+        }
+        if (tid == 0) S[row] = __int_as_float(src[c16].x);
+    }
+#undef R4D_SP_R0
+#undef R4D_SP_NR
+}
+
+#define R4D_ARQ8S_PARAMS const uint16_t* __restrict__ x, uint16_t* __restrict__ res,              \
+    const void* __restrict__ w, const void* __restrict__ wp, const void* __restrict__ sc,          \
+    uint32_t sc_f32, uint32_t wf32, uint32_t gres, signed char* __restrict__ q,                    \
+    float* __restrict__ S, R4DArWidePeers<int4, WS - 1> peers, const int4* __restrict__ my_base,   \
+    unsigned int* __restrict__ my_flags, unsigned int* __restrict__ seq_ctrs, int M, uint32_t n,   \
+    float eps, float wadd, uint32_t r_ld, int slot_stride16, int rank, int drain, int acq, int pub, \
+    long long* gate, unsigned int* gate_ctr
+#define R4D_ARQ8S_ARGS x, res, w, wp, sc, sc_f32, wf32, gres, q, S, peers, my_base, my_flags,     \
+    seq_ctrs, M, n, eps, wadd, r_ld, slot_stride16, rank, drain, acq, pub, gate, gate_ctr
+template <uint32_t EPT, uint32_t THR, int WS>
+__global__ __launch_bounds__(THR) void ar_rmsnorm_quant_i8_sp_kernel(R4D_ARQ8S_PARAMS) {
+    ar_rmsnorm_quant_i8_sp_body<EPT, THR, WS>(R4D_ARQ8S_ARGS);
+}
+template <uint32_t EPT, uint32_t THR, int WS>
+__global__ __launch_bounds__(THR) void r4dchain_ar_rmsnorm_quant_i8_sp(R4D_ARQ8S_PARAMS) {
+    r4d_chain_wait();
+    ar_rmsnorm_quant_i8_sp_body<EPT, THR, WS>(R4D_ARQ8S_ARGS);
+    r4d_chain_done();
+}
+#undef R4D_ARQ8S_ARGS
+#undef R4D_ARQ8S_PARAMS
+
 }  // namespace
 
 // ============================================================== the plugin ABI entry point
@@ -667,24 +873,33 @@ extern "C" int r4d_rad_rmsnorm_quant_i8(const RadArgs* a, RadStream stream) {
     const float wadd = (float)r4d_getf(a, "wadd", 0.0);
     const uint32_t scf = sc ? (sc->dtype == RAD_F32) : 0u;
 
-    // The decode form keeps a thread's columns in registers: at 1024 threads, EPT of them.
-    const int ept = (thr != 1024 || !r4d_cfg_rmsq8_reg(a)) ? 0
-                  : n <= 4096 ? 4 : n <= 6144 ? 6 : n <= 8192 ? 8 : 0;
+    // The decode form keeps a thread's columns in registers, EPT of them: at 1024 threads (to 32
+    // rows) and at 512 (33 to 72-120 rows, r4d_act_threads), the same partition and arithmetic as
+    // the re-read form at that width, so the same bytes. At 512 it serves the multi-user verify
+    // (five to fifteen users of a DFlash2 verify, 8 rows a user), where the re-read form took ~14 us
+    // a junction under --profile-ops at 64 rows of 5376.
+    const int ept = !r4d_cfg_rmsq8_reg(a) ? 0
+                  : thr == 1024 ? (n <= 4096 ? 4 : n <= 6144 ? 6 : n <= 8192 ? 8 : 0)
+                  : thr == 512  ? (n <= 4096 ? 8 : n <= 6144 ? 12 : n <= 8192 ? 16 : 0)
+                  : 0;
 
 #define R4D_RQI8_T(WF, RS, PO, SC, T) emit_rc = R4D_EMIT(stream,                                 \
     (rmsnorm_quant_i8_kernel<WF, RS, PO, SC, T>), dim3((uint32_t)M), dim3(T), lds,               \
     (const uint16_t*)r4d_p(x), (uint16_t*)r4d_wp(rs), r4d_p(w), r4d_p(wp), r4d_p(sc), scf,       \
     (signed char*)r4d_wp(q), (float*)r4d_wp(s), (uint16_t*)r4d_wp(y), (uint32_t)n, eps, wadd,    \
     (uint32_t)xp, (uint32_t)rp, (uint32_t)yp)
-#define R4D_RQI8_R(WF, RS, PO, SC, E) emit_rc = R4D_EMIT(stream,                                 \
-    (rmsnorm_quant_i8_reg_kernel<WF, RS, PO, SC, 1024, E>), dim3((uint32_t)M), dim3(1024), lds,  \
+#define R4D_RQI8_R(WF, RS, PO, SC, T, E) emit_rc = R4D_EMIT(stream,                              \
+    (rmsnorm_quant_i8_reg_kernel<WF, RS, PO, SC, T, E>), dim3((uint32_t)M), dim3(T), lds,        \
     (const uint16_t*)r4d_p(x), (uint16_t*)r4d_wp(rs), r4d_p(w), r4d_p(wp), r4d_p(sc), scf,       \
     (signed char*)r4d_wp(q), (float*)r4d_wp(s), (uint16_t*)r4d_wp(y), (uint32_t)n, eps, wadd,    \
     (uint32_t)xp, (uint32_t)rp, (uint32_t)yp)
 #define R4D_RQI8(WF, RS, PO, SC)                                                                  \
-    do { if (ept == 4)        R4D_RQI8_R(WF, RS, PO, SC, 4);                                      \
-         else if (ept == 6)   R4D_RQI8_R(WF, RS, PO, SC, 6);                                      \
-         else if (ept == 8)   R4D_RQI8_R(WF, RS, PO, SC, 8);                                      \
+    do { if (thr == 1024 && ept == 4)      R4D_RQI8_R(WF, RS, PO, SC, 1024, 4);                   \
+         else if (thr == 1024 && ept == 6) R4D_RQI8_R(WF, RS, PO, SC, 1024, 6);                   \
+         else if (thr == 1024 && ept == 8) R4D_RQI8_R(WF, RS, PO, SC, 1024, 8);                   \
+         else if (thr == 512 && ept == 8)  R4D_RQI8_R(WF, RS, PO, SC, 512, 8);                    \
+         else if (thr == 512 && ept == 12) R4D_RQI8_R(WF, RS, PO, SC, 512, 12);                   \
+         else if (thr == 512 && ept == 16) R4D_RQI8_R(WF, RS, PO, SC, 512, 16);                   \
          else if (thr == 1024) R4D_RQI8_T(WF, RS, PO, SC, 1024);                                  \
          else if (thr == 512) R4D_RQI8_T(WF, RS, PO, SC, 512);                                    \
          else if (thr == 256) R4D_RQI8_T(WF, RS, PO, SC, 256);                                    \
@@ -771,7 +986,7 @@ extern "C" int r4d_ar_rmsnorm_quant_i8_4rank(long peer_scratch0, long peer_scrat
                                              float eps, float wadd, int w_f32, int r_ld, int y_ld,
                                              int rank, long stream, int nblocks, int drain, int acq,
                                              int pub, long gate, long gate_ctr,
-                                             long tail_ctr, int tail_nbt, int chain) {
+                                             long tail_ctr, int tail_nbt, int chain, int sp) {
     constexpr int WS = 4, NPEERS = WS - 1;
     const long ps[NPEERS] = { peer_scratch0, peer_scratch1, peer_scratch2 };
     const long pf[NPEERS] = { peer_flags0, peer_flags1, peer_flags2 };
@@ -814,6 +1029,50 @@ extern "C" int r4d_ar_rmsnorm_quant_i8_4rank(long peer_scratch0, long peer_scrat
 
     const int thr = r4d_act_threads(M, n);
     const size_t lds = (size_t)n * sizeof(uint16_t);
+
+    /* The all-reduce split around the junction (ar_rmsnorm_quant_i8_sp_kernel): `sp` 1, or 2 with
+     * the residual gathered too. A block a local row, ceil(M / 4) of them; its two hops in the slot
+     * the message would fill. Where it cannot run (no residual or post-norm, a width without a
+     * register form, rows past the flag array or the slot, a residual pitch off 16 bytes) the
+     * forms below run instead, which leave every byte this one does and more. It leaves no bf16
+     * norm output, so one asked for (`y`) takes those forms too. */
+    if (sp > 0 && res && wp && !y) {
+        const int ep = thr == 1024 ? (n <= 4096 ? 4 : n <= 6144 ? 6 : n <= 8192 ? 8 : 0)
+                     : thr == 512  ? (n <= 4096 ? 8 : n <= 6144 ? 12 : n <= 8192 ? 16 : 0) : 0;
+        const int nbs = (M + WS - 1) / WS;
+        const long need = (long)nbs * (n / 8) + (long)nbs * (n / 16 + 1 + (sp == 2 ? n / 8 : 0));
+        if (ep > 0 && nbs <= R4D_AR_WIDE_MAX_BLOCKS && need <= slot_stride16 &&
+            (sp != 2 || r_ld % 8 == 0)) {
+            try {
+                const long fb = (long)nbs * WS * (long)sizeof(unsigned int);
+                r4d_ar_check_extent(my_flags, fb, "ar_rmsnorm_quant_i8", "my_flags");
+                for (int i = 0; i < NPEERS; ++i)
+                    r4d_ar_check_extent(pf[i], fb, "ar_rmsnorm_quant_i8", "peer flags");
+            } catch (...) {
+                return -8;
+            }
+            const size_t lds_sp = (size_t)n * (sizeof(uint16_t) + 1);
+#define R4D_ARQ8S_K(E, T)                                                                         \
+            hipLaunchKernelGGL((chain ? r4dchain_ar_rmsnorm_quant_i8_sp<E, T, WS>                 \
+                                      : ar_rmsnorm_quant_i8_sp_kernel<E, T, WS>),                \
+                               dim3((uint32_t)nbs), dim3(T), lds_sp, (hipStream_t)stream,         \
+                               (const uint16_t*)x, (uint16_t*)res, (const void*)w,                \
+                               (const void*)wp, (const void*)sc, (uint32_t)sc_f32,                \
+                               (uint32_t)w_f32, (uint32_t)(sp == 2), (signed char*)q, (float*)s,  \
+                               peers, (const int4*)my_scratch, (unsigned int*)my_flags,           \
+                               (unsigned int*)seq_ctrs, M, (uint32_t)n, eps, wadd,                \
+                               (uint32_t)r_ld, (int)slot_stride16, rank, drain, acq, pub,         \
+                               (long long*)gate, (unsigned int*)gate_ctr)
+            if (thr == 1024 && ep == 4)      R4D_ARQ8S_K(4, 1024);
+            else if (thr == 1024 && ep == 6) R4D_ARQ8S_K(6, 1024);
+            else if (thr == 1024)            R4D_ARQ8S_K(8, 1024);
+            else if (ep == 8)                R4D_ARQ8S_K(8, 512);
+            else if (ep == 12)               R4D_ARQ8S_K(12, 512);
+            else                             R4D_ARQ8S_K(16, 512);
+#undef R4D_ARQ8S_K
+            return hipGetLastError() == hipSuccess ? 0 : -4;
+        }
+    }
 
     /* The junction as the standalone two-shot's tail (ar_rmsnorm_quant_i8_tail_kernel): at the
      * junction's register width (1024 threads), up to R4D_ARQ8_TAIL_MAX_ROWS rows. */

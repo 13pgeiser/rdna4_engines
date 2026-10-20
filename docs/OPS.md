@@ -2171,7 +2171,7 @@ device code.
 | `ar_rmsnorm_quant_fp8` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `ar_rmsnorm_post_quant_fp8` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`:inout, `residual`:inout, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w |
 | `ar_rmsnorm_had_quant_i8g` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
-| `ar_rmsnorm_quant_i8` | `M` `n` `eps`:f64 `world_size` `dtype` `wadd`:f64/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
+| `ar_rmsnorm_quant_i8` | `M` `n` `eps`:f64 `world_size` `dtype` `wadd`:f64/opt `sp`/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
 | `ar_hc_write` | `M`(range) `n` `hc` `world_size` `dtype` `wire`/opt | `y`:inout, `inj`, `h`:inout |
 | `ar_gather_hc_write` | `M`(range) `n` `hc` `top_k` `world_size` `dtype` `act`/opt `wire`/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`?, `y`:inout, `inj`, `h`:inout |
 | `ar_ln_had_quant_i8` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
@@ -2182,6 +2182,14 @@ parameter for the same reason as `min_bytes`. `x` is inout on `ar_rmsnorm_quant_
 the message and the input, and the reduced sum lands in it.
 `ar_rmsnorm_had_quant_i8g` is `ar_rmsnorm_quant_fp8` with `rmsnorm_had_quant_i8g`'s quantiser:
 `x` and the residual are the same bytes, and the codes are int8 for a weight at `i8a8h`.
+
+`sp` on `ar_rmsnorm_quant_i8` (0 when absent) lets a row split the all-reduce around the
+junction: reduce-scatter, the junction on the rows this rank owns (`M` split evenly over the
+ranks in rank order), all-gather of what the next GEMM reads. At 1 the op promises `q` and
+`scale` on every row and `residual` on this rank's rows only; at 2 `residual` on every row too;
+either way `x` is left unspecified. A row may always run the whole form, which keeps every
+promise. The caller must not read a residual row it does not own after an `sp` 1 junction
+until a junction or reduction writes it whole again.
 
 The norm-carrying forms are two-rank only. `ar_hc_write` and `ar_gather_hc_write` also have an
 exact-wire four-rank form. At other widths the arch blocks issue the plain ops.

@@ -158,6 +158,222 @@ __device__ __forceinline__ void r4d_ar_twoshot_wide_exact_body(
   if (CHAIN) r4d_chain_done();
 }
 
+// ---- the coded form: both pushes carry ~12.2 bits a bf16 value instead of 16, losslessly
+//
+// The prefill overlap's reductions are link-bound, and a residual stream's bf16 words have few
+// distinct exponents: on the 31B (4x R9700, 64 groups of 512 x 5376 values from a 9.9k-token
+// prefill) 2.5-3.2 bits of exponent entropy against 8 stored. A chunk is one int4 word (8
+// values); 8 consecutive chunks (64 values) form a group that shares a base exponent, and each
+// value keeps its sign, its 7 mantissa bits and a 4-bit exponent offset (0 = an exact zero, 1..15 =
+// base .. base + 14), 8 values to 3 dwords. A group holding a subnormal, an inf or NaN, or an
+// exponent range past 14 (0.02% of groups there) is stored raw in a shadow area, its base byte
+// 0xFF. A region (one source's shard in an owner's scratch) is [3 dwords a chunk][a base byte a
+// group][the shadow, 16 bytes a chunk]; A and B are two regions in a slot. A wave codes 32
+// consecutive chunks: the group's exponents meet by lane shuffles, and the packed dwords are
+// redistributed so every store a wave makes is contiguous, keeping the P2P writes coalesced.
+//
+// Decoding gives back the same bf16 values, so the reduce folds the same numbers in the same rank
+// order: the bytes are the plain kernel's. Four-card microbenchmark (the real payload above, the
+// two-shot of a 1024-row slice beside the w4a8 prefill GEMM): byte-identical; the reduction 1383
+// us at the plain lane launch (2 x 256) against 996 us coded at 4 x 1024, with the GEMM beside it
+// 746 -> 724 us. Below 1024 threads a launch codes too slowly (2 x 256: 2492 us).
+__device__ __forceinline__ unsigned r4d_arc_shfl(unsigned v, int src) {
+  return (unsigned)__builtin_amdgcn_ds_bpermute(src << 2, (int)v);
+}
+struct R4dArcEnc { unsigned w[3]; unsigned base; };
+// Code this lane's chunk; every lane of the wave calls (a lane past the end with valid false).
+__device__ __forceinline__ R4dArcEnc r4d_arc_enc(int4 v, bool valid) {
+  const unsigned d[4] = {(unsigned)v.x, (unsigned)v.y, (unsigned)v.z, (unsigned)v.w};
+  unsigned emin = 255u, emax = 0u, bad = 0u;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const unsigned u = (d[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+    const unsigned e = (u >> 7) & 0xffu, m = u & 0x7fu;
+    if (e) { emin = e < emin ? e : emin; emax = e > emax ? e : emax; }
+    bad |= (unsigned)(e == 0u && m != 0u) | (unsigned)(e == 255u);
+  }
+  if (!valid) { emin = 255u; emax = 0u; bad = 0u; }
+  const int lane = (int)(threadIdx.x & 31u);
+#pragma unroll
+  for (int s = 1; s < 8; s <<= 1) {
+    const unsigned a = r4d_arc_shfl(emin, lane ^ s), b = r4d_arc_shfl(emax, lane ^ s);
+    const unsigned c = r4d_arc_shfl(bad, lane ^ s);
+    emin = a < emin ? a : emin; emax = b > emax ? b : emax; bad |= c;
+  }
+  R4dArcEnc r;
+  const unsigned base = emin == 255u ? 1u : emin;
+  r.base = (bad || emax > base + 14u) ? 0xFFu : base;
+  unsigned c[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const unsigned u = (d[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+    const unsigned e = (u >> 7) & 0xffu, m = u & 0x7fu, sg = u >> 15;
+    c[i] = (sg << 11) | (m << 4) | (e ? (e - base + 1u) & 15u : 0u);
+  }
+  r.w[0] = c[0] | (c[1] << 12) | (c[2] << 24);
+  r.w[1] = (c[2] >> 8) | (c[3] << 4) | (c[4] << 16) | (c[5] << 28);
+  r.w[2] = (c[5] >> 4) | (c[6] << 8) | (c[7] << 20);
+  return r;
+}
+__device__ __forceinline__ int4 r4d_arc_dec(const unsigned (&w)[3], unsigned base) {
+  unsigned c[8];
+  c[0] = w[0] & 0xfffu; c[1] = (w[0] >> 12) & 0xfffu; c[2] = (w[0] >> 24) | ((w[1] & 0xfu) << 8);
+  c[3] = (w[1] >> 4) & 0xfffu; c[4] = (w[1] >> 16) & 0xfffu; c[5] = (w[1] >> 28) | ((w[2] & 0xffu) << 4);
+  c[6] = (w[2] >> 8) & 0xfffu; c[7] = w[2] >> 20;
+  unsigned u[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const unsigned off = c[i] & 15u;
+    u[i] = ((c[i] >> 11) << 15) | ((off ? base + off - 1u : 0u) << 7) | ((c[i] >> 4) & 0x7fu);
+  }
+  int4 v;
+  v.x = (int)(u[0] | (u[1] << 16)); v.y = (int)(u[2] | (u[3] << 16));
+  v.z = (int)(u[4] | (u[5] << 16)); v.w = (int)(u[6] | (u[7] << 16));
+  return v;
+}
+struct R4dArcRegion { unsigned* packed; unsigned* bases; int4* shadow; };
+__host__ __device__ constexpr size_t r4d_arc_shadow_off(long SL) {
+  return ((size_t)12 * SL + (size_t)SL / 8 + 15) & ~(size_t)15;
+}
+__host__ __device__ constexpr size_t r4d_arc_region_bytes(long SL) {
+  return (r4d_arc_shadow_off(SL) + (size_t)16 * SL + 255) & ~(size_t)255;
+}
+__device__ __forceinline__ R4dArcRegion r4d_arc_region(const void* p, int SL) {
+  char* b = (char*)p;
+  return R4dArcRegion{(unsigned*)b, (unsigned*)(b + (size_t)12 * SL), (int4*)(b + r4d_arc_shadow_off(SL))};
+}
+// A wave's coded chunks [k0, k0 + 32) (k0 a multiple of 32) into ND regions, every store contiguous.
+template <int ND>
+__device__ __forceinline__ void r4d_arc_put(R4dArcRegion (&dst)[ND], int k0, const R4dArcEnc& e,
+                                            int4 raw, bool valid) {
+  const int lane = (int)(threadIdx.x & 31u);
+#pragma unroll
+  for (int j = 0; j < 3; ++j) {
+    const int p = 32 * j + lane, sl = p / 3, wi = p - sl * 3;
+    const unsigned a0 = r4d_arc_shfl(e.w[0], sl), a1 = r4d_arc_shfl(e.w[1], sl);
+    const unsigned a2 = r4d_arc_shfl(e.w[2], sl), vs = r4d_arc_shfl(valid ? 1u : 0u, sl);
+    const unsigned val = wi == 0 ? a0 : wi == 1 ? a1 : a2;
+    if (vs) {
+#pragma unroll
+      for (int q = 0; q < ND; ++q) dst[q].packed[(size_t)k0 * 3 + p] = val;
+    }
+  }
+  const unsigned b0 = r4d_arc_shfl(e.base, 0), b1 = r4d_arc_shfl(e.base, 8);
+  const unsigned b2 = r4d_arc_shfl(e.base, 16), b3 = r4d_arc_shfl(e.base, 24);
+  if (lane == 0 && valid) {
+#pragma unroll
+    for (int q = 0; q < ND; ++q) dst[q].bases[k0 / 32] = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+  }
+  if (valid && e.base == 0xFFu) {
+#pragma unroll
+    for (int q = 0; q < ND; ++q) dst[q].shadow[k0 + lane] = raw;
+  }
+}
+// A wave's chunks [k0, k0 + 32) back from a region; every lane calls.
+__device__ __forceinline__ int4 r4d_arc_get(const R4dArcRegion& src, int k0, bool valid) {
+  const int lane = (int)(threadIdx.x & 31u);
+  unsigned ld[3];
+#pragma unroll
+  for (int j = 0; j < 3; ++j) ld[j] = valid ? src.packed[(size_t)k0 * 3 + 32 * j + lane] : 0u;
+  unsigned w[3];
+#pragma unroll
+  for (int i = 0; i < 3; ++i) {
+    const int q = 3 * lane + i, sl = q & 31, j = q >> 5;
+    const unsigned a0 = r4d_arc_shfl(ld[0], sl), a1 = r4d_arc_shfl(ld[1], sl);
+    const unsigned a2 = r4d_arc_shfl(ld[2], sl);
+    w[i] = j == 0 ? a0 : j == 1 ? a1 : a2;
+  }
+  const unsigned base = ((valid ? src.bases[k0 / 32] : 0u) >> ((lane >> 3) * 8)) & 0xffu;
+  if (base == 0xFFu) return valid ? src.shadow[k0 + lane] : make_int4(0, 0, 0, 0);
+  return r4d_arc_dec(w, base);
+}
+
+// The coded two-shot, bf16 only; the launcher checks that each shard is a whole number of waves'
+// 32 chunks and that a slot holds two regions.
+template <int WS, bool CHAIN>
+__device__ __forceinline__ void r4d_ar_twoshot_coded_body(
+    const int4* __restrict__ in4, R4DArWidePeers<int4, WS - 1> peers,
+    const int4* __restrict__ my_base, unsigned int* __restrict__ my_flags,
+    int4* __restrict__ out4, unsigned int* __restrict__ seq_ctrs, int n16,
+    int slot_stride16, int rank, int drain, int acq, int pub,
+    long long* gate, unsigned int* gate_ctr) {
+  if (CHAIN) r4d_chain_wait();
+  constexpr int NPEERS = WS - 1;
+  const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
+  __shared__ unsigned int s_seq, s_slot;
+  const long long gate_word = r4d_ar_link_word(gate, (unsigned int)tid);
+  r4d_ar_seq_take(seq_ctrs, R4D_AR_WIDE_MAX_BLOCKS, s_seq, s_slot);
+  const unsigned int s = s_seq;
+  const int parity = (int)s_slot;
+  const int SL = n16 / WS;                       /* every shard: a multiple of 32 chunks */
+  int w = (SL + nb - 1) / nb;
+  w = (w + 31) & ~31;
+  const int w0 = b * w;
+  int w1 = w0 + w; if (w1 > SL) w1 = SL;
+  const size_t RB = r4d_arc_region_bytes(SL);
+  const int lane = tid & 31;
+
+  // phase 1: my contribution to each peer-owned shard, coded, into the owner's region A for me
+  for (int p = 0; p < NPEERS; ++p) {
+    const int owner = peers.rank[p];
+    const int4* src = in4 + (size_t)owner * SL;
+    R4dArcRegion dst[1] = {r4d_arc_region(peers.scratch[p] + ((size_t)parity * WS + rank) * (size_t)slot_stride16, SL)};
+    for (int k = w0 + tid; k - lane < w1; k += nt) {
+      const bool valid = k < w1;
+      const int4 v = valid ? src[k] : make_int4(0, 0, 0, 0);
+      r4d_arc_put<1>(dst, k - lane, r4d_arc_enc(v, valid), v, valid);
+    }
+  }
+  r4d_ar_handshake<WS>(peers, my_flags, b, rank, 2u * s - 1u, drain, acq, pub);
+
+  // reduce my shard (fp32, ascending rank, my own contribution raw from the input), code it once,
+  // and push it to every peer's region B
+  R4dArcRegion srcA[WS], dstB[NPEERS];
+#pragma unroll
+  for (int r = 0; r < WS; ++r)
+    srcA[r] = r4d_arc_region(my_base + ((size_t)parity * WS + r) * (size_t)slot_stride16, SL);
+#pragma unroll
+  for (int p = 0; p < NPEERS; ++p)
+    dstB[p] = r4d_arc_region((const char*)(peers.scratch[p] + ((size_t)parity * WS + rank) * (size_t)slot_stride16) + RB, SL);
+  const int4* own = in4 + (size_t)rank * SL;
+  int4* my_out = out4 + (size_t)rank * SL;
+  for (int k = w0 + tid; k - lane < w1; k += nt) {
+    const bool valid = k < w1;
+    const int k0 = k - lane;
+    float acc[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[j] = 0.0f;
+#pragma unroll
+    for (int r = 0; r < WS; ++r) {
+      const int4 v = (r == rank) ? (valid ? own[k] : make_int4(0, 0, 0, 0)) : r4d_arc_get(srcA[r], k0, valid);
+      const __hip_bfloat16* pv = reinterpret_cast<const __hip_bfloat16*>(&v);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) acc[j] += (float)pv[j];
+    }
+    int4 o;
+    __hip_bfloat16* po = reinterpret_cast<__hip_bfloat16*>(&o);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) po[j] = (__hip_bfloat16)acc[j];
+    if (valid) my_out[k] = o;
+    r4d_arc_put<NPEERS>(dstB, k0, r4d_arc_enc(o, valid), o, valid);
+  }
+  r4d_ar_handshake<WS>(peers, my_flags, b, rank, 2u * s, drain, acq, pub);
+  r4d_ar_link_landed(gate, gate_word, gate_ctr, (unsigned int)nb, (unsigned int)tid);
+
+  // assemble: every peer-owned shard from my region B
+  for (int p = 0; p < NPEERS; ++p) {
+    const int owner = peers.rank[p];
+    const R4dArcRegion src = r4d_arc_region((const char*)(my_base + ((size_t)parity * WS + owner) * (size_t)slot_stride16) + RB, SL);
+    int4* dst = out4 + (size_t)owner * SL;
+    for (int k = w0 + tid; k - lane < w1; k += nt) {
+      const bool valid = k < w1;
+      const int4 v = r4d_arc_get(src, k - lane, valid);
+      if (valid) dst[k] = v;
+    }
+  }
+  if (CHAIN) r4d_chain_done();
+}
+
 #define R4D_ARTS_PARAMS const int4* __restrict__ in4, R4DArWidePeers<int4, WS - 1> peers,       \
     const int4* __restrict__ my_base, unsigned int* __restrict__ my_flags,                      \
     int4* __restrict__ out4, unsigned int* __restrict__ seq_ctrs, R4DArShardOff<WS> sh,         \
@@ -175,6 +391,24 @@ __global__ void r4dchain_ar_twoshot_wide_exact(R4D_ARTS_PARAMS) {
 }
 #undef R4D_ARTS_ARGS
 #undef R4D_ARTS_PARAMS
+// The coded form keeps the even split (its launcher checks every shard is whole waves' chunks), so
+// it takes the message length, not the plain form's shard table and pieces.
+#define R4D_ARTC_PARAMS const int4* __restrict__ in4, R4DArWidePeers<int4, WS - 1> peers,       \
+    const int4* __restrict__ my_base, unsigned int* __restrict__ my_flags,                      \
+    int4* __restrict__ out4, unsigned int* __restrict__ seq_ctrs, int n16, int slot_stride16,   \
+    int rank, int drain, int acq, int pub, long long* gate, unsigned int* gate_ctr
+#define R4D_ARTC_ARGS in4, peers, my_base, my_flags, out4, seq_ctrs, n16, slot_stride16, rank,   \
+    drain, acq, pub, gate, gate_ctr
+template <int WS>
+__global__ void r4d_ar_twoshot_coded_kernel(R4D_ARTC_PARAMS) {
+  r4d_ar_twoshot_coded_body<WS, false>(R4D_ARTC_ARGS);
+}
+template <int WS>
+__global__ void r4dchain_ar_twoshot_coded(R4D_ARTC_PARAMS) {
+  r4d_ar_twoshot_coded_body<WS, true>(R4D_ARTC_ARGS);
+}
+#undef R4D_ARTC_ARGS
+#undef R4D_ARTC_PARAMS
 
 // --- host side ---
 template <int WS>
@@ -304,6 +538,50 @@ void r4d_ar_twoshot_4rank_exact(long peer_scratch0, long peer_scratch1, long pee
   ar_twoshot_launch<4>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, inp, out, n_elem,
                        dtype, rank, stream, nblocks, nthreads, drain, acq, pub, gate, gate_ctr,
                        nullptr, 1L, chain != 0);
+}
+
+/* The coded form's conditions: bf16, a message that shards evenly into whole waves' 32 chunks
+ * (256 values) a rank, and a slot that holds two coded regions. */
+int r4d_ar_twoshot_coded_ok(long n_elem, long dtype, long world, long slot_stride16) {
+  if (dtype != 0 || world <= 0 || n_elem % (world * 256) != 0) return 0;
+  const long SL = n_elem / 8 / world;
+  return 2 * r4d_arc_region_bytes(SL) <= (size_t)slot_stride16 * 16 ? 1 : 0;
+}
+
+void r4d_ar_twoshot_4rank_exact_coded(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                                      long peer_flags0, long peer_flags1, long peer_flags2,
+                                      long my_scratch, long my_flags, long seq_ctrs,
+                                      long slot_stride16, long inp, long out, long n_elem,
+                                      long rank, long stream, long nblocks, long nthreads,
+                                      long drain, long acq, long pub, long gate, long gate_ctr,
+                                      long chain) {
+  constexpr int WS = 4;
+  if (!r4d_ar_twoshot_coded_ok(n_elem, 0, WS, slot_stride16))
+    throw std::runtime_error("all_reduce (coded): message or slot outside the coded form");
+  if (rank < 0 || rank >= WS) throw std::runtime_error("all_reduce (coded): rank out of range");
+  const long n16 = n_elem / 8, SL = n16 / WS;
+  int nb = (int)nblocks;
+  if (nb < 1) nb = 4;
+  if (nb > R4D_AR_WIDE_MAX_BLOCKS) nb = R4D_AR_WIDE_MAX_BLOCKS;
+  if (nb > SL / 32) nb = (int)(SL / 32);
+  int nt = (int)nthreads;
+  if (nt < 256) nt = 256;
+  if (nt > 1024) nt = 1024;
+  nt &= ~31;
+  R4DArWidePeers<int4, WS - 1> peers{};
+  const long ps[3] = {peer_scratch0, peer_scratch1, peer_scratch2};
+  const long pf[3] = {peer_flags0, peer_flags1, peer_flags2};
+  for (int i = 0; i < WS - 1; ++i) {
+    if (!ps[i] || !pf[i]) throw std::runtime_error("all_reduce (coded): null peer pointer");
+    peers.scratch[i] = (int4*)ps[i];
+    peers.flags[i] = (unsigned int*)pf[i];
+    peers.rank[i] = (i < (int)rank) ? i : i + 1;
+  }
+  hipStream_t st = (hipStream_t)stream;
+  (chain ? r4dchain_ar_twoshot_coded<WS> : r4d_ar_twoshot_coded_kernel<WS>)<<<nb, nt, 0, st>>>(
+      (const int4*)inp, peers, (const int4*)my_scratch, (unsigned int*)my_flags, (int4*)out,
+      (unsigned int*)seq_ctrs, (int)n16, (int)slot_stride16, (int)rank, (int)drain, (int)acq,
+      (int)pub, (long long*)gate, (unsigned int*)gate_ctr);
 }
 
 void r4d_ar_twoshot_8rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,

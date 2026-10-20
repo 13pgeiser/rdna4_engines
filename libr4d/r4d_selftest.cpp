@@ -11326,7 +11326,9 @@ static void rmsnorm_quant_i8_numeric(const Plugin& pl) {
     /* The row's reg axis at 1024 threads: 1 (the default) holds a thread's columns in registers,
      * 0 re-reads the row each pass; both must leave the chain's bytes. */
     struct RqCase { int64_t M; int reg; };
-    for (const RqCase rqc : { RqCase{ 1, 1 }, RqCase{ 8, 1 }, RqCase{ 8, 0 }, RqCase{ 40, 1 } }) {
+    /* 40 and 64 rows: the 512-thread width, its register form and its re-read form */
+    for (const RqCase rqc : { RqCase{ 1, 1 }, RqCase{ 8, 1 }, RqCase{ 8, 0 }, RqCase{ 40, 1 },
+                              RqCase{ 40, 0 }, RqCase{ 64, 1 } }) {
         const int64_t M = rqc.M;
         const std::string form = rqc.reg ? "" : " (re-read form)";
         const int64_t K = 5376;   /* Gemma 4 31B's hidden width: 336 sixteen-byte k steps */
@@ -21734,6 +21736,9 @@ struct ArPattern {
     std::vector<int64_t> sizes;
     int out_of_place = -1;             /* index into sizes, or -1 */
     std::vector<int> pieces;           /* per size: a launch `pieces` parameter, 0 or absent none */
+    int overlap = 0;                   /* 1: launched as beside compute (the lane rows) */
+    int coded_pattern = 0;             /* 1: ar_coded_value, not ar_pattern_value */
+    int coded = -1;                    /* >= 0: the lane row's `coded` launch parameter */
     void* inst = nullptr;
     int rc_init = RAD_E_STATE, rc_launch = RAD_OK;
     std::vector<std::vector<float>> out;
@@ -21745,6 +21750,30 @@ static float ar_pattern_value(int rank, int64_t i) {
     return (float)((int)((i * 37 + (int64_t)rank * 101) % 509) - 254) / 64.0f;
 }
 
+/* The pattern for the two-shot's coded form (r4d_ar_twoshot_Nrank_exact.hip), which codes a group
+ * of 64 consecutive values on a shared exponent and sends a group it cannot code raw: the
+ * per-element pattern, with groups sent down each path -- an exponent range of exactly 14 (coded)
+ * and 15 (raw), one far past it, a subnormal, an infinity, all zeros, and exponents near the top.
+ * Every shard starts on a group, so an element's group is its index over 64; each path holds on
+ * both pushes (the inputs and the folded shard). */
+static float ar_coded_value(int rank, int64_t i) {
+    const int64_t g = i / 64, j = i % 64;
+    const float sg = (j & 1) ? -1.0f : 1.0f;
+    switch (g % 16) {
+    case 3:  return std::ldexp(ar_pattern_value(rank, i), 3 * (int)(j % 8));
+    case 5:  return j == 17 ? (rank == 1 ? h_bf16(0x0005) : 1.0f) : ar_pattern_value(rank, i);
+    case 7:  return (j == 40 && rank == 0) ? INFINITY : ar_pattern_value(rank, i);
+    case 9:  return 0.0f;
+    case 11: return sg * (j == 5 ? 16384.0f : 1.0f);
+    case 13: return sg * (j == 5 ? 32768.0f : 1.0f);
+    case 14: return std::ldexp(ar_pattern_value(rank, i), 100);
+    default: return ar_pattern_value(rank, i);
+    }
+}
+static float ar_value(int coded_pattern, int rank, int64_t i) {
+    return coded_pattern ? ar_coded_value(rank, i) : ar_pattern_value(rank, i);
+}
+
 static void ar_pattern_worker(ArPattern* t) {
     if (st_set_device(t->dev) != hipSuccess) { t->rc_init = RAD_E_DEVICE; return; }
     const bool bf = !std::strcmp(t->dtype, "bf16");
@@ -21754,6 +21783,7 @@ static void ar_pattern_worker(ArPattern* t) {
     std::vector<RadParam> ps = {
         PI("world_size", t->world), PI("numel", most), PS("dtype", t->dtype), PI("exact", 1),
     };
+    if (t->overlap) ps.push_back(PI("overlap", 1));
     t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, t->world, &t->inst);
     if (t->rc_init != RAD_OK) return;
     void* in = nullptr;
@@ -21764,7 +21794,7 @@ static void ar_pattern_worker(ArPattern* t) {
     for (size_t k = 0; k < t->sizes.size(); ++k) {
         const int64_t n = t->sizes[k];
         for (int64_t i = 0; i < n; ++i) {
-            const float v = ar_pattern_value(t->rank, i);
+            const float v = ar_value(t->coded_pattern, t->rank, i);
             if (bf) { const uint16_t b = h_to_bf16(v); std::memcpy(&h[(size_t)i * 2], &b, 2); }
             else    std::memcpy(&h[(size_t)i * 4], &v, 4);
         }
@@ -21778,6 +21808,7 @@ static void ar_pattern_worker(ArPattern* t) {
         a.t = ts; a.n_t = oop ? 2 : 1;
         std::vector<RadParam> lp = ps;
         if (k < t->pieces.size() && t->pieces[k] > 0) lp.push_back(PI("pieces", t->pieces[k]));
+        if (t->coded >= 0) lp.push_back(PI("coded", t->coded));
         a.p = lp.data(); a.n_p = (int)lp.size();
         a.instance = t->inst;
         a.rank = t->rank;
@@ -22417,6 +22448,91 @@ static void ar8_perf(const Plugin& pl, int64_t numel, int iters, const char* dty
                 ++cfg;
             }
         }
+    }
+}
+
+/* The four-rank two-shot's lane row (overlap 1: the prefill's reductions beside compute) in both
+ * its forms, which the `coded` launch parameter picks: the narrow plain launch (0), and the coded
+ * one (1), whose pushes carry ~12.2 bits a bf16 value. Each must equal the fp32 ascending-rank
+ * fold bit for bit, on the per-element pattern and on ar_coded_value. A message outside the coded
+ * form (shards that are not whole 256-value waves, or fp32) runs plain whatever the parameter
+ * says; each label says which form a size took, by the library's rule restated here. */
+static bool ar_coded_fits(const char* dtype, int64_t n, int64_t most) {
+    if (std::strcmp(dtype, "bf16") != 0 || n % 1024 != 0) return false;
+    const int64_t SL = n / 32;                              /* a shard's 16-byte chunks */
+    const int64_t shadow = (12 * SL + SL / 8 + 15) & ~(int64_t)15;
+    const int64_t region = (shadow + 16 * SL + 255) & ~(int64_t)255;
+    return 2 * region <= ((most * 2 + 15) & ~(int64_t)15);
+}
+static void ar_lane_forms(const Plugin& pl, const std::vector<int>& devs, const char* name) {
+    const RadKernelInfo* row = find(pl, name);
+    if (!row) { ok(name, false, "row absent"); return; }
+    if ((int)devs.size() < 4) { skip(name, "needs 4 gfx1201 cards"); return; }
+    struct Run { bool coded; int pat; const char* dtype; std::vector<int64_t> sizes; int oop; };
+    /* 1024: one wave a shard; 1055744: 1031 waves, an odd split over the blocks; 524352: bf16
+     * outside the coded form; 46137344: the feed-forward reduce at an 8192-token chunk. */
+    const std::vector<Run> runs = {
+        { false, 0, "bf16", { 4194304, 524352, 1055744, 20971520 }, 1 },
+        { true,  0, "bf16", { 4194304, 1024, 524352, 1055744, 20971520, 4194304 }, 3 },
+        { true,  1, "bf16", { 4194304, 1024, 1055744, 46137344, 4194304 }, 2 },
+        { true,  0, "fp32", { 524352 }, 0 },
+    };
+    for (const Run& run : runs) {
+        std::vector<ArPattern> t(4);
+        std::vector<std::thread> th;
+        for (int r = 0; r < 4; ++r) {
+            t[(size_t)r].row = row; t[(size_t)r].rank = r; t[(size_t)r].dev = devs[(size_t)r];
+            t[(size_t)r].world = 4;
+            t[(size_t)r].dtype = run.dtype; t[(size_t)r].sizes = run.sizes;
+            t[(size_t)r].out_of_place = run.oop;
+            t[(size_t)r].overlap = 1;
+            t[(size_t)r].coded_pattern = run.pat;
+            t[(size_t)r].coded = run.coded ? 1 : 0;
+            th.emplace_back(ar_pattern_worker, &t[(size_t)r]);
+        }
+        for (std::thread& x : th) x.join();
+        const std::string what = std::string(name) + " " + run.dtype +
+                                 (run.coded ? ", coded 1" : ", coded 0") +
+                                 (run.pat ? ", the coded form's pattern" : "");
+        bool up = true, ran = true;
+        std::string rcs;
+        for (const ArPattern& a : t) {
+            up = up && a.rc_init == RAD_OK; ran = ran && a.rc_launch == RAD_OK;
+            rcs += std::to_string(a.rc_init) + "/" + std::to_string(a.rc_launch) + " ";
+        }
+        ok((what + " init (peer rendezvous)").c_str(), up, "init/launch rc " + rcs);
+        if (!up) return;
+        ok((what + " launches").c_str(), ran, "init/launch rc " + rcs);
+        int64_t most = 0;
+        for (int64_t n : run.sizes) most = n > most ? n : most;
+        if (ran) {
+            const bool bf = !std::strcmp(run.dtype, "bf16");
+            for (size_t k = 0; k < run.sizes.size(); ++k) {
+                const int64_t n = run.sizes[k];
+                int64_t bad = 0, first = -1;
+                for (int64_t i = 0; i < n; ++i) {
+                    float acc = 0.0f;
+                    for (int r = 0; r < 4; ++r) {
+                        const float v = ar_value(run.pat, r, i);
+                        acc += bf ? h_bf16(h_to_bf16(v)) : v;
+                    }
+                    const float want = bf ? h_bf16(h_to_bf16(acc)) : acc;
+                    for (int r = 0; r < 4; ++r)
+                        if (t[(size_t)r].out.size() <= k || t[(size_t)r].out[k][(size_t)i] != want) {
+                            if (first < 0) first = i;
+                            ++bad;
+                        }
+                }
+                const bool coded = run.coded && ar_coded_fits(run.dtype, n, most);
+                const std::string label =
+                    what + " numel " + std::to_string(n) + " (" + (coded ? "coded" : "plain") +
+                    ((int)k == run.oop ? ", out of place" : ", in place") +
+                    ") == fp32 ascending-rank fold on every rank, bit for bit";
+                ok(label.c_str(), bad == 0,
+                   std::to_string(bad) + " elements wrong, first at " + std::to_string(first));
+            }
+        }
+        if (row->fini) for (ArPattern& a : t) if (a.inst) row->fini(a.inst);
     }
 }
 
@@ -23060,6 +23176,7 @@ struct ArQ8 {
     bool gated = false;                            /* hand the launch an odd `link_gate` word */
     long long gate_after = -1;                     /* ...and what the launch left in it */
     int tail = -1;                                 /* the `tail` axis pinned, or -1: the default */
+    int sp = 0;                                    /* `sp`: the all-reduce split around the junction */
     void* inst = nullptr;
     int rc_init = RAD_E_STATE, rc_launch = RAD_OK;
     const std::vector<uint16_t>* r_in = nullptr;   /* the replicated residual, w and w_post */
@@ -23081,6 +23198,7 @@ static void ar_q8_worker(ArQ8* t) {
     if (t->rc_init != RAD_OK) return;
     /* The tuned point arrives as a parameter of the launch, as the core appends it. */
     if (t->tail >= 0) ps.push_back(PI("tail", t->tail));
+    if (t->sp > 0) ps.push_back(PI("sp", t->sp));
 
     /* Allocated here and not through dalloc, whose list four rank threads would race on. */
     void* x = nullptr; void* r = nullptr; void* w = nullptr; void* wp = nullptr; void* sc = nullptr;
@@ -23111,6 +23229,7 @@ static void ar_q8_worker(ArQ8* t) {
             T(wp, RAD_BF16, { K }), T(sc, RAD_BF16, { 1 }) };
         if (!t->res) { absent(ts[1]); absent(ts[6]); }
         if (!t->scal) absent(ts[7]);
+        if (t->sp) absent(ts[5]);   /* the split form leaves no bf16 output */
         RadArgs a;
         std::memset(&a, 0, sizeof(a));
         a.t = ts.data(); a.n_t = (int)ts.size();
@@ -23149,12 +23268,19 @@ static void ar_rmsnorm_quant_i8_wide_case(const Plugin& pl, const std::vector<in
     const int world = 4;
     const bool host = nm_ends_with(name, "_host");   /* the mailbox twin leaves the hold alone */
     /* tail: the `tail` axis pinned (1 from 5 to 32 rows: the standalone two-shot with the junction
-     * as its tail) */
-    struct Shape { int64_t M, K; int tail; };
+     * as its tail); sp: the all-reduce split around the junction (1: the residual on each rank's
+     * rows, 2: on every row), including heights where a rank owns no row (1, 3) and the 31B's
+     * tp-4 band top (97) */
+    struct Shape { int64_t M, K; int tail; int sp = 0; };
     const Shape shapes[] = { { 1, 5376, 0 }, { 8, 5376, 0 }, { 40, 5376, 0 }, { 97, 5376, 0 },
                              { 64, 2816, 0 },
                              { 5, 5376, 1 }, { 8, 5376, 1 }, { 16, 5376, 1 }, { 32, 5376, 1 },
-                             { 8, 2816, 1 } };
+                             { 8, 2816, 1 },
+                             { 1, 5376, 0, 2 }, { 3, 5376, 0, 1 }, { 4, 5376, 0, 1 },
+                             { 5, 5376, 0, 1 }, { 8, 5376, 0, 1 }, { 8, 5376, 0, 2 },
+                             { 16, 5376, 0, 2 }, { 33, 5376, 0, 1 }, { 64, 5376, 0, 1 },
+                             { 64, 5376, 0, 2 }, { 97, 5376, 0, 2 }, { 64, 2816, 0, 1 },
+                             { 8, 2816, 0, 2 } };
     const std::string nm(name);
     for (const Shape& sh : shapes) {
         const int64_t M = sh.M, K = sh.K;
@@ -23191,7 +23317,9 @@ static void ar_rmsnorm_quant_i8_wide_case(const Plugin& pl, const std::vector<in
             const std::string at = " M=" + std::to_string(M) + " n=" + std::to_string(K) +
                                    (form == 0 ? ", plain" : form == 1 ? ", junction"
                                                                       : ", junction with scalar") +
-                                   (sh.tail ? ", two-shot with the junction as its tail" : ", one-shot");
+                                   (sh.sp == 2 ? ", split around the junction, residual gathered"
+                                    : sh.sp ? ", split around the junction"
+                                    : sh.tail ? ", two-shot with the junction as its tail" : ", one-shot");
 
             /* The chain on the first card: rmsnorm_quant_i8 over the reduced sum. */
             st_set_device(devs[0]);
@@ -23236,6 +23364,7 @@ static void ar_rmsnorm_quant_i8_wide_case(const Plugin& pl, const std::vector<in
                 x.row = row; x.rank = r; x.dev = devs[(size_t)r];
                 x.M = M; x.K = K; x.res = res; x.scal = scal; x.gated = scal;
                 x.tail = sh.tail;
+                x.sp = sh.sp;
                 x.r_in = &hr; x.w = &hw; x.wp = &hp; x.sc = hs;
                 x.x_in = hx[(size_t)r];
                 th.emplace_back(ar_q8_worker, &x);
@@ -23266,10 +23395,18 @@ static void ar_rmsnorm_quant_i8_wide_case(const Plugin& pl, const std::vector<in
             if (ran) {
                 int64_t bx = 0, br = 0, by = 0, bq = 0, bs = 0, nz = 0;
                 for (const ArQ8& x : t) {
+                    /* With `sp` the launch leaves x and the bf16 output alone, and at 1 the
+                     * residual only on the rows this rank owns: [a, a + na), M split evenly in
+                     * rank order. */
+                    const int64_t base = M / world, rem = M % world;
+                    const int64_t a = x.rank * base + std::min<int64_t>(x.rank, rem);
+                    const int64_t na = base + (x.rank < rem ? 1 : 0);
                     for (int64_t i = 0; i < M * K; ++i) {
-                        bx += x.x_out[(size_t)i] != xsum[(size_t)i];
-                        if (res) br += x.r_out[(size_t)i] != want_r[(size_t)i];
-                        by += x.y_out[(size_t)i] != want_y[(size_t)i];
+                        const int64_t row = i / K;
+                        if (!sh.sp) bx += x.x_out[(size_t)i] != xsum[(size_t)i];
+                        if (res && (sh.sp != 1 || (row >= a && row < a + na)))
+                            br += x.r_out[(size_t)i] != want_r[(size_t)i];
+                        if (!sh.sp) by += x.y_out[(size_t)i] != want_y[(size_t)i];
                         bq += x.q_out[(size_t)i] != want_q[(size_t)i];
                     }
                     for (int64_t i = 0; i < M; ++i)
@@ -26508,6 +26645,13 @@ static void device_phase(const Plugin& pl) {
                 ar_wide_pattern(pl, devs, n.c_str(), world);
             }
         }
+    }
+    /* The four-rank two-shot's lane row and its host twin, plain and coded (ar_lane_forms). */
+    for (const char* n : { "ar_twoshot_4rank_exact_lane", "ar_twoshot_4rank_exact_lane_host" }) {
+        if (!sel(n)) continue;
+        if (!g_case) std::printf("\ncross-rank, beside compute (overlap 1)\n");
+        std::printf("  %s\n", n);
+        ar_lane_forms(pl, devs, n);
     }
     /* The fused write rows at both widths and both gathers. The `_host` twins take the same
      * calls; they differ only in where the mailbox lives. */

@@ -347,6 +347,41 @@ int r4d_gemm_w4a8_nt_m64_group(void) { return R4D_GEMM_W4A8_GROUP; }
 // The operand reader and the split law are in r4d_gemm_args.h; see libr4d/r4d_args.h.
 /* ------------------------------------------------------------------ int8-activation grids */
 
+/* The multi-user verify heights (33 to 64 rows: five to eight users of a DFlash2 verify, 8 rows a
+ * user). The law's point there covers every row tile in one block at one N tile a wave (mb = all,
+ * npw = 1), which re-reads the activation once a 16-column tile and holds MT accumulators a wave;
+ * on 4x R9700 (one card, the 31B's per-card trunk shapes, every point byte-identical to the law's)
+ * it ran a layer's four GEMMs in 259 us at 64 rows against 157 us here:
+ *
+ *                 q|k|v 3584x5376   o_proj 5376x2048   gate_up 10752x5376   down 5376x5376
+ *   40 rows  law  46.4              27.4               67.1                 36.4
+ *            here 22.0 (mb1 npw2)   21.1 (mb1 npw2)    58.8 (mb1 npw4)      30.8 (mb1 npw2)
+ *   48 rows  law  31.4              30.4               71.9                 42.4
+ *            here 22.2              21.2               58.9                 31.6
+ *   56 rows  law  56.8              35.0               94.2                 62.4
+ *            here 24.0 (mb1 npw2)   22.3 (mb2 npw1)    69.0 (mb2 npw4)      43.0 (mb1 npw2)
+ *   64 rows  law  58.6              37.3               97.6                 65.2
+ *            here 24.7              22.7               69.6                 44.0
+ *
+ * Neither axis moves a byte: the split stays the law's (a point whose wider block cannot hold it
+ * is not taken, since a smaller split would regroup the K partials), and every output element
+ * keeps its accumulation order. Only where neither `mb` nor `npw` was tuned. */
+static void multi_user_point(const RadArgs* a, long long M, long long N, long long K, Cfg* c) {
+    if (M <= 32 || M > 64) return;
+    R4dGemmCfg cv;
+    r4d_cfg_gemm(a, &cv);
+    if (cv.mb > 0 || cv.npw > 1) return;
+    int mb, npw;
+    if (M <= 48)          { mb = 1; npw = N >= 8192 ? 4 : 2; }
+    else if (N >= 8192)   { mb = 2; npw = 4; }
+    else if (K <= 2048)   { mb = 2; npw = 1; }
+    else                  { mb = 1; npw = 2; }
+    if (c->wv * c->sk * WAVE32 > block_bound(BR_NPW, mb, npw)) return;
+    if ((size_t)c->wv * npw * c->sk * 256 * sizeof(float) > 64 * 1024) return;
+    c->mb = mb;
+    c->npw = npw;
+}
+
 /* The asymmetric grid is selected by `dtype`, not by the presence of a_sum (see is_asym). */
 
 extern "C" int r4d_rad_gemm_w4a8_m64(const RadArgs* a, RadStream s) {
@@ -360,6 +395,7 @@ extern "C" int r4d_rad_gemm_w4a8_m64(const RadArgs* a, RadStream s) {
     Cfg c;
     rc = cfg_for(a, g.K, g.M, group, BR_NPW, &c);
     if (rc != RAD_OK) return rc;
+    multi_user_point(a, g.M, g.N, g.K, &c);
 
     /* the engine's chained launch (RadKernelChainFn), at decode heights only */
     const bool chain = r4d_geti_or(a, "chain", 0) != 0 && g.M <= 64;

@@ -1499,7 +1499,11 @@ static const RadOperandSpec oGeluMulQuantI8[] = {
 };
 
 /* `ar_rmsnorm_quant_i8` is rmsnorm_quant_i8 with the two-rank exact all-reduce of `x` in front:
- * same operands with `x` inout (it receives the reduced sum), plus `world_size`. */
+ * same operands with `x` inout (it receives the reduced sum), plus `world_size`. `sp` (optional,
+ * 0) lets a row split the all-reduce around the junction at tensor parallel: 1 asks only for q and
+ * the scales on every row and the residual on the rows this rank owns (M split evenly over the
+ * ranks in rank order), 2 for the residual on every row too; `x` is then left unspecified. A row
+ * may always do more than asked (the whole form). */
 static const RadParamSpec pArRmsNormQuantI8[] = {
     { "M",          RAD_P_INT, RAD_REQUIRED },
     { "n",          RAD_P_INT, RAD_REQUIRED },
@@ -1507,6 +1511,7 @@ static const RadParamSpec pArRmsNormQuantI8[] = {
     { "world_size", RAD_P_INT, RAD_REQUIRED },
     { "dtype",      RAD_P_STR, RAD_REQUIRED },
     P_F64O("wadd"),
+    P_INTO("sp"),
 };
 static const RadOperandSpec oArRmsNormQuantI8[] = {
     { "x",        RAD_OPD_INOUT,  0 },
@@ -7923,7 +7928,9 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "sum, residual add, scalar, RMS norm and quant_act_i8's quantiser -- in one kernel",
   "exactly 4 ranks; n a multiple of 16, x unpitched (it is the message); a block owns whole rows; "
   "exact wire; one-shot ((ranks - 1) x the message a rank) -- for decode heights; from 5 to 32 "
-  "rows (axis `tail`) the standalone two-shot with the junction as its tail",
+  "rows (axis `tail`) the standalone two-shot with the junction as its tail; with `sp` the "
+  "all-reduce split around the junction (reduce-scatter, the junction on this rank's rows, "
+  "all-gather of the int8 codes), a block per local row, P2P",
   "bf16 in, int8 out in the w4a8 GEMM's fragment order with an f32 per-row scale; the reduced sum "
   "rounded to bf16 as the standalone exact all-reduce stores it",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,

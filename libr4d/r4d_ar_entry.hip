@@ -667,23 +667,27 @@ static int nb_for(long words16, int max_nb) {
     return (int)nb;
 }
 
-/* The four-rank exact one-shot's two-shot band (r4d_rad_ar_oneshot_4rank_exact from ts_min), over
- * the words of one shard: one block per 672 words, floor 2,
- * ceiling max_nb. A two-shot takes two handshakes, each a PCIe round trip a block, so small shards
- * want fewer blocks than nb_for's floor of 4: at a DFlash2 verify's 8 rows of 5376 at tp 4 (1344
- * words a shard) two blocks run the exact two-shot in 20.2 us against 22.8 at four, and from 16
- * rows (2688 words, four blocks either way) the two rules agree (4x R9700, a four-card
- * microbenchmark of this kernel, 2026-10-17). The block count moves no byte: every word is folded
- * by one thread in ascending rank order whatever the grid. */
+/* The four-rank exact two-shot at decode and verify heights (the one-shot row's band from ts_min,
+ * the junction's tail form, the two-shot row up to kTsDecodeShard words a shard), over the words of
+ * one shard: one block per 2688 words, floor 2, ceiling 8 (and max_nb). A two-shot takes two
+ * handshakes, each a PCIe round trip a block, so a block more costs more than its share of the
+ * bytes saves until the shards are large. One per 672 (the rule before 2026-10-19) launched 16
+ * blocks at 64 rows of 5376, where the multi-user verify runs (8 users x DFlash2's 8 rows): on 4x
+ * R9700, one launch at a time on the real payload, 64 rows took 85.6 us at 16 blocks against 75.3
+ * at 4, 32 rows 58.9 at 16 / 47.1 at 8 against 44.2 at 4, 128 rows 143.5 at 16 against 137.9 at 8;
+ * 8 rows (two blocks either way) 19.6. The block count moves no byte: every word is folded by one
+ * thread in ascending rank order whatever the grid. */
 /* The chained two-shot (r4d_chain.h) where the row resolved with `chain`, for a decode-sized
  * message only (64 rows of an 8192-wide residual): DFlash2's verify-height reductions. */
 static long ar_chain(const RadArgs* a, long numel) {
     return r4d_geti_or(a, "chain", 0) != 0 && numel <= 64L * 8192L ? 1L : 0L;
 }
 
+static constexpr long kTsDecodeShard = 43008;   /* 256 rows of 5376 at tp 4 */
 static int nb_for_shard(long shard16, int max_nb) {
-    long nb = shard16 / 672;
+    long nb = shard16 / 2688;
     if (nb < 2) nb = 2;
+    if (nb > 8) nb = 8;
     if (nb > max_nb) nb = max_nb;
     if (nb > shard16) nb = shard16 > 0 ? shard16 : 1;
     return (int)nb;
@@ -740,7 +744,9 @@ static int ar_setup(const RadArgs* a, ArCall* c, int shard_nb) {
      * flag rounds cost more than the added reduce bandwidth (8 against 16 blocks measured up to 3 %
      * faster from 2097152 elements on). */
     if (shard_nb && in->world == 8 && cap > 8) cap = 8;
-    c->nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : nb_for(basis, cap);
+    /* a decode-sized shard takes the decode rule (nb_for_shard), a prompt-sized one nb_for's */
+    c->nblocks = cfgv.nblocks > 0 ? cfgv.nblocks
+               : (shard_nb && basis <= kTsDecodeShard) ? nb_for_shard(basis, cap) : nb_for(basis, cap);
     if (c->nblocks > in->max_blocks) c->nblocks = in->max_blocks;
     return RAD_OK;
 }
@@ -1114,6 +1120,25 @@ extern "C" int r4d_rad_ar_twoshot_4rank_exact(const RadArgs* a, RadStream s) {
     if (words16 % c.in->world) return RAD_E_SHAPE;
     if (2 * (c.numel * c.in->esize) / c.in->world > c.in->slot_bytes) return RAD_E_SCRATCH;
     const ArInst* in = c.in;
+    /* A reduction beside compute (overlap 1) carries its pushes coded at ~12.2 bits a bf16 value
+     * (r4d_ar_twoshot_Nrank_exact.hip, the coded form), at 4 blocks of 1024 threads, wherever the
+     * message fits that form; the same bytes either way. The 31B's prefill (4x R9700, a
+     * 5033-token prompt): 5724 -> 5949 tok/s (+3.9%), every reply identical; 8 x 512 gave +2.1%,
+     * 16 x 256 +1.3%, 6 x 1024 -1.9% (the blocks crowd the GEMM beside them). `coded` 0, a launch
+     * parameter no declaration carries, keeps the plain wire: r4d_selftest's plain arm. */
+    const bool lane = r4d_geti_or(a, "overlap", 0) == 1;
+    if (lane && r4d_geti_or(a, "coded", 1) != 0 &&
+        r4d_ar_twoshot_coded_ok(c.numel, in->dtype, 4, in->slot16)) {
+        const long gate = link_gate(a), early = in->host ? 0L : gate;
+        R4D_TRY("ar_twoshot_4rank_exact (coded)",
+            r4d_ar_twoshot_4rank_exact_coded(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
+                                             in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
+                                             in->my_scratch, in->my_flags, in->my_seq, in->slot16,
+                                             c.inp, c.out, c.numel, in->rank, (long)(uintptr_t)s,
+                                             4, 1024, c.drain, c.acq, c.pub, early,
+                                             early ? in->gate_ctr : 0L, ar_chain(a, c.numel)));
+        return early ? RAD_LINK_ENDED : RAD_OK;
+    }
     /* The kernel ends the hold after its second handshake (its reduce is fused with the phase-2
      * push); through the host mailbox early stays 0 and the engine releases by barrier. */
     const long gate = link_gate(a), early = in->host ? 0L : gate;
@@ -1548,6 +1573,10 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_i8_4rank(const RadArgs* a, RadStream s) 
         if (tail_nbt > in->max_blocks) tail_nbt = in->max_blocks;
     }
     const long tail_ctr = in->my_seq + (2L * in->max_blocks + 8) * 4;
+    /* `sp` (0 unless asked): the all-reduce split around the junction, P2P only. The host mailbox
+     * runs the whole form, which leaves every byte the split one does. */
+    const long long sp = r4d_geti_or(a, "sp", 0);
+    if (sp < 0 || sp > 2) return RAD_E_INVAL;
     /* The junction after the last handshake is local, so either form releases there. */
     const long gate = link_gate(a), early = in->host ? 0L : gate;
     const int e = r4d_ar_rmsnorm_quant_i8_4rank(
@@ -1559,7 +1588,7 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_i8_4rank(const RadArgs* a, RadStream s) 
         (int)v.M, (int)v.K, (float)r4d_getf(a, "eps", 1e-6), (float)r4d_getf(a, "wadd", 0.0),
         v.w->dtype == RAD_F32, (int)v.rp, (int)v.yp, (int)in->rank, (long)(uintptr_t)s, nblocks,
         cfgv.drain, cfgv.acq, cfgv.pub, early, early ? in->gate_ctr : 0L, tail_ctr, tail_nbt,
-        r4d_geti_or(a, "chain", 0) != 0 ? 1 : 0);
+        r4d_geti_or(a, "chain", 0) != 0 ? 1 : 0, in->host ? 0 : (int)sp);
     if (e != 0) return RAD_E_SHAPE;
     return early ? RAD_LINK_ENDED : RAD_OK;
 }

@@ -888,16 +888,40 @@ void Gemma4Mlp::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool tai
  * taller step issues the pair. */
 static constexpr int64_t kArOneShotElems = 524288;
 static constexpr int64_t kAr4FoldRows = 16;
+/* From kArSpMinRows rows to the same band's top, libr4d's four-rank row takes `sp` instead: the
+ * all-reduce split around the junction. Each rank reduces only the rows it owns (a quarter, in
+ * rank order), runs the junction on them and gathers the int8 codes the next GEMM reads, so the
+ * second hop carries a byte a column instead of two and the junction a quarter of the rows. The
+ * fold and the sums are the whole form's, so q and the scales are byte for byte the same; the
+ * residual stream then holds this rank's rows only, which is all the next junction reads. A
+ * junction whose stream anything else reads next asks for the residual on every row too (sp 2):
+ * the layers the drafter taps, and the last layer's attention junction, since that layer's
+ * feed-forward closes with its own all-reduce, post-norm and add over every row. One launch at a
+ * time on 4x R9700 (2026-10-19): 19.8 against 21.9 us at 4 rows of 5376 (the one-shot fold), 22.9
+ * against 24.5 at 8 and 30.8 against 34.9 at 16 (the tail), 72.3 against 89.2 at 64. Below 4 rows
+ * a rank would idle (31.7 against 18.7 us at one).
+ *
+ * In the engine it pays only where it replaces the fold: a DFlash2 verify (8 rows) ran 402 / 297 /
+ * 216 / 603 tok/s code / prose / story / long against 392 / 290 / 210 / 585, replies identical,
+ * but steps of 24-64 rows, where the pair runs instead, lost ~10% under load (4 users 588 against
+ * 698 aggregate, 8 users 781 against 867; 12 users even; 4x R9700, 2026-10-19). So it serves to
+ * kArSpMaxRows, the fold's band, within the one-shot's. */
+static constexpr int64_t kArSpMinRows = 4;
+static constexpr int64_t kArSpMaxRows = 16;
 
 struct G4Junction {
     rad_op     op = 0;
     rad_op     op_ar = 0;   /* the same with the exact all-reduce of `x` in front, or 0 */
     int64_t    ar_rows = 0; /* the most rows op_ar serves: the step's at two ranks, a band at four */
+    rad_op     op_sp = 0;   /* ...with the all-reduce split around it (four ranks), or 0 */
+    int64_t    sp_hi = 0;   /* the most rows op_sp serves, from kArSpMinRows */
     rad_buf    x = 0, res = 0, q8 = 0, s8 = 0;
     rad_weight w = 0, wp = 0, sc = 0;
 
+    /* `full_res`: something besides the next junction reads the residual stream after this one,
+     * so the split form must leave it on every row. */
     int declare(RadBuilder* b, const Geom& g, rad_buf x_, rad_buf res_, rad_weight w_,
-                rad_weight wp_, rad_weight sc_, const G4Linear& into) {
+                rad_weight wp_, rad_weight sc_, const G4Linear& into, bool full_res = false) {
         x = x_; res = res_; w = w_; wp = wp_; sc = sc_; q8 = into.q8; s8 = into.s8;
         if (!into.quant || into.shared_in || !q8 || !s8 || !w || (sc && !wp) || ((wp || sc) && !res))
             return RAD_E_INVAL;
@@ -934,11 +958,32 @@ struct G4Junction {
                 rad_op_writes(b, op_ar, wa, 4);
                 ar_rows = hi;
             }
+            /* The split form from kArSpMinRows to kArSpMaxRows rows. It needs the post-norm, as
+             * every trunk junction past the first has; `x` is declared written, as the fold's. */
+            const int64_t top = std::min<int64_t>(
+                std::min<int64_t>(g.max_tok, kArOneShotElems / g.n_embd), kArSpMaxRows);
+            if (op_ar && four && wp && top >= kArSpMinRows) {
+                const RadParam ps[] = { RAD_RANGE("M", 1, top), RAD_INT("n", g.n_embd),
+                                        RAD_F64("eps", g.eps), RAD_INT("world_size", g.world),
+                                        RAD_STR("dtype", g.dtype), RAD_F64("wadd", g.wadd),
+                                        RAD_INT("sp", full_res ? 2 : 1) };
+                op_sp = rad_decl_op(b, "ar_rmsnorm_quant_i8", ps, (int)(sizeof ps / sizeof ps[0]),
+                                    ws, nw);
+                if (op_sp) {
+                    const rad_buf wa[4] = { x, q8, s8, res };
+                    rad_op_reads (b, op_sp, rd, 2);
+                    rad_op_writes(b, op_sp, wa, 4);
+                    sp_hi = top;
+                }
+            }
         }
         return RAD_OK;
     }
+    /* The most rows a step may have for step(..., true): the fold's band, and the split form's. */
+    int64_t ar_top() const { return op_sp ? std::max(ar_rows, sp_hi) : ar_rows; }
     void step(RadCtx* c, int64_t T, bool with_ar = false) const {
-        RAD_ISSUE_N(c, with_ar ? op_ar : op, T, brows(x, T), res ? brows(res, T) : RAD_NONE, RAD_W(w),
+        const rad_op o = !with_ar ? op : (op_sp && T >= kArSpMinRows && T <= sp_hi) ? op_sp : op_ar;
+        RAD_ISSUE_N(c, o, T, brows(x, T), res ? brows(res, T) : RAD_NONE, RAD_W(w),
                     brows(q8, T), brows(s8, T), RAD_NONE,
                     wp ? RAD_W(wp) : RAD_NONE, sc ? RAD_W(sc) : RAD_NONE);
     }
@@ -1941,13 +1986,18 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             ok = m.j0.op != 0;
             for (int64_t l = 0; ok && l < m.n_main; ++l) {
                 Layer& lay = m.layers[(size_t)l];
+                /* the split form's residual on every row: before the last layer's feed-forward
+                 * (its own reduction, post-norm and add over every row), and where the drafter
+                 * taps the stream */
+                bool tapped = false;
+                for (int t = 0; t < m.n_taps; ++t) tapped = tapped || m.tap_layer[t] == (int)l;
                 RAD_ARCH_TRY(lay.j_am.declare(b, g, m.b_h, m.b_x, lay.mlp.w_norm, lay.attn.w_post, 0,
-                                              lay.mlp.ln_gu));
+                                              lay.mlp.ln_gu, l + 1 == m.n_main));
                 ok = lay.j_am.op != 0;
                 if (ok && l + 1 < m.n_main) {
                     const Layer& nx = m.layers[(size_t)l + 1];
                     RAD_ARCH_TRY(lay.j_ma.declare(b, g, m.b_h, m.b_x, nx.attn.w_norm, lay.mlp.w_post,
-                                                  lay.w_scalar, nx.attn.ln_in()));
+                                                  lay.w_scalar, nx.attn.ln_in(), tapped));
                     ok = lay.j_ma.op != 0;
                 }
             }
@@ -1958,8 +2008,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         for (int64_t l = 0; ar && l < m.n_main; ++l) {
             const Layer& lay = m.layers[(size_t)l];
             ar = lay.j_am.op_ar != 0 && (l + 1 >= m.n_main || lay.j_ma.op_ar != 0);
-            if (ar) rows = std::min(rows, lay.j_am.ar_rows);
-            if (ar && l + 1 < m.n_main) rows = std::min(rows, lay.j_ma.ar_rows);
+            if (ar) rows = std::min(rows, lay.j_am.ar_top());
+            if (ar && l + 1 < m.n_main) rows = std::min(rows, lay.j_ma.ar_top());
         }
         m.fuse_ar = ar;
         m.ar_rows = ar ? rows : 0;
@@ -2178,6 +2228,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (m.fuse && (g.world == 2 || g.world == 4)) {
         if (!m.fuse_ar)
             rad_note(b, "residual junctions: the all-reduce in front of each issued apart");
+        else if (g.world == 4 && m.layers[0].j_am.op_sp)
+            rad_note(b, "residual junctions: the all-reduce in front of each folded in at steps of "
+                        "%lld rows or fewer (libr4d's four-rank row: the fold to %lld rows, the "
+                        "all-reduce split around the junction from %lld), issued apart above",
+                     (long long)m.ar_rows, (long long)kArSpMinRows - 1, (long long)kArSpMinRows);
         else if (g.world == 4)
             rad_note(b, "residual junctions: the all-reduce in front of each folded in at steps of "
                         "%lld rows or fewer (the four-rank one-shot), issued apart above",

@@ -4612,8 +4612,9 @@ TEST(gemma4_attention_join_writes_the_routed_inputs_on_fp8_experts) {
  * at two ranks (only the embedding's and the last layer's feed-forward reduction stand alone),
  * through ar_rmsnorm_quant_i8 declared at world_size 4 up to 16 rows (kAr4FoldRows: a DFlash
  * verify's rows, which libr4d folds in its tail form, inside its one-shot band of 524288 / 5376 =
- * 97). A taller step issues each reduction and its junction apart, and where no library declares
- * the fold every step issues the pair. */
+ * 97), and beside each the same op with `sp` (the all-reduce split around the junction) over the
+ * same 16 rows, which a step from 4 rows takes. A taller step issues each reduction and its
+ * junction apart, and where no library declares the fold every step issues the pair. */
 TEST(a_gemma4_w4a8_step_at_four_ranks_folds_the_all_reduce_into_the_junction_at_decode_heights) {
     const int L = 12;
     std::vector<std::string> folded = { "embed_lookup", "all_reduce", "rmsnorm_quant_i8" };
@@ -4684,7 +4685,7 @@ TEST(a_gemma4_w4a8_step_at_four_ranks_folds_the_all_reduce_into_the_junction_at_
         int64_t hi = -1;
         *n = 0;
         for (const auto& o : bb.ops) {
-            if (o.op != "ar_rmsnorm_quant_i8") continue;
+            if (o.op != "ar_rmsnorm_quant_i8" || pint(&o, "sp") != -12345) continue;
             ++*n;
             CHECK_EQ(pint(&o, "world_size"), 4);
             for (const auto& p : o.p)
@@ -4695,6 +4696,37 @@ TEST(a_gemma4_w4a8_step_at_four_ranks_folds_the_all_reduce_into_the_junction_at_
     int n_ar = 0;
     CHECK_EQ(fold_hi(b, &n_ar), 16);
     CHECK_EQ(n_ar, 2 * L - 1);
+    /* the split form beside each fold, over its 16 rows; the residual on every row (sp 2) only
+     * before the last layer's feed-forward, with no drafter tapping the stream here */
+    auto sp_hi = [](const RadBuilder& bb, int* n, int* n2) {
+        int64_t hi = -1;
+        *n = 0; *n2 = 0;
+        for (const auto& o : bb.ops) {
+            if (o.op != "ar_rmsnorm_quant_i8" || pint(&o, "sp") == -12345) continue;
+            ++*n;
+            if (pint(&o, "sp") == 2) ++*n2;
+            else CHECK_EQ(pint(&o, "sp"), 1);
+            CHECK_EQ(pint(&o, "world_size"), 4);
+            for (const auto& p : o.p)
+                if (p.key == "M") hi = p.ihi;
+        }
+        return hi;
+    };
+    int n_sp = 0, n_sp2 = 0;
+    CHECK_EQ(sp_hi(b, &n_sp, &n_sp2), 16);
+    CHECK_EQ(n_sp, 2 * L - 1);
+    CHECK_EQ(n_sp2, 1);
+    /* which form a step's junctions take: the split one from 4 rows, the fold below */
+    auto sp_issued = [&b](const RadCtx& c) {
+        int n = 0, folds = 0;
+        for (const auto& i : c.issues) {
+            const RecOp* o = b.op_of(i.op);
+            if (!o || o->op != "ar_rmsnorm_quant_i8") continue;
+            ++folds;
+            if (pint(o, "sp") != -12345) ++n;
+        }
+        return std::make_pair(n, folds);
+    };
 
     /* 20 MB of gate_up beside the attention's reduction and of the next layer's q beside the
      * feed-forward's, and 9 MB of down_proj beside the attention */
@@ -4725,6 +4757,17 @@ TEST(a_gemma4_w4a8_step_at_four_ranks_folds_the_all_reduce_into_the_junction_at_
         gemma4_bf16::step(&d, &tall);
         CHECK(d.step_fail.empty());
         CHECK_EQ(join(issued_ops(b, d)), join(rows <= 16 ? folded : apart_tall));
+        if (rows <= 16) CHECK(sp_issued(d) == std::make_pair(2 * L - 1, 2 * L - 1));
+    }
+    /* three rows: the fold; eight users' verify (64 rows): the pair */
+    for (int rows : { 3, 64 }) {
+        RadBatch v = one_prompt(rows, out);
+        v.phase = RAD_PHASE_DECODE;
+        RadCtx d; d.b = &b; d.rank = 0; d.world = 4; d.batch = &v;
+        gemma4_bf16::step(&d, &v);
+        CHECK(d.step_fail.empty());
+        if (rows == 64) CHECK_EQ(join(issued_ops(b, d)), join(apart_tall));
+        CHECK(sp_issued(d) == (rows == 3 ? std::make_pair(0, 2 * L - 1) : std::make_pair(0, 0)));
     }
 
 
