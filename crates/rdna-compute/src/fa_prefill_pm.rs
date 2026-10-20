@@ -216,7 +216,7 @@ fn require_cache_dtype(codec: FaPrefillKvCodec, dtype: DType) -> HipResult<()> {
     Ok(())
 }
 
-fn require_cache_bytes(
+pub(crate) fn require_cache_bytes(
     codec: FaPrefillKvCodec,
     dtype: DType,
     have: usize,

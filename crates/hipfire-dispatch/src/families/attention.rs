@@ -2527,6 +2527,50 @@ fn dispatch_attend(
                 ))
             }
             KernelKey::AttnFp8E4m3KvBatchedMasked => {
+                // Prepared H16 Q is the native FP8 two-plane encoding, not
+                // the PM route's F16 Raw view. Consume it before any F32
+                // fallback and fail closed if caller/consumer admission drifts.
+                if io.q.dtype == DType::Raw
+                    && (io.n_heads, io.n_kv_heads, io.head_dim) == (16, 2, 256)
+                {
+                    if !(gpu.arch == "gfx1201"
+                        && gpu.flags.gfx12_fa2_prefill
+                        && gpu.flags.gfx12_fa_prep_fp8q
+                        && gpu.flags.attn_qresident
+                        && gpu.flags.attn_qresident_v2
+                        && plan.v_mode_bits == 8
+                        && plan.window <= 0
+                        && !plan.uses_givens
+                        && io.output.dtype == DType::F32
+                        && io.output_gate.is_none()
+                        && io.output_awq_scale.is_none()
+                        && io.tree_bias.is_none()
+                        && io.block_cols == 0
+                        && !ctx.verify_tile_attend
+                        && (64..=32768).contains(&io.batch_size)
+                        && (io.batch_size <= 512 || io.batch_size % 512 == 0)
+                        && (64..=262_144).contains(&io.max_ctx_len)
+                        && io.pos.checked_add(io.batch_size) == Some(io.max_ctx_len)
+                        && io.max_ctx_len <= io.physical_cap)
+                    {
+                        return Err(DispatchError::Hip(
+                            "H16 native FP8-Q requires admitted full-causal qresident-v2 attention"
+                                .into(),
+                        ));
+                    }
+                    return hip!(gpu.attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.positions(),
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.max_ctx_len,
+                        io.batch_size,
+                    ));
+                }
                 // A3B H16/KV2/D256 native-fp8 prefill: the PM direct body (same arithmetic DAG
                 // as the Q8_0 PM route downstream of the KV dequant) behind the same typed
                 // HIPFIRE_FA_PREFILL_PM flag, resolved for fp8 KV (off unless explicitly set

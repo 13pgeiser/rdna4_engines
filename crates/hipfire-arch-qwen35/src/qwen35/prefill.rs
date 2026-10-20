@@ -887,6 +887,11 @@ fn a4_attn_epilogue_enabled() -> bool {
 fn fa_ragged_packet_enabled() -> bool {
     hipfire_config::developer_bool("HIPFIRE_FA_RAGGED_PACKET", true)
 }
+/// Dense packets retain their F32 ingress. The H16 specialization only
+/// accepts the fused provider's FP8 codes + F32 scales, never F32 or PM Q16.
+fn fa_packet_head_geometry(n_heads: usize, n_kv_heads: usize, fp8q: bool) -> bool {
+    (n_heads, n_kv_heads) == (24, 4) || (fp8q && (n_heads, n_kv_heads) == (16, 2))
+}
 /// Incumbent fp8q n/commit-stride shape predicate (unchanged): single runs
 /// up to 512 rows or whole 512-row runs, with `commit_stride` either absent or
 /// exactly `Some(512)` over whole runs.
@@ -12155,6 +12160,8 @@ fn batch_chunk_fa_attend(
     // FP8 first — its neutral `VMode::Q8` still stores FP8 bytes — then
     // actual plain Q8 with 8-bit V; `None` keeps the incumbent route).
     // Codec-resolved flags preserve the FP8 opt-in and the Q8 qualification.
+    // Only unprepared/F32 Q belongs here. Prepared Raw FP8 codes plus scales
+    // must retain their encoding through dispatch, never the PM Q16 ingress.
     if tree_verify.is_none()
         && !gfx12_fa_prep_fp8q
         && max_ctx_len <= kv_cache.physical_cap
@@ -12214,8 +12221,7 @@ fn batch_chunk_fa_attend(
         let packet_runs = gpu.arch == "gfx1201"
             && (gpu.flags.gfx12_fa_packet || gpu.flags.attn_qresident)
             && kv_cache.quant_fp8
-            && config.n_heads == 24
-            && config.n_kv_heads == 4
+            && fa_packet_head_geometry(config.n_heads, config.n_kv_heads, gfx12_fa_prep_fp8q)
             && config.head_dim == 256
             && stride == WIDENED_COMMIT_ROWS
             && n % WIDENED_COMMIT_ROWS == 0
@@ -12563,20 +12569,37 @@ fn batch_chunk_fa_attend_ragged_fp8q(
     ] {
         let positions = pbs.positions.sub_offset(off, len);
         let out = pbs.fa_attn_out_batch.sub_offset(off * q_dim, len * q_dim);
-        gpu.attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_gfx1201(
-            &q_raw,
-            &kv_cache.k_gpu[layer_idx],
-            &kv_cache.v_gpu[layer_idx],
-            &out,
-            &positions,
-            config.n_heads,
-            config.n_kv_heads,
-            config.head_dim,
-            max_ctx_len,
-            len,
-            n,
-            off,
-        )?;
+        if (config.n_heads, config.n_kv_heads) == (16, 2) {
+            gpu.attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_a3b_gfx1201(
+                &q_raw,
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.v_gpu[layer_idx],
+                &out,
+                &positions,
+                config.n_heads,
+                config.n_kv_heads,
+                config.head_dim,
+                max_ctx_len,
+                len,
+                n,
+                off,
+            )?;
+        } else {
+            gpu.attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_gfx1201(
+                &q_raw,
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.v_gpu[layer_idx],
+                &out,
+                &positions,
+                config.n_heads,
+                config.n_kv_heads,
+                config.head_dim,
+                max_ctx_len,
+                len,
+                n,
+                off,
+            )?;
+        }
     }
     Ok(())
 }
@@ -12722,15 +12745,99 @@ fn gfx12_fa_prep_admitted(
     fusion: DflashFusionCtx,
     n: usize,
 ) -> bool {
+    (config.n_heads, config.n_kv_heads) == (24, 4)
+        && gfx12_fa_prep_geometry_admitted(gpu, config, fusion, n)
+}
+
+/// The existing fused F32-input provider supports both native head geometries.
+/// Keep H16 on its incumbent F32/F16 routes unless the FP8-Q consumer qualifies.
+fn gfx12_fa_prep_geometry_admitted(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    fusion: DflashFusionCtx,
+    n: usize,
+) -> bool {
     gpu.arch == "gfx1201"
         && gpu.flags.gfx12_fa_prep_fused
         && !fusion.is_chain_verify()
         && !gpu.flags.rope_interleaved_legacy
         && !hipfire_runtime::triattn::tap_enabled()
         && config.head_dim == 256
-        && (config.n_heads, config.n_kv_heads) == (24, 4)
+        && fa_packet_head_geometry(config.n_heads, config.n_kv_heads, true)
         && (config.head_dim as f32 * config.partial_rotary_factor) as usize == 64
         && n > 0
+}
+
+/// Admission shared by dense and resident-MoE callers. The H16 extension
+/// requires the actual native tier and whole physical prefix; no PM Q16,
+/// alternate codec, tree, window or independent-lane encoding can reach it.
+#[allow(clippy::too_many_arguments)]
+fn gfx12_fa_prep_fp8q_admitted(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    kv_cache: &llama::KvCache,
+    s: &Qwen35Scratch,
+    n: usize,
+    start_pos: usize,
+    max_ctx_len: usize,
+    batch_semantics: BatchSemantics<'_>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    multirow: bool,
+    fusion: DflashFusionCtx,
+    commit_stride: Option<usize>,
+) -> bool {
+    if !gfx12_fa_prep_geometry_admitted(gpu, config, fusion, n)
+        || gpu.fp8_verify_scope
+        || !gpu.flags.gfx12_fa_prep_fp8q
+        || !gpu.flags.attn_qresident
+        || !gpu.flags.attn_qresident_v2
+        || multirow
+        || batch_semantics.is_independent()
+        || !kv_cache.quant_fp8
+        || !(64..=32768).contains(&n)
+        || !(64..=262_144).contains(&max_ctx_len)
+        || tree_verify.is_some()
+        || !(fa_fp8q_incumbent_shape(n, commit_stride)
+            || (fa_ragged_packet_enabled()
+                && fa_ragged_packet_split(
+                    n,
+                    commit_stride,
+                    start_pos,
+                    max_ctx_len,
+                    kv_cache.physical_cap,
+                )
+                .is_some()))
+    {
+        return false;
+    }
+    if (config.n_heads, config.n_kv_heads) == (16, 2) {
+        if !gpu.flags.gfx12_fa2_prefill
+            || start_pos.checked_add(n) != Some(max_ctx_len)
+            || max_ctx_len > kv_cache.physical_cap
+        {
+            return false;
+        }
+        // Like dense qresident, this is replay-idempotent: derive the real
+        // capture plan rather than imposing the eager-only PM restriction.
+        return matches!(
+            KvTierPlan::derive(KvTierInputs {
+                pos: start_pos,
+                flash_mode: s.flash_mode as usize,
+                capture_mode: gpu.graphs.capture_mode,
+                batch_size: n,
+                is_tree: false,
+                ..kv_cache.tier_inputs()
+            }),
+            Ok(plan)
+                if plan.write_key == hipfire_dispatch::types::KernelKey::KvWriteFp8E4m3Batched
+                    && plan.attend_key
+                        == hipfire_dispatch::types::KernelKey::AttnFp8E4m3KvBatchedMasked
+                    && plan.window <= 0
+                    && !plan.uses_givens
+                    && plan.v_mode_bits == 8
+        );
+    }
+    true
 }
 
 /// PM KV codec of one chunk's actual resident cache. Native FP8 first: its
@@ -13025,33 +13132,25 @@ pub(crate) fn batch_chunk_full_attn_attn(
     // launch covers all N tokens at once.
     let kv_dim = config.n_kv_heads * config.head_dim;
     let q_dim = config.n_heads * config.head_dim;
-    let gfx12_fa_prep = gfx12_fa_prep_admitted(gpu, config, fusion, n);
+    let gfx12_fa_prep_f32 = gfx12_fa_prep_admitted(gpu, config, fusion, n);
     let math = verify_dense_math(gpu);
     // The PM FP8 verify scope has no in-place-gate / A4 out-projection arm
     // (`SingletonWmma` refuses them), so the fp8q prep stays off there.
-    let gfx12_fa_prep_fp8q = gfx12_fa_prep
-        && !gpu.fp8_verify_scope
-        && gpu.flags.gfx12_fa_prep_fp8q
-        && gpu.flags.attn_qresident
-        && gpu.flags.attn_qresident_v2
-        && !fa_attn_multirow
-        && !batch_semantics.is_independent()
-        && kv_cache.quant_fp8
-        && config.n_heads == 24
-        && config.n_kv_heads == 4
-        && (64..=32768).contains(&n)
-        && (64..=262_144).contains(&max_ctx_len)
-        && tree_verify.is_none()
-        && (fa_fp8q_incumbent_shape(n, commit_stride)
-            || (fa_ragged_packet_enabled()
-                && fa_ragged_packet_split(
-                    n,
-                    commit_stride,
-                    start_pos,
-                    max_ctx_len,
-                    kv_cache.physical_cap,
-                )
-                .is_some()));
+    let gfx12_fa_prep_fp8q = gfx12_fa_prep_fp8q_admitted(
+        gpu,
+        config,
+        kv_cache,
+        s,
+        n,
+        start_pos,
+        max_ctx_len,
+        batch_semantics,
+        tree_verify,
+        fa_attn_multirow,
+        fusion,
+        commit_stride,
+    );
+    let gfx12_fa_prep = gfx12_fa_prep_f32 || gfx12_fa_prep_fp8q;
     // Only the new ragged shape is admitted outside the incumbent n/commit
     // predicate. It keeps the F32 attention output (no A4 attention epilogue:
     // the A4 attend step cannot express the two-plane range launches).
@@ -13084,6 +13183,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
     // writes that producer's A4 slab (`HIPFIRE_A4_ATTN_EPI=0` keeps the
     // attention + producer pair). Implies the fp8q single-step attend.
     let a4_epi_awq = if fa_gate_in_place
+        && (config.n_heads, config.n_kv_heads) == (24, 4)
         && !newly_admitted_ragged
         && gpu.a4_slab_active()
         && gfx12_sigmoid_rotate_quant_admitted(gpu, &layer.wo, layer.wo.k, n, &epilogue)
@@ -15185,17 +15285,34 @@ fn batch_chunk_full_attn_moe(
     // F2 split: QKV projection + norms + RoPE (everything above the old
     // attend call) live in `batch_chunk_full_attn_moe_prep`; called here
     // for the single-chunk path in the original position.
-    let fa_pm_qprep = fa_pm_qprep_admitted(
-        gpu,
-        config,
-        kv_cache,
-        s,
-        n,
-        start_pos,
-        max_ctx_len,
-        batch_semantics,
-        tree_verify,
-    );
+    let gfx12_fa_prep_fp8q = (config.n_heads, config.n_kv_heads) == (16, 2)
+        && !ctx.verify_tile_attend
+        && gfx12_fa_prep_fp8q_admitted(
+            gpu,
+            config,
+            kv_cache,
+            s,
+            n,
+            start_pos,
+            max_ctx_len,
+            batch_semantics,
+            tree_verify,
+            fa_attn_multirow,
+            DflashFusionCtx::Off,
+            None,
+        );
+    let fa_pm_qprep = !gfx12_fa_prep_fp8q
+        && fa_pm_qprep_admitted(
+            gpu,
+            config,
+            kv_cache,
+            s,
+            n,
+            start_pos,
+            max_ctx_len,
+            batch_semantics,
+            tree_verify,
+        );
     batch_chunk_full_attn_moe_prep(
         gpu,
         layer,
@@ -15207,6 +15324,7 @@ fn batch_chunk_full_attn_moe(
         tree_verify,
         layer_idx,
         fa_pm_qprep,
+        gfx12_fa_prep_fp8q,
     )?;
     let attn_head_ns = t_attn.elapsed().as_nanos() as u64;
     // F2 split: KV-write + flash attention, sigmoid/wo and the MoE FFN now
@@ -15233,6 +15351,7 @@ fn batch_chunk_full_attn_moe(
         routed_out,
         route,
         fa_pm_qprep,
+        gfx12_fa_prep_fp8q,
     )?;
     // Single-chunk path only: the merged-pair path calls prep/finish directly
     // and stays untimed. `attn` = prep head (QKV/norms/RoPE); the finish's
@@ -15271,6 +15390,7 @@ fn batch_chunk_full_attn_moe_prep(
     tree_verify: Option<TreeVerifyCtx<'_>>,
     layer_idx: usize,
     fa_pm_qprep: bool,
+    gfx12_fa_prep_fp8q: bool,
 ) -> HipResult<()> {
     // Batched MoE FA layer. FA body is the same as FullAttn
     // (rmsnorm + qkv + deinterleave + q/k norm + RoPE +
@@ -15573,6 +15693,32 @@ fn batch_chunk_full_attn_moe_prep(
         batched_gemm_single_weight(gpu, &layer.wk, &pbs.x_rot_batch, &pbs.fa_k_batch, n)?;
         batched_gemm_single_weight(gpu, &layer.wv, &pbs.x_rot_batch, &pbs.fa_v_batch, n)?;
     }
+    if gfx12_fa_prep_fp8q {
+        // Both planes belong to this PBS until its attend completes; no
+        // shared GPU scratch, Q16 rounding, or post-prep F32 Q reads.
+        let bytes = n * config.n_heads * (config.head_dim + 4);
+        let q_codes = GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(pbs.fa_q_batch.buf.as_ptr(), bytes) },
+            shape: vec![bytes],
+            dtype: DType::Raw,
+        };
+        gpu.qwen35_fa_prep_batched_gfx1201(
+            &pbs.fa_q_full_batch,
+            rdna_compute::qwen35_fa_batch::FaPrepQOut::Fp8Codes(&q_codes),
+            Some(&pbs.fa_gate_batch),
+            &pbs.fa_k_batch,
+            &layer.q_norm,
+            &layer.k_norm,
+            &pbs.positions,
+            config.norm_eps,
+            config.rope_theta,
+            kv_cache.compact_offset as i32,
+            config.n_heads,
+            config.n_kv_heads,
+            n,
+        )?;
+        return Ok(());
+    }
     // Fused deinterleave + Q-rmsnorm — one launch instead of two, no Q
     // global-memory round trip. K-norm, triattn tap, and RoPE below are
     // unchanged.
@@ -15684,6 +15830,7 @@ fn batch_chunk_full_attn_moe_finish(
     routed_out: Option<&GpuTensor>,
     route: PrefillRouteMode<'_>,
     fa_pm_qprep: bool,
+    gfx12_fa_prep_fp8q: bool,
 ) -> HipResult<()> {
     // (Layer timers live in the parent `batch_chunk_full_attn_moe`: `t_attn`
     // covers the prep half plus this attend tail; `attn_ns` closes below.)
@@ -15709,7 +15856,7 @@ fn batch_chunk_full_attn_moe_finish(
             layer_idx,
             fa_attn_multirow,
             None, // commit_stride: MoE finish keeps legacy cadence
-            false,
+            gfx12_fa_prep_fp8q,
             false,
         )?;
     }
@@ -16869,10 +17016,10 @@ fn forward_prefill_chunk_pair(
             (LayerWeights::FullAttnMoe(layer), LayerType::FullAttention) if fa_batched_ok => {
                 if merge_fa {
                     batch_chunk_full_attn_moe_prep(
-                        gpu, layer, config, pbs_c, n, dim, kv_cache, None, layer_idx, false,
+                        gpu, layer, config, pbs_c, n, dim, kv_cache, None, layer_idx, false, false,
                     )?;
                     batch_chunk_full_attn_moe_prep(
-                        gpu, layer, config, pbs_n, n, dim, kv_cache, None, layer_idx, false,
+                        gpu, layer, config, pbs_n, n, dim, kv_cache, None, layer_idx, false, false,
                     )?;
                     batch_chunk_fa_attend_merged(
                         gpu,
@@ -16907,6 +17054,7 @@ fn forward_prefill_chunk_pair(
                         None,
                         PrefillRouteMode::Replicated,
                         false,
+                        false,
                     )?;
                     batch_chunk_full_attn_moe_finish(
                         gpu,
@@ -16927,6 +17075,7 @@ fn forward_prefill_chunk_pair(
                         weights,
                         None,
                         PrefillRouteMode::Replicated,
+                        false,
                         false,
                     )?;
                 } else {
@@ -24970,5 +25119,30 @@ mod tests {
         assert!(!fa_fp8q_incumbent_shape(1088, None));
         assert!(!fa_fp8q_incumbent_shape(1088, S));
         assert!(!fa_fp8q_incumbent_shape(1024, Some(256)));
+    }
+
+    #[test]
+    fn native_fp8q_head_admission_preserves_dense_and_old_q_encodings() {
+        assert!(fa_packet_head_geometry(24, 4, false));
+        assert!(fa_packet_head_geometry(24, 4, true));
+        assert!(fa_packet_head_geometry(16, 2, true));
+        // The H16 packet consumer is not an F32 or PM F16-Q ingress.
+        assert!(!fa_packet_head_geometry(16, 2, false));
+        for (heads, kv_heads) in [(16, 4), (24, 2), (32, 4), (16, 0)] {
+            assert!(!fa_packet_head_geometry(heads, kv_heads, true));
+            assert!(!fa_packet_head_geometry(heads, kv_heads, false));
+        }
+        // The production 8k rung remains whole-chunk, with no new cap or
+        // fabricated split; ragged chunks retain the actual range route.
+        assert!(fa_fp8q_incumbent_shape(8192, None));
+        assert!(fa_fp8q_incumbent_shape(8192, Some(WIDENED_COMMIT_ROWS)));
+        assert!(!fa_fp8q_incumbent_shape(
+            8192 + 64,
+            Some(WIDENED_COMMIT_ROWS)
+        ));
+        assert_eq!(
+            fa_ragged_packet_split(8192 + 64, Some(WIDENED_COMMIT_ROWS), 4096, 12_352, 16_384,),
+            Some((8192, 64)),
+        );
     }
 }

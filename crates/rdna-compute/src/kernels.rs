@@ -8146,6 +8146,16 @@ pub const ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_GFX1201_SRC: &str = concat!
     "#define HIPFIRE_FA2_KMODE 8\n",
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
 );
+/// Native H16/KV2/GQA8 geometry of the production KT48 Q-resident Q8 body.
+/// Q comes from upstream F32-to-E4M3 prep, not an F16-rounded packet input.
+/// Direct and range exports share the dense packed ABI and 49,936 B dynamic LDS.
+pub const ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_A3B_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_QRESIDENT_V2_Q8_A3B 1\n",
+    "#define HIPFIRE_FA2_QRESIDENT_V2_Q8 1\n",
+    "#define HIPFIRE_FA2_FP8 1\n",
+    "#define HIPFIRE_FA2_KMODE 8\n",
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
+);
 /// A4 epilogue twin of [`ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_GFX1201_SRC`]
 /// (`attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201`): the same
 /// body; its epilogue emits the FA out-projection's A4 slab (the bytes

@@ -137,6 +137,49 @@ pub fn q8_flash_tile_size(
 const QRESIDENT_V2_LDS_BYTES: u32 = 2 * (2 * 12288 + 2 * 192) + 16;
 const _: () = assert!(QRESIDENT_V2_LDS_BYTES == 49936);
 
+// Full Q planes and active native-cache prefix; no arithmetic uses tensor shape
+// products or the logical VMM reservation as a proxy for mapped storage.
+fn a3b_qresident_spans(
+    rows: usize,
+    total: usize,
+    offset: usize,
+    context: usize,
+) -> Option<(usize, usize, usize, usize, usize, usize)> {
+    if !(1..=32768).contains(&rows)
+        || !(1..=262144).contains(&context)
+        || offset.checked_add(rows)? > total
+    {
+        return None;
+    }
+    let codes = total.checked_mul(4096)?;
+    let q_bytes = codes.checked_add(total.checked_mul(64)?)?;
+    Some((
+        q_bytes,
+        offset.checked_mul(4096)?,
+        codes.checked_add(offset.checked_mul(64)?)?,
+        rows.checked_mul(4096 * 4)?,
+        rows.checked_mul(4)?,
+        context.checked_mul(2 * (256 + 2))?,
+    ))
+}
+
+// Six pointers followed by four i32 shape scalars and one f32 scale, exactly
+// the dense Q8 body's explicit ABI. No heap-backed argument vector/blob.
+fn a3b_qresident_args(ptrs: [*mut c_void; 6], rows: usize) -> [u8; 68] {
+    let mut args = [0; 68];
+    for (slot, ptr) in args[..48].chunks_exact_mut(8).zip(ptrs) {
+        slot.copy_from_slice(&(ptr as u64).to_le_bytes());
+    }
+    for (slot, value) in args[48..64]
+        .chunks_exact_mut(4)
+        .zip([16i32, 2, 256, rows as i32])
+    {
+        slot.copy_from_slice(&value.to_le_bytes());
+    }
+    args[64..68].copy_from_slice(&(1.0f32 / 16.0).to_le_bytes());
+    args
+}
+
 /// Context ceiling of the gfx1201 Q8 FA2 prefill body: the model's 262144
 /// positions (the same bound as dispatch's native-fp8 FA2 arms). The body's
 /// causal bound comes from `positions[]` and its K/V offsets are 64-bit, so
@@ -7324,6 +7367,174 @@ impl Gpu {
             max_ctx_len,
             batch_size,
             Some((q_total_rows, q_row_offset)),
+        )
+    }
+
+    /// Native H16/KV2/D256 attention over caller-owned FP8 Q code/scale planes.
+    /// `max_ctx_len` is the accessed prefix (max position + 1), not the cache
+    /// reservation. Positions must be nonnegative and below that prefix and
+    /// the caller-validated logical cache context. No device readback is done.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.qresident_a3b_launch(
+            "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201",
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            batch_size,
+            0,
+        )
+    }
+
+    /// Segment views of output/positions, but FULL two-plane Q allocation.
+    /// Offsets into codes and scales both use `q_total_rows`, never tail rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_a3b_gfx1201(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        q_total_rows: usize,
+        q_row_offset: usize,
+    ) -> HipResult<()> {
+        self.qresident_a3b_launch(
+            "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_a3b_gfx1201",
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            q_total_rows,
+            q_row_offset,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qresident_a3b_launch(
+        &mut self,
+        symbol: &'static str,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        q_total_rows: usize,
+        q_row_offset: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let invalid = || {
+            hip_bridge::HipError::new(
+                0,
+                "A3B Q8 resident attention invalid shape, range, dtype, span or alias",
+            )
+        };
+        if self.arch != "gfx1201" || (n_heads, n_kv_heads, head_dim) != (16, 2, 256) {
+            return Err(invalid());
+        }
+        let (q_bytes, code_off, scale_off, out_bytes, pos_bytes, cache_bytes) =
+            a3b_qresident_spans(batch_size, q_total_rows, q_row_offset, max_ctx_len)
+                .ok_or_else(invalid)?;
+        if q.dtype != crate::DType::Raw
+            || q.buf.size() < q_bytes
+            || out.dtype != crate::DType::F32
+            || out.buf.size() < out_bytes
+            || positions.buf.size() < pos_bytes
+        {
+            return Err(invalid());
+        }
+        // Unlike require_cache, this never bypasses mapped-prefix checks for VMM.
+        for (cache, name) in [(k_cache, "K cache"), (v_cache, "V cache")] {
+            crate::fa_prefill_pm::require_cache_bytes(
+                crate::fa_prefill_pm::FaPrefillKvCodec::Fp8E4M3,
+                cache.dtype,
+                cache.buf.size(),
+                cache_bytes,
+                name,
+            )?;
+        }
+        let output_start = out.buf.as_ptr() as usize;
+        let output_end = output_start.checked_add(out_bytes).ok_or_else(invalid)?;
+        for (input, bytes) in [
+            (q, q_bytes),
+            (k_cache, cache_bytes),
+            (v_cache, cache_bytes),
+            (positions, pos_bytes),
+        ] {
+            let start = input.buf.as_ptr() as usize;
+            let end = start.checked_add(bytes).ok_or_else(invalid)?;
+            if output_start < end && start < output_end {
+                return Err(invalid());
+            }
+        }
+        if !self.functions.contains_key(symbol) {
+            self.ensure_kernel(
+                "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201",
+                kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_A3B_GFX1201_SRC,
+                symbol,
+            )?;
+        }
+        let qp = unsafe { (q.buf.as_ptr() as *mut u8).add(code_off) as *mut c_void };
+        let sq = unsafe { (q.buf.as_ptr() as *mut u8).add(scale_off) as *mut c_void };
+        let mut args = a3b_qresident_args(
+            [
+                qp,
+                sq,
+                k_cache.buf.as_ptr(),
+                v_cache.buf.as_ptr(),
+                out.buf.as_ptr(),
+                positions.buf.as_ptr(),
+            ],
+            batch_size,
+        );
+        // Same capture/recording posture as dense qresident, no eager-only gate.
+        // KT48 double buffers: 2*(2*12288 + 2*192) + 16 = 49936 bytes.
+        self.launch_blob_recorded(
+            symbol,
+            [
+                (batch_size.min(512) * 8).div_ceil(384) as u32,
+                2,
+                batch_size.div_ceil(512) as u32,
+            ],
+            [768, 1, 1],
+            QRESIDENT_V2_LDS_BYTES,
+            &mut args,
+            crate::dispatch::ReplayLaunchBindings::NONE,
         )
     }
 
@@ -25013,6 +25224,55 @@ fn kv_slot_paged_symbol(func: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a3b_qresident_full_planes_and_ragged_ranges() {
+        use super::a3b_qresident_spans;
+        assert_eq!(
+            a3b_qresident_spans(17, 529, 512, 1041),
+            Some((
+                529 * 4160,
+                512 * 4096,
+                529 * 4096 + 512 * 64,
+                17 * 16384,
+                17 * 4,
+                1041 * 516
+            ))
+        );
+        assert!(a3b_qresident_spans(18, 529, 512, 1041).is_none());
+        assert!(a3b_qresident_spans(1, usize::MAX, usize::MAX, 1).is_none());
+        assert!(a3b_qresident_spans(1, usize::MAX, 0, 1).is_none());
+        assert!(a3b_qresident_spans(0, 1, 0, 1).is_none());
+        assert!(a3b_qresident_spans(1, 1, 0, 262145).is_none());
+        assert!(a3b_qresident_spans(32768, 32768, 0, 262144).is_some());
+    }
+
+    #[test]
+    fn a3b_qresident_packed_abi_and_native_mapped_prefix() {
+        use super::{a3b_qresident_args, a3b_qresident_spans};
+        use crate::fa_prefill_pm::{require_cache_bytes, FaPrefillKvCodec};
+        let args = a3b_qresident_args([std::ptr::null_mut(); 6], 529);
+        assert_eq!(&args[..48], &[0u8; 48]);
+        for (offset, value) in [(48, 16i32), (52, 2), (56, 256), (60, 529)] {
+            assert_eq!(&args[offset..offset + 4], &value.to_le_bytes());
+        }
+        assert_eq!(&args[64..], &(1.0f32 / 16.0).to_le_bytes());
+        let need = a3b_qresident_spans(17, 529, 512, 1041).unwrap().5;
+        for dtype in [crate::DType::Raw, crate::DType::F32] {
+            assert!(require_cache_bytes(FaPrefillKvCodec::Fp8E4M3, dtype, need, need, "K").is_ok());
+            assert!(
+                require_cache_bytes(FaPrefillKvCodec::Fp8E4M3, dtype, need - 1, need, "K").is_err()
+            );
+        }
+        assert!(require_cache_bytes(
+            FaPrefillKvCodec::Fp8E4M3,
+            crate::DType::Q8_0,
+            need,
+            need,
+            "K"
+        )
+        .is_err());
+        assert_eq!(super::QRESIDENT_V2_LDS_BYTES, 49936);
+    }
 
     #[test]
     fn fa_prefill_pm_admission_exhaustive_truth_table() {

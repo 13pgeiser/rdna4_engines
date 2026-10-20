@@ -1325,6 +1325,14 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ]
         );
         add!(
+            "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201",
+            kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_A3B_GFX1201_SRC,
+            [
+                "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201",
+                "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_a3b_gfx1201"
+            ]
+        );
+        add!(
             "dflash_gdn_replay_pre_ml",
             crate::dflash_gdn_replay::DFLASH_GDN_REPLAY_PRE_ML_SRC,
             ["dflash_gdn_replay_pre_ml"]
@@ -5757,6 +5765,59 @@ mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
     use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn a3b_qresident_q8_has_isolated_exports_and_shared_dense_body() {
+        let direct = "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201";
+        let range = "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_a3b_gfx1201";
+        let entry = lookup("gfx1201", direct, "").unwrap();
+        assert_eq!(entry.symbols, [direct, range]);
+        let source = entry.source();
+        let body = source
+            .strip_prefix(concat!(
+                "#define HIPFIRE_FA2_QRESIDENT_V2_Q8_A3B 1\n",
+                "#define HIPFIRE_FA2_QRESIDENT_V2_Q8 1\n",
+                "#define HIPFIRE_FA2_FP8 1\n",
+                "#define HIPFIRE_FA2_KMODE 8\n",
+            ))
+            .unwrap();
+        let dense = lookup(
+            "gfx1201",
+            "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201",
+            "",
+        )
+        .unwrap();
+        assert_eq!(
+            body,
+            dense
+                .source()
+                .strip_prefix(concat!(
+                    "#define HIPFIRE_FA2_QRESIDENT_V2_Q8 1\n",
+                    "#define HIPFIRE_FA2_FP8 1\n",
+                    "#define HIPFIRE_FA2_KMODE 8\n",
+                ))
+                .unwrap()
+        );
+        for contract in [
+            "QR_HEADS = 16, QR_KV_HEADS = 2, QR_GQA = 8",
+            "QR_HEADS = 24, QR_KV_HEADS = 4, QR_GQA = 6",
+            "row_base + 383 < QR_GQA * run_rows",
+            "v2i_t Qfr[16]",
+            "constexpr int TK = 48",
+            "LDS + 49920",
+            "const uint32_t* p32 = (const uint32_t*)p",
+            "kg * 8 + j, seq_len - 1",
+            "dc * 16 + (ml & ~3)",
+            "word >> (8 * (ml & 3))",
+        ] {
+            assert!(
+                body.contains(contract),
+                "missing source contract: {contract}"
+            );
+        }
+        assert!(!dense.symbols.contains(&direct));
+        assert!(!dense.symbols.contains(&range));
+    }
 
     #[test]
     fn mq4v2_k5120_inventory_preserves_generic_and_limits_arch() {
