@@ -747,6 +747,17 @@ int  r4d_ar_rmsnorm_quant_i8(long peer_scratch, long my_scratch, long peer_flags
                              long sc, int sc_f32, long y, long q, long s, int M, int n, float eps,
                              float wadd, int w_f32, int r_ld, int y_ld, long stream, int nblocks,
                              int drain, int acq);
+// ...and at four ranks, on the wide family's transport: r4d_ar_oneshot_4rank_exact's IPC
+// arguments (peers in ascending rank, this rank's own, the counters, the slot stride), `pub`, and
+// the engine's link gate with the instance's landed counter (0 for none; r4d_ar_seq.h).
+int  r4d_ar_rmsnorm_quant_i8_4rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                                   long peer_flags0, long peer_flags1, long peer_flags2,
+                                   long my_scratch, long my_flags, long seq_ctrs,
+                                   long slot_stride16, long x, long res, long w, long wp, long sc,
+                                   int sc_f32, long y, long q, long s, int M, int n, float eps,
+                                   float wadd, int w_f32, int r_ld, int y_ld, int rank,
+                                   long stream, int nblocks, int drain, int acq, int pub,
+                                   long gate, long gate_ctr);
 
 // ---- sampling ----------------------------------------------------------------------------------
 //

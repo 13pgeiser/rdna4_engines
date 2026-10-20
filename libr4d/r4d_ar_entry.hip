@@ -602,11 +602,11 @@ extern "C" int r4d_rad_ar_ln_host_init(const RadParam* p, int n_p, int rank, int
     return ar_ln_init(p, n_p, rank, world, 1, out);
 }
 
-/* The four-rank ar_hc_write and ar_gather_hc_write. The key is {rank, 4, bf16, M_hi * n}, shared
- * with a standalone all_reduce band only where the bounds agree. Either way is safe on one stream:
- * every wide kernel advances the instance's seq counters once per all-reduce and writes only its
- * (parity, source) slot (r4d_ar_wide.h), so ops on one instance interleave in any order all ranks
- * share. Exact wire only; `wire` 6 is refused. */
+/* The four-rank ar_hc_write, ar_gather_hc_write and ar_rmsnorm_quant_i8 (the norm declares no
+ * `wire`). The key is {rank, 4, bf16, M_hi * n}, shared with a standalone all_reduce band only where
+ * the bounds agree. Either way is safe on one stream: every wide kernel advances the instance's seq
+ * counters once per all-reduce and writes only its (parity, source) slot (r4d_ar_wide.h), so ops on
+ * one instance interleave in any order all ranks share. Exact wire only; `wire` 6 is refused. */
 static int ar_hc_wide_init(const RadParam* p, int n_p, int rank, int world, int host,
                            void** out) {
     if (!out) return RAD_E_INVAL;
@@ -1345,18 +1345,22 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
  * all-reduce. Width and block count as in ar_rmsnorm_quant_fp8. */
 enum { AQ8_X = 0, AQ8_RES, AQ8_W, AQ8_Q, AQ8_S, AQ8_Y, AQ8_WP, AQ8_SC };
 
-extern "C" int r4d_rad_ar_rmsnorm_quant_i8(const RadArgs* a, RadStream s) {
-    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
-    if (!in) return RAD_E_STATE;
-    if (in->world != 2) return RAD_E_SHAPE;
-    const RadTensor* x  = r4d_opt(a, AQ8_X);
-    const RadTensor* rs = r4d_opt(a, AQ8_RES);
-    const RadTensor* w  = r4d_opt(a, AQ8_W);
-    const RadTensor* q  = r4d_opt(a, AQ8_Q);
-    const RadTensor* sc = r4d_opt(a, AQ8_S);
-    const RadTensor* ob = r4d_opt(a, AQ8_Y);
-    const RadTensor* wp = r4d_opt(a, AQ8_WP);
-    const RadTensor* sl = r4d_opt(a, AQ8_SC);
+/* The operands and their rules, the same at every width. */
+struct ArQ8Args {
+    const RadTensor *x = nullptr, *rs = nullptr, *w = nullptr, *q = nullptr, *sc = nullptr;
+    const RadTensor *ob = nullptr, *wp = nullptr, *sl = nullptr;
+    long long M = 0, K = 0, yp = 0, rp = 0;
+};
+
+static int ar_q8_args(const RadArgs* a, const ArInst* in, ArQ8Args* o) {
+    const RadTensor* x  = o->x  = r4d_opt(a, AQ8_X);
+    const RadTensor* rs = o->rs = r4d_opt(a, AQ8_RES);
+    const RadTensor* w  = o->w  = r4d_opt(a, AQ8_W);
+    const RadTensor* q  = o->q  = r4d_opt(a, AQ8_Q);
+    const RadTensor* sc = o->sc = r4d_opt(a, AQ8_S);
+    const RadTensor* ob = o->ob = r4d_opt(a, AQ8_Y);
+    const RadTensor* wp = o->wp = r4d_opt(a, AQ8_WP);
+    const RadTensor* sl = o->sl = r4d_opt(a, AQ8_SC);
     if (!x || !w || !q || !sc) return RAD_E_INVAL;
     if ((wp || sl) && !rs) return RAD_E_INVAL;
     if (!r4d_contig(w) || (wp && !r4d_contig(wp))) return RAD_E_STRIDE;
@@ -1375,6 +1379,18 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_i8(const RadArgs* a, RadStream s) {
     const long long xp = r4d_row_pitch(x), yp = ob ? r4d_row_pitch(ob) : 0, rp = rs ? r4d_row_pitch(rs) : 0;
     if (xp != K || yp < 0 || rp < 0) return RAD_E_STRIDE;   /* x is the message: tight */
     if (r4d_geti_or(a, "wire", 0) != 0) return RAD_E_INVAL;
+    o->M = M; o->K = K; o->yp = yp; o->rp = rp;
+    return RAD_OK;
+}
+
+extern "C" int r4d_rad_ar_rmsnorm_quant_i8(const RadArgs* a, RadStream s) {
+    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
+    if (!in) return RAD_E_STATE;
+    if (in->world != 2) return RAD_E_SHAPE;
+    ArQ8Args v;
+    const int arc = ar_q8_args(a, in, &v);
+    if (arc != RAD_OK) return arc;
+    const long long M = v.M, K = v.K;
 
     R4dArCfg cfgv;
     r4d_cfg_ar(a, &cfgv);
@@ -1385,11 +1401,54 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_i8(const RadArgs* a, RadStream s) {
     if (nblocks < 1) nblocks = 1;
     const int e = r4d_ar_rmsnorm_quant_i8(
         in->peer_scratch[0], in->my_scratch, in->peer_flags[0], in->my_flags, in->my_seq,
-        in->slot16, r4d_addr(x), r4d_addr(rs), r4d_addr(w), r4d_addr(wp), r4d_addr(sl),
-        sl ? (sl->dtype == RAD_F32) : 0, r4d_addr(ob), r4d_addr(q), r4d_addr(sc), (int)M, (int)K,
-        (float)r4d_getf(a, "eps", 1e-6), (float)r4d_getf(a, "wadd", 0.0), w->dtype == RAD_F32,
-        (int)rp, (int)yp, (long)(uintptr_t)s, nblocks, cfgv.drain, cfgv.acq);
+        in->slot16, r4d_addr(v.x), r4d_addr(v.rs), r4d_addr(v.w), r4d_addr(v.wp), r4d_addr(v.sl),
+        v.sl ? (v.sl->dtype == RAD_F32) : 0, r4d_addr(v.ob), r4d_addr(v.q), r4d_addr(v.sc), (int)M,
+        (int)K, (float)r4d_getf(a, "eps", 1e-6), (float)r4d_getf(a, "wadd", 0.0),
+        v.w->dtype == RAD_F32, (int)v.rp, (int)v.yp, (long)(uintptr_t)s, nblocks, cfgv.drain,
+        cfgv.acq);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
+}
+
+/* The same at four ranks, on the wide family's one-shot transport (r4d_rmsnorm_quant_i8.hip's
+ * ar_rmsnorm_quant_i8_wide_kernel), the one ar_hc_write_4rank rides, with the junction as its
+ * epilogue. The operands and the norm's width are the two-rank form's. The block count is one per
+ * row, capped by the wide family's flag array in the launcher and by the instance here. The
+ * instance is the four-rank family's {rank, 4, bf16, M_hi * n} (ar_hc_wide_init), so it is a
+ * standalone all_reduce band's where the two bounds agree, which is safe on one stream for the
+ * reason that init gives. The plugin issues it only at one-shot heights: each rank sends three
+ * times the message, which the two-shot the standalone takes above them does not. */
+extern "C" int r4d_rad_ar_rmsnorm_quant_i8_4rank(const RadArgs* a, RadStream s) {
+    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
+    if (!in) return RAD_E_STATE;
+    if (in->world != 4) return RAD_E_SHAPE;
+    if (in->dtype != 0) return RAD_E_DTYPE;
+    ArQ8Args v;
+    const int arc = ar_q8_args(a, in, &v);
+    if (arc != RAD_OK) return arc;
+
+    R4dArCfg cfgv;
+    r4d_cfg_ar(a, &cfgv);
+    /* The fence-free forms rest on fine-grained P2P scratch and a store drain; the host mailbox
+     * (pinned host memory, cached on the way) keeps both fences. */
+    if (in->host || cfgv.drain != 3) {
+        if (cfgv.pub == 2) cfgv.pub = 1;
+        if (cfgv.acq == 2) cfgv.acq = 0;
+    }
+    int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : (int)v.M;
+    if (nblocks > in->max_blocks) nblocks = in->max_blocks;
+    /* One handshake, the junction after it local: the release is the one-shot's. */
+    const long gate = link_gate(a), early = in->host ? 0L : gate;
+    const int e = r4d_ar_rmsnorm_quant_i8_4rank(
+        in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
+        in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
+        in->my_scratch, in->my_flags, in->my_seq, in->slot16,
+        r4d_addr(v.x), r4d_addr(v.rs), r4d_addr(v.w), r4d_addr(v.wp), r4d_addr(v.sl),
+        v.sl ? (v.sl->dtype == RAD_F32) : 0, r4d_addr(v.ob), r4d_addr(v.q), r4d_addr(v.sc),
+        (int)v.M, (int)v.K, (float)r4d_getf(a, "eps", 1e-6), (float)r4d_getf(a, "wadd", 0.0),
+        v.w->dtype == RAD_F32, (int)v.rp, (int)v.yp, (int)in->rank, (long)(uintptr_t)s, nblocks,
+        cfgv.drain, cfgv.acq, cfgv.pub, early, early ? in->gate_ctr : 0L);
+    if (e != 0) return RAD_E_SHAPE;
+    return early ? RAD_LINK_ENDED : RAD_OK;
 }
 
 /* The all-reduce with the gated residual write: `all_reduce` of `y`, then `hc_write` of the reduced

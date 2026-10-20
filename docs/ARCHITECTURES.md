@@ -698,6 +698,19 @@ the bytes, for 176 MiB per rank more. Drafts are verified, so the coarser logits
 proposed, never what is accepted; `draft_n_accepted` shows whether they propose worse. Without the
 copy the head reads the bf16 table, and the startup note names which head is in use.
 
+**The 31B's junctions at four ranks.** At two ranks every junction carries the all-reduce in front
+of it (`ar_rmsnorm_quant_i8`). At four it does too, at decode heights. libr4d's
+`ar_rmsnorm_quant_i8_4rank` is the exact four-rank one-shot with the junction as its epilogue,
+byte-identical to `all_reduce` + `rmsnorm_quant_i8`. A one-shot sends three times the message per
+rank, so the plugin declares it only up to 4 rows and issues the pair in a taller step. On 4x
+R9700 the fold made plain decode 5.6% faster (94 against 89 tok/s) and a DFlash verify (16 rows)
+9% slower (276 against 300), where the standalone all-reduce is the exact two-shot. A decode step
+at tp 4 then has two standalone reductions (the embedding's and the last feed-forward's) where it
+had 121. It gives the pair's greedy text byte for byte. At sixteen rows of 5376 the junction is
+55 us against 22 at one row (--profile-ops): its handshakes, not its bytes, set it.
+`r4d_selftest --case ar_rmsnorm_quant_i8_4rank` checks it on four cards, and the startup note says
+which form a deployment takes.
+
 **FP8 experts.** The experts are ~90% of the weight bytes, so each projection is served as the
 container holds it, per layer: bf16 by `moe_gemm`, block fp8 by `moe_gemm_q`. gate_up
 `[1408, 2816]` is whole 64-row tiles and 128-blocks. down `[2816, 704]` is not (the fp8 grouped

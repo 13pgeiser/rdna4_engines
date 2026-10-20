@@ -2122,6 +2122,14 @@ so the gather half writes `y` before it is reduced in place, and the five gather
 mean what they mean on `moe_gather`. `wire` is `ar_hc_write`'s. On either wire it is byte-identical
 to the three kernels it replaces.
 
+`ar_rmsnorm_quant_i8` is the exact `all_reduce` of `x` followed by `rmsnorm_quant_i8`'s junction
+over the reduced sum, at two ranks and at four. At four it is the exact one-shot's transport with
+the junction as its epilogue: a block owns whole rows, and the fold is element by element in the
+norm's partition, each element the one-shot's arithmetic (fp32 from zero, ascending rank order,
+one rounding to bf16), so it is byte-identical to `all_reduce` + `rmsnorm_quant_i8`. A one-shot
+sends (ranks - 1) times the message a rank, so it is for decode heights; above them a caller
+issues the pair, whose `all_reduce` goes two-shot.
+
 ## Vocabulary edges
 
 | op | params | operands |

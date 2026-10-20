@@ -12,6 +12,7 @@
 #include <arch/rad_block_gemma4_vision.h>
 #include <arch/rad_gemma4_chat.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -546,9 +547,25 @@ void Gemma4Mlp::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool tai
 /* ---- one residual junction as one op: [post-norm of the branch `x`, the add into `res`, the
  * layer scalar,] the next block's norm and its int8 quantiser (libr4d `rmsnorm_quant_i8`). With
  * `res` null it is the plain norm of `x`, the first block's entry. */
+/* The four-rank fold's band. libr4d's exact all-reduce is a one-shot up to this many elements
+ * (R4D_AR_WIDE_ONESHOT_MAX_ELEMS) and a two-shot above, and the fused junction at four ranks is
+ * that one-shot with the junction as its epilogue: three times the message per rank on the link,
+ * which pays at decode heights and not at a prefill's. So at four ranks op_ar serves the rows a
+ * one-shot would, 97 at 5376, and a taller step issues the all-reduce and the junction apart.
+ *
+ * Within that band the fold pays only at the bottom. On 4x R9700 (2026-10-17, same image) a plain
+ * decode step (1 row) ran 5.6% slower without it (89 against 94 tok/s), and a DFlash verify
+ * (16 rows) 9% faster (300 against 276): at 16 rows the standalone all-reduce is the exact
+ * two-shot, while the fold's one block a row each takes a fenced handshake. The per-row costs
+ * cross near 4-5 rows, so the fold serves up to kAr4FoldRows rows and a taller step issues the
+ * pair. */
+static constexpr int64_t kArOneShotElems = 524288;
+static constexpr int64_t kAr4FoldRows = 4;
+
 struct G4Junction {
     rad_op     op = 0;
-    rad_op     op_ar = 0;   /* the same with the two-rank exact all-reduce of `x` in front, or 0 */
+    rad_op     op_ar = 0;   /* the same with the exact all-reduce of `x` in front, or 0 */
+    int64_t    ar_rows = 0; /* the most rows op_ar serves: the step's at two ranks, a band at four */
     rad_buf    x = 0, res = 0, q8 = 0, s8 = 0;
     rad_weight w = 0, wp = 0, sc = 0;
 
@@ -571,11 +588,16 @@ struct G4Junction {
         const rad_buf wr[3] = { q8, s8, res };
         rad_op_reads (b, op, rd, res ? 2 : 1);
         rad_op_writes(b, op, wr, res ? 3 : 2);
-        /* With the all-reduce in front, at two ranks on the exact wire: `x` is then a rank's
-         * partial sum of a column-sharded linear. With the lossy wire allowed, the standalone
-         * all-reduce is kept, since it may choose that wire. */
-        if (res && g.world == 2 && g.wire_exact && rad_op_declared(b, "ar_rmsnorm_quant_i8")) {
-            const RadParam pa[] = { RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+        /* With the all-reduce in front, at two or four ranks on the exact wire: `x` is then a
+         * rank's partial sum of a column-sharded linear. With the lossy wire allowed, the
+         * standalone all-reduce is kept, since it may choose that wire. At four ranks the fold is
+         * the one-shot's and serves only its band (kArOneShotElems, kAr4FoldRows). */
+        const bool four = g.world == 4;
+        const int64_t hi = four ? std::min<int64_t>(kAr4FoldRows, std::min<int64_t>(g.max_tok, kArOneShotElems / g.n_embd))
+                                : g.max_tok;
+        if (res && g.wire_exact && (g.world == 2 || four) && hi >= 1 &&
+            rad_op_declared(b, "ar_rmsnorm_quant_i8")) {
+            const RadParam pa[] = { RAD_RANGE("M", 1, hi), RAD_INT("n", g.n_embd),
                                     RAD_F64("eps", g.eps), RAD_INT("world_size", g.world),
                                     RAD_STR("dtype", g.dtype), RAD_F64("wadd", g.wadd) };
             op_ar = rad_decl_op(b, "ar_rmsnorm_quant_i8", pa, (int)(sizeof pa / sizeof pa[0]), ws, nw);
@@ -583,6 +605,7 @@ struct G4Junction {
                 const rad_buf wa[4] = { x, q8, s8, res };
                 rad_op_reads (b, op_ar, rd, 2);
                 rad_op_writes(b, op_ar, wa, 4);
+                ar_rows = hi;
             }
         }
         return RAD_OK;
@@ -1098,6 +1121,7 @@ struct Model {
     G4Junction j0{};       /* the first block's entry: norm + quantiser of the embedding stream */
     bool       fuse = false;
     bool       fuse_ar = false;   /* every junction also carries the all-reduce in front of it */
+    int64_t    ar_rows = 0;       /* ...in a step of at most this many rows (G4Junction::ar_rows) */
 };
 
 static Model g_model[MAX_RANKS];
@@ -1320,12 +1344,16 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             }
         }
         m.fuse = ok;
-        bool ar = ok && g.world == 2;
+        bool ar = ok && (g.world == 2 || g.world == 4);
+        int64_t rows = g.max_tok;
         for (int64_t l = 0; ar && l < m.n_main; ++l) {
             const Layer& lay = m.layers[(size_t)l];
             ar = lay.j_am.op_ar != 0 && (l + 1 >= m.n_main || lay.j_ma.op_ar != 0);
+            if (ar) rows = std::min(rows, lay.j_am.ar_rows);
+            if (ar && l + 1 < m.n_main) rows = std::min(rows, lay.j_ma.ar_rows);
         }
         m.fuse_ar = ar;
+        m.ar_rows = ar ? rows : 0;
     }
 
     /* ---- the tail: final norm, the sampled rows, the lm_head, and the soft-cap. */
@@ -1385,6 +1413,16 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              g.rank, g.world, (long long)g.n_layer, (long long)n_global,
              (long long)(g.n_layer - n_global), (long long)sliding_win,
               (long long)g.n_head, (long long)g.head_dim, (long long)g.n_head, (long long)head_g);
+    if (m.fuse && (g.world == 2 || g.world == 4)) {
+        if (!m.fuse_ar)
+            rad_note(b, "residual junctions: the all-reduce in front of each issued apart");
+        else if (g.world == 4)
+            rad_note(b, "residual junctions: the all-reduce in front of each folded in at steps of "
+                        "%lld rows or fewer (the four-rank one-shot), issued apart above",
+                     (long long)m.ar_rows);
+        else
+            rad_note(b, "residual junctions: the all-reduce in front of each folded in");
+    }
     return RAD_OK;
 }
 
@@ -1420,15 +1458,17 @@ static void step(RadCtx* c, const RadBatch* batch) {
 
     const int64_t T = batch->n_tok;
     if (m.fuse) m.j0.step(c, T);
+    /* the junctions carry the reductions in front of them in a step their fold serves */
+    const bool far = m.fuse_ar && T <= m.ar_rows;
     for (size_t li = 0; li < m.layers.size(); ++li) {
         const Layer& l = m.layers[li];
         const bool last = li + 1 == m.layers.size();
-        l.attn.step(c, batch, m.fuse, m.fuse, m.fuse_ar);
-        if (m.fuse) l.j_am.step(c, T, m.fuse_ar);
-        l.mlp.step(c, batch, m.fuse, m.fuse && !last, m.fuse_ar);
+        l.attn.step(c, batch, m.fuse, m.fuse, far);
+        if (m.fuse) l.j_am.step(c, T, far);
+        l.mlp.step(c, batch, m.fuse, m.fuse && !last, far);
         if (m.fuse && !last) {
             /* [all-reduce,] post-norm, add, layer scalar, next block's norm and quantiser: one op */
-            l.j_ma.step(c, T, m.fuse_ar);
+            l.j_ma.step(c, T, far);
             continue;
         }
         /* The per-layer scalar, `cur = cur * scalar` over the residual stream, applied after the

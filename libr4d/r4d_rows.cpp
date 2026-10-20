@@ -3080,7 +3080,7 @@ static const RadOpSchema kSchemas[] = {
            "gelu(gate) * up (tanh form) and the per-row int8 quantiser the w4a8 skinny GEMM reads, in "
            "one pass."),
     SCHEMA("ar_rmsnorm_quant_i8", pArRmsNormQuantI8, oArRmsNormQuantI8,
-           "the two-rank exact all-reduce of x and rmsnorm_quant_i8 after it, in one kernel."),
+           "the two- or four-rank exact all-reduce of x and rmsnorm_quant_i8 after it, in one kernel."),
     SCHEMA("gated_quant_fp8", pGatedQuantFp8, oGatedQuantFp8,
            "silu(a)*b or sigmoid(a)*b, then the same quantiser, in one pass."),
     SCHEMA("gated_had_quant_fp8", pGatedQuantFp8, oGatedQuantFp8,
@@ -4452,6 +4452,10 @@ static const RadConstraint cGeluMulQuantI8[] = {
 static const RadConstraint cArRmsNormQuantI8[] = {
     C_DIV("n", 16), C_LE("n", 30720), C_IN("dtype", "bf16"), C_EQ("world_size", 2), C_P2P,
 };
+/* The same at four ranks, on the wide family's transport. */
+static const RadConstraint cArRmsNormQuantI84[] = {
+    C_DIV("n", 16), C_LE("n", 30720), C_IN("dtype", "bf16"), C_EQ("world_size", 4), C_P2P,
+};
 static const RadConstraint cHadQuantActI8[] = {
     C_DIV("n", 16), C_DIV("n", 128), C_LE("group", 512), C_IN("dtype", "bf16"),
 };
@@ -4662,7 +4666,8 @@ static const RadTunable tAttnSplit[] = {
 /* ------------------------------------------------------------------- all-reduce launch geometry
  *
  * Four independent axes of the handshake: nblocks, nthreads, drain and acq. (`pub` is 1 in every
- * arm, a constant in r4d_ar_entry.hip.) nblocks 0 scales with the message and clamps; drain 3 is
+ * arm but the four-rank junction's, tArQ84, where it is an axis.) nblocks 0 scales with the message
+ * and clamps; drain 3 is
  * s_wait_storecnt, the correct wait for the fine-grained uncached IPC scratch.
  *
  * rad-tune cannot reach these rows: the two-rank kernels need a real peer over IPC and rad-tune
@@ -4682,6 +4687,28 @@ static const RadTunable tAr[] = {
   { "nthreads", kArNthreads, NELEM(kArNthreads), 1024, "threads per block; the fused fp8 row overrides this for bit-exactness" },
   { "drain",    kArDrain,    NELEM(kArDrain),    3, "store-drain wait before the flag: 3 = s_wait_storecnt, 1 = vmcnt" },
   { "acq",      kArAcq,      NELEM(kArAcq),      0, "acquire fence after the flag read" },
+};
+/* The four-rank fused junction (ar_rmsnorm_quant_i8_4rank): tAr's axes, its own value sets.
+ * On 4x R9700 over PCIe P2P a junction costs about 22 us at one row of 5376 and 57 us at sixteen
+ * (--profile-ops): it is bound by its handshakes, not its bytes.
+ *
+ * Every block takes one handshake, a system-scope release by its first
+ * thread and a system-scope acquire by every wave. Both are needed: on 4x R9700 behind an EPYC
+ * root complex, dropping either (an acq 2 and a pub 2 that were here, r4d_selftest 2026-10-16 and
+ * -17) left the readers with stale scratch on nearly every element, so the peers' stores do not
+ * reach them past the writer's L2 without the writeback. What can move is how many handshakes a
+ * call takes: fewer blocks (2 or 4, each owning several rows) take fewer. The defaults are the
+ * forms that have run on cards; the others are for RADIANCE_TUNE until they have. None of them
+ * changes the result. */
+static const int64_t kArQ84Nblocks[] = { 0, 2, 4, 8, 16, 24 };
+static const int64_t kArQ84Acq[]     = { 0, 1 };
+static const int64_t kArQ84Pub[]     = { 1 };
+static const RadTunable tArQ84[] = {
+  { "nblocks",  kArQ84Nblocks, NELEM(kArQ84Nblocks), 0, "blocks in the grid. 0 = one a row, clamped" },
+  { "nthreads", kArNthreads, NELEM(kArNthreads), 1024, "unused: the norm's width sets the block for bit-exactness" },
+  { "drain",    kArDrain,    NELEM(kArDrain),    3, "store-drain wait before the flag: 3 = s_wait_storecnt, 1 = vmcnt" },
+  { "acq",      kArQ84Acq,   NELEM(kArQ84Acq),   0, "acquire after the flag read: 0 system invalidate a wave, 1 full fence" },
+  { "pub",      kArQ84Pub,   NELEM(kArQ84Pub),   1, "release before the flag store: 1 one system writeback" },
 };
 /* The four-rank two-shots beside compute: four blocks of 1024. A pipelined Flash-Next prefill at
  * TP4 (qwen4exp_fp8) runs each all-reduce of a 2048-row piece beside the other piece's MoE passes,
@@ -7563,6 +7590,23 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   ROW(cArRmsNormQuantI8), ROW(tAr), nullptr,
   r4d_rad_ar_ln_init, r4d_rad_ar_fini, r4d_rad_ar_rmsnorm_quant_i8 },
 
+/* Its arithmetic is the four-rank exact one-shot's fold followed by the two-rank form's junction,
+ * each the code those two run. r4d_selftest's case of the same name holds it byte for byte to
+ * all_reduce + rmsnorm_quant_i8 on a four-card box, and the engine to a decode step's text against
+ * a build that issues the pair. Both have run on cards that way (the 31B's fused junctions, and
+ * r4d_selftest on four R9700s). */
+{ "ar_rmsnorm_quant_i8_4rank", "ar_rmsnorm_quant_i8", "quant",
+  "the four-rank exact one-shot all-reduce and the junction after it -- post-norm of the reduced "
+  "sum, residual add, scalar, RMS norm and quant_act_i8's quantiser -- in one kernel",
+  "exactly 4 ranks; n a multiple of 16, x unpitched (it is the message); a block owns whole rows; "
+  "exact wire; one-shot, so (ranks - 1) x the message a rank -- for decode heights",
+  "bf16 in, int8 out in the w4a8 GEMM's fragment order with an f32 per-row scale; the reduced sum "
+  "rounded to bf16 as the standalone exact all-reduce stores it",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cArRmsNormQuantI84), ROW(tArQ84), nullptr,
+  r4d_rad_ar_hc_wide_init, r4d_rad_ar_fini, r4d_rad_ar_rmsnorm_quant_i8_4rank, nullptr, nullptr,
+  nullptr, nullptr },
+
 { "had_quant_act_i8", "had_quant_act_i8", "quant",
   "block Hadamard along K then per-row symmetric int8 quantisation; the rotation is what makes "
   "int8 activations usable at all: unrotated, the per-row absmax is set by a few outlier channels "
@@ -8783,6 +8827,7 @@ extern "C" int rad_kernel_collective(int i) {
         r4d_rad_ar_oneshot_4rank_exact, r4d_rad_ar_twoshot_4rank_exact,
         r4d_rad_ar_twoshot_4rank_ti8, r4d_rad_ar_gather_4rank,
         r4d_rad_ar_hc_write_4rank, r4d_rad_ar_gather_hc_write_4rank,
+        r4d_rad_ar_rmsnorm_quant_i8_4rank,
     };
     for (RadLaunchFn f : kReleasing)
         if (k->launch == f) return 2;
@@ -8862,7 +8907,8 @@ extern "C" void r4d_cfg_ar(const RadArgs* a, R4dArCfg* out) {
     out->nthreads = TUNE(a, tAr, "nthreads");
     out->drain    = TUNE(a, tAr, "drain");
     out->acq      = TUNE(a, tAr, "acq");
-    out->pub      = 1;                 /* not an axis; see the note at tAr */
+    /* An axis of the four-rank junction only (tArQ84); 1 for every other row, as before. */
+    out->pub      = TUNE(a, tArQ84, "pub");
 }
 extern "C" void r4d_cfg_topk(const RadArgs* a, R4dTopkCfg* out) {
     out->rc  = 0;                      /* derived from pt1 at issue; see the note at tTopk */

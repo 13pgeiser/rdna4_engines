@@ -22508,6 +22508,251 @@ static void ar_hc_write_case(const Plugin& pl, const std::vector<int>& devs, con
     }
 }
 
+/* ------------------------------------------------------------------ the fused junction (ar_rmsnorm_quant_i8_4rank) */
+/* The four-rank all-reduce with the sandwich-norm junction as its epilogue, against the chain it
+ * replaces: the exact all-reduce (ar_vsum's f32 ascending-rank fold rounded once to bf16, as
+ * ar_hc_write_case's oracle folds it), then the single-rank `rmsnorm_quant_i8` row over that sum on
+ * the first card. The fused row's epilogue is that row's device function, so the check is
+ * byte-exact on everything it leaves: the reduced x on every rank, the residual, the bf16 norm
+ * output, the codes and the per-row scales.
+ *
+ * Tensor parallel replicates the residual stream, so every rank gets the same one, and x is each
+ * rank's own partial sum. The three forms the single-rank check walks (the plain norm, the
+ * junction, the junction with its scalar) run at decode heights, at the one-shot limit of the 31B's
+ * width (97 rows of 5376, more rows than the wide family has blocks), and at the 26B's width.
+ *
+ * The scalar form is also launched as the engine launches a collective it holds the link for, with
+ * an odd `link_gate` word on each card (rad_abi.h, rad_kernel_collective): over P2P the row must
+ * end the hold itself, leaving the word even and returning RAD_LINK_ENDED, and through the host
+ * mailbox it must leave the word alone and return RAD_OK. */
+struct ArQ8 {
+    const RadKernelInfo* row = nullptr;
+    int rank = 0, dev = 0;
+    int64_t M = 0, K = 0;
+    bool res = false, scal = false;
+    bool gated = false;                            /* hand the launch an odd `link_gate` word */
+    long long gate_after = -1;                     /* ...and what the launch left in it */
+    void* inst = nullptr;
+    int rc_init = RAD_E_STATE, rc_launch = RAD_OK;
+    const std::vector<uint16_t>* r_in = nullptr;   /* the replicated residual, w and w_post */
+    const std::vector<uint16_t>* w = nullptr;
+    const std::vector<uint16_t>* wp = nullptr;
+    uint16_t sc = 0;
+    std::vector<uint16_t> x_in;                    /* this rank's partial sum */
+    std::vector<uint16_t> x_out, r_out, y_out;     /* what it leaves behind */
+    std::vector<uint8_t>  q_out;
+    std::vector<float>    s_out;
+};
+
+static void ar_q8_worker(ArQ8* t) {
+    if (st_set_device(t->dev) != hipSuccess) { t->rc_init = RAD_E_DEVICE; return; }
+    const int64_t M = t->M, K = t->K;
+    std::vector<RadParam> ps = { PI("world_size", 4), PI("M", M), PI("n", K), PF("eps", 1e-6),
+                                 PS("dtype", "bf16"), PF("wadd", 0.0) };
+    t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, 4, &t->inst);
+    if (t->rc_init != RAD_OK) return;
+
+    /* Allocated here and not through dalloc, whose list four rank threads would race on. */
+    void* x = nullptr; void* r = nullptr; void* w = nullptr; void* wp = nullptr; void* sc = nullptr;
+    void* q = nullptr; void* s = nullptr; void* y = nullptr; void* gw = nullptr;
+    const size_t xb = (size_t)(M * K * 2), wb = (size_t)K * 2;
+    const bool mem = hipMalloc(&x, xb) == hipSuccess && hipMalloc(&r, xb) == hipSuccess &&
+                     hipMalloc(&w, wb) == hipSuccess && hipMalloc(&wp, wb) == hipSuccess &&
+                     hipMalloc(&sc, 4) == hipSuccess && hipMalloc(&q, (size_t)(M * K)) == hipSuccess &&
+                     hipMalloc(&s, (size_t)M * 4) == hipSuccess && hipMalloc(&y, xb) == hipSuccess &&
+                     (!t->gated || hipMalloc(&gw, 8) == hipSuccess);
+    if (!mem) {
+        t->rc_launch = RAD_E_NOMEM;
+    } else {
+        /* The engine's hold, as the engine sets it: an odd word on this card for the launch. */
+        if (gw) {
+            const long long one = 1;
+            st_memcpy(gw, &one, 8, hipMemcpyHostToDevice);
+            ps.push_back(PI("link_gate", (long long)(uintptr_t)gw));
+        }
+        st_memcpy(x, t->x_in.data(), xb, hipMemcpyHostToDevice);
+        st_memcpy(r, t->r_in->data(), xb, hipMemcpyHostToDevice);
+        st_memcpy(w, t->w->data(), wb, hipMemcpyHostToDevice);
+        st_memcpy(wp, t->wp->data(), wb, hipMemcpyHostToDevice);
+        st_memcpy(sc, &t->sc, 2, hipMemcpyHostToDevice);
+        std::vector<RadTensor> ts = {
+            T(x, RAD_BF16, { M, K }), T(r, RAD_BF16, { M, K }), T(w, RAD_BF16, { K }),
+            T(q, RAD_I8, { M, K }), T(s, RAD_F32, { M }), T(y, RAD_BF16, { M, K }),
+            T(wp, RAD_BF16, { K }), T(sc, RAD_BF16, { 1 }) };
+        if (!t->res) { absent(ts[1]); absent(ts[6]); }
+        if (!t->scal) absent(ts[7]);
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        a.instance = t->inst;
+        a.rank = t->rank;
+        a.world_size = 4;
+        t->rc_launch = t->row->launch(&a, nullptr);
+        st_stream_sync(nullptr);
+        t->x_out.resize((size_t)(M * K));
+        t->r_out.resize((size_t)(M * K));
+        t->y_out.resize((size_t)(M * K));
+        t->q_out.resize((size_t)(M * K));
+        t->s_out.resize((size_t)M);
+        st_memcpy(t->x_out.data(), x, xb, hipMemcpyDeviceToHost);
+        st_memcpy(t->r_out.data(), r, xb, hipMemcpyDeviceToHost);
+        st_memcpy(t->y_out.data(), y, xb, hipMemcpyDeviceToHost);
+        st_memcpy(t->q_out.data(), q, (size_t)(M * K), hipMemcpyDeviceToHost);
+        st_memcpy(t->s_out.data(), s, (size_t)M * 4, hipMemcpyDeviceToHost);
+        if (gw) st_memcpy(&t->gate_after, gw, 8, hipMemcpyDeviceToHost);
+    }
+    for (void* p : { x, r, w, wp, sc, q, s, y, gw }) if (p) st_free(p);
+}
+
+static bool nm_ends_with(const char* s, const char* tail) {
+    const size_t n = std::strlen(s), k = std::strlen(tail);
+    return n >= k && std::strcmp(s + n - k, tail) == 0;
+}
+
+static void ar_rmsnorm_quant_i8_wide_case(const Plugin& pl, const std::vector<int>& devs,
+                                          const char* name) {
+    const RadKernelInfo* row = find(pl, name);
+    const RadKernelInfo* rq  = find(pl, "rmsnorm_quant_i8");
+    if (!row || !rq) { ok(name, false, "row absent"); return; }
+    if ((int)devs.size() < 4) { skip(name, "needs 4 gfx1201 cards"); return; }
+    const int world = 4;
+    const bool host = nm_ends_with(name, "_host");   /* the mailbox twin leaves the hold alone */
+    struct Shape { int64_t M, K; };
+    const Shape shapes[] = { { 1, 5376 }, { 8, 5376 }, { 40, 5376 }, { 97, 5376 }, { 64, 2816 } };
+    const std::string nm(name);
+    for (const Shape& sh : shapes) {
+        const int64_t M = sh.M, K = sh.K;
+        std::vector<uint16_t> hr((size_t)(M * K)), hw((size_t)K), hp((size_t)K);
+        for (int64_t i = 0; i < M; ++i)
+            for (int64_t c = 0; c < K; ++c)
+                hr[(size_t)(i * K + c)] = h_to_bf16(0.019f * (float)((i * 13 + c * 29) % 67) - 0.6f);
+        for (int64_t c = 0; c < K; ++c) {
+            hw[(size_t)c] = h_to_bf16(0.004f * (float)((c * 19) % 51) - 0.1f);
+            hp[(size_t)c] = h_to_bf16(0.9f + 0.003f * (float)((c * 7) % 41));
+        }
+        const uint16_t hs = h_to_bf16(0.373f);
+        /* Each rank's partial sum, with per-group magnitudes an order apart and one outlier a row,
+         * as the single-rank check makes them, shifted by rank so the four differ. */
+        std::vector<std::vector<uint16_t>> hx((size_t)world, std::vector<uint16_t>((size_t)(M * K)));
+        for (int r = 0; r < world; ++r)
+            for (int64_t i = 0; i < M; ++i)
+                for (int64_t c = 0; c < K; ++c) {
+                    const float m = std::ldexp(1.0f, (int)((c / 384) % 6) - 3);
+                    const float v = m * (0.037f * (float)((i * 29 + c * 13 + r * 17) % 71) - 1.3f);
+                    hx[(size_t)r][(size_t)(i * K + c)] =
+                        h_to_bf16(c == (i * 37 + r * 11) % K ? v * 19.0f : v);
+                }
+        /* The fold: f32, ascending rank, rounded once. */
+        std::vector<uint16_t> xsum((size_t)(M * K));
+        for (int64_t i = 0; i < M * K; ++i) {
+            float acc = 0.0f;
+            for (int r = 0; r < world; ++r) acc += h_bf16(hx[(size_t)r][(size_t)i]);
+            xsum[(size_t)i] = h_to_bf16(acc);
+        }
+
+        for (const int form : { 0, 1, 2 }) {   /* the plain norm, the junction, with the scalar */
+            const bool res = form > 0, scal = form == 2;
+            const std::string at = " M=" + std::to_string(M) + " n=" + std::to_string(K) +
+                                   (form == 0 ? ", plain" : form == 1 ? ", junction"
+                                                                      : ", junction with scalar");
+
+            /* The chain on the first card: rmsnorm_quant_i8 over the reduced sum. */
+            st_set_device(devs[0]);
+            const size_t xb = (size_t)(M * K * 2), wb = (size_t)K * 2;
+            void* d_x = dalloc(xb); void* d_r = dalloc(xb); void* d_w = dalloc(wb);
+            void* d_p = dalloc(wb); void* d_sc = dalloc(4); void* d_q = dalloc((size_t)(M * K));
+            void* d_s = dalloc((size_t)M * 4); void* d_y = dalloc(xb);
+            if (!d_x || !d_r || !d_w || !d_p || !d_sc || !d_q || !d_s || !d_y) {
+                ok((nm + at + " alloc").c_str(), false, "hipMalloc failed");
+                return;
+            }
+            st_memcpy(d_x, xsum.data(), xb, hipMemcpyHostToDevice);
+            st_memcpy(d_r, hr.data(), xb, hipMemcpyHostToDevice);
+            st_memcpy(d_w, hw.data(), wb, hipMemcpyHostToDevice);
+            st_memcpy(d_p, hp.data(), wb, hipMemcpyHostToDevice);
+            st_memcpy(d_sc, &hs, 2, hipMemcpyHostToDevice);
+            const std::vector<RadParam> pn = { PI("M", M), PI("n", K), PF("eps", 1e-6),
+                                               PS("dtype", "bf16"), PF("wadd", 0.0) };
+            const int rc = launch_row(rq, { T(d_x, RAD_BF16, { M, K }),
+                                            res ? T(d_r, RAD_BF16, { M, K }) : T(nullptr, RAD_BF16, {}),
+                                            T(d_w, RAD_BF16, { K }), T(d_q, RAD_I8, { M, K }),
+                                            T(d_s, RAD_F32, { M }), T(d_y, RAD_BF16, { M, K }),
+                                            res ? T(d_p, RAD_BF16, { K }) : T(nullptr, RAD_BF16, {}),
+                                            scal ? T(d_sc, RAD_BF16, { 1 }) : T(nullptr, RAD_BF16, {}) },
+                                      pn);
+            if (rc != RAD_OK) {
+                ok((nm + at + ": the single-rank chain").c_str(), false, "rc=" + std::to_string(rc));
+                continue;
+            }
+            std::vector<uint16_t> want_r((size_t)(M * K)), want_y((size_t)(M * K));
+            std::vector<uint8_t>  want_q((size_t)(M * K));
+            std::vector<float>    want_s((size_t)M);
+            st_memcpy(want_r.data(), d_r, xb, hipMemcpyDeviceToHost);
+            st_memcpy(want_y.data(), d_y, xb, hipMemcpyDeviceToHost);
+            st_memcpy(want_q.data(), d_q, (size_t)(M * K), hipMemcpyDeviceToHost);
+            st_memcpy(want_s.data(), d_s, (size_t)M * 4, hipMemcpyDeviceToHost);
+
+            std::vector<ArQ8> t((size_t)world);
+            std::vector<std::thread> th;
+            for (int r = 0; r < world; ++r) {
+                ArQ8& x = t[(size_t)r];
+                x.row = row; x.rank = r; x.dev = devs[(size_t)r];
+                x.M = M; x.K = K; x.res = res; x.scal = scal; x.gated = scal;
+                x.r_in = &hr; x.w = &hw; x.wp = &hp; x.sc = hs;
+                x.x_in = hx[(size_t)r];
+                th.emplace_back(ar_q8_worker, &x);
+            }
+            for (std::thread& x : th) x.join();
+            st_set_device(devs[0]);
+
+            bool up = true, ran = true;
+            std::string rcs;
+            const int want_rc = scal && !host ? RAD_LINK_ENDED : RAD_OK;
+            bool released = true;
+            for (const ArQ8& x : t) {
+                up = up && x.rc_init == RAD_OK; ran = ran && x.rc_launch == want_rc;
+                rcs += std::to_string(x.rc_init) + "/" + std::to_string(x.rc_launch) + " ";
+                if (scal) released = released && x.gate_after == (host ? 1 : 0);
+            }
+            ok((nm + at + " init (peer rendezvous)").c_str(), up, "init/launch rc " + rcs);
+            if (!up) return;
+            ok((nm + at + " launch").c_str(), ran, "init/launch rc " + rcs + "(want " +
+                                                   std::to_string(want_rc) + ")");
+            if (scal) {
+                std::string g;
+                for (const ArQ8& x : t) g += std::to_string(x.gate_after) + " ";
+                ok((nm + at + (host ? ": the mailbox twin leaves the engine's link hold alone"
+                                    : ": the launch ends the engine's link hold itself")).c_str(),
+                   released, "link_gate words after the launch: " + g);
+            }
+            if (ran) {
+                int64_t bx = 0, br = 0, by = 0, bq = 0, bs = 0, nz = 0;
+                for (const ArQ8& x : t) {
+                    for (int64_t i = 0; i < M * K; ++i) {
+                        bx += x.x_out[(size_t)i] != xsum[(size_t)i];
+                        if (res) br += x.r_out[(size_t)i] != want_r[(size_t)i];
+                        by += x.y_out[(size_t)i] != want_y[(size_t)i];
+                        bq += x.q_out[(size_t)i] != want_q[(size_t)i];
+                    }
+                    for (int64_t i = 0; i < M; ++i)
+                        bs += std::memcmp(&x.s_out[(size_t)i], &want_s[(size_t)i], 4) != 0;
+                }
+                for (int64_t i = 0; i < M * K; ++i) nz += want_q[(size_t)i] != 0;
+                char d[200];
+                std::snprintf(d, sizeof d, "over four ranks: reduced x %lld, residual %lld, bf16 %lld, "
+                              "codes %lld, scales %lld differ; %lld of %lld codes nonzero",
+                              (long long)bx, (long long)br, (long long)by, (long long)bq,
+                              (long long)bs, (long long)nz, (long long)(M * K));
+                ok((nm + at + ": every rank holds the bytes of the all-reduce and the "
+                           "single-rank junction").c_str(),
+                   bx == 0 && br == 0 && by == 0 && bq == 0 && bs == 0 && nz > M * K / 2, d);
+            }
+            if (row->fini) for (ArQ8& x : t) if (x.inst) row->fini(x.inst);
+        }
+    }
+}
+
 /* ------------------------------------------------------------------ the device sweep */
 
 /* embed_lookup_q against a host gather of the same bytes, through the host side's own conversions.
@@ -25695,6 +25940,13 @@ static void device_phase(const Plugin& pl) {
     }
     /* The wide rows at every width are dispatched above and skip themselves, naming the width
      * they need, on a box with fewer cards. */
+    /* The junction's fused all-reduce at four ranks, and its host twin. */
+    for (const char* n : { "ar_rmsnorm_quant_i8_4rank", "ar_rmsnorm_quant_i8_4rank_host" }) {
+        if (!sel(n)) continue;
+        if (!g_case) std::printf("\ncross-rank, fused with the sandwich-norm junction\n");
+        std::printf("  %s\n", n);
+        ar_rmsnorm_quant_i8_wide_case(pl, devs, n);
+    }
     auto skip_pair = [](const char* base, const char* why) {
         for (const std::string& n : { std::string(base), std::string(base) + "_host" })
             if (sel(n.c_str())) skip(n.c_str(), why);

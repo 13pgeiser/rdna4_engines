@@ -6702,6 +6702,87 @@ TEST(gemma4_attention_join_writes_the_routed_inputs_on_fp8_experts) {
     CHECK_EQ(count_issued(issued_ops(b, c), "rmsnorm_quant_fp8"), 0);
 }
 
+/* At four ranks the junctions carry their reductions at decode heights, in the same issue order as
+ * at two ranks (only the embedding's and the last layer's feed-forward reduction stand alone),
+ * through ar_rmsnorm_quant_i8 declared at world_size 4 up to 4 rows (kAr4FoldRows: where the fold
+ * still beats the pair, inside libr4d's one-shot band of 524288 / 5376 = 97). A taller step, a DFlash
+ * verify's 16 rows included, issues each reduction and its junction apart, and where no library
+ * declares the fold every step issues the pair. */
+TEST(a_gemma4_w4a8_step_at_four_ranks_folds_the_all_reduce_into_the_junction_at_decode_heights) {
+    const int L = 12;
+    std::vector<std::string> folded = { "embed_lookup", "all_reduce", "rmsnorm_quant_i8" };
+    std::vector<std::string> apart  = folded;
+    for (int l = 0; l < L; ++l) {
+        const bool global = (l + 1) % 6 == 0;
+        for (int i = 0; i < (global ? 2 : 3); ++i) { folded.push_back("gemm_nt_q"); apart.push_back("gemm_nt_q"); }
+        for (const char* s : { "qkv_norm_rope", "kv_store", "attn_paged", "quant_act_i8", "gemm_nt_q",
+                               "ar_rmsnorm_quant_i8", "gemm_nt_q", "gelu_mul_quant_i8", "gemm_nt_q" })
+            folded.push_back(s);
+        for (const char* s : { "qkv_norm_rope", "kv_store", "attn_paged", "quant_act_i8", "gemm_nt_q",
+                               "all_reduce", "rmsnorm_quant_i8", "gemm_nt_q", "gelu_mul_quant_i8",
+                               "gemm_nt_q", "all_reduce" })
+            apart.push_back(s);
+        if (l < L - 1) {
+            folded.push_back("ar_rmsnorm_quant_i8");
+            apart.push_back("rmsnorm_quant_i8");
+        } else {
+            for (const char* s : { "all_reduce", "rmsnorm", "add", "scale" }) folded.push_back(s);
+            for (const char* s : { "rmsnorm", "add", "scale" }) apart.push_back(s);
+        }
+    }
+    for (const char* s : { "rmsnorm", "gather_rows", "logits_gemm", "logit_softcap" }) {
+        folded.push_back(s);
+        apart.push_back(s);
+    }
+    /* a decode step folds */
+    CHECK_EQ(join(gemma4_w4_step({}, 4)), join(folded));
+
+    auto declare4 = [](RadBuilder& b) {
+        const RadEncoding w4 = rad_enc_affine(RAD_I4, RAD_F16, 1, 128);
+        b.encs = { { "attn_q.", w4 }, { "attn_k.", w4 }, { "attn_v.", w4 }, { "attn_o.", w4 },
+                   { "ffn_gate_up.", w4 }, { "ffn_down.", w4 } };
+        RadModelMeta meta = gemma4_meta();
+        RadBuildCtx  ctx  = build_ctx(0, 4);
+        return gemma4_bf16::declare(&b, &meta, &ctx);
+    };
+    RadBuilder b;
+    CHECK_OK(declare4(b));
+    CHECK(noted(b, "folded in at steps of 4 rows or fewer"));
+    auto fold_hi = [](const RadBuilder& bb, int* n) {
+        int64_t hi = -1;
+        *n = 0;
+        for (const auto& o : bb.ops) {
+            if (o.op != "ar_rmsnorm_quant_i8") continue;
+            ++*n;
+            CHECK_EQ(pint(&o, "world_size"), 4);
+            for (const auto& p : o.p)
+                if (p.key == "M") hi = p.ihi;
+        }
+        return hi;
+    };
+    int n_ar = 0;
+    CHECK_EQ(fold_hi(b, &n_ar), 4);
+    CHECK_EQ(n_ar, 2 * L - 1);
+
+    /* a verify's height and a step past the one-shot's band both issue the pair */
+    const int32_t out[1] = { 127 };
+    for (int rows : { 16, 128 }) {
+        RadBatch tall = one_prompt(rows, out);
+        RadCtx c; c.b = &b; c.rank = 0; c.world = 4; c.batch = &tall;
+        gemma4_bf16::step(&c, &tall);
+        CHECK(c.step_fail.empty());
+        CHECK_EQ(join(issued_ops(b, c)), join(apart));
+    }
+
+
+    /* no library declares the fold: none declared, every step issues the pair */
+    RadBuilder off;
+    off.undeclared.insert("ar_rmsnorm_quant_i8");
+    CHECK_OK(declare4(off));
+    CHECK(noted(off, "issued apart"));
+    for (const auto& o : off.ops) CHECK(o.op != "ar_rmsnorm_quant_i8");
+}
+
 /* ==================================================================== the step lint, checked */
 
 namespace {

@@ -461,6 +461,7 @@ int r4d_rad_quant_act_i8          (const RadArgs*, RadStream);
 int r4d_rad_qkv_norm_rope         (const RadArgs*, RadStream);
 int r4d_rad_gelu_mul_quant_i8     (const RadArgs*, RadStream);
 int r4d_rad_ar_rmsnorm_quant_i8   (const RadArgs*, RadStream);
+int r4d_rad_ar_rmsnorm_quant_i8_4rank(const RadArgs*, RadStream);
 int r4d_rad_rmsnorm_quant_i8      (const RadArgs*, RadStream);
 int r4d_rad_had_quant_act_i8      (const RadArgs*, RadStream);
 int r4d_rad_rmsnorm_had_quant_i8  (const RadArgs*, RadStream);

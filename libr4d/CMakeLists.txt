@@ -223,6 +223,10 @@ add_executable(r4d_selftest ${CMAKE_CURRENT_SOURCE_DIR}/r4d_selftest.cpp)
 target_link_libraries(r4d_selftest PRIVATE radiance::abi ${CMAKE_DL_LIBS} ${RAD_HIP_RUNTIME})
 target_include_directories(r4d_selftest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 set_target_properties(r4d_selftest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+# Installed beside the tools, so the image can run the rows' own card checks without a build tree:
+#   r4d_selftest /opt/radiance/share/radiance/kernels/libr4d.so [--case <row>]
+# The collective cases need every card of the box in the container.
+install(TARGETS r4d_selftest RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # C++17: at C++20 clang tightens the address-space check on
 # __builtin_amdgcn_global_load_tr_b128_v8i16 in r4d_common.h. Kernel cost figures are for C++17.

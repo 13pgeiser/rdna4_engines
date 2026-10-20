@@ -54,7 +54,9 @@ __device__ __forceinline__ void r4d_ar_drain(int drain) {
   else if (drain == 3) asm volatile("s_wait_storecnt 0x0" ::: "memory");
 }
 // acq: 0 acquire-only fence (global_inv, no writeback half), 1 full threadfence_system,
-// 2 none -- fine-grained scratch only.
+// 2 none -- fine-grained scratch only. Every thread of the block runs it after the handshake, so at
+// 0 or 1 that is one system-scope invalidate a wave. The P2P scratch is fine-grained (the reads
+// bypass L2; r4d_ar_entry.hip's allocation says why), so 2 is the documented design there.
 __device__ __forceinline__ void r4d_ar_acquire(int acq) {
   if (acq == 1) __threadfence_system();
   else if (acq != 2) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
@@ -74,7 +76,16 @@ __device__ __forceinline__ void r4d_ar_handshake(const R4DArWidePeers<S, NPEERS>
   const int tid = threadIdx.x;
   if (tid == 0) {
     if (drain == 2) __threadfence_system();
-    if (pub) {
+    if (pub == 2) {
+      // No release fence: the flags go out behind the data with nothing written back. Meant for
+      // a P2P instance with drain 3, on the reasoning that fine-grained scratch stores reach past
+      // L2. They do not: on 4x R9700 the readers saw stale scratch on nearly every element
+      // (r4d_selftest, 2026-10-17), so no tuned point selects pub 2 (tArQ84); it is kept only
+      // as the measured negative.
+#pragma unroll
+      for (int p = 0; p < NPEERS; ++p)
+        r4d_ar_store_sys_rlx(&peers.flags[p][(size_t)b * WS + rank], val);
+    } else if (pub) {
       // One system writeback for the whole publish, then relaxed stores. Per-peer release stores
       // would add writebacks that order nothing, since the flags go to different peers.
       __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");

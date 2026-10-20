@@ -33,6 +33,7 @@
 #include "r4d_emit.h"
 #include "r4d_common.h"
 #include "r4d_ar_seq.h"
+#include "r4d_ar_wide.h"
 #include <cstdint>
 
 namespace {
@@ -223,6 +224,97 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_i8_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// The same junction with the four-rank all-reduce in front: the wide family's exact one-shot
+// (r4d_ar_oneshot_Nrank_exact.hip) with the junction as its epilogue, as ar_hc_write_4rank is that
+// one-shot with hc_write. Up to the reduce it is that one-shot's transport step for step (the same
+// seq take over R4D_AR_WIDE_MAX_BLOCKS counters, the same handshake value 2*s, the same (parity,
+// source) slots), so it shares an instance with the standalone all_reduce on one stream
+// (r4d_ar_wide.h). Two things differ, both for the junction:
+//
+//   * A block owns whole rows, the two-rank fused form's partition, since a post-norm's sum of
+//     squares closes over one row. Every rank runs the same grid over the same M, so block b's
+//     words are the same words on every rank and the per-block handshake pairs them.
+//   * The reduce is element by element in the norm's partition (thread t folds columns t, t+THR,
+//     ...), so the post-norm's sum of squares is the standalone norm's. Each element is ar_vsum's
+//     arithmetic exactly: fp32 from 0.0f, the ranks in ascending order, one rounding to bf16 as the
+//     __hip_bfloat16 cast rounds (bf16_hi_rne_nan). So the reduced row is the standalone exact
+//     all-reduce's to the bit, and what follows is rmsnorm_quant_i8's junction over it.
+//
+// In place is safe for the reason the hc_write form gives: a thread reads every source of an element
+// before it stores it, its block pushed that element to every peer before the handshake, and no peer
+// reads this rank's `x`.
+template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR, int WS>
+__global__ __launch_bounds__(THR) void ar_rmsnorm_quant_i8_wide_kernel(
+    uint16_t* __restrict__ x, uint16_t* __restrict__ res, const void* __restrict__ w,
+    const void* __restrict__ wp, const void* __restrict__ sc, uint32_t sc_f32,
+    signed char* __restrict__ q, float* __restrict__ S, uint16_t* __restrict__ yo,
+    R4DArWidePeers<int4, WS - 1> peers, const int4* __restrict__ my_base,
+    unsigned int* __restrict__ my_flags, unsigned int* __restrict__ seq_ctrs, int M, uint32_t n,
+    float eps, float wadd, uint32_t r_ld, uint32_t y_ld, int slot_stride16, int rank, int drain,
+    int acq, int pub, long long* gate, unsigned int* gate_ctr) {
+    constexpr int NPEERS = WS - 1;
+    extern __shared__ uint16_t ybuf[];
+    __shared__ float l1[THR / kWave], l2[THR / kWave], lm[THR / kWave];
+    __shared__ unsigned int s_seq, s_slot;
+    const int b = (int)blockIdx.x, nb = (int)gridDim.x;
+    const uint32_t tid = threadIdx.x;
+    const int r0 = (int)(((long)b * M) / nb), r1 = (int)(((long)(b + 1) * M) / nb);
+    const long long gate_word = r4d_ar_link_word(gate, tid);
+
+    r4d_ar_seq_take(seq_ctrs, R4D_AR_WIDE_MAX_BLOCKS, s_seq, s_slot);   /* device-resident, replay-safe */
+    const unsigned int s = s_seq;
+    const int parity = (int)s_slot;
+
+    /* push my rows into every peer's (parity, my rank) slot; `x` is a tight [M][n] of bf16 */
+    int4* ps[NPEERS];
+#pragma unroll
+    for (int p = 0; p < NPEERS; ++p)
+        ps[p] = peers.scratch[p] + ((size_t)parity * WS + rank) * (size_t)slot_stride16;
+    const int wpr = (int)(n >> 3);
+    const int4* const in4 = (const int4*)x;
+    for (int k = r0 * wpr + (int)tid; k < r1 * wpr; k += (int)THR) {
+        const int4 v = in4[k];
+#pragma unroll
+        for (int p = 0; p < NPEERS; ++p) ps[p][k] = v;
+    }
+
+    r4d_ar_handshake<WS>(peers, my_flags, b, rank, 2u * s, drain, acq, pub);
+    /* The one-shot's release: the fold and the junction behind it are local VRAM traffic, so the
+     * last block past its handshake ends the engine's hold on the link (r4d_ar_seq.h). Every block
+     * owns at least one row and takes exactly one handshake, so every path reaches it. */
+    r4d_ar_link_landed(gate, gate_word, gate_ctr, (unsigned int)nb, tid);
+
+    /* the sources in ascending global rank, this rank's own from `x` (its own slot is never
+     * written), the peers' from their slots in my scratch */
+    const uint16_t* src[WS];
+#pragma unroll
+    for (int r = 0; r < WS; ++r)
+        src[r] = r == rank ? (const uint16_t*)x
+                           : (const uint16_t*)(my_base + ((size_t)parity * WS + r) *
+                                                             (size_t)slot_stride16);
+    const float sv = SCL ? scalar_of(sc, sc_f32) : 1.0f;
+    for (int row = r0; row < r1; ++row) {
+        const size_t o = (size_t)row * n;
+        uint16_t* __restrict__ xr = x + o;
+        float ss = 0.0f;
+        for (uint32_t i = tid; i < n; i += THR) {
+            float acc = 0.0f;
+#pragma unroll
+            for (int r = 0; r < WS; ++r) acc += bf2f(src[r][o + i]);
+            const uint16_t a = (uint16_t)(bf16_hi_rne_nan(acc) >> 16);
+            xr[i] = a;
+            if (POST) { const float v = bf2f(a); ss += v * v; }
+        }
+        float s1 = 0.0f;
+        if (POST) s1 = rsqrtf(block_sum<THR / kWave>(ss, l1) / (float)n + eps);
+        junction_row<WF32, RES, POST, SCL, THR>(
+            xr, RES ? res + (size_t)row * r_ld : nullptr, w, wp, sv, q + (size_t)row * n, S + row,
+            yo ? yo + (size_t)row * y_ld : nullptr, n, eps, wadd, s1, ybuf, l2, lm);
+        __syncthreads();   /* the planes and ybuf are re-used by the next row this block owns */
+    }
+}
+
 }  // namespace
 
 // ============================================================== the plugin ABI entry point
@@ -348,5 +440,87 @@ extern "C" int r4d_ar_rmsnorm_quant_i8(long peer_scratch, long my_scratch, long 
 #undef R4D_ARQ8_W
 #undef R4D_ARQ8
 #undef R4D_ARQ8_T
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+// The four-rank form's launch. The IPC arguments are r4d_ar_oneshot_4rank_exact's -- each peer's
+// scratch and flags in ascending peer rank, this rank's own, the device-resident sequence counters
+// and the per-source slot stride -- and the rest is the junction's. The checks are the wide
+// launchers' (rank range, the message inside one slot, the grid inside the flag array, every
+// allocation's extent), returned as codes rather than thrown, for the reason this file gives.
+extern "C" int r4d_ar_rmsnorm_quant_i8_4rank(long peer_scratch0, long peer_scratch1,
+                                             long peer_scratch2, long peer_flags0,
+                                             long peer_flags1, long peer_flags2, long my_scratch,
+                                             long my_flags, long seq_ctrs, long slot_stride16,
+                                             long x, long res, long w, long wp, long sc,
+                                             int sc_f32, long y, long q, long s, int M, int n,
+                                             float eps, float wadd, int w_f32, int r_ld, int y_ld,
+                                             int rank, long stream, int nblocks, int drain, int acq,
+                                             int pub, long gate, long gate_ctr) {
+    constexpr int WS = 4, NPEERS = WS - 1;
+    const long ps[NPEERS] = { peer_scratch0, peer_scratch1, peer_scratch2 };
+    const long pf[NPEERS] = { peer_flags0, peer_flags1, peer_flags2 };
+    if (!x || !w || !q || !s) return -1;
+    if (!my_scratch || !my_flags || !seq_ctrs) return -1;
+    if (gate && !gate_ctr) return -1;   /* the release counts blocks in the instance's counter */
+    if (rank < 0 || rank >= WS) return -1;
+    if (M <= 0 || n <= 0) return -2;
+    if (n % 16) return -3;
+    if ((wp || sc) && !res) return -5;
+    if ((size_t)n * sizeof(uint16_t) > 60 * 1024) return -6;
+    if ((long)M * n / 8 > slot_stride16) return -7;   /* the message inside one source slot */
+    if (!r_ld) r_ld = n;
+    if (!y_ld) y_ld = n;
+
+    R4DArWidePeers<int4, NPEERS> peers{};
+    for (int i = 0; i < NPEERS; ++i) {
+        if (!ps[i] || !pf[i]) return -1;
+        peers.scratch[i] = (int4*)ps[i];
+        peers.flags[i] = (unsigned int*)pf[i];
+        peers.rank[i] = i < rank ? i : i + 1;   /* ascending global rank, this one removed */
+    }
+    int nb = nblocks < 1 ? 1 : nblocks;
+    if (nb > M) nb = M;                          /* a block owns whole rows */
+    if (nb > R4D_AR_WIDE_MAX_BLOCKS) nb = R4D_AR_WIDE_MAX_BLOCKS;
+    try {
+        const long slot_bytes = 2L * WS * slot_stride16 * 16;
+        const long flag_bytes = (long)nb * WS * (long)sizeof(unsigned int);
+        r4d_ar_check_extent(my_scratch, slot_bytes, "ar_rmsnorm_quant_i8", "my_scratch");
+        r4d_ar_check_extent(my_flags, flag_bytes, "ar_rmsnorm_quant_i8", "my_flags");
+        r4d_ar_check_extent(seq_ctrs, 2L * R4D_AR_WIDE_MAX_BLOCKS * (long)sizeof(unsigned int),
+                            "ar_rmsnorm_quant_i8", "seq_ctrs");
+        for (int i = 0; i < NPEERS; ++i) {
+            r4d_ar_check_extent(ps[i], slot_bytes, "ar_rmsnorm_quant_i8", "peer scratch");
+            r4d_ar_check_extent(pf[i], flag_bytes, "ar_rmsnorm_quant_i8", "peer flags");
+        }
+    } catch (...) {
+        return -8;
+    }
+
+    const int thr = r4d_act_threads(M, n);
+    const size_t lds = (size_t)n * sizeof(uint16_t);
+#define R4D_ARQ8W_T(WF, RS, PO, SC, T)                                                            \
+    hipLaunchKernelGGL((ar_rmsnorm_quant_i8_wide_kernel<WF, RS, PO, SC, T, WS>), dim3((uint32_t)nb), \
+                       dim3(T), lds, (hipStream_t)stream, (uint16_t*)x, (uint16_t*)res,          \
+                       (const void*)w, (const void*)wp, (const void*)sc, (uint32_t)sc_f32,       \
+                       (signed char*)q, (float*)s, (uint16_t*)y, peers, (const int4*)my_scratch, \
+                       (unsigned int*)my_flags, (unsigned int*)seq_ctrs, M, (uint32_t)n, eps,    \
+                       wadd, (uint32_t)r_ld, (uint32_t)y_ld, (int)slot_stride16, rank, drain, acq, \
+                       pub, (long long*)gate, (unsigned int*)gate_ctr)
+#define R4D_ARQ8W(WF, RS, PO, SC)                                                                 \
+    do { if (thr == 1024)     R4D_ARQ8W_T(WF, RS, PO, SC, 1024);                                  \
+         else if (thr == 512) R4D_ARQ8W_T(WF, RS, PO, SC, 512);                                   \
+         else                 R4D_ARQ8W_T(WF, RS, PO, SC, 256); } while (0)
+#define R4D_ARQ8W_W(WF)                                                                           \
+    do { if (!res)            R4D_ARQ8W(WF, false, false, false);                                 \
+         else if (!wp && !sc) R4D_ARQ8W(WF, true, false, false);                                  \
+         else if (wp && !sc)  R4D_ARQ8W(WF, true, true, false);                                   \
+         else if (wp && sc)   R4D_ARQ8W(WF, true, true, true);                                    \
+         else                 R4D_ARQ8W(WF, true, false, true); } while (0)
+    if (w_f32) R4D_ARQ8W_W(true);
+    else       R4D_ARQ8W_W(false);
+#undef R4D_ARQ8W_W
+#undef R4D_ARQ8W
+#undef R4D_ARQ8W_T
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
