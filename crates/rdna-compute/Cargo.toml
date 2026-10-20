@@ -38,6 +38,10 @@ required-features = ["lab"]
 name = "npu_trunk_consumers_check"
 required-features = ["lab"]
 
+[[example]]
+name = "pm_moe_cn_tiled_numeric_oracle"
+required-features = ["lab"]
+
 # Single-card gfx1201 GPU gate for the bounded device spin waits
 # (crate::device_wait): forced timeout, host error path, fail-fast, recovery.
 [[example]]
