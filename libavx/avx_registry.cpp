@@ -114,6 +114,10 @@ static const RadOperandSpec oCausalConv[] = { OPD("x"), WGT("w"), INOUT("conv_st
 static const RadParamSpec pHcWrite[]   = { P_INT("M"), P_INT("n"), P_INT("hc"), P_STR("dtype") };
 static const RadOperandSpec oHcEnter[] = { OPD("x"), OUT("h") };
 static const RadOperandSpec oHcWrite[] = { OPD("y"), OPD("inj"), INOUT("h") };
+/* The speed projection: one unit direction per layer (f32) and an int32 per-row switch. */
+static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("scale"),
+                                           P_STR("dtype") };
+static const RadOperandSpec oHcProject[] = { INOUT("h"), OPD("v"), OPD("on") };
 
 static const RadParamSpec pMtpEnter[]   = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("eps"),
                                             P_STR("dtype"), P_F64O("wadd"), P_INTO("ngroup"),
@@ -826,6 +830,9 @@ static const RadOpSchema kSchemas[] = {
   "gate argument, and hc_write adds into the UNNORMED h). `mix` names the matrices' stored "
   "format; a host kernel reads them as the dense tensors it is handed." },
 { "hc_write", ARR(pHcWrite), ARR(oHcWrite), "h[s] += inj[s] * y, into the unnormed stream." },
+{ "hc_project", ARR(pHcProject), ARR(oHcProject),
+  "The experimental speed projection (llama.cpp's `--cvec-mode project`): h[s] -= scale * "
+  "(h[s] . v) * v for each of the hc streams of a row whose flag is on. A zero flag is not read." },
 { "mtp_enter", ARR(pMtpEnter), ARR(oMtpEnter),
   "MTP head entry: two norms, a per-sub-stream fc and a broadcast fc. `fc` names the two "
   "matrices' stored format; a host kernel reads them as the dense tensors it is handed." },
@@ -1362,6 +1369,9 @@ ROWL("avx_hc_read", "hc_read", "norm",
      avx_layout_hc),
 SIMPLE("avx_hc_write", "hc_write", "norm", "gated residual write: h[s] += inj[s] * y", DT_FLOAT,
        L(hc_write)),
+SIMPLE("avx_hc_project", "hc_project", "norm",
+       "speed projection: h[s] -= scale * (h[s] . v) * v where the row's flag is on", DT_FLOAT,
+       L(hc_project)),
 ROWL("avx_mtp_enter", "mtp_enter", "norm",
      "MTP head entry: two norms, a per-sub-stream fc and a broadcast fc",
      DT_FLOAT ", or fc matrices of E4M3 / int8 codes with a scale plane, joined", L(mtp_enter),

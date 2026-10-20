@@ -339,6 +339,7 @@ int r4d_rad_dflash_select       (const RadArgs*, RadStream);
 
 /* -- the gated residual (r4d_hc_bf16.hip) -- */
 int     r4d_rad_hc_enter       (const RadArgs*, RadStream);
+int     r4d_rad_hc_project     (const RadArgs*, RadStream);
 int r4d_rad_mhc_pre(const RadArgs*, RadStream);
 int r4d_rad_mhc_pre_partial(const RadArgs*, RadStream);
 int r4d_rad_mhc_pre_finish(const RadArgs*, RadStream);
@@ -751,6 +752,7 @@ int r4d_shape_mhc_contract(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_mtp_enter      (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_hc_read        (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_hc_write       (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_hc_project     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_binary         (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_mul_weight     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_scatter_rows_bf16(const RadParam*, int, int operand, RadOpdDesc*);

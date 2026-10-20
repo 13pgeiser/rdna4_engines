@@ -436,6 +436,17 @@ int ref_hc_write_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     return o.finish("hc_write", operand, out);
 }
 
+int ref_hc_project_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M  = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t hc = gi(p, n_p, "hc", 0);
+    Opd o;
+    o.t(D, { M, hc * n });                 /* h, in place */
+    o.t((uint32_t) RAD_F32, { n });        /* v: one layer's unit direction */
+    o.t((uint32_t) RAD_I32, { M });        /* on: 1 = this row takes the projection */
+    return o.finish("hc_project", operand, out);
+}
+
 int ref_mtp_enter_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
     const int64_t M  = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);

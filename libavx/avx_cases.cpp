@@ -147,6 +147,13 @@ std::vector<Case> build_cases() {
                                 HF("lower_bound", -5), HF("scale", 0.1767766952966369),
                                 HF("l2_eps", 1e-6), HS("mode", mode), HS("dtype", dt) });
         add("hc_write",  { HI("M", 5), HI("n", 128), HI("hc", 4), HS("dtype", dt) });
+        add("hc_project",{ HI("M", 5), HI("n", 128), HI("hc", 4), HF("scale", 1.0),
+                           HS("dtype", dt) });
+        /* The model's own width: Qwen3.8-Flash-Next's stream is 2560 wide with hc 4, and a decode
+         * step is one row per sequence (with speculation, up to 1 + depth). One case at that
+         * geometry is what says whether 41 of these a step is affordable. */
+        add("hc_project",{ HI("M", 4), HI("n", 2560), HI("hc", 4), HF("scale", 1.0),
+                           HS("dtype", "bf16") });
         add("hc_read",   { HI("M", 5), HI("n", 128), HI("hc", 4), HI("lowrank", 8),
                            HF("eps", 1e-6), HS("dtype", dt), HF("wadd", 1), HI("inject", 1),
                            HI("group", 0) });

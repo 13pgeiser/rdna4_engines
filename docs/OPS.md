@@ -199,6 +199,7 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | `mhc_contract` | `M`(range) `n` `hc` `dtype` | `h` → `x` |
 | `hc_read` | `M`(range) `n` `hc` `lowrank` `eps`:f64 `dtype` `wadd`:f64/opt `inject`/opt `group`/opt `rotate`/opt `mix`/opt | `h`, `w`w, `mix_down`w, `mix_up`w, `inject_w`w? → `x`, `inj`?, `q`?, `scale`?, `rq`?, `rscale`? |
 | `hc_write` | `M`(range) `n` `hc` `dtype` | `y`, `inj`, `h`:inout |
+| `hc_project` | `M`(range) `n` `hc` `scale`:f64 `dtype` | `h`:inout, `v`, `on` |
 | `layernorm` | `M`(range) `n` `eps`:f64 `dtype` | `x`, `w`w, `b`w? → `y` |
 | `grid_embed` | `M`(range) `n` `side` `dtype` | `x`:inout, `table`w, `coord` |
 | `grid_embed_aa` | `M`(range) `n` `side` `dtype` | `x`:inout, `table`w, `coord` |
@@ -306,6 +307,13 @@ normalised to sum to one; separable, f32, rounded once. A different function fro
 so a different op rather than a mode a library could ignore.
 
 ### Hyper-connections
+
+`hc_project` is the control vector's projection (core/cvec.h): `h[s] -=
+scale * (h[s] . v) * v` for each of the `hc` streams of a row whose `on` flag (an int32 per row) is
+1, `v` being that layer's unit direction and `scale` the norm the file stored. It is llama.cpp's
+`--cvec-mode project`, applied after a layer's write into the stream. A row whose flag is 0 is
+neither read nor written, so an unprojected request's stream is the stock model's; the direction table is f32 and the op is issued only by an architecture that was
+declared with one (`RadBuildCtx::cvec`).
 
 `hc_read` and `hc_write` are the gated residual pair a hyper-connection model has instead of a
 pre-norm and a residual add. The stream is `hc` times the model width; every block reads a mix of

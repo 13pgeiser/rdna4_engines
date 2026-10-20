@@ -480,6 +480,19 @@ extern "C" int r4d_shape_hc_write(const RadParam* p, int n_p, int operand, RadOp
     R4D_PICK(l);
 }
 
+/* hc_project's three: the bf16 stream (in place), the layer's unit f32 direction, and the int32
+ * per-row switch. The switch is an index domain: 0 or 1. */
+extern "C" int r4d_shape_hc_project(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, hc * n),                                  /* h, in place */
+        opd((uint32_t) RAD_F32, n),                         /* v */
+        opd_idx(M, 1, 1, 0),                                /* on: 0 or 1 */
+    };
+    R4D_PICK(l);
+}
+
 /* hc_write's operands with the all-reduce in front; `y` is also the message. */
 extern "C" int r4d_shape_ar_hc_write(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     return r4d_shape_hc_write(p, n_p, operand, out);
