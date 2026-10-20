@@ -417,12 +417,14 @@ int VideoDriver::submit(std::unique_ptr<VideoRequest> r, std::string* why) {
      * frames and its soundtrack's are the Vencode/Aencode latent counts rad_arch_encode_geom gives
      * (a video's are the same before and after the encode pass clip-pads its short final clip). The
      * table must exist before the step layout is decided, because when the denoiser consumes it the
-     * reference rows are part of that layout. The keyframe count stays 0 (continuation is separate
-     * work), so the table holds only reference rows. */
+     * reference rows are part of that layout. Endpoint keyframes (a first and/or last frame pinned
+     * at the output's ends) are appended after the reference rows as {frame, video_t, audio_t}
+     * triples; a request carries either references or keyframes, never both. */
     if (d.encodes) {
         bool need_geom = false;
         for (const VideoRefMedia& m : r->refs)
-            if (m.kind != VideoRefMedia::IMAGE) need_geom = true;
+            if (m.kind != VideoRefMedia::IMAGE && m.kind != VideoRefMedia::FIRST_FRAME &&
+                m.kind != VideoRefMedia::LAST_FRAME) need_geom = true;
         if (need_geom && !enc_geom_)
             return no("the request carries a reference video or audio, but this plugin exports no "
                       "rad_arch_encode_geom, so their encoder geometry cannot be sized");
@@ -506,6 +508,33 @@ int VideoDriver::submit(std::unique_ptr<VideoRequest> r, std::string* why) {
                                   {1 /*a standalone audio*/, m.index, 0, 0, 0, (int32_t)a_t});
             }
             /* VIDEO_AUDIO rows are folded into their video above, so they take no row here. */
+        }
+        /* Endpoint keyframes: each FIRST_FRAME/LAST_FRAME the server resized to the target canvas
+         * and staged in enc_pixels folds into the pack's KEYFRAME table -- not a reference row. The
+         * DiT reads its latent rows PINNED at that frame's moment on the target timeline (denoised
+         * never): the first pins output frame 0, the last the final frame, and the gap between is
+         * diffused. The key triple is {pixel frame, video_t, audio_t}; a picture anchor is video-only
+         * (video_t = one latent frame, audio_t = 0), and its pixel frame is 0 or frames-1 -- the same
+         * resolved frame index the reference's MiniMaxH3ImageToVideo assigns. Its latents ride the
+         * image slot its keyframe ORDER names (1, then 2): a keyframe request carries no references,
+         * so those slots are free, and ref_parts -- and the scatter -- read them back by the same
+         * order. Keyframe rows are appended after every reference row, which is where ref_pack_of
+         * reads the table's key block. */
+        for (size_t i = 0; i < r->refs.size(); ++i) {
+            const VideoRefMedia& m = r->refs[i];
+            const bool first = m.kind == VideoRefMedia::FIRST_FRAME;
+            if (!first && m.kind != VideoRefMedia::LAST_FRAME) continue;
+            if (m.enc_pixels.empty())
+                return no("'" + m.name + "' was not prepared for the video encoder");
+            if (bad_side(m))
+                return no("'" + m.name + "' has encoder sides (" + std::to_string(m.enc_h) +
+                          "x" + std::to_string(m.enc_w) + ") the VAE grid of " +
+                          std::to_string(d.enc_ratio) + " does not divide");
+            if (j->ref_tab.empty()) j->ref_tab.assign(2, 0);   /* [n_refs, n_keys] */
+            const int32_t slot = ++j->ref_tab[1];              /* keyframe order -> image slot 1, 2 */
+            j->enc_q.push_back({RAD_ENC_IMAGE, slot, (int32_t)i});
+            j->ref_tab.insert(j->ref_tab.end(),
+                              {first ? 0 : s.frames - 1, 1 /*one latent frame*/, 0 /*no soundtrack*/});
         }
     }
     /* The step's packed sequence. When the denoiser consumes the reference table the pack is the
@@ -640,8 +669,8 @@ int VideoDriver::submit(std::unique_ptr<VideoRequest> r, std::string* why) {
      * chosen. Each reference the server decoded into encoder form rides one encode pass at the slot
      * its index numbers within its kind -- a picture or video a Vencode pass, a standalone audio and
      * every video's soundtrack an Aencode pass (a soundtrack at its video's slot, since the encoder
-     * and the scatter both number it by its video). The keyframe count stays 0: continuation is
-     * separate work. */
+     * and the scatter both number it by its video). Endpoint keyframes ride the same queue as
+     * picture anchors -- a Vencode pass at the image slot their keyframe order names. */
     /* The soundtrack's length, exactly the samples the decode will hand the encoder — the
      * number a caller that chains clips against an audio floor checks. A build without
      * libavcodec never gets the muxed file to read it back from, so it is logged here. */

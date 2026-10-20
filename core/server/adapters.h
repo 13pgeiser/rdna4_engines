@@ -719,6 +719,15 @@ public:
         return p_->encoder_image(bytes, n, ratio, max_side, out, why);
     }
 
+    int encoder_image_canvas(const uint8_t* bytes, size_t n, int32_t w, int32_t h, bool cover,
+                             mm::Frame* out, std::string* why) override {
+        if (!p_ || !mm::decoder_available()) {
+            if (why) *why = "no picture decoder is available";
+            return RAD_E_UNSUPPORTED;
+        }
+        return p_->encoder_image_canvas(bytes, n, w, h, cover, out, why);
+    }
+
     int encoder_video(const uint8_t* bytes, size_t n, int32_t ratio, int32_t max_side,
                       int32_t max_frames, std::vector<mm::Frame>* out, std::string* why) override {
         if (!p_ || !mm::decoder_available()) {

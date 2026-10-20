@@ -544,6 +544,17 @@ public:
         return RAD_E_UNSUPPORTED;
     }
 
+    /* A keyframe anchor in a video VAE's encoder-ready form: decoded under the same guard, then
+     * resized to the EXACT `w` x `h` output canvas (`cover` selects a plain stretch or a centre
+     * crop), not an aspect-kept snap -- a pinned keyframe's latent grid must be the target's. The
+     * video generator's server uses it for first_frame/last_frame parts. */
+    virtual int encoder_image_canvas(const uint8_t* bytes, size_t n, int32_t w, int32_t h,
+                                     bool cover, mm::Frame* out, std::string* why) {
+        (void)bytes; (void)n; (void)w; (void)h; (void)cover; (void)out;
+        if (why) *why = "this server prepares no reference media for a video encoder";
+        return RAD_E_UNSUPPORTED;
+    }
+
     /* A moving picture in a video VAE's encoder-ready form: decoded under the same guard, sampled to
      * a clip-friendly frame count (at most `max_frames`) and resized to `encoder_image`'s grid. The
      * frames are the trimmed, sampled count; the caller clip-pads to a whole clip. */

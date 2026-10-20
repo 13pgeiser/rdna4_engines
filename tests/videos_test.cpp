@@ -154,7 +154,9 @@ TEST(a_video_request_that_cannot_be_served_names_its_field) {
              std::string("num_inference_steps"));
     CHECK_EQ(v.refused(Videos::body({ { "input_reference", "file-1" } })),
              std::string("input_reference"));
-    CHECK_EQ(v.refused(Videos::body({ { "task", "fl2va" } })), std::string("task"));
+    /* fl2va is a valid task, but one that promises a first frame -- refused naming the missing
+     * part, not the task. */
+    CHECK_EQ(v.refused(Videos::body({ { "task", "fl2va" } })), std::string("first_frame"));
     CHECK_EQ(v.refused(Videos::body({ { "conditions", json::array({ json::object() }) } })),
              std::string("conditions"));
     CHECK_EQ(v.refused({ { "prompt", "p" }, { "target", { { "aspect_ratio", "wide" } } } }),
@@ -510,6 +512,70 @@ TEST(ref2va_videos_and_audios_are_encoded_and_spoken) {
     chars("<Audio 2>: ");
     chars("fox");
     CHECK(g.tokens == want);
+}
+
+/* Endpoint keyframes (task fl2va): a first and a last frame reach the generator as FIRST_FRAME and
+ * LAST_FRAME references, each resized to the EXACT output canvas -- a keyframe is a PIN, so its
+ * latent grid must be the target's, not an aspect-kept snap like a reference's. The pins-only path
+ * does not show them to the language model, so no media is built. The driver's fold into the pack's
+ * keyframe rows and the device scatter are the engine/device tests; this is the server half. */
+TEST(fl2va_keyframes_pin_the_output_ends) {
+    FakeMultimodal mm;
+    mm.enc_frames = 5; mm.enc_side = 16; mm.enc_n = 850;
+    FakeVideoGen gen;
+    std::unique_ptr<Fixture> f(new Fixture(Fixture::Tweak{ [&](ServerOptions& o, Deps& d) {
+        d.videos = &gen;
+        d.mm = &mm;
+        o.video_model = true;
+        gen.inf.encodes = 1;
+        gen.inf.enc_ratio = 16;
+        gen.inf.max_enc_side = 512;
+    } }));
+    HttpRequest q;
+    q.method = "POST";
+    q.path = "/v1/videos";
+    q.form = { FormPart{ "prompt", "", "", "fox" },
+               FormPart{ "size", "", "", "256x256" },
+               FormPart{ "task", "", "", "fl2va" },
+               FormPart{ "first_frame", "f.png", "image/png", "PF" },
+               FormPart{ "last_frame", "l.png", "image/png", "PL" } };
+    HttpResponse r = f->srv->router().dispatch(q);
+    REQUIRE_EQ(r.status, 200);
+    CHECK_EQ(mm.n_cenc, 2);                 /* both anchors canvas-resized ... */
+    CHECK_EQ(mm.n_ienc, 0);                 /* ... none snapped like a reference */
+    CHECK_EQ(mm.cenc_w, 256);
+    CHECK_EQ(mm.cenc_h, 256);
+    CHECK(mm.cenc_cover);                    /* the last call was the last frame's centre crop */
+    const gen::VideoRequest& g = gen.last();
+    REQUIRE_EQ(g.refs.size(), (size_t)2);
+    CHECK_EQ((int)g.refs[0].kind, (int)gen::VideoRefMedia::FIRST_FRAME);
+    CHECK_EQ((int)g.refs[1].kind, (int)gen::VideoRefMedia::LAST_FRAME);
+    CHECK_EQ(g.refs[0].enc_frames, 1);
+    CHECK_EQ(g.refs[0].enc_h, 256);          /* the target canvas, exactly */
+    CHECK_EQ(g.refs[0].enc_w, 256);
+    CHECK_EQ(g.refs[0].enc_pixels.size(), (size_t)256 * 256 * 3);
+    CHECK(g.media == nullptr);               /* pins-only: the anchors never reach the text encoder */
+}
+
+/* A named keyframe task must carry its frame: fl2va wants both ends. */
+TEST(a_keyframe_task_refuses_a_missing_frame) {
+    FakeVideoGen gen;
+    std::unique_ptr<Fixture> f(new Fixture(Fixture::Tweak{ [&](ServerOptions& o, Deps& d) {
+        d.videos = &gen;
+        o.video_model = true;
+        gen.inf.encodes = 1;
+        gen.inf.enc_ratio = 16;
+    } }));
+    /* fl2va with a first but no last -> names last_frame. */
+    HttpRequest q;
+    q.method = "POST";
+    q.path = "/v1/videos";
+    q.form = { FormPart{ "prompt", "", "", "fox" }, FormPart{ "size", "", "", "256x256" },
+               FormPart{ "task", "", "", "fl2va" },
+               FormPart{ "first_frame", "f.png", "image/png", "PF" } };
+    HttpResponse r = f->srv->router().dispatch(q);
+    CHECK(r.status >= 400);
+    CHECK(r.body.find("last_frame") != std::string::npos);
 }
 
 /* Everything about the parts that cannot be right is refused naming the part (or `task` when

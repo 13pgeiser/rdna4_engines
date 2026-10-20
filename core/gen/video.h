@@ -79,7 +79,14 @@ private:
  * its kind, which fixes its slot in the conditioning; VIDEO_AUDIO #i is the soundtrack of
  * VIDEO #i. */
 struct VideoRefMedia {
-    enum Kind : int32_t { IMAGE = 0, VIDEO = 1, VIDEO_AUDIO = 2, AUDIO = 3 };
+    /* FIRST_FRAME / LAST_FRAME are endpoint KEYFRAMES, not references: a keyframe completion pins
+     * one output frame (first to frame 0, last to the final frame) and diffuses the gap between.
+     * They are never conditioned on as identities, so they take no reference row -- the driver folds
+     * each into the pack's keyframe table and encodes it into an image slot (a keyframe request
+     * carries no references, so those slots are free). The server resizes each to the target canvas
+     * (first a plain stretch, last a centre crop) and sets enc_pixels to one frame at that size, so
+     * its latent grid is the target's exactly and its pinned rows are frame_rows wide. */
+    enum Kind : int32_t { IMAGE = 0, VIDEO = 1, VIDEO_AUDIO = 2, AUDIO = 3, FIRST_FRAME = 4, LAST_FRAME = 5 };
     Kind        kind = IMAGE;
     int32_t     index = 0;
     std::string name, filename, content_type;   /* the part's name and what the client called the file */

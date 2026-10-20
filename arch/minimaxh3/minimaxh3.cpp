@@ -3080,15 +3080,27 @@ static minimaxh3::Ref2VAPack ref_pack_of(const RadVideoGeom* g, const int32_t* r
 /* Which encoder slot each reference part's latents sit in, in the order ref2va_build lays the
  * reference segments down -- a standalone soundtrack alone; a clip its soundtrack (when it carries
  * one) then its video; a picture its video alone. The encode pass wrote these into b_evc / b_enca at
- * the same slot it names here (the driver's queue uses the ref's own index). Keyframe (cond) rows
- * ride the continuation tail, not an encode, so they are absent -- and get no scatter until the tail
- * path lands. `audio` picks the buffer (1 = b_enca, 0 = b_evc); `row` is that buffer's base for the
+ * the same slot it names here (the driver's queue uses the ref's own index). A keyframe (cond) row is
+ * encoded the same way a reference is -- a picture anchor rides the image slot its index names, a
+ * clip anchor's soundtrack the audio slot -- so it takes a part ahead of the references, whose
+ * segments ref2va_build lays after the keyframes'. `audio` picks the buffer (1 = b_enca, 0 = b_evc); `row` is that buffer's base for the
  * part. A row < 0 means the slot is unknown -- a table the encode queue never filled. */
 struct RefPart { int audio; int64_t row; };
 static void ref_parts(const int32_t* ref_tab, std::vector<RefPart>* out) {
     if (!ref_tab) return;
-    const int32_t nr = ref_tab[0];
+    const int32_t nr = ref_tab[0], nk = ref_tab[1];
     const int32_t* w = ref_tab + 2;
+    /* Keyframe parts FIRST: ref2va_build lays the sequence [text | keyframes | refs | targets], and
+     * the scatter consumes parts in segment order, so a keyframe's part precedes every reference's.
+     * A keyframe's video latent rides the image slot the key's own index names -- a keyframe request
+     * carries no references, so the image slots are free for it -- and a picture anchor's soundtrack
+     * (absent for FL2VA's stills, present for a clip keyframe) the standalone-audio slot. `w` stays
+     * where the reference loop below needs it; the keys trail the references in the table. */
+    const int32_t* kw = ref_tab + 2 + (int64_t)nr * 6;
+    for (int32_t i = 0; i < nk; ++i, kw += 3) {
+        if (kw[1] > 0) out->push_back({ 0, venc_slot_row(RAD_ENC_IMAGE, i + 1) });
+        if (kw[2] > 0) out->push_back({ 1, aenc_slot_row(RAD_ENC_AUDIO, i + 1) });
+    }
     for (int32_t i = 0; i < nr; ++i, w += 6) {
         const int32_t kind = w[0], slot = w[1], aframes = w[5];
         if (kind == minimaxh3::kR2VRefAudioOnly) {
@@ -3313,10 +3325,11 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
                 RAD_W(m.w_ain), RAD_W(m.b_ain), RAD_NONE, brow_slice(m.b_h, aseg, arows, D));
     RAD_ISSUE_N(c, m.op_vin, vrows, brow_slice(m.b_vstate, lane * m.maxV, vrows, kPatchVals),
                 RAD_W(m.w_vin), RAD_W(m.b_vin), RAD_NONE, brow_slice(m.b_h, vseg, vrows, D));
-    /* Then each reference block: the same input projection, but its latents read from the encoder's
-     * slot (b_evc / b_enca), scattered into the rows the pack placed between the prompt and the
-     * targets. Every ref part -- a picture, a clip's video, a clip's or a standalone's soundtrack --
-     * is one issue, its part list consumed in the order ref2va_build laid the segments down. */
+    /* Then each conditioning block -- a keyframe's pinned rows, then every reference: the same input
+     * projection, but its latents read from the encoder's slot (b_evc / b_enca), scattered into the
+     * rows the pack placed between the prompt and the targets. Every part -- a keyframe's picture
+     * anchor, a picture, a clip's video, a clip's or a standalone's soundtrack -- is one issue, its
+     * part list consumed in the order ref2va_build laid the segments down (keyframes first). */
     if (refc) {
         std::vector<RefPart> parts;
         ref_parts(V->ref_tab, &parts);
@@ -3324,7 +3337,10 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
         for (const minimaxh3::Ref2VASeg& s : pk.segs) {
             const bool img = minimaxh3::ref2va_is_img(s.kind), aud = minimaxh3::ref2va_is_audio(s.kind);
             if (!img && !aud) continue;                          /* text, and the targets above */
-            if (s.kind != minimaxh3::kR2VRefImg && s.kind != minimaxh3::kR2VRefAudio) continue;
+            /* A keyframe's pinned rows (kR2VCond / kR2VCondAudio) scatter exactly as a reference's
+             * do -- same projection, same encoder slot -- so they join the references here. */
+            if (s.kind != minimaxh3::kR2VRefImg && s.kind != minimaxh3::kR2VRefAudio &&
+                s.kind != minimaxh3::kR2VCond && s.kind != minimaxh3::kR2VCondAudio) continue;
             if (pi >= parts.size()) {
                 rad_step_fail(c, "minimaxh3: the reference conditioning has more reference blocks "
                                  "than its table describes");

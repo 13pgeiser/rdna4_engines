@@ -140,11 +140,13 @@ int64_t fake_pack_more(const RadVideoGeom* g, const int32_t* ref_tab, int32_t* s
 }
 
 /* The reference-aware layout: when a reference table rides, lay out
- * [text | one block per reference | audio target | video target] -- boundaries are segment starts
- * with the total rows last, so the video target runs [seg[nseg-2], seg[nseg-1]). Each picture
- * contributes a fixed 4 rows: this fake lays out the structure the driver stages, not the
- * reference's real visual-token arithmetic. With no table it lays the plain sequence, so the
- * encode/decode passes that call the pack without references get their plain table. */
+ * [text | one block per keyframe | one block per reference | audio target | video target] --
+ * boundaries are segment starts with the total rows last, so the video target runs
+ * [seg[nseg-2], seg[nseg-1]). Keyframes precede references, matching the real pack. Each keyframe
+ * contributes a fixed 2 rows and each picture a fixed 4: this fake lays out the structure the
+ * driver stages, not the reference's real visual-token arithmetic. With no table it lays the plain
+ * sequence, so the encode/decode passes that call the pack without references get their plain
+ * table. With nk = 0 the layout is exactly the reference-only one the older tests assert. */
 int64_t fake_pack_ref(const RadVideoGeom* g, const int32_t* ref_tab, int32_t* seg, int64_t cap_seg,
                       float* pos, int64_t cap_pos) {
     const int64_t audio = 2 * (int64_t)g->n_audio;
@@ -164,16 +166,18 @@ int64_t fake_pack_ref(const RadVideoGeom* g, const int32_t* ref_tab, int32_t* se
         return rows;
     }
     const int32_t nr = ref_tab[0], nk = ref_tab[1];
-    const int64_t rper = 4;
-    const int64_t rows = g->n_text + (int64_t)nr * rper + audio + vtarget;
-    const int64_t nseg = (int64_t)nr + 4;
+    const int64_t rper = 4, kper = 2;
+    const int64_t rows = g->n_text + (int64_t)nk * kper + (int64_t)nr * rper + audio + vtarget;
+    const int64_t nseg = (int64_t)nk + (int64_t)nr + 4;
     if (!seg) return rows;
-    if (cap_seg < nseg || nk != 0) return RAD_E_INVAL;
+    if (cap_seg < nseg) return RAD_E_INVAL;
     seg[0] = 0;
-    for (int32_t r = 0; r < nr; ++r) seg[1 + r] = (int32_t)(g->n_text + (int64_t)r * rper);
-    seg[1 + nr] = (int32_t)(g->n_text + (int64_t)nr * rper);   /* audio target start */
-    seg[2 + nr] = (int32_t)(seg[1 + nr] + audio);               /* video target start */
-    seg[3 + nr] = (int32_t)(seg[2 + nr] + vtarget);             /* total rows */
+    int64_t cur = g->n_text;
+    for (int32_t k = 0; k < nk; ++k) { seg[1 + k] = (int32_t)cur; cur += kper; }
+    for (int32_t r = 0; r < nr; ++r) { seg[1 + nk + r] = (int32_t)cur; cur += rper; }
+    seg[1 + nk + nr] = (int32_t)cur;                             /* audio target start */
+    seg[2 + nk + nr] = (int32_t)(cur + audio);                   /* video target start */
+    seg[3 + nk + nr] = (int32_t)(cur + audio + vtarget);         /* total rows */
     if (pos) {
         if (cap_pos < 3 * rows) return RAD_E_INVAL;
         for (int64_t c = 0; c < 3; ++c)
@@ -890,6 +894,95 @@ TEST(a_reference_conditioned_step_widens_to_the_pack_layout) {
     }
     CHECK(saw_step);
     CHECK(saw_encode);
+}
+
+/* An endpoint-keyframe completion (I2VA/L2VA/FL2VA) rides the same machinery a reference does, but
+ * fills the pack's KEYFRAME table instead of its reference rows. Each first/last anchor the server
+ * resized to the target canvas folds into a Vencode pass at the IMAGE slot its keyframe ORDER names
+ * (1, then 2 -- free, since a keyframe request carries no references), and the step widens to
+ * [text | keyframe block | keyframe block | audio target | video target]. The table is {0 references,
+ * 2 keys} then the two key triples {pixel frame, video_t, audio_t}: the first pins pixel frame 0,
+ * the last the final frame, each one latent frame of video and no soundtrack -- the resolved frame
+ * index the reference's MiniMaxH3ImageToVideo assigns. The sampler still owns only the two target
+ * streams; the pinned rows are never sampled. */
+TEST(a_keyframe_completes_widen_the_step_and_pin_the_ends) {
+    VideoFixture f;
+    f.build();
+    with_tower(f, 16);
+    RadVideoGenDecl& d = f.prog.video_gen;
+    d.encodes = 1;
+    d.enc_ratio = 16;
+    d.max_enc_frames = 1;
+    d.max_enc_side = 16;
+    d.ref_rows = 1;                     // the denoiser consumes the table: turn the widening on
+    CHECK_OK(f.start_with_pack_encode(fake_pack_ref, fake_encode_geom));
+    std::string why;
+    auto r = f.req(2);
+    r->tokens = { 1, 2, 3 };            /* 3 text tokens: pins are not references, so no tower run */
+    gen::VideoRefMedia first = ref_part(gen::VideoRefMedia::FIRST_FRAME, "first_frame", 1);
+    first.enc_frames = 1;
+    first.enc_h = 16;
+    first.enc_w = 16;
+    first.enc_pixels.assign(16 * 16 * 3, 1.0f);
+    gen::VideoRefMedia last = ref_part(gen::VideoRefMedia::LAST_FRAME, "last_frame", 2);
+    last.enc_frames = 1;
+    last.enc_h = 16;
+    last.enc_w = 16;
+    last.enc_pixels.assign(16 * 16 * 3, 2.0f);
+    r->refs.push_back(first);
+    r->refs.push_back(last);
+    CHECK_OK(f.drv.submit(std::move(r), &why));
+
+    const gen::VideoShape s = gen::video_shape(d, 64, 32, 2);
+    const int64_t n_text = 3, audio = 2 * s.n_audio, vtarget = s.video_rows, kper = 2;
+    const int64_t widened = n_text + 2 * kper + audio + vtarget;
+
+    int enc_seen = 0;
+    bool saw_first = false, saw_last = false, saw_step = false;
+    for (int i = 0; i < 20; ++i) {
+        const RadBatch* b = f.drv.next(i);
+        if (!b) break;
+        if (b->gen == RAD_GEN_PASS_VENCODE) {
+            const RadVideoGenBatch* V = b->vgen_b;
+            REQUIRE(V != nullptr);
+            CHECK(V->ref_tab != nullptr);                 /* the keyframe table rides the encode too */
+            CHECK_EQ(V->enc_kind, (int32_t)RAD_ENC_IMAGE); /* a picture anchor at an image slot */
+            CHECK_EQ(V->enc_slot, (int32_t)(++enc_seen));  /* order 1, then 2 */
+            if (enc_seen == 1) saw_first = true;
+            else if (enc_seen == 2) saw_last = true;
+        } else if (b->gen == RAD_GEN_PASS_VSTEP) {
+            const RadVideoGenBatch* V = b->vgen_b;
+            REQUIRE(V != nullptr);
+            saw_step = true;
+            CHECK_EQ(b->n_tok, widened);                          /* widened by the two key blocks */
+            CHECK_EQ(V->seg_cu[0], 0);
+            CHECK_EQ(V->seg_cu[1], (int32_t)n_text);              /* text | key 0 */
+            CHECK_EQ(V->seg_cu[2], (int32_t)(n_text + kper));     /* key 0 | key 1 */
+            CHECK_EQ(V->seg_cu[3], (int32_t)(n_text + 2 * kper));         /* key 1 | audio target */
+            CHECK_EQ(V->seg_cu[4], (int32_t)(n_text + 2 * kper + audio)); /* audio | video target */
+            CHECK_EQ(V->seg_cu[5], (int32_t)widened);                    /* video grid ends the row */
+            CHECK_EQ(V->lat_cu[1], (int32_t)vtarget);             /* sampler owns the target streams */
+            CHECK_EQ(V->lat_cu[3], (int32_t)audio);              /* only, never the pinned rows */
+            /* The keyframe table: {n_refs = 0, n_keys = 2}, then two 3-word key triples. Checked
+             * while the step's job is still alive -- the driver retires a finished job (freeing this
+             * table) on the next() that follows its last pass. */
+            const int32_t* tab = V->ref_tab;
+            REQUIRE(tab != nullptr);
+            CHECK_EQ(tab[0], 0);                 /* no references */
+            CHECK_EQ(tab[1], 2);                 /* two endpoint keys */
+            CHECK_EQ(tab[2], 0);                 /* first pins output frame 0 */
+            CHECK_EQ(tab[3], 1);                 /* one latent frame of video */
+            CHECK_EQ(tab[4], 0);                 /* no soundtrack */
+            CHECK_EQ(tab[5], s.frames - 1);      /* last pins the final frame */
+            CHECK_EQ(tab[6], 1);
+            CHECK_EQ(tab[7], 0);
+        }
+        f.answer(10 * i);
+        CHECK_OK(f.drv.done());
+    }
+    CHECK(saw_first);
+    CHECK(saw_last);
+    CHECK(saw_step);
 }
 
 /* What the container cannot consume is refused at submit, naming the part or the budget it breaks —

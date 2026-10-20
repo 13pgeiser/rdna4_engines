@@ -327,6 +327,17 @@ public:
     int encoder_image(const uint8_t* bytes, size_t n, int32_t ratio, int32_t max_side, Frame* out,
                       std::string* why) const;
 
+    /* A keyframe anchor in the video VAE's own form: decoded under the same `max_source_pixels`
+     * guard, then resized to the EXACT output canvas (`w` x `h`), unlike `encoder_image`'s
+     * aspect-kept snap. A keyframe's pinned rows must cover the target's latent grid exactly -- it
+     * is frame_rows wide, not the anchor's own grid -- so the anchor cannot keep its aspect: the
+     * reference stretches the first frame to the canvas ("disabled") and cover-crops the last
+     * ("center"). `cover` picks between them: false stretches both axes to fill the canvas (may
+     * distort); true instead scales up to COVER the canvas keeping aspect, then centre-crops
+     * the excess. `w`/`h` are the request's target size, already a multiple of the VAE ratio. */
+    int encoder_image_canvas(const uint8_t* bytes, size_t n, int32_t w, int32_t h, bool cover,
+                             Frame* out, std::string* why) const;
+
     /* A moving picture in the video VAE's own form: decoded under the same `max_source_pixels`
      * guard, then every frame resized to the one grid `encoder_image` picks. The frames are
      * SAMPLED first: uniformly across the stream, to the largest count no more than `max_frames`

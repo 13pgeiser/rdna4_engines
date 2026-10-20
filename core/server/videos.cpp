@@ -272,6 +272,11 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
      * since it may carry a file). A form may carry the reference media of a ref2va request as
      * named file parts; they are collected here and checked once the task is known. */
     std::vector<gen::VideoRefMedia> refs;
+    /* Endpoint keyframes: the "first_frame"/"last_frame" file parts, kept apart from the reference
+     * media because they are conditioned on differently (pinned rows, not reference rows) and are
+     * validated and encoded on their own path below. At most one of each; together they are FL2VA,
+     * alone they are I2VA (first) or L2VA (last). */
+    std::vector<gen::VideoRefMedia> keys;
     json body = json::object();
     if (!req.form.empty()) {
         for (const FormPart& p : req.form) {
@@ -281,6 +286,21 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
                                                         "ref_image_N file parts"
                                                       : "this server makes video from text "
                                                         "only"), req.peer);
+            if (p.name == "first_frame" || p.name == "last_frame") {
+                if (p.filename.empty())
+                    return error_response(err_bad(p.name, "'" + p.name + "' must carry an image "
+                                                          "file"), req.peer);
+                gen::VideoRefMedia m;
+                m.kind = p.name == "first_frame" ? gen::VideoRefMedia::FIRST_FRAME
+                                                 : gen::VideoRefMedia::LAST_FRAME;
+                m.index = 1;
+                m.name = p.name;
+                m.filename = p.filename;
+                m.content_type = p.content_type;
+                m.data = p.data;
+                keys.push_back(std::move(m));
+                continue;
+            }
             if (!p.filename.empty()) {
                 gen::VideoRefMedia m;
                 if (!parse_ref_name(p.name, &m.kind, &m.index))
@@ -341,16 +361,26 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
                               req.peer);
     /* The task: text always; reference conditioning for a model that takes reference media. */
     bool ref2va = false;
+    std::string kf_task;   /* an explicitly named keyframe task (i2va / l2va / fl2va), if any */
     if (has(body, "task")) {
         const std::string task = body["task"].is_string() ? body["task"].get<std::string>() : "";
         if (task == "ref2va" && takes_refs) ref2va = true;
+        /* The keyframe-completion tasks: a first and/or last frame pinned at the output's ends.
+         * They are recognised whatever a model declares (any model with a video encoder can pin a
+         * keyframe); which frames are actually present is decided by the file parts, cross-checked
+         * against this name below. t2va with a first_frame part is I2VA; a named task missing its
+         * frame is refused there. */
+        else if (task == "i2va" || task == "l2va" || task == "fl2va") kf_task = task;
         else if (task != "t2va") {
             ApiError e = err_unsupported("task", takes_refs
-                                         ? "this server makes video from text or from reference "
-                                           "media: t2va, ref2va"
-                                         : "this server makes video from text: t2va");
-            e.supported = takes_refs ? std::vector<std::string>{ "t2va", "ref2va" }
-                                     : std::vector<std::string>{ "t2va" };
+                                         ? "this server makes video from text, from reference "
+                                           "media, or between keyframes: t2va, ref2va, i2va, l2va, "
+                                           "fl2va"
+                                         : "this server makes video from text or between keyframes: "
+                                           "t2va, i2va, l2va, fl2va");
+            e.supported = takes_refs
+                ? std::vector<std::string>{ "t2va", "ref2va", "i2va", "l2va", "fl2va" }
+                : std::vector<std::string>{ "t2va", "i2va", "l2va", "fl2va" };
             return error_response(e, req.peer);
         }
     }
@@ -368,6 +398,36 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     if (ref2va) {
         ApiError e;
         if (validate_refs(refs, info, &e) < 0) return error_response(e, req.peer);
+    }
+    /* Endpoint keyframes: at most one of each, not alongside reference media (a request either
+     * completes between two pinned frames or conditions on references -- the two conditioning
+     * paths are different rows), and only on a model that encodes (a keyframe reaches the DiT as a
+     * pinned VAE latent). */
+    {
+        int n_first = 0, n_last = 0;
+        for (const gen::VideoRefMedia& m : keys)
+            if (m.kind == gen::VideoRefMedia::FIRST_FRAME) ++n_first; else ++n_last;
+        if (n_first > 1) return bad("first_frame", "at most one first_frame part");
+        if (n_last > 1) return bad("last_frame", "at most one last_frame part");
+        if (!keys.empty()) {
+            if (!info.encodes)
+                return bad("first_frame", "this model has no video encoder, so it cannot pin a "
+                                          "keyframe");
+            if (!refs.empty())
+                return bad("first_frame", "a keyframe completion conditions on its pinned frames, "
+                                          "not on reference media: give first_frame/last_frame or "
+                                          "the ref_* parts, not both");
+        }
+        /* A named keyframe task must carry the frame(s) it promises; t2va with parts is fine, the
+         * parts alone decide the mode. */
+        if (!kf_task.empty()) {
+            if ((kf_task == "i2va" || kf_task == "fl2va") && n_first < 1)
+                return bad("first_frame", "task '" + kf_task + "' pins a first frame: give a "
+                                          "first_frame part");
+            if ((kf_task == "l2va" || kf_task == "fl2va") && n_last < 1)
+                return bad("last_frame", "task '" + kf_task + "' pins a last frame: give a "
+                                         "last_frame part");
+        }
     }
     json target = json::object();
     if (has(body, "target")) {
@@ -495,6 +555,11 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
         r->seed = (((uint64_t)rd() << 32) ^ rd()) & (((uint64_t)1 << 53) - 1);
     }
     r->refs = std::move(refs);
+    /* Keyframes ride the reference vector for the driver's sake (its encode queue indexes it), but
+     * always AFTER every reference: the driver lays the reference rows down first, then folds each
+     * FIRST_FRAME/LAST_FRAME into the pack's keyframe table. first before last, so they keyframe-order
+     * 0 and 1 and take image slots 1 and 2. */
+    r->refs.insert(r->refs.end(), keys.begin(), keys.end());
 
     /* ---- the prompt: the template's text with special tokens, the reference media in its
      * presentation order, the prompt last (docs/PORT-REF2VA.md §3: images, then videos each
@@ -595,12 +660,29 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
      * geometry, clip-pads a video's frames and zero-pads an audio's samples to what it reports. The
      * processor decodes under the same guard it used for the text encoder, so a reference that got
      * this far decodes here too. */
-    if (ref2va && info.encodes && deps_.mm) {
+    if ((ref2va || !keys.empty()) && info.encodes && deps_.mm) {
         for (gen::VideoRefMedia& m : r->refs) {
             std::string why;
             const uint8_t* p = (const uint8_t*)m.data.data();
             const size_t   n = m.data.size();
-            if (m.kind == gen::VideoRefMedia::IMAGE) {
+            if (m.kind == gen::VideoRefMedia::FIRST_FRAME ||
+                m.kind == gen::VideoRefMedia::LAST_FRAME) {
+                /* A keyframe anchor resized to the EXACT output canvas: first a plain stretch
+                 * ("disabled"), last a centre crop ("center") -- the reference's own resize. Its
+                 * latent grid is then the target's, so the pack's pinned rows (frame_rows wide)
+                 * match what the encoder writes into the image slot. */
+                mm::Frame fr;
+                if (deps_.mm->encoder_image_canvas(p, n, (int32_t)W, (int32_t)H,
+                                                  m.kind == gen::VideoRefMedia::LAST_FRAME,
+                                                  &fr, &why) < 0)
+                    return bad(m.name.c_str(), "'" + m.name + "' could not be encoded: " + why);
+                m.enc_frames = 1;
+                m.enc_h = fr.h;
+                m.enc_w = fr.w;
+                m.enc_pixels.resize((size_t)fr.w * fr.h * 3);
+                for (size_t i = 0; i < m.enc_pixels.size(); ++i)
+                    m.enc_pixels[i] = (float)fr.rgb[i];
+            } else if (m.kind == gen::VideoRefMedia::IMAGE) {
                 mm::Frame fr;
                 if (deps_.mm->encoder_image(p, n, (int32_t)info.enc_ratio,
                                             (int32_t)info.max_enc_side, &fr, &why) < 0)

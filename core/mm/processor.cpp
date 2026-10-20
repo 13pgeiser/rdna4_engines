@@ -1041,6 +1041,44 @@ int Processor::encoder_image(const uint8_t* bytes, size_t n, int32_t ratio, int3
     return RAD_OK;
 }
 
+int Processor::encoder_image_canvas(const uint8_t* bytes, size_t n, int32_t w, int32_t h,
+                                    bool cover, Frame* out, std::string* why) const {
+    if (w < 1 || h < 1) {
+        if (why) *why = "the keyframe canvas is empty";
+        return RAD_E_INVAL;
+    }
+    /* The same decode guard as encoder_image(): a keyframe the client sends is held to the size a
+     * reference would be. */
+    Frame f;
+    RAD_TRY(decode_image(bytes, n, cfg_.max_source_pixels, &f, why));
+    if (!cover) {
+        /* "disabled": a plain stretch to the canvas, exactly the reference's first-frame resize. */
+        if (w == f.w && h == f.h) { *out = std::move(f); return RAD_OK; }
+        resize_lanczos_rgb(f, w, h, out);
+        return RAD_OK;
+    }
+    /* "center": scale up to COVER the canvas keeping aspect (both axes at least the target), then
+     * cut the exact canvas from the centre -- the reference's last-frame resize. The scale is the
+     * larger of the two axis ratios so neither side falls short; each is rounded up to at least the
+     * target so the crop always has enough to take from. */
+    const double s = std::max((double)w / (double)f.w, (double)h / (double)f.h);
+    int32_t cw = (int32_t)std::llround((double)f.w * s);
+    int32_t ch = (int32_t)std::llround((double)f.h * s);
+    if (cw < w) cw = w;
+    if (ch < h) ch = h;
+    Frame big;
+    resize_lanczos_rgb(f, cw, ch, &big);
+    const int32_t x0 = (cw - w) / 2, y0 = (ch - h) / 2;
+    out->w = w;
+    out->h = h;
+    out->rgb.resize((size_t)w * h * 3);
+    for (int32_t y = 0; y < h; ++y)
+        for (int32_t x = 0; x < w * 3; ++x)
+            out->rgb[(size_t)y * w * 3 + x] =
+                big.rgb[(size_t)(y0 + y) * cw * 3 + (size_t)(x0 * 3 + x)];
+    return RAD_OK;
+}
+
 namespace {
 /* Which frames of a source video a reference clip keeps: spread uniformly over the stream, the
  * largest count no more than both the stream's length and `max_frames` that is 5 modulo 17 — the

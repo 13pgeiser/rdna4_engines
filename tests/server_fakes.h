@@ -406,12 +406,23 @@ struct FakeMultimodal : IMultimodal {
      * clip, a sample count that is not a whole hop) — padding is the driver's, not the server's. */
     int32_t enc_frames = 5, enc_side = 16;
     int64_t enc_n = 850;
-    int n_ienc = 0, n_venc = 0, n_aenc = 0;
+    int n_ienc = 0, n_venc = 0, n_aenc = 0, n_cenc = 0;
+    /* The canvas an anchor was resized to, and whether the last frame's cover-crop was asked for. */
+    int32_t cenc_w = 0, cenc_h = 0;
+    bool cenc_cover = false;
     int encoder_image(const uint8_t*, size_t, int32_t, int32_t, mm::Frame* out,
                       std::string*) override {
         ++n_ienc;
         out->w = out->h = enc_side;
         out->rgb.assign((size_t)enc_side * enc_side * 3, 128);
+        return RAD_OK;
+    }
+    int encoder_image_canvas(const uint8_t*, size_t, int32_t w, int32_t h, bool cover,
+                             mm::Frame* out, std::string*) override {
+        ++n_cenc;
+        cenc_w = w; cenc_h = h; cenc_cover = cover;
+        out->w = w; out->h = h;
+        out->rgb.assign((size_t)w * h * 3, 100);
         return RAD_OK;
     }
     int encoder_video(const uint8_t*, size_t, int32_t, int32_t, int32_t, std::vector<mm::Frame>* out,
