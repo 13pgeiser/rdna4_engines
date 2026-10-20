@@ -48,6 +48,7 @@ struct ControlVector {
     std::vector<float> scales;
     int64_t n_embd = 0;
     int64_t n_layers = 0;
+    int64_t n_dirs = 0;               /* directions the file carried (47 for the published one) */
     int     first = -1, last = -1;    /* inclusive layer range */
     float   user_scale = 1.0f;
     std::string path;

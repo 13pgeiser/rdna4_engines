@@ -19,7 +19,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstring>
 #include <fstream>
 
 #include <nlohmann/json.hpp>
@@ -188,7 +187,9 @@ int control_vector_load(const std::string& path, const std::string& arch, int64_
             return fail("control vector " + path + ": tensor name '" + t.name +
                         "' does not end in a layer number");
         }
-        if (layer < 1 || layer > n_model_layers)
+        /* 1 .. n_layers-1: the table is indexed by layer (row 0 is unused, the format carrying no
+         * direction for it), so direction.<n_layers> would write one row past it. */
+        if (layer < 1 || layer >= n_model_layers)
             return fail("control vector " + path + ": direction." + std::to_string(layer) +
                         " is outside this model's " + std::to_string(n_model_layers) + " layers");
         if (t.n_dims != 1 || t.ne[0] != n_embd)
@@ -218,7 +219,7 @@ int control_vector_load(const std::string& path, const std::string& arch, int64_
     if (first < 1 || last < first)
         return fail("control vector " + path + ": the layer range " + std::to_string(first) + ":" +
                     std::to_string(last) + " is empty");
-    if (last > n_model_layers)
+    if (last >= n_model_layers)
         return fail("control vector " + path + ": the layer range " + std::to_string(first) + ":" +
                     std::to_string(last) + " runs past this model's " +
                     std::to_string(n_model_layers) + " layers");
@@ -229,6 +230,7 @@ int control_vector_load(const std::string& path, const std::string& arch, int64_
     /* Indexed by layer: rows 0..n_layers-1. Row 0 stays zero, the format carrying no direction
      * for layer 0, and every row a model can name exists. */
     out->n_layers = n_model_layers;
+    out->n_dirs = n_dir;
     out->first = first;
     out->last = last;
     out->user_scale = scale;

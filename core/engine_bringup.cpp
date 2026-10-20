@@ -1106,7 +1106,7 @@ int Engine::declare() {
         RAD_INFO("control vectors: %s: %lld directions of %lld, layers %d..%d, scale %.3f -- "
                  "off until a request asks for it (the dashboard's switch, or a request's `control_vector` "
                  "field)",
-                 cvec_.path.c_str(), (long long) (cvec_.n_layers > 0 ? cvec_.n_layers - 1 : 0),
+                 cvec_.path.c_str(), (long long) cvec_.n_dirs,
                  (long long) cvec_.n_embd, cvec_.first, cvec_.last, (double) cvec_.user_scale);
         decide("control vectors", cvec_.path,
                "found beside the container, in its directory, or in $RADIANCE_HOME/vectors; "

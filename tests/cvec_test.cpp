@@ -15,7 +15,6 @@
 #include "cvec.h"
 
 #include <cmath>
-#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -76,8 +75,6 @@ struct GgufWriter {
         h += dir;
         while (h.size() % alignment) h.push_back('\0');
         for (const T& t : tensors) {
-            const size_t at = h.size();
-            (void) at;
             h.append((const char*) t.data.data(), t.data.size() * 4);
             while (h.size() % alignment) h.push_back('\0');
         }
@@ -132,8 +129,8 @@ Loaded load(const GgufWriter& w, int64_t n_embd, int64_t model_layers, const std
 }  // namespace
 
 TEST(the_published_shape_loads_and_is_normalised) {
-    /* 47 directions of 2560 for a 48-layer model, the range the package's own JSON states. */
-    /* Nothing states a range, so the loader takes the published selection, 4..44. */
+    /* 47 directions of 2560 for a 48-layer model, and no JSON beside it: the loader takes the
+     * published selection, 4..44. */
     const Loaded f = load(make_vector(2560, 47), 2560, 48, "flash-next.gguf");
     CHECK_OK(f.rc);
     CHECK_EQ(f.cv.n_embd, (int64_t) 2560);
@@ -287,6 +284,20 @@ TEST(a_layer_range_past_the_model_is_refused) {
                           R"({"mode":"project","scale":1.0,"layer_range":[4,40]})");
     CHECK(l.rc < 0);
     CHECK(l.err.find("runs past") != std::string::npos);
+}
+
+/* A layer index the table cannot hold: a 48-layer model's table is rows 0..47 and the format has
+ * no direction for the last row, so direction.48 and a JSON range ending at 48 are both refused
+ * rather than indexing one row past it. */
+TEST(a_layer_at_the_models_own_count_is_refused) {
+    const Loaded a = load(make_vector(2560, 48), 2560, 48, "layer-48.gguf");
+    CHECK(a.rc < 0);
+    CHECK(a.err.find("outside") != std::string::npos);
+
+    const Loaded b = load(make_vector(2560, 47), 2560, 48, "range-to-48.gguf",
+                          R"({"mode":"project","scale":1.0,"layer_range":[4,48]})");
+    CHECK(b.rc < 0);
+    CHECK(b.err.find("runs past") != std::string::npos);
 }
 
 RAD_TEST_MAIN()
