@@ -1506,6 +1506,106 @@ impl Gpu {
             reservation,
         ))
     }
+    /// K3 down A4 producer of the gfx1100 aggregate K2 prefill: grouped BF16 SwiGLU rows `h`
+    /// `[grouped_rows, k]` -> the compact flat-slot `block_i4_128` down sidecar
+    /// `[k / 128, total_slots]` (record `g * total_slots + sorted[p]`, 72 bytes), padding rows
+    /// emit nothing. `producer` is the descriptor's embedded row-local entry (module key, image,
+    /// symbol, `k`; for gfx1100 `mq_i4_a4_r128_k640_gfx1100` of the certified builder module
+    /// `mq_i4_a4_pm_gfx1100`, 48-byte kernarg, grid `(k / 128) * grouped_rows`, block 32) and
+    /// `k` must equal the producer's `k`. Same handle and ownership as the hipcc arm of
+    /// [`Gpu::qwen4_moe_rotate128_i4`], which dispatches here.
+    pub(crate) fn qwen4_moe_rotate128_i4_embedded(
+        &mut self,
+        (module, image, symbol, producer_k): (&'static str, &'static [u8], &'static str, usize),
+        h: &GpuTensor,
+        sorted: &GpuTensor,
+        k: usize,
+        grouped_rows: usize,
+        total_slots: usize,
+    ) -> HipResult<crate::scratch::Int4MmqPrepared> {
+        if k != producer_k || grouped_rows == 0 || total_slots == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("qwen4_moe_rotate128_i4: need k == {producer_k} and nonzero rows"),
+            ));
+        }
+        crate::moe::require_span(
+            h,
+            &[grouped_rows, k, 2],
+            "qwen4_moe_rotate128_i4 grouped BF16 rows",
+        )?;
+        crate::moe::require_span(
+            sorted,
+            &[grouped_rows, 4],
+            "qwen4_moe_rotate128_i4 sorted slots",
+        )?;
+        let grid_x = u32::try_from((k / 128) * grouped_rows).map_err(|_| {
+            hip_bridge::HipError::new(0, "qwen4_moe_rotate128_i4: grid exceeds u32")
+        })?;
+        let (pv, lv) = match (u32::try_from(grouped_rows), u32::try_from(total_slots)) {
+            (Ok(p), Ok(l)) => (p, l),
+            _ => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "qwen4_moe_rotate128_i4: extent overflow",
+                ))
+            }
+        };
+        self.bind_thread()?;
+        self.ensure_mq_signs_128()?;
+        self.ensure_embedded_kernel(module, image, symbol)?;
+        let needed = k / 128 * total_slots * 72;
+        if crate::scratch::scratch_will_grow(
+            self.scratch.qwen4_moe_down_i4_scratch_bytes,
+            self.scratch.qwen4_moe_down_i4_scratch.is_some(),
+            needed,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
+        let reservation = self
+            .scratch
+            .reserve_qwen4_moe_down_i4(&self.hip, k, total_slots)?;
+        let hp = h.buf.as_ptr();
+        let sp = sorted.buf.as_ptr();
+        let xp = reservation.ptr();
+        let s1 = self.scratch.mq_signs1_128.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2_128.as_ref().unwrap().buf.as_ptr();
+        let mut params = [
+            &hp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &pv as *const _ as *mut c_void,
+            &lv as *const _ as *mut c_void,
+        ];
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "fwht",
+            symbol,
+            grouped_rows * (k * 2 + 4) + needed,
+        );
+        let result =
+            self.launch_maybe_blob(symbol, [grid_x, 1, 1], [32, 1, 1], 0, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(hp);
+                b.push_ptr(sp);
+                b.push_ptr(xp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_u32(pv);
+                b.push_u32(lv);
+                b
+            });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result?;
+        self.moe_route_census.a4_down_producer += 1;
+        Ok(crate::scratch::Int4MmqPrepared::from_reservation(
+            reservation,
+        ))
+    }
 
     /// S1 slow-link layer-major prefill: apply one panel of grouped BF16 down rows to the
     /// ordered combine accumulator `acc` (`[tokens, hidden]` F32 holding the BF16 running sum).

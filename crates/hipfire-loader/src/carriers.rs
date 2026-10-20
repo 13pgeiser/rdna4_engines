@@ -2227,6 +2227,12 @@ fn load_qwen4_rank_scoped(
             chunk_rows_env: chunk_rows_env.as_deref(),
             max_seq: ctx.max_seq,
         };
+        // The symmetric IU4 window route's one source-byte scan of every routed trunk layer
+        // (run only when its device terms hold, `HIPFIRE_QWEN4_MOE_SYM_IU4=1`).
+        let routed_source_symmetric = || {
+            hipfire_arch_qwen4::artifact::routed_headers_symmetric(&hfq, &manifest)
+                .map_err(|error| error.to_string())
+        };
         s1::select_load_profile(
             slowlink_mode,
             &shape,
@@ -2255,6 +2261,7 @@ fn load_qwen4_rank_scoped(
                     state_format,
                     scratch_mode,
                     purpose: s1::AdmissionPurpose::Product,
+                    routed_source_symmetric: &routed_source_symmetric,
                 };
                 let arenas = s1::single_device_arena_plan(&load)?;
                 let facts = s1::single_device_facts_with_arenas(
@@ -2700,8 +2707,33 @@ fn load_qwen4_rank_scoped(
                 }
             }
         };
-        let moved = residency::place_routed_experts(&mut manifest.weights, vram_layers);
-        applied_layers = vram_layers.min(config.num_hidden_layers);
+        // The default stays on the incumbent prefix path without allocating
+        // a set. Only an admitted S1 load may override its layer identities.
+        let resident_set = {
+            use hipfire_arch_qwen4::slowlink_admission as s1;
+            if slowlink_profile.is_some()
+                && s1::resident_layer_switch_is_override(
+                    hipfire_config::developer_var(s1::S1_RESIDENT_LAYERS_ENV)
+                        .ok()
+                        .as_deref(),
+                )
+            {
+                Some(s1::s1_resident_layer_set(
+                    config.num_hidden_layers,
+                    vram_layers,
+                )?)
+            } else {
+                None
+            }
+        };
+        let moved = if let Some(resident) = &resident_set {
+            residency::place_routed_experts_set(&mut manifest.weights, resident)
+        } else {
+            residency::place_routed_experts(&mut manifest.weights, vram_layers)
+        };
+        applied_layers = resident_set
+            .as_ref()
+            .map_or(vram_layers.min(config.num_hidden_layers), Vec::len);
         // This rank's pinned bytes; the host check covers every rank that
         // has not pinned yet (this one and the later ranks), each at its own
         // share (an uneven split gives the low ranks one more expert).
@@ -2726,7 +2758,16 @@ fn load_qwen4_rank_scoped(
             .emu_check_host_allocation(host_check_bytes, true)
             .map_err(|error| format!("qwen4: {error}"))?;
         let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
-        eprintln!(
+        if let Some(resident) = &resident_set {
+            eprintln!(
+                "  qwen4 routed experts: layers {resident:?} in VRAM, {moved} expert tensors ({:.1} GiB) in pinned host RAM \
+                 (MemAvailable - CMA {:.1} GiB + {:.1} GiB estimated in TTM's page pool)",
+                gib(host_bytes),
+                gib(mem_available.unwrap_or(0)),
+                gib(ttm_pool)
+            );
+        } else {
+            eprintln!(
                 "  qwen4 routed experts: layers 0..{} in VRAM, {moved} expert tensors ({:.1} GiB) in pinned host RAM \
                  (MemAvailable - CMA {:.1} GiB + {:.1} GiB estimated in TTM's page pool)",
                 vram_layers.min(config.num_hidden_layers),
@@ -2734,6 +2775,7 @@ fn load_qwen4_rank_scoped(
                 gib(mem_available.unwrap_or(0)),
                 gib(ttm_pool)
             );
+        }
         if let Some(plan) = &whole_first_plan {
             let resident = residency::resident_routed_expert_bytes(&manifest.weights, bytes_of)
                 .map_err(|error| format!("qwen4: {error}"))?;
@@ -7906,6 +7948,7 @@ mod qwen4_slowlink_tests {
             // The product loader's own purpose (never inferred from the
             // diagnostic bytes): it admits the product tile.
             purpose: s1::AdmissionPurpose::Product,
+            sym_iu4_source_symmetric: None,
         }
     }
 

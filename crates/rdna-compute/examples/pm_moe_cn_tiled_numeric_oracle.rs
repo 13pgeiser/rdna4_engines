@@ -74,8 +74,8 @@
 //! pm_moe_cn_tiled_numeric_oracle --help
 //! pm_moe_cn_tiled_numeric_oracle --selfcheck [--out FILE.json]
 //! pm_moe_cn_tiled_numeric_oracle --co CAND --k1-co K1 [--k1-sha256 HEX]
-//!   --arch gfx1151|gfx1201 [--rows A-B] [--shard I/4] [--cheap] [--expect-bdf BDF]
-//!   --out OUT.json
+//!   --arch gfx1151|gfx1201 [--rows A-B] [--shard I/4] [--cheap] [--guards-only]
+//!   [--expect-bdf BDF] --out OUT.json
 //! ```
 //! - `--selfcheck`: pure-host fixture/ABI/plan validation, no HIP init.
 //!   Constructs the actual ordinary R1..64 and focused fixtures, decodes every
@@ -83,7 +83,11 @@
 //!   Ordinary tables stay sparse (0/511); terminal80 maps all ten experts.
 //! - `--cheap`: kill gate first — R9 ordinary (all 4 specs), R8 tail pair
 //!   (gate M1282 / down M2563), and C65 rejection — then stop.
-//! - Full default: every R 1..64, all four `_t8` bodies, no cap, plus all focused extras.
+//! - `--guards-only`: skip all positive construction and launches and run only the
+//!   original invalid-descriptor guard family, regardless of rows or shard.
+//!   `--cheap` with `--guards-only` is rejected.
+//! - Full default: every R 1..64, all four `_t8` bodies, all focused extras, and
+//!   the invalid-descriptor guard family (including unsharded `--rows 1-64`).
 //! - Shards (four local processes): `--rows 1-16 --shard 1/4`, `--rows 17-32 --shard 2/4`,
 //!   `--rows 33-48 --shard 3/4`, `--rows 49-64 --shard 4/4` (rows must match shard).
 //!   Invalid-descriptor guard fixtures run on shard 1 only (or the unsharded full run);
@@ -390,6 +394,7 @@ struct Args {
     rows: Option<(u32, u32)>,
     shard: Option<(u32, u32)>,
     cheap: bool,
+    guards_only: bool,
     expect_bdf: Option<String>,
     out: Option<String>,
     selfcheck: bool,
@@ -406,6 +411,7 @@ fn parse_args() -> Result<Args> {
         rows: None,
         shard: None,
         cheap: false,
+        guards_only: false,
         expect_bdf: None,
         out: None,
         selfcheck: false,
@@ -417,6 +423,7 @@ fn parse_args() -> Result<Args> {
             "--help" | "-h" => o.help = true,
             "--selfcheck" => o.selfcheck = true,
             "--cheap" => o.cheap = true,
+            "--guards-only" => o.guards_only = true,
             "--co" => {
                 i += 1;
                 o.co = Some(a.get(i).ok_or("--co needs a value")?.clone());
@@ -465,6 +472,12 @@ fn parse_args() -> Result<Args> {
         }
         i += 1;
     }
+    if o.cheap && o.guards_only {
+        return Err(
+            "--cheap with --guards-only would silently skip the cheap gate positives; pick one"
+                .into(),
+        );
+    }
     if let (Some((p, _)), Some((lo, hi))) = (o.shard, o.rows) {
         let want = match p {
             1 => (1, 16),
@@ -483,7 +496,7 @@ fn parse_args() -> Result<Args> {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  pm_moe_cn_tiled_numeric_oracle --help\n  pm_moe_cn_tiled_numeric_oracle --selfcheck [--out FILE.json]\n  pm_moe_cn_tiled_numeric_oracle --co CAND --k1-co K1 [--k1-sha256 HEX] --arch gfx1151|gfx1201 [--rows A-B] [--shard I/4] [--cheap] [--expect-bdf BDF] --out OUT.json\n\nshards:\n  --rows 1-16 --shard 1/4 | --rows 17-32 --shard 2/4 | --rows 33-48 --shard 3/4 | --rows 49-64 --shard 4/4\nguards: invalid-descriptor suite runs on --shard 1/4 or the unsharded full run only, LAST (first fault stops).\nalloc: every device buffer is a right-aligned VMM arena (mapped prefix + unmapped suffix; inputs read-only).\n"
+    "usage:\n  pm_moe_cn_tiled_numeric_oracle --help\n  pm_moe_cn_tiled_numeric_oracle --selfcheck [--out FILE.json]\n  pm_moe_cn_tiled_numeric_oracle --co CAND --k1-co K1 [--k1-sha256 HEX] --arch gfx1151|gfx1201 [--rows A-B] [--shard I/4] [--cheap] [--guards-only] [--expect-bdf BDF] --out OUT.json\n\nshards:\n  --rows 1-16 --shard 1/4 | --rows 17-32 --shard 2/4 | --rows 33-48 --shard 3/4 | --rows 49-64 --shard 4/4\nguards: invalid-descriptor suite runs on --shard 1/4 or the unsharded full run, LAST (first fault stops). --guards-only skips all positive construction/launches and always runs the suite regardless of rows/shard.\nalloc: every device buffer is a right-aligned VMM arena (mapped prefix + unmapped suffix; inputs read-only).\n"
 }
 
 // --------------------------------------------------------------- selfcheck ---
@@ -2695,80 +2708,86 @@ fn verify(args: &Args) -> Result<serde_json::Value> {
         return Ok(v);
     }
 
-    // Full ordinary sweep over the shard rows; shared SpecCtx per spec (X64 + K1 Y persist).
-    let mut sweep_ctx: Vec<SpecCtx> = Vec::new();
-    let mut sweep_kc: Vec<HashMap<(u32, u32, u32, u32), [u8; 4]>> = Vec::new();
-    for s in specs {
-        let full = build_case(s, 64, prod_m(s), 0, 0, 0, None, 512);
-        sweep_ctx.push(SpecCtx::new(hip, id, &full, &mut counts)?);
-        sweep_kc.push(HashMap::new());
-    }
-    for (si, s) in specs.iter().enumerate() {
-        for r in rlo..=rhi {
-            // Per-R exact candidate X prefix: same host X64 prefix bytes, exact
-            // length allocation (right-aligned VMM, unmapped suffix). Tensors are
-            // shared by reference (host_tensors owned by ctx, never cloned).
-            let c = ordinary_case(*s, r, &sweep_ctx[si].host_x64, &sweep_ctx[si].host_tensors);
-            {
-                let sc = &sweep_ctx[si];
-                assert_eq!(c.x_stride, sc.x_stride);
-                assert_eq!(c.y_stride, sc.y_stride);
-                assert_eq!(c.n_experts, sc.n_experts);
+    // Guards-only never constructs positive cases or launches the K1 reference.
+    if !args.guards_only {
+        // Full ordinary sweep over the shard rows; shared SpecCtx per spec (X64 + K1 Y persist).
+        let mut sweep_ctx: Vec<SpecCtx> = Vec::new();
+        let mut sweep_kc: Vec<HashMap<(u32, u32, u32, u32), [u8; 4]>> = Vec::new();
+        for s in specs {
+            let full = build_case(s, 64, prod_m(s), 0, 0, 0, None, 512);
+            sweep_ctx.push(SpecCtx::new(hip, id, &full, &mut counts)?);
+            sweep_kc.push(HashMap::new());
+        }
+        for (si, s) in specs.iter().enumerate() {
+            for r in rlo..=rhi {
+                // Per-R exact candidate X prefix: same host X64 prefix bytes, exact
+                // length allocation (right-aligned VMM, unmapped suffix). Tensors are
+                // shared by reference (host_tensors owned by ctx, never cloned).
+                let c = ordinary_case(*s, r, &sweep_ctx[si].host_x64, &sweep_ctx[si].host_tensors);
+                {
+                    let sc = &sweep_ctx[si];
+                    assert_eq!(c.x_stride, sc.x_stride);
+                    assert_eq!(c.y_stride, sc.y_stride);
+                    assert_eq!(c.n_experts, sc.n_experts);
+                }
+                verify_case_full(
+                    hip,
+                    id,
+                    &cand_f[si],
+                    &k1_f[si],
+                    &mut sweep_ctx[si],
+                    &c,
+                    &mut sweep_kc[si],
+                    &mut input_hashes,
+                    &mut counts,
+                    false,
+                    false,
+                )?;
             }
+        }
+
+        // Focused extras, partitioned idx%4 when sharded.
+        let extras = focused_extras();
+        for e in &extras {
+            if let Some(sh) = shard_idx {
+                if e.idx % 4 != sh {
+                    continue;
+                }
+            }
+            let c = focused_case(e);
+            let mut ctx = SpecCtx::new(hip, id, &c, &mut counts)?;
+            let mut kc = HashMap::new();
+            // Null X and zero/constant K1 admission remain exclusive to xzero;
+            // all families retain full-grid, dual-poison, true-C1 verification.
+            let xzero = e.name.starts_with("xzero ");
             verify_case_full(
                 hip,
                 id,
-                &cand_f[si],
-                &k1_f[si],
-                &mut sweep_ctx[si],
+                &cand_f[e.spec],
+                &k1_f[e.spec],
+                &mut ctx,
                 &c,
-                &mut sweep_kc[si],
+                &mut kc,
                 &mut input_hashes,
                 &mut counts,
-                false,
-                false,
+                xzero,
+                xzero,
             )?;
+            ctx.release(hip)?;
+        }
+        for ctx in sweep_ctx {
+            ctx.release(hip)?;
         }
     }
 
-    // Focused extras, partitioned idx%4 when sharded.
-    let extras = focused_extras();
-    for e in &extras {
-        if let Some(sh) = shard_idx {
-            if e.idx % 4 != sh {
-                continue;
-            }
+    // Keep shard routing unchanged; an explicit unsharded full range also owes guards.
+    let run_guards = if args.guards_only {
+        true
+    } else {
+        match (args.shard, args.rows) {
+            (Some((1, _)), _) | (None, None) | (None, Some((1, 64))) => true,
+            _ => false,
         }
-        let c = focused_case(e);
-        let mut ctx = SpecCtx::new(hip, id, &c, &mut counts)?;
-        let mut kc = HashMap::new();
-        // Null X and zero/constant K1 admission remain exclusive to xzero;
-        // all families retain full-grid, dual-poison, true-C1 verification.
-        let xzero = e.name.starts_with("xzero ");
-        verify_case_full(
-            hip,
-            id,
-            &cand_f[e.spec],
-            &k1_f[e.spec],
-            &mut ctx,
-            &c,
-            &mut kc,
-            &mut input_hashes,
-            &mut counts,
-            xzero,
-            xzero,
-        )?;
-        ctx.release(hip)?;
-    }
-    for ctx in sweep_ctx {
-        ctx.release(hip)?;
-    }
-
-    // Invalid-descriptor guard suite: shard 1 (or unsharded full run) only, LAST.
-    let run_guards = match (args.shard, args.rows) {
-        (Some((1, _)), _) => true,
-        (None, None) => true,
-        _ => false,
     };
     if run_guards {
         for (si, s) in specs.iter().enumerate() {
@@ -2787,13 +2806,24 @@ fn verify(args: &Args) -> Result<serde_json::Value> {
         }
     }
 
+    let mode = if args.guards_only {
+        "verify-guards"
+    } else {
+        "verify"
+    };
+    let backend_note = if arch == "gfx1201" {
+        "gfx1201 source facts applied: K nonzero+group-aligned (not exact-K); table-before-slot order and offsets<=80-only are backend defects outside this oracle — fixtures kept exact and executed; first fault stops."
+    } else {
+        "gfx1151 Cn requires exact production K (gate 2560, down 640); wrong-K uses aligned non-production K+128 — no gfx1201 backend note applies on this arch."
+    };
     let v = json!({
-        "schema": "pm-moe-cn-tiled-numeric-oracle-v1", "mode": "verify",
+        "schema": "pm-moe-cn-tiled-numeric-oracle-v1", "mode": mode,
         "arch": arch, "candidate": co_path, "candidate_sha256": co_sha,
         "k1_co": k1_path, "k1_sha256": k1_sha, "k1_pin": args.k1_sha256,
         "device": {"uuid": dev.uuid, "bdf": dev.bdf, "arch": dev.arch, "id": dev.id},
         "rows": format!("{rlo}-{rhi}"), "shard": args.shard.map(|(p, q)| format!("{p}/{q}")),
-        "cheap": false, "guards_run": run_guards,
+        "cheap": false, "guards_only": args.guards_only, "guards_run": run_guards,
+        "positive_fixtures": if args.guards_only { &[] as &[&str] } else { &["ordinary", "focused"] },
         "tallies": {"cases": counts.cases, "candidate_launches": counts.candidate_launches,
             "k1_launches": counts.k1_launches, "k1_launch_note": "per-(token,rank,expert) grid-[M,1,1] block32 true-C1 local launches",
             "compared_words": counts.compared_words,
@@ -2807,7 +2837,7 @@ fn verify(args: &Args) -> Result<serde_json::Value> {
         "limitations": [
             "Native GPU cannot expose instruction written bits; dual-poison plus expected written-byte maps establish stores per byte; read-only VMM mappings fault on input stores.",
             "Leaf-only: executed _t8 numerics vs independent K1 C1/U1 block32 singletons only; no timing, capture, throughput, or admission claims.",
-            "gfx1201 source facts applied: K nonzero+group-aligned (not exact-K); table-before-slot order and offsets<=80-only are backend defects outside this oracle — fixtures kept exact and executed; first fault stops.",
+            backend_note,
         ],
     });
     std::fs::write(&out_path, serde_json::to_vec_pretty(&v).unwrap()).map_err(err)?;
