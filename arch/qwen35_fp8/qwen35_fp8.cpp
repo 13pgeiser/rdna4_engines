@@ -886,8 +886,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 #if !QWEN35_MOE
     /* The pipelined prefill (step_pipelined), wherever a step can be wide enough, at the rank
      * counts RADIANCE_PREFILL_PIPELINE allows (rad_prefill_pipe.h: two by default). Its second
-     * lane touches the residual stream, the normed input in both forms, the taps and the bounds,
-     * so those leave the sharing pool
+     * lane touches the residual stream, the normed input in both forms and the bounds, so those
+     * leave the sharing pool (the drafter taps are copied on the first lane: pipe_taps)
      * (Ctx::lane1_); the bounds also because no declared op reads them, which would leave a
      * transient dead before the kernels that take them raw. */
     {
@@ -898,7 +898,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         RAD_ARCH_TRY(rad_buf_concurrent(b, m.a_h.x));
         RAD_ARCH_TRY(rad_buf_concurrent(b, m.a_h.q));
         RAD_ARCH_TRY(rad_buf_concurrent(b, m.a_h.s));
-        if (m.b_dfsrc) RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_dfsrc));
         m.b_pipe_cu = decl_b(b, nm.f("pipe_cu"), RAD_I32, {4});
         RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_pipe_cu));
     }
@@ -1201,7 +1200,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
  * block's all-reduce at `overlap` 1 (a narrow launch that leaves the CUs to the compute beside it;
  * the fused all-reduce and norm would hold its blocks on the card while it waits on the link and
  * slow the GEMM beside it by a third), then the next block's plain norm, and after a feed-forward
- * that keeps its add, the add, the drafter taps and the final norm. Measured on Qwen3.8-27B at two
+ * that keeps its add, the add and the final norm (the drafter taps go on the first lane, pipe_taps). Measured on Qwen3.8-27B at two
  * R9700s: a 41k-token prompt 9.0 -> 8.4 s.
  *
  *   mixer     the delta net and the dense attention run whole a piece at a time and hand the
@@ -1219,7 +1218,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
  * The second lane's requirements (Ctx::lane1_) hold: every collective of the step is on it, the
  * embedding's included; none carries a device-wide arrival counter (the all-reduce's sequence
  * counters order its own launches, which one lane keeps in order); and the buffers it touches left
- * the sharing pool at declare. */
+ * the sharing pool at declare -- not the drafter taps, which it no longer touches (pipe_taps). */
 
 template <class F>
 static void pipe_on1(RadCtx* c, const F& issue) {
@@ -1247,12 +1246,6 @@ static void pipe_boundary(RadCtx* c, const Model& m, int64_t T, int64_t s, int64
     if (l.mlp.op_add)
         RAD_ISSUE_N(c, l.mlp.op_add, n, brow_slice(m.b_x, r0, n, g.n_embd),
                     brow_slice(m.a_h.x, r0, n, g.n_embd), brow_slice(m.b_x, r0, n, g.n_embd));
-    for (int t = 0; t < m.n_taps; ++t) {
-        if (m.tap_layer[t] != (int)li) continue;
-        RAD_ISSUE_N(c, m.op_tap, n, brow_slice(m.b_x, r0, n, g.n_embd),
-                    bcol_at(m.b_dfsrc, r0, (int64_t)m.n_taps * g.n_embd, (int64_t)t * g.n_embd,
-                            g.n_embd, n));
-    }
     if (li + 1 < (int64_t)m.layers.size()) {
         const Layer& nx = m.layers[(size_t)li + 1];
         (nx.full ? nx.attn.nq_h : nx.gdn.nq_h).step_plain(c, T, r0, n);
@@ -1262,8 +1255,23 @@ static void pipe_boundary(RadCtx* c, const Model& m, int64_t T, int64_t s, int64
     }
 }
 
+/* Layer `li`'s drafter taps of rows [r0, r0 + n), on lane 0. Issued once lane 0 has waited for that
+ * piece's feed-forward boundary (its add is the last write to those rows of x before the next
+ * block's boundary, which lane 1 starts only behind lane 0's next issues), so the taps buffer is
+ * never touched from lane 1 and stays in the sharing pool: rad_buf_concurrent would hold its
+ * [max_tok, n_taps * n_embd] for the whole program. */
+static void pipe_taps(RadCtx* c, const Model& m, int64_t li, int64_t r0, int64_t n) {
+    for (int t = 0; t < m.n_taps; ++t) {
+        if (m.tap_layer[t] != (int)li) continue;
+        RAD_ISSUE_N(c, m.op_tap, n, brow_slice(m.b_x, r0, n, m.g.n_embd),
+                    bcol_at(m.b_dfsrc, r0, (int64_t)m.n_taps * m.g.n_embd, (int64_t)t * m.g.n_embd,
+                            m.g.n_embd, n));
+    }
+}
+
 /* A mixer's first piece is done (ArPieces): lane 0 takes the previous block's second boundary
- * before the second piece, and lane 1 this block's first behind it. */
+ * before the second piece (and the previous layer's second-piece taps behind it), and lane 1 this
+ * block's first behind it. */
 struct PipeHand {
     RadCtx*      c = nullptr;
     const Model* m = nullptr;
@@ -1272,6 +1280,10 @@ struct PipeHand {
 static void pipe_hand(void* u, int64_t r0, int64_t n) {
     const PipeHand& h = *(const PipeHand*)u;
     pipe_wait1(h.c);
+    if (h.s >= 2) {
+        const int64_t R = pipe_rows(h.T);
+        pipe_taps(h.c, *h.m, h.s / 2 - 1, R, h.T - R);
+    }
     pipe_on1(h.c, [&] { pipe_boundary(h.c, *h.m, h.T, h.s, r0, n); });
 }
 
@@ -1382,9 +1394,11 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         pipe_on1(c, [&] { pipe_boundary(c, m, T, 2 * li + 1, 0, R); });
         l.mlp.body(c, T, R, T - R);
         pipe_wait1(c);
+        pipe_taps(c, m, li, 0, R);
         pipe_on1(c, [&] { pipe_boundary(c, m, T, 2 * li + 1, R, T - R); });
     }
     pipe_wait1(c);
+    if (L > 0) pipe_taps(c, m, L - 1, R, T - R);
 
     if (batch->n_out > 0) {
         RAD_ISSUE_N(c, m.op_gather, batch->n_out,

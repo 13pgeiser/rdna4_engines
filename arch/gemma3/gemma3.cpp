@@ -1191,7 +1191,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* The pipelined prefill (step_pipelined) wherever a step can be wide enough, on an MXFP4 trunk
      * with fused junctions (decided below), at the rank counts RADIANCE_PREFILL_PIPELINE allows
      * (rad_prefill_pipe.h: two by default). Its second lane touches the stream, the branch
-     * output, the shared input pair, the taps and the bounds, so those leave the sharing pool
+     * output, the shared input pair and the bounds, so those leave the sharing pool (the drafter
+     * taps are copied on the first lane: pipe_taps)
      * (Ctx::lane1_); the pair is one for every block so that this costs one pair, not one a
      * linear. */
     {
@@ -1303,7 +1304,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_h));
         RAD_ARCH_TRY(rad_buf_concurrent(b, m.pipe_in.q8));
         RAD_ARCH_TRY(rad_buf_concurrent(b, m.pipe_in.s8));
-        if (m.b_dfsrc) RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_dfsrc));
         m.b_pipe_cu = decl_b(b, nm.f("pipe_cu"), RAD_I32, {4});
         RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_pipe_cu));
         m.b_pipe_used = decl_b(b, nm.f("pipe_used"), RAD_I32, {2});
@@ -1388,8 +1388,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
  * and next norm, then the next block). A step of one prefill sequence of at least kPipeMinRows tokens
  * is cut into two pieces of about half; every block runs a piece at a time on the first lane, and
  * the work between two blocks -- the block's all-reduce at `overlap` 1, its post-norm and the fp8
- * junction, and after the last block its add, plus the drafter taps and the final norm -- runs a
- * piece at a time on the second. The ops are the serial step's at a narrower width, so a pipelined
+ * junction, and after the last block its add and the final norm -- runs a
+ * piece at a time on the second; the drafter taps run on the first (pipe_taps). The ops are the serial step's at a narrower width, so a pipelined
  * step is bit for bit the serial one where a chunk's rows do not depend on its width.
  *
  * The second lane's requirements (Ctx::lane1_) hold as in qwen35_fp8: every collective of the step
@@ -1422,27 +1422,41 @@ static void pipe_boundary(RadCtx* c, const Model& m, int64_t s, int64_t r0, int6
     l.mlp.post_rows(c, r0, n);
     if (!last) l.jf_ma.step_rows(c, r0, n);
     else       l.mlp.add_rows(c, r0, n);
-    for (int t = 0; t < m.n_taps; ++t) {
-        if (m.tap_layer[t] != (int)li) continue;
-        RAD_ISSUE_N(c, m.op_tap, n, brow_slice(m.b_x, r0, n, g.n_embd),
-                    bcol_at(m.b_dfsrc, r0, (int64_t)m.n_taps * g.n_embd, (int64_t)t * g.n_embd,
-                            g.n_embd, n));
-    }
     if (last)
         RAD_ISSUE_N(c, m.op_final, n, brow_slice(m.b_x, r0, n, g.n_embd), RAD_W(m.w_out),
                     brow_slice(m.b_h, r0, n, g.n_embd));
 }
 
+/* Layer `li`'s drafter taps of rows [r0, r0 + n), on lane 0. Issued once lane 0 has waited for that
+ * piece's feed-forward boundary (its junction is the last write to those rows of x before the next
+ * block's boundary, which lane 1 starts only behind lane 0's next issues), so the taps buffer is
+ * never touched from lane 1 and stays in the sharing pool: rad_buf_concurrent would hold its
+ * [max_tok, n_taps * n_embd] for the whole program. */
+static void pipe_taps(RadCtx* c, const Model& m, int64_t li, int64_t r0, int64_t n) {
+    for (int t = 0; t < m.n_taps; ++t) {
+        if (m.tap_layer[t] != (int)li) continue;
+        RAD_ISSUE_N(c, m.op_tap, n, brow_slice(m.b_x, r0, n, m.g.n_embd),
+                    bcol_at(m.b_dfsrc, r0, (int64_t)m.n_taps * m.g.n_embd, (int64_t)t * m.g.n_embd,
+                            m.g.n_embd, n));
+    }
+}
+
 /* An attention block's first piece is done (ArPieces): lane 0 takes the previous block's second
- * boundary before the second piece, and lane 1 this block's first behind it. */
+ * boundary before the second piece (and the previous layer's second-piece taps behind it), and
+ * lane 1 this block's first behind it. */
 struct PipeHand {
     RadCtx*      c = nullptr;
     const Model* m = nullptr;
     int64_t      s = 0;
+    int64_t      T = 0;
 };
 static void pipe_hand(void* u, int64_t r0, int64_t n) {
     const PipeHand& h = *(const PipeHand*)u;
     pipe_wait1(h.c);
+    if (h.s >= 2) {
+        const int64_t R = pipe_rows(h.T);
+        pipe_taps(h.c, *h.m, h.s / 2 - 1, R, h.T - R);
+    }
     pipe_on1(h.c, [&] { pipe_boundary(h.c, *h.m, h.s, r0, n); });
 }
 
@@ -1524,7 +1538,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     pipe_wait1(c);
     for (int64_t li = 0; li < L; ++li) {
         const Layer& l = m.layers[(size_t)li];
-        PipeHand h{c, &m, 2 * li};
+        PipeHand h{c, &m, 2 * li, T};
         ArPieces pc{};
         pc.rows = R; pc.done = pipe_hand; pc.u = &h; pc.cu = pcu; pc.in_ready = true;
         const int32_t* used0 = (const int32_t*)rad_buf_ptr(c, m.b_pipe_used) + (l.global ? 1 : 0);
@@ -1540,9 +1554,11 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         pipe_on1(c, [&] { pipe_boundary(c, m, 2 * li + 1, 0, R); });
         l.mlp.body_rows(c, R, T - R);
         pipe_wait1(c);
+        pipe_taps(c, m, li, 0, R);
         pipe_on1(c, [&] { pipe_boundary(c, m, 2 * li + 1, R, T - R); });
     }
     pipe_wait1(c);
+    if (L > 0) pipe_taps(c, m, L - 1, R, T - R);
     if (batch->n_out > 0) {
         RAD_ISSUE_N(c, m.op_gather, batch->n_out, brows(m.b_h, T),
                     praw(batch->out_ids, RAD_I32, batch->n_out), brows(m.b_hout, batch->n_out));
