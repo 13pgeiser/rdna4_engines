@@ -9859,13 +9859,13 @@ mod expert_iu4_load_tests {
     #[test]
     fn wide_reservation_logs_are_exact() {
         assert_eq!(
-            expert_iu4_wide_reserved_info(0, 4096),
-            "  qwen35 symmetric IU4 MoE: INFO: device 0: scratch reserved for 4096-row widened \
+            expert_iu4_wide_reserved_info(0, 8192),
+            "  qwen35 symmetric IU4 MoE: INFO: device 0: scratch reserved for 8192-row widened \
              resident MoE prefill"
         );
         assert_eq!(
-            expert_iu4_wide_fallback_warning(1, 4096, 512, "out of memory"),
-            "  qwen35 symmetric IU4 MoE: WARNING: device 1: widened 4096-row scratch reservation \
+            expert_iu4_wide_fallback_warning(1, 8192, 512, "out of memory"),
+            "  qwen35 symmetric IU4 MoE: WARNING: device 1: widened 8192-row scratch reservation \
              failed (out of memory); falling back to the incumbent 512-row prefill ceiling"
         );
     }
@@ -9887,12 +9887,12 @@ mod expert_iu4_load_tests {
     }
 
     #[test]
-    fn reserve_rows_default_widened_reserves_4096_only() {
+    fn reserve_rows_default_widened_reserves_8192_only() {
         let mut calls = Vec::new();
         let got =
-            expert_iu4_reserve_rows(Some(4096), 512, simulated_reserve(&[], &mut calls)).unwrap();
-        assert_eq!((got.rows, got.wide_failure), (4096, None));
-        assert_eq!(calls, [4096]);
+            expert_iu4_reserve_rows(Some(8192), 512, simulated_reserve(&[], &mut calls)).unwrap();
+        assert_eq!((got.rows, got.wide_failure), (8192, None));
+        assert_eq!(calls, [8192]);
     }
 
     #[test]
@@ -9906,19 +9906,19 @@ mod expert_iu4_load_tests {
         // A target not above the incumbent is never reserved.
         let mut calls = Vec::new();
         let got =
-            expert_iu4_reserve_rows(Some(4096), 8192, simulated_reserve(&[], &mut calls)).unwrap();
-        assert_eq!(got.rows, 8192);
-        assert_eq!(calls, [8192]);
+            expert_iu4_reserve_rows(Some(4096), 16384, simulated_reserve(&[], &mut calls)).unwrap();
+        assert_eq!(got.rows, 16384);
+        assert_eq!(calls, [16384]);
     }
 
     #[test]
     fn reserve_rows_failed_wide_falls_back_to_incumbent_loudly() {
         let mut calls = Vec::new();
-        let got = expert_iu4_reserve_rows(Some(4096), 512, simulated_reserve(&[4096], &mut calls))
+        let got = expert_iu4_reserve_rows(Some(8192), 512, simulated_reserve(&[8192], &mut calls))
             .unwrap();
         assert_eq!(got.rows, 512);
-        assert_eq!(got.wide_failure, Some((4096, "alloc 4096".to_owned())));
-        assert_eq!(calls, [4096, 512]);
+        assert_eq!(got.wide_failure, Some((8192, "alloc 8192".to_owned())));
+        assert_eq!(calls, [8192, 512]);
     }
 
     #[test]
@@ -9931,10 +9931,10 @@ mod expert_iu4_load_tests {
         // A failed wide attempt does not mask the incumbent's own error.
         let mut calls = Vec::new();
         let err =
-            expert_iu4_reserve_rows(Some(4096), 512, simulated_reserve(&[4096, 512], &mut calls))
+            expert_iu4_reserve_rows(Some(8192), 512, simulated_reserve(&[8192, 512], &mut calls))
                 .err()
                 .unwrap();
         assert_eq!(err, "alloc 512");
-        assert_eq!(calls, [4096, 512]);
+        assert_eq!(calls, [8192, 512]);
     }
 }

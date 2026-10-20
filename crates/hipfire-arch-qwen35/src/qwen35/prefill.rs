@@ -2246,8 +2246,9 @@ fn ordinary_dn_state_admitted(
 /// The one widened rung of the resident Qwen35 MoE ordinary route. Admission
 /// is binary: this rung when [`resident_moe_rung_fits`] holds, otherwise the
 /// incumbent `prefill_max_batch_for_model` ceiling — never an intermediate
-/// 1024/2048 rung, because 4096 is the only wider GEMM width validated for the
-/// grouped MoE producers.
+/// 1024/2048/4096 rung, because 8192 is the wider GEMM width validated for the
+/// grouped MoE producers (4096 was the prior rung; the 8192 producer, scratch,
+/// PBS, projection, Q16 and headroom proofs moved together).
 ///
 /// Origin of the incumbent 512: `PREFILL_DEFAULT_BATCH_GFX1100` is the
 /// gfx1100-measured MQ4V2 gate-up sweet spot (384 on exact gfx1201, 512 under
@@ -2256,9 +2257,9 @@ fn ordinary_dn_state_admitted(
 /// generic widened-chunk value; the MoE layer bodies (`batch_chunk_delta_net_moe`,
 /// `batch_chunk_full_attn_moe*`) do NOT take a commit stride and run the
 /// incumbent whole-chunk GDN launch and FA attend, exactly as an explicit
-/// `HIPFIRE_PREFILL_MAX_BATCH=4096` does. The seam is therefore not claimed
+/// `HIPFIRE_PREFILL_MAX_BATCH=8192` does. The seam is therefore not claimed
 /// for MoE bodies.
-pub(crate) const RESIDENT_MOE_CHUNK_ROWS: usize = 4096;
+pub(crate) const RESIDENT_MOE_CHUNK_ROWS: usize = 8192;
 ///
 /// Outcome of resolving the user's chunk request for the resident-MoE route.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2751,7 +2752,7 @@ struct WrapperPbsInputs<'a> {
     /// earlier request).
     existing_virtual: Option<(usize, bool)>,
     /// The DEFAULT resident-MoE request (no explicit knob) is statically
-    /// eligible and its 4096 rung fits memory with no caller PBS present.
+    /// eligible and its 8192 rung fits memory with no caller PBS present.
     default_moe_fits: bool,
     /// The call's own caller/capture facts ([`OrdinaryCallFacts`], the same
     /// record the inner entry builds, with no caller PBS) leave the call a
@@ -2760,11 +2761,11 @@ struct WrapperPbsInputs<'a> {
     call_eligible: bool,
 }
 ///
-/// Wrapper PBS plan. Beta's explicit `HIPFIRE_PREFILL_MAX_BATCH=4096` with
+/// Wrapper PBS plan. Beta's explicit `HIPFIRE_PREFILL_MAX_BATCH=8192` with
 /// `HIPFIRE_PREFILL_REUSE_PBS=1` runs on an implicit cache sized by
-/// [`implicit_reuse_pbs_plan`]`(arch, Some(4096), ..)` with the ceiling 4096.
+/// [`implicit_reuse_pbs_plan`]`(arch, Some(8192), ..)` with the ceiling 8192.
 /// An eligible, memory-admitted DEFAULT request is exactly that "virtual
-/// explicit 4096": same owner rows and tape flag (the existing explicit sizing
+/// explicit 8192": same owner rows and tape flag (the existing explicit sizing
 /// function and clamps), same ceiling, so every executed parameter is identical.
 /// A default that does not fit keeps the incumbent implicit cache and ceiling;
 /// an explicit manual knob is never rewritten (it never reports
@@ -2830,7 +2831,7 @@ fn pbs_has_tape(p: &PrefillBatchScratch) -> bool {
 /// - the ordinary batched (PBS) path actually runs for ITS OWN row count `n`
 ///   (`batched_eligible(n)`: the verify-decouple window, the `prefill_batched`
 ///   switch, the two-token minimum, DeltaNet layers and layer admission; a
-///   one-token call falls to the per-token AR loop, so a 4096 owner would be
+///   one-token call falls to the per-token AR loop, so a 8192 owner would be
 ///   allocated for nothing), and
 /// - the widened chunks (every one at least the 512-row commit seam) are
 ///   batched-eligible too (`batched_eligible(WIDENED_COMMIT_ROWS)`, the probe
@@ -3339,7 +3340,7 @@ impl ResidentMoeOwner {
 /// Memory admission of [`RESIDENT_MOE_CHUNK_ROWS`]: batched flash attention
 /// must be selectable for the KV tier, the device free-byte query must
 /// succeed (a failed query keeps the incumbent), and the rung must fit. The
-/// charged PBS is the larger of the tape-free 4096-row rung and `owner`'s own
+/// charged PBS is the larger of the tape-free 8192-row rung and `owner`'s own
 /// projected bytes. `cached` is the retained widened owner `(rows, lean)` the
 /// grow-only route credits; `owner.credit_bytes` credits an existing owner.
 fn resident_moe_memory_admits(
@@ -3379,7 +3380,7 @@ fn resident_moe_memory_admits(
 }
 ///
 /// The DEFAULT resident-MoE request is eligible and its rung fits with
-/// `owner` as the PBS: the wrapper's "virtual explicit 4096" test. `mem` is
+/// `owner` as the PBS: the wrapper's "virtual explicit 8192" test. `mem` is
 /// read only once the static decision admits.
 fn resident_moe_default_fits(
     static_facts: &ResidentMoeStaticFacts,
@@ -4589,8 +4590,8 @@ pub fn forward_prefill_batch(
 ) -> HipResult<()> {
     // Wrapper PBS plan (`plan_wrapper_pbs`): the dense widened route drops the
     // implicit ≤512 cache; an eligible, memory-admitted DEFAULT resident-MoE
-    // request runs as a virtual explicit `HIPFIRE_PREFILL_MAX_BATCH=4096`
-    // (owner rows/tape from the explicit cache sizing, ceiling 4096); every
+    // request runs as a virtual explicit `HIPFIRE_PREFILL_MAX_BATCH=8192`
+    // (owner rows/tape from the explicit cache sizing, ceiling 8192); every
     // other call keeps the implicit cache. Capped/explicit-PBS callers never
     // bypass (see `forward_prefill_batch_capped` and the inner entry).
     let call = ordinary_call_facts(
@@ -5158,7 +5159,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
     // wider allocation or launch. The dense widened wrapper omits its
     // *implicit* ≤512 legacy cache above (`plan_wrapper_pbs`); an eligible,
     // memory-admitted DEFAULT resident-MoE request arrives here as a virtual
-    // explicit `HIPFIRE_PREFILL_MAX_BATCH=4096` (caller owner with the explicit
+    // explicit `HIPFIRE_PREFILL_MAX_BATCH=8192` (caller owner with the explicit
     // cache rows/tape and `max_batch_override`), and every other cache is a
     // caller owner that keeps legacy cadence. An explicit smaller caller PBS
     // always wins. Every parameter below comes from `plan_ordinary_prefill`,
@@ -12147,7 +12148,7 @@ fn batch_chunk_fa_attend(
         unreachable!("independent variant must carry active_mask");
     }
     // The A3B PM body accepts the whole resident-MoE chunk, including the
-    // widened 4096-row rung. Write all K/V rows once through the shared
+    // widened 8192-row rung. Write all K/V rows once through the shared
     // dispatch step before attending; future rows remain causally masked.
     // This must precede commit-stride segmentation and the multirow bypass.
     // The codec is the actual resident cache's ([`fa_pm_kv_codec`]: native
@@ -20710,11 +20711,12 @@ mod tests {
         // Explicit chunk_rows below the rung opts out; at/above it requests the rung.
         assert_eq!(resident_moe_request(None, Some(512)), Incumbent);
         assert_eq!(resident_moe_request(None, Some(2048)), Incumbent);
-        assert_eq!(resident_moe_request(None, Some(4095)), Incumbent);
-        assert_eq!(resident_moe_request(None, Some(4096)), default);
+        assert_eq!(resident_moe_request(None, Some(4096)), Incumbent);
+        assert_eq!(resident_moe_request(None, Some(8191)), Incumbent);
+        assert_eq!(resident_moe_request(None, Some(8192)), default);
         assert_eq!(
-            resident_moe_request(None, Some(8192)),
-            Widen { requested: 8192 }
+            resident_moe_request(None, Some(16384)),
+            Widen { requested: 16384 }
         );
     }
 
@@ -20992,8 +20994,8 @@ mod tests {
         );
         // Explicit max batch and a sub-rung chunk request opt out.
         for request in [
-            resident_moe_request(Some(4096), None),
-            resident_moe_request(None, Some(2048)),
+            resident_moe_request(Some(8192), None),
+            resident_moe_request(None, Some(4096)),
         ] {
             assert_eq!(
                 resident_moe_static_decision(&d53_static_facts(request, true, true)),
@@ -21014,10 +21016,10 @@ mod tests {
             down: qwen4_moe_down_i4_bytes(config.moe_intermediate_size, slots).unwrap(),
             gate: config.dim / 128 * rows * 72,
         };
-        // A3B (E256, top-8, H2048, I512) extents at 4096 rows.
+        // A3B (E256, top-8, H2048, I512) extents at 8192 rows.
         assert_eq!(
             (full.group, full.down, full.gate),
-            (394_240, 9_437_184, 4_718_592)
+            (787_456, 18_874_368, 9_437_184)
         );
         assert!(moe_sym_scratch_covers_rows(full, rows, &config));
         assert!(moe_sym_scratch_covers_rows(full, 512, &config));
@@ -21061,13 +21063,13 @@ mod tests {
     /// decision would admit them: one shared request resolver and decision.
     #[test]
     fn resident_moe_load_and_prefill_agree_on_the_widen_request() {
-        let explicit_max = [None, Some(512), Some(4096)];
-        let explicit_chunk = [None, Some(512), Some(2048), Some(4096), Some(8192)];
+        let explicit_max = [None, Some(512), Some(8192)];
+        let explicit_chunk = [None, Some(512), Some(2048), Some(4096), Some(8192), Some(16384)];
         for max in explicit_max {
             for chunk in explicit_chunk {
                 let request = resident_moe_request(max, chunk);
                 let widens = matches!(request, ResidentMoeRequest::Widen { .. });
-                assert_eq!(widens, max.is_none() && chunk.is_none_or(|c| c >= 4096));
+                assert_eq!(widens, max.is_none() && chunk.is_none_or(|c| c >= 8192));
                 let wide = resident_moe_static_decision(&d53_static_facts(request, false, true));
                 assert_eq!(wide, widens.then_some(RESIDENT_MOE_CHUNK_ROWS), "{max:?} {chunk:?}");
             }
@@ -21389,7 +21391,7 @@ mod tests {
             taped,
             0
         ));
-        // An owner smaller than the rung never lowers the 4096-row charge.
+        // An owner smaller than the rung never lowers the 8192-row charge.
         let small = ResidentMoeOwner {
             rows: WIDENED_COMMIT_ROWS,
             tape: false,
@@ -21511,21 +21513,21 @@ mod tests {
         };
         let bytes = |rows: usize| resident_moe_pbs_bytes(&moe, rows).unwrap();
         // No owner: the exact full-rung boundary.
-        assert_eq!(limit(None, 4096, need), RESIDENT_MOE_CHUNK_ROWS);
-        assert_eq!(limit(None, 4096, need - 1), incumbent);
+        assert_eq!(limit(None, 8192, need), RESIDENT_MOE_CHUNK_ROWS);
+        assert_eq!(limit(None, 8192, need - 1), incumbent);
         // Same-shape owner reused in place: positive credit, exact boundary.
-        let same = Some((4096, false));
+        let same = Some((8192, false));
         assert_eq!(
-            limit(same, 4096, need - bytes(4096)),
+            limit(same, 8192, need - bytes(8192)),
             RESIDENT_MOE_CHUNK_ROWS
         );
-        assert_eq!(limit(same, 4096, need - bytes(4096) - 1), incumbent);
-        // Short owner at 4096 needed rows must be replaced: growth rejects the
+        assert_eq!(limit(same, 8192, need - bytes(8192) - 1), incumbent);
+        // Short owner at 8192 needed rows must be replaced: growth rejects the
         // budget the speculative credit would admit, and charges the full rung.
         let short = Some((2048, false));
-        assert_eq!(limit(short, 4096, need - bytes(2048)), incumbent);
-        assert_eq!(limit(short, 4096, need), RESIDENT_MOE_CHUNK_ROWS);
-        assert_eq!(limit(short, 4096, need - 1), incumbent);
+        assert_eq!(limit(short, 8192, need - bytes(2048)), incumbent);
+        assert_eq!(limit(short, 8192, need), RESIDENT_MOE_CHUNK_ROWS);
+        assert_eq!(limit(short, 8192, need - 1), incumbent);
         // The same short owner is reused (and credited) when the call needs no
         // more rows than it holds; one row more is a replacement.
         assert_eq!(
@@ -22010,7 +22012,7 @@ mod tests {
     fn sc_static_facts(moe: &InstalledMoe, sc: &Sc) -> ResidentMoeStaticFacts {
         let caps =
             rdna_compute::arch_caps::ArchCaps::new(sc.arch, std::sync::Arc::new(sc.flags.clone()));
-        let explicit_max = sc.explicit.then_some(4096usize);
+        let explicit_max = sc.explicit.then_some(8192usize);
         let plan = DeltaNetStatePlan::new(&moe.config, sc.dn_quant, sc.dn_batch, sc.dn_ef);
         ResidentMoeStaticFacts {
             moe_config: moe.config.num_experts != 0,
@@ -22053,7 +22055,7 @@ mod tests {
     ) -> (WrapperPbsPlan, bool, bool) {
         let arch = sc.arch;
         let fp8 = fp8_chunk512_for_flags(arch, &sc.flags);
-        let explicit_max = sc.explicit.then_some(4096usize);
+        let explicit_max = sc.explicit.then_some(8192usize);
         // The implicit reuse cache as `Qwen35Scratch` allocates it for this
         // knob state, the virtual-explicit target, and the shared fit.
         let physical = sc
@@ -22137,7 +22139,7 @@ mod tests {
     fn run(moe: &InstalledMoe, sc: &Sc) -> Run {
         let arch = sc.arch;
         let fp8 = fp8_chunk512_for_flags(arch, &sc.flags);
-        let explicit_max = sc.explicit.then_some(4096usize);
+        let explicit_max = sc.explicit.then_some(8192usize);
         let request = resident_moe_request(explicit_max, explicit_max);
         let legacy_max_batch = legacy_prefill_max_batch(explicit_max, arch, fp8, false);
         assert!(
@@ -22289,14 +22291,14 @@ mod tests {
 
     /// Planner proof over the INSTALLED artifacts: both real HFQs go through the
     /// loader's expert binding; the production default and the beta explicit
-    /// `HIPFIRE_PREFILL_MAX_BATCH=4096` arms go through the SAME
+    /// `HIPFIRE_PREFILL_MAX_BATCH=8192` arms go through the SAME
     /// wrapper-cache / `plan_ordinary_prefill` / memory / chunk functions the
     /// production inner entry calls, with `HIPFIRE_PREFILL_REUSE_PBS` on and
     /// off, and every denying fact is flipped against the same decision. Absent
     /// artifacts skip loudly unless `HIPFIRE_REQUIRE_INSTALLED_A3B_HFQ` is set,
     /// which makes both mandatory.
     #[test]
-    fn resident_moe_installed_artifacts_admit_4096_and_log_it() {
+    fn resident_moe_installed_artifacts_admit_8192_and_log_it() {
         use hipfire_runtime::hfq::HfqFile;
         let models = std::env::var_os("HIPFIRE_MODELS_DIR")
             .map(std::path::PathBuf::from)
@@ -22347,7 +22349,7 @@ mod tests {
                     None
                 );
 
-                // --- reuse PBS off: default vs beta explicit 4096 -------------
+                // --- reuse PBS off: default vs beta explicit 8192 -------------
                 for n in [4096usize, 8192, 3855, 16384, 4097, 513, 100] {
                     let d = run(&moe, &baseline(&moe, arch, false, false, n));
                     let e = run(&moe, &baseline(&moe, arch, true, false, n));
@@ -22358,7 +22360,7 @@ mod tests {
                     assert_eq!(
                         resident_moe_static_decision(&e.facts),
                         None,
-                        "{name} {arch}: explicit 4096 keeps the incumbent static gate"
+                        "{name} {arch}: explicit 8192 keeps the incumbent static gate"
                     );
                     assert!(d.plan.wide && e.plan.wide, "{name} {arch} n={n}");
                     assert_eq!(d.plan.limit, RESIDENT_MOE_CHUNK_ROWS);
@@ -22370,29 +22372,29 @@ mod tests {
                     );
                     assert_eq!((d.owner, e.owner), (None, None));
                 }
-                let d4096 = run(&moe, &baseline(&moe, arch, false, false, 4096));
-                assert_eq!(d4096.plan.pbs_rows, 4096);
-                assert_eq!(d4096.chunks, vec![(4096, Some(WIDENED_COMMIT_ROWS))]);
+                let d8192 = run(&moe, &baseline(&moe, arch, false, false, 8192));
+                assert_eq!(d8192.plan.pbs_rows, 8192);
+                assert_eq!(d8192.chunks, vec![(8192, Some(WIDENED_COMMIT_ROWS))]);
                 assert_eq!(
-                    line(&d4096),
-                    "prefill_chunk: requested=4096 admitted=4096 commit_stride=512"
+                    line(&d8192),
+                    "prefill_chunk: requested=8192 admitted=8192 commit_stride=512"
                 );
                 eprintln!(
-                    "resident_moe production-planner proof: {name} {arch}: default==explicit4096 limit={} pbs_rows={} chunks(n=4096)={:?} line=\"{}\"",
-                    d4096.plan.limit,
-                    d4096.plan.pbs_rows,
-                    d4096.chunks,
-                    line(&d4096)
+                    "resident_moe production-planner proof: {name} {arch}: default==explicit8192 limit={} pbs_rows={} chunks(n=8192)={:?} line=\"{}\"",
+                    d8192.plan.limit,
+                    d8192.plan.pbs_rows,
+                    d8192.chunks,
+                    line(&d8192)
                 );
                 let guard = std::sync::atomic::AtomicUsize::new(0);
                 assert!(emit_prefill_chunk_receipt_guarded(
                     &guard,
-                    d4096.plan.receipt.requested,
-                    d4096.plan.receipt.admitted,
-                    d4096.plan.receipt.commit_stride,
+                    d8192.plan.receipt.requested,
+                    d8192.plan.receipt.admitted,
+                    d8192.plan.receipt.commit_stride,
                 ));
 
-                // --- reuse PBS on: default == beta explicit 4096, EXACTLY -------
+                // --- reuse PBS on: default == beta explicit 8192, EXACTLY -------
                 let flags0 = rdna_compute::FeatureFlags::from_active_config(arch);
                 let _ = &flags0;
                 let eff = |r: &Run| {
@@ -22559,7 +22561,7 @@ mod tests {
                         assert_eq!(ne.owner, Some(default_physical));
                     }
                     eprintln!(
-                        "resident_moe reuse-PBS proof: {name} {arch} fp8_chunk512={fp8_now}: default cache={default_physical:?} -> virtual-explicit owner={target:?} limit=4096 wide=false commit=none == beta explicit4096 (EXACT, fresh + existing owner); low-mem keeps incumbent"
+                        "resident_moe reuse-PBS proof: {name} {arch} fp8_chunk512={fp8_now}: default cache={default_physical:?} -> virtual-explicit owner={target:?} limit=8192 wide=false commit=none == beta explicit8192 (EXACT, fresh + existing owner); low-mem keeps incumbent"
                     );
                 }
                 let _ = &flags0;
@@ -22718,7 +22720,7 @@ mod tests {
                 assert_eq!(
                     fallback.plan.receipt.to_string(),
                     format!(
-                        "prefill_chunk: requested=4096 admitted={} commit_stride=none",
+                        "prefill_chunk: requested=8192 admitted={} commit_stride=none",
                         fallback.max_batch
                     ),
                     "{name} {arch}: memory fallback receipt"
@@ -22749,7 +22751,7 @@ mod tests {
                 // place (non-lean, rows >= the call's owned PBS rows). A smaller or
                 // lean owner is freed to the allocator pool (bucket-local, not
                 // guaranteed reclaimable by another size) and replaced, so the
-                // full 4096 PBS is charged: no speculative credit.
+                // full 8192 PBS is charged: no speculative credit.
                 let pbs_rows_bytes =
                     |rows: usize| resident_moe_pbs_bytes(&moe.config, rows).unwrap();
                 let with_cached = |n: usize, cached: Option<(usize, bool)>, free: usize| {
@@ -22760,7 +22762,7 @@ mod tests {
                     c
                 };
                 let short = pbs_rows_bytes(2048);
-                // Short owner (2048 < the 4096 rows an 8192-row call needs) is
+                // Short owner (2048 < the 8192 rows an 8192-row call needs) is
                 // replaced: the old speculative credit would admit this budget.
                 deny(
                     "short cached owner earns no credit",
@@ -22773,16 +22775,16 @@ mod tests {
                     "{name} {arch}: short cached owner, full rung charged exactly"
                 );
                 // Same-shape owner reused in place: positive credit, exact boundary.
-                let same = pbs_rows_bytes(4096);
+                let same = pbs_rows_bytes(8192);
                 assert!(
-                    run(&moe, &with_cached(8192, Some((4096, false)), need - same))
+                    run(&moe, &with_cached(8192, Some((8192, false)), need - same))
                         .plan
                         .wide,
                     "{name} {arch}: reused owner credit"
                 );
                 deny(
                     "reused owner credit boundary",
-                    &with_cached(8192, Some((4096, false)), need - same - 1),
+                    &with_cached(8192, Some((8192, false)), need - same - 1),
                 );
                 // A call needing only the owner's rows reuses a smaller owner.
                 assert!(
@@ -22893,10 +22895,10 @@ mod tests {
             ),
             (WrapperOwner::Physical, None, true, false)
         );
-        // Fitting default on gfx1100: the explicit-4096 owner (4096 rows, tape) from the
-        // existing explicit sizing function, ceiling 4096.
+        // Fitting default on gfx1100: the explicit-8192 owner (8192 rows, tape) from the
+        // existing explicit sizing function, ceiling 8192.
         let target = implicit_reuse_pbs_plan("gfx1100", Some(RESIDENT_MOE_CHUNK_ROWS), false);
-        assert_eq!(target, (4096, true));
+        assert_eq!(target, (8192, true));
         let p = plan_wrapper_pbs(&inputs(
             "gfx1100",
             false,
@@ -22914,10 +22916,10 @@ mod tests {
             ),
             (
                 WrapperOwner::Virtual {
-                    rows: 4096,
+                    rows: 8192,
                     tape: true
                 },
-                Some(4096),
+                Some(8192),
                 false,
                 true
             )
@@ -22990,7 +22992,7 @@ mod tests {
         assert_eq!(resolve_ordinary_max_batch(512, Some(4096), Some(256)), 256);
         assert_eq!(resolve_ordinary_max_batch(512, Some(4096), None), 4096);
         assert_eq!(resolve_ordinary_max_batch(384, None, None), 384);
-        // gfx1201 with the FP8 path: the implicit cache already is the explicit-4096 shape.
+        // gfx1201 with the FP8 path: the implicit cache already is the explicit-8192 shape.
         let p = plan_wrapper_pbs(&inputs(
             "gfx1201",
             true,
@@ -23001,7 +23003,7 @@ mod tests {
         ));
         assert_eq!(
             (p.owner, p.max_batch_override, p.alloc_virtual),
-            (WrapperOwner::Physical, Some(4096), false)
+            (WrapperOwner::Physical, Some(8192), false)
         );
         // gfx1201 without it: 384-row cache -> the 512-row tape-free explicit owner.
         let p = plan_wrapper_pbs(&inputs(
@@ -23019,7 +23021,7 @@ mod tests {
                     rows: 512,
                     tape: false
                 },
-                Some(4096),
+                Some(8192),
                 true
             )
         );
@@ -23048,13 +23050,13 @@ mod tests {
             (384, false)
         );
         assert_eq!(
-            implicit_reuse_pbs_plan("gfx1201", Some(4096), false),
+            implicit_reuse_pbs_plan("gfx1201", Some(8192), false),
             (512, false)
         );
         assert_eq!(implicit_reuse_pbs_plan("gfx1100", None, false), (512, true));
         assert_eq!(
-            implicit_reuse_pbs_plan("gfx1100", Some(4096), false),
-            (4096, true)
+            implicit_reuse_pbs_plan("gfx1100", Some(8192), false),
+            (8192, true)
         );
         assert_eq!(implicit_reuse_pbs_plan("gfx1151", None, false), (512, true));
         // State gate over the allocator's own scalar plan.
@@ -23385,7 +23387,7 @@ mod tests {
     #[test]
     fn wrapper_virtual_credit_is_same_target_only() {
         let moe = resident_moe_test_config();
-        let target = (4096usize, true);
+        let target = (8192usize, true);
         let bytes = resident_moe_owner_bytes(&moe, target.0, target.1).unwrap();
         let physical = Some((512usize, true));
         assert_eq!(
@@ -23396,7 +23398,7 @@ mod tests {
             wrapper_virtual_credit_bytes(&moe, physical, None, target),
             0
         );
-        for stale in [(1024usize, true), (4096, false), (8192, true), (512, false)] {
+        for stale in [(1024usize, true), (4096, false), (8192, false), (512, false)] {
             assert_eq!(
                 wrapper_virtual_credit_bytes(&moe, physical, Some(stale), target),
                 0,
@@ -23419,7 +23421,7 @@ mod tests {
             call_eligible: true,
         });
         assert!(!p.free_virtual && !p.alloc_virtual);
-        for stale in [(1024usize, true), (4096, false)] {
+        for stale in [(1024usize, true), (4096, false), (8192, true)] {
             let p = plan_wrapper_pbs(&WrapperPbsInputs {
                 arch: "gfx1100",
                 fp8_chunk512: false,
@@ -23435,7 +23437,7 @@ mod tests {
 
     /// Wrapper actual-N proof over `moe` through the SHARED production
     /// wrapper decision ([`OrdinaryWrapperGate`], [`wrapper_run`] /
-    /// [`run`]): valid positive n equals the explicit 4096 parameters; n = 1
+    /// [`run`]): valid positive n equals the explicit 8192 parameters; n = 1
     /// and the config-off / verify-decouple small windows (actual n and the
     /// 512 seam disagree) keep the original incumbent resource plan with no
     /// override, KV mapping, memory query or allocation.
@@ -23464,7 +23466,7 @@ mod tests {
                 r.plan.receipt.to_string(),
             )
         };
-        // Valid positive n, reuse off and on: the default equals the explicit 4096.
+        // Valid positive n, reuse off and on: the default equals the explicit 8192.
         for reuse in [false, true] {
             for n in [2usize, 16, 33, 100] {
                 let d = run(moe, &base(false, reuse, n));
@@ -23478,7 +23480,7 @@ mod tests {
                 assert_eq!(
                     eff(&d),
                     eff(&e),
-                    "{name} {arch} reuse={reuse} n={n}: default vs explicit 4096"
+                    "{name} {arch} reuse={reuse} n={n}: default vs explicit 8192"
                 );
                 assert_eq!(
                     d.maps_kv, reuse,

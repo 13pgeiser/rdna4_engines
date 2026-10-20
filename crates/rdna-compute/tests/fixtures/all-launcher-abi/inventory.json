@@ -315,7 +315,7 @@
     "crates/rdna-compute/src/slab_moe.rs::slab_k1_wide_capable": "predicate comparing a SlabK1's symbol table with MQ_I4_MOE_GEMV_SYMBOLS; names only, never issues a launch",
     "crates/rdna-compute/src/gemm.rs::slab_k2_raw": "ungated K2 inventory selector keyed by (arch, slab codec) returning (module name, [gate/up, down] symbol names) from slab_k2_metadata and the QWEN4_MOE_SYM_PM_*/QWEN4_MOE_SYM_W3_* name constants; names only, it has no launch, ensure or compile call and its only caller is expert_capabilities::k2_raw, which builds a RawKernel name pair for the admission matrix",
     "crates/rdna-compute/src/gemm.rs::qwen4_moe_sym_gemm_symbols_wide": "reporting-only twin of qwen4_moe_sym_gemm_symbols: returns the canonical native pair except the F2 widened resident NT8 gate/up entry; names only, never launches (launchers call qwen4_moe_sym_gemm)",
-    "crates/rdna-compute/src/slab_moe.rs::slab_k1_pick": "pure module/symbol/geometry selector for K1/Cn slab launches; names only, never launches (callers launch the picked entry)"
+    "crates/rdna-compute/src/gemm.rs::qwen4_moe_sym_gemm_symbols": "reporting-only twin target of qwen4_moe_sym_gemm_symbols_wide: returns the canonical native pair over the descriptor entries; names only, never launches (launchers call qwen4_moe_sym_gemm)"
   },
   "forwarders": {
     "crates/rdna-compute/src/gemm.rs::gemm_mq4g256v2_moe_grouped_top10_bf16out": {
