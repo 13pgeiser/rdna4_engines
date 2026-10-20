@@ -924,6 +924,15 @@ fn fa_ragged_packet_split(
         None
     }
 }
+/// Native H16 true-prefill row/context eligibility: general 2..=32768-row
+/// tails (AR1/single-row decode stays excluded), whole context 2..=262144
+/// ending at the chunk, ordinary widened or unstrided commits only.
+fn fa_a3b_native_prefill_rows(n: usize, commit_stride: Option<usize>, max_ctx_len: usize) -> bool {
+    (2..=32768).contains(&n)
+        && (2..=262_144).contains(&max_ctx_len)
+        && n <= max_ctx_len
+        && (commit_stride.is_none() || commit_stride == Some(WIDENED_COMMIT_ROWS))
+}
 /// gfx1201 FA out-proj producer: fuse the still-standalone
 /// `sigmoid_mul_f32` into the AWQ rotate+IU4 sidecar. This is deliberately
 /// AWQ-only: the arm of record has AWQ sidecars, while every failed predicate
@@ -12216,15 +12225,20 @@ fn batch_chunk_fa_attend(
         // legacy runs in one launch. Every row keeps its absolute position;
         // pre-writing later K/V rows is unobservable under the causal mask,
         // while x restarts per run so each workgroup sees the same query set
-        // and max/min bounds as the former per-step launch. Only whole-run
-        // chunks qualify; an odd tail takes the per-segment loop below.
+        // and max/min bounds as the former per-step launch. Whole-run chunks
+        // qualify; native H16 true-prefill general tails take the same
+        // whole-batch Raw route above the loop, while other odd tails keep
+        // the per-segment loop below.
         let packet_runs = gpu.arch == "gfx1201"
             && (gpu.flags.gfx12_fa_packet || gpu.flags.attn_qresident)
             && kv_cache.quant_fp8
             && fa_packet_head_geometry(config.n_heads, config.n_kv_heads, gfx12_fa_prep_fp8q)
             && config.head_dim == 256
             && stride == WIDENED_COMMIT_ROWS
-            && n % WIDENED_COMMIT_ROWS == 0
+            && (n % WIDENED_COMMIT_ROWS == 0
+                || (gfx12_fa_prep_fp8q
+                    && (config.n_heads, config.n_kv_heads) == (16, 2)
+                    && fa_a3b_native_prefill_rows(n, Some(stride), max_ctx_len)))
             && n <= 32768
             && max_ctx_len <= 262_144
             && tree_verify.is_none();
@@ -12786,6 +12800,8 @@ fn gfx12_fa_prep_fp8q_admitted(
     fusion: DflashFusionCtx,
     commit_stride: Option<usize>,
 ) -> bool {
+    let native_a3b = (config.n_heads, config.n_kv_heads) == (16, 2)
+        && fa_a3b_native_prefill_rows(n, commit_stride, max_ctx_len);
     if !gfx12_fa_prep_geometry_admitted(gpu, config, fusion, n)
         || gpu.fp8_verify_scope
         || !gpu.flags.gfx12_fa_prep_fp8q
@@ -12794,10 +12810,11 @@ fn gfx12_fa_prep_fp8q_admitted(
         || multirow
         || batch_semantics.is_independent()
         || !kv_cache.quant_fp8
-        || !(64..=32768).contains(&n)
-        || !(64..=262_144).contains(&max_ctx_len)
+        || !(native_a3b || (64..=32768).contains(&n))
+        || !(native_a3b || (64..=262_144).contains(&max_ctx_len))
         || tree_verify.is_some()
-        || !(fa_fp8q_incumbent_shape(n, commit_stride)
+        || !(native_a3b
+            || fa_fp8q_incumbent_shape(n, commit_stride)
             || (fa_ragged_packet_enabled()
                 && fa_ragged_packet_split(
                     n,
@@ -25144,5 +25161,44 @@ mod tests {
             fa_ragged_packet_split(8192 + 64, Some(WIDENED_COMMIT_ROWS), 4096, 12_352, 16_384,),
             Some((8192, 64)),
         );
+    }
+
+    #[test]
+    fn native_fp8q_a3b_tiny_tail_rows_preserve_decode_and_legacy() {
+        // Legacy dense helpers stay byte-identical: 522 is neither incumbent
+        // nor ragged (10-row tail below the 64-row floor).
+        assert!(!fa_fp8q_incumbent_shape(522, None));
+        assert!(!fa_fp8q_incumbent_shape(522, Some(WIDENED_COMMIT_ROWS)));
+        assert_eq!(
+            fa_ragged_packet_split(522, Some(WIDENED_COMMIT_ROWS), 0, 522, 16_384),
+            None
+        );
+        for n in [2, 7, 8, 16, 17, 63, 64, 511, 512, 513, 522, 1023, 32768] {
+            assert!(
+                fa_a3b_native_prefill_rows(n, None, n),
+                "unstrided native tail {n}"
+            );
+            assert!(
+                fa_a3b_native_prefill_rows(n, Some(WIDENED_COMMIT_ROWS), n),
+                "strided native tail {n}"
+            );
+        }
+        for bad in [0, 1, 32769, usize::MAX] {
+            assert!(!fa_a3b_native_prefill_rows(bad, None, bad.max(2)));
+            assert!(!fa_a3b_native_prefill_rows(
+                bad,
+                Some(WIDENED_COMMIT_ROWS),
+                262_144
+            ));
+        }
+        assert!(!fa_a3b_native_prefill_rows(7, None, 1));
+        assert!(!fa_a3b_native_prefill_rows(7, None, 262_145));
+        assert!(!fa_a3b_native_prefill_rows(7, Some(256), 7));
+        assert!(!fa_a3b_native_prefill_rows(64, None, 63));
+        assert!(!fa_a3b_native_prefill_rows(
+            32768,
+            Some(WIDENED_COMMIT_ROWS),
+            262_145
+        ));
     }
 }
