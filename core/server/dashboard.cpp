@@ -1588,7 +1588,7 @@ function acceptTriple(c, showNow) {
  * The counters go backwards when the engine restarts; that poll resets the window rather than
  * reporting a negative draft. */
 const accPool = {};          /* per concurrency: ring of {dr, da} for the pooled tile window */
-let accPrev = null, accUp = -1, accRestart = false;
+let accPrev = null, accUp = -1;
 function accWindow(s) {
   let reach = 0, hit = 0;
   for (const p of (s.draft_positions || [])) { reach += p.reached || 0; hit += p.accepted || 0; }
@@ -1596,15 +1596,15 @@ function accWindow(s) {
    * the page was watching. uptime_s going backwards catches the one it missed: a backgrounded
    * tab whose accPrev froze while a new process drafted past the old process's lifetime total,
    * where the delta is positive and the first guard never fires. Either clears every pooled
-   * ring -- a pre-restart pair must not pool with a post-restart one -- and asks update() to
-   * dash the headline, so a dead process's ratio never masquerades as the new one's. */
+   * ring -- a pre-restart pair must not pool with a post-restart one -- and yields no delta,
+   * so the headline reads the idle 0 rather than a dead process's ratio. */
   const up = s.uptime_s;
   const restart = accPrev !== null && (reach < accPrev.r || hit < accPrev.a ||
                                        (typeof up === "number" && up < accUp));
   if (typeof up === "number") accUp = up;
   if (accPrev === null || restart) {
     accPrev = { r: reach, a: hit };
-    if (restart) { for (const k in accPool) delete accPool[k]; accRestart = true; }
+    if (restart) for (const k in accPool) delete accPool[k];
     return null;
   }
   const dr = reach - accPrev.r, da = hit - accPrev.a;
@@ -1921,14 +1921,20 @@ function update(s, dt) {
    * mixed load the answer is the mean of two populations. `step_ns_decode / steps_decode` is
    * neither -- it is what a decode step cost.
    *
-   * A window with no decode steps in it holds the last reading rather than blanking, because a
-   * gauge that flickers to a dash every time the engine pauses is a gauge nobody reads. */
+   * A window with no decode steps in it reads 0, not the last reading (operator ruling
+   * 2026-10-20, second pass): every other live figure on this page shows 0 when the lane is idle
+   * -- tps() renders 0 as "0" and the engine publishes 0 rates -- so 0 IS the idle signal here,
+   * and the dash stays reserved for a quantity that has no value at all. A held value was the
+   * original sin (a stale number wearing a current name); a dash was an over-correction that
+   * broke the convention. The floor and the engine's recent window below are the engine's own
+   * figures and stay put. */
   const dSteps = prev ? s.steps_decode - prev.steps_decode : 0;
   const stepMs = dSteps > 0 ? (s.step_ns_decode - prev.step_ns_decode) / 1e6 / dSteps : null;
   if (stepMs != null) lastStepMs = stepMs;
-  const st = stepTime(lastStepMs);
+  const liveStepMs = stepMs === null ? 0 : stepMs;   /* no steps in the window -> 0, the idle figure */
+  const st = stepTime(liveStepMs);
   M.step.u.textContent = st.u;
-  setMetric("step",    lastStepMs,    st.n);
+  setMetric("step",    liveStepMs,    st.n);
 
   /* Single-stream steps only: the floor is a single-sequence window, and a batched step read
    * against it would report a batch arriving as a slowdown. */
@@ -1995,7 +2001,6 @@ function update(s, dt) {
       : "";
   const aw = accWindow(s);
   const awR = aw ? aw.ratio : null;
-  const restarted = accRestart; accRestart = false;
   if (awR != null) noteSample("accept", s.running > 0 ? s.running : lastActiveC, awR, null, false);
   /* POOLED ACCEPTANCE WINDOW (2026-10-20, math audit before the production roll).
    * triple()'s `recent` averages the per-poll RATIOS; polls carry unequal draft counts, so a
@@ -2013,16 +2018,17 @@ function update(s, dt) {
    * it one point against a 33,000-draft denominator, and it froze outright the moment the lane
    * went quiet. Every other tile's big number is the current value, and feeding the cumulative one
    * here also fed the sparkline a quantity that is flat by construction.
-   * Polls with no new drafts push NOTHING and the headline freezes with them: acceptance is
-   * UNDEFINED when nothing was drafted, so neither 0 (reads as failure) nor the last value (reads
-   * as stable) is the truth. A server with no draft head shows the dash -- there is no such figure
-   * to show. The lifetime ratio stays on /stats and /metrics; what the tile answers is "what is it
-   * accepting now".
+   * Polls with no new drafts read 0 (operator ruling 2026-10-20, second pass): the page's
+   * convention is that a live figure shows 0 when the lane is doing nothing, and the dash is for
+   * quantities with no value at all. The original freeze was the real defect -- a held value
+   * reads as a live measurement of a lane that drafted nothing. The lifetime ratio stays on
+   * /stats and /metrics; what the tile answers is "what is it accepting now", and now, idle,
+   * it is accepting nothing.
    * THE SPARKLINE'S SCALE DIFFERS from the other tiles: its samples are 10 s drafting windows, not
    * 500 ms polls, so this box spans up to 120 windows of actual drafting rather than 60 s. */
   if (!(s.draft_positions && s.draft_positions.length)) setMetric("accept", null, DASH);
-  else if (restarted) setMetric("accept", null, DASH);
   else if (awR != null) setMetric("accept", 100 * awR, pctn(awR, 0));
+  else setMetric("accept", 0, pctn(0, 0));   /* drafted nothing this poll -> 0, the idle figure */
   $("m-acceptdet").textContent = acceptTriple(cNow, busy);
   M.flight.u.textContent = "/ " + s.queue_cap;
 
@@ -2119,15 +2125,19 @@ function update(s, dt) {
      * PINNED, NOT PRICED: the Operator may prefer the average back in the big seat, and the swap
      * is these two lines. What must not happen is the average returning as the headline with no
      * bullet left behind, because then the live figure is the thing nobody can see.
-     * Undefined when nothing was drafted -- freeze rather than print 0 or repaint the last value. */
-    if (restarted) $("acc_n").firstChild.nodeValue = "\u2013";
-    else if (awR != null) $("acc_n").firstChild.nodeValue = pctn(awR, 0);
+     * Nothing drafted this poll reads 0 -- the page's idle figure, same law as the accept tile
+     * (op ruling 2026-10-20, second pass). The defect being fixed is the FREEZE: a held value
+     * reads as a live measurement of a lane that drafted nothing. */
+    if (awR != null) $("acc_n").firstChild.nodeValue = pctn(awR, 0);
+    else $("acc_n").firstChild.nodeValue = pctn(0, 0);   /* idle: 0, the page's idle figure */
     $("specaside").textContent = "depth " + dp.length;
     spec["Drafter"].textContent       = drafterName;
     spec["Depth"].textContent         = dp.length;
-    /* Undefined when nothing has been drafted yet -- dash, not 0%. The panel's own rule is
-     * that 0 reads as failure, and this bullet was the one writer breaking it. */
-    spec["Average"].textContent        = s.draft_accept > 0 ? pct(s.draft_accept, 0) : DASH;
+    /* The lifetime marginal, always shown. Judge 22: guarding on >0 conflated "no drafts yet"
+     * with "drafts made, all rejected" -- a drafter that accepts nothing is exactly the case a
+     * reader needs to see, and a dash hid it. 0 is the honest figure for both, and the README's
+     * "Draft acceptance" section says which question this bullet answers. */
+    spec["Average"].textContent        = pct(s.draft_accept, 0);
   }
 
   /* ---- devices, in the same panel as the cache meter: they are one question. */

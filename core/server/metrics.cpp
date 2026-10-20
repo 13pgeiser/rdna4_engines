@@ -339,8 +339,8 @@ std::string Metrics::render() const {
                 "Fastest single-sequence decode step window this process has run, in seconds "
                 "PER STEP. A mean over 32 consecutive single-stream steps, not a stopwatch "
                 "reading. Not seconds per token: with speculation a step can emit several "
-                "tokens, so divide by the accepted-per-step figure to compare against a "
-                "token rate. Resets on restart.", L, g_step_best_.get());
+                "tokens, so per-token time is this divided by (1 + accepted per step), "
+                "not by the accepted figure alone. Resets on restart.", L, g_step_best_.get());
     if (g_step_recent_.get() > 0)
         w.gauge("radiance:decode_step_seconds_recent",
                 "Most recent single-sequence decode step window, in seconds PER STEP (see "
