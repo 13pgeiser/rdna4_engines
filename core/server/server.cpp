@@ -132,6 +132,7 @@ void Server::register_routes() {
         return r;
     });
     router_.get ("/v1/models",           [this](const HttpRequest& q) { return handle_models(q); });
+    router_.get ("/v1/loras",            [this](const HttpRequest& q) { return handle_loras(q); });
     router_.get ("/v1/models/*id",       [this](const HttpRequest& q) { return handle_models(q); });
     router_.post("/v1/load_lora_adapter",   [this](const HttpRequest& q) { return handle_lora_admin(q, true); });
     router_.post("/v1/unload_lora_adapter", [this](const HttpRequest& q) { return handle_lora_admin(q, false); });
@@ -1864,6 +1865,22 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
 /* Runtime LoRA admin, vLLM's routes and bodies: {"lora_name", "lora_path"} to load, {"lora_name"}
  * to unload. The path is read on this machine, so without --api-key only a loopback client may
  * ask, the rule /diagnostics follows. */
+/* A generator's adapter files: what `loras` and <lora:...> tags may name. */
+HttpResponse Server::handle_loras(const HttpRequest& req) {
+    using json = nlohmann::json;
+    if (!opt_.gen_lora_names) {
+        ApiError e;
+        e.status = 404;
+        e.type = "not_found_error";
+        e.message = "this server takes no adapters in image or video requests (--lora, --lora-dir)";
+        return error_response(e, req.peer);
+    }
+    json data = json::array();
+    for (const std::string& n : opt_.gen_lora_names()) data.push_back({ { "id", n }, { "object", "lora" } });
+    metrics_.observe_http(200);
+    return HttpResponse::json_body(200, json_dump(json{ { "object", "list" }, { "data", std::move(data) } }));
+}
+
 HttpResponse Server::handle_lora_admin(const HttpRequest& req, bool load) {
     using json = nlohmann::json;
     auto fail = [&](int status, const char* type, const std::string& msg) {

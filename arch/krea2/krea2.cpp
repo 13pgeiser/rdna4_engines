@@ -297,6 +297,36 @@ static int check_format(const RadModelMeta* meta) {
     return RAD_OK;
 }
 
+/* ================================================================== adapter key names */
+/* LoRA files for Krea 2 name the DiT and the text fusion by the reference code's modules
+ * (krea-ai/krea-2 mmdit.py): `blocks.N.attn.wq`, `txtfusion.refiner_blocks.N.mlp.up`, `tproj.1`;
+ * the container keeps diffusers' names. The language model takes no adapters. */
+static int declare_lora_names(RadBuilder* b) {
+    std::vector<LoraName> n;
+    static const char* const kInner[][2] = {
+        { "attn.wq", "attn.to_q" },   { "attn.wk", "attn.to_k" },  { "attn.wv", "attn.to_v" },
+        { "attn.wo", "attn.to_out.0" }, { "attn.gate", "attn.to_gate" },
+        { "mlp.gate", "ff.gate" },    { "mlp.up", "ff.up" },       { "mlp.down", "ff.down" },
+    };
+    static const char* const kBlocks[][2] = {
+        { "blocks.#.", "transformer_blocks.#." },
+        { "txtfusion.layerwise_blocks.#.", "text_fusion.layerwise_blocks.#." },
+        { "txtfusion.refiner_blocks.#.", "text_fusion.refiner_blocks.#." },
+    };
+    for (const auto& bl : kBlocks)
+        for (const auto& in : kInner)
+            n.push_back({ std::string(bl[0]) + in[0], std::string(bl[1]) + in[1] });
+    n.push_back({ "txtfusion.projector", "text_fusion.projector" });
+    n.push_back({ "txtmlp.1", "txt_in.linear_1" });
+    n.push_back({ "txtmlp.3", "txt_in.linear_2" });
+    n.push_back({ "first", "img_in" });
+    n.push_back({ "last_linear", "final_layer.linear" });
+    n.push_back({ "tmlp.0", "time_embed.linear_1" });
+    n.push_back({ "tmlp.2", "time_embed.linear_2" });
+    n.push_back({ "tproj.1", "time_mod_proj" });
+    return lora_names(b, "transformer.", kLoraDiffusionSpellings, n);
+}
+
 /* ================================================================== declare */
 static int declare_te(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     Geom& g = m.gt;
@@ -1059,6 +1089,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.b_prev  = decl_b(b, nm.f("lat_preview"), RAD_BF16, { lane_rows, m.C }, RAD_BUF_PERSIST);
     m.b_store = decl_b(b, nm.f("cond_store"), RAD_BF16,
                        { 2 * (int64_t)kMaxLanes * kCondRows, gd.n_embd }, RAD_BUF_PERSIST);
+    RAD_ARCH_TRY(declare_lora_names(b));
     RAD_ARCH_TRY(declare_te(b, meta, m));
     RAD_ARCH_TRY(declare_fusion(b, meta, m));
     RAD_ARCH_TRY(declare_dit(b, meta, m));

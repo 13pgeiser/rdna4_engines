@@ -310,6 +310,11 @@ struct LoraIssueSite {
     int32_t  pool = -1;                            /* index into Program::lora_pools */
     int32_t  t = -1;                               /* index into Program::lora_t */
     int64_t  R = 0, K = 0, N = 0;
+    /* A generator's narrower pairs: the same pools read to rank R_v[i] < R, the pass taking the
+     * narrowest that holds its slot's ranks (Program::lora_rused). */
+    uint32_t shrink_v[2] = { 0, 0 }, expand_v[2] = { 0, 0 };
+    int64_t  R_v[2] = { 0, 0 };
+    int8_t   n_v = 0;
 };
 /* One targeted weight's adapter slots: A [S, R, K], B [S, N, R] bf16 and the per-column scale
  * [S, N] f32, persistent buffers, so the arena plan (and with it the KV budget) holds them. */
@@ -322,6 +327,16 @@ struct LoraPool {
 struct LoraScratch {
     int64_t R = 0;
     rad_buf lane[2] = { 0, 0 };
+};
+/* A generator's adapter key names (rad_lora_root, rad_lora_alias in rad_builder.h). */
+struct LoraRoot {
+    std::string              native;      /* checkpoint prefix of the network's tensors */
+    std::vector<std::string> spellings;   /* adapter-side prefixes; "" is a bare key */
+};
+struct LoraAlias {
+    std::string root;                     /* LoraRoot::native it is relative to */
+    std::string from, to;                 /* module paths, '#' a decimal index */
+    int64_t     from_lo = 0, from_hi = 0, to_lo = 0;
 };
 
 /* Everything declare produced. The core owns it; the plugin only ever sees handles into it. */
@@ -349,6 +364,17 @@ public:
     std::vector<LoraIssueSite> lora_sites;
     std::vector<LoraPool>      lora_pools;
     std::vector<LoraScratch>   lora_t;
+    /* A generator's adapter key names: declared by the plugin whether or not adapters are on. A
+     * generator that declares no root carries no adapters. */
+    std::vector<LoraRoot>      lora_roots;
+    std::vector<LoraAlias>     lora_aliases;
+    /* A generator's pass runs with one adapter in every row: `lora_rows` is [S * lora_rows_n]
+     * i32, run s all s, so a pass's slot operand is run s of it. 0 on a token-step program. */
+    rad_buf                    lora_rows = 0;
+    int64_t                    lora_rows_n = 0;
+    /* A generator's slots pack each combination's ranks from j = 0: the ranks pool p takes in
+     * slot s at [p * S + s], 0 for a pool the combination does not reach (no adapter op runs). */
+    std::vector<int32_t>       lora_rused;
 
     /* The declared draft head (rad_declare_drafter). `kind == RAD_DRAFT_NONE` when none, the
      * normal case: the engine then speculates with the scheduler's prompt-lookup drafter or not at
@@ -716,7 +742,7 @@ struct Config {
      * slower. `on` forces P2P and stops startup naming the refused pairs instead of falling
      * back. */
     int   p2p = RAD_P2P_AUTO;         /* --p2p auto|on|off */
-    int64_t max_tok = 8192;            /* --max-num-batched-tokens */
+    int64_t max_tok = 2048;            /* --max-num-batched-tokens */
     /* --busy-prefill-chunk: how much of a step a prefill chunk may take when other work is
      * pending in it (decode rows, another prefill, a request waiting for admission). -1 = auto:
      * leave those their rows plus a share for admission, but keep at least the smallest pass the

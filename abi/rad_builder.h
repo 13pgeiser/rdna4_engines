@@ -429,7 +429,7 @@ int rad_op_declared(RadBuilder* b, const char* op);
  * convert-time fusions (q/k/v into one qkv, gate and up into gate_up). It is the only component
  * that knows both sides, and rad-convert reads the map from it (spec §2.4). */
 enum { RAD_MAP_COPY = 0, RAD_MAP_CONCAT = 1, RAD_MAP_WNORM = 2, RAD_MAP_ROWS = 3,
-       RAD_MAP_TRANSPOSE = 4, RAD_MAP_EMA = 5, RAD_MAP_TAP = 6 };
+       RAD_MAP_TRANSPOSE = 4, RAD_MAP_EMA = 5, RAD_MAP_TAP = 6, RAD_MAP_COLS = 7 };
 
 typedef struct RadNameMap {
     const char* declared;        /* the name given to rad_decl_weight */
@@ -445,7 +445,8 @@ typedef struct RadNameMap {
     int         src_index[8];
 
     /* RAD_MAP_ROWS only: piece i is rows [src_index[i], src_index[i] + src_rows[i]) of the 2-D (or
-     * higher, rows along dim 0) tensor src[i]; the pieces join along dim 0. */
+     * higher, rows along dim 0) tensor src[i]; the pieces join along dim 0. RAD_MAP_COLS: columns
+     * [src_index[0], src_index[0] + src_rows[0]) of src[0]'s last dimension. */
     int64_t     src_rows[8];
 } RadNameMap;
 
@@ -463,7 +464,13 @@ typedef struct RadNameMap {
  *
  * RAD_MAP_ROWS keeps only row ranges of its sources (see src_rows), joined: a head read over a
  * fraction of a vocabulary (an audio model's codes, a few rows of a text model's 200K) stores that
- * fraction rather than the whole table.
+ * fraction rather than the whole table. Successive ROWS maps for one name extend it in call order,
+ * as CONCAT maps do, so a weight may take more than eight pieces (an output projection whose rows
+ * are permuted, one piece a row).
+ *
+ * RAD_MAP_COLS keeps one column range of src[0] (see src_rows): a linear whose input carries
+ * channels the runtime never feeds (Cosmos's padding-mask channel, always zero) is read over the
+ * columns it is fed.
  *
  * RAD_MAP_TRANSPOSE swaps the last two dimensions of src[0] in each leading slice, [.., a, b] to
  * [.., b, a]: a linear a checkpoint keeps as (in, out), where the GEMMs read (out, in).
@@ -478,7 +485,7 @@ typedef struct RadNameMap {
  * run on a single frame reads only its last temporal tap, so [cout, cin, kt, kh, kw] read at tap -1
  * of dimension 2 is the 2-D convolution it then is.
  *
- * TRANSPOSE, EMA and TAP are computed at convert in f32, like WNORM, and stored as the recipe
+ * TRANSPOSE, EMA, TAP and COLS are computed at convert in f32, like WNORM, and stored as the recipe
  * says. */
 
 int rad_decl_name_map(RadBuilder* b, const RadNameMap* m);
@@ -714,7 +721,8 @@ typedef struct RadGeneratorDecl {
 
     /* The sampler: flow matching, Euler steps from sigma 1 towards 0.
      *   A fixed schedule: `n_sigmas` values, the terminal 0 implied; a request may not change the
-     *   step count. Otherwise `default_steps` sigmas from 1 to 1/steps, shifted:
+     *   step count. Otherwise `default_steps` sigmas from 1 to 1/steps (or off `sigma_grid`'s
+     *   table), shifted:
      *     dyn_shift 0   sigma' = shift * s / (1 + (shift - 1) * s)
      *     dyn_shift 1   mu linear in the image's token count, 256 -> base_shift .. max_seq ->
      *                   max_shift; shift_exp 1: exp(mu) / (exp(mu) + (1/s - 1)), 0: mu / (mu + ...)
@@ -755,9 +763,102 @@ typedef struct RadGeneratorDecl {
     /* 1: a reference picture is shrunk to `ref_area` only when larger and cut to `size_multiple`
      * by a centred crop; 0: resized to `ref_area` at its own aspect. */
     int32_t     ref_shrink_only;
+
+    /* ---- appended in ABI 25 (Anima, SDXL) */
+    /* `aux_tokens` nonzero: the conditioning also reads the user's prompt through the container's
+     * second tokenizer (rad-convert --tokenizer2), as that tokenizer encodes it alone, special
+     * tokens included, and the COND pass carries the ids (RadGenBatch::aux_ids). A prompt whose
+     * second tokenisation is longer than `aux_max_tokens` is refused. */
+    int64_t     aux_max_tokens;
+    /* The unshifted sigmas of a schedule that is not fixed: 0 is diffusers' linspace(1, 1 / steps,
+     * steps); N > 0 picks them off a table of N timesteps as ComfyUI's `simple` scheduler does,
+     * step i at (N - floor(i N / steps)) / N, each an f32 quotient of the table's own. */
+    int32_t     sigma_grid;
+    /* A prompt shorter than this many tokens after `drop_prefix` is padded with `pad_token` up to
+     * it, the padding read as prompt (a reference tokenizer's minimum length: an empty prompt is
+     * one padding token, and stays empty rather than becoming " "). 0: no minimum. */
+    int32_t     min_tokens;
+    int32_t     aux_tokens;
+    /* ---- a discrete-time denoiser (train_steps 0: the flow-matching sampler above)
+     * A model trained on `train_steps` timesteps of a variance-preserving schedule, betas from
+     * `beta_start` to `beta_end` (RAD_GEN_BETAS_*), sampled as k-diffusion samples it (Stable
+     * Diffusion's family). Its schedule is in sigmas, sigma_t = sqrt((1 - abar_t) / abar_t) for
+     * the cumulative product abar of 1 - beta; `zero_snr` rescales it to a zero terminal SNR
+     * (the last abar 4.8973451890853435e-08, as ComfyUI does). A request names a sampler
+     * (RAD_GEN_SAMPLER_*, one of those `samplers` holds as 1 << id, which the plugin's step
+     * serves) and a scheduler (RAD_GEN_SCHED_*), which places the request's steps between the
+     * table's largest and smallest sigma, 0 last. A DENOISE pass carries each entry's sigma,
+     * next and previous sigma in these units, the timestep the denoiser is conditioned on, the
+     * sampler and the step (RadGenBatch). n_sigmas, shift and the dynamic shift are unused. */
+    double      beta_start, beta_end;
+    int32_t     train_steps;
+    int32_t     beta_schedule;
+    int32_t     zero_snr;
+    uint32_t    samplers;
+    int32_t     default_sampler;
+    int32_t     default_scheduler;
+
+    /* ---- the prompt in windows (a CLIP text encoder's fixed context)
+     * Nonzero: the prompt's tokens after `drop_prefix` are cut into runs of at most
+     * `chunk_tokens`, each laid out as `chunk_bos`, the run, `chunk_eos`, then `pad_token` up to
+     * chunk_tokens + 2 rows, the windows end to end; a prompt with no tokens is one window of
+     * the two markers and padding. The JOINT_STEP layout only, with `pad_multiple` 0, and
+     * `cond_rows` a whole number of windows. */
+    int32_t     chunk_tokens;
+    int32_t     chunk_bos, chunk_eos;
 } RadGeneratorDecl;
 
+/* RadGeneratorDecl::beta_schedule: betas linear in sqrt(beta) (Stable Diffusion's
+ * "scaled_linear"), or linear in beta. */
+enum { RAD_GEN_BETAS_SCALED_LINEAR = 0, RAD_GEN_BETAS_LINEAR = 1 };
+/* A discrete-time model's samplers, as k-diffusion (and ComfyUI) name and define them. */
+enum {
+    RAD_GEN_SAMPLER_EULER           = 0,   /* "euler" */
+    RAD_GEN_SAMPLER_EULER_ANCESTRAL = 1,   /* "euler_ancestral", eta 1 */
+    RAD_GEN_SAMPLER_DPMPP_2M        = 2,   /* "dpmpp_2m" */
+    RAD_GEN_SAMPLER_COUNT           = 3
+};
+/* ... and its schedulers, ComfyUI's: "normal" (timesteps evenly spaced, the last at the smallest
+ * sigma), "karras" (rho 7), "exponential", "sgm_uniform" (normal without its last point) and
+ * "simple" (the table read at even strides). */
+enum {
+    RAD_GEN_SCHED_NORMAL      = 0,
+    RAD_GEN_SCHED_KARRAS      = 1,
+    RAD_GEN_SCHED_EXPONENTIAL = 2,
+    RAD_GEN_SCHED_SGM_UNIFORM = 3,
+    RAD_GEN_SCHED_SIMPLE      = 4,
+    RAD_GEN_SCHED_COUNT       = 5
+};
+
 int rad_declare_generator(RadBuilder* b, const RadGeneratorDecl* d);
+
+/* ================================================================== adapter key names */
+/* How LoRA files written for this model name its linears, for an image or video generator served
+ * with runtime adapters (--lora, --lora-dir, --max-loras; core/lora/). Adapter files from training
+ * tools and UIs name a module by the model's original code, not by the checkpoint the container
+ * was converted from, and wrap it in a prefix of their own: `diffusion_model.blocks.3.attn.wq`,
+ * kohya's `lora_unet_blocks_3_attn_wq`, a bare `blocks.3.attn.wq`. Both calls are optional,
+ * made before the GEMMs they cover are declared, and only a program that declares a root carries
+ * adapters at all. Additive exports; RAD_ABI_VERSION does not move.
+ *
+ * rad_lora_root declares one network the adapters may reach (the denoiser, a text encoder): every
+ * LoRA-capable GEMM over a checkpoint tensor whose name starts with `native` gets an adapter path.
+ * `spellings` lists, space separated, the prefixes adapter keys of this network start with in
+ * place of `native`; one ending in '_' is kohya's form, in which the rest of the key is the module
+ * path with every '.' written '_'. `native` itself is always accepted, and "-" stands for a key
+ * with no prefix at all. A key is tried against the longest matching spelling first.
+ *
+ * rad_lora_alias maps an adapter module that the checkpoint names differently. `from` and `to`
+ * are module paths relative to the root's prefixes (no ".weight"), '#' standing for a decimal
+ * index that `to` repeats in the same order. Rows [from_lo, from_hi) of the adapter module's
+ * output (its lora_B rows; from_hi 0 = all of them) land at rows from `to_lo` of the checkpoint
+ * module `to`. Several aliases with one `from` split a fused adapter module over separate
+ * checkpoint tensors (a `qkv` over `to_q`, `to_k`, `to_v`); several `from` into one `to` at
+ * different `to_lo` place separate adapter modules into one fused tensor. A module path that is
+ * the checkpoint's own needs no alias. */
+int rad_lora_root(RadBuilder* b, const char* native, const char* spellings);
+int rad_lora_alias(RadBuilder* b, const char* native, const char* from, const char* to,
+                   int64_t from_lo, int64_t from_hi, int64_t to_lo);
 
 /* ================================================================== the audio generator */
 /* A program that makes audio from text: an autoregressive language model writes the piece frame by

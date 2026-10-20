@@ -45,7 +45,9 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | GLM-5.3-Flash: MXFP4 experts and block-FP8 attention (AMD Quark), MTP, eight cards | `glm53-flash-mxfp4.rad` (171 GiB) | [convert](#convert-a-checkpoint) | `glm53-flash.yaml` |
 | Qwen3.8-27B bf16 | `qwen3.8-27b-bf16.rad` (50 GiB) | [convert](#convert-a-checkpoint) | `qwen3.8-27b-bf16.yaml` |
 | Qwen3.8-Flash-Next bf16, a disk-streamed reference | `qwen3.8-flash-next-bf16.rad` (335 GiB) | [convert](#convert-a-checkpoint) | `flashnext-bf16.yaml` |
+| Stable Diffusion XL bf16 and its finetunes (Illustrious, NoobAI, Pony): text to image, one card | `illustrious-xl-v2.0-bf16.rad` (6.4 GiB), from any single-file SDXL checkpoint | [convert](#convert-a-checkpoint) | `sdxl.yaml` |
 | EmbeddingGemma 2 bf16: text, image, video and audio embeddings, one card | `embeddinggemma2-bf16.rad` (1.4 GiB) | [convert](#convert-a-checkpoint) | `embeddinggemma2.yaml` |
+| Anima Aesthetic FP8: anime and illustration, text to image, one card (Base and Turbo convert the same way) | `anima-aesthetic-fp8.rad` (3.0 GiB) | [convert](#convert-a-checkpoint) | `anima.yaml` |
 | Qwen3-ASR 1.7B bf16: speech to text, `/v1/audio/transcriptions` and live over `/v1/realtime`, 30 languages, one card | the checkpoint as it ships (4.1 GiB) | [Qwen/Qwen3-ASR-1.7B-hf](https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf) | — |
 
 A container holds everything the server needs: the weights, the tokeniser, the chat template and
@@ -256,6 +258,11 @@ build/bin/rad-convert /srv/models/hf/z-lab/Qwen3.8-27B-PARO -o qwen3.8-27b-paro-
     --draft-model /srv/models/hf/z-lab/Qwen3.8-27B-DFlash2
 build/bin/rad-convert /srv/models/hf/ukisai/Swift-1.5-Qwen3.8-27b-W4A16-AWQ -o swift15-27b-w4a16.rad \
     --recipe data/recipes/q38-27b-w4a16.recipe
+# Any single-file SDXL checkpoint (SDXL 1.0, Illustrious, NoobAI, Pony, a civitai finetune), with
+# CLIP's tokenizer.json from openai/clip-vit-large-patch14
+build/bin/rad-convert /srv/models/hf/OnomaAIResearch/Illustrious-XL-v2.0/Illustrious-XL-v2.0.safetensors \
+    -o illustrious-xl-v2.0-bf16.rad --recipe data/recipes/sdxl-bf16.recipe \
+    --tokenizer /srv/models/hf/openai/clip-vit-large-patch14/tokenizer.json
 ```
 
 With Docker, use `docker run --rm -v /srv/models:/models --entrypoint rad-convert stilldeadcode/radiance ...`.

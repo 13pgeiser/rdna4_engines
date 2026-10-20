@@ -1254,6 +1254,10 @@ int ref_lora_expand_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* o
     return o.finish("lora_expand", operand, out);
 }
 
+int ref_lora_expand_mm_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return ref_lora_expand_shape(p, n_p, operand, out);
+}
+
 /* ================================================================== attention
  *
  * The paged layout (ref_ops.h):
@@ -2602,6 +2606,53 @@ int ref_flow_euler_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     return o.finish("flow_euler", operand, out);
 }
 
+/* The k-diffusion sampler's two ops over flow_euler's entries: two equal-length entries where M
+ * allows, the lanes f32, sigmas drawn in (0, 1) so every logarithm and root is of a positive
+ * value. Flags draw only the first step (bit 1): the preview needs its optional operand and
+ * neither op repaints; the hand-written cases take the rest. */
+int ref_kd_input_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), st = gi(p, n_p, "stride", 0);
+    if (M <= 0 || n <= 0 || st <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t S = (M % 2 == 0 && M / 2 <= st) ? 2 : 1;
+    if (M > S * st) return RAD_E_UNSUPPORTED;
+    const uint32_t F = (uint32_t)RAD_F32;
+    Opd o;
+    o.t_fill(F, { S }, (uint32_t)RAD_FILL_SIGMOID, 0);       /* sigma */
+    o.t_idx({ S }, S, -1, 0);                                 /* pair */
+    o.t_idx({ S }, REF_LANES, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);   /* lane */
+    o.t_idx({ S }, 2, -1, 0);                                 /* flags */
+    o.t_idx({ 2 * S }, (int64_t)1 << 30, -1, 0);              /* seed */
+    o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);    /* cu_seqlens */
+    o.t(F, { REF_LANES * st, n });                            /* state, INOUT */
+    o.t(act_dt(p, n_p), { M, n });                            /* y */
+    return o.finish("kd_input", operand, out);
+}
+
+int ref_kd_step_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), st = gi(p, n_p, "stride", 0);
+    if (M <= 0 || n <= 0 || st <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t S = (M % 2 == 0 && M / 2 <= st) ? 2 : 1;
+    if (M > S * st) return RAD_E_UNSUPPORTED;
+    const uint32_t F = (uint32_t)RAD_F32;
+    Opd o;
+    o.t(act_dt(p, n_p), { M, n });                            /* out */
+    o.t_fill(F, { S }, (uint32_t)RAD_FILL_SIGMOID, 0);       /* sigma */
+    o.t_fill(F, { S }, (uint32_t)RAD_FILL_SIGMOID, 0);       /* sigma_next */
+    o.t_fill(F, { S }, (uint32_t)RAD_FILL_SIGMOID, 0);       /* sigma_prev */
+    o.t(F, { S });                                            /* cfg */
+    o.t_idx({ S }, S, -1, 0);                                 /* pair */
+    o.t_idx({ S }, REF_LANES, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);   /* lane */
+    o.t_idx({ S }, 2, -1, 0);                                 /* flags */
+    o.t_idx({ 2 * S }, (int64_t)1 << 30, -1, 0);              /* seed */
+    o.t_idx({ S }, 3, -1, 0);                                 /* sampler */
+    o.t_idx({ S }, 64, -1, 0);                                /* step */
+    o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);    /* cu_seqlens */
+    o.t(F, { REF_LANES * st, n });                            /* state, INOUT */
+    o.t(F, { REF_LANES * st, n });                            /* hist, INOUT */
+    o.t(F, { REF_LANES * st, n });                            /* preview, INOUT */
+    return o.finish("kd_step", operand, out);
+}
+
 /* ---- an image decoder's convolutions and shortcuts. Sizes are read off the operands and M counts
  * output pixels, so this picks eight columns where M allows (a row with both edges and an interior)
  * and the input that produces that output; otherwise it declines. */
@@ -2634,6 +2685,27 @@ int ref_conv2d_nhwc_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* o
     o.t(D, { cout });                                         /* b */
     o.t(D, { Ho, Wo * cout });                                /* y */
     return o.finish("conv2d_nhwc", operand, out);
+}
+
+/* conv2d_nhwc's geometry with the receptive fields as y's rows: M output pixels of cin k k values. */
+int ref_im2col_nhwc_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), cin = gi(p, n_p, "cin", 0), k = gi(p, n_p, "k", 0);
+    const int64_t stride = gi(p, n_p, "stride", 1), up = gi(p, n_p, "up", 1);
+    const char* pad = gs(p, n_p, "pad");
+    if (M <= 0 || cin <= 0 || k <= 0 || stride <= 0 || up <= 0) return RAD_E_UNSUPPORTED;
+    const bool down = pad && !std::strcmp(pad, "down");
+    const int64_t pads = down ? 1 : 2 * (k / 2);
+    const int64_t Wo = cols_for(M, 1), Ho = Wo ? M / Wo : 0;
+    if (!Wo) return RAD_E_UNSUPPORTED;
+    const int64_t Hv = (Ho - 1) * stride + k - pads, Wv = (Wo - 1) * stride + k - pads;
+    if (Hv <= 0 || Wv <= 0 || Hv % up || Wv % up) return RAD_E_UNSUPPORTED;
+    if ((Hv + pads - k) / stride + 1 != Ho || (Wv + pads - k) / stride + 1 != Wo)
+        return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { Hv / up, (Wv / up) * cin });                     /* x */
+    o.t(D, { Ho * Wo, cin * k * k });                         /* y */
+    return o.finish("im2col_nhwc", operand, out);
 }
 
 int ref_d2s_add_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
@@ -2744,6 +2816,14 @@ int ref_gelu_tanh_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out
     o.t(D, { M, n });
     o.t(D, { M, n });
     return o.finish("gelu_tanh", operand, out);
+}
+int ref_gelu_quick_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M, n });
+    o.t(D, { M, n });
+    return o.finish("gelu_quick", operand, out);
 }
 int ref_scatter_add_rows_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);

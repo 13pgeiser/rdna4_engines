@@ -432,6 +432,28 @@ inline int map_rows(RadBuilder* b, const char* declared, std::initializer_list<R
     return rad_decl_name_map(b, &m);
 }
 
+/* How adapter files name a generator's modules (rad_lora_root, rad_lora_alias): one network
+ * under the checkpoint prefix `native`, the prefixes adapter keys use for it, and the module paths
+ * that differ, '#' standing for a block index. */
+struct LoraName {
+    std::string from, to;
+    int64_t     from_lo = 0, from_hi = 0, to_lo = 0;
+};
+inline int lora_names(RadBuilder* b, const char* native, const char* spellings,
+                      const std::vector<LoraName>& names) {
+    const int s = rad_lora_root(b, native, spellings);
+    if (s < 0) return s;
+    for (const LoraName& n : names) {
+        const int a = rad_lora_alias(b, native, n.from.c_str(), n.to.c_str(), n.from_lo, n.from_hi,
+                                     n.to_lo);
+        if (a < 0) return a;
+    }
+    return RAD_OK;
+}
+/* The prefixes ComfyUI, kohya and bare-key adapter files put before a diffusion model's modules. */
+inline const char* kLoraDiffusionSpellings = "diffusion_model. model.diffusion_model. lora_unet_ "
+                                             "base_model.model. -";
+
 /* A weight-normalised checkpoint tensor folded into its plain weight (RAD_MAP_WNORM). */
 inline int map_wnorm(RadBuilder* b, const char* declared, const char* g, const char* v) {
     RadNameMap m = map_base(declared, RAD_MAP_WNORM);

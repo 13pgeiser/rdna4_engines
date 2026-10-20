@@ -219,6 +219,7 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | `gelu_mul` | `M`(range) `n` `dtype` | `gate_up` → `y` (splits `[M,2n]` into gelu·up, tanh approx) |
 | `seg_sinusoid` | `M`(range) `n` `period` `max_timescale`:f64/opt `cu_div`/opt `dtype` | `cu_seqlens` → `y` |
 | `gelu` / `silu` | `M`(range) `n` `dtype` | `x` → `y` |
+| `gelu_quick` | `M`(range) `n` `dtype` | `x` → `y` |
 | `cast` | `M`(range) `n` `from` `to` | `x` → `y` |
 | `softmax` | `M`(range) `n` `dtype` | `x` → `y` |
 | `sigmoid` | `M`(range) `n` `dtype` | `x` → `y` |
@@ -229,6 +230,10 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 
 `gelu` (exact erf) and `silu` share one schema; `silu` has a row of its own because a row names one
 op.
+
+**`gelu_quick`** is CLIP's `quick_gelu`, `x * sigmoid(1.702 x)`, rounded where torch stores each
+tensor in a reduced dtype: `a = rd(1.702 x)`, `s = rd(1 / (1 + exp(-a)))`, `y = rd(x s)`, `rd` the
+rounding to `y`'s dtype and the arithmetic f32 (CLIP-L's feed-forward in SDXL's text encoder).
 
 **`rmsnorm`** is `y = x * rsqrt(mean(x^2) + eps) * (w + wadd)`; `wadd` is GemmaRMSNorm's `1 +`,
 added in f32. `mult` scales the normed row before its one rounding, for a residual branch weighted
@@ -732,6 +737,7 @@ butterfly), so every tile is byte-identical (`tests/r4d_emu/test_f32.cpp`).
 |---|---|---|
 | `lora_shrink` | `M`(range) `K` `R` `S` `group`/opt `dtype` | `a`, `a_scale`?, `slot`, `lora_a` → `t` |
 | `lora_expand` | `M`(range) `N` `R` `S` `dtype` | `t`, `slot`, `lora_b`, `scale`, `y`:inout |
+| `lora_expand_mm` | `M`(range) `N` `R` `S` `dtype` | `t`, `slot`, `lora_b`, `scale`, `y`:inout |
 
 The two halves of `y += scale ⊙ (B · (A · x))` at a trunk GEMM, issued by the core right after the
 GEMM in the GEMM's own row slice, with several adapters and no adapter mixed in one step; a step
@@ -740,7 +746,9 @@ an i32 per row naming its adapter's pool slot -- the step batch's `RadBatch::lor
 GEMM's first row on; **a row with `slot < 0 || slot >= S` is a base row and neither op touches
 it**: `lora_shrink` writes nothing into its `t` row, and `lora_expand` does not read or write its
 `y` row at all — so a base row stays bit for bit what the GEMM wrote, where `y + 0` would already
-have turned a -0 into +0.
+have turned a -0 into +0. On an image or video generator's pass every row runs the same adapter,
+and `slot` is a run of the core's slot-row table holding that slot's index in every element, so the
+GEMM's rows need not be the pass's token rows.
 
 - `lora_shrink`: `t[m, j] = Σ_k x(m, k) · lora_a[s, j, k]`, `s = slot[m]`, f32 accumulate.
   `a`/`a_scale` are the GEMM's own first two operands, and `x(m, k)` is the value `gemm_nt_q` uses
@@ -755,6 +763,13 @@ have turned a -0 into +0.
   accumulate, one rounding to `y`'s dtype (`bf16`/`f16`/`f32`, named by `dtype`). `lora_b` is
   `[S, N, R]` bf16 and `scale` `[S, N]` f32 — per output column, so a fused projection whose parts
   carry different `alpha / r` is one launch.
+
+- `lora_expand_mm`: `lora_expand` with `t` rounded to bf16 and the sum over `j` in any order,
+  `y[m, n] = y[m, n] + scale[s, n] · Σ_j bf16(t[m, j]) · lora_b[s, n, j]`, f32 accumulate, one
+  rounding to `y`; base rows as `lora_expand`. A row's bytes may depend on `M`. The core declares
+  it in place of `lora_expand` for an image or video generator, whose passes are thousands of rows
+  of one adapter and where the exact row's scalar sum is most of the adapter's cost; libr4d runs
+  it on the WMMA over 64 x 64 tiles.
 
 `a`, `a_scale` and `y` may be row and column slices of wider buffers; every row stride is the
 tensor's. The pools are ordinary inputs and not weights: the engine owns them as program buffers
@@ -1006,8 +1021,11 @@ says which (`libref/ref_gen.cpp`).
 | `lane_store` | `M`(range) `n` `stride` `dtype` | `src`, `lane`, `dst`:inout |
 | `randn_lanes` | `M`(range) `n` `stride` `dtype` | `flags`, `seed`, `lane`, `cu_seqlens`, `dst`:inout |
 | `flow_euler` | `M`(range) `n` `stride` `dtype` | `v`, `sigma`, `sigma_next`, `cfg`, `pair`, `lane`, `flags`, `seed`, `cu_seqlens`, `inp_lat`?, `inp_mask`?, `state`:inout, `preview`:inout? |
+| `kd_input` | `M`(range) `n` `stride` `dtype` | `sigma`, `pair`, `lane`, `flags`, `seed`, `cu_seqlens`, `state`:inout → `y` |
+| `kd_step` | `M`(range) `n` `stride` `pred` `dtype` | `out`, `sigma`, `sigma_next`, `sigma_prev`, `cfg`, `pair`, `lane`, `flags`, `seed`, `sampler`, `step`, `cu_seqlens`, `state`:inout, `hist`:inout, `preview`:inout? |
 | `chan_affine` | `M`(range) `n` `mul` `add` `mode` `dtype` `round`/opt | `x` → `y` |
 | `conv2d_nhwc` | `M`(range) `cin` `cout` `k` `stride` `pad` `up` `dtype` | `x`, `w`w, `b`w → `y` |
+| `im2col_nhwc` | `M`(range) `cin` `k` `stride` `pad` `up` `dtype` | `x` → `y` |
 | `l2norm_chan` | `M`(range) `n` `act` `dtype` | `x`, `gamma`w → `y` |
 | `d2s_add` | `M`(range) `cin` `cout` `ft` `dtype` | `x`, `y`:inout |
 | `s2d_avg_add` | `M`(range) `cin` `cout` `ft` `dtype` | `x`, `y`:inout |
@@ -1057,6 +1075,34 @@ source into every listed lane (a repainted picture's latent into each of its ima
   `x' = bf16(m x' + (1 - m)((1 - sigma_next) src + sigma_next noise))` with `m` the lane's f32
   `inp_mask` row, `src` its `inp_lat` row and `noise` the seed's stream.
 
+**The k-diffusion sampler.** A denoiser trained on discrete timesteps of a variance-preserving
+schedule (SDXL; eps- or v-prediction) is sampled as k-diffusion samples it, in the
+variance-exploding form `x = x0 + sigma eps`: the lane holds `x` in f32 (`state` and `hist` are f32
+`[lanes * stride, n]`), the model reads `c_in x` with `c_in = 1 / sqrt(sigma^2 + 1)`, and its output
+`out` (`dtype`, in the pass's compact image order bounded by `cu_seqlens`) becomes the clean
+estimate. Entries, pairs, lanes, flags and seeds are `flow_euler`'s; `sigma`, `sigma_next`,
+`sigma_prev` and `cfg` are f32 `[n_seq]`, `sampler` and `step` i32 `[n_seq]`. Every product and sum
+is one f32 rounding; `log`, `expm1` and `sqrt` are the library's. A repaint (flag 2) is refused.
+
+- `kd_input`: for every entry with `pair != -2`, a first step (flag 1) sets the lane to the seed's
+  normal stream times `sqrt(1 + sigma^2)` (`rad_philox_normal(seed, k n + c)`, the start of a
+  schedule at the model's largest sigma); then `y = rd(x / sqrt(sigma^2 + 1))` at the entry's rows
+  and, when `pair >= 0`, at the pair's rows too, so the negative entry reads the same latent without
+  a second writer.
+- `kd_step`: for every entry with `pair != -2`, with `x` the lane's value,
+  `D(o) = x - sigma o` (`pred` `eps`) or `x / (sigma^2 + 1) - o sigma / sqrt(sigma^2 + 1)` (`v`),
+  guided as `D = D(o_u) + cfg (D(o_c) - D(o_u))` against the pair's rows (`D(o_c)` without one);
+  flag 4 writes `D` to the lane's `preview`. Then by `sampler`:
+  0, Euler: `x' = x + (sigma_next - sigma)(x - D) / sigma`;
+  1, Euler ancestral (eta 1): `sigma_up = min(sigma_next, sqrt(sigma_next^2 (sigma^2 -
+  sigma_next^2) / sigma^2))`, `sigma_down = sqrt(sigma_next^2 - sigma_up^2)`,
+  `x' = x + (x - D) / sigma (sigma_down - sigma)`, plus `sigma_up` times the seed's stream
+  `1 + step` (`rad_philox_normal_s`, element `k n + c`) while `sigma_next > 0`;
+  2, DPM++ 2M: `x' = D` at `sigma_next` 0; otherwise with `t = -ln sigma`, `h = -ln sigma_next - t`,
+  `x' = (sigma_next / sigma) x - expm1(-h) D'`, where `D' = D` on a first step and otherwise
+  `(1 + 1/(2r)) D - (1/(2r)) hist` with `r = (t + ln sigma_prev) / h`.
+  Every step stores `D` to `hist` for the next. Any other sampler is refused.
+
 **Images** are `[height, width * channels]`, dense, and the ops read both sizes off the operand
 shapes: an image's size belongs to a request, and a parameter is fixed at declare.
 
@@ -1065,6 +1111,16 @@ shapes: an image's size belongs to a request, and a parameter is fixed at declar
   is `k/2` zeros a side, `down` is none above and left and one below and right
   (`ZeroPad2d((0,1,0,1))` before a stride-2 conv), `causal` is `k - 1` rows above, none below and
   `k/2` columns a side (causal along the rows: LTX-2's audio VAE). f32 accumulation, the bias added, one rounding.
+- `im2col_nhwc`: `conv2d_nhwc`'s receptive fields as rows, so a convolution is a GEMM against the
+  checkpoint's own weight. `x` is the image `[Hin, Win * cin]` (rows at their own pitch), read
+  through `up`, `pad` and `stride` as `conv2d_nhwc` reads it; `y` is `[Ho * Wo, cin * k * k]`, its
+  rows exactly the output pixels, and row `oy * Wo + ox`, column `(ci * k + i) * k + j` holds the
+  value `conv2d_nhwc` multiplies `w[o, ci, i, j]` by, 0 in the padding. That column order is the
+  weight's own `[cout, cin, k, k]` flattened, so `y @ w.reshape(cout, cin k k)^T + b` (a
+  `gemm_nt_bias`) is the convolution with the weight as stored, and a runtime LoRA over that GEMM
+  reads a conv adapter's down projection `[rank, cin, k, k]` flattened the same way. A copy: no
+  arithmetic, the bits moved. libr4d stages a block's k input rows in LDS so its reads and its
+  stores are both coalesced; it serves `k` up to 7 and `stride` and `up` 1 or 2.
 - `l2norm_chan`: each pixel's channels to unit L2 (eps 1e-12), times `sqrt(n)`, times `gamma`
   (three roundings), then `act` `none` or `silu`.
 - `chan_affine`: `mul` and `add` are space-separated lists of `n` values, each rounded to bf16;
@@ -1464,7 +1520,9 @@ Every op honours its activation operands' row pitches. `rd` is a rounding into t
   and `rstd_g`, and the rest is the implementation's scratch (partial sums of up to 1024 parts a
   group; libref leaves it untouched). A kernel may take several launches but must be deterministic,
   a fixed reduction order with no float atomics. `y` may be the same memory as `x`. `w` and `b`
-  `[n]`, bf16 or f32. MiniMax-H3: `n` 512, `groups` 32, `eps` 1e-5.
+  `[n]`, bf16 or f32. MiniMax-H3: `n` 512, `groups` 32, `eps` 1e-5; SDXL's UNet 320 to 2560
+  channels in 32 groups (10 to 80 a group), its VAE 128 to 512. libr4d serves `n` a multiple of 8
+  up to 8192 with an even group width.
 - `tconv_dw`: a depthwise convolution along the frames (a Conv3d of kernel `(k, 1, 1)`, one group a
   channel): `geom = (T, H, W)`, `P = H W` rows a frame, `w` PyTorch's `[n, 1, k, 1, 1]` (tap `j` of
   channel `c` at `c k + j`), `b [n]`, `k` odd:

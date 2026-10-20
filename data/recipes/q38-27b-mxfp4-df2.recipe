@@ -1,0 +1,41 @@
+# q38-27b-mxfp4-df2.recipe -- a bf16 Qwen3.8-27B (or a finetune of it) at MXFP4 with the DFlash2
+# drafter.
+#
+#   rad-convert <bf16 Qwen3.8-27B checkpoint> --draft-model <z-lab/Qwen3.8-27B-DFlash2> \
+#       --recipe q38-27b-mxfp4-df2.recipe \
+#       --set quantization_config.quant_method=fp8 --set quantization_config.fmt=e4m3 \
+#       -o q38-27b-mxfp4-df2.rad
+#
+# The --set keys give the container the family's fp8 descriptor, so qwen35_fp8 serves it as it
+# serves the Quark, ParoQuant and NVFP4 releases; without them a bf16 checkpoint selects
+# qwen35_bf16, which has no 4-bit GEMM.
+#
+# The trunk's linears are rounded to MXFP4 (`fp4_e2m1`, an e8m0 scale per 32 of K, the OCP exponent
+# rule) from the bf16 source, once: the encoding and kernels of q38-27b-quark-mxfp4-df2.recipe,
+# without Quark's AWQ fold. The delta net's a/b projections, the norms, the embedding and the
+# vision tower stay bf16; the head goes block fp8 as in the other 27B recipes. The checkpoint's MTP
+# head is not read: the DFlash2 drafter displaces it.
+#
+# The drafter as q38-27b-quark-mxfp4-df2.recipe makes it: its linears at MXFP4, and a 2-bit copy
+# of the target's head (u2 with a u8 zero, least-squares clip search) whose top 32 the engine
+# rescores against the target's fp8 head.
+
+blk.*.ffn_gate_up.weight                 rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.ffn_down.weight                    rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.attn_qg.weight                     rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.attn_k.weight                      rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.attn_v.weight                      rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.attn_output.weight                 rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.ssm_inz.weight                     rtn  codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.ssm_out.weight                     rtn  codes=fp4_e2m1 group=32 scale=e8m0
+
+output.weight                            rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.draft_head.weight                 rtn  codes=u2 zero=u8 group=128 scale=f16 rule=search
+
+dflash.fc.weight                         rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_q.weight               rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_k.weight               rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_v.weight               rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_output.weight          rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.ffn_gate_up.weight          rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.ffn_down.weight             rtn  codes=fp4_e2m1 group=32 scale=e8m0

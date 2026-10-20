@@ -809,6 +809,7 @@ const RadBatch* VideoDriver::build_cond(Job& j, int step) {
     if (j.auto_len) rb_.assign(1, Readback{ decl_.duration_out, 4, duration_host_ });
     pass_.kind = RAD_GEN_PASS_VCOND;
     pass_.job = j.id;
+    pass_.lora_slot = j.req->lora_slot;
     return &out_[0];
 }
 
@@ -858,6 +859,7 @@ const RadBatch* VideoDriver::build_step(Job& j, int step) {
     for (auto& B : out_) B.gen = RAD_GEN_PASS_VSTEP;
     pass_.kind = RAD_GEN_PASS_VSTEP;
     pass_.job = j.id;
+    pass_.lora_slot = j.req->lora_slot;
     return &out_[0];
 }
 

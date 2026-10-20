@@ -39,6 +39,7 @@
  * special tokens and the prompt without, so a caller cannot write control tokens into it.
  */
 #include "server.h"
+#include "loras.h"
 #include "oai.h"
 
 #include "gen/video.h"
@@ -168,7 +169,9 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
                 return error_response(err_bad(p.name, "'" + p.name + "' takes text, not a file"),
                                       req.peer);
             json v = p.data;
-            if (p.name == "target" || p.name == "conditions") {
+            if (p.name == "target" || p.name == "conditions" ||
+                ((p.name == "loras" || p.name == "lora") && !p.data.empty() &&
+                 (p.data[0] == '[' || p.data[0] == '{'))) {
                 v = json::parse(p.data, nullptr, false);
                 if (v.is_discarded())
                     return error_response(err_bad(p.name, "expected JSON"), req.peer);
@@ -183,7 +186,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     static const char* kKnown[] = {
         "model", "prompt", "seconds", "size", "input_reference", "seed", "num_inference_steps",
         "task", "target", "conditions", "user", "latent_upscale", "upscale_refine_steps",
-        "negative_prompt", "decoder",
+        "negative_prompt", "decoder", "loras", "lora",
         /* RadVideoGenBatch::guidance_h's order */
         "guidance_scale", "stg_scale", "modality_scale", "guidance_rescale",
         "audio_guidance_scale", "audio_stg_scale", "audio_modality_scale", "audio_guidance_rescale",
@@ -210,7 +213,17 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     if (!has(body, "prompt") || !body["prompt"].is_string() ||
         body["prompt"].get<std::string>().find_first_not_of(" \t\r\n") == std::string::npos)
         return bad("prompt", "the prompt is required, as a non-empty string");
-    const std::string prompt = body["prompt"].get<std::string>();
+    std::string prompt = body["prompt"].get<std::string>();
+    /* Runtime LoRA adapters: `loras` and <lora:...> tags, which leave the prompt. */
+    std::vector<std::pair<std::string, double>> loras;
+    {
+        std::string field, why;
+        if (parse_loras(body, &prompt, &loras, &field, &why) < 0) return bad(field.c_str(), why);
+        if (!loras.empty() && !opt_.gen_lora_acquire)
+            return error_response(err_unsupported(field.c_str(), "this server was started without "
+                                                                 "adapters (--lora, --lora-dir)"),
+                                  req.peer);
+    }
     if (has(body, "input_reference")) {
         /* JSON: a data URL, as a string or an image_url object. */
         const json& v = body["input_reference"];
@@ -497,6 +510,16 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     }
 
     /* ---- admitted and queued: the job holds its place until its file is written */
+    if (!loras.empty()) {
+        std::string why, note;
+        const int s = opt_.gen_lora_acquire(loras, &r->lora_slot, &r->lora_hold, &note, &why);
+        if (s < 0) {
+            ApiError e = err_bad("loras", why);
+            if (s == RAD_E_NOTFOUND) { e.status = 404; e.type = "not_found_error"; }
+            else if (s != RAD_E_INVAL) { e.status = 503; e.type = "server_error"; }
+            return error_response(e, req.peer);
+        }
+    }
     if (auto no = admit(1, req.peer)) return *no;
     auto j = std::make_shared<VideoJob>();
     j->id = new_video_id();

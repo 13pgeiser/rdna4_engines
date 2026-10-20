@@ -201,6 +201,9 @@ public:
     /* Call once on the rank thread before its first run_step: the backend's current device is
      * thread-local, and init may have run on another thread. */
     int bind_thread();
+    /* The runtime LoRA slot every row of the generator passes that follow runs with, -1 for none
+     * (Ctx::issue_lora). Set by the pass loop before it releases the rank for a pass. */
+    void set_gen_lora_slot(int32_t s) { gen_lora_slot_ = s; }
 
     /* ---------------------------------------------------------- run-phase queries */
     const RadBatch* batch()      const { return batch_; }
@@ -350,6 +353,7 @@ private:
     int  bind_weights();
     int  bind_ops();
     int  issue_lora(rad_op h, const RadOperand* opd, int n_opd, int64_t n);
+    int32_t gen_lora_slot_ = -1;
     int  bind_routing();
     int  bind_profiling();
     int  check_domain(rad_op h, int domain) const;

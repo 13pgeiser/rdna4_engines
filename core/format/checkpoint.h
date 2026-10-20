@@ -120,6 +120,14 @@ public:
      * borrows the target's embedding and head, so it goes into the target's container with its
      * tensors and config.json keys under `draft.`. */
     int add_draft(const std::string& dir, const std::string& prefix);
+    /* Merge one more safetensors file, its tensor names kept: a release that ships its networks
+     * as separate single files (ComfyUI's split_files: a diffusion model, a text encoder and a
+     * VAE). A name already present is refused. */
+    int add_file(const std::string& path);
+    /* Before open(): read config.json, generation_config.json and the tokenizer from `dir` rather
+     * than from beside the checkpoint, for a single-file checkpoint that ships none of them (the
+     * text encoder's repository describes such a release). */
+    void set_meta_dir(const std::string& dir) { meta_dir_ = dir; }
 
     const SrcTensor* find(const std::string& n) const;
     const std::vector<SrcTensor>& tensors() const { return tensors_; }
@@ -177,12 +185,13 @@ private:
                   const std::unordered_map<std::string, std::string>* owner = nullptr);
     int open_safetensors(const std::string& path);
     int open_diffusers();
+    int open_sgm();
     int add_companions();
     int open_gguf(const std::string& path);
     void detect_import();
 
     enum Kind { None, Gguf, SafeT } kind_ = None;
-    std::string path_, dir_, tok_dir_;
+    std::string path_, dir_, tok_dir_, meta_dir_;
     GgufFile    gguf_;
     MetaOwn     meta_;
     std::vector<std::unique_ptr<SafeTensorsFile>> shards_;
@@ -249,7 +258,7 @@ struct CkptWeight {
      * (the values change), so a recipe rule stores it. */
     bool        wnorm = false;
     std::vector<float> wnorm_scale;
-    /* A weight computed from its sources at resolve (RAD_MAP_TRANSPOSE, RAD_MAP_EMA): its f32
+    /* A weight computed from its sources at resolve (RAD_MAP_TRANSPOSE, EMA, TAP, COLS): its f32
      * values in the logical shape, which ckpt_rows_f32 serves. Not trivial, so a recipe rule
      * stores it. */
     std::vector<float> derived;

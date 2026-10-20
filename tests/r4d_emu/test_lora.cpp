@@ -511,6 +511,74 @@ static void test_codes() {
                 checked);
 }
 
+/* lora_expand_mm (the generators' expand): t rounded to bf16 and summed on the WMMA in its own
+ * order, so each output is held to the double sum over bf16(t) within one rounding of y plus the
+ * f32 sum's bound; base rows and everything outside the slice untouched, bit for bit. Mixed slots
+ * in a tile, an odd M and N, R not a multiple of 32, every y dtype, aligned and not. */
+static void test_expand_mm() {
+    std::mt19937 rng(41);
+    struct Sh { int M, N, R, S; uint32_t ydt; bool al; int base_pct; };
+    const Sh shapes[] = {
+        { 1,    20,    16,  1, RAD_BF16, true,  0  },
+        { 64,   64,    32,  1, RAD_BF16, true,  0  },
+        { 130,  300,   48,  2, RAD_BF16, false, 20 },
+        { 77,   9216,  192, 1, RAD_BF16, true,  0  },   /* a fused qkv, one adapter */
+        { 200,  1000,  64,  3, RAD_F32,  false, 30 },
+        { 65,   257,   24,  2, RAD_F16,  true,  10 },
+        { 512,  2048,  128, 1, RAD_BF16, true,  0  },
+    };
+    int64_t worst_n = 0;
+    double worst = 0;
+    for (const Sh& sh : shapes) {
+        const std::vector<int32_t> slot = rand_slots(rng, sh.M, sh.S, sh.base_pct);
+        Expand E = make_expand(rng, sh.M, sh.N, sh.R, sh.S, sh.ydt, slot, sh.al);
+        std::vector<uint8_t> got;
+        if (run_expand(E, r4d_rad_lora_expand_mm, &got) != RAD_OK) {
+            fail("expand_mm", fmt("rc (M %d N %d R %d)", sh.M, sh.N, sh.R));
+            continue;
+        }
+        const size_t e = esz(sh.ydt), ny = (size_t)E.yoff + (size_t)sh.M * E.ldy;
+        int64_t bad_base = 0, bad_val = 0;
+        for (size_t i = 0; i < ny; ++i) {
+            const long long q = (long long)i - E.yoff;
+            const int m = q < 0 ? -1 : (int)(q / E.ldy), n = q < 0 ? -1 : (int)(q % E.ldy);
+            const int sl = m >= 0 && m < sh.M ? slot[(size_t)m] : -1;
+            if (m < 0 || m >= sh.M || n >= sh.N || sl < 0 || sl >= sh.S) {
+                bad_base += std::memcmp(&got[i * e], &E.y0[i * e], e) != 0;
+                continue;
+            }
+            double acc = 0, terms = 0;
+            for (int j = 0; j < sh.R; ++j) {
+                const double tv = rad_bf16_to_f32(rad_f32_to_bf16(E.t[(size_t)m * sh.R + j]));
+                const double bv = rad_bf16_to_f32(E.lb[((size_t)sl * sh.N + n) * sh.R + j]);
+                acc += tv * bv;
+                terms += std::fabs(tv * bv);
+            }
+            const double sc = E.sc[(size_t)sl * sh.N + n];
+            const double y0 = lora_cases::get(sh.ydt, E.y0.data(), i);
+            const double want = y0 + sc * acc;
+            const double g = lora_cases::get(sh.ydt, got.data(), i);
+            if (std::isnan(y0)) { bad_val += !std::isnan(g); continue; }
+            const double ulp = sh.ydt == RAD_BF16 ? std::ldexp(1.0, -8)
+                             : sh.ydt == RAD_F16  ? std::ldexp(1.0, -10) : std::ldexp(1.0, -23);
+            const double tol = std::fabs(want) * ulp + sc * terms * (sh.R + 2) * std::ldexp(1.0, -24) +
+                               1e-30;
+            const double r = std::fabs(g - want) / tol;
+            worst = std::max(worst, r);
+            if (r > 1.0) ++bad_val;
+            ++worst_n;
+        }
+        if (bad_base)
+            fail("expand_mm", fmt("touched %lld base-row / outside bytes (M %d N %d R %d %s)",
+                                  (long long)bad_base, sh.M, sh.N, sh.R, rad_dtype_name(sh.ydt)));
+        if (bad_val)
+            fail("expand_mm", fmt("%lld outputs outside the bound (M %d N %d R %d %s)",
+                                  (long long)bad_val, sh.M, sh.N, sh.R, rad_dtype_name(sh.ydt)));
+    }
+    std::printf("lora expand_mm: %zu shapes, %lld outputs, worst |err|/bound %.3f\n",
+                sizeof(shapes) / sizeof(shapes[0]), (long long)worst_n, worst);
+}
+
 int main() {
     LaunchFn rs = nullptr, re = nullptr;
     load_libref(&rs, &re);
@@ -532,6 +600,7 @@ int main() {
     test_invariance();
     test_all_base();
     test_codes();
+    test_expand_mm();
     std::printf("lora tiled rows: %d failure(s)\n", g_fails);
     return (T.fails != 0 || g_fails != 0) ? 1 : 0;
 }

@@ -22,6 +22,7 @@
 #include <sstream>
 #include <cstdio>
 #include <string>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <cstring>
 #include <vector>
@@ -129,7 +130,8 @@ TEST(the_kl_mode_records_or_scores_and_says_which_input_it_lacks) {
 
 /* Runtime LoRA: the adapters reach their fields in order, the targets as sorted leaf names, and a
  * combination that would size slots no adapter uses, or name an adapter that is not served, is
- * refused by name. */
+ * refused by name. A text model's slot count against its adapters, and its targets, are checked
+ * at startup, where the engine knows whether the model generates text. */
 TEST(the_lora_flags_reach_their_fields_and_refuse_what_serves_no_adapter) {
     Config c;
     CHECK_OK(parse({ "--lora", "b=/ad/b", "--lora", "a=/ad/a", "--max-loras", "3",
@@ -144,6 +146,15 @@ TEST(the_lora_flags_reach_their_fields_and_refuse_what_serves_no_adapter) {
     Config d;
     CHECK_OK(parse({}, &d));
     CHECK(!d.lora.enabled());
+    CHECK_EQ(d.lora.rank(false), 16);
+    CHECK_EQ(d.lora.rank(true), 64);
+    Config e;
+    const std::string dir = radtest::tmp_path("loradir");
+    mkdir(dir.c_str(), 0755);
+    CHECK_OK(parse({ "--lora-dir", dir.c_str() }, &e));
+    CHECK(e.lora.enabled());
+    CHECK_EQ(e.lora.slots(), 2);
+    CHECK_EQ(e.lora.rank(true), 64);
 
     auto refused = [](std::initializer_list<const char*> v, const char* why) {
         int st = RAD_OK;
@@ -157,10 +168,9 @@ TEST(the_lora_flags_reach_their_fields_and_refuse_what_serves_no_adapter) {
     refused({ "--lora", "/ad/a" }, "NAME=PATH");
     refused({ "--lora", "a=" }, "NAME=PATH");
     refused({ "--lora", "a=/x", "--lora", "a=/y" }, "names the adapter 'a' twice");
-    refused({ "--lora", "a=/x", "--lora", "b=/y", "--max-loras", "1" }, "fewer adapters");
     refused({ "--max-lora-rank", "32" }, "--max-lora-rank sizes runtime LoRA slots");
     refused({ "--lora-target-modules", "q_proj" }, "--lora-target-modules sizes");
-    refused({ "--max-loras", "2" }, "names no module an adapter may target");
+    refused({ "--lora-dir", "/no/such/dir" }, "is not a directory");
     refused({ "--lora", "a=/x", "--lora-target-modules", "self_attn.q_proj" }, "leaf names");
     refused({ "--lora", "a=/x", "--lora-target-modules", ".*proj" }, "leaf names");
     refused({ "--lora", "a=/x", "--lora-target-modules", " , " }, "names no module");
@@ -454,6 +464,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--kld-corpus", { "/c.jsonl", "--kld-record", "/r" } },
         { "--kld-out", { "/o.json", "--kld-ref", "/r" } },
         { "--lora", { "a=/adapters/a" } },
+        { "--lora-dir", { "/" } },
         { "--max-loras", { "2", "--lora-target-modules", "q_proj" } },
         { "--max-lora-rank", { "32", "--lora", "a=/adapters/a" } },
         { "--lora-target-modules", { "q_proj,v_proj", "--max-loras", "1" } },

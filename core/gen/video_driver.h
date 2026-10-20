@@ -53,6 +53,7 @@ public:
     /* ---------------------------------------------------------- the engine thread */
     const RadBatch* next(int step) override;
     const RadBatch* batch_for(int rank) const override;
+    int32_t lora_slot() const override { return pass_.lora_slot; }
     const std::vector<Readback>& readbacks() const override { return rb_; }
     int  done() override;
 
@@ -99,6 +100,7 @@ private:
         int      kind = 0;
         uint64_t job = 0;
         int32_t  n_frames = 0;
+        int32_t  lora_slot = -1;
     };
 
     /* Staging regions: their offsets in the host span and every rank's slab. */

@@ -29,6 +29,8 @@ struct IPassDriver {
      * `step` is the engine's pass counter, carried into RadBatch::step. */
     virtual const RadBatch* next(int step) = 0;
     virtual const RadBatch* batch_for(int rank) const = 0;
+    /* The runtime LoRA slot every row of the staged pass runs with, -1 for none. */
+    virtual int32_t lora_slot() const { return -1; }
     /* What the staged pass's results are, valid until done(). */
     virtual const std::vector<Readback>& readbacks() const = 0;
     /* The pass has run on every rank, its streams are drained and the readbacks have landed. */

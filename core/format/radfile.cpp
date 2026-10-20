@@ -40,6 +40,7 @@ void RadFile::close() {
     hdr_ = nullptr; meta_ = nullptr; dir_ = nullptr; planes_ = nullptr; encs_ = nullptr;
     prof_ = nullptr;
     vocab_ = VocabSection{};
+    aux_vocab_ = VocabSection{};
     groups_.clear();
     by_name_.clear();
     path_.clear();
@@ -197,6 +198,9 @@ int RadFile::validate() {
     if (!need(span_n(hdr_->prof_off, hdr_->prof_count, sizeof(RadFileProfile)),
               "the expert profile")) return RAD_E_FORMAT;
     if (!need(span_ok(hdr_->vocab_off, hdr_->vocab_bytes), "the vocab section")) return RAD_E_FORMAT;
+    if (!need(span_ok(hdr_->reserved[RAD_HDR_AUX_VOCAB_OFF],
+                      hdr_->reserved[RAD_HDR_AUX_VOCAB_BYTES]), "the second vocab section"))
+        return RAD_E_FORMAT;
     if (!need(span_ok(hdr_->data_off, hdr_->data_bytes), "the data blob")) return RAD_E_FORMAT;
 
     if (hdr_->data_bytes && (hdr_->data_off % RAD_ALIGN_POOL) != 0) {
@@ -312,22 +316,29 @@ int RadFile::validate() {
     }
 
     /* ---------------------------------------------------------------- vocab */
-    if (hdr_->vocab_bytes >= sizeof(RadVocabHeader)) {
-        /* The section is read in place through typed pointers, so the header and every array must
-         * be aligned to their element (the writer guarantees it). */
-        if (hdr_->vocab_off % alignof(RadVocabHeader) != 0) {
-            RAD_ERR("%s: the vocab section starts at %llu, which is not %zu-aligned", path_.c_str(),
-                    (unsigned long long)hdr_->vocab_off, alignof(RadVocabHeader));
+    /* The vocab section, and the second one a generator may read its prompt through: the same
+     * layout, each checked against its own extent. */
+    auto read_vocab = [&](uint64_t voff, uint64_t vbytes, const char* what,
+                          VocabSection* out) -> int {
+        if (vbytes == 0) return RAD_OK;
+        if (vbytes < sizeof(RadVocabHeader)) {
+            RAD_ERR("%s: the %s section is %llu bytes, shorter than its own header (%zu)",
+                    path_.c_str(), what, (unsigned long long)vbytes, sizeof(RadVocabHeader));
             return RAD_E_FORMAT;
         }
-        const RadVocabHeader* v = (const RadVocabHeader*)(base_ + hdr_->vocab_off);
+        /* The section is read in place through typed pointers, so the header and every array must
+         * be aligned to their element (the writer guarantees it). */
+        if (voff % alignof(RadVocabHeader) != 0) {
+            RAD_ERR("%s: the %s section starts at %llu, which is not %zu-aligned", path_.c_str(),
+                    what, (unsigned long long)voff, alignof(RadVocabHeader));
+            return RAD_E_FORMAT;
+        }
+        const RadVocabHeader* v = (const RadVocabHeader*)(base_ + voff);
         /* Offset 0 means an optional array is absent (scores are unigram-only; types default to
          * normal). Nothing real lives at file offset 0. */
         auto arr_ok = [&](uint64_t off, uint64_t bytes, size_t align) {
             return bytes == 0 || off == 0 ||
-                   (off >= hdr_->vocab_off &&
-                    off - hdr_->vocab_off <= hdr_->vocab_bytes &&
-                    bytes <= hdr_->vocab_bytes - (off - hdr_->vocab_off) &&
+                   (off >= voff && off - voff <= vbytes && bytes <= vbytes - (off - voff) &&
                     off % align == 0);
         };
         const uint64_t nt = v->n_tokens, nm = v->n_merges, ns = v->n_steps;
@@ -336,47 +347,50 @@ int RadFile::validate() {
             !arr_ok(v->tok_type_off,  nt, 1) ||
             !arr_ok(v->merge_off,     nm * 2 * sizeof(uint32_t), alignof(uint32_t)) ||
             !arr_ok(v->step_off,      ns * sizeof(RadVocabStep), alignof(RadVocabStep))) {
-            RAD_ERR("%s: the vocab section's arrays do not fit inside it, or one is not aligned "
-                    "to its element", path_.c_str());
+            RAD_ERR("%s: the %s section's arrays do not fit inside it, or one is not aligned to its "
+                    "element",
+                    path_.c_str(), what);
             return RAD_E_FORMAT;
         }
-        vocab_.h         = v;
-        vocab_.tok_text  = (nt && v->tok_text_off) ? (const rad_stroff*)(base_ + v->tok_text_off) : nullptr;
-        vocab_.tok_score = (nt && v->tok_score_off) ? (const float*)(base_ + v->tok_score_off) : nullptr;
-        vocab_.tok_type  = (nt && v->tok_type_off)  ? (const uint8_t*)(base_ + v->tok_type_off) : nullptr;
-        vocab_.merges    = (nm && v->merge_off) ? (const uint32_t*)(base_ + v->merge_off) : nullptr;
-        vocab_.steps     = (ns && v->step_off) ? (const RadVocabStep*)(base_ + v->step_off) : nullptr;
+        VocabSection& vs = *out;
+        vs.h         = v;
+        vs.tok_text  = (nt && v->tok_text_off) ? (const rad_stroff*)(base_ + v->tok_text_off) : nullptr;
+        vs.tok_score = (nt && v->tok_score_off) ? (const float*)(base_ + v->tok_score_off) : nullptr;
+        vs.tok_type  = (nt && v->tok_type_off)  ? (const uint8_t*)(base_ + v->tok_type_off) : nullptr;
+        vs.merges    = (nm && v->merge_off) ? (const uint32_t*)(base_ + v->merge_off) : nullptr;
+        vs.steps     = (ns && v->step_off) ? (const RadVocabStep*)(base_ + v->step_off) : nullptr;
 
-        if (vocab_.tok_text)
+        if (vs.tok_text)
             for (uint64_t i = 0; i < nt; ++i)
-                if (!str_ok(vocab_.tok_text[i])) {
-                    RAD_ERR("%s: vocab token %llu points outside the string blob", path_.c_str(),
-                            (unsigned long long)i);
+                if (!str_ok(vs.tok_text[i])) {
+                    RAD_ERR("%s: %s token %llu points outside the string blob", path_.c_str(),
+                            what, (unsigned long long)i);
                     return RAD_E_FORMAT;
                 }
-        if (vocab_.steps)
+        if (vs.steps)
             for (uint64_t i = 0; i < ns; ++i)
-                if (!str_ok(vocab_.steps[i].arg0) || !str_ok(vocab_.steps[i].arg1)) {
-                    RAD_ERR("%s: vocab step %llu points outside the string blob", path_.c_str(),
+                if (!str_ok(vs.steps[i].arg0) || !str_ok(vs.steps[i].arg1)) {
+                    RAD_ERR("%s: %s step %llu points outside the string blob", path_.c_str(), what,
                             (unsigned long long)i);
                     return RAD_E_FORMAT;
                 }
-        if (vocab_.merges)
+        if (vs.merges)
             for (uint64_t i = 0; i < nm * 2; ++i)
-                if (vocab_.merges[i] >= nt) {
-                    RAD_ERR("%s: merge %llu names token %u of %llu", path_.c_str(),
-                            (unsigned long long)(i / 2), vocab_.merges[i], (unsigned long long)nt);
+                if (vs.merges[i] >= nt) {
+                    RAD_ERR("%s: %s merge %llu names token %u of %llu", path_.c_str(), what,
+                            (unsigned long long)(i / 2), vs.merges[i], (unsigned long long)nt);
                     return RAD_E_FORMAT;
                 }
         if (!str_ok(v->chat_template)) {
-            RAD_ERR("%s: the chat template offset is outside the string blob", path_.c_str());
+            RAD_ERR("%s: the %s section's chat template offset is outside the string blob",
+                    path_.c_str(), what);
             return RAD_E_FORMAT;
         }
-    } else if (hdr_->vocab_bytes != 0) {
-        RAD_ERR("%s: the vocab section is %llu bytes, shorter than its own header (%zu)",
-                path_.c_str(), (unsigned long long)hdr_->vocab_bytes, sizeof(RadVocabHeader));
-        return RAD_E_FORMAT;
-    }
+        return RAD_OK;
+    };
+    RAD_TRY(read_vocab(hdr_->vocab_off, hdr_->vocab_bytes, "vocab", &vocab_));
+    RAD_TRY(read_vocab(hdr_->reserved[RAD_HDR_AUX_VOCAB_OFF],
+                       hdr_->reserved[RAD_HDR_AUX_VOCAB_BYTES], "second vocab", &aux_vocab_));
 
     return RAD_OK;
 }
@@ -956,6 +970,29 @@ int RadWriter::check_complete() const {
     return RAD_OK;
 }
 
+/* A serialised vocab section's arrays rebased from section-relative to file offsets. */
+static void rebase_vocab(std::vector<uint8_t>& blob, uint64_t at) {
+    auto* vh = (RadVocabHeader*)blob.data();
+    if (vh->tok_text_off)  vh->tok_text_off  += at;
+    if (vh->tok_score_off) vh->tok_score_off += at;
+    if (vh->tok_type_off)  vh->tok_type_off  += at;
+    if (vh->merge_off)     vh->merge_off     += at;
+    if (vh->step_off)      vh->step_off      += at;
+}
+
+int RadWriter::set_aux_vocab_section(const void* blob, int64_t bytes) {
+    std::vector<uint8_t> keep;
+    keep.swap(vocab_blob_);
+    const bool had = have_vocab_;
+    const int s = set_vocab_section(blob, bytes);
+    keep.swap(vocab_blob_);
+    have_vocab_ = had;
+    if (s < 0) return s;
+    aux_vocab_blob_.assign((const uint8_t*)blob, (const uint8_t*)blob + bytes);
+    have_aux_vocab_ = true;
+    return RAD_OK;
+}
+
 int RadWriter::set_vocab_section(const void* blob, int64_t bytes) {
     if (!began_ || sealed_) return RAD_E_STATE;
     if (!blob || bytes < (int64_t)sizeof(RadVocabHeader)) {
@@ -1049,6 +1086,10 @@ void RadWriter::layout(RadFileHeader* hp) {
     h.enc_count  = encs_.size();
     h.vocab_off  = (uint64_t)place8((int64_t)vocab_blob_.size());
     h.vocab_bytes= have_vocab_ ? vocab_blob_.size() : 0;
+    if (have_aux_vocab_) {
+        h.reserved[RAD_HDR_AUX_VOCAB_OFF]   = (uint64_t)place8((int64_t)aux_vocab_blob_.size());
+        h.reserved[RAD_HDR_AUX_VOCAB_BYTES] = aux_vocab_blob_.size();
+    }
     h.prof_off   = (uint64_t)place8((int64_t)(prof_.size() * sizeof(RadFileProfile)));
     h.prof_count = prof_.size();
 
@@ -1095,14 +1136,8 @@ int RadWriter::finish() {
      * aligned within the blob, so alignment is preserved. */
     for (auto& e : dir_) e.offset += h.data_off;
     for (auto& p : planes_) p.offset += h.data_off;
-    if (have_vocab_) {
-        auto* vh = (RadVocabHeader*)vocab_blob_.data();
-        if (vh->tok_text_off)  vh->tok_text_off  += h.vocab_off;
-        if (vh->tok_score_off) vh->tok_score_off += h.vocab_off;
-        if (vh->tok_type_off)  vh->tok_type_off  += h.vocab_off;
-        if (vh->merge_off)     vh->merge_off     += h.vocab_off;
-        if (vh->step_off)      vh->step_off      += h.vocab_off;
-    }
+    if (have_vocab_) rebase_vocab(vocab_blob_, h.vocab_off);
+    if (have_aux_vocab_) rebase_vocab(aux_vocab_blob_, h.reserved[RAD_HDR_AUX_VOCAB_OFF]);
 
     int st = RAD_OK;
     int64_t at = 0;
@@ -1120,6 +1155,9 @@ int RadWriter::finish() {
     emit(planes_.data(), (int64_t)(planes_.size() * sizeof(RadFilePlane)), (int64_t)h.plane_off);
     emit(encs_.data(), (int64_t)(encs_.size() * sizeof(RadEncoding)), (int64_t)h.enc_off);
     if (have_vocab_) emit(vocab_blob_.data(), (int64_t)vocab_blob_.size(), (int64_t)h.vocab_off);
+    if (have_aux_vocab_)
+        emit(aux_vocab_blob_.data(), (int64_t)aux_vocab_blob_.size(),
+             (int64_t)h.reserved[RAD_HDR_AUX_VOCAB_OFF]);
     emit(prof_.data(), (int64_t)(prof_.size() * sizeof(RadFileProfile)), (int64_t)h.prof_off);
     if (st < 0) { RAD_ERR("%s: %s", path_.c_str(), std::strerror(errno)); abort(); return st; }
 
@@ -1249,6 +1287,10 @@ int RadWriter::finish_append() {
     h.enc_count  = encs_.size();
     h.vocab_off  = (uint64_t)place8((int64_t)vocab_blob_.size());
     h.vocab_bytes= have_vocab_ ? vocab_blob_.size() : 0;
+    if (have_aux_vocab_) {
+        h.reserved[RAD_HDR_AUX_VOCAB_OFF]   = (uint64_t)place8((int64_t)aux_vocab_blob_.size());
+        h.reserved[RAD_HDR_AUX_VOCAB_BYTES] = aux_vocab_blob_.size();
+    }
     h.prof_off   = (uint64_t)place8((int64_t)(prof_.size() * sizeof(RadFileProfile)));
     h.prof_count = prof_.size();
 
@@ -1264,14 +1306,8 @@ int RadWriter::finish_append() {
         if (!dir_abs_[i])
             for (uint32_t k = 0; k < dir_[i].n_planes; ++k)
                 planes_[dir_[i].plane_first + k].offset += (uint64_t)append_base_;
-    if (have_vocab_) {
-        auto* vh = (RadVocabHeader*)vocab_blob_.data();
-        if (vh->tok_text_off)  vh->tok_text_off  += h.vocab_off;
-        if (vh->tok_score_off) vh->tok_score_off += h.vocab_off;
-        if (vh->tok_type_off)  vh->tok_type_off  += h.vocab_off;
-        if (vh->merge_off)     vh->merge_off     += h.vocab_off;
-        if (vh->step_off)      vh->step_off      += h.vocab_off;
-    }
+    if (have_vocab_) rebase_vocab(vocab_blob_, h.vocab_off);
+    if (have_aux_vocab_) rebase_vocab(aux_vocab_blob_, h.reserved[RAD_HDR_AUX_VOCAB_OFF]);
 
     int st = RAD_OK;
     auto put = [&](const void* p, int64_t bytes, uint64_t at) {
@@ -1283,6 +1319,9 @@ int RadWriter::finish_append() {
     put(planes_.data(), (int64_t)(planes_.size() * sizeof(RadFilePlane)), h.plane_off);
     put(encs_.data(), (int64_t)(encs_.size() * sizeof(RadEncoding)), h.enc_off);
     if (have_vocab_) put(vocab_blob_.data(), (int64_t)vocab_blob_.size(), h.vocab_off);
+    if (have_aux_vocab_)
+        put(aux_vocab_blob_.data(), (int64_t)aux_vocab_blob_.size(),
+            h.reserved[RAD_HDR_AUX_VOCAB_OFF]);
     put(prof_.data(), (int64_t)(prof_.size() * sizeof(RadFileProfile)), h.prof_off);
     if (st >= 0 && ::ftruncate(fd_out_, (off_t)off) != 0) st = RAD_E_IO;
     /* Make everything durable before the new header names it. */

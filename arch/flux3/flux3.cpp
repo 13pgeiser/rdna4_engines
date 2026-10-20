@@ -937,6 +937,32 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.b_mask  = decl_b(b, nm.f("lat_mask"), RAD_F32, { lane_rows, 1 }, RAD_BUF_PERSIST);
     m.b_store = decl_b(b, nm.f("cond_store"), RAD_BF16,
                        { 2 * (int64_t)kMaxLanes * cond_rows(), gd.n_embd }, RAD_BUF_PERSIST);
+    /* ---- adapter key names. LoRA files name the blocks by Black Forest Labs' modules, as
+     * ComfyUI loads them (comfy/ldm/flux3): `single_blocks.N.q_proj` or a fused `qkv`,
+     * `attn_out`, `mlp_in`, `mlp_out`, and the mode blocks under `content_mode_blocks`. */
+    {
+        const int64_t Q = gd.n_head_all * gd.head_dim;
+        std::vector<LoraName> n;
+        static const char* const kBlocks[][2] = {
+            { "single_blocks.#.", "single_transformer_blocks.#." },
+            { "txt_mode_blocks.#.", "txt_mode_blocks.#." },
+            { "content_mode_blocks.image.#.", "mode_blocks.image.#." },
+            { "content_mode_blocks.image_cond.#.", "mode_blocks.image_cond.#." },
+        };
+        for (const auto& bl : kBlocks) {
+            const std::string f = bl[0], t = bl[1];
+            n.push_back({ f + "q_proj", t + "attn.to_q" });
+            n.push_back({ f + "k_proj", t + "attn.to_k" });
+            n.push_back({ f + "v_proj", t + "attn.to_v" });
+            n.push_back({ f + "qkv", t + "attn.to_q", 0, Q, 0 });
+            n.push_back({ f + "qkv", t + "attn.to_k", Q, 2 * Q, 0 });
+            n.push_back({ f + "qkv", t + "attn.to_v", 2 * Q, 3 * Q, 0 });
+            n.push_back({ f + "attn_out", t + "attn.to_out.0" });
+            n.push_back({ f + "mlp_in", t + "ff.linear_in" });
+            n.push_back({ f + "mlp_out", t + "ff.linear_out" });
+        }
+        RAD_ARCH_TRY(lora_names(b, "transformer.", kLoraDiffusionSpellings, n));
+    }
     RAD_ARCH_TRY(declare_te(b, meta, m));
     RAD_ARCH_TRY(declare_encoder(b, meta, m));
     RAD_ARCH_TRY(declare_dit(b, meta, m));

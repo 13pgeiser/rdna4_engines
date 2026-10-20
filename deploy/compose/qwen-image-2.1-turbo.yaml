@@ -2,6 +2,9 @@
 # qwen-image-2.1.yaml's model, the same images API, 2048x2048 by default. It samples on its own
 # 8-step schedule, so a request's num_inference_steps may only be 8. --tp-wire wht6 sends the DiT's
 # all-reduces as 6-bit; drop it for the exact wire.
+# LoRA files (Civitai and the like, docs/GUIDE.md §4.9.2): put them under
+# $RADIANCE_MODELS/loras/qwen-image and add `--lora-dir /models/loras/qwen-image` to the command;
+# a request names them in `loras` or as <lora:name:0.8> in its prompt.
 name: radiance-qwen-image-turbo
 services:
   radiance:

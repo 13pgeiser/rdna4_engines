@@ -412,12 +412,15 @@ __global__ __launch_bounds__(kCThreads) R4D_WAVES(6) void conv3d_kernel(
 // give the same bytes:
 //
 //   1. parts: block p takes rows [p rpp, (p + 1) rpp) and writes each group's (count, mean, M2)
-//      of them to the scratch. A thread keeps one 8-channel chunk of one group over every
-//      `slots`-th row, summing deviations from its first value (the shift keeps the f32 sums of
-//      squares from cancelling against a large mean); the block merges its threads' triples per
-//      group in thread order (Chan's parallel update).
+//      of them to the scratch. A row is `tpr` threads, each owning `cpt` consecutive CW-channel
+//      chunks of one group, and the block holds `slots` = 256 / tpr rows at a time (the threads
+//      past slots * tpr idle). A thread keeps its chunks over every `slots`-th row, summing
+//      deviations from its first value (the shift keeps the f32 sums of squares from cancelling
+//      against a large mean); the block merges its threads' triples per group in thread order
+//      (Chan's parallel update).
 //   2. final: block g merges group g's parts, 256 strided runs then a fixed tree, and writes
-//      stats[2g] = mean and stats[2g + 1] = rstd = 1 / sqrt(M2 / count + eps).
+//      stats[2g] = mean and stats[2g + 1] = rstd = 1 / sqrt(M2 / count + eps), the count the
+//      group's exact M n / groups.
 //   3. apply: a thread an 8-channel chunk, v = (x - mean) rstd w + b, the modulation and SiLU in
 //      f32, one rounding.
 //
@@ -436,31 +439,33 @@ __device__ __forceinline__ void chan_merge(float& n, float& mean, float& m2, flo
     n = nab;
 }
 
-/* `cpr_log`: log2 of the chunks a row (n / CW, a power of two dividing the block); `gs8` the
- * chunks a group. A chunk is CW channels: 8, or 4 for groups of 4 channels. */
+/* A chunk is CW channels (8, 4 or 2: the widest dividing a group). `tpr` threads a row, each over
+ * `cpt` chunks; `tpg` threads a group (its chunks / cpt). */
 template <typename TX, int CW>
 __global__ __launch_bounds__(kT) void gn_part_kernel(const TX* __restrict__ x,
                                                      float* __restrict__ stats, int M, int groups,
-                                                     int cpr_log, int gs8, int ldx, int rpp) {
+                                                     int tpr, int cpt, int tpg, int ldx, int rpp) {
     __shared__ float sh[3][kT];
     const int tid = threadIdx.x;
-    const int cpr = 1 << cpr_log, slots = kT >> cpr_log;
-    const int c = tid & (cpr - 1), slot = tid >> cpr_log;
+    const int slots = kT / tpr;
+    const int c = tid % tpr, slot = tid / tpr;
     const int p = blockIdx.x;
     const int r0 = p * rpp, r1 = min(M, r0 + rpp);
     float cnt = 0.0f, s1 = 0.0f, s2 = 0.0f, shift = 0.0f;
-    for (int r = r0 + slot; r < r1; r += slots) {
-        float v[CW];
-        ldc<CW>(x + (size_t)r * ldx + c * CW, v);
-        if (cnt == 0.0f) shift = v[0];
+    if (slot < slots)
+        for (int r = r0 + slot; r < r1; r += slots)
+            for (int q = 0; q < cpt; ++q) {
+                float v[CW];
+                ldc<CW>(x + (size_t)r * ldx + (c * cpt + q) * CW, v);
+                if (cnt == 0.0f) shift = v[0];
 #pragma unroll
-        for (int j = 0; j < CW; ++j) {
-            const float d = v[j] - shift;
-            s1 += d;
-            s2 += d * d;
-        }
-        cnt += (float)CW;
-    }
+                for (int j = 0; j < CW; ++j) {
+                    const float d = v[j] - shift;
+                    s1 += d;
+                    s2 += d * d;
+                }
+                cnt += (float)CW;
+            }
     float mean = 0.0f, m2 = 0.0f;
     if (cnt > 0.0f) {
         const float q = s1 / cnt;
@@ -474,8 +479,8 @@ __global__ __launch_bounds__(kT) void gn_part_kernel(const TX* __restrict__ x,
     for (int g = tid; g < groups; g += kT) {
         float N = 0.0f, Mn = 0.0f, Q = 0.0f;
         for (int s = 0; s < slots; ++s)
-            for (int k = 0; k < gs8; ++k) {
-                const int t = (s << cpr_log) + g * gs8 + k;
+            for (int k = 0; k < tpg; ++k) {
+                const int t = s * tpr + g * tpg + k;
                 chan_merge(N, Mn, Q, sh[0][t], sh[1][t], sh[2][t]);
             }
         float* o = stats + 2 * groups + ((size_t)g * kGnParts + p) * 3;
@@ -486,7 +491,7 @@ __global__ __launch_bounds__(kT) void gn_part_kernel(const TX* __restrict__ x,
 }
 
 __global__ __launch_bounds__(kT) void gn_final_kernel(float* __restrict__ stats, int groups,
-                                                      int parts, float eps) {
+                                                      int parts, float count, float eps) {
     __shared__ float sh[3][kT];
     const int g = blockIdx.x, tid = threadIdx.x;
     const float* P = stats + 2 * groups + (size_t)g * kGnParts * 3;
@@ -507,24 +512,24 @@ __global__ __launch_bounds__(kT) void gn_final_kernel(float* __restrict__ stats,
         __syncthreads();
     }
     if (tid == 0) {
-        const float var = sh[2][0] / sh[0][0];
+        const float var = sh[2][0] / count;
         stats[2 * g] = sh[1][0];
         stats[2 * g + 1] = 1.0f / sqrtf(var + eps);
     }
 }
 
 /* `wf`, `bf`: the gain's and bias's dtype is f32; `modk` 0 no modulation, 1 a bf16 row, 2 an f32
- * one. x and y may be the same memory: a thread reads its chunk before it writes it. */
+ * one. A thread is chunk `i % cpr` of row `i / cpr`, `gs8` chunks a group. x and y may be the same
+ * memory: a thread reads its chunk before it writes it. */
 template <typename TX, typename TY, int CW>
 __global__ __launch_bounds__(kT) void gn_apply_kernel(
     const TX* x, TY* y, const void* __restrict__ w, const void* __restrict__ b,
-    const void* __restrict__ mod, const float* __restrict__ stats, int M, int n, int cpr_log,
+    const void* __restrict__ mod, const float* __restrict__ stats, int M, int n, int cpr,
     int gs8, int ldx, int ldy, int wf, int bf, int modk, int silu) {
-    const int slots = kT >> cpr_log;
-    const int tid = threadIdx.x;
-    const int r = blockIdx.x * slots + (tid >> cpr_log);
+    const long long i = (long long)blockIdx.x * kT + threadIdx.x;
+    const int r = (int)(i / cpr);
     if (r >= M) return;
-    const int ck = tid & ((1 << cpr_log) - 1), c = ck * CW;
+    const int ck = (int)(i - (long long)r * cpr), c = ck * CW;
     const int g = ck / gs8;
     const float mean = stats[2 * g], rstd = stats[2 * g + 1];
     float v[CW], wv[CW], bv[CW];
@@ -741,12 +746,6 @@ int parse_f32_list(const char* s, float* out, int max) {
     return n;
 }
 
-inline int log2_exact(long long v) {
-    int l = 0;
-    while ((1ll << l) < v) ++l;
-    return (1ll << l) == v ? l : -1;
-}
-
 }  // namespace
 
 // ============================================================== the plugin ABI entry points
@@ -833,14 +832,18 @@ extern "C" int r4d_rad_group_norm(const RadArgs* a, RadStream stream) {
         if (!std::strcmp(act, "silu")) silu = 1;
         else if (std::strcmp(act, "none")) return R4D_NO(RAD_E_INVAL);
     }
-    /* A thread a chunk of CW channels inside one group (8; 4 for groups of 4 channels, the
-     * FLUX.2 VAE's 128 channels in 32 groups; 2 for groups of 2), a row's chunks a power of two
-     * dividing the 256-thread block. */
+    /* A chunk is CW channels inside one group: 8, 4 or 2, the widest dividing the group (the
+     * FLUX.2 VAE's 128 channels in 32 groups take 4, SDXL's 320 in 32 take 2). A row's chunks are
+     * split over at most 256 threads, each taking `cpt` consecutive chunks of one group, `cpt`
+     * the smallest divisor of the group's chunks that fits the row in the block. */
     if (groups <= 0 || groups > kT || n <= 0 || n % groups || (n / groups) % 2)
         return R4D_NO(RAD_E_SHAPE);
-    const int CW = (n / groups) % 8 == 0 ? 8 : (n / groups) % 4 == 0 ? 4 : 2;
-    const int cpr_log = log2_exact(n / CW);
-    if (cpr_log < 0 || n / CW > kT) return R4D_NO(RAD_E_SHAPE);
+    const long long cg = n / groups;
+    const int CW = cg % 8 == 0 ? 8 : cg % 4 == 0 ? 4 : 2;
+    const int cpr = (int)(n / CW), gs8 = (int)(cg / CW);
+    int cpt = 1;
+    while (cpr / cpt > kT || gs8 % cpt) ++cpt;
+    const int tpr = cpr / cpt, tpg = gs8 / cpt;
     if (r4d_numel(w) < n || r4d_numel(b) < n || (mod && r4d_numel(mod) < 2 * n) ||
         r4d_numel(st) < groups * (2 + 3 * kGnParts))
         return R4D_NO(RAD_E_SHAPE);
@@ -849,22 +852,22 @@ extern "C" int r4d_rad_group_norm(const RadArgs* a, RadStream stream) {
         return R4D_NO(RAD_E_STRIDE);
     long long rx = 0, ldx = 0, ry = 0, ldy = 0;
     if (!rows8(x, n, &rx, &ldx) || !rows8(y, n, &ry, &ldy)) return R4D_NO(RAD_E_STRIDE);
-    /* Over y's rows, as libref's (x may hold more); M is not read. Counts are f32 sums: exact
-     * while a group's M n / groups values stay under 2^24. */
+    /* Over y's rows, as libref's (x may hold more); M is not read. A part's count is exact in f32
+     * (rpp cg <= 2^24); the merged counts only weigh the merges, and the variance divides by the
+     * group's exact count. */
     const long long M = ry;
-    if (M <= 0 || M > rx || M > ry || M * (n / groups) >= (1ll << 24)) return R4D_NO(RAD_E_SHAPE);
-    const int slots = kT >> cpr_log;
+    if (M <= 0 || M > rx || M > ry || M * cg >= (1ll << 31)) return R4D_NO(RAD_E_SHAPE);
+    const int slots = kT / tpr;
     /* Whole passes of the block a part, as few parts as fill the scratch. */
     long long rpp = (M + kGnParts - 1) / kGnParts;
     rpp = (rpp + slots - 1) / slots * slots;
     const int parts = (int)((M + rpp - 1) / rpp);
-    const int gs8 = (int)(n / groups / CW);
     float* S = (float*)r4d_wp(st);
     const float eps = (float)r4d_getf(a, "eps", 1e-5);
     int rc;
 #define GN_P(TX, C4)                                                                              \
     rc = R4D_EMIT(stream, (gn_part_kernel<TX, C4>), dim3((unsigned)parts), dim3(kT), 0,           \
-                  (const TX*)r4d_p(x), S, (int)M, (int)groups, cpr_log, gs8, (int)ldx, (int)rpp)
+                  (const TX*)r4d_p(x), S, (int)M, (int)groups, tpr, cpt, tpg, (int)ldx, (int)rpp)
     if (is_f32(x)) {
         if (CW == 8)      GN_P(float, 8);
         else if (CW == 4) GN_P(float, 4);
@@ -877,14 +880,14 @@ extern "C" int r4d_rad_group_norm(const RadArgs* a, RadStream stream) {
 #undef GN_P
     if (rc != RAD_OK) return R4D_NO(rc);
     rc = R4D_EMIT(stream, gn_final_kernel, dim3((unsigned)groups), dim3(kT), 0, S, (int)groups,
-                  parts, eps);
+                  parts, (float)(M * cg), eps);
     if (rc != RAD_OK) return R4D_NO(rc);
     const int modk = !mod ? 0 : is_f32(mod) ? 2 : 1;
-    const dim3 grid((unsigned)((M + slots - 1) / slots));
+    const dim3 grid((unsigned)((M * cpr + kT - 1) / kT));
 #define GN_A2(TX, TY, C4)                                                                         \
     return R4D_EMIT(stream, (gn_apply_kernel<TX, TY, C4>), grid, dim3(kT), 0, (const TX*)r4d_p(x),\
                     (TY*)r4d_wp(y), r4d_p(w), r4d_p(b), r4d_p(mod), (const float*)S, (int)M,      \
-                    (int)n, cpr_log, gs8, (int)ldx, (int)ldy, (int)is_f32(w), (int)is_f32(b),     \
+                    (int)n, cpr, gs8, (int)ldx, (int)ldy, (int)is_f32(w), (int)is_f32(b),         \
                     modk, silu)
 #define GN_A(TX, TY)                                                                              \
     do { if (CW == 8) GN_A2(TX, TY, 8); if (CW == 4) GN_A2(TX, TY, 4); GN_A2(TX, TY, 2); } while (0)

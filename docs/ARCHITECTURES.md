@@ -22,7 +22,9 @@ plugin claims.
 | `arch/gemma4` | `gemma4` | *(empty)* | Gemma 4 text from Google's bf16 checkpoint (the 26B-A4B MoE and the dense sizes without per-layer embeddings) with z-lab's DFlash drafter; routed experts bf16 or block fp8 |
 | `arch/qwenimage21` | `qwenimage21` | *(empty)* | Qwen-Image 2.1 and 2.1-Turbo, an image generator, from the diffusers pipeline directory; DiT and text encoder bf16 or block fp8 |
 | `arch/krea2` | `krea2` | *(empty)* | Krea 2 Raw and Turbo, an image generator: Qwen3-VL-4B's tapped layers through a text-fusion transformer, a 12.9B single-stream DiT and Wan 2.1's VAE, from the diffusers pipeline directory; bf16 or block fp8 |
+| `arch/sdxl` | `sdxl` | *(empty)* | Stable Diffusion XL and its finetunes (Illustrious, NoobAI, Pony), an image generator: CLIP ViT-L and OpenCLIP bigG text encoders, the 2.6B UNet sampled by k-diffusion's Euler, Euler ancestral or DPM++ 2M on ComfyUI's schedules, the SDXL VAE; from the single-file checkpoint, bf16, one card |
 | `arch/flux3` | `flux3` | *(empty)* | FLUX.3 [klein] and its base, an image generator and editor: Qwen3-VL-4B's tapped layers, a 5.6B three-mode DiT over the text, up to ten reference pictures and the image, FLUX.2's VAE; bf16 or block fp8 |
+| `arch/anima` | `anima` | *(empty)* | Anima (Base, Aesthetic, Turbo), an image generator: Qwen3-0.6B-Base through the LLM adapter over the prompt's T5 tokens, Cosmos-Predict2's 2B cross-attention DiT and the Qwen-Image VAE, from the release's single files; bf16 or block fp8, one card |
 | `arch/flux3distilled` | `flux3distilled` | *(empty)* | the same plugin under the name FLUX.3 [klein]'s step-distilled release gives itself (`Flux3DistilledModularPipeline`; its base is a `Flux3ModularPipeline`) |
 | `arch/qwen3asr_bf16` | `qwen3asr` | *(empty)* | Qwen3-ASR: a Whisper-style audio encoder over a dense Qwen3 decoder, speech to text |
 | `arch/minimaxmusic3` | `minimaxmusic3` | *(empty)* | MiniMax-Music3, songs from a description and lyrics: a Qwen3-8B frame model, a depth decoder, a flow-matching DiT and a DAC vocoder, from the diffusers pipeline directory, bf16 |
@@ -38,6 +40,25 @@ The traps below are readings that are wrong without any error: the model produce
 `hidden_size / num_attention_heads` is 213, and a derived value silently breaks the projection
 widths, the KV page size and the attention kernel's band. `core/engine_bringup.cpp` takes it from
 the container's meta.
+
+## Adapter key names of the generators
+
+A generator that serves LoRA files ([GUIDE §4.9.2](GUIDE.md)) declares, before its GEMMs, how
+those files name its modules (`rad_lora_root`, `rad_lora_alias`; `lora_names` in
+`arch/common/rad_arch.h`). Files follow the model's original code or ComfyUI's port of it, while
+containers keep the diffusers names, and the two disagree in ways that load without an error and
+generate garbage: a fused `qkv` against separate q, k and v, a SwiGLU projection whose gate half
+comes first in one and second in the other. The tables, by plugin:
+
+| plugin | adapter files | checkpoint |
+|---|---|---|
+| `krea2` | `blocks.N.attn.wq/wk/wv/wo/gate`, `mlp.gate/up/down`, `txtfusion.{layerwise,refiner}_blocks.N.*`, `first`, `last_linear`, `tmlp.0/2`, `tproj.1`, `txtmlp.1/3` | `transformer_blocks.N.attn.to_q/...`, `ff.*`, `text_fusion.*`, `img_in`, `final_layer.linear`, `time_embed.linear_1/2`, `time_mod_proj`, `txt_in.linear_1/2` |
+| `qwenimage21` | the checkpoint's names, or `img_mlp.gate_up` = [gate; up] | `img_mlp.gate_layer`, `img_mlp.proj` |
+| `minimaxh3` | `blocks.N.attn.qkv_proj` (q, k, v), `out_proj`, `mlp.fc1` = [gate; up], `fc2`; `token_refiner.blocks.N.*`; `video_patch_proj`, `audio_patch_proj`, `condition_proj`, `time_embedder.proj_in/out`, `final_layer.video_out/audio_out` | `attn.to_q/k/v`, `to_out.0`, `ff.net.0.proj` = [up; gate], `ff.net.2`; `token_refiner.refiner_blocks.N.*`; `proj_in`, `audio_proj_in`, `context_embedder`, `time_embedder.linear_1/2`, `proj_out`, `audio_proj_out` |
+| `flux3` | `single_blocks.N`, `txt_mode_blocks.N`, `content_mode_blocks.{image,image_cond}.N` with `q_proj/k_proj/v_proj` or `qkv`, `attn_out`, `mlp_in`, `mlp_out` | `single_transformer_blocks.N`, `txt_mode_blocks.N`, `mode_blocks.{image,image_cond}.N` with `attn.to_q/k/v`, `attn.to_out.0`, `ff.linear_in/out` |
+| `ltx2` | the checkpoint's names | |
+| `anima` | the checkpoint's names behind `diffusion_model.` / `lora_unet_`; the text encoder as `lora_te_layers_N_...` | DiT under `net.` or `model.diffusion_model.`, Qwen3 under `model.layers.` |
+| `sdxl` | kohya's `lora_unet_` over the single-file UNet paths (convolutions included), `lora_te1_` / `lora_te2_` over the CLIPs' transformers names | UNet under `model.diffusion_model.`, CLIP-L and bigG under `conditioner.embedders.{0,1}.transformer.` |
 
 ---
 
@@ -922,6 +943,76 @@ quantisation's: the container's codes decoded to bf16 on the host give the same 
 
 ---
 
+# `sdxl`: Stable Diffusion XL and its finetunes, an image generator
+
+`arch/sdxl` serves SDXL 1.0 and every finetune published as one `.safetensors` in Stability's
+(sgm) layout: Illustrious, NoobAI, Pony and the civitai checkpoints built on them. rad-convert's
+importer (`core/format/checkpoint.cpp`, `open_sgm`) reads the file as it ships; the plugin is a
+JOINT_STEP generator whose conditioning rides in each lane's store and is read by the UNet's cross
+attention, and whose sampler is the core's discrete-time one (`RadGeneratorDecl::train_steps`).
+
+```
+names     the UNet under model.diffusion_model.*, CLIP ViT-L under
+          conditioner.embedders.0.transformer.text_model.*, both as the file has them; OpenCLIP
+          bigG renamed to transformers' CLIPTextModelWithProjection under
+          conditioner.embedders.1.transformer.* (in_proj split into q/k/v_proj, c_fc/c_proj as
+          fc1/fc2, ln_* as layer_norm*, text_projection transposed into a linear's weight); the VAE
+          decoder in diffusers' names under vae.*. These are the names kohya's lora_unet_*,
+          lora_te1_* and lora_te2_* adapters are written against
+text      the prompt in CLIP windows: BOS, up to 75 tokens, EOS, padding to 77 (the core cuts them,
+          RadGeneratorDecl::chunk_tokens), each window encoded on its own and causally. ViT-L (12
+          layers, quick_gelu) and bigG (32 layers, gelu); the context is ViT-L's and bigG's
+          PENULTIMATE hidden states side by side (2048 wide, no final norm); the pooled vector is
+          bigG's LAST layer through final_layer_norm at the first window's EOS, through
+          text_projection
+padding   ViT-L's padding is EOS (49407), bigG's is token 0 ("!"), as the two tokenizers pad; the
+          padded rows are part of the context the UNet attends to
+UNet      320/640/1280 channels at 1, 1/2, 1/4 of the latent; residual blocks (GroupNorm(32) eps
+          1e-5, SiLU, 3x3 conv, the time embedding's projection added per channel, a 1x1 skip when
+          the width changes); spatial transformers (GroupNorm eps 1e-6, linear proj_in/out, blocks
+          of self attention, cross attention over the context and GEGLU, 64-wide heads) 2 deep at
+          1/2, 10 deep at 1/4 and in the middle; skip connections concatenated after h
+added     the time embedding (sinusoid of the timestep, cos first, 320 wide) plus label_emb of
+          [pooled | sinusoids of (height, width), (0, 0), (height, width)] (2816 wide)
+VAE       AutoencoderKL, 4 channels at 8x, the latent divided by 0.13025; run bf16
+sampler   k-diffusion over 1000 scaled-linear timesteps (betas 0.00085..0.012): f32 latent lanes,
+          the UNet's input x / sqrt(sigma^2 + 1), the timestep the nearest trained one (ComfyUI),
+          guidance on the denoised estimates; Euler, Euler ancestral, DPM++ 2M on ComfyUI's
+          normal, karras, exponential, sgm_uniform and simple schedules
+```
+
+Each denoising pass runs the UNet once per entry at that entry's size: a convolution's image size
+comes from its operands, so two sizes cannot share a launch. The sampler ops run over every entry.
+Every 3x3 convolution is `im2col_nhwc` and a `gemm_nt_bias` over the weight read as
+`[cout, cin * 9]` (the checkpoint's order), so it carries a runtime LoRA like a linear; this is 9%
+faster than `conv2d_nhwc` over the UNet's shapes at 1024x1024, slower only at 1/1 with 320
+channels. conv_in and out.2 (4 channels) are direct convolutions.
+
+Traps:
+
+- **The context is the penultimate layer of both encoders.** hidden_states[-2], before any final
+  norm; only the pooled vector goes through bigG's final norm, from its last layer.
+- **bigG's padding is not EOS.** Its tokenizer pads with "!"; reading the padding as EOS changes
+  the context rows the UNet attends to (it does not change the pooled vector).
+- **The size conditioning is (height, width), not (width, height)**, each through its own
+  256-wide sinusoid, after the pooled vector.
+- **open_clip's text_projection multiplies from the right** (x @ P); a linear's weight is P^T.
+- **bf16, not f16.** The release is f16 and the SDXL VAE overflows in f16; bf16 has f32's range.
+
+Against a torch reference -- diffusers' text encoders, UNet and VAE in f32 under the same
+k-diffusion loop, schedule and Philox noise -- from the same seeds at 1024x1024 on one R9700 (relative
+L2; diffusers' own bf16 run against the same f32 one in brackets): ViT-L's context 0.28% (0.28%),
+bigG's 1.8% (2.0%), the pooled vector 0.9% (1.0%), the UNet's first evaluation 0.25% (0.31%); the VAE
+on the same latent 45.0 dB. Whole pictures (PSNR against f32; diffusers bf16 in brackets): SDXL 1.0
+Euler 31.3 dB (27.4), DPM++ 2M Karras 34.6 dB, Euler ancestral 24.8 dB (18.0); Illustrious-XL v2.0
+Euler 30.0 dB, Euler ancestral 22.3 dB (25.7), 832x1216 Euler 33.1 dB (28.3 against a reference
+given (width, height) for its size); NoobAI-XL V-Pred 1.0 (v prediction, zero terminal
+SNR) Euler 22.4 dB (22.6). A 91-token prompt's two windows against the same windows encoded by
+transformers in f32 (Illustrious): ViT-L 0.7% in each, bigG 1.6% and 2.2%, the pooled vector 1.3%.
+An image is the same bytes whether its pass carries other requests' images of other sizes or not.
+
+---
+
 # `flux3`: FLUX.3 [klein] and its base, an image generator and editor
 
 `arch/flux3` declares a JOINT_STEP generator over three modes: the text, the reference pictures'
@@ -965,6 +1056,64 @@ Traps:
 Against diffusers' modular pipeline in bf16 on a tiny random-weight pipeline of the same layout
 (256x256, from the same latents, mean absolute difference in 8-bit levels, GPU): [klein] 1.17, the
 base guided 2.30, an edit with one reference picture 1.16.
+
+---
+
+# `anima`: Anima (Base, Aesthetic, Turbo), an image generator
+
+`arch/anima` declares a JOINT_STEP generator, though its DiT is a cross-attention model: the
+conditioning pass leaves each lane's 512 context rows in its store, and every denoising step reads
+them back (the entry's text mode, `mode_src`) for the cross-attention's keys and values; the text
+rows the layout carries are never run through the DiT. Served on `/v1/images/generations`; it
+takes no reference pictures.
+
+```
+text      Qwen3-0.6B-Base over the prompt as it is (no template); its last hidden state after the
+          final norm. An empty prompt is one <|endoftext|> (min_tokens 1), not " "
+adapter   the LLM adapter: the prompt's T5 tokens (the container's second vocabulary) as query
+          rows, embedded from a 32128-row table; six blocks of RMS-normed self-attention over them,
+          cross-attention to the Qwen3 rows and a GELU MLP, 16 heads of 64, q and k RMS-normed and
+          rotated (NeoX, theta 1e4) at their own row index on either side; out_proj and an RMS
+          norm; zero-padded to 512 rows
+DiT       Cosmos-Predict2's MiniTrainDIT at 2B: 28 blocks of 2048 (16 heads of 128); per block a
+          self-attention (q/k RMS norms, a NeoX rotary of 22 + 21 + 21 frequency pairs over
+          frame, row and column at 10000 x 4^(42/40); the frame is 0), a cross-attention to the
+          512 context rows (q/k norms, no rotary) and a GELU MLP, each behind a LayerNorm without
+          affine times (1 + scale) plus shift and added back times its gate
+modulation each of a block's three: Linear(256, 6144)(Linear(2048, 256)(silu(e))) + the shared
+          AdaLN-LoRA term Linear(2048, 6144)(silu(Linear(2048, 2048)(t))), t the sinusoid of the
+          step's sigma (a timestep in [0, 1], [cos | sin]) and e its RMS norm
+patches   a token is 2 x 2 latents, 64 values channel-major; the patch embedding was trained on 68
+          (a padding-mask channel, always zero), read over its first 64 columns (RAD_MAP_COLS);
+          the final linear's rows reordered from (row, column, channel) to channel-major
+VAE       the Qwen-Image VAE under ComfyUI's Wan 2.1 names, 16 channels at 8x; the latent
+          denormalised with Wan 2.1's statistics in f32
+schedule  ComfyUI's FLOW sampling (multiplier 1, shift 3) and its `simple` scheduler over 1000
+          timesteps (sigma_grid), Euler steps; guidance uncond + s (cond - uncond). Base and
+          Aesthetic: 30 steps, s 4, the card's negative prompt; Turbo: 10 steps, unguided. The
+          variant is `anima.variant` (rad-convert --set)
+```
+
+Traps:
+
+- **T5 tokens, not Qwen3's, are the queries.** The adapter reads the same prompt twice: Qwen3's
+  ids for the source, T5's for the queries; T5's normaliser is SentencePiece's precompiled map
+  over extended grapheme clusters (core/text/tokenizer_grapheme.h). Reading the queries off Qwen3's
+  tokens gives a plausible, wrong picture.
+- **The padding rows are attended to.** The context is zero-padded to 512 rows and the DiT's
+  cross-attention reads all 512: a zero row is a zero key and value, which still takes its share
+  of the softmax.
+- **The DiT keys have two spellings.** Base ships `net.blocks.N...`, Aesthetic 1.1 and Turbo 1.1
+  `model.diffusion_model.blocks.N...`; the plugin reads the prefix off the checkpoint at convert
+  and keeps the file's own names as the name map's sources.
+- **The empty negative prompt is not " ".** ComfyUI encodes "" as one padding token for Qwen3 and
+  </s> for T5; the core keeps an empty prompt empty for a model with `min_tokens`.
+
+Against ComfyUI in bf16 on an RTX 4090 from the same noise: the DiT's velocity at sigma 1 rel
+0.48% (cos 0.99999) from the bf16 container and 1.5% from the block-fp8 one, the adapter's 512 rows
+rel 1.9% (Qwen3's output in bf16 against ComfyUI's f32), the VAE on the same latent 46.9 dB; three
+1024 x 1024 pictures after 30 guided steps 32.8, 36.0 and 39.0 dB from bf16, 26.7, 26.0 and 28.6 dB
+from fp8 (the same picture to the eye).
 
 ---
 

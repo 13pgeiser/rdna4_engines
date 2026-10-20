@@ -101,8 +101,8 @@ int ref_lora_shrink(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
-/* operands: t, slot, lora_b, scale, y (inout) */
-int ref_lora_expand(const RadArgs* a, RadStream) {
+/* operands: t, slot, lora_b, scale, y (inout). `bf16_t`: lora_expand_mm, t rounded to bf16. */
+static int lora_expand_impl(const RadArgs* a, bool bf16_t) {
     if (!have(a, 5)) return RAD_E_INVAL;
     const RadTensor *T = &a->t[0], *SL = &a->t[1], *LB = &a->t[2], *SC = &a->t[3], *Y = &a->t[4];
     const int64_t N = p_int(a, "N", 0), R = p_int(a, "R", 0), S = p_int(a, "S", 0);
@@ -127,9 +127,11 @@ int ref_lora_expand(const RadArgs* a, RadStream) {
         if (s < 0) continue;                     /* a base row: not read, not written */
         const int64_t t0 = m * mt.rs, b0 = s * pb.s0 + n * pb.s1;
         float acc = 0.0f;
-        for (int64_t j = 0; j < R; ++j)
-            acc += ((const float*)T->data)[t0 + j * mt.cs] *
-                   ld_dt(LB->dtype, LB->data, b0 + j * pb.s2);
+        for (int64_t j = 0; j < R; ++j) {
+            float tv = ((const float*)T->data)[t0 + j * mt.cs];
+            if (bf16_t) tv = rad_bf16_to_f32(rad_f32_to_bf16(tv));
+            acc += tv * ld_dt(LB->dtype, LB->data, b0 + j * pb.s2);
+        }
         const float sc = ((const float*)SC->data)[s * sc_r + n * sc_c];
         const int64_t o = m * ys_r + n * ys_c;
         /* `sc * acc` and then the add, each rounded: the order is the definition. */
@@ -138,3 +140,9 @@ int ref_lora_expand(const RadArgs* a, RadStream) {
     }
     return RAD_OK;
 }
+
+int ref_lora_expand(const RadArgs* a, RadStream) { return lora_expand_impl(a, false); }
+
+/* lora_expand with t rounded to bf16; the order of the sum is free, so j ascending is one of the
+ * answers it allows. */
+int ref_lora_expand_mm(const RadArgs* a, RadStream) { return lora_expand_impl(a, true); }

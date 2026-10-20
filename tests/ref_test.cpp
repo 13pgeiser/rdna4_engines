@@ -939,7 +939,7 @@ TEST(op_vocabulary) {
         "dequant",
         "gemm_nt", "gemm_nt_bias", "gemm_nt_q", "gemm_nt_q_bias", "grid_embed",
         /* Runtime LoRA's two halves, issued by the core beside a trunk GEMM. */
-        "lora_shrink", "lora_expand",
+        "lora_shrink", "lora_expand", "lora_expand_mm",
         "grid_embed_aa",
         "attn_paged", "attn_dense", "kv_store", "rope", "rope_table", "qk_norm_rope", "qsa_block_key",
         /* The rest of the QSA indexer and DFlash2's convolution: not fusions, so a model that
@@ -958,9 +958,12 @@ TEST(op_vocabulary) {
         /* The image generator's (arch/qwenimage21): a DiT's modulation and gates, the per-lane
          * sampler state, the VAE's convolutions and shortcuts, attention over a cached prefix. */
         "ln_mod", "gate_add", "timestep_embed", "gather_rows2", "lane_gather", "lane_store",
-        "randn_lanes", "flow_euler", "chan_affine", "conv2d_nhwc", "l2norm_chan", "d2s_add",
-        "s2d_avg_add", "to_rgba8", "gelu_tanh", "scatter_add_rows", "attn_prefix_self",
+        "randn_lanes", "flow_euler", "chan_affine", "conv2d_nhwc", "im2col_nhwc", "l2norm_chan",
+        "d2s_add", "s2d_avg_add", "to_rgba8", "gelu_tanh", "scatter_add_rows", "attn_prefix_self",
         "ln_mod_quant_fp8",
+        /* SDXL's (arch/sdxl): CLIP-L's activation and the k-diffusion sampler over a
+         * discrete-time denoiser. */
+        "gelu_quick", "kd_input", "kd_step",
         /* The music generator's (arch/minimaxmusic3): the codec's convolutions and activation, the
          * guided frame sampler and the frame embeddings, the window states of the latent
          * denoiser, and the index helpers that feed them. */
@@ -5554,6 +5557,136 @@ TEST(flow_euler_guides_previews_and_repaints_as_stated) {
     CHECK_EQ(state.at(8), 7.0f); CHECK_EQ(state.at(9), 8.0f);
 }
 
+/* kd_input: entry 0's first step fills its lane with the seed's stream times sqrt(1 + sigma^2)
+ * and writes x / sqrt(sigma^2 + 1) to its rows and its pair's (entry 1, pair -2, writes nothing of
+ * its own); entry 2 reads its lane as it is. */
+TEST(kd_input_starts_the_lane_and_scales_by_c_in) {
+    const int64_t n = 2, st = 2;
+    const uint64_t seed = 0xabcdef12345ull;
+    T sg(RAD_F32, {3}); sg.f({3, 3, 1});
+    T pair(RAD_I32, {3}); pair.n({1, -2, -1});
+    T lane(RAD_I32, {3}); lane.n({0, 1, 2});
+    T fl(RAD_I32, {3}); fl.n({1, 0, 0});
+    T sd(RAD_U32, {3, 2}); sd.n({(int64_t)(seed & 0xffffffffu), (int64_t)(seed >> 32), 0, 0, 5, 0});
+    T cu(RAD_I32, {4}); cu.n({0, 2, 4, 5});
+    T state(RAD_F32, {3 * st, n}); state.f({0, 0, 0, 0, 7, 7, 7, 7, 4, -2, 9, 9});
+    T y(RAD_F32, {5, n});
+    A a; a.t(sg).t(pair).t(lane).t(fl).t(sd).t(cu).t(state).t(y).i("M", 5).i("n", n)
+          .i("stride", st).s("dtype", "f32");
+    CHECK_OK(run("kd_input", a));
+    const float init = std::sqrt(1.0f + 9.0f), cin = 1.0f / std::sqrt(9.0f + 1.0f);
+    for (int64_t k = 0; k < 2; ++k)
+        for (int64_t c = 0; c < n; ++c) {
+            const float x0 = rad_philox_normal(seed, (uint64_t)(k * n + c)) * init;
+            CHECK_EQ(state.at(k * n + c), x0);
+            CHECK_EQ(y.at(k * n + c), x0 * cin);
+            CHECK_EQ(y.at((2 + k) * n + c), x0 * cin);
+            CHECK_EQ(state.at((st + k) * n + c), 7.0f);   /* the parked entry's lane */
+        }
+    CHECK_NEAR(y.at(8), 4.0f / std::sqrt(2.0f), 1e-6); CHECK_NEAR(y.at(9), -2.0f / std::sqrt(2.0f), 1e-6);
+    /* A repaint is refused. */
+    T fl2(RAD_I32, {3}); fl2.n({2, 0, 0});
+    A b; b.t(sg).t(pair).t(lane).t(fl2).t(sd).t(cu).t(state).t(y).i("M", 5).i("n", n)
+          .i("stride", st).s("dtype", "f32");
+    CHECK_EQ(run("kd_input", b), RAD_E_UNSUPPORTED);
+}
+
+/* kd_step, one element an entry: Euler guided against a parked entry with a preview; Euler
+ * ancestral at sigma_next 0 and above it; DPM++ 2M's first step, its second-order step and its
+ * last step; and a v-prediction model. */
+TEST(kd_step_denoises_guides_and_steps_each_sampler) {
+    const int64_t n = 1, st = 1;
+    /* entry: 0 euler guided, 1 parked, 2 ancestral to 0, 3 ancestral, 4 dpm first, 5 dpm second,
+     * 6 dpm last */
+    T o(RAD_F32, {7, n}); o.f({0.5f, 0.25f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f});
+    T sg(RAD_F32, {7}); sg.f({2, 2, 2, 2, 2, 2, 2});
+    T sgn(RAD_F32, {7}); sgn.f({1, 1, 0, 1, 1, 1, 0});
+    T sgp(RAD_F32, {7}); sgp.f({0, 0, 0, 0, 0, 4, 4});
+    T cfg(RAD_F32, {7}); cfg.f({3, 1, 1, 1, 1, 1, 1});
+    T pair(RAD_I32, {7}); pair.n({1, -2, -1, -1, -1, -1, -1});
+    T lane(RAD_I32, {7}); lane.n({0, 1, 2, 3, 4, 5, 6});
+    T fl(RAD_I32, {7}); fl.n({4, 0, 0, 0, 1, 0, 0});
+    T sd(RAD_U32, {7, 2}); sd.n({0, 0, 0, 0, 0, 0, 77, 0, 0, 0, 0, 0, 0, 0});
+    T smp(RAD_I32, {7}); smp.n({0, 0, 1, 1, 2, 2, 2});
+    T stp(RAD_I32, {7}); stp.n({0, 0, 0, 5, 0, 1, 2});
+    T cu(RAD_I32, {8}); cu.n({0, 1, 2, 3, 4, 5, 6, 7});
+    T state(RAD_F32, {7, n}); state.f({2, 9, 2, 2, 2, 2, 2});
+    T hist(RAD_F32, {7, n}); hist.f({0, 0, 0, 0, 0, 0.5f, 0});
+    T prev(RAD_F32, {7, n});
+    A a; a.t(o).t(sg).t(sgn).t(sgp).t(cfg).t(pair).t(lane).t(fl).t(sd).t(smp).t(stp).t(cu)
+          .t(state).t(hist).t(prev).i("M", 7).i("n", n).i("stride", st).s("pred", "eps")
+          .s("dtype", "f32");
+    CHECK_OK(run("kd_step", a));
+    /* D = x - sigma o: 1 for the positive entry, 1.5 for its negative, guided 1.5 + 3 (1 - 1.5) =
+     * 0; Euler: x + (1 - 2)(2 - 0) / 2 = 1. */
+    CHECK_EQ(prev.at(0), 0.0f);
+    CHECK_EQ(state.at(0), 1.0f);
+    CHECK_EQ(hist.at(0), 0.0f);
+    CHECK_EQ(state.at(1), 9.0f);                     /* parked */
+    CHECK_EQ(state.at(2), 1.0f);                     /* ancestral to 0: D */
+    {
+        /* sigma_up = min(1, sqrt(1 (4 - 1) / 4)) = sqrt(0.75), sigma_down = sqrt(1 - 0.75). */
+        const float sup = std::sqrt(0.75f), sdown = std::sqrt(1.0f - sup * sup);
+        const float d = (2.0f - 1.0f) / 2.0f;
+        const float want = 2.0f + d * (sdown - 2.0f) + rad_philox_normal_s(77, 6, 0) * sup;
+        CHECK_NEAR(state.at(3), want, 1e-6);
+    }
+    /* DPM++ 2M: h = ln 2, so x' = x / 2 - expm1(-ln 2) D = 1 + 0.5 D' with D = 1. */
+    CHECK_NEAR(state.at(4), 1.5f, 1e-6);
+    /* r = (ln 4 - ln 2) / ln 2 = 1: D' = 1.5 D - 0.5 hist = 1.25. */
+    CHECK_NEAR(state.at(5), 1.625f, 1e-6);
+    CHECK_EQ(state.at(6), 1.0f);                     /* to sigma 0: D */
+    CHECK_EQ(hist.at(5), 1.0f);
+
+    /* v-prediction at sigma 1: D = x / 2 - o / sqrt(2), so o = sqrt(2) at x = 2 gives D = 0, and
+     * Euler to 0 lands on it. */
+    T ov(RAD_F32, {1, 1}); ov.f({std::sqrt(2.0f)});
+    T s1(RAD_F32, {1}); s1.f({1});
+    T z1(RAD_F32, {1}); z1.f({0});
+    T c1(RAD_F32, {1}); c1.f({1});
+    T p1(RAD_I32, {1}); p1.n({-1});
+    T l1(RAD_I32, {1}); l1.n({0});
+    T f1(RAD_I32, {1}); f1.n({0});
+    T d1(RAD_U32, {1, 2}); d1.n({0, 0});
+    T m1(RAD_I32, {1}); m1.n({0});
+    T cu1(RAD_I32, {2}); cu1.n({0, 1});
+    T x1(RAD_F32, {1, 1}); x1.f({2});
+    T h1(RAD_F32, {1, 1});
+    A b; b.t(ov).t(s1).t(z1).t(z1).t(c1).t(p1).t(l1).t(f1).t(d1).t(m1).t(m1).t(cu1).t(x1).t(h1)
+          .i("M", 1).i("n", 1).i("stride", 1).s("pred", "v").s("dtype", "f32");
+    CHECK_OK(run("kd_step", b));
+    CHECK_NEAR(x1.at(0), 0.0f, 1e-6);
+
+    /* An unknown sampler is refused, and so is a preview without its operand. */
+    T bad(RAD_I32, {1}); bad.n({3});
+    A c; c.t(ov).t(s1).t(z1).t(z1).t(c1).t(p1).t(l1).t(f1).t(d1).t(bad).t(m1).t(cu1).t(x1).t(h1)
+          .i("M", 1).i("n", 1).i("stride", 1).s("pred", "v").s("dtype", "f32");
+    CHECK_EQ(run("kd_step", c), RAD_E_UNSUPPORTED);
+    T f4(RAD_I32, {1}); f4.n({4});
+    A d; d.t(ov).t(s1).t(z1).t(z1).t(c1).t(p1).t(l1).t(f4).t(d1).t(m1).t(m1).t(cu1).t(x1).t(h1)
+          .i("M", 1).i("n", 1).i("stride", 1).s("pred", "v").s("dtype", "f32");
+    CHECK_EQ(run("kd_step", d), RAD_E_INVAL);
+}
+
+/* gelu_quick rounds the scaled input and the sigmoid to y's dtype before the product. */
+TEST(gelu_quick_rounds_like_torch_in_bf16) {
+    T x(RAD_BF16, {1, 3}); x.f({1.0f, -2.0f, 0.375f});
+    T y(RAD_BF16, {1, 3});
+    A a; a.t(x).t(y).i("M", 1).i("n", 3).s("dtype", "bf16");
+    CHECK_OK(run("gelu_quick", a));
+    for (int i = 0; i < 3; ++i) {
+        const float v = x.at(i);
+        const float t = round_dt(RAD_BF16, 1.702f * v);
+        const float s = round_dt(RAD_BF16, 1.0f / (1.0f + std::exp(-t)));
+        CHECK_EQ(y.at(i), round_dt(RAD_BF16, v * s));
+    }
+    T xf(RAD_F32, {1, 1}); xf.f({0.5f});
+    T yf(RAD_F32, {1, 1});
+    A b; b.t(xf).t(yf).i("M", 1).i("n", 1).s("dtype", "f32");
+    CHECK_OK(run("gelu_quick", b));
+    CHECK_EQ(yf.at(0), 0.5f * (1.0f / (1.0f + std::exp(-0.851f))));
+}
+
 /* chan_affine: lists are bf16 values; fma is bf16(bf16(x * mul) + add) and inv its inverse. */
 TEST(chan_affine_reads_bf16_lists_and_inverts) {
     T x(RAD_BF16, {1, 3}); x.f({1, 1, 1});
@@ -5626,6 +5759,56 @@ TEST(conv2d_nhwc_pads_and_upsamples) {
     CHECK_OK(run("conv2d_nhwc", c));
     const float want[16] = { 1, 1, 2, 2, 1, 1, 2, 2, 3, 3, 4, 4, 3, 3, 4, 4 };
     for (int i = 0; i < 16; ++i) CHECK_EQ(y2.at(i), want[i]);
+}
+
+/* im2col_nhwc: its rows times the weight read as [cout, cin k k] are conv2d_nhwc, at both paddings
+ * of a stride-2 conv, the upsample and a 1x1, with x at a row pitch. Small integers keep every sum
+ * exact, so the two orders of accumulation agree to the bit. */
+TEST(im2col_nhwc_times_the_weight_is_the_convolution) {
+    struct Case { const char* pad; int64_t cin, cout, k, stride, up, H, W; };
+    for (const Case& c : { Case{ "same", 3, 4, 3, 1, 1, 5, 6 }, Case{ "same", 2, 3, 3, 2, 1, 7, 5 },
+                           Case{ "down", 3, 2, 3, 2, 1, 6, 8 }, Case{ "same", 2, 3, 3, 1, 2, 3, 4 },
+                           Case{ "same", 5, 2, 1, 1, 1, 4, 3 } }) {
+        const bool down = !std::strcmp(c.pad, "down");
+        const int64_t Hv = c.H * c.up, Wv = c.W * c.up, pads = down ? 1 : 2 * (c.k / 2);
+        const int64_t Ho = (Hv + pads - c.k) / c.stride + 1, Wo = (Wv + pads - c.k) / c.stride + 1;
+        const int64_t KK = c.cin * c.k * c.k, ld = c.W * c.cin + 3;
+        std::vector<float> xv((size_t)(c.H * ld)), wv((size_t)(c.cout * KK)), bv((size_t)c.cout);
+        for (size_t i = 0; i < xv.size(); ++i) xv[i] = (float)((int)(i * 7 % 11) - 5);
+        for (size_t i = 0; i < wv.size(); ++i) wv[i] = (float)((int)(i * 5 % 7) - 3);
+        for (size_t i = 0; i < bv.size(); ++i) bv[i] = (float)i - 1.0f;
+        T xbuf(RAD_F32, {c.H, ld}); xbuf.f(xv);
+        T x = xbuf;
+        x.t.shape[1] = c.W * c.cin;                  /* [H, W cin] at a row pitch of ld */
+        T w(RAD_F32, {c.cout, c.cin, c.k, c.k}); w.f(wv);
+        T w2(RAD_F32, {c.cout, KK}); w2.f(wv);
+        T b(RAD_F32, {c.cout}); b.f(bv);
+        T y(RAD_F32, {Ho, Wo * c.cout});
+        A a; a.t(x).t(w).t(b).t(y).i("M", Ho * Wo).i("cin", c.cin).i("cout", c.cout).i("k", c.k)
+              .i("stride", c.stride).s("pad", c.pad).i("up", c.up).s("dtype", "f32");
+        CHECK_OK(run("conv2d_nhwc", a));
+        T u(RAD_F32, {Ho * Wo, KK});
+        A d; d.t(x).t(u).i("M", Ho * Wo).i("cin", c.cin).i("k", c.k).i("stride", c.stride)
+              .s("pad", c.pad).i("up", c.up).s("dtype", "f32");
+        CHECK_OK(run("im2col_nhwc", d));
+        T g(RAD_F32, {Ho * Wo, c.cout});
+        A e; e.t(u).t(w2).t(b).tnull().t(g).i("M", Ho * Wo).i("N", c.cout).i("K", KK)
+              .s("dtype", "f32");
+        CHECK_OK(run("gemm_nt_bias", e));
+        for (int64_t i = 0; i < Ho * Wo * c.cout; ++i) CHECK_EQ(g.at(i), y.at(i));
+        /* Spot the column order: (ci, i, j), the weight's own. */
+        const int64_t oy = Ho - 1, ox = 0, ci = c.cin - 1, i = c.k - 1, j = 0;
+        const int64_t iy = oy * c.stride + i - (down ? 0 : c.k / 2);
+        const int64_t ix = ox * c.stride + j - (down ? 0 : c.k / 2);
+        const float want = iy < 0 || iy >= Hv || ix < 0 || ix >= Wv
+                               ? 0.0f : xv[(size_t)((iy / c.up) * ld + (ix / c.up) * c.cin + ci)];
+        CHECK_EQ(u.at((oy * Wo + ox) * KK + (ci * c.k + i) * c.k + j), want);
+    }
+    /* y must be exactly the output pixels. */
+    T x(RAD_F32, {3, 3}), y(RAD_F32, {8, 9});
+    A a; a.t(x).t(y).i("M", 8).i("cin", 1).i("k", 3).i("stride", 1).s("pad", "same").i("up", 1)
+          .s("dtype", "f32");
+    CHECK_EQ(run("im2col_nhwc", a), RAD_E_SHAPE);
 }
 
 /* l2norm_chan: each pixel to unit L2, times sqrt(n), times gamma, then the optional silu; an
@@ -7797,6 +7980,7 @@ std::vector<Geo> geometries() {
                                     .s("dtype", "fp8a8")),
         G("lora_shrink", "M", 3, a.i("M", R).i("K", 40).i("R", 8).i("S", 2).s("dtype", "f32")),
         G("lora_expand", "M", 3, a.i("M", R).i("N", 20).i("R", 8).i("S", 2).s("dtype", "f32")),
+        G("lora_expand_mm", "M", 3, a.i("M", R).i("N", 20).i("R", 8).i("S", 2).s("dtype", "f32")),
         G("attn_paged", "q_len", 3, a.i("q_len", R).i("head_dim", 8).i("gqa", 2).i("block_size", 4)
                                     .i("causal", 1).i("window", 0).s("q_dtype", "f32")
                                     .s("kv_dtype", "f32").i("n_head", 4).i("ctx", 9)),
@@ -7886,15 +8070,21 @@ std::vector<Geo> geometries() {
         G("lane_store", "M", 4, a.i("M", R).i("n", 8).i("stride", 8).s("dtype", "bf16")),
         G("randn_lanes", "M", 4, a.i("M", R).i("n", 8).i("stride", 4).s("dtype", "bf16")),
         G("flow_euler", "M", 4, a.i("M", R).i("n", 8).i("stride", 4).s("dtype", "bf16")),
+        G("kd_input", "M", 4, a.i("M", R).i("n", 4).i("stride", 4).s("dtype", "bf16")),
+        G("kd_step", "M", 4, a.i("M", R).i("n", 4).i("stride", 4).s("pred", "eps")
+                             .s("dtype", "bf16")),
         G("chan_affine", "M", 2, a.i("M", R).i("n", 3).s("mul", "1 2 3").s("add", "0 1 2")
                                  .s("mode", "fma").s("dtype", "bf16")),
         G("conv2d_nhwc", "M", 16, a.i("M", R).i("cin", 2).i("cout", 3).i("k", 3).i("stride", 1)
+                                  .s("pad", "same").i("up", 1).s("dtype", "bf16")),
+        G("im2col_nhwc", "M", 16, a.i("M", R).i("cin", 2).i("k", 3).i("stride", 1)
                                   .s("pad", "same").i("up", 1).s("dtype", "bf16")),
         G("l2norm_chan", "M", 3, a.i("M", R).i("n", 8).s("act", "silu").s("dtype", "f32")),
         G("d2s_add", "M", 16, a.i("M", R).i("cin", 4).i("cout", 2).i("ft", 1).s("dtype", "bf16")),
         G("s2d_avg_add", "M", 16, a.i("M", R).i("cin", 2).i("cout", 4).i("ft", 1).s("dtype", "bf16")),
         G("to_rgba8", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("gelu_tanh", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
+        G("gelu_quick", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("scatter_add_rows", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("attn_prefix_self", "q_len", 3, a.i("q_len", R).i("head_dim", 8).i("gqa", 2)
                                           .i("block_size", 4).i("causal", 1).s("q_dtype", "bf16")

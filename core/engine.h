@@ -31,6 +31,7 @@
 #include "text/tokenizer.h"
 #include "format/radfile.h"
 #include "format/table_copy.h"
+#include "lora/adapter.h"
 #include "lora/slots.h"
 
 #include <atomic>
@@ -155,6 +156,30 @@ public:
     int lora_acquire(const std::string& name, int32_t* slot, uint64_t* uid,
                      std::shared_ptr<void>* hold);
     std::vector<std::string> lora_names() const;
+    /* A generator's adapters: a request names one or more adapter files at their strengths, and
+     * gets the slot holding exactly that combination, composed into a free (or the least recently
+     * used idle) slot when none holds it yet. `note` says what the composition left out or
+     * approximated, for the reply. RAD_E_NOTFOUND names an adapter neither --lora nor --lora-dir
+     * provides; RAD_E_FULL means every slot is held by running requests. */
+    struct LoraUse { std::string name; double weight = 1.0; };
+    int gen_lora_acquire(const std::vector<LoraUse>& uses, int32_t* slot,
+                         std::shared_ptr<void>* hold, std::string* note, std::string* err);
+    /* The adapter files a generator request may name: --lora's and those under --lora-dir. */
+    std::vector<std::string> gen_lora_names() const;
+    bool gen_lora_enabled() const { return lora_gen_; }
+private:
+    /* A generator's adapter files by name (--lora, POST /v1/load_lora_adapter, --lora-dir), opened
+     * once and kept mapped; compositions read them when a combination is put in a slot. */
+    int gen_lora_open(const std::string& name, std::shared_ptr<const lora::AdapterFile>* out,
+                      std::string* err);
+    int gen_lora_start();
+    /* Every rank's packed bytes into `slot` of its pools, each rank on a stream of its own. */
+    int lora_copy(int slot, const std::vector<std::vector<lora::PackedSite>>& packed,
+                  std::string* err);
+    bool                        lora_gen_ = false;
+    std::unique_ptr<lora::KeyMap> lora_keys_;
+    mutable std::mutex          lora_lib_mu_;
+    std::map<std::string, std::pair<std::string, std::shared_ptr<const lora::AdapterFile>>> lora_lib_;
 private:
     std::atomic<uint64_t>      lora_epoch_{0};   /* step-loop iterations, for slot reuse */
     lora::SlotTable            lora_table_;      /* reads lora_epoch_, so declared after it */
@@ -216,6 +241,9 @@ private:
      * which references `vocab_` and must not outlive it. */
     std::shared_ptr<const Vocab> vocab_;
     std::unique_ptr<VocabView>   vocab_view_;
+    /* The container's second vocabulary (rad-convert --tokenizer2), which an image generator that
+     * declares `aux_tokens` reads its prompt through; null without one. */
+    std::shared_ptr<const Vocab> aux_vocab_;
 
     /* The chunk geometry, resolved once and shared: the prefix cache needs the checkpoint interval
      * at configure time and the scheduler the whole geometry at init. Resolving it separately

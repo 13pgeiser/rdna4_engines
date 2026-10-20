@@ -277,6 +277,7 @@ and runs.
 | `embgemma2` | EmbeddingGemma 2, an embedding model (§5.6) |
 | `qwenimage21` | Qwen-Image 2.1 and 2.1-Turbo, an image model (§5.6) |
 | `krea2` | Krea 2 Raw and Turbo, an image model from text (§5.6) |
+| `anima` | Anima Base, Aesthetic and Turbo, an anime and illustration image model from text (§5.6) |
 | `flux3`, `flux3distilled` | FLUX.3 [klein] and its base, an image model that also edits (§5.6); one plugin under the two names the releases give themselves |
 | `qwen3asr_bf16` | Qwen3-ASR, speech to text from the checkpoint as it ships (§5.14) |
 | `minimaxmusic3` | MiniMax-Music3, songs from a description and lyrics (§5.15) |
@@ -405,6 +406,36 @@ rad-convert /srv/models/krea/Krea-2-Turbo -o krea-2-turbo-fp8.rad \
 rad-convert /srv/models/black-forest-labs/flux-3-image-klein -o flux-3-klein-fp8.rad \
     --recipe data/recipes/flux-3-klein-fp8.recipe
 
+# A Krea 2 finetune shipped as one DiT file in Krea's key names (civitai, ComfyUI): rewritten as the
+# transformer/ of a directory holding the release's other parts (Turbo's model_index.json for a Turbo
+# finetune, Raw's for a Raw one); a plain-fp8 file keeps its codes under krea-2-fp8-unscaled.recipe
+P=/srv/models/lustify-krea2; mkdir -p $P/transformer
+cp -r /srv/models/krea/Krea-2-Turbo/{model_index.json,scheduler,text_encoder,tokenizer,vae} $P/
+cp /srv/models/krea/Krea-2-Turbo/transformer/config.json $P/transformer/
+scripts/krea2_native.py lustifyNSFWCheckpoint_v10Krea2_fp8.safetensors \
+    $P/transformer/diffusion_pytorch_model.safetensors
+rad-convert $P -o lustify-krea2-turbo-fp8.rad --recipe data/recipes/krea-2-fp8-unscaled.recipe
+
+# Anima, an image model (§5.6): the release's three single files merged (--add), Qwen3-0.6B-Base's
+# config.json and tokenizer.json (--config: the repository or a directory with just those two), and
+# ComfyUI's T5 tokenizer (comfy/text_encoders/t5_tokenizer/tokenizer.json, with its
+# tokenizer_config.json beside it) as the second vocabulary. The variant (base, aesthetic, turbo)
+# sets the defaults; anima-bf16.recipe keeps every linear bf16
+A=/srv/models/circlestone-labs/Anima/split_files
+rad-convert $A/diffusion_models/anima-aesthetic-v1.1.safetensors \
+    --add $A/text_encoders/qwen_3_06b_base.safetensors --add $A/vae/qwen_image_vae.safetensors \
+    --config /srv/models/Qwen/Qwen3-0.6B-Base --tokenizer2 /srv/ComfyUI/comfy/text_encoders/t5_tokenizer/tokenizer.json \
+    --arch anima --set anima.variant=aesthetic -o anima-aesthetic-fp8.rad \
+    --recipe data/recipes/anima-fp8.recipe
+
+# Stable Diffusion XL or any of its finetunes (Illustrious, NoobAI, Pony, ...), an image model
+# (§5.6): the single .safetensors as civitai and Hugging Face publish it (Stability's layout, read as
+# it ships), bf16 throughout (6.4 GiB, one card). The file carries no tokenizer: CLIP's tokenizer.json
+# (openai/clip-vit-large-patch14) is passed beside it
+rad-convert /srv/models/OnomaAIResearch/Illustrious-XL-v2.0/Illustrious-XL-v2.0.safetensors \
+    -o illustrious-xl-v2.0-bf16.rad --recipe data/recipes/sdxl-bf16.recipe \
+    --tokenizer /srv/models/openai/clip-vit-large-patch14/tokenizer.json
+
 # LTX-2.5, video with sound (§5.16): the diffusers pipeline directory, latent_upsampler/ included
 # for the distilled release's two-stage recipe; fp8 blocks for the text encoder, the connectors and
 # the DiT, or bf16 (both recipes keep the vocoders f32, which they run in)
@@ -514,6 +545,13 @@ rad-convert /srv/models/amd/GLM-5.3-Flash-Quark-MXFP4 \
 # them made MXFP4 by one recipe, the head block fp8
 rad-convert /srv/models/unsloth/Qwen3.8-27B-NVFP4 --draft-model /srv/models/z-lab/Qwen3.8-27B-DFlash2 \
     --recipe data/recipes/q38-27b-nvfp4-df2.recipe -o q38-27b-nvfp4-df2.rad
+
+# A bf16 Qwen3.8-27B or finetune (here orcarouter's Uncensored) with the DFlash2 drafter: the trunk
+# rounded to MXFP4 once, the head block fp8; the --set keys select the quantised plugin
+rad-convert /srv/models/orcarouter/Qwen3.8-27B-Uncensored --draft-model /srv/models/z-lab/Qwen3.8-27B-DFlash2 \
+    --recipe data/recipes/q38-27b-mxfp4-df2.recipe \
+    --set quantization_config.quant_method=fp8 --set quantization_config.fmt=e4m3 \
+    -o qwen3.8-27b-uncensored-mxfp4.rad
 
 # An int4 W4A16 Qwen3.8-27B (compressed-tensors AWQ or GPTQ, AutoRound's auto_gptq; here ukisai's
 # Swift 1.5 W4A16-AWQ, and its INT4 and W4A16-AutoRound the same way): the shipped grids on the
@@ -1345,11 +1383,57 @@ below.
 Refused at startup or load, by name: DoRA, embedding or `lm_head` LoRA, `modules_to_save`, trained
 biases, PEFT's `layer_replication`, QA-LoRA and activated LoRA, a module the base does not have, and
 a module some op cannot carry -- a routed MoE expert, a rotated (ParoQuant) or otherwise transformed
-weight, a GEMM fed int8 codes in the WMMA's step order (`w4a8`, `w8a8`, `w2a8`). Adapters serve models that generate text: an
-image, audio or video generator and an embedding model refuse `--lora` and `--max-loras`. A fused
-GEMM over a targeted weight (the fp8 gated gate_up fold) is not used while LoRA is on, for base
-requests too; the unfused pair runs instead. A drafter keeps the base's weights: proposals are
-still verified by the adapter, so output is exact and only the acceptance rate can drop.
+weight, a GEMM fed int8 codes in the WMMA's step order (`w4a8`, `w8a8`, `w2a8`). An audio
+generator and an embedding model refuse `--lora` and `--max-loras`; image and video generators take
+adapter files instead (§4.9.2). A fused GEMM over a targeted weight (the fp8 gated gate_up fold) is
+not used while LoRA is on, for base requests too; the unfused pair runs instead. A drafter keeps the
+base's weights: proposals are still verified by the adapter, so output is exact and only the
+acceptance rate can drop.
+
+### 4.9.2 LoRA files for image and video models
+
+The LoRAs shared for image and video models (Civitai, Hugging Face) are single `.safetensors` files,
+named after the model's original code and written by whichever trainer or UI made them. Radiance
+reads them as they come, on Krea 2, Anima, Stable Diffusion XL and its finetunes (Illustrious,
+NoobAI, Pony), Qwen-Image 2.1, MiniMax H3, FLUX.3 [klein] and LTX-2.5:
+
+```sh
+radiance --model krea-2-turbo-fp8.rad --lora-dir /loras --lora film=/loras/film-grain.safetensors
+```
+
+- **Spellings:** kohya (`lora_unet_blocks_0_attn_wq.lora_down/up` + `alpha`), ComfyUI
+  (`diffusion_model.*.lora_A/B` or `lora_down/up`), PEFT/diffusers (`transformer.*.lora_A/B`,
+  `.default`), bare keys, and the checkpoint's own names. Each model declares how its original
+  module names map onto the container's (a fused `qkv` onto separate q, k and v, a SwiGLU whose
+  halves are ordered the other way), so a file trained against either layout lands on the same
+  weights.
+- **Kinds:** LoRA and LoCon (`alpha / rank * up @ down`; on SDXL a LoCon's convolutions too, its
+  3 x 3 `down` read flattened as the UNet's im2col GEMMs read theirs), LoHa (`hada_w*`, applied exactly as a
+  product of rank1 x rank2), LoKr (`lokr_w*`, by its Kronecker structure) and full deltas (`.diff`).
+  DoRA, OFT and Tucker cores are refused by name; bias and norm deltas are reported and left out.
+- **Choosing per request:** `/v1/images/generations`, `/v1/images/edits` and `/v1/videos` take
+  `"loras": ["film", "ink:0.6", {"name": "style/watercolor", "weight": 0.8}]` (or an object
+  `{"film": 1, "ink": 0.6}`), and Stable Diffusion web UI tags in the prompt, `<lora:film:0.8>`,
+  which are taken out of the prompt. A strength not given is 1; several adapters stack.
+  `GET /v1/loras` lists what a request may name: the `--lora` files and every `NAME.safetensors`
+  under `--lora-dir` (subdirectories one level deep, as `sub/NAME`).
+- **Slots:** a slot holds one combination of adapters at their strengths. The first request that
+  asks for a combination composes it into a free slot, or into the least recently used one no running
+  request holds (milliseconds to a second, logged with what it left out); later requests find it
+  there. Requests with different combinations run in separate passes. `--max-loras` sets the slot
+  count (default: the number of `--lora`, 2 with `--lora-dir` alone).
+- **Rank:** `--max-lora-rank` (default 64 for a generator) is the rank every checkpoint module's
+  slot holds. The slots are VRAM the weights and the arena would otherwise have (startup prints
+  their size); LTX-2.5, which fills one card on its own, fits one slot at rank 16. Stacked adapters whose ranks fit it, and LoHa and LoKr within it, are held exactly;
+  past it the sum is truncated to its best rank-R approximation, and the log says how much of the
+  delta was kept.
+- **What carries an adapter:** every plain GEMM of the denoiser (attention, feed-forward, the text
+  fusion or refiner, embedders and modulation where they are plain), and of the text encoder where
+  adapter files train it (Anima's Qwen3, SDXL's two CLIPs as kohya's `lora_te1_` / `lora_te2_`;
+  CLIP-L's last layer, whose output SDXL never reads, has nothing to adapt). An adapter module the model has no
+  such GEMM for is reported and skipped, as UIs do.
+- `POST /v1/load_lora_adapter {"lora_name": "x", "lora_path": "/file.safetensors"}` adds a file
+  under a name; unload removes it and frees the slots of every combination using it.
 
 ### 4.10 Every flag
 
@@ -1368,7 +1452,7 @@ still verified by the adapter, so output is exact and only the acceptance rate c
 
 | flag | default | |
 |---|---|---|
-| `--max-num-batched-tokens N` | 8192 | largest token count one step may carry |
+| `--max-num-batched-tokens N` | 2048 | largest token count one step may carry |
 | `--prefill-interleave N` | 0 (off) | decode-only steps after each prefill chunk while other sequences decode (§4.5), at most 64 |
 | `--busy-prefill-chunk MODE` | auto | a prefill chunk's share of a step that has other work: `auto` leaves decode rows and waiting requests their room (§4.5), `off` takes the whole step, `N` holds it to N tokens |
 | `--max-num-seqs N` | 256 | largest number of sequences one step may carry |
@@ -1392,9 +1476,10 @@ still verified by the adapter, so output is exact and only the acceptance rate c
 
 | flag | default | |
 |---|---|---|
-| `--lora NAME=PATH` | none | serve a PEFT LoRA adapter as model NAME; repeatable |
-| `--max-loras N` | the number of `--lora` | adapter slots resident at once; 0 with no `--lora` is off |
-| `--max-lora-rank R` | 16 | the rank each slot is sized for |
+| `--lora NAME=PATH` | none | serve a LoRA adapter: a PEFT directory as model NAME (text), a `.safetensors` file requests name in `loras` (image and video, §4.9.2); repeatable |
+| `--lora-dir DIR` | none | image and video models: requests may name any `NAME.safetensors` under DIR |
+| `--max-loras N` | the number of `--lora` (2 with `--lora-dir` alone) | adapter slots resident at once; 0 with no adapter is off |
+| `--max-lora-rank R` | 16 text, 64 image and video | the rank each slot is sized for |
 | `--lora-target-modules LIST` | the adapters' own | HF module names adapters may target |
 
 **Host tier for finished conversations**
@@ -1756,7 +1841,7 @@ becomes up to 280 tokens by default (`--image-tokens`, or a request's `image_tok
 `document`, `Retrieval-query`, `STS`, ...) and applies to text and content-part inputs; a model that
 states a default prompt applies it when the request names none.
 
-**An image model** (Qwen-Image 2.1 or 2.1-Turbo, Krea 2, FLUX.3 [klein]) serves OpenAI's images API only; completions, chat
+**An image model** (Qwen-Image 2.1 or 2.1-Turbo, Krea 2, FLUX.3 [klein], Anima) serves OpenAI's images API only; completions, chat
 and embeddings answer 501. OpenAI images clients (Open WebUI, the OpenAI SDKs) work unchanged; the
 picture always comes back in the response. The engine sizes the step, batch and context for an image
 model itself (`--max-num-batched-tokens` and `--max-model-len` from the model's largest pass,
@@ -1828,6 +1913,44 @@ negative prompt and Turbo 8 steps unguided; Krea 2 reads only text, so `/v1/imag
 pictures, each shrunk to 1024x1024 of area when larger. The guidance scale is `guidance_scale` or
 `true_cfg_scale` (one of them), in the model card's terms. FLUX.3's pipeline can rewrite a prompt
 with a separate language model first; radiance reads the prompt as given.
+
+**Anima** makes RGB pictures, 1024x1024 by default, sides rounded down to multiples of 16, up to
+1536x1536 (9216 latent tokens; the card's range is 512x512 to 1536x1536). Base and Aesthetic run 30
+steps at guidance 4 (`uncond + s (cond - uncond)`, so 1 is off) against the card's negative prompt
+(`worst quality, low quality, score_1, score_2, score_3, artist name, blurry, jpeg artifacts,
+chromatic aberration`); Turbo runs 10 unguided. The sampler is ComfyUI's Euler over its `simple`
+schedule at shift 3, so a seed's noise aside, a picture is what ComfyUI's `euler` / `simple`
+workflow makes. The prompt is read as written, Danbooru tags and natural language as the card
+describes: ComfyUI's `(word:1.2)` weighting and its `\(` escapes are not interpreted, so write
+`fern (sousou no frieren)` rather than `fern \(sousou no frieren\)`. A prompt is at most 512
+tokens to either of its two tokenizers. Anima reads only text, so `/v1/images/edits` answers 501.
+It is under the CircleStone Labs non-commercial license (the pictures may be used commercially).
+On one R9700 a 1024x1024 picture takes 8.5 s from the Aesthetic or Base fp8 container (30 guided
+steps) and 12.0 s from bf16; Turbo takes 1.6 s (fp8) and 2.2 s (bf16); 1536x1536 takes 24.8 s (fp8).
+The fp8 pictures look the same as bf16's; against ComfyUI from the same noise bf16 is 33 to 39 dB,
+fp8 26 to 29 dB (docs/ARCHITECTURES.md).
+
+**Stable Diffusion XL** and its finetunes (Illustrious, NoobAI, Pony: any single-file SDXL
+checkpoint, §3.2) take the same fields and two more, `sampler` and `scheduler`, by ComfyUI's names:
+
+| field | |
+|---|---|
+| `sampler` | `euler`, `euler_ancestral` (the default) or `dpmpp_2m` |
+| `scheduler` | `normal` (the default), `karras`, `exponential`, `sgm_uniform` or `simple` |
+
+A model sampled by flow matching refuses both fields. SDXL makes RGB pictures, 1024x1024 by default,
+sides rounded down to multiples of 32, up to 36864 latent tokens (1536x1536, or that area at another
+aspect: 2048x1152). It runs 28 steps at guidance 6 (`guidance_scale`, uncond + s (cond - uncond))
+against an empty negative prompt unless the request names one; guidance 1 turns it off. A prompt
+longer than CLIP's 75 tokens is read in windows of 75, each encoded on its own and laid end to end
+(A1111's and ComfyUI's long-prompt behaviour), up to 8 windows. Emphasis syntax such as
+`(masterpiece:1.2)` is not interpreted: the parentheses and the number are read as text. The noise
+is radiance's own (the same seed gives the same picture here, not the picture ComfyUI gives).
+`/v1/images/edits` answers 501: there is no image-to-image or inpainting yet. A v-prediction
+checkpoint (NoobAI-XL V-Pred, marked by its `v_pred` tensor) is sampled as one, with the zero
+terminal SNR schedule when the checkpoint says so (`ztsnr`). On one R9700 a 1024x1024 picture at 28
+guided steps takes about 5.1 s and 1536x1536 at 25 about 10.8 s; images in flight together share
+passes but not launches (the UNet runs once per image and branch), so two take twice as long.
 
 ### 5.7 Request fields
 
@@ -2748,7 +2871,7 @@ is the part of a log to paste into an issue. Its sections:
   warning is also printed as a `W` line of its own.
 
 ```
-I STARTUP REPORT -- radiance 1.9.0
+I STARTUP REPORT -- radiance 1.10.0
 I CONFIGURATION -- every option, the value in force, and where it came from
 I   --model                            /models/flashnext.rad                       [command line]
 I   --tp                               2                                           [command line]

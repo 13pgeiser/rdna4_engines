@@ -2318,6 +2318,21 @@ static const RadOperandSpec oFlowEuler[] = {
     { "inp_lat", RAD_OPD_IN, 1 }, { "inp_mask", RAD_OPD_IN, 1 }, { "state", RAD_OPD_INOUT, 0 },
     { "preview", RAD_OPD_INOUT, 1 },
 };
+/* The k-diffusion sampler's input and step: `pred` "eps" or "v", the lanes f32. */
+static const RadParamSpec pKdStep[] = { P_INT("M"), P_INT("n"), P_INT("stride"), P_STR("pred"),
+                                        P_STR("dtype") };
+static const RadOperandSpec oKdInput[] = {
+    { "sigma", RAD_OPD_IN, 0 }, { "pair", RAD_OPD_IN, 0 }, { "lane", RAD_OPD_IN, 0 },
+    { "flags", RAD_OPD_IN, 0 }, { "seed", RAD_OPD_IN, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 },
+    { "state", RAD_OPD_INOUT, 0 }, { "y", RAD_OPD_OUT, 0 },
+};
+static const RadOperandSpec oKdStep[] = {
+    { "out", RAD_OPD_IN, 0 }, { "sigma", RAD_OPD_IN, 0 }, { "sigma_next", RAD_OPD_IN, 0 },
+    { "sigma_prev", RAD_OPD_IN, 0 }, { "cfg", RAD_OPD_IN, 0 }, { "pair", RAD_OPD_IN, 0 },
+    { "lane", RAD_OPD_IN, 0 }, { "flags", RAD_OPD_IN, 0 }, { "seed", RAD_OPD_IN, 0 },
+    { "sampler", RAD_OPD_IN, 0 }, { "step", RAD_OPD_IN, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 },
+    { "state", RAD_OPD_INOUT, 0 }, { "hist", RAD_OPD_INOUT, 0 }, { "preview", RAD_OPD_INOUT, 1 },
+};
 /* `round` 0 keeps the lists and the arithmetic in f32 (default 1, bf16 lists and roundings). */
 static const RadParamSpec pChanAffine[] = { P_INT("M"), P_INT("n"), P_STR("mul"), P_STR("add"),
                                             P_STR("mode"), P_STR("dtype"), P_INTO("round") };
@@ -2329,6 +2344,8 @@ static const RadOperandSpec oConvNhwc[] = {
     { "x", RAD_OPD_IN, 0 }, { "w", RAD_OPD_WEIGHT, 0 }, { "b", RAD_OPD_WEIGHT, 0 },
     { "y", RAD_OPD_OUT, 0 },
 };
+static const RadParamSpec pIm2col[] = { P_INT("M"), P_INT("cin"), P_INT("k"), P_INT("stride"),
+                                        P_STR("pad"), P_INT("up"), P_STR("dtype") };
 static const RadParamSpec pL2Norm[] = { P_INT("M"), P_INT("n"), P_STR("act"), P_STR("dtype") };
 static const RadOperandSpec oL2Norm[] = {
     { "x", RAD_OPD_IN, 0 }, { "gamma", RAD_OPD_WEIGHT, 0 }, { "y", RAD_OPD_OUT, 0 },
@@ -3231,6 +3248,11 @@ static const RadOpSchema kSchemas[] = {
            "y[m, n] = y[m, n] + scale[s, n] * sum_j t[m, j] * lora_b[s, n, j] for each row m "
            "whose s = slot[m] is in [0, S), f32 accumulate, one rounding to y's dtype. A base "
            "row's `y` is neither read nor written."),
+    SCHEMA("lora_expand_mm", pLoraExpand, oLoraExpand,
+           "lora_expand with t rounded to bf16 and the sum over j in any order: y[m, n] = y[m, n] "
+           "+ scale[s, n] * sum_j bf16(t[m, j]) * lora_b[s, n, j], f32 accumulate, one rounding "
+           "to y's dtype; a base row's `y` is neither read nor written. A row's bytes may depend "
+           "on M."),
     SCHEMA("ln_mod", pLnMod, oLnMod,
            "y = bf16(bf16(LN(x)) * bf16(1 + s[seq])): a layer norm with no gain or bias, then the "
            "row's sequence's modulation row of `s`."),
@@ -3258,17 +3280,30 @@ static const RadOpSchema kSchemas[] = {
            "an image's first step: its lane's rows become its seed's normal stream."),
     SCHEMA("flow_euler", pLane, oFlowEuler,
            "one Euler step of a flow-matching sampler per entry that moves a lane."),
+    SCHEMA("kd_input", pLane, oKdInput,
+           "a k-diffusion sampler's model input per entry that moves a lane: a first step's noise "
+           "times sqrt(1 + sigma^2) into the lane, then rd(x / sqrt(sigma^2 + 1)) at its rows and "
+           "its pair's."),
+    SCHEMA("kd_step", pKdStep, oKdStep,
+           "one k-diffusion sampler step per entry that moves a lane: the guided clean estimate "
+           "from an eps or v output, then Euler, Euler ancestral or DPM++ 2M; the lanes f32."),
     SCHEMA("chan_affine", pChanAffine, oGenUnary,
            "a per-channel affine from two parameter lists of n values; `round` 0 keeps the lists "
            "and the arithmetic in f32, rounded once into y."),
     SCHEMA("conv2d_nhwc", pConvNhwc, oConvNhwc,
            "an image convolution, channels innermost, the sizes read off the operands."),
+    SCHEMA("im2col_nhwc", pIm2col, oGenUnary,
+           "conv2d_nhwc's receptive fields as rows: y [Ho * Wo, cin * k * k], column "
+           "(ci * k + i) * k + j of row oy * Wo + ox the input conv2d_nhwc multiplies weight[o, ci, "
+           "i, j] by, 0 in the padding."),
     SCHEMA("l2norm_chan", pL2Norm, oL2Norm,
            "unit-L2 per row, times sqrt(n), times gamma, then `act`: an image decoder's norm."),
     SCHEMA("d2s_add", pSpaceDepth, oSpaceDepth, "an upsampling shortcut added in."),
     SCHEMA("s2d_avg_add", pSpaceDepth, oSpaceDepth, "a downsampling shortcut added in."),
     SCHEMA("to_rgba8", pGenMn, oGenUnary, "decoded pixels in [-1, 1] to bytes."),
     SCHEMA("gelu_tanh", pGenMn, oGenUnary, "the tanh approximation of gelu."),
+    SCHEMA("gelu_quick", pGenMn, oGenUnary,
+           "CLIP's quick_gelu: a = rd(1.702 x), s = rd(sigmoid(a)), y = rd(x s)."),
     SCHEMA("scatter_add_rows", pGenMn, oScatterAdd, "x[idx[i]] += v[i]; a negative index adds nothing."),
     SCHEMA("attn_prefix_self", pAttnPS, oAttnPS,
            "attention over a paged prefix and the step's own rows, causal over the own rows or not. "
@@ -4784,14 +4819,14 @@ static const RadConstraint cPatchUnfold[] = { C_IN("dtype", "f32"), C_LE("C", 64
 static const RadConstraint cGenAnyFloat[] = { C_IN("dtype", "bf16 f32") };
 static const RadConstraint cSnakeAa[] = { C_IN("dtype", "f32"), C_LE("k", 32) };
 /* ---- a video latent upscaler (r4d_upscaler.hip). The convolution decodes 3 x 3 x 3 taps as
- * constants and reads 16-byte chunks of a voxel row; the group norm puts a thread on an 8-channel
- * chunk inside one group, a row's chunks a power of two dividing the 256-thread block (the shim
- * checks that and n / groups % 8), and merges at most 256 groups; the temporal convolution keeps
+ * constants and reads 16-byte chunks of a voxel row; the group norm puts a thread on chunks of 8, 4
+ * or 2 channels inside one group, a row's chunks spread over at most the 256-thread block (the
+ * shim checks an even group width), and merges at most 256 groups; the temporal convolution keeps
  * its 5-frame window in registers; the fold's lists are kernel arguments, 64 floats at most. */
 static const RadConstraint cConv3d[] = { C_IN("dtype", "bf16"), C_EQ("k", 3), C_EQ("kt", 3),
                                          C_DIV("cin", 8) };
 static const RadConstraint cGroupNorm[] = { C_IN("dtype", "bf16 f32"), C_DIV("n", 8),
-                                            C_LE("n", 2048), C_LE("groups", 256) };
+                                            C_LE("n", 8192), C_LE("groups", 256) };
 static const RadConstraint cTconvDw[] = { C_IN("dtype", "bf16"), C_EQ("k", 5), C_DIV("n", 8) };
 static const RadConstraint cResizeBil[] = { C_IN("dtype", "bf16 f32"), C_DIV("n", 8) };
 static const RadConstraint cPatchFold[] = { C_IN("dtype", "bf16 f32"), C_LE("C", 64) };
@@ -4799,6 +4834,8 @@ static const RadConstraint cLnModQ[] = { C_IN("dtype", "bf16"), C_DIV("n", 128),
                                          C_EQ("group", 128) };
 /* The lane copies move 32-bit words, so any row of whole words: bf16 latents and an f32 mask. */
 static const RadConstraint cGenLanes[] = { C_IN("dtype", "bf16 f32") };
+/* gelu_quick: x and y of one dtype, any width and pitch. */
+static const RadConstraint cGeluQuick[] = { C_IN("dtype", "bf16 f32") };
 /* The two lists are kernel arguments, 64 floats each at most (r4d_gen.hip). */
 static const RadConstraint cGenAffine[] = { C_IN("dtype", "bf16"), C_LE("n", 64) };
 static const RadConstraint cGenAffineF32[] = { C_IN("dtype", "f32"), C_LE("n", 64) };
@@ -7868,6 +7905,17 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   RAD_DOMAIN_DEVICE, R4D_PRIO_LORA_TILED,
   ROW(cLoraExpand), NOTUNE,
   nullptr, nullptr, r4d_rad_lora_expand_tiled },
+/* The generators' expand (lora_expand_mm): the same delta on the WMMA, for passes of many rows of
+ * one adapter, where the exact row's scalar sum is most of the adapter's cost. */
+{ "lora_expand_mm_wmma", "lora_expand_mm", "gemm",
+  "y += scale * (bf16(t) B[slot]^T) per row, base rows neither read nor written: WMMA bf16 over "
+  "64-row x 64-column tiles, four waves of 2 x 2 16 x 16 tiles, one pass a distinct slot of a tile",
+  "any M and N, 1 <= R <= 65536, 1 <= S <= 2^20; row and column strides of t and y honoured, "
+  "16-byte pool loads where B's rows are aligned",
+  "f32 t and scale; bf16 lora_b; i32 slot; bf16 / f16 / f32 y",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_LORA_TILED,
+  ROW(cLoraExpand), NOTUNE,
+  nullptr, nullptr, r4d_rad_lora_expand_mm },
 { "attn_prefix_self_h128_bf16", "attn_prefix_self", "attn",
   "attention over a paged prefix and the pass's own rows, causal over the own rows or not",
   "head_dim 128, 1/2/4/8 query heads a KV head, a flat grid over the sequences' query blocks; "
@@ -8062,6 +8110,22 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   ROW(cGenBf16), NOTUNE,
   nullptr, nullptr, r4d_rad_flow_euler },
 
+{ "kd_input_bf16", "kd_input", "elem",
+  "a k-diffusion sampler's model input: a first step's noise into the f32 lane, c_in x out",
+  "any M, row pitches honoured; a thread an element of an entry",
+  "f32 lanes, bf16 y",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_kd_input },
+
+{ "kd_step_bf16", "kd_step", "elem",
+  "a k-diffusion sampler step with guidance and preview: Euler, Euler ancestral or DPM++ 2M",
+  "any M, row pitches honoured; a thread an element of an entry",
+  "bf16 model output, f32 lanes, history and preview, f32 arithmetic",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_kd_step },
+
 { "chan_affine_bf16", "chan_affine", "elem",
   "a per-channel affine from parameter lists; `round` 0 keeps the lists and arithmetic f32",
   "any M, row pitches honoured",
@@ -8118,6 +8182,14 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   ROW(cGenRows8), NOTUNE,
   nullptr, nullptr, r4d_rad_gelu_tanh },
 
+{ "gelu_quick_bf16", "gelu_quick", "elem",
+  "CLIP's quick_gelu, libref's three roundings",
+  "any M and n, row pitches honoured",
+  "bf16 or f32 in and out (one dtype), f32 arithmetic",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGeluQuick), NOTUNE,
+  nullptr, nullptr, r4d_rad_gelu_quick },
+
 { "scatter_add_rows_bf16", "scatter_add_rows", "elem",
   "x[idx[i]] += v[i]",
   "any M, row pitches honoured",
@@ -8134,6 +8206,15 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   ROW(cGenBf16), NOTUNE,
   nullptr, nullptr, r4d_rad_conv2d_nhwc, nullptr, r4d_rad_layout_conv_tap, r4d_rad_relayout_conv_tap,
   nullptr, r4d_rad_unrelayout_conv_tap },
+
+{ "im2col_nhwc_bf16", "im2col_nhwc", "elem",
+  "a convolution's receptive fields as GEMM rows in the weight's (cin, kh, kw) order: 32 output "
+  "pixels by 64 channels a block, the input rows staged in LDS, coalesced loads and stores",
+  "k <= 7, stride and up 1 or 2; x rows at their own pitch; y exactly Ho * Wo rows at its pitch",
+  "bf16 in and out, copied bit for bit",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_im2col_nhwc },
 
 /* -------------------------------------------------------------------------- audio generation */
 { "conv1d_bf16", "conv1d", "conv",
@@ -8392,9 +8473,9 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
 
 { "group_norm", "group_norm", "norm",
   "GroupNorm over all rows in three launches: per-part (count, mean, M2), their merge to mean and "
-  "rstd, then the affine, modulation and SiLU a thread an 8-channel chunk",
-  "n % 8 == 0 with n / 8 a power of two up to 256, n / groups % 8 == 0, groups <= 256, M n / "
-  "groups < 2^24; row pitches honoured, y may alias x",
+  "rstd, then the affine, modulation and SiLU a thread an 8-, 4- or 2-channel chunk",
+  "n % 8 == 0 up to 8192, an even n / groups, groups <= 256, M n / groups < 2^31; row pitches "
+  "honoured, y may alias x",
   "bf16 or f32 rows, bf16 or f32 gain, bias and modulation, f32 statistics",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cGroupNorm), NOTUNE,

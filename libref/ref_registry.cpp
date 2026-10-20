@@ -741,12 +741,25 @@ static const RadOperandSpec oFlowEuler[]  = { OPD("v"), OPD("sigma"), OPD("sigma
                                               OPD("pair"), OPD("lane"), OPD("flags"), OPD("seed"),
                                               OPD("cu_seqlens"), OPD_O("inp_lat"), OPD_O("inp_mask"),
                                               INOUT("state"), INOUT_O("preview") };
+/* The k-diffusion sampler's input and step: `pred` "eps" or "v", the lanes f32. */
+static const RadParamSpec pKdStep[] = { P_INT("M"), P_INT("n"), P_INT("stride"), P_STR("pred"),
+                                        P_STR("dtype") };
+static const RadOperandSpec oKdInput[] = { OPD("sigma"), OPD("pair"), OPD("lane"), OPD("flags"),
+                                           OPD("seed"), OPD("cu_seqlens"), INOUT("state"),
+                                           OUT("y") };
+static const RadOperandSpec oKdStep[]  = { OPD("out"), OPD("sigma"), OPD("sigma_next"),
+                                           OPD("sigma_prev"), OPD("cfg"), OPD("pair"), OPD("lane"),
+                                           OPD("flags"), OPD("seed"), OPD("sampler"), OPD("step"),
+                                           OPD("cu_seqlens"), INOUT("state"), INOUT("hist"),
+                                           INOUT_O("preview") };
 /* `round` 0 keeps the lists and the arithmetic in f32 (default 1, bf16 lists and roundings). */
 static const RadParamSpec pChanAffine[] = { P_INT("M"), P_INT("n"), P_STR("mul"), P_STR("add"),
                                             P_STR("mode"), P_STR("dtype"), P_INTO("round") };
 static const RadParamSpec pConvNhwc[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
                                           P_INT("stride"), P_STR("pad"), P_INT("up"), P_STR("dtype") };
 static const RadOperandSpec oConvNhwc[] = { OPD("x"), WGT("w"), WGT("b"), OUT("y") };
+static const RadParamSpec pIm2col[] = { P_INT("M"), P_INT("cin"), P_INT("k"), P_INT("stride"),
+                                        P_STR("pad"), P_INT("up"), P_STR("dtype") };
 static const RadParamSpec pL2Norm[] = { P_INT("M"), P_INT("n"), P_STR("act"), P_STR("dtype") };
 static const RadOperandSpec oL2Norm[] = { OPD("x"), WGT("gamma"), OUT("y") };
 static const RadParamSpec pSpaceDepth[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("ft"),
@@ -1265,6 +1278,11 @@ static const RadOpSchema kSchemas[] = {
   "slot[m] is in [0, S), f32 accumulate, j ascending, one rounding to y's dtype. A base row's `y` "
   "is neither read nor written, so it stays bit for bit what the GEMM wrote (not y + 0: that "
   "turns -0 into +0)." },
+{ "lora_expand_mm", ARR(pLoraExpand), ARR(oLoraExpand),
+  "lora_expand with t rounded to bf16 and the sum over j in any order: y[m, n] = y[m, n] + "
+  "scale[s, n] * sum_j bf16(t[m, j]) * lora_b[s, n, j], f32 accumulate, one rounding to y's dtype. "
+  "A base row's `y` is neither read nor written. A row's bytes may depend on M: the generators' "
+  "expand, whose passes are many rows of one adapter." },
 
 { "attn_paged", ARR(pAttnPaged), ARR(oAttnPaged),
   "Paged attention over kv_cache[num_blocks, kv_heads, block_size, 2*head_dim] (K then V per "
@@ -1550,6 +1568,15 @@ static const RadOpSchema kSchemas[] = {
   "one Euler step of a flow-matching sampler per entry that moves a lane: guidance against the "
   "paired entry, x' = bf16(x + bf16(bf16(sigma_next - sigma) * v)), a preview of the clean "
   "latent with flag 4, the kept region of a repaint restored with flag 2 (docs/OPS.md)." },
+{ "kd_input", ARR(pLane), ARR(oKdInput),
+  "a k-diffusion sampler's model input per entry that moves a lane: on a first step the lane "
+  "becomes its seed's normal stream times sqrt(1 + sigma^2); y = rd(x / sqrt(sigma^2 + 1)) at the "
+  "entry's rows and at its pair's (docs/OPS.md)." },
+{ "kd_step", ARR(pKdStep), ARR(oKdStep),
+  "one k-diffusion sampler step over a discrete-time denoiser per entry that moves a lane: the "
+  "clean estimate D from an eps or v output, guided against the pair, then Euler, Euler ancestral "
+  "or DPM++ 2M by the entry's sampler, the lane f32; flag 4 previews D, `hist` keeps it "
+  "(docs/OPS.md)." },
 { "chan_affine", ARR(pChanAffine), ARR(oUnary),
   "a per-channel affine from two parameter lists of n values (rounded to bf16): `fma` is "
   "bf16(bf16(x * mul) + add), `inv` bf16(bf16(x - add) / mul). `round` 0 keeps the lists and "
@@ -1559,6 +1586,11 @@ static const RadOpSchema kSchemas[] = {
   "the sizes read off them; PyTorch's [cout, cin, k, k] weight and a bias; `up` 2 reads the input "
   "upsampled nearest-neighbour; `pad` same (k/2 a side) or down (0 above and left, 1 below and "
   "right)." },
+{ "im2col_nhwc", ARR(pIm2col), ARR(oUnary),
+  "conv2d_nhwc's receptive fields as rows: x [Hin, Win * cin], y [Hout * Wout, cin * k * k], row "
+  "oy * Wout + ox and column (ci * k + i) * k + j the value conv2d_nhwc multiplies weight[o, ci, "
+  "i, j] by (0 in the padding), so y @ w.reshape(cout, cin * k * k)^T + b is the convolution; "
+  "`up`, `pad` and `stride` as conv2d_nhwc reads them." },
 { "l2norm_chan", ARR(pL2Norm), ARR(oL2Norm),
   "each row normalised to unit L2 (eps 1e-12), times sqrt(n), times gamma -- three bf16 roundings "
   "-- then `act` none or silu: an image decoder's channel norm." },
@@ -1572,6 +1604,8 @@ static const RadOpSchema kSchemas[] = {
   "decoded pixels in [-1, 1] to bytes as diffusers' postprocess makes them: "
   "round(clamp(bf16(bf16(clamp(x) / 2) + 0.5), 0, 1) * 255), u8 out." },
 { "gelu_tanh", ARR(pMnD), ARR(oUnary), "the tanh approximation of gelu." },
+{ "gelu_quick", ARR(pMnD), ARR(oUnary),
+  "CLIP's quick_gelu, three roundings: a = rd(1.702 x), s = rd(sigmoid(a)), y = rd(x s)." },
 { "scatter_add_rows", ARR(pMnD), ARR(oScatterRows),
   "x[idx[i]] += v[i], rounded to x's dtype; a negative index adds nothing." },
 { "attn_prefix_self", ARR(pAttnPS), ARR(oAttnPS),
@@ -2072,6 +2106,9 @@ SIMPLE("ref_lora_shrink", "lora_shrink", "gemm", "t = x A[slot]^T per row, base 
 SIMPLE("ref_lora_expand", "lora_expand", "gemm",
        "y += scale * (t B[slot]^T) per row, base rows untouched",
        "f32 t and scale; bf16 lora_b; i32 slot; bf16 / f16 / f32 y", ref_lora_expand),
+SIMPLE("ref_lora_expand_mm", "lora_expand_mm", "gemm",
+       "y += scale * (bf16(t) B[slot]^T) per row, base rows untouched",
+       "f32 t and scale; bf16 lora_b; i32 slot; bf16 / f16 / f32 y", ref_lora_expand_mm),
 
 ROW("ref_attn_paged", "attn_paged", "attn",
     "paged causal / sliding-window attention, any query length",
@@ -2209,10 +2246,16 @@ SIMPLE("ref_randn_lanes", "randn_lanes", "elem", "a lane's rows from its seed's 
        DT_FLOAT, ref_randn_lanes),
 SIMPLE("ref_flow_euler", "flow_euler", "elem", "a flow-matching Euler step with guidance",
        DT_FLOAT, ref_flow_euler),
+SIMPLE("ref_kd_input", "kd_input", "elem", "a k-diffusion sampler's model input", DT_FLOAT,
+       ref_kd_input),
+SIMPLE("ref_kd_step", "kd_step", "elem", "a k-diffusion sampler step with guidance", DT_FLOAT,
+       ref_kd_step),
 SIMPLE("ref_chan_affine", "chan_affine", "elem", "a per-channel affine from parameter lists",
        DT_FLOAT, ref_chan_affine),
 SIMPLE("ref_conv2d_nhwc", "conv2d_nhwc", "elem", "an image convolution, channels innermost",
        DT_FLOAT, ref_conv2d_nhwc),
+SIMPLE("ref_im2col_nhwc", "im2col_nhwc", "elem", "a convolution's receptive fields as rows",
+       DT_FLOAT, ref_im2col_nhwc),
 SIMPLE("ref_l2norm_chan", "l2norm_chan", "norm", "unit-L2 channel norm, scaled, optional silu",
        DT_FLOAT, ref_l2norm_chan),
 SIMPLE("ref_d2s_add", "d2s_add", "elem", "an upsampling shortcut added in", DT_FLOAT,
@@ -2221,6 +2264,7 @@ SIMPLE("ref_s2d_avg_add", "s2d_avg_add", "elem", "a downsampling shortcut added 
        ref_s2d_avg_add),
 SIMPLE("ref_to_rgba8", "to_rgba8", "elem", "decoded pixels to bytes", DT_FLOAT, ref_to_rgba8),
 SIMPLE("ref_gelu_tanh", "gelu_tanh", "elem", "tanh gelu", DT_FLOAT, ref_gelu_tanh),
+SIMPLE("ref_gelu_quick", "gelu_quick", "elem", "quick gelu", DT_FLOAT, ref_gelu_quick),
 SIMPLE("ref_scatter_add_rows", "scatter_add_rows", "elem", "x[idx[i]] += v[i]", DT_FLOAT,
        ref_scatter_add_rows),
 SIMPLE("ref_attn_prefix_self", "attn_prefix_self", "attn",

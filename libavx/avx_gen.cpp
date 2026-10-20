@@ -677,6 +677,203 @@ AVX_KERNEL(flow_euler) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ kd_input, kd_step */
+/* The k-diffusion sampler over a discrete-time denoiser (libref/ref_gen.cpp): libref's f32 steps
+ * bit for bit, element by element, `kd_keep` holding every product to its own rounding before the
+ * sum that follows it. The lanes are a few thousand rows of four channels, so a scalar loop costs
+ * nothing next to the denoiser. */
+namespace {
+
+enum { kSamplerEuler = 0, kSamplerEulerAncestral = 1, kSamplerDpmpp2m = 2 };
+
+/* A product the compiler may not fuse into the next add (any ISA level: a scalar in an xmm). */
+inline float kd_keep(float x) { __asm__("" : "+x"(x)); return x; }
+
+struct KdEntry {
+    float s = 0, sn = 0, w = 0;
+    float cskip = 0, cout = 0;
+    float sup = 0, sdown = 0;
+    float ratio = 0, em = 0;
+    float c1 = 0, c2 = 0;
+    bool  second = false;
+};
+
+KdEntry kd_entry(float s, float sn, float sp, float w, int64_t sampler, bool first) {
+    KdEntry k;
+    k.s = s;
+    k.sn = sn;
+    k.w = w;
+    const float s2p = kd_keep(s * s) + 1.0f;
+    k.cskip = 1.0f / s2p;
+    k.cout = s / std::sqrt(s2p);
+    if (sampler == kSamplerEulerAncestral) {
+        const float s2 = kd_keep(s * s), sn2 = kd_keep(sn * sn);
+        const float up2 = kd_keep(sn2 * (s2 - sn2)) / s2;
+        float sup = std::sqrt(up2);
+        if (!(sup < sn)) sup = sn;
+        const float dn2 = sn2 - kd_keep(sup * sup);
+        k.sup = sup;
+        k.sdown = std::sqrt(dn2 > 0.0f ? dn2 : 0.0f);
+    } else if (sampler == kSamplerDpmpp2m && sn > 0.0f) {
+        const float t = -std::log(s), tn = -std::log(sn);
+        const float h = tn - t;
+        k.ratio = sn / s;
+        k.em = std::expm1(-h);
+        if (!first) {
+            const float hl = t - (-std::log(sp));
+            const float r = hl / h;
+            k.c2 = 1.0f / kd_keep(2.0f * r);
+            k.c1 = 1.0f + k.c2;
+            k.second = true;
+        }
+    }
+    return k;
+}
+
+inline float kd_denoised(const KdEntry& k, bool v_pred, float x, float o) {
+    return v_pred ? kd_keep(x * k.cskip) - kd_keep(o * k.cout) : x - kd_keep(k.s * o);
+}
+
+inline float kd_next(const KdEntry& k, int64_t sampler, float x, float D, float hist, float nz) {
+    if (sampler == kSamplerEuler) {
+        const float d = (x - D) / k.s;
+        return x + kd_keep((k.sn - k.s) * d);
+    }
+    if (sampler == kSamplerEulerAncestral) {
+        const float d = (x - D) / k.s;
+        float xn = x + kd_keep(d * (k.sdown - k.s));
+        if (k.sn > 0.0f) xn = xn + kd_keep(nz * k.sup);
+        return xn;
+    }
+    if (k.sn == 0.0f) return D;
+    const float Dd = k.second ? kd_keep(k.c1 * D) - kd_keep(k.c2 * hist) : D;
+    return kd_keep(k.ratio * x) - kd_keep(k.em * Dd);
+}
+
+}  /* namespace */
+
+/* The model's input per entry that moves a lane: a first step's noise times sqrt(1 + sigma^2)
+ * into the lane, then rd(x / sqrt(sigma^2 + 1)) at the entry's rows and its pair's. Every entry is
+ * checked before any is written. */
+AVX_KERNEL(kd_input) {
+    if (!rad_args_have(a, 8)) return RAD_E_INVAL;
+    const RadTensor *sg = &a->t[0], *pair = &a->t[1], *lane = &a->t[2], *fl = &a->t[3];
+    const RadTensor *seed = &a->t[4], *cu = &a->t[5], *st = &a->t[6], *Y = &a->t[7];
+    const int64_t n = p_int(a, "n", 0), stride = p_int(a, "stride", 0);
+    if (n <= 0 || stride <= 0) return RAD_E_SHAPE;
+    const int64_t n_seq = numel(cu) - 1, st_rows = rows_of(st, n), y_rows = rows_of(Y, n);
+    if (n_seq <= 0 || cu_at(cu, n_seq) <= cu_at(cu, 0)) return RAD_E_SHAPE;
+    if (numel(sg) < n_seq || numel(pair) < n_seq || numel(lane) < n_seq || numel(fl) < n_seq ||
+        numel(seed) < 2 * n_seq)
+        return RAD_E_SHAPE;
+    for (int64_t e = 0; e < n_seq; ++e) {
+        const int64_t pr = ldi(pair, offlin(pair, e));
+        if (pr == -2) continue;
+        const int64_t L = ldi(lane, offlin(lane, e));
+        const int64_t b0 = cu_at(cu, e), len = cu_at(cu, e + 1) - b0;
+        if (L < 0 || len > stride || (L + 1) * stride > st_rows || b0 < 0 || b0 + len > y_rows)
+            return RAD_E_SHAPE;
+        if (pr >= n_seq || (pr >= 0 && (cu_at(cu, pr + 1) - cu_at(cu, pr) != len ||
+                                        cu_at(cu, pr) < 0 || cu_at(cu, pr) + len > y_rows)))
+            return RAD_E_SHAPE;
+        if (ldi(fl, offlin(fl, e)) & kInpaint) return RAD_E_UNSUPPORTED;
+    }
+    for (int64_t e = 0; e < n_seq; ++e) {
+        const int64_t pr = ldi(pair, offlin(pair, e));
+        if (pr == -2) continue;
+        const int64_t L = ldi(lane, offlin(lane, e));
+        const int64_t b0 = cu_at(cu, e), len = cu_at(cu, e + 1) - b0;
+        const int64_t p0 = pr >= 0 ? cu_at(cu, pr) : 0;
+        const float s = ldt(sg, offlin(sg, e));
+        const float init = std::sqrt(1.0f + kd_keep(s * s));
+        const float cin = 1.0f / std::sqrt(kd_keep(s * s) + 1.0f);
+        const bool first = (ldi(fl, offlin(fl, e)) & kFirst) != 0;
+        const uint64_t sd = seed_of(seed, e);
+        AVX_PARALLEL_FOR_IF(len * n * 8 >= AVX_PAR_MIN)
+        for (int64_t k = 0; k < len; ++k) {
+            const int64_t sb = rowoff(st, L * stride + k, n), ss = laststride(st);
+            const int64_t yb = rowoff(Y, b0 + k, n), ys = laststride(Y);
+            const int64_t pb = pr >= 0 ? rowoff(Y, p0 + k, n) : 0;
+            for (int64_t c = 0; c < n; ++c) {
+                if (first) stt(st, sb + c * ss, rad_philox_normal(sd, (uint64_t)(k * n + c)) * init);
+                const float v = ldt(st, sb + c * ss) * cin;
+                stt(Y, yb + c * ys, v);
+                if (pr >= 0) stt(Y, pb + c * ys, v);
+            }
+        }
+    }
+    return RAD_OK;
+}
+
+/* One sampler step per entry that moves a lane, libref's arithmetic (docs/OPS.md, kd_step). */
+AVX_KERNEL(kd_step) {
+    if (!rad_args_have(a, 14)) return RAD_E_INVAL;
+    const RadTensor *O = &a->t[0], *sg = &a->t[1], *sgn = &a->t[2], *sgp = &a->t[3];
+    const RadTensor *cfg = &a->t[4], *pair = &a->t[5], *lane = &a->t[6], *fl = &a->t[7];
+    const RadTensor *seed = &a->t[8], *smp = &a->t[9], *stp = &a->t[10], *cu = &a->t[11];
+    const RadTensor *st = &a->t[12], *hs = &a->t[13], *pv = rad_arg_in(a, 14);
+    const int64_t n = p_int(a, "n", 0), stride = p_int(a, "stride", 0);
+    const char* pred = p_str(a, "pred", "eps");
+    const bool v_pred = pred && !std::strcmp(pred, "v");
+    if (!v_pred && (!pred || std::strcmp(pred, "eps"))) return RAD_E_INVAL;
+    if (n <= 0 || stride <= 0) return RAD_E_SHAPE;
+    const int64_t n_seq = numel(cu) - 1, st_rows = rows_of(st, n), o_rows = rows_of(O, n);
+    if (n_seq <= 0 || cu_at(cu, n_seq) <= cu_at(cu, 0)) return RAD_E_SHAPE;
+    for (const RadTensor* t : { sg, sgn, sgp, cfg, pair, lane, fl, smp, stp })
+        if (numel(t) < n_seq) return RAD_E_SHAPE;
+    if (numel(seed) < 2 * n_seq || rows_of(hs, n) < st_rows || (pv && rows_of(pv, n) < st_rows))
+        return RAD_E_SHAPE;
+    for (int64_t e = 0; e < n_seq; ++e) {
+        const int64_t pr = ldi(pair, offlin(pair, e));
+        if (pr == -2) continue;
+        const int64_t L = ldi(lane, offlin(lane, e));
+        const int64_t b0 = cu_at(cu, e), len = cu_at(cu, e + 1) - b0;
+        if (L < 0 || len > stride || (L + 1) * stride > st_rows || b0 < 0 || b0 + len > o_rows)
+            return RAD_E_SHAPE;
+        if (pr >= n_seq || (pr >= 0 && (cu_at(cu, pr + 1) - cu_at(cu, pr) != len ||
+                                        cu_at(cu, pr) < 0 || cu_at(cu, pr) + len > o_rows)))
+            return RAD_E_SHAPE;
+        const int64_t f = ldi(fl, offlin(fl, e)), sm = ldi(smp, offlin(smp, e));
+        if ((f & kInpaint) || sm < kSamplerEuler || sm > kSamplerDpmpp2m) return RAD_E_UNSUPPORTED;
+        if ((f & kPreview) && !pv) return RAD_E_INVAL;
+    }
+    for (int64_t e = 0; e < n_seq; ++e) {
+        const int64_t pr = ldi(pair, offlin(pair, e));
+        if (pr == -2) continue;
+        const int64_t L = ldi(lane, offlin(lane, e));
+        const int64_t b0 = cu_at(cu, e), len = cu_at(cu, e + 1) - b0;
+        const int64_t p0 = pr >= 0 ? cu_at(cu, pr) : 0;
+        const int64_t f = ldi(fl, offlin(fl, e)), sm = ldi(smp, offlin(smp, e));
+        const uint64_t stream = (uint64_t)(uint32_t)(1 + ldi(stp, offlin(stp, e)));
+        const KdEntry K = kd_entry(ldt(sg, offlin(sg, e)), ldt(sgn, offlin(sgn, e)),
+                                   ldt(sgp, offlin(sgp, e)), ldt(cfg, offlin(cfg, e)), sm,
+                                   (f & kFirst) != 0);
+        const uint64_t sd = seed_of(seed, e);
+        AVX_PARALLEL_FOR_IF(len * n * 8 >= AVX_PAR_MIN)
+        for (int64_t k = 0; k < len; ++k) {
+            const int64_t ob = rowoff(O, b0 + k, n), os = laststride(O);
+            const int64_t ub = pr >= 0 ? rowoff(O, p0 + k, n) : 0;
+            const int64_t sb = rowoff(st, L * stride + k, n), ss = laststride(st);
+            const int64_t hb = rowoff(hs, L * stride + k, n), hss = laststride(hs);
+            for (int64_t c = 0; c < n; ++c) {
+                const float x = ldt(st, sb + c * ss);
+                float D = kd_denoised(K, v_pred, x, ldt(O, ob + c * os));
+                if (pr >= 0) {
+                    const float Du = kd_denoised(K, v_pred, x, ldt(O, ub + c * os));
+                    D = Du + kd_keep(K.w * (D - Du));
+                }
+                if (f & kPreview)
+                    stt(pv, rowoff(pv, L * stride + k, n) + c * laststride(pv), D);
+                const float nz = sm == kSamplerEulerAncestral && K.sn > 0.0f
+                                     ? rad_philox_normal_s(sd, stream, (uint64_t)(k * n + c)) : 0.0f;
+                stt(st, sb + c * ss, kd_next(K, sm, x, D, ldt(hs, hb + c * hss), nz));
+                stt(hs, hb + c * hss, D);
+            }
+        }
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ flow_x0_step */
 /* x' = f32(f32(r x) + f32(f32(1 - r) d)) with d = f32(x + f32((1 - t) v)) and
  * r = sigma_next / sigma: libref's f32 steps bit for bit, `keep` holding each product to its own
@@ -765,6 +962,56 @@ AVX_KERNEL(chan_affine) {
         }
         out_row(Y, rowoff(Y, r, n), n, t);
     }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ im2col_nhwc */
+/* conv2d_nhwc's receptive fields as rows (libref's definition): y [Ho * Wo, cin * k * k], column
+ * (ci k + i) k + j of row oy * Wo + ox the input at that tap, 0 in the padding. Each output row is
+ * filled tap by tap from the input pixel's channel run; bf16 into bf16 copies the bits. Parallel
+ * over output image rows. */
+AVX_KERNEL(im2col_nhwc) {
+    if (!rad_args_have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *Y = &a->t[1];
+    const int64_t cin = p_int(a, "cin", 0), k = p_int(a, "k", 0);
+    const int64_t stride = p_int(a, "stride", 1), up = p_int(a, "up", 1);
+    const char* pad = p_str(a, "pad", "same");
+    const bool down = pad && !std::strcmp(pad, "down");
+    const bool causal = pad && !std::strcmp(pad, "causal");
+    if (cin <= 0 || k <= 0 || stride <= 0 || up <= 0) return RAD_E_SHAPE;
+    if (X->rank != 2 || X->shape[1] % cin) return RAD_E_SHAPE;
+    const int64_t Hin = X->shape[0], Win = X->shape[1] / cin, kk = cin * k * k;
+    if (Hin <= 0 || Win <= 0) return RAD_E_SHAPE;
+    const int64_t Hv = Hin * up, Wv = Win * up;
+    const int64_t pt = down ? 0 : causal ? k - 1 : k / 2, pb = down ? 1 : causal ? 0 : k / 2;
+    const int64_t pl = down ? 0 : k / 2, pr = down ? 1 : k / 2;
+    const int64_t Ho = (Hv + pt + pb - k) / stride + 1, Wo = (Wv + pl + pr - k) / stride + 1;
+    if (Ho <= 0 || Wo <= 0 || rows_of(Y, kk) != Ho * Wo) return RAD_E_SHAPE;
+    const int64_t xr = X->stride[0], xs = laststride(X), ys = laststride(Y);
+    const bool bits = X->dtype == RAD_BF16 && Y->dtype == RAD_BF16;
+    AVX_PARALLEL_FOR_IF(Ho * Wo * kk >= AVX_PAR_MIN)
+    for (int64_t oy = 0; oy < Ho; ++oy)
+        for (int64_t ox = 0; ox < Wo; ++ox) {
+            const int64_t yb = rowoff(Y, oy * Wo + ox, kk);
+            for (int64_t i = 0; i < k; ++i) {
+                const int64_t iy = oy * stride + i - pt;
+                for (int64_t j = 0; j < k; ++j) {
+                    const int64_t ix = ox * stride + j - pl;
+                    const bool in = iy >= 0 && iy < Hv && ix >= 0 && ix < Wv;
+                    const int64_t xb = in ? (iy / up) * xr + (ix / up) * cin * xs : 0;
+                    const int64_t yt = yb + (i * k + j) * ys;
+                    for (int64_t ci = 0; ci < cin; ++ci) {
+                        const int64_t yo = yt + ci * k * k * ys;
+                        if (bits) {
+                            ((uint16_t*)Y->data)[yo] =
+                                in ? ((const uint16_t*)X->data)[xb + ci * xs] : (uint16_t)0;
+                        } else {
+                            stt(Y, yo, in ? ldt(X, xb + ci * xs) : 0.0f);
+                        }
+                    }
+                }
+            }
+        }
     return RAD_OK;
 }
 
@@ -1165,6 +1412,32 @@ AVX_KERNEL(gelu_tanh) {
             y[c] = 0.5f * g * (1.0f + sc_tanh(0.7978845608028654f * (g + 0.044715f * g * g * g)));
         }
         out_row(Y, rowoff(Y, r, n), n, y);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ gelu_quick */
+/* CLIP's quick_gelu in libref's three roundings: a = rd(1.702 x), s = rd(sigmoid(a)),
+ * y = rd(x s), libm's exp, element by element: a text encoder's feed-forward, small beside its
+ * GEMMs. */
+AVX_KERNEL(gelu_quick) {
+    if (!rad_args_have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *Y = &a->t[1];
+    const int64_t n = p_int(a, "n", 0);
+    if (n <= 0) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(Y, n);
+    if (rows <= 0 || rows_of(X, n) < rows) return RAD_E_SHAPE;
+    const uint32_t dt = Y->dtype;
+    AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t xb = rowoff(X, r, n), xs = laststride(X);
+        const int64_t yb = rowoff(Y, r, n), ys = laststride(Y);
+        for (int64_t c = 0; c < n; ++c) {
+            const float v = ldt(X, xb + c * xs);
+            const float t = narrow1(dt, 1.702f * v);
+            const float s = narrow1(dt, 1.0f / (1.0f + std::exp(-t)));
+            stt(Y, yb + c * ys, v * s);
+        }
     }
     return RAD_OK;
 }

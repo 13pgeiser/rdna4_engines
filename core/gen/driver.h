@@ -60,6 +60,7 @@ public:
     /* ---------------------------------------------------------- the engine thread */
     const RadBatch* next(int step) override;
     const RadBatch* batch_for(int rank) const override;
+    int32_t lora_slot() const override { return pass_.lora_slot; }
     /* A decode pass's pixels: `image_out` into the pinned image buffer. */
     const std::vector<Readback>& readbacks() const override { return rb_; }
     int  done() override;
@@ -85,6 +86,8 @@ private:
         int32_t  h_lat = 0, w_lat = 0;
         int64_t  tokens = 0;
         std::vector<float> sigmas;
+        /* A discrete-time model's: each step's timestep, beside `sigmas`. */
+        std::vector<float> tsteps;
         std::vector<int32_t> lanes;
         std::vector<std::pair<int32_t, int32_t>> ref_hw;
         int32_t  images_done = 0;
@@ -112,13 +115,15 @@ private:
         bool     preview = false;
         std::vector<int32_t> lanes;   /* DENOISE: the lanes it stepped, one per image */
         std::vector<char>    marks;   /* ... and whether each was marked for a preview */
+        int32_t  lora_slot = -1;      /* every image of a pass runs with the same adapters */
     };
 
     /* Staging regions: their offsets in the host span and every rank's slab. */
     struct Region { int64_t off = 0, bytes = 0, used = 0; };
     enum { R_TOK, R_POS, R_ROPE, R_CU, R_MMROW, R_ENCPIX, R_ENCCRD, R_ENCCU, R_SRC, R_GROPE,
            R_SEG, R_SLOT, R_PX, R_MASK, R_SIG, R_SIGN, R_CFG, R_PAIR, R_LANE, R_FLAGS, R_SEED,
-           R_BT, R_USED, R_ROPEF, R_ICU, R_IROWS, R_MCU, R_VCU, R_MROWS, R_MSRC, R_MCCU, R_MROPE, R_N };
+           R_BT, R_USED, R_ROPEF, R_ICU, R_IROWS, R_MCU, R_VCU, R_MROWS, R_MSRC, R_MCCU, R_MROPE,
+           R_AUX, R_SIGP, R_TSTEP, R_SAMP, R_STEPI, R_SIZE, R_N };
 
     int  layout_regions();
     template <class T> T* hptr(int r) const { return reinterpret_cast<T*>(host_ + reg_[r].off); }
@@ -147,6 +152,9 @@ private:
 
     RadGeneratorDecl      decl_{};
     std::vector<double>   fixed_;
+    /* A discrete-time model's sigma table (RadGeneratorDecl::train_steps), empty otherwise. */
+    DiscreteTable         table_;
+    bool discrete() const { return decl_.train_steps > 0; }
     int64_t               max_tok_ = 0, max_seqs_ = 0, max_enc_ = 0, patch_dim_ = 0;
     int64_t               max_rows_ = 0;     /* the longest conditioning sequence */
     int64_t               max_px_ = 0;       /* pixels the staging holds */
@@ -170,6 +178,8 @@ private:
     Pass                         pass_;
     /* Host arrays a COND pass's plugin reads on the host (RadGenBatch's _h fields). */
     std::vector<int32_t>         host_bidi_, host_px_, host_lanes_;
+    /* A DENOISE pass's per-entry host array (RadGenBatch::entry_h). */
+    std::vector<int32_t>         host_entry_;
     int64_t                      host_nmode_[3] = { 0, 0, 0 };
 
     mutable std::mutex           mu_;

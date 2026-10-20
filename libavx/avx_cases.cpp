@@ -314,8 +314,9 @@ std::vector<Case> build_cases() {
                 add("lora_shrink", { HI("M", M), HI("K", K), HI("R", 48), HI("S", 4),
                                      HI("group", 128), HS("dtype", dt) }, 0, 2.0 * M * 48 * K);
         for (const char* dt : { "f32", "bf16", "f16" })
-            add("lora_expand", { HI("M", M), HI("N", 645), HI("R", 48), HI("S", 4),
-                                 HS("dtype", dt) }, 0, 2.0 * M * 645 * 48);
+            for (const char* op : { "lora_expand", "lora_expand_mm" })
+                add(op, { HI("M", M), HI("N", 645), HI("R", 48), HI("S", 4), HS("dtype", dt) }, 0,
+                    2.0 * M * 645 * 48);
     }
     for (const char* dt : { "f32", "bf16" }) {
         add("embed_lookup",   { HI("M", 9), HI("n_embd", 128), HI("n_vocab", 64), HS("dtype", dt),
@@ -728,6 +729,10 @@ std::vector<Case> build_cases() {
         add("randn_lanes", { HI("M", 24), HI("n", 64), HI("stride", 16), HI("n_seq", 2),
                              HS("dtype", dt) });
         add("flow_euler",  { HI("M", 24), HI("n", 64), HI("stride", 16), HS("dtype", dt) });
+        add("kd_input", { HI("M", 24), HI("n", 4), HI("stride", 16), HS("dtype", dt) });
+        for (const char* pred : { "eps", "v" })
+            add("kd_step", { HI("M", 24), HI("n", 4), HI("stride", 16), HS("pred", pred),
+                             HS("dtype", dt) });
         for (const char* mode : { "fma", "inv" })
             for (int round : { 1, 0 })
                 add("chan_affine", { HI("M", 9), HI("n", 67), HS("mul", kMul.c_str()),
@@ -737,6 +742,7 @@ std::vector<Case> build_cases() {
             add("l2norm_chan", { HI("M", 9), HI("n", 645), HS("act", act), HS("dtype", dt) });
         add("to_rgba8",  { HI("M", 9), HI("n", 4), HS("dtype", dt) });
         add("gelu_tanh", { HI("M", 6), HI("n", 645), HS("dtype", dt) });
+        add("gelu_quick", { HI("M", 6), HI("n", 645), HS("dtype", dt) });
         add("scatter_add_rows", { HI("M", 6), HI("n", 645), HS("dtype", dt) });
         struct Conv { int M, cin, cout, k, stride, up; const char* pad; };
         static const Conv kConv[] = {
@@ -751,6 +757,17 @@ std::vector<Case> build_cases() {
                                  HI("stride", v.stride), HS("pad", v.pad), HI("up", v.up),
                                  HS("dtype", dt) },
                 0, 2.0 * v.M * v.cout * v.cin * v.k * v.k);
+        /* The convolutions' geometries once each: cout is not a parameter of the unfold. */
+        for (const Conv& v : kConv) {
+            bool seen = false;
+            for (const Conv* u = kConv; u != &v; ++u)
+                seen = seen || (u->M == v.M && u->cin == v.cin && u->k == v.k &&
+                                u->stride == v.stride && u->up == v.up && u->pad == v.pad);
+            if (seen) continue;
+            add("im2col_nhwc", { HI("M", v.M), HI("cin", v.cin), HI("k", v.k),
+                                 HI("stride", v.stride), HS("pad", v.pad), HI("up", v.up),
+                                 HS("dtype", dt) });
+        }
         for (int ft : { 1, 2 }) {
             add("d2s_add",     { HI("M", 64), HI("cin", 24), HI("cout", 24), HI("ft", ft),
                                  HS("dtype", dt) });

@@ -98,7 +98,7 @@ int         avx_par_force(int threads);
     /* ---- gemm and the vocabulary edges */                                                      \
     X(gemm_nt)              X(gemm_nt_bias)         X(gemm_nt_q)            X(gemm_nt_q_bias)     \
     X(gemm_nt_q_gated)      X(embed_lookup)         X(embed_lookup_q)       X(logits_gemm)        \
-    X(lora_shrink)          X(lora_expand)                                                        \
+    X(lora_shrink)          X(lora_expand)          X(lora_expand_mm)                             \
     /* ---- attention */                                                                          \
     X(attn_paged)           X(attn_dense)           X(attn_cross) X(attn_na3d) X(table_add) X(mix_rows) X(chan_stats) X(kv_store)             X(rope)               \
     X(rope_table)           X(qk_norm_rope)         X(qsa_block_key)        X(attn_local_rel)     \
@@ -117,7 +117,8 @@ int         avx_par_force(int threads);
     X(gather_rows2)         X(lane_gather)          X(lane_store)           X(randn_lanes)        \
     X(flow_euler)           X(chan_affine)          X(conv2d_nhwc)          X(l2norm_chan)        \
     X(d2s_add)              X(s2d_avg_add)          X(to_rgba8)             X(gelu_tanh)          \
-    X(scatter_add_rows)     X(attn_prefix_self)                                                   \
+    X(scatter_add_rows)     X(attn_prefix_self)     X(kd_input)             X(kd_step)            \
+    X(gelu_quick)           X(im2col_nhwc)                                                        \
     /* ---- video generation */                                                                   \
     X(rms_mod)              X(rms_mod_quant_fp8)    X(flow_x0_step)         X(patch_unfold)       \
     X(vtile_gather)         X(vtile_stitch)         X(grid_pos3)            X(vsa_select)         \

@@ -145,7 +145,9 @@ the cards the engine runs on.
 | `qwen-image-2.1.yaml` | `qwen-image-2.1-fp8.rad` | Qwen-Image 2.1 as block fp8 on two cards: OpenAI's images API, generation and edits |
 | `qwen-image-2.1-turbo.yaml` | `qwen-image-2.1-turbo-fp8.rad` | Qwen-Image 2.1 Turbo, the same in 8 steps |
 | `krea-2-turbo.yaml`, `krea-2-raw.yaml` | `krea-2-turbo-fp8.rad`, `krea-2-raw-fp8.rad` | Krea 2 Turbo and Raw as block fp8: text to image on one card (`RADIANCE_GPU`) |
+| `anima.yaml` | `anima-aesthetic-fp8.rad` | Anima Aesthetic as block fp8: text to image on one card (`RADIANCE_GPU`); the Base and Turbo containers serve the same way |
 | `flux-3-klein.yaml` | `flux-3-klein-fp8.rad` | FLUX.3 [klein] as block fp8: generation and edits on one card (`RADIANCE_GPU`); the base container serves the same way |
+| `sdxl.yaml` | `illustrious-xl-v2.0-bf16.rad` | Stable Diffusion XL in bf16 (here Illustrious-XL v2.0; any single-file SDXL checkpoint converts the same way): text to image on one card (`RADIANCE_GPU`) |
 | `qwen3-asr-1.7b.yaml` | `Qwen3-ASR-1.7B-hf/` (the checkpoint) | Qwen3-ASR 1.7B: `/v1/audio/transcriptions` and live `/v1/realtime`, on one card (`RADIANCE_GPU`) |
 | `minimax-h3.yaml` | `minimax-h3-fp8.rad` | MiniMax-H3 as block fp8: video with its stereo soundtrack on `/v1/videos`, two cards and about 39 GiB of pinned host memory |
 | `fasth3.yaml` | `fasth3-8-step-v2-fp8.rad` | FastVideo's FastH3 8-Step V2, the same in eight steps |

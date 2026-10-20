@@ -88,8 +88,13 @@ bool excluded_source(const std::string& src) {
     return false;
 }
 
+/* A generator that declared adapter key names (rad_lora_root): its scope is those roots, every
+ * matrix under one of them, and none of the token model's rules below apply. */
+bool gen_scope(const Program& prog) { return !prog.lora_roots.empty(); }
+
 const char* excluded_weight(const Program& prog, const WeightInfo& w) {
     if (w.decl.access == RAD_ACCESS_VOCAB) return "a vocabulary weight (embedding / lm_head)";
+    if (gen_scope(prog)) return w.decl.rank == 2 ? nullptr : "not a matrix";
     if (w.decl.access == RAD_ACCESS_PER_REQUEST) return "an encoder tower weight (per-request access)";
     if (prog.meta.n_layers > 0 && w.decl.group.layer >= prog.meta.n_layers)
         return "a drafter / MTP layer (layer group at or above meta.n_layers)";
@@ -121,8 +126,23 @@ void scan_maps(const Program& prog, const std::string& declared,
 struct MapIndex {
     std::unordered_map<std::string, std::vector<const RadNameMap*>> by;
     explicit MapIndex(const Program& prog) {
-        for (const RadNameMap& m : prog.name_map)
-            if (m.declared) by[m.declared].push_back(&m);
+        /* An entry repeated whole (a plugin's encoding probe maps the weight it then declares) is
+         * one entry. */
+        auto same = [](const RadNameMap& a, const RadNameMap& b) {
+            if (a.mode != b.mode || a.n_src != b.n_src || a.concat_dim != b.concat_dim) return false;
+            for (int k = 0; k < a.n_src && k < 8; ++k)
+                if (std::strcmp(a.src[k] ? a.src[k] : "", b.src[k] ? b.src[k] : "") != 0 ||
+                    a.src_index[k] != b.src_index[k] || a.src_rows[k] != b.src_rows[k])
+                    return false;
+            return true;
+        };
+        for (const RadNameMap& m : prog.name_map) {
+            if (!m.declared) continue;
+            std::vector<const RadNameMap*>& v = by[m.declared];
+            bool dup = false;
+            for (const RadNameMap* x : v) dup = dup || same(*x, m);
+            if (!dup) v.push_back(&m);
+        }
     }
     const std::vector<const RadNameMap*>* find(const std::string& d) const {
         auto it = by.find(d);
@@ -130,19 +150,27 @@ struct MapIndex {
     }
 };
 
+/* Is checkpoint tensor `src` an adapter target? A token model: its leaf is in the target list and
+ * it is in the trunk. A generator: it is under a declared root, and its leaf is in the list or the
+ * list is "*". */
+bool source_targeted(const Program& prog, const TargetSet& targets, const std::string& src) {
+    std::string leaf;
+    if (module_of(src, &leaf).empty()) return false;
+    if (!gen_scope(prog)) return targets.count(leaf) && !excluded_source(src);
+    if (!targets.count("*") && !targets.count(leaf)) return false;
+    for (const LoraRoot& r : prog.lora_roots)
+        if (src.compare(0, r.native.size(), r.native) == 0) return true;
+    return false;
+}
+
 /* weight_targeted(), over the maps already found. */
 bool targeted_core(const Program& prog, const WeightInfo& w,
                    const std::vector<const RadNameMap*>& maps, const TargetSet& targets) {
     if (targets.empty() || maps.empty()) return false;
     if (excluded_weight(prog, w)) return false;
     for (const RadNameMap* m : maps)
-        for (int k = 0; k < m->n_src && k < 8; ++k) {
-            if (!m->src[k]) continue;
-            const std::string src = m->src[k];
-            std::string leaf;
-            if (module_of(src, &leaf).empty()) continue;
-            if (targets.count(leaf) && !excluded_source(src)) return true;
-        }
+        for (int k = 0; k < m->n_src && k < 8; ++k)
+            if (m->src[k] && source_targeted(prog, targets, m->src[k])) return true;
     return false;
 }
 
@@ -464,40 +492,46 @@ int make_site(const Program& prog, const MapIndex& mi, const TargetSet& targets,
     if (!maps || maps->empty())
         return fail(err, RAD_E_NOTFOUND, fmt("weight '%s' has no name-map entry", W.name.c_str()));
     std::vector<std::string> srcs;
+    /* A row piece of a checkpoint tensor (RAD_MAP_ROWS) is a source of its own, named
+     * `<module>@<first row>+<rows>`: the adapter's B rows it takes are that range of the
+     * module's. */
+    std::vector<std::string> piece;
     const bool alternatives = maps->size() == 1 && (*maps)[0]->mode == RAD_MAP_COPY &&
                               (*maps)[0]->n_src > 1;
     for (const RadNameMap* m : *maps)
         for (int k = 0; k < m->n_src && k < 8; ++k) {
-            if (m->src_index[k] >= 0)
+            const bool rows = m->mode == RAD_MAP_ROWS;
+            if (!rows && m->src_index[k] >= 0)
                 return fail(err, RAD_E_UNSUPPORTED,
                             fmt("weight '%s' is slice %d of the stacked checkpoint tensor %s; a "
                                 "LoRA on a stacked (expert) tensor is not supported",
                                 W.name.c_str(), m->src_index[k], m->src[k]));
             srcs.push_back(m->src[k] ? m->src[k] : "");
+            piece.push_back(rows ? fmt("@%d+%lld", m->src_index[k], (long long)m->src_rows[k]) : "");
         }
     if (alternatives) {
         /* COPY with alternatives: the first one the container holds is the weight, and which one
          * that is is not recorded. Usable only when exactly one alternative is targeted. */
         std::vector<std::string> hit;
-        for (const std::string& x : srcs) {
-            std::string leaf;
-            if (!module_of(x, &leaf).empty() && targets.count(leaf) && !excluded_source(x))
-                hit.push_back(x);
-        }
+        for (const std::string& x : srcs)
+            if (source_targeted(prog, targets, x)) hit.push_back(x);
         if (hit.size() != 1)
             return fail(err, RAD_E_UNSUPPORTED,
                         fmt("weight '%s' is one of %zu alternative checkpoint tensors and %zu of "
                             "them are targeted; which one the container holds is not recorded",
                             W.name.c_str(), srcs.size(), hit.size()));
         srcs = hit;
+        piece.assign(srcs.size(), "");
     }
     int slot = 0;
-    for (const std::string& x : srcs) {
+    for (size_t si = 0; si < srcs.size(); ++si) {
+        const std::string& x = srcs[si];
         SiteSource ss;
         std::string leaf;
         ss.module = module_of(x, &leaf);
         if (ss.module.empty()) ss.module = x;
-        ss.targeted = !leaf.empty() && targets.count(leaf) && !excluded_source(x);
+        ss.module += piece[si];
+        ss.targeted = source_targeted(prog, targets, x);
         if (ss.targeted) ss.slot = slot++;
         s.sources.push_back(ss);
     }
@@ -544,6 +578,8 @@ int make_site(const Program& prog, const MapIndex& mi, const TargetSet& targets,
 /* ================================================================== predicates */
 bool weight_targeted(const Program& prog, rad_weight w, const TargetSet& targets) {
     if (targets.empty() || w == 0 || w >= prog.weights.size()) return false;
+    /* A generator's fused GEMMs are kept: its scope is the plain GEMMs (build_sites). */
+    if (gen_scope(prog)) return false;
     const WeightInfo& wi = prog.weights[w];
     if (excluded_weight(prog, wi)) return false;
     std::vector<const RadNameMap*> maps;
@@ -598,7 +634,7 @@ bool op_is_site(const Program& prog, const OpInfo& op, rad_weight* b_out, std::s
 int find_unsupported_uses(const Program& prog, const TargetSet& targets,
                           std::vector<UnsupportedUse>* out) {
     if (out) out->clear();
-    if (targets.empty()) return 0;
+    if (targets.empty() || gen_scope(prog)) return 0;
     const MapIndex mi(prog);
     int n = 0;
     for (size_t i = 1; i < prog.ops.size(); ++i) {
@@ -642,14 +678,47 @@ int build_sites(const Program& prog, const TargetSet& targets, int max_rank,
     if (max_rank <= 0) return fail(err, RAD_E_INVAL, fmt("max LoRA rank %d", max_rank));
     if (targets.empty()) return RAD_OK;
     const MapIndex mi(prog);
+    /* A generator's weight carries an adapter only when every op reading it is a site over it; one
+     * read elsewhere (a fused GEMM, a non-GEMM op) stays the base everywhere. */
+    std::set<std::string> other_reader;
+    if (gen_scope(prog))
+        for (size_t i = 1; i < prog.ops.size(); ++i) {
+            const OpInfo& op = prog.ops[i];
+            if (op.weights.empty() || !op_live(op)) continue;
+            rad_weight b = 0;
+            const bool site = op_is_site(prog, op, &b, nullptr);
+            for (rad_weight h : op.weights)
+                if (h && h < prog.weights.size() &&
+                    (!site || !b || prog.weights[b].source != prog.weights[h].source))
+                    other_reader.insert(prog.weights[h].source);
+        }
     std::map<rad_weight, int32_t> pool_of;
     std::vector<size_t> first_site;
     for (size_t i = 1; i < prog.ops.size(); ++i) {
         rad_weight b = 0;
         if (!op_live(prog.ops[i]) || !op_is_site(prog, prog.ops[i], &b, nullptr)) continue;
         if (!targeted_idx(prog, mi, b, targets)) continue;
+        if (other_reader.count(prog.weights[b].source)) continue;
+        if (gen_scope(prog)) {
+            /* Checkpoint tensors copied, joined, transposed or cut into row pieces carry a
+             * generator's adapter; a folded or derived one (weight norm, EMA) stays the base. */
+            bool whole = true;
+            if (const auto* maps = mi.find(prog.weights[b].source))
+                for (const RadNameMap* m : *maps)
+                    whole = whole && (m->mode == RAD_MAP_COPY || m->mode == RAD_MAP_CONCAT ||
+                                      m->mode == RAD_MAP_TRANSPOSE || m->mode == RAD_MAP_ROWS);
+            if (!whole) continue;
+        }
         Site s;
         const int st = make_site(prog, mi, targets, max_rank, (uint32_t)i, b, &s, err);
+        if (st < 0 && gen_scope(prog)) {
+            /* A generator's every plain GEMM is a candidate; one whose geometry cannot be told
+             * stays the base, as a fused one does. */
+            RAD_WARN("lora: '%s' carries no adapter: %s", prog.weights[b].name.c_str(),
+                     err ? err->c_str() : "");
+            if (err) err->clear();
+            continue;
+        }
         if (st < 0) return st;
         auto it = pool_of.find(b);
         if (it == pool_of.end()) {
@@ -728,15 +797,6 @@ std::string explain_module(const Program& prog, const TargetSet& targets, const 
 
 /* ================================================================== the adapter */
 namespace {
-
-struct AdModule {
-    std::string name;
-    const StTensor* A = nullptr;
-    const StTensor* B = nullptr;
-    int64_t rank = 0;
-    double  alpha = 0.0;
-    float   scale = 0.0f;
-};
 
 struct Slot { int32_t pool; int32_t source; };
 
@@ -937,6 +997,12 @@ int load_adapter(const std::string& dir, const std::vector<Site>& sites, int max
         info->leaves.insert(d == std::string::npos ? am.name : am.name.substr(d + 1));
     }
 
+    return pack_modules(sites, max_rank, mods, info, packed, err);
+}
+
+int pack_modules(const std::vector<Site>& sites, int max_rank,
+                 const std::map<std::string, AdModule>& mods, AdapterInfo* info,
+                 std::vector<PackedSite>* packed, std::string* err, bool compact) {
     /* ---- the sites, by pool: the representative of each pool and where its modules sit. */
     int32_t n_pools = 0;
     for (const Site& s : sites) {
@@ -955,7 +1021,9 @@ int load_adapter(const std::string& dir, const std::vector<Site>& sites, int max
     }
     std::unordered_map<std::string, std::vector<Slot>> where;
     for (int32_t p = 0; p < n_pools; ++p) {
-        if (!rep[(size_t)p]) return fail(err, RAD_E_INVAL, fmt("pool %d has no site", p));
+        /* A pool whose only GEMM could carry no adapter ops (lora_declare drops it) holds
+         * nothing. */
+        if (!rep[(size_t)p]) continue;
         const Site& s = *rep[(size_t)p];
         for (size_t i = 0; i < s.sources.size(); ++i)
             if (s.sources[i].targeted) where[s.sources[i].module].push_back({ p, (int32_t)i });
@@ -1001,9 +1069,10 @@ int load_adapter(const std::string& dir, const std::vector<Site>& sites, int max
     /* ---- pack, pool by pool */
     packed->resize((size_t)n_pools);
     for (int32_t p = 0; p < n_pools; ++p) {
-        const Site& s = *rep[(size_t)p];
         PackedSite& out = (*packed)[(size_t)p];
         out.pool = p;
+        if (!rep[(size_t)p]) continue;
+        const Site& s = *rep[(size_t)p];
         out.a.assign((size_t)(s.R * s.K_r), 0);
         out.b.assign((size_t)(s.N_r * s.R), 0);
         out.scale.assign((size_t)s.N_r, 0.0f);
@@ -1135,12 +1204,19 @@ int load_adapter(const std::string& dir, const std::vector<Site>& sites, int max
         }
 
         /* Pack. A: rows t_off.. of the module's block; B: rows y_col.., columns t_off..; scale on
-         * the module's rows. */
+         * the module's rows. Compact: the modules' ranks one after another from 0. */
+        std::vector<int64_t> off(n, 0);
+        int64_t used = 0;
+        for (size_t i = 0; i < n; ++i) {
+            off[i] = compact ? used : (int64_t)s.sources[i].slot * max_rank;
+            if (am[i]) used += am[i]->rank;
+        }
+        out.r_used = compact ? used : s.R;
         for (size_t i = 0; i < n; ++i) {
             if (!am[i]) continue;
             const StTensor& A = *am[i]->A;
             const int64_t r = am[i]->rank, kc = A.shape[1];
-            const int64_t t0 = (int64_t)s.sources[i].slot * max_rank;
+            const int64_t t0 = off[i];
             for (int64_t j = 0; j < r; ++j)
                 for (int64_t k = 0; k < s.K_r; ++k)
                     out.a[(size_t)((t0 + j) * s.K_r + k)] = elem_bf16(A, j * kc + s.k_lo + k);
@@ -1156,7 +1232,7 @@ int load_adapter(const std::string& dir, const std::vector<Site>& sites, int max
                 if (yr < 0 || yr >= s.N_r)
                     return fail(err, RAD_E_STATE, fmt("weight '%s': a part lands outside y", s.weight.c_str()));
                 for (int64_t j = 0; j < r; ++j)
-                    out.b[(size_t)(yr * s.R + sp.t_off + j)] = elem_bf16(B, row * r + j);
+                    out.b[(size_t)(yr * s.R + off[i] + j)] = elem_bf16(B, row * r + j);
                 out.scale[(size_t)yr] = am[i]->scale;
             }
         }

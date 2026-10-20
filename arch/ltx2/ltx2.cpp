@@ -3240,6 +3240,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     /* ---- in issue order: the conditioning pass, the step, the frames, the soundtrack, the
      * upscale */
+    /* LoRA files for LTX-2.5 name the DiT's modules as the checkpoint does (`transformer_blocks.N.
+     * attn1.to_q`, `ff.net.0.proj`), behind ComfyUI's or kohya's prefix. */
+    RAD_ARCH_TRY(lora_names(b, "transformer.", kLoraDiffusionSpellings, {}));
     RAD_ARCH_TRY(declare_te(b, meta, m));
     {
         const int64_t wz = std::max<int64_t>(rad_meta_geti(meta, "connectors.video_hidden_dim", 0),

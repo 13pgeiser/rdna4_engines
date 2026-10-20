@@ -88,13 +88,14 @@ TEST(the_shipped_architectures_load_with_distinct_selection_keys) {
         CHECK(keys.emplace(std::make_pair(p.arch_id, p.arch_quant), p.name).second);
     }
     const std::set<std::pair<std::string, std::string>> want = {
-        { "breeze", "" }, { "embeddinggemma2", "" }, { "flux3", "" }, { "flux3distilled", "" },
+        { "anima", "" }, { "breeze", "" }, { "embeddinggemma2", "" }, { "flux3", "" },
+        { "flux3distilled", "" },
         { "gemma3", "" }, { "gemma4", "" },
         { "gemma4", "compressed-tensors" }, { "glm5next", "" }, { "lfm2", "" }, { "llama", "" },
         { "llama", "fp8_e4m3" }, { "qwen35", "" },
         { "qwen35", "fp8_e4m3" }, { "qwen35", "w8a8_fwht128" }, { "qwen35moe", "fp8_e4m3" },
         { "qwen3asr", "" }, { "krea2", "" }, { "ltx2", "" }, { "minimaxh3", "" },
-        { "minimaxmusic3", "" }, { "qwen4exp", "" }, { "qwenimage21", "" } };
+        { "minimaxmusic3", "" }, { "qwen4exp", "" }, { "qwenimage21", "" }, { "sdxl", "" } };
     std::set<std::pair<std::string, std::string>> got;
     for (const auto& [k, name] : keys) got.insert(k);
     if (got != want)

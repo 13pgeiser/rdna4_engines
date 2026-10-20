@@ -2,6 +2,9 @@
 # to ten reference pictures on OpenAI's /v1/images/generations and /v1/images/edits, on one card,
 # RADIANCE_GPU in .env (default 0). For the base model, point --model at flux-3-klein-base-fp8.rad.
 # The FLUX Kommunity License (non-commercial use) applies.
+# LoRA files (Civitai and the like, docs/GUIDE.md §4.9.2): put them under
+# $RADIANCE_MODELS/loras/flux3 and add `--lora-dir /models/loras/flux3` to the command;
+# a request names them in `loras` or as <lora:name:0.8> in its prompt.
 name: radiance-flux-3-klein
 services:
   radiance:

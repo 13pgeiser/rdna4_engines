@@ -3663,6 +3663,14 @@ int Engine::load_vocab() {
     auto v = std::make_shared<Vocab>();
     RAD_TRY(v->load(std::move(vb)));
     vocab_ = v;
+    if (file_ && file_->aux_vocab()) {
+        VocabBuild ab;
+        RAD_TRY(vocab_deserialize(file_->base(), (uint64_t)file_->size(), file_->aux_vocab().h, ab));
+        auto av = std::make_shared<Vocab>();
+        RAD_TRY(av->load(std::move(ab)));
+        aux_vocab_ = av;
+        RAD_INFO("vocab: a second vocabulary of %d tokens", aux_vocab_->n_tokens());
+    }
 
     auto view = std::make_unique<TokenView>();
     RAD_TRY(view->init(vocab_));

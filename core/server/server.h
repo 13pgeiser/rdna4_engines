@@ -141,6 +141,12 @@ struct ServerOptions {
      * of an adapter requests still use drains it: RAD_OK with *in_flight > 0 (Engine::lora_unload). */
     std::function<int(const std::string&, const std::string&, std::string*)> lora_load;
     std::function<int(const std::string&, std::string*, int*)>              lora_unload;
+    /* A generator's adapters (Engine::gen_lora_acquire): the images and videos endpoints' `loras`
+     * and <lora:...> tags get a slot holding that combination, a hold on it and a note on what was
+     * left out; `gen_lora_names` is GET /v1/loras. Unset without adapters. */
+    std::function<int(const std::vector<std::pair<std::string, double>>&, int32_t*,
+                      std::shared_ptr<void>*, std::string*, std::string*)> gen_lora_acquire;
+    std::function<std::vector<std::string>()>                                gen_lora_names;
 
     std::string api_key;
     bool        cors = true;
@@ -240,6 +246,7 @@ private:
     void realtime_run(RealtimeSession& s, WsConn& ws);
     bool realtime_loop(RealtimeSession& s, WsConn& ws);
     HttpResponse handle_models(const HttpRequest& req);
+    HttpResponse handle_loras(const HttpRequest& req);
     HttpResponse handle_metrics(const HttpRequest& req);
     std::optional<HttpResponse> refuse_text(const std::string& peer,
                                             ApiShape shape = ApiShape::OpenAI);

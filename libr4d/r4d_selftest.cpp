@@ -8004,6 +8004,60 @@ void conv2d_cases(const Plugin& pl) {
     }
 }
 
+/* im2col_nhwc against a host unfold, bit for bit: SDXL's widths (a tail of channels past the
+ * 64-channel chunks, the upsample, both stride-2 paddings), an input whose channels are not a
+ * multiple of eight (the element loads), a 1x1 and a 5x5 (k at run time), x at a row pitch, and an
+ * odd output width (the narrowest stores). The y rows past the unfold must stay as they were. */
+void im2col_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "im2col_nhwc_bf16");
+    if (!r) { ok("im2col_nhwc_bf16", false, "row absent"); return; }
+    struct Case { const char* pad; int64_t cin, k, stride, up, H, W, xpad; };
+    for (const Case c : { Case{ "same", 320, 3, 1, 1, 40, 37, 0 }, Case{ "same", 200, 3, 1, 2, 9, 13, 0 },
+                          Case{ "same", 640, 3, 2, 1, 22, 17, 0 }, Case{ "down", 64, 3, 2, 1, 10, 14, 0 },
+                          Case{ "same", 4, 3, 1, 1, 33, 35, 0 }, Case{ "same", 6, 3, 1, 1, 7, 9, 2 },
+                          Case{ "same", 96, 1, 1, 1, 11, 7, 8 }, Case{ "same", 72, 5, 1, 1, 12, 15, 0 },
+                          Case{ "causal", 24, 3, 1, 1, 8, 5, 0 } }) {
+        const bool down = !std::strcmp(c.pad, "down"), causal = !std::strcmp(c.pad, "causal");
+        const int64_t Hv = c.H * c.up, Wv = c.W * c.up;
+        const int64_t pt = down ? 0 : causal ? c.k - 1 : c.k / 2, pb = down ? 1 : causal ? 0 : c.k / 2;
+        const int64_t pl0 = down ? 0 : c.k / 2, pr = down ? 1 : c.k / 2;
+        const int64_t Ho = (Hv + pt + pb - c.k) / c.stride + 1, Wo = (Wv + pl0 + pr - c.k) / c.stride + 1;
+        const int64_t KK = c.cin * c.k * c.k, ld = c.W * c.cin + c.xpad;
+        const std::string nm = fmt("im2col_nhwc_bf16 %s, %lld channels, k %lld, stride %lld, up %lld, "
+                                   "%lldx%lld", c.pad, (long long)c.cin, (long long)c.k,
+                                   (long long)c.stride, (long long)c.up, (long long)c.H,
+                                   (long long)c.W);
+        std::vector<float> x = randv((size_t)(c.H * ld), 1.0f);
+        void* dx = up_bf16(x);
+        std::vector<float> pre((size_t)((Ho * Wo + 1) * KK), -7.5f);
+        void* dy = up_bf16(pre);
+        RadTensor tx = T(dx, RAD_BF16, { c.H, c.W * c.cin });
+        tx.stride[0] = ld;
+        const int rc = launch(r, { tx, T(dy, RAD_BF16, { Ho * Wo, KK }) },
+                              { PI("M", Ho * Wo), PI("cin", c.cin), PI("k", c.k),
+                                PI("stride", c.stride), PS("pad", c.pad), PI("up", c.up),
+                                PS("dtype", "bf16") });
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        const std::vector<float> got = down_bf16(dy, pre.size());
+        int64_t bad = 0;
+        for (int64_t oy = 0; oy < Ho; ++oy)
+            for (int64_t ox = 0; ox < Wo; ++ox)
+                for (int64_t ci = 0; ci < c.cin; ++ci)
+                    for (int64_t i = 0; i < c.k; ++i)
+                        for (int64_t j = 0; j < c.k; ++j) {
+                            const int64_t iy = oy * c.stride + i - pt, ix = ox * c.stride + j - pl0;
+                            const float v = iy < 0 || iy >= Hv || ix < 0 || ix >= Wv
+                                                ? 0.0f
+                                                : x[(size_t)((iy / c.up) * ld + (ix / c.up) * c.cin + ci)];
+                            const int64_t at = (oy * Wo + ox) * KK + (ci * c.k + i) * c.k + j;
+                            bad += got[(size_t)at] != v;
+                        }
+        for (int64_t e = Ho * Wo * KK; e < (Ho * Wo + 1) * KK; ++e)
+            bad += got[(size_t)e] != -7.5f;
+        ok(nm.c_str(), bad == 0, fmt("%lld elements differ", (long long)bad));
+    }
+}
+
 }  /* namespace ltx */
 
 /* ---- a video latent upscaler's ops, at MiniMax-H3's shapes ---------------------------------------
@@ -8287,6 +8341,7 @@ void group_norm_cases(const Plugin& pl) {
         bool silu, inplace;
         float offset;      /* added to every value: a mean far from zero */
         int64_t pad;
+        float eps = 1e-5f;
     };
     for (const G& g : {
              /* The target size modulated with SiLU (a block's second norm), then plain with SiLU
@@ -8306,6 +8361,17 @@ void group_norm_cases(const Plugin& pl) {
              G{ "2 channels a group", 48 * 8 * 8, 64, 32, false, false, false, 0, true, false, 0.0f, 0 },
              G{ "2 channels a group, f32 rows", 777, 64, 32, true, true, true, 2, false, false, 5.0f, 8 },
              G{ "4 channels a group, f32", 777, 128, 32, true, true, true, 2, false, false, 20.0f, 8 },
+             /* SDXL's UNet: 10 to 80 channels a group, a row's chunks not a power of two (160),
+              * or more than the block (480 and 320 chunks, three and two to a thread); a
+              * resnet's norm with SiLU at eps 1e-5, a transformer's without at 1e-6. */
+             G{ "SDXL 320", 128 * 128, 320, 32, false, false, false, 0, true, false, 0.0f, 0 },
+             G{ "SDXL 640, eps 1e-6", 64 * 64, 640, 32, false, false, false, 0, false, false, 3.0f, 8, 1e-6f },
+             G{ "SDXL 960 in place", 128 * 128, 960, 32, false, false, false, 0, true, true, 0.0f, 0 },
+             G{ "SDXL 1280, eps 1e-6", 32 * 32, 1280, 32, false, false, false, 0, false, false, 0.0f, 0, 1e-6f },
+             G{ "SDXL 1920", 64 * 64, 1920, 32, false, false, false, 0, true, false, -2.0f, 16 },
+             G{ "SDXL 2560", 32 * 32 + 7, 2560, 32, false, false, true, 2, true, false, 0.0f, 8 },
+             /* A group of more than 2^24 values: the counts past f32's integers. */
+             G{ "2^24 values a group", 600 * 1024, 64, 2, false, false, false, 0, true, false, 1.0f, 0 },
          }) {
         const int64_t M = g.M, n = g.n, ld = n + g.pad, rows = M + 2;
         const std::string nm = fmt("group_norm %s: %lld x %lld in %lld groups", g.what,
@@ -8343,12 +8409,12 @@ void group_norm_cases(const Plugin& pl) {
             T(db, g.wf ? RAD_F32 : RAD_BF16, { n }), tm,
             T(ds, RAD_F32, { g.groups * (2 + 3 * 1024) }), pitched(dy, ydt, M, n, ld) };
         const std::vector<RadParam> ps = { PI("M", M), PI("n", n), PI("groups", g.groups),
-                                           PF("eps", 1e-5), PS("act", g.silu ? "silu" : "none"),
+                                           PF("eps", g.eps), PS("act", g.silu ? "silu" : "none"),
                                            PS("dtype", g.xf ? "f32" : "bf16") };
         const int rc = launch(r, ts, ps);
         if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
         std::vector<float> want, mean, rstd;
-        gn_ref(x, M, n, g.groups, w, b, g.mod ? &mod : nullptr, g.silu, 1e-5f, !g.yf, &want,
+        gn_ref(x, M, n, g.groups, w, b, g.mod ? &mod : nullptr, g.silu, g.eps, !g.yf, &want,
                &mean, &rstd);
         const size_t yel = (size_t)(rows * ld);
         const std::vector<float> yall = g.yf ? down_f32(dy, yel) : down_bf16(dy, yel);
@@ -8395,10 +8461,10 @@ void group_norm_cases(const Plugin& pl) {
     }
     RadTensor nomod = T(nullptr, RAD_BF16, { 1 });
     absent(nomod);
-    ok("group_norm refuses 12 channels a group",
+    ok("group_norm refuses 3 channels a group",
        launch(r, { TA(RAD_BF16, { 4, 96 }), TA(RAD_BF16, { 96 }), TA(RAD_BF16, { 96 }), nomod,
-                   TA(RAD_F32, { 8 * 3074 }), TA(RAD_BF16, { 4, 96 }) },
-              { PI("M", 4), PI("n", 96), PI("groups", 8), PF("eps", 1e-5), PS("act", "none"),
+                   TA(RAD_F32, { 32 * 3074 }), TA(RAD_BF16, { 4, 96 }) },
+              { PI("M", 4), PI("n", 96), PI("groups", 32), PF("eps", 1e-5), PS("act", "none"),
                 PS("dtype", "bf16") }) == RAD_E_SHAPE);
 }
 
@@ -9472,6 +9538,165 @@ void attn_long_case(const Plugin& pl, const char* name, int64_t hd, int64_t nh,
         }
     }
     check(nm + " numerics", got, want, 2e-2);
+}
+
+/* ---- SDXL's: CLIP-L's activation and the k-diffusion sampler, against a host port of libref's
+ * arithmetic (libref/ref_gen.cpp). */
+void gelu_quick_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "gelu_quick_bf16");
+    if (!r) { ok("gelu_quick_bf16", false, "row absent"); return; }
+    const int64_t M = 77, n = 3072, ld = 3080;
+    std::vector<float> x = randv((size_t)(M * ld), 4.0f);
+    void* dx = up_bf16(x);
+    void* dy = dalloc((size_t)(M * n) * 2);
+    RadTensor tx = T(dx, RAD_BF16, { M, n });
+    tx.stride[0] = ld;
+    const int rc = launch(r, { tx, T(dy, RAD_BF16, { M, n }) },
+                          { PI("M", M), PI("n", n), PS("dtype", "bf16") });
+    if (rc != RAD_OK) { ok("gelu_quick_bf16", false, "rc " + std::to_string(rc)); return; }
+    std::vector<float> want((size_t)(M * n));
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t c = 0; c < n; ++c) {
+            const float v = x[(size_t)(m * ld + c)];
+            const float a = bfr(1.702f * v), s = bfr(1.0f / (1.0f + std::exp(-a)));
+            want[(size_t)(m * n + c)] = bfr(v * s);
+        }
+    check("gelu_quick_bf16 over pitched rows", down_bf16(dy, want.size()), want, 4e-3);
+}
+
+/* The host port of kd_step's per-element arithmetic for one entry. */
+struct KdHost {
+    float s, sn, w, cskip, cout, sup = 0, sdown = 0, ratio = 0, em = 0, c1 = 0, c2 = 0;
+    bool second = false;
+    KdHost(float s_, float sn_, float sp, float w_, int sampler, bool first)
+        : s(s_), sn(sn_), w(w_) {
+        const float s2p = s * s + 1.0f;
+        cskip = 1.0f / s2p;
+        cout = s / std::sqrt(s2p);
+        if (sampler == 1) {
+            const float s2 = s * s, sn2 = sn * sn;
+            float u = std::sqrt(sn2 * (s2 - sn2) / s2);
+            if (!(u < sn)) u = sn;
+            sup = u;
+            const float d2 = sn2 - u * u;
+            sdown = std::sqrt(d2 > 0.0f ? d2 : 0.0f);
+        } else if (sampler == 2 && sn > 0.0f) {
+            const float t = -std::log(s), h = -std::log(sn) - t;
+            ratio = sn / s;
+            em = std::expm1(-h);
+            if (!first) {
+                const float rr = (t + std::log(sp)) / h;
+                c2 = 1.0f / (2.0f * rr);
+                c1 = 1.0f + c2;
+                second = true;
+            }
+        }
+    }
+    float den(bool v, float x, float o) const { return v ? x * cskip - o * cout : x - s * o; }
+    float next(int sampler, float x, float D, float hist, float nz) const {
+        if (sampler == 0) return x + (sn - s) * ((x - D) / s);
+        if (sampler == 1) return x + ((x - D) / s) * (sdown - s) + (sn > 0.0f ? nz * sup : 0.0f);
+        if (sn == 0.0f) return D;
+        return ratio * x - em * (second ? c1 * D - c2 * hist : D);
+    }
+};
+
+/* Five entries over lanes of 300 rows by 4 channels, an image of 280 latent rows each: entry 0 a
+ * first step guided against entry 1 (parked), entries 2-4 unguided at later steps. kd_input fills
+ * entry 0's lane and writes both entries' rows; kd_step takes every sampler at each prediction. */
+void kd_cases(const Plugin& pl) {
+    const RadKernelInfo* ri = find(pl, "kd_input_bf16");
+    const RadKernelInfo* rs = find(pl, "kd_step_bf16");
+    if (!ri || !rs) { ok("kd_input_bf16 / kd_step_bf16", false, "row absent"); return; }
+    const int64_t n = 4, stride = 300, len = 280, S = 5, R = S * len, LR = S * stride;
+    const std::vector<int32_t> pair = { 1, -2, -1, -1, -1 }, lane = { 3, 0, 1, 4, 2 };
+    std::vector<int32_t> cu(S + 1);
+    for (int64_t e = 0; e <= S; ++e) cu[(size_t)e] = (int32_t)(e * len);
+    const std::vector<uint32_t> seeds = { 0x9e3779b9u, 7u, 0, 0, 5u, 1u, 77u, 0, 0xdeadbeefu, 3u };
+    std::vector<int32_t> sdw(seeds.begin(), seeds.end());
+    const std::vector<float> sg = { 14.6f, 14.6f, 3.5f, 1.25f, 0.4f };
+    const std::vector<float> sgn = { 11.0f, 11.0f, 2.0f, 0.7f, 0.0f };
+    const std::vector<float> sgp = { 0.0f, 0.0f, 5.0f, 2.0f, 0.9f };
+    const std::vector<float> cfg = { 6.0f, 1.0f, 1.0f, 1.0f, 1.0f };
+    const std::vector<int32_t> step = { 0, 0, 7, 4, 20 };
+    std::vector<float> st0 = randv((size_t)(LR * n), 2.0f);
+
+    /* ---- kd_input */
+    void* dst = up_f32(st0);
+    void* dy = dalloc((size_t)(R * n) * 2);
+    const std::vector<int32_t> fl_in = { 1, 0, 0, 0, 0 };
+    int rc = launch(ri, { T(up_f32(sg), RAD_F32, { S }), TI32({ S }, pair), TI32({ S }, lane),
+                          TI32({ S }, fl_in), T(up_i32(sdw), RAD_U32, { 2 * S }),
+                          TI32({ S + 1 }, cu), T(dst, RAD_F32, { LR, n }),
+                          T(dy, RAD_BF16, { R, n }) },
+                    { PI("M", R), PI("n", n), PI("stride", stride), PS("dtype", "bf16") });
+    if (rc != RAD_OK) { ok("kd_input_bf16", false, "rc " + std::to_string(rc)); return; }
+    std::vector<float> st1 = st0, ywant((size_t)(R * n), 0.0f);
+    for (int64_t e = 0; e < S; ++e) {
+        if (pair[(size_t)e] == -2) continue;
+        const float s = sg[(size_t)e];
+        const uint64_t sd = (uint64_t)seeds[(size_t)(2 * e)] | ((uint64_t)seeds[(size_t)(2 * e + 1)] << 32);
+        for (int64_t k = 0; k < len; ++k)
+            for (int64_t c = 0; c < n; ++c) {
+                float& x = st1[(size_t)(((int64_t)lane[(size_t)e] * stride + k) * n + c)];
+                if (fl_in[(size_t)e] & 1)
+                    x = rad_philox_normal(sd, (uint64_t)(k * n + c)) * std::sqrt(1.0f + s * s);
+                const float v = x * (1.0f / std::sqrt(s * s + 1.0f));
+                ywant[(size_t)((cu[(size_t)e] + k) * n + c)] = v;
+                if (pair[(size_t)e] >= 0) ywant[(size_t)((cu[(size_t)pair[(size_t)e]] + k) * n + c)] = v;
+            }
+    }
+    check_f32("kd_input_bf16 lanes", down_f32(dst, st1.size()), st1, 1e-6);
+    check("kd_input_bf16 model input", down_bf16(dy, ywant.size()), ywant, 4e-3);
+
+    /* ---- kd_step, each sampler for every entry, both predictions */
+    for (const bool v_pred : { false, true })
+        for (int smp = 0; smp < 3; ++smp) {
+            std::vector<float> out = randv((size_t)(R * n), 1.5f), hs = randv((size_t)(LR * n), 1.0f);
+            void* ds = up_f32(st1);
+            void* dh = up_f32(hs);
+            void* dp = dalloc((size_t)(LR * n) * 4);
+            const std::vector<int32_t> fl = { 5, 0, 0, 1, 0 };
+            const std::vector<int32_t> sm(S, smp);
+            const int rc2 = launch(rs, { T(up_bf16(out), RAD_BF16, { R, n }),
+                                         T(up_f32(sg), RAD_F32, { S }), T(up_f32(sgn), RAD_F32, { S }),
+                                         T(up_f32(sgp), RAD_F32, { S }), T(up_f32(cfg), RAD_F32, { S }),
+                                         TI32({ S }, pair), TI32({ S }, lane), TI32({ S }, fl),
+                                         T(up_i32(sdw), RAD_U32, { 2 * S }), TI32({ S }, sm),
+                                         TI32({ S }, step), TI32({ S + 1 }, cu),
+                                         T(ds, RAD_F32, { LR, n }), T(dh, RAD_F32, { LR, n }),
+                                         T(dp, RAD_F32, { LR, n }) },
+                                   { PI("M", R), PI("n", n), PI("stride", stride),
+                                     PS("pred", v_pred ? "v" : "eps"), PS("dtype", "bf16") });
+            const std::string nm = fmt("kd_step_bf16 sampler %d %s", smp, v_pred ? "v" : "eps");
+            if (rc2 != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc2)); return; }
+            std::vector<float> sw = st1, hw = hs, pw((size_t)(LR * n), 0.0f);
+            for (int64_t e = 0; e < S; ++e) {
+                const int32_t pr = pair[(size_t)e];
+                if (pr == -2) continue;
+                const KdHost K(sg[(size_t)e], sgn[(size_t)e], sgp[(size_t)e], cfg[(size_t)e], smp,
+                               (fl[(size_t)e] & 1) != 0);
+                const uint64_t sd = (uint64_t)seeds[(size_t)(2 * e)] | ((uint64_t)seeds[(size_t)(2 * e + 1)] << 32);
+                for (int64_t k = 0; k < len; ++k)
+                    for (int64_t c = 0; c < n; ++c) {
+                        const size_t li = (size_t)(((int64_t)lane[(size_t)e] * stride + k) * n + c);
+                        const float x = sw[li];
+                        float D = K.den(v_pred, x, out[(size_t)((cu[(size_t)e] + k) * n + c)]);
+                        if (pr >= 0) {
+                            const float Du = K.den(v_pred, x, out[(size_t)((cu[(size_t)pr] + k) * n + c)]);
+                            D = Du + K.w * (D - Du);
+                        }
+                        if (fl[(size_t)e] & 4) pw[li] = D;
+                        const float nz = rad_philox_normal_s(sd, (uint64_t)(uint32_t)(1 + step[(size_t)e]),
+                                                             (uint64_t)(k * n + c));
+                        sw[li] = K.next(smp, x, D, hw[li], nz);
+                        hw[li] = D;
+                    }
+            }
+            check_f32(nm + " lanes", down_f32(ds, sw.size()), sw, 1e-5);
+            check_f32(nm + " history", down_f32(dh, hw.size()), hw, 1e-5);
+            if (smp == 0) check_f32(nm + " preview", down_f32(dp, pw.size()), pw, 1e-5);
+        }
 }
 
 }  /* namespace vg */
@@ -16225,6 +16450,96 @@ static void attn_perf(const Plugin& pl, int64_t M, int64_t H, int iters) {
               PI("max_seqs", 1), PS("qk", qk), PS("pv", "fp8") });
     }
     dfree_all();
+}
+
+/* SDXL's UNet convolutions at 1024 x 1024 (a 128 x 128 latent): the implicit GEMM against the
+ * unfold and a GEMM over the checkpoint's own weight, which runtime LoRA can attach to. */
+static void conv_perf(const Plugin& pl, int iters) {
+    if (iters <= 0) iters = 20;
+    const RadKernelInfo* rc = find(pl, "conv2d_nhwc_bf16");
+    const RadKernelInfo* ri = find(pl, "im2col_nhwc_bf16");
+    const RadKernelInfo* rg = find(pl, "gemm_bf16_nt_bias_tiled");
+    if (!rc || !ri || !rg) { std::printf("conv timing: a row is absent\n"); return; }
+    auto rand_fill = [](void* d, size_t bytes) {
+        const size_t chunk = std::min<size_t>(bytes, (size_t)16 << 20);
+        std::vector<uint16_t> h(chunk / 2);
+        for (size_t i = 0; i < h.size(); ++i) h[i] = st_rand_bf16((uint32_t)i);
+        for (size_t off = 0; off < bytes; off += chunk)
+            st_memcpy((uint8_t*)d + off, h.data(), std::min(chunk, bytes - off), hipMemcpyHostToDevice);
+    };
+    auto time_row = [&](const RadKernelInfo* r, std::vector<RadTensor> ts, std::vector<RadParam> ps)
+        -> double {
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        a.world_size = 1;
+        const int code = r->launch(&a, nullptr);
+        if (code != RAD_OK) return (double)code;
+        if (st_stream_sync(nullptr) != hipSuccess) return -1000.0;
+        return st_time_us([&](int) { r->launch(&a, nullptr); }, iters, nullptr);
+    };
+    struct C { int64_t side, cin, cout, stride, up; };
+    static const C kC[] = {
+        { 128, 320, 320, 1, 1 }, { 128, 960, 320, 1, 1 }, { 128, 640, 320, 1, 1 },
+        { 64, 640, 640, 1, 2 }, { 128, 320, 320, 2, 1 },
+        { 64, 320, 640, 1, 1 }, { 64, 640, 640, 1, 1 }, { 64, 1920, 640, 1, 1 },
+        { 64, 1280, 640, 1, 1 }, { 64, 960, 640, 1, 1 }, { 32, 1280, 1280, 1, 2 },
+        { 64, 640, 640, 2, 1 },
+        { 32, 640, 1280, 1, 1 }, { 32, 1280, 1280, 1, 1 }, { 32, 2560, 1280, 1, 1 },
+        { 32, 1920, 1280, 1, 1 },
+    };
+    std::printf("SDXL's 3x3 convolutions at 1024 x 1024, %d launches each: conv2d_nhwc_bf16 "
+                "against im2col_nhwc_bf16 + gemm_bf16_nt_bias_tiled\n", iters);
+    std::printf("  %-28s %10s %10s %10s %10s %7s\n", "input -> output, channels", "conv us",
+                "im2col us", "gemm us", "sum us", "ratio");
+    double tc = 0, ti = 0, tg = 0;
+    for (const C& c : kC) {
+        const int64_t Hin = c.side, Hv = Hin * c.up, Ho = (Hv + 2 - 3) / c.stride + 1, k = 3;
+        const int64_t P = Ho * Ho, K = c.cin * k * k;
+        void* dx = dalloc((size_t)(Hin * Hin * c.cin) * 2);
+        void* dw = dalloc((size_t)(c.cout * K) * 2);
+        void* db = dalloc((size_t)c.cout * 2);
+        void* dc = dalloc((size_t)(P * K) * 2);
+        void* dy = dalloc((size_t)(P * c.cout) * 2);
+        if (!dx || !dw || !db || !dc || !dy) { std::printf("  hipMalloc failed\n"); dfree_all(); continue; }
+        rand_fill(dx, (size_t)(Hin * Hin * c.cin) * 2);
+        rand_fill(dw, (size_t)(c.cout * K) * 2);
+        rand_fill(db, (size_t)c.cout * 2);
+        const std::vector<RadParam> pc = { PI("M", P), PI("cin", c.cin), PI("cout", c.cout),
+                                           PI("k", k), PI("stride", c.stride), PS("pad", "same"),
+                                           PI("up", c.up), PS("dtype", "bf16") };
+        const double uc = time_row(rc, { T(dx, RAD_BF16, { Hin, Hin * c.cin }),
+                                         T(dw, RAD_BF16, { c.cout, c.cin, k, k }),
+                                         T(db, RAD_BF16, { c.cout }), T(dy, RAD_BF16, { Ho, Ho * c.cout }) },
+                                   pc);
+        const std::vector<RadParam> pi = { PI("M", P), PI("cin", c.cin), PI("k", k),
+                                           PI("stride", c.stride), PS("pad", "same"), PI("up", c.up),
+                                           PS("dtype", "bf16") };
+        const double ui = time_row(ri, { T(dx, RAD_BF16, { Hin, Hin * c.cin }),
+                                         T(dc, RAD_BF16, { P, K }) }, pi);
+        RadTensor tres = T(nullptr, RAD_BF16, { 1 });
+        absent(tres);
+        const double ug = time_row(rg, { T(dc, RAD_BF16, { P, K }), T(dw, RAD_BF16, { c.cout, K }),
+                                         T(db, RAD_BF16, { c.cout }), tres,
+                                         T(dy, RAD_BF16, { P, c.cout }) },
+                                   { PI("M", P), PI("N", c.cout), PI("K", K), PS("dtype", "bf16") });
+        const std::string nm = fmt("%lldx%lld%s -> %lldx%lld, %lld -> %lld", (long long)Hin,
+                                   (long long)Hin, c.up == 2 ? " up2" : "", (long long)Ho,
+                                   (long long)Ho, (long long)c.cin, (long long)c.cout);
+        if (uc < 0 || ui < 0 || ug < 0) {
+            std::printf("  %-28s rc %d / %d / %d\n", nm.c_str(), (int)uc, (int)ui, (int)ug);
+        } else {
+            std::printf("  %-28s %10.1f %10.1f %10.1f %10.1f %7.2f\n", nm.c_str(), uc, ui, ug,
+                        ui + ug, (ui + ug) / uc);
+            tc += uc;
+            ti += ui;
+            tg += ug;
+        }
+        dfree_all();
+    }
+    std::printf("  %-28s %10.1f %10.1f %10.1f %10.1f %7.2f\n", "total", tc, ti, tg, ti + tg,
+                (ti + tg) / tc);
 }
 
 static void video_perf(const Plugin& pl, int iters, const char* only) {
@@ -24719,6 +25034,7 @@ static void device_phase(const Plugin& pl) {
     if (sel("stft_logmel")) ltx::stft_cases(pl);
     if (sel("bwe_up")) ltx::bwe_cases(pl);
     if (sel("conv2d_nhwc_bf16")) ltx::conv2d_cases(pl);
+    if (sel("im2col_nhwc_bf16")) ltx::im2col_cases(pl);
     if (sel("int_affine")) ltx::int_affine_cases(pl);
     if (sel("vsa_select_h128_bf16")) vsa::select_cases(pl);
     if (sel("attn_vsa_h128_bf16")) vsa::attn_cases(pl);
@@ -24738,6 +25054,8 @@ static void device_phase(const Plugin& pl) {
     if (sel("layernorm_bf16")) vg::norm_f32_rows_cases(pl, true);
     if (sel("timestep_embed_f32")) vg::timestep_f32_case(pl);
     if (sel("randn_lanes_f32")) vg::randn_f32_case(pl);
+    if (sel("gelu_quick_bf16")) vg::gelu_quick_cases(pl);
+    if (sel("kd_input_bf16") || sel("kd_step_bf16")) vg::kd_cases(pl);
     if (sel("interleave2_bf16")) vg::interleave2_f32_case(pl);
     if (sel("chan_affine_f32")) vg::chan_affine_cases(pl, "chan_affine_f32");
     if (sel("chan_affine_bf16")) vg::chan_affine_cases(pl, "chan_affine_bf16");
@@ -25518,6 +25836,8 @@ static void usage(void) {
                 "             decoder's tiles), upscaler (a latent upscaler's 3D convolutions\n"
                 "             beside the bf16 GEMM at the same M, N and K, then its norm and\n"
                 "             elementwise ops); every section without one.\n"
+                "  --perfconv [iters]:  SDXL's 3x3 convolutions at 1024 x 1024, conv2d_nhwc against\n"
+                "             im2col_nhwc and the biased GEMM over the unfolded rows.\n"
                 "  --perfvsa [iters] [local]:  vsa_select and attn_vsa at 1344 x 768 (38010\n"
                 "             rows, 28 heads), sparsity 0.8 and 0, beside attn_dense over the same\n"
                 "             rows. `local` gives q and k features of the row's grid position, so a\n"
@@ -25591,6 +25911,7 @@ int main(int argc, char** argv) {
     long long m16_m = 0, m16_e = 256, m16_k = 10, m16_d = 0;
     int m16_it = 20;
     int video_it = 0;
+    int conv_it = 0;
     long long attn_m = 0, attn_h = 0;
     int attn_it = 5;
     int vsa_it = 0;
@@ -25778,6 +26099,9 @@ int main(int argc, char** argv) {
             video_it = 10;
             if (i + 1 < argc && argv[i + 1][0] != '-') video_it = (int)std::strtol(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != '-') video_sec = argv[++i];
+        } else if (!std::strcmp(argv[i], "--perfconv")) {
+            conv_it = 20;
+            if (i + 1 < argc && argv[i + 1][0] != '-') conv_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfvsa")) {
             vsa_it = 5;
             if (i + 1 < argc && argv[i + 1][0] != '-' && std::strcmp(argv[i + 1], "local"))
@@ -25813,6 +26137,16 @@ int main(int argc, char** argv) {
         attn_perf(pl, attn_m, attn_h, attn_it);
 #else
         skip("attention timing", "built without HIP");
+#endif
+        return 0;
+    }
+    if (conv_it) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        conv_perf(pl, conv_it);
+        dfree_all();
+#else
+        skip("convolution timing", "built without HIP");
 #endif
         return 0;
     }

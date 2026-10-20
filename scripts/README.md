@@ -23,6 +23,7 @@ and `agentreplay.py` need `python3`. Scripts find each other through `$(dirname 
 | `convdspark.sh` | Rebuilds the container `mcserve.sh` serves, with the drafter merged, as `minicpm5-2b-dspark.new.rad` beside it. The checkpoint and drafter paths are fixed; `RECIPE=` overrides the recipe. |
 | `convfn.sh` | Rebuilds the container `fnserve.sh` serves, as `w4nl64-i8lm.new.rad` beside it, from `data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe`. Needs `CALIB=<dir>`: the recipe's expert rule runs GPTQ against the calibration Grams there (`docs/MOE-W4.md`). |
 | `hfget.sh` | Fetches a Hugging Face repo with `curl` and `jq`. Resumable, and skips the duplicate weight formats a repo often carries beside its safetensors. `radiance --model <repo id>` runs it. |
+| `krea2_native.py` | Rewrites a Krea 2 DiT single file in Krea's own key names (`turbo.safetensors`, civitai and ComfyUI finetunes) as diffusers' transformer file, bytes unchanged, so it converts as the `transformer/` of a Krea 2 pipeline directory (`docs/GUIDE.md`). |
 
 ## Measuring
 

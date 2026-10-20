@@ -56,8 +56,15 @@ typedef struct RadFileHeader {
     uint64_t prof_off,  prof_count;    /* RadFileProfile[] -- expert popularity */
     uint64_t data_off,  data_bytes;    /* the blob; RAD_ALIGN_POOL-aligned */
 
+    /* reserved[RAD_HDR_AUX_VOCAB_OFF] and reserved[RAD_HDR_AUX_VOCAB_BYTES] place a second vocab
+     * section, laid out as the first (RadVocabHeader + its payload, its strings in the one string
+     * blob): a tokenizer a generator reads its prompt through beside the model's own
+     * (RadGeneratorDecl::aux_tokens). Both zero when there is none, as in a file written before
+     * the section existed; the rest are zero. */
     uint64_t reserved[8];
 } RadFileHeader;
+
+enum { RAD_HDR_AUX_VOCAB_OFF = 0, RAD_HDR_AUX_VOCAB_BYTES = 1 };
 
 /* ------------------------------------------------------------------ metadata */
 typedef struct RadFileKV {
@@ -124,9 +131,17 @@ enum { RAD_TOK_BPE = 1, RAD_TOK_UNIGRAM = 2, RAD_TOK_WORDPIECE = 3, RAD_TOK_RWKV
 enum {
     RAD_NORM_NFC = 1, RAD_NORM_NFKC = 2, RAD_NORM_NFD = 3, RAD_NORM_NFKD = 4,
     RAD_NORM_LOWERCASE = 5, RAD_NORM_STRIP = 6, RAD_NORM_REPLACE = 7, RAD_NORM_PREPEND = 8,
+    RAD_NORM_PRECOMPILED = 9,
     RAD_PRE_BYTELEVEL = 32, RAD_PRE_SPLIT = 33, RAD_PRE_METASPACE = 34,
     RAD_PRE_WHITESPACE = 35, RAD_PRE_PUNCTUATION = 36, RAD_PRE_DIGITS = 37,
     RAD_PRE_BYTE_FALLBACK = 38,
+    /* BPE's end-of-word suffix (arg0, CLIP's "</w>"): a word's last symbol carries it, so the
+     * merges and the vocabulary tell a word's end from its middle. */
+    RAD_PRE_END_OF_WORD = 39,
+    /* An added token matched in the normalised text rather than the raw one (tokenizers'
+     * `normalized`): arg0 its spelling, iarg its id. Cut out after the normalisers and before
+     * the other pre-tokenisers. */
+    RAD_PRE_ADDED_NORMALIZED = 40,
     RAD_DEC_BYTELEVEL = 64, RAD_DEC_METASPACE = 65, RAD_DEC_REPLACE = 66,
     RAD_DEC_STRIP = 67, RAD_DEC_FUSE = 68, RAD_DEC_BYTE_FALLBACK = 69
 };

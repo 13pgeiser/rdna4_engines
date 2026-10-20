@@ -1914,6 +1914,51 @@ void gen_cases(std::vector<Hand>& hs) {
             hs.push_back(std::move(h));
         }
         {
+            /* The k-diffusion input: entry 0 a first step guided against entry 1 (pair -2, which
+             * only its positive entry writes), entry 2 a later step, unguided, in lane 3. */
+            static const uint32_t kSeeds[6] = { 11u, 0u, 0u, 0u, 0xfeedbeefu, 3u };
+            Hand h(("first, parked, later, n 4" + sfx).c_str(), "kd_input", 0.0);
+            h.dense(RAD_F32, { 3 }, [](int64_t i) { return 14.6f - 6.0f * (float)i; })
+             .idx({ 1, -2, -1 })
+             .idx({ 0, 1, 3 })
+             .idx({ 1, 0, 0 })
+             .raw(RAD_U32, { 6 }, kSeeds)
+             .idx({ 0, 5, 10, 13 })
+             .dense(RAD_F32, { 24, 4 }, hfill(227), true)
+             .dense(dt, { 13, 4 }, zero, true)
+             .pi("M", 13).pi("n", 4).pi("stride", 6).ps("dtype", dn);
+            hs.push_back(std::move(h));
+        }
+        for (const char* pred : { "eps", "v" }) {
+            /* Every sampler: entry 0 Euler guided against entry 1 with a preview, entry 2 Euler
+             * ancestral at step 7, entry 3 DPM++ 2M past its first step, entry 4 DPM++ 2M's first
+             * step, entry 5 Euler ancestral to sigma 0, entry 6 DPM++ 2M to sigma 0. */
+            static const uint32_t kSeeds[14] = { 3u, 0u, 4u, 0u, 5u, 9u, 6u, 1u, 7u, 0u, 8u, 0u,
+                                                 9u, 2u };
+            Hand h(("seven entries, every sampler, " + std::string(pred) + sfx).c_str(), "kd_step",
+                   0.0);
+            static const float kS[7]  = { 6.0f, 6.0f, 3.5f, 1.25f, 9.0f, 0.4f, 0.3f };
+            static const float kSn[7] = { 4.5f, 4.5f, 2.0f, 0.7f, 6.5f, 0.0f, 0.0f };
+            static const float kSp[7] = { 0.0f, 0.0f, 5.0f, 2.0f, 0.0f, 0.9f, 0.6f };
+            h.dense(dt, { 21, 5 }, hfill(228))
+             .dense(RAD_F32, { 7 }, [](int64_t i) { return kS[i]; })
+             .dense(RAD_F32, { 7 }, [](int64_t i) { return kSn[i]; })
+             .dense(RAD_F32, { 7 }, [](int64_t i) { return kSp[i]; })
+             .dense(RAD_F32, { 7 }, [](int64_t) { return 6.5f; })
+             .idx({ 1, -2, -1, -1, -1, -1, -1 })
+             .idx({ 0, 1, 2, 3, 4, 5, 6 })
+             .idx({ 4, 0, 0, 0, 1, 0, 0 })
+             .raw(RAD_U32, { 14 }, kSeeds)
+             .idx({ 0, 0, 1, 2, 2, 1, 2 })
+             .idx({ 0, 0, 7, 4, 0, 20, 21 })
+             .idx({ 0, 3, 6, 9, 12, 15, 18, 21 })
+             .dense(RAD_F32, { 28, 5 }, hfill(229, 3.0f), true)
+             .dense(RAD_F32, { 28, 5 }, hfill(230), true)
+             .dense(RAD_F32, { 28, 5 }, zero, true)
+             .pi("M", 21).pi("n", 5).pi("stride", 4).ps("pred", pred).ps("dtype", dn);
+            hs.push_back(std::move(h));
+        }
+        {
             Hand h(("a mask column into three lanes" + sfx).c_str(), "lane_store", 0.0);
             h.dense(dt, { 9, 1 }, hfill(225))
              .idx({ 3, 0, 1 })

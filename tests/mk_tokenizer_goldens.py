@@ -246,6 +246,104 @@ def metaspace_specials(scheme):
                       "vocab": vocab, "merges": [[MS, "H"], ["H", "i"], [MS + "H", "i"]]}}
 
 
+# ---------------------------------------------------------------------------- CLIP-shaped
+
+CLIP_SPLIT = r"""'s|'t|'re|'ve|'m|'ll|'d|[\p{L}]+|[\p{N}]|[^\s\p{L}\p{N}]+"""
+
+
+def gpt2_alphabet():
+    """GPT-2's byte -> character map, in CLIP's vocabulary order."""
+    bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("\xa1"), ord("\xac") + 1)) + \
+        list(range(ord("\xae"), ord("\xff") + 1))
+    cs = bs[:]
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    return [chr(c) for c in cs]
+
+
+CLIP_TRAIN = ("a photo of a cat, a painting of a dog, best quality, masterpiece, 1girl, solo, "
+              "looking at viewer, it's a photograph of the mountains at sunset, don't stop, "
+              "highly detailed digital art, portrait of an astronaut riding a horse, ") * 3
+
+
+def clip_like():
+    """CLIP ViT-L/14's tokenizer.json with its vocabulary cut down: the real normaliser, Split,
+    ByteLevel, RobertaProcessing and decoder, the 512 byte tokens with and without the "</w>"
+    end-of-word suffix in CLIP's order, and merges trained here (most frequent pair, then the
+    smallest) over a few prompts, each merged token's id 512 + its rank as in CLIP's own file."""
+    from tokenizers import normalizers, pre_tokenizers, Regex
+    norm = normalizers.Sequence([normalizers.NFC(), normalizers.Replace(Regex(r"\s+"), " "),
+                                 normalizers.Lowercase()])
+    pre = pre_tokenizers.Sequence([
+        pre_tokenizers.Split(Regex(CLIP_SPLIT), behavior="removed", invert=True),
+        pre_tokenizers.ByteLevel(add_prefix_space=False)])
+    alpha = gpt2_alphabet()
+    vocab = alpha + [c + "</w>" for c in alpha]
+    words = {}
+    for w, _ in pre.pre_tokenize_str(norm.normalize_str(CLIP_TRAIN)):
+        sym = tuple(list(w[:-1]) + [w[-1] + "</w>"])
+        words[sym] = words.get(sym, 0) + 1
+    merges = []
+    for _ in range(160):
+        pairs = {}
+        for sym, n in words.items():
+            for a, b in zip(sym, sym[1:]):
+                pairs[(a, b)] = pairs.get((a, b), 0) + n
+        if not pairs:
+            break
+        best = min(pairs, key=lambda k: (-pairs[k], k))
+        merges.append(best)
+        vocab.append(best[0] + best[1])
+        nw = {}
+        for sym, n in words.items():
+            out, i = [], 0
+            while i < len(sym):
+                if i + 1 < len(sym) and (sym[i], sym[i + 1]) == best:
+                    out.append(sym[i] + sym[i + 1])
+                    i += 2
+                else:
+                    out.append(sym[i])
+                    i += 1
+            nw[tuple(out)] = nw.get(tuple(out), 0) + n
+        words = nw
+    bos, eos = len(vocab), len(vocab) + 1
+    vocab += ["<|startoftext|>", "<|endoftext|>"]
+    return {
+        "added_tokens": [
+            {"id": bos, "content": "<|startoftext|>", "single_word": False, "lstrip": False,
+             "rstrip": False, "normalized": True, "special": True},
+            {"id": eos, "content": "<|endoftext|>", "single_word": False, "lstrip": False,
+             "rstrip": False, "normalized": False, "special": True}],
+        "normalizer": {"type": "Sequence", "normalizers": [
+            {"type": "NFC"}, {"type": "Replace", "pattern": {"Regex": r"\s+"}, "content": " "},
+            {"type": "Lowercase"}]},
+        "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+            {"type": "Split", "pattern": {"Regex": CLIP_SPLIT}, "behavior": "Removed",
+             "invert": True},
+            {"type": "ByteLevel", "add_prefix_space": False, "trim_offsets": True}]},
+        "post_processor": {"type": "RobertaProcessing", "sep": ["<|endoftext|>", eos],
+                           "cls": ["<|startoftext|>", bos], "trim_offsets": False,
+                           "add_prefix_space": False},
+        "decoder": {"type": "ByteLevel", "add_prefix_space": True, "trim_offsets": True},
+        "model": {"type": "BPE", "dropout": None, "unk_token": "<|endoftext|>",
+                  "continuing_subword_prefix": "", "end_of_word_suffix": "</w>",
+                  "fuse_unk": False, "vocab": {t: i for i, t in enumerate(vocab)},
+                  "merges": [a + " " + b for a, b in merges]},
+    }
+
+
+CLIP_TEXTS = ["a photo of a cat", "1girl, solo, masterpiece, best quality, (absurdres:1.2), "
+              "looking_at_viewer, hatsune_miku", "A Photograph of the Mountains, it's DON'T stop",
+              "1024x1024 2.5 v1.0", "Café naïve 東京タワー 서울 🍣👩‍👩‍👧 İstanbul ΣΊΣΥΦΟΣ",
+              "  many   spaces\t\ttabs\n\nnewlines  ", "...!!!??? ((()))[[]]", "", "a",
+              "<|startoftext|>a cat<|endoftext|>", "x<|StartOfText|>y", "a</w>b catcat",
+              "photographphotograph", "it'sit's'll"]
+
+
 SPECIAL_TEXTS = ["Hi", "[INST]Hi", "[INST] Hi", "Hi[INST]Hi", "<s>Hi", "Hi Hi[INST]Hi"]
 
 GEMMA_TEXTS = ["hello", " hello", "hello world", "hello  world", "the cat", "\nthe\n\ncat",
@@ -337,6 +435,30 @@ def main():
         for text in SPECIAL_TEXTS:
             ids = tok.encode(text, add_special_tokens=False).ids
             print("        { %s, { %s, %s, {} } }," % (cstr(scheme), cstr(text), ids_cpp(ids)))
+    print("    };")
+    print("    return v;")
+    print("}")
+    print()
+    c = clip_like()
+    tok = Tokenizer.from_str(json.dumps(c))
+    print("const char* const kClipLike = R\"JSON(%s)JSON\";" % json.dumps(c, ensure_ascii=False))
+    print()
+    print("const std::vector<EncodeGolden>& clip_goldens() {")
+    print("    static const std::vector<EncodeGolden> v = {")
+    for t in CLIP_TEXTS:
+        a = tok.encode(t, add_special_tokens=False).ids
+        b = tok.encode(t, add_special_tokens=True).ids
+        print("        { %s, %s, %s }," % (cstr(t), ids_cpp(a), ids_cpp(b)))
+    print("    };")
+    print("    return v;")
+    print("}")
+    print()
+    print("/* The decode of every CLIP golden with special tokens skipped, as HF reports it. */")
+    print("const std::vector<const char*>& clip_decoded() {")
+    print("    static const std::vector<const char*> v = {")
+    for t in CLIP_TEXTS:
+        print("        %s," % cstr(tok.decode(tok.encode(t, add_special_tokens=True).ids,
+                                              skip_special_tokens=True)))
     print("    };")
     print("    return v;")
     print("}")

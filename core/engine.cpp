@@ -2113,7 +2113,23 @@ int Engine::run_server() {
     o.graph_json  = [this] { return dump_graph_json(ranks_[0]->program); };
     /* Per request, from a reading at most a second old (Engine::diagnostics_json). */
     o.diagnostics_json = [this] { return diagnostics_json(); };
-    if (cfg_.lora.enabled()) {
+    if (cfg_.lora.enabled() && ranks_[0]->program.is_pass_driven()) {
+        /* A generator's request names its adapters in `loras`; `model` stays the model. */
+        o.gen_lora_acquire = [this](const std::vector<std::pair<std::string, double>>& u,
+                                    int32_t* slot, std::shared_ptr<void>* hold, std::string* note,
+                                    std::string* e) {
+            std::vector<LoraUse> uses;
+            for (const auto& [n, w] : u) uses.push_back({ n, w });
+            return gen_lora_acquire(uses, slot, hold, note, e);
+        };
+        o.gen_lora_names = [this] { return gen_lora_names(); };
+        o.lora_load = [this](const std::string& n, const std::string& d, std::string* e) {
+            return lora_load(n, d, e);
+        };
+        o.lora_unload = [this](const std::string& n, std::string* e, int* in_flight) {
+            return lora_unload(n, e, in_flight);
+        };
+    } else if (cfg_.lora.enabled()) {
         /* `model` picks the adapter, and the served model's own name picks the base. */
         for (const auto& [name, dir] : cfg_.lora.adapters)
             if (name == o.model_id) {
@@ -2347,7 +2363,14 @@ int Engine::run_server() {
         gen::Driver*         drv = nullptr;
         const mm::Processor* proc = nullptr;
         server::ImageGenInfo inf;
+        Tokenizer            aux;
+        bool                 has_aux = false;
         const server::ImageGenInfo& info() const override { return inf; }
+        int encode_aux(const std::string& text, std::vector<int32_t>* out) const override {
+            if (!has_aux) return RAD_E_UNSUPPORTED;
+            out->clear();
+            return aux.encode(text, *out, /*add_special=*/true, /*parse_special=*/true);
+        }
         int submit(std::unique_ptr<gen::Request> r, std::string* why) override {
             return drv->submit(std::move(r), why);
         }
@@ -2393,6 +2416,27 @@ int Engine::run_server() {
         in.cfg_original = gd.cfg_original != 0;
         in.has_default_negative = pg.gen_str.has_default_negative;
         in.default_negative = pg.gen_str.default_negative;
+        in.min_tokens = gd.min_tokens;
+        in.pad_token = gd.pad_token;
+        in.aux_tokens = gd.aux_tokens != 0;
+        in.aux_max_tokens = gd.aux_max_tokens;
+        if (in.aux_tokens) {
+            if (!aux_vocab_) {
+                RAD_ERR("images: '%s' reads its prompt through a second tokenizer and %s carries "
+                        "none; convert it with rad-convert --tokenizer2", in.name.c_str(),
+                        cfg_.model.c_str());
+                return RAD_E_FORMAT;
+            }
+            RAD_TRY(image_bridge.aux.init(aux_vocab_));
+            image_bridge.has_aux = true;
+        }
+        in.samplers = gd.train_steps > 0 ? gd.samplers : 0;
+        in.default_sampler = gd.default_sampler;
+        in.default_scheduler = gd.default_scheduler;
+        in.chunk_tokens = gd.chunk_tokens;
+        in.chunk_bos = gd.chunk_bos;
+        in.chunk_eos = gd.chunk_eos;
+        in.chunk_pad = gd.pad_token;
         image_bridge.drv = img_gen_;
         image_bridge.proc = mm_proc.get();
         d.images = &image_bridge;
@@ -2407,6 +2451,9 @@ int Engine::run_server() {
                  (long long)in.default_height, (long long)in.max_tokens, (long long)in.max_refs,
                  in.fixed_schedule ? (std::to_string(in.fixed_steps) + " fixed steps").c_str()
                                    : (std::to_string(in.default_steps) + " steps by default").c_str());
+        if (in.samplers)
+            RAD_INFO("images: sampler %s, scheduler %s by default", gen::sampler_name(in.default_sampler),
+                     gen::scheduler_name(in.default_scheduler));
     }
 
     /* An audio generator's endpoint: the driver's queue, the declared prompt and limits, and the

@@ -128,6 +128,12 @@ struct RadBuilder {
     RadGeneratorDecl generator{};
     std::string      generator_name;
 
+    /* Adapter key names (rad_lora_root, rad_lora_alias): (native, spellings), and each alias as
+     * (native, from, to, from_lo, from_hi, to_lo). */
+    std::vector<std::pair<std::string, std::string>> lora_roots;
+    struct LoraAliasRec { std::string native, from, to; int64_t from_lo, from_hi, to_lo; };
+    std::vector<LoraAliasRec> lora_aliases;
+
     /* What rad_weight_encoding answers: the first entry whose key the source name contains. Empty
      * means no model, so every weight is plain in its declared dtype. */
     std::vector<std::pair<std::string, RadEncoding>> encs;
@@ -266,6 +272,19 @@ extern "C" int rad_declare_generator(RadBuilder* b, const RadGeneratorDecl* d) {
     if (!b || !d || !d->image_out || b->logits || b->pooled) return RAD_E_INVAL;
     b->generator = *d;
     b->generator_name = d->name ? d->name : "";
+    return RAD_OK;
+}
+
+/* Recorded: a generator's adapter key names. */
+extern "C" int rad_lora_root(RadBuilder* b, const char* native, const char* spellings) {
+    if (!b || !native || !*native) return RAD_E_INVAL;
+    b->lora_roots.push_back({ native, spellings ? spellings : "" });
+    return RAD_OK;
+}
+extern "C" int rad_lora_alias(RadBuilder* b, const char* native, const char* from, const char* to,
+                              int64_t from_lo, int64_t from_hi, int64_t to_lo) {
+    if (!b || !native || !from || !to) return RAD_E_INVAL;
+    b->lora_aliases.push_back({ native, from, to, from_lo, from_hi, to_lo });
     return RAD_OK;
 }
 
@@ -482,6 +501,8 @@ extern "C" int rad_memset_async(void* dst, int value, int64_t bytes, RadStream s
 #include "../arch/embgemma2/embgemma2.cpp"
 /* Qwen-Image 2.1: a generator conditioned by Qwen3-VL. */
 #include "../arch/qwenimage21/qwenimage21.cpp"
+/* Anima: a cross-attention generator conditioned through two tokenizers. */
+#include "../arch/anima/anima.cpp"
 /* GLM-5.3-Flash: its connection, router, attention and cache blocks, and the plugin. */
 #include <arch/rad_block_mhc.h>
 #include <arch/rad_block_glm_router.h>
@@ -8428,6 +8449,30 @@ TEST(qwenimage21_declares_a_generator_with_one_shared_modulation) {
 
 /* Every collective follows --tp-wire: exact unless the lossy wire was accepted, and the floor
  * under which a message stays exact is the deployment's. */
+/* The DiT's adapter names: one root before any GEMM, and every alias lands on a checkpoint tensor
+ * the plugin maps, with the gate half of ComfyUI's `gate_up` on `gate_layer`. */
+TEST(qwenimage21_names_its_adapter_keys_onto_mapped_tensors) {
+    MetaKV mk = qimg_meta();
+    RadBuilder b;
+    const RadBuildCtx ctx = qimg_ctx(0, 1);
+    REQUIRE_EQ(qwenimage21::declare(&b, mk.meta(), &ctx), RAD_OK);
+    REQUIRE_EQ(b.lora_roots.size(), (size_t)1);
+    CHECK_EQ(b.lora_roots[0].first, std::string("transformer."));
+    CHECK(b.lora_roots[0].second.find("lora_unet_") != std::string::npos);
+    std::set<std::string> srcs;
+    for (const RecMap& m : b.maps) for (const std::string& x : m.src) srcs.insert(x);
+    REQUIRE_EQ(b.lora_aliases.size(), (size_t)2);
+    for (const auto& a : b.lora_aliases) {
+        std::string to = a.native + a.to;
+        const size_t h = to.find('#');
+        if (h != std::string::npos) to.replace(h, 1, "0");
+        CHECK(srcs.count(to + ".weight"));
+    }
+    CHECK(b.lora_aliases[0].to.find("gate_layer") != std::string::npos);
+    CHECK_EQ(b.lora_aliases[0].from_lo, (int64_t)0);
+    CHECK_EQ(b.lora_aliases[1].from_lo, b.lora_aliases[0].from_hi);
+}
+
 TEST(qwenimage21_collectives_follow_the_tp_wire) {
     MetaKV mk = qimg_meta();
     for (int lossy : { 0, 1 }) {
@@ -8471,6 +8516,314 @@ TEST(qwenimage21_generator_passes_lint_clean) {
             qwenimage21::step(&c, &tok->b);
             CHECK(!c.step_fail.empty());
         }
+}
+
+/* ==================================================================== anima */
+
+namespace {
+
+/* Anima's text encoder (Qwen3-0.6B-Base) as the container's config states it; the DiT, adapter
+ * and VAE are the plugin's own constants. */
+MetaKV anima_meta(const char* variant) {
+    RadModelMeta m{};
+    m.arch_id = "anima"; m.name = "test-anima"; m.quant = "";
+    m.n_layers = 28; m.n_embd = 1024; m.n_head = 16; m.n_head_kv = 8; m.head_dim = 128;
+    m.n_ff = 3072; m.n_vocab = 151936; m.n_ctx_train = 32768;
+    m.rms_eps = 1e-6f; m.rope_theta = 1e6f; m.rope_scale = 1.0f;
+    MetaKV k(m);
+    k.set("num_hidden_layers", "28").set("hidden_size", "1024").set("anima.variant", variant);
+    return k;
+}
+
+RadBuildCtx anima_ctx() {
+    RadBuildCtx c = build_ctx(0, 1);
+    c.max_tok = 2 * (4096 + 512);
+    c.max_seqs = 4;
+    return c;
+}
+
+/* A JOINT_STEP pass as the driver lays one out for Anima: COND over a prompt of `nq` Qwen3 tokens
+ * (padded to 512) and `nt` T5 ids, DENOISE over `entries` entries of 512 context rows and `ni`
+ * image rows each, or DECODE of a 64 x 64 picture. */
+struct AnimaKit {
+    std::vector<int32_t> tok, pos, cu, src, lane, flags, pair, aux, aux_cu, valid_cu;
+    std::vector<int32_t> img_cu, img_rows, mode_cu, mode_rows, mode_src, mode_ccu;
+    std::vector<int64_t> n_mode;
+    std::vector<uint32_t> seed;
+    std::vector<float> sigma, sigma_next, cfg, rope_f, mode_rope_f;
+    RadGenBatch g{};
+    RadBatch b{};
+};
+
+std::unique_ptr<AnimaKit> anima_pass(int pass, int64_t nq = 12, int64_t nt = 9, int64_t ni = 16,
+                                     int64_t entries = 1) {
+    auto k = std::make_unique<AnimaKit>();
+    RadGenBatch& g = k->g;
+    RadBatch& b = k->b;
+    b.gen = pass;
+    b.gen_b = &k->g;
+    if (pass == RAD_GEN_PASS_COND) {
+        for (int64_t i = 0; i < 512; ++i) {
+            k->tok.push_back(i < nq ? (int32_t)(100 + i) : 151643);
+            k->pos.push_back(i < nq ? (int32_t)i : 1);
+        }
+        for (int64_t i = 0; i < nt; ++i) k->aux.push_back((int32_t)(3 + i));
+        k->aux_cu = { 0, (int32_t)nt };
+        k->valid_cu = { 0, (int32_t)nq };
+        k->cu = { 0, 512 };
+        k->lane = { 0, 1 };
+        k->sigma = { 0.0f };
+        b.n_tok = 512;
+        b.n_seq = 1;
+        b.token_ids = k->tok.data();
+        b.positions = k->pos.data();
+        b.cu_seqlens = k->cu.data();
+        g.rows = 512;
+        g.n_pad = (int32_t)(512 - nq);
+        g.valid_cu = k->valid_cu.data();
+        g.n_lane = 2;
+        g.lane = k->lane.data();
+        g.lane_h = k->lane.data();
+        g.branch = 1;
+        g.sigma = k->sigma.data();
+        g.n_aux = nt;
+        g.aux_ids = k->aux.data();
+        g.aux_cu = k->aux_cu.data();
+        return k;
+    }
+    if (pass == RAD_GEN_PASS_DECODE) {
+        k->cu = { 0, 16 };
+        b.n_tok = 16;
+        b.n_seq = 1;
+        b.cu_seqlens = k->cu.data();
+        g.dec_lane = 1;
+        g.dec_height = g.dec_width = 64;
+        return k;
+    }
+    const int64_t S = entries, N = S * (512 + ni);
+    k->cu.push_back(0);
+    k->img_cu.push_back(0);
+    for (int64_t s = 0; s < S; ++s) {
+        k->mode_cu.push_back((int32_t)(s * (512 + ni)));
+        k->mode_cu.push_back((int32_t)(s * (512 + ni) + 512));
+        k->mode_cu.push_back((int32_t)(s * (512 + ni) + 512));
+        for (int64_t r = 0; r < 512; ++r) k->src.push_back((int32_t)(s * 512 + r));
+        for (int64_t r = 0; r < ni; ++r) {
+            k->src.push_back((int32_t)(-1 - (s * ni + r)));
+            k->img_rows.push_back((int32_t)(s * (512 + ni) + 512 + r));
+        }
+        k->cu.push_back((int32_t)((s + 1) * (512 + ni)));
+        k->img_cu.push_back((int32_t)((s + 1) * ni));
+        k->lane.push_back((int32_t)(s / 2));
+        k->pair.push_back(S > 1 ? (s % 2 ? -2 : (int32_t)(s + 1)) : -1);
+    }
+    k->mode_cu.push_back((int32_t)N);
+    for (int64_t s = 0; s < S; ++s)
+        for (int64_t r = 0; r < 512; ++r) {
+            k->mode_rows.push_back((int32_t)(s * (512 + ni) + r));
+            k->mode_src.push_back((int32_t)(s * 512 + r));
+        }
+    for (int64_t s = 0; s < S; ++s)
+        for (int64_t r = 0; r < ni; ++r) {
+            k->mode_rows.push_back((int32_t)(s * (512 + ni) + 512 + r));
+            k->mode_src.push_back((int32_t)(-1 - (s * ni + r)));
+        }
+    k->n_mode = { 512 * S, 0, ni * S };
+    for (int m = 0; m < 3; ++m)
+        for (int64_t s = 0; s <= S; ++s)
+            k->mode_ccu.push_back((int32_t)(s * (m == 0 ? 512 : m == 1 ? 0 : ni)));
+    k->rope_f.assign((size_t)(4 * N), 0.0f);
+    k->mode_rope_f.assign((size_t)(4 * N), 0.0f);
+    k->tok.assign((size_t)N, 0);
+    k->pos.assign((size_t)N, 0);
+    k->sigma.assign((size_t)S, 0.75f);
+    k->sigma_next.assign((size_t)S, 0.5f);
+    k->cfg.assign((size_t)S, 4.0f);
+    k->flags.assign((size_t)S, RAD_GEN_F_FIRST);
+    k->seed.assign((size_t)(2 * S), 7u);
+    b.n_tok = N;
+    b.n_seq = S;
+    b.token_ids = k->tok.data();
+    b.positions = k->pos.data();
+    b.cu_seqlens = k->cu.data();
+    g.src = k->src.data();
+    g.n_img = ni * S;
+    g.img_cu = k->img_cu.data();
+    g.img_rows = k->img_rows.data();
+    g.mode_cu = k->mode_cu.data();
+    g.rope_f = k->rope_f.data();
+    g.mode_rows = k->mode_rows.data();
+    g.mode_src = k->mode_src.data();
+    g.mode_ccu = k->mode_ccu.data();
+    g.n_mode_h = k->n_mode.data();
+    g.mode_rope_f = k->mode_rope_f.data();
+    g.sigma = k->sigma.data();
+    g.sigma_next = k->sigma_next.data();
+    g.cfg = k->cfg.data();
+    g.pair = k->pair.data();
+    g.lane = k->lane.data();
+    g.lane_dh = k->lane.data();
+    g.flags = k->flags.data();
+    g.seed = k->seed.data();
+    return k;
+}
+
+/* The linears a LoRA for Anima names: every DiT block's attention, MLP and modulation linears
+ * and the text encoder's. */
+bool anima_lora_target(const std::string& w) {
+    for (const char* t : { "attn_qkv", "attn_output", "cross_q", "cross_k", "cross_v",
+                           "cross_output", "mlp_layer1", "mlp_layer2", ".mod_", "ffn_gate_up",
+                           "ffn_down" })
+        if (has(w, t) && !has(w, ".scale")) return true;
+    return false;
+}
+
+}  /* namespace */
+
+/* A JOINT_STEP generator that reads a second tokenizer, pads an empty prompt to one token and
+ * samples on ComfyUI's simple schedule; the variant sets its defaults and the DiT keys' prefix is
+ * the checkpoint's, `model.diffusion_model.` here and `net.` for Base. */
+TEST(anima_declares_a_two_tokenizer_generator_under_the_checkpoints_prefix) {
+    const RadEncoding plain = rad_enc_plain(RAD_BF16);
+    RadBuildCtx ctx = anima_ctx();
+    MetaKV mk = anima_meta("aesthetic");
+    RadBuilder b;
+    b.encs = { { "dit.t_norm.mdm", plain }, { "dit.blk.0.attn_qkv", plain } };
+    REQUIRE_EQ(anima::declare(&b, mk.meta(), &ctx), RAD_OK);
+    CHECK_EQ(b.logits, (rad_buf)0);
+    CHECK_EQ(b.generator_name, std::string("anima-aesthetic"));
+    const RadGeneratorDecl& d = b.generator;
+    CHECK_EQ(d.layout, (int32_t)RAD_GEN_LAYOUT_JOINT_STEP);
+    CHECK_EQ(d.aux_tokens, 1);
+    CHECK_EQ(d.aux_max_tokens, (int64_t)512);
+    CHECK_EQ(d.min_tokens, 1);
+    CHECK_EQ(d.pad_multiple, 512);
+    CHECK_EQ(d.cond_rows, (int64_t)512);
+    CHECK_EQ(d.sigma_grid, 1000);
+    CHECK_EQ(d.shift, 3.0);
+    CHECK_EQ(d.dyn_shift, 0);
+    CHECK_EQ(d.cfg_original, 0);
+    CHECK_EQ(d.default_steps, (int64_t)30);
+    CHECK_EQ(d.default_cfg, 4.0);
+    CHECK_EQ(d.latent_channels, (int64_t)64);
+    CHECK(b.kv_groups.empty());
+    const RecMap* q = find_map(b, "dit.blk.27.attn_qkv.weight");
+    REQUIRE(q != nullptr);
+    REQUIRE_EQ(q->src.size(), (size_t)3);
+    CHECK_EQ(q->src[0], std::string("model.diffusion_model.blocks.27.self_attn.q_proj.weight"));
+    const RecMap* te = find_map(b, "te.blk.3.ffn_gate_up.weight");
+    REQUIRE(te != nullptr);
+    CHECK_EQ(te->src[1], std::string("model.layers.3.mlp.up_proj.weight"));
+    /* The patch embedding over its first 64 columns, the final linear's rows in eight pieces. */
+    const RecMap* xe = find_map(b, "dit.x_embed.weight");
+    REQUIRE(xe != nullptr);
+    CHECK_EQ(xe->mode, (int)RAD_MAP_COLS);
+    int final_maps = 0;
+    for (const auto& m : b.maps)
+        if (m.declared == "dit.final.weight") { ++final_maps; CHECK_EQ(m.mode, (int)RAD_MAP_ROWS); }
+    CHECK_EQ(final_maps, 8);
+    /* The DiT's rotary: 22, 21 and 21 pairs, NeoX, over (frame, row, column). */
+    int axial = 0;
+    for (const auto& o : b.ops)
+        if (o.op == "qk_norm_rope" && pstr(&o, "mode") == "axial") {
+            CHECK_EQ(pstr(&o, "sections"), std::string("22 21 21"));
+            ++axial;
+        }
+    CHECK_EQ(axial, 28);
+
+    MetaKV turbo = anima_meta("turbo");
+    RadBuilder bt;
+    bt.encs = { { "dit.t_norm.mdm", plain } };
+    REQUIRE_EQ(anima::declare(&bt, turbo.meta(), &ctx), RAD_OK);
+    CHECK_EQ(bt.generator_name, std::string("anima-turbo"));
+    CHECK_EQ(bt.generator.default_steps, (int64_t)10);
+    CHECK_EQ(bt.generator.default_cfg, 1.0);
+
+    MetaKV base = anima_meta("base");
+    RadBuilder bb;
+    bb.encs = { { "dit.t_norm.net", plain } };
+    REQUIRE_EQ(anima::declare(&bb, base.meta(), &ctx), RAD_OK);
+    const RecMap* nq = find_map(bb, "dit.blk.0.mlp_layer1.weight");
+    REQUIRE(nq != nullptr);
+    CHECK_EQ(nq->src[0], std::string("net.blocks.0.mlp.layer1.weight"));
+
+    /* Neither spelling, or an unknown variant, is refused. */
+    RadBuilder none;
+    CHECK(anima::declare(&none, mk.meta(), &ctx) < 0);
+    MetaKV odd = anima_meta("deluxe");
+    RadBuilder bo;
+    bo.encs = { { "dit.t_norm.mdm", plain } };
+    CHECK(anima::declare(&bo, odd.meta(), &ctx) < 0);
+}
+
+/* Every linear a LoRA for Anima names is read by a plain GEMM a runtime LoRA can follow: gemm_nt
+ * in a bf16 container, gemm_nt_q without rotated parts in a block-fp8 one, its activation a
+ * separate op. */
+TEST(anima_lora_targets_are_plain_gemms) {
+    const RadEncoding plain = rad_enc_plain(RAD_BF16);
+    const auto fp8 = rad_enc_affine(RAD_F8E4M3, RAD_BF16, 128, 128);
+    RadBuildCtx ctx = anima_ctx();
+    MetaKV mk = anima_meta("base");
+    for (bool q : { false, true }) {
+        RadBuilder b;
+        b.encs = { { "dit.t_norm.net", plain } };
+        if (!q) b.encs.push_back({ "dit.blk.0.attn_qkv", plain });
+        if (q)
+            for (const char* t : { "attn_qkv", "attn_output", "cross_q", "cross_k", "cross_v",
+                                   "cross_output", "mlp_layer1", "mlp_layer2", "ffn_gate_up",
+                                   "ffn_down" })
+                b.encs.push_back({ t, fp8 });
+        REQUIRE_EQ(anima::declare(&b, mk.meta(), &ctx), RAD_OK);
+        int targets = 0;
+        for (const auto& o : b.ops)
+            for (rad_weight w : o.w) {
+                const std::string& n = b.weights[w - 1].name;
+                if (!anima_lora_target(n)) continue;
+                ++targets;
+                const bool ok = o.op == "gemm_nt" || (q && o.op == "gemm_nt_q" &&
+                                                      pint(&o, "pb1") <= 0 && pint(&o, "pb2") <= 0);
+                if (!ok) fprintf(stderr, "    '%s' read by %s\n", n.c_str(), o.op.c_str());
+                CHECK(ok);
+                CHECK(o.op != "gemm_nt_bias");
+            }
+        /* 28 blocks of 8 linears (two views a block-fp8 one) and 6 modulation linears; 28 text
+         * encoder layers of 4. */
+        CHECK(targets >= 28 * (8 + 6) + 28 * 4);
+    }
+}
+
+/* The three passes the core drives (a conditioning with its T5 ids, denoising one image or a
+ * guided pair, decoding one) lint clean in a bf16 and a block-fp8 container. */
+TEST(anima_generator_passes_lint_clean) {
+    const RadEncoding plain = rad_enc_plain(RAD_BF16);
+    const auto fp8 = rad_enc_affine(RAD_F8E4M3, RAD_BF16, 128, 128);
+    RadBuildCtx ctx = anima_ctx();
+    MetaKV mk = anima_meta("aesthetic");
+    for (bool q : { false, true }) {
+        RadBuilder b;
+        b.encs = { { "dit.t_norm.mdm", plain } };
+        if (!q) b.encs.push_back({ "dit.blk.0.attn_qkv", plain });
+        if (q) b.encs.push_back({ "attn_qkv", fp8 }), b.encs.push_back({ "attn_output", fp8 }),
+               b.encs.push_back({ "cross_", fp8 }), b.encs.push_back({ "mlp_layer", fp8 }),
+               b.encs.push_back({ "ffn_", fp8 });
+        REQUIRE_EQ(anima::declare(&b, mk.meta(), &ctx), RAD_OK);
+        for (const auto& k : { anima_pass(RAD_GEN_PASS_COND, 12, 9),
+                               anima_pass(RAD_GEN_PASS_COND, 3, 40),
+                               anima_pass(RAD_GEN_PASS_DENOISE, 12, 9, 16, 1),
+                               anima_pass(RAD_GEN_PASS_DENOISE, 12, 9, 16, 2),
+                               anima_pass(RAD_GEN_PASS_DECODE) }) {
+            RadCtx c{ .b = &b, .batch = &k->b, .rank = 0, .world = 1 };
+            anima::step(&c, &k->b);
+            CHECK(c.step_fail.empty());
+            if (!c.step_fail.empty()) fprintf(stderr, "    %s\n", c.step_fail.c_str());
+            CHECK(!c.issues.empty());
+            CHECK_LINT(b, &c);
+        }
+        const auto tok = kit(b, { 1 }, {});
+        RadCtx c{ .b = &b, .batch = &tok->b, .rank = 0, .world = 1 };
+        anima::step(&c, &tok->b);
+        CHECK(!c.step_fail.empty());
+    }
 }
 
 /* ======================================================== the conventional vocabulary */

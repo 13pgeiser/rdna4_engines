@@ -1,0 +1,15 @@
+# Stable Diffusion XL or one of its finetunes (here Illustrious-XL v2.0, OnomaAIResearch) at bf16: text
+# to image on OpenAI's /v1/images/generations, on one card, RADIANCE_GPU in .env (default 0). Any
+# single-file SDXL checkpoint converts the same way (README, "Stable Diffusion XL"); point --model
+# at its container. The checkpoint's own license applies.
+name: radiance-sdxl
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-sdxl
+    environment:
+      ROCR_VISIBLE_DEVICES: "${RADIANCE_GPU:-0}"
+    command: >
+      --model /models/illustrious-xl-v2.0-bf16.rad
+      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --tp 1

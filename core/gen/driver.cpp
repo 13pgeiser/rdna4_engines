@@ -23,7 +23,7 @@ int64_t ref_tokens_max(const RadGeneratorDecl& d) {
 }
 
 struct Sizes {
-    int64_t T = 0, S = 0, EP = 0, PD = 0, R = 0, P = 0, PX = 0, NT = 0, NB = 0;
+    int64_t T = 0, S = 0, EP = 0, PD = 0, R = 0, P = 0, PX = 0, NT = 0, NB = 0, AX = 0;
     bool    joint = false;
 };
 
@@ -43,6 +43,7 @@ Sizes sizes_of(const Program& prog, int64_t block_size) {
     z.PX = z.R * (ref_tokens_max(d) * s2) + d.max_tokens * s2;
     z.NT = d.max_tokens;
     z.NB = block_size > 0 ? (z.P + block_size - 1) / block_size : 0;
+    z.AX = d.aux_tokens ? d.aux_max_tokens : 0;
     return z;
 }
 
@@ -85,6 +86,12 @@ int64_t carve(const Sizes& z, int64_t pixel_ch, int64_t (*bytes)[2], int n) {
         { 0, J * z.T * I },             /* R_MSRC */
         { 0, J * 3 * (z.S + 1) * I },   /* R_MCCU */
         { 0, J * 4 * z.T * 4 },         /* R_MROPE */
+        { 0, (z.AX ? z.AX + 2 : 0) * I },  /* R_AUX: a COND's {0, n} and second-tokenizer ids */
+        { 0, z.S * 4 },                 /* R_SIGP */
+        { 0, z.S * 4 },                 /* R_TSTEP */
+        { 0, z.S * I },                 /* R_SAMP */
+        { 0, z.S * I },                 /* R_STEPI */
+        { 0, 2 * z.S * 4 },             /* R_SIZE */
     };
     int64_t off = 0;
     for (int r = 0; r < n; ++r) {
@@ -113,6 +120,14 @@ int Driver::init(const Program& prog, IKVManager* kv, const std::vector<RankIO>&
     fixed_  = prog.gen_str.sigmas;
     kv_     = kv;
     ranks_  = ranks;
+    table_  = DiscreteTable{};
+    if (discrete()) {
+        std::string why;
+        if (discrete_table(decl_, &table_, &why) < 0) {
+            RAD_ERR("image generator: %s", why.c_str());
+            return RAD_E_INVAL;
+        }
+    }
     /* Exactly one paged full-attention KV group, holding the conditioning; none in the joint
      * layout, where the conditioning rides in the steps. Group handles start at 1 (group 0 is the
      * null handle); the KV manager and a batch both index by handle. */
@@ -216,6 +231,10 @@ int Driver::submit(std::unique_ptr<Request> r, std::string* why) {
         return no("at most " + std::to_string(d.max_refs) + " pictures a request");
     for (const Branch* b : { &r->pos, &r->neg }) {
         if (b == &r->neg && !r->has_neg) continue;
+        if (d.aux_tokens && (b->aux.empty() || (int64_t)b->aux.size() > d.aux_max_tokens))
+            return no("the prompt is " + std::to_string(b->aux.size()) + " tokens to the "
+                      "model's second tokenizer, which reads 1.." +
+                      std::to_string(d.aux_max_tokens));
         if ((int64_t)b->tokens.size() > max_tok_)
             return no("the prompt is " + std::to_string(b->tokens.size()) + " tokens with its "
                       "pictures; a conditioning pass carries " + std::to_string(max_tok_));
@@ -235,6 +254,10 @@ int Driver::submit(std::unique_ptr<Request> r, std::string* why) {
                        r->inp_src.h != r->height))
         return no("the mask's picture is not at the size being made");
     if (r->previews < 0 || r->previews > 3) return no("partial_images must be 0..3");
+    if (discrete() && (r->sampler < 0 || r->sampler >= RAD_GEN_SAMPLER_COUNT ||
+                       !(decl_.samplers & (1u << r->sampler)) || r->scheduler < 0 ||
+                       r->scheduler >= RAD_GEN_SCHED_COUNT))
+        return no("the sampler or scheduler is not one this model serves");
     r->ticket->t_submit_ns = (int64_t)rad_mono_ns();
     std::lock_guard<std::mutex> lk(mu_);
     if (closed_) {
@@ -373,7 +396,13 @@ int Driver::admit_locked() {
             release_kv_locked(j);
             break;
         }
-        j.sigmas = schedule(decl_, fixed_, r.steps, j.tokens);
+        if (discrete()) {
+            j.sigmas = schedule_discrete(decl_, table_, r.scheduler, r.steps);
+            j.tsteps.clear();
+            for (float sg : j.sigmas) j.tsteps.push_back(sg > 0 ? (float)table_.timestep(sg) : 0.0f);
+        } else {
+            j.sigmas = schedule(decl_, fixed_, r.steps, j.tokens);
+        }
         const int32_t n_steps = (int32_t)j.sigmas.size() - 1;
         for (int b = 0; b < j.n_branch; ++b) {
             Cond& c = j.cond[b];
@@ -491,6 +520,16 @@ void Driver::finish_batches(int64_t n_tok, int64_t n_seq, int32_t max_q, int ste
         G.mode_ccu = nullptr;
         G.n_mode_h = nullptr;
         G.mode_rope_f = nullptr;
+        G.n_aux = 0;
+        G.aux_ids = nullptr;
+        G.aux_cu = nullptr;
+        G.sigma_prev = nullptr;
+        G.timestep = nullptr;
+        G.sampler = nullptr;
+        G.step = nullptr;
+        G.size_px = nullptr;
+        G.entry_h = nullptr;
+        G.tokens_h = nullptr;
     }
 }
 
@@ -529,15 +568,18 @@ const RadBatch* Driver::next(int step) {
         for (int b = 0; b < j.n_branch; ++b)
             if (!j.cond[b].encoded) return build_cond(j, b, step);
     }
-    /* 3. A denoise step over what is in flight, oldest request first. */
+    /* 3. A denoise step over what is in flight, oldest request first, with the oldest one's
+     * adapters: a pass runs one runtime LoRA slot in every row. */
     std::vector<int32_t> take;
     int64_t rows = 0, entries = 0;
+    int32_t lora = -2;
     for (auto& jp : jobs_) {
         Job& j = *jp;
         if (!j.admitted || j.failed) continue;
         bool ready = true;
         for (int b = 0; b < j.n_branch; ++b) ready = ready && j.cond[b].encoded;
         if (!ready) continue;
+        if (lora != -2 && j.req->lora_slot != lora) continue;
         const int32_t n_steps = (int32_t)j.sigmas.size() - 1;
         for (int32_t l : j.lanes) {
             const Lane& ln = lanes_[(size_t)l];
@@ -548,10 +590,13 @@ const RadBatch* Driver::next(int step) {
             rows += need;
             entries += j.n_branch;
             take.push_back(l);
+            lora = j.req->lora_slot;
         }
     }
     if (take.empty()) return nullptr;
-    return build_denoise(take, step);
+    const RadBatch* b = build_denoise(take, step);
+    pass_.lora_slot = lora;
+    return b;
 }
 
 const RadBatch* Driver::batch_for(int rank) const {
@@ -704,6 +749,15 @@ const RadBatch* Driver::build_cond(Job& j, int branch, int step) {
     /* The conditioning is modulated at t = 0. */
     hptr<float>(R_SIG)[0] = 0.0f;
     reg_[R_SIG].used = 4;
+    /* The prompt through the second tokenizer, for a model that reads it. */
+    const int64_t n_aux = decl_.aux_tokens ? (int64_t)br.aux.size() : 0;
+    if (n_aux) {
+        int32_t* ax = hptr<int32_t>(R_AUX);
+        ax[0] = 0;
+        ax[1] = (int32_t)n_aux;
+        std::memcpy(ax + 2, br.aux.data(), (size_t)n_aux * 4);
+        reg_[R_AUX].used = (n_aux + 2) * 4;
+    }
     /* Host-side arrays the plugin reads (segment kinds, pixel blocks, lanes), owned by the driver
      * for the life of the pass. */
     host_bidi_ = c.lay.bidi;
@@ -758,6 +812,10 @@ const RadBatch* Driver::build_cond(Job& j, int branch, int step) {
         G.n_lane = (int64_t)host_lanes_.size();
         G.lane_h = host_lanes_.data();
         G.lane = G.n_lane ? dptr<int32_t>(ri, R_LANE) : nullptr;
+        G.n_aux = n_aux;
+        G.aux_cu = n_aux ? dptr<int32_t>(ri, R_AUX) : nullptr;
+        G.aux_ids = n_aux ? dptr<int32_t>(ri, R_AUX) + 2 : nullptr;
+        G.tokens_h = hptr<int32_t>(R_TOK);
         if (joint()) {
             B.n_kv_groups = 0;
             B.kv = nullptr;
@@ -771,6 +829,7 @@ const RadBatch* Driver::build_cond(Job& j, int branch, int step) {
     }
     pass_.kind = RAD_GEN_PASS_COND;
     pass_.job = j.id;
+    pass_.lora_slot = j.req->lora_slot;
     pass_.branch = branch;
     return &out_[0];
 }
@@ -821,6 +880,12 @@ const RadBatch* Driver::build_denoise(const std::vector<int32_t>& take, int step
     uint32_t* seed = hptr<uint32_t>(R_SEED);
     int32_t* btab = hptr<int32_t>(R_BT);
     int32_t* used = hptr<int32_t>(R_USED);
+    float* sigp = hptr<float>(R_SIGP);
+    float* tstep = hptr<float>(R_TSTEP);
+    int32_t* samp = hptr<int32_t>(R_SAMP);
+    int32_t* stepi = hptr<int32_t>(R_STEPI);
+    float* size = hptr<float>(R_SIZE);
+    host_entry_.assign((size_t)(4 * S), 0);
     int64_t row = 0;
     cu[0] = 0;
     pass_.lanes.clear();
@@ -866,6 +931,16 @@ const RadBatch* Driver::build_denoise(const std::vector<int32_t>& take, int step
         cu[i + 1] = (int32_t)row;
         sig[i] = j.sigmas[(size_t)ln.step];
         sign[i] = j.sigmas[(size_t)ln.step + 1];
+        sigp[i] = ln.step > 0 ? j.sigmas[(size_t)ln.step - 1] : 0.0f;
+        tstep[i] = discrete() ? j.tsteps[(size_t)ln.step] : 0.0f;
+        samp[i] = j.req->sampler;
+        stepi[i] = ln.step;
+        size[2 * i] = (float)j.req->height;
+        size[2 * i + 1] = (float)j.req->width;
+        host_entry_[(size_t)(4 * i)] = joint() ? (int32_t)c.lay.rows : 0;
+        host_entry_[(size_t)(4 * i + 1)] = j.req->height;
+        host_entry_[(size_t)(4 * i + 2)] = j.req->width;
+        host_entry_[(size_t)(4 * i + 3)] = e.branch;
         const bool neg = e.branch == 1;
         cfg[i] = neg ? 0.0f : (j.n_branch > 1 ? j.req->cfg : 1.0f);
         pair[i] = neg ? -2 : (j.n_branch > 1 ? (int32_t)(i + 1) : -1);
@@ -930,6 +1005,8 @@ const RadBatch* Driver::build_denoise(const std::vector<int32_t>& take, int step
         reg_[R_GROPE].used = 3 * n_tok * 4;
     }
     reg_[R_SIG].used = reg_[R_SIGN].used = reg_[R_CFG].used = S * 4;
+    reg_[R_SIGP].used = reg_[R_TSTEP].used = reg_[R_SAMP].used = reg_[R_STEPI].used = S * 4;
+    reg_[R_SIZE].used = 2 * S * 4;
     reg_[R_PAIR].used = reg_[R_LANE].used = reg_[R_FLAGS].used = S * 4;
     reg_[R_SEED].used = 2 * S * 4;
     reg_[R_BT].used = joint() ? 0 : S * pitch * 4;
@@ -954,6 +1031,12 @@ const RadBatch* Driver::build_denoise(const std::vector<int32_t>& take, int step
         G.lane_h = nullptr;
         G.rope = joint() ? nullptr : dptr<int32_t>(ri, R_GROPE);
         G.lane_dh = hptr<int32_t>(R_LANE);
+        G.sigma_prev = dptr<float>(ri, R_SIGP);
+        G.timestep = dptr<float>(ri, R_TSTEP);
+        G.sampler = dptr<int32_t>(ri, R_SAMP);
+        G.step = dptr<int32_t>(ri, R_STEPI);
+        G.size_px = dptr<float>(ri, R_SIZE);
+        G.entry_h = host_entry_.data();
         if (joint()) {
             G.src = dptr<int32_t>(ri, R_SRC);
             G.n_img = n_img;

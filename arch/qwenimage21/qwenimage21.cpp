@@ -911,6 +911,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * (Vae says why the order matters.) */
     m.media = VisionTower::present(meta) && ctx->max_enc_patches > 0;
     if (m.media) RAD_ARCH_TRY(m.vit.declare(b, meta, ctx, nm, m.gt.n_embd, kGrpVision, true));
+    /* ---- adapter key names. The DiT's LoRA files use the checkpoint's own names, or
+     * ComfyUI's, which join the SwiGLU's gate and up projections as `img_mlp.gate_up` [gate; up]
+     * (comfy/ldm/qwen_image21). */
+    {
+        const int64_t F = gd.n_ff_all;
+        RAD_ARCH_TRY(lora_names(b, "transformer.", kLoraDiffusionSpellings,
+                                { { "transformer_blocks.#.img_mlp.gate_up",
+                                    "transformer_blocks.#.img_mlp.gate_layer", 0, F, 0 },
+                                  { "transformer_blocks.#.img_mlp.gate_up",
+                                    "transformer_blocks.#.img_mlp.proj", F, 2 * F, 0 } }));
+    }
     RAD_ARCH_TRY(declare_te(b, meta, m));
     RAD_ARCH_TRY(declare_encoder(b, meta, m));
     RAD_ARCH_TRY(declare_dit(b, meta, m));

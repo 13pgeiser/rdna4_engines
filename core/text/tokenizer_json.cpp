@@ -9,6 +9,7 @@
  *   vocab_serialize()       into the .rad's vocab section, and back.
  */
 #include "text/tokenizer.h"
+#include "text/tokenizer_grapheme.h"
 #include "text/tokenizer_regex.h"
 #include "text/gguf.h"
 
@@ -161,6 +162,21 @@ int read_normalizer(const json& n, std::vector<VocabStep>& out, const char* orig
         s.kind  = RAD_NORM_STRIP;
         s.flags = (bool_or(n, "strip_left", true) ? 1u : 0u) |
                   (bool_or(n, "strip_right", true) ? 2u : 0u);
+        out.push_back(s);
+        return RAD_OK;
+    }
+    if (t == "Precompiled") {
+        /* SentencePiece's precompiled character map (T5's), kept base64 as the file carries it
+         * and decoded at load (tokenizer_grapheme.h). */
+        s.kind = RAD_NORM_PRECOMPILED;
+        s.arg0 = str_or(n, "precompiled_charsmap", "");
+        PrecompiledMap pm;
+        std::string why;
+        if (s.arg0.empty() || pm.load(s.arg0, &why) < 0) {
+            RAD_ERR("%s: Precompiled normalizer: %s", origin,
+                    s.arg0.empty() ? "no precompiled_charsmap" : why.c_str());
+            return RAD_E_FORMAT;
+        }
         out.push_back(s);
         return RAD_OK;
     }
@@ -385,12 +401,10 @@ int read_model(const json& m, VocabBuild& out, const char* origin, uint64_t id_l
     if (type == "BPE") {
         out.kind = RAD_TOK_BPE;
         out.ignore_merges = bool_or(m, "ignore_merges", false);
-        /* Subword affixes change what every merge produces, and dropout makes encoding random;
-         * the encoder implements neither. */
-        for (const char* k : { "continuing_subword_prefix", "end_of_word_suffix" }) {
-            const std::string v = str_or(m, k, "");
-            if (!v.empty()) return refuse_value(origin, (std::string("BPE ") + k).c_str(), v);
-        }
+        /* A continuation prefix changes what every merge produces, and dropout makes encoding
+         * random; the encoder implements neither. */
+        const std::string prefix = str_or(m, "continuing_subword_prefix", "");
+        if (!prefix.empty()) return refuse_value(origin, "BPE continuing_subword_prefix", prefix);
         if (const json* d = get(m, "dropout"); d && d->is_number() && d->get<double>() > 0.0)
             return refuse_value(origin, "BPE dropout", d->dump());
         RAD_TRY(read_text_to_id("BPE"));
@@ -434,6 +448,18 @@ int read_model(const json& m, VocabBuild& out, const char* origin, uint64_t id_l
         return RAD_E_UNSUPPORTED;
     }
 
+    /* The end-of-word suffix (CLIP's "</w>") is a model property in tokenizer.json but a step
+     * here, as byte fallback is below: it changes the symbols a word starts as. */
+    if (type == "BPE") {
+        const std::string eow = str_or(m, "end_of_word_suffix", "");
+        if (!eow.empty()) {
+            VocabStep s;
+            s.kind = RAD_PRE_END_OF_WORD;
+            s.arg0 = eow;
+            out.steps.push_back(s);
+        }
+    }
+
     /* Byte fallback is a model property in tokenizer.json but a step here: it changes what the
      * encoder does on a miss. */
     if (bool_or(m, "byte_fallback", false)) {
@@ -472,12 +498,17 @@ int read_model(const json& m, VocabBuild& out, const char* origin, uint64_t id_l
  * The encoder matches an added token against the raw text, exactly as written. HuggingFace's
  * AddedToken flags each change that: `single_word` matches only between word boundaries,
  * `normalized` matches against the normalised text (the same thing when there is no normaliser),
- * and `lstrip` / `rstrip` take the whitespace beside a match into it. Most files spell out every
+ * and `lstrip` / `rstrip` take the whitespace beside a match into it. A normalised token becomes a
+ * RAD_PRE_ADDED_NORMALIZED step, placed first among the pre-tokenisers (so `<|StartOfText|>` under
+ * a Lowercase is CLIP's `<|startoftext|>`); one whose spelling the normaliser itself changes would
+ * be matched by that changed spelling, which is refused. Most files spell out every
  * flag, so a flag is refused only at a value that changes the result. lstrip and rstrip would
  * also refuse released models (Phi-3's chat markers carry rstrip), and the container has no field
  * to carry them, so they are warned about instead. */
 int read_added(const json& arr, VocabBuild& out, const char* origin, uint64_t id_limit,
-               bool has_normalizer) {
+               const std::vector<VocabStep>& norm) {
+    const bool has_normalizer = !norm.empty();
+    std::vector<VocabStep> matched_normalized;
     if (!arr.is_array()) return RAD_OK;
     std::string stripped;
     for (const json& e : arr) {
@@ -500,14 +531,27 @@ int read_added(const json& arr, VocabBuild& out, const char* origin, uint64_t id
         const bool special = bool_or(e, "special", false);
         if (bool_or(e, "single_word", false))
             return refuse_value(origin, "added token single_word=true on", content);
-        if (has_normalizer && bool_or(e, "normalized", false))
-            return refuse_value(origin, "added token normalized=true (under a normalizer) on",
-                                content);
+        if (has_normalizer && bool_or(e, "normalized", false)) {
+            std::string n = content;
+            if (vocab_normalize(norm, &n) != RAD_OK || n != content)
+                return refuse_value(origin, "added token normalized=true (under a normalizer that "
+                                            "changes its spelling) on", content);
+            if (!content.empty()) {
+                VocabStep st;
+                st.kind = RAD_PRE_ADDED_NORMALIZED;
+                st.arg0 = content;
+                st.iarg = (int64_t)id;
+                matched_normalized.push_back(st);
+            }
+        }
         if (bool_or(e, "lstrip", false) || bool_or(e, "rstrip", false))
             stripped += (stripped.empty() ? "" : " ") + content;
         out.tokens[id] = content;
         out.types[id]  = special ? (uint8_t)RAD_TT_CONTROL : (uint8_t)RAD_TT_USER_DEFINED;
     }
+    /* Ahead of the other pre-tokenisers, after the normalisers. */
+    out.steps.insert(out.steps.begin() + (std::ptrdiff_t)norm.size(), matched_normalized.begin(),
+                     matched_normalized.end());
     if (!stripped.empty())
         RAD_WARN("%s: added tokens %s take the whitespace beside them in HuggingFace (lstrip / "
                  "rstrip); this tokenizer keeps it as text, so prompts with whitespace next to "
@@ -544,8 +588,11 @@ void read_config_json(const std::string& dir, VocabBuild& out) {
         auto it = id_of.find(text);
         return it == id_of.end() ? -1 : it->second;
     };
-    out.bos = token_id("bos_token");
-    out.eos = token_id("eos_token");
+    /* An id the post-processor already gave (interpret_tokenizer_json) stays when the config
+     * names no such token. */
+    const int32_t bos = token_id("bos_token"), eos = token_id("eos_token");
+    if (bos >= 0 || out.bos < 0) out.bos = bos;
+    if (eos >= 0 || out.eos < 0) out.eos = eos;
     out.pad = token_id("pad_token");
     out.unk = out.unk >= 0 ? out.unk : token_id("unk_token");
     out.sep = token_id("sep_token");
@@ -622,7 +669,7 @@ int interpret_tokenizer_json(const json& j, uint64_t id_limit, const char* origi
     out.steps.insert(out.steps.end(), dec.begin(),  dec.end());
 
     if (const json* a = get(j, "added_tokens"))
-        RAD_TRY(read_added(*a, out, origin, id_limit, !norm.empty()));
+        RAD_TRY(read_added(*a, out, origin, id_limit, norm));
 
     /* The model's unknown token, by text. The encoder emits it for text no token covers, which
      * HuggingFace does too; tokenizer_config.json's unk_token, read later, agrees or is absent. */
@@ -654,7 +701,28 @@ int interpret_tokenizer_json(const json& j, uint64_t id_limit, const char* origi
      * Only a special token before and/or after the sequence is read. The config's
      * add_bos_token / add_eos_token, read later, win where present. */
     if (const json* pp = get(j, "post_processor")) {
-        if (str_or(*pp, "type", "") == "TemplateProcessing") {
+        const std::string ppt = str_or(*pp, "type", "");
+        /* RobertaProcessing and BertProcessing frame a sequence as `cls $A sep`; they name the
+         * two tokens, which stand for BOS and EOS where the config names none (CLIP's). */
+        if (ppt == "RobertaProcessing" || ppt == "BertProcessing") {
+            auto framing = [&](const char* k) -> int32_t {
+                const json* v = get(*pp, k);
+                int32_t id = -1;
+                if (!v || !v->is_array() || v->size() != 2 || !read_id((*v)[1], out.tokens.size(), &id))
+                    return -1;
+                return id;
+            };
+            const int32_t cls = framing("cls"), sep = framing("sep");
+            if (cls < 0 || sep < 0) {
+                RAD_ERR("%s: %s names no [token, id] cls and sep in the vocabulary", origin,
+                        ppt.c_str());
+                return RAD_E_FORMAT;
+            }
+            out.bos = cls;
+            out.eos = sep;
+            out.add_bos = out.add_eos = true;
+        }
+        if (ppt == "TemplateProcessing") {
             const json* single = get(*pp, "single");
             if (single && single->is_array() && !single->empty()) {
                 auto special = [](const json& e) -> bool { return e.is_object() && e.contains("SpecialToken"); };
