@@ -25,18 +25,25 @@ public:
     Arena& operator=(const Arena&) = delete;
 
     /* `kind` is a RAD_MEM_* class: RAD_MEM_DEVICE for the device arena, RAD_MEM_HOST for the
-     * second arena a program with RAD_DOMAIN_HOST buffers gets. `regions` scratch regions of
-     * `scratch_bytes` each sit at the tail, one per lane. */
-    int  init(int64_t plan_bytes, int64_t scratch_bytes, int kind, int regions = 1);
+     * second arena a program with RAD_DOMAIN_HOST buffers gets. `regions` scratch regions sit at the
+     * tail, one per lane: region 0 of `scratch_bytes`, the others of `scratch_bytes1` (-1: the same;
+     * Program::scratch_bytes_lane1). */
+    int  init(int64_t plan_bytes, int64_t scratch_bytes, int kind, int regions = 1,
+              int64_t scratch_bytes1 = -1);
     void release();
 
     char*   base()          const { return base_; }
     /* Region `r`, or region 0 when the arena holds fewer. */
     void*   scratch(int r = 0) const {
         if (!base_) return nullptr;
-        return base_ + scratch_off_ + (r > 0 && r < scratch_regions_ ? r * scratch_pitch_ : 0);
+        return base_ + scratch_off_ +
+               (r > 0 && r < scratch_regions_ ? scratch_pitch_ + (r - 1) * scratch_pitch1_ : 0);
     }
+    /* Region 0's size (the program's largest kernel), or region `r`'s. */
     int64_t scratch_bytes() const { return scratch_bytes_; }
+    int64_t scratch_bytes(int r) const {
+        return r > 0 && r < scratch_regions_ ? scratch_bytes1_ : scratch_bytes_;
+    }
     int     scratch_regions() const { return scratch_regions_; }
     int64_t bytes()         const { return bytes_; }
     bool    live()          const { return base_ != nullptr; }
@@ -48,6 +55,8 @@ private:
     int64_t scratch_off_ = 0;
     int64_t scratch_bytes_ = 0;
     int64_t scratch_pitch_ = 0;     /* scratch_bytes_ padded to RAD_ALIGN_UNIT */
+    int64_t scratch_bytes1_ = 0;    /* each region past 0 */
+    int64_t scratch_pitch1_ = 0;
     int     scratch_regions_ = 1;
 };
 

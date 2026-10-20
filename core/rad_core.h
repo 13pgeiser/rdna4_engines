@@ -458,6 +458,11 @@ public:
      * region safely through in-order launch; a second lane is a second stream and needs its own.
      * Two when the architecture declared a buffer rad_buf_concurrent. */
     int32_t scratch_regions = 1;
+    /* Region 1's size when there are two: the largest device scratch of an op the second lane may
+     * issue. By Ctx::lane1_'s rule 3 such an op touches only rad_buf_concurrent buffers, so an op
+     * with any other transient buffer never runs there; one naming no transient buffer counts.
+     * At most scratch_bytes; -1 (a program not built by the Builder) means scratch_bytes. */
+    int64_t scratch_bytes_lane1 = -1;
 
     /* Everything that resolved to nothing, reported whole rather than stopping at the first
      * failure (spec §3.1). Structured because the domains are reported differently: a device miss

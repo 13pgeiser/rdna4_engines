@@ -153,13 +153,20 @@ int Ctx::bind_arena() {
     int64_t dev_bytes = 0, total = 0;
     arena_plan_bytes(P, &dev_bytes, &total);
 
-    RAD_TRY(arena_.init(dev_bytes, P.scratch_bytes, RAD_MEM_DEVICE, std::max(P.scratch_regions, 1)));
+    RAD_TRY(arena_.init(dev_bytes, P.scratch_bytes, RAD_MEM_DEVICE, std::max(P.scratch_regions, 1),
+                        P.scratch_bytes_lane1));
     /* The arena is in no pool and scales with max_tok, so core/mem/vram_budget.cpp charges it by
      * name rather than leaving it to --gpu-headroom-mib. This log line must agree with that
      * charge. */
-    RAD_INFO("arena: %s device + %d x %s scratch = %s, charged to the VRAM budget before it was "
-             "split", humanb(dev_bytes).c_str(), arena_.scratch_regions(),
-             humanb(P.scratch_bytes).c_str(), humanb(total).c_str());
+    if (arena_.scratch_regions() > 1)
+        RAD_INFO("arena: %s device + %s scratch + %s for the second lane = %s, charged to the VRAM "
+                 "budget before it was split", humanb(dev_bytes).c_str(),
+                 humanb(P.scratch_bytes).c_str(), humanb(arena_.scratch_bytes(1)).c_str(),
+                 humanb(total).c_str());
+    else
+        RAD_INFO("arena: %s device + %s scratch = %s, charged to the VRAM budget before it was "
+                 "split", humanb(dev_bytes).c_str(), humanb(P.scratch_bytes).c_str(),
+                 humanb(total).c_str());
 
     if (host_hw > 0) {
         /* RAD_MEM_HOST_MAPPED, not RAD_MEM_HOST: nothing copies between the two arenas, so device

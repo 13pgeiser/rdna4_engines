@@ -5,15 +5,18 @@
 
 namespace rad {
 
-int Arena::init(int64_t plan_bytes, int64_t scratch_bytes, int kind, int regions) {
+int Arena::init(int64_t plan_bytes, int64_t scratch_bytes, int kind, int regions,
+                int64_t scratch_bytes1) {
     release();
     if (plan_bytes < 0 || scratch_bytes < 0 || regions < 1) return RAD_E_INVAL;
+    if (scratch_bytes1 < 0 || scratch_bytes1 > scratch_bytes) scratch_bytes1 = scratch_bytes;
 
     /* Scratch starts on a page boundary, so a workspace gets 4 KiB alignment for at most one
      * page of padding. */
     const int64_t off   = align_up(plan_bytes, RAD_ALIGN_UNIT);
-    const int64_t pitch = align_up(scratch_bytes, RAD_ALIGN_UNIT);
-    const int64_t tail  = pitch * regions;
+    const int64_t pitch  = align_up(scratch_bytes, RAD_ALIGN_UNIT);
+    const int64_t pitch1 = align_up(scratch_bytes1, RAD_ALIGN_UNIT);
+    const int64_t tail   = pitch + pitch1 * (regions - 1);
     int64_t       total = off + tail;
 
     /* Never zero bytes: a null base would turn a plan bug into an anonymous segfault. */
@@ -33,6 +36,8 @@ int Arena::init(int64_t plan_bytes, int64_t scratch_bytes, int kind, int regions
     scratch_off_   = off;
     scratch_bytes_ = scratch_bytes;
     scratch_pitch_ = pitch;
+    scratch_bytes1_ = regions > 1 ? scratch_bytes1 : 0;
+    scratch_pitch1_ = regions > 1 ? pitch1 : 0;
     scratch_regions_ = regions;
     return RAD_OK;
 }
@@ -87,8 +92,10 @@ int64_t arena_plan_bytes(const Program& P, int64_t* dev_out, int64_t* total_out)
     /* The staging region sits above every buffer, so it is a separate term. */
     if (P.arena_stage_bytes > 0 && P.arena_stage_off >= 0)
         dev_bytes = std::max(dev_bytes, P.arena_stage_off + P.arena_stage_bytes);
-    int64_t total = align_up(dev_bytes, RAD_ALIGN_UNIT) +
-                    align_up(P.scratch_bytes, RAD_ALIGN_UNIT) * std::max<int64_t>(P.scratch_regions, 1);
+    const int64_t s1 = P.scratch_bytes_lane1 < 0 || P.scratch_bytes_lane1 > P.scratch_bytes
+                           ? P.scratch_bytes : P.scratch_bytes_lane1;
+    int64_t total = align_up(dev_bytes, RAD_ALIGN_UNIT) + align_up(P.scratch_bytes, RAD_ALIGN_UNIT) +
+                    align_up(s1, RAD_ALIGN_UNIT) * (std::max<int64_t>(P.scratch_regions, 1) - 1);
     if (total == 0) total = RAD_ALIGN_UNIT;     /* Arena::init's floor, for the same reason */
     if (dev_out)   *dev_out = dev_bytes;
     if (total_out) *total_out = total;

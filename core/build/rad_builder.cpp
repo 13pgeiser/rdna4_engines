@@ -2210,6 +2210,25 @@ void Builder::finish_buffer_liveness() {
          * output likewise: the engine reads it after the last op. */
         if ((rad_buf)i == prog_.logits_buf || (rad_buf)i == prog_.pooled_buf) b.last_use = last_op;
     }
+
+    /* Region 1 holds what an op the second lane may issue asks for (Program::scratch_bytes_lane1):
+     * every transient buffer of such an op is concurrent (Ctx::lane1_ rule 3). Ctx::issue refuses a
+     * larger request on lane 1 by name, so an op that breaks the rule fails rather than overruns. */
+    prog_.scratch_bytes_lane1 = 0;
+    if (prog_.scratch_regions > 1)
+        for (size_t o = 1; o < prog_.ops.size() && o < op_bufs_.size(); ++o) {
+            bool lane1 = true;
+            for (const std::vector<rad_buf>* v : { &op_bufs_[o].reads, &op_bufs_[o].writes })
+                for (rad_buf h : *v)
+                    if (prog_.buffers[h].decl.kind == RAD_BUF_TRANSIENT && !concurrent_bufs_.count(h))
+                        lane1 = false;
+            if (!lane1) continue;
+            for (const Band& bd : prog_.ops[o].bands)
+                if (bd.dom[RAD_DOMAIN_DEVICE] &&
+                    bd.dom[RAD_DOMAIN_DEVICE].scratch_bytes > prog_.scratch_bytes_lane1)
+                    prog_.scratch_bytes_lane1 = bd.dom[RAD_DOMAIN_DEVICE].scratch_bytes;
+        }
+    if (prog_.scratch_bytes_lane1 > prog_.scratch_bytes) prog_.scratch_bytes_lane1 = prog_.scratch_bytes;
 }
 
 int Builder::finish() {

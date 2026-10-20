@@ -1895,6 +1895,8 @@ TEST(the_logits_pooled_and_concurrent_buffers_live_past_their_declared_uses) {
             CHECK_EQ(by->first_def, 0);
             CHECK_EQ(by->last_use, 4);
             CHECK_EQ(p.scratch_regions, 2);
+            /* The second lane's region is bounded by the ops it may issue, never the larger. */
+            CHECK(p.scratch_bytes_lane1 >= 0 && p.scratch_bytes_lane1 <= p.scratch_bytes);
             /* Without the extension y (op 4) would take the bytes the output (op 1) left. */
             CHECK(by->arena_offset >= bo->arena_offset + bo->bytes ||
                   bo->arena_offset >= by->arena_offset + by->bytes);

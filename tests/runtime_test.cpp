@@ -911,6 +911,32 @@ TEST(a_declared_second_lane_has_its_own_scratch_region) {
     }
 }
 
+/* A request on the second lane larger than its region (an op whose buffers are not all
+ * rad_buf_concurrent, breaking Ctx::lane1_ rule 3) is refused by name; on lane 0 the same op runs. */
+TEST(a_second_lane_scratch_request_past_its_region_is_refused_by_name) {
+    Fixture f;
+    f.P.scratch_bytes       = kScrBytes;
+    f.P.scratch_bytes_lane1 = kScrBytes / 4;
+    f.P.scratch_regions     = 2;
+    rad_buf x = f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    rad_op a0 = f.add_op("gemm_nt", "M", { 8192 }, { k_scr_seen0 }, { "s0" }, nullptr, {});
+    f.P.ops[a0].bands[0].dom[RAD_DOMAIN_DEVICE].scratch_bytes = kScrBytes;
+    CHECK_OK(f.start());
+
+    CHECK_OK(f.step(4, 0, [&](Ctx& c) {
+        RadOperand opd[1] = { RAD_B(x) };
+        CHECK_OK(c.issue(a0, opd, 1, RAD_N_BATCH));
+    }));
+    const int s = f.step(4, 1, [&](Ctx& c) {
+        RadOperand opd[1] = { RAD_B(x) };
+        CHECK_OK(c.set_lane(1));
+        c.issue(a0, opd, 1, RAD_N_BATCH);
+        CHECK_OK(c.set_lane(0));
+    });
+    CHECK_EQ(s, RAD_E_SCRATCH);
+    CHECK(std::strstr(f.ctx.step_error(), "rad_buf_concurrent") != nullptr);
+}
+
 /* Operands are positional (spec §2.3), so a miscount is silent numerical garbage at the kernel,
  * not a diagnosable failure. The runtime checks the given arity against the schema. */
 TEST(operand_arity_is_checked_against_the_schema) {
@@ -1251,6 +1277,30 @@ TEST(the_predicted_arena_counts_every_scratch_region) {
     CHECK_EQ(a.bytes(), total);
     CHECK_EQ(a.scratch_regions(), 2);
     CHECK_EQ((char*)a.scratch(1) - (char*)a.scratch(0), rad::align_up(300, RAD_ALIGN_UNIT));
+    CHECK((char*)a.scratch(1) + 300 <= a.base() + a.bytes());
+    a.release();
+}
+
+/* Region 1 sized apart (Program::scratch_bytes_lane1): the prediction and the allocation agree,
+ * region 1 starts right after region 0 and ends inside the arena. */
+TEST(the_second_lanes_scratch_region_takes_its_own_size) {
+    Fixture f;
+    f.add_buffer("x", RAD_BF16, 16, 16, 0);
+    f.P.arena_bytes         = 512;
+    f.P.scratch_bytes       = 3 * RAD_ALIGN_UNIT;
+    f.P.scratch_bytes_lane1 = 300;
+    f.P.scratch_regions     = 2;
+    int64_t dev = 0, total = 0;
+    rad::arena_plan_bytes(f.P, &dev, &total);
+    CHECK_EQ(total, rad::align_up(dev, RAD_ALIGN_UNIT) + 3 * RAD_ALIGN_UNIT +
+                        rad::align_up(300, RAD_ALIGN_UNIT));
+    rad::Arena a;
+    CHECK_OK(a.init(dev, f.P.scratch_bytes, RAD_MEM_DEVICE, f.P.scratch_regions,
+                    f.P.scratch_bytes_lane1));
+    CHECK_EQ(a.bytes(), total);
+    CHECK_EQ(a.scratch_bytes(0), 3 * RAD_ALIGN_UNIT);
+    CHECK_EQ(a.scratch_bytes(1), 300);
+    CHECK_EQ((char*)a.scratch(1) - (char*)a.scratch(0), 3 * RAD_ALIGN_UNIT);
     CHECK((char*)a.scratch(1) + 300 <= a.base() + a.bytes());
     a.release();
 }
