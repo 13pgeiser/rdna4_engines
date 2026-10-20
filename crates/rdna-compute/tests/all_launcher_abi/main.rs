@@ -1991,10 +1991,18 @@ fn t8_bytes_source(writes: &str) -> String {
 fn t8_full_writes() -> String {
     let mut w = String::new();
     for i in 0..7 {
-        w.push_str(&format!("    ka[{}..{}].copy_from_slice(&p{i}.to_le_bytes());\n", 8 * i, 8 * i + 8));
+        w.push_str(&format!(
+            "    ka[{}..{}].copy_from_slice(&p{i}.to_le_bytes());\n",
+            8 * i,
+            8 * i + 8
+        ));
     }
     for i in 0..10 {
-        w.push_str(&format!("    ka[{}..{}].copy_from_slice(&v{i}.to_le_bytes());\n", 56 + 4 * i, 60 + 4 * i));
+        w.push_str(&format!(
+            "    ka[{}..{}].copy_from_slice(&v{i}.to_le_bytes());\n",
+            56 + 4 * i,
+            60 + 4 * i
+        ));
     }
     w
 }
@@ -2006,7 +2014,12 @@ fn negative_external_t8_family_layout_is_pinned() {
     // All eight share one identical ABI: the hand-handle launch cannot tie a
     // layout variant to one kernel, so any difference must fail.
     for w in syms.windows(2) {
-        assert!(hip::same_layout(&w[0].1, &w[1].1), "{} vs {}", w[0].0, w[1].0);
+        assert!(
+            hip::same_layout(&w[0].1, &w[1].1),
+            "{} vs {}",
+            w[0].0,
+            w[1].0
+        );
     }
     for (name, d) in &syms {
         assert_eq!(d.args.len(), 17, "{name}");
@@ -2027,14 +2040,16 @@ fn negative_external_t8_family_layout_is_pinned() {
     // scanner only tracks names in its symbol table, so that launch site is
     // then intentionally ignored and both violation lists stay empty.)
     {
-        let text = std::fs::read_to_string(root().join(
-            "crates/rdna-compute/tests/fixtures/all-launcher-abi/external_t8_abi.json",
-        ))
+        let text = std::fs::read_to_string(
+            root().join("crates/rdna-compute/tests/fixtures/all-launcher-abi/external_t8_abi.json"),
+        )
         .expect("fixture");
         let mut v: serde_json::Value = serde_json::from_str(&text).expect("parse");
         let map = v["symbols"].as_object_mut().expect("symbols object");
         assert_eq!(map.len(), 8);
-        assert!(map.remove("mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8").is_some());
+        assert!(map
+            .remove("mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8")
+            .is_some());
         let dir = std::env::temp_dir().join(format!("t8neg-missing-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("tmpdir");
         std::fs::write(
@@ -2049,15 +2064,26 @@ fn negative_external_t8_family_layout_is_pinned() {
     }
     // The zero-initialised `reserved`@92 word may stay unwritten (existing
     // `compare_bytes` reserved handling): the zero-init proof keeps it zero.
-    let no_res = t8_full_writes().replace("    ka[92..96].copy_from_slice(&v9.to_le_bytes());\n", "");
+    let no_res =
+        t8_full_writes().replace("    ka[92..96].copy_from_slice(&v9.to_le_bytes());\n", "");
     let (abi, cov) = run_synth_at(PROBE_PATH, &t8_bytes_source(&no_res), &refs, &no_policy());
-    assert!(abi.is_empty() && cov.is_empty(), "omitted zero-init reserved must pass: {abi:?} {cov:?}");
+    assert!(
+        abi.is_empty() && cov.is_empty(),
+        "omitted zero-init reserved must pass: {abi:?} {cov:?}"
+    );
     // Dropping a live word (n_experts@88) must fail instead.
-    let short = t8_full_writes().replace("    ka[88..92].copy_from_slice(&v8.to_le_bytes());\n", "");
+    let short =
+        t8_full_writes().replace("    ka[88..92].copy_from_slice(&v8.to_le_bytes());\n", "");
     let (abi, _) = run_synth_at(PROBE_PATH, &t8_bytes_source(&short), &refs, &no_policy());
-    assert!(!abi.is_empty(), "unwritten n_experts@88 word must fail: {abi:?}");
+    assert!(
+        !abi.is_empty(),
+        "unwritten n_experts@88 word must fail: {abi:?}"
+    );
     // A straddling write matches no declared argument.
-    let straddle = format!("{}    ka[86..90].copy_from_slice(&v8.to_le_bytes());\n", short);
+    let straddle = format!(
+        "{}    ka[86..90].copy_from_slice(&v8.to_le_bytes());\n",
+        short
+    );
     let (abi, _) = run_synth_at(PROBE_PATH, &t8_bytes_source(&straddle), &refs, &no_policy());
     assert!(!abi.is_empty(), "straddling write must fail: {abi:?}");
     let small = full.replace("[0u8; 96]", "[0u8; 92]");
@@ -2075,7 +2101,11 @@ fn negative_external_t8_loader_fails_closed() {
     let load = |text: &str| {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!("t8neg-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::SeqCst)));
+        let dir = std::env::temp_dir().join(format!(
+            "t8neg-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
         std::fs::create_dir_all(&dir).expect("tmpdir");
         let p = dir.join("external_t8_abi.json");
         std::fs::write(&p, text).expect("write");
@@ -2096,8 +2126,13 @@ fn negative_external_t8_loader_fails_closed() {
             kept.insert(k, s);
         }
     }
-    v.as_object_mut().unwrap().insert("symbols".into(), kept.into());
-    assert!(load(&serde_json::to_string(&v).unwrap()).is_err(), "missing export must fail closed");
+    v.as_object_mut()
+        .unwrap()
+        .insert("symbols".into(), kept.into());
+    assert!(
+        load(&serde_json::to_string(&v).unwrap()).is_err(),
+        "missing export must fail closed"
+    );
     // Wrong offset/size/name/kind/value_kind/segment, unknown fields,
     // wrapping numerics, bad provenance, missing contract, wrong module, and
     // non-family symbols are all hard errors, never silent defaults.
@@ -2106,39 +2141,105 @@ fn negative_external_t8_loader_fails_closed() {
         f(&mut w);
         load(&serde_json::to_string(&w).unwrap())
     };
-    assert!(mutate(&|w| { w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["args"][8]["offset"] = 84.into(); }).is_err());
-    assert!(mutate(&|w| { w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["args"][0]["size"] = 4.into(); }).is_err());
-    assert!(mutate(&|w| { w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["args"][16]["name"] = "pad".into(); }).is_err());
-    assert!(mutate(&|w| { w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["args"][0]["kind"] = "v".into(); }).is_err());
-    assert!(mutate(&|w| { w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["args"][0]["value_kind"] = "by_value".into(); }).is_err());
-    assert!(mutate(&|w| { w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["args"][8]["value_kind"] = "global_buffer".into(); }).is_err());
-    assert!(mutate(&|w| { w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["segment"] = 104.into(); }).is_err());
-    assert!(mutate(&|w| { w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["args"][1]["bogus"] = 1.into(); }).is_err());
-    assert!(mutate(&|w| { w.as_object_mut().unwrap().insert("bogus".into(), 1.into()); }).is_err());
+    assert!(mutate(&|w| {
+        w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["args"][8]["offset"] = 84.into();
+    })
+    .is_err());
+    assert!(mutate(&|w| {
+        w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["args"][0]["size"] = 4.into();
+    })
+    .is_err());
+    assert!(mutate(&|w| {
+        w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["args"][16]["name"] = "pad".into();
+    })
+    .is_err());
+    assert!(mutate(&|w| {
+        w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["args"][0]["kind"] = "v".into();
+    })
+    .is_err());
+    assert!(mutate(&|w| {
+        w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["args"][0]["value_kind"] =
+            "by_value".into();
+    })
+    .is_err());
+    assert!(mutate(&|w| {
+        w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["args"][8]["value_kind"] =
+            "global_buffer".into();
+    })
+    .is_err());
+    assert!(mutate(&|w| {
+        w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["segment"] = 104.into();
+    })
+    .is_err());
+    assert!(mutate(&|w| {
+        w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["args"][1]["bogus"] = 1.into();
+    })
+    .is_err());
+    assert!(mutate(&|w| {
+        w.as_object_mut().unwrap().insert("bogus".into(), 1.into());
+    })
+    .is_err());
     // A `u64` offset of 2^32 + 0 would wrap to 0 under `as u32`: refused.
-    assert!(mutate(&|w| { w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["args"][0]["offset"] = 4294967296u64.into(); }).is_err());
+    assert!(mutate(&|w| {
+        w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["args"][0]["offset"] =
+            4294967296u64.into();
+    })
+    .is_err());
     // Provenance: truncated/uppercase digests, missing dirs, missing contract.
-    assert!(mutate(&|w| { w["provenance"]["gfx1201_module_co_sha256"] = "c7b528dcee126e0188d43f371dbad4a0f81b0cd962d71c0d392ec8c9865aa5".into(); }).is_err());
-    assert!(mutate(&|w| { w["provenance"]["cn_module_co_sha256"] = "4CFAAEC12F0585EE1811259429E3BE981DC7F9934A7EB933A591C67C81407FA2".into(); }).is_err());
-    assert!(mutate(&|w| { w["provenance"].as_object_mut().unwrap().remove("cn_artifact_dir"); }).is_err());
-    assert!(mutate(&|w| { w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"].as_object_mut().unwrap().remove("contract"); }).is_err());
-    assert!(mutate(&|w| { w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["contract"] = "shapes/other.json".into(); }).is_err());
+    assert!(mutate(&|w| {
+        w["provenance"]["gfx1201_module_co_sha256"] =
+            "c7b528dcee126e0188d43f371dbad4a0f81b0cd962d71c0d392ec8c9865aa5".into();
+    })
+    .is_err());
+    assert!(mutate(&|w| {
+        w["provenance"]["cn_module_co_sha256"] =
+            "4CFAAEC12F0585EE1811259429E3BE981DC7F9934A7EB933A591C67C81407FA2".into();
+    })
+    .is_err());
+    assert!(mutate(&|w| {
+        w["provenance"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cn_artifact_dir");
+    })
+    .is_err());
+    assert!(mutate(&|w| {
+        w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]
+            .as_object_mut()
+            .unwrap()
+            .remove("contract");
+    })
+    .is_err());
+    assert!(mutate(&|w| {
+        w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["contract"] =
+            "shapes/other.json".into();
+    })
+    .is_err());
     // Wrong module association (Cn symbol claimed in the gfx1201 module).
-    assert!(mutate(&|w| { w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["module"] = "mq_i4_moe_gemv_pm_gfx1201".into(); }).is_err());
+    assert!(mutate(&|w| {
+        w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["module"] =
+            "mq_i4_moe_gemv_pm_gfx1201".into();
+    })
+    .is_err());
     // A non-family `_t8` stem is refused even with the suffix.
     assert!(mutate(&|w| {
         let s = w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"].clone();
-        w["symbols"].as_object_mut().unwrap().insert("mq_i4_moe_gemv_bogus_r256_gate_up_t8".into(), s);
+        w["symbols"]
+            .as_object_mut()
+            .unwrap()
+            .insert("mq_i4_moe_gemv_bogus_r256_gate_up_t8".into(), s);
     })
     .is_err());
     // A non-_t8 symbol smuggled into the external family is refused.
     assert!(mutate(&|w| {
         let s = w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"].clone();
-        w["symbols"].as_object_mut().unwrap().insert("mq_i4_moe_gemv_plain".into(), s);
+        w["symbols"]
+            .as_object_mut()
+            .unwrap()
+            .insert("mq_i4_moe_gemv_plain".into(), s);
     })
     .is_err());
 }
-
 
 #[test]
 fn self_referential_format_names_resolve_without_looping() {

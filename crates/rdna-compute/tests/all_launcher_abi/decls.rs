@@ -457,7 +457,9 @@ fn expect_t8_layout(symbol: &str, args: &[Arg], end: u32, segment: u32) -> Resul
         let name = parts.next().unwrap_or("");
         let vk = parts.next().unwrap_or("");
         if name != *want {
-            return Err(format!("{symbol}: arg {i} is named `{name}`, want `{want}`"));
+            return Err(format!(
+                "{symbol}: arg {i} is named `{name}`, want `{want}`"
+            ));
         }
         let (want_off, want_size, want_kind, want_vk) = if i < 7 {
             (i as u32 * 8, 8u32, 'p', "global_buffer")
@@ -500,13 +502,24 @@ fn u32_field(fixture: &str, ctx: &str, v: &serde_json::Value, field: &str) -> Re
 }
 
 /// A 64-character lowercase hex SHA-256 digest; anything else is refused.
-fn sha256_field(fixture: &str, ctx: &str, v: &serde_json::Value, field: &str) -> Result<String, String> {
+fn sha256_field(
+    fixture: &str,
+    ctx: &str,
+    v: &serde_json::Value,
+    field: &str,
+) -> Result<String, String> {
     let s = v
         .get(field)
         .and_then(|x| x.as_str())
         .ok_or_else(|| format!("{fixture}:{ctx}: missing `{field}`"))?;
-    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit() && !(b as char).is_ascii_uppercase()) {
-        return Err(format!("{fixture}:{ctx}: `{field}` is not a 64-char lowercase hex digest"));
+    if s.len() != 64
+        || !s
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !(b as char).is_ascii_uppercase())
+    {
+        return Err(format!(
+            "{fixture}:{ctx}: `{field}` is not a 64-char lowercase hex digest"
+        ));
     }
     Ok(s.to_string())
 }
@@ -521,7 +534,9 @@ fn t8_family_parts(symbol: &str) -> Result<(bool, &str, &str), String> {
         Some(r) => (true, r),
         None => (false, rest),
     };
-    let rest = rest.strip_suffix("_t8").ok_or_else(|| format!("{symbol}: not a `_t8` candidate"))?;
+    let rest = rest
+        .strip_suffix("_t8")
+        .ok_or_else(|| format!("{symbol}: not a `_t8` candidate"))?;
     let (codec, kind) = rest
         .split_once("_r")
         .ok_or_else(|| format!("{symbol}: no codec/kind separator"))?;
@@ -562,9 +577,13 @@ const EXPECTED_T8_FAMILY: [&str; 8] = [
 /// association, or symbols whose layouts differ are hard errors, never silent
 /// defaults.
 pub fn build_external(root: &Path, fixture: &str, syms: &mut Symbols) -> Result<(), String> {
-    let text = std::fs::read_to_string(root.join(fixture)).map_err(|e| format!("{fixture}: {e}"))?;
-    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{fixture}: {e}"))?;
-    let obj = v.as_object().ok_or_else(|| format!("{fixture}: top level must be an object"))?;
+    let text =
+        std::fs::read_to_string(root.join(fixture)).map_err(|e| format!("{fixture}: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("{fixture}: {e}"))?;
+    let obj = v
+        .as_object()
+        .ok_or_else(|| format!("{fixture}: top level must be an object"))?;
     for k in obj.keys() {
         if !["scope", "provenance", "kernarg_segment_bytes", "symbols"].contains(&k.as_str()) {
             return Err(format!("{fixture}: unknown top-level field `{k}`"));
@@ -603,8 +622,18 @@ pub fn build_external(root: &Path, fixture: &str, syms: &mut Symbols) -> Result<
             return Err(format!("{fixture}: empty provenance `{dir_field}`"));
         }
     }
-    let prov_gfx1201_sha = sha256_field(fixture, "provenance", &serde_json::Value::Object(prov.clone()), "gfx1201_module_co_sha256")?;
-    let prov_cn_sha = sha256_field(fixture, "provenance", &serde_json::Value::Object(prov.clone()), "cn_module_co_sha256")?;
+    let prov_gfx1201_sha = sha256_field(
+        fixture,
+        "provenance",
+        &serde_json::Value::Object(prov.clone()),
+        "gfx1201_module_co_sha256",
+    )?;
+    let prov_cn_sha = sha256_field(
+        fixture,
+        "provenance",
+        &serde_json::Value::Object(prov.clone()),
+        "cn_module_co_sha256",
+    )?;
     let _ = (prov_gfx1201_sha, prov_cn_sha);
     let syms_obj = obj
         .get("symbols")
@@ -637,9 +666,15 @@ pub fn build_external(root: &Path, fixture: &str, syms: &mut Symbols) -> Result<
     let origin = format!("external:{fixture}");
     let mut layouts: Vec<Decl> = Vec::new();
     for (symbol, s) in syms_obj {
-        let s = s.as_object().ok_or_else(|| format!("{fixture}:{symbol} must be an object"))?;
+        let s = s
+            .as_object()
+            .ok_or_else(|| format!("{fixture}:{symbol} must be an object"))?;
         for k in s.keys() {
-            if !["arch", "module", "contract", "export", "end", "segment", "args"].contains(&k.as_str()) {
+            if ![
+                "arch", "module", "contract", "export", "end", "segment", "args",
+            ]
+            .contains(&k.as_str())
+            {
                 return Err(format!("{fixture}:{symbol}: unknown field `{k}`"));
             }
         }
@@ -669,7 +704,9 @@ pub fn build_external(root: &Path, fixture: &str, syms: &mut Symbols) -> Result<
             ));
         }
         if (arch == "gfx1151") != cn {
-            return Err(format!("{fixture}:{symbol}: arch/module mismatch (arch {arch}, cn {cn})"));
+            return Err(format!(
+                "{fixture}:{symbol}: arch/module mismatch (arch {arch}, cn {cn})"
+            ));
         }
         // Contract provenance is required: a non-empty `.contract.json` path
         // naming this symbol's arch, so a declaration without raw-export
@@ -678,7 +715,8 @@ pub fn build_external(root: &Path, fixture: &str, syms: &mut Symbols) -> Result<
             .get("contract")
             .and_then(|x| x.as_str())
             .ok_or_else(|| format!("{fixture}:{symbol}: missing `contract`"))?;
-        if contract.is_empty() || !contract.ends_with(".contract.json") || !contract.contains(arch) {
+        if contract.is_empty() || !contract.ends_with(".contract.json") || !contract.contains(arch)
+        {
             return Err(format!("{fixture}:{symbol}: bad `contract` `{contract}`"));
         }
         if s.get("export").and_then(|x| x.as_str()) != Some("FUNC") {
@@ -693,7 +731,9 @@ pub fn build_external(root: &Path, fixture: &str, syms: &mut Symbols) -> Result<
             .ok_or_else(|| format!("{fixture}:{symbol}: `args` must be an array"))?;
         let mut args: Vec<Arg> = Vec::new();
         for a in arr {
-            let a = a.as_object().ok_or_else(|| format!("{fixture}:{symbol}: arg must be an object"))?;
+            let a = a
+                .as_object()
+                .ok_or_else(|| format!("{fixture}:{symbol}: arg must be an object"))?;
             for k in a.keys() {
                 if !["name", "offset", "size", "kind", "value_kind"].contains(&k.as_str()) {
                     return Err(format!("{fixture}:{symbol}: unknown arg field `{k}`"));
@@ -713,7 +753,11 @@ pub fn build_external(root: &Path, fixture: &str, syms: &mut Symbols) -> Result<
             let kind = match kind {
                 "p" => 'p',
                 "v" => 'v',
-                _ => return Err(format!("{fixture}:{symbol}: arg `{aname}` has unknown kind `{kind}`")),
+                _ => {
+                    return Err(format!(
+                        "{fixture}:{symbol}: arg `{aname}` has unknown kind `{kind}`"
+                    ))
+                }
             };
             let vk = a
                 .get("value_kind")
@@ -724,17 +768,30 @@ pub fn build_external(root: &Path, fixture: &str, syms: &mut Symbols) -> Result<
                     "{fixture}:{symbol}: arg `{aname}` has unknown value_kind `{vk}`"
                 ));
             }
-            args.push(Arg { offset, size, kind, text: format!("{aname}:{vk}") });
+            args.push(Arg {
+                offset,
+                size,
+                kind,
+                text: format!("{aname}:{vk}"),
+            });
         }
         expect_t8_layout(symbol, &args, end, segment)?;
         let decl = Decl { args, end };
         layouts.push(decl.clone());
-        syms.origin_symbols.entry(origin.clone()).or_default().push(symbol.clone());
-        syms.pm.entry(symbol.clone()).or_default().push((origin.clone(), decl));
+        syms.origin_symbols
+            .entry(origin.clone())
+            .or_default()
+            .push(symbol.clone());
+        syms.pm
+            .entry(symbol.clone())
+            .or_default()
+            .push((origin.clone(), decl));
     }
     for d in layouts.iter().skip(1) {
         if !crate::hip::same_layout(&layouts[0], d) {
-            return Err(format!("{fixture}: external symbols declare different ABIs"));
+            return Err(format!(
+                "{fixture}: external symbols declare different ABIs"
+            ));
         }
     }
     Ok(())
