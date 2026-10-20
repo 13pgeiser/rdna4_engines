@@ -430,48 +430,120 @@ but confined to one op-order, and the frame-0 bisection made it golden-verifiabl
 shadows + the full tail now read ratio ~1.0 against the reference. Strict end-to-end numeric parity of the
 whole pipeline (benchmarks, multi-frame) remains #10/P6. #20 stays closed (norm already per-frame).
 
-## #10 / P6 — Radiance TP2 engine-throughput measured (2026-10-19)
+## #10 / P6 — Radiance TP2 engine-throughput + ComfyUI comparison (2026-10-19)
 
 FFmpeg is now present on this box (the §6.1 "no libav → encoding_failed at t≈0" blocker is gone — clips
 mux to mp4 and generate to completion). The encoder **value-parity** half of P6 is done (both encoders at the
-bf16 floor, above). What was measured now is Radiance's own **engine wall-clock** at fixed shapes
-(`--tp 2 --vision-tower-placement ram --max-model-len 4096`, `wall = completed_at − created_at`, empty queue):
+bf16 floor, above). The comparative half is now **unblocked** — the external Hermes stock-vs-sol-attn baseline
+arrived (`radiance-fl2va-examples/solattn-bench-results.md`, single R9700, REF2VA 1-image, 25 step, compute
+columns with queue separated). The two are now matched **shape-for-shape** (task=ref2va, ONE image ref, 25
+step, seed fixed, `wall = completed_at − created_at` on an empty queue ⇒ wall≈compute).
 
-| job | shape | wall |
+**Matched battery — Radiance TP2 (`--tp 2 --vision-tower-placement ram --max-model-len 4096`):**
+
+| shape | 3 s | 4 s | 5 s | 6 s | 12 s |
+|---|---|---|---|---|---|
+| 256×256 · ref2va · 25 step | 13 s | — | 21 s | — | — |
+| 512×512 · ref2va · 25 step | 42 s | 62 s | 72 s | 95 s | **207 s** |
+
+**512×512 comparison vs ComfyUI single-card (same shape/config, compute):**
+
+| 512²·s | Rad TP2 | ComfyUI stock | ComfyUI sol | TP2 vs **1** stock | TP2 vs **1** sol | **card-parity**: 2·TP2 vs 2 stock-lanes | 2·TP2 vs 2 sol-lanes |
+|---|---|---|---|---|---|---|---|
+| 3 s | 42 | 90.2 | 95.2 | **2.15×** | **2.27×** | **1.07× (win)** | **1.13× (win)** |
+| 4 s | 62 | 130.7 | 125.3 | **2.11×** | **2.02×** | 1.05× (win) | 1.01× (win) |
+| 5 s | 72 | 150.2 | 150.3 | **2.09×** | **2.09×** | 1.04× (win) | 1.04× (win) |
+| 6 s | 95 | 195.3 | 175.3 | **2.06×** | **1.85×** | 1.03× (win) | 0.92× (slow) |
+| 12 s | 207 | 405.5 | 340.5 | **1.96×** | **1.64×** | 0.98× (≈tie) | 0.82× (slow) |
+
+Two framings, both reported honestly:
+
+- **Per single clip** (one TP2 instance vs one ComfyUI card): Radiance wins at every row — 1.96–2.15× vs
+  stock, 1.64–2.27× vs sol. This is a 2-card-vs-1-card comparison (TP2 spreads one clip across both cards)
+  and overstates fleet efficiency; quote it only as "a single TP2 request beats a single-card clip."
+- **Card-parity fleet** (one TP2 = 2 cards vs a 2-lane ComfyUI fleet = the same 2 cards, equal work = 2
+  clips: TP2 serialises them at 2·T, the fleet runs them in parallel at T_1clip): **Radiance beats or ties
+  two stock lanes at every row** (1.03–1.07×, and a 0.98× dead-heat at 12 s), and **beats two sol-attn lanes
+  at short clips (≤5 s)** because Radiance's native VSA block-sparse attention is always on while sol-attn
+  only engages above its ~12 k-token floor. Radiance **trails two sol lanes at 6–12 s** (0.92×, 0.82×) where
+  sol's tau-1.3 sparsity fully engages.
+
+**§6 verdict:** the "one TP2 beats two single-card ComfyUI" claim is **MET against stock at every row** (or
+dead-heat at 12 s), and **MET against sol-attn below ~12 k tokens (≤5 s @ 512²)** but **NOT met at 6–12 s**,
+where sol's sparsity fully engages. The sol-attn gap at the 12 s production row is the honest weak point —
+and it is measured under a **215 W per-card power cap (default 300 W), powersave CPU governor, and a link
+cap**, all of which handicap Radiance precisely on the compute-heavy long rows; the sol baseline itself
+carries ±5 s reproducibility. Radiance's wall also includes ~2.2 s queue+prompt that the ComfyUI compute
+columns exclude (minor; both are post-submit processing). Harnesses: `build/tmp/bench.sh` (legacy) and
+`build/tmp/ex10/bench2.sh` (this matched battery; results in `build/tmp/ex10/bench/results.tsv`).
+
+## #8 kR2VCond keyframe-pin (FL2VA) — disposition: SHIPPED + device-verified (2026-10-19)
+
+**Supersedes the earlier "left optional, not wired" disposition.** The user elevated FL2VA from optional to a
+**hard requirement**, so the keyframe path was implemented and shipped (commit `98ecbeb`, placeholder author,
+NOT pushed). The `nk=0` gate in `video_driver.cpp` is gone on the keyframe request path; a keyframe request now
+stages + VAE-encodes the two anchors and populates the `ref_tab` cond rows.
+
+**Mechanism (correction to the earlier guess).** A keyframe is a **pinned (`update=0`) attention cond row**
+carrying its VAE latent at the frame's time position — it is NOT a sampler pin-mask. The **sampler is
+untouched**; the denoise step simply widens to carry the cond rows (faithful to `comfy/ldm/minimax/model.py`
+`img_update==False` keyframe rows). **One keyframe path serves I2VA / L2VA / FL2VA** (first-frame only,
+last-frame only, both). Keyframes are **⊥ refs** — mutually exclusive with `ref_image_N`/`ref_video_N`/etc.
+
+**Device-verified** (seed-9999 differential): pins are **consumed** (fl2va ≠ same-seed t2va) **and force the
+endpoints** — frame 0 vs anchor similarity 0.687 pinned vs 0.460 un-pinned; last frame 0.719 vs 0.521.
+Endpoint parity is therefore **SOFT / GENERATIVE** (strong with a matching prompt), matching the reference
+golden's own loose endpoint honoring (frame0 re-painted, last frame motion-blurred) — not bit-exact. A 73-frame
+MP4+AAC renders clean.
+
+**512-output keyframes were broken at ≤256 — found + fixed (2026-10-19).** The `98ecbeb` device-verify above
+ran at ≤256; at the production 512² canvas I2VA/L2VA/FL2VA failed with "the video encoder refuses a reference at
+512x512 over 1 frames." Root cause: the keyframe is resized to the **target canvas** and its latent rows **share
+the TARGET grid** (`rad_ref2va_pack` `ref2va_build` — keyframes carry no own h/w, unlike references), so they
+must be VAE-encoded at **output** resolution; but `venc_geom` had a flat `h,w > kEncMaxSide(256)` reject. That
+guard is a crude proxy for the real constraint — the encoder holds ONE clip's pixels sized for a
+`kVaeClipLength(17)`-frame clip at 256 (`Rmax=17·256²=1.11M` rows); a **one-frame** media (a picture or keyframe)
+is a single-frame clip and fits at up to `√Rmax≈1055`/side. Fix = replace the flat side cap with `clip·h·w ≤ 17·256²`
+(video refs unchanged: clip=17 forces each side back to 256; single-frame admits full-res). **No buffer/kernel/
+arena change** — a 512² keyframe (262 k rows) is a third of the existing budget. A first relax then **faulted**
+("op 'cast' n=128 at M=262144 outside band, fatal") because the encoder's **debug shadow** casts (`op_ve_cindbg`,
+per-level `op_ve_ldbg`, trunk, nout — write only `b_vcin/b_vl/b_vtrunk/b_vnout`, read only under `R4D_ENC_SEL`)
+were issued on **every** encode at a `PF[]` (256-frame-plane) range a 512 plane overflows. Gate them on
+`R4D_ENC_DEBUG` (the same env the readback uses) — a no-op for the production latent, and it also stops paying
+for debug work on every encode. **Device-verified at 512²:** FL2VA 512×512 completes clean (46.8 s, server
+survives, no band fault); host geom/video/ref2va/encoding tests green. Core ops are within their declared bands
+(a 1-frame 512 level plane is `0.235×` the 17·256² they're sized for).
+
+**Remaining fidelity gap (→ #10 / P6 bucket, not a function gap).** The pins-only path **skips `clip.tokenize`
+vision tokens** for the keyframe images (the TE-anchor tokens the reference would also feed), so a prompt that
+*contradicts* the pinned image can let the text win. Closing this = feed TE-anchor tokens for keyframe rows;
+that is a value-fidelity follow-up, and the earlier "no golden engine to diff against" limit applies to it.
+Chaining still also works independently via the ref_video slot0 path.
+
+**Endpoint parity re-confirmed at 512 (2026-10-19, post-fix).** Same method (frame-0/last-frame cosine vs the
+resized anchor, 256² sampling space, RGB-mean-centred), on the fixed binary at 512²·12 s·25 step·seed 1234:
+
+| request | endpoint vs its anchor | same-seed un-pinned t2va endpoint |
 |---|---|---|
-| plain t2v | 256×256 · 3 s · 25 step | **12 s** |
-| plain t2v | 256×256 · 3 s · 50 step | 21 s |
-| plain t2v | 512×512 · 3 s · 25 step | 38 s |
-| plain t2v | 256×256 · 6 s · 25 step | 23 s |
-| ref2va full shape | 256×256 · 25 step (4 img + 1 vid + 2 aud) | **93 s** |
-| ref2va full shape | 512×512 · 25 step (4 img + 1 vid + 2 aud) | **121 s** |
+| FL2VA frame 0 vs `first` | **0.984** | 0.04 |
+| FL2VA last  vs `last`  | **0.985** | −0.573 |
+| I2VA  frame 0 vs `first` | **0.985** | 0.04 |
+| L2VA  last  vs `last`  | **0.985** | −0.573 |
 
-**These are engine throughput, not the §6 claim.** §6's win condition is `N × T_rad_tp2 < T_comfy_1clip`
-(one TP2 instance beating two single-GPU ComfyUI instances at equal work). The documented ComfyUI floors
-(590.4 s @ 12 s / 704×544 / 25 step; 315 s @ 7 s) are **stock-attention** (pre-sol) and INCLUDE queue wait —
-per the §6 Hermes correction they are only a floor, and the clean stock-vs-sol-attn pairs that the claim must
-be measured against are an **external Hermes deliverable** not available on this box (there is no second GPU
-pair running ComfyUI here). Against those floors the full-shape 512 clip (121 s) is far below a single
-ComfyUI clip, so the claim is *directionally* supported, but **P6's comparative verdict is blocked on the
-external sol-attn baseline**, not on anything in this branch. The harness is `build/tmp/bench.sh`.
+Every pinned endpoint lands at cos≈0.985 to its anchor; the same-seed un-pinned clip sits at ≈0/−0.6. The pins
+**force** the endpoints at output resolution (not just at ≤256), with a much wider pinned/un-pinned gap than the
+earlier ≤256 run (0.687 vs 0.460). Still soft/generative (the last frame can carry a little motion blur), not
+bit-exact.
 
-## #8 kR2VCond keyframe-pin (FL2VA exact-pin) — disposition: left optional, not wired (2026-10-19)
+**Example-clip inventory** (`build/tmp/ex10/examples/`, `examples.sh` + `examples_kf.sh`; all 512²·12 s·25
+step·seed 1234, `first`=standing, `last`=riding; `index.tsv` records status/wall/id):
 
-The pack layer is **done and reference-verified** (`ref2va_build` emits `kR2VCond`/`kR2VCondAudio`; golden
-fl2va/chain assert segment order/size/position/`img_pos`/`mod` bit-exact; `ref_pack_of`/`rad_arch_video_pack`
-already parse `nk` up to 8). What remains is **engine wiring only**: driver populates keyframe rows in
-`ref_tab` (`nk` stays 0 today — see `video_driver.cpp` submit/stage_geom "continuation is separate"), `step_dit`
-scatters cond rows from the reserved `RAD_ENC_TAIL` slot via `op_vin`/`op_ain`, a continuation-tail *input*
-API, and persisting the prior clip's tail latent across requests.
+| category | mp4 | wall | note |
+|---|---|---|---|
+| T2VA   | `t2va.mp4`   | 203 s | text-only baseline (also the un-pinned endpoint reference) |
+| I2VA   | `i2va.mp4`   | 208 s | `first` pinned to frame 0 |
+| L2VA   | `l2va.mp4`   | 209 s | `last` pinned to last frame |
+| FL2VA  | `fl2va.mp4`  | 214 s | both endpoints pinned (294 frames) |
+| REF2VA | `ref2va.mp4` | 214 s | 2 image refs (`last`,`first`), not keyframes |
 
-**Not implemented, deliberately.** DaSiWa chaining — the actual capability — already works via the
-**ref_video slot0 path** (no new code, device-verified), so the exact-pin is an alternative pinning mechanism,
-not a requirement. The wiring lands in the **shared `step_dit`** (serves every conditioned + plain path), and
-its *purpose* — an exact frame pin — is a **numeric-fidelity** claim with no golden to check against on this
-box (there is no reference FL2VA engine to diff latents against; same external limit as P6's comparative
-claim). Building it would be a blind change to shared kernels that could ship a silently-wrong latent, which
-the workflow rule forbids. It is left **pending and optional**; a function-level device battery (keyframe
-present/absent → deterministic content-sensitive change) is the verification available here, but that
-verifies consumption, not the exact pin, and does not justify the shared-path regression risk given chaining
-already works. **User action to unblock a faithful implementation:** a reference FL2VA engine (or the Hermes
-golden rows) to diff the pinned-clip latents against.
+Each has a matching `.thumb.webp`. These are SEQUENCE clips (single generated run), not loops.
