@@ -609,10 +609,7 @@ mod tests {
         assert_eq!(DIRECT_LDS, 65_536);
         assert_eq!(FP8_DIRECT_LDS, 32_768);
         assert_eq!(FaPrefillKvCodec::Q8_0.direct_lds_bytes(), DIRECT_LDS);
-        assert_eq!(
-            FaPrefillKvCodec::Fp8E4M3.direct_lds_bytes(),
-            FP8_DIRECT_LDS
-        );
+        assert_eq!(FaPrefillKvCodec::Fp8E4M3.direct_lds_bytes(), FP8_DIRECT_LDS);
     }
 
     #[test]

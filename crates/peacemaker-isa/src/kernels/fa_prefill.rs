@@ -231,21 +231,21 @@ const FSC: u8 = 64; // K scales 64 + t, V scales 68 + 2t' (+1)
 const FV: u8 = 72; // V codes: slot t' u0 = 72 + 16t', u1 = 80 + 16t'
 const FOUT: u8 = 104; // store-data ring
 const FTMP: u8 = 112; // integer / float temporaries
-                   // FP8 sequential-stage aliases (max 224; Q8 aliases above are untouched).
-                   // K-fill (live D_LOOP..D_KREADY): codes 16..47, scales 64..67,
-                   // output ring 68..71 (pairs (68,69),(70,71)), temporaries 72..79.
+                      // FP8 sequential-stage aliases (max 224; Q8 aliases above are untouched).
+                      // K-fill (live D_LOOP..D_KREADY): codes 16..47, scales 64..67,
+                      // output ring 68..71 (pairs (68,69),(70,71)), temporaries 72..79.
 const FK8: u8 = 16;
 const FSC8: u8 = 64;
 const FOUT8: u8 = 68;
 const FTMP8: u8 = 72;
-                   // V-fill streamed one t' group at a time (live D_QK_DONE..D_VREADY):
-                   // codes 64..79, scales 80..81, output ring 84..87, temporaries 88..95.
+// V-fill streamed one t' group at a time (live D_QK_DONE..D_VREADY):
+// codes 64..79, scales 80..81, output ring 84..87, temporaries 88..95.
 const VFC8: u8 = 64;
 const VFSC8: u8 = 80;
 const VFOUT8: u8 = 84;
 const VFTMP8: u8 = 88;
-                   // Softmax/PV (live D_VREADY..D_TURN): temporaries 64..71, packed
-                   // probabilities 80..83, V fragment buffers 84..87/88..91, O 96..223.
+// Softmax/PV (live D_VREADY..D_TURN): temporaries 64..71, packed
+// probabilities 80..83, V fragment buffers 84..87/88..91, O 96..223.
 const SMX8: u8 = 64;
 const SPRO8: u8 = 80;
 const SVFA8: u8 = 84;
@@ -677,47 +677,47 @@ fn plan_direct(fp8: bool) -> Result<RegPlan, String> {
         p.v::<8>("epilogue_temp", S0, epi())?;
         p.v::<8>("epilogue_temp", S0 + 8, epi())?;
     } else {
-    // Fill phase.
-    for i in 0..4u8 {
-        p.v::<8>("fill_k_codes", FK + 8 * i, fill())?;
-    }
-    p.v::<8>("fill_scales", FSC, fill())?;
-    for i in 0..4u8 {
-        p.v::<8>("fill_v_codes", FV + 16 * (i / 2) + 8 * (i % 2), fill())?;
-    }
-    p.v::<8>("fill_out_ring", FOUT, fill())?;
-    p.v::<8>("fill_temp", FTMP, fill())?;
-    // Tile phase.
-    for i in 0..4u8 {
-        p.v::<8>("score", S0 + 8 * i, tile())?;
-    }
-    for i in 0..4u8 {
-        p.v::<4>("q_frag", QF + 4 * i, w())?;
-    }
-    for i in 0..4u8 {
-        p.v::<4>("k_frag", KF + 4 * i, tile())?;
-    }
-    p.v::<4>("prow", PROW, tile())?;
-    p.v::<4>("v_frag_a", VFA, tile())?;
-    p.v::<4>("v_frag_b", VFB, tile())?;
-    for (name, base) in [
-        ("row_max", V_MX),
-        ("row_max_peer", V_SWZ),
-        ("m_new", V_MN),
-        ("alpha", V_AL),
-        ("sum", V_SUM),
-        ("peer", V_T1),
-        ("key_base", V_KEY),
-        ("key_j", V_KJ),
-    ] {
-        p.v::<1>(name, base, tile())?;
-    }
-    for i in 0..16u8 {
-        p.v::<8>("o", O + 8 * i, w())?;
-    }
-    // Epilogue temporaries.
-    p.v::<8>("epilogue_temp", S0, epi())?;
-    p.v::<8>("epilogue_temp", S0 + 8, epi())?;
+        // Fill phase.
+        for i in 0..4u8 {
+            p.v::<8>("fill_k_codes", FK + 8 * i, fill())?;
+        }
+        p.v::<8>("fill_scales", FSC, fill())?;
+        for i in 0..4u8 {
+            p.v::<8>("fill_v_codes", FV + 16 * (i / 2) + 8 * (i % 2), fill())?;
+        }
+        p.v::<8>("fill_out_ring", FOUT, fill())?;
+        p.v::<8>("fill_temp", FTMP, fill())?;
+        // Tile phase.
+        for i in 0..4u8 {
+            p.v::<8>("score", S0 + 8 * i, tile())?;
+        }
+        for i in 0..4u8 {
+            p.v::<4>("q_frag", QF + 4 * i, w())?;
+        }
+        for i in 0..4u8 {
+            p.v::<4>("k_frag", KF + 4 * i, tile())?;
+        }
+        p.v::<4>("prow", PROW, tile())?;
+        p.v::<4>("v_frag_a", VFA, tile())?;
+        p.v::<4>("v_frag_b", VFB, tile())?;
+        for (name, base) in [
+            ("row_max", V_MX),
+            ("row_max_peer", V_SWZ),
+            ("m_new", V_MN),
+            ("alpha", V_AL),
+            ("sum", V_SUM),
+            ("peer", V_T1),
+            ("key_base", V_KEY),
+            ("key_j", V_KJ),
+        ] {
+            p.v::<1>(name, base, tile())?;
+        }
+        for i in 0..16u8 {
+            p.v::<8>("o", O + 8 * i, w())?;
+        }
+        // Epilogue temporaries.
+        p.v::<8>("epilogue_temp", S0, epi())?;
+        p.v::<8>("epilogue_temp", S0 + 8, epi())?;
     }
     // SGPRs.
     p.s::<2>("kernarg_ptr", KARG, w())?;
@@ -1515,7 +1515,14 @@ fn fill_k_fp8(b: &mut Builder) -> R {
             let pair = (4 * t + w) % 2;
             let out = FOUT8 + 2 * pair;
             dequant_pair(b, out, (scale, a0), (scale, a0 + 1), FTMP8 + 4, FTMP8 + 5)?;
-            dequant_pair(b, out + 1, (scale, a2), (scale, a2 + 1), FTMP8 + 4, FTMP8 + 5)?;
+            dequant_pair(
+                b,
+                out + 1,
+                (scale, a2),
+                (scale, a2 + 1),
+                FTMP8 + 4,
+                FTMP8 + 5,
+            )?;
             let imm = 512 * u32::from(t)
                 + 2048 * u32::from(w >> 2)
                 + 256 * u32::from((w >> 1) & 1)
@@ -1539,13 +1546,19 @@ fn fill_v_fp8(b: &mut Builder) -> R {
         let c = T[5 + 2 * tp as usize];
         sop(
             b,
-            format!("s_add_co_i32 s{a}, s{REM}, {}", imm_i32(1 - 32 * i32::from(tp))),
+            format!(
+                "s_add_co_i32 s{a}, s{REM}, {}",
+                imm_i32(1 - 32 * i32::from(tp))
+            ),
             &[a],
             &[REM],
         )?;
         sop(
             b,
-            format!("s_add_co_i32 s{c}, s{REM}, {}", imm_i32(-32 * i32::from(tp))),
+            format!(
+                "s_add_co_i32 s{c}, s{REM}, {}",
+                imm_i32(-32 * i32::from(tp))
+            ),
             &[c],
             &[REM],
         )?;
@@ -1678,7 +1691,11 @@ const FP8_REGS: CodecRegs = CodecRegs {
     v_slot: L_STAGE,
 };
 fn regs(fp8: bool) -> CodecRegs {
-    if fp8 { FP8_REGS } else { Q8_REGS }
+    if fp8 {
+        FP8_REGS
+    } else {
+        Q8_REGS
+    }
 }
 fn qk(b: &mut Builder, fp8: bool) -> R {
     let r = regs(fp8);
@@ -1702,10 +1719,22 @@ fn qk(b: &mut Builder, fp8: bool) -> R {
             }
             for u in 0..4u8 {
                 let dc = u32::from(4 * dg + u);
-                dload128(b, r.k_slot, r.kf + 4 * u, V_LF, (dc * 4 + u32::from(sub)) * 512)?;
+                dload128(
+                    b,
+                    r.k_slot,
+                    r.kf + 4 * u,
+                    V_LF,
+                    (dc * 4 + u32::from(sub)) * 512,
+                )?;
             }
             for u in 0..4u8 {
-                wmma(b, r.scores + 8 * sub, r.kf + 4 * u, r.qf + 4 * u, dg > 0 || u > 0)?;
+                wmma(
+                    b,
+                    r.scores + 8 * sub,
+                    r.kf + 4 * u,
+                    r.qf + 4 * u,
+                    dg > 0 || u > 0,
+                )?;
             }
         }
         b.label(&end)?;

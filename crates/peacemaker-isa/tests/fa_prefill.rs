@@ -510,7 +510,11 @@ fn q8_prologue_temps_own_v16_through_v47_before_tile_loop() {
             1,
             "direct: v{v} must have exactly one live owner at entry"
         );
-        assert_eq!(owners[0].name.as_ref(), "prologue_temp", "direct: v{v} owner");
+        assert_eq!(
+            owners[0].name.as_ref(),
+            "prologue_temp",
+            "direct: v{v} owner"
+        );
         assert_eq!(
             (owners[0].base, owners[0].len),
             (16 + (v - 16) / 8 * 8, 8),
@@ -2315,13 +2319,18 @@ fn q8_two_plane_lds_lifecycle_is_ready_reads_retire() {
         text.find(&format!("{label}:"))
             .unwrap_or_else(|| panic!("Q8 direct: missing label {label}"))
     };
-    let (fill_done_def, qk_def, turn_def) =
-        (def(".Lfapd_fill_done"), def(".Lfapd_qk"), def(".Lfapd_turn"));
+    let (fill_done_def, qk_def, turn_def) = (
+        def(".Lfapd_fill_done"),
+        def(".Lfapd_qk"),
+        def(".Lfapd_turn"),
+    );
     // Helper path: the wave>=4 guard is the first branch after the QK entry label and skips compute straight to
     // the retire label, so the helper wave joins the retire rendezvous without reading either plane.
     let after_qk: Vec<&str> = text[qk_def..].lines().skip(1).take(3).collect();
     assert!(
-        after_qk.iter().any(|l| l.contains("s_cbranch_scc1 .Lfapd_turn")),
+        after_qk
+            .iter()
+            .any(|l| l.contains("s_cbranch_scc1 .Lfapd_turn")),
         "Q8 direct: helper wave at the QK entry must branch to .Lfapd_turn"
     );
     // Reads between publish and retire: 16-byte fragment loads hit BOTH planes — K plane offsets below 32768
@@ -2332,8 +2341,11 @@ fn q8_two_plane_lds_lifecycle_is_ready_reads_retire() {
             let t = l.split(';').next()?.split("//").next()?.trim();
             let tok = t.split_whitespace().next()?;
             let first = tok.chars().next()?;
-            (first.is_ascii_lowercase() && tok.contains('_') && !tok.ends_with(':') && !tok.contains('.'))
-                .then_some(t)
+            (first.is_ascii_lowercase()
+                && tok.contains('_')
+                && !tok.ends_with(':')
+                && !tok.contains('.'))
+            .then_some(t)
         })
         .collect();
     let mut saw_k = false;
@@ -2341,7 +2353,10 @@ fn q8_two_plane_lds_lifecycle_is_ready_reads_retire() {
     for l in &region {
         if mnemonic(l) == "ds_load_b128" {
             let off = imm_offset(l);
-            assert!(off + 16 <= 65_536, "Q8 direct: fragment read past both planes");
+            assert!(
+                off + 16 <= 65_536,
+                "Q8 direct: fragment read past both planes"
+            );
             if off < 32_768 {
                 saw_k = true;
             } else {
@@ -2349,16 +2364,28 @@ fn q8_two_plane_lds_lifecycle_is_ready_reads_retire() {
             }
         }
     }
-    assert!(saw_k, "Q8 direct: no K-plane fragment read between publish and retire");
-    assert!(saw_v, "Q8 direct: no V-plane fragment read between publish and retire");
+    assert!(
+        saw_k,
+        "Q8 direct: no K-plane fragment read between publish and retire"
+    );
+    assert!(
+        saw_v,
+        "Q8 direct: no V-plane fragment read between publish and retire"
+    );
     // Barrier placement in the text: the publish rendezvous sits between the fill_done label and the QK entry,
     // the retire rendezvous after the turn label.
-    let mut signals: Vec<usize> = text.match_indices("s_barrier_signal").map(|(i, _)| i).collect();
+    let mut signals: Vec<usize> = text
+        .match_indices("s_barrier_signal")
+        .map(|(i, _)| i)
+        .collect();
     assert_eq!(signals.len(), 2, "Q8 direct: two text rendezvous sites");
     let retire = signals.remove(1);
     assert!(
         fill_done_def < signals[0] && signals[0] < qk_def,
         "Q8 direct: publish barrier is not between fill_done and the QK entry"
     );
-    assert!(retire > turn_def, "Q8 direct: retire barrier is not after the turn label");
+    assert!(
+        retire > turn_def,
+        "Q8 direct: retire barrier is not after the turn label"
+    );
 }

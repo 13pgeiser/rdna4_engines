@@ -660,11 +660,7 @@ fn fp8_direct_resources_match_the_single_stage_layout() {
         (4, 4),
         "fp8 direct: four tile rendezvous sites (K publish/retire, V publish/retire)"
     );
-    assert_eq!(
-        e.proof.barriers.len(),
-        4,
-        "fp8 direct: proof barrier sites"
-    );
+    assert_eq!(e.proof.barriers.len(), 4, "fp8 direct: proof barrier sites");
     // Single LDS stage, base 0 length 32768: the ten sequential-stage labels
     // are all present, in K-ready / K-retire / V-ready / V-retire order.
     let labels = [
@@ -706,7 +702,10 @@ fn fp8_direct_resources_match_the_single_stage_layout() {
     );
     let sgprs = field(".amdhsa_next_free_sgpr");
     assert_eq!(sgprs.len(), 1, "{SYMBOL}");
-    assert_eq!(sgprs[0], 82, "{SYMBOL}: SGPR budget unchanged (84 in lifted metadata)");
+    assert_eq!(
+        sgprs[0], 82,
+        "{SYMBOL}: SGPR budget unchanged (84 in lifted metadata)"
+    );
     assert!(
         sgprs[0] <= 104 && u32::from(e.shape.next_free_sgpr) == sgprs[0],
         "{SYMBOL}: {} SGPRs",
@@ -714,7 +713,14 @@ fn fp8_direct_resources_match_the_single_stage_layout() {
     );
     // Unchanged arithmetic: the QK/softmax/PV opcode census is identical to
     // the Q8 direct body (only K/V fill addressing and decode differ).
-    let q8 = fa_prefill::emit(ARCH, &FaPrefillSpec { kv: FaKvCodec::Q8_0, ..spec() }).unwrap();
+    let q8 = fa_prefill::emit(
+        ARCH,
+        &FaPrefillSpec {
+            kv: FaKvCodec::Q8_0,
+            ..spec()
+        },
+    )
+    .unwrap();
     // Prologue O init (persistent online state): all 128 FP8 accumulators
     // 96..223 zeroed before the tile loop, never the stale 224..255 window;
     // Q8 keeps 128..255. Scoped to the prologue so fill/reuse zeroes after
@@ -743,7 +749,10 @@ fn fp8_direct_resources_match_the_single_stage_layout() {
         );
     }
     assert_eq!(
-        fp8_zeroed.iter().filter(|r| (96..224u32).contains(r)).count(),
+        fp8_zeroed
+            .iter()
+            .filter(|r| (96..224u32).contains(r))
+            .count(),
         128,
         "{SYMBOL}: prologue O96..223 init count"
     );
@@ -810,10 +819,7 @@ fn fp8_direct_resources_match_the_single_stage_layout() {
         assert_eq!(c["require_zero_spills"], true, "{symbol}");
         assert_eq!(c["require_zero_private"], true, "{symbol}");
         assert_eq!(c["vgpr_max"].as_u64(), Some(224), "{symbol}");
-        assert!(
-            c["sgpr_max"].as_u64().unwrap() <= 104,
-            "{symbol}"
-        );
+        assert!(c["sgpr_max"].as_u64().unwrap() <= 104, "{symbol}");
     }
 }
 #[test]
@@ -1235,8 +1241,12 @@ fn fp8_single_stage_rendezvous_guards_all_five_waves_at_all_four_barriers() {
     );
     // Proof barrier lifecycle: Ready(0) publishes K, Retire(0) releases K, Ready(0) publishes V, Retire(0)
     // releases V.
-    let transitions: Vec<Vec<String>> =
-        e.proof.barriers.iter().map(|b| b.transitions.clone()).collect();
+    let transitions: Vec<Vec<String>> = e
+        .proof
+        .barriers
+        .iter()
+        .map(|b| b.transitions.clone())
+        .collect();
     assert_eq!(
         transitions,
         vec![
@@ -1306,7 +1316,10 @@ fn fp8_single_stage_rendezvous_guards_all_five_waves_at_all_four_barriers() {
     );
     // Barrier placement in the text: K publish between kfill_done and kready, K retire between qk_done and
     // vfill_done, V publish between vfill_done and vready, V retire after turn. Exactly one rendezvous per site.
-    let mut signals: Vec<usize> = text.match_indices("s_barrier_signal").map(|(i, _)| i).collect();
+    let mut signals: Vec<usize> = text
+        .match_indices("s_barrier_signal")
+        .map(|(i, _)| i)
+        .collect();
     signals.retain(|&i| i > tile_def);
     assert_eq!(signals.len(), 4, "fp8 direct: four text rendezvous sites");
     let windows = [
@@ -1316,7 +1329,11 @@ fn fp8_single_stage_rendezvous_guards_all_five_waves_at_all_four_barriers() {
         (turn_def, text.len()),
     ];
     for (site, (lo, hi)) in windows.iter().enumerate() {
-        let inside: Vec<usize> = signals.iter().copied().filter(|&i| i > *lo && i < *hi).collect();
+        let inside: Vec<usize> = signals
+            .iter()
+            .copied()
+            .filter(|&i| i > *lo && i < *hi)
+            .collect();
         assert_eq!(
             inside.len(),
             1,
@@ -1330,7 +1347,14 @@ fn fp8_single_stage_rendezvous_guards_all_five_waves_at_all_four_barriers() {
     let region = &text[tile_def..turn_def];
     let mut targets: Vec<&str> = Vec::new();
     for l in region.lines() {
-        let t = l.split(';').next().unwrap_or("").split("//").next().unwrap_or("").trim();
+        let t = l
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .split("//")
+            .next()
+            .unwrap_or("")
+            .trim();
         let mut words = t.split_whitespace();
         match words.next() {
             Some("s_cbranch_scc1") | Some("s_cbranch_scc0") | Some("s_branch") => {
@@ -1382,10 +1406,24 @@ fn fp8_single_stage_rendezvous_guards_all_five_waves_at_all_four_barriers() {
     let mut wave_guarded = 0;
     let sm_lines: Vec<&str> = sm_region.lines().collect();
     for (i, l) in sm_lines.iter().enumerate() {
-        let t = l.split(';').next().unwrap_or("").split("//").next().unwrap_or("").trim();
+        let t = l
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .split("//")
+            .next()
+            .unwrap_or("")
+            .trim();
         if t == "s_cbranch_scc1 .Lfapd_turn" {
             turn_branches += 1;
-            let prev: String = sm_lines[..i].iter().rev().take(2).rev().copied().collect::<Vec<_>>().join("\n");
+            let prev: String = sm_lines[..i]
+                .iter()
+                .rev()
+                .take(2)
+                .rev()
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n");
             if prev.contains("s_cmp_lt_i32") {
                 cmp_lt_guarded += 1;
             }
@@ -1394,7 +1432,16 @@ fn fp8_single_stage_rendezvous_guards_all_five_waves_at_all_four_barriers() {
             }
         }
     }
-    assert_eq!(turn_branches, 4, "fp8 direct: V-ready window turn-bound branches (3 subtile + 1 helper)");
-    assert_eq!(cmp_lt_guarded, 3, "fp8 direct: subtile causal early exits must target .Lfapd_turn");
-    assert_eq!(wave_guarded, 1, "fp8 direct: V-ready helper guard must target .Lfapd_turn");
+    assert_eq!(
+        turn_branches, 4,
+        "fp8 direct: V-ready window turn-bound branches (3 subtile + 1 helper)"
+    );
+    assert_eq!(
+        cmp_lt_guarded, 3,
+        "fp8 direct: subtile causal early exits must target .Lfapd_turn"
+    );
+    assert_eq!(
+        wave_guarded, 1,
+        "fp8 direct: V-ready helper guard must target .Lfapd_turn"
+    );
 }
