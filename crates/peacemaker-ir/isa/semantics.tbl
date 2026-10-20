@@ -43,6 +43,7 @@ s_bitcmp1_b32	alu
 s_branch	control
 s_cbranch_scc0	control
 s_cbranch_scc1	control
+s_cbranch_vccnz	control
 s_clause	wait
 s_cmp_eq_u32	alu
 s_cmp_ge_i32	alu
@@ -95,6 +96,7 @@ v_cmp_gt_u32_e64	alu
 v_cmp_le_f32_e64	alu
 v_cmp_le_i32_e64	alu
 v_cmp_le_u32_e64	alu
+v_cmp_le_u32_e32	alu
 v_cmp_lt_f32_e64	alu
 v_cmp_lt_i32_e64	alu
 v_cmp_lt_u32_e64	alu
