@@ -21584,6 +21584,9 @@ impl Gpu {
     /// (`__launch_bounds__(256,3)`; measured not-slower than occ2 on XTX),
     /// the M/N tail uses the base entry. gfx1201 uses 16-row single-wave
     /// tiles (`_full_add`/`_full_set`) for every shape.
+    /// `shared_gate: Some(logits)` (gfx1201 V3 ADD only) selects the sigmoid-gated
+    /// residual epilogue `Y += sigmoid(logits[token]) * result`; `None` is the
+    /// plain SET/ADD.
     fn gemm_mq4g256v2_mmq_prequant_iu4(
         &mut self,
         a_raw: &GpuTensor,
@@ -21593,6 +21596,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
         add: bool,
+        shared_gate: Option<*mut c_void>,
     ) -> HipResult<()> {
         if !matches!(self.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201") {
             return Err(hip_bridge::HipError::new(
@@ -21607,6 +21611,15 @@ impl Gpu {
             return Err(hip_bridge::HipError::new(
                 1,
                 &format!("MQ4V2 iu4 MMQ requires K divisible by 256 (m={m} k={k} n={batch_size})"),
+            ));
+        }
+        if shared_gate.is_some() && self.arch.as_str() != "gfx1201" {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!(
+                    "MQ4V2 iu4 shared-gate epilogue requires exact gfx1201 (arch={} m={m} k={k} n={batch_size})",
+                    self.arch
+                ),
             ));
         }
         self.bind_thread()?;
@@ -21638,6 +21651,18 @@ impl Gpu {
                     &format!("slab A4 activations need the gfx1201 _b1s GEMM (m={m} k={k} n={batch_size})"),
                 ));
             }
+            // The sigmoid-gated residual epilogue exists only in the hipcc V3
+            // module's ADD entry (`add_val` 2 plus the trailing gate pointer).
+            let epi = shared_gate.is_some();
+            if epi && !(add && v3 && !slab) {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    &format!(
+                        "MQ4V2 iu4 shared-gate epilogue needs the symmetric V3 ADD entry (add={add} v3={v3} slab={slab} m={m} k={k} n={batch_size})"
+                    ),
+                ));
+            }
+            let isa = isa && !epi;
             let (module, source, kernel_name) = if slab {
                 (
                     "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
@@ -21718,7 +21743,11 @@ impl Gpu {
             let mut m_val = m as i32;
             let mut k_val = k as i32;
             let mut n_val = batch_size as i32;
-            let mut add_val = i32::from(add);
+            let mut add_val = if epi { 2 } else { i32::from(add) };
+            // The V3 ADD entry carries a trailing gate pointer at kernarg offset 40
+            // (NULL unless the gated epilogue is selected); no other module does.
+            let v3_add = !slab && !isa && v3 && add;
+            let mut gate_ptr: *mut c_void = shared_gate.unwrap_or(std::ptr::null_mut());
             let mut params: Vec<*mut c_void> = vec![
                 &mut a_ptr as *mut _ as *mut c_void,
                 &mut xq_ptr as *mut _ as *mut c_void,
@@ -21728,6 +21757,9 @@ impl Gpu {
                 &mut n_val as *mut _ as *mut c_void,
                 &mut add_val as *mut _ as *mut c_void,
             ];
+            if v3_add {
+                params.push(&mut gate_ptr as *mut _ as *mut c_void);
+            }
             let row_tiles = m.div_ceil(128);
             // 128-column workgroup tile (8 waves cover 2 64-col halves).
             let batch_tiles = batch_size.div_ceil(128);
@@ -21752,6 +21784,9 @@ impl Gpu {
                     b.push_i32(k_val);
                     b.push_i32(n_val);
                     b.push_i32(add_val);
+                    if v3_add {
+                        b.push_ptr(gate_ptr);
+                    }
                     b
                 },
             );
@@ -22214,7 +22249,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        self.gemm_mq4g256v2_mmq_prequant_iu4(a_raw, x_i4_ptr, y, m, k, batch_size, false)
+        self.gemm_mq4g256v2_mmq_prequant_iu4(a_raw, x_i4_ptr, y, m, k, batch_size, false, None)
     }
 
     pub fn gemm_mq4g256v2_mmq_add_prequant_iu4(
@@ -22226,7 +22261,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        self.gemm_mq4g256v2_mmq_prequant_iu4(a_raw, x_i4_ptr, y, m, k, batch_size, true)
+        self.gemm_mq4g256v2_mmq_prequant_iu4(a_raw, x_i4_ptr, y, m, k, batch_size, true, None)
     }
 
     /// A8 MQ4v2 SET/ADD (gfx1201, gfx1100/gfx1151). Xq is [K/128, N] of 136-byte blocks.
@@ -39940,6 +39975,279 @@ impl Gpu {
         self.gemm_mq4g256v2_xbatch(a_raw, x, y, m, k, batch_size, false)
     }
 
+    /// True exactly when [`Self::gemm_mq4g256v2`] on `(k, batch_size)` reaches the
+    /// gfx12 IU4 ADD consumer: WMMA + gfx12 arch caps, not in the FP8 verify
+    /// scope, A8 prefill not taking precedence, IU4 prefill enabled on exact
+    /// gfx1201, eager (no replay recording / graph capture), `k % 256 == 0`
+    /// and `batch_size >= 64`.
+    pub fn mq4g256v2_shared_iu4_supported(&self, k: usize, batch_size: usize) -> bool {
+        self.arch_caps.has_wmma()
+            && self.arch_caps.has_wmma_w32_gfx12()
+            && !self.fp8_verify_scope
+            && !self.a8_prefill_active(batch_size, k)
+            && self.flags.iu4_prefill_enabled()
+            && self.arch == "gfx1201"
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && k % 256 == 0
+            && batch_size >= 64
+    }
+
+    /// Selector router projection `Y = W·X` (plain [`Self::gemm_mq4g256v2`]
+    /// IU4 semantics: IU4 verify F16 receipt, fp16-X cache invalidate,
+    /// active-stream `memset(y)`, ONE `quantize_int4_mmq_ds128`, ADD consumer)
+    /// that returns the typed sidecar token so later same-`x`/`k` stages can
+    /// reuse the quantize via [`Self::try_gemm_mq4g256v2_shared_iu4`].
+    /// `Ok(None)` with no launches when [`Self::mq4g256v2_shared_iu4_supported`]
+    /// is false. The caller guarantees an MQ4V2 weight.
+    pub fn try_gemm_mq4g256v2_shared_router_iu4(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<Option<crate::scratch::Int4MmqPrepared>> {
+        if !self.mq4g256v2_shared_iu4_supported(k, batch_size) {
+            return Ok(None);
+        }
+        self.bind_thread()?;
+        self.iu4_verify_note_f16();
+        self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+        match self.active_stream.as_ref() {
+            Some(stream) => self
+                .hip
+                .memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
+            None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
+        }
+        let prepared = self.seal_shared_iu4_quantize(x, k, batch_size)?;
+        let xq = self.int4_mmq_prepared_ptr(&prepared, k, batch_size)?;
+        self.gemm_mq4g256v2_mmq_add_prequant_iu4(a_raw, xq, y, m, k, batch_size)?;
+        Ok(Some(prepared))
+    }
+
+    /// Plain `Y = W·X` ([`Self::gemm_mq4g256v2`] IU4 semantics) over an activation
+    /// a producer already quantized into `prepared`: IU4 verify F16 receipt,
+    /// fp16-X cache invalidate, active-stream `memset(y)`, ADD consumer — and no
+    /// quantize. `Err` with no side effect when
+    /// [`Self::mq4g256v2_shared_iu4_supported`] is false or the token is stale
+    /// (generation, live pointer, `k`, `n`); the caller owns the calibration
+    /// tap and the fallback. The caller guarantees an MQ4V2 weight.
+    pub fn gemm_mq4g256v2_prepared_iu4(
+        &mut self,
+        a_raw: &GpuTensor,
+        prepared: &crate::scratch::Int4MmqPrepared,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if !self.mq4g256v2_shared_iu4_supported(k, batch_size) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemm_mq4g256v2_prepared_iu4: IU4 consumer not supported for this call",
+            ));
+        }
+        self.bind_thread()?;
+        self.int4_mmq_prepared_ptr(prepared, k, batch_size)?;
+        self.iu4_verify_note_f16();
+        self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+        match self.active_stream.as_ref() {
+            Some(stream) => self
+                .hip
+                .memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
+            None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
+        }
+        let xq = self.int4_mmq_prepared_ptr(prepared, k, batch_size)?;
+        self.gemm_mq4g256v2_mmq_add_prequant_iu4(a_raw, xq, y, m, k, batch_size)
+    }
+
+    /// True exactly when the shared-expert down GEMM of `(m, k, rows)` can fold
+    /// its `sigmoid(gate) * down` residual add into the gfx12 V3 IU4 ADD entry:
+    /// the incumbent consumer route ([`Self::mq4g256v2_shared_iu4_supported`]:
+    /// exact gfx1201 WMMA, IU4 prefill, no FP8/A8 precedence, eager, `k % 256 ==
+    /// 0`, `rows >= 64`) with the symmetric fold the V3 module implements
+    /// (`mq4v2_symmetric`, `HIPFIRE_IU4_SYMFOLD` not `0`, and the V3 module
+    /// selected: `HIPFIRE_G12_IU4_ISA` or `HIPFIRE_G12_IU4_V3`, the same
+    /// predicate the incumbent launcher uses to pick V3 over the legacy
+    /// symfold modules). The V3 entry handles every `m`, so `m` is only
+    /// required nonzero.
+    pub fn mq4g256v2_shared_down_sigmoid_epi_supported(
+        &self,
+        m: usize,
+        k: usize,
+        rows: usize,
+    ) -> bool {
+        m > 0
+            && self.mq4g256v2_shared_iu4_supported(k, rows)
+            && self.mq4v2_symmetric
+            && *DISPATCH_IU4_SYMFOLD
+            && (self.flags.g12_iu4_isa || g12_iu4_v3_enabled())
+    }
+
+    /// Shared-expert down GEMM with the gated residual add fused into its
+    /// epilogue: `residual[t] += sigmoid(scalar[t]) * (W · x)[t]` in the V3 IU4
+    /// ADD entry (`add == 2`), replacing the incumbent
+    /// `gemm_mq4g256v2_prepared_iu4` / `gemm_mq4g256v2` into a zeroed temp plus
+    /// `sigmoid_scaled_residual_add_batched_f32`. No output memset and no
+    /// intermediate write. `Ok(false)` with no launches, taps or receipts when
+    /// [`Self::mq4g256v2_shared_down_sigmoid_epi_supported`] is false or the
+    /// activation sidecar is slab layout (only the `_b1s` bundle reads it).
+    /// `prepared`: `Some(token)` is validated (`int4_mmq_prepared_ptr`:
+    /// generation, live pointer, `k`, `rows`) and reused with no quantize;
+    /// `None` quantizes the already-rotated `x` once. Sequence, with the
+    /// incumbent's order: tap on `(a_raw, x)`, F16 receipt, fp16-X cache
+    /// invalidate, quantize (unprepared only), fused ADD launch. A stale token
+    /// is an `Err`, never a
+    /// re-quantize. The caller guarantees an MQ4V2 weight and `rows` logits in
+    /// `scalar`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_gemm_mq4g256v2_shared_down_sigmoid_epi(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        prepared: Option<&crate::scratch::Int4MmqPrepared>,
+        residual: &GpuTensor,
+        scalar: &GpuTensor,
+        m: usize,
+        k: usize,
+        rows: usize,
+    ) -> HipResult<bool> {
+        if !self.mq4g256v2_shared_down_sigmoid_epi_supported(m, k, rows) {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        if let Some(token) = prepared {
+            let xq = self.int4_mmq_prepared_ptr(token, k, rows)?;
+            if self.scratch.int4_mmq_slab_at(xq) {
+                return Ok(false);
+            }
+        }
+        self.maybe_capture_activation(a_raw, x, rows, k);
+        // The incumbent `gemm_mq4g256v2` / `gemm_mq4g256v2_prepared_iu4` order: F16
+        // receipt and fp16-X invalidate, then (unprepared only) the one quantize.
+        self.iu4_verify_note_f16();
+        self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+        let local;
+        let token = match prepared {
+            Some(token) => token,
+            None => {
+                local = self.seal_shared_iu4_quantize(x, k, rows)?;
+                if self
+                    .scratch
+                    .int4_mmq_slab_at(self.int4_mmq_prepared_ptr(&local, k, rows)?)
+                {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "shared down sigmoid epilogue: standalone quantize wrote a slab sidecar",
+                    ));
+                }
+                &local
+            }
+        };
+        let xq = self.int4_mmq_prepared_ptr(token, k, rows)?;
+        self.gemm_mq4g256v2_mmq_prequant_iu4(
+            a_raw,
+            xq,
+            residual,
+            m,
+            k,
+            rows,
+            true,
+            Some(scalar.buf.as_ptr()),
+        )?;
+        Ok(true)
+    }
+
+    /// One standalone `ensure_int4_mmq_x` quantize, sealed into a typed token
+    /// from the live generation + pointer. `Err` if the returned pointer is
+    /// null or not the live scratch.
+    fn seal_shared_iu4_quantize(
+        &mut self,
+        x: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<crate::scratch::Int4MmqPrepared> {
+        let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
+        let (generation, live) = self.scratch.int4_mmq_live();
+        if xq.is_null() || live != xq {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "shared IU4 quantize: sidecar not live after ensure_int4_mmq_x",
+            ));
+        }
+        Ok(crate::scratch::Int4MmqPrepared::from_live(
+            generation, live, k, batch_size,
+        ))
+    }
+
+    /// `projections = [selector, gate, up]` (`(weight, y, m)` each) over one
+    /// `x`, sharing ONE `quantize_int4_mmq_ds128`. Returns `false` with no
+    /// launches when [`Self::mq4g256v2_shared_iu4_supported`] is false.
+    /// `prepared`: `Some(token)` (e.g. from
+    /// [`Self::try_gemm_mq4g256v2_shared_router_iu4`]) is validated and reused
+    /// with no quantize; `None` quantizes once and seals a local token.
+    /// Reproduces the incumbent sequence with the quantize hoisted:
+    /// selector = [`Self::gemm_mq4g256v2`] IU4 branch (IU4 verify F16 receipt,
+    /// fp16-X cache invalidate, active-stream `memset(y)`, ADD consumer);
+    /// gate/up = [`Self::gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2`] IU4 branch
+    /// (one more F16 receipt, then SET consumer for gate and for up; no
+    /// memset, no fp16 invalidate). The caller guarantees all weights are
+    /// MQ4V2 with the same `k`. The token is validated
+    /// (`int4_mmq_prepared_ptr`: generation, live pointer, `k`, `n`) before
+    /// EACH consumer; a stale token is an `Err`, never a re-quantize.
+    /// This helper OWNS the calibration taps (`maybe_capture_activation`)
+    /// and only taps when it runs (never when unsupported):
+    /// selector tap -> selector ADD -> gate tap -> up tap -> gate SET -> up
+    /// SET. A supplied token is validated before the first tap.
+    pub fn try_gemm_mq4g256v2_shared_iu4(
+        &mut self,
+        projections: [(&GpuTensor, &GpuTensor, usize); 3],
+        x: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+        prepared: Option<&crate::scratch::Int4MmqPrepared>,
+    ) -> HipResult<bool> {
+        if !self.mq4g256v2_shared_iu4_supported(k, batch_size) {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        let [(a_sel, y_sel, sel_m), (a_gate, y_gate, gate_m), (a_up, y_up, up_m)] = projections;
+        if let Some(token) = prepared {
+            self.int4_mmq_prepared_ptr(token, k, batch_size)?;
+        }
+        self.maybe_capture_activation(a_sel, x, batch_size, k);
+        let local;
+        let token = match prepared {
+            Some(token) => token,
+            None => {
+                local = self.seal_shared_iu4_quantize(x, k, batch_size)?;
+                &local
+            }
+        };
+        // Selector: plain gemm_mq4g256v2 semantics (zero + ADD).
+        self.iu4_verify_note_f16();
+        self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+        match self.active_stream.as_ref() {
+            Some(stream) => self
+                .hip
+                .memset_async(&y_sel.buf, 0, batch_size * sel_m * 4, stream)?,
+            None => self.hip.memset(&y_sel.buf, 0, batch_size * sel_m * 4)?,
+        }
+        let xq = self.int4_mmq_prepared_ptr(token, k, batch_size)?;
+        self.gemm_mq4g256v2_mmq_add_prequant_iu4(a_sel, xq, y_sel, sel_m, k, batch_size)?;
+        // Fused gate/up: tap gate, tap up, SET gate, SET up.
+        self.maybe_capture_activation(a_gate, x, batch_size, k);
+        self.maybe_capture_activation(a_up, x, batch_size, k);
+        self.iu4_verify_note_f16();
+        let xq = self.int4_mmq_prepared_ptr(token, k, batch_size)?;
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_gate, xq, y_gate, gate_m, k, batch_size)?;
+        let xq = self.int4_mmq_prepared_ptr(token, k, batch_size)?;
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_up, xq, y_up, up_m, k, batch_size)?;
+        Ok(true)
+    }
+
     /// Plain `Y = W·X` over `batch_size` rows with the x-batched scalar V2
     /// GEMV (chunks of 4). Each row is byte-identical to the singleton
     /// `gemv_mq4g256v2` on that row (same per-row accumulation order), on
@@ -48289,9 +48597,12 @@ const QWEN4_MOE_SYM_PM_MODULE: [&str; 2] = [
     "qwen4_moe_iu4_sym_pm_gfx1151",
     "qwen4_moe_iu4_sym_pm_gfx1201",
 ];
-/// Expert-run entries `[arch][host_mapped]` (block 128, several 16-slot tiles
-/// per weight stream): NT4 on VRAM-resident experts; on gfx1201 NT8 when the
-/// layer's experts are host-mapped (twice the reuse per PCIe weight stream).
+/// Expert-run entries `[arch][nt8]` (block 128, several 16-slot tiles per weight stream): NT4 on
+/// VRAM-resident experts; on gfx1201 NT8 when the layer's experts are host-mapped (twice the reuse
+/// per PCIe weight stream). Resident, only the gate/up entry widens (to NT8 when the wide-tile
+/// flag resolves on (`HIPFIRE_MOE_IU4_WIDE_TILES`, unset on at exact gfx1201) and the real slots
+/// per expert reach 128, [`qwen4_moe_sym_nt8_selected`]); the resident down entry is always the NT4 incumbent (the NT8
+/// down is slower resident). The reported pair can therefore be mixed (gate/up NT8, down NT4).
 /// Every entry is bitwise the module's 16-slot entries, the ORACLE's anchor.
 const QWEN4_MOE_SYM_PM_GATE_UP: [[&str; 2]; 2] = [
     [
@@ -48313,6 +48624,440 @@ const QWEN4_MOE_SYM_PM_DOWN: [[&str; 2]; 2] = [
         "qwen4_moe_down_iu4_sym_pm_gfx1201_nt8",
     ],
 ];
+
+/// Real routed slots per expert from which a VRAM-resident gate/up expert run takes the NT8 entry
+/// (wide-tile flag resolved on): 128 slots are eight full 16-slot tiles, the width one NT8
+/// weight stream serves.
+pub(crate) const QWEN4_MOE_SYM_WIDE_MIN_SLOTS_PER_EXPERT: usize = 128;
+
+/// Total real routed slots of one grouped IU4 GEMM launch: the launcher's `x_src_rows * x_row_div`
+/// (gate/up: token rows x top-k; down: flat slots x 1), never the padded grouped rows. Checked:
+/// an overflowing product is 0, which no expert count reaches the wide-tile floor with.
+pub(crate) fn qwen4_moe_sym_total_slots(x_src_rows: usize, x_row_div: usize) -> usize {
+    x_src_rows.checked_mul(x_row_div).unwrap_or(0)
+}
+
+/// Whether `total_slots` real slots over `n_experts` table entries reach the wide-tile floor:
+/// `n_experts > 0` and `total_slots >= 128 * n_experts` (that is, `total_slots / n_experts >= 128`
+/// without the division). Allocation-free; the checked multiply fails closed on overflow.
+pub(crate) fn qwen4_moe_sym_wide_shape(total_slots: usize, n_experts: usize) -> bool {
+    n_experts != 0
+        && n_experts
+            .checked_mul(QWEN4_MOE_SYM_WIDE_MIN_SLOTS_PER_EXPERT)
+            .is_some_and(|floor| total_slots >= floor)
+}
+
+/// Which of the route's two grouped IU4 GEMMs an entry width is chosen for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Qwen4MoeSymGemm {
+    GateUp,
+    Down,
+}
+
+/// Whether the grouped IU4 GEMM `gemm` runs its NT8 entry (`..._gfx1201_nt8`) instead of NT4. Only
+/// gfx1201 carries an NT8 table (gfx1151 has the one NT4 width, so this is `false` there for every
+/// input). Host-mapped experts keep the existing NT8 for both GEMMs whatever the flag says.
+/// VRAM-resident experts widen only the gate/up GEMM, and only when the typed flag is on
+/// (`wide_flag`, `FeatureFlags::moe_iu4_wide_tiles`), the raw bundle inventory exists
+/// ([`crate::prefill_route_capabilities::raw_inventory`]) and [`qwen4_moe_sym_wide_shape`] holds;
+/// the resident down GEMM is always NT4 (measured slower as NT8). No card or model predicate.
+pub(crate) fn qwen4_moe_sym_nt8_selected(
+    gemm: Qwen4MoeSymGemm,
+    arch: &str,
+    host_mapped: bool,
+    wide_flag: bool,
+    total_slots: usize,
+    n_experts: usize,
+) -> bool {
+    let wide = gemm == Qwen4MoeSymGemm::GateUp
+        && wide_flag
+        && crate::prefill_route_capabilities::raw_inventory(
+            arch,
+            crate::prefill_route_capabilities::PrefillRoute::MoeIu4WideTiles,
+        )
+        && qwen4_moe_sym_wide_shape(total_slots, n_experts);
+    arch == "gfx1201" && (host_mapped || wide)
+}
+
+/// `[gate_up_nt8, down_nt8]` for one grouped call: the width of each GEMM's entry as the launchers
+/// and [`Gpu::qwen4_moe_sym_gemm_symbols`] choose it. Resident, the pair is `[wide, false]`, so a
+/// widened resident call is mixed (gate/up NT8, down NT4); host-mapped on gfx1201 it is
+/// `[true, true]`.
+pub(crate) fn qwen4_moe_sym_nt8_pair(
+    arch: &str,
+    host_mapped: bool,
+    wide_flag: bool,
+    total_slots: usize,
+    n_experts: usize,
+) -> [bool; 2] {
+    [Qwen4MoeSymGemm::GateUp, Qwen4MoeSymGemm::Down].map(|gemm| {
+        qwen4_moe_sym_nt8_selected(gemm, arch, host_mapped, wide_flag, total_slots, n_experts)
+    })
+}
+
+#[cfg(test)]
+mod qwen4_moe_sym_wide_tiles_tests {
+    use super::Qwen4MoeSymGemm::{Down, GateUp};
+    use super::*;
+    use crate::prefill_route_capabilities::{enabled, PrefillRoute};
+
+    const ARCHES: [&str; 6] = [
+        "gfx1201", "gfx1151", "gfx1100", "gfx942", "gfx1030", "unknown",
+    ];
+    const EXPLICIT: [Option<bool>; 3] = [None, Some(false), Some(true)];
+    const KINDS: [Qwen4MoeSymGemm; 2] = [GateUp, Down];
+
+    /// The expected selection, written independently of the production predicate: exact
+    /// 128-bit arithmetic, no checked ops. Host-mapped widens both GEMMs; resident widens
+    /// gate/up only, never down.
+    fn expected(
+        gemm: Qwen4MoeSymGemm,
+        arch: &str,
+        explicit: Option<bool>,
+        host: bool,
+        total_slots: usize,
+        experts: usize,
+    ) -> bool {
+        if arch != "gfx1201" {
+            return false;
+        }
+        let wide = gemm == GateUp
+            && explicit != Some(false)
+            && experts > 0
+            && (total_slots as u128) >= 128 * (experts as u128);
+        host || wide
+    }
+
+    /// Production selection through the resolved flag the way `FeatureFlags` builds it.
+    fn selected(
+        gemm: Qwen4MoeSymGemm,
+        arch: &str,
+        explicit: Option<bool>,
+        host: bool,
+        total_slots: usize,
+        experts: usize,
+    ) -> bool {
+        let flag = enabled(explicit, arch, PrefillRoute::MoeIu4WideTiles);
+        qwen4_moe_sym_nt8_selected(gemm, arch, host, flag, total_slots, experts)
+    }
+
+    fn gate_up(
+        arch: &str,
+        explicit: Option<bool>,
+        host: bool,
+        total_slots: usize,
+        experts: usize,
+    ) -> bool {
+        selected(GateUp, arch, explicit, host, total_slots, experts)
+    }
+
+    fn down(
+        arch: &str,
+        explicit: Option<bool>,
+        host: bool,
+        total_slots: usize,
+        experts: usize,
+    ) -> bool {
+        selected(Down, arch, explicit, host, total_slots, experts)
+    }
+
+    #[test]
+    fn truth_table_over_kinds_flags_arches_residency_and_shapes() {
+        let mut shapes: Vec<(usize, usize)> = Vec::new();
+        // A3B-like: top-8, 256 experts; rows 512 / 4096 / 8192 (16 / 128 / 256 slots per expert).
+        for rows in [512usize, 4096, 8192] {
+            shapes.push((rows * 8, 256));
+        }
+        // Threshold: 127 and 128 slots per expert, and one slot either side of the floor.
+        for experts in [1usize, 3, 256, 512] {
+            for per in [0usize, 1, 127, 128, 129] {
+                shapes.push((per * experts, experts));
+            }
+            shapes.push((128 * experts - 1, experts));
+            shapes.push((128 * experts + 1, experts));
+        }
+        // Zero experts, with and without slots.
+        shapes.extend([(0, 0), (1, 0), (65536, 0), (usize::MAX, 0)]);
+        // Overflowing floors: 128 * experts exceeds usize.
+        shapes.extend([
+            (usize::MAX, usize::MAX),
+            (usize::MAX, usize::MAX / 128 + 1),
+            (usize::MAX, usize::MAX / 64),
+            (0, usize::MAX),
+            (usize::MAX, usize::MAX / 128),
+            (usize::MAX - 127, usize::MAX / 128),
+        ]);
+        // Qwen4-like (512 experts, top-10): same rule, below then above the floor.
+        for rows in [512usize, 4096, 6553, 6554, 8192] {
+            shapes.push((rows * 10, 512));
+        }
+        let mut checked = 0usize;
+        let mut resident_gate_up_wide = 0usize;
+        for gemm in KINDS {
+            for arch in ARCHES {
+                for explicit in EXPLICIT {
+                    for host in [false, true] {
+                        for &(slots, experts) in &shapes {
+                            let got = selected(gemm, arch, explicit, host, slots, experts);
+                            assert_eq!(
+                                got,
+                                expected(gemm, arch, explicit, host, slots, experts),
+                                "{gemm:?} {arch} flag={explicit:?} host={host} slots={slots} \
+                                 experts={experts}"
+                            );
+                            checked += 1;
+                            if got && !host {
+                                // Resident NT8 is a gate/up-only outcome.
+                                assert_eq!(gemm, GateUp);
+                                resident_gate_up_wide += 1;
+                            }
+                            // The pair helper is the two kinds, in [gate/up, down] order.
+                            let flag = enabled(explicit, arch, PrefillRoute::MoeIu4WideTiles);
+                            let pair = qwen4_moe_sym_nt8_pair(arch, host, flag, slots, experts);
+                            assert_eq!(
+                                pair,
+                                [
+                                    expected(GateUp, arch, explicit, host, slots, experts),
+                                    expected(Down, arch, explicit, host, slots, experts),
+                                ]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            checked,
+            KINDS.len() * ARCHES.len() * EXPLICIT.len() * 2 * shapes.len()
+        );
+        assert!(resident_gate_up_wide > 0);
+    }
+
+    #[test]
+    fn resident_pair_is_mixed_gate_up_nt8_down_nt4_only_when_widened() {
+        // A3B at 4096 rows, flag on, resident: gate/up NT8, down NT4.
+        assert_eq!(
+            qwen4_moe_sym_nt8_pair("gfx1201", false, true, 4096 * 8, 256),
+            [true, false]
+        );
+        // Below the floor, or flag off: all NT4.
+        assert_eq!(
+            qwen4_moe_sym_nt8_pair("gfx1201", false, true, 512 * 8, 256),
+            [false, false]
+        );
+        assert_eq!(
+            qwen4_moe_sym_nt8_pair("gfx1201", false, false, 8192 * 8, 256),
+            [false, false]
+        );
+        // Host-mapped: NT8 for both, whatever the flag or shape.
+        for flag in [false, true] {
+            for slots in [0usize, 512 * 8, 8192 * 8] {
+                assert_eq!(
+                    qwen4_moe_sym_nt8_pair("gfx1201", true, flag, slots, 256),
+                    [true, true]
+                );
+            }
+        }
+        // gfx1151: NT4 only.
+        assert_eq!(
+            qwen4_moe_sym_nt8_pair("gfx1151", false, true, 8192 * 8, 256),
+            [false, false]
+        );
+        assert_eq!(
+            qwen4_moe_sym_nt8_pair("gfx1151", true, true, 8192 * 8, 256),
+            [false, false]
+        );
+    }
+
+    #[test]
+    fn resident_down_is_always_nt4_whatever_the_flag_arch_or_shape() {
+        for arch in ARCHES {
+            for explicit in EXPLICIT {
+                for (slots, experts) in [
+                    (0usize, 0usize),
+                    (4096 * 8, 256),
+                    (8192 * 8, 256),
+                    (128, 1),
+                    (usize::MAX, 1),
+                    (usize::MAX, usize::MAX),
+                ] {
+                    assert!(
+                        !down(arch, explicit, false, slots, experts),
+                        "{arch} {explicit:?}"
+                    );
+                }
+            }
+        }
+        // Host-mapped down keeps the existing NT8 on gfx1201 only, under every flag value.
+        for explicit in EXPLICIT {
+            assert!(down("gfx1201", explicit, true, 0, 0));
+            assert!(down("gfx1201", explicit, true, 8192 * 8, 256));
+            assert!(!down("gfx1151", explicit, true, 8192 * 8, 256));
+        }
+    }
+
+    #[test]
+    fn a3b_rows_widen_only_gate_up_from_4096_with_the_flag_on_a_raw_arch() {
+        for (rows, wide) in [(512usize, false), (4096, true), (8192, true)] {
+            let slots = rows * 8;
+            assert_eq!(slots / 256 >= 128, wide, "rows {rows}");
+            for explicit in EXPLICIT {
+                assert_eq!(
+                    gate_up("gfx1201", explicit, false, slots, 256),
+                    wide && explicit != Some(false),
+                    "rows {rows} flag {explicit:?}"
+                );
+                // The resident pair is gate/up NT8 + down NT4 when widened; never down NT8.
+                assert!(!down("gfx1201", explicit, false, slots, 256), "rows {rows}");
+                // Host-mapped experts keep NT8 for both GEMMs at every shape and flag value.
+                assert!(gate_up("gfx1201", explicit, true, slots, 256));
+                assert!(down("gfx1201", explicit, true, slots, 256));
+            }
+        }
+    }
+
+    #[test]
+    fn threshold_is_exactly_128_slots_per_expert_and_zero_never_opts_in() {
+        for experts in [1usize, 2, 7, 256, 512, 4096] {
+            assert!(!qwen4_moe_sym_wide_shape(127 * experts, experts));
+            assert!(!qwen4_moe_sym_wide_shape(128 * experts - 1, experts));
+            assert!(qwen4_moe_sym_wide_shape(128 * experts, experts));
+            assert!(qwen4_moe_sym_wide_shape(129 * experts, experts));
+            // Unset resolves on (qualified at exact gfx1201); only an explicit 0 keeps NT4.
+            assert!(gate_up("gfx1201", None, false, 129 * experts, experts));
+            assert!(!gate_up("gfx1201", None, false, 127 * experts, experts));
+            assert!(!gate_up(
+                "gfx1201",
+                Some(false),
+                false,
+                129 * experts,
+                experts
+            ));
+            assert!(gate_up(
+                "gfx1201",
+                Some(true),
+                false,
+                128 * experts,
+                experts
+            ));
+            assert!(!gate_up(
+                "gfx1201",
+                Some(true),
+                false,
+                127 * experts,
+                experts
+            ));
+            assert!(!down("gfx1201", Some(true), false, 129 * experts, experts));
+        }
+    }
+
+    #[test]
+    fn zero_experts_and_overflow_fail_closed() {
+        for slots in [0usize, 1, 128, usize::MAX] {
+            assert!(!qwen4_moe_sym_wide_shape(slots, 0));
+            assert!(!gate_up("gfx1201", Some(true), false, slots, 0));
+        }
+        // 128 * n overflows: no slot count reaches it.
+        for experts in [usize::MAX, usize::MAX / 128 + 1, usize::MAX / 2] {
+            assert!(experts.checked_mul(128).is_none());
+            assert!(!qwen4_moe_sym_wide_shape(usize::MAX, experts));
+            assert!(!gate_up("gfx1201", Some(true), false, usize::MAX, experts));
+        }
+        // The largest non-overflowing floor still compares exactly.
+        let edge = usize::MAX / 128;
+        assert!(qwen4_moe_sym_wide_shape(edge * 128, edge));
+        assert!(!qwen4_moe_sym_wide_shape(edge * 128 - 1, edge));
+        // An overflowing slot product is 0, never a huge count.
+        assert_eq!(qwen4_moe_sym_total_slots(usize::MAX, 2), 0);
+        assert_eq!(qwen4_moe_sym_total_slots(2, usize::MAX), 0);
+        assert_eq!(qwen4_moe_sym_total_slots(4096, 8), 32768);
+        assert!(!gate_up(
+            "gfx1201",
+            Some(true),
+            false,
+            qwen4_moe_sym_total_slots(usize::MAX, 8),
+            1
+        ));
+        // Host-mapped still takes NT8 (existing behavior) for both GEMMs even then.
+        assert!(gate_up("gfx1201", None, true, 0, 0));
+        assert!(down("gfx1201", None, true, 0, 0));
+    }
+
+    #[test]
+    fn gate_up_and_down_count_the_same_real_slots_not_padded_rows() {
+        // gate/up: x_src_rows = tokens, x_row_div = top-k; down: x_src_rows = flat slots, div 1.
+        for (tokens, topk) in [
+            (512usize, 8usize),
+            (4096, 8),
+            (8192, 8),
+            (4096, 10),
+            (6554, 10),
+        ] {
+            let gate_up = qwen4_moe_sym_total_slots(tokens, topk);
+            let down = qwen4_moe_sym_total_slots(tokens * topk, 1);
+            assert_eq!(gate_up, down);
+            assert_eq!(gate_up, tokens * topk);
+        }
+        // Padding cannot move the shape: 256 experts x 15 pad slots would otherwise cross it.
+        let experts = 256;
+        let real = 4095 * 8; // 127.97 per expert
+        let padded = real + experts * 15;
+        assert!(!qwen4_moe_sym_wide_shape(real, experts));
+        assert!(qwen4_moe_sym_wide_shape(padded, experts));
+        assert!(!gate_up("gfx1201", Some(true), false, real, experts));
+    }
+
+    #[test]
+    fn qwen4_like_shapes_follow_the_same_rule() {
+        // 512 experts, top-10: 4096 rows is 80 slots/expert (below), 8192 is 160 (above), and the
+        // floor falls between 6553 (127.98) and 6554 (128.0).
+        for (rows, wide) in [
+            (512usize, false),
+            (4096, false),
+            (6553, false),
+            (6554, true),
+            (8192, true),
+        ] {
+            assert_eq!(
+                gate_up("gfx1201", Some(true), false, rows * 10, 512),
+                wide,
+                "rows {rows}"
+            );
+            assert_eq!(gate_up("gfx1201", None, false, rows * 10, 512), wide);
+            assert!(!gate_up("gfx1201", Some(false), false, rows * 10, 512));
+            assert!(gate_up("gfx1201", None, true, rows * 10, 512));
+            assert!(!down("gfx1201", Some(true), false, rows * 10, 512));
+            assert!(down("gfx1201", None, true, rows * 10, 512));
+        }
+    }
+
+    #[test]
+    fn gfx1151_and_every_non_raw_arch_never_select_nt8() {
+        for arch in ARCHES.into_iter().filter(|arch| *arch != "gfx1201") {
+            for explicit in EXPLICIT {
+                for host in [false, true] {
+                    for (slots, experts) in [(0usize, 0usize), (65536, 256), (usize::MAX, 1)] {
+                        assert!(!gate_up(arch, explicit, host, slots, experts), "{arch}");
+                        assert!(!down(arch, explicit, host, slots, experts), "{arch}");
+                    }
+                }
+            }
+        }
+        // gfx1151's two residency entries are the one NT4 name: whichever index a caller picked,
+        // the selector now always picks index 0, bytes unchanged.
+        assert_eq!(
+            QWEN4_MOE_SYM_PM_GATE_UP[0][0],
+            QWEN4_MOE_SYM_PM_GATE_UP[0][1]
+        );
+        assert_eq!(QWEN4_MOE_SYM_PM_DOWN[0][0], QWEN4_MOE_SYM_PM_DOWN[0][1]);
+        assert!(QWEN4_MOE_SYM_PM_GATE_UP[0][0].ends_with("_nt4"));
+        // The gfx1201 widths are NT4 resident, NT8 selected.
+        assert!(QWEN4_MOE_SYM_PM_GATE_UP[1][0].ends_with("_gfx1201_nt4"));
+        assert!(QWEN4_MOE_SYM_PM_GATE_UP[1][1].ends_with("_gfx1201_nt8"));
+        assert!(QWEN4_MOE_SYM_PM_DOWN[1][0].ends_with("_gfx1201_nt4"));
+        assert!(QWEN4_MOE_SYM_PM_DOWN[1][1].ends_with("_gfx1201_nt8"));
+    }
+}
 /// MQ3-I4 NT1 module (gfx1201 only), same 60-byte ABI as the MQ4 16-slot
 /// entries; the embedded image is `kernels::QWEN4_MOE_IU4_SYM_W3_PM_GFX1201`.
 /// No NT4/NT8 or host-mapped widths exist: the module's exports are the two
@@ -48772,22 +49517,45 @@ impl Gpu {
     }
 
     /// `[gate/up, down]` entry names the route's GEMM launchers run on this
-    /// device for experts in VRAM or (`host_mapped`) in host-mapped memory:
-    /// the builder entries, or the gfx1151 hipcc entries under
-    /// `HIPFIRE_QWEN4_MOE_SYM_PM=0`. The down entry carries the row repeat of
-    /// [`Gpu::qwen4_moe_sym_down_rr`]; the launcher's `m % (64 * rr)` check
-    /// is what keeps its grid covering every row. `None` off gfx1151/gfx1201.
-    pub fn qwen4_moe_sym_gemm_symbols(&self, host_mapped: bool) -> Option<[&'static str; 2]> {
+    /// device for experts in VRAM or (`host_mapped`) in host-mapped memory, and
+    /// a grouped call of `total_slots` real routed slots over `n_experts` table
+    /// entries: the builder entries, or the gfx1151 hipcc entries under
+    /// `HIPFIRE_QWEN4_MOE_SYM_PM=0`. `total_slots` is `x_src_rows * x_row_div`
+    /// of the launcher (gate/up: tokens x top-k; down: flat slots x 1), NOT the
+    /// padded grouped rows; `n_experts` is the pointer-table length. On gfx1201
+    /// host-mapped experts take NT8 for both GEMMs. VRAM-resident experts widen
+    /// only gate/up, and only when the wide-tile flag resolves on (`HIPFIRE_MOE_IU4_WIDE_TILES`,
+    /// unset on at exact gfx1201; `=0` kills) with
+    /// `total_slots / n_experts >= 128`; the resident down entry is always NT4,
+    /// so a widened resident call reports the mixed pair (gate/up NT8, down NT4)
+    /// ([`qwen4_moe_sym_nt8_pair`]). gfx1151 has one NT4
+    /// width and is unaffected by every argument but the arch. The down entry
+    /// carries the row repeat of [`Gpu::qwen4_moe_sym_down_rr`]; the launcher's
+    /// `m % (64 * rr)` check is what keeps its grid covering every row. `None`
+    /// off gfx1151/gfx1201.
+    pub fn qwen4_moe_sym_gemm_symbols(
+        &self,
+        host_mapped: bool,
+        total_slots: usize,
+        n_experts: usize,
+    ) -> Option<[&'static str; 2]> {
         let arch = self.qwen4_moe_sym_arch_index()?;
-        let h = host_mapped as usize;
+        let [gate_up_nt8, down_nt8] = qwen4_moe_sym_nt8_pair(
+            self.arch.as_str(),
+            host_mapped,
+            self.flags.moe_iu4_wide_tiles,
+            total_slots,
+            n_experts,
+        )
+        .map(usize::from);
         Some(
             if qwen4_moe_sym_native_selected(self.arch.as_str(), arch != 1 && *QWEN4_MOE_SYM_PM) {
                 let down = match self.qwen4_moe_sym_down_rr().unwrap_or(1) {
                     2 => QWEN4_MOE_SYM_PM_DOWN_GFX1151_RR[0],
                     4 => QWEN4_MOE_SYM_PM_DOWN_GFX1151_RR[1],
-                    _ => QWEN4_MOE_SYM_PM_DOWN[arch][h],
+                    _ => QWEN4_MOE_SYM_PM_DOWN[arch][down_nt8],
                 };
-                [QWEN4_MOE_SYM_PM_GATE_UP[arch][h], down]
+                [QWEN4_MOE_SYM_PM_GATE_UP[arch][gate_up_nt8], down]
             } else {
                 [QWEN4_MOE_SYM_GATE_UP, QWEN4_MOE_SYM_DOWN]
             },
@@ -49372,7 +50140,49 @@ impl Gpu {
     /// -> FWHT128 -> `block_i4_128` (C2) into the compact flat-slot down
     /// sidecar `[k/128, total_slots]`, row `sorted[p]`; padding rows emit
     /// nothing.
+    ///
+    /// Runs the exact PeaceMaker twin ([`Gpu::qwen4_moe_rotate128_i4_pm`]) when
+    /// [`Gpu::moe_rotate_i4_pm_selected`] holds (`HIPFIRE_MOE_ROTATE_I4_PM=1` on exact
+    /// gfx1201, the symmetric IU4 route requested, C2, a supported shape; off by default),
+    /// otherwise the HIP incumbent ([`Gpu::qwen4_moe_rotate128_i4_incumbent`]). Both write the
+    /// same bytes, so every caller migrates through this one method.
     pub fn qwen4_moe_rotate128_i4(
+        &mut self,
+        h: &GpuTensor,
+        sorted: &GpuTensor,
+        k: usize,
+        grouped_rows: usize,
+        total_slots: usize,
+    ) -> HipResult<crate::scratch::Int4MmqPrepared> {
+        if self.moe_rotate_i4_pm_selected(k, grouped_rows, total_slots) {
+            return self.qwen4_moe_rotate128_i4_pm(h, sorted, k, grouped_rows, total_slots);
+        }
+        self.qwen4_moe_rotate128_i4_incumbent(h, sorted, k, grouped_rows, total_slots)
+    }
+
+    /// Grow (when needed, invalidating retained bindings first) and reserve the down A4
+    /// sidecar `[k/128, total_slots]` of `block_i4_128` records, bumping its generation.
+    pub(crate) fn reserve_qwen4_moe_down_i4_sidecar(
+        &mut self,
+        k: usize,
+        total_slots: usize,
+    ) -> HipResult<crate::scratch::Int4MmqReservation> {
+        let needed = k / 128 * total_slots * 72;
+        if crate::scratch::scratch_will_grow(
+            self.scratch.qwen4_moe_down_i4_scratch_bytes,
+            self.scratch.qwen4_moe_down_i4_scratch.is_some(),
+            needed,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
+        self.scratch
+            .reserve_qwen4_moe_down_i4(&self.hip, k, total_slots)
+    }
+
+    /// The HIP incumbent of [`Gpu::qwen4_moe_rotate128_i4`] (`qwen4_moe_rotate128_i4` module,
+    /// grid `[k/128 * grouped_rows, 1, 1]`): never selects the PM twin. The control of the
+    /// byte oracle `moe_rotate_i4_pm_oracle`.
+    pub fn qwen4_moe_rotate128_i4_incumbent(
         &mut self,
         h: &GpuTensor,
         sorted: &GpuTensor,
@@ -49410,16 +50220,7 @@ impl Gpu {
             QWEN4_MOE_ROTATE128_I4,
         )?;
         let needed = k / 128 * total_slots * 72;
-        if crate::scratch::scratch_will_grow(
-            self.scratch.qwen4_moe_down_i4_scratch_bytes,
-            self.scratch.qwen4_moe_down_i4_scratch.is_some(),
-            needed,
-        ) {
-            self.invalidate_for_scratch_growth();
-        }
-        let reservation = self
-            .scratch
-            .reserve_qwen4_moe_down_i4(&self.hip, k, total_slots)?;
+        let reservation = self.reserve_qwen4_moe_down_i4_sidecar(k, total_slots)?;
         let hp = h.buf.as_ptr();
         let sp = sorted.buf.as_ptr();
         let xp = reservation.ptr();
@@ -49476,7 +50277,11 @@ impl Gpu {
     /// m/2]` BF16 bits of rt(silu(rt(g)) * rt(u)), padding rows +0, sentinel
     /// tiles untouched. `xq` is the [`Gpu::qwen4_moe_rotate256_i4`] handle of
     /// `x_src_rows` tokens; `x_row_div` = top-k. `host_mapped`: the experts
-    /// behind `ptrs` live in host-mapped memory (selects the entry width).
+    /// behind `ptrs` live in host-mapped memory (selects the NT8 entries on gfx1201; resident
+    /// experts take the gate/up NT8 entry only when the wide-tile flag resolves on
+    /// (`HIPFIRE_MOE_IU4_WIDE_TILES`, unset on at exact gfx1201) with
+    /// `x_src_rows * x_row_div` real slots >= 128 per expert-table entry, see
+    /// [`Gpu::qwen4_moe_sym_gemm_symbols`]).
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_qwen4_moe_gate_up_silu_iu4_sym(
         &mut self,
@@ -49523,7 +50328,8 @@ impl Gpu {
     /// Grouped IU4 down: `y` `[grouped_rows, m]` BF16 per grouped row (no
     /// residual, no combine), padding rows +0, sentinel tiles untouched.
     /// `xq` is the [`Gpu::qwen4_moe_rotate128_i4`] handle of `x_src_rows`
-    /// flat slots; `x_row_div` = 1. `host_mapped` as for gate/up.
+    /// flat slots; `x_row_div` = 1. `host_mapped` as for gate/up; resident down is always the NT4
+    /// entry (the wide-tile flag never widens it).
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_qwen4_moe_down_iu4_sym(
         &mut self,
@@ -50061,8 +50867,14 @@ impl Gpu {
         } else {
             1
         };
+        // Real routed slots and the expert-table length decide the resident gate/up tile width
+        // (down is NT4 resident) in the same pure predicate the reporting selector uses, so the
+        // launched symbol and `qwen4_moe_sym_gemm_symbols` cannot disagree.
+        let nev = moe_expert_table_len(ptrs);
+        let n_experts = usize::try_from(nev).unwrap_or(0);
+        let total_slots = qwen4_moe_sym_total_slots(dims[4], dims[2]);
         let func = self
-            .qwen4_moe_sym_gemm_symbols(host_mapped)
+            .qwen4_moe_sym_gemm_symbols(host_mapped, total_slots, n_experts)
             .map(|[gate_up, dn]| if down { dn } else { gate_up })
             .unwrap_or(what);
         if dims[0] % (64 * rr) != 0 {
@@ -50121,7 +50933,6 @@ impl Gpu {
         let tp = tiles.buf.as_ptr();
         let sp = sorted.buf.as_ptr();
         let yp = y.buf.as_ptr();
-        let nev = moe_expert_table_len(ptrs);
         let mut params = [
             &pp as *const _ as *mut c_void,
             &tp as *const _ as *mut c_void,

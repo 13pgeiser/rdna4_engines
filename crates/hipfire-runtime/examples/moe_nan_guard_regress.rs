@@ -3123,12 +3123,26 @@ fn pm_k1_case(cx: &mut Ctx) -> R<Outcome> {
 /// Grouped IU4 symmetric GEMMs (`gemm_qwen4_moe_gate_up_silu_iu4_sym`, `_down_iu4_sym`, PM images):
 /// OLD image (60-byte kernarg) vs the NEW production launcher (64-byte), same sidecar.
 fn pm_iu4_case(cx: &mut Ctx) -> R<Outcome> {
-    let Some([gate_sym, down_sym]) = cx.gpu.qwen4_moe_sym_gemm_symbols(false) else {
+    // The case's real shapes: `rows` tokens x top-K routed slots over the E-entry expert table.
+    // The old image is loaded once, so the production selector must name the same entries for every
+    // row count the case runs.
+    const PM_IU4_ROWS: [usize; 2] = [7, 33];
+    let symbols_for = |cx: &Ctx, rows: usize| cx.gpu.qwen4_moe_sym_gemm_symbols(false, rows * K, E);
+    let Some([gate_sym, down_sym]) = symbols_for(cx, PM_IU4_ROWS[0]) else {
         return Ok(Outcome::Skip(format!(
             "symmetric IU4 MoE route is gfx1151/gfx1201-only, device is {}",
             cx.arch
         )));
     };
+    for rows in PM_IU4_ROWS {
+        if symbols_for(cx, rows) != Some([gate_sym, down_sym]) {
+            return Err(format!(
+                "the production selector names different PM IU4 entries at rows={rows} than at \
+                 rows={}: the single old-image load would compare the wrong kernels",
+                PM_IU4_ROWS[0]
+            ));
+        }
+    }
     let mut rng = Rng::new(0x4E41_4E90);
     let mut results = Vec::new();
     let rel = format!("kernels/qwen4_moe_iu4_sym_pm_{}.hxaco", cx.arch);
@@ -3137,7 +3151,7 @@ fn pm_iu4_case(cx: &mut Ctx) -> R<Outcome> {
     let gate = build_experts_with(cx, &mut rng, mq4_gate_expert, gm, gk)?;
     let down = build_experts_with(cx, &mut rng, mq4_down_expert, dm, dk)?;
     let sentinel_bytes = |n: usize| vec![0xA5u8; n];
-    for &rows in &[7usize, 33] {
+    for rows in PM_IU4_ROWS {
         let topk = make_topk(&mut rng, rows, Spread::Skewed);
         let slots = topk.len();
         let lay = scatter_ref(&topk);

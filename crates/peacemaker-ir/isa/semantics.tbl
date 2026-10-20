@@ -110,6 +110,7 @@ v_cvt_f32_f16_e64	alu
 v_cvt_f32_u32_e32	alu
 v_cvt_i32_f32_e32	alu
 v_cvt_pk_f32_fp8_e32	alu
+v_cvt_pk_f32_fp8_e64	alu
 v_cvt_u32_f32_e32	alu
 v_div_fixup_f32	alu
 v_div_fmas_f32	alu

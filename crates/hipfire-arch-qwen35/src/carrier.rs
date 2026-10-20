@@ -661,7 +661,7 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
         .map(|s| s.to_string())
         .unwrap_or_else(|| hipfire_runtime::config::get().kv_adaptive.clone());
     let adaptive_req = parse_kv_adaptive(&kv_adaptive_spec)?;
-    let native_eligible = kv_mode::qwen35_native_eligible(
+    let auto_native = kv_mode::qwen35_native_auto_eligible(
         ctx.gpu.arch.as_str(),
         config.n_heads,
         config.n_kv_heads,
@@ -671,7 +671,7 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
         ctx.cask.sidecar.is_some(),
     );
     let policy =
-        kv_mode::qwen35_policy_for_native(&kv_mode::QWEN35_HFQ_POLICY, &mode_raw, native_eligible);
+        kv_mode::qwen35_policy_for_native(&kv_mode::QWEN35_HFQ_POLICY, &mode_raw, auto_native);
 
     let pair = kv_mode::resolve_kv_pair(
         &mode_raw,
@@ -812,10 +812,12 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
     }
 }
 
-/// Admission for native fp8-E4M3 / flat-bf16 KV on the Qwen dense route.
-/// Explicit native presets require exact gfx1201 H24/Hkv4/D256, single GPU,
-/// non-adaptive, no CASK eviction, and neutral V. Implicit auto instead selects
-/// Q8 when the same geometry/policy is ineligible.
+/// Admission for native fp8-E4M3 / flat-bf16 KV on the Qwen route. Authored
+/// native presets need `kv_mode::qwen35_native_supported` (exact gfx1201,
+/// single GPU, non-adaptive, no CASK eviction, and a mode-specific exact
+/// geometry: fp8 H24/Hkv4/D256 or H16/Hkv2/D256, bf16 H24/Hkv4/D256) plus
+/// neutral V. Implicit auto is gated separately by
+/// `kv_mode::qwen35_native_auto_eligible` and instead selects Q8.
 pub fn validate_native_kv_admission(
     mode: hipfire_runtime::kv_mode::KvMode,
     config: &Qwen35Config,
@@ -827,7 +829,8 @@ pub fn validate_native_kv_admission(
     if !matches!(mode, KvMode::Fp8 | KvMode::Bf16) {
         return Ok(());
     }
-    if !kv_mode::qwen35_native_eligible(
+    if let Some(why) = kv_mode::qwen35_native_refusal(
+        mode,
         ctx.gpu.arch.as_str(),
         config.n_heads,
         config.n_kv_heads,
@@ -836,10 +839,7 @@ pub fn validate_native_kv_admission(
         adaptive,
         ctx.cask.sidecar.is_some(),
     ) {
-        return Err(format!(
-            "kv_mode {mode:?} requires exact gfx1201 H24/Hkv4/D256, single GPU, no adaptive/CASK (got {}, H{}/Hkv{}/D{}); use --kv-mode q8",
-            ctx.gpu.arch, config.n_heads, config.n_kv_heads, config.head_dim
-        ));
+        return Err(why);
     }
     if authored_v {
         return Err(format!(

@@ -149,6 +149,49 @@ pub const GFX12_Q8_FA2_MAX_CTX: usize = 262_144;
 /// [`Gpu::gfx12_q8_fa2_prefill_admitted`]).
 pub const GFX12_QUERY16_MAX_CTX: usize = 32_768;
 
+/// Why an A3B PM prefill request keeps the incumbent attention route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaPrefillPmRefusal {
+    Disabled,
+    InventoryUnavailable,
+    Recording,
+    Capture,
+    KvFormat,
+    Shape,
+    Rows,
+    Context,
+}
+
+impl FaPrefillPmRefusal {
+    fn log_once(self) {
+        let index = match self {
+            Self::Disabled => return,
+            Self::InventoryUnavailable => 0,
+            Self::Recording => 1,
+            Self::Capture => 2,
+            Self::KvFormat => 3,
+            Self::Shape => 4,
+            Self::Rows => 5,
+            Self::Context => 6,
+        };
+        static REFUSALS: [std::sync::Once; 7] = [
+            std::sync::Once::new(),
+            std::sync::Once::new(),
+            std::sync::Once::new(),
+            std::sync::Once::new(),
+            std::sync::Once::new(),
+            std::sync::Once::new(),
+            std::sync::Once::new(),
+        ];
+        REFUSALS[index].call_once(|| {
+            eprintln!(
+                "[fa-prefill-pm] HIPFIRE_FA_PREFILL_PM enabled, refused: {self:?}; \
+                 keeping incumbent attention"
+            );
+        });
+    }
+}
+
 /// Output of a Q-resident attention launch: the f32 rows, or (A4 epilogue
 /// twin) the Q/gate rows, output-projection AWQ scales and A4 slab.
 #[derive(Clone, Copy)]
@@ -5642,6 +5685,91 @@ impl Gpu {
             && (64..=GFX12_Q8_FA2_MAX_CTX).contains(&max_ctx_len)
     }
 
+    /// Pure admission for the A3B PM route (`kv`: the cache codec the body would read, `None`
+    /// for any format no PM body serves). `flag` is the flag already resolved FOR THAT CODEC
+    /// (explicit value or the codec's own qualification on unset; see
+    /// [`Self::fa_prefill_pm_flag`]); raw inventory alone never establishes a default.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fa_prefill_pm_admission(
+        flag: bool,
+        arch: &str,
+        in_recording: bool,
+        in_capture: bool,
+        kv: Option<crate::fa_prefill_pm::FaPrefillKvCodec>,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        max_ctx_len: usize,
+    ) -> Result<(), FaPrefillPmRefusal> {
+        use crate::fa_prefill_pm::{HEADS, HEAD_DIM, KV_HEADS, MAX_CONTEXT, MAX_ROWS, MIN_ROWS};
+        use crate::prefill_route_capabilities::{raw_inventory, PrefillRoute};
+        use FaPrefillPmRefusal::*;
+        if !flag {
+            Err(Disabled)
+        } else if !raw_inventory(arch, PrefillRoute::FaPrefillPm) {
+            Err(InventoryUnavailable)
+        } else if in_recording {
+            Err(Recording)
+        } else if in_capture {
+            Err(Capture)
+        } else if kv.is_none() {
+            Err(KvFormat)
+        } else if (n_heads, n_kv_heads, head_dim) != (HEADS, KV_HEADS, HEAD_DIM) {
+            Err(Shape)
+        } else if !(MIN_ROWS..=MAX_ROWS).contains(&batch_size) {
+            Err(Rows)
+        } else if !(1..=MAX_CONTEXT).contains(&max_ctx_len) {
+            Err(Context)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The resolved `HIPFIRE_FA_PREFILL_PM` flag for a cache codec: native fp8-E4M3 KV follows
+    /// its own qualification on unset (off until fp8 receipts exist), every other codec the
+    /// Q8_0 resolution. An explicit 1/0 is the same for both.
+    pub fn fa_prefill_pm_flag(&self, kv: Option<crate::fa_prefill_pm::FaPrefillKvCodec>) -> bool {
+        match kv {
+            Some(crate::fa_prefill_pm::FaPrefillKvCodec::Fp8E4M3) => {
+                self.flags.fa_prefill_pm_fp8_kv
+            }
+            _ => self.flags.fa_prefill_pm,
+        }
+    }
+
+    /// Current-device admission, shared by the generic Q8 wrapper, dispatch,
+    /// and widened resident-MoE chunks. Enabled refusals log once per reason.
+    /// Callers must also exclude tree/window/independent attention layouts.
+    pub fn fa_prefill_pm_admitted(
+        &self,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        max_ctx_len: usize,
+        kv: Option<crate::fa_prefill_pm::FaPrefillKvCodec>,
+    ) -> bool {
+        match Self::fa_prefill_pm_admission(
+            self.fa_prefill_pm_flag(kv),
+            &self.arch,
+            self.replay.is_recording(),
+            self.graphs.capture_mode,
+            kv,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            batch_size,
+            max_ctx_len,
+        ) {
+            Ok(()) => true,
+            Err(reason) => {
+                reason.log_once();
+                false
+            }
+        }
+    }
+
     /// Whether [`Self::attention_q8_0_fa2_gqa_gfx1201`] can run inside a
     /// hipGraph capture: its module is already loaded (no JIT) and its f16 Q
     /// scratch already holds `batch_size` H24/D256 rows (no growth, which
@@ -5694,6 +5822,28 @@ impl Gpu {
         max_ctx_len: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // Independently qualified route; dense H24/KV4 and every refused
+        if self.fa_prefill_pm_admitted(
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            batch_size,
+            max_ctx_len,
+            Some(crate::fa_prefill_pm::FaPrefillKvCodec::Q8_0),
+        ) {
+            return self.attention_q8_0_fa_prefill_pm_gfx1201(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_ctx_len,
+                batch_size,
+            );
+        }
         // Opt-in wide Q8/Q8 ingress. Dispatch has already resolved flash-off,
         // loaded CK, explicit alternate variants, window/tree, and workload;
         // the single-slot launcher independently checks its arch/shape/size.
@@ -24686,6 +24836,110 @@ fn kv_slot_paged_symbol(func: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn fa_prefill_pm_admission_exhaustive_truth_table() {
+        use super::FaPrefillPmRefusal as Refusal;
+        use crate::fa_prefill_pm::MAX_CONTEXT;
+        use crate::prefill_route_capabilities::{enabled, PrefillRoute};
+        use crate::Gpu;
+        let arches = [
+            "gfx1201", "gfx1200", "gfx12010", "gfx1151", "gfx1100", "gfx942", "",
+        ];
+        let batches = [
+            0,
+            1,
+            63,
+            64,
+            65,
+            511,
+            512,
+            513,
+            4096,
+            8191,
+            8192,
+            8193,
+            usize::MAX,
+        ];
+        let contexts = [
+            0,
+            1,
+            63,
+            64,
+            32768,
+            MAX_CONTEXT,
+            MAX_CONTEXT + 1,
+            usize::MAX,
+        ];
+        use crate::fa_prefill_pm::FaPrefillKvCodec as Codec;
+        use crate::prefill_route_capabilities::enabled_fp8_kv;
+        for arch in arches {
+            for explicit in [None, Some(false), Some(true)] {
+                for kv in [None, Some(Codec::Q8_0), Some(Codec::Fp8E4M3)] {
+                    // The flag is resolved per codec: fp8 KV never inherits the Q8_0 default.
+                    let flag = match kv {
+                        Some(Codec::Fp8E4M3) => {
+                            enabled_fp8_kv(explicit, arch, PrefillRoute::FaPrefillPm)
+                        }
+                        _ => enabled(explicit, arch, PrefillRoute::FaPrefillPm),
+                    };
+                    let resolved = match kv {
+                        Some(Codec::Fp8E4M3) => explicit.unwrap_or(false),
+                        _ => explicit.unwrap_or(arch == "gfx1201"),
+                    };
+                    assert_eq!(flag, resolved, "{arch} {explicit:?} {kv:?}");
+                    // Every combination of recording, capture and independently
+                    // valid/invalid H, KV and D (including dense).
+                    for bits in 0u8..32 {
+                        let in_recording = bits & 1 != 0;
+                        let in_capture = bits & 2 != 0;
+                        let nh = if bits & 4 == 0 { 16 } else { 24 };
+                        let nkv = if bits & 8 == 0 { 2 } else { 4 };
+                        let hd = if bits & 16 == 0 { 256 } else { 128 };
+                        for rows in batches {
+                            for ctx in contexts {
+                                let expected = if !resolved {
+                                    Err(Refusal::Disabled)
+                                } else if arch != "gfx1201" {
+                                    Err(Refusal::InventoryUnavailable)
+                                } else if in_recording {
+                                    Err(Refusal::Recording)
+                                } else if in_capture {
+                                    Err(Refusal::Capture)
+                                } else if kv.is_none() {
+                                    Err(Refusal::KvFormat)
+                                } else if (nh, nkv, hd) != (16, 2, 256) {
+                                    Err(Refusal::Shape)
+                                } else if rows < 64 || rows > 8192 {
+                                    Err(Refusal::Rows)
+                                } else if ctx == 0 || ctx > 262_144 {
+                                    Err(Refusal::Context)
+                                } else {
+                                    Ok(())
+                                };
+                                assert_eq!(
+                                    Gpu::fa_prefill_pm_admission(
+                                        flag,
+                                        arch,
+                                        in_recording,
+                                        in_capture,
+                                        kv,
+                                        nh,
+                                        nkv,
+                                        hd,
+                                        rows,
+                                        ctx,
+                                    ),
+                                    expected,
+                                    "{arch} {explicit:?} {kv:?} bits={bits} rows={rows} ctx={ctx}",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn encoder_qtiled_tile_matches_the_kernel_carve_up() {

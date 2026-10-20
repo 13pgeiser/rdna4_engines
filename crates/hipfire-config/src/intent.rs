@@ -474,4 +474,82 @@ mod tests {
             "HIPFIRE_MOE_SYM_IU4"
         ));
     }
+
+    #[test]
+    fn moe_router_fused_prefill_is_an_uncurated_advanced_developer_key() {
+        let key = "developer.moe_router_fused_prefill";
+        assert_eq!(intent_of(key), Intent::Advanced);
+        for intent in Intent::ALL {
+            assert!(!intent.curated().contains(&key), "{intent:?}");
+        }
+        assert!(key_matches(key, "HIPFIRE_MOE_ROUTER_FUSED_PREFILL"));
+        assert!(key_matches(key, "moe_router_fused_prefill"));
+    }
+
+    #[test]
+    fn moe_router_topk_multirow_is_an_uncurated_advanced_developer_key_with_its_own_env_name() {
+        let key = "developer.moe_router_topk_multirow";
+        assert_eq!(intent_of(key), Intent::Advanced);
+        for intent in Intent::ALL {
+            assert!(!intent.curated().contains(&key), "{intent:?}");
+        }
+        assert!(key_matches(key, "HIPFIRE_MOE_ROUTER_TOPK_MULTIROW"));
+        assert!(key_matches(key, "moe_router_topk_multirow"));
+        assert!(!key_matches(key, "HIPFIRE_MOE_ROUTER_FUSED_PREFILL"));
+        assert!(!key_matches(
+            "developer.moe_router_fused_prefill",
+            "HIPFIRE_MOE_ROUTER_TOPK_MULTIROW"
+        ));
+    }
+
+    #[test]
+    fn moe_shared_prepared_iu4_is_an_uncurated_advanced_developer_key_with_its_own_env_name() {
+        // Default-on capability route (`0`/`false` kills it): not a curated row,
+        // never aliased to the other symmetric IU4 keys.
+        let key = "developer.moe_shared_prepared_iu4";
+        assert_eq!(intent_of(key), Intent::Advanced);
+        for intent in Intent::ALL {
+            assert!(!intent.curated().contains(&key), "{intent:?}");
+        }
+        assert!(key_matches(key, "HIPFIRE_MOE_SHARED_PREPARED_IU4"));
+        assert!(key_matches(key, "moe_shared_prepared_iu4"));
+        assert!(!key_matches("developer.moe_sym_iu4", "SHARED_PREPARED"));
+    }
+
+    #[test]
+    fn prefill_iu4_producer_fused_is_an_uncurated_advanced_developer_key() {
+        // Qualified capability route (exact-gfx1201 default resolved by rdna-compute, not a
+        // schema default).
+        let key = "developer.prefill_iu4_producer_fused";
+        assert_eq!(intent_of(key), Intent::Advanced);
+        for intent in Intent::ALL {
+            assert!(!intent.curated().contains(&key), "{intent:?}");
+        }
+        assert!(key_matches(key, "HIPFIRE_PREFILL_IU4_PRODUCER_FUSED"));
+        assert!(key_matches(key, "prefill_iu4_producer_fused"));
+    }
+
+    #[test]
+    fn prefill_iu4_c8_pm_is_an_uncurated_advanced_developer_key() {
+        // Raw-inventory-only capability route: opt-in, no schema default.
+        let key = "developer.prefill_iu4_c8_pm";
+        assert_eq!(intent_of(key), Intent::Advanced);
+        for intent in Intent::ALL {
+            assert!(!intent.curated().contains(&key), "{intent:?}");
+        }
+        assert!(key_matches(key, "HIPFIRE_PREFILL_IU4_C8_PM"));
+        assert!(key_matches(key, "prefill_iu4_c8_pm"));
+    }
+
+    #[test]
+    fn moe_shared_down_sigmoid_epi_is_an_uncurated_advanced_developer_key() {
+        // Default-off opt-in capability route (no qualified row, no schema default).
+        let key = "developer.moe_shared_down_sigmoid_epi";
+        assert_eq!(intent_of(key), Intent::Advanced);
+        for intent in Intent::ALL {
+            assert!(!intent.curated().contains(&key), "{intent:?}");
+        }
+        assert!(key_matches(key, "HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI"));
+        assert!(key_matches(key, "moe_shared_down_sigmoid_epi"));
+    }
 }

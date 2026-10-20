@@ -71,6 +71,37 @@ fn diagnostic_specialized_capture_requested() -> bool {
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
 }
 
+/// `HIPFIRE_MOE_ROUTER_FUSED_PREFILL` (`developer.moe_router_fused_prefill`, a
+/// typed boolean): the explicit value, read once. `true`/`1` runs the fused
+/// prefill router on any wave32 arch, `false`/`0` is the kill switch. Unset
+/// follows `prefill_route_capabilities` qualification of `arch`. Admission
+/// (top-k 8, expert count, wave32) stays `Gpu::moe_router_fused_prefill_admitted`.
+fn moe_router_fused_prefill_on(arch: &str) -> bool {
+    use rdna_compute::prefill_route_capabilities::{enabled, PrefillRoute};
+    static EXPLICIT: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_typed_bool("HIPFIRE_MOE_ROUTER_FUSED_PREFILL")
+    });
+    enabled(*EXPLICIT, arch, PrefillRoute::MoeRouterFusedPrefill)
+}
+
+/// `HIPFIRE_MOE_ROUTER_TOPK_MULTIROW` (`developer.moe_router_topk_multirow`, a
+/// typed boolean): the explicit value, read once. Unset follows the
+/// exact-gfx1201 qualification (on there, off elsewhere); `false`/`0` kills it and
+/// `true`/`1` selects the two-row fused router wherever the raw capability
+/// inventory of `arch` is present.
+/// The caller still requires the fused-prefill route itself to be enabled and
+/// admitted (an explicit `HIPFIRE_MOE_ROUTER_FUSED_PREFILL=0` therefore keeps the
+/// incumbent router whatever this says), plus `Gpu::moe_router_topk_multirow_admitted`
+/// for the shape.
+fn moe_router_topk_multirow_on(arch: &str) -> bool {
+    use rdna_compute::prefill_route_capabilities::{enabled, raw_inventory, PrefillRoute};
+    static EXPLICIT: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_typed_bool("HIPFIRE_MOE_ROUTER_TOPK_MULTIROW")
+    });
+    enabled(*EXPLICIT, arch, PrefillRoute::MoeRouterTopkMultirow)
+        && raw_inventory(arch, PrefillRoute::MoeRouterTopkMultirow)
+}
+
 /// What a model adapter's eligible-forward boundary must do with the retained
 /// body on one forward.
 ///
@@ -2422,6 +2453,15 @@ pub(super) fn produce_prefill_route<'a>(
                 .route_policy
                 .map_or(0, |policy| policy.expert_keep_mask);
             if keep_mask != 0 {
+                // The masked kernel reads unrounded logits whenever the in-place
+                // round above was skipped (a grouped route), so the observer
+                // copy owes the same round: the exact complement of that skip.
+                #[cfg(feature = "moe-oracle")]
+                super::router_observer::record(
+                    "prefill-top10-masked",
+                    super::router_observer::RouterScoresAfterRoute::Logits,
+                    params.recipe.bf16_round_trip() && grouped,
+                );
                 gpu.moe_router_softmax_top10_masked_f32(
                     scores,
                     params.topk_indices,
@@ -2435,6 +2475,12 @@ pub(super) fn produce_prefill_route<'a>(
                 )
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
             } else if grouped {
+                #[cfg(feature = "moe-oracle")]
+                super::router_observer::record(
+                    "prefill-top10-grouped",
+                    super::router_observer::RouterScoresAfterRoute::Logits,
+                    params.recipe.bf16_round_trip(),
+                );
                 gpu.moe_router_softmax_top10_f32(
                     scores,
                     params.topk_indices,
@@ -2448,6 +2494,12 @@ pub(super) fn produce_prefill_route<'a>(
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
             } else {
                 let result = if params.k_top == 10 {
+                    #[cfg(feature = "moe-oracle")]
+                    super::router_observer::record(
+                        "prefill-guard-softmax-top10",
+                        super::router_observer::RouterScoresAfterRoute::Probabilities,
+                        false,
+                    );
                     // Pre-softmax guard: records any NaN/Inf logit row and poisons it
                     // so the renorm below fails it closed (ids -1, weights 0).
                     gpu.moe_router_logits_guard_top10(
@@ -2470,7 +2522,57 @@ pub(super) fn produce_prefill_route<'a>(
                         router_layer,
                         row_base,
                     )
+                } else if Gpu::moe_router_fused_prefill_admitted(
+                    // Explicit `1`/`0` wins on any wave32 arch; unset follows
+                    // `prefill_route_capabilities` qualification.
+                    moe_router_fused_prefill_on(&gpu.arch),
+                    params.k_top,
+                    params.n_exp,
+                    gpu.arch_caps.is_wave32(),
+                ) {
+                    // Not grouped: the logits were rounded in place above.
+                    #[cfg(feature = "moe-oracle")]
+                    super::router_observer::record(
+                        "prefill-fused-softmax-topk-k8",
+                        super::router_observer::RouterScoresAfterRoute::Logits,
+                        false,
+                    );
+                    // Two-row launch (unset on at exact gfx1201 by qualification), nested under
+                    // the fused route's own flag and admission: top-8, 256 experts, wave32, even
+                    // batch.
+                    if Gpu::moe_router_topk_multirow_admitted(
+                        moe_router_topk_multirow_on(&gpu.arch),
+                        params.k_top,
+                        params.n_exp,
+                        params.batch_size,
+                        gpu.arch_caps.is_wave32(),
+                    ) {
+                        gpu.moe_router_softmax_topk_k8_multirow_prefill(
+                            scores,
+                            params.topk_indices,
+                            params.topk_weights,
+                            params.n_exp,
+                            normalize,
+                            params.batch_size,
+                        )
+                    } else {
+                        gpu.moe_router_softmax_topk_k8_prefill(
+                            scores,
+                            params.topk_indices,
+                            params.topk_weights,
+                            params.n_exp,
+                            normalize,
+                            params.batch_size,
+                            Gpu::MOE_ROUTER_FUSED_PREFILL_LANES,
+                        )
+                    }
                 } else {
+                    #[cfg(feature = "moe-oracle")]
+                    super::router_observer::record(
+                        "prefill-softmax-topk-k8",
+                        super::router_observer::RouterScoresAfterRoute::Probabilities,
+                        false,
+                    );
                     gpu.softmax_f32(scores)
                         .map_err(|e| DispatchError::Hip(e.to_string()))?;
                     gpu.moe_topk_renorm_k8_batched(
@@ -2493,6 +2595,12 @@ pub(super) fn produce_prefill_route<'a>(
         MoeRouterInput::SigmoidTopK | MoeRouterInput::PrecomputedSigmoidTopK => {
             #[cfg(feature = "deltanet")]
             {
+                #[cfg(feature = "moe-oracle")]
+                super::router_observer::record(
+                    "prefill-sigmoid-topk-k8",
+                    super::router_observer::RouterScoresAfterRoute::Sigmoid,
+                    false,
+                );
                 gpu.sigmoid_f32(scores)
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
                 gpu.moe_topk_renorm_k8_batched(

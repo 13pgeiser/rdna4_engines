@@ -117,6 +117,19 @@ impl Int4MmqPrepared {
         Ok(self.ptr)
     }
 
+    /// Seal the CURRENT live `int4_mmq_x_scratch` (generation + pointer from
+    /// [`ScratchState::int4_mmq_live`]) after a successful standalone
+    /// `ensure_int4_mmq_x` quantize. Host only; crate-private so external
+    /// callers cannot forge a handle.
+    pub(crate) fn from_live(generation: u64, ptr: *mut c_void, k: usize, n: usize) -> Self {
+        Self {
+            ptr,
+            k,
+            n,
+            generation,
+        }
+    }
+
     #[inline]
     pub fn k(&self) -> usize {
         self.k
@@ -3736,6 +3749,26 @@ mod route_load_tests {
                 .admit_unplanned("gemv_mq2g256v2", "gemv_mq2g256v2")
                 .is_ok());
         }
+    }
+}
+
+#[cfg(test)]
+mod int4_mmq_from_live_tests {
+    use super::*;
+
+    #[test]
+    fn from_live_token_is_fail_closed() {
+        let ptr = 0x1000usize as *mut c_void;
+        let other = 0x2000usize as *mut c_void;
+        let token = Int4MmqPrepared::from_live(7, ptr, 2048, 128);
+        assert_eq!(token.checked_ptr(7, ptr, 2048, 128).unwrap(), ptr);
+        assert!(token.checked_ptr(8, ptr, 2048, 128).is_err());
+        assert!(token.checked_ptr(7, other, 2048, 128).is_err());
+        assert!(token
+            .checked_ptr(7, std::ptr::null_mut(), 2048, 128)
+            .is_err());
+        assert!(token.checked_ptr(7, ptr, 1024, 128).is_err());
+        assert!(token.checked_ptr(7, ptr, 2048, 64).is_err());
     }
 }
 

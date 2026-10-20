@@ -28,18 +28,23 @@
 // `qwen35_fa_prep_fp8q_nogate_batched_gfx1201` leaves unconsumed, instead of
 // a compact `[N x K]` gate copy: the same f32 values, so identical bytes.
 //
-// Bit-exactness: the FWHT body is a verbatim copy of `mq_rotate_x` /
-// `rotate_x_mq_awq` (same grid, same multiply order, same butterfly, same
-// scale). The sidecar reuses `emit_iu4_sidecar_from_producer8` from the
-// shared recipe (prepended by the host JIT with
-// `HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE=1`, same as the C2 producers):
-// f32 store→load is lossless, so the registers hold exactly what the
-// standalone quantizer would reload, the lane remap delivers the same
-// `xv[4]` per lane, and the shared `quantize_block_i4_128_wave` (amax →
-// 8-candidate strict-`<` MSE → rintf/clamp → exact int sum) yields
-// identical Xq bytes. Lane ownership matches because both this kernel and
-// the C2 producers hold 8 consecutive values per lane
+// Bit-exactness of the f32 path: the FWHT body is a verbatim copy of
+// `mq_rotate_x` / `rotate_x_mq_awq` (same grid, same multiply order, same
+// butterfly, same scale), and f32 store→load is lossless, so the registers
+// hold exactly what the standalone quantizer would reload. Lane ownership
+// matches the C2 producers because both hold 8 consecutive values per lane
 // (`d0 = tid * 8`, `base = group * 256 + d0`).
+//
+// The sidecar goes through `emit_iu4_sidecar_from_producer8` from the shared
+// recipe (prepended by the host JIT with
+// `HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE=1`). Its Xq bytes depend on the
+// candidate policy: the compiled emit (legacy; `cand_mode` 0) uses the build's
+// `IU4_A4_CANDIDATES` (gfx12 C2 {5,7}), so it matches the C2 producers but is
+// NOT in general byte-identical to the standalone quantizer. Only the
+// `cand_mode == 8` exact path (`emit_iu4_sidecar_from_producer8<true>`: the
+// same lane remap, then `quantize_block_i4_128_wave<false>`, the 8-candidate
+// strict-`<` MSE → rintf/clamp → exact int sum) matches the standalone
+// quantizer's bytes.
 
 #ifdef HIPFIRE_ROTATE_KERNEL
 /* caller (host JIT concat) already named the symbol */
@@ -64,6 +69,9 @@ extern "C" __global__ void HIPFIRE_ROTATE_KERNEL(
     block_i4_128* __restrict__ x_i4,       // [K/128, N] block_i4_128
     int K,
     int N
+#ifdef HIPFIRE_IU4_RUNTIME_CAND
+    , int cand_mode                        // 0: compiled emit (legacy); 8: exact reference8
+#endif
 ) {
     const int tid = threadIdx.x;
     const int groups_total = K / 256;
@@ -195,6 +203,21 @@ extern "C" __global__ void HIPFIRE_ROTATE_KERNEL(
         x_out_b[base + 7] = f7;
     }
 
+#ifdef HIPFIRE_IU4_RUNTIME_CAND
+    // -DHIPFIRE_IU4_RUNTIME_CAND=1 (only the two gfx12 `mq_rotate_x_i4_gfx12`
+    // / `rotate_x_mq_awq_i4_gfx12` host concats) appends a trailing
+    // `int cand_mode` kernel argument (wave-uniform). 8 selects the
+    // standalone-quantizer reference through the shared
+    // `emit_iu4_sidecar_from_producer8<true>` (same f0..f7 remap, then
+    // `quantize_block_i4_128_wave<false>`); any other value runs the compiled
+    // emit below, unchanged. The FWHT/f32 body above is identical in both modes.
+    if (cand_mode == 8) {
+        emit_iu4_sidecar_from_producer8<true>(
+            f0, f1, f2, f3, f4, f5, f6, f7,
+            x_i4, group, batch, N, tid);
+        return;
+    }
+#endif
     // IU4 sidecar: remap this wave's 8-floats/lane into the standalone
     // quant ownership and emit two block_i4_128 rows for this 256-group.
     // token = batch; N is the batch extent for the [K/128, N] layout.

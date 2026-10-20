@@ -4069,6 +4069,10 @@ impl Gpu {
     /// loader's reciprocal planes (`_v2_slab_fdiv`, one extra `awq_rcp`
     /// argument) when `awq` carries them ([`awq_has_rcp_planes`]) and
     /// `HIPFIRE_A4_RMS_FDIV` is on.
+    /// The sidecar uses the compiled candidate policy (gfx1201 C2 {5,7}); it is
+    /// NOT in general byte-identical to the standalone `quantize_int4_mmq_ds128`
+    /// (8-candidate) chain. The `_exact_batched` twin selects that reference
+    /// at runtime.
     pub fn fused_rmsnorm_rotate_mq_i4_gfx12_batched(
         &mut self,
         x: &GpuTensor,
@@ -4080,6 +4084,66 @@ impl Gpu {
         eps: f32,
         batch_size: usize,
     ) -> HipResult<crate::scratch::Int4MmqPrepared> {
+        self.fused_rmsnorm_rotate_mq_i4_gfx12_impl(
+            x,
+            weight,
+            awq,
+            x_rot,
+            reservation,
+            k,
+            eps,
+            batch_size,
+            false,
+        )
+    }
+
+    /// [`Self::fused_rmsnorm_rotate_mq_i4_gfx12_batched`] with the sidecar
+    /// emitted by the standalone-quantizer reference (runtime `cand_mode = 8`
+    /// on the existing non-`_v2` `fused_rmsnorm_mq_rotate_{,awq_}i4_gfx12`
+    /// exports: `quantize_block_i4_128_wave<false>`, 8-candidate search).
+    /// Always the non-`_v2` kernel regardless of `HIPFIRE_G12_NORM`, never
+    /// the slab/fdiv twins: the layout is the AoS `block_i4_128` and the
+    /// returned handle is not slab-marked. Same arguments.
+    pub fn fused_rmsnorm_rotate_mq_i4_gfx12_exact_batched(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        awq: Option<&GpuTensor>,
+        x_rot: Option<&GpuTensor>,
+        reservation: crate::scratch::Int4MmqReservation,
+        k: usize,
+        eps: f32,
+        batch_size: usize,
+    ) -> HipResult<crate::scratch::Int4MmqPrepared> {
+        self.fused_rmsnorm_rotate_mq_i4_gfx12_impl(
+            x,
+            weight,
+            awq,
+            x_rot,
+            reservation,
+            k,
+            eps,
+            batch_size,
+            true,
+        )
+    }
+
+    /// `exact`: forces the non-`_v2` export with trailing `cand_mode = 8`;
+    /// otherwise the existing v2/slab/fdiv selection, and the non-`_v2`
+    /// sources (`HIPFIRE_G12_NORM=0`) receive `cand_mode = 0`.
+    #[allow(clippy::too_many_arguments)]
+    fn fused_rmsnorm_rotate_mq_i4_gfx12_impl(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        awq: Option<&GpuTensor>,
+        x_rot: Option<&GpuTensor>,
+        reservation: crate::scratch::Int4MmqReservation,
+        k: usize,
+        eps: f32,
+        batch_size: usize,
+        exact: bool,
+    ) -> HipResult<crate::scratch::Int4MmqPrepared> {
         self.bind_thread()?;
         if reservation.k() != k || reservation.n() != batch_size {
             return Err(hip_bridge::HipError::new(
@@ -4087,8 +4151,34 @@ impl Gpu {
                 "fused_rmsnorm_rotate_mq_i4_gfx12_batched: reservation (k,n) mismatch",
             ));
         }
+        // Exact (reference8) producer only: `HIPFIRE_PREFILL_IU4_C8_PM` (opt-in, nested beneath
+        // the resolved F3 flag) swaps in the byte-identical PeaceMaker C8 twin when admitted;
+        // every other request runs the HIP export below unchanged.
+        if exact
+            && self.iu4_c8_pm_admitted(
+                true,
+                x,
+                Some(weight),
+                awq,
+                x_rot,
+                &reservation,
+                k,
+                batch_size,
+            )
+        {
+            return self.fused_rmsnorm_mq_rotate_i4_c8_pm(
+                x,
+                weight,
+                awq,
+                x_rot,
+                reservation,
+                k,
+                eps,
+                batch_size,
+            );
+        }
         self.ensure_mq_signs()?;
-        let v2 = self.flags.g12_norm_enabled();
+        let v2 = !exact && self.flags.g12_norm_enabled();
         let slab = awq.is_some() && v2 && self.a4_slab_active();
         let fdiv = slab
             && crate::gemm::a4_rms_fdiv_enabled()
@@ -4178,6 +4268,11 @@ impl Gpu {
                 &mut nv as *mut _ as *mut c_void,
             ]
         };
+        // Only the non-`_v2` sources carry the runtime-cand trailing argument.
+        let mut cand: i32 = if exact { 8 } else { 0 };
+        if !v2 {
+            params.push(&mut cand as *mut _ as *mut c_void);
+        }
         let block_size = 256u32;
         let shared_mem = if x_rot.is_some() {
             ((k + 256) * std::mem::size_of::<f32>()) as u32
@@ -4219,6 +4314,9 @@ impl Gpu {
                 b.push_i32(kv);
                 b.push_f32(eps_v);
                 b.push_i32(nv);
+                if !v2 {
+                    b.push_i32(cand);
+                }
                 b
             },
         );
@@ -4975,10 +5073,13 @@ impl Gpu {
     }
     /// gfx1201 slice-1 IU4 producer: SwiGLU/FWHT + in-register `block_i4_128`
     /// sidecar for the down-proj input. `x_rot = None` skips the f32 store
-    /// (emit_f32=false). `awq = Some` selects the AWQ twin symbol. Bit-identical
-    /// to the `fused_silu_mul_rotate_mq_*_batched` + standalone
-    /// `quantize_int4_mmq_ds128` chain: same producer arithmetic, same shared
-    /// wave quant recipe. Seals `reservation` into a prepared handle — never
+    /// (emit_f32=false). `awq = Some` selects the AWQ twin symbol. The legacy
+    /// path runs the compiled candidate policy (gfx1201 C2 {5,7}), so its
+    /// sidecar is NOT in general byte-identical to the `fused_silu_mul_rotate_mq_*_batched`
+    /// + standalone `quantize_int4_mmq_ds128` chain (8 candidates); the f32
+    /// producer arithmetic and shared wave quant recipe are the same. The
+    /// `_exact_batched` twin selects the 8-candidate reference at runtime.
+    /// Seals `reservation` into a prepared handle — never
     /// calls `ensure_int4_mmq_x`. Selected by `HIPFIRE_GFX12_SILU_QUANT_FUSED`
     /// (default on for exact-gfx1201 IU4; `=0` opts out).
     pub fn fused_silu_mul_rotate_mq_i4_gfx12_batched(
@@ -4990,6 +5091,57 @@ impl Gpu {
         reservation: crate::scratch::Int4MmqReservation,
         k: usize,
         batch_size: usize,
+    ) -> HipResult<crate::scratch::Int4MmqPrepared> {
+        self.fused_silu_mul_rotate_mq_i4_gfx12_impl(
+            gate,
+            up,
+            awq,
+            x_rot,
+            reservation,
+            k,
+            batch_size,
+            0,
+        )
+    }
+
+    /// [`Self::fused_silu_mul_rotate_mq_i4_gfx12_batched`] on the same
+    /// `_gfx12` kernel object with runtime `cand_mode = 8`: sidecar from the
+    /// standalone-quantizer reference (`quantize_block_i4_128_wave<false>`,
+    /// 8-candidate search). Same arguments, same f32/FWHT body.
+    pub fn fused_silu_mul_rotate_mq_i4_gfx12_exact_batched(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        awq: Option<&GpuTensor>,
+        x_rot: Option<&GpuTensor>,
+        reservation: crate::scratch::Int4MmqReservation,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<crate::scratch::Int4MmqPrepared> {
+        self.fused_silu_mul_rotate_mq_i4_gfx12_impl(
+            gate,
+            up,
+            awq,
+            x_rot,
+            reservation,
+            k,
+            batch_size,
+            8,
+        )
+    }
+
+    /// `cand_mode`: 0 = compiled emit (legacy), 8 = exact reference8.
+    #[allow(clippy::too_many_arguments)]
+    fn fused_silu_mul_rotate_mq_i4_gfx12_impl(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        awq: Option<&GpuTensor>,
+        x_rot: Option<&GpuTensor>,
+        reservation: crate::scratch::Int4MmqReservation,
+        k: usize,
+        batch_size: usize,
+        cand_mode: i32,
     ) -> HipResult<crate::scratch::Int4MmqPrepared> {
         self.bind_thread()?;
         if reservation.k() != k || reservation.n() != batch_size {
@@ -5026,6 +5178,7 @@ impl Gpu {
         let mut i4p = reservation.ptr();
         let mut kv = k as i32;
         let mut nv = batch_size as i32;
+        let mut cand = cand_mode;
         let mut params: Vec<*mut c_void> = if awq.is_some() {
             vec![
                 &mut gp as *mut _ as *mut c_void,
@@ -5037,6 +5190,7 @@ impl Gpu {
                 &mut i4p as *mut _ as *mut c_void,
                 &mut kv as *mut _ as *mut c_void,
                 &mut nv as *mut _ as *mut c_void,
+                &mut cand as *mut _ as *mut c_void,
             ]
         } else {
             vec![
@@ -5048,6 +5202,7 @@ impl Gpu {
                 &mut i4p as *mut _ as *mut c_void,
                 &mut kv as *mut _ as *mut c_void,
                 &mut nv as *mut _ as *mut c_void,
+                &mut cand as *mut _ as *mut c_void,
             ]
         };
         let blocks_k = k / 128;
@@ -5085,6 +5240,7 @@ impl Gpu {
                 b.push_ptr(i4p);
                 b.push_i32(kv);
                 b.push_i32(nv);
+                b.push_i32(cand);
                 b
             },
         );
@@ -6371,6 +6527,10 @@ impl Gpu {
     /// reader); the sidecar additionally seals `reservation` into a prepared
     /// handle — never calls `ensure_int4_mmq_x`. Gated by
     /// `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED`.
+    /// The sidecar uses the compiled candidate policy (gfx1201 C2 {5,7}); it is
+    /// NOT in general byte-identical to the standalone `quantize_int4_mmq_ds128`
+    /// (8-candidate) chain. The `_exact_batched` twin selects that reference
+    /// at runtime.
     pub fn rotate_x_mq_i4_gfx12_batched(
         &mut self,
         x_in: &GpuTensor,
@@ -6380,12 +6540,51 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<crate::scratch::Int4MmqPrepared> {
+        self.rotate_x_mq_i4_gfx12_impl(x_in, awq, x_out, reservation, k, batch_size, 0)
+    }
+
+    /// [`Self::rotate_x_mq_i4_gfx12_batched`] on the same `_gfx12` kernel
+    /// object with runtime `cand_mode = 8`: the sidecar is emitted by the
+    /// standalone-quantizer reference (`quantize_block_i4_128_wave<false>`,
+    /// 8-candidate search) instead of the compiled C2 emit. Same FWHT/f32
+    /// body, same arguments, same AoS `block_i4_128` layout.
+    pub fn rotate_x_mq_i4_gfx12_exact_batched(
+        &mut self,
+        x_in: &GpuTensor,
+        awq: Option<&GpuTensor>,
+        x_out: Option<&GpuTensor>,
+        reservation: crate::scratch::Int4MmqReservation,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<crate::scratch::Int4MmqPrepared> {
+        self.rotate_x_mq_i4_gfx12_impl(x_in, awq, x_out, reservation, k, batch_size, 8)
+    }
+
+    /// `cand_mode`: 0 = compiled emit (legacy), 8 = exact reference8; the
+    /// trailing kernel argument of the `HIPFIRE_IU4_RUNTIME_CAND` sources.
+    #[allow(clippy::too_many_arguments)]
+    fn rotate_x_mq_i4_gfx12_impl(
+        &mut self,
+        x_in: &GpuTensor,
+        awq: Option<&GpuTensor>,
+        x_out: Option<&GpuTensor>,
+        reservation: crate::scratch::Int4MmqReservation,
+        k: usize,
+        batch_size: usize,
+        cand_mode: i32,
+    ) -> HipResult<crate::scratch::Int4MmqPrepared> {
         self.bind_thread()?;
         if reservation.k() != k || reservation.n() != batch_size {
             return Err(hip_bridge::HipError::new(
                 0,
                 "rotate_x_mq_i4_gfx12_batched: reservation (k,n) mismatch",
             ));
+        }
+        // Exact (reference8) producer only: see `fused_rmsnorm_rotate_mq_i4_gfx12_impl`.
+        if cand_mode == 8
+            && self.iu4_c8_pm_admitted(false, x_in, None, awq, x_out, &reservation, k, batch_size)
+        {
+            return self.mq_rotate_x_i4_c8_pm(x_in, awq, x_out, reservation, k, batch_size);
         }
         self.ensure_mq_signs()?;
         let (module, source, kernel) = match awq {
@@ -6413,6 +6612,7 @@ impl Gpu {
         let mut i4p = reservation.ptr();
         let mut kv = k as i32;
         let mut nv = batch_size as i32;
+        let mut cand = cand_mode;
         let mut params: Vec<*mut c_void> = if awq.is_some() {
             vec![
                 &mut xp as *mut _ as *mut c_void,
@@ -6423,6 +6623,7 @@ impl Gpu {
                 &mut i4p as *mut _ as *mut c_void,
                 &mut kv as *mut _ as *mut c_void,
                 &mut nv as *mut _ as *mut c_void,
+                &mut cand as *mut _ as *mut c_void,
             ]
         } else {
             vec![
@@ -6433,6 +6634,7 @@ impl Gpu {
                 &mut i4p as *mut _ as *mut c_void,
                 &mut kv as *mut _ as *mut c_void,
                 &mut nv as *mut _ as *mut c_void,
+                &mut cand as *mut _ as *mut c_void,
             ]
         };
         let blocks_k = k / 128;
@@ -6465,6 +6667,7 @@ impl Gpu {
                 b.push_ptr(i4p);
                 b.push_i32(kv);
                 b.push_i32(nv);
+                b.push_i32(cand);
                 b
             },
         );
@@ -15734,7 +15937,8 @@ impl Gpu {
     /// Takes pre-softmaxed probs of shape `[batch_size × n_exp]` and writes
     /// `[batch_size × K_TOP]` indices and weights. Caller must run a batched
     /// softmax (`gpu.softmax_f32` on a [batch_size × n_exp] tensor) before
-    /// calling this kernel.
+    /// calling this kernel. Launches the shared kernel in mode 0
+    /// (`fuse_softmax = 0`, block 256).
     pub fn moe_topk_renorm_k8_batched(
         &mut self,
         probs: &GpuTensor,
@@ -15744,36 +15948,265 @@ impl Gpu {
         norm_topk: bool,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.launch_moe_topk_renorm_k8_batched(
+            probs, topk_idx, topk_w, n_exp, norm_topk, batch_size, false, 256, 1,
+        )
+    }
+
+    /// Production block size (lanes per workgroup) of the fused prefill
+    /// softmax+top-8 router. Callers pass this constant to
+    /// [`Self::moe_router_softmax_topk_k8_prefill`]; it is not an env knob.
+    /// 128 is the fastest admitted lane count measured on gfx1201 (A3B 256
+    /// experts: 118 us at 4096 rows vs 149 us at 256 lanes and 152 us for the
+    /// incumbent pair; all lane counts byte-identical, hold hga-oracles-run1).
+    pub const MOE_ROUTER_FUSED_PREFILL_LANES: usize = 128;
+
+    /// Pure validation of the fused prefill router block size. The fused
+    /// kernel strides every loop by `blockDim.x` and needs `blockDim.x >= 8`
+    /// (the final clamp/store uses lanes 0..8) and `<= 256` (the shared
+    /// reduction buffers); the launcher narrows that to the whole-wave
+    /// geometries 32/64/128/256.
+    pub fn moe_router_fused_prefill_lanes_admitted(lanes: usize) -> bool {
+        matches!(lanes, 32 | 64 | 128 | 256)
+    }
+
+    /// Pure admission rule for the fused prefill softmax+top-8 router
+    /// (`moe_router_softmax_topk_k8_prefill`): the flag is on (default ON,
+    /// `HIPFIRE_MOE_ROUTER_FUSED_PREFILL=0` kills it), the
+    /// route is top-8, the expert count is a power of two the exact-tree
+    /// emulation covers (128/256/512/1024; the incumbent softmax block is
+    /// `min(256, n_exp)` and the top-8 tree is fixed at 256 virtual threads,
+    /// and `MAX_NEXP` in the kernel is 1024), and the device is wave32. The
+    /// launch block size is validated separately by
+    /// [`Self::moe_router_fused_prefill_lanes_admitted`].
+    pub fn moe_router_fused_prefill_admitted(
+        enabled: bool,
+        k: usize,
+        n_exp: usize,
+        has_wave32: bool,
+    ) -> bool {
+        enabled && k == 8 && matches!(n_exp, 128 | 256 | 512 | 1024) && has_wave32
+    }
+
+    /// Fused prefill router: per-row softmax over raw `logits`
+    /// (`[batch_size × n_exp]`, left untouched) followed by top-8 + renorm,
+    /// in one launch of the shared `moe_topk_renorm_k8_batched` symbol in mode 1
+    /// (`fuse_softmax = 1`, block = `lanes`). Byte-identical to
+    /// `softmax_f32` + [`Self::moe_topk_renorm_k8_batched`]: the kernel emulates
+    /// the incumbent 256-thread reduction trees on `lanes` physical threads.
+    ///
+    /// `lanes` is launch geometry only (no kernel argument) and must satisfy
+    /// [`Self::moe_router_fused_prefill_lanes_admitted`] (32/64/128/256);
+    /// production passes [`Self::MOE_ROUTER_FUSED_PREFILL_LANES`]. Rejects
+    /// shapes/devices outside [`Self::moe_router_fused_prefill_admitted`]
+    /// (k = 8, wave32, n_exp ∈ {128, 256, 512, 1024}) and invalid `lanes`
+    /// before any launch. The env flag (default ON, kill switch `0`/`false`) is the caller's concern and is
+    /// deliberately not consulted here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_router_softmax_topk_k8_prefill(
+        &mut self,
+        logits: &GpuTensor,
+        topk_idx: &GpuTensor,
+        topk_w: &GpuTensor,
+        n_exp: usize,
+        norm_topk: bool,
+        batch_size: usize,
+        lanes: usize,
+    ) -> HipResult<()> {
+        if !Self::moe_router_fused_prefill_lanes_admitted(lanes) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "moe_router_softmax_topk_k8_prefill: lanes must be one of 32, 64, 128, 256",
+            ));
+        }
+        if !Self::moe_router_fused_prefill_admitted(true, 8, n_exp, self.arch_caps.is_wave32()) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "moe_router_softmax_topk_k8_prefill: requires a wave32 device and n_exp in {128, 256, 512, 1024}",
+            ));
+        }
+        self.launch_moe_topk_renorm_k8_batched(
+            logits, topk_idx, topk_w, n_exp, norm_topk, batch_size, true, lanes, 1,
+        )
+    }
+
+    /// Physical lanes per row of the two-row fused prefill router
+    /// ([`Self::moe_router_softmax_topk_k8_multirow_prefill`]): the same 128
+    /// lanes per row as [`Self::MOE_ROUTER_FUSED_PREFILL_LANES`], so every
+    /// virtual thread keeps its original lane assignment.
+    pub const MOE_ROUTER_TOPK_MULTIROW_LANES: usize = 128;
+
+    /// Rows per workgroup of the two-row fused prefill router
+    /// (`blockDim = (MOE_ROUTER_TOPK_MULTIROW_LANES, 2)`, 256 threads).
+    pub const MOE_ROUTER_TOPK_MULTIROW_ROWS: usize = 2;
+
+    /// Pure admission rule for the two-row fused prefill router
+    /// (`moe_router_softmax_topk_k8_multirow_prefill`): the route flag resolves on, the
+    /// route is top-8 over exactly 256 experts, the device is wave32, and the
+    /// batch is a positive even row count (every row slot of the last block is
+    /// then a real row, so no partial-block barrier hazard). Callers also
+    /// require the fused-prefill route to be enabled and admitted.
+    pub fn moe_router_topk_multirow_admitted(
+        enabled: bool,
+        k: usize,
+        n_exp: usize,
+        batch_size: usize,
+        has_wave32: bool,
+    ) -> bool {
+        enabled
+            && k == 8
+            && n_exp == 256
+            && has_wave32
+            && batch_size >= Self::MOE_ROUTER_TOPK_MULTIROW_ROWS
+            && batch_size.is_multiple_of(Self::MOE_ROUTER_TOPK_MULTIROW_ROWS)
+    }
+
+    /// Launch geometry `(grid, block, dynamic shared bytes)` of the two-row
+    /// route for an admitted `n_exp` / `batch_size`. The dynamic bytes hold the
+    /// second row slot's `smem_v[n_exp]`, `reduce_v[256]`, `reduce_i[256]`,
+    /// `picked_idx[8]`, `picked_w[8]` (4 * (n_exp + 528) = 3136 at 256 experts);
+    /// slot zero reuses the kernel's static arrays.
+    fn moe_router_topk_multirow_geometry(
+        n_exp: usize,
+        batch_size: usize,
+    ) -> ([u32; 3], [u32; 3], u32) {
+        (
+            [
+                (batch_size / Self::MOE_ROUTER_TOPK_MULTIROW_ROWS) as u32,
+                1,
+                1,
+            ],
+            [
+                Self::MOE_ROUTER_TOPK_MULTIROW_LANES as u32,
+                Self::MOE_ROUTER_TOPK_MULTIROW_ROWS as u32,
+                1,
+            ],
+            (4 * (n_exp + 2 * 256 + 2 * 8)) as u32,
+        )
+    }
+
+    /// Two-row fused prefill router: the same per-row softmax + top-8 +
+    /// renorm as [`Self::moe_router_softmax_topk_k8_prefill`], with two rows per
+    /// workgroup (128 lanes x 2 rows, one launch of the shared
+    /// `moe_topk_renorm_k8_batched` symbol with `rows_per_block = 2` and 3136
+    /// dynamic shared bytes). Each row keeps its original lane assignment,
+    /// virtual trees and operation order, so the output is byte-identical to
+    /// the one-row fused launch.
+    ///
+    /// Rejects shapes/devices outside
+    /// [`Self::moe_router_topk_multirow_admitted`] (top-8, 256 experts, wave32,
+    /// positive even `batch_size`) before any launch. The route flag
+    /// (`HIPFIRE_MOE_ROUTER_TOPK_MULTIROW`) is the caller's concern and is deliberately not consulted here.
+    pub fn moe_router_softmax_topk_k8_multirow_prefill(
+        &mut self,
+        logits: &GpuTensor,
+        topk_idx: &GpuTensor,
+        topk_w: &GpuTensor,
+        n_exp: usize,
+        norm_topk: bool,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if !Self::moe_router_topk_multirow_admitted(
+            true,
+            8,
+            n_exp,
+            batch_size,
+            self.arch_caps.is_wave32(),
+        ) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "moe_router_softmax_topk_k8_multirow_prefill: requires a wave32 device, n_exp = 256 and a positive even batch_size",
+            ));
+        }
+        self.launch_moe_topk_renorm_k8_batched(
+            logits,
+            topk_idx,
+            topk_w,
+            n_exp,
+            norm_topk,
+            batch_size,
+            true,
+            Self::MOE_ROUTER_TOPK_MULTIROW_LANES,
+            Self::MOE_ROUTER_TOPK_MULTIROW_ROWS,
+        )
+    }
+
+    /// Shared launcher for `moe_topk_renorm_k8_batched`. `lanes` is the block
+    /// x size (fused mode only) and `rows_per_block` the row slots per
+    /// workgroup (block y). Every existing caller passes `rows_per_block = 1`:
+    /// grid `batch_size`, block `[lanes | 256, 1, 1]`, no dynamic shared
+    /// memory. `rows_per_block = 2` (fused only, even `batch_size`, 256
+    /// experts) launches grid `batch_size / 2`, block `[lanes, 2, 1]` and the
+    /// dynamic shared bytes of [`Self::moe_router_topk_multirow_geometry`];
+    /// recorded launches carry that block and dynamic shared size. Kernarg ABI:
+    /// 3 pointers (offsets 0/8/16: input read, idx write, weights write) +
+    /// `n_exp`, `norm_topk`, `fuse_softmax`, `rows_per_block` (i32 at
+    /// 24/28/32/36) = 40 explicit bytes; recorded launches pad to 16 B (48).
+    #[allow(clippy::too_many_arguments)]
+    fn launch_moe_topk_renorm_k8_batched(
+        &mut self,
+        input: &GpuTensor,
+        topk_idx: &GpuTensor,
+        topk_w: &GpuTensor,
+        n_exp: usize,
+        norm_topk: bool,
+        batch_size: usize,
+        fuse_softmax: bool,
+        lanes: usize,
+        rows_per_block: usize,
+    ) -> HipResult<()> {
+        debug_assert!(rows_per_block == 1 || (fuse_softmax && rows_per_block == 2));
         self.bind_thread()?;
         self.ensure_kernel(
             "moe_topk_renorm_k8_batched",
             kernels::MOE_TOPK_RENORM_K8_BATCHED_SRC,
             "moe_topk_renorm_k8_batched",
         )?;
-        let lp = probs.buf.as_ptr();
+        let lp = input.buf.as_ptr();
         let ip = topk_idx.buf.as_ptr();
         let wp = topk_w.buf.as_ptr();
         let n = n_exp as i32;
         let nr = if norm_topk { 1i32 } else { 0i32 };
+        let fuse = if fuse_softmax { 1i32 } else { 0i32 };
+        let rows = rows_per_block as i32;
         let mut params: Vec<*mut c_void> = vec![
             &lp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
             &wp as *const _ as *mut c_void,
             &n as *const _ as *mut c_void,
             &nr as *const _ as *mut c_void,
+            &fuse as *const _ as *mut c_void,
+            &rows as *const _ as *mut c_void,
         ];
         let bytes = (n_exp * 4 + 8 * 8) * batch_size;
         let timer = crate::profile::begin_timer(
             &self.hip,
             "elementwise",
-            "moe_topk_renorm_k8_batched",
+            if rows_per_block > 1 {
+                "moe_router_softmax_topk_k8_multirow_prefill"
+            } else if fuse_softmax {
+                "moe_router_softmax_topk_k8_prefill"
+            } else {
+                "moe_topk_renorm_k8_batched"
+            },
             bytes,
         );
+        // Mode 0 keeps the original 256-thread block (`lanes` is ignored); mode 1
+        // runs `lanes` threads per row slot.
+        let (grid, block, shared_mem) = if rows_per_block > 1 {
+            Self::moe_router_topk_multirow_geometry(n_exp, batch_size)
+        } else {
+            (
+                [batch_size as u32, 1, 1],
+                [if fuse_softmax { lanes as u32 } else { 256u32 }, 1, 1],
+                0u32,
+            )
+        };
         let result = self.launch_maybe_blob(
             "moe_topk_renorm_k8_batched",
-            [batch_size as u32, 1, 1],
-            [256, 1, 1],
-            0,
+            grid,
+            block,
+            shared_mem,
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
@@ -15782,6 +16215,8 @@ impl Gpu {
                 b.push_ptr(wp);
                 b.push_i32(n);
                 b.push_i32(nr);
+                b.push_i32(fuse);
+                b.push_i32(rows);
                 b
             },
         );
@@ -15790,6 +16225,7 @@ impl Gpu {
         }
         result
     }
+
     /// Batched top-10 companion for sealed Qwen4 prefill.  Inputs are already
     /// softmaxed/sigmoid scores; route normalization is performed once here.
     /// A row without ten valid finite picks (NaN probabilities) fails closed as a
@@ -23572,3 +24008,215 @@ mod mq4v2_multirow_r2_x3_tests {
         gpu.free_tensor(x).expect("free x");
     }
 }
+
+#[cfg(test)]
+mod moe_router_fused_prefill_admission_tests {
+    use super::Gpu;
+
+    #[test]
+    fn admission_truth_table_over_flag_k_experts_and_wave32() {
+        let admitted_experts = [128usize, 256, 512, 1024];
+        let rejected_experts = [
+            0usize, 1, 2, 8, 64, 127, 129, 192, 255, 257, 384, 513, 640, 768, 1023, 1025, 2048,
+        ];
+        for enabled in [false, true] {
+            for k in [0usize, 1, 4, 7, 8, 9, 10, 16] {
+                for has_wave32 in [false, true] {
+                    for &n_exp in admitted_experts.iter().chain(rejected_experts.iter()) {
+                        let expect =
+                            enabled && k == 8 && has_wave32 && admitted_experts.contains(&n_exp);
+                        assert_eq!(
+                            Gpu::moe_router_fused_prefill_admitted(enabled, k, n_exp, has_wave32),
+                            expect,
+                            "enabled={enabled} k={k} n_exp={n_exp} wave32={has_wave32}"
+                        );
+                    }
+                }
+            }
+        }
+        // The only admitted combination for each supported expert count.
+        for &n_exp in &admitted_experts {
+            assert!(Gpu::moe_router_fused_prefill_admitted(true, 8, n_exp, true));
+        }
+    }
+
+    #[test]
+    fn lanes_admission_accepts_only_whole_wave_geometries() {
+        for lanes in [32usize, 64, 128, 256] {
+            assert!(
+                Gpu::moe_router_fused_prefill_lanes_admitted(lanes),
+                "lanes={lanes}"
+            );
+        }
+        for lanes in [
+            0usize,
+            1,
+            2,
+            4,
+            7,
+            8,
+            16,
+            31,
+            33,
+            63,
+            65,
+            127,
+            129,
+            255,
+            257,
+            512,
+            1024,
+            usize::MAX,
+        ] {
+            assert!(
+                !Gpu::moe_router_fused_prefill_lanes_admitted(lanes),
+                "lanes={lanes}"
+            );
+        }
+        assert!(Gpu::moe_router_fused_prefill_lanes_admitted(
+            Gpu::MOE_ROUTER_FUSED_PREFILL_LANES
+        ));
+        assert_eq!(Gpu::MOE_ROUTER_FUSED_PREFILL_LANES, 128);
+    }
+}
+
+#[cfg(test)]
+mod moe_router_topk_multirow_admission_tests {
+    use super::Gpu;
+
+    #[test]
+    fn admission_truth_table_over_opt_in_k_experts_batch_and_wave32() {
+        let batches = [
+            0usize,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            255,
+            256,
+            257,
+            4095,
+            4096,
+            4097,
+            8191,
+            8192,
+            usize::MAX,
+        ];
+        let experts = [0usize, 1, 8, 64, 128, 255, 256, 257, 384, 512, 1024, 2048];
+        for enabled in [false, true] {
+            for k in [0usize, 1, 4, 7, 8, 9, 10, 16] {
+                for has_wave32 in [false, true] {
+                    for n_exp in experts {
+                        for batch in batches {
+                            let expect = enabled
+                                && k == 8
+                                && has_wave32
+                                && n_exp == 256
+                                && batch >= 2
+                                && batch % 2 == 0;
+                            assert_eq!(
+                                Gpu::moe_router_topk_multirow_admitted(
+                                    enabled, k, n_exp, batch, has_wave32
+                                ),
+                                expect,
+                                "enabled={enabled} k={k} n_exp={n_exp} batch={batch} wave32={has_wave32}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_shapes_are_never_admitted() {
+        // The one admitted combination: flag on, top-8, 256 experts, wave32, even batch.
+        assert!(Gpu::moe_router_topk_multirow_admitted(
+            true, 8, 256, 2, true
+        ));
+        assert!(Gpu::moe_router_topk_multirow_admitted(
+            true, 8, 256, 4096, true
+        ));
+        // Odd, zero and single-row batches would leave a row slot without a row.
+        for batch in [0usize, 1, 3, 4095, 8191, usize::MAX] {
+            assert!(!Gpu::moe_router_topk_multirow_admitted(
+                true, 8, 256, batch, true
+            ));
+        }
+        // Other expert counts the one-row fused route admits stay on that route.
+        for n_exp in [128usize, 512, 1024] {
+            assert!(Gpu::moe_router_fused_prefill_admitted(true, 8, n_exp, true));
+            assert!(!Gpu::moe_router_topk_multirow_admitted(
+                true, 8, n_exp, 4096, true
+            ));
+        }
+        // Wave64 devices, the flag off, and non-top-8 routes never qualify.
+        assert!(!Gpu::moe_router_topk_multirow_admitted(
+            true, 8, 256, 4096, false
+        ));
+        assert!(!Gpu::moe_router_topk_multirow_admitted(
+            false, 8, 256, 4096, true
+        ));
+        for k in [0usize, 4, 9, 10] {
+            assert!(!Gpu::moe_router_topk_multirow_admitted(
+                true, k, 256, 4096, true
+            ));
+        }
+        // An admitted shape is always one the one-row fused route also admits.
+        for batch in [2usize, 4, 4096] {
+            assert!(Gpu::moe_router_fused_prefill_admitted(true, 8, 256, true));
+            assert!(Gpu::moe_router_topk_multirow_admitted(
+                true, 8, 256, batch, true
+            ));
+        }
+    }
+
+    #[test]
+    fn geometry_is_two_rows_of_128_lanes_with_3136_dynamic_bytes() {
+        assert_eq!(Gpu::MOE_ROUTER_TOPK_MULTIROW_LANES, 128);
+        assert_eq!(Gpu::MOE_ROUTER_TOPK_MULTIROW_ROWS, 2);
+        // Same lanes per row as the one-row fused route, and an admitted lane count.
+        assert_eq!(
+            Gpu::MOE_ROUTER_TOPK_MULTIROW_LANES,
+            Gpu::MOE_ROUTER_FUSED_PREFILL_LANES
+        );
+        assert!(Gpu::moe_router_fused_prefill_lanes_admitted(
+            Gpu::MOE_ROUTER_TOPK_MULTIROW_LANES
+        ));
+        for batch in [2usize, 4, 6, 256, 4096, 8192] {
+            assert!(Gpu::moe_router_topk_multirow_admitted(
+                true, 8, 256, batch, true
+            ));
+            let (grid, block, shared) = Gpu::moe_router_topk_multirow_geometry(256, batch);
+            assert_eq!(grid, [(batch / 2) as u32, 1, 1], "batch={batch}");
+            assert_eq!(block, [128, 2, 1], "batch={batch}");
+            assert_eq!(shared, 3136, "batch={batch}");
+            // Every row is covered exactly once: grid * rows_per_block == batch.
+            assert_eq!(grid[0] as usize * Gpu::MOE_ROUTER_TOPK_MULTIROW_ROWS, batch);
+            // 256 threads per block: the kernel's `__launch_bounds__(256, 2)`.
+            assert_eq!(block[0] * block[1] * block[2], 256);
+        }
+    }
+
+    #[test]
+    fn dynamic_bytes_hold_exactly_the_second_row_slot_and_total_13440() {
+        // Kernel static LDS (slot zero + mode-0 index array), in bytes:
+        // smem_v[1024] f32, smem_i[1024] i32, reduce_v[256] f32, reduce_i[256] i32,
+        // picked_idx[8] i32, picked_w[8] f32.
+        let static_bytes = 4 * (1024 + 1024 + 256 + 256 + 8 + 8);
+        assert_eq!(static_bytes, 10304);
+        // Slot one: smem_v[n_exp], reduce_v[256], reduce_i[256], picked_idx[8], picked_w[8].
+        let slot_bytes = 4 * (256 + 256 + 256 + 8 + 8);
+        let (_, _, shared) = Gpu::moe_router_topk_multirow_geometry(256, 4096);
+        assert_eq!(shared as usize, slot_bytes);
+        assert_eq!(static_bytes + shared as usize, 13440);
+        // Linear in n_exp (only the score row scales).
+        let (_, _, wide) = Gpu::moe_router_topk_multirow_geometry(1024, 4096);
+        assert_eq!(wide, shared + 4 * (1024 - 256));
+    }
+}
+

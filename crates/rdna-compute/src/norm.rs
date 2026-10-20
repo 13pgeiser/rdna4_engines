@@ -98,7 +98,7 @@ pub fn gdn_chunk_size() -> usize {
     cs.clamp(1, 32)
 }
 
-/// Storage of the GDN chunk-scan `out` plane (`[T][48][128]` elements, see
+/// Storage of the GDN chunk-scan `out` plane (`[T][n_value_heads][128]` elements, see
 /// [`Gpu::gdn_chunk_scan_segment`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GdnScanOut {
@@ -173,6 +173,26 @@ fn check_independent_lanes(op: &str, lanes: usize) -> HipResult<()> {
         return Err(hip_bridge::HipError::new(
             1,
             &format!("{op}: {lanes} independent lanes exceeds the 64-lane active_mask limit"),
+        ));
+    }
+    Ok(())
+}
+
+/// Pure predicate for the runtime Q/K head ratio of the sequential Q8 GDN
+/// kernels: the ratio must be positive and divide the value-head count.
+#[cfg(feature = "deltanet")]
+fn valid_gdn_qk_head_ratio(n_heads: usize, qk_head_ratio: usize) -> bool {
+    qk_head_ratio > 0 && n_heads % qk_head_ratio == 0
+}
+
+#[cfg(feature = "deltanet")]
+fn check_gdn_qk_head_ratio(op: &str, n_heads: usize, qk_head_ratio: usize) -> HipResult<()> {
+    if !valid_gdn_qk_head_ratio(n_heads, qk_head_ratio) {
+        return Err(hip_bridge::HipError::new(
+            1,
+            &format!(
+                "{op}: qk_head_ratio {qk_head_ratio} must be > 0 and divide n_heads {n_heads}"
+            ),
         ));
     }
     Ok(())
@@ -1642,12 +1662,89 @@ impl Gpu {
         // is no compaction (the common case) — it's a literal no-op offset then.
         pos_offset: i32,
     ) -> HipResult<()> {
+        self.rope_partial_halfsplit_capture_f32_batched(
+            Some(q),
+            k,
+            positions,
+            n_heads_q,
+            n_heads_k,
+            head_dim,
+            n_rot,
+            freq_base,
+            batch_size,
+            pos_offset,
+            None,
+        )
+    }
+
+    /// [`Self::rope_partial_interleaved_f32_batched`] with two generalizations that are
+    /// runtime arguments of the one halfsplit kernel (`rope_partial_halfsplit_batched_f32`),
+    /// both off for every other caller:
+    ///
+    /// * `q = None` is a K-only launch (requires `n_heads_q == 0`; the kernel then never
+    ///   reads or writes Q).
+    /// * `angles = Some(table)` additionally stores the exact `cosf`/`sinf` floats the rotation
+    ///   consumes, per row `[n_rot]` f32: `cos[0..n_rot/2]` then `sin[n_rot/2..n_rot]`
+    ///   (A3B F5 PM Q prep, `fa_qprep_pm`, rotates Q by this same table). K arithmetic is
+    ///   unchanged. Requires the non-legacy half-split kernel and `table` of at least
+    ///   `batch_size * n_rot * 4` bytes. The kernel always receives the table pointer
+    ///   explicitly (null when `None`).
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_partial_halfsplit_capture_f32_batched(
+        &mut self,
+        q: Option<&GpuTensor>,
+        k: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads_q: usize,
+        n_heads_k: usize,
+        head_dim: usize,
+        n_rot: usize,
+        freq_base: f32,
+        batch_size: usize,
+        pos_offset: i32,
+        angles: Option<&GpuTensor>,
+    ) -> HipResult<()> {
         self.bind_thread()?;
+        if q.is_none() && n_heads_q != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rope_partial_halfsplit_capture_f32_batched: a K-only launch (q = None) requires n_heads_q == 0",
+            ));
+        }
+        if let Some(table) = angles {
+            if self.flags.rope_interleaved_legacy {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "rope_partial_halfsplit_capture_f32_batched: angle capture requires the half-split kernel (HIPFIRE_ROPE_INTERLEAVED_LEGACY is set)",
+                ));
+            }
+            let need = batch_size
+                .checked_mul(n_rot)
+                .and_then(|n| n.checked_mul(4))
+                .ok_or_else(|| {
+                    hip_bridge::HipError::new(
+                        0,
+                        "rope_partial_halfsplit_capture_f32_batched: angle table extent overflow",
+                    )
+                })?;
+            if table.buf.size() < need {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "rope_partial_halfsplit_capture_f32_batched: angle table needs {need} bytes, has {}",
+                        table.buf.size()
+                    ),
+                ));
+            }
+        }
         if batch_size > GRID_Y_ROW_CHUNK {
             let (q_row, k_row) = (n_heads_q * head_dim * 4, n_heads_k * head_dim * 4);
             for (r0, rows) in grid_y_row_chunks(batch_size) {
-                self.rope_partial_interleaved_f32_batched(
-                    &rows_tensor(q, r0, rows, q_row),
+                let q_rows = q.map(|q| rows_tensor(q, r0, rows, q_row));
+                let angle_rows = angles.map(|t| rows_tensor(t, r0, rows, n_rot * 4));
+                self.rope_partial_halfsplit_capture_f32_batched(
+                    q_rows.as_ref(),
                     &rows_tensor(k, r0, rows, k_row),
                     &rows_tensor(positions, r0, rows, 4),
                     n_heads_q,
@@ -1657,6 +1754,7 @@ impl Gpu {
                     freq_base,
                     rows,
                     pos_offset,
+                    angle_rows.as_ref(),
                 )?;
             }
             return Ok(());
@@ -1681,7 +1779,8 @@ impl Gpu {
             )
         };
         self.ensure_kernel(cache_key, src, entry)?;
-        let mut qp = q.buf.as_ptr();
+        // K-only: the Q pointer is never dereferenced (n_heads_q == 0); alias K.
+        let mut qp = q.unwrap_or(k).buf.as_ptr();
         let mut kp = k.buf.as_ptr();
         let mut pp = positions.buf.as_ptr();
         let mut nhq = n_heads_q as i32;
@@ -1691,6 +1790,8 @@ impl Gpu {
         let mut fb = freq_base;
         let mut bs = batch_size as i32;
         let mut po = pos_offset;
+        // Explicit trailing kernarg of the half-split kernel: the angle table, or null.
+        let mut ap: *mut c_void = angles.map_or(std::ptr::null_mut(), |t| t.buf.as_ptr());
         let mut params: Vec<*mut c_void> = vec![
             &mut qp as *mut _ as *mut c_void,
             &mut kp as *mut _ as *mut c_void,
@@ -1703,6 +1804,9 @@ impl Gpu {
             &mut bs as *mut _ as *mut c_void,
             &mut po as *mut _ as *mut c_void,
         ];
+        if !legacy {
+            params.push(&mut ap as *mut _ as *mut c_void);
+        }
         let n_pairs = (n_rot / 2) as u32;
         let (grid_x, block, shared_bytes) = if legacy {
             let block = 32u32.min(n_pairs);
@@ -1730,6 +1834,9 @@ impl Gpu {
                 b.push_f32(fb);
                 b.push_i32(bs);
                 b.push_i32(po);
+                if !legacy {
+                    b.push_ptr(ap);
+                }
                 b
             },
         );
@@ -3357,6 +3464,7 @@ impl Gpu {
                 kernels::GATED_DELTA_NET_Q8_FAST_SRC,
                 "gated_delta_net_q8_fast",
             )?;
+            let qk_ratio = 1i32;
             let mut params: Vec<*mut c_void> = vec![
                 &qp as *const _ as *mut c_void,
                 &kp as *const _ as *mut c_void,
@@ -3371,6 +3479,7 @@ impl Gpu {
                 &hd as *const _ as *mut c_void,
                 &fr as *const _ as *mut c_void,
                 &efp as *const _ as *mut c_void,
+                &qk_ratio as *const _ as *mut c_void,
             ];
             let timer = crate::profile::begin_timer(
                 &self.hip,
@@ -3400,6 +3509,7 @@ impl Gpu {
                     b.push_i32(hd);
                     b.push_i32(fr);
                     b.push_ptr(efp);
+                    b.push_i32(qk_ratio);
                     b
                 },
             );
@@ -3414,6 +3524,7 @@ impl Gpu {
                 "gated_delta_net_q8",
             )?;
             let rpt = 1i32; // per_token is always true in this path
+            let qk_ratio = 1i32;
             let mut params: Vec<*mut c_void> = vec![
                 &qp as *const _ as *mut c_void,
                 &kp as *const _ as *mut c_void,
@@ -3429,6 +3540,7 @@ impl Gpu {
                 &fr as *const _ as *mut c_void,
                 &efp as *const _ as *mut c_void,
                 &rpt as *const _ as *mut c_void,
+                &qk_ratio as *const _ as *mut c_void,
             ];
             let timer =
                 crate::profile::begin_timer(&self.hip, "deltanet", "gated_delta_net_q8", bytes);
@@ -3455,6 +3567,7 @@ impl Gpu {
                     b.push_i32(fr);
                     b.push_ptr(efp);
                     b.push_i32(rpt);
+                    b.push_i32(qk_ratio);
                     b
                 },
             );
@@ -3680,6 +3793,56 @@ impl Gpu {
         // (and chunk-boundary) error — consistent with the per-token decode/replay.
         ef_residual: Option<&GpuTensor>,
     ) -> HipResult<()> {
+        self.gated_delta_net_q8_batch_seq_indexed(
+            q_batch,
+            k_batch,
+            v_batch,
+            gate_batch,
+            beta_batch,
+            s_q8,
+            s_scales,
+            output_batch,
+            n_tokens,
+            n_heads,
+            head_dim,
+            ef_residual,
+            1,
+        )
+    }
+
+    /// [`Self::gated_delta_net_q8_batch_seq`] with a runtime Q/K head ratio.
+    ///
+    /// `q_batch` / `k_batch` hold `n_heads / qk_head_ratio` heads per token
+    /// (`[N × (n_heads / qk_head_ratio) × head_dim]`); state head `h` reads Q/K
+    /// head `h / qk_head_ratio`, which is the mapping
+    /// `repeat_interleave_qk_f32_batched` materializes
+    /// (`kernels/src/repeat_interleave_qk_batched.hip`: `kh = (idx/head_dim)/ratio`).
+    /// V, gate, beta, output and state keep `n_heads`. `qk_head_ratio == 1` is
+    /// the canonical entry's launch (Q/K already expanded). Errors unless
+    /// `qk_head_ratio > 0` and divides `n_heads`.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_net_q8_batch_seq_indexed(
+        &mut self,
+        q_batch: &GpuTensor,
+        k_batch: &GpuTensor,
+        v_batch: &GpuTensor,
+        gate_batch: &GpuTensor,
+        beta_batch: &GpuTensor,
+        s_q8: &GpuTensor,
+        s_scales: &GpuTensor,
+        output_batch: &GpuTensor,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+        ef_residual: Option<&GpuTensor>,
+        qk_head_ratio: usize,
+    ) -> HipResult<()> {
+        check_gdn_qk_head_ratio(
+            "gated_delta_net_q8_batch_seq_indexed",
+            n_heads,
+            qk_head_ratio,
+        )?;
         self.bind_thread()?;
 
         let use_fast = !dn_requant_per_token();
@@ -3720,6 +3883,7 @@ impl Gpu {
             .map(|t| t.buf.as_ptr())
             .unwrap_or(std::ptr::null_mut());
         let mut rpt = dn_requant_per_token() as i32;
+        let mut qk_ratio = qk_head_ratio as i32;
         let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
         let timer = crate::profile::begin_timer(
             &self.hip,
@@ -3743,6 +3907,7 @@ impl Gpu {
                 &mut hd as *mut _ as *mut c_void,
                 &mut fr as *mut _ as *mut c_void,
                 &mut efp as *mut _ as *mut c_void,
+                &mut qk_ratio as *mut _ as *mut c_void,
             ];
             self.launch_maybe_blob(
                 kernel_name,
@@ -3765,6 +3930,7 @@ impl Gpu {
                     b.push_i32(hd);
                     b.push_i32(fr);
                     b.push_ptr(efp);
+                    b.push_i32(qk_ratio);
                     b
                 },
             )
@@ -3784,6 +3950,7 @@ impl Gpu {
                 &mut fr as *mut _ as *mut c_void,
                 &mut efp as *mut _ as *mut c_void,
                 &mut rpt as *mut _ as *mut c_void,
+                &mut qk_ratio as *mut _ as *mut c_void,
             ];
             self.launch_maybe_blob(
                 "gated_delta_net_q8",
@@ -3807,6 +3974,7 @@ impl Gpu {
                     b.push_i32(fr);
                     b.push_ptr(efp);
                     b.push_i32(rpt);
+                    b.push_i32(qk_ratio);
                     b
                 },
             )
@@ -3872,6 +4040,7 @@ impl Gpu {
             .map(|t| t.buf.as_ptr())
             .unwrap_or(std::ptr::null_mut());
         let mut rpt = dn_requant_per_token() as i32;
+        let mut qk_ratio = 1i32;
         let bytes = crate::profile::gated_delta_net_q8_bytes(1, n_heads, head_dim) * batch_size;
         let timer = crate::profile::begin_timer(
             &self.hip,
@@ -3894,6 +4063,7 @@ impl Gpu {
                 &mut hd as *mut _ as *mut c_void,
                 &mut fr as *mut _ as *mut c_void,
                 &mut efp as *mut _ as *mut c_void,
+                &mut qk_ratio as *mut _ as *mut c_void,
             ];
             self.launch_maybe_blob(
                 "gated_delta_net_q8_fast",
@@ -3916,6 +4086,7 @@ impl Gpu {
                     b.push_i32(hd);
                     b.push_i32(fr);
                     b.push_ptr(efp);
+                    b.push_i32(qk_ratio);
                     b
                 },
             )
@@ -3935,6 +4106,7 @@ impl Gpu {
                 &mut fr as *mut _ as *mut c_void,
                 &mut efp as *mut _ as *mut c_void,
                 &mut rpt as *mut _ as *mut c_void,
+                &mut qk_ratio as *mut _ as *mut c_void,
             ];
             self.launch_maybe_blob(
                 "gated_delta_net_q8",
@@ -3958,6 +4130,7 @@ impl Gpu {
                     b.push_i32(fr);
                     b.push_ptr(efp);
                     b.push_i32(rpt);
+                    b.push_i32(qk_ratio);
                     b
                 },
             )
@@ -5387,6 +5560,44 @@ impl Gpu {
         result
     }
 
+    /// Runtime head geometry of the gfx1201-source GDN chunk kernels (head dim
+    /// 128): key head `h` serves value heads `h * ratio..(h + 1) * ratio`, and
+    /// their per-head tables hold at most 48 value heads.
+    #[cfg(feature = "deltanet")]
+    fn gdn_chunk_check_heads(n_key_heads: usize, n_value_heads: usize) -> HipResult<()> {
+        if n_key_heads == 0
+            || n_value_heads == 0
+            || n_value_heads > 48
+            || n_value_heads % n_key_heads != 0
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "GDN chunk kernels: unsupported heads (key {n_key_heads}, value \
+                     {n_value_heads}); need 0 < key, 0 < value <= 48, value % key == 0"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The gfx11-specific chunk kernels (`gdn_chunk_prep_gfx11`,
+    /// `gdn_chunk_kkt_solve_gfx1100`, `gdn_chunk_scan_gfx1151`) keep the fixed
+    /// 16 key / 48 value head geometry and their original kernarg ABI.
+    #[cfg(feature = "deltanet")]
+    fn gdn_chunk_fixed_heads(n_key_heads: usize, n_value_heads: usize) -> HipResult<()> {
+        if (n_key_heads, n_value_heads) != (16, 48) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "GDN chunk: the gfx11-specific kernels support only 16 key / 48 value \
+                     heads, got {n_key_heads} / {n_value_heads}"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Row-major GDN preparation is exact on gfx11. Disable for A/B via
     /// `HIPFIRE_GDN_PREP_GFX11=0`.
     #[cfg(feature = "deltanet")]
@@ -5445,8 +5656,11 @@ impl Gpu {
         ef_residual: &GpuTensor,
         out: &GpuTensor,
         n_tokens: usize,
+        n_key_heads: usize,
+        n_value_heads: usize,
     ) -> HipResult<()> {
         const MODULE: &str = "gdn_chunk_scan_bf16_mseg";
+        Self::gdn_chunk_check_heads(n_key_heads, n_value_heads)?;
         self.bind_thread()?;
         self.ensure_kernel(MODULE, kernels::GDN_CHUNK_SCAN_BF16_MSEG_SRC, MODULE)?;
         // Same frame cadence as one reservation per segment launch.
@@ -5468,6 +5682,7 @@ impl Gpu {
         );
         let r0 = 0i32;
         let nt = n_tokens as i32;
+        let (hk, hv) = (n_key_heads as u32, n_value_heads as u32);
         let mut params: Vec<*mut c_void> = vec![
             &qp as *const _ as *mut c_void,
             &kp as *const _ as *mut c_void,
@@ -5481,14 +5696,18 @@ impl Gpu {
             &op as *const _ as *mut c_void,
             &r0 as *const _ as *mut c_void,
             &nt as *const _ as *mut c_void,
+            &hk as *const _ as *mut c_void,
+            &hv as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(MODULE, [1, 48, 1], [512, 1, 1], 0, &mut params, || {
+        self.launch_maybe_blob(MODULE, [1, hv, 1], [512, 1, 1], 0, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
             for p in [qp, kp, vp, ap, gp, bp, sqp, scp, efp, op] {
                 b.push_ptr(p);
             }
             b.push_i32(r0);
             b.push_i32(nt);
+            b.push_u32(hk);
+            b.push_u32(hv);
             b
         })
     }
@@ -5621,19 +5840,26 @@ impl Gpu {
         n_tokens: usize,
         q_scale: f32,
         eps: f32,
+        n_key_heads: usize,
+        n_value_heads: usize,
     ) -> HipResult<()> {
+        Self::gdn_chunk_check_heads(n_key_heads, n_value_heads)?;
         self.gdn_chunk_prep_module()?;
         let gfx11 = self.gdn_chunk_prep_gfx11();
+        if gfx11 {
+            Self::gdn_chunk_fixed_heads(n_key_heads, n_value_heads)?;
+        }
         let prep_module = if gfx11 {
             "gdn_chunk_prep_gfx11"
         } else {
             "gdn_chunk_prep"
         };
         let chunks = ((n_tokens + 63) / 64) as u32;
+        let units_y = (2 * n_key_heads + n_value_heads).div_ceil(8) as u32;
         let grid = if gfx11 {
             [10, chunks, 1]
         } else {
-            [chunks, 10, 1]
+            [chunks, units_y, 1]
         };
 
         let xp = input.buf.as_ptr();
@@ -5649,6 +5875,7 @@ impl Gpu {
         let nt = n_tokens as i32;
         let qs = q_scale;
         let ep = eps;
+        let (hk, hv) = (n_key_heads as u32, n_value_heads as u32);
         let mut params: Vec<*mut c_void> = vec![
             &xp as *const _ as *mut c_void,
             &wp as *const _ as *mut c_void,
@@ -5664,6 +5891,10 @@ impl Gpu {
             &qs as *const _ as *mut c_void,
             &ep as *const _ as *mut c_void,
         ];
+        if !gfx11 {
+            params.push(&hk as *const _ as *mut c_void);
+            params.push(&hv as *const _ as *mut c_void);
+        }
         self.launch_maybe_blob(prep_module, grid, [256, 1, 1], 0, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(xp);
@@ -5679,6 +5910,10 @@ impl Gpu {
             b.push_i32(nt);
             b.push_f32(qs);
             b.push_f32(ep);
+            if !gfx11 {
+                b.push_u32(hk);
+                b.push_u32(hv);
+            }
             b
         })
     }
@@ -5706,8 +5941,9 @@ impl Gpu {
     /// Completion pass after the F2 QKVZA+GDN GEMM (`gemm_mq4g256v2_fp8_qkvzagdn_row_b1`):
     /// same ABI as [`Self::gdn_chunk_prep`], where `input` holds only the raw rows
     /// that GEMM left (tile positions 0..2 / 125..127 and the last three tokens).
-    /// Grid `(max(ceil(T/64), ceil(T/128)), 11)`: row 0 owns the C64 gates, rows
-    /// 1..10 the 80 q/k/v units of every tile head and the persistent conv ring.
+    /// Grid `(max(ceil(T/64), ceil(T/128)), 1 + ceil((2 * n_key_heads + n_value_heads) / 8))`:
+    /// row 0 owns the C64 gates, the rest the q/k/v units of every tile head and the
+    /// persistent conv ring (27B: 16 key / 48 value heads, grid y 11).
     #[cfg(feature = "deltanet")]
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_chunk_prep_fixup(
@@ -5725,10 +5961,15 @@ impl Gpu {
         n_tokens: usize,
         q_scale: f32,
         eps: f32,
+        n_key_heads: usize,
+        n_value_heads: usize,
     ) -> HipResult<()> {
         const MODULE: &str = "gdn_chunk_prep_fixup";
+        Self::gdn_chunk_check_heads(n_key_heads, n_value_heads)?;
         self.gdn_chunk_prep_fixup_prepare()?;
         let grid_x = n_tokens.div_ceil(64).max(n_tokens.div_ceil(128)) as u32;
+        let grid_y = (1 + (2 * n_key_heads + n_value_heads).div_ceil(8)) as u32;
+        let (hk, hv) = (n_key_heads as u32, n_value_heads as u32);
         let ptrs = [
             input,
             conv_weight,
@@ -5749,22 +5990,33 @@ impl Gpu {
             &nt as *const _ as *mut c_void,
             &q_scale as *const _ as *mut c_void,
             &eps as *const _ as *mut c_void,
+            &hk as *const _ as *mut c_void,
+            &hv as *const _ as *mut c_void,
         ]);
-        self.launch_maybe_blob(MODULE, [grid_x, 11, 1], [256, 1, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            for p in ptrs {
-                b.push_ptr(p);
-            }
-            b.push_i32(nt);
-            b.push_f32(q_scale);
-            b.push_f32(eps);
-            b
-        })
+        self.launch_maybe_blob(
+            MODULE,
+            [grid_x, grid_y, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                for p in ptrs {
+                    b.push_ptr(p);
+                }
+                b.push_i32(nt);
+                b.push_f32(q_scale);
+                b.push_f32(eps);
+                b.push_u32(hk);
+                b.push_u32(hv);
+                b
+            },
+        )
     }
 
     /// [`Self::gdn_chunk_scan_segment`]'s KKT solve for every row of the layer
     /// chunk in one launch (`gdn_chunk_kkt_solve_batched`, row0 = 0, T =
-    /// `n_tokens`, grid [16 key heads, chunks]): chunk c's A block lands at
+    /// `n_tokens`, grid [n_key_heads, chunks]): chunk c's A block lands at
     /// row 64c of `a`, so the segment at `row0` (a multiple of 64) reads it
     /// from `a` offset by `row0` rows. Gated by
     /// [`Self::gdn_kkt_batched_enabled`]; each segment then runs with `kkt = false`.
@@ -5776,7 +6028,10 @@ impl Gpu {
         beta: &GpuTensor,
         a: &GpuTensor,
         n_tokens: usize,
+        n_key_heads: usize,
+        n_value_heads: usize,
     ) -> HipResult<()> {
+        Self::gdn_chunk_check_heads(n_key_heads, n_value_heads)?;
         self.bind_thread()?;
         const SYMBOL: &str = "gdn_chunk_kkt_solve_batched";
         self.ensure_kernel(SYMBOL, kernels::GDN_CHUNK_KKT_SOLVE_BATCHED_SRC, SYMBOL)?;
@@ -5786,6 +6041,7 @@ impl Gpu {
         let ap = a.buf.as_ptr();
         let r0 = 0i32;
         let nt = n_tokens as i32;
+        let (hk, hv) = (n_key_heads as u32, n_value_heads as u32);
         let mut params: Vec<*mut c_void> = vec![
             &kp as *const _ as *mut c_void,
             &gp as *const _ as *mut c_void,
@@ -5793,10 +6049,12 @@ impl Gpu {
             &ap as *const _ as *mut c_void,
             &r0 as *const _ as *mut c_void,
             &nt as *const _ as *mut c_void,
+            &hk as *const _ as *mut c_void,
+            &hv as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
             SYMBOL,
-            [16, n_tokens.div_ceil(64) as u32, 1],
+            [hk, n_tokens.div_ceil(64) as u32, 1],
             [128, 1, 1],
             0,
             &mut params,
@@ -5808,6 +6066,8 @@ impl Gpu {
                 b.push_ptr(ap);
                 b.push_i32(r0);
                 b.push_i32(nt);
+                b.push_u32(hk);
+                b.push_u32(hv);
                 b
             },
         )
@@ -5815,7 +6075,7 @@ impl Gpu {
 
     /// GDN KKT solve and fused scan for one legacy segment.
     /// All parent arrays remain unsliced; `row0` selects the segment and state
-    /// stays the single unsliced persistent owner. `out` is `[T][48][128]` in
+    /// stays the single unsliced persistent owner. `out` is `[T][n_value_heads][128]` in
     /// `out_fmt` elements (4 or 2 bytes). `kkt = false` skips the KKT launch
     /// when [`Self::gdn_chunk_kkt_solve_batched`] already wrote this segment's
     /// A blocks and `a` points at the segment's first row.
@@ -5837,28 +6097,34 @@ impl Gpu {
         row0: usize,
         n_tokens: usize,
         kkt: bool,
+        n_key_heads: usize,
+        n_value_heads: usize,
     ) -> HipResult<()> {
+        Self::gdn_chunk_check_heads(n_key_heads, n_value_heads)?;
         self.bind_thread()?;
-        let (kkt_module, kkt_source, kkt_symbol, kkt_rows, kkt_heads, kkt_block) =
-            if self.gdn_chunk_kkt_gfx1100() {
-                (
-                    "gdn_chunk_kkt_solve_gfx1100",
-                    kernels::GDN_CHUNK_KKT_SOLVE_GFX1100_SRC,
-                    "gdn_chunk_kkt_solve_gfx1100",
-                    64,
-                    48,
-                    128,
-                )
-            } else {
-                (
-                    "gdn_chunk_kkt_solve",
-                    kernels::GDN_CHUNK_KKT_SOLVE_SRC,
-                    "gdn_chunk_kkt_solve",
-                    64,
-                    16,
-                    128,
-                )
-            };
+        let kkt_gfx1100 = self.gdn_chunk_kkt_gfx1100();
+        let (kkt_module, kkt_source, kkt_symbol, kkt_rows, kkt_heads, kkt_block) = if kkt_gfx1100 {
+            (
+                "gdn_chunk_kkt_solve_gfx1100",
+                kernels::GDN_CHUNK_KKT_SOLVE_GFX1100_SRC,
+                "gdn_chunk_kkt_solve_gfx1100",
+                64,
+                48,
+                128,
+            )
+        } else {
+            (
+                "gdn_chunk_kkt_solve",
+                kernels::GDN_CHUNK_KKT_SOLVE_SRC,
+                "gdn_chunk_kkt_solve",
+                64,
+                n_key_heads as u32,
+                128,
+            )
+        };
+        if kkt && kkt_gfx1100 {
+            Self::gdn_chunk_fixed_heads(n_key_heads, n_value_heads)?;
+        }
         if kkt {
             self.ensure_kernel(kkt_module, kkt_source, kkt_symbol)?;
         }
@@ -5866,10 +6132,14 @@ impl Gpu {
         self.ensure_kernel(scan_module, scan_source, scan_module)?;
         // The gfx1151 twin runs one BV=64 value half of a head per 256-thread
         // workgroup; every other scan module runs both halves in 512 threads.
-        let (scan_grid, scan_block) = if scan_module == "gdn_chunk_scan_gfx1151" {
+        let gfx1151_twin = scan_module == "gdn_chunk_scan_gfx1151";
+        if gfx1151_twin {
+            Self::gdn_chunk_fixed_heads(n_key_heads, n_value_heads)?;
+        }
+        let (scan_grid, scan_block) = if gfx1151_twin {
             ([2, 48, 1], [256, 1, 1])
         } else {
-            ([1, 48, 1], [512, 1, 1])
+            ([1, n_value_heads as u32, 1], [512, 1, 1])
         };
 
         let kp = k.buf.as_ptr();
@@ -5878,6 +6148,7 @@ impl Gpu {
         let ap = a.buf.as_ptr();
         let r0 = row0 as i32;
         let nt = n_tokens as i32;
+        let (hk, hv) = (n_key_heads as u32, n_value_heads as u32);
         if kkt {
             let mut kkt_params: Vec<*mut c_void> = vec![
                 &kp as *const _ as *mut c_void,
@@ -5887,6 +6158,10 @@ impl Gpu {
                 &r0 as *const _ as *mut c_void,
                 &nt as *const _ as *mut c_void,
             ];
+            if !kkt_gfx1100 {
+                kkt_params.push(&hk as *const _ as *mut c_void);
+                kkt_params.push(&hv as *const _ as *mut c_void);
+            }
             self.launch_maybe_blob(
                 kkt_symbol,
                 [((n_tokens + kkt_rows - 1) / kkt_rows) as u32, kkt_heads, 1],
@@ -5901,6 +6176,10 @@ impl Gpu {
                     b.push_ptr(ap);
                     b.push_i32(r0);
                     b.push_i32(nt);
+                    if !kkt_gfx1100 {
+                        b.push_u32(hk);
+                        b.push_u32(hv);
+                    }
                     b
                 },
             )?;
@@ -5929,6 +6208,10 @@ impl Gpu {
             &r0 as *const _ as *mut c_void,
             &nt as *const _ as *mut c_void,
         ];
+        if !gfx1151_twin {
+            scan_params.push(&hk as *const _ as *mut c_void);
+            scan_params.push(&hv as *const _ as *mut c_void);
+        }
         self.launch_maybe_blob(
             scan_module,
             scan_grid,
@@ -5949,6 +6232,10 @@ impl Gpu {
                 b.push_ptr(op);
                 b.push_i32(r0);
                 b.push_i32(nt);
+                if !gfx1151_twin {
+                    b.push_u32(hk);
+                    b.push_u32(hv);
+                }
                 b
             },
         )
@@ -8013,5 +8300,29 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+}
+
+#[cfg(all(test, feature = "deltanet"))]
+mod gdn_qk_head_ratio_tests {
+    use super::{check_gdn_qk_head_ratio, valid_gdn_qk_head_ratio};
+
+    #[test]
+    fn ratio_must_be_positive_and_divide_heads() {
+        assert!(valid_gdn_qk_head_ratio(32, 1));
+        assert!(valid_gdn_qk_head_ratio(32, 2));
+        assert!(valid_gdn_qk_head_ratio(48, 3));
+        assert!(valid_gdn_qk_head_ratio(32, 32));
+        assert!(!valid_gdn_qk_head_ratio(32, 0));
+        assert!(!valid_gdn_qk_head_ratio(32, 3));
+        assert!(!valid_gdn_qk_head_ratio(32, 64));
+        assert!(!valid_gdn_qk_head_ratio(0, 0));
+    }
+
+    #[test]
+    fn check_reports_op_and_values() {
+        assert!(check_gdn_qk_head_ratio("op", 32, 2).is_ok());
+        assert!(check_gdn_qk_head_ratio("op", 32, 0).is_err());
+        assert!(check_gdn_qk_head_ratio("op", 30, 4).is_err());
     }
 }

@@ -31,6 +31,8 @@ deltanet = ["rdna-compute/deltanet"]
 # Lab examples (CPU microbenchmarks); off by default.
 lab = []
 flash-attn-ck = ["rdna-compute/flash-attn-ck"]
+# Developer-only observer channel for the `moe-oracle` report (router route label).
+moe-oracle = []
 
 [[example]]
 name = "d2_cpu_arm_bench"
