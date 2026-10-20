@@ -8,8 +8,10 @@
 //! A hybrid decoder interleaves gated-DeltaNet linear attention with gated
 //! full attention, each followed by a dense SwiGLU or MoE FFN. Architecture
 //! crates declare one operation per sublayer and bind their resident weights,
-//! recurrent state, KV storage and fixed scratch; every arch-, shape- and
-//! dtype-gated route choice lives here, once.
+//! recurrent state, KV storage and fixed scratch; the arch-, shape- and
+//! dtype-gated route choices of these sublayers live here, once. (MoE routing
+//! and the cross-layer MoE combine gate stay with the sealed MoE program and
+//! its caller.)
 //!
 //! The executor bodies are the former Qwen3.5 single-token decode super-op
 //! handlers moved verbatim, so every route issues the same launches in the
@@ -581,15 +583,15 @@ pub fn swiglu_down_residual(
         }
         dtype => {
             gpu.silu_mul_f32(gate, up, hidden).map_err(hip)?;
+            // Two taps, as the runtime twin's residual-then-GEMV fallback
+            // (`weight_gemv_residual` + `weight_gemv`) takes: calibration
+            // weighting must not depend on which decode path ran.
+            gpu.maybe_capture_activation(w_down.buf, hidden, 1, w_down.k);
             gpu.maybe_capture_activation(w_down.buf, hidden, 1, w_down.k);
             // Rotated formats (MQ8, G128, Givens, FP4, ...) keep their rotation
-            // and AWQ sidecar so `run_auto` rotates the input first.
-            let w = if dtype_needs_rotation(dtype) {
-                gpu.ensure_mq_signs().map_err(hip)?;
-                w_down
-            } else {
-                &wr
-            };
+            // and AWQ sidecar so `run_auto` rotates the input first; it also
+            // prepares that rotation's own sign tables and scratch.
+            let w = if dtype_needs_rotation(dtype) { w_down } else { &wr };
             let tmp = gpu.alloc_tensor(&[w_down.m], DType::F32).map_err(hip)?;
             let run = GEMV.run_auto(ctx, gpu, w, hidden, &tmp);
             let add = run.and_then(|_| gpu.add_inplace_f32(x, &tmp).map_err(hip));

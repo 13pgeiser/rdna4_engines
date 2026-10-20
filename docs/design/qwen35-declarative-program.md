@@ -47,17 +47,28 @@ handlers. Every gate exists once:
   admission uses it too).
 - `qkv/qkvza/gate_up_via_execute_steps` forward to `hybrid::normed_projection`.
 
-`lower_variant` and `Qwen35Bindings` stay for the EP decode executor and the
-exact VMM slot route. Their handlers delegate to the same hybrid stages, so
-each body exists once.
+`lower_variant` and `Qwen35Bindings` stay for the EP decode executor
+(`forward_ep`) and the exact VMM slot route. Their handlers delegate to the
+same hybrid stages, so each body exists once. Paths that keep their own
+bodies, all older than this port: the PP decode loop
+(`forward_scratch_layers_multi`), the dense TP partials, and the gfx1201
+exact-VMM row twins (`exact.rs`), which must change in lockstep with
+`DeltaNetMixerOp::prepare` and `GatedAttentionOp::attend`.
 
 Left for later slices: the hand arms (`HIPFIRE_FORWARD_LOWERED=0`, DFlash
 hidden-state capture, VL mrope, `memory.offload_exec=cpu` spills that own
 host CPU weights), batched prefill/verify executors, and the MTP head.
 `hipfire_runtime::llama::weight_gemv_swiglu_residual` still serves those
 hand arms and the other architectures. `hybrid::swiglu_down_residual` is
-its dispatch twin: its rotated-format arm runs `GemvFamily::run_auto`
-where the runtime runs `weight_gemv`.
+its dispatch twin: same kernels, the same calibration taps per token
+(one for MQ, two for HFQ, three for the plain-GEMV fallback). In the
+fallback arm, `GemvFamily::run_auto` prepares each rotation's own sign
+tables where the runtime's `weight_gemv` does it explicitly.
+
+The decode error text changed: the step program wraps a failing launch's
+error once, where the super-op executor wrapped it twice (`… (hipError=0)`
+instead of `… (hipError=0) (hipError=0)`). No caller classifies errors by
+that text.
 
 ## Gates
 

@@ -2365,24 +2365,21 @@ fn forward_scratch_layers(
     hidden_rb: Option<&mut HiddenStateRingBuffer>,
     mrope: Option<&MropeCtx>,
 ) -> HipResult<()> {
-    // #397 Ship 6 — forward-as-pipeline. When the lowered toggle is on (default
-    // on; `HIPFIRE_FORWARD_LOWERED=0` opts out), route single-GPU decode through
-    // the lowered super-op executor. Skipped when a hidden-state ring buffer is
-    // active (spec-decode capture engages only the hand path for now).
+    // Single-GPU decode runs the declarative layer program (`super::program`:
+    // hybrid `DeltaNetMixer`/`GatedAttention` + `SwigluFfn`/MoE Steps) unless
+    // `HIPFIRE_FORWARD_LOWERED=0` opts out. Skipped when a hidden-state ring
+    // buffer is active (spec-decode capture engages only the hand path for now).
     //
-    // Also skipped when a 3D mrope context is present: the lowered executor's
-    // ATTEND_FULL binding (`Qwen35Bindings::run_attend`) still issues the 1D
-    // `rope_partial_interleaved_f32` / `qwen35_fa_prep_gfx1100` pair and has no
-    // channel for the (t,h,w) buffer, so routing a VL request through it would
-    // silently reinstate sequential positions. VL therefore always takes the
-    // hand arms below, which DO branch on `mrope`.
+    // Also skipped when a 3D mrope context is present: `GatedAttentionOp::attend`
+    // issues the 1D `rope_partial_interleaved_f32` / `qwen35_fa_prep_gfx1100`
+    // pair and has no channel for the (t,h,w) buffer, so routing a VL request
+    // through it would silently reinstate sequential positions. VL therefore
+    // always takes the hand arms below, which DO branch on `mrope`.
     //
     // Also skipped when the model owns host CPU weights
-    // (`memory.offload_exec=cpu` over a spilled prefix): the lowered executor
-    // bypasses the `execute_steps` seam that routes host-mapped weights to the
-    // CPU splice and refuses them instead, while the hand arms below keep the
-    // splice. Device-resident and PCIe-spilled models report false here, so
-    // their lowered routing is unchanged.
+    // (`memory.offload_exec=cpu` over a spilled prefix): the hand arms below
+    // carry the certified CPU splice. Device-resident and PCIe-spilled models
+    // report false here, so their routing is unchanged.
     if forward_lowered_enabled()
         && hidden_rb.is_none()
         && mrope.is_none()
@@ -5732,11 +5729,11 @@ pub fn forward_prefill_dense_tp_with_hidden(
 // (`memory.offload_exec=cpu` over host-mapped weights) on the hand arms, whose
 // `execute_steps` seam routes to the CPU splice the lowered executor bypasses.
 //
-// The super-op handlers call the SAME helper fns the hand path uses
-// (`qkv/qkvza/gate_up_via_execute_steps`, `kv_cache_attention_dispatch`,
-// `moe_ffn_dispatch`, `weight_gemv_swiglu_residual`) plus the inline attend/
-// recurrent/gated-norm fragments. DIAG dumps / trace_finite / hidden_rb are
-// output-neutral and omitted here (hidden_rb engages only the hand path).
+// The super-op handlers (`Qwen35Bindings`, kept for the EP and exact-VMM
+// executors) delegate to the same `hipfire_dispatch::pipeline::hybrid` stages
+// the single-GPU step program runs (`super::program`), plus `moe_ffn_dispatch`.
+// DIAG dumps / trace_finite / hidden_rb are output-neutral and omitted here
+// (hidden_rb engages only the hand path).
 // ─────────────────────────────────────────────────────────────────────────
 
 /// qwen35-local super-op opcodes, encoded into `OpBinding.weights[0].0`. The
