@@ -14,8 +14,9 @@
  *      documents: h -= scale * (h . v) v per hyper-connection stream, and an untouched row where
  *      the mask is 0.
  *
- * The kernel parity check (libavx against libref, and libr4d on a card) is rad-kbench's
- * `hc_project` case (libavx/avx_cases.cpp); this file pins the meaning.
+ * The kernel parity check (libavx against libref) is libavx/avx_cases.cpp, fed to rad-avx-check;
+ * libr4d's device kernel has no in-tree parity case yet (the rad-kbench fixture is still missing).
+ * This file pins the meaning.
  */
 #include "rad_test.h"
 
@@ -27,7 +28,6 @@
 #include <cmath>
 #include <cstring>
 #include <dlfcn.h>
-#include <cstring>
 #include <string>
 #include <vector>
 
@@ -132,8 +132,8 @@ TEST(the_derivation_refuses_a_buffer_too_small) {
 
 TEST(the_reference_projection_removes_the_direction_per_stream) {
     /* Directly the operation the package's README states, on a synthetic stream: after one
-     * application every stream's component along v is scale * |d| times what it was, and with a
-     * unit direction at the stored scale 1 the projection is exactly h -= (h.v) v. */
+     * application every stream's component along v is (1 - scale) times what it was, and with a
+     * unit direction at the stored scale 1 it is exactly zero, i.e. h -= (h.v) v. */
     const int64_t n = 8, hc = 2, rows = 2;
     std::vector<float> h((size_t) (rows * hc * n));
     std::vector<float> v((size_t) n);

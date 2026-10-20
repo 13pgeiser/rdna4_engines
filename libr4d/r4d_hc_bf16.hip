@@ -1,4 +1,5 @@
-// r4d_hc_bf16.hip -- the gated residual (hyper-connections): hc_enter, hc_read and hc_write.
+// r4d_hc_bf16.hip -- the gated residual (hyper-connections): hc_enter, hc_read,
+// hc_write and hc_project.
 //
 // Qwen4-Exp carries a residual stream `hc` times the model width, with no pre-norm and no residual
 // add: every block reads a data-dependent mix of the hc sub-streams and writes its output back into

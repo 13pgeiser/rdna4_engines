@@ -3061,7 +3061,7 @@ async function identify() {
   } catch (err) { /* the header simply keeps its placeholder */ }
 }
 
-/* THE SPEED PROJECTION, asked when the Model view opens. It is not a polled value: it changes only
+/* THE CONTROL VECTOR, asked when the Model view opens. It is not a polled value: it changes only
  * when this page (or an admin call) flips it, and a control that silently reverted under the
  * reader would be worse than one that is a second old. A deployment without a control vector
  * answers 404 and the panel stays hidden. */

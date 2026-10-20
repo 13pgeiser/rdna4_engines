@@ -477,9 +477,6 @@ static const RadOperandSpec oGdnConvRecurrentUpdate[] = {
     { "o_scale",      RAD_OPD_OUT,    1 },
 };
 
-/* The gated residual. `hc_enter` and `hc_write` share a parameter list; `hc_read` adds the two
- * switches its operand list depends on: `inject` 0 is the final mixer and `group` 0 a read whose
- * consumer wants bf16. Both default on, as every trunk connection uses both. */
 /* The control vector's projection (r4d_hc_bf16.hip, with the other gated-residual kernels): a bf16
  * stream, one unit f32 direction for every stream, an int32 switch per row. */
 static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("scale"),
@@ -490,6 +487,9 @@ static const RadOperandSpec oHcProject[] = {
 static const RadConstraint cHcProject[] = {
     C_GE("M", 1), C_GE("n", 1), C_GE("hc", 2), C_LE("hc", 8), C_IN("dtype", "bf16"),
 };
+/* The gated residual. `hc_enter` and `hc_write` share a parameter list; `hc_read` adds the two
+ * switches its operand list depends on: `inject` 0 is the final mixer and `group` 0 a read whose
+ * consumer wants bf16. Both default on, as every trunk connection uses both. */
 static const RadParamSpec pHcPlain[] = {
     P_INT("M"), P_INT("n"), P_INT("hc"), P_STR("dtype"),
 };

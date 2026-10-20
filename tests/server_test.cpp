@@ -4570,6 +4570,18 @@ TEST(the_control_vector_field_overrides_the_default_or_is_refused) {
         CHECK_EQ(r2.status, 200);
         CHECK(f.sched.last_sp.use_control_vector);
 
+        /* Both spellings in one body: the field's own name wins over Strata's alias, whichever
+         * order the parser happens to read them in. */
+        HttpResponse r3 = f.post("/v1/chat/completions",
+                                 R"({"messages":[{"role":"user","content":"hi"}],
+                                     "max_tokens":4,
+                                     "experimental_speed_projection":true,
+                                     "control_vector":false})");
+        if (r3.streaming()) drain(r3);
+        f.sched.join_all();
+        CHECK_EQ(r3.status, 200);
+        CHECK(!f.sched.last_sp.use_control_vector);
+
         const HttpResponse g = f.get("/admin/control-vector");
         CHECK_EQ(g.status, 200);
         CHECK(g.body.find("\"default\":true") != std::string::npos);

@@ -1456,7 +1456,7 @@ the `control_vector` request field with nothing else to configure; every quantis
 shares it, because the file names the architecture and the width, not the quant. The operation's
 parameters come from the package's own JSON (`layer_range`, `scale`, `mode`), so there is no flag for
 them either: a file that does not fit this container is reported and skipped, never served. The
-default for *requests* stays off in all cases.
+default for *requests* is off at startup.
 
 - **Only a compatible container accepts it.** The file must be a GGUF `controlvector` whose
   `controlvector.model_hint` (when present) is this model's architecture (`qwen4exp`), whose
