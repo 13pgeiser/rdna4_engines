@@ -186,7 +186,9 @@ fn record_then_publish(
 
 /// Flatten validated whole rows into one uint4 row. The single owner entry and
 /// kernel are prepared at provision, so submission allocates no host storage.
-fn copy_bytes(
+/// This is the copy `qualify_peer` byte-qualifies; every cross-device read of
+/// the mesh executor (edge banks and TP partials) goes through it.
+pub(super) fn copy_bytes(
     gpu: &mut Gpu,
     owners: &GpuTensor,
     src: usize,

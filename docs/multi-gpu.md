@@ -1030,29 +1030,40 @@ token. The first decode token after load runs direct and the second captures
 ### Generic mesh executor: TP collectives (developer)
 
 `Gpus::provision_mesh_edges` admits pure PP meshes (TP = EP = 1) and pure TP
-meshes (PP = EP = 1). TP×PP and any EP axis are refused before anything is
-touched. For a pure TP mesh the executor runs the splitter's `AllReduceAdd`
+meshes (PP = EP = 1). TP×PP and any EP axis are refused before any mesh state
+is written. For a pure TP mesh the executor runs the splitter's `AllReduceAdd`
 and `AllReduce` collectives over the group of every rank in rank order, with
 the hand dense-TP routes' numeric contract: `x + (p0 + p1 + …)` and
 `p0 + p1 + …`, the same bytes on every rank. The transport is chosen once at
-provisioning, with no runtime fallback:
+provisioning, and each transport has exactly one route (no per-call choice;
+`peer_access_enabled`, `HIPFIRE_TP_PEER_DIRECT` and `hardware.tp_use_rccl` do
+not apply to it):
 
-- **Peer** (the `Gpus` rooted rank-order fold): every rank pair is either one
-  device under `HIPFIRE_EMULATE_GPUS` or passes byte-qualified peer reads.
-- **RCCL**: otherwise, two ranks only, unless `hardware.tp_use_rccl = false`.
-  RCCL does not fix the order of a wider sum, so a wider group without peer
-  access is refused.
+- **Peer**: every rank pair is one device under `HIPFIRE_EMULATE_GPUS` or
+  passes `qualify_peer`. Each rank pulls every partial with the same kernel
+  copy that `qualify_peer` byte-checks (never `hipMemcpyPeer`, which writes
+  nothing into allocations made after peer enable) and folds the sum locally.
+  Producer and read events order the cross-rank reads; nothing waits on the
+  host.
+- **Host**: some pair is not peer-qualified. The hand route's host-staged
+  rank-order reduction (`Gpus::all_reduce_sum_f32_host`), then `x + sum` on
+  each rank. It synchronizes the rank streams. RCCL is never used, as in the
+  hand dense-TP route (`qwen35` `dense_tp_all_reduce_sum_f32`).
 
-Scratch, events and the RCCL communicator are allocated at provisioning. The
+Scratch, events, host staging and kernels are prepared at provisioning. The
 whole epoch is validated before the first enqueue (group = every rank
 ascending, one occurrence per rank, F32 descriptors equal on every rank,
-no overlapping operands or targets, the replaced `Accumulate` not scheduled),
-and a failed drain quarantines the mesh exactly as for PP edges. Family
-bindings return the operand as `BoundaryIo::view`, the `AllReduceAdd` target
-as `BoundaryIo::into`, and `Gpus::mesh_tp_epoch()` as the descriptor epoch.
+16-byte aligned, no overlapping operands or targets, the replaced
+`Accumulate` not scheduled), and a failed drain quarantines the mesh exactly
+as for PP edges. Family bindings return the operand as `BoundaryIo::view`, the
+`AllReduceAdd` target as `BoundaryIo::into`, and `Gpus::mesh_tp_epoch()` as
+the descriptor epoch. An `AllReduceAdd` operand's contents are unspecified
+afterwards.
 
-Oracle (byte identity against the single-device rank-order sum over two
-undrained epochs, plus a TP×EP refusal); on one device:
+Oracle: byte identity against the single-device rank-order sum over three
+undrained epochs with distinct partials, for the provisioned transport and the
+forced host transport, plus a TP×EP refusal. Every oracle buffer is allocated
+after provisioning has enabled peer access. On one device:
 
 ```sh
 cargo test -p hipfire-runtime --lib --no-run   # prints the unittests binary
@@ -1061,14 +1072,27 @@ for n in 2 4; do HIPFIRE_EMULATE_GPUS=$n <binary> \
   --ignored --nocapture --test-threads=1; done
 ```
 
-Physical runbook (gfx1201, not run on a single-device box): run the same test
-without `HIPFIRE_EMULATE_GPUS`; it uses every visible device as one rank.
-Run it with `HIP_VISIBLE_DEVICES` set to two and then four peer-capable cards
-(Peer transport). The RCCL
-transport is reached only with two cards whose peer qualification fails; on a
-box where every pair qualifies there is no RCCL arm to run. Record per arm the
-`TP<n> oracle` line (FNV-64 digests of `x` and `n`), the binary MD5 and
-`HIP_VISIBLE_DEVICES`.
+Physical runbook (gfx1201, not run on a single-device box). Run the same
+binary without `HIPFIRE_EMULATE_GPUS`: every visible device is one rank.
+
+1. **Peer reads into post-enable allocations (the arm that guards the Peer
+   transport).** `HIP_VISIBLE_DEVICES` = two, then four peer-capable cards.
+   Pass: the `provisioned transport Peer` line (not `Host`) and the `host`
+   line both report byte identity on every rank. Provisioning enables peer
+   access before the oracle allocates its activations, so a copy mechanism
+   that does not reach post-enable allocations fails the `x`/`n` comparison
+   (the partials differ per epoch, so a stale read fails too). A `Host`
+   provisioned line on cards expected to be peer-capable means `qualify_peer`
+   refused the pair; record it.
+2. **Optional reference.** The same arm with the binary from the first PR head
+   (`99853a2db`, rooted `hipMemcpyPeerAsync` route) shows whether the
+   `hipMemcpyPeer` trap reproduces on that ROCm; arm 1 must pass either way.
+3. **Host transport.** Arm 1's `host` line already runs it on the same cards.
+   If the box has a pair without peer access, run that pair too: its
+   provisioned line must read `Host`.
+
+Record per arm the `TP<n> oracle` lines (FNV-64 digests of `x` and `n`), the
+binary MD5, `HIP_VISIBLE_DEVICES` and the ROCm version.
 
 ### Architectural limits (current)
 
