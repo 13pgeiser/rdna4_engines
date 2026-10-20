@@ -2941,7 +2941,7 @@ fn z_past_descriptor(bucket: usize) -> Vec<u8> {
     build_descriptor(1, bucket, &vec![Vec::new()])
 }
 
-fn z_past_kernarg(spec: Spec, descriptor_base: u64) -> Vec<u8> {
+fn z_past_kernarg(spec: Spec, descriptor_base: u64) -> [u8; 96] {
     let db = descriptor_base;
     let bucket = spec.codec.bucket() as u64;
     encode_kernarg(
@@ -2967,5 +2967,4 @@ fn z_past_kernarg(spec: Spec, descriptor_base: u64) -> Vec<u8> {
             0,
         ],
     )
-    .to_vec()
 }
