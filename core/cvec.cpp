@@ -284,7 +284,7 @@ const float* control_vector_upload(const ControlVector& cv, int rank) {
     const int64_t bytes = (int64_t) cv.dir.size() * 4;
     void* d = rad_dev_alloc(bytes, RAD_MEM_DEVICE);
     if (!d) {
-        RAD_ERR("speed projection: rank %d: could not allocate %.2f MiB on the card for the "
+        RAD_ERR("control vector: rank %d: could not allocate %.2f MiB on the card for the "
                 "directions", rank, (double) bytes / (1024.0 * 1024.0));
         return nullptr;
     }
@@ -297,7 +297,7 @@ const float* control_vector_upload(const ControlVector& cv, int rank) {
     rad_stream_sync(s);
     rad_stream_destroy(s);
     if (rc < 0) {
-        RAD_ERR("speed projection: rank %d: uploading the directions failed: %s", rank,
+        RAD_ERR("control vector: rank %d: uploading the directions failed: %s", rank,
                 rad_dev_last_error());
         rad_dev_free(d, RAD_MEM_DEVICE);
         return nullptr;

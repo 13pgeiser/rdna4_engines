@@ -4523,7 +4523,7 @@ int status_with(Fixture& f, const std::string& ep, const std::string& key, const
 
 }  /* namespace */
 
-/* The experimental speed projection: absent, the engine's default applies; an explicit `true` on a
+/* The control vector: absent, the deployment's default applies; an explicit `true` on a
  * deployment with no vector is refused by name (serving the stock model while the client believes
  * otherwise would be a silent lie), and on one with a vector it reaches the engine's request. */
 TEST(the_control_vector_field_overrides_the_default_or_is_refused) {

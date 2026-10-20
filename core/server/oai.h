@@ -94,7 +94,7 @@ struct OaiRequest {
 
     int             n = 1;
     SamplingParams  sp;
-    /* The experimental speed projection, tri-state: -1 the request named no choice (the engine's
+    /* The control vector, tri-state: -1 the request named no choice (the deployment's
      * runtime default applies), 0 it asked for the stock model, 1 for the loaded control vector.
      * Parsed from `control_vector` (or Strata's `experimental_speed_projection`); a deployment
      * with no vector refuses 1 rather than silently serving the stock model. */

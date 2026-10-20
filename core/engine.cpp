@@ -1633,7 +1633,7 @@ bool Engine::state_slots_of(uint64_t seq, std::vector<int32_t>* out) const {
 /* The engine's part of /server_info: model, cards, KV, drafting and wire, for a running process.
  * The server holds only interfaces, so the engine renders this object and the server splices it in
  * verbatim. */
-/* The experimental speed projection, for /stats, /v1/models and /server_info. `available` is
+/* The control vector, for /stats and /server_info. `available` is
  * what a client should test before sending the field: without a loaded vector a request that asks
  * for it is refused, so a UI can hide the control rather than offer a switch that fails. */
 std::string Engine::cvec_json() const {
@@ -2030,7 +2030,7 @@ int Engine::run_server() {
     d.tok   = &tok_bridge;
     d.grammar = &grammar_bridge;
     d.live  = snap;
-    /* The experimental speed projection, when a vector was loaded. The admin endpoint flips the
+    /* The control vector, when one was found. The admin endpoint flips the
      * default through this; nothing rebuilds a graph, so a toggle takes effect on the next request
      * and leaves the running ones alone. */
     if (cvec_.loaded()) {

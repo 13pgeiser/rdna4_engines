@@ -253,7 +253,7 @@ int ref_hc_write(const RadArgs* a, RadStream) {
 }
 
 /* ------------------------------------------------------------------ hc_project */
-/* The experimental speed projection: h[row, s*n + i] -= scale * (h . v) * v, for each of the hc
+/* The control vector's projection: h[row, s*n + i] -= scale * (h . v) * v, for each of the hc
  * streams s, on the rows whose `on` flag is 1.
  *
  * `v` is one layer's unit direction (the engine normalises the file's rows when it uploads them)

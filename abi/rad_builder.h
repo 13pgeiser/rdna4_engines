@@ -174,7 +174,7 @@ typedef struct RadBuildCtx {
      * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
     int      kv_quant;
 
-    /* A control vector loaded from a GGUF `controlvector` file (--speed-projection), or null.
+    /* A control vector loaded from a GGUF `controlvector` file found for this model, or null.
      *
      * The engine loads and validates it once, at bringup, and the plugin only reads it: the
      * direction table lives in device memory on every rank, in the activations' own float form,

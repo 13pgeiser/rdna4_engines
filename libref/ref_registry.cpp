@@ -118,7 +118,7 @@ static const RadOperandSpec oCausalConv[] = { OPD("x"), WGT("w"), INOUT("conv_st
                                              OPD_O("num_accepted"), OUT("y") };
 
 static const RadParamSpec pHcWrite[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_STR("dtype") };
-/* The speed projection (libref/ref_hc.cpp, core/cvec.h): one unit direction per layer and a
+/* The control vector's projection (libref/ref_hc.cpp, core/cvec.h): one unit direction per layer and a
  * per-row switch. `v` is f32 whatever the stream's dtype is, because the engine uploads the table
  * in f32; `on` is an int32 row mask (core derive.cpp's `projection_on_rows`). */
 static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("scale"),
@@ -1010,7 +1010,7 @@ static const RadOpSchema kSchemas[] = {
   "The write half: h[s] += inj[s] * y, for each of the hc streams of h. In place, and `h` is the "
   "UNNORMED stream the paired hc_read was handed -- the normalisation never enters the residual." },
 { "hc_project", ARR(pHcProject), ARR(oHcProject),
-  "The experimental speed projection (llama.cpp's `--cvec-mode project`): for each of the hc "
+  "The control vector's projection (llama.cpp's `--cvec-mode project`): for each of the hc "
   "streams of a row whose `on` flag is 1, h[s] -= scale * (h[s] . v) * v, with v that layer's unit "
   "direction and scale the norm the file stored. The dot is per stream, not on the stream mean. A "
   "row whose flag is 0 is not read and not written, so an unprojected request is byte-identical to "
@@ -1970,7 +1970,7 @@ ROWL("ref_mtp_enter", "mtp_enter", "norm",
 SIMPLE("ref_hc_write", "hc_write", "norm", "gated residual write: h[s] += inj[s] * y",
        DT_FLOAT, ref_hc_write),
 SIMPLE("ref_hc_project", "hc_project", "norm",
-       "speed projection: h[s] -= scale * (h[s] . v) * v where the row's flag is on",
+       "control vector: h[s] -= scale * (h[s] . v) * v where the row's flag is on",
        DT_FLOAT, ref_hc_project),
 SIMPLE("ref_layernorm", "layernorm", "norm", "layer norm with gain and bias", DT_FLOAT,
        ref_layernorm),

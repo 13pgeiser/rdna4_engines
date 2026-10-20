@@ -483,7 +483,7 @@ private:
     bool        has_ngram_ = false;  /* the model carries an n-gram table */
     std::string prefix_off_why_;     /* why the engine itself turned prefix caching off, or "" */
 
-    /* ---- the experimental speed projection (core/cvec.h). `cvec_` is the host table, loaded
+    /* ---- control vectors (core/cvec.h). `cvec_` is the host table, loaded
      * once at bringup and empty when the feature is off; `cvec_views_` is, per rank, that table
      * uploaded to the rank's card and the ABI view build_ctx hands to a declaring plugin (the
      * view's `dir` is the allocation, so one vector holds both). `cvec_salt_` partitions the

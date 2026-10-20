@@ -1,4 +1,4 @@
-/* cvec_test.cpp -- the experimental speed projection's loader (core/cvec.h).
+/* cvec_test.cpp -- the control vector's loader (core/cvec.h).
  *
  * The vector is the published package's format: a GGUF `controlvector` with one unit f32
  * `direction.<l>` per layer and three metadata keys. These cases write such a file, then check

@@ -1,4 +1,4 @@
-/* cvec.h -- the experimental speed projection: a GGUF control vector on the residual stream.
+/* cvec.h -- control vectors: one GGUF direction per layer, projected out of the residual stream.
  *
  * ============================== what it is ==============================
  *

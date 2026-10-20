@@ -1,4 +1,4 @@
-/* projection_test.cpp -- the per-request switch that feeds the speed projection.
+/* projection_test.cpp -- the per-request switch that feeds the control vector.
  *
  * Two halves, both host-side:
  *

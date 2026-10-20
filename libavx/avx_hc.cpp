@@ -332,7 +332,7 @@ AVX_KERNEL(hc_write) {
 }
 
 /* ------------------------------------------------------------------ hc_project */
-/* The experimental speed projection (core/cvec.h): h[s] -= scale * (h[s] . v) * v for each of the
+/* The control vector's projection (core/cvec.h): h[s] -= scale * (h[s] . v) * v for each of the
  * hc streams of a row whose switch is on. v is f32, the stream may be bf16/f16/f32; a row with a
  * zero switch is skipped without a read, so an unprojected request is byte-identical to one on a
  * deployment with no vector. */
