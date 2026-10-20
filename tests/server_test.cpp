@@ -4538,6 +4538,9 @@ TEST(the_control_vector_field_overrides_the_default_or_is_refused) {
         f.sched.join_all();
         CHECK_EQ(r.status, 400);
         CHECK(r.body.find("control_vector") != std::string::npos);
+        /* The route itself is present and answers 404: that is what the page tests for before it
+         * hides the panel, and what distinguishes "no vector here" from "not signed in". */
+        CHECK_EQ(f.get("/admin/control-vector").status, 404);
     }
     {
         /* A vector loaded, default off: the request's own choice wins and reaches the engine. */

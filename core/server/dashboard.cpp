@@ -43,10 +43,16 @@ namespace server {
  * no such feature, and its requests refuse `control_vector: true` by name. */
 HttpResponse Server::handle_control_vector(const HttpRequest& req) {
     const bool have = deps_.control_vector.available && deps_.control_vector.available();
-    if (!have)
-        return error_response(err_not_implemented(
-            "this deployment found no control vector for its model; there is nothing to switch"),
-            req.peer);
+    if (!have) {
+        /* 404, like a model the server does not serve: the route exists, this deployment has nothing
+         * behind it, and that is what the page tests for before hiding the panel. */
+        ApiError e;
+        e.status  = 404;
+        e.type    = "not_found_error";
+        e.message = "this deployment found no control vector for its model; there is nothing to "
+                    "switch";
+        return error_response(e, req.peer);
+    }
 
     if (req.method == "POST") {
         json body;
@@ -62,8 +68,6 @@ HttpResponse Server::handle_control_vector(const HttpRequest& req) {
         if (deps_.control_vector.set_default) deps_.control_vector.set_default(on);
         RAD_INFO("control vector: default %s by an admin request%s", on ? "ON" : "OFF",
                  req.peer.empty() ? "" : (" from " + req.peer).c_str());
-    } else if (req.method != "GET") {
-        return HttpResponse::json_body(405, err_bad("method", "GET or POST").dump());
     }
 
     metrics_.observe_http(200);
