@@ -312,7 +312,11 @@ fn cand_symbol(arch: &str, spec: Spec) -> String {
     // These are exports of the externally supplied tiled candidate, not the
     // embedded narrow/K1 images. The gfx1201 tiled route is deliberately non-Cn.
     match arch {
-        "gfx1151" => format!("mq_i4_moe_gemv_cn_{}_{}_t8", spec.codec.tag(), spec.kind.tag()),
+        "gfx1151" => format!(
+            "mq_i4_moe_gemv_cn_{}_{}_t8",
+            spec.codec.tag(),
+            spec.kind.tag()
+        ),
         _ => format!("mq_i4_moe_gemv_{}_{}_t8", spec.codec.tag(), spec.kind.tag()),
     }
 }
@@ -604,7 +608,10 @@ fn selfcheck(out: Option<String>) -> Result<()> {
             }
         }
     }
-    notes.push("symbols: four external tiled _t8 candidates and four independent narrow K1 per arch ok".into());
+    notes.push(
+        "symbols: four external tiled _t8 candidates and four independent narrow K1 per arch ok"
+            .into(),
+    );
     // Shards cover 1..64 exactly once.
     {
         let shards = [(1u32, 16u32), (17, 32), (33, 48), (49, 64)];
@@ -2720,16 +2727,8 @@ fn verify(args: &Args) -> Result<serde_json::Value> {
                 bufs.push(b);
             }
             let cand_h = cand_handle(hip, &cand_mod, &arch, *s)?;
-            let (y0, y1) = run_guard_launch(
-                hip,
-                id,
-                &cand_h,
-                plan,
-                &bases,
-                y_len,
-                gate,
-                &mut counts,
-            )?;
+            let (y0, y1) =
+                run_guard_launch(hip, id, &cand_h, plan, &bases, y_len, gate, &mut counts)?;
             expect_silent(&y0, &y1, &format!("C65 {}", k1_symbol(*s)))
                 .map_err(|e| format!("cheap gate: {e}"))?;
             counts.cases += 1;

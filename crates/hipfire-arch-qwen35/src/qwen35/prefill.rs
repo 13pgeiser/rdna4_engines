@@ -20777,8 +20777,14 @@ mod tests {
         assert!(!resident_moe_producer_dtypes_supported(&merged, true));
         let mut ragged_gate_up = resident_moe_dtypes(DType::MQ4G256);
         ragged_gate_up.expert_gate_up_uniform = false;
-        assert!(!resident_moe_producer_dtypes_supported(&ragged_gate_up, false));
-        assert!(!resident_moe_producer_dtypes_supported(&ragged_gate_up, true));
+        assert!(!resident_moe_producer_dtypes_supported(
+            &ragged_gate_up,
+            false
+        ));
+        assert!(!resident_moe_producer_dtypes_supported(
+            &ragged_gate_up,
+            true
+        ));
         let mut ragged_down = resident_moe_dtypes(DType::MQ4G256);
         ragged_down.expert_down_uniform = false;
         assert!(!resident_moe_producer_dtypes_supported(&ragged_down, false));
@@ -20910,8 +20916,16 @@ mod tests {
     fn resident_moe_d53_layer_capability_needs_resident_placement_and_iu4() {
         let d53 = d53_dtypes();
         let resident = ResidentMoePlacement::default();
-        assert!(!resident_moe_layer_facts_capable(&resident, Some(&d53), false));
-        assert!(resident_moe_layer_facts_capable(&resident, Some(&d53), true));
+        assert!(!resident_moe_layer_facts_capable(
+            &resident,
+            Some(&d53),
+            false
+        ));
+        assert!(resident_moe_layer_facts_capable(
+            &resident,
+            Some(&d53),
+            true
+        ));
         assert!(!resident_moe_layer_facts_capable(&resident, None, true));
         for placement in [
             ResidentMoePlacement {
@@ -20935,7 +20949,11 @@ mod tests {
                 ..Default::default()
             },
         ] {
-            assert!(!resident_moe_layer_facts_capable(&placement, Some(&d53), true));
+            assert!(!resident_moe_layer_facts_capable(
+                &placement,
+                Some(&d53),
+                true
+            ));
         }
         // Uniform same-format layers are unchanged by the capability.
         for dt in [DType::MQ4G256, DType::MQ4G256V2] {
@@ -21064,14 +21082,25 @@ mod tests {
     #[test]
     fn resident_moe_load_and_prefill_agree_on_the_widen_request() {
         let explicit_max = [None, Some(512), Some(8192)];
-        let explicit_chunk = [None, Some(512), Some(2048), Some(4096), Some(8192), Some(16384)];
+        let explicit_chunk = [
+            None,
+            Some(512),
+            Some(2048),
+            Some(4096),
+            Some(8192),
+            Some(16384),
+        ];
         for max in explicit_max {
             for chunk in explicit_chunk {
                 let request = resident_moe_request(max, chunk);
                 let widens = matches!(request, ResidentMoeRequest::Widen { .. });
                 assert_eq!(widens, max.is_none() && chunk.is_none_or(|c| c >= 8192));
                 let wide = resident_moe_static_decision(&d53_static_facts(request, false, true));
-                assert_eq!(wide, widens.then_some(RESIDENT_MOE_CHUNK_ROWS), "{max:?} {chunk:?}");
+                assert_eq!(
+                    wide,
+                    widens.then_some(RESIDENT_MOE_CHUNK_ROWS),
+                    "{max:?} {chunk:?}"
+                );
             }
         }
     }

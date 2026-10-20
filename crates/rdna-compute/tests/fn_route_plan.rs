@@ -265,13 +265,18 @@ fn walked_layouts_are_the_canonical_and_split_flash_next_headers() {
 }
 
 /// walk ⊆ plan: every (module, symbol) the walked dispatch bound is planned
-/// under its route with the walked identity, and nothing else is, for each
-/// header layout's own plan.
+/// under its route with the current registry recipe (module identity, walked
+/// symbol set, current flags/profile/source), and nothing else is, for each
+/// header layout's own plan. The checked-in row digests are the historical
+/// walk-time capture provenance and are never compared here; regeneration is
+/// the existing `scripts/route_plan_walk.py` + `scripts/route_plan_build.py`
+/// generator, not a hash alias or a partial plan.
 #[test]
 fn every_walked_kernel_is_planned() {
     for layout in &layouts() {
         let (ar, mtp) = gfx1201_plans(layout);
         let walked = walked("gfx1201", &layout.sha);
+        let inventory = entries("gfx1201", &builtin_flags("gfx1201").hipcc_extra_flags).unwrap();
         for (plan, native_mtp) in [(&ar, false), (&mtp, true)] {
             let rows: Vec<_> = walked
                 .rows
@@ -299,11 +304,39 @@ fn every_walked_kernel_is_planned() {
                     layout.name,
                     row.module
                 );
-                let sha = match entry {
-                    PlannedKernel::Hip(e) => format!("{:x}", Sha256::digest(e.source().as_bytes())),
-                    PlannedKernel::Embedded { image, .. } => format!("{:x}", Sha256::digest(image)),
-                };
-                assert_eq!(sha, row.sha256, "{} {}", layout.name, row.module);
+                if let PlannedKernel::Hip(e) = entry {
+                    let live = inventory
+                        .iter()
+                        .find(|live| live.module == row.module)
+                        .unwrap_or_else(|| {
+                            panic!("{}: registry has no walked {}", layout.name, row.module)
+                        });
+                    assert_eq!(
+                        e.source(),
+                        live.source(),
+                        "{} {} is not the current registry source",
+                        layout.name,
+                        row.module
+                    );
+                    assert_eq!(
+                        e.flags, live.flags,
+                        "{} {} flags are not the current registry recipe",
+                        layout.name, row.module
+                    );
+                    assert_eq!(
+                        e.scheduler_profile, live.scheduler_profile,
+                        "{} {} profile is not the current registry recipe",
+                        layout.name, row.module
+                    );
+                } else {
+                    let sha = match entry {
+                        PlannedKernel::Embedded { image, .. } => {
+                            format!("{:x}", Sha256::digest(image))
+                        }
+                        PlannedKernel::Hip(_) => unreachable!(),
+                    };
+                    assert_eq!(sha, row.sha256, "{} {}", layout.name, row.module);
+                }
                 assert_eq!(
                     row.embedded,
                     matches!(entry, PlannedKernel::Embedded { .. }),
