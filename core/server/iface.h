@@ -649,6 +649,10 @@ struct AudioGenInfo {
     int64_t sample_rate = 0, channels = 0;
     int64_t default_steps = 0, max_lanes = 1;   /* default_steps 0: no denoiser */
     double  default_cfg = 1.0;
+    /* RadAudioGenDecl::branches (1: no guidance) and ::input_special (the {input} slot is
+     * tokenised with special tokens). */
+    int32_t branches = 2;
+    bool    input_special = false;
 };
 
 class IAudioGen {

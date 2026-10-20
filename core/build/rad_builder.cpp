@@ -1371,6 +1371,18 @@ int Builder::declare_audio_generator(const RadAudioGenDecl* d) {
                          "instructions and needs {input} alone", nm);
         return RAD_E_INVAL;
     }
+    if (d->branches != 0 && d->branches != 1 && d->branches != 2) {
+        err(RAD_E_INVAL, "declare_audio_generator '%s': branches is %d; a request runs 1 sequence "
+                         "or 2 (0 means 2)", nm, (int)d->branches);
+        return RAD_E_INVAL;
+    }
+    /* One branch has no unconditional prompt to render and no guidance to apply. */
+    if (d->branches == 1 && (d->neg_tmpl || d->default_cfg != 1.0)) {
+        err(RAD_E_INVAL, "declare_audio_generator '%s': a model of one branch has no "
+                         "unconditional template and no guidance (default_cfg %g)", nm,
+            d->default_cfg);
+        return RAD_E_INVAL;
+    }
     if (d->neg_tmpl && !d->prompt_whole) {
         err(RAD_E_INVAL, "declare_audio_generator '%s': an unconditional template makes branches "
                          "of different lengths, which step together only as whole prompts; set "

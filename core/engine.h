@@ -355,6 +355,9 @@ private:
     gen::AudioDriver*                 aud_gen_ = nullptr;
     gen::VideoDriver*                 vid_gen_ = nullptr;
     int  gen_loop();
+    /* Zeroes the state slots the KV manager granted since the last step, on every rank's stream,
+     * before the step or pass that first reads them. */
+    void clear_fresh_states();
     bool serial_drafting() const;
     int  advance_all(int mode, int round, bool from_proposal, int rows = -1);
     int  issue_serial_drafter(int step, StepOut& so);

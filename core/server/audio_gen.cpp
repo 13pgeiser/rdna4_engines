@@ -14,8 +14,9 @@
  * Prompt: the plugin's template with its slots filled, each text first rewritten by the plugin
  * into the form the model was trained on (rad_arch_text_prepare). The template is tokenised with
  * its special tokens and the texts without, so a caller cannot write the model's control tokens
- * into a lyric. A model that declares the unconditional branch's own template gets that one
- * rendered from the same texts.
+ * into a lyric; a model that declares `input_special` has its input tokenised with them too (its
+ * speaker tags), its prepare() refusing the control tokens. A model that declares the
+ * unconditional branch's own template gets that one rendered from the same texts.
  *
  * Response: the whole piece, once it is finished, as `response_format` wav (16-bit PCM, the
  * model's rate and channels) or pcm (the same samples raw, little-endian). Streamed as the
@@ -156,6 +157,8 @@ int Server::speech_request(const json& body, const std::string& text,
         if (!body["guidance_scale"].is_number() || !(body["guidance_scale"].get<double>() >= 1.0) ||
             body["guidance_scale"].get<double>() > 30.0)
             return fail(err_bad("guidance_scale", "expected a number in [1, 30]"));
+        if (info.branches == 1 && body["guidance_scale"].get<double>() != 1.0)
+            return fail(err_unsupported("guidance_scale", "this model runs without guidance"));
         r->cfg = (float)body["guidance_scale"].get<double>();
     }
     bool seed_given = false;
@@ -191,7 +194,10 @@ int Server::speech_request(const json& body, const std::string& text,
             }
             if (p == std::string::npos) break;
             const bool is_inst = p == a;
-            const auto ids = deps_.tok->encode(is_inst ? i2 : t2, false, /*parse_special=*/false);
+            /* The input keeps its special tokens only for a model that asks (its speaker tags);
+             * the plugin's prepare() has refused the ones a caller may not write. */
+            const auto ids = deps_.tok->encode(is_inst ? i2 : t2, false,
+                                               /*parse_special=*/!is_inst && info.input_special);
             ids_out->insert(ids_out->end(), ids.begin(), ids.end());
             at = p + (is_inst ? kInst : kInput).size();
         }

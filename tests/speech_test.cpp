@@ -174,6 +174,28 @@ TEST(a_speech_model_takes_optional_instructions_and_renders_its_unconditional_pr
     CHECK(m.last().neg_tokens.empty());
 }
 
+/* A model that declares input_special (its speaker tags are special tokens) has its input
+ * tokenised with them, and one of one branch refuses any guidance but 1 under its field; other
+ * models' input stays plain text. */
+TEST(a_model_that_asks_has_its_input_read_with_special_tokens_and_one_branch_has_no_guidance) {
+    Speech s;
+    s.gen.inf.tmpl_plain = "<s>{input}";
+    s.gen.inf.default_steps = 0;
+    s.gen.inf.input_special = true;
+    s.gen.inf.branches = 1;
+    s.f->tok.last_parse_special = false;
+    CHECK_EQ(s.post({ { "input", "hi" } }).status, 200);
+    CHECK(s.f->tok.last_parse_special);
+    CHECK_EQ(s.refused({ { "input", "hi" }, { "guidance_scale", 2.0 } }),
+             std::string("guidance_scale"));
+    CHECK_EQ(s.post({ { "input", "hi" }, { "guidance_scale", 1.0 } }).status, 200);
+    Speech m;
+    m.gen.inf.tmpl_plain = "<s>{input}";
+    m.gen.inf.default_steps = 0;
+    CHECK_EQ(m.post({ { "input", "hi" } }).status, 200);
+    CHECK(!m.f->tok.last_parse_special);
+}
+
 /* ================================================================== the response */
 
 /* The whole piece: the windows in order whatever order they were played in, as a WAV whose header

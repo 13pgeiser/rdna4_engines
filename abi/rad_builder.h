@@ -963,6 +963,16 @@ typedef struct RadAudioGenDecl {
      * latent: `lat_num` = `lat_den` = 1, `samples_per_latent` samples a frame. */
     int64_t     voc_chunk;
     int64_t     voc_context;
+    /* Sequences a request runs: 0 or 2, the conditional and unconditional branches above; 1, the
+     * conditional one alone, for a model without guidance (no unconditional prompt is rendered,
+     * a request's guidance must be 1, and every per-entry array of a PROMPT or FRAME pass has one
+     * entry a lane, its `slot` the lane itself). The KV, the prompt's rows and a frame's rows then
+     * cost half. */
+    int32_t     branches;
+    /* Nonzero: the `{input}` slot is tokenised with its special tokens, which the template's own
+     * text always is, so a caller can write the model's speaker tags. The plugin's
+     * rad_arch_text_prepare then refuses the control tokens a caller must not write. */
+    int32_t     input_special;
 } RadAudioGenDecl;
 
 int rad_declare_audio_generator(RadBuilder* b, const RadAudioGenDecl* d);

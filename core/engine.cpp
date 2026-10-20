@@ -438,22 +438,7 @@ int Engine::step_loop() {
         idle = 0;
         if (t_on) phase_mark(PH_PLAN);
 
-        /* Zero freshly assigned recurrent slots before the step that reads them. The manager
-         * records the grab but cannot write (StateClear in core/mem/kv.h); the list is empty except
-         * on a sequence's first step. Each rank clears by its own plan: the slot number is the
-         * scheduler's, but the state size depends on the heads this rank holds, which can differ
-         * per rank (rad_arch.h remainder_place). */
-        for (const StateClear& c : ranks_[0]->kv.state_clears()) {
-            for (auto& rk : ranks_) {
-                const KVGroupPlan* gp = rk->kv.plan(c.group);
-                if (!gp || !gp->stateful()) continue;
-                const int64_t bytes = gp->layer_bytes_per_state();
-                for (int64_t l = 0; l < gp->n_layers; ++l)
-                    if (void* p = rk->kv.state_ptr(c.group, (int32_t)l, c.slot))
-                        rad_memset_async(p, 0, bytes, rk->ctx.stream());
-            }
-        }
-        ranks_[0]->kv.clear_state_clears();
+        clear_fresh_states();
 
         /* Entries that want logits rows, in BatchBuilder's out_ids order: those with
          * produces_token, 1 + n_spec rows each. Row and sequence indices differ (a mid-prompt
@@ -1337,6 +1322,25 @@ void Engine::drain_completed() {
      * is seen exactly once. */
     sched_.take_completed(&done_);
     for (uint64_t id : done_) for (auto& rk : ranks_) rk->sampler.end_request(id);
+}
+
+/* Zero freshly assigned recurrent slots before the step that reads them. The manager records the
+ * grab but cannot write (StateClear in core/mem/kv.h); the list is empty except on a sequence's
+ * first step. Each rank clears by its own plan: the slot number is the scheduler's, but the state
+ * size depends on the heads this rank holds, which can differ per rank (rad_arch.h
+ * remainder_place). */
+void Engine::clear_fresh_states() {
+    for (const StateClear& c : ranks_[0]->kv.state_clears()) {
+        for (auto& rk : ranks_) {
+            const KVGroupPlan* gp = rk->kv.plan(c.group);
+            if (!gp || !gp->stateful()) continue;
+            const int64_t bytes = gp->layer_bytes_per_state();
+            for (int64_t l = 0; l < gp->n_layers; ++l)
+                if (void* p = rk->kv.state_ptr(c.group, (int32_t)l, c.slot))
+                    rad_memset_async(p, 0, bytes, rk->ctx.stream());
+        }
+    }
+    ranks_[0]->kv.clear_state_clears();
 }
 
 int Engine::serve(std::unique_ptr<StallWatch> watch) {
@@ -2494,6 +2498,8 @@ int Engine::run_server() {
         in.default_steps = ad.voc_chunk > 0 ? 0 : ad.default_steps;
         in.default_cfg = ad.default_cfg;
         in.max_lanes = ad.max_lanes;
+        in.branches = ad.branches == 1 ? 1 : 2;
+        in.input_special = ad.input_special != 0;
         audio_bridge.drv = aud_gen_;
         audio_bridge.plugins = &plugins_;
         d.audio = &audio_bridge;

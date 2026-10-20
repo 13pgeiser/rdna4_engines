@@ -53,6 +53,8 @@ int Engine::gen_loop() {
             continue;
         }
         idle = 0;
+        /* A hybrid model's recurrent state: the slots a newly admitted request was granted. */
+        clear_fresh_states();
         if (const int ps = prepare_release(b); ps < 0) return stop(ps);
         for (auto& rk : ranks_) rk->ctx.set_gen_lora_slot(gen_->lora_slot());
         issue_what_.store(kIssueModel, std::memory_order_release);

@@ -209,4 +209,89 @@ TEST(the_unconditional_branch_is_the_conditional_prompt_at_guidance_one) {
     }
 }
 
+/* A hybrid language model (paged attention beside a linear-attention state and a convolution
+ * group, as Qwen3.5's delta-net layers keep) of one branch: every pass stages one sequence a
+ * request, the state groups' rows are the sequence's slots, and each entry carries its context
+ * and a one-based num_accepted. The slots held at the prompt are the frames' too; guidance other
+ * than 1 is refused. */
+TEST(a_hybrid_model_of_one_branch_stages_its_state_groups) {
+    AudioFixture f;
+    f.prog.audio_gen = decl_chunked();
+    f.prog.audio_gen.branches = 1;
+    f.prog.agen_str.name = "hybrid";
+    f.prog.ctx.max_tok = 64;
+    f.prog.ctx.max_seqs = 8;
+    f.prog.kv_groups.emplace_back();
+    for (int kind : { RAD_KV_FULL, RAD_KV_LINEAR, RAD_KV_CONV }) {
+        KVGroupInfo g;
+        g.name = kind == RAD_KV_FULL ? "attn" : kind == RAD_KV_LINEAR ? "state" : "conv";
+        g.decl.kind = kind;
+        g.block_size = kind == RAD_KV_FULL ? 16 : 0;
+        f.prog.kv_groups.push_back(g);
+    }
+    f.kv.setup(f.prog.kv_groups, 1 << 20, 256, 4);
+    CHECK_OK(f.start());
+    std::string why;
+    CHECK(f.drv.submit(f.req(2.0f), &why) < 0);
+    CHECK(has(why, "without guidance"));
+    CHECK_OK(f.drv.submit(f.req(1.0f), &why));
+
+    auto state_rows = [](const RadBatch* b, int32_t* st, int32_t* cv) {
+        *st = *cv = -2;
+        for (int i = 0; i < b->n_kv_groups; ++i) {
+            const RadKVGroupBatch& k = b->kv[i];
+            if (k.group == 1) continue;
+            REQUIRE(k.state_index != nullptr && k.block_table != nullptr);
+            CHECK_EQ(k.block_table[0], k.state_index[0]);
+            (k.group == 2 ? *st : *cv) = k.state_index[0];
+        }
+    };
+    const RadBatch* b = f.drv.next(0);
+    REQUIRE(b != nullptr && b->gen == RAD_GEN_PASS_PROMPT);
+    CHECK_EQ(b->n_seq, (int64_t)1);
+    CHECK_EQ(b->n_tok, (int64_t)4);
+    REQUIRE_EQ(b->n_kv_groups, 3);
+    int32_t st0 = 0, cv0 = 0;
+    state_rows(b, &st0, &cv0);
+    CHECK(st0 >= 0 && cv0 >= 0);
+    REQUIRE(b->ctx_lens != nullptr && b->num_accepted != nullptr);
+    CHECK_EQ(b->ctx_lens[0], 0);
+    CHECK_EQ(b->num_accepted[0], 1);
+    CHECK_EQ(b->agen_b->slot[0], b->agen_b->lane_h[0]);   /* one branch: the slot is the lane */
+    f.answer(b, 0, 0.0f);
+    CHECK_OK(f.drv.done());
+
+    b = f.drv.next(1);
+    REQUIRE(b != nullptr && b->gen == RAD_GEN_PASS_FRAME);
+    CHECK_EQ(b->n_seq, (int64_t)1);
+    CHECK_EQ(b->n_tok, (int64_t)1);
+    CHECK_EQ(b->positions[0], 4);                          /* after the four prompt rows */
+    CHECK_EQ(b->ctx_lens[0], 4);
+    CHECK_EQ(b->num_accepted[0], 1);
+    int32_t st1 = 0, cv1 = 0;
+    state_rows(b, &st1, &cv1);
+    CHECK_EQ(st1, st0);
+    CHECK_EQ(cv1, cv0);
+}
+
+/* The driver stages one paged group beside state groups: a second paged group is refused at init,
+ * by name. */
+TEST(a_second_paged_group_is_refused) {
+    AudioFixture f;
+    f.prog.audio_gen = decl_chunked();
+    f.prog.agen_str.name = "two";
+    f.prog.ctx.max_tok = 64;
+    f.prog.ctx.max_seqs = 8;
+    f.prog.kv_groups.emplace_back();
+    for (int i = 0; i < 2; ++i) {
+        KVGroupInfo g;
+        g.name = i ? "b" : "a";
+        g.decl.kind = RAD_KV_FULL;
+        g.block_size = 16;
+        f.prog.kv_groups.push_back(g);
+    }
+    f.kv.setup(f.prog.kv_groups, 1 << 20, 256, 4);
+    CHECK(f.start() < 0);
+}
+
 RAD_TEST_MAIN()
