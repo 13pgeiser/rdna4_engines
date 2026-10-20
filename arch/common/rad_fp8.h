@@ -78,20 +78,26 @@ struct ActFP8 {
      * `rows` defaults to g.max_tok and must be given for any buffer that is not one row per token
      * (a MoE expert plane is `rows * top_k`, an encoder tower's its patch count); too small a value
      * overruns the arena (core/runtime/issue.cpp refuses such an issue). */
+    /* `i8` declares the int8 pair; `fp8_pair` the E4M3 one. A trunk read entirely by int8 linears
+     * (a W8A8 model's) passes i8 with fp8_pair false: no consumer reads the E4M3 codes, and an
+     * unused plane still takes arena the KV cache needs. */
     int declare_qs(RadBuilder* b, Names& nm, const Geom& g, const char* name, int64_t n,
-                   int64_t rows = 0, bool i8 = false) {
+                   int64_t rows = 0, bool i8 = false, bool fp8_pair = true) {
         /* bf16 linears read only `x` (Geom::w_bf16), so declare no codes; an unused plane would
          * still take arena space. */
         if (g.w_bf16) { q = s = q8 = s8 = 0; return RAD_OK; }
         const int64_t m = rows > 0 ? rows : g.max_tok;
-        q = decl_b(b, nm.f("%s.q", name), RAD_F8E4M3, { m, n });
-        s = decl_b(b, nm.f("%s.s", name), RAD_F32,    { m, fp8_blocks(n) });
+        if (fp8_pair) {
+            q = decl_b(b, nm.f("%s.q", name), RAD_F8E4M3, { m, n });
+            s = decl_b(b, nm.f("%s.s", name), RAD_F32,    { m, fp8_blocks(n) });
+            if (!q || !s) return RAD_E_INVAL;
+        }
         if (i8) {
             q8 = decl_b(b, nm.f("%s.q8", name), RAD_I8,  { m, n });
             s8 = decl_b(b, nm.f("%s.s8", name), RAD_F32, { m, fp8_blocks(n) });
             if (!q8 || !s8) return RAD_E_INVAL;
         }
-        return (q && s) ? RAD_OK : RAD_E_INVAL;
+        return (fp8_pair || i8) ? RAD_OK : RAD_E_INVAL;
     }
 };
 
@@ -489,9 +495,12 @@ struct GateQuantFP8 {
      * codes (`op_q`). */
     rad_op op_q = 0;
 
+    /* `silu_only` takes the `silu_mul`-into-bf16 path regardless of `g.w_bf16`: an int8 trunk whose
+     * down projection quantises its own input (LinearFP8::i8's op_q) needs only the bf16 product,
+     * and `gated_quant_fp8` cannot supply it alone (its code and scale outputs are mandatory). */
     int  declare(RadBuilder* b, const Geom& g, rad_buf gate_up, const ActFP8& act, int64_t n,
                  const char* act_name = "silu", int64_t max_rows = 0, bool bf16_out = true,
-                 bool rot = false);
+                 bool rot = false, bool silu_only = false);
     void step(RadCtx* c, rad_buf gate_up, int64_t T, int64_t r0 = 0, int64_t rows = 0) const;
 };
 
@@ -500,13 +509,13 @@ struct GateQuantFP8 {
  * bf16 output is unrotated either way. */
 inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, const ActFP8& act,
                                  int64_t n, const char* act_name, int64_t max_rows,
-                                 bool bf16_out, bool rot) {
+                                 bool bf16_out, bool rot, bool silu_only) {
     a = act;
     want_x = bf16_out;
     this->n = n;
-    /* bf16 linears read the product itself: `silu_mul` into the bf16 plane only, and no
-     * rotation. */
-    bf16 = g.w_bf16;
+    /* bf16 linears read the product itself, and an int8 trunk's down projection quantises its own
+     * input (`silu_only`): `silu_mul` into the bf16 plane only, and no rotation. */
+    bf16 = g.w_bf16 || silu_only;
     if (bf16) {
         if (!gate_up || !a.x || n <= 0 || rot || std::strcmp(act_name, "silu") != 0) {
             fprintf(stderr, "radiance: a bf16 gate is silu over [gate|up] into a bf16 plane; "

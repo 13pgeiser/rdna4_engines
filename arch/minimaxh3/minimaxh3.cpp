@@ -450,8 +450,13 @@ struct Model {
     rad_buf b_v8 = 0, b_vs = 0;  /* its values at E4M3 codes and their column scales */
     /* The trained schedule's base times (a few-step checkpoint's), or none. */
     std::vector<double> rungs;
-    rad_buf b_h = 0, b_qkv = 0, b_ao = 0, b_gu = 0, b_hn = 0, b_hf = 0, b_vel = 0, b_avel = 0;
+    rad_buf b_h = 0, b_hm = 0, b_qkv = 0, b_ao = 0, b_gu = 0, b_hn = 0, b_hf = 0, b_vel = 0,
+            b_avel = 0;
     ActFP8  a_hm{}, a_attn{}, a_ffn{};
+    /* The DiT's trunk linears are int8 (a W8A8 container). Learned by probing one linear before
+     * the activation code planes are declared; switches the trunk's producers from the fused E4M3
+     * quantisers to bf16 planes each int8 linear quantises itself (LinearFP8::i8). */
+    bool    dit_i8 = false;
     std::vector<DitBlock> dit;
     rad_weight w_no_n = 0, w_vout = 0, b_vout = 0, w_aout = 0, b_aout = 0;
     rad_op  op_nout = 0, op_hcast = 0, op_vout = 0, op_aout = 0, op_ev = 0, op_ea = 0;
@@ -1133,6 +1138,22 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     /* ---- the packed sequence: the lane's prompt rows, the soundtrack's and the video's latents
      * through their f32 projections, rounded to bf16 as the reference packs them */
     m.b_h = decl_b(b, nm.f("dit.h"), RAD_BF16, { T, D });
+    /* Learn the trunk's weight format from one linear before declaring the activation code planes.
+     * An int8 (W8A8) denoiser quantises its per-token activations to int8 too -- E4M3's three
+     * mantissa bits band the smooth activations that carry detail, and its 448 clamp clips
+     * highlights -- so its producers write a bf16 plane and each int8 linear quantises that plane
+     * into its own codes (LinearFP8::i8's op_q). Probe block 0's down projection: a single-source
+     * linear whose name map declare() will not re-make. */
+    RAD_ARCH_TRY(m.dit[0].down.probe(b, nm, g, nm.f("dit.blk.0.ffn_down"),
+                                     { nm.ckpt("transformer.transformer_blocks.0.ff.net.2.weight") }));
+    m.dit_i8 = m.dit[0].down.probed_i8;
+    if (m.dit_i8) {
+        /* The bf16 modulated-norm plane the producers write for the int8 trunk; the E4M3 pair is
+         * never read, so a_hm is declared without it below. */
+        m.b_hm = decl_b(b, nm.f("dit.hmb"), RAD_BF16, { T, D });
+        if (!m.b_hm) return RAD_E_INVAL;
+        m.a_hm.x = m.b_hm;
+    }
     m.op_text = rw(b, RAD_OP(b, "lane_gather",
                              RAD_PARAMS(RAD_RANGE("M", 1, (int64_t)kMaxText), RAD_INT("n", D),
                                         RAD_INT("stride", (int64_t)kMaxText),
@@ -1149,7 +1170,7 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
         return RAD_E_INVAL;
 
     /* ---- the blocks */
-    RAD_ARCH_TRY(m.a_hm.declare_qs(b, nm, g, "dit.hm", D));
+    RAD_ARCH_TRY(m.a_hm.declare_qs(b, nm, g, "dit.hm", D, 0, m.dit_i8, !m.dit_i8));
     /* With video sparse attention a fourth projection beside q, k and v gates the pooled-tile
      * attention into each row's output. */
     const int64_t nparts = m.vsa ? 4 : 3;
@@ -1163,27 +1184,49 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     m.b_v8 = decl_b(b, nm.f("dit.v8"), RAD_F8E4M3, { T, qd });
     m.b_vs = decl_b(b, nm.f("dit.vs"), RAD_F32, { qd });
     m.a_attn.x = decl_b(b, nm.f("dit.attn"), RAD_BF16, { T, qd });
-    RAD_ARCH_TRY(m.a_attn.declare_qs(b, nm, g, "dit.attn", qd));
+    RAD_ARCH_TRY(m.a_attn.declare_qs(b, nm, g, "dit.attn", qd, 0, m.dit_i8, !m.dit_i8));
+    /* For an int8 trunk the standalone quantiser (q_attn) writes int8 codes and o_proj reads them
+     * directly (q8_fed), so o declares no quantiser of its own. */
+    m.a_attn.q8_fed = m.dit_i8;
     m.b_ao = decl_b(b, nm.f("dit.ao"), RAD_BF16, { T, D });
     /* More than one rank: the all-reduces of b_ao's halves run on the second lane (step_dit). */
     if (g.world > 1) RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_ao));
     m.b_gu = decl_b(b, nm.f("dit.gate_up"), RAD_BF16, { T, 2 * g.n_ff });
     m.a_ffn.x = decl_b(b, nm.f("dit.ffn"), RAD_BF16, { T, g.n_ff });
-    RAD_ARCH_TRY(m.a_ffn.declare_qs(b, nm, g, "dit.ffn", g.n_ff));
+    RAD_ARCH_TRY(m.a_ffn.declare_qs(b, nm, g, "dit.ffn", g.n_ff, 0, m.dit_i8, !m.dit_i8));
     const char* sections = nm.f("%lld %lld %lld", (long long)rf, (long long)rf, (long long)rf);
     const int64_t ff_all = g.n_ff_all;
 
+    /* The block's modulated norm of `b_h`. For the E4M3 container it is fused with the quantiser:
+     * `rms_mod_quant_fp8` folds the previous block's all-reduced delta in, renormalises with the
+     * timestep/segment modulation, and writes `a_hm`'s E4M3 codes plus the updated residual. For the
+     * int8 trunk the quantiser is the whole point of the change -- E4M3 banded these activations --
+     * so it comes apart: plain `rms_mod` (no `group` param) writes only the bf16 plane `b_hm`, and
+     * each int8 linear reading `a_hm` (qkv, gate_up) quantises that plane into its own int8 codes. */
     auto mod_q = [&](rad_weight w, bool gated) {
-        rad_op op = RAD_OP(b, "rms_mod_quant_fp8",
-                           RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_F64("eps", eps),
-                                      RAD_INT("group", RAD_FP8_BLOCK), RAD_INT("gated", gated ? 1 : 0),
-                                      RAD_STR("dtype", "bf16")),
-                           RAD_WEIGHTS(w));
+        rad_op op;
+        if (m.dit_i8) {
+            op = RAD_OP(b, "rms_mod",
+                        RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_F64("eps", eps),
+                                   RAD_INT("gated", gated ? 1 : 0), RAD_STR("dtype", "bf16")),
+                        RAD_WEIGHTS(w));
+        } else {
+            op = RAD_OP(b, "rms_mod_quant_fp8",
+                        RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_F64("eps", eps),
+                                   RAD_INT("group", RAD_FP8_BLOCK),
+                                   RAD_INT("gated", gated ? 1 : 0), RAD_STR("dtype", "bf16")),
+                        RAD_WEIGHTS(w));
+        }
         if (!op) return op;
         rad_buf rd[3] = { m.b_modg, m.b_h, m.b_ao };
-        rad_buf wr[3] = { m.a_hm.q, m.a_hm.s, m.b_h };
         rad_op_reads(b, op, rd, gated ? 3 : 2);
-        rad_op_writes(b, op, wr, 3);
+        if (m.dit_i8) {
+            rad_buf wr[2] = { m.b_hm, m.b_h };
+            rad_op_writes(b, op, wr, 2);
+        } else {
+            rad_buf wr[3] = { m.a_hm.q, m.a_hm.s, m.b_h };
+            rad_op_writes(b, op, wr, 3);
+        }
         return op;
     };
 
@@ -1295,7 +1338,8 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
         RAD_ARCH_TRY(B.gate_up.declare(b, nm, g, nm.f("%s.ffn_gate_up", dn), 2 * g.n_ff, D,
                                        RAD_SHARD_ROW, grp_layer(grp), { fsrc }, m.a_hm, m.b_gu, 0,
                                        { g.n_ff, g.n_ff }));
-        RAD_ARCH_TRY(B.gq.declare(b, g, m.b_gu, m.a_ffn, g.n_ff, "silu", 0, false));
+        RAD_ARCH_TRY(B.gq.declare(b, g, m.b_gu, m.a_ffn, g.n_ff, "silu", 0, false, false,
+                                  m.dit_i8));
         RAD_ARCH_TRY(B.down.declare(b, nm, g, nm.f("%s.ffn_down", dn), D, g.n_ff, RAD_SHARD_COL,
                                     grp_layer(grp), { nm.ckpt("%s.ff.net.2.weight", pre) },
                                     m.a_ffn, m.b_ao));
@@ -2905,7 +2949,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     RAD_ARCH_TRY(declare_dit(b, meta, m));
     if (m.dit[0].qkv.bf16) {
         fprintf(stderr, "radiance: minimaxh3: the DiT's linears are bf16; this plugin serves the "
-                        "block-fp8 container (data/recipes/minimax-h3-fp8.recipe)\n");
+                        "block-fp8 container (data/recipes/minimax-h3-fp8.recipe) or the int8 one "
+                        "(data/recipes/minimax-h3-w8a8.recipe)\n");
         return RAD_E_UNSUPPORTED;
     }
     RAD_ARCH_TRY(declare_ups(b, meta, m));
@@ -3430,10 +3475,18 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
         for (int h = 0; h < nh; ++h) {
             const int64_t r0 = hr0[h], n = hn[h];
             if (h > 0 && l > 0) wait_ar();
-            RAD_ISSUE_N(c, B.op_mq1, n, l > 0 ? brow_slice(m.b_ao, r0, n, D) : RAD_NONE,
-                        l > 0 ? modh(h, l - 1, 5, 1) : RAD_NONE, modh(h, l, 0, 2), RAD_W(B.w_n1),
-                        segh[h], brow_slice(m.b_h, r0, n, D), brow_slice(m.a_hm.q, r0, n, D),
-                        brow_slice(m.a_hm.s, r0, n, nD), RAD_NONE);
+            if (m.dit_i8)
+                /* rms_mod: z (the bf16 plane the int8 qkv quantises) bound, no q/scale. */
+                RAD_ISSUE_N(c, B.op_mq1, n, l > 0 ? brow_slice(m.b_ao, r0, n, D) : RAD_NONE,
+                            l > 0 ? modh(h, l - 1, 5, 1) : RAD_NONE, modh(h, l, 0, 2),
+                            RAD_W(B.w_n1), segh[h], brow_slice(m.b_h, r0, n, D),
+                            brow_slice(m.b_hm, r0, n, D));
+            else
+                RAD_ISSUE_N(c, B.op_mq1, n, l > 0 ? brow_slice(m.b_ao, r0, n, D) : RAD_NONE,
+                            l > 0 ? modh(h, l - 1, 5, 1) : RAD_NONE, modh(h, l, 0, 2),
+                            RAD_W(B.w_n1), segh[h], brow_slice(m.b_h, r0, n, D),
+                            brow_slice(m.a_hm.q, r0, n, D), brow_slice(m.a_hm.s, r0, n, nD),
+                            RAD_NONE);
             B.qkv.step(c, m.a_hm, m.b_qkv, R, r0, n);
         }
         RAD_ISSUE_N(c, B.op_qkr, R, bcol(m.b_qkv, 0, 3 * qd, R), pos, RAD_W(B.w_qn),
@@ -3464,9 +3517,15 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
         }
         for (int h = 0; h < nh; ++h) {
             const int64_t r0 = hr0[h], n = hn[h];
-            RAD_ISSUE_N(c, B.op_mq2, n, brow_slice(m.b_ao, r0, n, D), modh(h, l, 2, 1),
-                        modh(h, l, 3, 2), RAD_W(B.w_n2), segh[h], brow_slice(m.b_h, r0, n, D),
-                        brow_slice(m.a_hm.q, r0, n, D), brow_slice(m.a_hm.s, r0, n, nD), RAD_NONE);
+            if (m.dit_i8)
+                RAD_ISSUE_N(c, B.op_mq2, n, brow_slice(m.b_ao, r0, n, D), modh(h, l, 2, 1),
+                            modh(h, l, 3, 2), RAD_W(B.w_n2), segh[h], brow_slice(m.b_h, r0, n, D),
+                            brow_slice(m.b_hm, r0, n, D));
+            else
+                RAD_ISSUE_N(c, B.op_mq2, n, brow_slice(m.b_ao, r0, n, D), modh(h, l, 2, 1),
+                            modh(h, l, 3, 2), RAD_W(B.w_n2), segh[h], brow_slice(m.b_h, r0, n, D),
+                            brow_slice(m.a_hm.q, r0, n, D), brow_slice(m.a_hm.s, r0, n, nD),
+                            RAD_NONE);
             B.gate_up.step(c, m.a_hm, m.b_gu, R, r0, n);
             B.gq.step(c, m.b_gu, R, r0, n);
             B.down.step(c, m.a_ffn, m.b_ao, R, r0, n);

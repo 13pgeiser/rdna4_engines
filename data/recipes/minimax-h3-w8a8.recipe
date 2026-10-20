@@ -1,0 +1,93 @@
+# minimax-h3-w8a8.recipe -- MiniMax-H3 with the DiT denoiser's linears at int8 (W8A8).
+#
+# This is minimax-h3-fp8.recipe with the DiT's four per-token linears (qkv, output, gate_up, down)
+# quantised to symmetric int8 on a per-row 128-column grid instead of E4M3, and read by the w8a8
+# GEMMs. The point is the denoiser's OUTPUT QUALITY: E4M3 has three mantissa bits and clamps the
+# activation at 448, so the fp8a8 denoiser banded smooth gradients (a watercolour look) and clipped
+# highlights (oversaturated colour). int8 is 126 uniform levels a group with no clamp -- far finer on
+# the smooth per-token activations that carry detail -- at the same one byte a weight, so the
+# container's footprint and the served memory are unchanged. The text encoder, the token refiner and
+# the modulation (ada) projections stay E4M3: they are read once or a few times a step, not on every
+# token, so they are not the fidelity limit. Serve with the minimaxh3 plugin's W8A8 DiT path.
+#
+#   rad-convert <MiniMax-H3 pipeline directory> --recipe data/recipes/minimax-h3-w8a8.recipe \
+#       -o minimax-h3-w8a8.rad
+#
+# From an existing minimax-h3-fp8.rad only the DiT changes, so reuse the rest:
+#
+#   rad-convert <pipeline directory> --recipe data/recipes/minimax-h3-w8a8.recipe \
+#       --reuse minimax-h3-fp8.rad --changed <every transformer. tensor> -o minimax-h3-w8a8.rad
+#
+# The directory needs the text-to-video-and-audio components only: text_encoder/, transformer/,
+# vae/, audio_vae/, the processor or tokenizer and both scheduler folders (transformer_ref/ and
+# the original-layout FL2VA/ and Ref2VA/ are not read).
+#
+# FastVideo's FastH3 releases (the denoiser distilled to eight steps with video sparse attention)
+# take the same recipe: their text encoder and decoders are MiniMax-H3's files, so a container of
+# the base model can supply them, with every transformer tensor listed as changed:
+#
+#   rad-convert <FastH3 directory> --recipe data/recipes/minimax-h3-fp8.recipe \
+#       --reuse minimax-h3-fp8.rad --changed <the transformer's tensor names, "transformer." first> \
+#       -o fasth3-8step-fp8.rad
+#
+# LBH-123-AI's latent upscaler (Minimax_h3_latent_Upscaler, Apache-2.0) is a companion folder:
+# put its config.json (minimax_h3_latent_upscaler_3d_conv_v1/config.json) and its bf16 weights,
+# named diffusion_pytorch_model.safetensors, in latent_upscaler/ of the pipeline directory. It
+# converts with the rest, or is appended to a container converted without it, which keeps every
+# weight the container holds where it is:
+#
+#   rad-convert <pipeline directory> --recipe data/recipes/minimax-h3-fp8.recipe \
+#       --reuse minimax-h3-fp8.rad --in-place
+#
+# Every linear of the text encoder's first 50 layers, of the token refiner and of the DiT's 50
+# blocks, and the per-modality modulation projections, become E4M3 codes with a bf16 scale a
+# 128 x 128 block, read by the fp8a8 GEMMs. What keeps the checkpoint's precision is read once a
+# step or less: the embedding table, context_embedder and norm_out (bf16), the timestep MLP and the
+# four patch projections (f32), every norm and bias. The video decoder's linears are cast to bf16
+# from the checkpoint's f32, its norms, layer scales, biases and register tokens stay f32; the
+# audio decoder stays f32 (its weight norms folded at convert). The ref2va encoders convert with
+# them when the checkpoint ships them: the audio encoder's f32 chain convs are weight-normalised
+# and stored folded; the video encoder's 3x3x3 convs are cast to bf16, which is how the implicit-
+# GEMM kernel stores them (conv_in and the k=1 convs read f32 as declared and need no rule).
+
+te.blk.*.attn_qkv.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.attn_output.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.ffn_gate_up.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.ffn_down.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.attn_norm.weight            cast dtype=f32
+te.blk.*.ffn_norm.weight             cast dtype=f32
+ref.blk.*.attn_qkv.weight            rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+ref.blk.*.attn_output.weight         rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+ref.blk.*.ffn_gate_up.weight         rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+ref.blk.*.ffn_down.weight            rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.attn_qkv.weight            rtn  codes=i8 group=128 scale=bf16 clamp=sym
+dit.blk.*.attn_output.weight         rtn  codes=i8 group=128 scale=bf16 clamp=sym
+dit.blk.*.ffn_gate_up.weight         rtn  codes=i8 group=128 scale=bf16 clamp=sym
+dit.blk.*.ffn_down.weight            rtn  codes=i8 group=128 scale=bf16 clamp=sym
+dit.blk.*.ada*.weight                rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+vae.blk.*.attn_qkv.weight            cast dtype=bf16
+vae.blk.*.attn_out.weight            cast dtype=bf16
+vae.blk.*.ffn_up.weight              cast dtype=bf16
+vae.blk.*.ffn_down.weight            cast dtype=bf16
+vae.proj_out.*                       cast dtype=bf16
+aud.*.weight                         cast dtype=f32
+# The audio encoder's strided downsamplers and its attention/MLP pre-block run in a bf16 island
+# inside the f32 chain (arch/minimaxh3/minimaxh3.cpp, declare_aenc): conv1d, layernorm and gemm
+# pin every operand to one dtype, so their weights cast; the chain's own f32 weights are stored
+# folded from the checkpoint's weight-norm pairs.
+aenc.d*.w                              cast dtype=bf16
+aenc.d*.b                              cast dtype=bf16
+aenc.pb.*                              cast dtype=bf16
+aenc.b*.u*.c1.weight                   cast dtype=f32
+aenc.b*.u*.c2.weight                   cast dtype=f32
+aenc.cin.weight                        cast dtype=f32
+aenc.fin.weight                        cast dtype=f32
+# The video encoder: the implicit-GEMM kernel stores its 3x3x3 weights bf16 tap-major, so those
+# four name classes cast; conv_in (3 input channels) and the k=1 shortcut/quant convs run on the
+# reference kernel with their f32 weights as they are, and the norms and biases need no rule.
+venc.l*.b*.c1w                         cast dtype=bf16
+venc.l*.b*.c2w                         cast dtype=bf16
+venc.l*.dnw                            cast dtype=bf16
+venc.cout.weight                       cast dtype=bf16
+ups.embed.*                          cast dtype=f32
+ups.*.emb_layers.*                   cast dtype=f32
