@@ -37,6 +37,9 @@ def main():
     ap.add_argument("--every", type=float, default=1.0, help="seconds between polls")
     ap.add_argument("--seconds", type=float, default=0.0, help="stop after this long; 0 = run until interrupted")
     ap.add_argument("--out", default="stats.jsonl")
+    ap.add_argument("--max-mib", type=float, default=256.0,
+                    help="rotate the file when it passes this size (0 = never); "
+                         "keeps 5 generations as .1 (newest) .. .5")
     ap.add_argument("--api-key", default=os.environ.get("RADIANCE_API_KEY"),
                     help="or set RADIANCE_API_KEY; the key is never echoed")
     a = ap.parse_args()
@@ -48,7 +51,22 @@ def main():
     # Append, never truncate: a file that already holds last week's data is worth more than a clean
     # start, and the rows carry their own timestamps.
     out = open(a.out, "a")
-    prev, ok, lost, streak = None, 0, 0, 0
+    prev, ok, lost, streak, rotated = None, 0, 0, 0, 0
+
+    def rotate():
+        """Size cap (audit 2026-10-20 §6): an append-only recorder with no cap is a
+        disk-full timer. Shift .1->.2 ... keep 5, start fresh; rows carry their own
+        timestamps so the chain stays readable in order."""
+        nonlocal out, rotated
+        out.close()
+        for i in range(4, 0, -1):
+            src = "%s.%d" % (a.out, i)
+            if os.path.exists(src):
+                os.replace(src, "%s.%d" % (a.out, i + 1))
+        os.replace(a.out, a.out + ".1")
+        out = open(a.out, "a")
+        rotated += 1
+        sys.stderr.write("statsdump: rotated %s (generation %d)\n" % (a.out, rotated))
     sys.stderr.write("statsdump: %s/stats every %.1fs -> %s\n" % (base, a.every, a.out))
     try:
         while True:
@@ -67,11 +85,25 @@ def main():
             else:
                 streak = 0
                 row["t"] = t0
-                row["dt_s"] = round(t0 - prev, 3) if prev is not None else 0.0
-                prev = t0
-                out.write(json.dumps(row, separators=(",", ":")) + "\n")
-                out.flush()   # a killed poller must not lose the polls it did get
-                ok += 1
+                # dt_s from the MONOTONIC clock: a wall-clock step (NTP) could make it
+                # negative, and a consumer dividing counters by dt_s would inherit the
+                # step. t stays wall-clock: it is the row's timestamp, not a delta.
+                row["dt_s"] = round(time.monotonic() - prev, 3) if prev is not None else 0.0
+                prev = time.monotonic()
+                line = json.dumps(row, separators=(",", ":")) + "\n"
+                try:
+                    out.write(line)
+                    out.flush()   # a killed poller must not lose the polls it did get
+                    ok += 1
+                except OSError as e:
+                    # Disk full mid-write: loud, counted, and the poller SURVIVES to
+                    # report it (audit §6: this path used to die with a traceback and
+                    # no exit summary). The partial line, if any, is detectable JSONL.
+                    lost += 1; streak += 1
+                    sys.stderr.write("statsdump: write failed (%s), %d lost\n"
+                                     % (type(e).__name__, lost))
+                if a.max_mib > 0 and out.tell() >= a.max_mib * 1024 * 1024:
+                    rotate()
             if deadline is not None and time.time() >= deadline:
                 break
             # Sleep from the poll's START, so a slow engine does not walk the schedule later.
@@ -82,7 +114,8 @@ def main():
         sys.stderr.write("statsdump: interrupted\n")
     finally:
         out.close()
-    sys.stderr.write("statsdump: %d rows written, %d polls lost, %s\n" % (ok, lost, a.out))
+    sys.stderr.write("statsdump: %d rows written, %d polls lost, %d rotations, %s\n"
+                     % (ok, lost, rotated, a.out))
     # An empty file is a failure, not a quiet run: say so with the exit status, not only in prose.
     return 1 if ok == 0 else 0
 
