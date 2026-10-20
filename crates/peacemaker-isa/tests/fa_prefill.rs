@@ -2253,3 +2253,105 @@ mod toolchain {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+// ------------------------------------------------------------------------------------------------ Q8 LDS lifecycle
+#[test]
+fn q8_two_plane_lds_lifecycle_is_ready_reads_retire() {
+    // The Q8 direct keeps two resident 32-KiB planes across the whole tile loop: K publishes, every compute wave
+    // reads K (QK) and V (PV), then both planes retire before the next tile. The helper wave (wave 4) skips the
+    // compute but joins both rendezvous. This pins the proof slot roles, the exact barrier transitions, the label
+    // order and the helper path using only the public emitted IR/text.
+    let direct = fa_prefill::emit(ARCH, &spec()).unwrap();
+    let text = direct.s_text.clone();
+    // Proof slot roles: `k_plane` id 0 base 0 len 32768, `v_plane` id 1 base 32768 len 32768.
+    let slots = &direct.proof.lds_slots;
+    assert_eq!(slots.len(), 2, "Q8 direct: two LDS planes");
+    assert_eq!(
+        (slots[0].name.as_str(), slots[0].base, slots[0].len),
+        ("k_plane", 0, 32_768),
+        "Q8 direct: K plane slot"
+    );
+    assert_eq!(
+        (slots[1].name.as_str(), slots[1].base, slots[1].len),
+        ("v_plane", 32_768, 32_768),
+        "Q8 direct: V plane slot"
+    );
+    // Proof barrier lifecycle: Ready(0,1) publishes both planes, Retire(0,1) releases them after the last V read.
+    let barriers = &direct.proof.barriers;
+    assert_eq!(barriers.len(), 2, "Q8 direct: publish + retire rendezvous");
+    assert_eq!(
+        barriers[0].transitions,
+        vec!["Ready(0)".to_string(), "Ready(1)".to_string()],
+        "Q8 direct: publish transitions"
+    );
+    assert_eq!(
+        barriers[1].transitions,
+        vec!["Retire(0)".to_string(), "Retire(1)".to_string()],
+        "Q8 direct: retire transitions"
+    );
+    // Label order: fill_done (publish) < qk (compute entry) < turn (retire) < epi < end.
+    let labels = [
+        ".Lfapd_fill_done",
+        ".Lfapd_qk",
+        ".Lfapd_turn",
+        ".Lfapd_epi",
+        ".Lfapd_end",
+    ];
+    let mut cursor = 0;
+    for label in labels {
+        let at = text[cursor..]
+            .find(label)
+            .unwrap_or_else(|| panic!("Q8 direct: missing label {label}"));
+        cursor += at + label.len();
+    }
+    // Label definitions carry the trailing colon; bare finds would catch earlier branch uses.
+    let def = |label: &str| {
+        text.find(&format!("{label}:"))
+            .unwrap_or_else(|| panic!("Q8 direct: missing label {label}"))
+    };
+    let (fill_done_def, qk_def, turn_def) =
+        (def(".Lfapd_fill_done"), def(".Lfapd_qk"), def(".Lfapd_turn"));
+    // Helper path: the wave>=4 guard is the first branch after the QK entry label and skips compute straight to
+    // the retire label, so the helper wave joins the retire rendezvous without reading either plane.
+    let after_qk: Vec<&str> = text[qk_def..].lines().skip(1).take(3).collect();
+    assert!(
+        after_qk.iter().any(|l| l.contains("s_cbranch_scc1 .Lfapd_turn")),
+        "Q8 direct: helper wave at the QK entry must branch to .Lfapd_turn"
+    );
+    // Reads between publish and retire: 16-byte fragment loads hit BOTH planes — K plane offsets below 32768
+    // (QK) and V plane offsets at/above 32768 (PV).
+    let region: Vec<&str> = text[qk_def..turn_def]
+        .lines()
+        .filter_map(|l| {
+            let t = l.split(';').next()?.split("//").next()?.trim();
+            let tok = t.split_whitespace().next()?;
+            let first = tok.chars().next()?;
+            (first.is_ascii_lowercase() && tok.contains('_') && !tok.ends_with(':') && !tok.contains('.'))
+                .then_some(t)
+        })
+        .collect();
+    let mut saw_k = false;
+    let mut saw_v = false;
+    for l in &region {
+        if mnemonic(l) == "ds_load_b128" {
+            let off = imm_offset(l);
+            assert!(off + 16 <= 65_536, "Q8 direct: fragment read past both planes");
+            if off < 32_768 {
+                saw_k = true;
+            } else {
+                saw_v = true;
+            }
+        }
+    }
+    assert!(saw_k, "Q8 direct: no K-plane fragment read between publish and retire");
+    assert!(saw_v, "Q8 direct: no V-plane fragment read between publish and retire");
+    // Barrier placement in the text: the publish rendezvous sits between the fill_done label and the QK entry,
+    // the retire rendezvous after the turn label.
+    let mut signals: Vec<usize> = text.match_indices("s_barrier_signal").map(|(i, _)| i).collect();
+    assert_eq!(signals.len(), 2, "Q8 direct: two text rendezvous sites");
+    let retire = signals.remove(1);
+    assert!(
+        fill_done_def < signals[0] && signals[0] < qk_def,
+        "Q8 direct: publish barrier is not between fill_done and the QK entry"
+    );
+    assert!(retire > turn_def, "Q8 direct: retire barrier is not after the turn label");
+}

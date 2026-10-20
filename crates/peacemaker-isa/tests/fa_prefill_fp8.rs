@@ -1214,3 +1214,187 @@ fn nan_codes_are_classified_separately_from_the_finite_gate() {
         }
     }
 }
+// ------------------------------------------------------------------------------------------------ 5. stage rendezvous
+#[test]
+fn fp8_single_stage_rendezvous_guards_all_five_waves_at_all_four_barriers() {
+    // The FP8 direct reuses ONE 32-KiB stage sequentially: K-fill publishes, QK reads, the stage retires, V-fill
+    // publishes, softmax/PV reads, the stage retires. All five waves (four compute + helper) join all four
+    // barriers; the helper skips K-fill to the K-ready rendezvous and QK to `.Lfapd_qk_done`, V-fill to the V-ready
+    // rendezvous and softmax/PV to `.Lfapd_turn`. This pins the proof slot role, the exact barrier transitions,
+    // the label order and both helper branch targets using only the public emitted IR/text.
+    let (emitted, text, _) = fa_prefill::emit_fp8_module(ARCH, &spec()).unwrap();
+    assert_eq!(emitted.len(), 1, "the fp8 module holds exactly one export");
+    let e = &emitted[0];
+    // Proof slot role: one `stage` slot, id 0, base 0, len 32768.
+    let slots = &e.proof.lds_slots;
+    assert_eq!(slots.len(), 1, "fp8 direct: one LDS stage");
+    assert_eq!(
+        (slots[0].name.as_str(), slots[0].base, slots[0].len),
+        ("stage", 0, 32_768),
+        "fp8 direct: stage slot"
+    );
+    // Proof barrier lifecycle: Ready(0) publishes K, Retire(0) releases K, Ready(0) publishes V, Retire(0)
+    // releases V.
+    let transitions: Vec<Vec<String>> =
+        e.proof.barriers.iter().map(|b| b.transitions.clone()).collect();
+    assert_eq!(
+        transitions,
+        vec![
+            vec!["Ready(0)".to_string()],
+            vec!["Retire(0)".to_string()],
+            vec!["Ready(0)".to_string()],
+            vec!["Retire(0)".to_string()],
+        ],
+        "fp8 direct: stage publish/retire lifecycle"
+    );
+    // Label order across the sequential schedule.
+    let labels = [
+        ".Lfapd_tile",
+        ".Lfapd_kfill_done",
+        ".Lfapd_kready",
+        ".Lfapd_qk",
+        ".Lfapd_qk_done",
+        ".Lfapd_vfill_done",
+        ".Lfapd_vready",
+        ".Lfapd_turn",
+        ".Lfapd_epi",
+        ".Lfapd_end",
+    ];
+    let mut cursor = 0;
+    for label in labels {
+        let at = text[cursor..]
+            .find(label)
+            .unwrap_or_else(|| panic!("fp8 direct: missing label {label}"));
+        cursor += at + label.len();
+    }
+    // Label definitions carry the trailing colon; bare finds would catch earlier branch uses (e.g. the
+    // `.Lfapd_qk_done` branch at the K-ready entry precedes its label definition).
+    let def = |label: &str| {
+        text.find(&format!("{label}:"))
+            .unwrap_or_else(|| panic!("fp8 direct: missing label {label}"))
+    };
+    let tile_def = def(".Lfapd_tile");
+    let kfill_done_def = def(".Lfapd_kfill_done");
+    let kready_def = def(".Lfapd_kready");
+    let qk_done_def = def(".Lfapd_qk_done");
+    let vfill_done_def = def(".Lfapd_vfill_done");
+    let vready_def = def(".Lfapd_vready");
+    let turn_def = def(".Lfapd_turn");
+    // Helper rendezvous: the wave>=4 guard at the K-ready entry skips QK straight to `.Lfapd_qk_done` (NOT
+    // `.Lfapd_turn`: the helper must still join the K-retire rendezvous before V-fill reuses the stage), and the
+    // guard at the V-ready entry skips softmax/PV straight to `.Lfapd_turn`.
+    assert!(
+        text[kready_def..qk_done_def].contains("s_cbranch_scc1 .Lfapd_qk_done"),
+        "fp8 direct: helper wave at the K-ready entry must branch to .Lfapd_qk_done"
+    );
+    assert!(
+        !text[kready_def..qk_done_def].contains("s_cbranch_scc1 .Lfapd_turn"),
+        "fp8 direct: helper wave at the K-ready entry must not skip the K-retire rendezvous"
+    );
+    assert!(
+        text[vready_def..turn_def].contains("s_cbranch_scc1 .Lfapd_turn"),
+        "fp8 direct: helper wave at the V-ready entry must branch to .Lfapd_turn"
+    );
+    // Fill skips: the K-fill and V-fill bodies skip to their own fill-done rendezvous, never across stages.
+    assert!(
+        text[tile_def..kfill_done_def].contains("s_cbranch_scc1 .Lfapd_kfill_done"),
+        "fp8 direct: K-fill skip must target .Lfapd_kfill_done"
+    );
+    assert!(
+        text[qk_done_def..vfill_done_def].contains("s_cbranch_scc1 .Lfapd_vfill_done"),
+        "fp8 direct: V-fill skip must target .Lfapd_vfill_done"
+    );
+    // Barrier placement in the text: K publish between kfill_done and kready, K retire between qk_done and
+    // vfill_done, V publish between vfill_done and vready, V retire after turn. Exactly one rendezvous per site.
+    let mut signals: Vec<usize> = text.match_indices("s_barrier_signal").map(|(i, _)| i).collect();
+    signals.retain(|&i| i > tile_def);
+    assert_eq!(signals.len(), 4, "fp8 direct: four text rendezvous sites");
+    let windows = [
+        (kfill_done_def, kready_def),
+        (qk_done_def, vfill_done_def),
+        (vfill_done_def, vready_def),
+        (turn_def, text.len()),
+    ];
+    for (site, (lo, hi)) in windows.iter().enumerate() {
+        let inside: Vec<usize> = signals.iter().copied().filter(|&i| i > *lo && i < *hi).collect();
+        assert_eq!(
+            inside.len(),
+            1,
+            "fp8 direct: rendezvous {site} is not exactly once inside its label window"
+        );
+    }
+    // Bounded ordered path model over the tile region: every branch between the tile entry and the final V
+    // retire stays inside the K-ready -> K-retire -> V-ready -> V-retire sequence, so all five waves (four
+    // compute falling through, the helper rejoining at each rendezvous) meet the same four barriers in order.
+    // Count alone is not the proof: each barrier pair is bracketed by its labels and no branch leaps over one.
+    let region = &text[tile_def..turn_def];
+    let mut targets: Vec<&str> = Vec::new();
+    for l in region.lines() {
+        let t = l.split(';').next().unwrap_or("").split("//").next().unwrap_or("").trim();
+        let mut words = t.split_whitespace();
+        match words.next() {
+            Some("s_cbranch_scc1") | Some("s_cbranch_scc0") | Some("s_branch") => {
+                if let Some(dst) = words.next() {
+                    targets.push(dst);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut allowed: std::collections::BTreeSet<String> = [
+        ".Lfapd_kfill_done",
+        ".Lfapd_qk_done",
+        ".Lfapd_vfill_done",
+        ".Lfapd_turn",
+        ".Lfapd_tile",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    for sub in 0..4 {
+        allowed.insert(format!(".Lfapd_full{sub}"));
+        allowed.insert(format!(".Lfapd_mask{sub}"));
+    }
+    for dg in 0..4 {
+        allowed.insert(format!(".Lfapd_dg{dg}_end"));
+    }
+    for dst in &targets {
+        assert!(
+            allowed.contains(&dst.to_string()),
+            "fp8 direct: tile-region branch escapes the ordered barrier sequence -> {dst}"
+        );
+    }
+    // No tile-region branch leaves the loop body early: nothing targets the epilogue, the end label, or any
+    // label past the turn; every tile pass (and every wave) reaches the final V-retire rendezvous before the
+    // loop-back branch returns to the tile entry.
+    for ban in [".Lfapd_epi", ".Lfapd_end", ".Lfapd_vready", ".Lfapd_kready"] {
+        assert!(
+            !targets.contains(&ban),
+            "fp8 direct: tile-region branch skips a rendezvous -> {ban}"
+        );
+    }
+    // Causal / tail subtile early exits target the FINAL V-retire label `.Lfapd_turn`: the three sub>0 skips
+    // (remaining-rows compare) plus the one V-ready helper guard make exactly four turn-bound branches in the
+    // V-ready window, so a short tail still retires the reused stage instead of stranding it published.
+    let sm_region = &text[vready_def..turn_def];
+    let mut turn_branches = 0;
+    let mut cmp_lt_guarded = 0;
+    let mut wave_guarded = 0;
+    let sm_lines: Vec<&str> = sm_region.lines().collect();
+    for (i, l) in sm_lines.iter().enumerate() {
+        let t = l.split(';').next().unwrap_or("").split("//").next().unwrap_or("").trim();
+        if t == "s_cbranch_scc1 .Lfapd_turn" {
+            turn_branches += 1;
+            let prev: String = sm_lines[..i].iter().rev().take(2).rev().copied().collect::<Vec<_>>().join("\n");
+            if prev.contains("s_cmp_lt_i32") {
+                cmp_lt_guarded += 1;
+            }
+            if prev.contains("s_cmp_ge_u32") {
+                wave_guarded += 1;
+            }
+        }
+    }
+    assert_eq!(turn_branches, 4, "fp8 direct: V-ready window turn-bound branches (3 subtile + 1 helper)");
+    assert_eq!(cmp_lt_guarded, 3, "fp8 direct: subtile causal early exits must target .Lfapd_turn");
+    assert_eq!(wave_guarded, 1, "fp8 direct: V-ready helper guard must target .Lfapd_turn");
+}

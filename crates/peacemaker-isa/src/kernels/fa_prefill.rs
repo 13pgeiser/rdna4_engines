@@ -1636,7 +1636,8 @@ struct CodecRegs {
     st1: u8,
     skey: u8,
     skj: u8,
-    slot: usize,
+    k_slot: usize,
+    v_slot: usize,
 }
 const Q8_REGS: CodecRegs = CodecRegs {
     qf: QF,
@@ -1654,7 +1655,8 @@ const Q8_REGS: CodecRegs = CodecRegs {
     st1: V_T1,
     skey: V_KEY,
     skj: V_KJ,
-    slot: L_K,
+    k_slot: L_K,
+    v_slot: L_V,
 };
 const FP8_REGS: CodecRegs = CodecRegs {
     qf: QF,
@@ -1672,7 +1674,8 @@ const FP8_REGS: CodecRegs = CodecRegs {
     st1: SMX8 + 5,
     skey: SMX8 + 6,
     skj: SMX8 + 7,
-    slot: L_STAGE,
+    k_slot: L_STAGE,
+    v_slot: L_STAGE,
 };
 fn regs(fp8: bool) -> CodecRegs {
     if fp8 { FP8_REGS } else { Q8_REGS }
@@ -1699,7 +1702,7 @@ fn qk(b: &mut Builder, fp8: bool) -> R {
             }
             for u in 0..4u8 {
                 let dc = u32::from(4 * dg + u);
-                dload128(b, r.slot, r.kf + 4 * u, V_LF, (dc * 4 + u32::from(sub)) * 512)?;
+                dload128(b, r.k_slot, r.kf + 4 * u, V_LF, (dc * 4 + u32::from(sub)) * 512)?;
             }
             for u in 0..4u8 {
                 wmma(b, r.scores + 8 * sub, r.kf + 4 * u, r.qf + 4 * u, dg > 0 || u > 0)?;
@@ -1953,7 +1956,7 @@ fn softmax_sub(b: &mut Builder, sub: u8, fp8: bool) -> R {
     // PV: O^T = V^T * P^T, O rescaled by this lane's own alpha before each dc update.
     let buf = |dc: u8| if dc % 2 == 0 { vfa } else { vfb };
     let vbase: u32 = if fp8 { 0 } else { 32_768 };
-    let vslot = r.slot;
+    let vslot = r.v_slot;
     let vo = |dc: u8| vbase + (16 * u32::from(sub) + u32::from(dc)) * 512;
     dload128(b, vslot, vfa, V_LF, vo(0))?;
     for dc in 0..16u8 {
@@ -2002,7 +2005,7 @@ fn body(b: &mut Builder, fp8: bool) -> R {
         b.barrier(&[Transition::Ready(L_STAGE)])?;
         b.label(D_KREADY)?;
         sop(b, format!("s_cmp_ge_u32 s{WAVE}, 4"), &[], &[WAVE])?;
-        op(b, format!("s_cbranch_scc1 {D_TURN}"), &[], &[])?;
+        op(b, format!("s_cbranch_scc1 {D_QK_DONE}"), &[], &[])?;
         qk(b, fp8)?;
         b.label(D_QK_DONE)?;
         b.barrier(&[Transition::Retire(L_STAGE)])?;

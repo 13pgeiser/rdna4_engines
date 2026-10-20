@@ -2221,6 +2221,29 @@ fn parse() -> Result<Opts> {
     }
     Ok(o)
 }
+/// Same NEW-kernel controlled dynamic-LDS comparison on the actually loaded FP8 direct
+/// symbol (`fa_prefill_pm::FP8_DIRECT`, block 160, static LDS fixed 0): actual 32,768 B
+/// dynamic vs 65,536 B dynamic control. Not the old PM driver proof. Reports the real
+/// `Gpu::occupancy_max_active_blocks` results; call only after the PM module is loaded
+/// (a PM direct launch has run), so the loaded-function lookup resolves.
+fn occupancy_control(gpu: &Gpu) -> Value {
+    let block = [DIRECT_BLOCK, 1, 1];
+    let probe = |dynamic_lds: u32| match gpu.occupancy_max_active_blocks(
+        fa_prefill_pm::FP8_DIRECT,
+        block,
+        dynamic_lds,
+    ) {
+        Ok(v) => json!({"ok": true, "max_active_blocks": v}),
+        Err(e) => json!({"ok": false, "error": e.to_string()}),
+    };
+    json!({"kind": "occupancy_control",
+        "kernel": fa_prefill_pm::FP8_DIRECT, "module": fa_prefill_pm::FP8_MODULE,
+        "block": block, "static_lds_bytes": 0,
+        "actual_dynamic_lds_32768": probe(32_768),
+        "control_dynamic_lds_65536": probe(65_536),
+        "note": "same NEW-kernel controlled dynamic-LDS comparison; not the old PM driver proof"})
+}
+
 fn run() -> Result<bool> {
     let n = self_check();
     let o = parse()?;
@@ -2352,7 +2375,19 @@ fn run() -> Result<bool> {
                 finite_identical += ok as usize;
             }
             failures += !ok as usize;
+            // Fail fast on an actual ordinary-case FAIL: stop immediately so a real GPU
+            // divergence is not buried under later cells. NaN expected-classification
+            // variation is not a failure here: `ok` already carries the NaN-aware
+            // classification gate, and all finite/classification/poison checks are unchanged.
+            if !ok {
+                break;
+            }
         }
+    }
+    // The ordinary loop above ran at least one PM direct launch, so the actual PM module
+    // is loaded and the loaded-function occupancy lookup resolves.
+    if ieee_ok && finite_cells + nan_cells > 0 {
+        println!("{}", occupancy_control(&gpu));
     }
     println!(
         "{}",
