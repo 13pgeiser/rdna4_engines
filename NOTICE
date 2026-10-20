@@ -76,3 +76,12 @@ LiquidAI/d1-3B repository): the prompt it renders, its question blocks, the opti
 fallback codebook and the answer spellings, unchanged, in code rewritten in C++. That text is Liquid
 AI, Inc.'s, under the LFM Open License v1.0, whose terms -- including its limit on commercial use --
 apply to it; the license is in core/server/LICENSE.lfm.
+
+data/vectors/qwen4exp-control-vector.gguf and data/vectors/qwen4exp-control-vector.json are the
+published refusal-direction vector for Qwen3.8-Flash-Next, by Cudecnik
+(huggingface.co/Cudecnik/Qwen3.8-Flash-Next-refusal-projection), copied unchanged. The directions
+were measured out of Qwen3.8-Flash-Next's own residual stream, so they are Qwen's, under the Qwen
+Community License 1.0 -- data/vectors/LICENSE.qwen-community-1.0.txt -- which carries the file and
+every copy of it, including its condition that a Model-as-a-Service or AI-work-assistant business
+needs a separate license from Qwen to use it commercially. radiance's Apache-2.0 grant covers the
+code that loads and applies the file; it does not cover the file or its directions.

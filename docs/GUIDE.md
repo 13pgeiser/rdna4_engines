@@ -1443,8 +1443,9 @@ runs, it moves every token's residual stream off that direction. radiance implem
 package for Qwen3.8-Flash-Next was tuned for:
 
 **One flag loads it: `--control-vector off` or `--control-vector on`** (explicit
-`--control-vector disabled` is the same as no flag). Without it nothing is loaded: the graph declares no projection op (so an off request costs the stock model's launches), a
-request that asks for the vector is refused by name, and `/admin/control-vector` answers 404. The
+`--control-vector disabled` is the same as no flag). Without it nothing is loaded: the graph declares
+no projection op (so an off request costs the stock model's launches), a request that asks for the
+vector is refused by name, and `/admin/control-vector` answers 404. The
 flag's value is the startup switch — `off` leaves requests off until one asks or the dashboard flips
 the default, `on` starts them on. With the flag the engine looks, in order, at:
 
@@ -1452,15 +1453,20 @@ the default, `on` starts them on. With the flag the engine looks, in order, at:
 2. `control-vector.gguf` in the container's directory (one file serves a directory of quants of
    the family), then
 3. `<home>/vectors/<architecture>-control-vector.gguf` for each `--radiance-home`, i.e.
-   `…/vectors/qwen4exp-control-vector.gguf`.
+   `…/vectors/qwen4exp-control-vector.gguf` — **and that one ships with radiance**
+   (`data/vectors/`, installed into every plugin home), so there is normally nothing to place.
 
-So a deployment that starts with `--control-vector off` (or `on`) and drops the file beside its
-Flash-Next container offers the Model-view switch and the `control_vector` request field; every
-quantisation of the family shares it, because the file names the architecture and the width, not the
-quant. The operation's parameters come from the package's own JSON (`layer_range`, `scale`, `mode`),
-so there is no flag for them: a file that does not fit this container is reported and skipped, never
-served. Only the startup switch is a flag, because it is the one decision that changes the declared
-graph.
+So a Flash-Next deployment does one thing: start with `--control-vector off` (or `on`). The
+Model-view switch and the `control_vector` request field are then there, because the vector came with
+the plugin home; the first two paths exist so an operator can override it per model or per directory,
+which is also how every quantisation of the family shares one file — the file names the architecture
+and the width, not the quant. The shipped copy is Cudecnik's published file unchanged and stays under
+the **Qwen Community License 1.0** (`data/vectors/LICENSE.qwen-community-1.0.txt`, `NOTICE`): the
+directions are Qwen's, derived from Flash-Next's own residual stream, and radiance's Apache-2.0 grant
+covers the code that applies them, not the file. The operation's parameters come from the package's
+own JSON (`layer_range`, `scale`, `mode`), so there is no flag for them either: a file that does not
+fit this container is reported and skipped, never served. Only the startup switch is a flag, because
+it is the one decision that changes the declared graph.
 
 - **Only a compatible container accepts it.** The file must be a GGUF `controlvector` whose
   `controlvector.model_hint` (when present) is this model's architecture (`qwen4exp`), whose

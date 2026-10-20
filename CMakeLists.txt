@@ -184,6 +184,30 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/data/kernels_moe.rkb)
   install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/data/kernels_moe.rkb
           DESTINATION ${CMAKE_INSTALL_DATADIR}/radiance)
 endif()
+# The published refusal-direction vector for qwen4exp, copied into the built home's vectors/ so a
+# Flash-Next container offers the switch with nothing for an operator to install: core/cvec.cpp looks
+# for <home>/vectors/<arch>-control-vector.gguf after the sidecar paths. The file is Cudecnik's,
+# unchanged (huggingface.co/Cudecnik/Qwen3.8-Flash-Next-refusal-projection; the gguf is sha256
+# ef0724c5b79297e4..., the json d4a3dd842506a6fb..., and that is what the measurements in
+# docs/GUIDE.md 4.10 were made with). Refresh with:
+#
+#   huggingface-cli download Cudecnik/Qwen3.8-Flash-Next-refusal-projection \
+#     Qwen3.8-Flash-Next-refusal-projection.{gguf,json}
+#
+# The directions are derived from Qwen3.8-Flash-Next's weights and stay under the Qwen Community
+# License 1.0 (data/vectors/LICENSE.qwen-community-1.0.txt, NOTICE); radiance's Apache-2.0 grant
+# covers the code that reads them, never the file. It ships loaded only when the deployment asks
+# (--control-vector), and the request default is off, because what it removes is a safety behaviour.
+file(MAKE_DIRECTORY ${RAD_PLUGIN_OUT}/vectors)
+foreach(rrad_vector qwen4exp-control-vector.gguf qwen4exp-control-vector.json)
+  configure_file(${CMAKE_CURRENT_SOURCE_DIR}/data/vectors/${rrad_vector}
+                 ${RAD_PLUGIN_OUT}/vectors/${rrad_vector} COPYONLY)
+  install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/data/vectors/${rrad_vector}
+          DESTINATION ${CMAKE_INSTALL_DATADIR}/radiance/vectors)
+endforeach()
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/data/vectors/LICENSE.qwen-community-1.0.txt
+        DESTINATION ${CMAKE_INSTALL_DOCDIR}/third_party RENAME qwen-community.LICENSE)
+
 # The downloader behind `radiance --model <owner/name>` (core/hf_model.cpp). The engine looks in
 # <bin>/../libexec/radiance/, so the build tree mirrors that layout.
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/scripts/hfget.sh
