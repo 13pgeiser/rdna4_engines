@@ -27,11 +27,11 @@
 // 64+4r, 192+4r); the xor-16 step is in-thread and the rest is DPP
 // row_xmask within the row.
 //
-// The q heads are processed in two halves of GROUP/2 heads (3+3 at group 6,
-// 4+4 at group 8) in the score and P.V phases, so the per-head arithmetic,
-// the softmax wave mapping (wave w = head w) and the key order are the same
-// at every group; only the number of heads per half differs. Group 6 and
-// group 8 are two instantiations of one template body (two entry symbols).
+// Scores process group 6 in two halves (3+3) and group 8 in four quarters
+// (2+2+2+2); P.V processes both groups in two halves of GROUP/2 heads.
+// Per-head arithmetic, softmax wave mapping (wave w = head w) and key order
+// are unchanged. Group 6 and group 8 are two instantiations of one template
+// body (two entry symbols).
 #include <hip/hip_runtime.h>
 
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1201__)
@@ -223,13 +223,21 @@ __device__ __forceinline__ void gqa_tile(
     if (tid < GQA_TILE) vs_lds[tid] = vs;
     __syncthreads();
 
-    // ── Scores: two keys per pass (one per 16-lane row); heads in two
-    //    halves of HPG so only one half's Q is register-resident. The
-    //    memory clobber keeps the scheduler from hoisting half 1's Q loads
-    //    into half 0, which spills.
-    gqa_scores_group<HPG>(0, q_lds, kw, ks, scale_attn, tile_len, wave, row, rl, sc);
-    asm volatile("" ::: "memory");
-    gqa_scores_group<HPG>(1, q_lds, kw, ks, scale_attn, tile_len, wave, row, rl, sc);
+    // Scores: group 8 uses two-head batches to reduce live Q registers;
+    // group 6 retains its existing two halves. Keep Q loads separated.
+    if constexpr (GROUP == GQA_GROUP8) {
+        gqa_scores_group<2>(0, q_lds, kw, ks, scale_attn, tile_len, wave, row, rl, sc);
+        asm volatile("" ::: "memory");
+        gqa_scores_group<2>(1, q_lds, kw, ks, scale_attn, tile_len, wave, row, rl, sc);
+        asm volatile("" ::: "memory");
+        gqa_scores_group<2>(2, q_lds, kw, ks, scale_attn, tile_len, wave, row, rl, sc);
+        asm volatile("" ::: "memory");
+        gqa_scores_group<2>(3, q_lds, kw, ks, scale_attn, tile_len, wave, row, rl, sc);
+    } else {
+        gqa_scores_group<HPG>(0, q_lds, kw, ks, scale_attn, tile_len, wave, row, rl, sc);
+        asm volatile("" ::: "memory");
+        gqa_scores_group<HPG>(1, q_lds, kw, ks, scale_attn, tile_len, wave, row, rl, sc);
+    }
     __syncthreads();
 
     // ── Softmax: one wave per head, reference lane-strided order.

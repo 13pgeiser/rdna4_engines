@@ -13,6 +13,7 @@ Kernel compilation, caching, and dispatch for RDNA GPUs. Owns `Gpu`/`GpuTensor`,
 - Precompiled `kernels/compiled/<arch>/` blobs are preferred only when their hash matches; mismatched hash triggers `hipcc` JIT or a warned unvalidated blob.
 - `Gpu` methods pick WMMA → specialized → baseline via `arch_caps` predicates — adding a new arch clause that a newer predicate already subsumes is redundant.
 - `a3b_gqa8_oracle` requires `lab` and carries the original full-allocation decode dump comparison and VerifyAttn byte-identity gates. Native FP8 H16/KV2 uses the gfx1201 group-8 decode/verify exports under the existing admission flags; H24/group-6 and Q8 defaults remain unchanged. The already-blocked VMM mode is excluded from this target; existing production VMM refusal/fallback semantics are unchanged.
+- The gfx1201 native FP8 GQA8 tile scores heads in four two-head batches to reduce live Q registers; P.V retains two four-head halves. Group-6 scoring, per-head arithmetic order, ABI, launch geometry, LDS layout and admission guards are unchanged.
 
 ## Crate map
 

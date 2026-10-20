@@ -10,6 +10,7 @@
 
 ## Unreleased (0.4.3)
 
+- **Native FP8 GQA8 tile scores use four two-head batches instead of two four-head halves to reduce live Q registers.** Group-6 scoring and both groups' P.V halves, per-head arithmetic order, ABI, launch geometry, LDS layout and admission guards are unchanged.
 - **Fixed: the serve harness stamps `kv_mode_effective` from the loader's actual split `effective K=… V=…` line when no loaded ACK is present.** The consumer fallback only matched the singular `effective KV=…` grammar, so the real `effective K=q8, effective V=q8` (and `effective K=q8 V=q8`) lines left `kv_mode_resolved=UNOBSERVED`; it now stamps the canonical mode when K and V agree, and stays UNOBSERVED on mismatch, partial, or requested-only lines. ACK-first precedence and the singular fallback are unchanged.
 - **Developer tooling: added a standalone tiled MoE numerical oracle behind the existing `lab` feature.** `pm_moe_cn_tiled_numeric_oracle` compares externally selected candidate and independent K1 code objects with VMM guards and dual output poisons, and provides a host-only `--selfcheck`. It does not change production routing, row admission, or defaults.
 - **Fixed: PeaceMaker emulation recognizes the existing unsigned-compare and VCC-branch handlers.** Registers `v_cmp_le_u32_e32` and `s_cbranch_vccnz` so those instructions are dispatched instead of rejected as unsupported; handler math and kernel defaults are unchanged.
