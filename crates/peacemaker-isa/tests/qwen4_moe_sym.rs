@@ -584,19 +584,28 @@ fn down_nt8_stream_fold_census_and_split_epoch_advance() {
         fmac.iter().all(|l| !l.contains("v154") && !l.contains("v155")),
         "down NT8 stream: no FMA reads the d slots"
     );
-    assert!(
-        fmac.chunks(4).all(|chunk| (56..64u8).all(|p| {
-            let needle = format!("v{p}");
-            chunk.iter().any(|l| l.contains(&needle))
-        }) && (48..56u8).all(|c| {
-            let needle = format!("v{c}");
-            chunk.iter().any(|l| l.contains(&needle))
-        }) && (72..136u8).all(|s| {
-            let needle = format!("v{s}");
-            chunk.iter().any(|l| l.contains(&needle))
-        })),
-        "down NT8 stream: each fold reads TPROD and CACC and writes the sums"
-    );
+    // Each fold updates only its tile's eight sums, not all 64 sums.
+    // Match every half's complete register tuple, including the bank-swizzled
+    // product t+(row^2), rather than loose substring coverage.
+    for (fold, packets) in fmac.chunks_exact(4).enumerate() {
+        let sum = 72 + 8 * (fold % 8) as u16;
+        for (packet, line) in packets.iter().enumerate() {
+            let halves: Vec<_> = line.split("::").collect();
+            assert_eq!(halves.len(), 2, "down NT8 stream: dual FMAC packet");
+            for (half, text) in halves.iter().enumerate() {
+                let row = (2 * packet + half) as u16;
+                let regs: Vec<u16> = text
+                    .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .filter_map(|word| word.strip_prefix('v')?.parse().ok())
+                    .collect();
+                assert_eq!(
+                    regs,
+                    [sum + row, 56 + (row ^ 2), 48 + row],
+                    "down NT8 stream: fold {fold}, row {row} FMAC dst/product/chain"
+                );
+            }
+        }
+    }
     let lines: Vec<&str> = text.lines().collect();
     // Back-edge ledger regression: the stream drains outstanding loads at
     // both loop boundaries (`G::settles_loads`, `Prefetch::<0>::wait_load`
