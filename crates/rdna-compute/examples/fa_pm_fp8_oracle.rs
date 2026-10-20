@@ -495,6 +495,8 @@ enum NativeKind {
     /// Both E4M3 NaN encodings: K key3 and V key0. Independently specified
     /// NaN positions must agree; unaffected words must be finite and exact.
     Nan,
+    QNan,
+    QInf,
 }
 impl NativeKind {
     fn name(self) -> &'static str {
@@ -503,7 +505,15 @@ impl NativeKind {
             NativeKind::Kt48 => "kt48",
             NativeKind::Random => "random",
             NativeKind::Nan => "nan",
+            NativeKind::QNan => "q_nan_probe",
+            NativeKind::QInf => "q_inf_probe",
         }
+    }
+    fn nonfinite(self) -> bool {
+        matches!(self, Self::Nan | Self::QNan | Self::QInf)
+    }
+    fn winner(self) -> bool {
+        matches!(self, Self::Winner | Self::Kt48)
     }
 }
 #[derive(Clone, Copy)]
@@ -1042,10 +1052,42 @@ const NATIVE_CELLS: [(usize, usize, NativeKind); 28] = [
     (65, 63, NativeKind::Nan),
 ];
 fn native_cells() -> Vec<NativeCell> {
-    NATIVE_CELLS
+    let mut cells: Vec<_> = NATIVE_CELLS
         .iter()
         .map(|&(rows, start, kind)| NativeCell { rows, start, kind })
-        .collect()
+        .collect();
+    // Close the identified nonfinite-Q hole only; do not manufacture a
+    // one-for-one replacement for the obsolete 31-case F16/KT64 packet set.
+    cells.push(NativeCell {
+        rows: 8,
+        start: 0,
+        kind: NativeKind::QNan,
+    });
+    cells.push(NativeCell {
+        rows: 8,
+        start: 0,
+        kind: NativeKind::QInf,
+    });
+    cells
+}
+/// Bounded consumer-visible coverage, not a cardinality-equivalence or reuse
+/// of old packet numerical PASS. Primitive reuse is explicitly source-bound.
+fn native_coverage_map() -> Value {
+    json!({
+        "native_cells":30,"finite":26,"nonfinite":4,
+        "reference":"all finite direct/range outputs: independent H16 FP8-WMMA KT48 byte gate",
+        "shape_groups":{
+            "tails_winners":"n1/7/8/16, n48_s1, n64_s1, n49_s1, n48_s14, n600_s2",
+            "KT48_live_keys":"47/48/49/63/64/65, including odd 516-byte rows",
+            "general_positions":"n47/48/49_s63; n511/512/513_s1; n512_s63; n64_s64; n65_s63",
+            "long_active_prefix":"n512_s15872 and n64_s16320 reach key16383",
+            "range":"every cell: FULL-total scale plane, offset0 replay and nonzero offset where possible",
+            "nonfinite":"KV NaN n8_s0/n65_s63 plus F32-Q NaN/Inf n8_s0; independent affected-head masks"
+        },
+        "producer":"two finite F32 fixtures x three actual provider modes; full codes/scales, varied heads, non-F16-exact values",
+        "legacy_primitive_reuse":"unchanged native codec/writer and Fixture position primitives retain legacy source/ABI; CPU E4M3 signed-zero/tie/subnormal checks remain",
+        "not_claimed":"old31 case-for-case native GPU equivalence, F16-first rounding, KT64 recurrence, or old packet attention PASS"
+    })
 }
 /// General finite K/V: rotating E4M3 sweeps on odd/even 516-byte rows,
 /// with head/key-dependent F16 scales. No assumed 8-byte alignment.
@@ -1609,7 +1651,7 @@ fn hip_pre_seg(gpu: &Gpu, a: &Arena, q16: &Buf, off: usize, n: usize) -> Result<
 }
 /// Native arena, disjoint from legacy `Arena`: Raw Q two-plane, native 516B
 /// K/V rows, positions, three F32 outputs and host-fixture F32 Q. All eight
-/// buffers retain both-side canaries. Allocated once for the selected family.
+/// buffers retain both-side canaries and are allocated once per family.
 struct NativeArena {
     b: Vec<Buf>,
 }
@@ -1652,7 +1694,7 @@ impl NativeArena {
             DType::F32,
         ];
         let mut b = Vec::new();
-        for i in 0..8 {
+        for i in 0..NATIVE_BUFFER_NAMES.len() {
             b.push(Buf::new(gpu, NATIVE_BUFFER_NAMES[i], sizes[i], dtypes[i])?);
         }
         Ok(Self { b })
@@ -2050,7 +2092,7 @@ fn native_prepare(cell: &NativeCell, round: usize) -> Result<NativePrepared> {
     let seed =
         fnv(&cell.name()) ^ (0xa3b00000u64 + (round as u64).wrapping_mul(0x9E3779B97F4A7C15));
     let mut rng = Rng(seed);
-    let q_f32: Vec<f32> = match cell.kind {
+    let mut q_f32: Vec<f32> = match cell.kind {
         // Exact byte-gate fixtures use uniform all-448 Q rows: amax is exactly
         // 448, so the prep scale is exactly 1.0 and every code is exactly 0x7e.
         // Scores become exactly (448 x 448 x 256)/16 vs exactly 0: the gap is
@@ -2066,17 +2108,28 @@ fn native_prepare(cell: &NativeCell, round: usize) -> Result<NativePrepared> {
             })
             .collect(),
     };
+    if matches!(cell.kind, NativeKind::QNan | NativeKind::QInf) {
+        let (positive, negative) = if cell.kind == NativeKind::QInf {
+            (f32::INFINITY, f32::NEG_INFINITY)
+        } else {
+            (f32::NAN, -f32::NAN)
+        };
+        q_f32[0] = positive;
+        q_f32[D + 7] = negative;
+        q_f32[(2 * H + 3) * D + 10] = positive;
+        q_f32[(5 * H + 8) * D + 200] = negative;
+        q_f32[(5 * H + 8) * D + 201] = positive;
+        if cell.kind == NativeKind::QNan {
+            for i in 5 * ROW..6 * ROW {
+                q_f32[i] = if i % 2 == 0 { positive } else { negative };
+            }
+        }
+    }
     // Positions: exact-gate cells pin every query's horizon at `start` (the
     // winner key; every row sees the same causal prefix).
     // Non-pinned cells use the standard 8-wide fixture pattern; round 1
     // reverses it (second DISTINCT position round, same existing pattern).
-    let mut positions: Vec<i32> = (0..rows)
-        .map(|row| {
-            let (g, r) = (row / 8, row % 8);
-            let m = (rows - g * 8).min(8);
-            (cell.start + g * 8 + if round == 0 { r } else { m - 1 - r }) as i32
-        })
-        .collect();
+    let mut positions = Fixture::Std.for_round(round).positions(rows, cell.start);
     if matches!(cell.kind, NativeKind::Kt48 | NativeKind::Winner) {
         for p in positions.iter_mut() {
             *p = cell.start as i32;
@@ -2090,7 +2143,7 @@ fn native_prepare(cell: &NativeCell, round: usize) -> Result<NativePrepared> {
             native_winner_kv(max_ctx, win, 0x5300)
         }
         NativeKind::Nan => (native_cache(max_ctx, 3), native_cache(max_ctx, 9)),
-        NativeKind::Random => (
+        _ => (
             native_cache(max_ctx, round * 13),
             native_cache(max_ctx, 7 + round * 13),
         ),
@@ -2128,7 +2181,6 @@ fn native_prepare(cell: &NativeCell, round: usize) -> Result<NativePrepared> {
     native_validate(rows, &positions, max_ctx, used_q, used_cache)?;
     let expected = match cell.kind {
         NativeKind::Winner | NativeKind::Kt48 => native_expected(&k_cache, &positions),
-        NativeKind::Random => Vec::new(),
         // K key3: all words when live. V key0: dim0 of KVhead0 and
         // dim255 of KVhead1 for every query. Other words must be finite
         // and byte-identical to the independent quantized HIP reference.
@@ -2145,6 +2197,14 @@ fn native_prepare(cell: &NativeCell, round: usize) -> Result<NativePrepared> {
                 })
             })
             .collect(),
+        NativeKind::QNan | NativeKind::QInf => q_f32
+            .chunks_exact(D)
+            .flat_map(|head| {
+                let poisoned = head.iter().any(|v| !v.is_finite());
+                std::iter::repeat(if poisoned { f32::NAN } else { 0.0 }).take(D)
+            })
+            .collect(),
+        _ => Vec::new(),
     };
     Ok(NativePrepared {
         q_f32,
@@ -2191,8 +2251,8 @@ fn native_upload(gpu: &mut Gpu, a: &NativeArena, p: &NativePrepared, round: usiz
     gpu.hip.device_synchronize()?;
     Ok(())
 }
-/// Native guard + input integrity (existing canary pattern on the 8 native
-/// buffers): every guard intact and every uploaded plane bit-identical.
+/// Native input/guard integrity: all inputs unchanged, all eight native
+/// buffer canaries intact, including after perturbed-cache probe launches.
 fn native_integrity(
     gpu: &Gpu,
     a: &NativeArena,
@@ -2433,11 +2493,11 @@ fn native_output_poison(gpu: &Gpu, buf: &Buf, len: usize, round: usize) -> Resul
     Ok(())
 }
 
-/// Real provider proof, once per selected native family. LAB scratch is
-/// allocated once and reused for all six launches (two fixtures/poisons,
-/// F32 baseline + FP8 gate + FP8 nogate). Production APIs are unchanged.
-/// Norm/RoPE use the exact existing provider/source/ABI; only quantization
-/// and head permutation are independently modeled on CPU.
+/// Real provider proof: two finite F32 source fixtures (the two poison
+/// rounds), each with 17 QUERY ROWS, x F32 baseline / FP8 gate / FP8 nogate
+/// = six launches. One eight-buffer LAB allocation is reused. EVERY provider
+/// input is reset before EVERY launch, especially its in-place K input.
+/// Norm/RoPE reuse exact source/ABI; CPU quantization/head layout is independent.
 fn native_producer_proof(gpu: &mut Gpu) -> Result<Value> {
     const N: usize = 17;
     let qbytes = N * ROW * 4;
@@ -2503,17 +2563,18 @@ fn native_producer_proof(gpu: &mut Gpu) -> Result<Value> {
         for (buf, &size) in b.iter().zip(&sizes) {
             buf.arm_guards(gpu, size)?;
         }
-        b[0].upload(gpu, bytes(&interleaved))?;
-        b[2].upload(gpu, bytes(&qw))?;
-        b[3].upload(gpu, bytes(&kw))?;
-        b[4].upload(gpu, bytes(&positions))?;
         let mut baseline = Vec::new();
         let mut baseline_k = Vec::new();
         let mut baseline_gate = Vec::new();
         let mut modes = Vec::new();
         for mode in 0..3 {
-            // K is in-place: restore the SAME pre-norm bytes before each arm.
+            // Reset EVERY provider input from its original host bytes before
+            // each arm, especially K (the provider mutates K in place).
+            b[0].upload(gpu, bytes(&interleaved))?;
             b[1].upload(gpu, bytes(&kin))?;
+            b[2].upload(gpu, bytes(&qw))?;
+            b[3].upload(gpu, bytes(&kw))?;
+            b[4].upload(gpu, bytes(&positions))?;
             let output = if mode == 0 { 5 } else { 6 };
             native_output_poison(gpu, &b[output], sizes[output], round)?;
             native_output_poison(gpu, &b[7], qbytes, round)?;
@@ -2554,8 +2615,8 @@ fn native_producer_proof(gpu: &mut Gpu) -> Result<Value> {
                 baseline = f32s(&out);
                 baseline_k = kout;
                 baseline_gate = gout;
-                // Require exercised, non-F16-exact output and nonuniform
-                // head scales; otherwise the fixture fails, never skips.
+                // Require exercised F32-only precision and varied per-head
+                // scales; a trivial/unwritten baseline must fail, not skip.
                 let nonhalf = baseline
                     .iter()
                     .filter(|&&x| {
@@ -2600,8 +2661,9 @@ fn native_producer_proof(gpu: &mut Gpu) -> Result<Value> {
             }
         }
         let ok = modes.len() == 3 && modes.iter().all(pass);
-        rounds.push(json!({"round":round, "rows":N, "heads":H,
-            "poison_byte":NATIVE_POISONS[round], "modes":modes, "pass":ok}));
+        rounds.push(json!({"round":round,"fixture":"general_f32_varied_heads",
+            "query_rows":N,"heads":H,
+            "poison_byte":NATIVE_POISONS[round],"modes":modes,"pass":ok}));
     }
     let ok = rounds.len() == 2 && rounds.iter().all(pass);
     Ok(json!({"provider":"Gpu::qwen35_fa_prep_batched_gfx1201",
@@ -2609,10 +2671,15 @@ fn native_producer_proof(gpu: &mut Gpu) -> Result<Value> {
         "source_sha256":sha_hex(NATIVE_PREP_BODY.as_bytes()),
         "kernarg_bytes":{"F32_gate":80,"FP8_gate":88,"FP8_nogate":80},
         "shape":{"q_heads":H,"kv_heads":KV,"head_dim":D,"n_rot":64,"rows":N},
-        "eps":1.0e-6,"freq_base":1_000_000.0,"position_offset":11,
+        "eps":1.0e-6,
+        "freq_base":1_000_000.0,"position_offset":11,
+        "reset_before_every_launch":["Q_interleaved_including_gates","K_pre_norm","Q_norm_weight","K_norm_weight","positions"],
+        "no_v_input":"this production prep ABI has no V argument",
         "normalization_rope":"exact existing source/ABI reuse, not independent algorithm proof",
         "quantizer":"independent CPU per-D256-head amax/448 E4M3 RNE + permute",
-        "launches":6, "rounds":rounds, "pass":ok}))
+        "source_fixtures":2,"poison_rounds":2,
+        "modes_per_fixture":["F32_gate","FP8_gate","FP8_nogate"],
+        "query_rows_per_fixture":N,"launches":6,"rounds":rounds,"pass":ok}))
 }
 
 /// Every finite output gates against the independent quantized HIP reference.
@@ -2628,7 +2695,7 @@ fn native_out_compare(
     if words == 0
         || cand_bytes.len() != ref_bytes.len()
         || cand_bytes.len() % 4 != 0
-        || (kind != NativeKind::Random && expected.len() != words)
+        || ((kind.nonfinite() || kind.winner()) && expected.len() != words)
     {
         return json!({"pass":false, "error":"output/expectation extent mismatch"});
     }
@@ -2645,7 +2712,7 @@ fn native_out_compare(
     {
         let c = f32::from_ne_bytes(cb.try_into().unwrap());
         let r = f32::from_ne_bytes(rb.try_into().unwrap());
-        if kind == NativeKind::Nan && expected[i].is_nan() {
+        if kind.nonfinite() && expected[i].is_nan() {
             affected_nan += 1;
             if !c.is_nan() || !r.is_nan() {
                 nan_mismatches += 1;
@@ -2672,8 +2739,8 @@ fn native_out_compare(
         && nonfinite == 0
         && nan_mismatches == 0
         && secondary_mismatches == 0
-        && (kind != NativeKind::Nan || affected_nan > 0);
-    json!({"classification":if kind == NativeKind::Nan {"nan_codes_separate"} else {"finite_byte_gate"},
+        && (!kind.nonfinite() || affected_nan > 0);
+    json!({"classification":if kind.nonfinite() {"nonfinite_positions_separate"} else {"finite_byte_gate"},
         "reference":"independent_quantized_HIP", "gate":true, "words":words,
         "candidate_reference_word_mismatches":mismatches,
         "unexpected_nonfinite_words":nonfinite, "expected_nan_words":affected_nan,
@@ -2853,7 +2920,7 @@ fn native_round(gpu: &mut Gpu, a: &NativeArena, cell: &NativeCell, round: usize)
         range_gate["outside_segment_unchanged"] = json!(untouched);
         range_gate["pass"] = json!(gate_ok);
     }
-    let finite = !matches!(cell.kind, NativeKind::Nan);
+    let finite = !cell.kind.nonfinite();
     let content_ok = {
         let words: Vec<u32> = cand_whole
             .chunks_exact(4)
@@ -3120,10 +3187,12 @@ fn plan() {
                 "lds": NATIVE_LDS, "kt": 48,
                 "reference_grid": [nc.rows * H, 1, 1], "reference_block": [32, 1, 1], "reference_lds": 0,
                 "launches_per_round": "both direct + both offset0 range + both nonzero range + causal probes",
-                "poison_rounds": ["0xA5", "0x5A"], "finite_byte_gate": nc.kind != NativeKind::Nan,
-                "producer_family_launches": 6, "producer_rows": 17})
+                "poison_rounds": ["0xA5", "0x5A"], "finite_byte_gate": !nc.kind.nonfinite(),
+                "producer_family_launches": 6, "producer_source_fixtures":2,
+                "producer_query_rows_per_fixture": 17})
         );
     }
+    println!("{}", json!({"native_coverage_map":native_coverage_map()}));
     let cells = oracle_cells();
     let with_long: Vec<Cell> = cells.iter().copied().chain(long_cells()).collect();
     let sizes = arena_sizes(&with_long);
@@ -3737,8 +3806,8 @@ fn self_check() -> usize {
         );
     }
     ok(
-        native_cells().len() == NATIVE_CELLS.len() && NATIVE_CELLS.len() == 28,
-        "native family: 28 planned cells (26 finite byte gates, 2 NaN masks)",
+        native_cells().len() == 30 && NATIVE_CELLS.len() == 28,
+        "native family: 30 planned cells (26 finite byte gates, 4 nonfinite masks)",
     );
     ok(
         native_cells()
@@ -3759,7 +3828,7 @@ fn self_check() -> usize {
         native_cells()
             .iter()
             .all(|c| native_prepare(c, 0).is_ok() && native_prepare(c, 1).is_ok()),
-        "native family: all 28 cells build on CPU for both poison rounds",
+        "native family: all 30 cells build on CPU for both poison rounds",
     );
     ok(
         NATIVE_REF_BODY.contains("q_scales[") && NATIVE_REF_BODY.contains("q_codes + "),
@@ -3795,6 +3864,31 @@ fn self_check() -> usize {
                 .any(|c| c.rows == rows && c.kind == NativeKind::Random)
         }),
         "general finite gates cover 48-query groups and the 512-query run reset",
+    );
+    let mapping = native_coverage_map();
+    ok(
+        mapping["native_cells"] == 30,
+        "bounded native coverage is explicit, not old31 numerical equivalence",
+    );
+    let inf = native_prepare(
+        &NativeCell {
+            rows: 8,
+            start: 0,
+            kind: NativeKind::QInf,
+        },
+        0,
+    )
+    .expect("F32 Inf fixture");
+    ok(
+        inf.q_scales[0].is_infinite()
+            && inf.q_codes[0] & 0x7f == 0x7f
+            && inf.expected[..D].iter().all(|v| v.is_nan()),
+        "F32 Inf analog: Inf scale, Inf/Inf NaN code, independently tainted output head",
+    );
+    let (nan_codes, nan_scale) = prep_q_row(&vec![f32::NAN; D]);
+    ok(
+        nan_scale == 1.0 && nan_codes.iter().all(|c| c & 0x7f == 0x7f),
+        "all-NaN F32 head retains scale1 and NaN code positions",
     );
     n
 }
@@ -4075,7 +4169,7 @@ fn run() -> Result<bool> {
                     }
                 }
             }
-            let finite_gate = nc.kind != NativeKind::Nan;
+            let finite_gate = !nc.kind.nonfinite();
             if finite_gate {
                 native_finite += 1;
                 native_finite_ok += ok as usize;
@@ -4087,11 +4181,8 @@ fn run() -> Result<bool> {
                 json!({"kind": "native_cell", "cell": nc.name(), "rows": nc.rows,
                     "start": nc.start, "kind": nc.kind.name(), "context": nc.ctx(),
                     "rounds": rounds,
-                    "classification": match nc.kind {
-                        NativeKind::Nan => "nan_codes_separate",
-                        NativeKind::Random => "finite_byte_gate",
-                        _ => "finite_byte_gate",
-                    },
+                    "classification":if nc.kind.nonfinite() {"nonfinite_positions_separate"}
+                        else {"finite_byte_gate"},
                     "pass": ok})
             );
             if !ok {
@@ -4101,7 +4192,7 @@ fn run() -> Result<bool> {
     }
     let native_finite_selected = native_selected
         .iter()
-        .filter(|c| c.kind != NativeKind::Nan)
+        .filter(|c| !c.kind.nonfinite())
         .count();
     let native_acceptance = native_requested
         && !native_selected.is_empty()
@@ -4128,6 +4219,7 @@ fn run() -> Result<bool> {
             "native_requested":native_requested,"native_selected":native_selected.len(),
             "native_finite_selected":native_finite_selected,"native_gpu_producer":native_producer,
             "native_acceptance":native_acceptance,
+            "native_coverage":if native_requested {native_coverage_map()} else {Value::Null},
             "native_reference_sha256":native_src_sha})
     );
     println!("all_byte_identical {}", finite_cells == finite_identical);
