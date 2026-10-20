@@ -309,7 +309,8 @@ void r4d_ar_wht6_dims(int* group, int* bits, int* chunk_elems); // rotated-6-bit
 void r4d_ar_gather_2rank(long peer_scratch, long my_scratch, long peer_flags, long my_flags,
                          long seq_ctrs, long slot_stride16, long inp, long out, long n_elem,
                          long dtype, long rank, long row_elems, long stream, long nblocks,
-                         long nthreads, long drain, long acq);
+                         long nthreads, long drain, long acq, long dpitch,
+                         long spitch);
 
 // ---- all-reduce: one-shot, push, 4 or 8 ranks over P2P -------------------------------------
 // The same algorithm at width (r4d_ar_oneshot_Nrank_exact.hip). Peer arguments are in ascending
@@ -343,7 +344,8 @@ void r4d_ar_gather_3rank(long peer_scratch0, long peer_scratch1, long peer_flags
                          long peer_flags1, long my_scratch, long my_flags, long seq_ctrs,
                          long slot_stride16, long inp, long out, long n_elem, long dtype,
                          long rank, long row_elems, long stream, long nblocks, long nthreads,
-                         long drain, long acq, long pub);
+                         long drain, long acq, long pub, long dpitch,
+                         long spitch);
 void r4d_ar_oneshot_8rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                                 long peer_scratch3, long peer_scratch4, long peer_scratch5,
                                 long peer_scratch6, long peer_flags0, long peer_flags1,

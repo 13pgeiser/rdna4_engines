@@ -35,11 +35,10 @@
 # 32 GiB R9700.
 #
 # This starts from bf16 for the reason gemma4-31b-dense-bf16-w4a8-df.recipe gives: the drafter
-# reads the trunk's hidden states and was trained beside the bf16 trunk.
+# reads the trunk's hidden states and was trained beside the bf16 trunk. q, k and v are one linear
+# (blk.*.attn_qkv), for the reason that recipe gives.
 
-blk.*.attn_q.weight       rtn  codes=i8 group=128 scale=f16 clamp=sym
-blk.*.attn_k.weight       rtn  codes=i8 group=128 scale=f16 clamp=sym
-blk.*.attn_v.weight       rtn  codes=i8 group=128 scale=f16 clamp=sym
+blk.*.attn_qkv.weight     rtn  codes=i8 group=128 scale=f16 clamp=sym
 blk.*.attn_o.weight       rtn  codes=i8 group=128 scale=f16 clamp=sym
 blk.*.ffn_down.weight     rtn  codes=i8 group=128 scale=f16 clamp=sym
 blk.*.ffn_gate_up.weight  rtn  codes=i8 group=128 scale=f16 clamp=sym

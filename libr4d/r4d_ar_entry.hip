@@ -752,7 +752,7 @@ extern "C" void r4d_ar_gather_4rank(long peer_scratch0, long peer_scratch1, long
                                     long slot_stride16, long inp, long out, long n_elem,
                                     long dtype, long rank, long row_elems, long stream,
                                     long nblocks, long nthreads, long drain, long acq, long pub,
-                                    long gate, long gate_ctr);
+                                    long gate, long gate_ctr, long dpitch, long spitch);
 extern "C" void r4d_ar_gather_8rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                                     long peer_scratch3, long peer_scratch4, long peer_scratch5,
                                     long peer_scratch6, long peer_flags0, long peer_flags1,
@@ -761,11 +761,14 @@ extern "C" void r4d_ar_gather_8rank(long peer_scratch0, long peer_scratch1, long
                                     long my_flags, long seq_ctrs, long slot_stride16, long inp,
                                     long out, long n_elem, long dtype, long rank, long row_elems,
                                     long stream, long nblocks, long nthreads, long drain, long acq,
-                                    long pub);
+                                    long pub, long dpitch, long spitch);
 
-/* Not ar_setup: an all-gather's output is world_size times its input. */
+/* Not ar_setup: an all-gather's output is world_size times its input. With `row`, `y` may also be
+ * the leading world_size * row columns of a wider buffer and `x` a row-wide window of one
+ * (docs/OPS.md); `*dpitch_out` and `*spitch_out` are then their row pitches in elements, else 0. */
 static int ar_gather_wide_setup(const RadArgs* a, int ws, const ArInst** out_in, ArCall* c,
-                                long long* row_out) {
+                                long long* row_out, long long* dpitch_out,
+                                long long* spitch_out) {
     const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
     if (!in) return RAD_E_STATE;                  /* init did not run: a core sequencing bug */
     if (in->world != ws) return RAD_E_SHAPE;      /* the peer bundle is compiled for this width */
@@ -773,7 +776,6 @@ static int ar_gather_wide_setup(const RadArgs* a, int ws, const ArInst** out_in,
     const RadTensor* x = r4d_opt(a, AR_X);
     const RadTensor* y = r4d_opt(a, AR_Y);
     if (!x || !y) return RAD_E_INVAL;             /* the gather has no in-place form */
-    if (!r4d_contig(x) || !r4d_contig(y)) return RAD_E_STRIDE;
     if (y->data == x->data) return RAD_E_INVAL;
 
     const long n = (long)r4d_numel(x);
@@ -783,6 +785,27 @@ static int ar_gather_wide_setup(const RadArgs* a, int ws, const ArInst** out_in,
 
     const long long row = r4d_pgeti_or(a->p, a->n_p, "row", 0);
     if (row < 0 || (row > 0 && (n % row || (row * in->esize) % 16))) return RAD_E_SHAPE;
+    /* A row-interleaved gather's [rows][world * row] may sit in the leading columns of a wider
+     * buffer, the pitch in whole 16-byte words: rows land at that pitch, the rest of each row is
+     * left alone. */
+    long long dpitch = 0;
+    if (!r4d_contig(y)) {
+        const long long p = r4d_row_pitch(y);
+        if (row <= 0 || y->rank != 2 || p <= 0 || y->shape[1] != (int64_t)row * in->world ||
+            (p * in->esize) % 16)
+            return RAD_E_STRIDE;
+        dpitch = p;
+    }
+    /* Likewise x may be [rows][row] read at a wider pitch: a rank's window of a row it computed
+     * wider (a split linear's block-aligned superset, arch/common/rad_block_dflash2.h). */
+    long long spitch = 0;
+    if (!r4d_contig(x)) {
+        const long long p = r4d_row_pitch(x);
+        if (row <= 0 || x->rank != 2 || p <= 0 || x->shape[1] != (int64_t)row ||
+            (p * in->esize) % 16)
+            return RAD_E_STRIDE;
+        spitch = p;
+    }
 
     if (((long long)n * in->esize) % 16) return RAD_E_ALIGN;
     if (!r4d_aligned(x->data, 16) || !r4d_aligned(y->data, 16)) return RAD_E_ALIGN;
@@ -804,43 +827,46 @@ static int ar_gather_wide_setup(const RadArgs* a, int ws, const ArInst** out_in,
     c->acq = cfgv.acq;
     c->pub = cfgv.pub;
     *row_out = row;
+    *dpitch_out = dpitch;
+    *spitch_out = spitch;
     return RAD_OK;
 }
 
 extern "C" int r4d_rad_ar_gather_2rank(const RadArgs* a, RadStream s) {
     const ArInst* in = nullptr;
     ArCall c;
-    long long row = 0;
-    int rc = ar_gather_wide_setup(a, 2, &in, &c, &row);
+    long long row = 0, dpitch = 0, spitch = 0;
+    int rc = ar_gather_wide_setup(a, 2, &in, &c, &row, &dpitch, &spitch);
     if (rc != RAD_OK) return rc;
     R4D_TRY("ar_gather_2rank",
         r4d_ar_gather_2rank(in->peer_scratch[0], in->my_scratch, in->peer_flags[0], in->my_flags,
                             in->my_seq, in->slot16, c.inp, c.out, c.numel, in->dtype, in->rank,
                             (long)row, (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain,
-                            c.acq));
+                            c.acq, (long)dpitch, (long)spitch));
     return RAD_OK;
 }
 
 extern "C" int r4d_rad_ar_gather_3rank(const RadArgs* a, RadStream s) {
     const ArInst* in = nullptr;
     ArCall c;
-    long long row = 0;
-    int rc = ar_gather_wide_setup(a, 3, &in, &c, &row);
+    long long row = 0, dpitch = 0, spitch = 0;
+    int rc = ar_gather_wide_setup(a, 3, &in, &c, &row, &dpitch, &spitch);
     if (rc != RAD_OK) return rc;
     R4D_TRY("ar_gather_3rank",
         r4d_ar_gather_3rank(in->peer_scratch[0], in->peer_scratch[1],
                             in->peer_flags[0], in->peer_flags[1],
                             in->my_scratch, in->my_flags, in->my_seq, in->slot16,
                             c.inp, c.out, c.numel, in->dtype, in->rank, (long)row,
-                            (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq, c.pub));
+                            (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq, c.pub,
+                            (long)dpitch, (long)spitch));
     return RAD_OK;
 }
 
 extern "C" int r4d_rad_ar_gather_4rank(const RadArgs* a, RadStream s) {
     const ArInst* in = nullptr;
     ArCall c;
-    long long row = 0;
-    int rc = ar_gather_wide_setup(a, 4, &in, &c, &row);
+    long long row = 0, dpitch = 0, spitch = 0;
+    int rc = ar_gather_wide_setup(a, 4, &in, &c, &row, &dpitch, &spitch);
     if (rc != RAD_OK) return rc;
     /* One handshake, placement after it local: the release is the one-shot's. */
     const long gate = link_gate(a), early = in->host ? 0L : gate;
@@ -850,15 +876,15 @@ extern "C" int r4d_rad_ar_gather_4rank(const RadArgs* a, RadStream s) {
                             in->my_scratch, in->my_flags, in->my_seq, in->slot16,
                             c.inp, c.out, c.numel, in->dtype, in->rank, (long)row,
                             (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq, c.pub,
-                            early, early ? in->gate_ctr : 0L));
+                            early, early ? in->gate_ctr : 0L, (long)dpitch, (long)spitch));
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
 
 extern "C" int r4d_rad_ar_gather_8rank(const RadArgs* a, RadStream s) {
     const ArInst* in = nullptr;
     ArCall c;
-    long long row = 0;
-    int rc = ar_gather_wide_setup(a, 8, &in, &c, &row);
+    long long row = 0, dpitch = 0, spitch = 0;
+    int rc = ar_gather_wide_setup(a, 8, &in, &c, &row, &dpitch, &spitch);
     if (rc != RAD_OK) return rc;
     R4D_TRY("ar_gather_8rank",
         r4d_ar_gather_8rank(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
@@ -869,7 +895,8 @@ extern "C" int r4d_rad_ar_gather_8rank(const RadArgs* a, RadStream s) {
                             in->peer_flags[6],
                             in->my_scratch, in->my_flags, in->my_seq, in->slot16,
                             c.inp, c.out, c.numel, in->dtype, in->rank, (long)row,
-                            (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq, c.pub));
+                            (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq, c.pub,
+                            (long)dpitch, (long)spitch));
     return RAD_OK;
 }
 

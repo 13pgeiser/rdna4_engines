@@ -28,10 +28,14 @@
 #
 # ~20 GiB: the int4 trunk's linears (~14 GiB), the bf16 table and its int8 head (2 GiB), the
 # vision tower, the drafter at block fp8 (1.4 GiB) and its head's block-fp8 copy (0.7 GiB).
+#
+# q, k and v are one linear, blk.*.attn_qkv (q | k | v; q | k on the global layers, where v is
+# k): the plugin serves one GEMM a layer where three paid the skinny GEMM's fixed cost each. The
+# grid's groups never cross a row, so the codes are those of three separate rules (on the cards k
+# and v may round differently in the last bit: the GEMM's K split follows N). A container
+# converted before this, with the three apart, still serves.
 
-blk.*.attn_q.weight       rtn  codes=i4 group=128 scale=f16 rule=search
-blk.*.attn_k.weight       rtn  codes=i4 group=128 scale=f16 rule=search
-blk.*.attn_v.weight       rtn  codes=i4 group=128 scale=f16 rule=search
+blk.*.attn_qkv.weight     rtn  codes=i4 group=128 scale=f16 rule=search
 blk.*.attn_o.weight       rtn  codes=i4 group=128 scale=f16 rule=search
 blk.*.ffn_down.weight     rtn  codes=i4 group=128 scale=f16 rule=search
 blk.*.ffn_gate_up.weight  rtn  codes=i4 group=128 scale=f16 rule=search

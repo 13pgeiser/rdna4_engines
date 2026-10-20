@@ -691,7 +691,7 @@ may not have arrived.
 | `gemm_nt` | `M`(range) `N` `K` `dtype` | `a`, `b`w → `y` |
 | `gemm_nt_f32` | `M`(range) `N` `K` `dtype` | `a`, `b`w → `y` |
 | `gemm_nt_bias` | `M`(range) `N` `K` `dtype` `act`/opt | `a`, `b`w, `bias`w, `res`? → `y` |
-| `gemm_nt_q` | `M`(range) `N` `K` `group` `dtype` `pb1`/opt `pb2`/opt | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? |
+| `gemm_nt_q` | `M`(range) `N` `K` `group` `dtype` `pb1`/opt `pb2`/opt `split_n`/opt | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? |
 | `gemm_nt_q_bias` | `M`(range) `N` `K` `group` `dtype` | `a`, `a_scale`, `b`w, `b_scale`w, `bias`w → `y` |
 
 `nt` is A row-major `[M,K]` times B transposed `[N,K]`, giving `[M,N]`: the layout every weight in
@@ -726,7 +726,14 @@ weight element (n, k) is `(code - zero) * scale`, one f16 scale and one integer 
 
 `a_sum` is `quant_act_i8`'s `asum`, group-major `[K/group][Mpad]` with `Mpad = ceil(M/16)*16`. The
 ParoQuant grids (the four 4- and 5-bit ones) take parts (`pb1`, `pb2`); `w2a8` and `w4a8_asym` do
-not, and none has a bias form. libr4d's kernels compute the same products in another order (split-K
+not, and none has a bias form.
+
+`split_n` is the output width whose K split the call takes, when it is a row slice of a wider
+linear (a rank's share of a weight whose rows do not divide among the ranks, issued as two slices).
+libr4d's narrow fp8a8 and i8a8 kernels pick their K split from N alone, and the split sets the order
+K partials are summed in, so a slice given the whole width sums each output as the whole linear
+does and its outputs are the linear's to the bit. Absent, N. The host libraries never split K and
+ignore it. libr4d's kernels compute the same products in another order (split-K
 partials, the activation scale applied at the store); libavx folds the scales into its decoded rows,
 each product rounding once where libref rounds each group's sub-sum. A `b_scale` that is not joined
 at these grids has no zero to read and is refused (`RAD_E_DTYPE`). libref describes none of them
@@ -2093,6 +2100,12 @@ libr4d serves these at 2, 3, 4 and 8 ranks:
   8 has no lossy wire.
 - `all_gather` at those widths rides the same instance as the wide `all_reduce` (`ar_gather_3rank`,
   `_4rank`, `_8rank`).
+
+With `row`, `all_gather`'s `y` may be the leading `world_size * row` columns of a wider buffer, and
+`x` a `row`-wide window of a wider one (column views whose row pitch is whole 16-byte words): rows
+are read and land at those pitches, and the rest of each row is left as it was. A linear split by
+rows whose rank shares cut its scale blocks has each rank compute the whole blocks covering its
+share and hand over the share's window, gathered into a tight output (arch/common's DFlash2 fc).
 
 `min_bytes` is the byte floor under which a lossy row serves the message exactly. It is a parameter,
 not a library constant, because it is a property of the link: compression pays only once the

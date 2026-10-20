@@ -1,0 +1,46 @@
+# gemma4-31b-dense-bf16-w4a8-df2.recipe -- Gemma 4 31B dense (text) from Google's bf16 checkpoint
+# at w4a8, as gemma4-31b-dense-bf16-w4a8-df.recipe makes it, with RedHatAI's DFlash2 speculator
+# merged in place of z-lab's DFlash drafter.
+#
+#   rad-convert <gemma-4-31B-it> --draft-model <gemma-4-31B-it-speculator.dflash2> \
+#       --recipe data/recipes/gemma4-31b-dense-bf16-w4a8-df2.recipe \
+#       --set quantization_config.quant_method=compressed-tensors -o gemma4-31b-dense-w4a8-df2-qkv.rad
+#
+#   radiance serve gemma4-31b-dense-w4a8-df2-qkv.rad --num-speculative-tokens auto ...
+#
+# The drafter (RedHatAI/gemma-4-31B-it-speculator.dflash2) is a speculators-format DFlash2: five
+# Qwen3-shaped layers at 5376 (32 heads / 16 kv x 256, MLP 21504), every one on a 2048-token
+# window, non-causal, an fc over the trunk's residual stream entering layers 1 17 29 47 59, a
+# grouped dynamic convolution around each sublayer and a candidate selector (rank 256, top-k 16):
+# 2.75 B parameters, 5.5 GB at bf16. It proposes 7 tokens a pass (block 8); the plugin's probe names
+# that depth, and rad_block_dflash2.h is the block.
+#
+# It ships no embedding or head: it reads the trunk's table, unscaled, and the trunk's head. The
+# trunk is the -df recipe's (int4 trunk, q|k|v as one linear, int8 lm_head), so the same rules.
+#
+# ~24 GiB: the -df recipe's trunk and table (~16 GiB), the vision tower, the drafter at block fp8
+# (2.6 GiB), its selector codebooks at bf16 (2 x 128 MiB) and its head's int8 copy (1.4 GiB).
+
+blk.*.attn_qkv.weight     rtn  codes=i4 group=128 scale=f16 rule=search
+blk.*.attn_o.weight       rtn  codes=i4 group=128 scale=f16 rule=search
+blk.*.ffn_down.weight     rtn  codes=i4 group=128 scale=f16 rule=search
+blk.*.ffn_gate_up.weight  rtn  codes=i4 group=128 scale=f16 rule=search
+
+output.weight             rtn  codes=i8 group=128 scale=bf16 clamp=sym
+
+# The drafter's seven linears: block fp8, read at fp8a8 against an E4M3 activation, as the block
+# declares them (rad_fp8.h's DenseFP8). The convolution projections, the selector and the norms
+# stay bf16, as the block reads them.
+dflash.fc.weight                 rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_q.weight       rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_k.weight       rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_v.weight       rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_output.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.ffn_gate_up.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.ffn_down.weight     rtn codes=fp8_e4m3 block=128x128 scale=bf16
+
+# The draft head: the trunk's tied table under the block's own name, int8 with an f16 scale per
+# (row, 128 of K), which the block reads at w8a8 (rad_block_dflash2.h, head_i8). Not the 2-bit
+# grid the Qwen3.8 recipes use: the selector then ranks the candidates an 8-bit head proposes.
+# Drafts are verified, so this changes what is proposed, never what is accepted.
+dflash.draft_head.weight         rtn codes=i8 group=128 scale=f16 clamp=sym

@@ -32,14 +32,15 @@ extern "C" void r4d_ar_gather_3rank(long peer_scratch0, long peer_scratch1,
                                     long my_scratch, long my_flags, long seq_ctrs,
                                     long slot_stride16, long inp, long out, long n_elem,
                                     long dtype, long rank, long row_elems, long stream,
-                                    long nblocks, long nthreads, long drain, long acq, long pub);
+                                    long nblocks, long nthreads, long drain, long acq, long pub,
+                                    long dpitch, long spitch);
 extern "C" void r4d_ar_gather_4rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                                     long peer_flags0, long peer_flags1, long peer_flags2,
                                     long my_scratch, long my_flags, long seq_ctrs,
                                     long slot_stride16, long inp, long out, long n_elem,
                                     long dtype, long rank, long row_elems, long stream,
                                     long nblocks, long nthreads, long drain, long acq, long pub,
-                                    long gate, long gate_ctr);
+                                    long gate, long gate_ctr, long dpitch, long spitch);
 extern "C" void r4d_ar_gather_8rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                                     long peer_scratch3, long peer_scratch4, long peer_scratch5,
                                     long peer_scratch6, long peer_flags0, long peer_flags1,
@@ -48,14 +49,23 @@ extern "C" void r4d_ar_gather_8rank(long peer_scratch0, long peer_scratch1, long
                                     long my_flags, long seq_ctrs, long slot_stride16, long inp,
                                     long out, long n_elem, long dtype, long rank, long row_elems,
                                     long stream, long nblocks, long nthreads, long drain, long acq,
-                                    long pub);
+                                    long pub, long dpitch, long spitch);
 
 // Where a rank's words land: the 2-rank r4d_g_dst generalised to WS. Named differently because two
 // __device__ definitions of one name in the two units would violate the ODR.
-__device__ __forceinline__ int r4d_g_dst_ws(int k, int row16, int n16, int WS, int who) {
+// `dp16` is the output's row pitch in words, WS * row16 when the gathered rows are tight.
+__device__ __forceinline__ int r4d_g_dst_ws(int k, int row16, int n16, int who, int dp16) {
   if (row16 <= 0 || row16 >= n16) return who * n16 + k;
   const int m = k / row16, c = k - m * row16;
-  return m * (WS * row16) + who * row16 + c;
+  return m * dp16 + who * row16 + c;
+}
+
+// Where word k of this rank's contribution is read: `sp16` is the input's row pitch in words,
+// row16 when its rows are tight, more when they are a window of a wider row.
+__device__ __forceinline__ int r4d_g_src_ws(int k, int row16, int n16, int sp16) {
+  if (row16 <= 0 || row16 >= n16 || sp16 == row16) return k;
+  const int m = k / row16, c = k - m * row16;
+  return m * sp16 + c;
 }
 
 // Block b owns words [start,end) of the 16B-word space and drives its own handshake; no cross-block
@@ -65,8 +75,8 @@ __global__ void r4d_ar_gather_wide_kernel(
     const int4* __restrict__ in4, R4DArWidePeers<int4, WS - 1> peers,
     const int4* __restrict__ my_base, int4* __restrict__ out4,
     unsigned int* __restrict__ my_flags, unsigned int* __restrict__ seq_ctrs,
-    int n16, int slot_stride16, int rank, int row16, int drain, int acq, int pub,
-    long long* gate, unsigned int* gate_ctr) {
+    int n16, int slot_stride16, int rank, int row16, int dp16, int sp16, int drain, int acq,
+    int pub, long long* gate, unsigned int* gate_ctr) {
   constexpr int NPEERS = WS - 1;
   // Placement holds WS source words live per output word, so the 2x unroll spills at ws=8 (same
   // limit as the one-shot all-reduce).
@@ -95,14 +105,17 @@ __global__ void r4d_ar_gather_wide_kernel(
   {
     int k = start + tid;
     for (; k + 3 * nt < end; k += 4 * nt) {
-      const int4 v0 = in4[k], v1 = in4[k + nt], v2 = in4[k + 2 * nt], v3 = in4[k + 3 * nt];
+      const int4 v0 = in4[r4d_g_src_ws(k, row16, n16, sp16)];
+      const int4 v1 = in4[r4d_g_src_ws(k + nt, row16, n16, sp16)];
+      const int4 v2 = in4[r4d_g_src_ws(k + 2 * nt, row16, n16, sp16)];
+      const int4 v3 = in4[r4d_g_src_ws(k + 3 * nt, row16, n16, sp16)];
 #pragma unroll
       for (int p = 0; p < NPEERS; ++p) {
         ps[p][k] = v0; ps[p][k + nt] = v1; ps[p][k + 2 * nt] = v2; ps[p][k + 3 * nt] = v3;
       }
     }
     for (; k < end; k += nt) {
-      const int4 v = in4[k];
+      const int4 v = in4[r4d_g_src_ws(k, row16, n16, sp16)];
 #pragma unroll
       for (int p = 0; p < NPEERS; ++p) ps[p][k] = v;
     }
@@ -117,7 +130,7 @@ __global__ void r4d_ar_gather_wide_kernel(
   r4d_ar_link_landed(gate, gate_word, gate_ctr, (unsigned int)nb, (unsigned int)tid);
 
   // Place every rank's slice. Slot [parity][our rank] of our own scratch is never written, so, as
-  // in the all-reduce, our rank's source is the input itself and the loop is branch-free.
+  // in the all-reduce, our rank's source is the input itself, read at its own pitch.
   const int4* src[WS];
 #pragma unroll
   for (int r = 0; r < WS; ++r)
@@ -127,17 +140,19 @@ __global__ void r4d_ar_gather_wide_kernel(
     int k = start + tid;
     if (RU == 2) {
       for (; k + nt < end; k += 2 * nt) {
+        const int k0 = r4d_g_src_ws(k, row16, n16, sp16), k1 = r4d_g_src_ws(k + nt, row16, n16, sp16);
 #pragma unroll
         for (int r = 0; r < WS; ++r) {
-          out4[r4d_g_dst_ws(k,      row16, n16, WS, r)] = src[r][k];
-          out4[r4d_g_dst_ws(k + nt, row16, n16, WS, r)] = src[r][k + nt];
+          out4[r4d_g_dst_ws(k,      row16, n16, r, dp16)] = src[r][r == rank ? k0 : k];
+          out4[r4d_g_dst_ws(k + nt, row16, n16, r, dp16)] = src[r][r == rank ? k1 : k + nt];
         }
       }
     }
     for (; k < end; k += nt) {
+      const int k0 = r4d_g_src_ws(k, row16, n16, sp16);
 #pragma unroll
       for (int r = 0; r < WS; ++r)
-        out4[r4d_g_dst_ws(k, row16, n16, WS, r)] = src[r][k];
+        out4[r4d_g_dst_ws(k, row16, n16, r, dp16)] = src[r][r == rank ? k0 : k];
     }
   }
 }
@@ -150,7 +165,7 @@ static void ar_gather_wide_launch(const long* peer_scratch, const long* peer_fla
                                   long my_flags, long seq_ctrs, long slot_stride16, long inp,
                                   long out, long n_elem, long dtype, long rank, long row_elems,
                                   long stream_i, long nblocks, long nthreads, long drain, long acq,
-                                  long pub, long gate, long gate_ctr) {
+                                  long pub, long gate, long gate_ctr, long dpitch, long spitch) {
   constexpr int NPEERS = WS - 1;
   static_assert(NPEERS <= R4D_AR_WIDE_MAX_PEERS, "npeers exceeds the peer bundle bound");
 
@@ -173,6 +188,20 @@ static void ar_gather_wide_launch(const long* peer_scratch, const long* peer_fla
   if (row_elems > 0 && (rowb % 16 != 0 || nbytes % rowb != 0))
     throw std::runtime_error("all_gather: row is not a whole number of 16B words");
   const int row16 = row_elems > 0 ? (int)(rowb / 16) : 0;
+  // The output's row pitch in elements, 0 for a tight [rows][WS][row]: whole words, at least the
+  // WS ranks' row (the gathered rows as the leading columns of a wider buffer).
+  const long dpb = (long)dpitch * esize;
+  if (dpitch > 0 && (row16 <= 0 || dpb % 16 != 0 || dpitch < (long)WS * row_elems))
+    throw std::runtime_error("all_gather: the output pitch is not a whole number of 16B words "
+                             "at least " + std::to_string(WS) + " rows wide");
+  const int dp16 = dpitch > 0 ? (int)(dpb / 16) : WS * row16;
+  // The input's row pitch in elements, 0 for tight rows: whole words, at least a row (a rank's
+  // window of a wider row).
+  const long spb = (long)spitch * esize;
+  if (spitch > 0 && (row16 <= 0 || spb % 16 != 0 || spitch < row_elems))
+    throw std::runtime_error("all_gather: the input pitch is not a whole number of 16B words "
+                             "at least a row wide");
+  const int sp16 = spitch > 0 ? (int)(spb / 16) : row16;
 
   int nb = (int)nblocks;
   if (nb < 1) nb = R4D_AR_NB_DESIGN;
@@ -209,8 +238,8 @@ static void ar_gather_wide_launch(const long* peer_scratch, const long* peer_fla
   hipStream_t st = (hipStream_t)stream_i;
   r4d_ar_gather_wide_kernel<WS><<<nb, nt, 0, st>>>(
       (const int4*)inp, peers, (const int4*)my_scratch, (int4*)out, (unsigned int*)my_flags,
-      (unsigned int*)seq_ctrs, n16, (int)slot_stride16, (int)rank, row16, (int)drain, (int)acq,
-      (int)pub, (long long*)gate, (unsigned int*)gate_ctr);
+      (unsigned int*)seq_ctrs, n16, (int)slot_stride16, (int)rank, row16, dp16, sp16, (int)drain,
+      (int)acq, (int)pub, (long long*)gate, (unsigned int*)gate_ctr);
 }
 
 /* Three ranks, e.g. Qwen3.8-Flash-Next padded to 36 heads / 3 KV heads (docs/TP3.md). */
@@ -218,13 +247,14 @@ void r4d_ar_gather_3rank(long peer_scratch0, long peer_scratch1,
                          long peer_flags0, long peer_flags1, long my_scratch,
                          long my_flags, long seq_ctrs, long slot_stride16, long inp, long out,
                          long n_elem, long dtype, long rank, long row_elems, long stream,
-                         long nblocks, long nthreads, long drain, long acq, long pub) {
+                         long nblocks, long nthreads, long drain, long acq, long pub, long dpitch,
+                         long spitch) {
   const long ps[2] = {peer_scratch0, peer_scratch1};
   const long pf[2] = {peer_flags0, peer_flags1};
   /* No link gate at three ranks: the row answers 1, the engine releases by barrier. */
   ar_gather_wide_launch<3>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, inp, out, n_elem,
                            dtype, rank, row_elems, stream, nblocks, nthreads, drain, acq, pub,
-                           0L, 0L);
+                           0L, 0L, dpitch, spitch);
 }
 
 void r4d_ar_gather_4rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
@@ -232,12 +262,12 @@ void r4d_ar_gather_4rank(long peer_scratch0, long peer_scratch1, long peer_scrat
                          long my_flags, long seq_ctrs, long slot_stride16, long inp, long out,
                          long n_elem, long dtype, long rank, long row_elems, long stream,
                          long nblocks, long nthreads, long drain, long acq, long pub, long gate,
-                         long gate_ctr) {
+                         long gate_ctr, long dpitch, long spitch) {
   const long ps[3] = {peer_scratch0, peer_scratch1, peer_scratch2};
   const long pf[3] = {peer_flags0, peer_flags1, peer_flags2};
   ar_gather_wide_launch<4>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, inp, out, n_elem,
                            dtype, rank, row_elems, stream, nblocks, nthreads, drain, acq, pub,
-                           gate, gate_ctr);
+                           gate, gate_ctr, dpitch, spitch);
 }
 
 void r4d_ar_gather_8rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
@@ -247,7 +277,7 @@ void r4d_ar_gather_8rank(long peer_scratch0, long peer_scratch1, long peer_scrat
                          long my_scratch, long my_flags, long seq_ctrs, long slot_stride16,
                          long inp, long out, long n_elem, long dtype, long rank, long row_elems,
                          long stream, long nblocks, long nthreads, long drain, long acq,
-                         long pub) {
+                         long pub, long dpitch, long spitch) {
   const long ps[7] = {peer_scratch0, peer_scratch1, peer_scratch2, peer_scratch3,
                       peer_scratch4, peer_scratch5, peer_scratch6};
   const long pf[7] = {peer_flags0, peer_flags1, peer_flags2, peer_flags3,
@@ -255,5 +285,5 @@ void r4d_ar_gather_8rank(long peer_scratch0, long peer_scratch1, long peer_scrat
   /* No link gate at eight ranks: the row answers 1, the engine releases by barrier. */
   ar_gather_wide_launch<8>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, inp, out, n_elem,
                            dtype, rank, row_elems, stream, nblocks, nthreads, drain, acq, pub,
-                           0L, 0L);
+                           0L, 0L, dpitch, spitch);
 }

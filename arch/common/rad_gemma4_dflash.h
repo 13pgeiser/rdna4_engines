@@ -159,6 +159,54 @@ inline bool dflash_probe(const RadModelMeta* meta, RadArchProbe* out) {
     return true;
 }
 
+/* The same for a DFlash2 drafter, for a plugin that serves rad_block_dflash2.h (the 31B's): its
+ * anchor predicts nothing either, so the depth is the trained block less one, 7 for RedHatAI's
+ * gemma-4-31B-it-speculator.dflash2 (block_size 8). */
+inline bool dflash2_probe(const RadModelMeta* meta, RadArchProbe* out) {
+    if (dflash_kind(meta) != 2) return false;
+    const long long bs = dflash_block(meta);
+    if (bs <= 1) return false;
+    out->draft_depth = (int)(bs - 1);
+    out->draft_depth_fixed = 1;
+    return true;
+}
+
+/* A DFlash2 drafter's trunk taps, as the layers whose output the trunk copies into `dflash_src`.
+ *
+ * vLLM's speculators format names them `aux_hidden_state_layer_ids`, counted as vLLM captures
+ * them: id i is the residual stream entering layer i, so the output of layer i - 1 (id n_layer,
+ * which `--include-last-layer` emits, is the last layer's output). z-lab's `target_layer_ids` count
+ * the layer whose output is taken. RedHatAI's 1 17 29 47 59 are this trunk's layers 0 16 28 46
+ * 58. Id 0 would be the embedding, which no layer outputs, and is refused. */
+inline int dflash2_taps(const RadModelMeta* meta, const RadBuildCtx* ctx, int64_t n_layer, int* out,
+                        int max) {
+    if (ctx->max_spec <= 0 || dflash_kind(meta) != 2) return 0;
+    const char* aux = rad_meta_gets(meta, "draft.aux_hidden_state_layer_ids", nullptr);
+    int n = 0;
+    if (aux) {
+        int raw[16];
+        const int m = parse_layer_ids(aux, n_layer + 1, raw, max < 16 ? max : 16);
+        for (int i = 0; i < m; ++i) {
+            if (raw[i] < 1) {
+                fprintf(stderr, "radiance: gemma4: the DFlash2 drafter taps aux hidden state 0, the "
+                                "embedding, which no trunk layer outputs\n");
+                return RAD_E_UNSUPPORTED;
+            }
+            out[n++] = raw[i] - 1;
+        }
+    } else {
+        const char* ids = rad_meta_gets(meta, "draft.dflash_config.target_layer_ids", nullptr);
+        if (!ids) ids = rad_meta_gets(meta, "draft.target_layer_ids", nullptr);
+        n = parse_layer_ids(ids, n_layer, out, max);
+    }
+    if (n <= 0) {
+        fprintf(stderr, "radiance: gemma4: the DFlash2 drafter names no trunk layer this model has; "
+                        "it is paired with a different target\n");
+        return RAD_E_UNSUPPORTED;
+    }
+    return n;
+}
+
 /* ============================================================== the block */
 
 struct Dflash1 {

@@ -17,7 +17,7 @@ plugin claims.
 | `arch/glm5next` | `glm5next` | *(empty)* | GLM-5.3-Flash from AMD's Quark MXFP4 export: four mHC residual streams over 34 KDA and 11 sparse latent-attention (MLA) layers with a DSA indexer, 288 MXFP4 experts at top-8 under sigmoid routing, block-FP8 attention and dense layers at f32 scales, each weight served as stored; its MTP layer is a serial drafter. Text only, bf16 KV |
 | `arch/lfm2_bf16` | `lfm2` | *(empty)* | LiquidAI's LFM2 and LFM2-VL, bf16, one rank |
 | `arch/embgemma2` | `embeddinggemma2` | *(empty)* | EmbeddingGemma 2: a bidirectional encoder with Gemma 4's vision tower and audio conformer, pooled to one vector |
-| `arch/gemma4_bf16` | `gemma4` | `compressed-tensors` | Gemma 4 31B dense with its vision tower: sliding-window and proportional-RoPE global (`attention_k_eq_v`) attention, GELU ffn, softcapped logits; int4 codes with an f16 scale per 128 from Google's CT-INT4 (QAT) release or from bf16, served w4a8, or int8 codes on the same grid from bf16 (w8a8, the Q8 container). Optional draft model (`rad-convert --draft-model`): Google's assistant, with no cache of its own (`rad_drafter_shared_kv`), or z-lab's DFlash drafter, the block `arch/gemma4` serves (`arch/common/rad_gemma4_dflash.h`) |
+| `arch/gemma4_bf16` | `gemma4` | `compressed-tensors` | Gemma 4 31B dense with its vision tower: sliding-window and proportional-RoPE global (`attention_k_eq_v`) attention, GELU ffn, softcapped logits; int4 codes with an f16 scale per 128 from Google's CT-INT4 (QAT) release or from bf16, served w4a8, or int8 codes on the same grid from bf16 (w8a8, the Q8 container). Optional draft model (`rad-convert --draft-model`): Google's assistant, with no cache of its own (`rad_drafter_shared_kv`), or z-lab's DFlash drafter, the block `arch/gemma4` serves (`arch/common/rad_gemma4_dflash.h`), or RedHatAI's DFlash2 speculator (`arch/common/rad_block_dflash2.h`) |
 | `arch/gemma3` | `gemma3` | *(empty)* | Gemma 3 dense text (TranslateGemma 27B) from the bf16 checkpoint: sliding-window and global attention at one head geometry, GemmaRMSNorm, GELU ffn; linears bf16, or int8, MXFP4 or asymmetric int4 over an activation scaled per (row, 128), as the recipe stores them. Optional DFlash2 drafter (`rad-convert --draft-model`) |
 | `arch/gemma4` | `gemma4` | *(empty)* | Gemma 4 text from Google's bf16 checkpoint (the 26B-A4B MoE and the dense sizes without per-layer embeddings) with z-lab's DFlash drafter; routed experts bf16 or block fp8 |
 | `arch/qwenimage21` | `qwenimage21` | *(empty)* | Qwen-Image 2.1 and 2.1-Turbo, an image generator, from the diffusers pipeline directory; DiT and text encoder bf16 or block fp8 |
@@ -744,6 +744,49 @@ lm_head and the drafter, ~33 GiB). Both start from bf16, because the drafter rea
 hidden states and was trained beside the bf16 trunk. Both plugins scale the embedding by
 sqrt(hidden) rounded to bf16, as the reference's embedding module does (73.5 at 5376, not 73.32),
 and the drafter reads it through the same scale.
+
+**The 31B's prefill overlap.** `arch/gemma4_bf16` cuts a prefill step of 1024 rows or more in two
+(slice A whole 128-row tiles, both at least 512) and runs each slice's two all-reduces per layer on
+the second lane beside the other slice's compute, as the prefill overlap above does, with one
+difference: o_proj and down_proj both write `h`, so the issue order never lets lane 0 write rows of
+`h` that lane 1 is reducing, and `h` is the one buffer taken out of the arena's sharing. Attention
+runs whole. Both slices are above every row band the sliced kernels have (the int8 GEMMs' skinny
+band at 64, since the prefill kernel takes each row's K in order whatever M is, and
+r4d_act_threads' last width change at 120 rows for these widths), so on the exact wire the output
+equals the whole step's bit for bit. Every junction must be fused, as the w4a8 and w8a8
+containers' are; a bf16 trunk runs whole, and so does every step under `RADIANCE_GEMMA4_OVERLAP=0`.
+
+**The 31B's q, k and v as one linear.** Converted with a recipe that names `blk.*.attn_qkv.weight`
+(both -df recipes do), each layer's q, k and v (q and k on a global layer, where v is k) are one
+weight, each rank holding its slice of every part, and one `gemm_nt_q` reads them where three did:
+at decode on the R9700 q, k and v take 17 + 13.5 + 13.5 us and a 4096-row GEMM of the same K 25.
+The grid's groups never cross a row, so the codes are those of three separate rules, and on libref
+the replies are too. On libr4d the skinny GEMM picks its in-block K split from N (k and v alone
+split K in two, the fused GEMM does not), so k and v can round differently in the last bit and a
+long greedy reply can part from the old container's late. `qkv_norm_rope` and `kv_store` work on
+the row's column slices in place. A global layer's
+attention reads q in the row (`attn_paged_qrow`, the windowed kernel that serves head_dim 512 under
+`attn_paged` too); a sliding layer's reads it there in a one-row step, and a taller step copies q
+out with a `cast` for libr4d's h256/gqa2 kernels, which take 0.26-0.71 of the windowed kernel's
+time. Without `qkv_norm_rope` (a CPU-only engine) q, k and v are copied out for the unfused
+prologue. A container that holds the three apart serves as before: the plugin asks the weight's
+encoding, which rad-convert answers from the recipe and a container from its entries.
+
+**The 31B with a DFlash2 drafter.** RedHatAI's `gemma-4-31B-it-speculator.dflash2` is z-lab's
+DFlash2 architecture trained with vLLM's speculators library: five Qwen3-shaped layers at 5376 (32
+heads / 16 kv x 256, ffn 21504), every one on a 2048-token window and non-causal, the grouped
+dynamic convolution and the candidate selector (rank 256, top-k 16), block 8 (seven drafts). The
+31B serves it with the block qwen35_fp8 uses for Qwen3.8's (`arch/common/rad_block_dflash2.h`) in
+place of z-lab's DFlash, when the container's drafter is a `DFlash2DraftModel`. Its config is in
+the speculators layout: the speculator's keys at the top of `draft.` and the layers' under
+`draft.transformer_layer_config.` (`drafter_layer_prefix`). Its `aux_hidden_state_layer_ids`
+count as vLLM captures them, the residual entering a layer, so 1 17 29 47 59 tap the outputs of
+layers 0 16 28 46 58 (`gemma4::dflash2_taps`). It was trained against the target's table as a
+plain embedding and the target's head as a plain linear, so its lookup takes no Gemma scale and its
+head no soft-cap. The -df2 recipe stores its head copy int8 (`head_i8`, read at w8a8) rather than
+the 2-bit grid Qwen3.8's recipes use, so the selector ranks what an 8-bit head proposes. Its
+attention is the sliding layers' h256 gqa-2 split-KV decode, non-causal. `run-gemma4-31b.sh`
+takes it with `DRAFTER=df2`.
 
 **The 31B's junctions at four ranks.** At two ranks every junction carries the all-reduce in front
 of it (`ar_rmsnorm_quant_i8`). At four it does too, at decode heights. libr4d's

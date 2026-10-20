@@ -11647,6 +11647,62 @@ static void fp8_numeric(const Plugin& pl, int64_t N, int64_t K) {
                    why.empty(), why);
             }
 
+            /* A row slice of this linear issued with split_n = N (DenseFP8::declare_slice: a split
+             * fc's share and its tail) must give each of its rows exactly as the whole GEMM does,
+             * whatever K split its own width would pick: half the rows, and the last 128 (which
+             * alone would split K the most). The slice's planes are quantised from its own rows,
+             * which on whole 128-row blocks are the whole weight's codes and scales. */
+            if (N >= 256) {
+                const int64_t cut = (N / 2) / 128 * 128;
+                std::string why;
+                const std::pair<int64_t, int64_t> slices[] = { { 0, cut }, { N - 128, N } };
+                for (const auto& sl : slices) {
+                    const int64_t lo = sl.first, hi = sl.second, Ns = hi - lo;
+                    std::vector<float> wsl(wf.begin() + lo * K, wf.begin() + hi * K);
+                    const Planes psl = fp8_block_planes(wsl, Ns, K);
+                    std::vector<RadParam> lps = { PI("N", Ns), PI("K", K), PI("group", 128) };
+                    std::vector<uint8_t> qsl;
+                    if (stored(nr, lps, 2, psl, { "codes" }, &qsl) != RAD_OK) {
+                        why = "the slice's layout hook refused";
+                        break;
+                    }
+                    void* d_wsl = dalloc((size_t)Ns * K);
+                    void* d_ysl = dalloc((size_t)M * Ns * 2);
+                    if (!d_wsl || !d_ysl) { why = "hipMalloc failed"; break; }
+                    st_memcpy(d_wsl, qsl.data(), qsl.size(), hipMemcpyHostToDevice);
+                    std::vector<RadTensor> tsl = {
+                        T(d_q, RAD_F8E4M3, { M, K }), T(d_qs, RAD_F32, { M, sk }),
+                        T(d_wsl, RAD_F8E4M3, { Ns, K }),
+                        T((char*)d_s + (size_t)(lo / 128) * (size_t)sk * 2, RAD_BF16,
+                          { Ns / 128, sk }),
+                        T(d_ysl, RAD_BF16, { M, Ns }), T(nullptr, RAD_F32, { 1 }),
+                        T(nullptr, RAD_U8, { 1 }),
+                    };
+                    absent(tsl[5]); absent(tsl[6]);
+                    std::vector<RadParam> pss = {
+                        PI("M", M), PI("N", Ns), PI("K", K), PI("group", 128),
+                        PS("dtype", "fp8a8"), PI("split_n", N),
+                    };
+                    st_memset(d_ysl, 0, (size_t)M * Ns * 2);
+                    run_case(nr, tsl, pss);
+                    std::vector<uint16_t> ys((size_t)M * Ns);
+                    st_memcpy(ys.data(), d_ysl, ys.size() * 2, hipMemcpyDeviceToHost);
+                    for (int64_t m = 0; m < M && why.empty(); ++m)
+                        for (int64_t r = 0; r < Ns; ++r)
+                            if (ys[(size_t)(m * Ns + r)] != got[(size_t)(m * N + lo + r)]) {
+                                why = "rows [" + std::to_string((long long)lo) + ", " +
+                                      std::to_string((long long)hi) + ") differ at m " +
+                                      std::to_string((long long)m) + " row " +
+                                      std::to_string((long long)(lo + r));
+                                break;
+                            }
+                    if (!why.empty()) break;
+                }
+                ok((std::string("gemm_fp8a8_nt_m16's row slices given split_n are the whole GEMM's "
+                                "rows, M ") + std::to_string((long long)M)).c_str(),
+                   why.empty(), why);
+            }
+
             /* ---- ...and with the gate and the quantiser folded into its epilogue -------------
              *
              * Byte equality: the engine substitutes the fold for the pair (this GEMM's bf16
@@ -21025,6 +21081,12 @@ struct ArThread {
     /* Ranks in the collective: 2, or 3 for the wide family at a width that is not a power of
      * two. */
     int world = 2;
+    /* The all-gather's output row pitch in elements, 0 for a tight [rows][world][row]; more lands
+     * the gathered rows in the leading columns of a wider buffer. */
+    int64_t pitch = 0;
+    /* Its input row pitch, 0 for tight rows; more reads each row's first `row_elems` out of a wider
+     * row whose other columns hold junk. */
+    int64_t spitch = 0;
 };
 
 static void ar_worker(ArThread* t) {
@@ -21207,8 +21269,10 @@ static void gather_worker(ArThread* t) {
 
     void* in = nullptr;
     void* out = nullptr;
+    const int64_t rows = t->pitch > 0 ? t->numel / t->row_elems : 0;
+    const int64_t out_n = t->pitch > 0 ? rows * t->pitch : t->numel * t->world;
     if (hipMalloc(&in, (size_t)t->numel * 4) != hipSuccess) { t->rc_launch = RAD_E_NOMEM; return; }
-    if (hipMalloc(&out, (size_t)t->numel * 4 * t->world) != hipSuccess) { t->rc_launch = RAD_E_NOMEM; return; }
+    if (hipMalloc(&out, (size_t)out_n * 4) != hipSuccess) { t->rc_launch = RAD_E_NOMEM; return; }
 
     std::vector<uint32_t> h((size_t)t->numel);
     for (int64_t i = 0; i < t->numel; i += 2) {
@@ -21216,10 +21280,29 @@ static void gather_worker(ArThread* t) {
         const float v = (float)(t->rank + 1) * 0.5f + (float)i;            /* its logit */
         std::memcpy(&h[(size_t)i + 1], &v, 4);
     }
-    st_memcpy(in, h.data(), h.size() * 4, hipMemcpyHostToDevice);
-    st_memset(out, 0xAB, (size_t)t->numel * 4 * t->world);   /* marks untouched slices */
+    if (t->spitch > 0) {   /* each row's contribution at the front of a wider row of junk */
+        const int64_t srows = t->numel / t->row_elems;
+        std::vector<uint32_t> hp((size_t)(srows * t->spitch), 0xCDCDCDCDu);
+        for (int64_t m = 0; m < srows; ++m)
+            std::memcpy(&hp[(size_t)(m * t->spitch)], &h[(size_t)(m * t->row_elems)],
+                        (size_t)t->row_elems * 4);
+        st_free(in);
+        if (hipMalloc(&in, hp.size() * 4) != hipSuccess) { t->rc_launch = RAD_E_NOMEM; return; }
+        st_memcpy(in, hp.data(), hp.size() * 4, hipMemcpyHostToDevice);
+    } else {
+        st_memcpy(in, h.data(), h.size() * 4, hipMemcpyHostToDevice);
+    }
+    st_memset(out, 0xAB, (size_t)out_n * 4);   /* marks untouched slices */
 
     RadTensor ts[2] = { T(in, RAD_F32, { t->numel }), T(out, RAD_F32, { t->numel * t->world }) };
+    if (t->pitch > 0) {   /* [rows][world * row], the leading columns of rows `pitch` apart */
+        ts[1] = T(out, RAD_F32, { rows, t->world * t->row_elems });
+        ts[1].stride[0] = t->pitch;
+    }
+    if (t->spitch > 0) {  /* [rows][row], read `spitch` apart */
+        ts[0] = T(in, RAD_F32, { t->numel / t->row_elems, t->row_elems });
+        ts[0].stride[0] = t->spitch;
+    }
     RadArgs a;
     std::memset(&a, 0, sizeof(a));
     a.t = ts; a.n_t = 2;
@@ -21230,7 +21313,7 @@ static void gather_worker(ArThread* t) {
     t->rc_launch = t->row->launch(&a, nullptr);
     st_stream_sync(nullptr);
 
-    t->out.assign((size_t)t->numel * t->world, 0.0f);
+    t->out.assign((size_t)out_n, 0.0f);
     st_memcpy(t->out.data(), out, t->out.size() * 4, hipMemcpyDeviceToHost);
     st_free(in);
     st_free(out);
@@ -22310,6 +22393,86 @@ static void gather_wide_rank(const Plugin& pl, const std::vector<int>& devs, con
        bad == 0, std::to_string(bad) + " words wrong, " + std::to_string(bad_id) +
                      " of them token ids");
     if (row->fini) for (ArThread& a : t) if (a.inst) row->fini(a.inst);
+
+    /* The same rows landed in the leading columns of a wider buffer, as a row-sharded linear whose
+     * width does not divide among the ranks gathers into the front of its full output row: 64
+     * columns (four words) past world * row, which must keep their marker. */
+    {
+        const int64_t pitch = W * rowe + 64;
+        std::vector<ArThread> tp((size_t)W);
+        std::vector<std::thread> thp;
+        for (int r = 0; r < W; ++r) {
+            tp[(size_t)r] = ArThread{ row, r, devs[(size_t)r], numel };
+            tp[(size_t)r].world = W;
+            tp[(size_t)r].row_elems = rowe;
+            tp[(size_t)r].pitch = pitch;
+            thp.emplace_back(gather_worker, &tp[(size_t)r]);
+        }
+        for (std::thread& x : thp) x.join();
+        bool upp = true;
+        std::string rcp;
+        for (const ArThread& a : tp) {
+            upp = upp && a.rc_init == RAD_OK && a.rc_launch == RAD_OK;
+            rcp += std::to_string(a.rc_init) + "/" + std::to_string(a.rc_launch) + " ";
+        }
+        int64_t badp = 0, clobbered = 0;
+        if (upp)
+            for (const ArThread& a : tp)
+                for (int64_t m = 0; m < nrows; ++m) {
+                    for (int r = 0; r < W; ++r)
+                        for (int64_t j = 0; j < rowe; ++j) {
+                            uint32_t got;
+                            std::memcpy(&got, &a.out[(size_t)(m * pitch + r * rowe + j)], 4);
+                            if (got != sent(r, m * rowe + j)) ++badp;
+                        }
+                    for (int64_t j = W * rowe; j < pitch; ++j) {
+                        uint32_t got;
+                        std::memcpy(&got, &a.out[(size_t)(m * pitch + j)], 4);
+                        if (got != 0xABABABABu) ++clobbered;
+                    }
+                }
+        ok((w + "-rank all-gather lands its rows at a wider output pitch, the rest untouched").c_str(),
+           upp && badp == 0 && clobbered == 0,
+           upp ? std::to_string(badp) + " words wrong, " + std::to_string(clobbered) +
+                     " words past the rows overwritten"
+               : "init/launch rc " + rcp);
+        if (row->fini) for (ArThread& a : tp) if (a.inst) row->fini(a.inst);
+    }
+
+    /* And each rank's rows read out of a wider input row, as a split linear's rank hands over its
+     * window of the block-aligned rows it computed: the junk around the window must not travel. */
+    {
+        const int64_t spitch = rowe + 64;
+        std::vector<ArThread> ts2((size_t)W);
+        std::vector<std::thread> ths;
+        for (int r = 0; r < W; ++r) {
+            ts2[(size_t)r] = ArThread{ row, r, devs[(size_t)r], numel };
+            ts2[(size_t)r].world = W;
+            ts2[(size_t)r].row_elems = rowe;
+            ts2[(size_t)r].spitch = spitch;
+            ths.emplace_back(gather_worker, &ts2[(size_t)r]);
+        }
+        for (std::thread& x : ths) x.join();
+        bool ups = true;
+        std::string rcs2;
+        for (const ArThread& a : ts2) {
+            ups = ups && a.rc_init == RAD_OK && a.rc_launch == RAD_OK;
+            rcs2 += std::to_string(a.rc_init) + "/" + std::to_string(a.rc_launch) + " ";
+        }
+        int64_t bads = 0;
+        if (ups)
+            for (const ArThread& a : ts2)
+                for (int64_t m = 0; m < nrows; ++m)
+                    for (int r = 0; r < W; ++r)
+                        for (int64_t j = 0; j < rowe; ++j) {
+                            uint32_t got;
+                            std::memcpy(&got, &a.out[(size_t)(m * W * rowe + r * rowe + j)], 4);
+                            if (got != sent(r, m * rowe + j)) ++bads;
+                        }
+        ok((w + "-rank all-gather reads each rank's rows at a wider input pitch").c_str(),
+           ups && bads == 0, ups ? std::to_string(bads) + " words wrong" : "init/launch rc " + rcs2);
+        if (row->fini) for (ArThread& a : ts2) if (a.inst) row->fini(a.inst);
+    }
     ok((w + "-rank all-gather fini ran").c_str(), true);
 }
 

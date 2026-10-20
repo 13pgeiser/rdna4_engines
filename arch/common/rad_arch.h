@@ -1262,17 +1262,30 @@ inline const RadKVGroupBatch* kv_batch(const RadBatch* b, rad_kvgroup group) {
  * layer, head, feed-forward, norm and rotary geometry of the container's `draft.` config, split
  * over the ranks, and a plain RMS norm. A drafter is a second model, so nothing is defaulted: a
  * config that does not describe one is refused, naming `what` (spec §17). So is a vocabulary
- * other than the target's, since a drafter reads the target's embedding and lm_head. */
+ * other than the target's, since a drafter reads the target's embedding and lm_head.
+ *
+ * The layer config sits at the top of `draft.` in z-lab's and SpecForge's checkpoints, and under
+ * `draft.transformer_layer_config.` in vLLM's speculators format (RedHatAI's DFlash2 drafters),
+ * whose top level holds the speculator's own keys instead (drafter_layer_prefix). */
+inline const char* drafter_layer_prefix(const RadModelMeta* meta) {
+    if (rad_meta_geti(meta, "draft.num_hidden_layers", 0) > 0) return "draft.";
+    if (rad_meta_geti(meta, "draft.transformer_layer_config.num_hidden_layers", 0) > 0)
+        return "draft.transformer_layer_config.";
+    return "draft.";
+}
 inline int drafter_geom(Geom& dg, const Geom& target, const RadModelMeta* meta, const char* what) {
     dg = target;
-    dg.n_layer       = rad_meta_geti(meta, "draft.num_hidden_layers", 0);
-    dg.head_dim      = rad_meta_geti(meta, "draft.head_dim", 0);
-    dg.n_head_all    = rad_meta_geti(meta, "draft.num_attention_heads", 0);
-    dg.n_head_kv_all = rad_meta_geti(meta, "draft.num_key_value_heads", 0);
-    dg.n_ff_all      = rad_meta_geti(meta, "draft.intermediate_size", 0);
-    dg.eps           = (float)rad_meta_getf(meta, "draft.rms_norm_eps", 0.0);
-    dg.theta         = (float)rad_meta_getf(meta, "draft.rope_parameters.rope_theta",
-                                            rad_meta_getf(meta, "draft.rope_theta", 0.0));
+    const char* pre = drafter_layer_prefix(meta);
+    char key[160];
+    auto k = [&](const char* name) { std::snprintf(key, sizeof key, "%s%s", pre, name); return key; };
+    dg.n_layer       = rad_meta_geti(meta, k("num_hidden_layers"), 0);
+    dg.head_dim      = rad_meta_geti(meta, k("head_dim"), 0);
+    dg.n_head_all    = rad_meta_geti(meta, k("num_attention_heads"), 0);
+    dg.n_head_kv_all = rad_meta_geti(meta, k("num_key_value_heads"), 0);
+    dg.n_ff_all      = rad_meta_geti(meta, k("intermediate_size"), 0);
+    dg.eps           = (float)rad_meta_getf(meta, k("rms_norm_eps"), 0.0);
+    const double th  = rad_meta_getf(meta, k("rope_theta"), 0.0);
+    dg.theta         = (float)rad_meta_getf(meta, k("rope_parameters.rope_theta"), th);
     dg.wadd = dg.wadd_qk = 0.0f;
     if (dg.n_layer <= 0 || dg.head_dim <= 0 || dg.n_head_all <= 0 || dg.n_head_kv_all <= 0 ||
         dg.n_ff_all <= 0 || !(dg.eps > 0.0f) || !(dg.theta > 0.0f)) {
@@ -1283,11 +1296,11 @@ inline int drafter_geom(Geom& dg, const Geom& target, const RadModelMeta* meta, 
                 (long long)dg.head_dim, (long long)dg.n_ff_all, (double)dg.eps, (double)dg.theta);
         return RAD_E_INVAL;
     }
-    RAD_ARCH_TRY(yarn_from(dg, meta, "draft.", dg.head_dim));
+    RAD_ARCH_TRY(yarn_from(dg, meta, pre, dg.head_dim));
     RAD_ARCH_TRY(divide_or_fail(dg.n_head_all,    dg.world, "draft num_attention_heads", &dg.n_head));
     RAD_ARCH_TRY(divide_or_fail(dg.n_head_kv_all, dg.world, "draft num_key_value_heads", &dg.n_head_kv));
     RAD_ARCH_TRY(divide_or_fail(dg.n_ff_all,      dg.world, "draft intermediate_size",   &dg.n_ff));
-    const long long dvocab = rad_meta_geti(meta, "draft.vocab_size", dg.n_vocab_all);
+    const long long dvocab = rad_meta_geti(meta, k("vocab_size"), dg.n_vocab_all);
     if (dvocab != dg.n_vocab_all) {
         fprintf(stderr, "radiance: the %s drafter claims a %lld-token vocabulary and the target "
                         "has %lld; it reads the target's embedding and lm_head\n",

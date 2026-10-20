@@ -4722,15 +4722,19 @@ struct G431Df {
 /* The trunk at w4a8 as the -df recipe makes it, the drafter's linears on one 8-bit grid -- the
  * E4M3 one (block fp8) or the int8 one (w8a8) -- and, with `head`, the table's 8-bit copy in the
  * same grid. The drafter's keys come FIRST: the fake answers the first key a name contains, and
- * `attn_q.` is in `dflash.blk.0.attn_q.weight` too. */
-void g431df_encs(RadBuilder& b, bool i8, bool head) {
+ * `attn_q.` is in `dflash.blk.0.attn_q.weight` too. With `fused`, the trunk's q, k and v are one
+ * linear, as a recipe naming `blk.*.attn_qkv.weight` converts them. */
+void g431df_encs(RadBuilder& b, bool i8, bool head, bool fused = false) {
     const RadEncoding w4  = rad_enc_affine(RAD_I4, RAD_F16, 1, 128);
     const RadEncoding fp8 = rad_enc_affine(RAD_F8E4M3, RAD_BF16, 128, 128);
     const RadEncoding q8  = rad_enc_affine(RAD_I8, RAD_F16, 1, 128);
     const RadEncoding& d  = i8 ? q8 : fp8;
     b.encs = { { "dflash.fc.", d }, { "dflash.blk.", d } };
     if (head) b.encs.push_back({ "dflash.draft_head.", d });
-    for (const char* s : { "attn_q.", "attn_k.", "attn_v.", "attn_o.", "ffn_gate_up.", "ffn_down." })
+    if (fused) b.encs.push_back({ "attn_qkv.", w4 });
+    else
+        for (const char* s : { "attn_q.", "attn_k.", "attn_v." }) b.encs.push_back({ s, w4 });
+    for (const char* s : { "attn_o.", "ffn_gate_up.", "ffn_down." })
         b.encs.push_back({ s, w4 });
 }
 
@@ -5080,6 +5084,140 @@ TEST(gemma4_31b_dflash_at_four_ranks) {
     }
 }
 
+/* The 31B's prefill in two slices (gemma4_bf16, trunk_overlap). The order and the work: every
+ * trunk reduction rides lane 1 behind its producer and ahead of its consumer and nothing else does;
+ * no two issues on different lanes reach the same rows unordered (`h` carries both reductions); the
+ * cut leaves both slices at least 512 rows; and the slices issue exactly the rows the whole step
+ * issues, the drafter's taps a slice each. Only `h` is taken out of the arena's sharing. A step
+ * under two slices, and a decode step, run whole with their reductions on lane 0. At two ranks the
+ * slices take the plain junctions, the whole step the ones with the all-reduce folded in. */
+TEST(a_gemma4_31b_prefill_step_runs_as_two_slices_with_its_reductions_on_the_second_lane) {
+    G431Df f;
+    const RadModelMeta meta = f.meta();
+    const int64_t E = 5376, L = 12;
+    for (int world : { 4, 2 }) {
+        auto model = [&](RadBuilder& b, bool lossy) {
+            g431df_encs(b, false, true);
+            RadBuildCtx ctx = build_ctx(0, world);
+            ctx.max_tok  = 4096;
+            ctx.max_spec = 15;
+            if (lossy) ctx.tp_wire_lossy = 1;   /* nothing shows a slice its bits on that wire */
+            return gemma4_bf16::declare(&b, &meta, &ctx);
+        };
+        auto run = [&](RadBuilder& b, RadCtx& c, RadBatch& batch) {
+            c.b = &b; c.rank = 0; c.world = world; c.batch = &batch;
+            gemma4_bf16::step(&c, &batch);
+        };
+
+        struct Case { int64_t T, cut; };
+        for (const Case k : { Case{4096, 2048}, Case{1100, 512}, Case{1024, 512}, Case{1023, 0} }) {
+            const int32_t out[1] = { (int32_t)(k.T - 1) };
+            RadBuilder b;
+            CHECK_OK(model(b, false));
+            CHECK(noted(b, "prefill overlap: a step of 1024 rows or more runs as two slices"));
+            REQUIRE(b.concurrent.size() == 1);
+            CHECK_EQ(b.concurrent[0], (rad_buf)buf_named(b, "h"));
+            RadBatch batch = one_prompt(k.T, out);
+            RadCtx c;
+            run(b, c, batch);
+            CHECK(c.step_fail.empty());
+            CHECK_EQ(c.lane, 0);
+            CHECK_EQ(races(b, c), 0);
+
+            std::vector<int64_t> lane1;
+            int other1 = 0;
+            for (const auto& i : c.issues) {
+                if (i.lane != 1) continue;
+                const RecOp* o = b.op_of(i.op);
+                REQUIRE(o != nullptr);
+                if (o->op == "all_reduce") lane1.push_back(i.n);
+                else ++other1;
+            }
+            CHECK_EQ(other1, 0);
+            if (k.cut == 0) {
+                CHECK(lane1.empty());
+            } else {
+                REQUIRE(lane1.size() == (size_t)(4 * L));
+                for (int64_t l = 0; l < L; ++l) {
+                    CHECK_EQ(lane1[4 * l + 0], k.cut * E);              /* attention, slice A */
+                    CHECK_EQ(lane1[4 * l + 1], (k.T - k.cut) * E);      /* attention, slice B */
+                    CHECK_EQ(lane1[4 * l + 2], k.cut * E);              /* feed-forward, slice A */
+                    CHECK_EQ(lane1[4 * l + 3], (k.T - k.cut) * E);      /* feed-forward, slice B */
+                }
+                CHECK_EQ(count_issued(issued_ops(b, c), "ar_rmsnorm_quant_i8"), 0);
+            }
+
+            /* The whole step, on the lossy wire: the same rows by op -- every junction, GEMM and
+             * quantiser over the same rows, the reductions over the same elements. */
+            RadBuilder w;
+            CHECK_OK(model(w, true));
+            CHECK(noted(w, "prefill overlap: off (the lossy all-reduce wire)"));
+            CHECK(w.concurrent.empty());
+            RadBatch wbatch = one_prompt(k.T, out);
+            RadCtx wc;
+            run(w, wc, wbatch);
+            CHECK(wc.step_fail.empty());
+            for (const auto& i : wc.issues) CHECK_EQ(i.lane, 0);
+            std::map<std::string, int64_t> sliced = rows_by_op(b, c, k.T), whole = rows_by_op(w, wc, k.T);
+            if (world == 2 && k.cut == 0) {
+                /* At two ranks on the exact wire a step that runs whole folds all but two of its
+                 * reductions -- the embedding's and the last layer's feed-forward -- into its
+                 * 2L - 1 junctions; the lossy wire folds none. */
+                CHECK_EQ(sliced["ar_rmsnorm_quant_i8"], (2 * L - 1) * k.T);
+                sliced.erase("ar_rmsnorm_quant_i8");
+                sliced["all_reduce"] += (2 * L - 1) * k.T * E;
+                sliced["rmsnorm_quant_i8"] += (2 * L - 1) * k.T;
+            }
+            CHECK(sliced == whole);
+            CHECK_EQ((int)ns_of(b, c, "cast").size(), k.cut ? 6 : 3);   /* three taps, a slice each */
+        }
+
+        /* a decode step runs whole: every reduction on lane 0, nothing on lane 1 */
+        RadBuilder b;
+        CHECK_OK(model(b, false));
+        RadBatch d = decode_batch();
+        RadCtx c;
+        run(b, c, d);
+        CHECK(c.step_fail.empty());
+        CHECK(c.joins.empty());
+        for (const auto& i : c.issues) CHECK_EQ(i.lane, 0);
+        /* folded where the plugin declares the fold at this rank count (two ranks; four with the
+         * four-rank junction), every junction but the last layer's feed-forward one */
+        bool fold = false;
+        for (const auto& o : b.ops) fold = fold || o.op == "ar_rmsnorm_quant_i8";
+        CHECK(fold || world == 4);
+        CHECK_EQ(count_issued(issued_ops(b, c), "ar_rmsnorm_quant_i8"), fold ? 2 * (int)L - 1 : 0);
+    }
+
+    /* the overlap needs the fused junctions: a bf16 trunk keeps its chain and runs whole */
+    RadBuilder b;
+    RadModelMeta plain = gemma4_meta();
+    RadBuildCtx ctx = build_ctx(0, 4);
+    ctx.max_tok = 4096;
+    CHECK_OK(gemma4_bf16::declare(&b, &plain, &ctx));
+    CHECK(noted(b, "prefill overlap: off (the residual junctions are not fused)"));
+    CHECK(b.concurrent.empty());
+
+    /* and the switch: every step whole, nothing on the second lane */
+    setenv("RADIANCE_GEMMA4_OVERLAP", "0", 1);
+    RadBuilder sw;
+    g431df_encs(sw, false, true);
+    RadBuildCtx sctx = build_ctx(0, 4);
+    sctx.max_tok  = 4096;
+    sctx.max_spec = 15;
+    const int rc = gemma4_bf16::declare(&sw, &meta, &sctx);
+    unsetenv("RADIANCE_GEMMA4_OVERLAP");
+    CHECK_OK(rc);
+    CHECK(noted(sw, "prefill overlap: off (RADIANCE_GEMMA4_OVERLAP=0)"));
+    CHECK(sw.concurrent.empty());
+    const int32_t out[1] = { 4095 };
+    RadBatch big = one_prompt(4096, out);
+    RadCtx sc; sc.b = &sw; sc.rank = 0; sc.world = 4; sc.batch = &big;
+    gemma4_bf16::step(&sc, &big);
+    CHECK(sc.step_fail.empty());
+    for (const auto& i : sc.issues) CHECK_EQ(i.lane, 0);
+}
+
 /* Where no loaded library declares libr4d's fused ops (a CPU-only build, where rad-convert and the
  * host backend run), asking for one is an error, so the 31B with its DFlash drafter asks first and
  * declares the chains: the junctions, the attention prologue, the gated quantiser, the folded
@@ -5121,23 +5259,26 @@ TEST(gemma4_31b_without_libr4d_declares_the_chains_and_asks_for_no_undeclared_op
  * passes behind it. The lint holds the buffers each pass reads to what an earlier op of the step
  * wrote and the planner kept alive, across the passes, so a tap whose plane the planner let another
  * buffer share, or a drafter buffer read after its arena slot was reused, fails here. Eight
- * sequences at a block of 16 is 128 query rows, past every fused band the drafter has. */
+ * sequences at a block of 16 is 128 query rows, past every fused band the drafter has. Both trunk
+ * layouts: q, k and v apart, and as one linear, where a one-row decode reads q in the row and a
+ * taller step copies it out. */
 TEST(gemma4_31b_steps_lint_clean_with_a_dflash_drafter) {
     G431Df f;
     const RadModelMeta meta = f.meta();
+    for (int fused = 0; fused < 2; ++fused)
     for (int i8 = 0; i8 < 2; ++i8)
         for (int world : { 1, 2, 4 })
             for (int rank : { 0, world - 1 }) {
                 if (world == 1 && rank > 0) continue;
                 RadBuilder b;
-                g431df_encs(b, i8 == 1, true);
+                g431df_encs(b, i8 == 1, true, fused == 1);
                 RadBuildCtx ctx = build_ctx(rank, world);
                 ctx.max_tok = 2048;
                 ctx.max_spec = 15;
                 REQUIRE_EQ(gemma4_bf16::declare(&b, &meta, &ctx), RAD_OK);
                 REQUIRE_EQ((int)b.drafter.kind, (int)RAD_DRAFT_BLOCK);
-                for (const auto& k : { kit(b, { 1, 1, 1 }, {}), kit(b, { 8, 1 }, { 5 }),
-                                       kit(b, {}, { 1500 }) }) {
+                for (const auto& k : { kit(b, { 1 }, {}), kit(b, { 1, 1, 1 }, {}),
+                                       kit(b, { 8, 1 }, { 5 }), kit(b, {}, { 1500 }) }) {
                     const auto v = run_passes(b, gemma4_bf16::step, { k.get() }, rank, world);
                     CHECK_PASSES(b, v);
                 }
@@ -5150,6 +5291,304 @@ TEST(gemma4_31b_steps_lint_clean_with_a_dflash_drafter) {
                     CHECK_PASSES(b, v);
                 }
             }
+}
+
+/* ============ gemma4 31B + DFlash2: RedHatAI's speculators-format drafter ============ */
+namespace {
+/* The 31B fixture with a DFlash2 drafter in vLLM's speculators layout, as rad-convert merges
+ * RedHatAI/gemma-4-31B-it-speculator.dflash2's config.json: the speculator's own keys at the top of
+ * `draft.`, the decoder layers' config under `draft.transformer_layer_config.`, booleans as 1/0.
+ * Taps at aux ids 1 5 9 (the residual entering those layers) for the fixture's twelve layers. */
+struct G431Df2 {
+    std::vector<const char*> keys, vals;
+    G431Df2() {
+        keys.assign(std::begin(k_gem4_keys), std::end(k_gem4_keys));
+        vals.assign(std::begin(k_gem4_vals), std::end(k_gem4_vals));
+        const char* kv[][2] = {
+            { "draft.architectures", "[\"DFlash2DraftModel\"]" },
+            { "draft.speculators_model_type", "dflash2" },
+            { "draft.block_size", "8" },
+            { "draft.mask_token_id", "4" },
+            { "draft.aux_hidden_state_layer_ids", "[1, 5, 9]" },
+            { "draft.selector_rank", "256" },
+            { "draft.selector_top_k", "16" },
+            { "draft.conv_kernel_size", "2" },
+            { "draft.conv_group_size", "16" },
+            { "draft.sample_from_anchor", "0" },
+            { "draft.sliding_window_non_causal", "1" },
+            { "draft.draft_vocab_size", "262144" },
+            { "draft.transformer_layer_config.num_hidden_layers", "5" },
+            { "draft.transformer_layer_config.head_dim", "256" },
+            { "draft.transformer_layer_config.num_attention_heads", "32" },
+            { "draft.transformer_layer_config.num_key_value_heads", "16" },
+            { "draft.transformer_layer_config.intermediate_size", "21504" },
+            { "draft.transformer_layer_config.rms_norm_eps", "1e-06" },
+            { "draft.transformer_layer_config.rope_parameters.rope_theta", "10000.0" },
+            { "draft.transformer_layer_config.hidden_size", "5376" },
+            { "draft.transformer_layer_config.vocab_size", "262144" },
+            { "draft.transformer_layer_config.hidden_act", "silu" },
+            { "draft.transformer_layer_config.sliding_window", "2048" },
+            { "draft.transformer_layer_config.use_sliding_window", "1" },
+            { "draft.transformer_layer_config.layer_types",
+              "[\"sliding_attention\", \"sliding_attention\", \"sliding_attention\", "
+              "\"sliding_attention\", \"sliding_attention\"]" },
+        };
+        for (const auto& p : kv) { keys.push_back(p[0]); vals.push_back(p[1]); }
+    }
+    RadModelMeta meta() const {
+        RadModelMeta m = gemma4_meta();
+        m.n_kv   = (int)keys.size();
+        m.kv_key = keys.data();
+        m.kv_val = vals.data();
+        return m;
+    }
+};
+
+/* The -df2 recipe's grids: the drafter's linears at block fp8, its head copy int8 (or, without
+ * `head8`, no 8-bit encoding, which leaves the 2-bit grid), and the trunk at w4a8 with q|k|v fused. */
+void g431df2_encs(RadBuilder& b, bool head8) {
+    g431df_encs(b, false, false, true);
+    if (head8) b.encs.insert(b.encs.begin(), { "dflash.draft_head.", rad_enc_affine(RAD_I8, RAD_F16, 1, 128) });
+}
+}  /* namespace */
+
+/* The 31B declares RedHatAI's DFlash2 drafter as a block drafter past its trunk, read from the
+ * speculators layout: depth 7 (block 8, the anchor predicting nothing), mask 4, every layer on a
+ * 2048-token window, non-causal, its own windowed KV group of 16 kv heads x 256, the taps on the
+ * layers BEFORE the aux ids (1 5 9 -> 0 4 8), the trunk's table read unscaled, and its head on the
+ * 8-bit copy, the candidates merged across ranks where the head is vocab-sharded. */
+TEST(gemma4_31b_declares_redhats_dflash2_from_the_speculators_layout) {
+    G431Df2 f;
+    const RadModelMeta meta = f.meta();
+    RadBuildCtx pc = build_ctx();
+    pc.max_spec = 7;
+    int taps[8] = {};
+    CHECK_EQ(gemma4::dflash2_taps(&meta, &pc, 12, taps, 8), 3);
+    CHECK_EQ(taps[0], 0);
+    CHECK_EQ(taps[1], 4);
+    CHECK_EQ(taps[2], 8);
+    RadArchProbe p{};
+    CHECK_OK(gemma4_bf16::probe(&meta, &p));
+    CHECK_EQ(p.draft_depth, 7);
+    CHECK_EQ(p.draft_depth_fixed, 1);
+
+    for (int world : { 1, 4 })
+    for (int head8 = 0; head8 < 2; ++head8) {
+        RadBuilder b;
+        g431df2_encs(b, head8 == 1);
+        RadBuildCtx ctx = build_ctx(0, world);
+        ctx.max_spec = 7;
+        REQUIRE_EQ(gemma4_bf16::declare(&b, &meta, &ctx), RAD_OK);
+
+        CHECK_EQ(b.drafter_name, std::string("dflash2"));
+        CHECK_EQ((int)b.drafter.kind, (int)RAD_DRAFT_BLOCK);
+        CHECK_EQ(b.drafter.depth, 7);
+        CHECK_EQ((int)b.drafter.block, 8);
+        CHECK_EQ(b.drafter.mask_token, 4);
+        CHECK_EQ(b.drafter.window, 2048);
+        CHECK_EQ(b.drafter.proposal, (rad_buf)buf_named(b, "dflash_tokens"));
+
+        const rad_kvgroup kvd = kv_named(b, "kv_draft");
+        REQUIRE(kvd != 0);
+        CHECK_EQ((int)b.kv_groups[kvd - 1].d.kind, (int)RAD_KV_WINDOW);
+        CHECK_EQ(b.kv_groups[kvd - 1].d.head_dim, 256);
+        CHECK_EQ(b.kv_groups[kvd - 1].d.n_head_kv, 16 / world);
+
+        const int src = buf_named(b, "dflash_src");
+        REQUIRE(src > 0);
+        CHECK_EQ(b.bufs[src - 1].d.shape[1], 3 * 5376);
+
+        /* attention: head 256, gqa 2, non-causal, the window */
+        int n_attn = 0;
+        for (const auto& o : b.ops)
+            if (o.op == "attn_paged" && pint(&o, "head_dim") == 256 && pint(&o, "window") == 2048 &&
+                pint(&o, "causal") == 0) {
+                ++n_attn;
+                CHECK_EQ(pint(&o, "gqa"), 2);
+            }
+        CHECK_EQ(n_attn, 1);
+
+        /* the drafter's lookup reads the trunk's table without Gemma's scale */
+        const RecOp* te = find_op(b, "embed_lookup", 0);
+        const RecOp* de = find_op(b, "embed_lookup", 1);
+        REQUIRE(te != nullptr && de != nullptr);
+        CHECK(te->w == de->w);
+        CHECK_NEAR(pflt(te, "mult"), 73.5, 1e-9);
+        CHECK(param(de, "mult") == nullptr);
+
+        /* the head: 8-bit where the copy is int8, else the 2-bit grid; merged across ranks */
+        bool head_seen = false;
+        for (const auto& o : b.ops)
+            if (o.op == "gemm_nt_q" && pint(&o, "K") == 5376 && pint(&o, "N") == 262144 / world) {
+                head_seen = true;
+                CHECK_EQ(pstr(&o, "dtype"), std::string(head8 ? "w8a8" : "w2a8"));
+            }
+        CHECK(head_seen);
+        CHECK_EQ(count_op(b, "row_topk_merge"), world > 1 ? 1 : 0);
+        CHECK_EQ(count_op(b, "dflash_select"), 1);
+    }
+}
+
+/* Every engine step with RedHatAI's DFlash2 behind the trunk lints clean at one, two and four ranks:
+ * decode, a mixed step, a prefill chunk, and a verify step with the drafter's context and query
+ * passes behind it (block 8). */
+TEST(gemma4_31b_steps_lint_clean_with_a_dflash2_drafter) {
+    G431Df2 f;
+    const RadModelMeta meta = f.meta();
+    for (int world : { 1, 2, 4 })
+        for (int rank : { 0, world - 1 }) {
+            if (world == 1 && rank > 0) continue;
+            RadBuilder b;
+            g431df2_encs(b, true);
+            RadBuildCtx ctx = build_ctx(rank, world);
+            ctx.max_tok = 2048;
+            ctx.max_spec = 7;
+            REQUIRE_EQ(gemma4_bf16::declare(&b, &meta, &ctx), RAD_OK);
+            for (const auto& k : { kit(b, { 1 }, {}), kit(b, { 1, 1, 1 }, {}),
+                                   kit(b, { 8, 1 }, { 5 }), kit(b, {}, { 1500 }) }) {
+                const auto v = run_passes(b, gemma4_bf16::step, { k.get() }, rank, world);
+                CHECK_PASSES(b, v);
+            }
+            for (int64_t n_seq : { 2, 8 }) {
+                const auto ver = kit(b, std::vector<int>((size_t)n_seq, 8), {});
+                const auto ctxp = context_pass(b, *ver);
+                const auto qry = query_pass(b, n_seq, 8, 7);
+                const auto v = run_passes(b, gemma4_bf16::step,
+                                          { ver.get(), ctxp.get(), qry.get() }, rank, world);
+                CHECK_PASSES(b, v);
+            }
+        }
+}
+
+/* DFlash2's fc, split by rows over the ranks and kept bit for bit. At four ranks each rank hands
+ * over 1344 of c's 5376 columns and computes the 11 whole scale blocks covering them (1408 rows: a
+ * span of the one stored weight, so a container converted before the split serves it), its window
+ * starting 0 or 64 rows in; the GEMM takes its K split from the whole 5376 rows (split_n), and the
+ * all_gather reads each window at the GEMM output's pitch and writes c whole. At two ranks a share
+ * is 21 whole blocks; at one rank the fc is whole, and so is an MXFP4 fc at four (its GEMM picks
+ * its own K split, so only block fp8 splits). */
+TEST(gemma4_31b_dflash2_fc_splits_by_rows_without_changing_a_bit) {
+    G431Df2 f;
+    const RadModelMeta meta = f.meta();
+    const int64_t E = 5376, K = 3 * E;   /* the fixture taps three trunk layers */
+    struct Case { int world; int rank; int64_t lo, hi, share; };
+    for (const Case cs : { Case{ 4, 0, 0, 1408, 1344 }, Case{ 4, 1, 1280, 2688, 1344 },
+                           Case{ 4, 2, 2688, 4096, 1344 }, Case{ 4, 3, 3968, 5376, 1344 },
+                           Case{ 2, 0, 0, 2688, 2688 }, Case{ 2, 1, 2688, 5376, 2688 },
+                           Case{ 1, 0, 0, 0, 0 } }) {
+        RadBuilder b;
+        g431df2_encs(b, true);
+        RadBuildCtx ctx = build_ctx(cs.rank, cs.world);
+        ctx.max_tok = 2048;
+        ctx.max_spec = 7;
+        REQUIRE_EQ(gemma4_bf16::declare(&b, &meta, &ctx), RAD_OK);
+        const RecWeight* fw = find_w(b, "dflash.fc.weight");
+        const RecWeight* fs = find_w(b, "dflash.fc.scale");
+        REQUIRE(fw != nullptr);
+        REQUIRE(fs != nullptr);
+        CHECK_EQ(fw->d.shape[1], K);
+        CHECK(find_w(b, "dflash.fc_tail.weight") == nullptr);
+        int split_gemms = 0, fc_gathers = 0;
+        for (const RecOp& o : b.ops) {
+            if (o.op == "gemm_nt_q" && pint(&o, "split_n") == E) {
+                ++split_gemms;
+                CHECK_EQ(pint(&o, "N"), (long long)(cs.hi - cs.lo));
+            }
+            if (o.op == "all_gather" && pint(&o, "row") == cs.share) {
+                ++fc_gathers;
+                CHECK_EQ(pint(&o, "numel"), (long long)(2048 * E));   /* the trunk's instance */
+                CHECK_EQ(pint(&o, "world_size"), (long long)cs.world);
+            }
+        }
+        if (!cs.share) {
+            CHECK_EQ(fw->d.shape[0], E);
+            CHECK_EQ(fw->d.shard, RAD_SHARD_NONE);
+            CHECK(!fw->span_set);
+            CHECK_EQ(split_gemms, 0);
+            continue;
+        }
+        CHECK_EQ(fw->d.shape[0], cs.hi - cs.lo);
+        CHECK_EQ(fw->d.shard, RAD_SHARD_ROW);
+        CHECK(fw->span_set);
+        CHECK_EQ(fw->span_lo, cs.lo);
+        CHECK_EQ(fw->span_hi, cs.hi);
+        CHECK(fs->span_set);   /* the scale plane's span is in 128-row blocks */
+        CHECK_EQ(fs->span_lo, cs.lo / 128);
+        CHECK_EQ(fs->span_hi, cs.hi / 128);
+        /* the window covers exactly this rank's share */
+        CHECK(cs.lo <= cs.rank * cs.share && (cs.rank + 1) * cs.share <= cs.hi);
+        CHECK_EQ(split_gemms, 1);
+        CHECK_EQ(fc_gathers, 1);
+    }
+
+    /* An MXFP4 drafter: fc whole on every rank. */
+    {
+        RadBuilder b;
+        g431df2_encs(b, true);
+        for (auto& e : b.encs)
+            if (e.first == "dflash.fc." || e.first == "dflash.blk.")
+                e.second = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
+        RadBuildCtx ctx = build_ctx(1, 4);
+        ctx.max_tok = 2048;
+        ctx.max_spec = 7;
+        REQUIRE_EQ(gemma4_bf16::declare(&b, &meta, &ctx), RAD_OK);
+        const RecWeight* fw = find_w(b, "dflash.fc.weight");
+        REQUIRE(fw != nullptr);
+        CHECK_EQ(fw->d.shape[0], E);
+        CHECK_EQ(fw->d.shard, RAD_SHARD_NONE);
+        CHECK(find_w(b, "dflash.fc_tail.weight") == nullptr);
+        for (const RecOp& o : b.ops) CHECK(pint(&o, "split_n") != E);
+    }
+}
+
+/* Where the container holds q, k and v as one linear (a recipe naming blk.*.attn_qkv.weight), the
+ * 31B declares one projection a layer -- q | k | v on a sliding layer, q | k on a global one, each
+ * rank its slice of every part -- and none of the three apart, and the junction writes that
+ * linear's int8 pair. The step: four GEMMs a layer instead of six (five on a global layer). A
+ * global layer's attention reads q in the row (attn_paged_qrow); a sliding layer's reads it there
+ * at one row and from attn_qs, copied out, at sixteen. */
+TEST(gemma4_31b_takes_q_k_and_v_as_one_linear_where_the_container_holds_them_so) {
+    G431Df f;
+    const RadModelMeta meta = f.meta();
+    const int64_t E = 5376, L = 12;
+    for (int world : { 1, 4 }) {
+        RadBuilder b;
+        g431df_encs(b, false, true, true);
+        RadBuildCtx ctx = build_ctx(0, world);
+        ctx.max_tok = 2048;
+        ctx.max_spec = 15;
+        REQUIRE_EQ(gemma4_bf16::declare(&b, &meta, &ctx), RAD_OK);
+
+        for (int64_t l = 0; l < L; ++l) {
+            const bool global = (l + 1) % 6 == 0;
+            const std::string pre = "blk." + std::to_string(l) + ".";
+            const RecWeight* qkv = nullptr;
+            for (const RecWeight& w : b.weights) {
+                if (w.name == pre + "attn_qkv.weight") qkv = &w;
+                for (const char* sep : { "attn_q.weight", "attn_k.weight", "attn_v.weight" })
+                    CHECK(w.name != pre + sep);
+            }
+            REQUIRE(qkv);
+            CHECK_EQ(qkv->d.shape[0], (global ? 32 * 512 + 4 * 512 : 32 * 256 + 2 * 16 * 256) / world);
+            CHECK_EQ(qkv->d.shape[1], E);
+            CHECK_EQ((int)qkv->d.n_row_parts, global ? 2 : 3);
+        }
+
+        for (const int q : { 1, 16 }) {
+            const auto k = kit(b, { q }, {});
+            const auto v = run_passes(b, gemma4_bf16::step, { k.get() }, 0, world);
+            CHECK_PASSES(b, v);
+            const std::vector<std::string> ops = issued_ops(b, *v[0]);
+            CHECK_EQ(count_issued(ops, "gemm_nt_q"), (int)(4 * L));
+            CHECK_EQ(count_issued(ops, "attn_paged_qrow"), 2);
+            CHECK_EQ(count_issued(ops, "attn_paged"), 10);
+            CHECK_EQ(count_issued(ops, "quant_act_i8"), (int)L);   /* o_proj's input only */
+            CHECK_EQ(count_writes_to(b, *v[0], buf_named(b, "attn_qs")), q == 1 ? 0 : 10);
+            /* the GEMM, then qkv_norm_rope in place */
+            CHECK_EQ(count_writes_to(b, *v[0], buf_named(b, "attn_qkvs")), 2 * 10);
+            CHECK_EQ(count_writes_to(b, *v[0], buf_named(b, "attn_qkvg")), 2 * 2);
+        }
+    }
 }
 
 /* ==================================================================== the step lint, checked */
@@ -7321,6 +7760,11 @@ struct ArchCases {
             b->encs = { { "attn_q.", w4g }, { "attn_k.", w4g }, { "attn_v.", w4g },
                         { "attn_o.", w4g }, { "ffn_gate_up.", w4g }, { "ffn_down.", w4g } };
         };
+        /* The same with q, k and v as one linear, as a recipe naming attn_qkv converts it. */
+        auto g4qkv = [this](RadBuilder* b) {
+            b->encs = { { "attn_qkv.", w4g }, { "attn_o.", w4g }, { "ffn_gate_up.", w4g },
+                        { "ffn_down.", w4g } };
+        };
         /* The ops libref lacks that each still asks for, both two-rank fusions with no chain:
          * qwen35_fp8's all-reduce norm (layer_fold assumes it at two ranks) and Flash-Next's
          * all-reduce into the wide stream. */
@@ -7365,15 +7809,24 @@ struct ArchCases {
         add("lfm2_bf16", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 0); return lfm2_bf16::declare(b, &lfm, &c); },
             lfm2_bf16::step, 0, {}, 0x1775b188dc4a5120ull);
+        /* The first three moved only by the attn_qkv name map each layer declares to ask whether
+         * the container holds q, k and v as one linear: with those maps left out of the hash they
+         * are the earlier pins, 0xafc23087c634a537, 0x719fa07788f8b98a and 0x93b174ab52cc0d31. */
         add("gemma4_bf16", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 0); return gemma4_bf16::declare(b, &g4, &c); },
-            gemma4_bf16::step, 0, {}, 0xafc23087c634a537ull);
+            gemma4_bf16::step, 0, {}, 0x174e157911e121a9ull);
         add("gemma4_bf16, w4a8", [this, sc, g4w4](RadBuilder* b) {
                 g4w4(b); auto c = sc(1, 0); return gemma4_bf16::declare(b, &g4, &c); },
-            gemma4_bf16::step, 0, {}, 0x719fa07788f8b98aull);
+            gemma4_bf16::step, 0, {}, 0x4bf536b78c6b11eeull);
         add("gemma4_bf16, w4a8, two ranks", [this, sc, g4w4](RadBuilder* b) {
                 g4w4(b); auto c = sc(2, 0); return gemma4_bf16::declare(b, &g4, &c); },
-            nullptr, 0, {}, 0x93b174ab52cc0d31ull);
+            nullptr, 0, {}, 0xed7ccbb0c6aecfebull);
+        add("gemma4_bf16, w4a8, fused qkv", [this, sc, g4qkv](RadBuilder* b) {
+                g4qkv(b); auto c = sc(1, 0); return gemma4_bf16::declare(b, &g4, &c); },
+            gemma4_bf16::step, 0, {}, 0x0ae60e16d6b6424cull);
+        add("gemma4_bf16, w4a8, fused qkv, two ranks", [this, sc, g4qkv](RadBuilder* b) {
+                g4qkv(b); auto c = sc(2, 0); return gemma4_bf16::declare(b, &g4, &c); },
+            nullptr, 0, {}, 0xcc58bb53457bca11ull);
         add("gemma4", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 0); return gemma4::declare(b, &g4m, &c); },
             gemma4::step, 0, {}, 0x0f227f5853b6488cull);

@@ -931,7 +931,7 @@ extern "C" int r4d_gemm_fp8a8_block(void)          { return (int)kBlock; }
 static int gemm_fp8a8_nt_m16_emit(long a, long ascale, long wq, long ws, long c,
                                   int M, int K, int N, int a_ld, int sa_ld, int w_ld, int sw_ld,
                                   long scratch, long scratch_bytes, RadStream stream,
-                                  bool i8 = false);
+                                  bool i8 = false, int split_n = 0);
 
 extern "C" int r4d_gemm_fp8a8_nt_m16(long a, long ascale, long wq, long ws, long c,
                                      int M, int K, int N, int a_ld, int sa_ld, int w_ld, int sw_ld,
@@ -961,11 +961,20 @@ extern "C" void r4d_gemm_fp8a8_pin_nt(int nt) {
 // Bytes of f32 scratch one r4d_gemm_fp8a8_nt_m16 call needs, or 0 when it will not split. The
 // caller may pass more, or none (the launch then runs unsplit: correct but slow, and unreported).
 // The bound is max_m() so the query and the band cannot drift apart.
-extern "C" long r4d_gemm_fp8a8_nt_m16_scratch(int M, int K, int N) {
+//
+// `split_n` (0: N) is the width the split is chosen for. The split depends on N alone, and it
+// fixes the order K partials are summed in, so a row slice of a wider linear (N rows of a
+// split_n-row weight) passes the whole width to sum each output as the whole linear does: the
+// slice's outputs are then the linear's to the bit.
+static long m16_scratch(int M, int K, int N, int split_n) {
     if (M <= 0 || K <= 0 || N <= 0 || M > r4d_gemm_fp8a8_nt_m16_max_m()) return 0;
     uint32_t ck = 0;
-    const uint32_t k2 = narrow_ksplit((uint32_t)N, (uint32_t)K, (uint32_t)M, &ck);
+    const uint32_t k2 = narrow_ksplit((uint32_t)(split_n > 0 ? split_n : N), (uint32_t)K,
+                                      (uint32_t)M, &ck);
     return k2 > 1 ? (long)k2 * M * N * (long)sizeof(float) : 0;
+}
+extern "C" long r4d_gemm_fp8a8_nt_m16_scratch(int M, int K, int N) {
+    return m16_scratch(M, K, N, 0);
 }
 
 // C[M,N] = A[M,K] @ dequant(Wq)[N,K]^T, M <= 64.
@@ -976,10 +985,12 @@ extern "C" long r4d_gemm_fp8a8_nt_m16_scratch(int M, int K, int N) {
 //   ws      [ceil(N/128)][ceil(K/128)] bf16, `sw_ld` elements a row (0 = ceil(K/128))
 //   c       [M][N]                     bf16
 //
-// Returns 0, or a negative code for a shape it does not serve. `scratch` may be 0.
+// Returns 0, or a negative code for a shape it does not serve. `scratch` may be 0. `split_n` is
+// r4d_gemm_fp8a8_nt_m16_scratch's.
 static int gemm_fp8a8_nt_m16_emit(long a, long ascale, long wq, long ws, long c,
                                   int M, int K, int N, int a_ld, int sa_ld, int w_ld, int sw_ld,
-                                  long scratch, long scratch_bytes, RadStream stream, bool i8) {
+                                  long scratch, long scratch_bytes, RadStream stream, bool i8,
+                                  int split_n) {
     int emit_rc = RAD_OK;
     if (!a || !ascale || !wq || !ws || !c) return -1;
     if (M <= 0 || K <= 0 || N <= 0) return -2;
@@ -1000,7 +1011,8 @@ static int gemm_fp8a8_nt_m16_emit(long a, long ascale, long wq, long ws, long c,
     const uint32_t gx = ((uint32_t)N + fm - 1) / fm;
 
     uint32_t ck = 0;
-    uint32_t ksplit = narrow_ksplit((uint32_t)N, (uint32_t)K, (uint32_t)M, &ck);
+    uint32_t ksplit = narrow_ksplit((uint32_t)(split_n > 0 ? split_n : N), (uint32_t)K,
+                                    (uint32_t)M, &ck);
     const long need = ksplit > 1 ? (long)ksplit * M * N * (long)sizeof(float) : 0;
     if (need && (!scratch || scratch_bytes < need)) { ksplit = 1; ck = 0; }
 
@@ -1260,10 +1272,10 @@ static int gemm_8a8_tiled(long a, long ascale, long wq, long ws, long c, int M, 
 // The shared operand reader is r4d_fp8_args.h; see libr4d/r4d_args.h.
 extern "C" int64_t r4d_rad_gemm_fp8a8_m16_scratch(const RadArgs* a) {
     const long long M = r4d_geti_or(a, "M", 0), N = r4d_geti_or(a, "N", 0),
-                    K = r4d_geti_or(a, "K", 0);
+                    K = r4d_geti_or(a, "K", 0), sn = r4d_geti_or(a, "split_n", 0);
     if (M < 1 || N < 1 || K < 1) return 0;
     if (M > r4d_gemm_fp8a8_nt_m16_max_m()) return 0;
-    return (int64_t)r4d_gemm_fp8a8_nt_m16_scratch((int)M, (int)K, (int)N);
+    return (int64_t)m16_scratch((int)M, (int)K, (int)N, (int)sn);
 }
 
 extern "C" int r4d_rad_gemm_fp8a8_m16(const RadArgs* a, RadStream stream) {
@@ -1276,7 +1288,8 @@ extern "C" int r4d_rad_gemm_fp8a8_m16(const RadArgs* a, RadStream stream) {
     const int e = gemm_fp8a8_nt_m16_emit(
         r4d_addr(g.a), r4d_addr(g.ascale), r4d_addr(g.b), r4d_addr(g.bscale), r4d_addr(g.y),
         (int)g.M, (int)g.K, (int)g.N, (int)g.a_ld, (int)g.sa_ld, (int)g.w_ld, (int)g.sw_ld,
-        (long)(uintptr_t)a->scratch, (long)a->scratch_bytes, stream);
+        (long)(uintptr_t)a->scratch, (long)a->scratch_bytes, stream, false,
+        (int)r4d_geti_or(a, "split_n", 0));
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 
@@ -1390,7 +1403,8 @@ extern "C" int r4d_rad_gemm_i8a8_m16(const RadArgs* a, RadStream stream) {
     const int e = gemm_fp8a8_nt_m16_emit(
         r4d_addr(g.a), r4d_addr(g.ascale), r4d_addr(g.b), r4d_addr(g.bscale), r4d_addr(g.y),
         (int)g.M, (int)g.K, (int)g.N, (int)g.a_ld, (int)g.sa_ld, (int)g.w_ld, (int)g.sw_ld,
-        (long)(uintptr_t)a->scratch, (long)a->scratch_bytes, stream, true);
+        (long)(uintptr_t)a->scratch, (long)a->scratch_bytes, stream, true,
+        (int)r4d_geti_or(a, "split_n", 0));
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 

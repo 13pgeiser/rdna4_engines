@@ -69,10 +69,21 @@
  * q/kv and gate_up shard by row, o and down by column with an all-reduce: ten collectives per
  * draft pass, each 5120 * block * 2 bytes (80 KiB at block 8), below the lossy wire's floor.
  *
+ * fc              [n_embd, n_taps*n_embd], 262 MiB in fp8 at Qwen3.8's width, read whole by the
+ *                   context pass every step. Split by rows over the ranks and all-gathered, and
+ *                   kept bit for bit. Each rank hands over an equal share of c's columns
+ *                   (n_embd / world) and computes the fewest whole 128-row scale blocks that cover
+ *                   it (the 31B at tp 4: 1344 columns a rank inside 11 blocks, 1408 rows, against
+ *                   42 blocks whole), a row span of the one stored weight
+ *                   (DenseFP8::declare_slice), so no reconvert. The GEMM takes its K split from
+ *                   the whole width (OPS.md's `split_n`), so each output is summed as the unsplit
+ *                   fc sums it, and the all-gather reads each rank's window out of its wider rows
+ *                   (an input pitch) and writes c whole. A GEMM cannot write a column slice (the
+ *                   narrow fp8 kernel's store is tight), which is why the windows are the
+ *                   gather's to cut. One rank, or an fc off block fp8, keeps it whole.
+ *
  * Replicated:
  *
- *   fc              [n_embd, n_taps*n_embd], 262 MiB. Column-sharding would halve it but add an
- *                   all-reduce to the prefill path.
  *   conv weights    projection and base kernel, 26 MiB a layer. The convolution spans the whole
  *                   replicated hidden row, so every rank needs every coefficient.
  *   codebooks       [n_vocab, 256], 127 MiB each, gathered by global token id. Only 128 rows are
@@ -127,6 +138,10 @@ struct Dflash2 {
         /* the context pass */
         rad_buf src  = 0;   /* [max_tok, n_taps * n_embd]  the trunk's taps, read only */
         rad_buf c    = 0;   /* [max_tok, n_embd]           fc's output, then normed in place */
+        /* [max_tok, fc_rows]  the block-aligned rows of a split fc this rank computes, whose
+         * fc_share-wide window at fc_off is gathered into c. The block declares it (only when it
+         * splits fc); leave it 0. */
+        rad_buf cpart = 0;
         /* K and V are separate buffers because of the per-head k norm: `rmsnorm` takes one row
          * pitch, and K heads inside a fused [K|V] row are head_dim apart within a token but
          * 2*kv_dim apart between tokens. libr4d refuses such an operand (libr4d/r4d_model.cpp,
@@ -191,10 +206,17 @@ struct Dflash2 {
      * MXFP4 accepts ~1% fewer tokens per step than fp8 and saves ~1.5 ms of a ~34 ms step.
      * Quantisation can only change acceptance, since every draft is verified. */
     DenseFP8   w_fc{};
+    /* fc split by rows (see SHARDING): w_fc is this rank's fc_rows block-aligned rows, holding its
+     * fc_share output columns at row fc_off. fc_rows 0: w_fc is the whole fc, replicated. */
+    int64_t    fc_share = 0, fc_rows = 0, fc_off = 0;
     rad_weight w_hnorm = 0, w_norm = 0;
     rad_weight w_selp = 0, w_pred = 0, w_succ = 0;
     rad_weight w_tok = 0;                    /* the target's embedding table */
-    rad_weight w_dh = 0, w_dhs = 0;          /* the 2-bit copy of the target's lm_head */
+    rad_weight w_dh = 0, w_dhs = 0;          /* the 2-bit (or 8-bit) copy of the target's lm_head */
+    /* The copy is int8 with an f16 scale per (row, 128 of K) where the recipe made it so (the
+     * 31B's: the head read at w8a8, so the selector sees the candidates an 8-bit head ranks), and
+     * the 2-bit grid otherwise. Set by declare from the copy's encoding. */
+    bool       head_i8 = false;
 
     /* per-layer weights */
     rad_weight w_anorm[MAX_LAYERS] = {}, w_fnorm[MAX_LAYERS] = {};
@@ -209,6 +231,7 @@ struct Dflash2 {
 
     /* context-pass ops */
     rad_op op_cfc = 0, op_cnorm = 0, op_crope = 0, op_cstore = 0;
+    rad_op op_cgath = 0;   /* the split fc's all-gather */
     rad_op op_ck[MAX_LAYERS] = {}, op_cv[MAX_LAYERS] = {}, op_cknorm[MAX_LAYERS] = {};
 
     /* Activation quantisers, one per activation that feeds a linear. Weightless, so one declaration
@@ -284,9 +307,38 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
     if (qrows <= 0 || srows <= 0) return RAD_E_INVAL;
 
     /* ---------------------------------------------------------------- model-scope weights */
-    RAD_ARCH_TRY(w_fc.declare(b, nm, nm.f("dflash.fc"), g.n_embd, cfg.n_taps * g.n_embd,
-                              RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model(),
-                              { nm.ckpt("%s.fc.weight", ck) }));
+    {
+        const int64_t K   = cfg.n_taps * g.n_embd;
+        const char*   fwn = nm.f("dflash.fc.weight");
+        RAD_ARCH_TRY(map_linear(b, fwn, { nm.ckpt("%s.fc.weight", ck) }));
+        /* Split only block fp8 (an MXFP4 GEMM's K split is its own), into equal shares of whole
+         * 16-byte words (the gather's unit). */
+        RadEncoding  fe{};
+        const RadEncPlane* fsc = nullptr;
+        const bool fp8 = weight_enc(b, fwn, &fe) && rad_enc_is(&fe, "affine") && fe.n_planes == 2 &&
+                         !fe.transform[0] && fe.plane[0].dtype == RAD_F8E4M3 &&
+                         (fsc = rad_enc_plane(&fe, "scale")) && fsc->block[0] == RAD_FP8_BLOCK &&
+                         fsc->block[1] == RAD_FP8_BLOCK;
+        const int64_t share = (g.world > 1 && g.n_embd % RAD_FP8_BLOCK == 0 &&
+                               g.n_embd % g.world == 0 && (g.n_embd / g.world) % 8 == 0)
+                                  ? g.n_embd / g.world : 0;
+        if (fp8 && share > 0) {
+            const int64_t B  = RAD_FP8_BLOCK;
+            const int64_t lo = share * g.rank / B * B;
+            const int64_t hi = (share * (g.rank + 1) + B - 1) / B * B;
+            fc_share = share;
+            fc_rows  = hi - lo;
+            fc_off   = share * g.rank - lo;
+            RAD_ARCH_TRY(w_fc.declare_slice(b, nm, nm.f("dflash.fc"), fwn, lo, hi, K,
+                                            RAD_ACCESS_PER_TOKEN, grp_model()));
+            if (!w.cpart)
+                w.cpart = decl_b(b, nm.f("df_cpart"), g.act_dtype, { g.max_tok, fc_rows });
+        } else {
+            RAD_ARCH_TRY(w_fc.declare(b, nm, nm.f("dflash.fc"), g.n_embd, K, RAD_ACCESS_PER_TOKEN,
+                                      RAD_SHARD_NONE, grp_model(), { nm.ckpt("%s.fc.weight", ck) },
+                                      {}, true));
+        }
+    }
     RAD_ARCH_TRY(map_copy(b, nm.f("dflash.hidden_norm.weight"), nm.ckpt("%s.hidden_norm.weight", ck)));
     RAD_ARCH_TRY(map_copy(b, nm.f("dflash.norm.weight"),        nm.ckpt("%s.norm.weight", ck)));
     RAD_ARCH_TRY(map_copy(b, nm.f("dflash.sel_proj.weight"),
@@ -321,10 +373,28 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
     const int  dh_split = dh_shard ? RAD_SHARD_ROW : RAD_SHARD_NONE;
     const char* dhn = nm.f("dflash.draft_head.weight");
     RAD_ARCH_TRY(map_copy(b, dhn, ck_lm));
-    w_dh  = decl_view(b, dhn, nullptr, "codes", RAD_U2, {head_rows(g), g.n_embd},
-                      RAD_ACCESS_PER_TOKEN, dh_split, grp_model());
-    w_dhs = decl_view(b, nm.f("dflash.draft_head.scale"), dhn, "scale,zero", RAD_F16,
-                      {head_rows(g), g.n_embd}, RAD_ACCESS_PER_TOKEN, dh_split, grp_model());
+    /* The 8-bit form: int8 codes, one f16 scale per (row, 128 of K), symmetric, which gemm_nt_q
+     * reads at w8a8 against the same quant_act_i8 activation (without its asum). */
+    {
+        RadEncoding e{};
+        const RadEncPlane* sc = nullptr;
+        head_i8 = weight_enc(b, dhn, &e) && rad_enc_is(&e, "affine") && e.n_planes == 2 &&
+                  !e.transform[0] && e.plane[0].dtype == RAD_I8 && e.plane[0].block[1] == 1 &&
+                  (sc = rad_enc_plane(&e, "scale")) && sc->dtype == RAD_F16 &&
+                  sc->block[0] == 1 && sc->block[1] == DF_W2_GROUP;
+    }
+    if (head_i8) {
+        w_dh  = decl_view(b, dhn, nullptr, "codes", RAD_I8, {head_rows(g), g.n_embd},
+                          RAD_ACCESS_PER_TOKEN, dh_split, grp_model());
+        w_dhs = decl_view(b, nm.f("dflash.draft_head.scale"), dhn, "scale", RAD_F16,
+                          {head_rows(g), g.n_embd / DF_W2_GROUP}, RAD_ACCESS_PER_TOKEN, dh_split,
+                          grp_model());
+    } else {
+        w_dh  = decl_view(b, dhn, nullptr, "codes", RAD_U2, {head_rows(g), g.n_embd},
+                          RAD_ACCESS_PER_TOKEN, dh_split, grp_model());
+        w_dhs = decl_view(b, nm.f("dflash.draft_head.scale"), dhn, "scale,zero", RAD_F16,
+                          {head_rows(g), g.n_embd}, RAD_ACCESS_PER_TOKEN, dh_split, grp_model());
+    }
     if (!w_dh || !w_dhs) return RAD_E_INVAL;
 
     /* ---------------------------------------------------------------- per-layer weights */
@@ -422,7 +492,21 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                                RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype)),
                     RAD_NOWEIGHTS),
                 {w.src}, {w.srcq, w.srcs});
-    op_cfc = w_fc.gemm(b, crows, g.n_embd, cfg.n_taps * g.n_embd, {w.srcq, w.srcs}, {w.c});
+    if (fc_rows) {
+        /* The split (SHARDING above): this rank's block-aligned rows into `cpart`, its window of
+         * them gathered into `c`. The GEMM takes its K split from the whole width. The gather
+         * rides the trunk's all-reduce instance (the same numel bound, so the same instance). */
+        op_cfc = w_fc.gemm(b, crows, fc_rows, cfg.n_taps * g.n_embd, {w.srcq, w.srcs}, {w.cpart},
+                           g.n_embd);
+        op_cgath = rw(b, RAD_OP(b, "all_gather",
+                         RAD_PARAMS(RAD_INT("world_size", g.world),
+                                    RAD_INT("numel", crows * g.n_embd),
+                                    RAD_STR("dtype", g.dtype), RAD_INT("row", fc_share)),
+                         RAD_NOWEIGHTS),
+                     {w.cpart}, {w.c});
+    } else {
+        op_cfc = w_fc.gemm(b, crows, g.n_embd, cfg.n_taps * g.n_embd, {w.srcq, w.srcs}, {w.c});
+    }
     /* In place, like the per-head q/k norms below: a row's scale is computed before the row is
      * written. */
     op_cnorm = rw(b, RAD_OP(b, "rmsnorm",
@@ -643,12 +727,19 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                                  RAD_INT("group", DF_W2_GROUP), RAD_STR("dtype", g.dtype)),
                       RAD_NOWEIGHTS),
                   {w.sel_h}, {w.dq, w.ds, w.dsum});
-    op_dlogits = rw(b, RAD_OP(b, "gemm_nt_q",
-                       RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("N", head_rows(g)),
-                                  RAD_INT("K", g.n_embd), RAD_INT("group", DF_W2_GROUP),
-                                  RAD_STR("dtype", "w2a8")),
-                       RAD_WEIGHTS(w_dh, w_dhs)),
-                   {w.dq, w.ds, w.dsum}, {w.dlog});
+    op_dlogits = head_i8
+        ? rw(b, RAD_OP(b, "gemm_nt_q",
+                RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("N", head_rows(g)),
+                           RAD_INT("K", g.n_embd), RAD_INT("group", DF_W2_GROUP),
+                           RAD_STR("dtype", "w8a8")),
+                RAD_WEIGHTS(w_dh, w_dhs)),
+             {w.dq, w.ds}, {w.dlog})
+        : rw(b, RAD_OP(b, "gemm_nt_q",
+                RAD_PARAMS(RAD_RANGE("M", 1, srows), RAD_INT("N", head_rows(g)),
+                           RAD_INT("K", g.n_embd), RAD_INT("group", DF_W2_GROUP),
+                           RAD_STR("dtype", "w2a8")),
+                RAD_WEIGHTS(w_dh, w_dhs)),
+             {w.dq, w.ds, w.dsum}, {w.dlog});
     /* Sharded, the top-R runs over this rank's plane, reports global ids and also writes the pair
      * plane the gather moves. Replicated, `vocab_off` is omitted: an optional parameter present
      * with value 0 is a different declaration from an absent one. */
@@ -731,8 +822,14 @@ inline void Dflash2::context(RadCtx* c, const RadBatch* batch) const {
 
     /* As wide as the prefill chunk, one launch per op (the fp8a8 pair covers every M). */
     RAD_ISSUE_N(c, op_qsrc, T, brows(w.src, T), brows(w.srcq, T), brows(w.srcs, T));
-    RAD_ISSUE_N(c, op_cfc, T, brows(w.srcq, T), brows(w.srcs, T), RAD_W(w_fc.w), RAD_W(w_fc.s),
-                brows(w.c, T), RAD_NONE, w_fc.bref());
+    if (fc_rows) {
+        RAD_ISSUE_N(c, op_cfc, T, brows(w.srcq, T), brows(w.srcs, T), RAD_W(w_fc.w), RAD_W(w_fc.s),
+                    brows(w.cpart, T), RAD_NONE, w_fc.bref());
+        RAD_ISSUE_N(c, op_cgath, T, bcol(w.cpart, fc_off, fc_share, T), brows(w.c, T));
+    } else {
+        RAD_ISSUE_N(c, op_cfc, T, brows(w.srcq, T), brows(w.srcs, T), RAD_W(w_fc.w), RAD_W(w_fc.s),
+                    brows(w.c, T), RAD_NONE, w_fc.bref());
+    }
     RAD_ISSUE_N(c, op_cnorm, T, brows(w.c, T), RAD_W(w_hnorm), brows(w.c, T));
     RAD_ISSUE_N(c, op_qc, T, brows(w.c, T), brows(w.cq, T), brows(w.cs, T));
 
@@ -843,9 +940,10 @@ inline void Dflash2::step(RadCtx* c, const RadBatch* batch) const {
      * whole. */
     RAD_ISSUE_N(c, op_dquant, S, brows(w.sel_h, S), brows(w.dq, S), brows(w.ds, S), RAD_B(w.dsum));
     /* The trailing operand is mxfp4's optional reference, absent here. Operands are positional,
-     * so an absent optional one is RAD_NONE, not a shorter list. */
+     * so an absent optional one is RAD_NONE, not a shorter list. The 8-bit head is symmetric and
+     * takes no asum. */
     RAD_ISSUE_N(c, op_dlogits, S, brows(w.dq, S), brows(w.ds, S), RAD_W(w_dh), RAD_W(w_dhs),
-                brows(w.dlog, S), RAD_B(w.dsum), RAD_NONE);
+                brows(w.dlog, S), head_i8 ? RAD_NONE : RAD_B(w.dsum), RAD_NONE);
     /* RAD_NONE fills the unused `pairs` slot. Sharded, this rank's top-R are only candidates and
      * the merge overwrites `cand`/`unary`. */
     if (op_dmerge) {

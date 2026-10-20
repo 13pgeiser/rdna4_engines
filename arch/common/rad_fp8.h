@@ -1521,14 +1521,46 @@ struct DenseFP8 {
                 int access, int shard, RadWeightGroup grp,
                 std::initializer_list<const char*> src,
                 std::initializer_list<int64_t> row_parts = {}, bool mapped = false);
-    /* `gemm_nt_q` over this weight, `fp8a8` or `mxfp4a8` as it was declared, ranged M 1..hi. */
+    /* Rows [lo, hi) of the stored block-fp8 weight `src_wn` (codes and scale plane; mapped by
+     * whoever declared it), read as an [hi - lo, K] weight named `<base>`: a row slice that need
+     * not be a rank's even share, and may be the same rows on every rank. Whole 128-row blocks,
+     * so each slice's codes and scales are the stored ones. fp8 only: an MXFP4 linear's GEMM
+     * splits K by its own rule. A slice issued with `gemm(..., split_n)` set to the stored width
+     * computes the stored linear's outputs to the bit. */
+    int declare_slice(RadBuilder* b, Names& nm, const char* base, const char* src_wn, int64_t lo,
+                      int64_t hi, int64_t K, int access, RadWeightGroup grp) {
+        if (lo < 0 || hi <= lo || lo % RAD_FP8_BLOCK || hi % RAD_FP8_BLOCK || K % RAD_FP8_BLOCK)
+            return RAD_E_INVAL;
+        mx  = false;
+        ref = 0;
+        const char* wn = nm.f("%s.weight", base);
+        const char* sn = nm.f("%s.scale", base);
+        const bool own = !std::strcmp(wn, src_wn);   /* the stored weight's own name */
+        w = decl_view(b, wn, own ? nullptr : src_wn, "codes", RAD_F8E4M3, { hi - lo, K }, access,
+                      RAD_SHARD_ROW, grp);
+        s = decl_view(b, sn, src_wn, "scale", RAD_BF16, { fp8_blocks(hi - lo), fp8_blocks(K) },
+                      access, RAD_SHARD_ROW, grp);
+        if (!w || !s) return RAD_E_INVAL;
+        RAD_ARCH_TRY(rad_weight_shard_span(b, w, lo, hi));
+        return rad_weight_shard_span(b, s, lo / RAD_FP8_BLOCK, hi / RAD_FP8_BLOCK);
+    }
+    /* `gemm_nt_q` over this weight, `fp8a8` or `mxfp4a8` as it was declared, ranged M 1..hi.
+     * `split_n`, when set, is the stored width a row slice takes its K split from (docs/OPS.md). */
     rad_op gemm(RadBuilder* b, int64_t hi, int64_t N, int64_t K,
-                std::initializer_list<rad_buf> reads, std::initializer_list<rad_buf> writes) const {
+                std::initializer_list<rad_buf> reads, std::initializer_list<rad_buf> writes,
+                int64_t split_n = 0) const {
         if (mx)
             return rw(b, RAD_OP(b, "gemm_nt_q",
                           RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
                                      RAD_INT("group", RAD_MX_GROUP), RAD_STR("dtype", "mxfp4a8")),
                           RAD_WEIGHTS(w, s, ref)),
+                      reads, writes);
+        if (split_n > 0)
+            return rw(b, RAD_OP(b, "gemm_nt_q",
+                          RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
+                                     RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "fp8a8"),
+                                     RAD_INT("split_n", split_n)),
+                          RAD_WEIGHTS(w, s)),
                       reads, writes);
         return rw(b, RAD_OP(b, "gemm_nt_q",
                       RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),

@@ -317,8 +317,10 @@ static const RadParamSpec pGemmBias[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_
 static const RadOperandSpec oGemmBias[] = { OPD("a"), WGT("b"), WGT("bias"), OPD_O("res"),
                                             OUT("y") };
 
+/* `split_n` is libr4d's (docs/OPS.md): ref never splits K, so it accepts and ignores it. */
 static const RadParamSpec pGemmQ[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
-                                       P_STR("dtype"), P_INTO("pb1"), P_INTO("pb2") };
+                                       P_STR("dtype"), P_INTO("pb1"), P_INTO("pb2"),
+                                       P_INTO("split_n") };
 /* The bias form has no parts (`pb1`/`pb2`); only the plain product supports them. */
 static const RadParamSpec pGemmQBias[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
                                            P_STR("dtype") };

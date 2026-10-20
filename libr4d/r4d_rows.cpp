@@ -736,6 +736,9 @@ static const RadParamSpec pGemmNtQ[] = {
     { "dtype", RAD_P_STR, RAD_REQUIRED },
     { "pb1",   RAD_P_INT, RAD_OPTIONAL },
     { "pb2",   RAD_P_INT, RAD_OPTIONAL },
+    /* The width whose K split a row slice of a wider linear takes (docs/OPS.md); only the narrow
+     * fp8a8 / i8a8 rows split K by N, and they read it. */
+    { "split_n", RAD_P_INT, RAD_OPTIONAL },
 };
 /* docs/OPS.md's `gemm_nt_q` is `a`, `a_scale`, `b`w, `b_scale`w -> `y`. Two of libr4d's six
  * quantised GEMMs need a seventh operand. RadLayout can declare aux streams beside a weight, but
