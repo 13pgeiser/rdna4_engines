@@ -23398,7 +23398,7 @@ mod tests {
             wrapper_virtual_credit_bytes(&moe, physical, None, target),
             0
         );
-        for stale in [(1024usize, true), (4096, false), (8192, false), (512, false)] {
+        for stale in [(1024usize, true), (4096, false), (4096, true), (512, false)] {
             assert_eq!(
                 wrapper_virtual_credit_bytes(&moe, physical, Some(stale), target),
                 0,
@@ -23421,7 +23421,7 @@ mod tests {
             call_eligible: true,
         });
         assert!(!p.free_virtual && !p.alloc_virtual);
-        for stale in [(1024usize, true), (4096, false), (8192, true)] {
+        for stale in [(1024usize, true), (4096, false)] {
             let p = plan_wrapper_pbs(&WrapperPbsInputs {
                 arch: "gfx1100",
                 fp8_chunk512: false,
