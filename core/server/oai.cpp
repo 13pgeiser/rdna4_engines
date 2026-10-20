@@ -846,14 +846,16 @@ static int parse_sampling(const json& b, const OaiLimits& lim, OaiRequest* r, Ap
     /* The control vector (core/cvec.h): an opt-in per request, and the only place an API client
      * turns it on when the deployment's default is off. `control_vector` is the field's name;
      * `experimental_speed_projection` is Strata's spelling of the same switch, kept as an alias so
-     * a client written against that reports what it means. */
-    /* The field's own name is read last, so a request that sends both spellings is read as
-     * `control_vector`; the alias is Strata's name for the same switch. */
-    for (const char* key : { "experimental_speed_projection", "control_vector" }) {
-        if (!b.contains(key)) continue;
+     * a client written against that reports what it means -- and read only when the request did not
+     * send the field itself, so the field wins when a body carries both. A JSON null is "not sent",
+     * as everywhere else in this parser. */
+    for (const char* key : { "control_vector", "experimental_speed_projection" }) {
+        const auto it = b.find(key);
+        if (it == b.end() || it->is_null()) continue;
         bool on = false;
         if (!get_bool(b, key, &on, err)) return RAD_E_INVAL;
         r->control_vector = on ? 1 : 0;
+        break;
     }
 
     /* stop: a string or an array of strings. Bounded in count and length because every stop

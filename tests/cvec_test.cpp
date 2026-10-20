@@ -138,6 +138,7 @@ TEST(the_published_shape_loads_and_is_normalised) {
     CHECK_EQ(f.cv.last, 44);
     /* Indexed by layer, so row 0 exists (the format has no direction for it) and 47 rows follow. */
     CHECK_EQ(f.cv.n_layers, (int64_t) 48);
+    CHECK_EQ(f.cv.n_dirs, (int64_t) 47);
 
     for (int l = 1; l <= 47; ++l) {
         double ss = 0.0;
@@ -286,9 +287,9 @@ TEST(a_layer_range_past_the_model_is_refused) {
     CHECK(l.err.find("runs past") != std::string::npos);
 }
 
-/* A layer index the table cannot hold: a 48-layer model's table is rows 0..47 and the format has
- * no direction for the last row, so direction.48 and a JSON range ending at 48 are both refused
- * rather than indexing one row past it. */
+/* A layer index the table cannot hold: a 48-layer model's table is rows 0..47, indexed by layer, so
+ * direction.48 names one row past it -- as does a JSON range ending at 48. Both are refused rather
+ * than writing or reading past the table. */
 TEST(a_layer_at_the_models_own_count_is_refused) {
     const Loaded a = load(make_vector(2560, 48), 2560, 48, "layer-48.gguf");
     CHECK(a.rc < 0);

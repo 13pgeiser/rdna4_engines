@@ -4538,9 +4538,13 @@ TEST(the_control_vector_field_overrides_the_default_or_is_refused) {
         f.sched.join_all();
         CHECK_EQ(r.status, 400);
         CHECK(r.body.find("control_vector") != std::string::npos);
-        /* The route itself is present and answers 404: that is what the page tests for before it
-         * hides the panel, and what distinguishes "no vector here" from "not signed in". */
-        CHECK_EQ(f.get("/admin/control-vector").status, 404);
+        /* The route itself is present and answers 404 on both methods: that is what the page tests
+         * for before it hides the panel, and what distinguishes "no vector here" from "not signed
+         * in". */
+        const HttpResponse g0 = f.get("/admin/control-vector");
+        CHECK_EQ(g0.status, 404);
+        CHECK(g0.body.find("not_found_error") != std::string::npos);
+        CHECK_EQ(f.post("/admin/control-vector", R"({"enabled":true})").status, 404);
     }
     {
         /* A vector loaded, default off: the request's own choice wins and reaches the engine. */
@@ -4581,6 +4585,16 @@ TEST(the_control_vector_field_overrides_the_default_or_is_refused) {
         f.sched.join_all();
         CHECK_EQ(r3.status, 200);
         CHECK(!f.sched.last_sp.use_control_vector);
+
+        /* A JSON null is "not sent", not "false": the deployment's default (on, here) applies. */
+        HttpResponse r4 = f.post("/v1/chat/completions",
+                                 R"({"messages":[{"role":"user","content":"hi"}],
+                                     "max_tokens":4,
+                                     "control_vector":null})");
+        if (r4.streaming()) drain(r4);
+        f.sched.join_all();
+        CHECK_EQ(r4.status, 200);
+        CHECK(f.sched.last_sp.use_control_vector);
 
         const HttpResponse g = f.get("/admin/control-vector");
         CHECK_EQ(g.status, 200);
