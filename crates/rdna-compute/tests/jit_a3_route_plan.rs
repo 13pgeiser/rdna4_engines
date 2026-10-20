@@ -148,23 +148,32 @@ fn manifest(
     out
 }
 
-/// Current-registry binding: every planned HIP entry must carry the exact
-/// source text the current registry serves for that module under the same
-/// arch/flags. Wording drift inside the registry moves both sides together;
-/// a plan bound to a stale capture diverges here and fails as a real cause.
+/// Bind plans to the current corpus, including runtime-generated VMM recipes.
+/// A stale source, compiler recipe or missing symbol remains a real failure;
+/// historical capture source-text fingerprints are not current cache keys.
 fn assert_current_registry_binding(plan: &RouteKernelPlan, arch: &str, extra_flags: &str) {
+    let corpus = rdna_compute::kernel_registry::corpus_entries(arch, extra_flags).unwrap();
     for entry in &plan.entries {
         if let PlannedKernel::Hip(e) = entry {
-            let live = rdna_compute::kernel_registry::lookup(arch, e.module, extra_flags)
-                .unwrap_or_else(|err| {
-                    panic!("{arch}:{} missing from the current registry: {err:?}", e.module)
-                });
+            let mut matches = corpus.iter().filter(|live| live.module == e.module);
+            let live = matches.next().unwrap_or_else(|| {
+                panic!("{arch}:{} missing from the current corpus", e.module)
+            });
+            assert!(matches.next().is_none(), "duplicate corpus module {}", e.module);
             assert_eq!(
                 e.source(),
                 live.source(),
                 "{}: plan source is not the current registry source",
                 e.module
             );
+            assert_eq!(e.flags, live.flags, "{}: compiler flags differ", e.module);
+            assert_eq!(
+                e.scheduler_profile, live.scheduler_profile,
+                "{}: scheduler profile differs", e.module
+            );
+            for symbol in &e.symbols {
+                assert!(live.symbols.contains(symbol), "{}: missing {symbol}", e.module);
+            }
         }
     }
 }
