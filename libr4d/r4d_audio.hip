@@ -988,6 +988,13 @@ __global__ __launch_bounds__(kT) void cu_repeat_kernel(const int* __restrict__ l
     if (j < n) y[j] = j * len[0] * mult;
 }
 
+__global__ __launch_bounds__(kT) void sub_i32_kernel(const int* __restrict__ x,
+                                                     const int* __restrict__ s, int* __restrict__ y,
+                                                     int n) {
+    const int j = blockIdx.x * kT + threadIdx.x;
+    if (j < n) y[j] = x[j] - s[0];
+}
+
 // ---------------------------------------------------------------------------- attention
 // Dense causal attention over short sequences, head_dim 256, one query head a key head: a depth
 // decoder runs a frame's handful of positions, the codebooks so far. A workgroup a (sequence,
@@ -1638,6 +1645,18 @@ extern "C" int r4d_rad_int_affine(const RadArgs* a, RadStream s) {
         if (p.src[j] >= r4d_numel(x)) return R4D_NO(RAD_E_SHAPE);
     hipLaunchKernelGGL(int_affine_kernel, dim3(1), dim3(kAffMax), 0, (hipStream_t)s,
                        (const int*)x->data, (int*)y->data, p, n);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_sub_i32(const RadArgs* a, RadStream s) {
+    const RadTensor *x = r4d_opt(a, 0), *sc = r4d_opt(a, 1), *y = r4d_opt(a, 2);
+    if (!x || !sc || !y) return R4D_NO(RAD_E_INVAL);
+    if (!is_i32(x) || !is_i32(sc) || !is_i32(y)) return R4D_NO(RAD_E_DTYPE);
+    if (!r4d_contig(x) || !r4d_contig(y)) return R4D_NO(RAD_E_STRIDE);
+    const long long n = r4d_numel(y);
+    if (n <= 0 || r4d_numel(x) < n || r4d_numel(sc) < 1) return R4D_NO(RAD_E_SHAPE);
+    hipLaunchKernelGGL(sub_i32_kernel, dim3(blocks_for(n)), dim3(kT), 0, (hipStream_t)s,
+                       (const int*)x->data, (const int*)sc->data, (int*)y->data, (int)n);
     return st_of(hipGetLastError());
 }
 

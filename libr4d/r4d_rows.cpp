@@ -2580,6 +2580,10 @@ static const RadParamSpec pIota[] = { P_INT("M"), P_INT("start"), P_INT("step"),
                                       P_INTO("period") };
 static const RadOperandSpec oIota[] = { { "y", RAD_OPD_OUT, 0 } };
 static const RadParamSpec pCuRepeat[] = { P_INT("M"), P_INT("mult") };
+static const RadParamSpec pSubI32[] = { P_INT("M") };
+static const RadOperandSpec oSubI32[] = {
+    { "x", RAD_OPD_IN, 0 }, { "s", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 },
+};
 static const RadOperandSpec oCuRepeat[] = { { "len", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 } };
 static const RadParamSpec pIntAffine[] = { P_INT("M"), P_STR("src"), P_STR("mul"), P_STR("add") };
 static const RadOperandSpec oIntAffine[] = { { "x", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 } };
@@ -3522,6 +3526,9 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("cu_repeat", pCuRepeat, oCuRepeat, "bounds of equal sequences, y[j] = j * len[0] * mult."),
     SCHEMA("int_affine", pIntAffine, oIntAffine,
            "y[j] = (src[j] < 0 ? 0 : x[src[j]]) * mul[j] + add[j] over three integer lists."),
+    SCHEMA("sub_i32", pSubI32, oSubI32,
+           "y[i] = x[i] - s[0], int32: a device length less a device offset (a pipelined prefill's "
+           "first piece sees its group's seqused less the second piece's rows)."),
     SCHEMA("snake_aa", pSnakeAa, oSnakeAa,
            "BigVGAN's alias-free SnakeBeta over each sequence, f32: replicate-padded, upsampled "
            "`ratio` times by `f_up`, SnakeBeta, filtered by `f_down` at stride `ratio`."),
@@ -9070,6 +9077,12 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   nullptr, 0, NOTUNE,
   nullptr, nullptr, r4d_rad_iota },
+
+{ "sub_i32", "sub_i32", "elem",
+  "a device int32 vector less a device scalar", "contiguous i32", "i32",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  nullptr, 0, NOTUNE,
+  nullptr, nullptr, r4d_rad_sub_i32 },
 
 { "cu_repeat", "cu_repeat", "elem",
   "bounds of equal sequences from a device length", "contiguous i32", "i32",

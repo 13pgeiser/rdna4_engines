@@ -6941,6 +6941,26 @@ void mul_weight_f32_case(const Plugin& pl) {
     }
 }
 
+/* sub_i32: a vector less a device scalar, negatives included. Exact. */
+void sub_i32_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "sub_i32");
+    if (!r) { ok("sub_i32", false, "row absent"); return; }
+    const int64_t n = 300;
+    std::vector<int32_t> x((size_t)n);
+    for (int64_t i = 0; i < n; ++i) x[(size_t)i] = (int32_t)(i * 37 - 4000);
+    const std::vector<int32_t> sv = { 1234 };
+    void* dx = up_i32(x);
+    void* ds = up_i32(sv);
+    void* dy = dalloc((size_t)n * 4);
+    const int rc = launch(r, { T(dx, RAD_I32, { n }), T(ds, RAD_I32, { 1 }), T(dy, RAD_I32, { n }) },
+                          { PI("M", n) });
+    if (rc != RAD_OK) { ok("sub_i32", false, "rc " + std::to_string(rc)); return; }
+    std::vector<int32_t> want((size_t)n);
+    for (int64_t i = 0; i < n; ++i) want[(size_t)i] = x[(size_t)i] - 1234;
+    const int64_t bad = differ(down_i32(dy, (size_t)n), want);
+    ok("sub_i32 exact", bad == 0, fmt("%lld entries differ", (long long)bad));
+}
+
 /* iota with and without a period. Exact. */
 void iota_cases(const Plugin& pl) {
     const RadKernelInfo* r = find(pl, "iota");
@@ -27309,6 +27329,7 @@ static void device_phase(const Plugin& pl) {
     if (sel("rvq_embed_bf16")) au::rvq_embed_cases(pl);
     if (sel("frame_store")) au::frame_store_cases(pl);
     if (sel("iota")) au::iota_cases(pl);
+    if (sel("sub_i32")) au::sub_i32_cases(pl);
     if (sel("gelu_bf16")) au::gelu_case(pl);
     if (sel("mul_weight_bf16")) au::mul_weight_f32_case(pl);
     if (sel("qk_norm_rope_bf16")) au::qk_norm_rope_f32_gain_case(pl);

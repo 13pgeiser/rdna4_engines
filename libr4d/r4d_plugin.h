@@ -248,6 +248,7 @@ int     r4d_rad_attn_dense_small_h256 (const RadArgs*, RadStream);
 int     r4d_rad_iota                  (const RadArgs*, RadStream);
 int     r4d_rad_cu_repeat             (const RadArgs*, RadStream);
 int     r4d_rad_int_affine            (const RadArgs*, RadStream);
+int     r4d_rad_sub_i32               (const RadArgs*, RadStream);
 /* r4d_video.hip */
 int     r4d_rad_rms_mod               (const RadArgs*, RadStream);
 int     r4d_rad_rms_mod_quant_fp8     (const RadArgs*, RadStream);

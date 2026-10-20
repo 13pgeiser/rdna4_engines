@@ -1282,6 +1282,7 @@ libref function says which (`libref/ref_audio.cpp`).
 | `iota` | `M`(range) `start` `step` `period`/opt | → `y` |
 | `cu_repeat` | `M`(range) `mult` | `len` → `y` |
 | `int_affine` | `M`(range) `src` `mul` `add` | `x` → `y` |
+| `sub_i32` | `M`(range) | `x`, `s` → `y` |
 
 **Frames.** A lane is one piece; a frame is one step of its language model, whose branches (the
 conditional first, then the unconditional) are consecutive rows, `rep` of them a lane.
@@ -1316,6 +1317,8 @@ conditional first, then the unconditional) are consecutive rows, `rep` of them a
   `y[j] = (src[j] < 0 ? 0 : x[src[j]]) mul[j] + add[j]` over three lists of integers of one length
   (`src` -1 a constant): the shapes and bounds a model derives from a pass's device geometry, such
   as a decoder's volume at each of its scales.
+- `sub_i32`: `y[i] = x[i] - s[0]`, int32: a device length less a device offset (a pipelined
+  prefill's first piece takes its KV group's `seqused` less the second piece's rows).
 
 **Windows.** The denoiser runs over windows of frames, each entry of a window step a lane's latent
 in a state buffer `stride` rows a lane (`lat_cu` bounds each entry's rows, `win_lane` names its
