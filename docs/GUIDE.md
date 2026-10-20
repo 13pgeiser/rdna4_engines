@@ -2475,10 +2475,11 @@ curl -s http://localhost:8000/v1/audio/speech -H 'Content-Type: application/json
   cloning a voice from a recording is not served yet.
 - **The length** is `duration` in seconds or `max_new_tokens` in frames (21.5 a second), up to 95 s;
   the model ends the speech at the end of the script. The prompt holds at most 2048 tokens.
-- **Sampling** is fish-speech's server's: temperature 0.7, top-p 0.7, top-k 30, with its
-  repetition-aware redraw of the first code. A take sometimes stops after its first line or falls
-  silent until its length runs out (the model's own failure, more often with several speakers);
-  another `seed` usually speaks the whole script.
+- **Sampling** is SGLang-Omni's: temperature 1.0 and top-p 0.9 (Fish Audio's model card), the
+  first code uncapped and each later code at top-k 30, with fish-speech's repetition-aware redraw
+  of the first code. fish-speech's server samples at 0.7, 0.7 and 30, where the model often falls
+  silent after a tag or a speaker's line and runs to its length (docs/ARCHITECTURES.md has the
+  counts). A take can still end before its last line; another `seed` usually speaks it all.
 - **`seed`**, **`response_format`**, **`speed`** and **`voice`** are read as for music below.
 
 Speech is played sixteen frames (0.74 s) at a time as it is made. On two R9700s a sentence is made

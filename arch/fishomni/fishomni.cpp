@@ -84,10 +84,13 @@ constexpr int64_t kCodes = 10, kVocab = 4096, kResVocab = 1024;
 constexpr int64_t kEos = 248046, kSemBegin = 248099, kSemEnd = 252194, kCand = kVocab + 1;
 /* The tower: four shared layers, then one a codebook after the first. */
 constexpr int kShared = 4, kTower = kShared + (int)kCodes - 1;
-/* fish-speech's server and SDK defaults (sampling.py), the technical report's evaluation
- * settings: temperature 0.7, top-p 0.7, top-k 30, for the main token and every head alike. */
-constexpr int64_t kTopK = 30;
-static const double kTemp = 0.7, kTopP = 0.7;
+/* The draws: temperature 1.0 and top-p 0.9, the settings of Fish Audio's model card, for the main
+ * token and every head; the main token uncapped (256, cfg_topk_sample's widest) and each head at
+ * top-k 30, as SGLang-Omni draws them. fish-speech's server defaults (0.7, 0.7, 30 for both) make
+ * the model fall silent after a tag or a speaker's line and never come back: over 40 takes of
+ * four short scripts, 8 ran to their length in silence against none here (docs/ARCHITECTURES.md). */
+constexpr int64_t kMainTopK = 256, kHeadTopK = 30;
+static const double kTemp = 1.0, kTopP = 0.9;
 /* The repetition-aware redraw, fixed by the training recipe (tower.py): when the first draw is
  * semantic and among the last 16 main tokens, a second draw at temperature 1, top-p 0.95,
  * top-k 30 is taken instead. */
@@ -717,7 +720,7 @@ static int declare_frame_head(RadBuilder* b, Model& m) {
                                         RAD_INT("n_embd", D), RAD_STR("dtype", "bf16")),
                              RAD_WEIGHTS(m.w_cand)),
                    { m.b_plane }, { m.b_slog });
-    m.op_samp = draw_op(b, S, kCand, kTopK, kTemp, kTopP, 0, m.b_slog, m.b_first);
+    m.op_samp = draw_op(b, S, kCand, kMainTopK, kTemp, kTopP, 0, m.b_slog, m.b_first);
     m.op_samp_ras = draw_op(b, S, kCand, kRasTopK, kRasTemp, kRasTopP, 1, m.b_slog, m.b_alt);
     /* The redraw: only a semantic first draw (candidates 1..4096), and only one the lane's last
      * 16 picks hold; the prompt's rows are text, so its window starts empty (op_rasinit). */
@@ -961,7 +964,7 @@ static int declare_tower(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                                 RAD_INT("n_embd", D), RAD_STR("dtype", "bf16")),
                                      RAD_WEIGHTS(L.w_head)),
                            { m.b_tho }, { m.b_hlog });
-            L.op_samp = draw_op(b, S, kVocab, kTopK, kTemp, kTopP, 2 + k, m.b_hlog, m.b_codes);
+            L.op_samp = draw_op(b, S, kVocab, kHeadTopK, kTemp, kTopP, 2 + k, m.b_hlog, m.b_codes);
             if (!L.w_head || !L.op_head || !L.op_samp) return RAD_E_INVAL;
         }
     }
@@ -1374,11 +1377,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              (long long)m.moecfg.top_k, kTower, (long long)m.n_main,
              (long long)(m.n_main + kTower - 1), (long long)m.gt.n_head, (long long)m.gt.n_ff,
              (int)kCtLayers, (long long)m.lanes);
-    rad_note(b, "sampling: temperature %.2f, top-p %.2f, top-k %lld for the main token and every "
-                "head; a semantic first draw among the lane's last %lld picks is redrawn at "
-                "temperature %.2f, top-p %.2f, top-k %lld",
-             kTemp, kTopP, (long long)kTopK, (long long)kRasWin, kRasTemp, kRasTopP,
-             (long long)kRasTopK);
+    rad_note(b, "sampling: temperature %.2f, top-p %.2f for every draw, top-k %lld for the main "
+                "token and %lld for each head; a semantic first draw among the lane's last %lld "
+                "picks is redrawn at temperature %.2f, top-p %.2f, top-k %lld",
+             kTemp, kTopP, (long long)kMainTopK, (long long)kHeadTopK, (long long)kRasWin,
+             kRasTemp, kRasTopP, (long long)kRasTopK);
     return RAD_OK;
 }
 

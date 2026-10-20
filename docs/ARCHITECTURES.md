@@ -1340,9 +1340,9 @@ tower     13 layers bound as layers 40..52 of the backbone's full-attention KV g
           wqkv's rows [Q 4096 | G 4096 | K 512 | V 512], (1 + w) q/k norms, GPT-J rotary on 64
           dims at 1e7, attention * sigmoid(gate), SwiGLU 6144), a final (1 + w) norm. The first
           shared layer also adds the input frame's codes 2..9, embedded and summed in f32
-sampling  fish-speech's server defaults: temperature 0.7, top-p 0.7 over the whole candidate set,
-          then top-k 30, for the main token and every head; a semantic first draw among the
-          lane's last 16 picks is redrawn at 1.0 / 0.95 / 30 (`ras_pick`)
+sampling  temperature 1.0, top-p 0.9 over the whole candidate set, then the top-k: the main
+          token uncapped (256) and each head 30, as SGLang-Omni draws; a semantic first draw
+          among the lane's last 16 picks is redrawn at 1.0 / 0.95 / 30 (`ras_pick`)
 codec     Fish S2's modified DAC decoder: ten raw codebook rows of 8 (one of 4096, nine of 1024,
           codes 1..9 clamped to 1023), each through its own weight-normed 1x1 projection to 1024
           and summed; 8 layers of 1024 (16 heads of 64, GPT-J rotary on all 64 at theta 1e4,
@@ -1386,7 +1386,8 @@ Traps (each still speaks, wrongly):
 - **The input is written as fish-speech's server writes it**: each speaker's turn
   `<|speaker:N|> ` and its text stripped, turns joined by a newline, untagged text speaker 0's.
   The same two turns joined by a space are spoken through far less often: for one two-line script,
-  one seed in six spoke both lines, against seven in ten with the newline.
+  at fish-speech's sampling, one seed in six spoke both lines, against seven in ten with the
+  newline.
 
 Against fish-speech's own PyTorch code (the CPU path: experts fp8, dequantised per forward, so
 W8A16 where radiance runs W8A8), teacher-forced with radiance's codes over a 34-row prompt and 80
@@ -1398,11 +1399,22 @@ over the 79 frames that are spoken. Through the codec, radiance's chunked bf16 d
 from the reference's whole-utterance bf16 decode of the same codes. Qwen3-ASR transcribes
 radiance's speech word for word.
 
-The model's own failure is to stop after the first line of a script, or to fall silent until the
-length runs out (vLLM-Omni's recipe and SGLang-Omni's notes describe it). Over 20 seeds of two
-invented two-speaker lines, the second speaker was spoken in 14 and 17 of 20, and 2 and 3 takes ran
-past 8 s; at a main top-k of 256 instead of 30 it was 14 and 15, with 5 long takes each, so the
-reference's 30 stays.
+The sampling is not fish-speech's server's (temperature 0.7, top-p 0.7, top-k 30 for every draw).
+At those the model falls silent after a tag or a speaker's line and does not come back, the failure
+vLLM-Omni's recipe and SGLang-Omni's notes describe; SGLang-Omni's comment puts it on the main
+token's top-k cap, and the counts bear it out. Ten seeds each of four short scripts (an aside in
+`<whisper>`, two two-speaker exchanges, a plain sentence), complete by Qwen3-ASR, and stuck (run to
+the 400-frame limit in silence):
+
+| temperature, top-p, top-k (main / heads) | complete | stuck |
+|---|---|---|
+| 0.7, 0.7, 30 / 30 (fish-speech's server) | 28 / 40 | 8 / 40 |
+| 1.0, 0.9, 30 / 30 (Fish Audio's model card) | 35 / 40 | 2 / 40 |
+| 1.0, 0.9, 256 / 30 (SGLang-Omni) | 36 / 40 | 0 / 40 |
+
+The four misses at the last setting are a take that ended before the line after the whisper (twice),
+a second speaker's single word, and one word the recogniser misheard; the whispered line itself is
+spoken in all ten. A take still pauses a second or so around an aside.
 
 On two R9700s a sentence is made at 0.30 of the time it plays (3.67 s of speech in 1.08 s, 13.5 ms
 a frame with the codec), a paragraph at 0.29 (11.6 s in 3.34 s); a stream's first audio comes
