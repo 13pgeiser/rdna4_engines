@@ -1212,9 +1212,9 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-lane-rows-pm",
         predicates: &[IsRecording, CaptureMode],
-        condition: "Gpu::lane_rows_pm_enabled (lane_rows_pm.rs): HIPFIRE_FN_LANE_PM_ROWS (gfx1151 default on, 0 kills), exact gfx1151, Gpu::lane_rows_scope (set by forward_lanes) and `!is_recording() && !capture_mode`",
+        condition: "Gpu::lane_rows_pm_enabled (lane_rows_pm.rs): HIPFIRE_FN_LANE_PM_ROWS (gfx1151 default on, 0 kills), exact gfx1151, Gpu::lane_rows_scope (set by forward_lanes, the qwen4 speculative verify forward in forward_chunk_inner and the DFlash2 draft head dflash_lm_head) and `!is_recording() && !capture_mode`",
         effect: KernelSelection,
-        switches: "eager lane step: qwen4_lane_rows_pm (gemv_mq6g256v2_xbatch_pm, its x4 form, gemv_q8_0_k8_xbatch_pm, gemv_q8_0_k320_xbatch_pm) at rows 2..=8; recorded: incumbent rows kernels",
+        switches: "eager lane step, speculative verify and DFlash2 draft head: qwen4_lane_rows_pm (gemv_mq6g256v2_xbatch_pm, its x4 form, gemv_q8_0_k8_xbatch_pm, gemv_q8_0_k320_xbatch_pm) at rows 2..=8; recorded: incumbent rows kernels",
         kernels: &["gemm_mq6g256v2_f32_rows", "gemm_mq6g256v2_f32_rows_x4", "gemv_q8_0_k8_rows", "gemv_q8_0_staged_rows"],
         verdict: ByteExact,
         evidence: "rdna-compute examples/lane_rows_pm_oracle on gfx1151 (fn-batch S7 r1-rows): 15 shapes x B=1..8, 225 launches, 0 bad bytes PM vs 1-row incumbent and vs incumbent rows (output allocation and guards)",

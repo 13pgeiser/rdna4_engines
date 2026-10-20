@@ -1468,7 +1468,8 @@ pub struct Gpu {
     /// on prefill chunks of >= 512 rows).  An explicit value of those
     /// variables applies everywhere, as before.
     pub qwen4_scope: bool,
-    /// True while the Flash-Next lane step runs (set by the lane-step driver):
+    /// True while the Flash-Next lane step, a Qwen4 speculative verify forward
+    /// or the DFlash2 draft head runs (set by their drivers):
     /// together with the `fn_lane_pm_rows` flag it routes the four incumbent
     /// rows launchers to the gfx1151 PeaceMaker lane-rows kernels
     /// ([`Gpu::lane_rows_pm_enabled`]).
