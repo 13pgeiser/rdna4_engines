@@ -1562,13 +1562,13 @@ function acceptTriple(c, showNow) {
   const ring = accPool[c];
   if (!e || !(c in e) || !ring || !ring.length) return "";
   let R = 0, A = 0;
-  for (const d of ring) { R += d.r; A += d.a; }
+  for (const d of ring) { R += d.dr; A += d.da; }
   if (R <= 0) return "";
   const last = ring[ring.length - 1];
   const tag = typeof c === "number" && c > 1 ? "@c" + c : "";
   let out = "highest " + pct(e[c], 0) + " \u00b7 recent " + pct(A / R, 0);
-  if (showNow !== false && e[c] > 0 && last.r > 0)
-    out += " \u00b7 now " + Math.round(100 * (last.a / last.r) / e[c]) + "% of highest" + tag;
+  if (showNow !== false && e[c] > 0 && last.dr > 0)
+    out += " \u00b7 now " + Math.round(100 * (last.da / last.dr) / e[c]) + "% of highest" + tag;
   return out;
 }
 
@@ -1656,7 +1656,7 @@ const totals = kvPanel($("totals"), ["Requests", "Steps"]);
  * panel used to carry as its headline. A bullet now rather than the big number: see the note at
  * the accept tile. It divides by every token DRAFTED, so it is not comparable with the live
  * figure above it, which divides by the positions actually REACHED -- the two bases are worked
- * through in the GUIDE, and both are derivable from the log. Deliberately not spelled out on the
+ * through in README.md, section "Draft acceptance", and both are derivable from the log. Deliberately not spelled out on the
  * face of the panel: the distinction is an analysis-time concern, and a tooltip is invisible on
  * the phone anyway. */
 const spec = kvPanel($("spec"), ["Drafter", "Depth", "Average"]);
@@ -2119,7 +2119,9 @@ function update(s, dt) {
     $("specaside").textContent = "depth " + dp.length;
     spec["Drafter"].textContent       = drafterName;
     spec["Depth"].textContent         = dp.length;
-    spec["Average"].textContent        = pctn(s.draft_accept, 0) + "%";
+    /* Undefined when nothing has been drafted yet -- dash, not 0%. The panel's own rule is
+     * that 0 reads as failure, and this bullet was the one writer breaking it. */
+    spec["Average"].textContent        = s.draft_accept > 0 ? pct(s.draft_accept, 0) : DASH;
   }
 
   /* ---- devices, in the same panel as the cache meter: they are one question. */

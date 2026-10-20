@@ -291,6 +291,27 @@ ctest --test-dir build -L oot              # rebuilds every bundled plugin out o
 `CMakePresets.json` names the same runs (`ctest --preset fast`, `host`, `gpu`, `full`, `asan`), and
 [`docs/GUIDE.md`](docs/GUIDE.md) §1.3 describes the tiers and the test binaries' options.
 
+## Draft acceptance
+
+Speculative decoding drafts up to `--num-speculative-tokens` tokens a step; the target model
+verifies them in one pass, and a draft survives only if it matches what the target would have
+produced. A position is verified only when every earlier position survived, so the same events
+admit two ratios, and they differ only in the denominator:
+
+- **Conditional** -- accepted / *reached*: of the drafts actually verified at a position, how
+  many passed. The dashboard's live "accepted now" figure and the per-position bars are
+  conditional. Always the higher number, and it moves with the workload.
+- **Marginal** -- accepted / *drafted*: of everything the drafter proposed, how much survived.
+  The engine's `draft_accept` (/stats, and `radiance:draft_acceptance_ratio` on /metrics) is
+  marginal, cumulative over the life of the process. Lower by construction, and slow to move.
+
+They cannot agree, and neither is the other one broken. At depth 3 a step drafts three tokens
+but reaches position 3 only when 1 and 2 both passed, so marginal is roughly the product of the
+conditionals: bars reading 56/75/77% give (0.56 + 0.56x0.75 + 0.56x0.75x0.77) / 3 = 43%. A live
+63% beside a lifetime 43% is one lane, two questions. Quote the conditional when asking "how
+good is the drafter right now"; quote the marginal when asking "what fraction of draft work
+became text." Never compare the two across that boundary.
+
 ## Documentation
 
 | | |
