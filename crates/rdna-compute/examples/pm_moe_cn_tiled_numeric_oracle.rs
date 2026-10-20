@@ -2,10 +2,10 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Native tiled `_t8` numerical oracle (`pm_moe_cn_tiled_numeric_oracle`).
+//! Native tiled numerical oracle (`pm_moe_cn_tiled_numeric_oracle`).
 //!
 //! Standalone example only (ownership forbids external docs; all CLI usage lives here).
-//! Compares the actually emitted fixed-eight-row descriptor (`_t8`) candidate entries
+//! Compares the fixed-eight-row-tiled candidate entries
 //! against independently pinned K1 narrow singleton launches (true per-token local
 //! singletons: C1/U1, local slot=rank, X pointer at the token's row window of the
 //! case X, local x_src_rows clamped to the case's remaining rows, x_stride is the
@@ -17,8 +17,8 @@
 //!   K1 module `mq_i4_moe_gemv_pm_gfx1151`, symbols
 //!   `mq_i4_moe_gemv_{mq3i4,mq4sym}_{r256_gate_up,r128_down}`.
 //! - gfx1201: candidate module `mq_i4_moe_gemv_pm_gfx1201`, symbols
-//!   `mq_i4_moe_gemv_{mq3i4,mq4sym}_{r256_gate_up,r128_down}_t8` (existing
-//!   non-Cn `emit_rowtiles` route); K1 module `mq_i4_moe_gemv_pm_gfx1201` narrow symbols.
+//!   `mq_i4_moe_gemv_{mq3i4,mq4sym}_{r256_gate_up,r128_down}_t8`;
+//!   K1 module `mq_i4_moe_gemv_pm_gfx1201` narrow symbols.
 //! No CO retag or kernel edits happen here; `--co` / `--k1-co` select files externally.
 //!
 //! Frozen ABI (both archs): one guarded contiguous descriptor allocation, 482 u32
@@ -86,7 +86,7 @@
 //! - `--guards-only`: skip all positive construction and launches and run only the
 //!   original invalid-descriptor guard family, regardless of rows or shard.
 //!   `--cheap` with `--guards-only` is rejected.
-//! - Full default: every R 1..64, all four `_t8` bodies, all focused extras, and
+//! - Full default: every R 1..64, all four candidate bodies, all focused extras, and
 //!   the invalid-descriptor guard family (including unsharded `--rows 1-64`).
 //! - Shards (four local processes): `--rows 1-16 --shard 1/4`, `--rows 17-32 --shard 2/4`,
 //!   `--rows 33-48 --shard 3/4`, `--rows 49-64 --shard 4/4` (rows must match shard).
@@ -99,14 +99,14 @@
 //! Receipt: JSON with candidate/reference/source identities, arch, device UUID/BDF,
 //! fixture and write counts, VMM read-only/right-aligned status, full input
 //! verification note, and the leaf-only limitation. Leaf-only: this proves executed
-//! `_t8` numerics vs independent K1 singletons only; no hardware VM/LGKM timing,
+//! Candidate numerics vs independent K1 singletons only; no hardware VM/LGKM timing,
 //! barrier-participation, capture/replay, throughput, admission, or product claims.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use hip_bridge::{
-    DeviceBuffer, Function, HipMemAccessDesc, HipMemAllocationProp, HipRuntime, VmmArena,
+    DeviceBuffer, Function, HipMemAccessDesc, HipMemAllocationProp, HipRuntime, Module, VmmArena,
     HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
 };
 use serde_json::json;
@@ -309,17 +309,44 @@ fn ystride_prod(spec: Spec) -> u32 {
 }
 
 fn cand_symbol(arch: &str, spec: Spec) -> String {
+    // These are exports of the externally supplied tiled candidate, not the
+    // embedded narrow/K1 images. The gfx1201 tiled route is deliberately non-Cn.
     match arch {
-        "gfx1151" => format!(
-            "mq_i4_moe_gemv_cn_{}_{}_t8",
-            spec.codec.tag(),
-            spec.kind.tag()
-        ),
+        "gfx1151" => format!("mq_i4_moe_gemv_cn_{}_{}_t8", spec.codec.tag(), spec.kind.tag()),
         _ => format!("mq_i4_moe_gemv_{}_{}_t8", spec.codec.tag(), spec.kind.tag()),
     }
 }
 fn k1_symbol(spec: Spec) -> String {
     format!("mq_i4_moe_gemv_{}_{}", spec.codec.tag(), spec.kind.tag())
+}
+/// Handle loader for the candidate image: the same `(arch, spec)` selection
+/// as [`cand_symbol`], but binding the module-loaded [`Function`] handle
+/// through a literal symbol name per finite `(arch, codec, kind)` case, so the
+/// launcher ABI gate resolves every launch site to its checked kernels.
+fn cand_handle(hip: &HipRuntime, m: &Module, arch: &str, spec: Spec) -> Result<Function> {
+    let name: &str = match (arch, spec.codec, spec.kind) {
+        ("gfx1151", Codec::Mq3I4, Kind::GateUp) => "mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8",
+        ("gfx1151", Codec::Mq3I4, Kind::Down) => "mq_i4_moe_gemv_cn_mq3i4_r128_down_t8",
+        ("gfx1151", Codec::Mq4Sym, Kind::GateUp) => "mq_i4_moe_gemv_cn_mq4sym_r256_gate_up_t8",
+        ("gfx1151", Codec::Mq4Sym, Kind::Down) => "mq_i4_moe_gemv_cn_mq4sym_r128_down_t8",
+        (_, Codec::Mq3I4, Kind::GateUp) => "mq_i4_moe_gemv_mq3i4_r256_gate_up_t8",
+        (_, Codec::Mq3I4, Kind::Down) => "mq_i4_moe_gemv_mq3i4_r128_down_t8",
+        (_, Codec::Mq4Sym, Kind::GateUp) => "mq_i4_moe_gemv_mq4sym_r256_gate_up_t8",
+        (_, Codec::Mq4Sym, Kind::Down) => "mq_i4_moe_gemv_mq4sym_r128_down_t8",
+    };
+    hip.module_get_function(m, name).map_err(err)
+}
+
+/// Handle loader for the K1 image: the same `spec` selection as [`k1_symbol`],
+/// binding through a literal symbol name per finite `(codec, kind)` case.
+fn k1_handle(hip: &HipRuntime, m: &Module, spec: Spec) -> Result<Function> {
+    let name: &str = match (spec.codec, spec.kind) {
+        (Codec::Mq3I4, Kind::GateUp) => "mq_i4_moe_gemv_mq3i4_r256_gate_up",
+        (Codec::Mq3I4, Kind::Down) => "mq_i4_moe_gemv_mq3i4_r128_down",
+        (Codec::Mq4Sym, Kind::GateUp) => "mq_i4_moe_gemv_mq4sym_r256_gate_up",
+        (Codec::Mq4Sym, Kind::Down) => "mq_i4_moe_gemv_mq4sym_r128_down",
+    };
+    hip.module_get_function(m, name).map_err(err)
 }
 
 // tile -> list of (expert, absolute slots)
@@ -372,15 +399,27 @@ fn build_descriptor(n_tiles: usize, bucket: usize, groups: &TileGroups) -> Vec<u
     words.into_iter().flat_map(u32::to_le_bytes).collect()
 }
 
-fn encode_kernarg(ptrs: [u64; 7], values: [u32; 10]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(96);
-    for p in ptrs {
-        out.extend(p.to_le_bytes());
-    }
-    for v in values {
-        out.extend(v.to_le_bytes());
-    }
-    assert_eq!(out.len(), 96);
+fn encode_kernarg(ptrs: [u64; 7], values: [u32; 10]) -> [u8; 96] {
+    // Seven u64 pointers followed by ten u32 scalars; keep each ABI field's
+    // exact byte range explicit for both host readers and the launcher checker.
+    let mut out = [0u8; 96];
+    out[0..8].copy_from_slice(&ptrs[0].to_le_bytes());
+    out[8..16].copy_from_slice(&ptrs[1].to_le_bytes());
+    out[16..24].copy_from_slice(&ptrs[2].to_le_bytes());
+    out[24..32].copy_from_slice(&ptrs[3].to_le_bytes());
+    out[32..40].copy_from_slice(&ptrs[4].to_le_bytes());
+    out[40..48].copy_from_slice(&ptrs[5].to_le_bytes());
+    out[48..56].copy_from_slice(&ptrs[6].to_le_bytes());
+    out[56..60].copy_from_slice(&values[0].to_le_bytes());
+    out[60..64].copy_from_slice(&values[1].to_le_bytes());
+    out[64..68].copy_from_slice(&values[2].to_le_bytes());
+    out[68..72].copy_from_slice(&values[3].to_le_bytes());
+    out[72..76].copy_from_slice(&values[4].to_le_bytes());
+    out[76..80].copy_from_slice(&values[5].to_le_bytes());
+    out[80..84].copy_from_slice(&values[6].to_le_bytes());
+    out[84..88].copy_from_slice(&values[7].to_le_bytes());
+    out[88..92].copy_from_slice(&values[8].to_le_bytes());
+    out[92..96].copy_from_slice(&values[9].to_le_bytes());
     out
 }
 
@@ -552,7 +591,7 @@ fn selfcheck(out: Option<String>) -> Result<()> {
         return Err("kernarg-96B pointer/scalar layout".into());
     }
     notes.push("kernarg-96B ok".into());
-    // Symbols per arch.
+    // Tiled external candidates and independent narrow K1 must stay distinct.
     for arch in ["gfx1151", "gfx1201"] {
         for s in all_specs() {
             let c = cand_symbol(arch, s);
@@ -560,9 +599,12 @@ fn selfcheck(out: Option<String>) -> Result<()> {
             if !c.ends_with("_t8") || k.ends_with("_t8") {
                 return Err("symbol family".into());
             }
+            if (arch == "gfx1151") != c.contains("_cn_") {
+                return Err("symbol family".into());
+            }
         }
     }
-    notes.push("symbols 4x_t8 + 4xK1 per arch ok".into());
+    notes.push("symbols: four external tiled _t8 candidates and four independent narrow K1 per arch ok".into());
     // Shards cover 1..64 exactly once.
     {
         let shards = [(1u32, 16u32), (17, 32), (33, 48), (49, 64)];
@@ -1845,8 +1887,8 @@ fn run_guard_launch(
     hip: &HipRuntime,
     id: i32,
     func: &Function,
-    grid: [u32; 3],
-    ka: &mut [u8],
+    plan: &GuardPlan,
+    bases: &[u64],
     y_len: usize,
     gate: bool,
     counts: &mut Counts,
@@ -1860,14 +1902,20 @@ fn run_guard_launch(
     } else {
         None
     };
-    ka[40..48].copy_from_slice(&(d_y0.logical() + GUARD as u64).to_le_bytes());
-    if gate {
-        ka[48..56]
-            .copy_from_slice(&(d_y1.as_ref().unwrap().logical() + GUARD as u64).to_le_bytes());
-    } else {
-        ka[48..56].copy_from_slice(&0u64.to_le_bytes());
-    }
-    launch256(hip, func, grid, ka)?;
+    let ptrs = plan.bound_ptrs(bases);
+    let mut ka = encode_kernarg(
+        [
+            ptrs[0],
+            ptrs[1],
+            ptrs[2],
+            ptrs[3],
+            ptrs[4],
+            d_y0.logical() + GUARD as u64,
+            d_y1.as_ref().map_or(0, |y| y.logical() + GUARD as u64),
+        ],
+        plan.scalars(),
+    );
+    launch256(hip, func, plan.grid, &mut ka)?;
     counts.guard_bytes += y_len as u64;
     let y0 = vmm_download(hip, &d_y0)?;
     let y1 = if let Some(y) = &d_y1 {
@@ -1900,7 +1948,7 @@ fn expect_silent(y0: &[u8], y1: &[u8], what: &str) -> Result<()> {
 struct GuardPlan {
     name: String,
     grid: [u32; 3],
-    ka: Vec<u8>,
+    ka: [u8; 96],
     regions: Vec<Vec<u8>>,
     region_names: Vec<String>,
     bindings: [Option<(usize, usize)>; 5],
@@ -1909,19 +1957,28 @@ struct GuardPlan {
 }
 
 impl GuardPlan {
-    /// Clone the template kernarg, patching ONLY the first five pointers from
-    /// the supplied region bases. Y pointers stay zero here; the existing
-    /// `run_guard_launch` patches Y0/Y1 at bytes 40/48 from live VMM buffers.
-    fn bind(&self, bases: &[u64]) -> Vec<u8> {
-        let mut ka = self.ka.clone();
-        for i in 0..5 {
-            let ptr = match self.bindings[i] {
-                Some((ri, off)) => bases[ri] + off as u64,
-                None => 0,
-            };
-            ka[8 * i..8 * i + 8].copy_from_slice(&ptr.to_le_bytes());
-        }
-        ka
+    /// Resolve only the five downstream pointers. Unbound pointers remain NULL.
+    fn bound_ptrs(&self, bases: &[u64]) -> [u64; 5] {
+        std::array::from_fn(|i| match self.bindings[i] {
+            Some((ri, off)) => bases[ri] + off as u64,
+            None => 0,
+        })
+    }
+
+    fn scalars(&self) -> [u32; 10] {
+        std::array::from_fn(|i| {
+            u32::from_le_bytes(self.ka[56 + 4 * i..60 + 4 * i].try_into().unwrap())
+        })
+    }
+
+    /// Rebuild the template without aliasing or patching bytes. Runtime Y
+    /// pointers are supplied only when constructing the fresh launch blob.
+    fn bind(&self, bases: &[u64]) -> [u8; 96] {
+        let ptrs = self.bound_ptrs(bases);
+        encode_kernarg(
+            [ptrs[0], ptrs[1], ptrs[2], ptrs[3], ptrs[4], 0, 0],
+            self.scalars(),
+        )
     }
 }
 
@@ -1941,7 +1998,7 @@ fn negative_guard_plans(arch: &str, s: Spec) -> Vec<GuardPlan> {
     let mut plans = Vec::new();
     let mut mk = |name: String,
                   grid: [u32; 3],
-                  ka: Vec<u8>,
+                  ka: [u8; 96],
                   regions: Vec<(&'static str, Vec<u8>)>,
                   bindings: [Option<(usize, usize)>; 5],
                   expected_reason: &'static str,
@@ -2215,8 +2272,7 @@ fn run_guard_plans(
             bases.push(b.logical());
             bufs.push(b);
         }
-        let mut ka = plan.bind(&bases);
-        let (y0, y1) = run_guard_launch(hip, id, func, plan.grid, &mut ka, y_len, gate, counts)?;
+        let (y0, y1) = run_guard_launch(hip, id, func, plan, &bases, y_len, gate, counts)?;
         expect_silent(&y0, &y1, &plan.name)?;
         counts.cases += 1;
         counts.candidate_launches += 1;
@@ -2260,7 +2316,7 @@ fn prove_guard_plan(arch: &str, s: Spec, plan: &GuardPlan) -> Result<serde_json:
     let scalars: [u32; 10] =
         std::array::from_fn(|i| u32::from_le_bytes(ka[56 + 4 * i..60 + 4 * i].try_into().unwrap()));
     // Bound pointers must equal base+offset; unbound downstream pointers and
-    // both Y pointers (patched only at runtime) must be null in the template.
+    // both Y pointers (supplied only at runtime) must be null in the template.
     for i in 0..5 {
         match plan.bindings[i] {
             Some((ri, off)) => {
@@ -2435,7 +2491,7 @@ fn prove_guard_plan(arch: &str, s: Spec, plan: &GuardPlan) -> Result<serde_json:
     // Machine-usable interchange: raw 96 B kernarg bytes (NULL = literal zero
     // LE bytes), per-region raw bytes keyed by address, candidate symbol, and
     // the host-only symbolic bases. Template Y pointers stay NULL here; the
-    // output arena below documents the actual runtime Y patch (bytes 40/48).
+    // output arena below documents the runtime Y fields (bytes 40/48).
     let regions_json: Vec<serde_json::Value> = plan
         .regions
         .iter()
@@ -2446,7 +2502,7 @@ fn prove_guard_plan(arch: &str, s: Spec, plan: &GuardPlan) -> Result<serde_json:
         "name": plan.name, "arch": arch, "candidate_symbol": cand_symbol(arch, s),
         "k1_symbol": k1_symbol(s), "bucket": bucket,
         "grid": plan.grid, "kernarg_len": ka.len(),
-        "kernarg_bytes": ka.clone(),
+        "kernarg_bytes": ka.to_vec(),
         "kernarg_hex": ka.iter().map(|b| format!("{b:02x}")).collect::<String>(),
         "kernarg_address": 0x80000u64,
         "host_only_symbolic_bases": true,
@@ -2573,19 +2629,15 @@ fn verify(args: &Args) -> Result<serde_json::Value> {
     let cand_mod = hip.module_load_data(&co_bytes).map_err(err)?;
     let k1_mod = hip.module_load_data(&k1_bytes).map_err(err)?;
     let specs = all_specs();
-    let mut cand_f: Vec<Function> = Vec::new();
-    let mut k1_f: Vec<Function> = Vec::new();
+    // Fail fast when an expected entry is absent from the external images
+    // (same errors the old eager Vec fill produced, before any case runs).
     for s in specs {
         let cs = cand_symbol(&arch, s);
-        cand_f.push(
-            hip.module_get_function(&cand_mod, &cs)
-                .map_err(|e| format!("candidate missing {cs}: {e}"))?,
-        );
+        hip.module_get_function(&cand_mod, &cs)
+            .map_err(|e| format!("candidate missing {cs}: {e}"))?;
         let ks = k1_symbol(s);
-        k1_f.push(
-            hip.module_get_function(&k1_mod, &ks)
-                .map_err(|e| format!("k1 missing {ks}: {e}"))?,
-        );
+        hip.module_get_function(&k1_mod, &ks)
+            .map_err(|e| format!("k1 missing {ks}: {e}"))?;
     }
     let (rlo, rhi) = shard_range(args.shard, args.rows);
     let shard_idx: Option<usize> = args.shard.map(|(p, _)| (p - 1) as usize);
@@ -2607,11 +2659,13 @@ fn verify(args: &Args) -> Result<serde_json::Value> {
             let c = build_case(*s, 9, prod_m(*s), 0, 0, 0, None, 512);
             let mut ctx = SpecCtx::new(hip, id, &c, &mut counts)?;
             let mut kc = HashMap::new();
+            let cand_h = cand_handle(hip, &cand_mod, &arch, *s)?;
+            let k1_h = k1_handle(hip, &k1_mod, *s)?;
             verify_case_full(
                 hip,
                 id,
-                &cand_f[si],
-                &k1_f[si],
+                &cand_h,
+                &k1_h,
                 &mut ctx,
                 &c,
                 &mut kc,
@@ -2626,11 +2680,13 @@ fn verify(args: &Args) -> Result<serde_json::Value> {
             let c = cheap_tail_case(si, *s);
             let mut ctx = SpecCtx::new(hip, id, &c, &mut counts)?;
             let mut kc = HashMap::new();
+            let cand_h = cand_handle(hip, &cand_mod, &arch, *s)?;
+            let k1_h = k1_handle(hip, &k1_mod, *s)?;
             verify_case_full(
                 hip,
                 id,
-                &cand_f[si],
-                &k1_f[si],
+                &cand_h,
+                &k1_h,
                 &mut ctx,
                 &c,
                 &mut kc,
@@ -2663,13 +2719,13 @@ fn verify(args: &Args) -> Result<serde_json::Value> {
                 bases.push(b.logical());
                 bufs.push(b);
             }
-            let mut ka = plan.bind(&bases);
+            let cand_h = cand_handle(hip, &cand_mod, &arch, *s)?;
             let (y0, y1) = run_guard_launch(
                 hip,
                 id,
-                &cand_f[si],
-                plan.grid,
-                &mut ka,
+                &cand_h,
+                plan,
+                &bases,
                 y_len,
                 gate,
                 &mut counts,
@@ -2700,7 +2756,7 @@ fn verify(args: &Args) -> Result<serde_json::Value> {
             "inputs_verified": "every immutable byte downloaded and compared after each launch (not hash-only)",
             "limitations": [
                 "Native GPU cannot expose instruction written bits; dual-poison plus expected written-byte maps establish stores per byte; read-only VMM mappings fault on input stores.",
-                "Leaf-only: executed _t8 numerics vs independent K1 C1/U1 block32 singletons only; no timing, capture, throughput, or admission claims.",
+                "Leaf-only: executed candidate numerics vs independent K1 C1/U1 block32 singletons only; no timing, capture, throughput, or admission claims.",
             ],
         });
         std::fs::write(&out_path, serde_json::to_vec_pretty(&v).unwrap()).map_err(err)?;
@@ -2730,11 +2786,13 @@ fn verify(args: &Args) -> Result<serde_json::Value> {
                     assert_eq!(c.y_stride, sc.y_stride);
                     assert_eq!(c.n_experts, sc.n_experts);
                 }
+                let cand_h = cand_handle(hip, &cand_mod, &arch, *s)?;
+                let k1_h = k1_handle(hip, &k1_mod, *s)?;
                 verify_case_full(
                     hip,
                     id,
-                    &cand_f[si],
-                    &k1_f[si],
+                    &cand_h,
+                    &k1_h,
                     &mut sweep_ctx[si],
                     &c,
                     &mut sweep_kc[si],
@@ -2760,11 +2818,13 @@ fn verify(args: &Args) -> Result<serde_json::Value> {
             // Null X and zero/constant K1 admission remain exclusive to xzero;
             // all families retain full-grid, dual-poison, true-C1 verification.
             let xzero = e.name.starts_with("xzero ");
+            let cand_h = cand_handle(hip, &cand_mod, &arch, specs[e.spec])?;
+            let k1_h = k1_handle(hip, &k1_mod, specs[e.spec])?;
             verify_case_full(
                 hip,
                 id,
-                &cand_f[e.spec],
-                &k1_f[e.spec],
+                &cand_h,
+                &k1_h,
                 &mut ctx,
                 &c,
                 &mut kc,
@@ -2794,10 +2854,11 @@ fn verify(args: &Args) -> Result<serde_json::Value> {
             let ys = ystride_prod(*s);
             let gate = s.kind.gate();
             let y_len = y_len_for(650, ys);
+            let cand_h = cand_handle(hip, &cand_mod, &arch, *s)?;
             run_guard_plans(
                 hip,
                 id,
-                &cand_f[si],
+                &cand_h,
                 &negative_guard_plans(&arch, *s),
                 y_len,
                 gate,
@@ -2836,7 +2897,7 @@ fn verify(args: &Args) -> Result<serde_json::Value> {
         "inputs_verified": "every immutable byte downloaded and compared after each launch (not hash-only)",
         "limitations": [
             "Native GPU cannot expose instruction written bits; dual-poison plus expected written-byte maps establish stores per byte; read-only VMM mappings fault on input stores.",
-            "Leaf-only: executed _t8 numerics vs independent K1 C1/U1 block32 singletons only; no timing, capture, throughput, or admission claims.",
+            "Leaf-only: executed candidate numerics vs independent K1 C1/U1 block32 singletons only; no timing, capture, throughput, or admission claims.",
             backend_note,
         ],
     });
@@ -2906,4 +2967,5 @@ fn z_past_kernarg(spec: Spec, descriptor_base: u64) -> Vec<u8> {
             0,
         ],
     )
+    .to_vec()
 }

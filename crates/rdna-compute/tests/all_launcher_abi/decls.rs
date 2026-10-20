@@ -422,6 +422,324 @@ pub fn build_pm(root: &Path, images: &[String], syms: &mut Symbols) -> Result<()
     Ok(())
 }
 
+/// Expected 17-argument layout of one external tiled `_t8` candidate symbol:
+/// seven 8-byte `global_buffer` pointers at 0..56, ten 4-byte `by_value`
+/// scalars at 56..96. `Arg.text` carries `name:value_kind`; both halves are
+/// checked exactly.
+fn expect_t8_layout(symbol: &str, args: &[Arg], end: u32, segment: u32) -> Result<(), String> {
+    const NAMES: [&str; 17] = [
+        "expert_weight_ptrs",
+        "expert_ids",
+        "expert_offsets",
+        "slot_ids",
+        "Xrot",
+        "Y0",
+        "Y1",
+        "M",
+        "K",
+        "U",
+        "C",
+        "x_row_div",
+        "x_src_rows",
+        "x_row_stride",
+        "y_slot_stride",
+        "n_experts",
+        "reserved",
+    ];
+    if args.len() != 17 {
+        return Err(format!(
+            "{symbol}: external declaration has {} arguments, want 17",
+            args.len()
+        ));
+    }
+    for (i, (a, want)) in args.iter().zip(NAMES.iter()).enumerate() {
+        let mut parts = a.text.splitn(2, ':');
+        let name = parts.next().unwrap_or("");
+        let vk = parts.next().unwrap_or("");
+        if name != *want {
+            return Err(format!("{symbol}: arg {i} is named `{name}`, want `{want}`"));
+        }
+        let (want_off, want_size, want_kind, want_vk) = if i < 7 {
+            (i as u32 * 8, 8u32, 'p', "global_buffer")
+        } else {
+            (56 + (i as u32 - 7) * 4, 4u32, 'v', "by_value")
+        };
+        if a.offset != want_off || a.size != want_size {
+            return Err(format!(
+                "{symbol}: arg {i} `{want}` at offset {}, {} bytes; want offset {want_off}, {want_size} bytes",
+                a.offset, a.size
+            ));
+        }
+        if a.kind != want_kind {
+            return Err(format!(
+                "{symbol}: arg {i} `{want}` has class {}, want {want_kind}",
+                a.kind
+            ));
+        }
+        if vk != want_vk {
+            return Err(format!(
+                "{symbol}: arg {i} `{want}` has value_kind `{vk}`, want `{want_vk}`"
+            ));
+        }
+    }
+    if end != 96 || segment != 96 {
+        return Err(format!(
+            "{symbol}: declared end {end} / segment {segment}; want 96 / 96"
+        ));
+    }
+    Ok(())
+}
+
+/// Checked JSON-integer to `u32`: `as u32` would silently wrap `2^32 + x`.
+fn u32_field(fixture: &str, ctx: &str, v: &serde_json::Value, field: &str) -> Result<u32, String> {
+    let n = v
+        .get(field)
+        .and_then(|x| x.as_u64())
+        .ok_or_else(|| format!("{fixture}:{ctx}: missing `{field}`"))?;
+    u32::try_from(n).map_err(|_| format!("{fixture}:{ctx}: `{field}` {n} does not fit in u32"))
+}
+
+/// A 64-character lowercase hex SHA-256 digest; anything else is refused.
+fn sha256_field(fixture: &str, ctx: &str, v: &serde_json::Value, field: &str) -> Result<String, String> {
+    let s = v
+        .get(field)
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| format!("{fixture}:{ctx}: missing `{field}`"))?;
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit() && !(b as char).is_ascii_uppercase()) {
+        return Err(format!("{fixture}:{ctx}: `{field}` is not a 64-char lowercase hex digest"));
+    }
+    Ok(s.to_string())
+}
+
+/// The exact tiled-candidate family: `mq_i4_moe_gemv_[cn_]<codec>_r<kind>_t8`.
+/// A bare `_t8` suffix is not enough: any other stem is refused.
+fn t8_family_parts(symbol: &str) -> Result<(bool, &str, &str), String> {
+    let rest = symbol
+        .strip_prefix("mq_i4_moe_gemv_")
+        .ok_or_else(|| format!("{symbol}: not a mq_i4_moe_gemv candidate"))?;
+    let (cn, rest) = match rest.strip_prefix("cn_") {
+        Some(r) => (true, r),
+        None => (false, rest),
+    };
+    let rest = rest.strip_suffix("_t8").ok_or_else(|| format!("{symbol}: not a `_t8` candidate"))?;
+    let (codec, kind) = rest
+        .split_once("_r")
+        .ok_or_else(|| format!("{symbol}: no codec/kind separator"))?;
+    if codec != "mq3i4" && codec != "mq4sym" {
+        return Err(format!("{symbol}: unknown codec `{codec}`"));
+    }
+    if kind != "256_gate_up" && kind != "128_down" {
+        return Err(format!("{symbol}: unknown kind `r{kind}`"));
+    }
+    Ok((cn, codec, kind))
+}
+
+/// The exact external tiled-candidate export family: every `{cn_,}<codec>_r<kind>_t8`
+/// combination over both codecs (`mq3i4`, `mq4sym`) and both kinds (`256_gate_up`,
+/// `128_down`) on both arches. The fixture must declare all eight and nothing else:
+/// a missing export would leave a launch with no declaration, so a subset is a hard
+/// error, never a smaller valid family.
+const EXPECTED_T8_FAMILY: [&str; 8] = [
+    "mq_i4_moe_gemv_cn_mq3i4_r128_down_t8",
+    "mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8",
+    "mq_i4_moe_gemv_cn_mq4sym_r128_down_t8",
+    "mq_i4_moe_gemv_cn_mq4sym_r256_gate_up_t8",
+    "mq_i4_moe_gemv_mq3i4_r128_down_t8",
+    "mq_i4_moe_gemv_mq3i4_r256_gate_up_t8",
+    "mq_i4_moe_gemv_mq4sym_r128_down_t8",
+    "mq_i4_moe_gemv_mq4sym_r256_gate_up_t8",
+];
+
+/// Index the externally supplied tiled `_t8` candidate family from a truthful
+/// JSON fixture (see `fixtures/all-launcher-abi/external_t8_abi.json`).
+///
+/// This pins the DECLARED 96-byte/17-argument layout shared by the eight `_t8`
+/// exports; it never opens the out-of-tree `--co` files and claims nothing
+/// about any supplied `--co` file at runtime. Every field is validated
+/// fail-closed: the exact eight-symbol membership, wrong offsets/sizes/names/
+/// kinds/value_kinds/segment, unknown fields, non-`u32` numerics, malformed
+/// provenance digests, missing contract paths, wrong arch/module/symbol
+/// association, or symbols whose layouts differ are hard errors, never silent
+/// defaults.
+pub fn build_external(root: &Path, fixture: &str, syms: &mut Symbols) -> Result<(), String> {
+    let text = std::fs::read_to_string(root.join(fixture)).map_err(|e| format!("{fixture}: {e}"))?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{fixture}: {e}"))?;
+    let obj = v.as_object().ok_or_else(|| format!("{fixture}: top level must be an object"))?;
+    for k in obj.keys() {
+        if !["scope", "provenance", "kernarg_segment_bytes", "symbols"].contains(&k.as_str()) {
+            return Err(format!("{fixture}: unknown top-level field `{k}`"));
+        }
+    }
+    if obj.get("kernarg_segment_bytes").and_then(|x| x.as_u64()) != Some(96) {
+        return Err(format!("{fixture}: kernarg_segment_bytes must be 96"));
+    }
+    // Provenance: both raw artifact dirs and both raw module.co SHA-256
+    // digests are required, well-formed, and non-empty. The digests pin which
+    // raw exports the declared layout was read from; they are format- and
+    // presence-checked here, not re-hashed (the loader never opens the .co).
+    let prov = obj
+        .get("provenance")
+        .and_then(|x| x.as_object())
+        .ok_or_else(|| format!("{fixture}: missing `provenance` object"))?;
+    for k in prov.keys() {
+        if ![
+            "note",
+            "gfx1201_artifact_dir",
+            "cn_artifact_dir",
+            "gfx1201_module_co_sha256",
+            "cn_module_co_sha256",
+        ]
+        .contains(&k.as_str())
+        {
+            return Err(format!("{fixture}: unknown provenance field `{k}`"));
+        }
+    }
+    for dir_field in ["gfx1201_artifact_dir", "cn_artifact_dir"] {
+        let d = prov
+            .get(dir_field)
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| format!("{fixture}: missing provenance `{dir_field}`"))?;
+        if d.is_empty() {
+            return Err(format!("{fixture}: empty provenance `{dir_field}`"));
+        }
+    }
+    let prov_gfx1201_sha = sha256_field(fixture, "provenance", &serde_json::Value::Object(prov.clone()), "gfx1201_module_co_sha256")?;
+    let prov_cn_sha = sha256_field(fixture, "provenance", &serde_json::Value::Object(prov.clone()), "cn_module_co_sha256")?;
+    let _ = (prov_gfx1201_sha, prov_cn_sha);
+    let syms_obj = obj
+        .get("symbols")
+        .and_then(|x| x.as_object())
+        .ok_or_else(|| format!("{fixture}: `symbols` must be an object"))?;
+    if syms_obj.is_empty() {
+        return Err(format!("{fixture}: no symbols declared"));
+    }
+    // Exact family membership: every expected export present, nothing else. (A
+    // 7-of-8 subset used to load fine and left the dropped launch with no
+    // declaration downstream; it must fail here instead.)
+    {
+        let mut missing: Vec<&str> = Vec::new();
+        for want in EXPECTED_T8_FAMILY {
+            if !syms_obj.contains_key(want) {
+                missing.push(want);
+            }
+        }
+        let mut extra: Vec<&String> = syms_obj
+            .keys()
+            .filter(|k| !EXPECTED_T8_FAMILY.contains(&k.as_str()))
+            .collect();
+        extra.sort();
+        if !missing.is_empty() || !extra.is_empty() {
+            return Err(format!(
+                "{fixture}: external family must declare exactly the eight _t8 exports; missing {missing:?}, unexpected {extra:?}"
+            ));
+        }
+    }
+    let origin = format!("external:{fixture}");
+    let mut layouts: Vec<Decl> = Vec::new();
+    for (symbol, s) in syms_obj {
+        let s = s.as_object().ok_or_else(|| format!("{fixture}:{symbol} must be an object"))?;
+        for k in s.keys() {
+            if !["arch", "module", "contract", "export", "end", "segment", "args"].contains(&k.as_str()) {
+                return Err(format!("{fixture}:{symbol}: unknown field `{k}`"));
+            }
+        }
+        let (cn, _codec, _kind) = t8_family_parts(symbol).map_err(|e| format!("{fixture}:{e}"))?;
+        let arch = s
+            .get("arch")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| format!("{fixture}:{symbol}: missing `arch`"))?;
+        if arch != "gfx1151" && arch != "gfx1201" {
+            return Err(format!("{fixture}:{symbol}: unknown arch `{arch}`"));
+        }
+        // Exact arch/module/symbol association: gfx1151 is the Cn family in
+        // the Cn module; gfx1201 is non-Cn in the K1 module. A swapped or
+        // foreign module is refused, not remapped.
+        let want_module = if arch == "gfx1151" {
+            "mq_i4_moe_gemv_cn_pm_gfx1151"
+        } else {
+            "mq_i4_moe_gemv_pm_gfx1201"
+        };
+        let module = s
+            .get("module")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| format!("{fixture}:{symbol}: missing `module`"))?;
+        if module != want_module {
+            return Err(format!(
+                "{fixture}:{symbol}: module `{module}` does not match arch {arch} (want `{want_module}`)"
+            ));
+        }
+        if (arch == "gfx1151") != cn {
+            return Err(format!("{fixture}:{symbol}: arch/module mismatch (arch {arch}, cn {cn})"));
+        }
+        // Contract provenance is required: a non-empty `.contract.json` path
+        // naming this symbol's arch, so a declaration without raw-export
+        // provenance cannot slip in.
+        let contract = s
+            .get("contract")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| format!("{fixture}:{symbol}: missing `contract`"))?;
+        if contract.is_empty() || !contract.ends_with(".contract.json") || !contract.contains(arch) {
+            return Err(format!("{fixture}:{symbol}: bad `contract` `{contract}`"));
+        }
+        if s.get("export").and_then(|x| x.as_str()) != Some("FUNC") {
+            return Err(format!("{fixture}:{symbol}: export must be FUNC"));
+        }
+        let sv = serde_json::Value::Object(s.clone());
+        let end = u32_field(fixture, symbol, &sv, "end")?;
+        let segment = u32_field(fixture, symbol, &sv, "segment")?;
+        let arr = s
+            .get("args")
+            .and_then(|x| x.as_array())
+            .ok_or_else(|| format!("{fixture}:{symbol}: `args` must be an array"))?;
+        let mut args: Vec<Arg> = Vec::new();
+        for a in arr {
+            let a = a.as_object().ok_or_else(|| format!("{fixture}:{symbol}: arg must be an object"))?;
+            for k in a.keys() {
+                if !["name", "offset", "size", "kind", "value_kind"].contains(&k.as_str()) {
+                    return Err(format!("{fixture}:{symbol}: unknown arg field `{k}`"));
+                }
+            }
+            let aname = a
+                .get("name")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| format!("{fixture}:{symbol}: arg missing `name`"))?;
+            let av = serde_json::Value::Object(a.clone());
+            let offset = u32_field(fixture, &format!("{symbol} arg `{aname}`"), &av, "offset")?;
+            let size = u32_field(fixture, &format!("{symbol} arg `{aname}`"), &av, "size")?;
+            let kind = a
+                .get("kind")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| format!("{fixture}:{symbol}: arg `{aname}` missing `kind`"))?;
+            let kind = match kind {
+                "p" => 'p',
+                "v" => 'v',
+                _ => return Err(format!("{fixture}:{symbol}: arg `{aname}` has unknown kind `{kind}`")),
+            };
+            let vk = a
+                .get("value_kind")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| format!("{fixture}:{symbol}: arg `{aname}` missing `value_kind`"))?;
+            if vk != "global_buffer" && vk != "by_value" {
+                return Err(format!(
+                    "{fixture}:{symbol}: arg `{aname}` has unknown value_kind `{vk}`"
+                ));
+            }
+            args.push(Arg { offset, size, kind, text: format!("{aname}:{vk}") });
+        }
+        expect_t8_layout(symbol, &args, end, segment)?;
+        let decl = Decl { args, end };
+        layouts.push(decl.clone());
+        syms.origin_symbols.entry(origin.clone()).or_default().push(symbol.clone());
+        syms.pm.entry(symbol.clone()).or_default().push((origin.clone(), decl));
+    }
+    for d in layouts.iter().skip(1) {
+        if !crate::hip::same_layout(&layouts[0], d) {
+            return Err(format!("{fixture}: external symbols declare different ABIs"));
+        }
+    }
+    Ok(())
+}
+
 /// Argument lists of every call `name(..)` in `ts` (nested groups included).
 pub fn calls_of(ts: &[Tt], name: &str, out: &mut Vec<Vec<Vec<Tt>>>) {
     for k in 0..ts.len() {

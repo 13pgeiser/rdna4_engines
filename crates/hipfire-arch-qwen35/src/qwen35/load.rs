@@ -6942,6 +6942,59 @@ fn expert_iu4_admitted_info(moe_layers: usize) -> String {
          (default on; HIPFIRE_MOE_SYM_IU4=0 kills it); headers verified symmetric, scratch reserved"
     )
 }
+fn expert_iu4_wide_reserved_info(device: usize, rows: usize) -> String {
+    format!(
+        "  qwen35 symmetric IU4 MoE: INFO: device {device}: scratch reserved for {rows}-row \
+         widened resident MoE prefill"
+    )
+}
+
+fn expert_iu4_wide_fallback_warning(
+    device: usize,
+    wide_rows: usize,
+    rows: usize,
+    error: &str,
+) -> String {
+    format!(
+        "  qwen35 symmetric IU4 MoE: WARNING: device {device}: widened {wide_rows}-row scratch \
+         reservation failed ({error}); falling back to the incumbent {rows}-row prefill ceiling"
+    )
+}
+
+/// Outcome of one device's scratch reservation. `wide_failure` is the widened
+/// attempt `(rows, error)` that fell back to the incumbent `rows`.
+struct ExpertIu4Reservation<E> {
+    rows: usize,
+    wide_failure: Option<(usize, E)>,
+}
+
+/// Pure reservation policy over an allocator `reserve(rows)`. A `wide` target
+/// above the incumbent is tried first; its failure is returned (for a loud
+/// warning) while the incumbent rows are reserved instead. A failure of the
+/// incumbent reservation is returned unchanged, exactly as before widening.
+fn expert_iu4_reserve_rows<E>(
+    wide: Option<usize>,
+    incumbent: usize,
+    mut reserve: impl FnMut(usize) -> Result<(), E>,
+) -> Result<ExpertIu4Reservation<E>, E> {
+    let mut wide_failure = None;
+    if let Some(wide_rows) = wide.filter(|&rows| rows > incumbent) {
+        match reserve(wide_rows) {
+            Ok(()) => {
+                return Ok(ExpertIu4Reservation {
+                    rows: wide_rows,
+                    wide_failure: None,
+                });
+            }
+            Err(error) => wide_failure = Some((wide_rows, error)),
+        }
+    }
+    reserve(incumbent)?;
+    Ok(ExpertIu4Reservation {
+        rows: incumbent,
+        wide_failure,
+    })
+}
 
 fn layer_moe_ffn_mut(layer: &mut LayerWeights) -> Option<&mut MoeFfnWeights> {
     match layer {
@@ -7082,9 +7135,12 @@ fn release_loaded_weights(devices: &mut [Gpu], layout: &Layout, weights: Qwen35W
 /// * otherwise every MoE layer must carry the same verified capability on a
 ///   capable arch, and the route's scratch must reserve on every owner device
 ///   sized for the model's prefill chunk ceiling
-///   ([`prefill_max_batch_for_model`]) plus the FWHT sign tables, so no
-///   allocation happens inside prefill -> capability bound on ALL layers and
-///   one INFO;
+///   ([`prefill_max_batch_for_model`]), or for the widened resident-MoE rows
+///   when prefill's own static decision can widen the model
+///   ([`resident_moe_iu4_load_wide_rows`]; a failed widened reservation falls
+///   back to the incumbent rows with a WARNING and prefill then cannot widen),
+///   plus the FWHT sign tables, so no allocation happens inside prefill ->
+///   capability bound on ALL layers and one INFO;
 /// * any failure (incapable arch, a MoE layer without the capability, disagreeing
 ///   layer recipes, reservation/sign-table error) refuses the whole load with a
 ///   typed error after releasing the loaded weights.
@@ -7160,29 +7216,61 @@ fn finalize_expert_iu4(
         }
         if let (true, Some(spec)) = (verified, spec) {
             for &device in &hosting {
-                let max_rows =
+                let incumbent =
                     super::prefill::prefill_max_batch_for_model(&devices[device], &weights);
-                // The rotate256_i4 / rotate128_i4 launches lazily build the FWHT
-                // sign tables; build them here too so an admitted prefill
-                // allocates nothing.
+                // The widened rows are reserved only where prefill's own static
+                // decision can widen this model (single hosting device; TP/EP,
+                // host-mapped, paged or ineligible layers keep the incumbent).
+                let wide = if hosting.len() == 1 {
+                    super::prefill::resident_moe_iu4_load_wide_rows(&devices[device], &weights)
+                } else {
+                    None
+                };
                 let gpu = &mut devices[device];
-                let reserved = gpu
-                    .reserve_qwen4_moe_sym(
-                        max_rows,
+                let reserved = expert_iu4_reserve_rows(wide, incumbent, |rows| {
+                    gpu.reserve_qwen4_moe_sym(
+                        rows,
                         spec.top_k as usize,
                         spec.experts as usize,
                         spec.hidden as usize,
                         spec.intermediate as usize,
                     )
-                    .and_then(|()| gpu.ensure_mq_signs())
-                    .and_then(|()| gpu.ensure_mq_signs_128());
-                if let Err(error) = reserved {
-                    reserve_ok = false;
-                    detail = format!(
-                        "symmetric IU4 scratch/sign-table reservation failed on device {device}: {}",
-                        error.message
-                    );
-                    break;
+                })
+                // The rotate256_i4 / rotate128_i4 launches lazily build the FWHT
+                // sign tables; build them here too so an admitted prefill
+                // allocates nothing.
+                .and_then(|reservation| {
+                    gpu.ensure_mq_signs()?;
+                    gpu.ensure_mq_signs_128()?;
+                    Ok(reservation)
+                });
+                match reserved {
+                    Ok(reservation) => {
+                        if let Some((wide_rows, error)) = &reservation.wide_failure {
+                            eprintln!(
+                                "{}",
+                                expert_iu4_wide_fallback_warning(
+                                    device,
+                                    *wide_rows,
+                                    reservation.rows,
+                                    &error.message
+                                )
+                            );
+                        } else if wide.is_some_and(|rows| rows == reservation.rows) {
+                            eprintln!(
+                                "{}",
+                                expert_iu4_wide_reserved_info(device, reservation.rows)
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        reserve_ok = false;
+                        detail = format!(
+                            "symmetric IU4 scratch/sign-table reservation failed on device {device}: {}",
+                            error.message
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -9767,5 +9855,86 @@ mod expert_iu4_load_tests {
         assert!(info.contains("admitted by capability"), "{info}");
         assert!(info.contains("default on"), "{info}");
         assert!(info.contains("HIPFIRE_MOE_SYM_IU4=0 kills it"), "{info}");
+    }
+    #[test]
+    fn wide_reservation_logs_are_exact() {
+        assert_eq!(
+            expert_iu4_wide_reserved_info(0, 4096),
+            "  qwen35 symmetric IU4 MoE: INFO: device 0: scratch reserved for 4096-row widened \
+             resident MoE prefill"
+        );
+        assert_eq!(
+            expert_iu4_wide_fallback_warning(1, 4096, 512, "out of memory"),
+            "  qwen35 symmetric IU4 MoE: WARNING: device 1: widened 4096-row scratch reservation \
+             failed (out of memory); falling back to the incumbent 512-row prefill ceiling"
+        );
+    }
+
+    /// Simulated allocator: records every requested row count and fails the
+    /// rows listed in `fail`.
+    fn simulated_reserve<'a>(
+        fail: &'static [usize],
+        calls: &'a mut Vec<usize>,
+    ) -> impl FnMut(usize) -> Result<(), String> + 'a {
+        move |rows| {
+            calls.push(rows);
+            if fail.contains(&rows) {
+                Err(format!("alloc {rows}"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn reserve_rows_default_widened_reserves_4096_only() {
+        let mut calls = Vec::new();
+        let got =
+            expert_iu4_reserve_rows(Some(4096), 512, simulated_reserve(&[], &mut calls)).unwrap();
+        assert_eq!((got.rows, got.wide_failure), (4096, None));
+        assert_eq!(calls, [4096]);
+    }
+
+    #[test]
+    fn reserve_rows_without_a_widen_target_keeps_the_incumbent() {
+        // Explicit max batch, chunk opt-out, kill, ineligible placement and
+        // non-IU4 arch all hand the loader no widened target.
+        let mut calls = Vec::new();
+        let got = expert_iu4_reserve_rows(None, 512, simulated_reserve(&[], &mut calls)).unwrap();
+        assert_eq!((got.rows, got.wide_failure), (512, None));
+        assert_eq!(calls, [512]);
+        // A target not above the incumbent is never reserved.
+        let mut calls = Vec::new();
+        let got =
+            expert_iu4_reserve_rows(Some(4096), 8192, simulated_reserve(&[], &mut calls)).unwrap();
+        assert_eq!(got.rows, 8192);
+        assert_eq!(calls, [8192]);
+    }
+
+    #[test]
+    fn reserve_rows_failed_wide_falls_back_to_incumbent_loudly() {
+        let mut calls = Vec::new();
+        let got = expert_iu4_reserve_rows(Some(4096), 512, simulated_reserve(&[4096], &mut calls))
+            .unwrap();
+        assert_eq!(got.rows, 512);
+        assert_eq!(got.wide_failure, Some((4096, "alloc 4096".to_owned())));
+        assert_eq!(calls, [4096, 512]);
+    }
+
+    #[test]
+    fn reserve_rows_incumbent_failure_keeps_the_existing_error() {
+        let mut calls = Vec::new();
+        let err = expert_iu4_reserve_rows(None, 512, simulated_reserve(&[512], &mut calls))
+            .err()
+            .unwrap();
+        assert_eq!(err, "alloc 512");
+        // A failed wide attempt does not mask the incumbent's own error.
+        let mut calls = Vec::new();
+        let err =
+            expert_iu4_reserve_rows(Some(4096), 512, simulated_reserve(&[4096, 512], &mut calls))
+                .err()
+                .unwrap();
+        assert_eq!(err, "alloc 512");
+        assert_eq!(calls, [4096, 512]);
     }
 }

@@ -1295,8 +1295,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-ple-async-upload",
         predicates: &[CaptureMode, GraphSlotCapturing],
-        condition: "hipfire-arch-qwen4 ple_async_upload (ple_stage.rs), consulted by forward_chunk_scoped (gpu_forward.rs) and the exact lane step forward_lanes_scoped (gpu_forward_lanes.rs) with `gpu.graphs.capture_mode`: the deferred PLE rows upload with a fenced asynchronous copy (HIPFIRE_QWEN4_PLE_ASYNC_UPLOAD) only when no graph capture is open; under capture the blocking `memcpy_htod_auto` path (async on the active stream while capturing) runs. A pipeline-parallel mesh band forward (forward_chunk_scoped under a mesh epoch) takes the same fenced `upload_async` only when `!gpu.graphs.capture_mode`, so the mesh never blocks the host on the device queue outside capture",
-        effect: LaunchMechanism,
+        condition: "hipfire-arch-qwen4 ple_async_upload (ple_stage.rs), consulted by forward_chunk_scoped (gpu_forward.rs), the exact lane step forward_lanes_scoped (gpu_forward_lanes.rs), and the S1 layer-major tile step stage_tile (slowlink_prefill.rs) with `gpu.graphs.capture_mode`: the deferred PLE rows upload with a fenced asynchronous copy (HIPFIRE_QWEN4_PLE_ASYNC_UPLOAD) only when no graph capture is open; under capture the blocking `memcpy_htod_auto` path (async on the active stream while capturing) runs. A pipeline-parallel mesh band forward (forward_chunk_scoped under a mesh epoch) takes the same fenced `upload_async` only when `!gpu.graphs.capture_mode`, so the mesh never blocks the host on the device queue outside capture. The S1 tile step passes the same `gpu.graphs.capture_mode` through the same helper into the same `stage_ple_rows` upload-mode branches, so the recorded and eager tiles stage identical bytes to the identical device buffer",
         switches: "hipMemcpyAsync on the null stream with a hip-event fence over the host staging buffer, vs the blocking or capture-aware upload; same bytes to the same device buffer",
         kernels: &[],
         verdict: Invariant,
@@ -1824,6 +1823,12 @@ pub const SITES: &[Site] = &[
         file: "hipfire-arch-qwen4/src/ple_stage.rs",
         function: "ple_async_upload",
         occurrences: 2,
+        decisions: &["qwen4-ple-async-upload"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/slowlink_prefill.rs",
+        function: "stage_tile",
+        occurrences: 1,
         decisions: &["qwen4-ple-async-upload"],
     },
     Site {

@@ -7521,7 +7521,9 @@ fn prefill_expert_iu4_down_stage(
 
 /// BF16 grouped down rows widened to F32 and combined in ascending top-k slot
 /// order (`fma(w, v, acc)`), then `+=` into the target the Path-2 combine
-/// (`moe_down_combine_grouped_k8`) would use. Its position relative to the shared
+/// (`moe_down_combine_grouped_k8`) would use. Runs the v2 twin only when
+/// `moe_program::expert_iu4_combine_v2_selected` admits it (`HIPFIRE_MOE_COMBINE_V2`
+/// resolved on: unset on at exact gfx1201, `0` kills; v2 bundle present, supported shape); otherwise the v1 twin. Its position relative to the shared
 /// expert and the mutation fence is the lowering's, unchanged.
 fn prefill_expert_iu4_combine_stage(
     gpu: &mut Gpu,
@@ -7535,11 +7537,24 @@ fn prefill_expert_iu4_combine_stage(
         plan.hidden,
         "down rows",
     )?;
+    let target = p.routed_out.unwrap_or(p.x_batch);
+    if moe_program::expert_iu4_combine_v2_selected(gpu, plan) {
+        return hip!(gpu.moe_down_combine_grouped_bf16in_v2_pm(
+            &y,
+            p.inverse_perm,
+            p.topk_weights,
+            target,
+            plan.hidden,
+            plan.k_top,
+            plan.rows,
+            plan.grouped_rows,
+        ));
+    }
     hip!(gpu.moe_down_combine_grouped_bf16in_pm(
         &y,
         p.inverse_perm,
         p.topk_weights,
-        p.routed_out.unwrap_or(p.x_batch),
+        target,
         plan.hidden,
         plan.k_top,
         plan.rows,

@@ -4584,7 +4584,7 @@ fn expert_iu4_launched_symbols(
 ) -> Option<[&'static str; 2]> {
     match decision {
         ExpertIu4Decision::Admitted(plan) => {
-            gpu.qwen4_moe_sym_gemm_symbols(plan.host_mapped, plan.total_slots, f.dims.n_exp)
+            gpu.qwen4_moe_sym_gemm_symbols_wide(plan.host_mapped, plan.total_slots, f.dims.n_exp)
         }
         _ => None,
     }

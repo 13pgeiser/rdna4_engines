@@ -50078,6 +50078,34 @@ impl Gpu {
             [QWEN4_MOE_SYM_GATE_UP, QWEN4_MOE_SYM_DOWN]
         })
     }
+    /// Widened reporting twin of [`Gpu::qwen4_moe_sym_gemm_symbols`]: the
+    /// canonical native pair, except a VRAM-resident gfx1201 call whose real
+    /// slots per expert reach 128 while the F2 opt-in
+    /// (`HIPFIRE_MOE_IU4_WIDE_TILES`, unset on at exact gfx1201) resolves on
+    /// reports the NT8 gate/up entry with the incumbent NT4 down (the mixed
+    /// pair the launcher runs; see the F2 substitution in
+    /// [`Gpu::qwen4_moe_sym_gemm`]).
+    pub fn qwen4_moe_sym_gemm_symbols_wide(
+        &self,
+        host_mapped: bool,
+        total_slots: usize,
+        n_experts: usize,
+    ) -> Option<[&'static str; 2]> {
+        let mut pair = self.qwen4_moe_sym_gemm_symbols(host_mapped, total_slots, n_experts)?;
+        if !host_mapped
+            && self.arch.as_str() == "gfx1201"
+            && qwen4_moe_sym_nt8_pair(
+                self.arch.as_str(),
+                host_mapped,
+                self.flags.moe_iu4_wide_tiles,
+                total_slots,
+                n_experts,
+            )[0]
+        {
+            pair[0] = QWEN4_MOE_SYM_PM_GATE_UP[1][1];
+        }
+        Some(pair)
+    }
 
     /// Down-GEMM row repeat: contiguous 64-row blocks one workgroup covers
     /// (`grid.x = m / (64 * rr)`). `HIPFIRE_QWEN4_MOE_SYM_DOWN_RR` (1, 2 or 4)
@@ -50680,10 +50708,10 @@ impl Gpu {
         grouped_rows: usize,
         total_slots: usize,
     ) -> HipResult<crate::scratch::Int4MmqPrepared> {
+        let kernel = self.qwen4_moe_sym_require("qwen4_moe_rotate128_i4")?;
         if self.moe_rotate_i4_pm_selected(k, grouped_rows, total_slots) {
             return self.qwen4_moe_rotate128_i4_pm(h, sorted, k, grouped_rows, total_slots);
         }
-        let kernel = self.qwen4_moe_sym_require("qwen4_moe_rotate128_i4")?;
         if let MoeSymIu4DownProducer::Embedded {
             module,
             image,

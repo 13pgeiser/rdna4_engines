@@ -211,6 +211,12 @@ fn build_fixture() -> Fixture {
         &mut syms,
     )
     .unwrap_or_else(|e| panic!("hip: {e}"));
+    build_external(
+        &root,
+        "crates/rdna-compute/tests/fixtures/all-launcher-abi/external_t8_abi.json",
+        &mut syms,
+    )
+    .unwrap_or_else(|e| panic!("external: {e}"));
     let mut images = strings(&inv, "pm_images");
     images.extend(strings(&inv, "pm_related_images"));
     build_pm(&root, &images, &mut syms).unwrap_or_else(|e| panic!("pm: {e}"));
@@ -1951,6 +1957,188 @@ fn negative_mutable_alias_of_a_helper_returned_blob_is_refused() {
         );
     }
 }
+
+/// The external `_t8` family pins the declared 96B/17-arg layout: the fixture
+/// loader requires the exact eight-symbol family and the byte proof covers
+/// every declared word.
+fn t8_external_syms() -> Vec<(String, Decl)> {
+    let root = root();
+    let mut syms = Symbols::default();
+    build_external(
+        &root,
+        "crates/rdna-compute/tests/fixtures/all-launcher-abi/external_t8_abi.json",
+        &mut syms,
+    )
+    .expect("external fixture loads");
+    let mut out: Vec<(String, Decl)> = Vec::new();
+    for (name, list) in &syms.pm {
+        for (origin, decl) in list {
+            if origin.starts_with("external:") {
+                out.push((name.clone(), decl.clone()));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+fn t8_bytes_source(writes: &str) -> String {
+    format!(
+        "fn probe(hip: &Hip, m: &Module) {{\n    let f = hip.module_get_function(m, \"mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8\").unwrap();\n    let mut ka = [0u8; 96];\n{writes}    hip.launch_kernel_blob(f, [8, 80, 8], [256, 1, 1], 0, None, &mut ka).unwrap();\n}}\n"
+    )
+}
+
+fn t8_full_writes() -> String {
+    let mut w = String::new();
+    for i in 0..7 {
+        w.push_str(&format!("    ka[{}..{}].copy_from_slice(&p{i}.to_le_bytes());\n", 8 * i, 8 * i + 8));
+    }
+    for i in 0..10 {
+        w.push_str(&format!("    ka[{}..{}].copy_from_slice(&v{i}.to_le_bytes());\n", 56 + 4 * i, 60 + 4 * i));
+    }
+    w
+}
+
+#[test]
+fn negative_external_t8_family_layout_is_pinned() {
+    let syms = t8_external_syms();
+    assert_eq!(syms.len(), 8, "eight _t8 symbols declared: {syms:?}");
+    // All eight share one identical ABI: the hand-handle launch cannot tie a
+    // layout variant to one kernel, so any difference must fail.
+    for w in syms.windows(2) {
+        assert!(hip::same_layout(&w[0].1, &w[1].1), "{} vs {}", w[0].0, w[1].0);
+    }
+    for (name, d) in &syms {
+        assert_eq!(d.args.len(), 17, "{name}");
+        assert_eq!(d.end, 96, "{name}");
+        assert_eq!(d.args[0].offset, 0, "{name}");
+        assert_eq!(d.args[7].offset, 56, "{name}");
+        assert_eq!(d.args[16].offset, 92, "{name}");
+    }
+    // The full 17-write zero-array proof passes against every declared symbol.
+    let full = t8_bytes_source(&t8_full_writes());
+    let refs: Vec<(&str, Decl)> = syms.iter().map(|(n, d)| (n.as_str(), d.clone())).collect();
+    let (abi, cov) = run_synth_at(PROBE_PATH, &full, &refs, &no_policy());
+    assert!(abi.is_empty() && cov.is_empty(), "{abi:?} {cov:?}");
+    // A missing export fails closed at load time: the fixture controller
+    // requires the exact eight-symbol family, so the probe target
+    // `mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8` cannot silently drop out of
+    // scope. (Filtering it from the synth decl list proves nothing: the
+    // scanner only tracks names in its symbol table, so that launch site is
+    // then intentionally ignored and both violation lists stay empty.)
+    {
+        let text = std::fs::read_to_string(root().join(
+            "crates/rdna-compute/tests/fixtures/all-launcher-abi/external_t8_abi.json",
+        ))
+        .expect("fixture");
+        let mut v: serde_json::Value = serde_json::from_str(&text).expect("parse");
+        let map = v["symbols"].as_object_mut().expect("symbols object");
+        assert_eq!(map.len(), 8);
+        assert!(map.remove("mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8").is_some());
+        let dir = std::env::temp_dir().join(format!("t8neg-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        std::fs::write(
+            dir.join("external_t8_abi.json"),
+            serde_json::to_string(&v).unwrap(),
+        )
+        .expect("write");
+        let mut syms = Symbols::default();
+        let r = build_external(&dir, "external_t8_abi.json", &mut syms);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(r.is_err(), "missing export must fail closed: {r:?}");
+    }
+    // The zero-initialised `reserved`@92 word may stay unwritten (existing
+    // `compare_bytes` reserved handling): the zero-init proof keeps it zero.
+    let no_res = t8_full_writes().replace("    ka[92..96].copy_from_slice(&v9.to_le_bytes());\n", "");
+    let (abi, cov) = run_synth_at(PROBE_PATH, &t8_bytes_source(&no_res), &refs, &no_policy());
+    assert!(abi.is_empty() && cov.is_empty(), "omitted zero-init reserved must pass: {abi:?} {cov:?}");
+    // Dropping a live word (n_experts@88) must fail instead.
+    let short = t8_full_writes().replace("    ka[88..92].copy_from_slice(&v8.to_le_bytes());\n", "");
+    let (abi, _) = run_synth_at(PROBE_PATH, &t8_bytes_source(&short), &refs, &no_policy());
+    assert!(!abi.is_empty(), "unwritten n_experts@88 word must fail: {abi:?}");
+    // A straddling write matches no declared argument.
+    let straddle = format!("{}    ka[86..90].copy_from_slice(&v8.to_le_bytes());\n", short);
+    let (abi, _) = run_synth_at(PROBE_PATH, &t8_bytes_source(&straddle), &refs, &no_policy());
+    assert!(!abi.is_empty(), "straddling write must fail: {abi:?}");
+    let small = full.replace("[0u8; 96]", "[0u8; 92]");
+    let (abi, _) = run_synth_at(PROBE_PATH, &small, &refs, &no_policy());
+    assert!(!abi.is_empty(), "92-byte array must fail: {abi:?}");
+}
+
+#[test]
+fn negative_external_t8_loader_fails_closed() {
+    let root = root();
+    let good = std::fs::read_to_string(
+        root.join("crates/rdna-compute/tests/fixtures/all-launcher-abi/external_t8_abi.json"),
+    )
+    .expect("fixture");
+    let load = |text: &str| {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!("t8neg-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::SeqCst)));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let p = dir.join("external_t8_abi.json");
+        std::fs::write(&p, text).expect("write");
+        let mut syms = Symbols::default();
+        let r = build_external(&dir, "external_t8_abi.json", &mut syms);
+        std::fs::remove_dir_all(&dir).ok();
+        r
+    };
+    // A missing export is rejected: the family is exactly eight symbols.
+    let mut v: serde_json::Value = serde_json::from_str(&good).expect("parse");
+    let syms = v["symbols"].as_object().unwrap().clone();
+    assert_eq!(syms.len(), 8);
+    let dropped = syms.keys().next().unwrap().clone();
+    v.as_object_mut().unwrap().remove("symbols").unwrap();
+    let mut kept = serde_json::Map::new();
+    for (k, s) in syms {
+        if k != dropped {
+            kept.insert(k, s);
+        }
+    }
+    v.as_object_mut().unwrap().insert("symbols".into(), kept.into());
+    assert!(load(&serde_json::to_string(&v).unwrap()).is_err(), "missing export must fail closed");
+    // Wrong offset/size/name/kind/value_kind/segment, unknown fields,
+    // wrapping numerics, bad provenance, missing contract, wrong module, and
+    // non-family symbols are all hard errors, never silent defaults.
+    let mutate = |f: &dyn Fn(&mut serde_json::Value)| {
+        let mut w: serde_json::Value = serde_json::from_str(&good).expect("parse");
+        f(&mut w);
+        load(&serde_json::to_string(&w).unwrap())
+    };
+    assert!(mutate(&|w| { w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["args"][8]["offset"] = 84.into(); }).is_err());
+    assert!(mutate(&|w| { w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["args"][0]["size"] = 4.into(); }).is_err());
+    assert!(mutate(&|w| { w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["args"][16]["name"] = "pad".into(); }).is_err());
+    assert!(mutate(&|w| { w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["args"][0]["kind"] = "v".into(); }).is_err());
+    assert!(mutate(&|w| { w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["args"][0]["value_kind"] = "by_value".into(); }).is_err());
+    assert!(mutate(&|w| { w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["args"][8]["value_kind"] = "global_buffer".into(); }).is_err());
+    assert!(mutate(&|w| { w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["segment"] = 104.into(); }).is_err());
+    assert!(mutate(&|w| { w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["args"][1]["bogus"] = 1.into(); }).is_err());
+    assert!(mutate(&|w| { w.as_object_mut().unwrap().insert("bogus".into(), 1.into()); }).is_err());
+    // A `u64` offset of 2^32 + 0 would wrap to 0 under `as u32`: refused.
+    assert!(mutate(&|w| { w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["args"][0]["offset"] = 4294967296u64.into(); }).is_err());
+    // Provenance: truncated/uppercase digests, missing dirs, missing contract.
+    assert!(mutate(&|w| { w["provenance"]["gfx1201_module_co_sha256"] = "c7b528dcee126e0188d43f371dbad4a0f81b0cd962d71c0d392ec8c9865aa5".into(); }).is_err());
+    assert!(mutate(&|w| { w["provenance"]["cn_module_co_sha256"] = "4CFAAEC12F0585EE1811259429E3BE981DC7F9934A7EB933A591C67C81407FA2".into(); }).is_err());
+    assert!(mutate(&|w| { w["provenance"].as_object_mut().unwrap().remove("cn_artifact_dir"); }).is_err());
+    assert!(mutate(&|w| { w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"].as_object_mut().unwrap().remove("contract"); }).is_err());
+    assert!(mutate(&|w| { w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["contract"] = "shapes/other.json".into(); }).is_err());
+    // Wrong module association (Cn symbol claimed in the gfx1201 module).
+    assert!(mutate(&|w| { w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"]["module"] = "mq_i4_moe_gemv_pm_gfx1201".into(); }).is_err());
+    // A non-family `_t8` stem is refused even with the suffix.
+    assert!(mutate(&|w| {
+        let s = w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"].clone();
+        w["symbols"].as_object_mut().unwrap().insert("mq_i4_moe_gemv_bogus_r256_gate_up_t8".into(), s);
+    })
+    .is_err());
+    // A non-_t8 symbol smuggled into the external family is refused.
+    assert!(mutate(&|w| {
+        let s = w["symbols"]["mq_i4_moe_gemv_cn_mq3i4_r256_gate_up_t8"].clone();
+        w["symbols"].as_object_mut().unwrap().insert("mq_i4_moe_gemv_plain".into(), s);
+    })
+    .is_err());
+}
+
 
 #[test]
 fn self_referential_format_names_resolve_without_looping() {

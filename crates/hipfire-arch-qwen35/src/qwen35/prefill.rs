@@ -2295,14 +2295,22 @@ fn resident_moe_request_now() -> ResidentMoeRequest {
     resident_moe_request(explicit_prefill_max_batch(), explicit_prefill_chunk_rows())
 }
 ///
+/// The d53 routed pair (`MQ4G256V2` gate_up, `MQ4G128V2` down) of the symmetric
+/// IU4 artifact class.
+fn resident_moe_iu4_d53_pair(d: &hipfire_dispatch::families::moe::MoePrefillDtypes) -> bool {
+    d.expert_gate_up == DType::MQ4G256V2 && d.expert_down == DType::MQ4G128V2
+}
+///
 /// Grouped-producer dtype capability of one MoE layer: routed experts uniform
 /// MQ4G256 or uniform MQ4G256V2 (gate_up and down the same format, no graded
-/// merge), shared expert MQ4G256/MQ4G256V2 with a fused gate/up pair, router
-/// and shared scalar gate in the formats the dispatch admission accepts.
-/// Anything else (MQ6, E8, Lloyd/codebook, PARO, mixed tiers) keeps the
-/// incumbent chunk.
+/// merge), or the d53 pair when the layer carries the verified loader IU4
+/// capability (`expert_iu4`), shared expert MQ4G256/MQ4G256V2 with a fused
+/// gate/up pair, router and shared scalar gate in the formats the dispatch
+/// admission accepts. Anything else (MQ6, E8, Lloyd/codebook, PARO, mixed
+/// tiers, d53 without the IU4 capability) keeps the incumbent chunk.
 fn resident_moe_producer_dtypes_supported(
     d: &hipfire_dispatch::families::moe::MoePrefillDtypes,
+    expert_iu4: bool,
 ) -> bool {
     let mq4 = |dt: DType| matches!(dt, DType::MQ4G256 | DType::MQ4G256V2);
     let scalar = |dt: DType| {
@@ -2315,7 +2323,7 @@ fn resident_moe_producer_dtypes_supported(
         && d.expert_gate_up_uniform
         && d.expert_down_uniform
         && mq4(d.expert_gate_up)
-        && d.expert_down == d.expert_gate_up
+        && (d.expert_down == d.expert_gate_up || (expert_iu4 && resident_moe_iu4_d53_pair(d)))
         && mq4(d.shared_expert_gate)
         && d.shared_expert_up == d.shared_expert_gate
         && mq4(d.shared_expert_down)
@@ -2408,7 +2416,24 @@ fn resident_moe_layer_capable(
     resident_moe_layer_facts_capable(
         &resident_moe_layer_placement(gpu, attention, ffn),
         moe_prefill_dtypes(ffn).as_ref(),
+        resident_moe_layer_iu4_bound(ffn),
     )
+}
+
+/// The layer carries the loader's verified symmetric IU4 capability (bound on
+/// every MoE layer by `finalize_expert_iu4`, withheld under the explicit kill
+/// and on incapable devices).
+fn resident_moe_layer_iu4_bound(ffn: &MoeFfnWeights) -> bool {
+    ffn.expert_iu4.is_some_and(|(_, verified)| verified)
+}
+
+/// A layer that the d53 pair admits only through the IU4 capability, so its
+/// prefill needs the symmetric IU4 scratch at the widened rows.
+fn resident_moe_layer_needs_iu4_scratch(
+    dtypes: Option<&hipfire_dispatch::families::moe::MoePrefillDtypes>,
+    expert_iu4: bool,
+) -> bool {
+    expert_iu4 && dtypes.is_some_and(resident_moe_iu4_d53_pair)
 }
 
 /// Pure core of [`resident_moe_layer_capable`]: every placement flag clear and
@@ -2416,8 +2441,64 @@ fn resident_moe_layer_capable(
 fn resident_moe_layer_facts_capable(
     placement: &ResidentMoePlacement,
     dtypes: Option<&hipfire_dispatch::families::moe::MoePrefillDtypes>,
+    expert_iu4: bool,
 ) -> bool {
-    placement.resident() && dtypes.is_some_and(resident_moe_producer_dtypes_supported)
+    placement.resident()
+        && dtypes.is_some_and(|d| resident_moe_producer_dtypes_supported(d, expert_iu4))
+}
+///
+/// Actual symmetric-IU4 MoE scratch held by one device, bytes per owner: the
+/// live buffer size capped by the tracked bytes (the dispatch
+/// `expert_iu4_scratch_ready` evidence), 0 for an owner never allocated.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MoeSymScratchHave {
+    group: usize,
+    down: usize,
+    gate: usize,
+}
+
+impl MoeSymScratchHave {
+    fn of(gpu: &Gpu) -> Self {
+        let s = &gpu.scratch;
+        let held = |buf: &Option<hip_bridge::DeviceBuffer>, tracked: usize| {
+            buf.as_ref().map_or(0, |b| b.size().min(tracked))
+        };
+        Self {
+            group: held(&s.qwen4_moe_group_scratch, s.qwen4_moe_group_scratch_bytes),
+            down: held(
+                &s.qwen4_moe_down_i4_scratch,
+                s.qwen4_moe_down_i4_scratch_bytes,
+            ),
+            gate: held(&s.int4_mmq_x_scratch, s.int4_mmq_x_scratch_bytes),
+        }
+    }
+}
+
+/// Whether `have` covers every owner `Gpu::reserve_qwen4_moe_sym` would size
+/// for `rows` rows of this model (grouping layout of `rows * top_k` slots, the
+/// down sidecar, and the gate/up activation scratch). Overflow or a rejected
+/// shape fails closed. No allocation.
+fn moe_sym_scratch_covers_rows(
+    have: MoeSymScratchHave,
+    rows: usize,
+    config: &Qwen35Config,
+) -> bool {
+    use rdna_compute::scratch::{
+        int4_mmq_reservation_bytes, qwen4_moe_down_i4_bytes, qwen4_moe_group_layout_checked,
+    };
+    let Some(slots) = rows.checked_mul(config.num_experts_per_tok) else {
+        return false;
+    };
+    match (
+        qwen4_moe_group_layout_checked(slots, config.num_experts),
+        qwen4_moe_down_i4_bytes(config.moe_intermediate_size, slots),
+        int4_mmq_reservation_bytes(config.dim, rows),
+    ) {
+        (Some(group), Some(down), Some(gate)) => {
+            have.group >= group.bytes && have.down >= down && have.gate >= gate
+        }
+        _ => false,
+    }
 }
 ///
 /// Every static (no allocation, no memory query) fact the resident Qwen35 MoE
@@ -2443,6 +2524,13 @@ struct ResidentMoeStaticFacts {
     batch_pbs_eligible: bool,
     /// Every layer passes [`resident_moe_layer_facts_capable`].
     layers_resident_capable: bool,
+    /// Some layer is a d53 pair admitted only through the IU4 capability
+    /// ([`resident_moe_layer_needs_iu4_scratch`]).
+    iu4_d53_layers: bool,
+    /// The device's actual symmetric-IU4 scratch covers
+    /// [`RESIDENT_MOE_CHUNK_ROWS`] ([`moe_sym_scratch_covers_rows`]). Read only
+    /// when `iu4_d53_layers`.
+    iu4_scratch_wide: bool,
 }
 ///
 /// Static (no allocation, no memory query) eligibility of the resident
@@ -2473,7 +2561,13 @@ fn resident_moe_static_decision(f: &ResidentMoeStaticFacts) -> Option<usize> {
     if !f.batch_pbs_eligible {
         return None;
     }
-    f.layers_resident_capable.then_some(RESIDENT_MOE_CHUNK_ROWS)
+    if !f.layers_resident_capable {
+        return None;
+    }
+    // A d53 layer's prefill allocates nothing: when the loader's widened
+    // reservation fell back to the incumbent rows the scratch cannot hold the
+    // widened chunk.
+    (!f.iu4_d53_layers || f.iu4_scratch_wide).then_some(RESIDENT_MOE_CHUNK_ROWS)
 }
 ///
 /// Gather [`ResidentMoeStaticFacts`] from the loaded model. The gates are read
@@ -2498,6 +2592,8 @@ fn resident_moe_static_facts(
         dn_state_admitted: false,
         batch_pbs_eligible: false,
         layers_resident_capable: false,
+        iu4_d53_layers: false,
+        iu4_scratch_wide: false,
     };
     if !f.moe_config
         || !matches!(f.request, ResidentMoeRequest::Widen { .. })
@@ -2524,7 +2620,20 @@ fn resident_moe_static_facts(
     if !f.batch_pbs_eligible {
         return f;
     }
-    f.layers_resident_capable = weights.layers.iter().all(|layer| match layer {
+    f.layers_resident_capable = resident_moe_weights_capable(gpu, weights);
+    if !f.layers_resident_capable {
+        return f;
+    }
+    f.iu4_d53_layers = resident_moe_weights_need_iu4_scratch(weights);
+    f.iu4_scratch_wide = f.iu4_d53_layers
+        && moe_sym_scratch_covers_rows(MoeSymScratchHave::of(gpu), RESIDENT_MOE_CHUNK_ROWS, config);
+    f
+}
+///
+/// Every layer passes [`resident_moe_layer_capable`] (placement, dtype and
+/// IU4 capability read from the loaded weights).
+fn resident_moe_weights_capable(gpu: &Gpu, weights: &Qwen35Weights) -> bool {
+    weights.layers.iter().all(|layer| match layer {
         LayerWeights::DeltaNetMoe(l) => {
             resident_moe_layer_capable(gpu, &[&l.wqkv, &l.wz, &l.w_alpha, &l.w_beta, &l.wo], &l.ffn)
         }
@@ -2532,8 +2641,48 @@ fn resident_moe_static_facts(
             resident_moe_layer_capable(gpu, &[&l.wq, &l.wk, &l.wv, &l.wo], &l.ffn)
         }
         _ => false,
-    });
-    f
+    })
+}
+
+fn resident_moe_ffn_needs_iu4_scratch(ffn: &MoeFfnWeights) -> bool {
+    resident_moe_layer_needs_iu4_scratch(
+        moe_prefill_dtypes(ffn).as_ref(),
+        resident_moe_layer_iu4_bound(ffn),
+    )
+}
+
+/// Some MoE layer is a d53 pair admitted through the IU4 capability.
+fn resident_moe_weights_need_iu4_scratch(weights: &Qwen35Weights) -> bool {
+    weights.layers.iter().any(|layer| match layer {
+        LayerWeights::DeltaNetMoe(l) => resident_moe_ffn_needs_iu4_scratch(&l.ffn),
+        LayerWeights::FullAttnMoe(l) => resident_moe_ffn_needs_iu4_scratch(&l.ffn),
+        _ => false,
+    })
+}
+///
+/// Rows the loader reserves symmetric-IU4 scratch for on `gpu` beyond the
+/// incumbent ceiling: [`RESIDENT_MOE_CHUNK_ROWS`] only when the SAME static
+/// decision prefill applies ([`resident_moe_static_decision`], hence the same
+/// [`resident_moe_request`], WMMA, placement, residency, dtype and IU4 gates)
+/// admits the loaded model, `None` otherwise. Facts that need the not-yet-built
+/// DeltaNet state or live batching context (`dn_state_admitted`,
+/// `batch_pbs_eligible`) are runtime-only and re-checked by prefill, and the
+/// scratch fact is what this reservation creates, so it is taken as met here.
+pub(crate) fn resident_moe_iu4_load_wide_rows(gpu: &Gpu, weights: &Qwen35Weights) -> Option<usize> {
+    resident_moe_static_decision(&ResidentMoeStaticFacts {
+        moe_config: true,
+        request: resident_moe_request_now(),
+        has_wmma: gpu.arch_caps.has_wmma(),
+        pager: weights.pager.is_some(),
+        ep_shard: weights.ep_shard.is_some(),
+        moe_has_mq6: weights.moe_has_mq6,
+        layers_present: !weights.layers.is_empty(),
+        dn_state_admitted: true,
+        batch_pbs_eligible: true,
+        layers_resident_capable: resident_moe_weights_capable(gpu, weights),
+        iu4_d53_layers: false,
+        iu4_scratch_wide: true,
+    })
 }
 ///
 /// Wrapper-level gate: the DENSE widened ordinary route is statically
@@ -20558,8 +20707,12 @@ mod tests {
     fn resident_moe_dtype_capability_covers_v1_and_v2_only() {
         for supported in [DType::MQ4G256, DType::MQ4G256V2] {
             assert!(
-                resident_moe_producer_dtypes_supported(&resident_moe_dtypes(supported)),
+                resident_moe_producer_dtypes_supported(&resident_moe_dtypes(supported), false),
                 "{supported:?} grouped producer must be admitted"
+            );
+            assert!(
+                resident_moe_producer_dtypes_supported(&resident_moe_dtypes(supported), true),
+                "{supported:?} grouped producer must stay admitted with the IU4 capability"
             );
         }
         // A Q8/F32/MQ4 router and scalar gate are all accepted.
@@ -20567,7 +20720,8 @@ mod tests {
             let mut d = resident_moe_dtypes(DType::MQ4G256V2);
             d.router = router;
             d.shared_expert_scalar_gate = router;
-            assert!(resident_moe_producer_dtypes_supported(&d));
+            assert!(resident_moe_producer_dtypes_supported(&d, false));
+            assert!(resident_moe_producer_dtypes_supported(&d, true));
         }
         for unsupported in [
             DType::MQ6G256,
@@ -20579,33 +20733,112 @@ mod tests {
             DType::Q8_0,
         ] {
             assert!(
-                !resident_moe_producer_dtypes_supported(&resident_moe_dtypes(unsupported)),
+                !resident_moe_producer_dtypes_supported(&resident_moe_dtypes(unsupported), false),
                 "{unsupported:?} must keep the incumbent chunk"
+            );
+            assert!(
+                !resident_moe_producer_dtypes_supported(&resident_moe_dtypes(unsupported), true),
+                "{unsupported:?} must keep the incumbent chunk even with the IU4 capability"
             );
         }
         // V1 gate_up with V2 down (or the reverse) is a graded mix, not a uniform pair.
         let mut mixed = resident_moe_dtypes(DType::MQ4G256);
         mixed.expert_down = DType::MQ4G256V2;
-        assert!(!resident_moe_producer_dtypes_supported(&mixed));
+        assert!(!resident_moe_producer_dtypes_supported(&mixed, false));
+        assert!(!resident_moe_producer_dtypes_supported(&mixed, true));
         // Graded merge, non-uniform experts, broken shared pair, MQ6 router.
         let mut merged = resident_moe_dtypes(DType::MQ4G256V2);
         merged.routed_mixed_merged = true;
-        assert!(!resident_moe_producer_dtypes_supported(&merged));
+        assert!(!resident_moe_producer_dtypes_supported(&merged, false));
+        assert!(!resident_moe_producer_dtypes_supported(&merged, true));
         let mut ragged_gate_up = resident_moe_dtypes(DType::MQ4G256);
         ragged_gate_up.expert_gate_up_uniform = false;
-        assert!(!resident_moe_producer_dtypes_supported(&ragged_gate_up));
+        assert!(!resident_moe_producer_dtypes_supported(&ragged_gate_up, false));
+        assert!(!resident_moe_producer_dtypes_supported(&ragged_gate_up, true));
         let mut ragged_down = resident_moe_dtypes(DType::MQ4G256);
         ragged_down.expert_down_uniform = false;
-        assert!(!resident_moe_producer_dtypes_supported(&ragged_down));
+        assert!(!resident_moe_producer_dtypes_supported(&ragged_down, false));
+        assert!(!resident_moe_producer_dtypes_supported(&ragged_down, true));
         let mut shared_pair = resident_moe_dtypes(DType::MQ4G256V2);
         shared_pair.shared_expert_up = DType::MQ4G256;
-        assert!(!resident_moe_producer_dtypes_supported(&shared_pair));
+        assert!(!resident_moe_producer_dtypes_supported(&shared_pair, false));
+        assert!(!resident_moe_producer_dtypes_supported(&shared_pair, true));
         let mut shared_down = resident_moe_dtypes(DType::MQ4G256V2);
         shared_down.shared_expert_down = DType::MQ6G256V2;
-        assert!(!resident_moe_producer_dtypes_supported(&shared_down));
+        assert!(!resident_moe_producer_dtypes_supported(&shared_down, false));
+        assert!(!resident_moe_producer_dtypes_supported(&shared_down, true));
         let mut router = resident_moe_dtypes(DType::MQ4G256V2);
         router.router = DType::MQ6G256;
-        assert!(!resident_moe_producer_dtypes_supported(&router));
+        assert!(!resident_moe_producer_dtypes_supported(&router, false));
+        assert!(!resident_moe_producer_dtypes_supported(&router, true));
+    }
+
+    fn d53_dtypes() -> hipfire_dispatch::families::moe::MoePrefillDtypes {
+        let mut d = resident_moe_dtypes(DType::MQ4G256V2);
+        d.expert_down = DType::MQ4G128V2;
+        d
+    }
+
+    #[test]
+    fn resident_moe_d53_pair_is_admitted_only_with_the_iu4_capability() {
+        let d53 = d53_dtypes();
+        assert!(!resident_moe_producer_dtypes_supported(&d53, false));
+        assert!(resident_moe_producer_dtypes_supported(&d53, true));
+        // Uniform only: no graded merge, no per-projection mix.
+        let mut merged = d53;
+        merged.routed_mixed_merged = true;
+        let mut ragged_gate_up = d53;
+        ragged_gate_up.expert_gate_up_uniform = false;
+        let mut ragged_down = d53;
+        ragged_down.expert_down_uniform = false;
+        // The capability widens only the exact d53 pair.
+        let mut v1_gate_up = d53;
+        v1_gate_up.expert_gate_up = DType::MQ4G256;
+        let mut reversed = d53;
+        reversed.expert_gate_up = DType::MQ4G128V2;
+        reversed.expert_down = DType::MQ4G256V2;
+        let mut qt53_both = d53;
+        qt53_both.expert_gate_up = DType::MQ4G128V2;
+        // Shared expert and router keep their gates.
+        let mut shared_pair = d53;
+        shared_pair.shared_expert_up = DType::MQ4G256;
+        let mut shared_down = d53;
+        shared_down.shared_expert_down = DType::MQ6G256V2;
+        let mut shared_qt53 = d53;
+        shared_qt53.shared_expert_down = DType::MQ4G128V2;
+        let mut router = d53;
+        router.router = DType::MQ6G256;
+        let mut scalar_gate = d53;
+        scalar_gate.shared_expert_scalar_gate = DType::MQ4G128V2;
+        for (what, d) in [
+            ("graded merge", merged),
+            ("non-uniform gate_up", ragged_gate_up),
+            ("non-uniform down", ragged_down),
+            ("V1 gate_up + qt53 down", v1_gate_up),
+            ("qt53 gate_up + V2 down", reversed),
+            ("qt53 gate_up + qt53 down", qt53_both),
+            ("shared gate/up pair", shared_pair),
+            ("shared down MQ6", shared_down),
+            ("shared down qt53", shared_qt53),
+            ("router MQ6", router),
+            ("scalar gate qt53", scalar_gate),
+        ] {
+            assert!(
+                !resident_moe_producer_dtypes_supported(&d, true),
+                "{what} must keep the incumbent chunk even with the IU4 capability"
+            );
+        }
+        // Same-format admission is independent of the capability.
+        for dt in [DType::MQ4G256, DType::MQ4G256V2] {
+            let d = resident_moe_dtypes(dt);
+            assert!(resident_moe_producer_dtypes_supported(&d, false));
+            assert!(resident_moe_producer_dtypes_supported(&d, true));
+        }
+        for dt in [DType::MQ6G256, DType::MQ4G128V2, DType::Q8_0] {
+            let d = resident_moe_dtypes(dt);
+            assert!(!resident_moe_producer_dtypes_supported(&d, false));
+            assert!(!resident_moe_producer_dtypes_supported(&d, true));
+        }
     }
 
     #[test]
@@ -20647,6 +20880,175 @@ mod tests {
         ];
         for placement in nonresident {
             assert!(!placement.resident(), "{placement:?} must not widen");
+        }
+    }
+    #[test]
+    fn resident_moe_d53_layer_capability_needs_resident_placement_and_iu4() {
+        let d53 = d53_dtypes();
+        let resident = ResidentMoePlacement::default();
+        assert!(!resident_moe_layer_facts_capable(&resident, Some(&d53), false));
+        assert!(resident_moe_layer_facts_capable(&resident, Some(&d53), true));
+        assert!(!resident_moe_layer_facts_capable(&resident, None, true));
+        for placement in [
+            ResidentMoePlacement {
+                routed_gate_up_host: true,
+                ..Default::default()
+            },
+            ResidentMoePlacement {
+                routed_down_host: true,
+                ..Default::default()
+            },
+            ResidentMoePlacement {
+                paged_experts: true,
+                ..Default::default()
+            },
+            ResidentMoePlacement {
+                multi_device_contract: true,
+                ..Default::default()
+            },
+            ResidentMoePlacement {
+                sidecar_experts: true,
+                ..Default::default()
+            },
+        ] {
+            assert!(!resident_moe_layer_facts_capable(&placement, Some(&d53), true));
+        }
+        // Uniform same-format layers are unchanged by the capability.
+        for dt in [DType::MQ4G256, DType::MQ4G256V2] {
+            let d = resident_moe_dtypes(dt);
+            assert!(resident_moe_layer_facts_capable(&resident, Some(&d), false));
+            assert!(resident_moe_layer_facts_capable(&resident, Some(&d), true));
+        }
+        // Only a d53 layer bound to the capability needs the IU4 scratch.
+        assert!(resident_moe_layer_needs_iu4_scratch(Some(&d53), true));
+        assert!(!resident_moe_layer_needs_iu4_scratch(Some(&d53), false));
+        assert!(!resident_moe_layer_needs_iu4_scratch(None, true));
+        for dt in [DType::MQ4G256, DType::MQ4G256V2] {
+            let d = resident_moe_dtypes(dt);
+            assert!(!resident_moe_layer_needs_iu4_scratch(Some(&d), true));
+        }
+    }
+
+    fn d53_static_facts(
+        request: ResidentMoeRequest,
+        iu4_d53_layers: bool,
+        iu4_scratch_wide: bool,
+    ) -> ResidentMoeStaticFacts {
+        ResidentMoeStaticFacts {
+            moe_config: true,
+            request,
+            has_wmma: true,
+            pager: false,
+            ep_shard: false,
+            moe_has_mq6: false,
+            layers_present: true,
+            dn_state_admitted: true,
+            batch_pbs_eligible: true,
+            layers_resident_capable: true,
+            iu4_d53_layers,
+            iu4_scratch_wide,
+        }
+    }
+
+    #[test]
+    fn resident_moe_d53_widening_requires_actual_wide_scratch() {
+        let widen = resident_moe_request(None, None);
+        assert_eq!(
+            resident_moe_static_decision(&d53_static_facts(widen, true, true)),
+            Some(RESIDENT_MOE_CHUNK_ROWS)
+        );
+        // The loader's widened reservation fell back: the scratch holds only
+        // the incumbent rows, so the fallback cannot widen.
+        assert_eq!(
+            resident_moe_static_decision(&d53_static_facts(widen, true, false)),
+            None
+        );
+        // Same-format layers never read the scratch fact.
+        assert_eq!(
+            resident_moe_static_decision(&d53_static_facts(widen, false, false)),
+            Some(RESIDENT_MOE_CHUNK_ROWS)
+        );
+        // Explicit max batch and a sub-rung chunk request opt out.
+        for request in [
+            resident_moe_request(Some(4096), None),
+            resident_moe_request(None, Some(2048)),
+        ] {
+            assert_eq!(
+                resident_moe_static_decision(&d53_static_facts(request, true, true)),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn moe_sym_scratch_cover_matches_the_reservation_extents() {
+        use rdna_compute::scratch::{qwen4_moe_down_i4_bytes, qwen4_moe_group_layout};
+        let mut config = resident_moe_test_config();
+        config.dim = 2048;
+        let rows = RESIDENT_MOE_CHUNK_ROWS;
+        let slots = rows * config.num_experts_per_tok;
+        let full = MoeSymScratchHave {
+            group: qwen4_moe_group_layout(slots, config.num_experts).bytes,
+            down: qwen4_moe_down_i4_bytes(config.moe_intermediate_size, slots).unwrap(),
+            gate: config.dim / 128 * rows * 72,
+        };
+        // A3B (E256, top-8, H2048, I512) extents at 4096 rows.
+        assert_eq!(
+            (full.group, full.down, full.gate),
+            (394_240, 9_437_184, 4_718_592)
+        );
+        assert!(moe_sym_scratch_covers_rows(full, rows, &config));
+        assert!(moe_sym_scratch_covers_rows(full, 512, &config));
+        assert!(!moe_sym_scratch_covers_rows(full, rows + 1, &config));
+        // Every owner is required.
+        for short in [
+            MoeSymScratchHave {
+                group: full.group - 1,
+                ..full
+            },
+            MoeSymScratchHave {
+                down: full.down - 1,
+                ..full
+            },
+            MoeSymScratchHave {
+                gate: full.gate - 1,
+                ..full
+            },
+            MoeSymScratchHave::default(),
+        ] {
+            assert!(!moe_sym_scratch_covers_rows(short, rows, &config));
+        }
+        // The incumbent 512-row reservation cannot widen.
+        let incumbent = MoeSymScratchHave {
+            group: qwen4_moe_group_layout(512 * config.num_experts_per_tok, config.num_experts)
+                .bytes,
+            down: qwen4_moe_down_i4_bytes(
+                config.moe_intermediate_size,
+                512 * config.num_experts_per_tok,
+            )
+            .unwrap(),
+            gate: config.dim / 128 * 512 * 72,
+        };
+        assert!(moe_sym_scratch_covers_rows(incumbent, 512, &config));
+        assert!(!moe_sym_scratch_covers_rows(incumbent, rows, &config));
+        // Overflow fails closed.
+        assert!(!moe_sym_scratch_covers_rows(full, usize::MAX, &config));
+    }
+
+    /// The loader reserves the widened rows exactly when prefill's static
+    /// decision would admit them: one shared request resolver and decision.
+    #[test]
+    fn resident_moe_load_and_prefill_agree_on_the_widen_request() {
+        let explicit_max = [None, Some(512), Some(4096)];
+        let explicit_chunk = [None, Some(512), Some(2048), Some(4096), Some(8192)];
+        for max in explicit_max {
+            for chunk in explicit_chunk {
+                let request = resident_moe_request(max, chunk);
+                let widens = matches!(request, ResidentMoeRequest::Widen { .. });
+                assert_eq!(widens, max.is_none() && chunk.is_none_or(|c| c >= 4096));
+                let wide = resident_moe_static_decision(&d53_static_facts(request, false, true));
+                assert_eq!(wide, widens.then_some(RESIDENT_MOE_CHUNK_ROWS), "{max:?} {chunk:?}");
+            }
         }
     }
 
@@ -21059,6 +21461,8 @@ mod tests {
             dn_state_admitted: true,
             batch_pbs_eligible: true,
             layers_resident_capable: true,
+            iu4_d53_layers: false,
+            iu4_scratch_wide: false,
         };
         let kv = KvTierFlags {
             quant_q8: true,
@@ -21599,8 +22003,10 @@ mod tests {
             // `resident_moe_static_facts` evaluates it.
             batch_pbs_eligible: sc_batched_eligible(moe, sc, WIDENED_COMMIT_ROWS),
             layers_resident_capable: sc.layers.iter().all(|(placement, dtypes)| {
-                resident_moe_layer_facts_capable(placement, Some(dtypes))
+                resident_moe_layer_facts_capable(placement, Some(dtypes), false)
             }),
+            iu4_d53_layers: false,
+            iu4_scratch_wide: false,
         }
     }
 
