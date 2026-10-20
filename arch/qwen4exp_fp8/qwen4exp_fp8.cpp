@@ -109,6 +109,11 @@ struct Layer {
     QsaIndexer   qsa;        /* full-attention layers only; inert when the checkpoint has none */
     GdnFP8       gdn;
     MoeFP8       mlp;
+    /* The control vector's projection, applied to the wide stream right after this layer's
+     * feed-forward write -- where llama.cpp's `build_cvec(res_hc, il)` sits in the `qwen4exp`
+     * graph. Inert (no op) when the deployment has no vector or this layer is outside its range
+     * (arch/common/rad_block_hc.h). */
+    HcProject    proj;
 };
 
 struct Model {
@@ -941,6 +946,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* The stream's initial value: hc identical copies of the embedding. */
     RAD_ARCH_TRY(m.enter.declare(b, g, m.hccfg.hc, m.a_x.x, m.b_h));
 
+    /* The control vector's per-token switch, when this deployment found one (HcProject). All zeros
+     * is the stock model, so a request that does not ask for the vector is unaffected. */
+    const rad_buf proj_on = HcProject::declare_mask(b, nm.f("projection_on"), g, ctx->cvec);
+
     /* ---- the layers.
      *
      * Declaration order is the buffer planner's liveness: a transient lives over [first
@@ -1170,6 +1179,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             lay.mlp.gather_out_rows  = lay.hc_ffn.gather_rows;
             lay.mlp.gather_out_rows6 = lay.hc_ffn.gather_rows6;
         }
+
+        /* The control vector's projection for this layer, if the vector steers it. */
+        RAD_ARCH_TRY(lay.proj.declare(b, nm.f("blk.%lld.proj", (long long) l), g, l, ctx->cvec,
+                                      proj_on, m.b_h, m.hccfg.hc));
     }
 
     /* Each routed layer predicts the next one's experts at its router input (MoeFP8::xp_next). */
@@ -1541,6 +1554,8 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         for (int64_t p = 0; p < K; ++p) {
             if (p == K - 1) wait1();
             l.hc_ffn.write(c, T, r0(p), rn(p));
+            /* The projection of this piece, before the next layer reads it. */
+            l.proj.step(c, r0(p), rn(p));
             if (nx && !ple_next) nx->hc_mix.read(c, T, r0(p), rn(p));
         }
         if (ple_next) {
@@ -1584,6 +1599,8 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
         l.hc_ffn.read_pieces(c, T);
         l.mlp.step(c, batch);
         l.hc_ffn.write(c, T, 0, T);
+        /* The request's control vector, on the stream the write just finished. */
+        l.proj.step(c, 0, T);
         dbg_resid(c, (int)li, "ffn", g.n_embd, m.b_h, m.a_x.x);
     }
 }
