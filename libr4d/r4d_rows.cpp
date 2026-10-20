@@ -480,8 +480,8 @@ static const RadOperandSpec oGdnConvRecurrentUpdate[] = {
 /* The gated residual. `hc_enter` and `hc_write` share a parameter list; `hc_read` adds the two
  * switches its operand list depends on: `inject` 0 is the final mixer and `group` 0 a read whose
  * consumer wants bf16. Both default on, as every trunk connection uses both. */
-/* The experimental speed projection (libr4d/r4d_hc_project.hip): a bf16 stream, one unit f32
- * direction per layer, an int32 switch per row. */
+/* The control vector's projection (r4d_hc_bf16.hip, with the other gated-residual kernels): a bf16
+ * stream, one unit f32 direction for every stream, an int32 switch per row. */
 static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("scale"),
                                            P_STR("dtype") };
 static const RadOperandSpec oHcProject[] = {
@@ -2945,11 +2945,11 @@ static const RadOpSchema kSchemas[] = {
            "the mean of the gated streams -- plus the per-branch write gains and, optionally, "
            "the block-scaled fp8 form of the block input and its Hadamard-rotated twin."),
     SCHEMA("hc_project", pHcProject, oHcProject,
-           "the experimental speed projection (llama.cpp's `--cvec-mode project`): for each of the "
+           "the control vector's projection (llama.cpp's `--cvec-mode project`): for each of the "
            "hc streams of a row whose `on` flag is 1, h[s] -= scale * (h[s] . v) * v, v that "
-           "layer's unit direction and scale its stored norm. A row whose flag is 0 is neither read "
-           "nor written, so an unprojected request is byte-identical to a deployment with no "
-           "vector loaded."),
+           "layer's unit direction -- the same v for every stream -- and scale its stored norm. A "
+           "row whose flag is 0 is neither read nor written, so an unprojected request's stream is "
+           "the stock model's."),
     SCHEMA("hc_write", pHcPlain, oHcWrite,
            "the write half: h[s] += inj[s] * y, into the UNNORMED stream."),
     SCHEMA("mtp_enter", pMtpEnter, oMtpEnter,
@@ -6527,7 +6527,7 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   r4d_shape_hc_write },
 
 { "hc_project_bf16", "hc_project", "norm",
-  "speed projection: h[s] -= scale * (h[s] . v) * v where the row's flag is on",
+  "control vector: h[s] -= scale * (h[s] . v) * v where the row's flag is on",
   "any M, any n, hc 2..8",
   "bf16 stream, f32 direction, i32 switch",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,

@@ -847,7 +847,9 @@ static int parse_sampling(const json& b, const OaiLimits& lim, OaiRequest* r, Ap
      * turns it on when the deployment's default is off. `control_vector` is the field's name;
      * `experimental_speed_projection` is Strata's spelling of the same switch, kept as an alias so
      * a client written against that reports what it means. */
-    for (const char* key : { "control_vector", "experimental_speed_projection" }) {
+    /* The field's own name is read last, so a request that sends both spellings is read as
+     * `control_vector`; the alias is Strata's name for the same switch. */
+    for (const char* key : { "experimental_speed_projection", "control_vector" }) {
         if (!b.contains(key)) continue;
         bool on = false;
         if (!get_bool(b, key, &on, err)) return RAD_E_INVAL;

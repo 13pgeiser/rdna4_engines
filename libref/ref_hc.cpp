@@ -262,10 +262,10 @@ int ref_hc_write(const RadArgs* a, RadStream) {
  * patch): the dot is taken per hyper-connection stream, as `mul_mat` over a [n, hc, tokens] view
  * gives it, and not on the stream mean.
  *
- * A row whose flag is 0 is not touched: no read, no write, so a request that did not ask for the
- * vector's activations are the stock model's: no read, no write. (A deployment that merely *has* the
- * table loaded is not bit-identical to one without it -- the table's VRAM moves the expert/KV plan --
- * but that is placement, not this op.)
+ * A row whose flag is 0 is not touched: no read, no write, so an unprojected request's activations
+ * are the stock model's. (A deployment that merely *has* the table loaded is not bit-identical to
+ * one without it -- the table's VRAM moves the expert/KV plan -- but that is placement, not this
+ * op.)
  *
  * `on` is an int32 per row (core derive.cpp's `projection_on_rows`); the direction is f32. */
 int ref_hc_project(const RadArgs* a, RadStream) {

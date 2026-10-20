@@ -238,4 +238,55 @@ TEST(a_unit_vector_gives_scale_one_at_every_steered_layer) {
     CHECK_NEAR(cv.scales[(size_t) 44], 1.0f, 1e-5);
 }
 
+/* Discovery is the branch's policy -- a file beside the model makes the capability available -- so
+ * the order it searches in is part of the contract: the container's sidecar, then its directory,
+ * then each `$RADIANCE_HOME/vectors`, with an empty file skipped rather than reported as found. */
+TEST(discovery_finds_the_sidecar_then_the_directory_then_the_home) {
+    const std::string dir   = radtest::tmpdir();
+    const std::string model = dir + "/model.gguf";
+    const std::string home  = dir + "/home";
+    const std::string hvec  = home + "/vectors/qwen4exp-control-vector.gguf";
+    std::string found, tried;
+
+    /* Nothing anywhere: no answer, and the candidates are named for the log line. */
+    CHECK_OK(rad::control_vector_discover(model, "qwen4exp", home, &found, &tried));
+    CHECK(found.empty());
+    CHECK(tried.find(dir + "/model.control-vector.gguf") != std::string::npos);
+
+    /* A home's vectors/ entry is the last candidate, and an empty file there is not a vector (the
+     * loader would refuse it), so discovery keeps looking rather than reporting it. */
+    std::filesystem::create_directories(home + "/vectors");
+    std::ofstream(hvec, std::ios::binary).close();
+    CHECK_OK(rad::control_vector_discover(model, "qwen4exp", home, &found, &tried));
+    CHECK(found.empty());
+    make_vector(2560, 47).write(hvec);
+    CHECK_OK(rad::control_vector_discover(model, "qwen4exp", home, &found, &tried));
+    CHECK_EQ(found, hvec);
+
+    /* The container's directory beats every home; the sidecar beats the directory. */
+    make_vector(2560, 47).write(dir + "/control-vector.gguf");
+    CHECK_OK(rad::control_vector_discover(model, "qwen4exp", home, &found, &tried));
+    CHECK_EQ(found, dir + "/control-vector.gguf");
+    make_vector(2560, 47).write(dir + "/model.control-vector.gguf");
+    CHECK_OK(rad::control_vector_discover(model, "qwen4exp", home, &found, &tried));
+    CHECK_EQ(found, dir + "/model.control-vector.gguf");
+
+    /* Homes separated by `:` are searched in order: one without a vector defers to the next. */
+    const std::string dir2 = dir + "/two";
+    std::filesystem::create_directories(dir2 + "/vectors");
+    make_vector(2560, 47).write(dir2 + "/vectors/qwen4exp-control-vector.gguf");
+    CHECK_OK(rad::control_vector_discover(dir2 + "/m.gguf", "qwen4exp", dir + "/none:" + dir2,
+                                          &found, &tried));
+    CHECK_EQ(found, dir2 + "/vectors/qwen4exp-control-vector.gguf");
+}
+
+/* The range is the package's, and it must lie inside the container. Twenty directions fit a
+ * 32-layer model; a JSON naming 4..40 does not. */
+TEST(a_layer_range_past_the_model_is_refused) {
+    const Loaded l = load(make_vector(2560, 20), 2560, 32, "range-past.gguf",
+                          R"({"mode":"project","scale":1.0,"layer_range":[4,40]})");
+    CHECK(l.rc < 0);
+    CHECK(l.err.find("runs past") != std::string::npos);
+}
+
 RAD_TEST_MAIN()

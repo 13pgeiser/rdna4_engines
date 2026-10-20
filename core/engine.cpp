@@ -1630,9 +1630,6 @@ bool Engine::state_slots_of(uint64_t seq, std::vector<int32_t>* out) const {
 }
 
 /* ------------------------------------------------------------------ the HTTP frontend */
-/* The engine's part of /server_info: model, cards, KV, drafting and wire, for a running process.
- * The server holds only interfaces, so the engine renders this object and the server splices it in
- * verbatim. */
 /* The control vector, for /stats and /server_info. `available` is
  * what a client should test before sending the field: without a loaded vector a request that asks
  * for it is refused, so a UI can hide the control rather than offer a switch that fails. */
@@ -1644,7 +1641,7 @@ std::string Engine::cvec_json() const {
         o["first"]   = cvec_.first;
         o["last"]    = cvec_.last;
         o["n_embd"]  = cvec_.n_embd;
-        o["n_layers"] = cvec_.n_layers > 0 ? cvec_.n_layers - 1 : 0;
+        o["n_layers"] = cvec_.n_layers;
         o["scale"]   = cvec_.user_scale;
         o["file"]    = cvec_.path;
         o["mode"]    = "project";
@@ -1652,6 +1649,9 @@ std::string Engine::cvec_json() const {
     return o.dump();
 }
 
+/* The engine's part of /server_info: model, cards, KV, drafting and wire, for a running process.
+ * The server holds only interfaces, so the engine renders this object and the server splices it in
+ * verbatim. */
 std::string Engine::engine_info() const {
     nlohmann::ordered_json e;
     e["arch"]        = meta_.arch_id ? meta_.arch_id : "";

@@ -1461,14 +1461,16 @@ default for *requests* stays off in all cases.
 - **Only a compatible container accepts it.** The file must be a GGUF `controlvector` whose
   `controlvector.model_hint` (when present) is this model's architecture (`qwen4exp`), whose
   directions are exactly the model's `--n-embd` wide, and whose range lies inside its layers.
-  Anything else stops startup with the reason: a direction from another model's residual basis
-  would move hidden states along a meaningless axis.
+  Anything else is reported and skipped, never served: a direction from another model's residual
+  basis would move hidden states along a meaningless axis.
 - **It is off until a request asks for it.** The dashboard's Model view flips the default for
   requests that name no choice, and a request's own `control_vector` field always wins. **No
   switch reloads the model**: the directions are uploaded once at startup and each step carries a
   per-request row mask.
-- **A request without it computes exactly what it computes with no vector loaded** — the op skips
-  a disabled row without reading or writing it.
+- **The op is a no-op when off** — it skips a disabled row without reading or writing it, so an
+  unprojected request's stream is the one the stock model computes. What a deployment that merely
+  *offers* a vector does not promise is bit-identity with one that has none: the table's VRAM can
+  move an expert or a KV block, the tie-level variance radiance documents elsewhere.
 - **Conversations are partitioned.** Blocks and linear-state snapshots computed with the vector
   on are keyed differently from those computed without it, so switching modes in one conversation
   recomputes instead of reusing hidden states that belonged to the other mode. A runtime LoRA
