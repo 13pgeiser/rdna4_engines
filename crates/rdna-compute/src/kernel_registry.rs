@@ -5209,10 +5209,12 @@ fn qwen36_27b_plain_rotate(input: &RouteKernelInput<'_>) -> Qwen36PlainRotate {
 
 // ── Walked route plans ──────────────────────────────────────────────────
 
-/// Generated route plans, one per model family and exact arch: the union of
-/// every (module, symbol) the dispatch bound during a recorded route walk
-/// (`scripts/route_plan_walk.py` + `scripts/route_plan_build.py`). Never
-/// edited by hand; regenerate after a dispatch or kernel-source change.
+/// Historical walked coverage/provenance, one file per model family and exact
+/// arch: the union of (module, symbol) bindings recorded by
+/// `scripts/route_plan_walk.py` + `scripts/route_plan_build.py`. Never edit by
+/// hand; record new walks after dispatch coverage or admission changes.
+/// The constructor rebinds HIP rows to current registry recipes; recorded
+/// embedded-binary identity remains strict.
 const WALKED_ROUTE_PLAN_FILES: &[&str] = &[
     include_str!("route_plans/qwen3.8-flash-next.gfx1201.tsv"),
     include_str!("route_plans/qwen3.8-flash-next-base.mq4-xts.gfx1201.tsv"),
