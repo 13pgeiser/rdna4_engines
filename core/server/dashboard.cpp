@@ -1555,6 +1555,23 @@ function triple(key, c, label, fmt, showNow) {
   if (showNow !== false && e[c] > 0) out += " · now " + Math.round(100 * now / e[c]) + "% of " + label + tag;
   return out;
 }
+/* The acceptance tile's detail line: highest stays the full-session extreme of window ratios
+ * (an extreme is an extreme), but recent and now are POOLED ratios of sums (see above). */
+function acceptTriple(c, showNow) {
+  const e = extAt["accept"];
+  const p = accPool[c];
+  if (!e || !(c in e) || !p || !p.length) return "";
+  let R = 0, A = 0;
+  for (const d of p) { R += d.r; A += d.a; }
+  if (R <= 0) return "";
+  const last = p[p.length - 1];
+  const tag = typeof c === "number" && c > 1 ? "@c" + c : "";
+  let out = "highest " + pct(e[c], 0) + " \u00b7 recent " + pct(A / R, 0);
+  if (showNow !== false && e[c] > 0 && last.r > 0)
+    out += " \u00b7 now " + Math.round(100 * (last.a / last.r) / e[c]) + "% of highest" + tag;
+  return out;
+}
+
 /* WINDOWED ACCEPTANCE. The engine's figure is cumulative and exact -- tot_accepted_/tot_drafted_
  * over the life of the process -- so a best/recent/now line built on it would print the same
  * number three times and call it a trend. The per-position counters the acceptance chart already
@@ -1565,6 +1582,7 @@ function triple(key, c, label, fmt, showNow) {
  * The counters go backwards when the engine restarts; that poll resets the window rather than
  * reporting a negative draft. */
 const ACC_WIN = 20;                                   /* 10 s of drafting at the 500 ms poll */
+const accPool = {};          /* per concurrency: ring of {dr, da} for the pooled tile window */
 let accPrev = null;
 const accDelta = [];
 function accWindow(s) {
@@ -1577,9 +1595,7 @@ function accWindow(s) {
   accPrev = { r: reach, a: hit };
   if (dr <= 0) return null;
   accDelta.push({ r: dr, a: da }); if (accDelta.length > ACC_WIN) accDelta.shift();
-  let R = 0, A = 0;
-  for (const d of accDelta) { R += d.r; A += d.a; }
-  return R > 0 ? A / R : null;
+  return { ratio: dr > 0 ? da / dr : null, dr: dr, da: da };
 }
 
 
@@ -1963,7 +1979,19 @@ function update(s, dt) {
         + (kvGave > 0 ? "  ·  " + hb(kvGave) + " lent to experts" : "")
       : "";
   const aw = accWindow(s);
-  if (aw != null) noteSample("accept", s.running > 0 ? s.running : lastActiveC, aw);
+  const awR = aw ? aw.ratio : null;
+  if (awR != null) noteSample("accept", s.running > 0 ? s.running : lastActiveC, awR);
+  /* POOLED ACCEPTANCE WINDOW (2026-10-20, math audit before the production roll).
+   * triple()'s `recent` averages the per-poll RATIOS; polls carry unequal draft counts, so a
+   * quiet poll and a 500-draft poll would weigh the same -- a mean of ratios, not a ratio of
+   * sums. Measured on a live c8 burst: avg-of-ratios 65.7% vs pooled 54.7%, a 11-point skew
+   * that grows with burstiness. The honest window figure is sum(accepted)/sum(reached) over
+   * the same span, so the tile keeps its own ring of delta pairs per concurrency. */
+  if (aw != null && aw.dr > 0) {
+    const c = s.running > 0 ? s.running : lastActiveC;
+    const p = accPool[c] || (accPool[c] = []);
+    p.push(aw); if (p.length > RECENT) p.shift();
+  }
   /* THE HEADLINE IS THE LIVE WINDOW, not the cumulative ratio. The engine's figure is exact but
    * cumulative, so on a process that has been up for hours it cannot move: 559 fresh drafts moved
    * it one point against a 33,000-draft denominator, and it froze outright the moment the lane
@@ -1977,8 +2005,8 @@ function update(s, dt) {
    * THE SPARKLINE'S SCALE DIFFERS from the other tiles: its samples are 10 s drafting windows, not
    * 500 ms polls, so this box spans up to 120 windows of actual drafting rather than 60 s. */
   if (!(s.draft_positions && s.draft_positions.length)) setMetric("accept", null, DASH);
-  else if (aw != null) setMetric("accept", 100 * aw, pctn(aw, 0));
-  $("m-acceptdet").textContent = triple("accept", cNow, "highest", (v) => pct(v, 0), busy);
+  else if (awR != null) setMetric("accept", 100 * awR, pctn(awR, 0));
+  $("m-acceptdet").textContent = acceptTriple(cNow, busy);
   M.flight.u.textContent = "/ " + s.queue_cap;
 
   const list = s.requests || [];
@@ -2075,7 +2103,7 @@ function update(s, dt) {
      * is these two lines. What must not happen is the average returning as the headline with no
      * bullet left behind, because then the live figure is the thing nobody can see.
      * Undefined when nothing was drafted -- freeze rather than print 0 or repaint the last value. */
-    if (aw != null) $("acc_n").firstChild.nodeValue = pctn(aw, 0);
+    if (awR != null) $("acc_n").firstChild.nodeValue = pctn(awR, 0);
     $("specaside").textContent = "depth " + dp.length;
     spec["Drafter"].textContent       = drafterName;
     spec["Depth"].textContent         = dp.length;
