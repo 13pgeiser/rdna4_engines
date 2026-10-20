@@ -13,9 +13,9 @@
 // Two forms, chosen from K alone so that a row's output bits do not depend on how many rows the
 // step carries (a verify step's first row is bit-identical to a plain decode of it):
 //
-// - K a multiple of 128: the WMMA form. One 16-column tile a block, eight waves on its K in chunks
-//   of one 128 block, and up to four 16-row tiles (M <= 64), each weight word multiplied with every
-//   tile's fragment once it is loaded. A lane loads its own B-fragment word of each k-step straight
+// - K a multiple of 128: the WMMA form. One 16-column tile a block (two from 25 rows), eight waves on
+//   its K in chunks of one 128 block, and up to four 16-row tiles (M <= 64), each weight word
+//   multiplied with every row tile's fragment once it is loaded. A lane loads its own B-fragment word of each k-step straight
 //   from the fragment-order weight (the order is the fragment's), the rows sit in the A fragments
 //   (rows >= M zero), and v_wmma_f32_16x16x16_fp8_fp8 multiplies. The per-(row, 128) activation scale is
 //   applied to each chunk's partial. At M = 1 the WMMA does sixteen times the work it needs, which
@@ -153,11 +153,18 @@ void r4d_gemm_mxfp4a8_gemv_kernel(
   }
 }
 
-// The WMMA form: one 16-column tile a block, RT 16-row tiles (M <= 16 RT). Needs K % 128 == 0 (a
-// chunk is a whole 128 block; a tail would be dropped); the launcher guarantees it and picks RT. A wave
-// loads each weight word of a chunk once and runs one WMMA chain per row tile over it, so the weight
-// streams once whatever M is, and a row's sum is its tile's chain alone -- the same at every RT.
-template <bool ABLK, int RT>
+// The WMMA form: TN 16-column tiles a block, RT 16-row tiles (M <= 16 RT). Needs K % 128 == 0 (a
+// chunk is a whole 128 block; a tail would be dropped); the launcher guarantees it and picks RT and TN.
+// A wave loads each weight word of a chunk once and runs one WMMA chain per row tile over it, so the
+// weight streams once whatever M is, and a row's sum is its tile's chain alone -- the same at every RT
+// and TN.
+//
+// TN: the activation is read per block, so one column tile a block reads all of it N/16 times (356 MB
+// from L2 at M = 64 on a 27B's 17408-row gate_up, against its 47 MB weight). Two tiles a block load
+// each activation fragment once for both. r4d_selftest --perfmx, clocks warmed, TN 1 -> 2: 17408 x 5120
+// at 32 rows 125 -> 85 us, at 64 157 -> 122; 5120 x 8704 75 -> 56, 95 -> 75; 21504 x 5376 154 -> 111,
+// 183 -> 150; at 16 to 24 rows within a few percent either way. Four tiles spill past 32 rows.
+template <bool ABLK, int RT, int TN = 1>
 __global__ __launch_bounds__(R4D_MXG_KW * 32)
 void r4d_gemm_mxfp4a8_gemvw_kernel(
     const unsigned char* __restrict__ A, const float* __restrict__ As,
@@ -168,29 +175,39 @@ void r4d_gemm_mxfp4a8_gemvw_kernel(
   __shared__ float sP[KW][16 * RT][16];
   const int lane = threadIdx.x & 31;
   const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x >> 5);
-  const int nt = blockIdx.x;
+  const int nt0 = blockIdx.x * TN;
   const int col = lane & 15, khalf = lane >> 4;  // B fragment: this lane's column and k half
   const int ksteps = K >> 4, chunks = K >> 7;
   const unsigned* __restrict__ Wp = (const unsigned*)W;
-  const int ref = (int)Wref[nt * 16 + col];
-  mxg_v8f tot[RT];
+  int ref[TN];
 #pragma unroll
-  for (int r = 0; r < RT; ++r) tot[r] = (mxg_v8f)(0.f);
+  for (int t = 0; t < TN; ++t) ref[t] = (int)Wref[(nt0 + t) * 16 + col];
+  mxg_v8f tot[RT][TN];
+#pragma unroll
+  for (int r = 0; r < RT; ++r)
+#pragma unroll
+    for (int t = 0; t < TN; ++t) tot[r][t] = (mxg_v8f)(0.f);
   for (int ch = wave; ch < chunks; ch += KW) {
-    unsigned wv[8];
+    unsigned wv[TN][8];
 #pragma unroll
-    for (int s = 0; s < 8; ++s)
-      wv[s] = __builtin_nontemporal_load(&Wp[((size_t)nt * ksteps + ch * 8 + s) * 32 + lane]);
-    int e8[4];
+    for (int t = 0; t < TN; ++t)
 #pragma unroll
-    for (int q = 0; q < 4; ++q) e8[q] = (int)Ws[(size_t)(ch * 4 + q) * ldws + nt * 16 + col];
-    mxg_v2i wf[8];
+      for (int s = 0; s < 8; ++s)
+        wv[t][s] = __builtin_nontemporal_load(&Wp[((size_t)(nt0 + t) * ksteps + ch * 8 + s) * 32 + lane]);
+    int e8[TN][4];
 #pragma unroll
-    for (int s = 0; s < 8; ++s) {
-      unsigned lo, hi;
-      r4d_mxfp4_unpack8(wv[s], r4d_mxfp4_fold_d(ref, e8[s >> 1]), &lo, &hi);
-      wf[s][0] = (int)lo; wf[s][1] = (int)hi;
-    }
+    for (int t = 0; t < TN; ++t)
+#pragma unroll
+      for (int q = 0; q < 4; ++q) e8[t][q] = (int)Ws[(size_t)(ch * 4 + q) * ldws + (nt0 + t) * 16 + col];
+    mxg_v2i wf[TN][8];
+#pragma unroll
+    for (int t = 0; t < TN; ++t)
+#pragma unroll
+      for (int s = 0; s < 8; ++s) {
+        unsigned lo, hi;
+        r4d_mxfp4_unpack8(wv[t][s], r4d_mxfp4_fold_d(ref[t], e8[t][s >> 1]), &lo, &hi);
+        wf[t][s][0] = (int)lo; wf[t][s][1] = (int)hi;
+      }
 #pragma unroll
     for (int r = 0; r < RT; ++r) {
       const int row = r * 16 + col;               // A fragment: this lane's row in tile r
@@ -205,29 +222,38 @@ void r4d_gemm_mxfp4a8_gemvw_kernel(
           af[s][0] = 0; af[s][1] = 0;
         }
       }
-      mxg_v8f acc = (mxg_v8f)(0.f);
-#pragma unroll
-      for (int s = 0; s < 8; ++s) acc = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(wf[s], af[s], acc);
-      // acc[e]: row (lane & 15) of tile r, column (lane >> 4) * 8 + e -- as the decode epilogue reads it.
       const float sc = ABLK ? (live ? As[(size_t)row * as_rs + ch] : 0.f) : 1.f;
 #pragma unroll
-      for (int e = 0; e < 8; ++e) tot[r][e] = fmaf(acc[e], sc, tot[r][e]);
+      for (int t = 0; t < TN; ++t) {
+        mxg_v8f acc = (mxg_v8f)(0.f);
+#pragma unroll
+        for (int s = 0; s < 8; ++s)
+          acc = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(wf[t][s], af[s], acc);
+        // acc[e]: row (lane & 15) of tile r, column (lane >> 4) * 8 + e -- as the decode epilogue reads it.
+#pragma unroll
+        for (int e = 0; e < 8; ++e) tot[r][t][e] = fmaf(acc[e], sc, tot[r][t][e]);
+      }
     }
   }
+  // One column tile at a time through sP (TN of them would not fit in LDS at four row tiles).
 #pragma unroll
-  for (int r = 0; r < RT; ++r)
+  for (int t = 0; t < TN; ++t) {
+    if (t) __syncthreads();
 #pragma unroll
-    for (int e = 0; e < 8; ++e) sP[wave][r * 16 + col][khalf * 8 + e] = tot[r][e];
-  __syncthreads();
-  for (int idx = threadIdx.x; idx < 16 * RT * 16; idx += KW * 32) {
-    const int m = idx >> 4, c = idx & 15;
-    if (m < M) {
-      float sum = 0.f;
+    for (int r = 0; r < RT; ++r)
 #pragma unroll
-      for (int w = 0; w < KW; ++w) sum += sP[w][m][c];
-      const int cc = nt * 16 + c;
-      const float rf = __int_as_float((int)Wref[cc] << 23);
-      C[(size_t)m * ldc + cc] = (__hip_bfloat16)(ABLK ? sum * rf : sum * rf * As[(size_t)m * as_rs]);
+      for (int e = 0; e < 8; ++e) sP[wave][r * 16 + col][khalf * 8 + e] = tot[r][t][e];
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < 16 * RT * 16; idx += KW * 32) {
+      const int m = idx >> 4, c = idx & 15;
+      if (m < M) {
+        float sum = 0.f;
+#pragma unroll
+        for (int w = 0; w < KW; ++w) sum += sP[w][m][c];
+        const int cc = (nt0 + t) * 16 + c;
+        const float rf = __int_as_float((int)Wref[cc] << 23);
+        C[(size_t)m * ldc + cc] = (__hip_bfloat16)(ABLK ? sum * rf : sum * rf * As[(size_t)m * as_rs]);
+      }
     }
   }
 }
@@ -253,11 +279,16 @@ void mxg_launch(long a, long ascale, long wq, long ws, long wref, long c, int M,
   const dim3 block(R4D_MXG_KW * 32);
   if (K % 128 == 0) {
     const int rt = (M + 15) / 16;
-#define MXW_L(AB_, RT_) hipLaunchKernelGGL((r4d_gemm_mxfp4a8_gemvw_kernel<AB_, RT_>), dim3(tiles), block, 0, \
-                                           st, Ap, Sp, Wp, Zp, Rp, Cp, M, K, as_rs, lda, ldws, ldc)
-#define MXW_AB(RT_) { if (ablk) MXW_L(true, RT_); else MXW_L(false, RT_); }
+    // Two column tiles a block from 25 rows (see the kernel); an odd tile count keeps one.
+    const bool tn2 = M > 24 && tiles % 2 == 0;
+#define MXW_L(AB_, RT_, TN_) hipLaunchKernelGGL((r4d_gemm_mxfp4a8_gemvw_kernel<AB_, RT_, TN_>), \
+                                                dim3(tiles / TN_), block, 0, st, Ap, Sp, Wp, Zp, Rp, \
+                                                Cp, M, K, as_rs, lda, ldws, ldc)
+#define MXW_TN(AB_, RT_) { if (tn2) MXW_L(AB_, RT_, 2); else MXW_L(AB_, RT_, 1); }
+#define MXW_AB(RT_) { if (ablk) MXW_TN(true, RT_) else MXW_TN(false, RT_) }
     if (rt <= 1) MXW_AB(1) else if (rt == 2) MXW_AB(2) else if (rt == 3) MXW_AB(3) else MXW_AB(4)
 #undef MXW_AB
+#undef MXW_TN
 #undef MXW_L
     return;
   }
