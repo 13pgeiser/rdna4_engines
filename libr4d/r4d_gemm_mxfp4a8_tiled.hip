@@ -32,6 +32,13 @@
 // Barriers fence LDS only: __syncthreads() also drains the global load counter, and nothing in
 // global memory is shared between the waves, so the next slab's A loads stay in flight.
 //
+// The weight words and exponents a thread stages are loaded a slab ahead, into registers, right
+// after the staging barrier, so their DRAM round trip runs under the slab's WMMAs instead of in
+// front of the next unpack (+1 VGPR at TN=4; r4d_selftest --perfmx, warmed: Qwen3.8 gate_up at
+// 1024 rows 804 -> 768 us, down 443 -> 417, TranslateGemma down 651 -> 617, attention q|gate
+// 6144 x 5120 306 -> 318; at 2048 rows 0..-4 %). Loading the A fragments a slab ahead too (+38
+// VGPRs) is slower everywhere.
+//
 // Staging is clamped, never predicated: a predicated load gets its own exec-mask region and the
 // compiler cannot carry a counted s_wait_loadcnt across the merge. Clamped loads (tile past M ->
 // last real tile, row past N -> last aligned group) issue back to back; the epilogue drops them.
@@ -156,6 +163,31 @@ __global__ __launch_bounds__(R4D_MXT_NTHR) void r4d_gemm_mxfp4a8_tiled_kernel(
   const unsigned int* __restrict__ Wp = (const unsigned int*)W;
   lds_barrier();   // sMag
 
+  // The slab's weight words and exponents, loaded a slab ahead (the first one here).
+  unsigned int wqn[NW][WSLOTS], wswn[NW];
+  auto wload = [&](int k0) {
+    const int kstep0 = k0 / 16;
+#pragma unroll
+    for (int it = 0; it < NW; ++it) {
+      const unsigned int* src =
+          &Wp[((size_t)(wrc[it] >> 4) * ksteps + kstep0 + wkst[it]) * 32 + wlanec[it]];
+      const int blk = (k0 + wkst[it] * 16) / R4D_MXFP4_GROUP;
+      if constexpr (WSLOTS == 4) {
+        const mxt_u4 v = *(const mxt_u4*)src;
+        wqn[it][0] = v[0]; wqn[it][1] = v[1]; wqn[it][2] = v[2]; wqn[it][3] = v[3];
+        wswn[it] = *(const unsigned int*)(Ws + (size_t)blk * ldws + wrc[it]);
+      } else if constexpr (WSLOTS == 2) {
+        const mxt_u2 v = *(const mxt_u2*)src;
+        wqn[it][0] = v[0]; wqn[it][1] = v[1];
+        wswn[it] = *(const unsigned short*)(Ws + (size_t)blk * ldws + wrc[it]);
+      } else {
+        wqn[it][0] = *src;
+        wswn[it] = Ws[(size_t)blk * ldws + wrc[it]];
+      }
+    }
+  };
+  wload(0);
+
   for (int k0 = 0; k0 < K; k0 += LBK) {
     // ABLK: at a 128 boundary each row's ratio goes to LDS, published by the staging barrier below
     // (sR's previous readers finished before the last slab's closing barrier). A zero block keeps
@@ -173,36 +205,20 @@ __global__ __launch_bounds__(R4D_MXT_NTHR) void r4d_gemm_mxfp4a8_tiled_kernel(
       for (int st = 0; st < NS; ++st)
         af[i][st] = *(const mxt_v2i*)(abase[i] +
                                       (aoff + (unsigned int)(k0 * 16) + (unsigned int)(st * 256)));
-    // W slab -> LDS, folded to e4m3.
-    const int kstep0 = k0 / 16;
+    // W slab -> LDS, folded to e4m3, from the words loaded a slab ago.
 #pragma unroll
     for (int it = 0; it < NW; ++it) {
-      const unsigned int* src =
-          &Wp[((size_t)(wrc[it] >> 4) * ksteps + kstep0 + wkst[it]) * 32 + wlanec[it]];
-      const int blk = (k0 + wkst[it] * 16) / R4D_MXFP4_GROUP;
-      unsigned int wq[WSLOTS], wsw;
-      if constexpr (WSLOTS == 4) {
-        const mxt_u4 v = *(const mxt_u4*)src;
-        wq[0] = v[0]; wq[1] = v[1]; wq[2] = v[2]; wq[3] = v[3];
-        wsw = *(const unsigned int*)(Ws + (size_t)blk * ldws + wrc[it]);
-      } else if constexpr (WSLOTS == 2) {
-        const mxt_u2 v = *(const mxt_u2*)src;
-        wq[0] = v[0]; wq[1] = v[1];
-        wsw = *(const unsigned short*)(Ws + (size_t)blk * ldws + wrc[it]);
-      } else {
-        wq[0] = *src;
-        wsw = Ws[(size_t)blk * ldws + wrc[it]];
-      }
 #pragma unroll
       for (int q = 0; q < WSLOTS; ++q) {
         const int d = r4d_mxfp4_fold_d((int)((wref[it] >> (8 * q)) & 0xFF),
-                                       (int)((wsw >> (8 * q)) & 0xFF));
+                                       (int)((wswn[it] >> (8 * q)) & 0xFF));
         unsigned int lo, hi;
-        r4d_mxfp4_unpack8_t(wq[q], sMag[d * 2], sMag[d * 2 + 1], &lo, &hi);
+        r4d_mxfp4_unpack8_t(wqn[it][q], sMag[d * 2], sMag[d * 2 + 1], &lo, &hi);
         *(mxt_u2*)(&sW[(wrow[it] + q) * STR + wkloc[it]]) = mxt_u2{lo, hi};
       }
     }
     lds_barrier();
+    if (k0 + LBK < K) wload(k0 + LBK);   // the next slab's weight flies across this slab's WMMAs
 
     if constexpr (ABLK) {
       // Re-express each row's partial sum in the new block's scale: one ratio a lane a row.
