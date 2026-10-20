@@ -6889,9 +6889,25 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // The native A3B port is a new module, not a historical P0 or S1 row.
+        // Keep the earlier inventory cohorts and their membership guards intact.
+        const NATIVE_A3B_ADDED_MODULES: [&str; 1] =
+            ["attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201"];
+        for module in NATIVE_A3B_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing native A3B module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
-            count + PRE_S1_ADDED_SINCE_P0 + S1_ADDED_MODULES.len(),
+            count + PRE_S1_ADDED_SINCE_P0 + S1_ADDED_MODULES.len() + NATIVE_A3B_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name
