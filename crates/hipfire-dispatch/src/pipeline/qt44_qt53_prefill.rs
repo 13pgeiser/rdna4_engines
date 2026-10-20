@@ -916,6 +916,30 @@ pub(crate) fn shared_down(
     {
         return Ok(());
     }
+    // Opt-in fused epilogue (`HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI`): an MQ4G256V2
+    // down over the F32 hidden, no BF16 round trip, and no other consumer of the
+    // unfused down rows (`shared_down_out` is the EP row gather's / another
+    // stage's input). The V3 IU4 ADD entry applies `target += sigmoid(scalar) *
+    // down` itself, replacing the temp GEMM and the gated add below. A declined
+    // call returns false with no tap and no launch and the incumbent runs.
+    if down.dtype == DType::MQ4G256V2
+        && hidden.dtype == DType::F32
+        && !p.recipe.bf16_round_trip()
+        && p.shared_down_out.is_none()
+        && super::prefill_shared_down_sigmoid_epi_admitted(gpu, p)
+        && hip(gpu.try_gemm_mq4g256v2_shared_down_sigmoid_epi(
+            down.buf,
+            &hidden,
+            None,
+            target,
+            shared.scalar,
+            down.m,
+            down.k,
+            p.batch_size,
+        ))?
+    {
+        return Ok(());
+    }
     let out = f32_view(
         p.shared_down_out.unwrap_or(p.down_expanded),
         0,

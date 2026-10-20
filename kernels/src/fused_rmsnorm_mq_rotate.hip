@@ -127,6 +127,9 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
     int K,
     float eps,
     int N
+#ifdef HIPFIRE_IU4_RUNTIME_CAND
+    , int cand_mode                     // 0: compiled emit (legacy); 8: exact reference8
+#endif
 #elif defined(HIPFIRE_FP8_STREAM)
     float* __restrict__ x_rot,          // [N, K] f32, always written (v1)
     unsigned char* __restrict__ x_fp8,  // [N, K] E4M3, standalone-pack layout
@@ -516,6 +519,16 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
             *reinterpret_cast<float4*>(x_rot_b + base + 4) = out1;
         }
         // token = blockIdx.x; N is the batch extent for [K/128, N] layout.
+#ifdef HIPFIRE_IU4_RUNTIME_CAND
+        // Wave-uniform kernel arg: 8 = standalone-quantizer reference through
+        // the shared `emit_iu4_sidecar_from_producer8<true>`; else the
+        // compiled emit below, unchanged. The f32 body above is shared.
+        if (cand_mode == 8) {
+            emit_iu4_sidecar_from_producer8<true>(
+                f0, f1, f2, f3, f4, f5, f6, f7,
+                x_i4, group, (int)blockIdx.x, N, lane_id);
+        } else
+#endif
         emit_iu4_sidecar_from_producer8(
             f0, f1, f2, f3, f4, f5, f6, f7,
             x_i4, group, (int)blockIdx.x, N, lane_id);

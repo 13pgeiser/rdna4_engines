@@ -13,6 +13,27 @@ Typed configuration schema and deterministic layer resolution for the operator p
 - DS4-specific knobs must never alter Qwen or the process-wide mixed-arch policy; respect the per-field scoping in `lib.rs`.
 - `mtp_mode_admits` / `mtp_effective_mode[_name]` / `mtp_no_floor_decline_line` are the one pure producer-capability gate for `speculation.mtp = auto`: `auto` arms only a producer whose crate declares `MTP_MEASURED_AR_FLOOR = true` (Qwen4); `on` always arms, `off` never. The host-spill policy (`mtp_host_spill_policy`) only narrows an already admitted mode. Keep the gate arch-blind: no tag or card names.
 - The registered `prefill.chunk_rows` value (`512`) is a schema fallback that the process config does not export; per-arch and per-model defaults (Qwen35 dense 8192, resident Qwen35 MoE memory-aware 4096) live in the arch crates.
+- A3B prefill's 15 carried keys are registered in [`src/lib.rs`](src/lib.rs) in `TYPED_BOOL_DEVELOPER_KEYS`; [`src/intent.rs`](src/intent.rs) classifies their operator intent. They accept `true`/`false`/`1`/`0` (invalid values are rejected when the layer is built). An unset `developer_typed_bool` lookup is `None`, not a schema default; consumers resolve it through [`rdna-compute/src/prefill_route_capabilities.rs`](../rdna-compute/src/prefill_route_capabilities.rs), then apply their existing inventory/shape/state gates. Existing typed keys, including `developer.qwen4_slowlink_prefill`, are unchanged.
+
+  | Typed developer key | Environment flag | Consumer route / prerequisite |
+  | --- | --- | --- |
+  | `developer.gdn_qk_indexed` | `HIPFIRE_GDN_QK_INDEXED` | `GdnQkIndexed`; raw-Q/K indexed sequential Q8 GDN launch |
+  | `developer.gdn_moe_pre_fused` | `HIPFIRE_GDN_MOE_PRE_FUSED` | `GdnMoePreFused`; fused MoE GDN preamble |
+  | `developer.gdn_moe_chunk_scan` | `HIPFIRE_GDN_MOE_CHUNK_SCAN` | `GdnMoeChunkScan`; generalized MoE scan with common and per-layer admission |
+  | `developer.moe_router_fused_prefill` | `HIPFIRE_MOE_ROUTER_FUSED_PREFILL` | `MoeRouterFusedPrefill`; sealed fused router |
+  | `developer.moe_shared_prepared_iu4` | `HIPFIRE_MOE_SHARED_PREPARED_IU4` | `MoeSharedPreparedIu4`; same-activation router/shared token reuse |
+  | `developer.fa_prefill_pm` | `HIPFIRE_FA_PREFILL_PM` | `FaPrefillPm`; PM attention, resolved per KV codec |
+  | `developer.moe_router_topk_multirow` | `HIPFIRE_MOE_ROUTER_TOPK_MULTIROW` | `MoeRouterTopkMultirow` (F4); nested beneath the admitted fused router |
+  | `developer.moe_combine_v2` | `HIPFIRE_MOE_COMBINE_V2` | `MoeCombineV2` (F1); admitted IU4 expert combine |
+  | `developer.moe_iu4_wide_tiles` | `HIPFIRE_MOE_IU4_WIDE_TILES` | `MoeIu4WideTiles` (F2); resident NT8 gate/up, resident down remains NT4 |
+  | `developer.prefill_iu4_producer_fused` | `HIPFIRE_PREFILL_IU4_PRODUCER_FUSED` | `PrefillIu4ProducerFused` (F3); exact eight-candidate IU4 producer |
+  | `developer.fa_prefill_pm_qprep` | `HIPFIRE_FA_PREFILL_PM_QPREP` | `FaPrefillPmQprep` (F5); nested beneath PM attention for the same codec |
+  | `developer.moe_rotate_i4_pm` | `HIPFIRE_MOE_ROTATE_I4_PM` | `MoeRotateI4Pm`; opt-in PM down-A4 producer beneath the symmetric IU4 route |
+  | `developer.prefill_iu4_c8_pm` | `HIPFIRE_PREFILL_IU4_C8_PM` | `PrefillIu4C8Pm`; opt-in PM C8 producers beneath resolved F3 |
+  | `developer.gdn_chunk_prep_pm` | `HIPFIRE_GDN_CHUNK_PREP_PM` | `GdnChunkPrepPm`; opt-in PM prep nested beneath admitted 16/32 MoE chunk scan |
+  | `developer.moe_shared_down_sigmoid_epi` | `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI` | `MoeSharedDownSigmoidEpi`; opt-in shared-down HIP V3 epilogue |
+
+- The first eleven routes retain their accepted exact-gfx1201 `QUALIFIED` rows; explicit `0` kills and `1` opts in only where admission permits. PM attention and F5 resolve via `Gpu::fa_prefill_pm_flag` / `fa_prefill_pm_qprep_flag` for the actual codec: Q8 keeps those defaults, but `FP8_KV_QUALIFIED` is empty, so native FP8 needs explicit PM `1` and, for F5, explicit Q-prep `1` too. A parent PM `0` always refuses F5. The four late-H routes have raw inventory only, no qualified row: unset is off everywhere. These keys neither select the KV storage mode nor promote native FP8 or late-H defaults.
 
 ## Crate map
 

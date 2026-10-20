@@ -275,11 +275,23 @@ pub fn run(
             256,
             &mut args,
         )?;
-        gpu.gdn_chunk_kkt_solve_batched(&k, p.gate, p.beta, &s.a, n)?;
+        gpu.gdn_chunk_kkt_solve_batched(&k, p.gate, p.beta, &s.a, n, p.key_heads, p.value_heads)?;
         let codes = raw(p.state, 0, 48 * 128 * 128);
         let scales = raw(p.state, 48 * 128 * 128, 48 * 128 * 4);
         gpu.gdn_chunk_scan_layer_mseg(
-            &q, &k, &v, &s.a, p.gate, p.beta, &codes, &scales, ef_plane, &out, n,
+            &q,
+            &k,
+            &v,
+            &s.a,
+            p.gate,
+            p.beta,
+            &codes,
+            &scales,
+            ef_plane,
+            &out,
+            n,
+            p.key_heads,
+            p.value_heads,
         )
     })();
     SCRATCH.with(|c| c.borrow_mut().push((gpu.device_id, s)));

@@ -153,10 +153,24 @@ __global__ void HIPFIRE_GDN_KERNEL(
     int head_dim,
     unsigned int frame,
     __half* __restrict__ s_ef_residual
+#if HIPFIRE_GDN_QK_HEAD_DIV == 1
+    // Runtime Q/K head ratio (n_heads / qk_heads): Q/K token stride is
+    // (n_heads / qk_head_ratio) * HD and state head h reads Q/K head
+    // h / qk_head_ratio (same mapping as repeat_interleave_qk_f32_batched).
+    // 1 = Q/K already expanded to n_heads (legacy layout). Compile-time
+    // compact builds (HIPFIRE_GDN_QK_HEAD_DIV != 1) keep their 13-arg ABI.
+    ,
+    int qk_head_ratio
+#endif
 ) {
     const int h = blockIdx.x;
     const int tile = blockIdx.y;
     const int lane = blockIdx.z;
+#endif
+#if HIPFIRE_GDN_QK_HEAD_DIV == 1 && !defined(HIPFIRE_GDN_LAYER_TABLE)
+    const int qk_ratio = qk_head_ratio;
+#else
+    const int qk_ratio = HIPFIRE_GDN_QK_HEAD_DIV;
 #endif
     if (h >= n_heads) return;
 #if HIPFIRE_GDN_WAVES_PER_BLOCK == 2
@@ -166,9 +180,9 @@ __global__ void HIPFIRE_GDN_KERNEL(
     const int tid = threadIdx.x;
 #endif
     const int stride = n_heads * HD;
-    const int qk_heads = n_heads / HIPFIRE_GDN_QK_HEAD_DIV;
+    const int qk_heads = n_heads / qk_ratio;
     const int qk_stride = qk_heads * HD;
-    const int qk_head = h / HIPFIRE_GDN_QK_HEAD_DIV;
+    const int qk_head = h / qk_ratio;
 #if HIPFIRE_GDN_WAVES_PER_BLOCK == 2
     const int row_start = tile * (TILE_ROWS * 2) + wave * TILE_ROWS;
 #else

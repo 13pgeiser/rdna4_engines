@@ -8,8 +8,13 @@
 //   - fused RMSNorm/FWHT and SwiGLU/FWHT IU4 producer sidecars (C2)
 //
 // Do not edit a second copy of the amax / 8-candidate MSE / rintf+clamp /
-// integer-sum path. Every consumer of this fragment must remain bit-identical
-// on the 72-byte block_i4_128 layout.
+// integer-sum path. Every consumer of this fragment shares that one recipe on
+// the 72-byte block_i4_128 layout. Bytes are identical only between consumers
+// that run the same candidate policy: the standalone quantizer and the
+// `emit_iu4_sidecar_from_producer8<true>` reference use the 8-candidate
+// `quantize_block_i4_128_wave<false>` body, while the producers' compiled
+// emit uses `IU4_A4_CANDIDATES` (RTN / {5,7} / C2 one-pass) and may differ
+// from it.
 
 #ifndef HIPFIRE_BLOCK_I4_128_QUANT_HIP
 #define HIPFIRE_BLOCK_I4_128_QUANT_HIP
@@ -382,6 +387,13 @@ __device__ __forceinline__ void emit_iu4_sidecar_c2_gfx12(
 // Producer lane p holds values 8p..8p+7. For half h∈{0,1}:
 //   source lane = 16*h + (l >> 1); even l → first float4, odd l → second.
 // Sidecar index: (2*group + h)*N + token.
+//
+// `Exact` (default false = the compiled producer emit, unchanged) selects, at
+// runtime-arg call sites only, the standalone-quantizer reference: it bypasses
+// the one-pass C2 emit and runs this same remap into
+// `quantize_block_i4_128_wave<false>` (the 8-candidate search the standalone
+// `quantize_int4_mmq_ds128` uses). No second quant recipe.
+template <bool Exact = false>
 __device__ __forceinline__ void emit_iu4_sidecar_from_producer8(
     float f0, float f1, float f2, float f3,
     float f4, float f5, float f6, float f7,
@@ -391,38 +403,49 @@ __device__ __forceinline__ void emit_iu4_sidecar_from_producer8(
     int N,
     int lane
 ) {
+#if defined(HIPFIRE_IU4_SLAB)
+    static_assert(!Exact, "Exact reference emit writes the AoS block_i4_128 layout, not the slab");
+#endif
 #if defined(HIPFIRE_IU4_C2_ONEPASS)
-    const float x[8] = {f0, f1, f2, f3, f4, f5, f6, f7};
-    emit_iu4_sidecar_c2_gfx12(x, Y, group, token, N, lane);
+    if constexpr (!Exact) {
+        const float x[8] = {f0, f1, f2, f3, f4, f5, f6, f7};
+        emit_iu4_sidecar_c2_gfx12(x, Y, group, token, N, lane);
+    } else
 #else
 #if defined(HIPFIRE_IU4_SLAB) && defined(__HIP_DEVICE_COMPILE__)
 #error "HIPFIRE_IU4_SLAB is emitted only by the one-pass IU4_A4_CANDIDATES=2 path"
 #endif
-    #pragma unroll
-    for (int h = 0; h < 2; ++h) {
-        const int src = 16 * h + (lane >> 1);
-        float s0 = __shfl(f0, src, 32);
-        float s1 = __shfl(f1, src, 32);
-        float s2 = __shfl(f2, src, 32);
-        float s3 = __shfl(f3, src, 32);
-        float s4 = __shfl(f4, src, 32);
-        float s5 = __shfl(f5, src, 32);
-        float s6 = __shfl(f6, src, 32);
-        float s7 = __shfl(f7, src, 32);
-        float xv[4];
-        if ((lane & 1) == 0) {
-            xv[0] = s0; xv[1] = s1; xv[2] = s2; xv[3] = s3;
-        } else {
-            xv[0] = s4; xv[1] = s5; xv[2] = s6; xv[3] = s7;
-        }
-        block_i4_128* out = Y + (long long)(2 * group + h) * N + token;
+#endif
+    {
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int src = 16 * h + (lane >> 1);
+            float s0 = __shfl(f0, src, 32);
+            float s1 = __shfl(f1, src, 32);
+            float s2 = __shfl(f2, src, 32);
+            float s3 = __shfl(f3, src, 32);
+            float s4 = __shfl(f4, src, 32);
+            float s5 = __shfl(f5, src, 32);
+            float s6 = __shfl(f6, src, 32);
+            float s7 = __shfl(f7, src, 32);
+            float xv[4];
+            if ((lane & 1) == 0) {
+                xv[0] = s0; xv[1] = s1; xv[2] = s2; xv[3] = s3;
+            } else {
+                xv[0] = s4; xv[1] = s5; xv[2] = s6; xv[3] = s7;
+            }
+            block_i4_128* out = Y + (long long)(2 * group + h) * N + token;
+            if constexpr (Exact) {
+                quantize_block_i4_128_wave<false>(xv, out, lane);
+            } else {
 #if defined(__gfx1201__) || defined(__gfx1100__) || defined(__gfx1151__)
-        quantize_block_i4_128_wave<true>(xv, out, lane);
+                quantize_block_i4_128_wave<true>(xv, out, lane);
 #else
-        quantize_block_i4_128_wave<false>(xv, out, lane);
+                quantize_block_i4_128_wave<false>(xv, out, lane);
 #endif
+            }
+        }
     }
-#endif
 }
 
 // Standalone quantizer: same (X, Y, K, N) contract as

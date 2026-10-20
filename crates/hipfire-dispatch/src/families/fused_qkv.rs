@@ -226,6 +226,37 @@ pub struct FusedQkvBiasParams<'a> {
     pub bias: [&'a GpuTensor; 3],
 }
 
+/// Operands of the opt-in exact-gfx1201 RMSNorm/FWHT + `block_i4_128` producer
+/// that feeds a prepared uniform-MQ4V2 QKV (`FusedQkvMq4G256V2`) or QKVZA
+/// (`FusedQkvzaMq4G256V2`) projection
+/// (`HIPFIRE_PREFILL_IU4_PRODUCER_FUSED`). The F32 `x_rot` store is always
+/// written so every downstream reader (calibration tap, small tails) sees the
+/// same bytes as the unprepared route.
+pub struct FusedQkvIu4RmsnormParams<'a> {
+    pub kind: KernelKey,
+    pub x: &'a GpuTensor,
+    pub norm_weight: &'a GpuTensor,
+    pub awq: Option<&'a GpuTensor>,
+    pub x_rot: &'a GpuTensor,
+    pub k: usize,
+    pub eps: f32,
+    pub batch_size: usize,
+}
+
+/// Operands of a prepared-IU4 fused QKV / QKVZA consumer. `x_rot` is the F32
+/// rotated activation the producer also emitted: the family's calibration taps
+/// read it exactly as the unprepared arm reads its input.
+pub struct FusedQkvIu4PreparedParams<'a> {
+    pub kind: KernelKey,
+    pub weights: &'a [&'a GpuTensor],
+    pub x_rot: &'a GpuTensor,
+    pub prepared: &'a rdna_compute::Int4MmqPrepared,
+    pub outputs: &'a [&'a GpuTensor],
+    pub m: &'a [usize],
+    pub k: usize,
+    pub batch_size: usize,
+}
+
 pub struct FusedQkvFamily {
     registry: KernelRegistry,
 }
@@ -272,11 +303,124 @@ impl FusedQkvFamily {
         self.resolve(params.kind, ctx, None)?;
         dispatch_fused_qkv_with_qwen2_bias(gpu, params)
     }
+
+    /// Opt-in exact IU4 RMSNorm producer for a prepared QKV / QKVZA consumer.
+    /// Resolves `params.kind` through the registry like [`Self::run`], reserves
+    /// the IU4 sidecar and seals it into a prepared handle.
+    pub fn emit_rmsnorm_iu4_exact(
+        &self,
+        ctx: &DispatchCtx,
+        gpu: &mut Gpu,
+        params: &FusedQkvIu4RmsnormParams,
+    ) -> Result<rdna_compute::Int4MmqPrepared, DispatchError> {
+        self.resolve(params.kind, ctx, None)?;
+        require_iu4_prepared_kind(params.kind)?;
+        let reservation = hip!(gpu.reserve_int4_mmq(params.k, params.batch_size))?;
+        hip!(gpu.fused_rmsnorm_rotate_mq_i4_gfx12_exact_batched(
+            params.x,
+            params.norm_weight,
+            params.awq,
+            Some(params.x_rot),
+            reservation,
+            params.k,
+            params.eps,
+            params.batch_size,
+        ))
+    }
+
+    /// Prepared-IU4 twin of [`Self::run`] for uniform MQ4V2 QKV / QKVZA with
+    /// `Some(n)` batch size. The prepared consumers neither tap nor note the
+    /// F16 receipt, so this performs both once (one tap per constituent weight
+    /// in projection order on the F32 `x_rot`, then the receipt) before the
+    /// prepared GEMMs, matching the unprepared arm.
+    pub fn run_iu4_prepared(
+        &self,
+        ctx: &DispatchCtx,
+        gpu: &mut Gpu,
+        params: &FusedQkvIu4PreparedParams,
+    ) -> Result<(), DispatchError> {
+        self.resolve(params.kind, ctx, None)?;
+        require_iu4_prepared_kind(params.kind)?;
+        guard_fused_qkv_dtype_key(params.weights, params.kind)?;
+        let (x, k, n) = (params.x_rot, params.k, params.batch_size);
+        match params.kind {
+            KernelKey::FusedQkvMq4G256V2 => {
+                let [wq, wk, wv] = <[&GpuTensor; 3]>::try_from(params.weights)
+                    .map_err(|_| err_wrong_arity(params.kind, 3))?;
+                let [q, kout, v] = <[&GpuTensor; 3]>::try_from(params.outputs)
+                    .map_err(|_| err_wrong_arity(params.kind, 3))?;
+                let [mq, mk, mv] = <[usize; 3]>::try_from(params.m)
+                    .map_err(|_| err_wrong_arity(params.kind, 3))?;
+                gpu.maybe_capture_activation(wq, x, n, k);
+                gpu.maybe_capture_activation(wk, x, n, k);
+                gpu.maybe_capture_activation(wv, x, n, k);
+                gpu.iu4_verify_note_f16();
+                hip!(gpu.gemm_qkv_mq4g256v2_wmma_iu4_prepared(
+                    wq,
+                    wk,
+                    wv,
+                    params.prepared,
+                    q,
+                    kout,
+                    v,
+                    mq,
+                    mk,
+                    mv,
+                    k,
+                    n,
+                ))
+            }
+            KernelKey::FusedQkvzaMq4G256V2 => {
+                let [wqkv, wz, w_beta, w_alpha] = <[&GpuTensor; 4]>::try_from(params.weights)
+                    .map_err(|_| err_wrong_arity(params.kind, 4))?;
+                let [qkv, z, beta, alpha] = <[&GpuTensor; 4]>::try_from(params.outputs)
+                    .map_err(|_| err_wrong_arity(params.kind, 4))?;
+                let [mqkv, mz, mbeta, malpha] = <[usize; 4]>::try_from(params.m)
+                    .map_err(|_| err_wrong_arity(params.kind, 4))?;
+                gpu.maybe_capture_activation(wqkv, x, n, k);
+                gpu.maybe_capture_activation(wz, x, n, k);
+                gpu.maybe_capture_activation(w_beta, x, n, k);
+                gpu.maybe_capture_activation(w_alpha, x, n, k);
+                gpu.iu4_verify_note_f16();
+                hip!(gpu.gemm_qkvza_mq4g256v2_wmma_iu4_prepared(
+                    wqkv,
+                    wz,
+                    w_beta,
+                    w_alpha,
+                    x,
+                    params.prepared,
+                    qkv,
+                    z,
+                    beta,
+                    alpha,
+                    mqkv,
+                    mz,
+                    mbeta,
+                    malpha,
+                    k,
+                    n,
+                ))
+            }
+            other => Err(err_wrong_arity(other, 0)),
+        }
+    }
 }
 
 impl KernelFamily for FusedQkvFamily {
     fn name(&self) -> &'static str {
         "fused_qkv"
+    }
+}
+
+/// The prepared-IU4 entry points exist only for the uniform MQ4V2 QKV and
+/// QKVZA keys; any other key is a caller error.
+fn require_iu4_prepared_kind(kind: KernelKey) -> Result<(), DispatchError> {
+    match kind {
+        KernelKey::FusedQkvMq4G256V2 | KernelKey::FusedQkvzaMq4G256V2 => Ok(()),
+        other => Err(DispatchError::Hip(format!(
+            "fused_qkv prepared IU4: key {other:?} has no prepared IU4 consumer \
+             (only FusedQkvMq4G256V2 / FusedQkvzaMq4G256V2)"
+        ))),
     }
 }
 

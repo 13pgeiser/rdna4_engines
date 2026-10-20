@@ -19,6 +19,15 @@
 //! `v = f32::from_bits((y[slot * dim + m] as u32) << 16)`;
 //! `acc = fma(w, v, acc)`. Then
 //! `x_residual[t * dim + m] = RN(x_residual[t * dim + m] + acc)`.
+//!
+//! v2 ([`Gpu::moe_down_combine_grouped_bf16in_v2_pm`], separate bundle
+//! `kernels/moe_slot_ops_v2_pm_gfx1201.hxaco`, symbol
+//! `moe_down_combine_grouped_bf16in_v2_pm_gfx1201`) has the same operands and
+//! per-column arithmetic, but each of the 256 lanes owns eight contiguous
+//! columns (one 16-byte BF16 group per slot), so the slot index and weight are
+//! uniform per wave and reused across the eight columns. Grid
+//! `[n_tokens, dim / 2048, 1]`; `dim` a positive multiple of 2048. It is
+//! selected only by `HIPFIRE_MOE_COMBINE_V2` (`PrefillRoute::MoeCombineV2`).
 
 use std::ffi::c_void;
 
@@ -31,10 +40,17 @@ use hip_bridge::HipResult;
 /// (`peacemaker-isa emit --kernel moe_down_combine_grouped_bf16in_pm --arch gfx1201`).
 pub const MOE_DOWN_COMBINE_BF16IN_PM_GFX1201_SYMBOL: &str =
     "moe_down_combine_grouped_bf16in_pm_gfx1201";
-/// Threads per workgroup (one output column per thread).
+/// Threads per workgroup (v1: one output column per thread; v2: eight
+/// contiguous columns per thread).
 pub const MOE_DOWN_COMBINE_BF16IN_BLOCK: u32 = 256;
 /// Largest `k_top` the kernel's fixed-order accumulation is certified for.
 pub const MOE_DOWN_COMBINE_BF16IN_MAX_K_TOP: usize = 8;
+/// Module key and device symbol of the grouped BF16-input down combine v2
+/// twin (bundle `kernels/moe_slot_ops_v2_pm_gfx1201.hxaco`).
+pub const MOE_DOWN_COMBINE_BF16IN_V2_PM_GFX1201_SYMBOL: &str =
+    "moe_down_combine_grouped_bf16in_v2_pm_gfx1201";
+/// Output columns of one v2 workgroup: 256 lanes x eight contiguous columns.
+pub const MOE_DOWN_COMBINE_V2_COLS_PER_BLOCK: usize = 2048;
 /// HIP's grid y extent limit.
 const GRID_Y_MAX: usize = 65_535;
 
@@ -45,6 +61,19 @@ fn moe_slot_ops_kernel(arch: &str) -> Option<(&'static [u8], &'static str)> {
         "gfx1201" => Some((
             kernels::MOE_SLOT_OPS_PM_GFX1201,
             MOE_DOWN_COMBINE_BF16IN_PM_GFX1201_SYMBOL,
+        )),
+        _ => None,
+    }
+}
+
+/// Embedded image and device symbol (also the module key) of the v2 combine
+/// bundle for `arch`; `None` where no builder object exists. The anchor of
+/// `PrefillRoute::MoeCombineV2`'s raw inventory.
+pub(crate) fn moe_slot_ops_v2_kernel(arch: &str) -> Option<(&'static [u8], &'static str)> {
+    match arch {
+        "gfx1201" => Some((
+            kernels::MOE_SLOT_OPS_V2_PM_GFX1201,
+            MOE_DOWN_COMBINE_BF16IN_V2_PM_GFX1201_SYMBOL,
         )),
         _ => None,
     }
@@ -63,15 +92,16 @@ pub(crate) struct MoeDownCombineGeometry {
     pub grid_y: u32,
 }
 
-/// Host-side domain check of the combine launch (pure). Every extent must fit
-/// the kernarg `u32`s, every byte span must stay below 2^32 (the kernel
-/// addresses with 32-bit byte offsets), `k_top` is `1..=8`, and the grid must fit.
-pub(crate) fn validate_moe_down_combine(
+/// Extent checks shared by both combine twins (pure). Every extent must fit
+/// the kernarg `u32`s, every byte span must stay below 2^32 (the kernels
+/// address with 32-bit byte offsets) and `k_top` is `1..=8`. Returns
+/// `(y_bytes, slot_bytes, residual_bytes)`.
+fn validate_moe_down_combine_extents(
     dim: usize,
     k_top: usize,
     n_tokens: usize,
     grouped_rows: usize,
-) -> Result<MoeDownCombineGeometry, String> {
+) -> Result<(usize, usize, usize), String> {
     if !(1..=MOE_DOWN_COMBINE_BF16IN_MAX_K_TOP).contains(&k_top) {
         return Err(format!("k_top {k_top} is outside 1..=8"));
     }
@@ -96,6 +126,19 @@ pub(crate) fn validate_moe_down_combine(
     let y_bytes = span([grouped_rows, dim, 2], "y_grouped_bf16")?;
     let slot_bytes = span([n_tokens, k_top, 4], "inverse_perm/topk_weights")?;
     let residual_bytes = span([n_tokens, dim, 4], "x_residual")?;
+    Ok((y_bytes, slot_bytes, residual_bytes))
+}
+
+/// Host-side domain check of the v1 combine launch (pure): the shared extent
+/// checks, and the grid must fit.
+pub(crate) fn validate_moe_down_combine(
+    dim: usize,
+    k_top: usize,
+    n_tokens: usize,
+    grouped_rows: usize,
+) -> Result<MoeDownCombineGeometry, String> {
+    let (y_bytes, slot_bytes, residual_bytes) =
+        validate_moe_down_combine_extents(dim, k_top, n_tokens, grouped_rows)?;
     let grid_y = dim.div_ceil(MOE_DOWN_COMBINE_BF16IN_BLOCK as usize);
     if grid_y > GRID_Y_MAX {
         return Err(format!("grid y {grid_y} exceeds {GRID_Y_MAX}"));
@@ -106,6 +149,46 @@ pub(crate) fn validate_moe_down_combine(
         residual_bytes,
         grid_y: grid_y as u32,
     })
+}
+
+/// Host-side domain check of the v2 combine launch (pure): the shared extent
+/// checks, `dim` a positive multiple of [`MOE_DOWN_COMBINE_V2_COLS_PER_BLOCK`]
+/// (256 lanes x eight contiguous columns), grid y `dim / 2048` must fit.
+pub(crate) fn validate_moe_down_combine_v2(
+    dim: usize,
+    k_top: usize,
+    n_tokens: usize,
+    grouped_rows: usize,
+) -> Result<MoeDownCombineGeometry, String> {
+    let (y_bytes, slot_bytes, residual_bytes) =
+        validate_moe_down_combine_extents(dim, k_top, n_tokens, grouped_rows)?;
+    if dim % MOE_DOWN_COMBINE_V2_COLS_PER_BLOCK != 0 {
+        return Err(format!(
+            "dim {dim} is not a multiple of {MOE_DOWN_COMBINE_V2_COLS_PER_BLOCK}"
+        ));
+    }
+    let grid_y = dim / MOE_DOWN_COMBINE_V2_COLS_PER_BLOCK;
+    if grid_y > GRID_Y_MAX {
+        return Err(format!("grid y {grid_y} exceeds {GRID_Y_MAX}"));
+    }
+    Ok(MoeDownCombineGeometry {
+        y_bytes,
+        slot_bytes,
+        residual_bytes,
+        grid_y: grid_y as u32,
+    })
+}
+
+/// Whether the v2 combine accepts this launch shape (pure; no device, no
+/// kernel image): `dim` a positive multiple of 2048, `k_top` in `1..=8`, and
+/// the v1 extent limits. The dispatch selection consults it before choosing v2.
+pub fn moe_combine_v2_shape_supported(
+    dim: usize,
+    k_top: usize,
+    n_tokens: usize,
+    grouped_rows: usize,
+) -> bool {
+    validate_moe_down_combine_v2(dim, k_top, n_tokens, grouped_rows).is_ok()
 }
 
 impl Gpu {
@@ -138,20 +221,75 @@ impl Gpu {
         n_tokens: usize,
         grouped_rows: usize,
     ) -> HipResult<()> {
+        let kernel = moe_slot_ops_kernel(&self.arch);
+        self.moe_down_combine_launch(
+            "moe_down_combine_grouped_bf16in_pm",
+            kernel,
+            validate_moe_down_combine,
+            [y_grouped_bf16, inverse_perm, topk_weights, x_residual],
+            [dim, k_top, n_tokens, grouped_rows],
+        )
+    }
+
+    /// This device has the embedded v2 builder object of the combine
+    /// (`kernels::MOE_SLOT_OPS_V2_PM_GFX1201` on gfx1201; every other arch: no).
+    pub fn moe_combine_v2_available(&self) -> bool {
+        moe_slot_ops_v2_kernel(&self.arch).is_some()
+    }
+
+    /// Grouped BF16-input down combine v2, certified builder kernel
+    /// ([`MOE_DOWN_COMBINE_BF16IN_V2_PM_GFX1201_SYMBOL`], bundle
+    /// `kernels::MOE_SLOT_OPS_V2_PM_GFX1201`), stream-ordered on the active
+    /// stream. Same operands, kernarg layout and arithmetic as
+    /// [`Gpu::moe_down_combine_grouped_bf16in_pm`] (each output `+0`, ascending
+    /// `k`, unsigned skip of `slot >= grouped_rows`, `fma(w, bf16, acc)`, final
+    /// `residual + acc`); each lane owns eight contiguous columns. `dim` must be
+    /// a positive multiple of 2048 and `k_top` in `1..=8`
+    /// ([`moe_combine_v2_shape_supported`]). Grid
+    /// `[n_tokens, dim / 2048, 1]`, block `[256, 1, 1]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_down_combine_grouped_bf16in_v2_pm(
+        &mut self,
+        y_grouped_bf16: &GpuTensor,
+        inverse_perm: &GpuTensor,
+        topk_weights: &GpuTensor,
+        x_residual: &GpuTensor,
+        dim: usize,
+        k_top: usize,
+        n_tokens: usize,
+        grouped_rows: usize,
+    ) -> HipResult<()> {
+        let kernel = moe_slot_ops_v2_kernel(&self.arch);
+        self.moe_down_combine_launch(
+            "moe_down_combine_grouped_bf16in_v2_pm",
+            kernel,
+            validate_moe_down_combine_v2,
+            [y_grouped_bf16, inverse_perm, topk_weights, x_residual],
+            [dim, k_top, n_tokens, grouped_rows],
+        )
+    }
+
+    /// Shared launch of the v1 and v2 combine twins: they differ only in the
+    /// embedded object, the host domain check and the grid.
+    fn moe_down_combine_launch(
+        &mut self,
+        label: &str,
+        kernel: Option<(&'static [u8], &'static str)>,
+        validate: fn(usize, usize, usize, usize) -> Result<MoeDownCombineGeometry, String>,
+        tensors: [&GpuTensor; 4],
+        extents: [usize; 4],
+    ) -> HipResult<()> {
+        let [y_grouped_bf16, inverse_perm, topk_weights, x_residual] = tensors;
+        let [dim, k_top, n_tokens, grouped_rows] = extents;
         self.bind_thread()?;
-        let refuse = |what: &str| {
-            Err(hip_bridge::HipError::new(
-                0,
-                &format!("moe_down_combine_grouped_bf16in_pm: {what}"),
-            ))
-        };
-        let Some((image, symbol)) = moe_slot_ops_kernel(&self.arch) else {
+        let refuse = |what: &str| Err(hip_bridge::HipError::new(0, &format!("{label}: {what}")));
+        let Some((image, symbol)) = kernel else {
             return refuse(&format!(
                 "the slot-ops combine is a gfx1201 builder module (device is {}); no hipcc fallback",
                 self.arch
             ));
         };
-        let geometry = match validate_moe_down_combine(dim, k_top, n_tokens, grouped_rows) {
+        let geometry = match validate(dim, k_top, n_tokens, grouped_rows) {
             Ok(geometry) => geometry,
             Err(why) => return refuse(&why),
         };
@@ -183,7 +321,7 @@ impl Gpu {
         let timer = crate::profile::begin_timer(
             &self.hip,
             "elementwise",
-            MOE_DOWN_COMBINE_BF16IN_PM_GFX1201_SYMBOL,
+            symbol,
             geometry.y_bytes + geometry.slot_bytes * 2 + geometry.residual_bytes * 2,
         );
         let result = self.launch_maybe_blob(
@@ -314,5 +452,90 @@ mod tests {
         // 65_535 * 256 columns is the largest dim whose grid fits; its BF16 row is < 2^32 bytes.
         assert!(validate_moe_down_combine(65_535 * 256, 8, 1, 1).is_ok());
         assert!(validate_moe_down_combine(65_535 * 256 + 1, 8, 1, 1).is_err());
+    }
+
+    #[test]
+    fn v2_kernel_selection_is_gfx1201_only_and_separate_from_v1() {
+        let (v2_image, v2_symbol) = moe_slot_ops_v2_kernel("gfx1201").unwrap();
+        let (v1_image, v1_symbol) = moe_slot_ops_kernel("gfx1201").unwrap();
+        assert_eq!(v2_symbol, MOE_DOWN_COMBINE_BF16IN_V2_PM_GFX1201_SYMBOL);
+        assert_eq!(v2_symbol, "moe_down_combine_grouped_bf16in_v2_pm_gfx1201");
+        assert_ne!(v2_symbol, v1_symbol);
+        assert_ne!(v2_image, v1_image, "v2 has its own bundle");
+        for arch in [
+            "gfx1200", "gfx1100", "gfx1101", "gfx1151", "gfx942", "gfx1030", "gfx11", "",
+        ] {
+            assert!(moe_slot_ops_v2_kernel(arch).is_none(), "{arch:?}");
+        }
+    }
+
+    #[test]
+    fn v2_embedded_image_exports_the_launcher_symbol() {
+        let (image, symbol) = moe_slot_ops_v2_kernel("gfx1201").unwrap();
+        assert!(
+            image.windows(4).any(|w| w == b"\x7fELF"),
+            "no device ELF in the {symbol} bundle"
+        );
+        assert!(
+            image.windows(symbol.len()).any(|w| w == symbol.as_bytes()),
+            "{symbol} missing from its image"
+        );
+    }
+
+    #[test]
+    fn v2_geometry_is_dim_over_2048_columns_per_block() {
+        for (dim, grid) in [
+            (2048usize, 1u32),
+            (4096, 2),
+            (6144, 3),
+            (2048 * 65_535, 65_535),
+        ] {
+            let g = validate_moe_down_combine_v2(dim, 8, 1, 1).unwrap();
+            assert_eq!(g.grid_y, grid, "dim {dim}");
+            assert_eq!(g.y_bytes, dim * 2);
+            assert_eq!(g.slot_bytes, 8 * 4);
+            assert_eq!(g.residual_bytes, dim * 4);
+        }
+        let g = validate_moe_down_combine_v2(A3B_DIM, 8, 8192, 8192 * 8 + 256 * 15).unwrap();
+        assert_eq!(g.grid_y, 1);
+        assert_eq!(g.slot_bytes, 8192 * 8 * 4);
+        assert_eq!(g.residual_bytes, 8192 * A3B_DIM * 4);
+        assert_eq!(g.y_bytes, (8192 * 8 + 256 * 15) * A3B_DIM * 2);
+    }
+
+    #[test]
+    fn v2_dim_must_be_a_positive_multiple_of_2048() {
+        for dim in [0usize, 1, 256, 1024, 2047, 2049, 4095, 4097] {
+            assert!(validate_moe_down_combine_v2(dim, 8, 1, 1).is_err(), "{dim}");
+            assert!(!moe_combine_v2_shape_supported(dim, 8, 1, 1), "{dim}");
+        }
+        for dim in [2048usize, 4096, 2048 * 3] {
+            assert!(validate_moe_down_combine_v2(dim, 8, 1, 1).is_ok(), "{dim}");
+            assert!(moe_combine_v2_shape_supported(dim, 8, 1, 1), "{dim}");
+        }
+        // v1 still accepts the dims v2 refuses.
+        assert!(validate_moe_down_combine(256, 8, 1, 1).is_ok());
+        assert!(validate_moe_down_combine(2049, 8, 1, 1).is_ok());
+    }
+
+    #[test]
+    fn v2_k_top_domain_and_shared_extent_limits_match_v1() {
+        assert!(validate_moe_down_combine_v2(2048, 0, 1, 1).is_err());
+        assert!(validate_moe_down_combine_v2(2048, 9, 1, 1).is_err());
+        for k in 1..=8 {
+            assert!(validate_moe_down_combine_v2(2048, k, 1, 1).is_ok(), "{k}");
+        }
+        assert!(validate_moe_down_combine_v2(2048, 8, 0, 1).is_err());
+        assert_eq!(
+            validate_moe_down_combine_v2(2048, 8, 1, 0).unwrap().y_bytes,
+            0
+        );
+        let max = u32::MAX as usize;
+        assert!(validate_moe_down_combine_v2(2048, 8, 1, max / (2048 * 2)).is_ok());
+        assert!(validate_moe_down_combine_v2(2048, 8, 1, max / (2048 * 2) + 1).is_err());
+        assert!(validate_moe_down_combine_v2(2048, 1, max / (2048 * 4), 1).is_ok());
+        assert!(validate_moe_down_combine_v2(2048, 1, max / (2048 * 4) + 1, 1).is_err());
+        assert!(validate_moe_down_combine_v2(2048, 8, i32::MAX as usize + 1, 1).is_err());
+        assert!(validate_moe_down_combine_v2(2048 * 65_536, 8, 1, 1).is_err());
     }
 }

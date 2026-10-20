@@ -833,17 +833,38 @@ pub fn certify(
             || contract.symbol.starts_with("qwen4_mq4_x4_pm_gfx");
         let mqi4_pm = contract.symbol.starts_with("mq_i4_rows_")
             || contract.symbol.starts_with("mq_i4_a4_")
+            || contract.symbol.starts_with("moe_rotate_i4_pm_")
             || contract.symbol.starts_with("mq_i4_moe_gemv_")
             || contract.symbol.starts_with("e8p_i4_moe_gemv_");
         let dflash_accept = contract.symbol.starts_with("dflash_sampled_accept_")
             && contract.symbol.contains("_pm_gfx");
+        // The A3B FA2-GQA twins: the Q8 module's two gfx1201 exports (direct attention, Q preconvert), the native-fp8
+        // module's single direct export (`fa_prefill_fp8_pm`), and the separate Q-prep bundle's single export
+        // (`fa_qprep_pm_gfx1201`) and the A3B GDN chunk-prep PM twin (`gdn_chunk_prep_pm_gfx1201`).
+        let fa_prefill_pm = arch == "gfx1201"
+            && matches!(
+                contract.symbol.as_str(),
+                "attention_q8_0_fa2_gqa_pm_gfx1201"
+                    | "attention_fp8_e4m3_fa2_gqa_f16_pm_gfx1201"
+                    | "attention_fa2_q_preconvert_pm_gfx1201"
+                    | "attention_fa2_qprep_pm_gfx1201"
+                    | "gdn_chunk_prep_pm_gfx1201"
+            );
+        // The A3B F3 exact C8 IU4 producers: the rotate and RMSNorm + rotate exports of `iu4_c8_producer_pm_gfx1201`.
+        let iu4_c8_pm = arch == "gfx1201"
+            && matches!(
+                contract.symbol.as_str(),
+                "iu4_c8_rotate_pm_gfx1201" | "iu4_c8_rmsnorm_rotate_pm_gfx1201"
+            );
         let m7_cert = matches!(arch, "gfx1100" | "gfx1151")
             || arch == "gfx1201"
                 && (contract.symbol.starts_with("qwen4_moe_")
                     || qsa_pm
                     || mq6_pm
                     || dflash_accept
-                    || mqi4_pm);
+                    || mqi4_pm
+                    || fa_prefill_pm
+                    || iu4_c8_pm);
         if contract.symbol.starts_with("gemm_mq4g256v2_fp8_") || gdn_iu4 || m7_cert {
             let mut highest_v = 0u32;
             let mut highest_s = 0u32;

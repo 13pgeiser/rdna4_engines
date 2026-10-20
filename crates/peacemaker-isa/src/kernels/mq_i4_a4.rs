@@ -124,25 +124,25 @@ pub fn module_specs(arch: Arch) -> Vec<Spec> {
 
 // ----------------------------------------------------------------------- SGPRs
 // s0:1 kernarg pointer; the workgroup id is ttmp9 (gfx12).
-const KARG: u8 = 0;
+pub(super) const KARG: u8 = 0;
 /// Kernargs: `s_load_b256` s[8:15] = h, sorted, xq, signs1; `s_load_b128` s[16:19] = signs2, P, L.
-const ARG_H: u8 = 8;
-const ARG_SORTED: u8 = 10;
-const ARG_XQ: u8 = 12;
-const ARG_S1: u8 = 14;
-const ARG_S2: u8 = 16;
+pub(super) const ARG_H: u8 = 8;
+pub(super) const ARG_SORTED: u8 = 10;
+pub(super) const ARG_XQ: u8 = 12;
+pub(super) const ARG_S1: u8 = 14;
+pub(super) const ARG_S2: u8 = 16;
 const ARG_P: u8 = 18;
 const ARG_L: u8 = 19;
 const WGX: u8 = 20;
 const ROWS5: u8 = 21;
-const ROW: u8 = 22;
-const GRP: u8 = 23;
-const T0: u8 = 24;
-const T1: u8 = 25;
-const SORT_PTR: u8 = 26;
-const SLOT: u8 = 28;
-const H_PTR: u8 = 30;
-const XQ_PTR: u8 = 32;
+pub(super) const ROW: u8 = 22;
+pub(super) const GRP: u8 = 23;
+pub(super) const T0: u8 = 24;
+pub(super) const T1: u8 = 25;
+pub(super) const SORT_PTR: u8 = 26;
+pub(super) const SLOT: u8 = 28;
+pub(super) const H_PTR: u8 = 30;
+pub(super) const XQ_PTR: u8 = 32;
 const C7: u8 = 34;
 const CM8: u8 = 35;
 const ZERO: u8 = 36;
@@ -151,7 +151,7 @@ const USE1: u8 = 38;
 const UNIT: u8 = 39;
 const MT: u8 = 40;
 const PSEL: u8 = 41;
-const KIMM: u8 = 42;
+pub(super) const KIMM: u8 = 42;
 
 // ----------------------------------------------------------------------- VGPRs
 // v0 = lane (1D block, no packed ids).
@@ -194,7 +194,7 @@ pub const VGPRS: u16 = 72;
 
 const EXIT: &str = ".Lmqi4a4_exit";
 
-fn plan() -> Result<RegPlan, String> {
+pub(super) fn plan() -> Result<RegPlan, String> {
     let mut regs = RegPlan::new(VGPRS, 64)?;
     for (name, kind, base, len) in [
         ("kernarg", Kind::S, KARG, 2),
@@ -235,7 +235,7 @@ fn plan() -> Result<RegPlan, String> {
     Ok(regs)
 }
 
-fn lbl() -> &'static str {
+pub(super) fn lbl() -> &'static str {
     EXIT
 }
 
@@ -285,21 +285,26 @@ pub fn emit_module(
 
 /// `dst = base + x * imm` over a 64-bit SGPR pair (`x` an unsigned SGPR, `imm` a literal);
 /// clobbers `T0`, `T1`.
-fn mad64(b: &mut Builder, dst: u8, base: u8, x: u8, imm: u32) -> R {
-    let a = b.spec.arch;
+pub(super) fn mad64(b: &mut Builder, dst: u8, base: u8, x: u8, imm: u32) -> R {
     // SOP2 literals other than inline constants are not encodable here: the multiplier goes through an SGPR.
     sop(b, format!("s_mov_b32 s{KIMM}, {}", lit(imm)), &[KIMM], &[])?;
+    mad64_reg(b, dst, base, x, KIMM)
+}
+
+/// `dst = base + x * s[mult]` over a 64-bit SGPR pair (`x`, `mult` unsigned SGPRs); clobbers `T0`, `T1`.
+pub(super) fn mad64_reg(b: &mut Builder, dst: u8, base: u8, x: u8, mult: u8) -> R {
+    let a = b.spec.arch;
     sop(
         b,
-        format!("s_mul_i32 s{T0}, s{x}, s{KIMM}"),
+        format!("s_mul_i32 s{T0}, s{x}, s{mult}"),
         &[T0],
-        &[x, KIMM],
+        &[x, mult],
     )?;
     sop(
         b,
-        format!("s_mul_hi_u32 s{T1}, s{x}, s{KIMM}"),
+        format!("s_mul_hi_u32 s{T1}, s{x}, s{mult}"),
         &[T1],
-        &[x, KIMM],
+        &[x, mult],
     )?;
     sop(
         b,
@@ -405,6 +410,12 @@ fn prologue(b: &mut Builder) -> R {
         &[T0, SLOT],
     )?;
     mad64(b, XQ_PTR, ARG_XQ, T0, RECORD_BYTES)?;
+    lane_setup(b)
+}
+
+/// The pointer-independent tail of every producer prologue: the clamp / permlane constants, the per-lane
+/// offsets, the three loads (this lane's bf16 pair from `H_PTR`, the two sign quads) and the lane-butterfly signs.
+pub(super) fn lane_setup(b: &mut Builder) -> R {
     sop(
         b,
         format!("s_mov_b32 s{C7}, {}", lit(7.0f32.to_bits())),
@@ -523,7 +534,7 @@ fn xch(b: &mut Builder, dst: u8, src: u8, m: u32) -> R {
 }
 
 /// The lane's four rotated elements (registers returned in element order).
-fn rotate(b: &mut Builder) -> Result<[u8; 4], String> {
+pub(super) fn rotate(b: &mut Builder) -> Result<[u8; 4], String> {
     // Widen: element 0 / 1 the low / high bf16 of dword 0, element 2 / 3 of dword 1.
     op(
         b,
@@ -734,7 +745,7 @@ fn reduce(b: &mut Builder, x: u8, combine: &str) -> R {
 
 /// The `{5,7}` block quantizer on the lane's elements `e`, leaving the packed `qs` word in
 /// `WORD`, the record's `(d, s)` in `DOUT`, `SOUT`.
-fn quantize(b: &mut Builder, e: [u8; 4]) -> R {
+pub(super) fn quantize(b: &mut Builder, e: [u8; 4]) -> R {
     // amax: lane max of |x|, then the wave.
     op(
         b,
@@ -963,7 +974,7 @@ fn quantize(b: &mut Builder, e: [u8; 4]) -> R {
 }
 
 /// Every lane stores its 16-bit qs word at record byte `8 + 2l`; lane 0 stores `(d, s)` at 0.
-fn store(b: &mut Builder) -> R {
+pub(super) fn store(b: &mut Builder) -> R {
     mem(
         b,
         format!(
@@ -995,6 +1006,12 @@ fn store(b: &mut Builder) -> R {
 /// no private or LDS memory. Committed as
 /// `kernels/mq_i4_a4.gfx1201.r128_k640.contract.json`.
 pub fn contract(spec: Spec, e: &Emitted) -> serde_json::Value {
+    contract_json(&spec.symbol(), e)
+}
+
+/// The shape contract of `e` under `symbol`; shared with `moe_rotate_i4_pm`, which is the same instruction set under
+/// the same resource ceilings.
+pub(super) fn contract_json(symbol: &str, e: &Emitted) -> serde_json::Value {
     let mut counts = serde_json::Map::new();
     for name in COUNTED {
         let n = e
@@ -1007,7 +1024,7 @@ pub fn contract(spec: Spec, e: &Emitted) -> serde_json::Value {
         }
     }
     serde_json::json!({
-        "symbol": spec.symbol(), "counts": counts,
+        "symbol": symbol, "counts": counts,
         "forbidden": ["scratch_*", "flat_*", "buffer_*", "ds_*", "s_barrier*", "v_readlane*", "v_writelane*", "v_wmma*", "v_swmmac*",
                       "v_fma_mix*", "s_waitcnt*", "s_setpc*", "s_swappc*", "s_branch*", "s_cbranch_vcc*", "s_cbranch_execz*", "s_cbranch_execnz*", "s_cbranch_scc0*"],
         "vgpr_max": VGPRS, "sgpr_max": 64,
@@ -1042,6 +1059,6 @@ const COUNTED: [&str; 24] = [
     "s_endpgm",
 ];
 
-fn branch(b: &mut Builder, text: &str) -> R {
+pub(super) fn branch(b: &mut Builder, text: &str) -> R {
     b.control(Instruction::new(text, vec![], vec![]))
 }

@@ -1262,6 +1262,7 @@ pub const FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_IU4_RUNTIME_CAND 1\n",
     "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_i4_gfx12\n",
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
 );
@@ -1273,6 +1274,7 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     "#define HIPFIRE_IU4_SIDECAR 1\n",
     "#define HIPFIRE_RMSNORM_AWQ 1\n",
+    "#define HIPFIRE_IU4_RUNTIME_CAND 1\n",
     "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i4_gfx12\n",
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
 );
@@ -1478,6 +1480,7 @@ pub const MQ_ROTATE_X_AWQ_I4_SRC: &str = concat!(
 pub const MQ_ROTATE_X_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_RUNTIME_CAND 1\n",
     "#define HIPFIRE_ROTATE_KERNEL mq_rotate_x_i4_gfx12\n",
     include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
 );
@@ -1487,6 +1490,7 @@ pub const MQ_ROTATE_X_AWQ_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     "#define HIPFIRE_ROTATE_AWQ 1\n",
+    "#define HIPFIRE_IU4_RUNTIME_CAND 1\n",
     "#define HIPFIRE_ROTATE_KERNEL rotate_x_mq_awq_i4_gfx12\n",
     include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
 );
@@ -2034,6 +2038,7 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_IU4_RUNTIME_CAND 1\n",
     "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_i4_gfx12\n",
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate.hip")
 );
@@ -2043,6 +2048,7 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_IU4_RUNTIME_CAND 1\n",
     "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_awq_i4_gfx12\n",
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq.hip")
 );
@@ -5098,8 +5104,9 @@ pub fn scheduler_profile_for_module(arch: &str, name: &str) -> radiowave::Schedu
 
 // gfx1201 K1 lean-issue IU4 (default on; `HIPFIRE_G12_IU4_V3=0` restores
 // `_symfold_g12r`; also the fallback for shapes the builder `_b1` rejects): same
-// ABI/launch geometry as the shipping `_symfold_g12r` module. Compile
-// defines match that build (symmetric fold + banded raster; A4C2 from hipcc).
+// launch geometry as the shipping `_symfold_g12r` module. The ADD entry appends
+// a gate pointer (null in its old mode) for the runtime shared-sigmoid epilogue.
+// Compile defines match that build (symmetric fold + banded raster; A4C2 from hipcc).
 // Entrypoints carry `_v3` (macro-renamed if the .hip still uses bare names).
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_V3_SRC: &str = concat!(
     "#define IU4_SYMMETRIC_FOLD 1\n",
@@ -10207,6 +10214,24 @@ pub const EP_TILE_PULL_N8_PM_GFX1100: &[u8] =
 /// Ascending top-k F32 FMA accumulation followed by an RN residual add; no LDS or atomics.
 pub const MOE_SLOT_OPS_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/moe_slot_ops_pm_gfx1201.hxaco");
+
+/// Certified PeaceMaker BF16 grouped expert combine v2 twin, gfx1201
+/// (`peacemaker-isa emit --kernel moe_slot_ops_v2_pm --arch gfx1201`, 48-byte kernarg), a
+/// separate bundle that leaves [`MOE_SLOT_OPS_PM_GFX1201`] untouched. Same arithmetic as v1
+/// (ordered ascending top-k F32 FMA, RN residual add); eight contiguous columns per lane
+/// (block 256, grid `[n_tokens, dim / 2048, 1]`), slot and weight uniform per wave; no
+/// atomics. Selected only by `HIPFIRE_MOE_COMBINE_V2` (`PrefillRoute::MoeCombineV2`).
+pub const MOE_SLOT_OPS_V2_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/moe_slot_ops_v2_pm_gfx1201.hxaco");
+
+/// Certified PeaceMaker exact twin of the down A4 producer `qwen4_moe_rotate128_i4`, gfx1201
+/// (module `moe_rotate_i4_pm_gfx1201`, symbol `moe_rotate_i4_pm_gfx1201`, 56-byte kernarg
+/// `h@0 sorted@8 xq@16 signs1@24 signs2@32 K@40 P@44 L@48`). Grid `[P, K/128, 1]`, block
+/// `[32, 1, 1]`; the FWHT128 + C2 `{5,7}` arithmetic of `mq_i4_a4_pm_gfx1201` with the row
+/// width a runtime kernarg. Selected only by `HIPFIRE_MOE_ROTATE_I4_PM`
+/// (`PrefillRoute::MoeRotateI4Pm`).
+pub const MOE_ROTATE_I4_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/moe_rotate_i4_pm_gfx1201.hxaco");
 
 /// 2D strided F32 row copy with a `float4` fast path:
 /// `dst[r*dst_row_stride + dst_col_offset + c] = src[r*src_row_stride + c]`.

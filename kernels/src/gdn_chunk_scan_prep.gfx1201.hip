@@ -6,16 +6,16 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>
 
-// Fixed Qwen3.5-27B GDN preparation geometry.
-// q/k: [T,16,128], v: [T,48,128], x: [T,10240].
-// Grid (ceil(T/64),10), block 256.  Each wave owns four channels from one
+// Runtime-geometry Qwen GDN preparation (head dim 128; key heads n_key_heads,
+// value heads n_value_heads <= 48 with n_value_heads % n_key_heads == 0):
+// q/k: [T,HK,128], v: [T,HV,128], x: [T,(2*HK+HV)*128].
+// Grid (ceil(T/64),ceil((2*HK+HV)/8)), block 256 (Qwen3.5-27B: HK=16, HV=48,
+// 80 units, x width 10240, grid y 10).  Each wave owns four channels from one
 // 128-wide Q/K/V head and keeps its width-four convolution window in registers.
+// The head counts are appended kernargs; every per-element expression and
+// reduction order is the fixed-geometry kernel's.
 #define GDN_CHUNK_C 64
 #define GDN_CHUNK_HD 128
-#define GDN_CHUNK_HK 16
-#define GDN_CHUNK_HV 48
-#define GDN_CHUNK_UNITS 80
-#define GDN_CHUNK_XDIM 10240
 
 __device__ __forceinline__ float gdn_chunk_softplus(float x) {
     if (x > 20.0f) return x;
@@ -41,7 +41,13 @@ __global__ void gdn_chunk_prep(
     unsigned short* __restrict__ v,
     int T,
     float q_scale,
-    float eps) {
+    float eps,
+    unsigned n_key_heads,
+    unsigned n_value_heads) {
+    const int hk = (int)n_key_heads;
+    const int hv = (int)n_value_heads;
+    const int units = 2 * hk + hv;
+    const long long xdim = (long long)units * GDN_CHUNK_HD;
     if (T <= 0) return;
 
     const int tid = (int)threadIdx.x;
@@ -55,18 +61,18 @@ __global__ void gdn_chunk_prep(
     // One block owns the gates.  Each wave scans one head at a time; two
     // adjacent rows per lane make the inclusive C64 prefix wave-local.
     if (blockIdx.y == 0) {
-        for (int h = wave; h < GDN_CHUNK_HV; h += 8) {
+        for (int h = wave; h < hv; h += 8) {
             const int r0 = lane * 2;
             const int r1 = r0 + 1;
             float g0 = 0.0f;
             float g1 = 0.0f;
             if (r0 < rows) {
-                const long long off = (long long)(chunk0 + r0) * GDN_CHUNK_HV + h;
+                const long long off = (long long)(chunk0 + r0) * hv + h;
                 g0 = -expf(a_log[h]) * gdn_chunk_softplus(a[off] + dt_bias[h]);
                 b[off] = 1.0f / (1.0f + expf(-b[off]));
             }
             if (r1 < rows) {
-                const long long off = (long long)(chunk0 + r1) * GDN_CHUNK_HV + h;
+                const long long off = (long long)(chunk0 + r1) * hv + h;
                 g1 = -expf(a_log[h]) * gdn_chunk_softplus(a[off] + dt_bias[h]);
                 b[off] = 1.0f / (1.0f + expf(-b[off]));
             }
@@ -78,14 +84,14 @@ __global__ void gdn_chunk_prep(
             }
             const float before = pair - g0 - g1;
             if (r0 < rows)
-                a[(long long)(chunk0 + r0) * GDN_CHUNK_HV + h] = before + g0;
+                a[(long long)(chunk0 + r0) * hv + h] = before + g0;
             if (r1 < rows)
-                a[(long long)(chunk0 + r1) * GDN_CHUNK_HV + h] = before + g0 + g1;
+                a[(long long)(chunk0 + r1) * hv + h] = before + g0 + g1;
         }
     }
 
     const int unit = (int)blockIdx.y * 8 + wave;
-    if (unit >= GDN_CHUNK_UNITS) return;
+    if (unit >= units) return;
     const int dbase = unit * GDN_CHUNK_HD + lane * 4;
 
     float w[4][4];
@@ -103,21 +109,21 @@ __global__ void gdn_chunk_prep(
             win[1][c] = conv_state[(dbase + c) * 3 + 1];
             win[2][c] = conv_state[(dbase + c) * 3];
         } else {
-            win[0][c] = x[(long long)(chunk0 - 3) * GDN_CHUNK_XDIM + dbase + c];
-            win[1][c] = x[(long long)(chunk0 - 2) * GDN_CHUNK_XDIM + dbase + c];
-            win[2][c] = x[(long long)(chunk0 - 1) * GDN_CHUNK_XDIM + dbase + c];
+            win[0][c] = x[(long long)(chunk0 - 3) * xdim + dbase + c];
+            win[1][c] = x[(long long)(chunk0 - 2) * xdim + dbase + c];
+            win[2][c] = x[(long long)(chunk0 - 1) * xdim + dbase + c];
         }
     }
 
-    const int region = unit < GDN_CHUNK_HK ? 0 : (unit < 2 * GDN_CHUNK_HK ? 1 : 2);
-    const int head = region == 0 ? unit : (region == 1 ? unit - GDN_CHUNK_HK
-                                                       : unit - 2 * GDN_CHUNK_HK);
+    const int region = unit < hk ? 0 : (unit < 2 * hk ? 1 : 2);
+    const int head = region == 0 ? unit : (region == 1 ? unit - hk
+                                                       : unit - 2 * hk);
 
     for (int r = 0; r < rows; ++r) {
         float out4[4];
 #pragma unroll
         for (int c = 0; c < 4; ++c) {
-            const float cur = x[(long long)(chunk0 + r) * GDN_CHUNK_XDIM + dbase + c];
+            const float cur = x[(long long)(chunk0 + r) * xdim + dbase + c];
             float y = fmaf(w[3][c], cur, w[2][c] * win[2][c]);
             y = fmaf(w[1][c], win[1][c], y);
             y = fmaf(w[0][c], win[0][c], y);
@@ -135,7 +141,7 @@ __global__ void gdn_chunk_prep(
             for (int d = 16; d > 0; d >>= 1) sum += __shfl_xor(sum, d, 32);
             const float inv = rsqrtf(sum + eps);
             unsigned short* dst = (region == 0 ? q : k)
-                + ((long long)(chunk0 + r) * GDN_CHUNK_HK + head) * GDN_CHUNK_HD
+                + ((long long)(chunk0 + r) * hk + head) * GDN_CHUNK_HD
                 + lane * 4;
 #pragma unroll
             for (int c = 0; c < 4; ++c) {
@@ -145,7 +151,7 @@ __global__ void gdn_chunk_prep(
             }
         } else {
             unsigned short* dst = v
-                + ((long long)(chunk0 + r) * GDN_CHUNK_HV + head) * GDN_CHUNK_HD
+                + ((long long)(chunk0 + r) * hv + head) * GDN_CHUNK_HD
                 + lane * 4;
 #pragma unroll
             for (int c = 0; c < 4; ++c) dst[c] = gdn_chunk_bf16(out4[c]);
@@ -159,11 +165,11 @@ __global__ void gdn_chunk_prep(
         for (int c = 0; c < 4; ++c) {
             const float old0 = conv_state[(dbase + c) * 3];
             const float old1 = conv_state[(dbase + c) * 3 + 1];
-            conv_state[(dbase + c) * 3] = x[(long long)(T - 1) * GDN_CHUNK_XDIM + dbase + c];
+            conv_state[(dbase + c) * 3] = x[(long long)(T - 1) * xdim + dbase + c];
             conv_state[(dbase + c) * 3 + 1] = T >= 2
-                ? x[(long long)(T - 2) * GDN_CHUNK_XDIM + dbase + c] : old0;
+                ? x[(long long)(T - 2) * xdim + dbase + c] : old0;
             conv_state[(dbase + c) * 3 + 2] = T >= 3
-                ? x[(long long)(T - 3) * GDN_CHUNK_XDIM + dbase + c]
+                ? x[(long long)(T - 3) * xdim + dbase + c]
                 : (T == 2 ? old0 : old1);
         }
     }

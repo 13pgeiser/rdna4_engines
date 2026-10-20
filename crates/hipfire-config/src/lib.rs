@@ -3991,6 +3991,21 @@ const TYPED_BOOL_DEVELOPER_KEYS: &[&str] = &[
     "developer.qwen4_d2_default",
     "developer.moe_sym_iu4",
     "developer.qwen4_slowlink_prefill",
+    "developer.gdn_qk_indexed",
+    "developer.gdn_moe_pre_fused",
+    "developer.gdn_moe_chunk_scan",
+    "developer.moe_router_fused_prefill",
+    "developer.moe_shared_prepared_iu4",
+    "developer.fa_prefill_pm",
+    "developer.moe_router_topk_multirow",
+    "developer.moe_combine_v2",
+    "developer.moe_iu4_wide_tiles",
+    "developer.prefill_iu4_producer_fused",
+    "developer.fa_prefill_pm_qprep",
+    "developer.moe_rotate_i4_pm",
+    "developer.prefill_iu4_c8_pm",
+    "developer.gdn_chunk_prep_pm",
+    "developer.moe_shared_down_sigmoid_epi",
 ];
 
 pub fn is_typed_bool_developer_key(key: &str) -> bool {
@@ -6996,6 +7011,516 @@ mod tests {
         let mut layer = ConfigLayer::default();
         layer.set_cli(MOE_SYM_IU4_KEY, "1").unwrap();
         assert_eq!(layer.get(SYM_IU4_KEY), None);
+    }
+
+    const GDN_QK_INDEXED_KEY: &str = "developer.gdn_qk_indexed";
+    const GDN_QK_INDEXED_ENV: &str = "HIPFIRE_GDN_QK_INDEXED";
+
+    #[test]
+    fn gdn_qk_indexed_is_a_typed_bool_developer_key_with_its_own_env_name() {
+        assert!(is_developer_key(GDN_QK_INDEXED_KEY));
+        assert!(is_typed_bool_developer_key(GDN_QK_INDEXED_KEY));
+        assert_eq!(
+            developer_key_for_env(GDN_QK_INDEXED_ENV).as_deref(),
+            Some(GDN_QK_INDEXED_KEY)
+        );
+        // Unset is None (the typed read; the route's unset default is the
+        // `prefill_route_capabilities` qualification); each spelling reads as
+        // a bool, `0`/`false` being the kill switch.
+        assert_eq!(typed_developer_bool_value(GDN_QK_INDEXED_ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(
+                typed_developer_bool_value(GDN_QK_INDEXED_ENV, Some(raw)),
+                Some(want),
+                "{raw}"
+            );
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(GDN_QK_INDEXED_KEY, raw).unwrap();
+            assert_eq!(
+                layer.get(GDN_QK_INDEXED_KEY),
+                Some(&ConfigValue::Bool(want)),
+                "{raw}"
+            );
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            let error = layer.set_cli(GDN_QK_INDEXED_KEY, bad).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::InvalidValue { key, .. } if key == GDN_QK_INDEXED_KEY),
+                "{bad:?}: {error}"
+            );
+            assert!(layer.values.is_empty(), "{bad:?} must not be stored");
+        }
+    }
+
+    const GDN_MOE_PRE_FUSED_KEY: &str = "developer.gdn_moe_pre_fused";
+    const GDN_MOE_PRE_FUSED_ENV: &str = "HIPFIRE_GDN_MOE_PRE_FUSED";
+
+    #[test]
+    fn gdn_moe_pre_fused_is_a_typed_bool_developer_key_with_its_own_env_name() {
+        assert!(is_developer_key(GDN_MOE_PRE_FUSED_KEY));
+        assert!(is_typed_bool_developer_key(GDN_MOE_PRE_FUSED_KEY));
+        assert_eq!(
+            developer_key_for_env(GDN_MOE_PRE_FUSED_ENV).as_deref(),
+            Some(GDN_MOE_PRE_FUSED_KEY)
+        );
+        // Distinct from the indexed flag.
+        assert_ne!(GDN_MOE_PRE_FUSED_KEY, GDN_QK_INDEXED_KEY);
+        assert_ne!(GDN_MOE_PRE_FUSED_ENV, GDN_QK_INDEXED_ENV);
+        // Unset is None (the typed read; the route's unset default is the
+        // `prefill_route_capabilities` qualification); each spelling reads as
+        // a bool, `0`/`false` being the kill switch.
+        assert_eq!(
+            typed_developer_bool_value(GDN_MOE_PRE_FUSED_ENV, None),
+            None
+        );
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(
+                typed_developer_bool_value(GDN_MOE_PRE_FUSED_ENV, Some(raw)),
+                Some(want),
+                "{raw}"
+            );
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(GDN_MOE_PRE_FUSED_KEY, raw).unwrap();
+            assert_eq!(
+                layer.get(GDN_MOE_PRE_FUSED_KEY),
+                Some(&ConfigValue::Bool(want)),
+                "{raw}"
+            );
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            let error = layer.set_cli(GDN_MOE_PRE_FUSED_KEY, bad).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::InvalidValue { key, .. } if key == GDN_MOE_PRE_FUSED_KEY),
+                "{bad:?}: {error}"
+            );
+            assert!(layer.values.is_empty(), "{bad:?} must not be stored");
+        }
+        // Setting one key never writes the other.
+        let mut layer = ConfigLayer::default();
+        layer.set_cli(GDN_MOE_PRE_FUSED_KEY, "1").unwrap();
+        assert_eq!(layer.get(GDN_QK_INDEXED_KEY), None);
+    }
+
+    const GDN_MOE_CHUNK_SCAN_KEY: &str = "developer.gdn_moe_chunk_scan";
+    const GDN_MOE_CHUNK_SCAN_ENV: &str = "HIPFIRE_GDN_MOE_CHUNK_SCAN";
+
+    #[test]
+    fn gdn_moe_chunk_scan_is_a_typed_bool_developer_key_with_its_own_env_name() {
+        assert!(is_developer_key(GDN_MOE_CHUNK_SCAN_KEY));
+        assert!(is_typed_bool_developer_key(GDN_MOE_CHUNK_SCAN_KEY));
+        assert_eq!(
+            developer_key_for_env(GDN_MOE_CHUNK_SCAN_ENV).as_deref(),
+            Some(GDN_MOE_CHUNK_SCAN_KEY)
+        );
+        // Distinct from the two MoE GDN preamble flags it supersedes.
+        assert_ne!(GDN_MOE_CHUNK_SCAN_KEY, GDN_MOE_PRE_FUSED_KEY);
+        assert_ne!(GDN_MOE_CHUNK_SCAN_KEY, GDN_QK_INDEXED_KEY);
+        assert_ne!(GDN_MOE_CHUNK_SCAN_ENV, GDN_MOE_PRE_FUSED_ENV);
+        assert_ne!(GDN_MOE_CHUNK_SCAN_ENV, GDN_QK_INDEXED_ENV);
+        // Unset is None (the typed read; the route's unset default is the
+        // `prefill_route_capabilities` qualification); each spelling reads as
+        // a bool, `0`/`false` being the kill switch.
+        assert_eq!(
+            typed_developer_bool_value(GDN_MOE_CHUNK_SCAN_ENV, None),
+            None
+        );
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(
+                typed_developer_bool_value(GDN_MOE_CHUNK_SCAN_ENV, Some(raw)),
+                Some(want),
+                "{raw}"
+            );
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(GDN_MOE_CHUNK_SCAN_KEY, raw).unwrap();
+            assert_eq!(
+                layer.get(GDN_MOE_CHUNK_SCAN_KEY),
+                Some(&ConfigValue::Bool(want)),
+                "{raw}"
+            );
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            let error = layer.set_cli(GDN_MOE_CHUNK_SCAN_KEY, bad).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::InvalidValue { key, .. } if key == GDN_MOE_CHUNK_SCAN_KEY),
+                "{bad:?}: {error}"
+            );
+            assert!(layer.values.is_empty(), "{bad:?} must not be stored");
+        }
+        // Setting the chunk-scan key never writes the flags it supersedes.
+        let mut layer = ConfigLayer::default();
+        layer.set_cli(GDN_MOE_CHUNK_SCAN_KEY, "1").unwrap();
+        assert_eq!(layer.get(GDN_MOE_PRE_FUSED_KEY), None);
+        assert_eq!(layer.get(GDN_QK_INDEXED_KEY), None);
+    }
+
+    #[test]
+    fn moe_router_fused_prefill_is_a_typed_bool_developer_key() {
+        const KEY: &str = "developer.moe_router_fused_prefill";
+        const ENV: &str = "HIPFIRE_MOE_ROUTER_FUSED_PREFILL";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        // Unset is None (the typed read; the route's unset default is the
+        // `prefill_route_capabilities` qualification); each spelling reads as
+        // a bool, `0`/`false` being the kill switch.
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [
+            ("1", true),
+            ("true", true),
+            ("TRUE", true),
+            ("0", false),
+            ("false", false),
+            ("False", false),
+        ] {
+            assert_eq!(
+                typed_developer_bool_value(ENV, Some(raw)),
+                Some(want),
+                "{raw}"
+            );
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)), "{raw}");
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            let error = layer.set_cli(KEY, bad).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::InvalidValue { key, .. } if key == KEY),
+                "{bad:?}: {error}"
+            );
+            assert!(layer.values.is_empty(), "{bad:?} must not be stored");
+        }
+        // Independent of the other MoE typed keys.
+        let mut layer = ConfigLayer::default();
+        layer.set_cli(KEY, "1").unwrap();
+        assert_eq!(layer.get("developer.moe_sym_iu4"), None);
+        assert_eq!(layer.get("developer.qwen4_moe_sym_iu4"), None);
+    }
+
+    const MOE_SHARED_PREPARED_IU4_KEY: &str = "developer.moe_shared_prepared_iu4";
+    const MOE_SHARED_PREPARED_IU4_ENV: &str = "HIPFIRE_MOE_SHARED_PREPARED_IU4";
+
+    #[test]
+    fn moe_shared_prepared_iu4_is_a_typed_bool_developer_key() {
+        assert!(is_developer_key(MOE_SHARED_PREPARED_IU4_KEY));
+        assert!(is_typed_bool_developer_key(MOE_SHARED_PREPARED_IU4_KEY));
+        // Independent of the symmetric IU4 keys.
+        assert_ne!(MOE_SHARED_PREPARED_IU4_KEY, MOE_SYM_IU4_KEY);
+        assert_ne!(MOE_SHARED_PREPARED_IU4_KEY, SYM_IU4_KEY);
+        // Unset is None (the typed read; the route's unset default is the
+        // `prefill_route_capabilities` qualification); each spelling reads as
+        // a bool, `0`/`false` being the kill switch.
+        assert_eq!(
+            typed_developer_bool_value(MOE_SHARED_PREPARED_IU4_ENV, None),
+            None
+        );
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(
+                typed_developer_bool_value(MOE_SHARED_PREPARED_IU4_ENV, Some(raw)),
+                Some(want),
+                "{raw}"
+            );
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(MOE_SHARED_PREPARED_IU4_KEY, raw).unwrap();
+            assert_eq!(
+                layer.get(MOE_SHARED_PREPARED_IU4_KEY),
+                Some(&ConfigValue::Bool(want)),
+                "{raw}"
+            );
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            let error = layer.set_cli(MOE_SHARED_PREPARED_IU4_KEY, bad).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::InvalidValue { key, .. } if key == MOE_SHARED_PREPARED_IU4_KEY),
+                "{bad:?}: {error}"
+            );
+            assert!(layer.values.is_empty(), "{bad:?} must not be stored");
+        }
+        // Setting it never writes the symmetric IU4 keys.
+        let mut layer = ConfigLayer::default();
+        layer.set_cli(MOE_SHARED_PREPARED_IU4_KEY, "1").unwrap();
+        assert_eq!(layer.get(MOE_SYM_IU4_KEY), None);
+        assert_eq!(layer.get(SYM_IU4_KEY), None);
+    }
+
+    #[test]
+    fn fa_prefill_pm_is_a_typed_bool_developer_key() {
+        const KEY: &str = "developer.fa_prefill_pm";
+        const ENV: &str = "HIPFIRE_FA_PREFILL_PM";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(typed_developer_bool_value(ENV, Some(raw)), Some(want));
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)));
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            assert!(matches!(
+                layer.set_cli(KEY, bad),
+                Err(ConfigError::InvalidValue { key, .. }) if key == KEY
+            ));
+            assert!(layer.values.is_empty());
+        }
+    }
+
+    #[test]
+    fn moe_combine_v2_is_a_typed_bool_developer_key() {
+        const KEY: &str = "developer.moe_combine_v2";
+        const ENV: &str = "HIPFIRE_MOE_COMBINE_V2";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        assert_ne!(KEY, "developer.moe_sym_iu4");
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(typed_developer_bool_value(ENV, Some(raw)), Some(want));
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)));
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            assert!(matches!(
+                layer.set_cli(KEY, bad),
+                Err(ConfigError::InvalidValue { key, .. }) if key == KEY
+            ));
+            assert!(layer.values.is_empty());
+        }
+    }
+    #[test]
+    fn moe_router_topk_multirow_is_a_typed_bool_developer_key() {
+        const KEY: &str = "developer.moe_router_topk_multirow";
+        const ENV: &str = "HIPFIRE_MOE_ROUTER_TOPK_MULTIROW";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        // Distinct from the fused-prefill key it nests under.
+        assert_ne!(KEY, "developer.moe_router_fused_prefill");
+        // The raw typed lookup of an unset variable is None (the architecture default is
+        // resolved later by qualification, not a schema default); explicit `1`/`true` opts in,
+        // `0`/`false` kills.
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(typed_developer_bool_value(ENV, Some(raw)), Some(want));
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)));
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            assert!(matches!(
+                layer.set_cli(KEY, bad),
+                Err(ConfigError::InvalidValue { key, .. }) if key == KEY
+            ));
+            assert!(layer.values.is_empty());
+        }
+        // Setting it never writes the fused-prefill key.
+        let mut layer = ConfigLayer::default();
+        layer.set_cli(KEY, "1").unwrap();
+        assert_eq!(layer.get("developer.moe_router_fused_prefill"), None);
+    }
+
+    #[test]
+    fn moe_iu4_wide_tiles_is_a_typed_bool_developer_key() {
+        const KEY: &str = "developer.moe_iu4_wide_tiles";
+        const ENV: &str = "HIPFIRE_MOE_IU4_WIDE_TILES";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        // Independent of the symmetric IU4 route keys and of the FA PM key.
+        for other in [MOE_SYM_IU4_KEY, SYM_IU4_KEY, MOE_SHARED_PREPARED_IU4_KEY] {
+            assert_ne!(KEY, other);
+        }
+        assert_ne!(ENV, MOE_SYM_IU4_ENV);
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(typed_developer_bool_value(ENV, Some(raw)), Some(want));
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)));
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            assert!(matches!(
+                layer.set_cli(KEY, bad),
+                Err(ConfigError::InvalidValue { key, .. }) if key == KEY
+            ));
+            assert!(layer.values.is_empty());
+        }
+        // Setting it never writes the route's own keys.
+        let mut layer = ConfigLayer::default();
+        layer.set_cli(KEY, "1").unwrap();
+        assert_eq!(layer.get(MOE_SYM_IU4_KEY), None);
+        assert_eq!(layer.get(SYM_IU4_KEY), None);
+    }
+
+    #[test]
+    fn prefill_iu4_producer_fused_is_a_typed_bool_developer_key() {
+        const KEY: &str = "developer.prefill_iu4_producer_fused";
+        const ENV: &str = "HIPFIRE_PREFILL_IU4_PRODUCER_FUSED";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        // The raw typed lookup of an unset variable is None: qualification resolves the
+        // architecture default later, never a schema default.
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(typed_developer_bool_value(ENV, Some(raw)), Some(want));
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)));
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            assert!(matches!(
+                layer.set_cli(KEY, bad),
+                Err(ConfigError::InvalidValue { key, .. }) if key == KEY
+            ));
+            assert!(layer.values.is_empty());
+        }
+    }
+
+    #[test]
+    fn fa_prefill_pm_qprep_is_a_typed_bool_developer_key() {
+        const KEY: &str = "developer.fa_prefill_pm_qprep";
+        const ENV: &str = "HIPFIRE_FA_PREFILL_PM_QPREP";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(typed_developer_bool_value(ENV, Some(raw)), Some(want));
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)));
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            assert!(matches!(
+                layer.set_cli(KEY, bad),
+                Err(ConfigError::InvalidValue { key, .. }) if key == KEY
+            ));
+            assert!(layer.values.is_empty());
+        }
+    }
+
+    #[test]
+    fn moe_rotate_i4_pm_is_a_typed_bool_developer_key() {
+        const KEY: &str = "developer.moe_rotate_i4_pm";
+        const ENV: &str = "HIPFIRE_MOE_ROTATE_I4_PM";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(typed_developer_bool_value(ENV, Some(raw)), Some(want));
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)));
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            assert!(matches!(
+                layer.set_cli(KEY, bad),
+                Err(ConfigError::InvalidValue { key, .. }) if key == KEY
+            ));
+            assert!(layer.values.is_empty());
+        }
+    }
+
+    #[test]
+    fn prefill_iu4_c8_pm_is_a_typed_bool_developer_key() {
+        const KEY: &str = "developer.prefill_iu4_c8_pm";
+        const ENV: &str = "HIPFIRE_PREFILL_IU4_C8_PM";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        // Unset is None: the capability table (raw inventory, no qualified row) resolves it
+        // off; the schema never supplies a default.
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(typed_developer_bool_value(ENV, Some(raw)), Some(want));
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)));
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            assert!(matches!(
+                layer.set_cli(KEY, bad),
+                Err(ConfigError::InvalidValue { key, .. }) if key == KEY
+            ));
+            assert!(layer.values.is_empty());
+        }
+        // Independent of the F3 flag it nests under at the consumer.
+        let mut layer = ConfigLayer::default();
+        layer.set_cli(KEY, "1").unwrap();
+        assert_eq!(layer.get("developer.prefill_iu4_producer_fused"), None);
+    }
+
+    #[test]
+    fn gdn_chunk_prep_pm_is_a_typed_bool_developer_key() {
+        const KEY: &str = "developer.gdn_chunk_prep_pm";
+        const ENV: &str = "HIPFIRE_GDN_CHUNK_PREP_PM";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        // Unset is None: the consumer resolves it with `PrefillRoute::GdnChunkPrepPm`, which
+        // has no qualified row, so unset is off.
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(typed_developer_bool_value(ENV, Some(raw)), Some(want));
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)));
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            assert!(matches!(
+                layer.set_cli(KEY, bad),
+                Err(ConfigError::InvalidValue { key, .. }) if key == KEY
+            ));
+            assert!(layer.values.is_empty());
+        }
+    }
+
+    #[test]
+    fn moe_shared_down_sigmoid_epi_is_a_typed_bool_developer_key() {
+        const KEY: &str = "developer.moe_shared_down_sigmoid_epi";
+        const ENV: &str = "HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        // Unset is None and no schema default exists: the capability table has no
+        // qualified row, so the route is off everywhere unless explicitly `1`.
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        assert_eq!(developer_env_for_key(KEY).as_deref(), Some(ENV));
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(typed_developer_bool_value(ENV, Some(raw)), Some(want));
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)));
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            assert!(matches!(
+                layer.set_cli(KEY, bad),
+                Err(ConfigError::InvalidValue { key, .. }) if key == KEY
+            ));
+            assert!(layer.values.is_empty());
+        }
     }
 
     #[test]

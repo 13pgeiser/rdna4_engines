@@ -101,6 +101,11 @@ required-features = ["lab"]
 name = "qwen4_moe_sym"
 required-features = ["lab"]
 
+# NT4 vs NT8 byte oracle; includes qwen4_moe_sym.rs by path (child module).
+[[example]]
+name = "moe_iu4_wide_tiles_oracle"
+required-features = ["lab"]
+
 [[example]]
 name = "qwen4_moe_f16_lds_oracle"
 required-features = ["lab"]
@@ -416,6 +421,10 @@ required-features = ["lab"]
 [[example]]
 name = "gdn_chunk_parity"
 required-features = ["lab"]
+
+[[example]]
+name = "gdn_chunk_generalized_oracle"
+required-features = ["lab", "deltanet"]
 
 [[example]]
 name = "gdn_state_precision_oracle"
@@ -1012,6 +1021,63 @@ required-features = ["lab"]
 [[example]]
 name = "cb_rows_twins_gate"
 required-features = ["deltanet"]
+
+
+[[example]]
+name = "moe_router_topk_multirow_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "moe_shared_prepared_iu4_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "moe_combine_v2_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "prefill_iu4_producer_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "shared_down_sigmoid_epi_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "fa_a3b_screen"
+required-features = ["lab"]
+
+[[example]]
+name = "fa_pm_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "fa_pm_fp8_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "fa_pm_qprep_oracle"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "moe_rotate_i4_pm_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "iu4_c8_pm_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "gdn_chunk_prep_pm_oracle"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "gdn_qk_indexed_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "gdn_moe_pre_fused_oracle"
+required-features = ["lab", "deltanet"]
 
 [[example]]
 name = "gemma4_kernel_f64_check"

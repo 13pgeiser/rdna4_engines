@@ -217,12 +217,61 @@ struct RouteStamp {
     adopted_from: Option<u64>,
 }
 
+/// Pure part of the router-to-shared IU4 token carry: the sealed prefill router
+/// is the MQ4G256V2 projection of a `SoftmaxGatedShared` recipe, the route is
+/// produced here (not adopted), and its K equals the shared selector's K, so
+/// the router's quantized `x_rot_batch` is exactly the one the shared group
+/// reads. The remaining truths (flag, all-three-MQ4 shared, rows, arch,
+/// capture/replay) are owned by `prefill_shared_prepared_iu4_admitted`.
+fn router_carries_shared_iu4(
+    recipe: MoeRecipe,
+    router_dtype: rdna_compute::DType,
+    router_k: usize,
+    shared_selector_k: Option<usize>,
+    adopted: bool,
+) -> bool {
+    matches!(recipe, MoeRecipe::SoftmaxGatedShared { .. })
+        && !adopted
+        && router_dtype == rdna_compute::DType::MQ4G256V2
+        && shared_selector_k == Some(router_k)
+}
+
+/// Pure part of the exact fused input-basis producer
+/// (`HIPFIRE_PREFILL_IU4_PRODUCER_FUSED`): the shared gate is MQ4G256V2 over the
+/// router's K, K a nonzero multiple of 256 (the IU4 consumers' floor), and the
+/// router/shared IU4 carry already holds (so the next two stages are the router
+/// and the shared gate/up, which read the same `x_rot_batch`, and nothing else
+/// can reserve or quantize into the sidecar slot before they consume it).
+fn input_basis_producer_fused_admitted(
+    flag: bool,
+    carries: bool,
+    gate_dtype: rdna_compute::DType,
+    gate_k: usize,
+    router_k: usize,
+) -> bool {
+    flag && carries
+        && gate_dtype == rdna_compute::DType::MQ4G256V2
+        && gate_k != 0
+        && gate_k % 256 == 0
+        && gate_k == router_k
+}
+
 /// Invocation-local mutable state. It borrows the sealed call but never gets
 /// stored by that call, so borrowed Steps cannot form a self-referential owner.
 pub(super) struct MoeStepState<'a> {
     call: &'a SealedMoeCall<'a>,
     host_route: OnceCell<HostRoute>,
     route_stamp: Cell<Option<RouteStamp>>,
+    /// The IU4 activation token the router stage quantized for the shared
+    /// group: written only by the router stage, taken (consumed, never
+    /// re-quantized) by the shared gate/up stage of the same invocation.
+    shared_iu4: RefCell<Option<rdna_compute::scratch::Int4MmqPrepared>>,
+    /// The IU4 sidecar the fused shared activation wrote for the shared down
+    /// (`HIPFIRE_PREFILL_IU4_PRODUCER_FUSED`): written only by the generic
+    /// shared activation stage, taken by the shared down stage that the lowering
+    /// places immediately after it (the fused route is not admitted for
+    /// `shared_after_combine`, whose routed stages would sit in between).
+    shared_down_iu4: RefCell<Option<rdna_compute::scratch::Int4MmqPrepared>>,
     shared_gate: Option<GpuTensor>,
     shared_up: Option<GpuTensor>,
     /// H8a: the routed target's zero fill was absorbed; the qt44 combine
@@ -310,6 +359,8 @@ impl<'a> MoeStepState<'a> {
             call,
             host_route: OnceCell::new(),
             route_stamp: Cell::new(route_stamp),
+            shared_iu4: RefCell::new(None),
+            shared_down_iu4: RefCell::new(None),
             shared_gate,
             shared_up,
             initial_zero: Cell::new(false),
@@ -703,6 +754,43 @@ impl<'a> SealedMoeOp<'a> {
             .shared
             .as_ref()
             .map(|shared| &shared.weights.gate);
+        if !selection.resolution.paro_mode {
+            if let Some(weight) = input_weight {
+                if input_basis_producer_fused_admitted(
+                    super::prefill_iu4_producer_fused_enabled(gpu),
+                    self.prefill_router_carries_shared_iu4(gpu, params),
+                    weight.dtype,
+                    weight.k,
+                    params.prelude.router.k,
+                ) {
+                    if self.state.shared_iu4.borrow().is_some() {
+                        return Err(DispatchError::Hip(
+                            "sealed moe: shared IU4 token already live before the input-basis producer"
+                                .into(),
+                        ));
+                    }
+                    // Exact8 rotate + `block_i4_128` producer on the same input and AWQ
+                    // as the incumbent rotate; it also writes the F32 `x_rot_batch`
+                    // every other reader (and the router tap) sees.
+                    let (k, n) = (weight.k, params.batch_size);
+                    let reservation = gpu
+                        .reserve_int4_mmq(k, n)
+                        .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                    let token = gpu
+                        .rotate_x_mq_i4_gfx12_exact_batched(
+                            params.x_norm_batch,
+                            weight.awq_scale,
+                            Some(params.x_rot_batch),
+                            reservation,
+                            k,
+                            n,
+                        )
+                        .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                    *self.state.shared_iu4.borrow_mut() = Some(token);
+                    return Ok(());
+                }
+            }
+        }
         if selection.resolution.paro_mode {
             super::prefill_input_basis_stage(gpu, params)?;
         } else if let Some(weight) = input_weight {
@@ -785,12 +873,14 @@ impl<'a> SealedMoeOp<'a> {
                 {
                     return super::qt44_qt53_prefill::router_projection(gpu, params);
                 }
+                let carry = self.prefill_router_carries_shared_iu4(gpu, params);
                 let prelude = &params.prelude;
                 let x = match prelude.router.dtype {
                     rdna_compute::DType::Q8_0 | rdna_compute::DType::F32 => params.x_norm_batch,
                     _ => params.x_rot_batch,
                 };
                 let result = match prelude.q8_router_policy {
+                    _ if carry => self.router_projection_carrying_shared_iu4(gpu, params),
                     MoeQ8RouterPolicy::FreshFp16Wmma { enabled, scratch }
                         if prelude.router.dtype == rdna_compute::DType::Q8_0 =>
                     {
@@ -858,6 +948,86 @@ impl<'a> SealedMoeOp<'a> {
                 Ok(())
             }
         }
+    }
+
+    /// Whether the generic prefill router stage hands its IU4 activation token to
+    /// the shared gate/up (and so the input-basis stage may produce it): the pure
+    /// carry predicate over the sealed call plus the GPU admission. Pure over the
+    /// call and device state, so the input-basis and router stages agree.
+    fn prefill_router_carries_shared_iu4(&self, gpu: &Gpu, params: &MoePrefillParams<'_>) -> bool {
+        let adopted = matches!(
+            params.prelude.route,
+            super::sealed_moe::PrefillRouteMode::AdoptRoot { .. }
+        ) || self
+            .state
+            .route_stamp
+            .get()
+            .is_some_and(|stamp| stamp.adopted_from.is_some());
+        router_carries_shared_iu4(
+            params.recipe,
+            params.prelude.router.dtype,
+            params.prelude.router.k,
+            params
+                .prelude
+                .shared
+                .as_ref()
+                .map(|shared| shared.weights.selector.k),
+            adopted,
+        ) && super::prefill_shared_prepared_iu4_admitted(gpu, params)
+    }
+
+    /// Router projection that quantizes `x_rot_batch` once and keeps the typed
+    /// token for the shared gate/up stage. Taps the calibration capture exactly
+    /// where the incumbent `GemmFamily` MQ4G256V2 path taps it; the GPU entry
+    /// itself never taps. Admission was already established by the caller, so a
+    /// declined launch is an error (never a silent re-tap and re-run).
+    fn router_projection_carrying_shared_iu4(
+        &self,
+        gpu: &mut Gpu,
+        params: &MoePrefillParams<'_>,
+    ) -> Result<(), DispatchError> {
+        let router = &params.prelude.router;
+        let (k, n) = (router.k, params.batch_size);
+        // A token already in the slot is the exact fused input-basis producer's
+        // (this stage is the only other writer, and runs once per invocation).
+        // It is consumed here with no quantize. The producer stage runs
+        // immediately before, so a superseded token is a bug and an `Err`
+        // before the tap or any launch, never a re-quantize.
+        let pending = self.state.shared_iu4.borrow_mut().take();
+        if let Some(token) = pending {
+            gpu.int4_mmq_prepared_ptr(&token, k, n)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            gpu.maybe_capture_activation(router.buf, params.x_rot_batch, n, k);
+            gpu.gemm_mq4g256v2_prepared_iu4(
+                router.buf,
+                &token,
+                params.prelude.router_logits,
+                router.m,
+                k,
+                n,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            *self.state.shared_iu4.borrow_mut() = Some(token);
+            return Ok(());
+        }
+        gpu.maybe_capture_activation(router.buf, params.x_rot_batch, params.batch_size, router.k);
+        let token = gpu
+            .try_gemm_mq4g256v2_shared_router_iu4(
+                router.buf,
+                params.x_rot_batch,
+                params.prelude.router_logits,
+                router.m,
+                router.k,
+                params.batch_size,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string()))?
+            .ok_or_else(|| {
+                DispatchError::Hip(
+                    "sealed moe: router shared IU4 admitted but the GPU declined".into(),
+                )
+            })?;
+        *self.state.shared_iu4.borrow_mut() = Some(token);
+        Ok(())
     }
 
     pub(super) fn route(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
@@ -996,7 +1166,15 @@ impl<'a> SealedMoeOp<'a> {
                 selection.uses_grouped_rows(),
             );
         }
-        super::prefill_shared_gate_up_stage(self.state.dispatch_ctx(), gpu, params)
+        // The router stage's IU4 token (if any) is consumed by exactly this
+        // stage; it never outlives the shared gate/up of its invocation.
+        let prepared = self.state.shared_iu4.borrow_mut().take();
+        super::prefill_shared_gate_up_stage(
+            self.state.dispatch_ctx(),
+            gpu,
+            params,
+            prepared.as_ref(),
+        )
     }
 
     pub(super) fn shared_activation(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
@@ -1029,7 +1207,15 @@ impl<'a> SealedMoeOp<'a> {
                 selection.uses_grouped_rows(),
             );
         }
-        super::prefill_shared_activation_stage(gpu, params)
+        if self.state.shared_down_iu4.borrow().is_some() {
+            return Err(DispatchError::Hip(
+                "sealed moe: shared down IU4 token already live before the shared activation"
+                    .into(),
+            ));
+        }
+        let token = super::prefill_shared_activation_stage(gpu, params)?;
+        *self.state.shared_down_iu4.borrow_mut() = token;
+        Ok(())
     }
 
     pub(super) fn shared_down(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
@@ -1094,7 +1280,8 @@ impl<'a> SealedMoeOp<'a> {
                 selection.uses_grouped_rows(),
             );
         }
-        super::prefill_shared_down_stage(self.state.dispatch_ctx(), gpu, params)
+        let prepared = self.state.shared_down_iu4.borrow_mut().take();
+        super::prefill_shared_down_stage(self.state.dispatch_ctx(), gpu, params, prepared.as_ref())
     }
 
     pub(super) fn scatter(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
@@ -4234,18 +4421,28 @@ fn expert_iu4_facts(
 }
 
 /// Log classes (one rate-limit counter each): admitted 0, each
-/// [`ExpertIu4Reject`] `1 + index`, each exclusion 19..=32, admitted host-mapped 33.
+/// [`ExpertIu4Reject`] `1 + index`, each exclusion 19..=32, admitted host-mapped 33, admitted
+/// resident with the NT8 gate/up entry and the NT4 down entry (`HIPFIRE_MOE_IU4_WIDE_TILES`) 34.
 const EXPERT_IU4_LOG_CLASSES: usize = 64;
 const EXPERT_IU4_CLASS_ADMITTED_HOST_MAPPED: usize = 33;
+const EXPERT_IU4_CLASS_ADMITTED_RESIDENT_NT8_GATE_UP: usize = 34;
 /// A WARNING repeats on its class's first occurrence and then every this many.
 const EXPERT_IU4_WARN_EVERY: u64 = 1000;
 
 /// Log class of a verdict (`None` for the unbound default, which logs nothing).
-fn expert_iu4_log_class(decision: &ExpertIu4Decision) -> Option<usize> {
+fn expert_iu4_log_class(
+    decision: &ExpertIu4Decision,
+    symbols: Option<[&'static str; 2]>,
+) -> Option<usize> {
     match decision {
         ExpertIu4Decision::Unbound => None,
         ExpertIu4Decision::Admitted(plan) if plan.host_mapped => {
             Some(EXPERT_IU4_CLASS_ADMITTED_HOST_MAPPED)
+        }
+        ExpertIu4Decision::Admitted(_)
+            if symbols.is_some_and(|[gate_up, _]| gate_up.ends_with("_nt8")) =>
+        {
+            Some(EXPERT_IU4_CLASS_ADMITTED_RESIDENT_NT8_GATE_UP)
         }
         ExpertIu4Decision::Admitted(_) => Some(0),
         ExpertIu4Decision::Fallback(ExpertIu4Fallback::Admission(reject)) => ExpertIu4Reject::ALL
@@ -4295,6 +4492,7 @@ pub(super) fn expert_iu4_log_line(
     f: &ExpertIu4Facts,
     decision: &ExpertIu4Decision,
     occurrence: u64,
+    symbols: Option<[&'static str; 2]>,
 ) -> Option<String> {
     let (spec, _) = f.capability?;
     let common = format!(
@@ -4305,12 +4503,27 @@ pub(super) fn expert_iu4_log_line(
     match decision {
         ExpertIu4Decision::Unbound => None,
         ExpertIu4Decision::Admitted(plan) => {
-            let nt = if plan.host_mapped { "nt8" } else { "nt4" };
+            let [gate_up, down] = symbols.unwrap_or(["unreported", "unreported"]);
+            // The raw inventory is the v2 bundle's own arch table (a test anchors them), so
+            // this names the combine `prefill_expert_iu4_combine_stage` selects on `arch`.
+            let combine = if expert_iu4_combine_v2_admits(
+                *MOE_COMBINE_V2,
+                arch,
+                rdna_compute::prefill_route_capabilities::raw_inventory(
+                    arch,
+                    rdna_compute::prefill_route_capabilities::PrefillRoute::MoeCombineV2,
+                ),
+                plan,
+            ) {
+                "moe_slot_ops_v2_pm_gfx1201[moe_down_combine_grouped_bf16in_v2_pm_gfx1201]"
+            } else {
+                "moe_slot_ops_pm_gfx1201[moe_down_combine_grouped_bf16in_pm_gfx1201]"
+            };
             Some(format!(
                 "{head} requested={} admitted host_mapped={} graph_capture={} {common} \
                  modules=qwen4_moe_iu4_sym_pm_gfx1201\
-                 [qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_{nt},qwen4_moe_down_iu4_sym_pm_gfx1201_{nt}]\
-                 +moe_slot_ops_pm_gfx1201[moe_down_combine_grouped_bf16in_pm_gfx1201]",
+                 [{gate_up},{down}]\
+                 +{combine}",
                 f.requested, plan.host_mapped, f.capturing_graph
             ))
         }
@@ -4339,21 +4552,41 @@ pub(super) fn expert_iu4_log_line(
 
 /// Log the verdict: INFO once per process per class, WARNING on each class's first
 /// occurrence and then every [`EXPERT_IU4_WARN_EVERY`]th.
-fn log_expert_iu4(arch: &str, f: &ExpertIu4Facts, decision: &ExpertIu4Decision) {
+fn log_expert_iu4(gpu: &Gpu, f: &ExpertIu4Facts, decision: &ExpertIu4Decision) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEEN: [AtomicU64; EXPERT_IU4_LOG_CLASSES] =
         [const { AtomicU64::new(0) }; EXPERT_IU4_LOG_CLASSES];
+    let symbols = expert_iu4_launched_symbols(gpu, f, decision);
     let (Some(class), Some(level)) = (
-        expert_iu4_log_class(decision),
+        expert_iu4_log_class(decision, symbols),
         expert_iu4_log_level(decision),
     ) else {
         return;
     };
     let occurrence = SEEN[class].fetch_add(1, Ordering::Relaxed);
     if expert_iu4_should_log(level, occurrence) {
-        if let Some(line) = expert_iu4_log_line(arch, f, decision, occurrence + 1) {
+        if let Some(line) =
+            expert_iu4_log_line(gpu.arch.as_str(), f, decision, occurrence + 1, symbols)
+        {
             eprintln!("{line}");
         }
+    }
+}
+
+/// The `[gate/up, down]` PM entries the two launchers run for an admitted verdict: the same pure
+/// selector they call (`Gpu::qwen4_moe_sym_gemm_symbols`) over the plan's real slots
+/// (`rows * k_top`, not padded grouped rows) and the expert-table length `n_exp`, so the log names
+/// what launches. `None` for every other verdict.
+fn expert_iu4_launched_symbols(
+    gpu: &Gpu,
+    f: &ExpertIu4Facts,
+    decision: &ExpertIu4Decision,
+) -> Option<[&'static str; 2]> {
+    match decision {
+        ExpertIu4Decision::Admitted(plan) => {
+            gpu.qwen4_moe_sym_gemm_symbols(plan.host_mapped, plan.total_slots, f.dims.n_exp)
+        }
+        _ => None,
     }
 }
 
@@ -4373,10 +4606,51 @@ impl MoeStepState<'_> {
         *self.expert_iu4.get_or_init(|| {
             let facts = expert_iu4_facts(gpu, params, selection);
             let decision = decide_expert_iu4(&facts);
-            log_expert_iu4(gpu.arch.as_str(), &facts, &decision);
+            log_expert_iu4(gpu, &facts, &decision);
             decision
         })
     }
+}
+
+/// `HIPFIRE_MOE_COMBINE_V2` (`developer.moe_combine_v2`, a typed boolean): the
+/// explicit value, read once. `true`/`1` opts the IU4 grouped-expert combine
+/// into the v2 BF16-input twin wherever its bundle and shape admit it;
+/// `false`/`0` kills it. Unset follows `prefill_route_capabilities`
+/// qualification of `PrefillRoute::MoeCombineV2`, which has an exact-gfx1201
+/// `QUALIFIED` row: on at gfx1201, off elsewhere.
+static MOE_COMBINE_V2: std::sync::LazyLock<Option<bool>> =
+    std::sync::LazyLock::new(|| hipfire_config::developer_typed_bool("HIPFIRE_MOE_COMBINE_V2"));
+
+/// Pure selection of the v2 combine twin over the v1 twin for an admitted IU4
+/// plan: the route flag resolves on `arch` (explicit `1`/`0` wins, unset follows
+/// qualification: on at exact gfx1201), the v2 bundle exists on the device (`available`), and
+/// the plan's launch shape is one the v2 kernel accepts (`dim` a positive
+/// multiple of 2048, `k_top` in `1..=8`, extent limits). Anything else keeps v1.
+pub(super) fn expert_iu4_combine_v2_admits(
+    flag: Option<bool>,
+    arch: &str,
+    available: bool,
+    plan: &ExpertIu4Plan,
+) -> bool {
+    use rdna_compute::prefill_route_capabilities::{enabled, PrefillRoute};
+    enabled(flag, arch, PrefillRoute::MoeCombineV2)
+        && available
+        && rdna_compute::moe_slot_ops::moe_combine_v2_shape_supported(
+            plan.hidden,
+            plan.k_top,
+            plan.rows,
+            plan.grouped_rows,
+        )
+}
+
+/// Whether the IU4 combine of `plan` runs the v2 twin on `gpu`.
+pub(super) fn expert_iu4_combine_v2_selected(gpu: &Gpu, plan: &ExpertIu4Plan) -> bool {
+    expert_iu4_combine_v2_admits(
+        *MOE_COMBINE_V2,
+        &gpu.arch,
+        gpu.moe_combine_v2_available(),
+        plan,
+    )
 }
 
 #[cfg(test)]
@@ -4395,6 +4669,91 @@ mod tests {
             rdna_compute::DType::MQ4G256,
             false,
             true,
+        ));
+    }
+
+    #[test]
+    fn router_shared_iu4_carry_admits_only_compatible_router() {
+        use rdna_compute::DType;
+        let gated = MoeRecipe::SoftmaxGatedShared {
+            bf16_round_trip: true,
+            shared_after_combine: true,
+        };
+        assert!(router_carries_shared_iu4(
+            gated,
+            DType::MQ4G256V2,
+            2048,
+            Some(2048),
+            false
+        ));
+        assert!(!router_carries_shared_iu4(
+            gated,
+            DType::MQ4G256V2,
+            2048,
+            Some(2048),
+            true
+        ));
+        assert!(!router_carries_shared_iu4(
+            gated,
+            DType::MQ4G256V2,
+            2048,
+            Some(1024),
+            false
+        ));
+        assert!(!router_carries_shared_iu4(
+            gated,
+            DType::MQ4G256V2,
+            2048,
+            None,
+            false
+        ));
+        for dtype in [DType::MQ4G256, DType::Q8_0, DType::F32, DType::MQ6G256V2] {
+            assert!(!router_carries_shared_iu4(
+                gated,
+                dtype,
+                2048,
+                Some(2048),
+                false
+            ));
+        }
+        assert!(!router_carries_shared_iu4(
+            MoeRecipe::SigmoidRoutedNoShared,
+            DType::MQ4G256V2,
+            2048,
+            Some(2048),
+            false
+        ));
+    }
+
+    #[test]
+    fn input_basis_producer_fused_admits_only_a_carried_mq4v2_gate() {
+        use rdna_compute::DType;
+        let mq = DType::MQ4G256V2;
+        assert!(input_basis_producer_fused_admitted(
+            true, true, mq, 2048, 2048
+        ));
+        assert!(input_basis_producer_fused_admitted(
+            true, true, mq, 512, 512
+        ));
+        // Flag off, or the router/shared carry does not hold (adopted route,
+        // non-MQ4V2 router, selector K mismatch, flag, capability, rows).
+        assert!(!input_basis_producer_fused_admitted(
+            false, true, mq, 2048, 2048
+        ));
+        assert!(!input_basis_producer_fused_admitted(
+            true, false, mq, 2048, 2048
+        ));
+        // The gate must be MQ4G256V2 over the router's K, a nonzero multiple of 256.
+        for dtype in [DType::MQ4G256, DType::MQ6G256V2, DType::Q8_0, DType::F32] {
+            assert!(!input_basis_producer_fused_admitted(
+                true, true, dtype, 2048, 2048
+            ));
+        }
+        for k in [0usize, 1, 255, 257, 2049] {
+            assert!(!input_basis_producer_fused_admitted(true, true, mq, k, k));
+        }
+        assert!(!input_basis_producer_fused_admitted(
+            true, true, mq, 2048, 1024
         ));
     }
 
@@ -4702,9 +5061,12 @@ mod tests {
             ..admitted_facts()
         };
         assert_eq!(decide_expert_iu4(&hostile), ExpertIu4Decision::Unbound);
-        assert_eq!(expert_iu4_log_class(&ExpertIu4Decision::Unbound), None);
         assert_eq!(
-            expert_iu4_log_line("gfx1201", &hostile, &ExpertIu4Decision::Unbound, 1),
+            expert_iu4_log_class(&ExpertIu4Decision::Unbound, None),
+            None
+        );
+        assert_eq!(
+            expert_iu4_log_line("gfx1201", &hostile, &ExpertIu4Decision::Unbound, 1, None),
             None
         );
         assert_eq!(expert_iu4_log_level(&ExpertIu4Decision::Unbound), None);
@@ -5162,12 +5524,26 @@ mod tests {
     #[test]
     fn expert_iu4_log_classes_are_distinct_and_lines_carry_the_decision() {
         use ExpertIu4Exclusion as X;
+        const PM_NT4: [&str; 2] = [
+            "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4",
+            "qwen4_moe_down_iu4_sym_pm_gfx1201_nt4",
+        ];
+        // Resident widened: gate/up NT8, down NT4 (the down is never widened resident).
+        const PM_MIXED: [&str; 2] = [
+            "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt8",
+            "qwen4_moe_down_iu4_sym_pm_gfx1201_nt4",
+        ];
+        const PM_NT8: [&str; 2] = [
+            "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt8",
+            "qwen4_moe_down_iu4_sym_pm_gfx1201_nt8",
+        ];
         let mut classes = std::collections::BTreeSet::new();
-        let mut push = |decision: ExpertIu4Decision| {
-            let class = expert_iu4_log_class(&decision).expect("loggable");
+        let mut push_with = |decision: ExpertIu4Decision, symbols: Option<[&'static str; 2]>| {
+            let class = expert_iu4_log_class(&decision, symbols).expect("loggable");
             assert!(class < EXPERT_IU4_LOG_CLASSES);
             assert!(classes.insert(class), "{decision:?} reuses class {class}");
         };
+        let mut push = |decision: ExpertIu4Decision| push_with(decision, None);
         let plan = ExpertIu4Plan {
             rows: 1,
             grouped_rows: 16,
@@ -5205,10 +5581,12 @@ mod tests {
         ] {
             push(ExpertIu4Decision::Fallback(ExpertIu4Fallback::Exclusion(x)));
         }
+        // A resident admission that launches the NT8 gate/up entry is its own class.
+        push_with(ExpertIu4Decision::Admitted(plan), Some(PM_MIXED));
 
         let facts = admitted_facts();
         let admitted = decide_expert_iu4(&facts);
-        let line = expert_iu4_log_line("gfx1201", &facts, &admitted, 1).unwrap();
+        let line = expert_iu4_log_line("gfx1201", &facts, &admitted, 1, Some(PM_NT4)).unwrap();
         for needle in [
             "requested=true",
             "admitted",
@@ -5220,12 +5598,21 @@ mod tests {
             "SymmetricBf16SlotsF32OrderedCombine",
             "qwen4_moe_iu4_sym_pm_gfx1201",
             "_nt4",
-            "moe_slot_ops_pm_gfx1201",
-            "moe_down_combine_grouped_bf16in_pm_gfx1201",
+            // Unset HIPFIRE_MOE_COMBINE_V2 is qualified on at exact gfx1201, so the admitted
+            // line names the v2 combine twin.
+            "moe_slot_ops_v2_pm_gfx1201",
+            "moe_down_combine_grouped_bf16in_v2_pm_gfx1201",
             "rows=8192",
         ] {
             assert!(line.contains(needle), "{needle}: {line}");
         }
+        // The v1 combine is named only when the flag is explicitly 0 (not reachable from this
+        // process-wide static; `expert_iu4_combine_v2_admits` tests cover the explicit-0 gate).
+        assert!(!line.contains("moe_slot_ops_pm_gfx1201"), "{line}");
+        assert!(
+            !line.contains("moe_down_combine_grouped_bf16in_pm_gfx1201"),
+            "{line}"
+        );
         assert!(!line.starts_with("WARNING"), "{line}");
 
         // A host-mapped admission names the NT8 entries and its own log class.
@@ -5235,22 +5622,46 @@ mod tests {
             ..facts
         };
         let admitted_host = decide_expert_iu4(&host);
-        let line = expert_iu4_log_line("gfx1201", &host, &admitted_host, 1).unwrap();
+        let line = expert_iu4_log_line("gfx1201", &host, &admitted_host, 1, Some(PM_NT8)).unwrap();
         for needle in ["host_mapped=true", "graph_capture=true", "_nt8"] {
             assert!(line.contains(needle), "{needle}: {line}");
         }
         assert!(!line.contains("_nt4"), "{line}");
         assert_ne!(
-            expert_iu4_log_class(&admitted),
-            expert_iu4_log_class(&admitted_host)
+            expert_iu4_log_class(&admitted, Some(PM_NT4)),
+            expert_iu4_log_class(&admitted_host, Some(PM_NT8))
         );
+
+        // A resident admission the launcher widens (flag + shape) names the entries it launches:
+        // gate/up NT8 and down NT4. It logs in its own class, distinct from both the NT4 resident
+        // and host-mapped ones.
+        let line = expert_iu4_log_line("gfx1201", &facts, &admitted, 1, Some(PM_MIXED)).unwrap();
+        assert!(line.contains("host_mapped=false"), "{line}");
+        assert!(
+            line.contains("[qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt8,qwen4_moe_down_iu4_sym_pm_gfx1201_nt4]"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("qwen4_moe_down_iu4_sym_pm_gfx1201_nt8"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("gate_up_silu_iu4_sym_pm_gfx1201_nt4"),
+            "{line}"
+        );
+        let classes_of = [
+            expert_iu4_log_class(&admitted, Some(PM_NT4)),
+            expert_iu4_log_class(&admitted, Some(PM_MIXED)),
+            expert_iu4_log_class(&admitted_host, Some(PM_NT8)),
+        ];
+        assert_eq!(classes_of, [Some(0), Some(34), Some(33)]);
 
         let refused = ExpertIu4Facts {
             requested: false,
             ..facts
         };
-        let line =
-            expert_iu4_log_line("gfx1100", &refused, &decide_expert_iu4(&refused), 1).unwrap();
+        let line = expert_iu4_log_line("gfx1100", &refused, &decide_expert_iu4(&refused), 1, None)
+            .unwrap();
         assert!(line.contains("requested=false"), "{line}");
         assert!(
             line.contains(ExpertIu4Reject::NotRequested.reason()),
@@ -5265,7 +5676,8 @@ mod tests {
             },
             ..facts
         };
-        let line = expert_iu4_log_line("gfx1201", &tight, &decide_expert_iu4(&tight), 1).unwrap();
+        let line =
+            expert_iu4_log_line("gfx1201", &tight, &decide_expert_iu4(&tight), 1, None).unwrap();
         assert!(line.contains("int4_mmq_x_scratch"), "{line}");
     }
 
@@ -5360,7 +5772,7 @@ mod tests {
             ..admitted_facts()
         };
         let decision = decide_expert_iu4(&recording);
-        let line = expert_iu4_log_line("gfx1201", &recording, &decision, 1001).unwrap();
+        let line = expert_iu4_log_line("gfx1201", &recording, &decision, 1001, None).unwrap();
         for needle in [
             "WARNING",
             ExpertIu4Exclusion::RedlineRecording.reason(),
@@ -5402,7 +5814,7 @@ mod tests {
             ),
         ] {
             let decision = decide_expert_iu4(&facts);
-            let line = expert_iu4_log_line("gfx1201", &facts, &decision, 1).unwrap();
+            let line = expert_iu4_log_line("gfx1201", &facts, &decision, 1, None).unwrap();
             assert!(line.starts_with("WARNING"), "{label}: {line}");
             assert!(line.contains(name), "{label}: {line}");
         }
@@ -5412,8 +5824,118 @@ mod tests {
             use_path2: false,
             ..admitted_facts()
         };
-        let line = expert_iu4_log_line("gfx1201", &path1, &decide_expert_iu4(&path1), 1).unwrap();
+        let line =
+            expert_iu4_log_line("gfx1201", &path1, &decide_expert_iu4(&path1), 1, None).unwrap();
         assert!(!line.starts_with("WARNING"), "{line}");
         assert!(line.contains(ExpertIu4Reject::NotPath2.reason()), "{line}");
+    }
+
+    #[test]
+    fn expert_iu4_combine_v2_selection_truth_table() {
+        use rdna_compute::prefill_route_capabilities::{enabled, PrefillRoute};
+        let a3b = ExpertIu4Plan {
+            rows: 8192,
+            grouped_rows: 8192 * 8 + 256 * 15,
+            total_slots: 8192 * 8,
+            hidden: 2048,
+            intermediate: 512,
+            k_top: 8,
+            host_mapped: false,
+        };
+        let shapes = [
+            (a3b, true),
+            (
+                ExpertIu4Plan {
+                    hidden: 4096,
+                    ..a3b
+                },
+                true,
+            ),
+            (ExpertIu4Plan { k_top: 1, ..a3b }, true),
+            (
+                ExpertIu4Plan {
+                    hidden: 2560,
+                    ..a3b
+                },
+                false,
+            ),
+            (
+                ExpertIu4Plan {
+                    hidden: 1024,
+                    ..a3b
+                },
+                false,
+            ),
+            (ExpertIu4Plan { hidden: 0, ..a3b }, false),
+            (ExpertIu4Plan { k_top: 0, ..a3b }, false),
+            (ExpertIu4Plan { k_top: 9, ..a3b }, false),
+            (ExpertIu4Plan { rows: 0, ..a3b }, false),
+        ];
+        for arch in ["gfx1201", "gfx1151", "gfx1100", "gfx942", "unknown"] {
+            for flag in [None, Some(false), Some(true)] {
+                for available in [false, true] {
+                    for (plan, shape_ok) in shapes {
+                        let want = flag != Some(false)
+                            && (flag == Some(true) || arch == "gfx1201")
+                            && available
+                            && shape_ok;
+                        assert_eq!(
+                            expert_iu4_combine_v2_admits(flag, arch, available, &plan),
+                            want,
+                            "flag {flag:?} arch {arch} available {available} plan {plan:?}"
+                        );
+                    }
+                }
+            }
+            // Unset follows qualification: on at exact gfx1201 only.
+            assert_eq!(
+                enabled(None, arch, PrefillRoute::MoeCombineV2),
+                arch == "gfx1201"
+            );
+        }
+    }
+
+    #[test]
+    fn expert_iu4_combine_v2_requires_the_flag_then_the_bundle_then_the_shape() {
+        let plan = ExpertIu4Plan {
+            rows: 4096,
+            grouped_rows: 4096 * 8,
+            total_slots: 4096 * 8,
+            hidden: 2048,
+            intermediate: 512,
+            k_top: 8,
+            host_mapped: true,
+        };
+        // gfx1201 with the bundle and a supported shape: unset is on by qualification, an
+        // explicit 0 kills it, an explicit 1 opts in.
+        assert!(expert_iu4_combine_v2_admits(None, "gfx1201", true, &plan));
+        assert!(!expert_iu4_combine_v2_admits(None, "gfx1201", false, &plan));
+        assert!(!expert_iu4_combine_v2_admits(None, "gfx1151", true, &plan));
+        assert!(!expert_iu4_combine_v2_admits(
+            Some(false),
+            "gfx1201",
+            true,
+            &plan
+        ));
+        assert!(expert_iu4_combine_v2_admits(
+            Some(true),
+            "gfx1201",
+            true,
+            &plan
+        ));
+        // The bundle missing (any other arch) keeps v1 even when forced on.
+        assert!(!expert_iu4_combine_v2_admits(
+            Some(true),
+            "gfx1151",
+            false,
+            &plan
+        ));
+        // The pure shape predicate is the launcher's own.
+        assert!(rdna_compute::moe_slot_ops::moe_combine_v2_shape_supported(
+            plan.hidden,
+            plan.k_top,
+            plan.rows,
+            plan.grouped_rows
+        ));
     }
 }

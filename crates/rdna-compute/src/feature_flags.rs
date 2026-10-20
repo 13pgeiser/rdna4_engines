@@ -434,6 +434,55 @@ pub struct FeatureFlags {
     /// Default ON on exact gfx1201; `=1` forces it on other arches
     /// (launchers stay gfx1201-only).
     pub gfx12_fa2_prefill: bool,
+    /// `HIPFIRE_FA_PREFILL_PM` (`developer.fa_prefill_pm`): typed flag for
+    /// A3B H16/KV2/D256 Q8_0 prefill. Unset follows route qualification
+    /// (on only on exact gfx1201); explicit 1/0 wins, admission still applies.
+    pub fa_prefill_pm: bool,
+    /// The same `HIPFIRE_FA_PREFILL_PM` key resolved for the native fp8-E4M3 KV codec: an
+    /// explicit 1/0 wins, unset follows `PrefillRoute::FaPrefillPm` fp8 qualification
+    /// (`prefill_route_capabilities::FP8_KV_QUALIFIED`, empty until fp8 has its own receipts, so
+    /// unset = off). The Q8_0 qualification never enables fp8 KV.
+    pub fa_prefill_pm_fp8_kv: bool,
+    /// `HIPFIRE_MOE_IU4_WIDE_TILES` (`developer.moe_iu4_wide_tiles`): typed flag
+    /// for the NT8 gate/up expert-run tile on VRAM-resident symmetric IU4 MoE experts
+    /// (exact gfx1201 raw inventory, per-expert real slots >= 128; see
+    /// `Gpu::qwen4_moe_sym_gemm_symbols`). The resident down entry stays NT4 whatever this
+    /// says. Unset follows route qualification (on only on exact gfx1201); explicit 1 opts in
+    /// (raw inventory is applied at selection), 0 kills.
+    /// Host-mapped experts keep their existing NT8 gate/up and down whatever this says.
+    pub moe_iu4_wide_tiles: bool,
+    /// `HIPFIRE_FA_PREFILL_PM_QPREP` (`developer.fa_prefill_pm_qprep`): typed
+    /// flag for the exact Q-prep fold that feeds the PM direct attention
+    /// (A3B H16/KV2/D256 Q8_0 prefill). Unset follows route qualification (on only on exact
+    /// gfx1201), explicit 1 opts in, 0 kills. Independent of `fa_prefill_pm` as a flag; the
+    /// route nests beneath the *resolved* PM flag (an explicit PM 0 refuses the fold), and
+    /// admission still applies.
+    pub fa_prefill_pm_qprep: bool,
+    /// The same `HIPFIRE_FA_PREFILL_PM_QPREP` key resolved for the native fp8-E4M3 KV codec;
+    /// qualification as [`Self::fa_prefill_pm_fp8_kv`] (unset = off until fp8 receipts exist).
+    pub fa_prefill_pm_qprep_fp8_kv: bool,
+    /// `HIPFIRE_MOE_ROTATE_I4_PM` (`developer.moe_rotate_i4_pm`): typed opt-in for the exact
+    /// PeaceMaker twin of the down A4 producer `qwen4_moe_rotate128_i4`. The route has raw
+    /// inventory (exact gfx1201) but no qualification row: unset is off everywhere, explicit 1
+    /// opts in (raw inventory, the requested symmetric IU4 route, the C2 candidate set and the
+    /// launch shape are all applied at selection), 0 kills.
+    pub moe_rotate_i4_pm: bool,
+    /// `HIPFIRE_PREFILL_IU4_PRODUCER_FUSED` (`developer.prefill_iu4_producer_fused`): typed
+    /// flag for the exact IU4 producer fusion, resolved through its qualification (on only on
+    /// exact gfx1201 when unset; explicit 1 opts in, 0 kills). The raw inventory is a separate
+    /// conjunct at the callers. Read here only so the exact C8 PM wrappers can nest beneath it.
+    pub prefill_iu4_producer_fused: bool,
+    /// `HIPFIRE_PREFILL_IU4_C8_PM` (`developer.prefill_iu4_c8_pm`): typed flag for the
+    /// PeaceMaker C8 rotate / RMSNorm-rotate producer twins. Raw inventory only (no qualified
+    /// row): unset is off, explicit 1 opts in (raw inventory is applied at admission), 0 kills.
+    /// Nests beneath the resolved `prefill_iu4_producer_fused` flag.
+    pub prefill_iu4_c8_pm: bool,
+    /// `HIPFIRE_GDN_CHUNK_PREP_PM` (`developer.gdn_chunk_prep_pm`): typed opt-in for the PM
+    /// twin of `gdn_chunk_prep` (A3B 16/32-head GDN chunk-scan preamble). The route has raw
+    /// exact-gfx1201 inventory and no `QUALIFIED` row, so unset is off everywhere, explicit 1
+    /// opts in and 0 kills. Independent of the chunk-scan flag as a flag; the MoE chunk-scan
+    /// layer admission still applies in `hipfire-arch-qwen35`.
+    pub gdn_chunk_prep_pm: bool,
     /// gfx1201 packet-minimal Q128 FA2 body (`HIPFIRE_GFX12_FA_PACKET`,
     /// `kernel.gfx12_fa_packet`). Default ON on exact gfx1201; `=0` opts out
     /// to the route-N body. Exact stage-b arithmetic; any raw-O bit difference
@@ -1046,8 +1095,90 @@ impl FeatureFlags {
             gfx1100_dec_norm: parse_bool("HIPFIRE_GFX1100_DEC_NORM").unwrap_or(arch == "gfx1100"),
             gfx11_producer_quant_fused: parse_bool("HIPFIRE_GFX11_PRODUCER_QUANT_FUSED")
                 .unwrap_or(matches!(arch, "gfx1100" | "gfx1151")),
-            gfx12_fp8_stream: parse_bool("HIPFIRE_GFX12_FP8_STREAM").unwrap_or(arch == "gfx1201"),
+            gfx12_fp8_stream: parse_bool("HIPFIRE_GFX12_FP8_STREAM")
+                .unwrap_or(arch == "gfx1201"),
             gfx12_fa2_prefill: parse_bool("HIPFIRE_GFX12_FA2_PREFILL").unwrap_or(arch == "gfx1201"),
+            fa_prefill_pm: crate::prefill_route_capabilities::enabled(
+                value("HIPFIRE_FA_PREFILL_PM").ok().map(|raw| {
+                    hipfire_config::parse_typed_bool(&raw).expect(
+                        "HIPFIRE_FA_PREFILL_PM is not a boolean: expected true, false, 1 or 0",
+                    )
+                }),
+                arch,
+                crate::prefill_route_capabilities::PrefillRoute::FaPrefillPm,
+            ),
+            fa_prefill_pm_fp8_kv: crate::prefill_route_capabilities::enabled_fp8_kv(
+                value("HIPFIRE_FA_PREFILL_PM").ok().map(|raw| {
+                    hipfire_config::parse_typed_bool(&raw).expect(
+                        "HIPFIRE_FA_PREFILL_PM is not a boolean: expected true, false, 1 or 0",
+                    )
+                }),
+                arch,
+                crate::prefill_route_capabilities::PrefillRoute::FaPrefillPm,
+            ),
+            moe_iu4_wide_tiles: crate::prefill_route_capabilities::enabled(
+                value("HIPFIRE_MOE_IU4_WIDE_TILES").ok().map(|raw| {
+                    hipfire_config::parse_typed_bool(&raw).expect(
+                        "HIPFIRE_MOE_IU4_WIDE_TILES is not a boolean: expected true, false, 1 or 0",
+                    )
+                }),
+                arch,
+                crate::prefill_route_capabilities::PrefillRoute::MoeIu4WideTiles,
+            ),
+            fa_prefill_pm_qprep: crate::prefill_route_capabilities::enabled(
+                value("HIPFIRE_FA_PREFILL_PM_QPREP").ok().map(|raw| {
+                    hipfire_config::parse_typed_bool(&raw).expect(
+                        "HIPFIRE_FA_PREFILL_PM_QPREP is not a boolean: expected true, false, 1 or 0",
+                    )
+                }),
+                arch,
+                crate::prefill_route_capabilities::PrefillRoute::FaPrefillPmQprep,
+            ),
+            fa_prefill_pm_qprep_fp8_kv: crate::prefill_route_capabilities::enabled_fp8_kv(
+                value("HIPFIRE_FA_PREFILL_PM_QPREP").ok().map(|raw| {
+                    hipfire_config::parse_typed_bool(&raw).expect(
+                        "HIPFIRE_FA_PREFILL_PM_QPREP is not a boolean: expected true, false, 1 or 0",
+                    )
+                }),
+                arch,
+                crate::prefill_route_capabilities::PrefillRoute::FaPrefillPmQprep,
+            ),
+            moe_rotate_i4_pm: crate::prefill_route_capabilities::enabled(
+                value("HIPFIRE_MOE_ROTATE_I4_PM").ok().map(|raw| {
+                    hipfire_config::parse_typed_bool(&raw).expect(
+                        "HIPFIRE_MOE_ROTATE_I4_PM is not a boolean: expected true, false, 1 or 0",
+                    )
+                }),
+                arch,
+                crate::prefill_route_capabilities::PrefillRoute::MoeRotateI4Pm,
+            ),
+            prefill_iu4_producer_fused: crate::prefill_route_capabilities::enabled(
+                value("HIPFIRE_PREFILL_IU4_PRODUCER_FUSED").ok().map(|raw| {
+                    hipfire_config::parse_typed_bool(&raw).expect(
+                        "HIPFIRE_PREFILL_IU4_PRODUCER_FUSED is not a boolean: expected true, false, 1 or 0",
+                    )
+                }),
+                arch,
+                crate::prefill_route_capabilities::PrefillRoute::PrefillIu4ProducerFused,
+            ),
+            prefill_iu4_c8_pm: crate::prefill_route_capabilities::enabled(
+                value("HIPFIRE_PREFILL_IU4_C8_PM").ok().map(|raw| {
+                    hipfire_config::parse_typed_bool(&raw).expect(
+                        "HIPFIRE_PREFILL_IU4_C8_PM is not a boolean: expected true, false, 1 or 0",
+                    )
+                }),
+                arch,
+                crate::prefill_route_capabilities::PrefillRoute::PrefillIu4C8Pm,
+            ),
+            gdn_chunk_prep_pm: crate::prefill_route_capabilities::enabled(
+                value("HIPFIRE_GDN_CHUNK_PREP_PM").ok().map(|raw| {
+                    hipfire_config::parse_typed_bool(&raw).expect(
+                        "HIPFIRE_GDN_CHUNK_PREP_PM is not a boolean: expected true, false, 1 or 0",
+                    )
+                }),
+                arch,
+                crate::prefill_route_capabilities::PrefillRoute::GdnChunkPrepPm,
+            ),
             gfx12_fa_packet: parse_bool("HIPFIRE_GFX12_FA_PACKET").unwrap_or(arch == "gfx1201"),
             attn_qresident: parse_bool("HIPFIRE_ATTN_QRESIDENT").unwrap_or(arch == "gfx1201"),
             attn_qresident_v2: parse_bool("HIPFIRE_ATTN_QRESIDENT_V2").unwrap_or(arch == "gfx1201"),
@@ -1575,6 +1706,15 @@ impl FeatureFlags {
             cb_verify_iu4: None,
             gfx12_mq4v2_fp8_v2: false,
             gfx12_fa2_prefill: false,
+            fa_prefill_pm: false,
+            fa_prefill_pm_fp8_kv: false,
+            moe_iu4_wide_tiles: false,
+            fa_prefill_pm_qprep: false,
+            fa_prefill_pm_qprep_fp8_kv: false,
+            moe_rotate_i4_pm: false,
+            prefill_iu4_producer_fused: false,
+            prefill_iu4_c8_pm: false,
+            gdn_chunk_prep_pm: false,
             gfx12_fa_packet: false,
             attn_qresident: false,
             attn_qresident_v2: false,
@@ -2545,6 +2685,316 @@ mod tests {
             let test_flags = FeatureFlags::for_test(arch);
             assert!(!test_flags.gfx12_fa2_prefill, "arch={arch}");
             assert!(!test_flags.gfx11_fa2_prefill, "arch={arch}");
+        }
+    }
+
+    #[test]
+    fn fa_prefill_pm_defaults_to_qualification_with_explicit_override() {
+        use crate::prefill_route_capabilities::{qualified, PrefillRoute};
+        for arch in ["gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown"] {
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(unset.fa_prefill_pm, qualified(arch, PrefillRoute::FaPrefillPm));
+            assert_eq!(unset.fa_prefill_pm, arch == "gfx1201");
+            assert!(!FeatureFlags::for_test(arch).fa_prefill_pm);
+            assert!(!unset.fa_prefill_pm_fp8_kv, "{arch}: fp8 has no qualification yet");
+            assert!(!FeatureFlags::for_test(arch).fa_prefill_pm_fp8_kv);
+            for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+                let flags = FeatureFlags::from_lookup(arch, |name| {
+                    if name == "HIPFIRE_FA_PREFILL_PM" {
+                        Ok(raw.into())
+                    } else {
+                        Err(())
+                    }
+                });
+                assert_eq!(flags.fa_prefill_pm, want, "{arch}: {raw}");
+                assert_eq!(flags.fa_prefill_pm_fp8_kv, want, "{arch}: fp8 {raw}");
+            }
+        }
+    }
+
+    #[test]
+    fn moe_iu4_wide_tiles_defaults_to_qualification_with_explicit_override() {
+        use crate::prefill_route_capabilities::{qualified, raw_inventory, PrefillRoute};
+        const ROUTE: PrefillRoute = PrefillRoute::MoeIu4WideTiles;
+        for arch in ["gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown"] {
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(unset.moe_iu4_wide_tiles, qualified(arch, ROUTE), "{arch}");
+            assert_eq!(unset.moe_iu4_wide_tiles, arch == "gfx1201", "{arch}");
+            assert!(!FeatureFlags::for_test(arch).moe_iu4_wide_tiles, "{arch}");
+            for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+                let flags = FeatureFlags::from_lookup(arch, |name| {
+                    if name == "HIPFIRE_MOE_IU4_WIDE_TILES" {
+                        Ok(raw.into())
+                    } else {
+                        Err(())
+                    }
+                });
+                // The flag is the typed request only; raw inventory is applied at selection.
+                assert_eq!(flags.moe_iu4_wide_tiles, want, "{arch}: {raw}");
+            }
+            // No other flag moves with it: an explicit PM `1` leaves the wide-tile default
+            // at its own qualification.
+            let only_other = FeatureFlags::from_lookup(arch, |name| {
+                if name == "HIPFIRE_FA_PREFILL_PM" {
+                    Ok("1".into())
+                } else {
+                    Err(())
+                }
+            });
+            assert_eq!(only_other.moe_iu4_wide_tiles, arch == "gfx1201", "{arch}");
+            assert!(only_other.fa_prefill_pm, "{arch}");
+        }
+        assert!(raw_inventory("gfx1201", ROUTE) && !raw_inventory("gfx1151", ROUTE));
+    }
+
+    #[test]
+    #[should_panic(expected = "HIPFIRE_MOE_IU4_WIDE_TILES is not a boolean")]
+    fn moe_iu4_wide_tiles_rejects_a_non_boolean_spelling() {
+        let _ = FeatureFlags::from_lookup("gfx1201", |name| {
+            if name == "HIPFIRE_MOE_IU4_WIDE_TILES" {
+                Ok("on".into())
+            } else {
+                Err(())
+            }
+        });
+    }
+
+    #[test]
+    fn moe_iu4_wide_tiles_selection_is_independent_of_the_combine_v2_and_multirow_flags() {
+        use crate::gemm::qwen4_moe_sym_nt8_pair;
+        // A3B top-8, 256 experts, 8192 rows: past the wide-tile shape floor.
+        const SLOTS: usize = 8192 * 8;
+        const EXPERTS: usize = 256;
+        let with = |wide: Option<&'static str>, combine: Option<&'static str>| {
+            FeatureFlags::from_lookup("gfx1201", |name| match name {
+                "HIPFIRE_MOE_IU4_WIDE_TILES" => wide.map(String::from).ok_or(()),
+                "HIPFIRE_MOE_COMBINE_V2" => combine.map(String::from).ok_or(()),
+                "HIPFIRE_MOE_ROUTER_TOPK_MULTIROW" => combine.map(String::from).ok_or(()),
+                _ => Err(()),
+            })
+        };
+        let pair = |flags: &FeatureFlags, host: bool| {
+            qwen4_moe_sym_nt8_pair("gfx1201", host, flags.moe_iu4_wide_tiles, SLOTS, EXPERTS)
+        };
+        // The F1 / F4 variables are read by `hipfire-dispatch`, never by `FeatureFlags`; setting
+        // them in the lookup proves nothing here reads them for the wide-tile flag.
+        for combine in [None, Some("0"), Some("1")] {
+            // F2 killed: resident stays the NT4 incumbent whatever F1 / F4 say.
+            let ctx = format!("wide=Some(\"0\") combine={combine:?}");
+            let flags = with(Some("0"), combine);
+            assert!(!flags.moe_iu4_wide_tiles, "{ctx}");
+            assert_eq!(pair(&flags, false), [false, false], "{ctx}");
+            // Host-mapped keeps its NT8 pair whatever any of the flags say.
+            assert_eq!(pair(&flags, true), [true, true], "{ctx}");
+            // F2 unset (qualified on exact gfx1201) or explicit 1: resident gate/up widens,
+            // down stays NT4, host-mapped unchanged.
+            for wide in [None, Some("1")] {
+                let ctx = format!("wide={wide:?} combine={combine:?}");
+                let flags = with(wide, combine);
+                assert!(flags.moe_iu4_wide_tiles, "{ctx}");
+                assert_eq!(pair(&flags, false), [true, false], "{ctx}");
+                assert_eq!(pair(&flags, true), [true, true], "{ctx}");
+            }
+        }
+    }
+
+    #[test]
+    fn fa_prefill_pm_qprep_defaults_to_qualification_with_explicit_override() {
+        use crate::prefill_route_capabilities::{qualified, PrefillRoute};
+        for arch in ["gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown"] {
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(
+                unset.fa_prefill_pm_qprep,
+                qualified(arch, PrefillRoute::FaPrefillPmQprep)
+            );
+            assert_eq!(unset.fa_prefill_pm_qprep, arch == "gfx1201");
+            assert!(!FeatureFlags::for_test(arch).fa_prefill_pm_qprep);
+            assert!(!unset.fa_prefill_pm_qprep_fp8_kv, "{arch}: fp8 has no qualification yet");
+            assert!(!FeatureFlags::for_test(arch).fa_prefill_pm_qprep_fp8_kv);
+            for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+                let flags = FeatureFlags::from_lookup(arch, |name| {
+                    if name == "HIPFIRE_FA_PREFILL_PM_QPREP" {
+                        Ok(raw.into())
+                    } else {
+                        Err(())
+                    }
+                });
+                assert_eq!(flags.fa_prefill_pm_qprep, want, "{arch}: {raw}");
+                assert_eq!(flags.fa_prefill_pm_qprep_fp8_kv, want, "{arch}: fp8 {raw}");
+                assert!(!flags.fa_prefill_pm_fp8_kv, "{arch}: Q-prep must not enable fp8 attention");
+                // Independent of the PM attention flag: the PM flag stays the resolved
+                // qualification (on only on exact gfx1201), whatever the Q-prep flag says.
+                assert_eq!(
+                    flags.fa_prefill_pm,
+                    qualified(arch, PrefillRoute::FaPrefillPm),
+                    "{arch}: {raw}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fa_prefill_pm_qprep_resolves_beside_the_resolved_pm_flag() {
+        let with = |arch: &str, pm: Option<&'static str>, qprep: Option<&'static str>| {
+            FeatureFlags::from_lookup(arch, |name| match name {
+                "HIPFIRE_FA_PREFILL_PM" => pm.map(String::from).ok_or(()),
+                "HIPFIRE_FA_PREFILL_PM_QPREP" => qprep.map(String::from).ok_or(()),
+                _ => Err(()),
+            })
+        };
+        for arch in ["gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown"] {
+            let gfx1201 = arch == "gfx1201";
+            // Both unset: each resolves to its own qualification (on only on exact gfx1201),
+            // so the pair is admitted by default exactly there.
+            let unset = with(arch, None, None);
+            assert_eq!(unset.fa_prefill_pm, gfx1201, "{arch}");
+            assert_eq!(unset.fa_prefill_pm_qprep, gfx1201, "{arch}");
+            assert!(!unset.fa_prefill_pm_fp8_kv && !unset.fa_prefill_pm_qprep_fp8_kv, "{arch}");
+            // PM unset + Q-prep 1: the resolved PM flag is on exactly where qualified.
+            let pm_unset = with(arch, None, Some("1"));
+            assert_eq!(pm_unset.fa_prefill_pm, gfx1201, "{arch}");
+            assert!(pm_unset.fa_prefill_pm_qprep, "{arch}");
+            assert!(!pm_unset.fa_prefill_pm_fp8_kv && pm_unset.fa_prefill_pm_qprep_fp8_kv, "{arch}");
+            // PM 0 + Q-prep unset / 1: the PM route is off, so the fold has nothing to feed
+            // (the admission refuses it with `PmDisabled`); the Q-prep flag itself is its own.
+            let pm_off = with(arch, Some("0"), None);
+            assert!(!pm_off.fa_prefill_pm, "{arch}");
+            assert_eq!(pm_off.fa_prefill_pm_qprep, gfx1201, "{arch}");
+            assert!(!pm_off.fa_prefill_pm_fp8_kv && !pm_off.fa_prefill_pm_qprep_fp8_kv, "{arch}");
+            let pm_off_on = with(arch, Some("0"), Some("1"));
+            assert!(!pm_off_on.fa_prefill_pm, "{arch}");
+            assert!(pm_off_on.fa_prefill_pm_qprep, "{arch}");
+            assert!(!pm_off_on.fa_prefill_pm_fp8_kv && pm_off_on.fa_prefill_pm_qprep_fp8_kv, "{arch}");
+            // PM 1 + Q-prep 1: both explicit.
+            let both = with(arch, Some("1"), Some("1"));
+            assert!(both.fa_prefill_pm && both.fa_prefill_pm_qprep, "{arch}");
+            assert!(both.fa_prefill_pm_fp8_kv && both.fa_prefill_pm_qprep_fp8_kv, "{arch}");
+            // Q-prep 0 kills the fold whatever the PM flag says.
+            for pm in [None, Some("0"), Some("1")] {
+                let flags = with(arch, pm, Some("0"));
+                assert!(!flags.fa_prefill_pm_qprep, "{arch}: pm {pm:?}");
+                assert!(!flags.fa_prefill_pm_qprep_fp8_kv, "{arch}: fp8 pm {pm:?}");
+            }
+        }
+    }
+    #[test]
+    fn prefill_iu4_c8_pm_is_opt_in_beside_the_resolved_f3_flag() {
+        use crate::prefill_route_capabilities::{qualified, PrefillRoute};
+        let with = |arch: &str, f3: Option<&'static str>, c8: Option<&'static str>| {
+            FeatureFlags::from_lookup(arch, |name| match name {
+                "HIPFIRE_PREFILL_IU4_PRODUCER_FUSED" => f3.map(String::from).ok_or(()),
+                "HIPFIRE_PREFILL_IU4_C8_PM" => c8.map(String::from).ok_or(()),
+                _ => Err(()),
+            })
+        };
+        for arch in [
+            "gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown",
+        ] {
+            let gfx1201 = arch == "gfx1201";
+            let unset = with(arch, None, None);
+            // F3 follows its qualification; the C8 PM route has no qualified row: off.
+            assert_eq!(
+                unset.prefill_iu4_producer_fused,
+                qualified(arch, PrefillRoute::PrefillIu4ProducerFused),
+                "{arch}"
+            );
+            assert_eq!(unset.prefill_iu4_producer_fused, gfx1201, "{arch}");
+            assert!(!unset.prefill_iu4_c8_pm, "{arch}: unset is off");
+            assert!(!FeatureFlags::for_test(arch).prefill_iu4_c8_pm, "{arch}");
+            assert!(
+                !FeatureFlags::for_test(arch).prefill_iu4_producer_fused,
+                "{arch}"
+            );
+            for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+                let flags = with(arch, None, Some(raw));
+                assert_eq!(flags.prefill_iu4_c8_pm, want, "{arch}: {raw}");
+                // Independent flag: F3 stays its own resolved qualification.
+                assert_eq!(flags.prefill_iu4_producer_fused, gfx1201, "{arch}: {raw}");
+            }
+            // An explicit F3 0 does not change the C8 PM flag itself (the wrapper nests).
+            let f3_off = with(arch, Some("0"), Some("1"));
+            assert!(!f3_off.prefill_iu4_producer_fused, "{arch}");
+            assert!(f3_off.prefill_iu4_c8_pm, "{arch}");
+        }
+    }
+
+    #[test]
+    fn moe_rotate_i4_pm_is_off_unless_explicitly_enabled() {
+        use crate::prefill_route_capabilities::{qualified, PrefillRoute};
+        for arch in [
+            "gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown",
+        ] {
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert!(!qualified(arch, PrefillRoute::MoeRotateI4Pm), "{arch}");
+            assert!(!unset.moe_rotate_i4_pm, "{arch}: unset is off");
+            assert!(!FeatureFlags::for_test(arch).moe_rotate_i4_pm, "{arch}");
+            for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+                let flags = FeatureFlags::from_lookup(arch, |name| {
+                    if name == "HIPFIRE_MOE_ROTATE_I4_PM" {
+                        Ok(raw.into())
+                    } else {
+                        Err(())
+                    }
+                });
+                // The flag is the typed request only; raw inventory is applied at selection.
+                assert_eq!(flags.moe_rotate_i4_pm, want, "{arch}: {raw}");
+                // No other route flag moves with it.
+                assert_eq!(flags.fa_prefill_pm, unset.fa_prefill_pm, "{arch}: {raw}");
+                assert_eq!(
+                    flags.moe_iu4_wide_tiles, unset.moe_iu4_wide_tiles,
+                    "{arch}: {raw}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "HIPFIRE_MOE_ROTATE_I4_PM is not a boolean")]
+    fn moe_rotate_i4_pm_rejects_a_non_boolean_spelling() {
+        let _ = FeatureFlags::from_lookup("gfx1201", |name| {
+            if name == "HIPFIRE_MOE_ROTATE_I4_PM" {
+                Ok("on".into())
+            } else {
+                Err(())
+            }
+        });
+    }
+
+    #[test]
+    fn gdn_chunk_prep_pm_is_opt_in_with_explicit_override() {
+        use crate::prefill_route_capabilities::{qualified, raw_inventory, PrefillRoute};
+        for arch in [
+            "gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown",
+        ] {
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(
+                unset.gdn_chunk_prep_pm,
+                qualified(arch, PrefillRoute::GdnChunkPrepPm)
+            );
+            assert!(
+                !unset.gdn_chunk_prep_pm,
+                "{arch}: no QUALIFIED row, unset is off"
+            );
+            assert!(!FeatureFlags::for_test(arch).gdn_chunk_prep_pm);
+            for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+                let flags = FeatureFlags::from_lookup(arch, |name| {
+                    if name == "HIPFIRE_GDN_CHUNK_PREP_PM" {
+                        Ok(raw.into())
+                    } else {
+                        Err(())
+                    }
+                });
+                assert_eq!(flags.gdn_chunk_prep_pm, want, "{arch}: {raw}");
+                // Independent of every other route flag: they keep their own resolution.
+                assert_eq!(flags.fa_prefill_pm, arch == "gfx1201", "{arch}");
+                assert_eq!(flags.fa_prefill_pm_qprep, arch == "gfx1201", "{arch}");
+            }
+            // An explicit 1 resolves on whatever the architecture; the launcher admission
+            // adds the raw inventory (exact gfx1201).
+            assert_eq!(
+                raw_inventory(arch, PrefillRoute::GdnChunkPrepPm),
+                arch == "gfx1201"
+            );
         }
     }
 

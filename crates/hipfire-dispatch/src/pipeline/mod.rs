@@ -15,6 +15,8 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use std::cell::OnceCell;
 use std::sync::{LazyLock, OnceLock};
 
+#[cfg(feature = "moe-oracle")]
+pub mod router_observer;
 pub mod sealed_moe;
 pub use sealed_moe::{
     checked_grouped_m_total_bound, checked_tp_local_shapes, seal_decode, seal_ep_routed_contrib,
@@ -3947,10 +3949,85 @@ fn prefill_shared_gemm_key(dtype: DType) -> Option<KernelKey> {
     })
 }
 
-fn prefill_shared_gate_up_stage(
+/// `HIPFIRE_MOE_SHARED_PREPARED_IU4` (`developer.moe_shared_prepared_iu4`, a
+/// typed boolean): the explicit value, read once. `true`/`1` arms the shared
+/// selector and gate/up reading one IU4-quantized activation, prepared once,
+/// wherever the GPU capability admits it; `false`/`0` is the kill switch.
+/// Unset follows `prefill_route_capabilities` qualification of the device
+/// architecture.
+static SHARED_PREPARED_IU4: LazyLock<Option<bool>> =
+    LazyLock::new(|| hipfire_config::developer_typed_bool("HIPFIRE_MOE_SHARED_PREPARED_IU4"));
+
+/// Pure admission of the shared-expert quantize-once IU4 route: flag on, the
+/// GPU capability (arch, IU4 prefill, fp8/a8 precedence), no replay recording,
+/// no graph capture, all three projections MQ4G256V2 with one nonzero K
+/// divisible by 256, and at least 64 rows.
+fn shared_prepared_iu4_admitted(
+    flag: bool,
+    gpu_capable: bool,
+    recording: bool,
+    capture: bool,
+    dtypes: [DType; 3],
+    ks: [usize; 3],
+    rows: usize,
+) -> bool {
+    flag && gpu_capable
+        && !recording
+        && !capture
+        && dtypes.iter().all(|d| *d == DType::MQ4G256V2)
+        && ks[0] != 0
+        && ks[0] % 256 == 0
+        && ks.iter().all(|k| *k == ks[0])
+        && rows >= 64
+}
+
+/// Whether the shared selector/gate/up of `p` take the quantize-once IU4 route
+/// on `gpu`: the flag, the GPU capability (replay recording and graph capture
+/// included), all three projections MQ4G256V2 with one nonzero K divisible by
+/// 256, and at least 64 rows. Pure over the current device state; the router
+/// stage uses it (plus its own dtype/K/rotation check) to decide whether to
+/// quantize `p.x_rot_batch` once for the router and carry the token here.
+pub(super) fn prefill_shared_prepared_iu4_admitted(
+    gpu: &Gpu,
+    p: &crate::families::moe::MoePrefillParams<'_>,
+) -> bool {
+    use rdna_compute::prefill_route_capabilities::{enabled, PrefillRoute};
+    let flag = enabled(
+        *SHARED_PREPARED_IU4,
+        &gpu.arch,
+        PrefillRoute::MoeSharedPreparedIu4,
+    );
+    if !flag {
+        return false;
+    }
+    let Some(shared) = p.prelude.shared.as_ref() else {
+        return false;
+    };
+    let w = &shared.weights;
+    let dtypes = [w.selector.dtype, w.gate.dtype, w.up.dtype];
+    let ks = [w.selector.k, w.gate.k, w.up.k];
+    shared_prepared_iu4_admitted(
+        flag,
+        gpu.mq4g256v2_shared_iu4_supported(ks[0], p.batch_size),
+        gpu.replay.is_recording(),
+        gpu.graphs.capture_mode,
+        dtypes,
+        ks,
+        p.batch_size,
+    )
+}
+
+/// `prepared` is the IU4 token the router stage quantized from
+/// `p.x_rot_batch` (`Some` only when it admitted through
+/// [`prefill_shared_prepared_iu4_admitted`]); it is consumed here without a
+/// second quantize. `Some` with the route not admitted, or declined by the GPU,
+/// fails closed instead of running the incumbent. The calibration taps run
+/// inside the grouped GPU helper in incumbent order.
+pub(super) fn prefill_shared_gate_up_stage(
     ctx: &DispatchCtx,
     gpu: &mut Gpu,
     p: &crate::families::moe::MoePrefillParams<'_>,
+    prepared: Option<&rdna_compute::scratch::Int4MmqPrepared>,
 ) -> Result<(), DispatchError> {
     reject_fp8_moe_unless_routed(&p.dtypes, p.route_policy.map(|policy| policy.capability))?;
     let shared =
@@ -3958,6 +4035,41 @@ fn prefill_shared_gate_up_stage(
             DispatchError::Hip("shared gate/up stage requires shared weights".into())
         })?;
     let n = p.batch_size;
+    if prefill_shared_prepared_iu4_admitted(gpu, p) {
+        let (selector, gate, up) = (
+            &shared.weights.selector,
+            &shared.weights.gate,
+            &shared.weights.up,
+        );
+        let k = selector.k;
+        let launched = gpu
+            .try_gemm_mq4g256v2_shared_iu4(
+                [
+                    (selector.buf, shared.scalar, selector.m),
+                    (gate.buf, shared.gate_out, gate.m),
+                    (up.buf, shared.up_out, up.m),
+                ],
+                p.x_rot_batch,
+                k,
+                n,
+                prepared,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        if !launched {
+            // Admission already required the helper's own capability, so this
+            // is unreachable; fail closed rather than re-tap and re-run the
+            // incumbent.
+            return Err(DispatchError::Hip(
+                "shared gate/up prepared IU4 admitted but helper declined".into(),
+            ));
+        }
+        return Ok(());
+    }
+    if prepared.is_some() {
+        return Err(DispatchError::Hip(
+            "shared gate/up received a prepared IU4 token but the route is not admitted".into(),
+        ));
+    }
     let selector_x = match shared.weights.selector.dtype {
         DType::Q8_0 | DType::F32 => p.x_norm_batch,
         _ => p.x_rot_batch,
@@ -4160,17 +4272,370 @@ fn prefill_shared_gate_up_stage(
     }
 }
 
+#[cfg(test)]
+mod shared_prepared_iu4_tests {
+    use super::*;
+
+    const MQ: DType = DType::MQ4G256V2;
+
+    fn admitted(rows: usize, ks: [usize; 3], dtypes: [DType; 3]) -> bool {
+        shared_prepared_iu4_admitted(true, true, false, false, dtypes, ks, rows)
+    }
+
+    #[test]
+    fn admits_the_exact_incumbent_shape() {
+        for rows in [64, 65, 512, 4096] {
+            assert!(admitted(rows, [2048; 3], [MQ; 3]), "rows {rows}");
+        }
+        assert!(admitted(64, [256; 3], [MQ; 3]));
+    }
+
+    #[test]
+    fn flag_capability_recording_and_capture_truth_table() {
+        for bits in 0..16u8 {
+            let (flag, cap, rec, graph) =
+                (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0);
+            for rows in [63, 64, 512, 4096] {
+                let want = flag && cap && !rec && !graph && rows >= 64;
+                assert_eq!(
+                    shared_prepared_iu4_admitted(flag, cap, rec, graph, [MQ; 3], [2048; 3], rows),
+                    want,
+                    "flag {flag} cap {cap} rec {rec} graph {graph} rows {rows}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn batch_threshold_is_sixty_four_rows() {
+        assert!(!admitted(0, [2048; 3], [MQ; 3]));
+        assert!(!admitted(1, [2048; 3], [MQ; 3]));
+        assert!(!admitted(63, [2048; 3], [MQ; 3]));
+        assert!(admitted(64, [2048; 3], [MQ; 3]));
+        assert!(admitted(512, [2048; 3], [MQ; 3]));
+        assert!(admitted(4096, [2048; 3], [MQ; 3]));
+    }
+
+    #[test]
+    fn any_non_mq4g256v2_dtype_in_any_slot_rejects() {
+        for other in [DType::BF16, DType::F32, DType::Q8_0, DType::F16] {
+            for slot in 0..3 {
+                let mut dtypes = [MQ; 3];
+                dtypes[slot] = other;
+                assert!(
+                    !admitted(512, [2048; 3], dtypes),
+                    "{other:?} in slot {slot}"
+                );
+            }
+            assert!(!admitted(512, [2048; 3], [other; 3]), "{other:?} x3");
+        }
+    }
+
+    #[test]
+    fn k_mismatch_non_multiple_of_256_and_zero_reject() {
+        for slot in 0..3 {
+            let mut ks = [2048; 3];
+            ks[slot] = 2304;
+            assert!(!admitted(512, ks, [MQ; 3]), "mismatch in slot {slot}");
+            ks[slot] = 0;
+            assert!(!admitted(512, ks, [MQ; 3]), "zero in slot {slot}");
+        }
+        for k in [0, 1, 255, 257, 2047, 2049] {
+            assert!(!admitted(512, [k; 3], [MQ; 3]), "k {k}");
+        }
+        assert!(admitted(512, [256; 3], [MQ; 3]));
+        assert!(admitted(512, [512; 3], [MQ; 3]));
+    }
+}
+
+/// `HIPFIRE_PREFILL_IU4_PRODUCER_FUSED` (`developer.prefill_iu4_producer_fused`,
+/// a typed boolean): the explicit value, read once. The capability table has
+/// raw exact-gfx1201 inventory and a qualified row there, so unset is on at
+/// exact gfx1201 and off elsewhere, `1` arms where the admission below holds,
+/// `0` is the kill switch.
+static PREFILL_IU4_PRODUCER_FUSED: LazyLock<Option<bool>> =
+    LazyLock::new(|| hipfire_config::developer_typed_bool("HIPFIRE_PREFILL_IU4_PRODUCER_FUSED"));
+
+/// `HIPFIRE_PREFILL_IU4_PRODUCER_FUSED` resolved through the capability table
+/// for `gpu`'s architecture: an explicit `1` needs the raw gfx1201 inventory,
+/// `0` is off, unset follows the exact-gfx1201 qualification.
+pub(super) fn prefill_iu4_producer_fused_enabled(gpu: &Gpu) -> bool {
+    use rdna_compute::prefill_route_capabilities::{enabled, raw_inventory, PrefillRoute};
+    let route = PrefillRoute::PrefillIu4ProducerFused;
+    // An explicit `1` wins over the qualified default on any architecture, so
+    // the raw inventory (exact gfx1201 launchers) is a separate conjunct.
+    enabled(*PREFILL_IU4_PRODUCER_FUSED, &gpu.arch, route) && raw_inventory(&gpu.arch, route)
+}
+
+/// The only shared-down K the fused producer serves (the A3B shared expert's
+/// intermediate width).
+const SHARED_DOWN_PRODUCER_FUSED_K: usize = 512;
+
+/// Pure admission of the fused shared-down SwiGLU/FWHT/`block_i4_128` producer:
+/// the flag resolved through the capability table, the GPU capability of the
+/// generic MQ4G256V2 GEMM's IU4 ADD consumer (`mq4g256v2_shared_iu4_supported`:
+/// exact gfx1201 WMMA, IU4 prefill, no A8/FP8 precedence, eager, K % 256, rows >= 64),
+/// an MQ4G256V2 down whose K is the shared intermediate width and equals
+/// [`SHARED_DOWN_PRODUCER_FUSED_K`], at least 64 rows, and a recipe whose
+/// `SharedDown` lowers immediately after `SharedActivation`
+/// (`!shared_after_combine`), so no routed stage can run between the producer
+/// and the consumer and the sidecar scratch slot cannot be re-reserved under
+/// the token.
+fn shared_down_producer_fused_admitted(
+    flag: bool,
+    gpu_capable: bool,
+    down_dtype: DType,
+    down_k: usize,
+    intermediate: usize,
+    rows: usize,
+    shared_after_combine: bool,
+) -> bool {
+    flag && gpu_capable
+        && !shared_after_combine
+        && down_dtype == DType::MQ4G256V2
+        && down_k == SHARED_DOWN_PRODUCER_FUSED_K
+        && intermediate == down_k
+        && rows >= 64
+}
+
+/// Whether the shared down of `p` takes the fused producer on `gpu`. The shared
+/// activation stage and the shared down stage both evaluate it; the token the
+/// activation stage returns is the only thing the down stage trusts.
+fn prefill_shared_down_producer_fused_admitted(
+    gpu: &Gpu,
+    p: &crate::families::moe::MoePrefillParams<'_>,
+) -> bool {
+    let flag = prefill_iu4_producer_fused_enabled(gpu);
+    if !flag {
+        return false;
+    }
+    let Some(shared) = p.prelude.shared.as_ref() else {
+        return false;
+    };
+    let down = &shared.weights.down;
+    shared_down_producer_fused_admitted(
+        flag,
+        gpu.mq4g256v2_shared_iu4_supported(down.k, p.batch_size),
+        down.dtype,
+        down.k,
+        shared.intermediate,
+        p.batch_size,
+        p.recipe.shared_after_combine(),
+    )
+}
+
+/// `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI` (`developer.moe_shared_down_sigmoid_epi`, a
+/// typed boolean): the explicit value, read once. The route has NO qualified row, so
+/// unset is off on every architecture, `0` is off, and only `1` opts in (where the
+/// raw exact-gfx1201 inventory and the admission below hold).
+static SHARED_DOWN_SIGMOID_EPI: LazyLock<Option<bool>> =
+    LazyLock::new(|| hipfire_config::developer_typed_bool("HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI"));
+
+/// Pure admission of the shared-down sigmoid residual epilogue: the flag resolved
+/// through the capability table (with raw inventory), the GPU capability of the V3
+/// IU4 ADD consumer (`mq4g256v2_shared_down_sigmoid_epi_supported`, which carries
+/// the recording/capture, rows, K and symmetric-fold conjuncts), an MQ4G256V2 down
+/// whose output rows are the residual row width, and no consumer of the shared
+/// intermediate or per-stage output armed (the fused launch writes neither the
+/// shared down temp nor a separate pre-add residual).
+fn shared_down_sigmoid_epi_admitted(
+    flag: bool,
+    gpu_capable: bool,
+    down_dtype: DType,
+    down_m: usize,
+    residual_dim: usize,
+    collector_active: bool,
+) -> bool {
+    flag && gpu_capable
+        && down_dtype == DType::MQ4G256V2
+        && down_m != 0
+        && down_m == residual_dim
+        && !collector_active
+}
+
+/// Whether a calibration / Hessian collector, the MoE stage dump or the hidden-state
+/// dump is armed: the same guards the decode head fusion honours.
+fn shared_down_collectors_active(gpu: &Gpu) -> bool {
+    gpu.active_capture.is_some()
+        || gpu.hessian_capture.is_some()
+        || moe_dump::enabled()
+        || hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN").is_ok()
+}
+
+fn prefill_shared_down_sigmoid_epi_admitted(
+    gpu: &Gpu,
+    p: &crate::families::moe::MoePrefillParams<'_>,
+) -> bool {
+    use rdna_compute::prefill_route_capabilities::{enabled, raw_inventory, PrefillRoute};
+    let route = PrefillRoute::MoeSharedDownSigmoidEpi;
+    let flag =
+        enabled(*SHARED_DOWN_SIGMOID_EPI, &gpu.arch, route) && raw_inventory(&gpu.arch, route);
+    if !flag {
+        return false;
+    }
+    let Some(shared) = p.prelude.shared.as_ref() else {
+        return false;
+    };
+    let down = &shared.weights.down;
+    shared_down_sigmoid_epi_admitted(
+        flag,
+        gpu.mq4g256v2_shared_down_sigmoid_epi_supported(down.m, down.k, p.batch_size),
+        down.dtype,
+        down.m,
+        p.down_m,
+        shared_down_collectors_active(gpu),
+    )
+}
+
+#[cfg(test)]
+mod shared_down_producer_fused_tests {
+    use super::*;
+
+    fn admitted(
+        flag: bool,
+        cap: bool,
+        dtype: DType,
+        k: usize,
+        intermediate: usize,
+        rows: usize,
+        after_combine: bool,
+    ) -> bool {
+        shared_down_producer_fused_admitted(flag, cap, dtype, k, intermediate, rows, after_combine)
+    }
+
+    #[test]
+    fn admits_only_the_a3b_mq4v2_shared_down_shape() {
+        let mq = DType::MQ4G256V2;
+        assert!(admitted(true, true, mq, 512, 512, 64, false));
+        assert!(admitted(true, true, mq, 512, 512, 4096, false));
+        for (flag, cap) in [(false, true), (true, false), (false, false)] {
+            assert!(!admitted(flag, cap, mq, 512, 512, 512, false));
+        }
+        // Rows below the IU4 consumer's floor.
+        assert!(!admitted(true, true, mq, 512, 512, 63, false));
+        assert!(!admitted(true, true, mq, 512, 512, 0, false));
+        // K is the A3B shared width only.
+        for k in [0, 256, 768, 1024, 2048, 17408] {
+            assert!(!admitted(true, true, mq, k, k, 512, false), "k {k}");
+        }
+        // The down K must be the shared intermediate width.
+        assert!(!admitted(true, true, mq, 512, 1024, 512, false));
+        assert!(!admitted(true, true, mq, 512, 0, 512, false));
+    }
+
+    #[test]
+    fn rejects_every_other_down_dtype() {
+        for dtype in [
+            DType::MQ4G256,
+            DType::MQ6G256,
+            DType::MQ6G256V2,
+            DType::ParoQ4G128,
+            DType::Q8_0,
+            DType::F32,
+            DType::BF16,
+            DType::MQ4G128V2,
+        ] {
+            assert!(
+                !admitted(true, true, dtype, 512, 512, 512, false),
+                "{dtype:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_after_combine_keeps_the_incumbent() {
+        // `SharedDown` is lowered after the routed stages: the sidecar slot
+        // is not provably untouched between producer and consumer.
+        assert!(!admitted(true, true, DType::MQ4G256V2, 512, 512, 512, true));
+    }
+}
+
+#[cfg(test)]
+mod shared_down_sigmoid_epi_tests {
+    use super::*;
+
+    fn admitted(
+        flag: bool,
+        cap: bool,
+        dtype: DType,
+        down_m: usize,
+        dim: usize,
+        collector: bool,
+    ) -> bool {
+        shared_down_sigmoid_epi_admitted(flag, cap, dtype, down_m, dim, collector)
+    }
+
+    #[test]
+    fn admits_only_the_flagged_capable_mq4v2_uncollected_shape() {
+        assert!(admitted(true, true, DType::MQ4G256V2, 2048, 2048, false));
+        for (flag, cap, collector) in [
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+            (false, false, true),
+        ] {
+            assert!(
+                !admitted(flag, cap, DType::MQ4G256V2, 2048, 2048, collector),
+                "flag {flag} cap {cap} collector {collector}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_every_other_down_dtype() {
+        for dtype in [
+            DType::MQ6G256V2,
+            DType::MQ4G256,
+            DType::MQ6G256,
+            DType::Q8_0,
+            DType::F32,
+            DType::ParoQ4G128,
+            DType::MFP4G32E8,
+        ] {
+            assert!(!admitted(true, true, dtype, 2048, 2048, false), "{dtype:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_a_down_that_is_not_the_residual_row_width() {
+        assert!(!admitted(true, true, DType::MQ4G256V2, 0, 0, false));
+        assert!(!admitted(true, true, DType::MQ4G256V2, 2048, 4096, false));
+    }
+}
+
+/// Shared expert activation. Returns `Some(token)` only when the fused exact
+/// producer ran: it wrote both the F32 `shared.rotated` (every other reader of
+/// it is preserved) and the IU4 sidecar the shared down consumes. Every other
+/// arm returns `None` and the shared down quantizes from `shared.rotated`.
 fn prefill_shared_activation_stage(
     gpu: &mut Gpu,
     p: &crate::families::moe::MoePrefillParams<'_>,
-) -> Result<(), DispatchError> {
+) -> Result<Option<rdna_compute::scratch::Int4MmqPrepared>, DispatchError> {
     reject_fp8_moe_unless_routed(&p.dtypes, p.route_policy.map(|policy| policy.capability))?;
     let shared =
         p.prelude.shared.as_ref().ok_or_else(|| {
             DispatchError::Hip("shared activation requires shared weights".into())
         })?;
     let down = &shared.weights.down;
-    if down.dtype == DType::ParoQ4G128 {
+    if prefill_shared_down_producer_fused_admitted(gpu, p) {
+        let (k, n) = (shared.intermediate, p.batch_size);
+        let reservation = gpu
+            .reserve_int4_mmq(k, n)
+            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        let token = gpu
+            .fused_silu_mul_rotate_mq_i4_gfx12_exact_batched(
+                shared.gate_out,
+                shared.up_out,
+                down.awq_scale,
+                Some(shared.rotated),
+                reservation,
+                k,
+                n,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        return Ok(Some(token));
+    }
+    let launched: Result<(), DispatchError> = if down.dtype == DType::ParoQ4G128 {
         let rot = down.rotation.as_ref().ok_or_else(|| {
             DispatchError::Hip("shared Paro down has no rotation metadata".into())
         })?;
@@ -4208,13 +4673,22 @@ fn prefill_shared_activation_stage(
             p.batch_size,
         )
         .map_err(|e| DispatchError::Hip(e.to_string()))
-    }
+    };
+    launched.map(|()| None)
 }
 
+/// `prepared` is the IU4 sidecar the fused shared activation wrote (`Some` only
+/// when that stage admitted the fused producer). It is consumed with the
+/// incumbent GEMM's exact sequence (calibration tap on `shared.rotated`, fp16-X
+/// cache invalidate, `memset(out)`, IU4 ADD consumer) and never re-quantized.
+/// The stages are adjacent, so a token that is not admitted here or whose
+/// scratch generation was superseded is a bug and an `Err` before the tap or
+/// any launch, never a fallback.
 fn prefill_shared_down_stage(
     ctx: &DispatchCtx,
     gpu: &mut Gpu,
     p: &crate::families::moe::MoePrefillParams<'_>,
+    prepared: Option<&rdna_compute::scratch::Int4MmqPrepared>,
 ) -> Result<(), DispatchError> {
     reject_fp8_moe_unless_routed(&p.dtypes, p.route_policy.map(|policy| policy.capability))?;
     let shared = p
@@ -4264,23 +4738,71 @@ fn prefill_shared_down_stage(
             )
             .map_err(|e| DispatchError::Hip(e.to_string())),
         DType::MQ4G256V2 | DType::MQ6G256V2 | DType::Q8_0 | DType::F32 => {
+            // Fused epilogue (opt-in): the V3 IU4 ADD entry applies
+            // `x_batch += sigmoid(scalar) * down` directly, so neither the temp
+            // GEMM nor the separate gated add below runs. A declined or
+            // unsupported call returns false with no tap and no launch and the
+            // incumbent sequence below (including its prepared-token checks) runs.
+            if down.dtype == DType::MQ4G256V2
+                && (prepared.is_none() || prefill_shared_down_producer_fused_admitted(gpu, p))
+                && prefill_shared_down_sigmoid_epi_admitted(gpu, p)
+                && gpu
+                    .try_gemm_mq4g256v2_shared_down_sigmoid_epi(
+                        down.buf,
+                        shared.rotated,
+                        prepared,
+                        p.x_batch,
+                        shared.scalar,
+                        down.m,
+                        down.k,
+                        p.batch_size,
+                    )
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?
+            {
+                return Ok(());
+            }
             let out = down_tmp();
-            // This aliases reused routed scratch, not a residual. Plain GEMM
-            // must overwrite it before the gated add into x_batch.
-            let key = prefill_shared_gemm_key(down.dtype)
-                .ok_or_else(|| DispatchError::Hip("shared down has no GEMM key".into()))?;
-            let gemm = GemmFamily::new();
-            gemm.run_key(
-                key,
-                ctx,
-                gpu,
-                &GemmParams {
-                    w: down,
-                    x: shared.rotated,
-                    y: &out,
-                    batch_size: p.batch_size,
-                },
-            )?;
+            if let Some(token) = prepared {
+                if !prefill_shared_down_producer_fused_admitted(gpu, p) {
+                    return Err(DispatchError::Hip(
+                        "shared down received a prepared IU4 token but the fused route is not admitted"
+                            .into(),
+                    ));
+                }
+                gpu.int4_mmq_prepared_ptr(token, down.k, p.batch_size)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                // The incumbent GEMM's sequence with the quantize already done by
+                // the producer: the tap the generic family takes (on the F32
+                // `shared.rotated` the producer also wrote), then the helper's receipt,
+                // fp16-X invalidate, `memset(out)` and IU4 ADD consumer.
+                gpu.maybe_capture_activation(down.buf, shared.rotated, p.batch_size, down.k);
+                gpu.gemm_mq4g256v2_prepared_iu4(
+                    down.buf,
+                    token,
+                    &out,
+                    down.m,
+                    down.k,
+                    p.batch_size,
+                )
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            } else {
+                // This aliases reused routed scratch, not a residual. Plain GEMM
+                // must overwrite it before the gated add into x_batch.
+                let key = prefill_shared_gemm_key(down.dtype)
+                    .ok_or_else(|| DispatchError::Hip("shared down has no GEMM key".into()))?;
+                let gemm = GemmFamily::new();
+                gemm.run_key(
+                    key,
+                    ctx,
+                    gpu,
+                    &GemmParams {
+                        w: down,
+                        x: shared.rotated,
+                        y: &out,
+                        batch_size: p.batch_size,
+                    },
+                )?;
+            }
             gpu.sigmoid_scaled_residual_add_batched_f32(
                 p.x_batch,
                 &out,
@@ -4422,6 +4944,7 @@ fn decode_gate_side_stage(
                 xr,
                 p.router_logits,
                 scalar_buf,
+
                 &shared_gate,
                 &shared_up,
                 p.router.m,
@@ -4682,6 +5205,16 @@ fn decode_route_gpu_stage(
     if !skip_routing {
         let keep_mask = p.route_policy.map_or(0, |policy| policy.expert_keep_mask);
         if keep_mask != 0 {
+            // The masked kernel reads unrounded logits whenever the in-place
+            // round in the gate stage was skipped (a grouped route), so the
+            // observer copy owes the same round: the exact complement of it.
+            #[cfg(feature = "moe-oracle")]
+            router_observer::record(
+                "decode-top10-masked",
+                router_observer::RouterScoresAfterRoute::Logits,
+                p.recipe.bf16_round_trip()
+                    && route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped),
+            );
             hip!(gpu.moe_router_softmax_top10_masked_f32(
                 p.router_logits,
                 p.topk_indices,
@@ -4695,6 +5228,12 @@ fn decode_route_gpu_stage(
                 0,
             ))?;
         } else if route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
+            #[cfg(feature = "moe-oracle")]
+            router_observer::record(
+                "decode-top10-grouped",
+                router_observer::RouterScoresAfterRoute::Logits,
+                p.recipe.bf16_round_trip(),
+            );
             hip!(gpu.moe_router_softmax_top10_f32(
                 p.router_logits,
                 p.topk_indices,
@@ -4708,6 +5247,12 @@ fn decode_route_gpu_stage(
                 0,
             ))?;
         } else if router_shared_fuse {
+            #[cfg(feature = "moe-oracle")]
+            router_observer::record(
+                "decode-fused-wave64-exact-shared-silu-rotate",
+                router_observer::RouterScoresAfterRoute::Logits,
+                false,
+            );
             let shared_x_rot = unsafe {
                 GpuTensor {
                     buf: gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias(),
@@ -4729,6 +5274,12 @@ fn decode_route_gpu_stage(
                 )
             )?;
         } else if exact_wave64_router {
+            #[cfg(feature = "moe-oracle")]
+            router_observer::record(
+                "decode-fused-wave64-exact",
+                router_observer::RouterScoresAfterRoute::Logits,
+                false,
+            );
             hip!(gpu.moe_router_softmax_topk_k8_wave64_exact(
                 p.router_logits,
                 p.topk_indices,
@@ -4737,6 +5288,12 @@ fn decode_route_gpu_stage(
                 p.norm_topk_prob
             ))?;
         } else if wave64_router {
+            #[cfg(feature = "moe-oracle")]
+            router_observer::record(
+                "decode-fused-wave64",
+                router_observer::RouterScoresAfterRoute::Logits,
+                false,
+            );
             hip!(gpu.moe_router_softmax_topk_k8_wave64(
                 p.router_logits,
                 p.topk_indices,
@@ -4745,6 +5302,12 @@ fn decode_route_gpu_stage(
                 p.norm_topk_prob
             ))?;
         } else {
+            #[cfg(feature = "moe-oracle")]
+            router_observer::record(
+                "decode-softmax-topk",
+                router_observer::RouterScoresAfterRoute::Probabilities,
+                false,
+            );
             hip!(gpu.softmax_f32(p.router_logits))?;
             hip!(gpu.moe_topk_renorm_k8(
                 p.router_logits,
@@ -5856,6 +6419,24 @@ fn decode_route_cpu_stage(
             });
         }
         _ => hip!(gpu.softmax_f32(p.router_logits))?,
+    }
+    #[cfg(feature = "moe-oracle")]
+    {
+        let (route, scores) = if matches!(
+            router,
+            crate::pipeline::sealed_moe::MoeRouterInput::SigmoidTopK
+        ) {
+            (
+                "decode-host-sigmoid-topk",
+                router_observer::RouterScoresAfterRoute::Sigmoid,
+            )
+        } else {
+            (
+                "decode-host-softmax-topk",
+                router_observer::RouterScoresAfterRoute::Probabilities,
+            )
+        };
+        router_observer::record(route, scores, false);
     }
     let (topk_indices, topk_weights): (Vec<usize>, Vec<f32>) = if k == 8 {
         hip!(gpu.moe_topk_renorm_k8(

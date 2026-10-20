@@ -529,7 +529,22 @@ pub fn module(emitted: &[Emitted], name: &str) -> Result<(String, ModuleProof), 
         // Local labels are per-kernel names; qualify them by epilogue so the
         // kernels can share one assembler unit.
         let tag = e.proof.variant.rsplit('-').next().unwrap_or("k");
-        bodies.push_str(&body.replace(".Liu4_", &format!(".Liu4_{tag}_")));
+        // A symbol that itself starts with `iu4_` (`iu4_c8_*_pm_gfx1201`) owns an end label `.Liu4_<symbol>_end` that
+        // `pm_check` looks up by name: keep it out of the per-kernel qualification.
+        let symbol_end = e
+            .s_text
+            .lines()
+            .find_map(|l| l.strip_prefix(".globl "))
+            .map(|s| format!(".L{}_end", s.trim()))
+            .filter(|end| end.starts_with(".Liu4_"));
+        let protected = symbol_end.as_deref().map_or_else(
+            || body.to_owned(),
+            |end| body.replace(end, "\u{1}SYMBOL_END"),
+        );
+        let qualified = protected.replace(".Liu4_", &format!(".Liu4_{tag}_"));
+        bodies.push_str(&symbol_end.as_deref().map_or(qualified.clone(), |end| {
+            qualified.replace("\u{1}SYMBOL_END", end)
+        }));
         let (_, list) = meta
             .split_once("amdhsa.kernels:\n")
             .ok_or("missing kernel list")?;
