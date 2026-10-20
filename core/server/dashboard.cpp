@@ -1912,7 +1912,7 @@ function renderRequests(list, poolTokens) {
 
 /* ---------------------------------------------------------------- update */
 let prev = null, prevAt = 0, bars = [], devs = [], layerBars = [];
-let lastStepMs = null, lastTps = null;
+let lastStepMs = null;   /* lastTps retired with the per-step freeze (slice 26) */
 
 /* The single-stream floor and the engine's most recent window, shown as two numbers with no
  * verdict. The engine records the fastest single-sequence decode window it has measured
@@ -1964,7 +1964,11 @@ function update(s, dt) {
    * ~500 ms poll mean and `best` a 32-step window mean, so a short fast stretch can beat the
    * floor; the figure is capped at 99 and shown as ~99, "at the best", rather than claiming a
    * record the window cannot confirm. */
-  if (s.running > 0 && lastStepMs != null) {
+  /* Gated on this window HAVING decode steps, not on the lane being busy: during a
+   * prefill-only stretch the lane is busy, lastStepMs holds the last DECODE poll, and the
+   * headline correctly reads 0 -- printing "now X% of best" under it would put a stale
+   * value under the word "now", the exact defect the idle-0 ruling exists to kill. */
+  if (stepMs != null && s.running > 0) {
     const k = s.running;
     if (!(k in bestAt) || lastStepMs < bestAt[k]) bestAt[k] = lastStepMs;
     const ref = k === 1 && floorMs > 0 ? floorMs : bestAt[k];
@@ -2042,7 +2046,12 @@ function update(s, dt) {
   if (!(s.draft_positions && s.draft_positions.length)) setMetric("accept", null, DASH);
   else if (awR != null) setMetric("accept", 100 * awR, pctn(awR, 0));
   else setMetric("accept", 0, pctn(0, 0));   /* drafted nothing this poll -> 0, the idle figure */
-  $("m-acceptdet").textContent = acceptTriple(cNow, busy);
+  /* `now` is shown only when THIS poll drafted. The guard inside acceptTriple (last.dr > 0)
+   * cannot ever be false -- the ring only stores deltas with dr > 0 -- so the freshness test
+   * belongs here, where the poll's own delta is known. Otherwise a busy lane that drafted
+   * nothing this poll shows 0 in the headline and "now Z% of highest" one line below it,
+   * computed from the last drafted delta. highest/recent are session statistics and stay. */
+  $("m-acceptdet").textContent = acceptTriple(cNow, busy && awR != null);
   M.flight.u.textContent = "/ " + s.queue_cap;
 
   const list = s.requests || [];
@@ -2126,8 +2135,12 @@ function update(s, dt) {
      * gives tokens a step for the whole batch -- which grows with concurrency and says nothing
      * about the drafter. What speculation buys is tokens a step for ONE sequence. */
     const perStep = sps > 0 && s.decode_tps > 0 ? s.decode_tps / sps / seqs : null;
-    if (perStep != null) lastTps = perStep;
-    $("tps_n").firstChild.nodeValue = lastTps == null ? DASH : sig3(lastTps);
+    /* Reads 0 when this window took no decode steps -- the page's idle figure, same law as
+     * the step tile above it, which this figure is derived from. It used to hold the last
+     * value, so a lane that stopped decoding kept reporting what its steps used to cost.
+     * (Extension of the operator's idle-0 ruling by one figure: same defect, one line down,
+     * flagged by judge slice 26 as "pre-existing, now more visible".) */
+    $("tps_n").firstChild.nodeValue = perStep == null ? "0" : sig3(perStep);
     /* ACCEPTED IS THE LIVE FIGURE, matching the tile above it. `aw` is the same pooled drafting
      * window the tile's headline reads, computed earlier in this function -- one derivation, two
      * readers, so the panel and the tile cannot disagree.
