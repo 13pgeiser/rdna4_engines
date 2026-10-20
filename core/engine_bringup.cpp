@@ -1073,14 +1073,19 @@ int Engine::declare() {
      * table from RadBuildCtx, so a table that failed validation must stop the server before a graph
      * is built around it.
      *
-     * There is nothing to configure. A vector is a property of the model family, so the engine
-     * looks for one beside the container (or in the directory, or in $RADIANCE_HOME/vectors) and
-     * uses it if it is compatible with this container; its operation parameters come from the
-     * package's own JSON. A file that does not fit is reported and skipped -- a sidecar must never
-     * stop a server nobody pointed at it -- while the switch itself stays off until a request (or
-     * the dashboard) asks for it. */
+     * The feature is loaded only when the deployment asks: `--control-vector off|on`. Without it
+     * nothing is looked for, the graph declares no projection op, and a request that asks for one
+     * is refused by name -- so a deployment that does not use the feature pays nothing. With the
+     * flag, the engine looks beside the container (or in the directory, or in
+     * $RADIANCE_HOME/vectors) and uses the file if it is compatible; its operation parameters come
+     * from the package's own JSON. A file that does not fit is reported and skipped -- a sidecar
+     * must never stop a server nobody pointed at it. The flag's value is the startup switch: `off`
+     * leaves requests off until one asks (or the dashboard flips the default), `on` starts them on. */
     const std::string arch = meta_.arch_id ? meta_.arch_id : "";
-    if (!arch.empty()) {
+    if (cfg_.control_vector == "disabled") {
+        RAD_INFO("control vectors: not loaded (no --control-vector); a request that asks for one is "
+                 "refused");
+    } else if (!arch.empty()) {
         std::string proj_path, tried;
         (void) control_vector_discover(cfg_.model, arch, cfg_.radiance_home, &proj_path, &tried);
         if (proj_path.empty()) {
@@ -1102,12 +1107,19 @@ int Engine::declare() {
     if (cvec_.loaded()) {
         cvec_views_.assign(ranks_.size(), RadControlVector{});
         cvec_salt_ = control_vector_salt(cvec_);
-        cvec_default_.store(false);
+        /* `--control-vector on` starts the request default on, which is also how `--kld-record`/
+         * `--kld-ref` score the projection itself: those modes serve no request to carry the
+         * switch. The switch still decides per request. */
+        const bool default_on = cfg_.control_vector == "on";
+        cvec_default_.store(default_on);
         RAD_INFO("control vectors: %s: %lld directions of %lld, layers %d..%d, scale %.3f -- "
-                 "off until a request asks for it (the dashboard's switch, or a request's `control_vector` "
-                 "field)",
+                 "default %s%s",
                  cvec_.path.c_str(), (long long) cvec_.n_dirs,
-                 (long long) cvec_.n_embd, cvec_.first, cvec_.last, (double) cvec_.user_scale);
+                 (long long) cvec_.n_embd, cvec_.first, cvec_.last, (double) cvec_.user_scale,
+                 default_on ? "ON" : "off",
+                 default_on ? " (--control-vector on; a request can still say false)"
+                            : " until a request asks for it (the dashboard's switch, or a request's "
+                              "`control_vector` field)");
         decide("control vectors", cvec_.path,
                "found beside the container, in its directory, or in $RADIANCE_HOME/vectors; "
                "requests opt in");

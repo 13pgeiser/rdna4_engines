@@ -123,6 +123,11 @@ static const Flag g_flags[] = {
     "                                    adapters target. Needed with --max-loras and no --lora"},
 
     { "--placement",          "MODE",   "all_vram | layer_offload | expert_tiered | auto" },
+    { "--control-vector",     "MODE",   "off | on | disabled: load the control-vector file found\n"
+    "                                    for this model and start requests off (off) or on (on).\n"
+    "                                    disabled -- the default, also with no flag at all -- loads\n"
+    "                                    nothing: no projection op is declared, and a request that\n"
+    "                                    asks for the vector is refused" },
     { "--deterministic",      nullptr,  "pin placement to the plan the loader made, so the resident\n"
     "                                    set cannot change under the heat engine. The sampler is\n"
     "                                    already order-independent and needs no pinning; note that\n"
@@ -577,6 +582,14 @@ int config_parse(int argc, char** argv, Config* c) {
                 return RAD_E_INVAL;
             }
             c->placement = v;
+        }
+        else if (S("--control-vector")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (std::strcmp(v, "off") && std::strcmp(v, "on") && std::strcmp(v, "disabled")) {
+                RAD_ERR("--control-vector takes off, on or disabled -- got '%s'", v);
+                return RAD_E_INVAL;
+            }
+            c->control_vector = v;
         }
         else if (S("--deterministic"))         c->deterministic = true;
         else if (S("--checkpoint-interval"))   { if (!num(0, INT64_MAX, &c->checkpoint_interval)) return RAD_E_INVAL; }
@@ -1036,6 +1049,7 @@ const ShowRow kShow[] = {
           for (const std::string& t : c.lora.targets) o += (o.empty() ? "" : ",") + t;
           return o.empty() ? std::string(c.lora.enabled() ? "the adapters' own" : "-") : o; } },
     { "--placement",          [](const Config& c) { return c.placement; } },
+    { "--control-vector",     [](const Config& c) { return c.control_vector; } },
     { "--deterministic",      [](const Config& c) { return onoff(c.deterministic); } },
     { "--checkpoint-interval", [](const Config& c) { return num(c.checkpoint_interval); } },
     { "--prefill-span",       [](const Config& c) { return num(c.prefill_span); } },

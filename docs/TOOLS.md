@@ -794,6 +794,10 @@ The mode changes these settings itself:
 Everything else comes from the command line: run every candidate with the same flags, and the
 reference with the exact wire and a bf16 KV cache.
 
+The control vector's switch is per request, and KLD mode serves none, so a deployment that has one
+loaded is scored with it **off**. `--control-vector on` starts the deployment default on, which is how
+the projection itself is scored (the switch still decides per request, and a request's false wins).
+
 `--kld-out FILE` writes the report as JSON, and every position's KL, both NLLs and the argmax
 agreement to `FILE.rows` (`[positions, 4]` f32, reference row order), so two candidates can be
 compared position by position.

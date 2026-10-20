@@ -1442,8 +1442,11 @@ runs, it moves every token's residual stream off that direction. radiance implem
 `--cvec-mode project` operation for it (`hc_project`, `docs/OPS.md`), which is what the published
 package for Qwen3.8-Flash-Next was tuned for:
 
-**The switch is present whenever a compatible vector is there — there is nothing to pass on the
-command line.** The engine looks, in order, at:
+**One flag loads it: `--control-vector off` or `--control-vector on`** (explicit
+`--control-vector disabled` is the same as no flag). Without it nothing is loaded: the graph declares no projection op (so an off request costs the stock model's launches), a
+request that asks for the vector is refused by name, and `/admin/control-vector` answers 404. The
+flag's value is the startup switch — `off` leaves requests off until one asks or the dashboard flips
+the default, `on` starts them on. With the flag the engine looks, in order, at:
 
 1. `<container without its extension>.control-vector.gguf` beside the model, and
 2. `control-vector.gguf` in the container's directory (one file serves a directory of quants of
@@ -1451,12 +1454,13 @@ command line.** The engine looks, in order, at:
 3. `<home>/vectors/<architecture>-control-vector.gguf` for each `--radiance-home`, i.e.
    `…/vectors/qwen4exp-control-vector.gguf`.
 
-So a deployment that drops the file beside its Flash-Next container offers the Model-view switch and
-the `control_vector` request field with nothing else to configure; every quantisation of the family
-shares it, because the file names the architecture and the width, not the quant. The operation's
-parameters come from the package's own JSON (`layer_range`, `scale`, `mode`), so there is no flag for
-them either: a file that does not fit this container is reported and skipped, never served. The
-default for *requests* is off at startup.
+So a deployment that starts with `--control-vector off` (or `on`) and drops the file beside its
+Flash-Next container offers the Model-view switch and the `control_vector` request field; every
+quantisation of the family shares it, because the file names the architecture and the width, not the
+quant. The operation's parameters come from the package's own JSON (`layer_range`, `scale`, `mode`),
+so there is no flag for them: a file that does not fit this container is reported and skipped, never
+served. Only the startup switch is a flag, because it is the one decision that changes the declared
+graph.
 
 - **Only a compatible container accepts it.** The file must be a GGUF `controlvector` whose
   `controlvector.model_hint` (when present) is this model's architecture (`qwen4exp`), whose
@@ -1467,6 +1471,10 @@ default for *requests* is off at startup.
   requests that name no choice, and a request's own `control_vector` field always wins. **No
   switch reloads the model**: the directions are uploaded once at startup and each step carries a
   per-request row mask.
+- **What the states cost** (this box, 4,096-token answers, speculation off, one boot per state,
+  median of six): stock 85.1 tok/s decode, `disabled` 86.1 (the same graph, nothing to pay), `off`
+  83.7 (41 launches a token, each returning at the zero-row guard — values untouched), `on` 82.8
+  (the projection itself). Prefill is the same in all four, 3,661–3,710 tok/s.
 - **The op is a no-op when off** — it skips a disabled row without reading or writing it, so an
   unprojected request's stream is the one the stock model computes. Measured in the engine's own KLD
   mode (`--kld-record` on stock 1.9.0, `--kld-ref` on this branch, both `--deterministic`, 227
@@ -1477,7 +1485,7 @@ default for *requests* is off at startup.
   its own corpus. The boot-to-boot spread is bimodal (≈0.02 or ≈0.08 mean KL, top-1 ≈96.5% or
   ≈92.5%) and wider than the effect, so reproducibility — not the feature — is what limits a quality
   claim on this box; within one boot it is exact (a repeated request is bit-identical, and
-  `control_vector: false` matches sending no field). With no vector file present the two builds
+  `control_vector: false` matches sending no field). Without `--control-vector` the two builds
   declare the same graph (same ops, buffers, arena and kernel selections, 17,090,734 bytes of
   `--debug-graph` either way; its listing varies in row order, so content, not bytes), and the
   table's own bytes are taken back out of the VRAM budget so the plan cannot see them
@@ -1544,6 +1552,7 @@ The published vector, its JSON and the llama.cpp patches it was built against ar
 |---|---|
 | `--model PATH` | required: the `.rad` container, a checkpoint served as it stands (§3.4), or a Hugging Face repo id fetched before startup (§3.1) |
 | `--download-dir DIR` | where a repo id is fetched to. Default `$XDG_CACHE_HOME/radiance/hf`, else `~/.cache/radiance/hf` |
+| `--control-vector off\|on\|disabled` | `disabled` (and no flag at all) loads nothing, declares no projection op and refuses a request that asks; `off` loads the vector found for this model and starts requests off; `on` starts them on (§4.10) |
 | `--radiance-home DIRS` | where `kernels/`, `architectures/` and `quantizers/` live; homes separated by `:` are searched in order, the first winning (§1.5) |
 | `--kernels LIST` | the kernel libraries to use, separated by `,` or `:`, first wins; a library not named is not loaded. Default: every library found |
 

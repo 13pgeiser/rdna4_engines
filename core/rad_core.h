@@ -818,6 +818,13 @@ struct Config {
     /* The pinned host pool one rank allocates: --host-pool-mib and the tables placed beside it. */
     int64_t host_pool_total_mib() const { return host_pool_mib + embedding_host_mib + tower_host_mib; }
     bool    deterministic = false;
+    /* --control-vector off|on. Without the flag (`disabled`) no vector is loaded: the program
+     * declares no projection op, an off request costs the stock model's launches, and a request
+     * that asks for one is refused by name. `off` loads the vector found for this container -- the
+     * op is declared for its layers -- and starts requests off; `on` does the same with the request
+     * default on. The graph is declared once, so this flag is the deployment's only decision about
+     * whether the op exists at all; the value names the startup switch. */
+    std::string control_vector = "disabled";
     int64_t checkpoint_interval = 2048;   /* linear-state checkpoints (spec §7.3) */
     /* Checkpoint intervals one step may carry of a prefill alone in its step, from an interval
      * boundary past the first (--prefill-span; 1 splits at every interval). The step's rows stay

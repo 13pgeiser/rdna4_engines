@@ -437,6 +437,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--num-speculative-tokens", { "2" } }, { "--draft-window", { "fixed" } },
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
         { "--served-model-name", { "m" } }, { "--mm-max-patches", { "1024" } },
+        { "--control-vector", { "off" } },
         { "--generation-config", { "/g.json" } }, { "--override-chat-template", { "/t.jinja" } },
         { "--temp", { "0.7" } }, { "--top-k", { "40" } }, { "--top-p", { "0.9" } },
         { "--min-p", { "0.05" } }, { "--reasoning-effort", { "low" } },
@@ -600,6 +601,28 @@ TEST(the_placement_is_one_of_the_planners_four) {
         const std::string log = stderr_of([&] { st = parse({ "--placement", bad }, &c); });
         CHECK_EQ(st, (int)RAD_E_INVAL);
         CHECK(has(log, "--placement"));
+    }
+}
+
+/* Three states, and the absent one is the zero-cost default: off and on load the module, disabled --
+ * or no flag -- does not, so no projection op is declared. */
+TEST(the_control_vector_flag_is_off_on_or_disabled) {
+    for (const char* ok : { "off", "on", "disabled" }) {
+        Config c;
+        CHECK_EQ(parse({ "--control-vector", ok }, &c), RAD_OK);
+        CHECK_EQ(c.control_vector, std::string(ok));
+    }
+    {
+        Config c;
+        CHECK_EQ(parse({}, &c), RAD_OK);
+        CHECK_EQ(c.control_vector, std::string("disabled"));
+    }
+    for (const char* bad : { "auto", "OFF", "", "1", "true" }) {
+        Config c;
+        int st = RAD_OK;
+        const std::string log = stderr_of([&] { st = parse({ "--control-vector", bad }, &c); });
+        CHECK_EQ(st, (int)RAD_E_INVAL);
+        CHECK(has(log, "--control-vector"));
     }
 }
 
