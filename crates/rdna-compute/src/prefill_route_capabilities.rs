@@ -327,10 +327,21 @@ pub fn enabled(explicit: Option<bool>, arch: &str, route: PrefillRoute) -> bool 
 /// Qualification rows of the native fp8-E4M3 KV codec of the two PM attention routes
 /// ([`PrefillRoute::FaPrefillPm`], [`PrefillRoute::FaPrefillPmQprep`]). The Q8_0 rows of
 /// [`QUALIFIED`] never cover fp8 KV: the fp8 direct body is a different kernel with its own
-/// byte oracle and KLD receipts. EMPTY until those receipts exist, so with the developer flags
-/// unset the fp8 cache keeps the incumbent attention and only an explicit
-/// `HIPFIRE_FA_PREFILL_PM=1` (and `HIPFIRE_FA_PREFILL_PM_QPREP=1` for the fold) opts in.
-pub const FP8_KV_QUALIFIED: [QualifiedCell; 0] = [];
+/// byte oracle and KLD receipts, named below. With the developer flags unset the fp8 cache
+/// takes the PM routes on exact gfx1201; an explicit `0` still kills, `1` still opts in
+/// where the raw inventory exists.
+pub const FP8_KV_QUALIFIED: [QualifiedCell; 2] = [
+    QualifiedCell {
+        arch: "gfx1201",
+        route: PrefillRoute::FaPrefillPm,
+        evidence: "currente626-dispatch-A-001 terminal-summary all11 handle match GQA8 0 spills; currente626-timing-C-001 PASS (pp4096/pp8192 retained + 12 new decode cells, same-card fp8>=q8 medians); currente626-quality-001 4/4 paired KLD pass; currente626-serve-redline-B-001 j1826 fp8 5/5 PM4 + j1831 redline bit-exact logits/kv/recurrent/gdn; currente626-state-G-fp8-pair-compare001 660/660 PASS (540 raw)",
+    },
+    QualifiedCell {
+        arch: "gfx1201",
+        route: PrefillRoute::FaPrefillPmQprep,
+        evidence: "same fp8-E4M3 direct body as FaPrefillPm (receipts above); currente626-state-G-fp8-pair-compare001 fp8 same-codec eager-B vs graph-C 660/660 PASS; currente626-quality-001 4/4 paired KLD pass; currente626-serve-redline-B-001 j1831 redline bit-exact kv/recurrent/gdn",
+    },
+];
 
 /// Whether `route` is qualified for native fp8-E4M3 KV on `arch`: the raw inventory is present
 /// AND an explicit [`FP8_KV_QUALIFIED`] row names the cell.
@@ -806,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn fp8_kv_has_its_own_qualification_and_is_unqualified_until_receipts_land() {
+    fn fp8_kv_has_its_own_qualification_receipts() {
         for route in [PrefillRoute::FaPrefillPm, PrefillRoute::FaPrefillPmQprep] {
             for arch in ARCHES {
                 assert_eq!(
@@ -818,18 +829,15 @@ mod tests {
                     "{arch}: {route:?}"
                 );
                 // The Q8_0 qualification never leaks into fp8 KV; explicit values still win.
-                assert!(!enabled_fp8_kv(None, arch, route), "{arch}: {route:?}");
+                assert_eq!(
+                    enabled_fp8_kv(None, arch, route),
+                    arch == "gfx1201",
+                    "{arch}: {route:?}"
+                );
                 assert!(enabled_fp8_kv(Some(true), arch, route), "{arch}: {route:?}");
                 assert!(!enabled_fp8_kv(Some(false), arch, route), "{arch}: {route:?}");
             }
             assert!(qualified("gfx1201", route));
-        }
-        for cell in &FP8_KV_QUALIFIED {
-            assert!(matches!(
-                cell.route,
-                PrefillRoute::FaPrefillPm | PrefillRoute::FaPrefillPmQprep
-            ));
-            assert_eq!(cell.arch, "gfx1201");
         }
     }
 }

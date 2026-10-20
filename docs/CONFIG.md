@@ -338,8 +338,8 @@ The EP owner-routed prefill and the expert-staging levers have no typed schema k
 
 | Developer key | Env | Default | Effect |
 |---|---|---|---|
-| `developer.fa_prefill_pm` | `HIPFIRE_FA_PREFILL_PM` | Q8_0: unset = on where qualified; native FP8: unset = off; explicit `true` / `1` or `false` / `0` wins | Codec-aware PeaceMaker full-causal prefill on exact gfx1201, H16/KV2/D256, 64..8192 query rows and context 1..262144. Q8_0 K/V and native FP8 E4M3 K/V use their own direct bodies after shared Q16 preconvert. FP8 token rows contain 512 codes and two f16 head scales (516 bytes); `FP8_KV_QUALIFIED` remains empty. Unsupported codec/layout, replay recording and graph capture keep the incumbent route. This flag does not change auto KV selection or qualify FP8 runtime behavior. |
-| `developer.fa_prefill_pm_qprep` | `HIPFIRE_FA_PREFILL_PM_QPREP` | Q8_0: unset = on where qualified; native FP8: unset = off; explicit `true` / `1` or `false` / `0` wins | Exact F5 Q-prep fold nested under both flags resolved for the actual cache codec. FP8 requires both flags enabled; disabling PM retains the incumbent regardless of this flag. Requires whole PM admission, 64 rotary dimensions, non-legacy half-split RoPE and a plain eager full-causal single-chunk layer. The codec must match both tier-plan entries: the Q8 or FP8 batched cache writer and corresponding masked attention. K then V are written with the matching production writer before `fa_prefill_pm_direct_codec`. Existing Q8 qualification is not FP8 qualification. |
+| `developer.fa_prefill_pm` | `HIPFIRE_FA_PREFILL_PM` | Q8_0 and native FP8: unset = on where qualified; explicit `true` / `1` or `false` / `0` wins | Codec-aware PeaceMaker full-causal prefill on exact gfx1201, H16/KV2/D256, 64..8192 query rows and context 1..262144. Q8_0 K/V and native FP8 E4M3 K/V use their own direct bodies after shared Q16 preconvert. FP8 token rows contain 512 codes and two f16 head scales (516 bytes); `FP8_KV_QUALIFIED` names exact gfx1201 for both PM routes. Unsupported codec/layout, replay recording and graph capture keep the incumbent route. Explicit `0` / `false` kills the route for that codec; this flag does not change auto KV selection. |
+| `developer.fa_prefill_pm_qprep` | `HIPFIRE_FA_PREFILL_PM_QPREP` | Q8_0 and native FP8: unset = on where qualified; explicit `true` / `1` or `false` / `0` wins | Exact F5 Q-prep fold nested under both flags resolved for the actual cache codec. FP8 requires both flags enabled; disabling PM retains the incumbent regardless of this flag. Requires whole PM admission, 64 rotary dimensions, non-legacy half-split RoPE and a plain eager full-causal single-chunk layer. The codec must match both tier-plan entries: the Q8 or FP8 batched cache writer and corresponding masked attention. K then V are written with the matching production writer before `fa_prefill_pm_direct_codec`. FP8 has its own qualified rows; Q8 qualification never enables FP8. |
 | `developer.moe_combine_v2` | `HIPFIRE_MOE_COMBINE_V2` | on where qualified (exact gfx1201) | Admitted grouped BF16-input combine v2; `false` / `0` restores the incumbent. Ordered top-k arithmetic is retained. |
 | `developer.moe_iu4_wide_tiles` | `HIPFIRE_MOE_IU4_WIDE_TILES` | on where qualified (exact gfx1201) | Admitted VRAM-resident symmetric IU4 gate/up runs use the existing NT8 pair when checked slot occupancy permits; `false` / `0` keeps incumbent tiles. |
 | `developer.prefill_iu4_producer_fused` | `HIPFIRE_PREFILL_IU4_PRODUCER_FUSED` | on where qualified (exact gfx1201) | Existing prefill RMSNorm/FWHT and SwiGLU/FWHT producers retain the exact eight-candidate IU4 search while avoiding separate preparation; `false` / `0` keeps the incumbent. |
@@ -543,14 +543,16 @@ FWHT/Lloyd-V; and explicit native FP8/BF16 on unsupported arch/PP all fail
 supported alternatives. No silent fallback on unsupported Qwen sites.
 
 **Resolution of `auto` / unset (Qwen family):** native **fp8** (one K+V
-layout) on exact **gfx1201** when the load is native-eligible: attention
-geometry H24 / Hkv4 / D256, single GPU (`pp = tp = 1`), no `kv_adaptive`,
-no CASK sidecar. Every other Qwen load resolves **q8/q8**: gfx1100, gfx1151
-and every other arch; gfx1201 with a different geometry, with adaptive or
-CASK, or on PP / dense TP / MoE EP (those policies have no native
-constructor); and Qwen3 dense (flat constructor). gfx1200 / gfx11 / gfx94x
-never inherit fp8. Registry Qwen cards leave mode as `auto` (a registry
-`default_kv_mode = "q8"` is not lowered into config).
+layout) on exact **gfx1201** single GPU (`pp = tp = 1`) when the load is
+native-eligible: attention geometry H24 / Hkv4 / D256 (dense 27B-class) or
+H16 / Hkv2 / D256 (A3B MoE-class), no `kv_adaptive`, no CASK sidecar, no
+slots, no TP/PP split. Native `bf16` stays H24 dense-only: `auto` never
+resolves an A3B load to `bf16`. Every other Qwen load resolves **q8/q8**:
+gfx1100, gfx1151 and every other arch; gfx1201 with a different geometry,
+with adaptive or CASK, on slots, or on PP / dense TP / MoE EP (those
+policies have no native constructor); and Qwen3 dense (flat constructor).
+gfx1200 / gfx11 / gfx94x never inherit fp8. Registry Qwen cards leave mode
+as `auto` (a registry `default_kv_mode = "q8"` is not lowered into config).
 
 **Non-Qwen families:** Maple keeps BF16/BF16 (registry and direct-path
 auto; explicit `--kv-mode q8` still works). Gemma4 keeps its sliding tier

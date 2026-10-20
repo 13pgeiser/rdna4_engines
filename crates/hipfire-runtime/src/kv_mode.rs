@@ -35,7 +35,7 @@ const QWEN35_NATIVE_BF16_SHAPES: &[(usize, usize, usize)] = &[(24, 4, 256)];
 
 /// Subset of [`QWEN35_NATIVE_FP8_SHAPES`] qualified for implicit selection:
 /// unset / `auto` picks native FP8 only here and stays Q8 elsewhere.
-const QWEN35_AUTO_FP8_SHAPES: &[(usize, usize, usize)] = &[(24, 4, 256)];
+const QWEN35_AUTO_FP8_SHAPES: &[(usize, usize, usize)] = &[(24, 4, 256), (16, 2, 256)];
 
 /// Route-level conditions shared by every native Qwen35 cache: exact gfx1201,
 /// single GPU, no adaptive tiering, no CASK eviction.
@@ -938,12 +938,12 @@ mod tests {
         assert_eq!(ok("bf16", "gfx1201", DENSE, 1, false, false), Ok(Bf16));
         assert_eq!(ok("q8", "gfx1201", DENSE, 1, false, false), Ok(Q8));
 
-        // Exact A3B H16/Hkv2/D256: explicit fp8 admitted, auto/unset stays q8,
+        // Exact A3B H16/Hkv2/D256: auto/unset and explicit fp8 are qualified;
         // q8 override honored, bf16 NOT widened.
-        assert_eq!(ok("fp8", "gfx1201", A3B, 1, false, false), Ok(Fp8));
-        for raw in ["", "auto", "q8"] {
-            assert_eq!(ok(raw, "gfx1201", A3B, 1, false, false), Ok(Q8), "a3b {raw}");
+        for raw in ["", "auto", "fp8"] {
+            assert_eq!(ok(raw, "gfx1201", A3B, 1, false, false), Ok(Fp8), "a3b {raw}");
         }
+        assert_eq!(ok("q8", "gfx1201", A3B, 1, false, false), Ok(Q8));
         assert!(ok("bf16", "gfx1201", A3B, 1, false, false).is_err());
         assert!(ok("fp8", "gfx1201", (8, 2, 256), 1, false, false).is_err());
 
@@ -1004,9 +1004,9 @@ mod tests {
         for m in [Q8, Asym2, Asym3, Asym4, Fwht2, Fwht3, Fwht4, F16] {
             assert!(!sup(m, (24, 4, 256)) && !sup(m, (16, 2, 256)), "{m:?}");
         }
-        // Auto qualification: dense only until A3B is qualified.
+        // Auto qualification includes both exact supported FP8 geometries.
         assert!(qwen35_native_auto_eligible("gfx1201", 24, 4, 256, 1, false, false));
-        assert!(!qwen35_native_auto_eligible("gfx1201", 16, 2, 256, 1, false, false));
+        assert!(qwen35_native_auto_eligible("gfx1201", 16, 2, 256, 1, false, false));
         for arch in ["gfx1201", "gfx1100"] {
             for (h, kv, d) in [(24, 4, 256), (16, 2, 256), (8, 2, 256)] {
                 for (pp, ad, cask) in [(1, false, false), (2, false, false), (1, true, false), (1, false, true)] {

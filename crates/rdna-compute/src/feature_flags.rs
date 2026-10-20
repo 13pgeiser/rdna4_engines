@@ -440,8 +440,8 @@ pub struct FeatureFlags {
     pub fa_prefill_pm: bool,
     /// The same `HIPFIRE_FA_PREFILL_PM` key resolved for the native fp8-E4M3 KV codec: an
     /// explicit 1/0 wins, unset follows `PrefillRoute::FaPrefillPm` fp8 qualification
-    /// (`prefill_route_capabilities::FP8_KV_QUALIFIED`, empty until fp8 has its own receipts, so
-    /// unset = off). The Q8_0 qualification never enables fp8 KV.
+    /// (`prefill_route_capabilities::FP8_KV_QUALIFIED`, on only on exact gfx1201).
+    /// The Q8_0 qualification never enables fp8 KV.
     pub fa_prefill_pm_fp8_kv: bool,
     /// `HIPFIRE_MOE_IU4_WIDE_TILES` (`developer.moe_iu4_wide_tiles`): typed flag
     /// for the NT8 gate/up expert-run tile on VRAM-resident symmetric IU4 MoE experts
@@ -459,7 +459,7 @@ pub struct FeatureFlags {
     /// admission still applies.
     pub fa_prefill_pm_qprep: bool,
     /// The same `HIPFIRE_FA_PREFILL_PM_QPREP` key resolved for the native fp8-E4M3 KV codec;
-    /// qualification as [`Self::fa_prefill_pm_fp8_kv`] (unset = off until fp8 receipts exist).
+    /// qualification as [`Self::fa_prefill_pm_fp8_kv`] (on only on exact gfx1201 when unset).
     pub fa_prefill_pm_qprep_fp8_kv: bool,
     /// `HIPFIRE_MOE_ROTATE_I4_PM` (`developer.moe_rotate_i4_pm`): typed opt-in for the exact
     /// PeaceMaker twin of the down A4 producer `qwen4_moe_rotate128_i4`. The route has raw
@@ -2696,7 +2696,7 @@ mod tests {
             assert_eq!(unset.fa_prefill_pm, qualified(arch, PrefillRoute::FaPrefillPm));
             assert_eq!(unset.fa_prefill_pm, arch == "gfx1201");
             assert!(!FeatureFlags::for_test(arch).fa_prefill_pm);
-            assert!(!unset.fa_prefill_pm_fp8_kv, "{arch}: fp8 has no qualification yet");
+            assert_eq!(unset.fa_prefill_pm_fp8_kv, arch == "gfx1201", "{arch}: fp8 default");
             assert!(!FeatureFlags::for_test(arch).fa_prefill_pm_fp8_kv);
             for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
                 let flags = FeatureFlags::from_lookup(arch, |name| {
@@ -2809,7 +2809,7 @@ mod tests {
             );
             assert_eq!(unset.fa_prefill_pm_qprep, arch == "gfx1201");
             assert!(!FeatureFlags::for_test(arch).fa_prefill_pm_qprep);
-            assert!(!unset.fa_prefill_pm_qprep_fp8_kv, "{arch}: fp8 has no qualification yet");
+            assert_eq!(unset.fa_prefill_pm_qprep_fp8_kv, arch == "gfx1201", "{arch}: fp8 default");
             assert!(!FeatureFlags::for_test(arch).fa_prefill_pm_qprep_fp8_kv);
             for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
                 let flags = FeatureFlags::from_lookup(arch, |name| {
@@ -2849,22 +2849,24 @@ mod tests {
             let unset = with(arch, None, None);
             assert_eq!(unset.fa_prefill_pm, gfx1201, "{arch}");
             assert_eq!(unset.fa_prefill_pm_qprep, gfx1201, "{arch}");
-            assert!(!unset.fa_prefill_pm_fp8_kv && !unset.fa_prefill_pm_qprep_fp8_kv, "{arch}");
+            assert_eq!(unset.fa_prefill_pm_fp8_kv, gfx1201, "{arch}");
+            assert_eq!(unset.fa_prefill_pm_qprep_fp8_kv, gfx1201, "{arch}");
             // PM unset + Q-prep 1: the resolved PM flag is on exactly where qualified.
             let pm_unset = with(arch, None, Some("1"));
             assert_eq!(pm_unset.fa_prefill_pm, gfx1201, "{arch}");
             assert!(pm_unset.fa_prefill_pm_qprep, "{arch}");
-            assert!(!pm_unset.fa_prefill_pm_fp8_kv && pm_unset.fa_prefill_pm_qprep_fp8_kv, "{arch}");
+            assert!(pm_unset.fa_prefill_pm_qprep_fp8_kv, "{arch}");
             // PM 0 + Q-prep unset / 1: the PM route is off, so the fold has nothing to feed
             // (the admission refuses it with `PmDisabled`); the Q-prep flag itself is its own.
             let pm_off = with(arch, Some("0"), None);
             assert!(!pm_off.fa_prefill_pm, "{arch}");
             assert_eq!(pm_off.fa_prefill_pm_qprep, gfx1201, "{arch}");
-            assert!(!pm_off.fa_prefill_pm_fp8_kv && !pm_off.fa_prefill_pm_qprep_fp8_kv, "{arch}");
+            assert!(!pm_off.fa_prefill_pm_fp8_kv, "{arch}");
+            assert_eq!(pm_off.fa_prefill_pm_qprep_fp8_kv, gfx1201, "{arch}");
             let pm_off_on = with(arch, Some("0"), Some("1"));
             assert!(!pm_off_on.fa_prefill_pm, "{arch}");
-            assert!(pm_off_on.fa_prefill_pm_qprep, "{arch}");
-            assert!(!pm_off_on.fa_prefill_pm_fp8_kv && pm_off_on.fa_prefill_pm_qprep_fp8_kv, "{arch}");
+            assert!(!pm_off_on.fa_prefill_pm_fp8_kv, "{arch}");
+            assert!(pm_off_on.fa_prefill_pm_qprep_fp8_kv, "{arch}");
             // PM 1 + Q-prep 1: both explicit.
             let both = with(arch, Some("1"), Some("1"));
             assert!(both.fa_prefill_pm && both.fa_prefill_pm_qprep, "{arch}");

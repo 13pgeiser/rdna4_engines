@@ -634,9 +634,11 @@ accepted sets differ by carrier). Concrete modes include:
 | `asym2` / `asym3` / `asym4` | **Deprecated since 0.4.0, removal in 0.5.0**: legacy Givens-rotated Lloyd K + Q8 V (fwht3 supersedes Givens asym KV). On Qwen the bare names alias `fwhtN`; the Givens constructors need `legacy-asymN` |
 
 **Qwen-family `auto` / unset** (arch-aware, Qwen only): native **fp8/fp8** on
-exact `gfx1201` when the load is native-eligible (H24/Hkv4/D256, single GPU,
-no adaptive, no CASK (deprecated since 0.4.0, removal in 0.5.0)); **q8/q8** everywhere else, gfx1100 and gfx1151
-included. Non-Qwen family defaults are unchanged (Maple BF16, DeepSeek
+exact `gfx1201` single GPU when the load is native-eligible (H24/Hkv4/D256
+dense or H16/Hkv2/D256 A3B, D256, no adaptive, no CASK
+(deprecated since 0.4.0, removal in 0.5.0), no slots/TP/PP split);
+**q8/q8** everywhere else, gfx1100 and gfx1151 included. Native `bf16`
+stays H24 dense-only. Non-Qwen family defaults are unchanged (Maple BF16, DeepSeek
 compressor F32, Gemma layered policy, …). Full K/V axis overrides (`--kv-k` /
 `--kv-v`) and precedence live in [`CONFIG.md`](CONFIG.md) / [`CLI.md`](CLI.md).
 

@@ -432,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn fp8_codec_resolves_its_own_flags_and_is_off_until_qualified() {
+    fn fp8_codec_resolves_its_own_flags_and_defaults_on_where_qualified() {
         use crate::prefill_route_capabilities::{enabled_fp8_kv, PrefillRoute};
         use FaPrefillPmQprepRefusal as R;
         let shape = (16, 2, 256);
@@ -444,16 +444,26 @@ mod tests {
                 arch, false, false, false, fp8, shape.0, shape.1, shape.2, 64, 4096, 4096,
             )
         };
-        // Unset is off for fp8 even where the Q8_0 fold is qualified on.
-        assert_eq!(admit("gfx1201", None, None), Err(R::Disabled));
-        assert_eq!(admit("gfx1201", None, Some(true)), Err(R::PmDisabled));
-        assert_eq!(admit("gfx1201", Some(true), None), Err(R::Disabled));
+        // Unset follows the fp8 qualification: on at exact gfx1201 for both keys.
+        assert_eq!(admit("gfx1201", None, None), Ok(()));
+        assert_eq!(admit("gfx1201", None, Some(true)), Ok(()));
+        assert_eq!(admit("gfx1201", Some(false), None), Err(R::PmDisabled));
+        assert_eq!(admit("gfx1201", Some(true), None), Ok(()));
+        assert_eq!(admit("gfx1201", None, Some(false)), Err(R::Disabled));
         // Explicit opt-in of both keys admits; an explicit PM 0 or Q-prep 0 refuses.
         assert_eq!(admit("gfx1201", Some(true), Some(true)), Ok(()));
         assert_eq!(admit("gfx1201", Some(false), Some(true)), Err(R::PmDisabled));
         assert_eq!(admit("gfx1201", Some(true), Some(false)), Err(R::Disabled));
-        assert_eq!(admit("gfx1151", Some(true), Some(true)), Err(R::InventoryUnavailable));
-        // Same gates after the flags: recording, capture, shape, rows, context and rotary.
+        // Other architectures: unset is off for both flags; an explicit pair lacks the inventory.
+        for arch in ["gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown"] {
+            assert_eq!(admit(arch, None, None), Err(R::Disabled), "{arch}");
+            assert_eq!(admit(arch, None, Some(true)), Err(R::PmDisabled), "{arch}");
+            assert_eq!(
+                admit(arch, Some(true), Some(true)),
+                Err(R::InventoryUnavailable),
+                "{arch}"
+            );
+        }
         let gate = |rec: bool, cap: bool, kv: Option<FaPrefillKvCodec>, shape: (usize, usize, usize),
                     rot: usize, rows: usize, ctx: usize| {
             Gpu::fa_prefill_pm_qprep_admission(

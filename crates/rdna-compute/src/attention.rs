@@ -5819,7 +5819,7 @@ impl Gpu {
     }
 
     /// The resolved `HIPFIRE_FA_PREFILL_PM` flag for a cache codec: native fp8-E4M3 KV follows
-    /// its own qualification on unset (off until fp8 receipts exist), every other codec the
+    /// its own gfx1201 qualification on unset, every other codec the
     /// Q8_0 resolution. An explicit 1/0 is the same for both.
     pub fn fa_prefill_pm_flag(&self, kv: Option<crate::fa_prefill_pm::FaPrefillKvCodec>) -> bool {
         match kv {
@@ -25053,7 +25053,8 @@ mod tests {
         for arch in arches {
             for explicit in [None, Some(false), Some(true)] {
                 for kv in [None, Some(Codec::Q8_0), Some(Codec::Fp8E4M3)] {
-                    // The flag is resolved per codec: fp8 KV never inherits the Q8_0 default.
+                    // The flag is resolved per codec: fp8 KV follows its own gfx1201
+                    // qualification, never the Q8_0 default.
                     let flag = match kv {
                         Some(Codec::Fp8E4M3) => {
                             enabled_fp8_kv(explicit, arch, PrefillRoute::FaPrefillPm)
@@ -25061,7 +25062,7 @@ mod tests {
                         _ => enabled(explicit, arch, PrefillRoute::FaPrefillPm),
                     };
                     let resolved = match kv {
-                        Some(Codec::Fp8E4M3) => explicit.unwrap_or(false),
+                        Some(Codec::Fp8E4M3) => explicit.unwrap_or(arch == "gfx1201"),
                         _ => explicit.unwrap_or(arch == "gfx1201"),
                     };
                     assert_eq!(flag, resolved, "{arch} {explicit:?} {kv:?}");
