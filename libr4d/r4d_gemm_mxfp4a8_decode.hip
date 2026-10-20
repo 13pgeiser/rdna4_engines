@@ -26,7 +26,7 @@
 //     blocks (see mxd_plan). A K not a multiple of 128 takes 64 (and a 2-way split widens to 4).
 //     The rule was tuned when the weight was staged through LDS too, (16*DTM + 128) * (DBK+8)
 //     bytes a block; the multi-fragment kernel now takes 2 * 16*DTM * (DBK+8).
-//   - past 64 rows, re-tuned for the register kernel (r4d_selftest --perfmx, warmed, every split
+//   - past 64 rows, re-tuned for the register kernel (r4d_selftest --perfmxd, warmed, every split
 //     1..8 at both slabs on the 27B's and TranslateGemma's per-rank shapes at 96 and 128 rows): the
 //     128-wide slab always (it never lost to 64), and a split only while every split keeps 16 slabs,
 //     towards a 48-block grid or, at K >= 8192, regardless, up to ks*M = 512 split rows. Against the
@@ -213,7 +213,7 @@ constexpr int mxd_waves(int dbk, int dtm, bool ablk) {
 // activation and weight are loaded while this slab computes. The arithmetic -- the fold, the k-step
 // and slab order, the scale carry and the epilogue -- is the one the kernel staging the weight through
 // LDS had, so the bits are its own (checked byte for byte when it was replaced). r4d_selftest
-// --perfmx, clocks warmed, LDS-staged -> registers: 17408 x 5120 at 64 rows 149 -> 129 us, at 96
+// --perfmxd, clocks warmed, LDS-staged -> registers: 17408 x 5120 at 64 rows 149 -> 129 us, at 96
 // 205 -> 159, at 128 245 -> 214; 5120 x 8704 at 128 169 -> 139; 6144 x 5120 at 128 121 -> 92.
 template <int DBK, int DKS, int DTM, bool NT, bool ABLK>
 __global__ __launch_bounds__(R4D_MXD_DWN * 32) R4D_WAVES(mxd_waves(DBK, DTM, ABLK))

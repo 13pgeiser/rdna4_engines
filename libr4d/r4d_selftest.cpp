@@ -12835,11 +12835,11 @@ static void perf_row(const Plugin& pl, const char* name, std::vector<RadTensor> 
     std::printf("  %-22s %8.1f us   %6.1f GB/s\n", name, us, bytes / (us * 1e3));
 }
 
-/* --perfmx: every MXFP4 GEMM row at one shape, the weight streamed from DRAM (rotated copies), on
+/* --perfmxd: every dense MXFP4 GEMM row at one shape, the weight streamed from DRAM (rotated copies), on
  * the per-(row, 128) activation grid. A row that does not serve the shape says so. */
 static void mx_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iters) {
     if (M < 1 || N < 16 || N % 16 || K < 64 || K % 64) {
-        std::printf("--perfmx: N must be a multiple of 16, K of 64, and M >= 1\n");
+        std::printf("--perfmxd: N must be a multiple of 16, K of 64, and M >= 1\n");
         return;
     }
     const char* rows[] = { "gemm_mxfp4a8_gemv", "gemm_mxfp4a8_decode", "gemm_mxfp4a8_nt_m64",
@@ -28152,7 +28152,7 @@ static void usage(void) {
                 "             u64 at byte 0> + the tensor's own data_offsets[0].\n"
                 "  --perf N K M [iters]:  time the fp8 decode GEMMs at one shape and print the\n"
                 "             weight bandwidth each reaches.\n"
-                "  --perfmx N K M [iters]:  the MXFP4 GEMM rows (gemv, decode, skinny, tiled) at\n"
+                "  --perfmxd N K M [iters]:  the dense MXFP4 GEMM rows (gemv, decode, skinny, tiled) at\n"
                 "             one shape, with the weight bandwidth each reaches.\n"
                 "  --perfbf16 N K M [iters]:  the bf16 skinny GEMM at every variant it has.\n"
                 "  --perff32 N K M [iters]:  gemm_nt_f32 at the tile form its rule picks, compared\n"
@@ -28327,7 +28327,7 @@ int main(int argc, char** argv) {
             perf_k = std::strtoll(argv[++i], nullptr, 0);
             perf_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != '-') perf_it = (int)std::strtol(argv[++i], nullptr, 0);
-        } else if (!std::strcmp(argv[i], "--perfmx")) {
+        } else if (!std::strcmp(argv[i], "--perfmxd")) {
             if (i + 3 >= argc) { usage(); return 2; }
             perf_mx = 1;
             perf_n = std::strtoll(argv[++i], nullptr, 0);

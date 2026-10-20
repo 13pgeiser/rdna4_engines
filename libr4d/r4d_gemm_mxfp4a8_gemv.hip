@@ -161,7 +161,7 @@ void r4d_gemm_mxfp4a8_gemv_kernel(
 //
 // TN: the activation is read per block, so one column tile a block reads all of it N/16 times (356 MB
 // from L2 at M = 64 on a 27B's 17408-row gate_up, against its 47 MB weight). Two tiles a block load
-// each activation fragment once for both. r4d_selftest --perfmx, clocks warmed, TN 1 -> 2: 17408 x 5120
+// each activation fragment once for both. r4d_selftest --perfmxd, clocks warmed, TN 1 -> 2: 17408 x 5120
 // at 32 rows 125 -> 85 us, at 64 157 -> 122; 5120 x 8704 75 -> 56, 95 -> 75; 21504 x 5376 154 -> 111,
 // 183 -> 150; at 16 to 24 rows within a few percent either way. Four tiles spill past 32 rows.
 // Narrow or shallow weights lose with two (fewer blocks than the part has units, a short K a wave):
