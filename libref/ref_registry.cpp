@@ -677,6 +677,8 @@ static const RadOperandSpec oRmsModQ[] = { OPD_O("y"), OPD_O("g"), OPD("s"), WGT
 /* `t`, `sigma` and `sigma_next` are one f32 value each. */
 static const RadOperandSpec oFlowX0[] = { OPD("v"), OPD("t"), OPD("sigma"), OPD("sigma_next"),
                                           INOUT("x") };
+static const RadOperandSpec oFlowRM[] = { OPD("v"), INOUT("x0"), OPD("sigma"), OPD("r"),
+                                          OPD("hb1"), OPD("hb2"), OPD("order"), INOUT("x") };
 static const RadParamSpec pTimestep[] = { P_INT("M"), P_INT("n"), P_F64("scale"), P_F64("max_period"),
                                           P_INTO("round"), P_F64O("clamp_min"), P_STR("dtype") };
 static const RadOperandSpec oTimestep[] = { OPD("t"), OUT("y") };
@@ -1438,6 +1440,12 @@ static const RadOpSchema kSchemas[] = {
   "a sampler step toward a data-ward velocity's clean estimate, in f32: st = 1 - t, "
   "d = x + st v, r = sigma_next / sigma, x = r x + (1 - r) d, each product and sum rounded "
   "once; t, sigma and sigma_next one value each (MiniMax-H3's scheduler)." },
+{ "flow_res_multistep", ARR(pMnD), ARR(oFlowRM),
+  "a second-order sampler step on the clean estimate: d = x + sigma v, then "
+  "x = r x + hb1 d + hb2 x0 with r = sigma_next / sigma, x0 the previous step's estimate (read, "
+  "then d written back for the next). order<2 makes it Euler (x = r x + (1 - r) d), the first "
+  "step, a schedule restart and the last step; there hb1 + hb2 = 1 - r. sigma, r, hb1, hb2 and "
+  "order one f32 each; x and x0 f32 (MiniMax-H3's DPM-Solver++2M / res_multistep)." },
 { "patch_unfold", ARR(pPatchUnfold), ARR(oPatchUnfold),
   "patch rows [F Hp Wp, C pt ph pw] (geom = (F, Hp, Wp)) unfolded to voxel rows "
   "[(F pt) (Hp ph) (Wp pw), C] and denormalised, f32(f32(x * mul[c]) + add[c]) with `mul` and "
@@ -1990,6 +1998,8 @@ SIMPLE("ref_rms_mod_quant_fp8", "rms_mod_quant_fp8", "norm",
        "gated residual, modulated RMS norm, block-scaled E4M3", DT_FLOAT, ref_rms_mod_quant_fp8),
 SIMPLE("ref_flow_x0_step", "flow_x0_step", "elem", "a sampler step toward the clean estimate",
        DT_FLOAT, ref_flow_x0_step),
+SIMPLE("ref_flow_res_multistep", "flow_res_multistep", "elem",
+       "a second-order sampler step on the clean estimate", DT_FLOAT, ref_flow_res_multistep),
 SIMPLE("ref_patch_unfold", "patch_unfold", "elem", "patch rows to denormalised voxel rows",
        DT_FLOAT, ref_patch_unfold),
 SIMPLE("ref_vtile_gather", "vtile_gather", "elem", "a video decoder's tiles out of the latent",

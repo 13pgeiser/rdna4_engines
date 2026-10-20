@@ -2251,6 +2251,20 @@ int ref_flow_x0_step_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* 
     o.t(F, { M, n });                                         /* x, INOUT */
     return o.finish("flow_x0_step", operand, out);
 }
+int ref_flow_res_multistep_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const uint32_t F = (uint32_t)RAD_F32;
+    Opd o;
+    o.t(act_dt(p, n_p), { M, n });                            /* v */
+    o.t(F, { M, n });                                         /* x0, INOUT: the estimate history */
+    o.t_fill(F, { 1 }, (uint32_t)RAD_FILL_SIGMOID, 0);        /* sigma */
+    o.t_fill(F, { 1 }, (uint32_t)RAD_FILL_SIGMOID, 0);        /* r */
+    o.t_fill(F, { 1 }, (uint32_t)RAD_FILL_SIGMOID, 0);        /* hb1 */
+    o.t_fill(F, { 1 }, (uint32_t)RAD_FILL_SIGMOID, 0);        /* hb2 */
+    o.t_fill(F, { 1 }, (uint32_t)RAD_FILL_SIGMOID, 0);        /* order */
+    o.t(F, { M, n });                                         /* x, INOUT */
+    return o.finish("flow_res_multistep", operand, out);
+}
 int ref_gate_add_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
     const uint32_t D = act_dt(p, n_p);

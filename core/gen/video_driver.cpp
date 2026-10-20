@@ -165,7 +165,8 @@ int64_t carve(const RadVideoGenDecl& d, int64_t max_tok, int64_t ep, int64_t pd,
         2 * 4,                   /* R_CU */
         3 * max_tok * 4,         /* R_ROPE: a step's rotary positions, a conditioning's [3,T] M-RoPE */
         RAD_VGEOM_N * 4,         /* R_GEOM */
-        6 * 4,                   /* R_SCHED */
+        16 * 4,                  /* R_SCHED: the Euler scalars [0..5], then the res_multistep
+                                  * coeffs -- video [6..10], audio [11..15] */
         d.max_steps * 4,         /* R_TV */
         d.max_steps * 4,         /* R_TA */
         4 * 4,                   /* R_SEED */
@@ -886,6 +887,7 @@ void VideoDriver::base_batches(const Job& j, const RadVideoGeom& g, int64_t n_to
         V.t_video = dptr<float>(ri, R_TV);
         V.t_audio = dptr<float>(ri, R_TA);
         V.step = j.step;
+        V.sampler = j.req->sampler;
         V.sched = dptr<float>(ri, R_SCHED);
         V.pos = dptr<float>(ri, R_ROPE);
         V.seed = dptr<uint32_t>(ri, R_SEED);
@@ -1052,8 +1054,21 @@ const RadBatch* VideoDriver::build_cond(Job& j, int step) {
     return &out_[0];
 }
 
-/* Step i's timesteps and sigmas, the video's then the soundtrack's (RadVideoGenBatch::sched);
- * with `to_clean` the next sigmas are 0, so the step lands on its clean estimate. */
+/* Step i's timesteps, sigmas and sampler coefficients (RadVideoGenBatch::sched). With `to_clean` the
+ * next sigmas are 0, so the step lands on its clean estimate. Both samplers' scalars are staged
+ * whichever runs, so the plugin reads the slots its sampler names:
+ *   [0..5]   Euler: video (t, sigma, sigma_next) then soundtrack.
+ *   [6..10]  res_multistep, video: sigma (= the velocity's weight), r = sigma_next/sigma, hb1, hb2,
+ *            order (1 or 2).
+ *   [11..15] res_multistep, soundtrack: the same five.
+ * The coefficients are DPM-Solver++2M data-prediction / k-diffusion res_multistep at eta=0: with
+ * h = log(sigma/sigma_next), h_last = log(sigma_prev/sigma) and rs = h_last/h,
+ *   hb1 = (1 - r)(1 + 1/(2 rs)),  hb2 = -(1 - r)/(2 rs),  order = 2.
+ * They are used only on a step that has a previous estimate on the SAME latent grid, so `order` is 1
+ * (plain Euler, hb unused) on the first step, on the first full-size step after a latent upscale
+ * (i == split, whose grid and rows differ from the small run's stale history) and on a step whose
+ * next sigma is 0 (the last, or the last small step). hb1 + hb2 == 1 - r on the two-estimate steps,
+ * so every branch shares the Euler limit. */
 void VideoDriver::stage_sched(const Job& j, int32_t i, bool to_clean) {
     float* s = hptr<float>(R_SCHED);
     s[0] = 1.0f - j.sched.sig_v[(size_t)i];
@@ -1062,7 +1077,31 @@ void VideoDriver::stage_sched(const Job& j, int32_t i, bool to_clean) {
     s[3] = 1.0f - j.sched.sig_a[(size_t)i];
     s[4] = j.sched.sig_a[(size_t)i];
     s[5] = to_clean ? 0.0f : j.sched.sig_a[(size_t)i + 1];
-    reg_[R_SCHED].used = 6 * 4;
+    /* A stream's res_multistep coefficients, written to out[0..4]. `prev` is the step before this
+     * one's sigma (>= i so i > 0), and the restart step (i == split) forces Euler. */
+    auto coeffs = [&](const std::vector<float>& sig, float* out) {
+        const float sg = sig[(size_t)i];
+        const float sgn = to_clean ? 0.0f : sig[(size_t)i + 1];
+        const float r = sg > 0.0f ? sgn / sg : 0.0f;
+        float hb1 = 1.0f - r, hb2 = 0.0f, order = 1.0f;
+        const bool two = sgn > 0.0f && i > 0 && !(j.split > 0 && i == j.split);
+        if (two) {
+            const float h = std::log(sg / sgn);
+            const float h_last = std::log(sig[(size_t)i - 1] / sg);
+            const float rs = h_last / h;
+            hb1 = (1.0f - r) * (1.0f + 1.0f / (2.0f * rs));
+            hb2 = -(1.0f - r) / (2.0f * rs);
+            order = 2.0f;
+        }
+        out[0] = sg;
+        out[1] = r;
+        out[2] = hb1;
+        out[3] = hb2;
+        out[4] = order;
+    };
+    coeffs(j.sched.sig_v, s + 6);
+    coeffs(j.sched.sig_a, s + 11);
+    reg_[R_SCHED].used = 16 * 4;
 }
 
 /* The video's noise seed is the request's; the soundtrack's the same with its top bit flipped, so

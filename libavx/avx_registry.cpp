@@ -485,6 +485,8 @@ static const RadOperandSpec oRmsModQ[] = { OPD_O("y"), OPD_O("g"), OPD("s"), WGT
                                            OUT_O("z") };
 static const RadOperandSpec oFlowX0[] = { OPD("v"), OPD("t"), OPD("sigma"), OPD("sigma_next"),
                                           INOUT("x") };
+static const RadOperandSpec oFlowRM[] = { OPD("v"), INOUT("x0"), OPD("sigma"), OPD("r"),
+                                          OPD("hb1"), OPD("hb2"), OPD("order"), INOUT("x") };
 static const RadParamSpec pTimestep[] = { P_INT("M"), P_INT("n"), P_F64("scale"), P_F64("max_period"),
                                           P_INTO("round"), P_F64O("clamp_min"), P_STR("dtype") };
 static const RadOperandSpec oTimestep[] = { OPD("t"), OUT("y") };
@@ -938,6 +940,9 @@ static const RadOpSchema kSchemas[] = {
 { "flow_x0_step", ARR(pMnD), ARR(oFlowX0),
   "x = r x + (1 - r)(x + (1 - t) v), r = sigma_next / sigma, each step one f32 rounding, bit for "
   "bit libref's." },
+{ "flow_res_multistep", ARR(pMnD), ARR(oFlowRM),
+  "x = r x + hb1 (x + sigma v) + hb2 x0, r = sigma_next / sigma; order<2 is Euler "
+  "(x = r x + (1 - r)(x + sigma v)); bit for bit libref's." },
 { "patch_unfold", ARR(pPatchUnfold), ARR(oPatchUnfold),
   "patch rows to denormalised voxel rows, f32(f32(x * mul) + add), bit for bit libref's." },
 { "vtile_gather", ARR(pVtileGather), ARR(oVtileGather),
@@ -1419,6 +1424,8 @@ SIMPLE("avx_rms_mod_quant_fp8", "rms_mod_quant_fp8", "norm",
        L(rms_mod_quant_fp8)),
 SIMPLE("avx_flow_x0_step", "flow_x0_step", "elem", "a sampler step toward the clean estimate",
        DT_FLOAT, L(flow_x0_step)),
+SIMPLE("avx_flow_res_multistep", "flow_res_multistep", "elem",
+       "a second-order sampler step on the clean estimate", DT_FLOAT, L(flow_res_multistep)),
 SIMPLE("avx_patch_unfold", "patch_unfold", "elem", "patch rows to denormalised voxel rows",
        DT_FLOAT, L(patch_unfold)),
 SIMPLE("avx_vtile_gather", "vtile_gather", "elem", "a video decoder's tiles out of the latent",

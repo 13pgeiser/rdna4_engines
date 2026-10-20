@@ -119,6 +119,9 @@ struct VideoRequest {
     int32_t  width = 0, height = 0;   /* pixels, within the declaration's limits */
     int32_t  chunks = 0;           /* the length in chunks (RadVideoGenDecl) */
     int32_t  steps = 0;            /* sigma grid points; 0: the model's default */
+    /* The sampler: a RAD_SAMPLER_* value (abi/rad_runtime.h). 0 = Euler, the default; 1 =
+     * res_multistep, the second-order step on the clean estimate. */
+    int32_t  sampler = 0;
     /* Latent upscaling (abi/rad_builder.h, RadVideoGenDecl): the factor, 0 for none, and the
      * evaluations at the full size after it, 0 for the model's default. */
     double   upscale = 0.0;

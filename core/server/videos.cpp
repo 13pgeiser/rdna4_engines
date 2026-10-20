@@ -59,6 +59,7 @@ struct Server::VideoJob {
     std::string id, model, prompt, seconds, size;
     int64_t     created_at = 0;
     uint64_t    seed = 0;
+    int32_t     sampler = 0;   /* the request's RAD_SAMPLER_* */
     std::shared_ptr<gen::VideoTicket> ticket;
     std::thread worker;
     /* Under Server::videos_m_ from here on. */
@@ -271,6 +272,8 @@ void Server::video_caps(json& caps, const IVideoGen* gen) {
     /* The containers `format` accepts; mp4 is the default and always available, the webm codecs
      * only when this build's libavcodec has the encoder and muxer for them. */
     caps["video_formats"] = json::array({ "mp4", "webm", "webm-av1" });
+    /* The samplers `sampler` accepts; euler is the default and always available. */
+    caps["video_samplers"] = json::array({ "euler", "res_multistep" });
 }
 
 HttpResponse Server::handle_video_create(const HttpRequest& req) {
@@ -343,6 +346,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     static const char* kKnown[] = {
         "model", "prompt", "seconds", "size", "input_reference", "seed", "num_inference_steps",
         "task", "target", "conditions", "user", "latent_upscale", "upscale_refine_steps", "format",
+        "sampler",
     };
     for (auto it = body.begin(); it != body.end(); ++it) {
         bool known = false;
@@ -552,6 +556,18 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
                                                   std::to_string(info.max_steps) +
                                                   " (sigma grid points, the last one 0)");
         r->steps = (int32_t)v;
+    }
+    if (has(body, "sampler")) {
+        const std::string sm = body["sampler"].is_string() ? body["sampler"].get<std::string>() : "";
+        if (sm.empty() || sm == "euler") r->sampler = RAD_SAMPLER_EULER;
+        else if (sm == "res_multistep") r->sampler = RAD_SAMPLER_RES_MULTISTEP;
+        else {
+            ApiError e = err_unsupported("sampler", "the sampler is euler (first order) or "
+                                                   "res_multistep (second order on the clean "
+                                                   "estimate)");
+            e.supported = { "euler", "res_multistep" };
+            return error_response(e, req.peer);
+        }
     }
     if (has(body, "latent_upscale")) {
         double v = 0;
@@ -770,6 +786,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     j->size = std::to_string(W) + "x" + std::to_string(H);
     j->created_at = unix_now();
     j->seed = r->seed;
+    j->sampler = r->sampler;
     j->fmt = fmt;
     for (const gen::VideoRefMedia& m : r->refs) j->refs.push_back(m.name);
     j->ticket = std::make_shared<gen::VideoTicket>();
@@ -955,6 +972,7 @@ json Server::video_json(const VideoJob& j) {
     o["size"] = j.size;
     o["seed"] = j.seed;
     o["format"] = format_name(j.fmt);   /* what /content will return */
+    o["sampler"] = j.sampler == RAD_SAMPLER_RES_MULTISTEP ? "res_multistep" : "euler";
     if (j.refine > 0) {
         o["latent_upscale"] = j.upscale;
         o["upscale_refine_steps"] = j.refine;

@@ -433,6 +433,8 @@ struct Model {
     rad_buf b_nout = 0;          /* [lanes * S, 3 * 2D] bf16: norm_out's, by segment */
     rad_buf b_vstate = 0;        /* [lanes * maxV, 96] f32 */
     rad_buf b_astate = 0;        /* [lanes * maxA, 32] f32 */
+    rad_buf b_vx0 = 0;           /* [lanes * maxV, 96] f32: res_multistep's previous video estimate */
+    rad_buf b_ax0 = 0;           /* [lanes * maxA, 32] f32: the soundtrack's */
     rad_buf b_prev = 0;          /* [lanes * 5 * area, 3] bf16: the decoder's frames across chunks */
 
     /* ---- the DiT */
@@ -460,6 +462,7 @@ struct Model {
     std::vector<DitBlock> dit;
     rad_weight w_no_n = 0, w_vout = 0, b_vout = 0, w_aout = 0, b_aout = 0;
     rad_op  op_nout = 0, op_hcast = 0, op_vout = 0, op_aout = 0, op_ev = 0, op_ea = 0;
+    rad_op  op_rmv = 0, op_rma = 0;   /* the res_multistep step, video and soundtrack */
 
     /* ---- the audio decoder */
     std::string a_mean, a_std;
@@ -1107,6 +1110,8 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     /* ---- the lanes' latents, and the first step's noise */
     m.b_vstate = decl_b(b, nm.f("lane.video"), RAD_F32, { La * m.maxV, kPatchVals }, RAD_BUF_PERSIST);
     m.b_astate = decl_b(b, nm.f("lane.audio"), RAD_F32, { La * m.maxA, kAudioC }, RAD_BUF_PERSIST);
+    m.b_vx0 = decl_b(b, nm.f("lane.video.x0"), RAD_F32, { La * m.maxV, kPatchVals }, RAD_BUF_PERSIST);
+    m.b_ax0 = decl_b(b, nm.f("lane.audio.x0"), RAD_F32, { La * m.maxA, kAudioC }, RAD_BUF_PERSIST);
     m.op_rnd_v = rw(b, RAD_OP(b, "randn_lanes",
                               RAD_PARAMS(RAD_RANGE("M", 1, m.maxV), RAD_INT("n", kPatchVals),
                                          RAD_INT("stride", m.maxV), RAD_STR("dtype", "f32")),
@@ -1382,7 +1387,21 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                       RAD_STR("dtype", "f32")),
                            RAD_NOWEIGHTS),
                  { m.b_avel, m.b_astate }, { m.b_astate });
-    return m.op_hcast && m.op_vout && m.op_aout && m.op_ev && m.op_ea ? RAD_OK : RAD_E_INVAL;
+    /* The second-order step's two INOUT buffers: the estimate history is both read (previous d) and
+     * written (this d), and the latent x as before; the velocity is read-only. Issued instead of the
+     * Euler pair when the batch's sampler is RES_MULTISTEP. */
+    m.op_rmv = rw(b, RAD_OP(b, "flow_res_multistep",
+                            RAD_PARAMS(RAD_RANGE("M", 1, m.maxV), RAD_INT("n", kPatchVals),
+                                       RAD_STR("dtype", "f32")),
+                            RAD_NOWEIGHTS),
+                  { m.b_vel, m.b_vx0, m.b_vstate }, { m.b_vx0, m.b_vstate });
+    m.op_rma = rw(b, RAD_OP(b, "flow_res_multistep",
+                            RAD_PARAMS(RAD_RANGE("M", 1, m.maxA), RAD_INT("n", kAudioC),
+                                       RAD_STR("dtype", "f32")),
+                            RAD_NOWEIGHTS),
+                  { m.b_avel, m.b_ax0, m.b_astate }, { m.b_ax0, m.b_astate });
+    return m.op_hcast && m.op_vout && m.op_aout && m.op_ev && m.op_ea && m.op_rmv && m.op_rma
+               ? RAD_OK : RAD_E_INVAL;
 }
 
 /* ================================================================== the audio decoder */
@@ -3524,12 +3543,31 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
     };
     heads(m.op_aout, m.w_aout, m.b_aout, aseg, arows, kAudioC, m.b_avel);
     heads(m.op_vout, m.w_vout, m.b_vout, vseg, vrows, kPatchVals, m.b_vel);
-    RAD_ISSUE_N(c, m.op_ev, vrows, brows(m.b_vel, vrows), praw(V->sched, RAD_F32, 1),
-                praw(V->sched + 1, RAD_F32, 1), praw(V->sched + 2, RAD_F32, 1),
-                brow_slice(m.b_vstate, lane * m.maxV, vrows, kPatchVals));
-    RAD_ISSUE_N(c, m.op_ea, arows, brows(m.b_avel, arows), praw(V->sched + 3, RAD_F32, 1),
-                praw(V->sched + 4, RAD_F32, 1), praw(V->sched + 5, RAD_F32, 1),
-                brow_slice(m.b_astate, lane * m.maxA, arows, kAudioC));
+    /* The step: Euler (the clean estimate alone, the lane's latent only) or the second-order
+     * res_multistep, which also reads and rotates the previous estimate kept in the lane's x0 buffer.
+     * The driver stages the scalars for whichever runs: sched[0..5] the Euler t/sigmas, sched[6..10]
+     * the video's sigma/r/hb1/hb2/order and sched[11..15] the soundtrack's. */
+    if (V->sampler == RAD_SAMPLER_RES_MULTISTEP) {
+        RAD_ISSUE_N(c, m.op_rmv, vrows, brows(m.b_vel, vrows),
+                    brow_slice(m.b_vx0, lane * m.maxV, vrows, kPatchVals),
+                    praw(V->sched + 6, RAD_F32, 1), praw(V->sched + 7, RAD_F32, 1),
+                    praw(V->sched + 8, RAD_F32, 1), praw(V->sched + 9, RAD_F32, 1),
+                    praw(V->sched + 10, RAD_F32, 1),
+                    brow_slice(m.b_vstate, lane * m.maxV, vrows, kPatchVals));
+        RAD_ISSUE_N(c, m.op_rma, arows, brows(m.b_avel, arows),
+                    brow_slice(m.b_ax0, lane * m.maxA, arows, kAudioC),
+                    praw(V->sched + 11, RAD_F32, 1), praw(V->sched + 12, RAD_F32, 1),
+                    praw(V->sched + 13, RAD_F32, 1), praw(V->sched + 14, RAD_F32, 1),
+                    praw(V->sched + 15, RAD_F32, 1),
+                    brow_slice(m.b_astate, lane * m.maxA, arows, kAudioC));
+    } else {
+        RAD_ISSUE_N(c, m.op_ev, vrows, brows(m.b_vel, vrows), praw(V->sched, RAD_F32, 1),
+                    praw(V->sched + 1, RAD_F32, 1), praw(V->sched + 2, RAD_F32, 1),
+                    brow_slice(m.b_vstate, lane * m.maxV, vrows, kPatchVals));
+        RAD_ISSUE_N(c, m.op_ea, arows, brows(m.b_avel, arows), praw(V->sched + 3, RAD_F32, 1),
+                    praw(V->sched + 4, RAD_F32, 1), praw(V->sched + 5, RAD_F32, 1),
+                    brow_slice(m.b_astate, lane * m.maxA, arows, kAudioC));
+    }
 }
 
 /* The soundtrack: both channels, each a sequence, through the audio decoder, then interleaved. */

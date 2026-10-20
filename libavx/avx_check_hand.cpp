@@ -2154,6 +2154,24 @@ void video_cases(std::vector<Hand>& hs) {
             hs.push_back(std::move(h));
         }
 
+        /* ---- the second-order sampler: a bf16 velocity, f32 state AND estimate history, both
+         *      INOUT at wider pitches; order=2 leans on the history, order=1 is the Euler limit -- */
+        for (float order : { 2.0f, 1.0f }) {
+            Hand h((std::string(order >= 1.5f ? "two-estimate" : "Euler limit") +
+                    ", bf16 velocity, f32 state and history" + sfx).c_str(),
+                   "flow_res_multistep", 0.0);
+            h.dense(dt, { 7, 96 }, hfill(422, 2.0f))
+             .view(RAD_F32, { 7, 96 }, { 99, 1 }, 7 * 99, hfill(423), true)   /* x0, INOUT */
+             .dense(RAD_F32, { 1 }, [](int64_t) { return 0.5625f; })           /* sigma */
+             .dense(RAD_F32, { 1 }, [](int64_t) { return 0.625f; })            /* r */
+             .dense(RAD_F32, { 1 }, [](int64_t) { return 0.24f; })             /* hb1 */
+             .dense(RAD_F32, { 1 }, [](int64_t) { return -0.005f; })           /* hb2 */
+             .dense(RAD_F32, { 1 }, [order](int64_t) { return order; })        /* order */
+             .view(RAD_F32, { 7, 96 }, { 101, 1 }, 7 * 101, hfill(424), true)  /* x, INOUT */
+             .pi("M", 7).pi("n", 96).ps("dtype", dn);
+            hs.push_back(std::move(h));
+        }
+
         /* ---- the decoder's geometry: 3 frames of 6 x 9 latents, tiles of 4 over 1 ------------ *
          * Rows split 6 -> starts 0, 2 (overlap 2); columns 9 -> 0, 2, 5 (overlaps 2, 1). */
         {

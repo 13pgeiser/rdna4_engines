@@ -694,6 +694,57 @@ AVX_KERNEL(flow_x0_step) {
     return RAD_OK;
 }
 
+/* x' = f32(f32(r x) + f32(hb1 d) + f32(hb2 x0)) when order >= 2, else the Euler form
+ * f32(f32(r x) + f32((1 - r) d)), with d = f32(x + f32(sigma v)): libref's step bit for bit, `keep`
+ * holding each product to its own rounding. x0 is the previous estimate (read here, d written back). */
+AVX_KERNEL(flow_res_multistep) {
+    if (!rad_args_have(a, 8)) return RAD_E_INVAL;
+    const RadTensor *V = &a->t[0], *X0 = &a->t[1], *SG = &a->t[2], *RR = &a->t[3];
+    const RadTensor *HB1 = &a->t[4], *HB2 = &a->t[5], *ORD = &a->t[6], *X = &a->t[7];
+    const int64_t n = p_int(a, "n", 0);
+    if (n <= 0) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(X, n);
+    if (rows <= 0 || rows_of(V, n) < rows || rows_of(X0, n) < rows || numel(SG) < 1 ||
+        numel(RR) < 1 || numel(HB1) < 1 || numel(HB2) < 1 || numel(ORD) < 1)
+        return RAD_E_SHAPE;
+    const float sg = ldt(SG, offlin(SG, 0));
+    const float r = ldt(RR, offlin(RR, 0));
+    const float b1 = ldt(HB1, offlin(HB1, 0));
+    const float b2 = ldt(HB2, offlin(HB2, 0));
+    const bool two = ldt(ORD, offlin(ORD, 0)) >= 1.5f;
+    const float omr = 1.0f - r;
+
+    AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
+    for (int64_t k = 0; k < rows; ++k) {
+        float* buf = scratch_f32((size_t)(5 * n + 64));
+        float *vs = buf, *xs = buf + n + 16, *h0s = xs + n + 16, *o = h0s + n + 16, *o0 = o + n + 16;
+        const float* v = in_row(V, rowoff(V, k, n), n, vs);
+        const float* x = in_row(X, rowoff(X, k, n), n, xs);
+        const float* h0 = in_row(X0, rowoff(X0, k, n), n, h0s);
+        const vf vsg = vf_set1(sg), vr = vf_set1(r), vb1 = vf_set1(b1), vb2 = vf_set1(b2),
+                 vo = vf_set1(omr);
+        int64_t c = 0;
+        for (; c + VF_N <= n; c += VF_N) {
+            const vf xv = vf_loadu(x + c);
+            const vf d = vf_add(xv, keep(vf_mul(vsg, vf_loadu(v + c))));
+            const vf a = keep(vf_mul(vr, xv));
+            vf xo = two ? vf_add(vf_add(a, keep(vf_mul(vb1, d))), keep(vf_mul(vb2, vf_loadu(h0 + c))))
+                        : vf_add(a, keep(vf_mul(vo, d)));
+            vf_storeu(o + c, xo);
+            vf_storeu(o0 + c, d);
+        }
+        for (; c < n; ++c) {
+            const float d = x[c] + keep(sg * v[c]);
+            const float a = keep(r * x[c]);
+            o[c] = two ? (a + keep(b1 * d)) + keep(b2 * h0[c]) : a + keep(omr * d);
+            o0[c] = d;
+        }
+        out_row(X, rowoff(X, k, n), n, o);
+        out_row(X0, rowoff(X0, k, n), n, o0);
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ chan_affine */
 /* A per-channel affine from two lists of n bf16 values: `fma` is bf16(bf16(x * mul) + add), `inv`
  * is bf16(bf16(x - add) / mul), the inner rounding in y's dtype. */

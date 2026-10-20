@@ -428,6 +428,15 @@ enum {
  *   AENCODE  no rows of the pass's own: a reference audio's samples in `enc_samples`.
  *
  * Every pointer is device memory unless the name ends in _h. */
+
+/* RadVideoGenBatch::sampler: which sampler advances a lane's latents each step. EULER is the
+ * first-order step (`flow_x0_step`) every model has run with; RES_MULTISTEP is the second-order
+ * Adams-Bashforth step on the clean estimate (`flow_res_multistep`, DPM-Solver++2M data-prediction
+ * / k-diffusion's res_multistep at eta=0), which needs the previous step's estimate kept between
+ * steps. The driver stages both schedules' scalars into `sched` regardless, so a plugin reads the
+ * one its sampler names. A batch without the field laid out is an older engine's: EULER. */
+enum { RAD_SAMPLER_EULER = 0, RAD_SAMPLER_RES_MULTISTEP = 1 };
+
 typedef struct RadVideoGenBatch {
     int32_t         lane;
     RadVideoGeom    geom;          /* the request's geometry */
@@ -518,6 +527,9 @@ typedef struct RadVideoGenBatch {
      * ride a fixed table. On a plain request (or one that merges nothing) it is exactly `seg_cu`; a
      * driver stages the same bytes into both. Trailing since ABI 23. */
     const int32_t*  mod_cu;
+
+    /* ---- The sampler that advances the latents: RAD_SAMPLER_* above. Trailing since ABI 24. */
+    int32_t         sampler;
 } RadVideoGenBatch;
 
 /* RadVideoGenBatch::enc_kind: which reference media an encode pass carries. A plugin's latent

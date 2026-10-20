@@ -502,6 +502,50 @@ int ref_flow_x0_step(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ flow_res_multistep */
+/* A second-order sampler step on the clean estimate (DPM-Solver++2M data-prediction, k-diffusion's
+ * res_multistep at eta=0). The estimate is d = x + sigma v (the same x0 an Euler step takes); the
+ * step then leans on the PREVIOUS step's estimate x0 (read here, then this step's d written back for
+ * the next): x' = r x + hb1 d + hb2 x0 with r = sigma_next / sigma. The coefficients hb1, hb2 and
+ * the `order` flag are the driver's -- computed so that on the first step, after a schedule restart,
+ * and on the last step (where the next sigma is 0) order is 1 and the two-estimate term drops out:
+ * with order<2 the step is Euler, x' = r x + (1 - r) d. On the two-estimate steps hb1 + hb2 == 1 - r
+ * exactly, so both branches share the Euler limit and the difference is the second-order correction
+ * alone. sigma, r, hb1, hb2 and order are one f32 value each; x and x0 f32, x the evolving latent,
+ * x0 the estimate history (both INOUT). */
+int ref_flow_res_multistep(const RadArgs* a, RadStream) {
+    if (!have(a, 8)) return RAD_E_INVAL;
+    const RadTensor *v = &a->t[0], *x0 = &a->t[1], *sg = &a->t[2], *rr = &a->t[3];
+    const RadTensor *hb1 = &a->t[4], *hb2 = &a->t[5], *ord = &a->t[6], *x = &a->t[7];
+    const int64_t n = p_int(a, "n", 0);
+    if (n <= 0) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(x, n);
+    if (rows <= 0 || rows_of(v, n) < rows || rows_of(x0, n) < rows || numel(sg) < 1 ||
+        numel(rr) < 1 || numel(hb1) < 1 || numel(hb2) < 1 || numel(ord) < 1)
+        return RAD_E_SHAPE;
+    const float sgv = ldt(sg, offlin(sg, 0));
+    const float r = ldt(rr, offlin(rr, 0));
+    const float b1 = ldt(hb1, offlin(hb1, 0));
+    const float b2 = ldt(hb2, offlin(hb2, 0));
+    const bool two = ldt(ord, offlin(ord, 0)) >= 1.5f;
+    const float omr = 1.0f - r;
+    REF_PAR_FOR(rows * n)
+    for (int64_t k = 0; k < rows; ++k) {
+        const int64_t vb = rowoff(v, k, n), vs = laststride(v);
+        const int64_t xb = rowoff(x, k, n), xs = laststride(x);
+        const int64_t ob = rowoff(x0, k, n), os = laststride(x0);
+        for (int64_t c = 0; c < n; ++c) {
+            const float xv = ldt(x, xb + c * xs);
+            const float d = xv + sgv * ldt(v, vb + c * vs);
+            const float nx = two ? r * xv + b1 * d + b2 * ldt(x0, ob + c * os)
+                                 : r * xv + omr * d;
+            stt(x, xb + c * xs, nx);
+            stt(x0, ob + c * os, d);
+        }
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ chan_affine */
 /* A per-channel affine from two parameter lists (a latent's mean and deviation are configuration,
  * not weights), each value rounded to bf16 as upstream holds it: mode `fma` is

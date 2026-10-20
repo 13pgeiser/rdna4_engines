@@ -2306,6 +2306,11 @@ static const RadOperandSpec oFlowX0[] = {
     { "v", RAD_OPD_IN, 0 }, { "t", RAD_OPD_IN, 0 }, { "sigma", RAD_OPD_IN, 0 },
     { "sigma_next", RAD_OPD_IN, 0 }, { "x", RAD_OPD_INOUT, 0 },
 };
+static const RadOperandSpec oFlowRM[] = {
+    { "v", RAD_OPD_IN, 0 }, { "x0", RAD_OPD_INOUT, 0 }, { "sigma", RAD_OPD_IN, 0 },
+    { "r", RAD_OPD_IN, 0 }, { "hb1", RAD_OPD_IN, 0 }, { "hb2", RAD_OPD_IN, 0 },
+    { "order", RAD_OPD_IN, 0 }, { "x", RAD_OPD_INOUT, 0 },
+};
 static const RadParamSpec pPatchUnfold[] = { P_INT("M"), P_INT("C"), P_INT("pt"), P_INT("ph"),
                                              P_INT("pw"), P_STR("mul"), P_STR("add"),
                                              P_STR("dtype") };
@@ -3047,6 +3052,9 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("flow_x0_step", pGenMn, oFlowX0,
            "x = r x + (1 - r) (x + (1 - t) v), r = sigma_next / sigma, each step one f32 "
            "rounding."),
+    SCHEMA("flow_res_multistep", pGenMn, oFlowRM,
+           "x = r x + hb1 (x + sigma v) + hb2 x0, r = sigma_next / sigma, x0 the previous estimate; "
+           "order<2 is Euler."),
     SCHEMA("patch_unfold", pPatchUnfold, oPatchUnfold,
            "patch rows unfolded to voxel rows and denormalised with f32 lists."),
     SCHEMA("vtile_gather", pVtileGather, oVtileGather,
@@ -7308,6 +7316,13 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cGenF32), NOTUNE,
   nullptr, nullptr, r4d_rad_flow_x0_step },
+
+{ "flow_res_multistep_f32", "flow_res_multistep", "elem",
+  "a second-order sampler step on the clean estimate", "any M, row pitches honoured",
+  "f32 state and estimate history, f32 or bf16 velocity",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenF32), NOTUNE,
+  nullptr, nullptr, r4d_rad_flow_res_multistep },
 
 { "patch_unfold_f32", "patch_unfold", "elem",
   "patch rows to denormalised voxel rows, the geometry read on the device",

@@ -6388,6 +6388,52 @@ void flow_x0_cases(const Plugin& pl) {
     }
 }
 
+/* flow_res_multistep: an f32 and a bf16 velocity, the state AND the estimate history INOUT at wider,
+ * unequal pitches; order=2 leans on the history, order=1 is the Euler limit. Every value exact, and
+ * both INOUT buffers' pitch gaps left untouched -- the two-INOUT path exercised for the first time. */
+void flow_rm_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "flow_res_multistep_f32");
+    if (!r) { ok("flow_res_multistep_f32", false, "row absent"); return; }
+    const int64_t M = 37, n = 96, xld = 100, x0ld = 102;
+    for (const bool bf : { false, true })
+    for (const float order : { 2.0f, 1.0f }) {
+        std::vector<float> x = randv((size_t)(M * xld), 3.0f), x0 = randv((size_t)(M * x0ld), 2.0f),
+                             v = randv((size_t)(M * n), 2.0f);
+        const std::vector<float> sg = { 0.5625f }, rr = { 0.625f }, hb1 = { 0.24f },
+                                 hb2 = { -0.005f }, ord = { order };
+        void* dx = up_f32(x);
+        void* dx0 = up_f32(x0);
+        void* dv = bf ? up_bf16(v) : up_f32(v);
+        RadTensor tx = T(dx, RAD_F32, { M, n }); tx.stride[0] = xld;
+        RadTensor tx0 = T(dx0, RAD_F32, { M, n }); tx0.stride[0] = x0ld;
+        const std::string nm =
+            fmt("flow_res_multistep_f32 %s velocity order %g", bf ? "bf16" : "f32", order);
+        const int rc = launch(r, { T(dv, bf ? RAD_BF16 : RAD_F32, { M, n }), tx0,
+                                   T(up_f32(sg), RAD_F32, { 1 }), T(up_f32(rr), RAD_F32, { 1 }),
+                                   T(up_f32(hb1), RAD_F32, { 1 }), T(up_f32(hb2), RAD_F32, { 1 }),
+                                   T(up_f32(ord), RAD_F32, { 1 }), tx },
+                              { PI("M", M), PI("n", n), PS("dtype", "f32") });
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        const bool two = order >= 1.5f;
+        const float ra = rr[0], b1 = hb1[0], b2 = hb2[0], omr = 1.0f - ra;
+        std::vector<float> wantx = x, wantx0 = x0;   /* gaps keep their original bytes */
+        for (int64_t row = 0; row < M; ++row)
+            for (int64_t c = 0; c < n; ++c) {
+                const float xv = x[(size_t)(row * xld + c)];
+                const float h0 = x0[(size_t)(row * x0ld + c)];
+                const float p = sg[0] * v[(size_t)(row * n + c)];
+                const float d = xv + p;
+                const float a = ra * xv;
+                wantx[(size_t)(row * xld + c)] = two ? (a + b1 * d) + b2 * h0 : a + omr * d;
+                wantx0[(size_t)(row * x0ld + c)] = d;
+            }
+        int64_t bad = differ(down_f32(dx, wantx.size()), wantx);
+        bad += differ(down_f32(dx0, wantx0.size()), wantx0);
+        ok((nm + " exact, both INOUT gaps untouched").c_str(), bad == 0,
+           fmt("%lld values differ", (long long)bad));
+    }
+}
+
 /* grid_pos3: MiniMax-H3's tile of 7 x 16 x 16 and its registers over two periods, written into a
  * [3, M] view of a wider plane; exact. */
 void grid_pos3_cases(const Plugin& pl) {
@@ -19448,6 +19494,7 @@ static void device_phase(const Plugin& pl) {
     if (sel("rms_mod_bf16")) vid::rms_mod_cases(pl, false);
     if (sel("rms_mod_quant_fp8_bf16")) vid::rms_mod_cases(pl, true);
     if (sel("flow_x0_step_f32")) vid::flow_x0_cases(pl);
+    if (sel("flow_res_multistep_f32")) vid::flow_rm_cases(pl);
     if (sel("grid_pos3")) vid::grid_pos3_cases(pl);
     if (sel("snake_aa_f32")) vid::snake_aa_cases(pl);
     /* A video latent upscaler's ops, at its source and target sizes. */

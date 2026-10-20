@@ -165,6 +165,35 @@ __global__ __launch_bounds__(kT) void flow_x0_kernel(
     *xp = ra * xv + omr * d;
 }
 
+// ---------------------------------------------------------------------------- flow_res_multistep
+// A second-order sampler step on the clean estimate: d = x + sigma v, then x' = r x + hb1 d + hb2 x0
+// with r = sigma_next / sigma and x0 the previous step's estimate (read, then d written back for the
+// next step). order<2 is Euler -- x' = r x + (1 - r) d, the first step, a schedule restart and the
+// last step -- and on the two-estimate steps hb1 + hb2 == 1 - r, so both share the Euler limit.
+template <typename TV>
+__global__ __launch_bounds__(kT) void flow_rm_kernel(
+    const TV* __restrict__ v, float* __restrict__ x0, const float* __restrict__ sg,
+    const float* __restrict__ rr, const float* __restrict__ hb1, const float* __restrict__ hb2,
+    const float* __restrict__ ord, float* __restrict__ x, int n, int v_ld, int x_ld, int x0_ld,
+    int64_t total) {
+    const int64_t id = (int64_t)blockIdx.x * kT + threadIdx.x;
+    if (id >= total) return;
+    const int64_t r = id / n;
+    const int c = (int)(id % n);
+    const float sgv = sg[0];
+    const float ra = rr[0];
+    const float b1 = hb1[0];
+    const float b2 = hb2[0];
+    const bool two = ord[0] >= 1.5f;
+    const float omr = 1.0f - ra;
+    float* xp = x + r * x_ld + c;
+    float* op = x0 + r * x0_ld + c;
+    const float xv = *xp;
+    const float d = xv + sgv * ldv(v, r * v_ld + c);
+    *xp = two ? ra * xv + b1 * d + b2 * (*op) : ra * xv + omr * d;
+    *op = d;
+}
+
 // ---------------------------------------------------------------------------- patch_unfold
 // The two parameter lists of the latent's statistics, f32 kernel arguments.
 constexpr int kMaxChan = 64;
@@ -514,6 +543,36 @@ extern "C" int r4d_rad_flow_x0_step(const RadArgs* a, RadStream s) {
     if (is_f32(v)) R4D_FX0(float);
     else           R4D_FX0(uint16_t);
 #undef R4D_FX0
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_flow_res_multistep(const RadArgs* a, RadStream s) {
+    const RadTensor *v = r4d_opt(a, 0), *x0 = r4d_opt(a, 1), *sg = r4d_opt(a, 2);
+    const RadTensor *rr = r4d_opt(a, 3), *hb1 = r4d_opt(a, 4), *hb2 = r4d_opt(a, 5);
+    const RadTensor *ord = r4d_opt(a, 6), *x = r4d_opt(a, 7);
+    if (!v || !x0 || !sg || !rr || !hb1 || !hb2 || !ord || !x) return R4D_NO(RAD_E_INVAL);
+    if (!is_f32(x) || !is_f32(x0) || !is_f32(sg) || !is_f32(rr) || !is_f32(hb1) || !is_f32(hb2) ||
+        !is_f32(ord) || (!is_f32(v) && !is_bf16(v)))
+        return R4D_NO(RAD_E_DTYPE);
+    const long long n = r4d_geti_or(a, "n", 0);
+    long long rx = 0, rv = 0, rx0 = 0;
+    const long long xl = n > 0 ? r4d_rows_pitch(x, n, &rx) : -1;
+    const long long vl = n > 0 ? r4d_rows_pitch(v, n, &rv) : -1;
+    const long long x0l = n > 0 ? r4d_rows_pitch(x0, n, &rx0) : -1;
+    if (xl < 0 || vl < 0 || x0l < 0) return R4D_NO(RAD_E_STRIDE);
+    if (rx <= 0 || rv < rx || rx0 < rx || r4d_numel(sg) < 1 || r4d_numel(rr) < 1 ||
+        r4d_numel(hb1) < 1 || r4d_numel(hb2) < 1 || r4d_numel(ord) < 1)
+        return R4D_NO(RAD_E_SHAPE);
+    const int64_t total = (int64_t)rx * n;
+#define R4D_FRM(TV)                                                                               \
+    hipLaunchKernelGGL(flow_rm_kernel<TV>, dim3(blocks_for(total)), dim3(kT), 0, (hipStream_t)s,  \
+                       (const TV*)v->data, (float*)x0->data, (const float*)sg->data,              \
+                       (const float*)rr->data, (const float*)hb1->data, (const float*)hb2->data,  \
+                       (const float*)ord->data, (float*)x->data, (int)n, (int)vl, (int)xl,        \
+                       (int)x0l, total)
+    if (is_f32(v)) R4D_FRM(float);
+    else           R4D_FRM(uint16_t);
+#undef R4D_FRM
     return st_of(hipGetLastError());
 }
 

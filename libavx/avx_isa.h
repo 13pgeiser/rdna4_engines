@@ -111,6 +111,7 @@ int         avx_par_force(int threads);
     X(scatter_add_rows)     X(attn_prefix_self)                                                   \
     /* ---- video generation */                                                                   \
     X(rms_mod)              X(rms_mod_quant_fp8)    X(flow_x0_step)         X(patch_unfold)       \
+    X(flow_res_multistep)                                                                           \
     X(vtile_gather)         X(vtile_stitch)         X(grid_pos3)            X(vsa_select)         \
     X(attn_vsa)             X(conv3d_ndhwc)         X(group_norm)           X(tconv_dw)           \
     X(resize_bilinear)      X(patch_fold)           X(flow_renoise)                               \
