@@ -8360,7 +8360,9 @@ pub const ATTENTION_FLASH_FP8_E4M3_TILE_SRC: &str = concat!(
 /// one 256-thread workgroup per (kv head, tile) serves the six q heads of its kv
 /// head, so each K/V tile is read once. Same 13-arg ABI and byte-identical
 /// `[2+head_dim]` partials as [`ATTENTION_FLASH_FP8_E4M3_TILE_SRC`] at head_dim
-/// 256, GQA group 6, tile 128, window 0. gfx1201 only.
+/// 256, GQA group 6, tile 128, window 0. The same source also exports
+/// `attention_flash_fp8_e4m3_tile_gqa8_gfx1201` (GQA group 8, H16/KV2). gfx1201
+/// only.
 pub const ATTENTION_FLASH_FP8_E4M3_TILE_GQA_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_fp8_e4m3_tile_gqa.gfx1201.hip");
 /// Head-dim-split flash-decode reduce (`attention_flash_reduce_dsplit_gfx1201`):
@@ -8414,14 +8416,15 @@ pub const ATTENTION_FLASH_FP8_E4M3_TILE_BATCHED_SRC: &str = concat!(
 );
 pub const ATTENTION_FLASH_Q8_0_TILE_ROWS_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_q8_0_tile_rows.hip");
-pub const ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC: &str =
-    include_str!("../../../kernels/src/attention_flash_asym_reduce_batched.hip");
 /// VerifyAttn Stage 0 (gfx1201): `attention_verify_gqa_{q8,fp8}_gfx1201`, the
 /// GQA-shared split-K twins of the batched Q8_0 / fp8 flash tiles (one KV scan
 /// per kv head for 8 query rows x 6 q heads, fixed context-independent grid),
-/// and `attention_verify_reduce_gfx1201`, the parallel twin of
+/// `attention_verify_gqa_fp8_gqa8_gfx1201` (fp8 only, H16/KV2 GQA group 8: 6
+/// query rows x 8 q heads per workgroup), and `attention_verify_reduce_gfx1201`,
+/// the parallel twin of
 /// [`ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC`]. Partials and output are
-/// byte-identical to the tile_batched + reduce pair at head_dim 256, GQA 6.
+/// byte-identical to the tile_batched + reduce pair at head_dim 256, GQA 6
+/// (and GQA 8 for the group-8 entry).
 pub const ATTENTION_VERIFY_GQA_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/attention_verify_gqa.gfx1201.hip");
 /// VerifyAttn Stage 0 (gfx1100, Q8 only): `attention_verify_gqa_q8_gfx1100`

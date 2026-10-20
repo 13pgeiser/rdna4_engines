@@ -931,7 +931,10 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!(
             "attention_flash_fp8_e4m3_tile_gqa_gfx1201",
             kernels::ATTENTION_FLASH_FP8_E4M3_TILE_GQA_GFX1201_SRC,
-            ["attention_flash_fp8_e4m3_tile_gqa_gfx1201"]
+            [
+                "attention_flash_fp8_e4m3_tile_gqa_gfx1201",
+                "attention_flash_fp8_e4m3_tile_gqa8_gfx1201"
+            ]
         );
         add!(
             "attention_flash_reduce_dsplit_gfx1201",
@@ -1273,6 +1276,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             [
                 "attention_verify_gqa_q8_gfx1201",
                 "attention_verify_gqa_fp8_gfx1201",
+                "attention_verify_gqa_fp8_gqa8_gfx1201",
                 "attention_verify_reduce_gfx1201"
             ]
         );
@@ -3992,7 +3996,10 @@ pub fn default_route_entries(
             add!(
                 "attention_flash_fp8_e4m3_tile_gqa_gfx1201",
                 kernels::ATTENTION_FLASH_FP8_E4M3_TILE_GQA_GFX1201_SRC,
-                ["attention_flash_fp8_e4m3_tile_gqa_gfx1201"]
+                [
+                    "attention_flash_fp8_e4m3_tile_gqa_gfx1201",
+                    "attention_flash_fp8_e4m3_tile_gqa8_gfx1201"
+                ]
             ); // attention.rs:7783
             add!(
                 "attention_flash_reduce_dsplit_gfx1201",
@@ -7405,6 +7412,7 @@ mod tests {
                 &[
                     "attention_verify_gqa_q8_gfx1201",
                     "attention_verify_gqa_fp8_gfx1201",
+                    "attention_verify_gqa_fp8_gqa8_gfx1201",
                     "attention_verify_reduce_gfx1201",
                 ][..],
             ),

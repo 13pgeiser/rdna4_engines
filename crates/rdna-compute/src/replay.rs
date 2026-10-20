@@ -1467,9 +1467,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "attention_flash_q8_0_tile"
         | "attention_flash_q8_0_tile_swa"
         | "attention_flash_fp8_e4m3_tile_gqa_gfx1201"
+        | "attention_flash_fp8_e4m3_tile_gqa8_gfx1201"
         | "attention_flash_q8_0_tile_gqa_gfx1100"
         | "attention_flash_q8_0_tile_gqa_gfx1151"
-        | "attention_flash_q8_0_tile_gqa_d256g2_gfx1151"
         | "attention_flash_q8_0_tile_gqa_d512g8_gfx1151" => {
             Some(vec![read(0), read(8), read(16), write(24), read(32)])
         }
@@ -1950,11 +1950,11 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "attention_flash_q8_0_tile"
         | "attention_flash_q8_0_tile_swa"
         | "attention_flash_fp8_e4m3_tile_gqa_gfx1201"
+        | "attention_flash_fp8_e4m3_tile_gqa8_gfx1201"
         | "gated_norm_mq_rotate_awq_k6144_gfx1201"
         | "attention_flash_q8_0_tile_gqa_gfx1100"
         | "attention_flash_q8_0_tile_gqa_gfx1151"
         | "attention_flash_q8_0_tile_gqa_d256g2_gfx1151"
-        | "attention_flash_q8_0_tile_gqa_d512g8_gfx1151"
         | "fused_qkv_hfq4g256"
         | "fused_qkv_mq4g256v2"
         | "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100"
@@ -9244,6 +9244,10 @@ mod tests {
         for (tile, reduce) in [
             (
                 "attention_flash_fp8_e4m3_tile_gqa_gfx1201",
+                "attention_flash_reduce_dsplit_gfx1201",
+            ),
+            (
+                "attention_flash_fp8_e4m3_tile_gqa8_gfx1201",
                 "attention_flash_reduce_dsplit_gfx1201",
             ),
             (
