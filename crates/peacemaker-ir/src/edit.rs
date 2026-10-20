@@ -30,7 +30,8 @@
 //! (digest-checked both ways), so undo never needs to re-prove semantic
 //! preconditions and restores instruction ids, hints and ABI bytes.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::fmt::{self, Write as _};
 use std::hash::{DefaultHasher, Hasher};
 
@@ -429,7 +430,7 @@ fn analyze_at(
             obligations.push(entry_obligation(id, &missing));
         }
     }
-    obligations.extend(abi_obligations(kern, &summary));
+    obligations.extend(abi_obligations(kern, &summary, arch));
     let kernargs = passes::kernargs::analyze(kern, arch);
     Ok(Analyzed {
         program,
@@ -480,7 +481,11 @@ fn entry_obligation(id: InstId, missing: &Bits) -> Obligation {
     }
 }
 
-fn abi_obligations(kern: &Kernel, summary: &crate::state::ResourceSummary) -> Vec<Obligation> {
+fn abi_obligations(
+    kern: &Kernel,
+    summary: &crate::state::ResourceSummary,
+    arch: Arch,
+) -> Vec<Obligation> {
     let Abi::Hsa {
         descriptor,
         metadata,
@@ -528,12 +533,20 @@ fn abi_obligations(kern: &Kernel, summary: &crate::state::ResourceSummary) -> Ve
     if descriptor.private_segment_fixed_size != 0 {
         push("scratch-in-use", format!("kernel allocates {} bytes of architected flat scratch per work-item; scratch address bounds are not certified", descriptor.private_segment_fixed_size));
     }
-    let sgprs = u32::from(summary.max_sgpr) + if summary.uses_vcc { 2 } else { 0 };
+    // gfx11's enabled system inputs occupy ordinary SGPRs even if the code
+    // never reads them. gfx12 workgroup IDs occupy TTMPs, not this budget.
+    let entry_sgprs = if matches!(arch, Arch::Gfx1100 | Arch::Gfx1151) {
+        let rsrc2 = descriptor.compute_pgm_rsrc2.0;
+        (rsrc2 >> 1 & 0x1f) + (7..=10).filter(|bit| rsrc2 >> bit & 1 != 0).count() as u32
+    } else {
+        0
+    };
+    let sgprs = u32::from(summary.max_sgpr).max(entry_sgprs) + if summary.uses_vcc { 2 } else { 0 };
     if sgprs > meta.sgpr_count {
         push(
             "resource-sgpr-metadata",
             format!(
-                "code needs {sgprs} SGPRs (VCC included), .sgpr_count is {}",
+                "code/ABI entry needs {sgprs} SGPRs (VCC included), .sgpr_count is {}",
                 meta.sgpr_count
             ),
         );
@@ -1280,7 +1293,7 @@ struct Flow {
     succ: Vec<SmallVec<[usize; 2]>>,
     pred: Vec<SmallVec<[usize; 2]>>,
     acc: Vec<Access>,
-    predicates: Vec<HashMap<InstId, bool>>,
+    guards: passes::predicates::PredicateGuards,
 }
 
 fn label_of(inst: &Inst) -> Option<BlockId> {
@@ -1353,7 +1366,7 @@ impl Flow {
             succ,
             pred,
             acc,
-            predicates: passes::predicates::partitions(body, arch),
+            guards: passes::predicates::discover(body, arch),
         })
     }
 
@@ -1414,11 +1427,17 @@ impl Flow {
     }
 
     /// Must-defined (in, out) per position from the entry seed.
+    ///
+    /// The coarse fixpoint is sound on its own; the symbolic pass only adds a
+    /// candidate read half when every entry-originating undefined path to it
+    /// is infeasible under the eligible immutable guards. Each real execution
+    /// induces one consistent valuation of those guards, so a FALSE undefined
+    /// root discharges only paths no execution can take.
     fn defined(&self, seed: Bits) -> (Vec<Bits>, Vec<Bits>) {
         let coarse = self.defined_on(seed, &self.succ, &self.pred);
         // Must-defined without guard correlation is conservative. Refine only
         // when a consumer lacks a definition, not merely because guards exist.
-        if (self.predicates.len() == 1 && self.predicates[0].is_empty())
+        if self.guards.is_empty()
             || self
                 .acc
                 .iter()
@@ -1427,35 +1446,162 @@ impl Flow {
         {
             return coarse;
         }
-        let mut joined_in = vec![Bits::FULL; self.n];
-        let mut joined_out = vec![Bits::FULL; self.n];
-        for choices in &self.predicates {
-            let mut succ = self.succ.clone();
-            for (p, id) in self.ids.iter().enumerate() {
-                if let Some(&taken) = choices.get(id) {
-                    if succ[p].len() > 1 {
-                        succ[p].retain(|q| (*q != p + 1) == taken);
-                    }
+        let mut candidates = Bits::default();
+        for p in 0..self.n {
+            candidates.or(&self.acc[p].reads.minus(&coarse.0[p]));
+        }
+        let (mut refined_in, mut refined_out) = coarse;
+        let mut bdd = passes::predicates::Bdd::new();
+        let mut incoming = vec![passes::predicates::BddId::FALSE; self.n];
+        let mut outgoing = vec![passes::predicates::BddId::FALSE; self.n];
+        // RPO priority lets forward joins settle before partial path cubes
+        // propagate downstream, avoiding the LIFO traversal's transient BDD explosion.
+        let rpo = self.reverse_postorder_ranks();
+        let mut work = BinaryHeap::with_capacity(self.n);
+        let mut queued = vec![false; self.n];
+        for bit in candidates.ones() {
+            bdd.reset();
+            self.undefined_paths(
+                bit,
+                seed,
+                &mut bdd,
+                &mut incoming,
+                &mut outgoing,
+                &rpo,
+                &mut work,
+                &mut queued,
+            );
+            for p in 0..self.n {
+                if incoming[p] == passes::predicates::BddId::FALSE {
+                    refined_in[p].bit(bit);
                 }
             }
-            let reachable = self.reach(&[0], &|_| false, &|p| succ[p].clone(), self.n);
-            let mut pred = vec![SmallVec::<[usize; 2]>::new(); self.n];
             for p in 0..self.n {
-                if reachable[p] {
-                    for &q in &succ[p] {
-                        pred[q].push(p);
-                    }
-                }
-            }
-            let (inn, out) = self.defined_on(seed, &succ, &pred);
-            for p in 0..self.n {
-                if reachable[p] {
-                    joined_in[p] = joined_in[p].inter(&inn[p]);
-                    joined_out[p] = joined_out[p].inter(&out[p]);
+                if outgoing[p] == passes::predicates::BddId::FALSE {
+                    refined_out[p].bit(bit);
                 }
             }
         }
-        (joined_in, joined_out)
+        (refined_in, refined_out)
+    }
+
+    fn reverse_postorder_ranks(&self) -> Vec<usize> {
+        let mut ranks = vec![usize::MAX; self.n];
+        let mut stack = Vec::with_capacity(self.n);
+        let mut next_rank = self.n;
+        // Traverse a DFS forest so unreachable positions also receive a rank.
+        // self.n marks discovered positions until their final rank is assigned.
+        for start in 0..self.n {
+            if ranks[start] != usize::MAX {
+                continue;
+            }
+            ranks[start] = self.n;
+            stack.push((start, 0));
+            while let Some((p, next)) = stack.last_mut() {
+                if *next < self.succ[*p].len() {
+                    let s = self.succ[*p][*next];
+                    *next += 1;
+                    if ranks[s] == usize::MAX {
+                        ranks[s] = self.n;
+                        stack.push((s, 0));
+                    }
+                } else {
+                    next_rank -= 1;
+                    ranks[*p] = next_rank;
+                    stack.pop();
+                }
+            }
+        }
+        ranks
+    }
+
+    /// Guard selecting the `from -> to` edge: TRUE for fallthroughs, jumps,
+    /// and ineligible branches; the taken/not-taken literal for the matching
+    /// eligible edge; TRUE for a deduplicated target/fallthrough edge or any
+    /// unclassifiable edge, which must stay conservative, never infeasible.
+    /// A final conditional keeps only its in-body target, which still needs
+    /// its taken literal; the missing exit outcome has no successor here, and
+    /// excluding it is the branch's own transfer, not this edge function.
+    fn edge_guard(
+        &self,
+        bdd: &mut passes::predicates::Bdd,
+        from: usize,
+        to: usize,
+    ) -> passes::predicates::BddId {
+        let fallthrough = from + 1 == to;
+        match self.guards.branch(from) {
+            None => passes::predicates::BddId::TRUE,
+            Some(guard) => {
+                let targets_target = guard.target == to;
+                if targets_target && fallthrough {
+                    // One interior successor stands for taken OR not-taken.
+                    passes::predicates::BddId::TRUE
+                } else if targets_target {
+                    bdd.literal(guard.atom, guard.taken_when)
+                } else if fallthrough && to < self.n {
+                    bdd.literal(guard.atom, !guard.taken_when)
+                } else {
+                    passes::predicates::BddId::TRUE
+                }
+            }
+        }
+    }
+
+    /// Least fixed point of undefined-path roots for one candidate half:
+    /// `incoming[p]` is the BDD over guard valuations reaching `p` with `bit`
+    /// still undefined. The entry seed contributes even under a backedge; a
+    /// position's own read is checked from its incoming root before its write
+    /// kills the outgoing root, so a later loop write cannot initialize an
+    /// earlier first-iteration read.
+    fn undefined_paths(
+        &self,
+        bit: usize,
+        seed: Bits,
+        bdd: &mut passes::predicates::Bdd,
+        incoming: &mut [passes::predicates::BddId],
+        outgoing: &mut [passes::predicates::BddId],
+        rpo: &[usize],
+        work: &mut BinaryHeap<Reverse<(usize, usize)>>,
+        queued: &mut [bool],
+    ) {
+        incoming
+            .iter_mut()
+            .for_each(|root| *root = passes::predicates::BddId::FALSE);
+        outgoing
+            .iter_mut()
+            .for_each(|root| *root = passes::predicates::BddId::FALSE);
+        work.clear();
+        work.extend(rpo.iter().enumerate().map(|(p, &rank)| Reverse((rank, p))));
+        queued.iter_mut().for_each(|q| *q = true);
+        while let Some(Reverse((_, p))) = work.pop() {
+            queued[p] = false;
+            let mut root = if p == 0 && !seed.has(bit) {
+                passes::predicates::BddId::TRUE
+            } else {
+                passes::predicates::BddId::FALSE
+            };
+            for &q in &self.pred[p] {
+                // Literals are interned per epoch, so recompute the edge guard
+                // first; no handle crosses a `reset`.
+                let guard = self.edge_guard(bdd, q, p);
+                let through = bdd.and(outgoing[q], guard);
+                root = bdd.or(root, through);
+            }
+            if root != incoming[p] {
+                incoming[p] = root;
+                outgoing[p] = if self.acc[p].writes.has(bit) {
+                    passes::predicates::BddId::FALSE
+                } else {
+                    root
+                };
+                for &s in &self.succ[p] {
+                    if !queued[s] {
+                        queued[s] = true;
+                        work.push(Reverse((rpo[s], s)));
+                    }
+                }
+            }
+        }
     }
 
     fn defined_on(
@@ -4060,6 +4206,60 @@ mod tests {
         }
     }
 
+    fn workgroup_abi_kernel(axes: u32, sgpr_count: u32) -> Kernel {
+        let mut kernel = program_of(body_of(vec![I(endpgm())])).kernels.remove(0);
+        let Abi::Hsa {
+            descriptor,
+            metadata,
+        } = &mut kernel.abi
+        else {
+            unreachable!()
+        };
+        descriptor.compute_pgm_rsrc2 = Rsrc2(4 | axes);
+        metadata.parsed.sgpr_count = sgpr_count;
+        kernel
+    }
+
+    #[test]
+    fn workgroup_z_entry_seed_is_arch_specific() {
+        for arch in [Arch::Gfx1100, Arch::Gfx1151] {
+            for z in [false, true] {
+                let axes = (1 << 7) | (1 << 8) | if z { 1 << 9 } else { 0 };
+                let kernel = workgroup_abi_kernel(axes, 5);
+                let seed = entry_seed(&kernel, arch).unwrap();
+                assert!(seed.has(2 * (S0 + 3)));
+                assert_eq!(seed.has(2 * (S0 + 4)), z, "{arch:?}");
+                assert!(!seed.has(2 * (T0 + 7)));
+                assert!(!seed.has(2 * (T0 + 9)));
+            }
+        }
+        for axes in [0, 1 << 8, 1 << 9, (1 << 8) | (1 << 9)] {
+            let kernel = workgroup_abi_kernel(axes, 2);
+            let seed = entry_seed(&kernel, Arch::Gfx1201).unwrap();
+            assert_eq!(seed.has(2 * (T0 + 7)), axes != 0);
+            assert!(!seed.has(2 * (S0 + 4)));
+        }
+    }
+
+    #[test]
+    fn workgroup_z_entry_sgprs_must_fit_metadata_only_on_gfx11() {
+        let axes = (1 << 7) | (1 << 8) | (1 << 9);
+        for arch in [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201] {
+            for count in [4, 5] {
+                let kernel = workgroup_abi_kernel(axes, count);
+                let summary = passes::resources::summarize(&kernel.body, arch, kernel.wave, 0);
+                let obligations = abi_obligations(&kernel, &summary, arch);
+                assert_eq!(
+                    obligations
+                        .iter()
+                        .any(|o| o.rule_id == "resource-sgpr-metadata"),
+                    arch != Arch::Gfx1201 && count < 5,
+                    "{arch:?} count={count}: {obligations:?}"
+                );
+            }
+        }
+    }
+
     fn analyzed(items: Vec<It>) -> Analyzed<Program> {
         analyze(program_of(body_of(items)), &sym()).unwrap()
     }
@@ -4138,6 +4338,671 @@ mod tests {
                 .is_empty(),
             "both reaching immutable-guard outcomes must retain the guarded definition"
         );
+    }
+
+    fn cmp_ge(sreg: u16, imm: i8) -> Inst {
+        mk("s_cmp_ge_u32", vec![s(sreg), int(imm)])
+    }
+
+    fn missing_entry(items: Vec<It>) -> Vec<Obligation> {
+        analyzed(items)
+            .obligations
+            .into_iter()
+            .filter(|o| o.rule_id == "definedness-entry")
+            .collect()
+    }
+
+    /// Guarded-definition shape with the required write omitted: the guard
+    /// still correlates, but the consumer must stay a real obligation.
+    fn missing_write_items() -> Vec<It> {
+        vec![
+            I(smov(s(32), s(0))),
+            I(cmp_ge(32, 2)),
+            B("s_cbranch_scc1", "skip_def"),
+            L("skip_def"),
+            I(cmp_ge(32, 2)),
+            B("s_cbranch_scc1", "done"),
+            I(vadd(151, 150, 150)),
+            L("done"),
+            I(endpgm()),
+        ]
+    }
+
+    /// Repeated forward diamonds with one immutable scalar definition and a
+    /// distinct threshold per group. Each branch skips only its own nop, so
+    /// no irrelevant outcome selects the later guarded definition. Each group
+    /// owns two different labels in a bounded, non-aliasing fixture pool.
+    fn irr_label(g: usize) -> &'static str {
+        static POOL: std::sync::LazyLock<Vec<String>> =
+            std::sync::LazyLock::new(|| (0..128).map(|g| format!("irr{g}")).collect());
+        &POOL[g]
+    }
+
+    fn irrelevant_diamonds(count: usize, base: u16, label_base: usize) -> Vec<It> {
+        // Two identical comparisons per group; thresholds -16..47 stay
+        // distinct across all 64 groups as single-word inline constants.
+        let mut items = vec![I(smov(s(base), s(0)))];
+        for g in 0..count {
+            let threshold = i8::try_from(g).unwrap() - 16;
+            let compare = || cmp_ge(base, threshold);
+            let first = irr_label(2 * (label_base + g));
+            let second = irr_label(2 * (label_base + g) + 1);
+            items.extend([
+                I(compare()),
+                B("s_cbranch_scc1", first),
+                I(nop()),
+                L(first),
+                I(compare()),
+                B("s_cbranch_scc1", second),
+                I(nop()),
+                L(second),
+            ]);
+        }
+        items
+    }
+
+    #[test]
+    fn predicate_refinement_ninth_and_many_groups() {
+        // The relevant scalar's comparison is first encountered after all
+        // distinct irrelevant groups: it is the ninth or sixty-fifth group.
+        // Check the consumer itself, including its genuine missing-write
+        // twin, rather than an internal discovery count or budget.
+        for groups in [9usize, 65] {
+            for omit_write in [false, true] {
+                let mut items = vec![I(smov(s(32), s(0)))];
+                items.extend(irrelevant_diamonds(groups - 1, 40, 0));
+                items.extend([I(cmp_ge(32, 2)), B("s_cbranch_scc1", "skip_def")]);
+                if !omit_write {
+                    items.push(I(vmov(150, int(1))));
+                }
+                items.extend([
+                    L("skip_def"),
+                    I(cmp_ge(32, 2)),
+                    B("s_cbranch_scc1", "done"),
+                    I(vadd(151, 150, 150)),
+                    L("done"),
+                    I(endpgm()),
+                ]);
+                let a = analyzed(items);
+                let kernel = &a.program.kernels[0];
+                let expected = vadd(151, 150, 150);
+                let consumer = kernel
+                    .body
+                    .layout
+                    .iter()
+                    .copied()
+                    .find(|&id| {
+                        let inst = kernel.body.insts.get(id).unwrap();
+                        inst.op == expected.op && inst.operands == expected.operands
+                    })
+                    .expect("typed v150 consumer");
+                let flow = Flow::new(&kernel.body, ARCH, kernel.wave).unwrap();
+                let seed = entry_seed(kernel, ARCH).unwrap();
+                let (coarse, _) = flow.defined_on(seed, &flow.succ, &flow.pred);
+                let (defined, _) = flow.defined(seed);
+                let p = flow.pos[&consumer];
+                let mut both_halves = Bits::default();
+                both_halves.dword(150);
+                assert_eq!(
+                    flow.acc[p].reads.minus(&coarse[p]),
+                    both_halves,
+                    "{groups} groups: the guarded consumer must be coarse-missing"
+                );
+                let expected_missing = if omit_write {
+                    both_halves
+                } else {
+                    Bits::default()
+                };
+                assert_eq!(
+                    flow.acc[p].reads.minus(&defined[p]),
+                    expected_missing,
+                    "{groups} groups: only the omitted write leaves either v150 half missing"
+                );
+                assert_eq!(
+                    a.obligations.iter().any(|o| {
+                        o.kind == ObligationKind::Definedness
+                            && o.rule_id == "definedness-entry"
+                            && o.insts == [consumer]
+                    }),
+                    omit_write,
+                    "{groups} groups: report exactly the real missing-write consumer"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn predicate_refinement_ignores_irrelevant_group_order() {
+        let consumer_missing = |items: Vec<It>, omit_def: bool| {
+            let a = analyzed(items);
+            let kernel = &a.program.kernels[0];
+            let expected = vadd(151, 150, 150);
+            let consumer = kernel
+                .body
+                .layout
+                .iter()
+                .copied()
+                .find(|&id| {
+                    let inst = kernel.body.insts.get(id).unwrap();
+                    inst.op == expected.op && inst.operands == expected.operands
+                })
+                .expect("typed v150 consumer");
+            let flow = Flow::new(&kernel.body, ARCH, kernel.wave).unwrap();
+            let (defined, _) = flow.defined(entry_seed(kernel, ARCH).unwrap());
+            let p = flow.pos[&consumer];
+            let mut expected_missing = Bits::default();
+            if omit_def {
+                expected_missing.dword(150);
+            }
+            assert_eq!(
+                flow.acc[p].reads.minus(&defined[p]),
+                expected_missing,
+                "only the omitted write may leave either v150 half undefined"
+            );
+            a.obligations.iter().any(|o| {
+                o.kind == ObligationKind::Definedness
+                    && o.rule_id == "definedness-entry"
+                    && o.insts == [consumer]
+            })
+        };
+        // Both orders contain the same irrelevant groups. Each scalar has one
+        // definition, and disjoint label ranges prevent a preamble branch
+        // from accidentally jumping over the relevant scalar/write guard.
+        let fixture = |order: &str, reverse: bool, omit_def: bool| {
+            let mut items = vec![I(smov(s(32), s(0)))];
+            let early = irrelevant_diamonds(3, 40, 0);
+            let late = irrelevant_diamonds(3, 50, 3);
+            let irrelevant: Vec<It> = if reverse {
+                late.into_iter().chain(early).collect()
+            } else {
+                early.into_iter().chain(late).collect()
+            };
+            let (before, after) = if order == "relevant-last" {
+                (irrelevant, Vec::new())
+            } else {
+                (Vec::new(), irrelevant)
+            };
+            items.extend(before);
+            items.extend([I(cmp_ge(32, 2)), B("s_cbranch_scc1", "skip_def")]);
+            if !omit_def {
+                items.push(I(vmov(150, int(1))));
+            }
+            items.push(L("skip_def"));
+            items.extend(after);
+            items.extend([
+                I(cmp_ge(32, 2)),
+                B("s_cbranch_scc1", "done"),
+                I(vadd(151, 150, 150)),
+                L("done"),
+                I(endpgm()),
+            ]);
+            items
+        };
+        for order in ["relevant-first", "relevant-last"] {
+            for reverse in [false, true] {
+                assert!(!consumer_missing(fixture(order, reverse, false), false));
+                assert!(consumer_missing(fixture(order, reverse, true), true));
+            }
+        }
+    }
+
+    #[test]
+    fn predicate_refinement_preserves_missing_write_obligation() {
+        // The mandatory true negative: omitting the guarded write must still
+        // report the consumer even though the guard correlates.
+        let a = analyzed(missing_write_items());
+        let kernel = &a.program.kernels[0];
+        let expected = vadd(151, 150, 150);
+        let consumer = kernel
+            .body
+            .layout
+            .iter()
+            .copied()
+            .find(|&id| {
+                let inst = kernel.body.insts.get(id).unwrap();
+                inst.op == expected.op && inst.operands == expected.operands
+            })
+            .expect("typed v150 consumer");
+        let flow = Flow::new(&kernel.body, ARCH, kernel.wave).unwrap();
+        let (defined, _) = flow.defined(entry_seed(kernel, ARCH).unwrap());
+        let p = flow.pos[&consumer];
+        let mut expected_missing = Bits::default();
+        expected_missing.dword(150);
+        assert_eq!(flow.acc[p].reads.minus(&defined[p]), expected_missing);
+        assert!(
+            a.obligations.iter().any(|o| {
+                o.kind == ObligationKind::Definedness
+                    && o.rule_id == "definedness-entry"
+                    && o.insts == [consumer]
+            }),
+            "both source halves at the typed consumer need the omitted write: {:?}",
+            a.obligations
+        );
+    }
+
+    #[test]
+    fn predicate_refinement_loop_read_before_write_and_seed() {
+        // A write later in the loop cannot initialize the first iteration's
+        // earlier read; the consumer before it stays obligated.
+        let looping = vec![
+            I(smov(s(32), s(0))),
+            L("loop"),
+            I(vadd(151, 150, 150)),
+            I(vmov(150, int(1))),
+            I(cmp_ge(32, 2)),
+            B("s_cbranch_scc1", "loop"),
+            I(endpgm()),
+        ];
+        assert!(
+            !missing_entry(looping).is_empty(),
+            "first-iteration read precedes the loop write"
+        );
+        // A dominating write before the loop, or an entry-seeded source, makes
+        // the same shape legal.
+        let dominated = vec![
+            I(smov(s(32), s(0))),
+            I(vmov(150, int(1))),
+            L("loop"),
+            I(vadd(151, 150, 150)),
+            I(vmov(150, int(2))),
+            I(cmp_ge(32, 2)),
+            B("s_cbranch_scc1", "loop"),
+            I(endpgm()),
+        ];
+        assert!(missing_entry(dominated).is_empty());
+        let seeded = vec![
+            L("loop"),
+            I(vadd(151, 0, 0)),
+            I(cmp_ge(0, 2)),
+            B("s_cbranch_scc1", "loop"),
+            I(endpgm()),
+        ];
+        assert!(
+            missing_entry(seeded).is_empty(),
+            "ABI entry VGPR v0 is a genuine seed"
+        );
+    }
+
+    #[test]
+    fn predicate_refinement_same_instruction_read_write() {
+        // A self-reading update does not initialize its own incoming value.
+        let update = vec![I(vadd(150, 150, 150)), I(endpgm())];
+        assert!(
+            !missing_entry(update).is_empty(),
+            "self-read must be checked before the write kills it"
+        );
+        let defined = vec![I(vmov(150, int(1))), I(vadd(150, 150, 150)), I(endpgm())];
+        assert!(missing_entry(defined).is_empty());
+    }
+
+    #[test]
+    fn predicate_refinement_unknown_branches_remain_conservative() {
+        let assert_missing_consumer = |items: Vec<It>| {
+            let a = analyzed(items);
+            let kernel = &a.program.kernels[0];
+            let expected = vadd(151, 150, 150);
+            let consumer = kernel
+                .body
+                .layout
+                .iter()
+                .copied()
+                .find(|&id| {
+                    let inst = kernel.body.insts.get(id).unwrap();
+                    inst.op == expected.op && inst.operands == expected.operands
+                })
+                .expect("typed v150 consumer");
+            let flow = Flow::new(&kernel.body, ARCH, kernel.wave).unwrap();
+            let (defined, _) = flow.defined(entry_seed(kernel, ARCH).unwrap());
+            let p = flow.pos[&consumer];
+            let mut expected_missing = Bits::default();
+            expected_missing.dword(150);
+            assert_eq!(flow.acc[p].reads.minus(&defined[p]), expected_missing);
+            assert!(
+                a.obligations.iter().any(|o| {
+                    o.kind == ObligationKind::Definedness
+                        && o.rule_id == "definedness-entry"
+                        && o.insts == [consumer]
+                }),
+                "the conservative path must retain both missing source halves: {:?}",
+                a.obligations
+            );
+        };
+        // An unsupported predicate (execz) keeps both edges; the skipped
+        // definition still reaches the consumer on the fallthrough path.
+        let unsupported = vec![
+            I(mk("s_cmp_eq_u32", vec![s(0), int(0)])),
+            B("s_cbranch_execz", "skip_def"),
+            I(vmov(150, int(1))),
+            L("skip_def"),
+            I(mk("s_cmp_eq_u32", vec![s(0), int(0)])),
+            B("s_cbranch_execz", "done"),
+            I(vadd(151, 150, 150)),
+            L("done"),
+            I(endpgm()),
+        ];
+        assert_missing_consumer(unsupported);
+        // A mutated scalar between the comparisons breaks the correlation.
+        let mutated = vec![
+            I(smov(s(32), s(0))),
+            I(cmp_ge(32, 2)),
+            B("s_cbranch_scc1", "skip_def"),
+            I(vmov(150, int(1))),
+            L("skip_def"),
+            I(smov(s(32), s(1))),
+            I(cmp_ge(32, 2)),
+            B("s_cbranch_scc1", "done"),
+            I(vadd(151, 150, 150)),
+            L("done"),
+            I(endpgm()),
+        ];
+        assert_missing_consumer(mutated);
+        // A cyclic scalar definition keeps a real missing path: s0 = u32::MAX
+        // skips the write, wraps to zero, then reaches the consumer and exit.
+        // The other outcome can return to the cyclic definition.
+        let cyclic = vec![
+            L("loop"),
+            I(smov(s(32), s(0))),
+            I(cmp_ge(32, 2)),
+            B("s_cbranch_scc1", "skip_def"),
+            I(vmov(150, int(1))),
+            L("skip_def"),
+            I(mk("s_add_co_i32", vec![s(32), s(32), int(1)])),
+            I(cmp_ge(32, 2)),
+            B("s_cbranch_scc1", "done"),
+            I(vadd(151, 150, 150)),
+            L("done"),
+            B("s_cbranch_scc1", "loop"),
+            I(endpgm()),
+        ];
+        assert_missing_consumer(cyclic);
+        // A mutated guard input on a side path breaks the correlation: only
+        // the fallthrough definition path stays feasible, so the consumer on
+        // the taken path still misses its definition.
+        let bypass = vec![
+            I(smov(s(32), s(0))),
+            I(cmp_ge(32, 2)),
+            B("s_cbranch_scc1", "def_path"),
+            I(smov(s(32), s(1))),
+            B("s_branch", "use_path"),
+            L("def_path"),
+            I(vmov(150, int(1))),
+            L("use_path"),
+            I(cmp_ge(32, 2)),
+            B("s_cbranch_scc1", "done"),
+            I(vadd(151, 150, 150)),
+            L("done"),
+            I(endpgm()),
+        ];
+        assert_missing_consumer(bypass);
+    }
+
+    #[test]
+    fn predicate_refinement_half_aliases_and_unreachable_reads() {
+        // A low-half write cannot initialize a high-half read (VGPR below
+        // v128 so the true16 encoding assembles).
+        let lo_defines_hi = vec![
+            I(mk(
+                "v_mov_b16_e32",
+                vec![
+                    Operand::Half(
+                        RegRef {
+                            kind: Kind::V,
+                            base: 10,
+                            len: 1,
+                        },
+                        crate::operand::Half::Lo,
+                    ),
+                    int(1),
+                ],
+            )),
+            I(vadd(11, 10, 10)),
+            I(endpgm()),
+        ];
+        let missing = missing_entry(lo_defines_hi);
+        assert!(
+            missing.iter().any(|o| o.text.contains("v10.h")),
+            "halves are distinct locations: {missing:?}"
+        );
+        // A definition on the fallthrough path, read only under the taken
+        // outcome of the same repeated comparison, stays obligated on the
+        // taken path; the fallthrough consumer is fine.
+        let split_outcomes = vec![
+            I(smov(s(32), s(0))),
+            I(cmp_ge(32, 2)),
+            B("s_cbranch_scc1", "taken"),
+            I(vmov(150, int(1))),
+            B("s_branch", "join"),
+            L("taken"),
+            L("join"),
+            I(cmp_ge(32, 2)),
+            B("s_cbranch_scc1", "use_taken"),
+            B("s_branch", "use_fall"),
+            L("use_taken"),
+            I(vadd(151, 150, 150)),
+            B("s_branch", "done"),
+            L("use_fall"),
+            I(vadd(152, 150, 150)),
+            L("done"),
+            I(endpgm()),
+        ];
+        let missing = missing_entry(split_outcomes);
+        assert!(
+            missing.iter().any(|o| o.text.contains("v150")),
+            "the taken-path consumer misses the fallthrough-only definition: {missing:?}"
+        );
+    }
+    /// Independent all-group oracle for small CFGs: enumerate every assignment
+    /// of the atoms new discovery exposes (never production `partitions`,
+    /// whose wait budget would invalidate the reference), keep both edges for
+    /// unknown branches and duplicate target/fallthrough edges, drop
+    /// unreachable predecessors, run coarse `defined_on` per assignment, and
+    /// intersect only over assignments reaching each position. Unreached
+    /// positions keep vacuous FULL.
+    fn all_group_oracle(body: &Body, seed: Bits) -> (Vec<Bits>, Vec<Bits>) {
+        let flow = Flow::new(body, ARCH, Wave::Wave32).unwrap();
+        let mut atoms = Vec::new();
+        for p in 0..flow.n {
+            if let Some(guard) = flow.guards.branch(p) {
+                if !atoms.contains(&guard.atom) {
+                    atoms.push(guard.atom);
+                }
+            }
+        }
+        let mut ref_in = vec![Bits::FULL; flow.n];
+        let mut ref_out = vec![Bits::FULL; flow.n];
+        // Test-only corpus stays small (at most two atoms below); enumerate all.
+        assert!(
+            atoms.len() <= 2,
+            "oracle corpus outgrew exhaustive enumeration"
+        );
+        for mask in 0..(1usize << atoms.len()) {
+            let value = |atom: usize| {
+                atoms
+                    .iter()
+                    .position(|&a| a == atom)
+                    .map(|i| mask & (1 << i) != 0)
+                    .unwrap_or(false)
+            };
+            let mut succ = flow.succ.clone();
+            for p in 0..flow.n {
+                if let Some(guard) = flow.guards.branch(p) {
+                    let taken = value(guard.atom) == guard.taken_when;
+                    let target = guard.target;
+                    let fallthrough = p + 1;
+                    if target == fallthrough {
+                        continue;
+                    }
+                    succ[p].retain(|q| {
+                        let q = *q;
+                        (q == target) == taken || (q != target && q != fallthrough)
+                    });
+                }
+            }
+            let mut reachable = vec![false; flow.n];
+            let mut stack = vec![0usize];
+            reachable[0] = true;
+            while let Some(p) = stack.pop() {
+                for &q in &succ[p] {
+                    if !reachable[q] {
+                        reachable[q] = true;
+                        stack.push(q);
+                    }
+                }
+            }
+            let mut pred = vec![SmallVec::<[usize; 2]>::new(); flow.n];
+            for p in 0..flow.n {
+                if reachable[p] {
+                    for &q in &succ[p] {
+                        pred[q].push(p);
+                    }
+                }
+            }
+            let (inn, out) = flow.defined_on(seed, &succ, &pred);
+            for p in 0..flow.n {
+                if reachable[p] {
+                    ref_in[p] = ref_in[p].inter(&inn[p]);
+                    ref_out[p] = ref_out[p].inter(&out[p]);
+                }
+            }
+        }
+        (ref_in, ref_out)
+    }
+
+    fn check_oracle(case: &str, items: Vec<It>, expect_missing: bool) {
+        let program = program_of(body_of(items));
+        let kernel = &program.kernels[0];
+        let flow = Flow::new(&kernel.body, ARCH, kernel.wave).unwrap();
+        let seed = entry_seed(kernel, ARCH).unwrap();
+        let (got_in, _) = flow.defined(seed);
+        let (ref_in, _) = all_group_oracle(&kernel.body, seed);
+        let (coarse_in, _) = flow.defined_on(seed, &flow.succ, &flow.pred);
+        let expected = vadd(151, 150, 148);
+        let consumer = kernel
+            .body
+            .layout
+            .iter()
+            .position(|&id| {
+                let inst = kernel.body.insts.get(id).unwrap();
+                inst.op == expected.op && inst.operands == expected.operands
+            })
+            .expect("typed correlated consumer");
+        let mut coarse_missing = Bits::default();
+        coarse_missing.dword(148);
+        coarse_missing.dword(150);
+        assert_eq!(
+            flow.acc[consumer].reads.minus(&coarse_in[consumer]),
+            coarse_missing,
+            "{case}: both source dwords must really be coarse-missing"
+        );
+        let mut expected_missing = Bits::default();
+        if expect_missing {
+            expected_missing.dword(150);
+        }
+        assert_eq!(
+            flow.acc[consumer].reads.minus(&ref_in[consumer]),
+            expected_missing,
+            "{case}: exhaustive assignments must preserve exactly the real missing halves"
+        );
+        assert_eq!(
+            flow.acc[consumer].reads.minus(&got_in[consumer]),
+            expected_missing,
+            "{case}: v148 must refine even when v150 has a real missing-write path"
+        );
+        for p in 0..flow.n {
+            let missing_got = flow.acc[p].reads.minus(&got_in[p]);
+            let missing_ref = flow.acc[p].reads.minus(&ref_in[p]);
+            assert_eq!(
+                missing_got, missing_ref,
+                "{case}, position {p}: symbolic and oracle missing reads disagree"
+            );
+            assert!(
+                got_in[p].minus(&ref_in[p]).is_empty(),
+                "{case}, position {p}: symbolic in-facts exceed the oracle must-defined facts"
+            );
+        }
+    }
+
+    #[test]
+    fn predicate_refinement_matches_small_all_group_oracle() {
+        // Each shape has one immutable repeated guard, a write/join/read
+        // correlation, and a consumer missing both source dwords coarsely.
+        // v148 is always safe; v150 also tests an omitted write and an unknown
+        // bypass. Thus even every negative must actually refine v148.
+        for shape in ["duplicate", "unknown", "loop"] {
+            for (mode, omit_write, unknown_bypass) in [
+                ("safe", false, false),
+                ("missing-write", true, false),
+                ("unknown-bypass", false, true),
+            ] {
+                let mut items = vec![I(smov(s(32), s(0)))];
+                if shape == "duplicate" {
+                    // Taken OR not-taken is the same forward edge, not a
+                    // constraint on the later, genuinely guarded write.
+                    items.extend([I(cmp_ge(32, 2)), B("s_cbranch_scc1", "next"), L("next")]);
+                }
+                items.extend([
+                    I(cmp_ge(32, 2)),
+                    B("s_cbranch_scc1", "skip_def"),
+                    I(vmov(148, int(1))),
+                ]);
+                if unknown_bypass {
+                    items.push(B("s_cbranch_execz", "skip_v150"));
+                }
+                if !omit_write {
+                    items.push(I(vmov(150, int(1))));
+                }
+                items.extend([L("skip_v150"), L("skip_def")]);
+                if shape == "unknown" {
+                    // Both unknown edges rejoin before the correlated read.
+                    items.extend([
+                        B("s_cbranch_execz", "unknown_join"),
+                        I(nop()),
+                        L("unknown_join"),
+                    ]);
+                }
+                if shape == "loop" {
+                    // A real backedge, but neither immutable comparison nor
+                    // its scalar definition belongs to the cyclic region.
+                    items.extend([L("loop"), I(nop()), B("s_cbranch_execz", "loop")]);
+                }
+                items.extend([
+                    I(cmp_ge(32, 2)),
+                    B("s_cbranch_scc1", "done"),
+                    I(vadd(151, 150, 148)),
+                    L("done"),
+                    I(endpgm()),
+                ]);
+                check_oracle(
+                    &format!("{shape}/{mode}"),
+                    items,
+                    omit_write || unknown_bypass,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn final_conditional_without_interior_fallthrough_is_rejected() {
+        // Entry jumps over the consumer/endpgm block to the actual final
+        // conditional. Its taken edge returns to that block; its false edge
+        // would exit the body. Such a shape is malformed, not a valid-kernel
+        // refinement case: the CFG builder requires an interior fallthrough.
+        for branch in ["s_cbranch_scc1", "s_cbranch_execz"] {
+            let mut body = Body::default();
+            for inst in [
+                mk("s_branch", vec![Operand::Imm(ImmField::Sopp(2))]),
+                vadd(151, 150, 150),
+                endpgm(),
+                mk(branch, vec![Operand::Imm(ImmField::Sopp(-3))]),
+            ] {
+                let id = body.insts.insert(inst);
+                body.layout.push(id);
+            }
+            assert_eq!(
+                build_blocks(&mut body, ARCH),
+                Err(passes::cfg::CfgError::MissingEndPgm),
+            );
+        }
     }
 
     #[test]
