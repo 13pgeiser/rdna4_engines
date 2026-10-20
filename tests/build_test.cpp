@@ -1904,6 +1904,53 @@ TEST(the_logits_pooled_and_concurrent_buffers_live_past_their_declared_uses) {
     }
 }
 
+/* Under a declared window (rad_lane1_window_begin) a concurrent buffer is live across the window and
+ * its own uses, not the whole program: a buffer used only past the window can take its bytes. */
+TEST(a_concurrent_buffer_under_a_window_lives_across_the_window_only) {
+    NEED_PLUGIN(reg)
+    Builder b(reg, make_meta(), make_ctx());
+    RadBufDecl bd{};
+    bd.dtype = RAD_I8;
+    bd.rank = 1;
+    bd.shape[0] = 4096;
+    bd.kind = RAD_BUF_TRANSIENT;
+    bd.domain = RAD_DOMAIN_DEVICE;
+    const rad_buf y = b.decl_buffer("y", &bd);
+    const rad_buf z = b.decl_buffer("z", &bd);
+    const rad_weight w = decl_w(b, "w0");
+    CHECK_OK(rad_lane1_window_begin(&b));
+    rad_op o1 = decl_gemm(b, w), o2 = decl_gemm(b, w);
+    CHECK_OK(rad_lane1_window_end(&b));
+    rad_op o3 = decl_gemm(b, w);
+    CHECK_OK(b.op_writes(o1, &y, 1));
+    CHECK_OK(b.op_reads(o2, &y, 1));
+    CHECK_OK(b.op_writes(o3, &z, 1));
+    CHECK_OK(b.buf_concurrent(y));
+    CHECK_OK(b.finish());
+    Program& p = b.program();
+    CHECK_EQ(p.lane1_w0, (int32_t)o1);
+    CHECK_EQ(p.lane1_w1, (int32_t)o2);
+    const BufferInfo* by = p.buffer(y);
+    const BufferInfo* bz = p.buffer(z);
+    CHECK_EQ(by->first_def, (int32_t)o1);
+    CHECK_EQ(by->last_use, (int32_t)o2);
+    /* z lives past the window only, so it shares y's bytes (whole program, it could not). */
+    CHECK_EQ(bz->first_def, (int32_t)o3);
+    CHECK(bz->arena_offset < by->arena_offset + by->bytes &&
+          by->arena_offset < bz->arena_offset + bz->bytes);
+}
+
+/* A window opened and never closed is refused at finish. */
+TEST(a_second_lane_window_must_be_closed) {
+    NEED_PLUGIN(reg)
+    Builder b(reg, make_meta(), make_ctx());
+    const rad_weight w = decl_w(b, "w0");
+    CHECK_OK(rad_lane1_window_begin(&b));
+    decl_gemm(b, w);
+    b.finish();
+    CHECK_EQ(b.status(), RAD_E_STATE);
+}
+
 /* ================================================================== the buffer plan, at random */
 
 /* The packer is greedy, so its output depends on sizes, and a liveness or offset mistake aliases

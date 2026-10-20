@@ -446,6 +446,17 @@ int rad_op_writes(RadBuilder* b, rad_op h, const rad_buf* bufs, int n);
  * A no-op for a PERSIST or DERIVED buffer, which is live everywhere already. */
 int rad_buf_concurrent(RadBuilder* b, rad_buf buf);
 
+/* The second lane's window: every op the architecture issues on lane 1 is declared between
+ * rad_lane1_window_begin and rad_lane1_window_end, and lane 1 is joined into lane 0 before any op
+ * declared after the window runs. With a window a rad_buf_concurrent buffer is live over the window
+ * and its own declared uses instead of the whole program, so buffers used only outside the window
+ * (a drafter's, the heads') can share its bytes. The runtime holds the architecture to it: an op
+ * issued on lane 1 outside the window fails the step by name, and the first op past the window
+ * issued on lane 0 joins lane 1 first when lane 1 has work pending. Optional, one window a program;
+ * call both at declare, in order. Additive export; RAD_ABI_VERSION does not move. */
+int rad_lane1_window_begin(RadBuilder* b);
+int rad_lane1_window_end(RadBuilder* b);
+
 /* An uneven shard: this rank's slice of a RAD_SHARD_ROW or RAD_SHARD_COL weight's split dimension
  * is [lo, hi) rather than an even 1/tp. Rows of each stacked row part for ROW, columns for COL, in
  * the container's unsharded units. The declared extent must already be `hi - lo` (per row part,

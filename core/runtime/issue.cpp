@@ -592,6 +592,23 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                               ? "has no host kernel for this band, and the placement planner put "
                                 "it on the host anyway"
                               : "has no device kernel for this band");
+    /* The second lane's window (rad_lane1_window_begin): its concurrent buffers are live only across
+     * it, so lane 1 runs nothing outside it, and lane 1 is joined before lane 0 runs past it. */
+    if (program_ && program_->lane1_w1 >= 0) {
+        if (lane_ == 1 && (p.order < program_->lane1_w0 || p.order > program_->lane1_w1))
+            return abort_step_msg(h, RAD_E_STATE,
+                                  fmt("issued on the second lane outside its declared window (ops "
+                                      "%d..%d, this one %d): the buffers it may touch there are "
+                                      "live only across the window",
+                                      (int)program_->lane1_w0, (int)program_->lane1_w1, (int)p.order));
+        if (lane_ == 0 && lane1_pending_ && p.order > program_->lane1_w1) {
+            const int js = lane_join(1, 0);
+            if (js < 0)
+                return abort_step_msg(h, js, "joining the second lane at its window's end failed");
+        }
+    }
+    if (lane_ == 1) lane1_pending_ = true;
+
     /* The row's DIV on the ranged parameter held at the band's upper bound, maybe not here. */
     if (ip.ranged_div > 1 && n % ip.ranged_div != 0)
         return abort_step_msg(h, RAD_E_SHAPE,

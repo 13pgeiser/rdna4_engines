@@ -681,7 +681,8 @@ int rad_issue(RadCtx* c, rad_op op, const RadOperand* opd, int n_opd, int64_t n)
  * the all-reduce numbers its scratch slots per launch and the ranks must agree; a kernel with a
  * device-wide arrival counter must key it on the stream (libr4d's split-K GEMM does), or it may
  * not run here; and every buffer the second lane touches must be named to rad_buf_concurrent,
- * because the planner packs transients from one linear order. */
+ * because the planner packs transients from one linear order (live for the whole program, or across
+ * the second lane's window where the architecture declares one, abi/rad_builder.h). */
 int rad_lane(RadCtx* c, int lane);
 int rad_lane_join(RadCtx* c, int from, int to);
 

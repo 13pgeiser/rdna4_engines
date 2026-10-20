@@ -331,6 +331,8 @@ int Ctx::bind_ops() {
         p.billed     = (oi.op == "all_reduce");
         p.collective = p.billed;
         p.lora_site  = oi.lora_site;
+        p.order      = oi.anchor > 0 && (size_t)oi.anchor < P.ops.size() ? P.ops[(size_t)oi.anchor].index
+                                                                          : oi.index;
 
         for (const Band& b : oi.bands) band_table_.push_back(b.hi);
 
@@ -906,6 +908,7 @@ int Ctx::lane_join(int from, int to) {
     RAD_TRY(rad_event_record(lane_ev_[from], fs));
     RAD_TRY(rad_event_wait(ts, lane_ev_[from]));
     scratch_open_[from] = false;        /* `to` is now behind every scratch user `from` issued */
+    if (from == 1 && to == 0) lane1_pending_ = false;
     return RAD_OK;
 }
 

@@ -841,6 +841,26 @@ int Builder::buf_concurrent(rad_buf b) {
     return RAD_OK;
 }
 
+/* See rad_lane1_window_begin. The window is the ops declared between the two calls. */
+int Builder::lane1_window(bool end) {
+    if (finished_) { err(RAD_E_STATE, "rad_lane1_window after declare finished"); return RAD_E_STATE; }
+    const int32_t next = (int32_t)prog_.ops.size();   /* the next op's handle */
+    if (!end) {
+        if (lane1_w0_ >= 0) {
+            err(RAD_E_STATE, "rad_lane1_window_begin called twice: one window a program");
+            return RAD_E_STATE;
+        }
+        lane1_w0_ = next;
+    } else {
+        if (lane1_w0_ < 0 || lane1_w1_ >= 0 || next - 1 < lane1_w0_) {
+            err(RAD_E_STATE, "rad_lane1_window_end without a begin, twice, or around no op");
+            return RAD_E_STATE;
+        }
+        lane1_w1_ = next - 1;
+    }
+    return RAD_OK;
+}
+
 /* See rad_weight_shard_span. Checked against the declaration here, where the plugin can be named;
  * the loader checks it against the container. */
 int Builder::weight_shard_span(rad_weight h, int64_t lo, int64_t hi) {
@@ -2178,6 +2198,10 @@ void Builder::finish_buffer_liveness() {
     /* A second lane, signalled by any concurrent buffer, gets a second scratch region
      * (Program::scratch_regions). */
     prog_.scratch_regions = concurrent_bufs_.empty() ? 1 : 2;
+    if (lane1_w0_ >= 0 && lane1_w1_ < 0)
+        err(RAD_E_STATE, "rad_lane1_window_begin without rad_lane1_window_end");
+    prog_.lane1_w0 = lane1_w1_ >= 0 ? lane1_w0_ : -1;
+    prog_.lane1_w1 = lane1_w1_;
 
     /* Each buffer's first and last declaring op, in one pass over the op lists. */
     const size_t nb = prog_.buffers.size();
@@ -2195,9 +2219,17 @@ void Builder::finish_buffer_liveness() {
          * rule); a buffer on the second lane, whose declared range does not bound when its bytes
          * are in use; and one with no declared use, since an op may issue any handle in any
          * order (--debug-graph reports the cost). */
-        if (b.decl.kind != RAD_BUF_TRANSIENT || concurrent_bufs_.count((rad_buf)i) || first[i] < 0) {
+        if (b.decl.kind != RAD_BUF_TRANSIENT || first[i] < 0 ||
+            (concurrent_bufs_.count((rad_buf)i) && lane1_w1_ < 0)) {
             b.first_def = 0;
             b.last_use  = last_op;
+            continue;
+        }
+        /* A concurrent buffer under a declared window (rad_lane1_window_begin): live across the
+         * window, when lane 1 may touch it, and over its own uses. */
+        if (concurrent_bufs_.count((rad_buf)i)) {
+            b.first_def = std::min(first[i], lane1_w0_);
+            b.last_use  = std::max(last[i], lane1_w1_);
             continue;
         }
         b.first_def = first[i];
@@ -2359,6 +2391,16 @@ int rad_op_writes(RadBuilder* b, rad_op h, const rad_buf* bufs, int n) {
 int rad_buf_concurrent(RadBuilder* b, rad_buf buf) {
     if (!b) return RAD_E_INVAL;
     return B(b)->buf_concurrent(buf);
+}
+
+int rad_lane1_window_begin(RadBuilder* b) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->lane1_window(false);
+}
+
+int rad_lane1_window_end(RadBuilder* b) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->lane1_window(true);
 }
 
 int rad_weight_shard_span(RadBuilder* b, rad_weight w, int64_t lo, int64_t hi) {

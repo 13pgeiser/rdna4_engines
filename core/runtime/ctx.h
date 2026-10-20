@@ -88,6 +88,9 @@ struct OpPlan {
     bool          billed = false;
     /* Runtime LoRA: this gemm's row in Program::lora_sites, -1 for every op that is not one. */
     int32_t       lora_site = -1;
+    /* Its position in the declared order, or its anchor's for a core-appended op: what the second
+     * lane's window (Program::lane1_w0..lane1_w1) is checked against. */
+    int32_t       order = 0;
 };
 
 /* ------------------------------------------------------------------ routing handoff */
@@ -619,7 +622,8 @@ private:
      * 3. The buffer planner packs from one linear order, so two lanes can alias arena bytes
      *    through buffers with disjoint declared lifetimes. The architecture passes every buffer
      *    its second lane touches to `rad_buf_concurrent`, which makes it live for the whole
-     *    program.
+     *    program, or, where the architecture declares the second lane's window
+     *    (rad_lane1_window_begin / _end), across the window and its own declared uses.
      *
      * 4. A slice must land in the same bucket-table band as the whole, or it picks a kernel with
      *    a different summation order and silently changes output. `--debug-graph` prints a model's
@@ -641,6 +645,8 @@ private:
     bool      own_lane1_  = false;
     int       lane_       = 0;
     RadEvent  lane_ev_[2] = { nullptr, nullptr };
+    /* An op was issued on lane 1 since lane 1 was last joined into lane 0 (the window's join). */
+    bool      lane1_pending_ = false;
     /* The last device op on each lane that touched host-domain memory. A host op runs at issue on
      * this thread and must be ordered behind every earlier device op that touched the host arena;
      * on each lane those complete no later than the last one. So a device op with a host-domain

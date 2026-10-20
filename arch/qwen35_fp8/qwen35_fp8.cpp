@@ -875,7 +875,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (m.media) RAD_ARCH_TRY(m.mrows.declare(b, g.max_tok, g.n_embd, m.b_x));
     /* Always exact, not g.wire_exact: this all_reduce sums disjoint rows (each token's embedding
      * comes from one rank, the others contribute zero), so a lossy wire would only add error.
-     * min_bytes stays 0 for the same reason. */
+     * min_bytes stays 0 for the same reason.
+     *
+     * The second lane's window opens here and closes after the final norm (rad_lane1_window_begin):
+     * the embedding's reduction, the pipelined prefill's boundaries, the GDN a|b lane and the MoE
+     * shared arm are all declared inside it, so the concurrent buffers stay live only there and the
+     * drafter and the heads can share their bytes. */
+    RAD_ARCH_TRY(rad_lane1_window_begin(b));
     if (g.world > 1)
         m.op_embed_ar = rw(b, RAD_OP(b, "all_reduce",
                                RAD_PARAMS(RAD_INT("world_size", g.world),
@@ -1016,6 +1022,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                         RAD_F64("eps", g.eps), RAD_F64("wadd", final_wadd), RAD_STR("dtype", g.dtype)),
                              RAD_WEIGHTS(m.w_out_norm)),
                          {m.b_x}, {m.a_h.x});
+    RAD_ARCH_TRY(rad_lane1_window_end(b));
 
     m.op_gather = rw(b, RAD_OP(b, "gather_rows",
                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows),

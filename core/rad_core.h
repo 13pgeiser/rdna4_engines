@@ -463,6 +463,9 @@ public:
      * with any other transient buffer never runs there; one naming no transient buffer counts.
      * At most scratch_bytes; -1 (a program not built by the Builder) means scratch_bytes. */
     int64_t scratch_bytes_lane1 = -1;
+    /* The second lane's window (rad_lane1_window_begin): the first and last op handle lane 1 may run;
+     * -1 when the architecture declared none (concurrent buffers then live for the whole program). */
+    int32_t lane1_w0 = -1, lane1_w1 = -1;
 
     /* Everything that resolved to nothing, reported whole rather than stopping at the first
      * failure (spec §3.1). Structured because the domains are reported differently: a device miss

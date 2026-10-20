@@ -120,6 +120,8 @@ struct RadBuilder {
 
     /* The buffers named to rad_buf_concurrent: the ones a second lane touches. */
     std::vector<rad_buf> concurrent;
+    /* The second lane's window (rad_lane1_window_begin), first and last op index; -1 when none. */
+    int32_t lane1_w0 = -1, lane1_w1 = -1;
 
     /* The vision and audio encoder declarations (rad_declare_encoder), if any. */
     RadEncoderDecl encoder{};
@@ -295,6 +297,19 @@ extern "C" int rad_lora_alias(RadBuilder* b, const char* native, const char* fro
 extern "C" int rad_buf_concurrent(RadBuilder* b, rad_buf buf) {
     if (!b || !buf) return RAD_E_INVAL;
     b->concurrent.push_back(buf);
+    return RAD_OK;
+}
+/* Recorded: the second lane's window (qwen35_fp8, gemma3), applied by liveness() as the real builder
+ * applies it. Ops are handed out from 1 in declaration order, so the next op's index is size + 1. */
+extern "C" int rad_lane1_window_begin(RadBuilder* b) {
+    if (!b || b->lane1_w0 >= 0) return RAD_E_STATE;
+    b->lane1_w0 = (int32_t)b->ops.size() + 1;
+    return RAD_OK;
+}
+extern "C" int rad_lane1_window_end(RadBuilder* b) {
+    if (!b || b->lane1_w0 < 0 || b->lane1_w1 >= 0 || (int32_t)b->ops.size() < b->lane1_w0)
+        return RAD_E_STATE;
+    b->lane1_w1 = (int32_t)b->ops.size();
     return RAD_OK;
 }
 extern "C" int rad_weight_shard_span(RadBuilder* b, rad_weight w, int64_t lo, int64_t hi) {
@@ -700,7 +715,8 @@ int count_issued(const std::vector<std::string>& v, const std::string& name) {
 namespace rad_fake {
 
 /* One buffer's planned lifetime. `planned` is false for a buffer live over the whole program
- * (PERSIST, DERIVED, rad_buf_concurrent, or no declared use), which shares bytes with nothing. */
+ * (PERSIST, DERIVED, rad_buf_concurrent without a second-lane window, or no declared use), which
+ * shares bytes with nothing. */
 struct Live {
     int32_t lo = 0, hi = 0;
     bool    planned = false;
@@ -729,9 +745,15 @@ std::vector<Live> liveness(const RadBuilder& b) {
         Live& l = L[h];
         l.transient = d.kind == RAD_BUF_TRANSIENT;
         l.domain    = d.domain;
-        if (!l.transient || conc.count((rad_buf)h) || first[h] < 0) {
+        if (!l.transient || first[h] < 0 || (conc.count((rad_buf)h) && b.lane1_w1 < 0)) {
             l.lo = 0;
             l.hi = last_op;
+            continue;
+        }
+        if (conc.count((rad_buf)h)) {   /* under the window: across it and over its own uses */
+            l.planned = true;
+            l.lo = std::min(first[h], b.lane1_w0);
+            l.hi = std::max(last[h], b.lane1_w1);
             continue;
         }
         l.planned = true;

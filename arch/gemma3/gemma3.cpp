@@ -1180,6 +1180,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                RAD_F64("mult", emult)),
                     RAD_WEIGHTS(m.w_tok)),
                    {}, {m.b_x});
+    /* The second lane's window (rad_lane1_window_begin): from the embedding's reduction to the final
+     * norm, where the pipelined prefill runs its boundaries; the drafter and the heads lie outside it
+     * and can share the concurrent buffers' bytes. */
+    RAD_ARCH_TRY(rad_lane1_window_begin(b));
     if (g.world > 1)
         m.op_embed_ar = rw(b, RAD_OP(b, "all_reduce",
                                RAD_PARAMS(RAD_INT("world_size", g.world),
@@ -1355,6 +1359,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                  RAD_F64("eps", g.eps), RAD_F64("wadd", g.wadd), RAD_STR("dtype", g.dtype)),
                       RAD_WEIGHTS(m.w_out)),
                      {m.b_x}, {m.b_h});
+    RAD_ARCH_TRY(rad_lane1_window_end(b));
     m.op_gather = rw(b, RAD_OP(b, "gather_rows",
                       RAD_PARAMS(RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", g.n_embd), RAD_STR("dtype", g.dtype)),
                       RAD_NOWEIGHTS),
