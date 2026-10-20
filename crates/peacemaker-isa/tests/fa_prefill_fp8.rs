@@ -715,6 +715,51 @@ fn fp8_direct_resources_match_the_single_stage_layout() {
     // Unchanged arithmetic: the QK/softmax/PV opcode census is identical to
     // the Q8 direct body (only K/V fill addressing and decode differ).
     let q8 = fa_prefill::emit(ARCH, &FaPrefillSpec { kv: FaKvCodec::Q8_0, ..spec() }).unwrap();
+    // Prologue O init (persistent online state): all 128 FP8 accumulators
+    // 96..223 zeroed before the tile loop, never the stale 224..255 window;
+    // Q8 keeps 128..255. Scoped to the prologue so fill/reuse zeroes after
+    // `.Lfapd_tile` cannot satisfy it.
+    let prologue_zeroed = |src: &str| -> Vec<u32> {
+        let head = src.split(".Lfapd_tile").next().unwrap_or("");
+        head.lines()
+            .filter_map(|l| {
+                let t = l.split(';').next()?.split("//").next()?.trim();
+                let (dst, rhs) = t.split_once(',')?;
+                if !dst.starts_with("v_mov_b32_e32 v") {
+                    return None;
+                }
+                if rhs.trim() != "0" {
+                    return None;
+                }
+                dst.strip_prefix("v_mov_b32_e32 v")?.trim().parse().ok()
+            })
+            .collect()
+    };
+    let fp8_zeroed = prologue_zeroed(&text);
+    for r in 96..224u32 {
+        assert!(
+            fp8_zeroed.contains(&r),
+            "{SYMBOL}: prologue never zeroes O accumulator v{r}"
+        );
+    }
+    assert_eq!(
+        fp8_zeroed.iter().filter(|r| (96..224u32).contains(r)).count(),
+        128,
+        "{SYMBOL}: prologue O96..223 init count"
+    );
+    for r in 224..256u32 {
+        assert!(
+            !fp8_zeroed.contains(&r),
+            "{SYMBOL}: prologue zeroes stale v{r} past O96..223"
+        );
+    }
+    let q8_zeroed = prologue_zeroed(&q8.s_text);
+    for r in 128..256u32 {
+        assert!(
+            q8_zeroed.contains(&r),
+            "Q8 direct: prologue never zeroes O accumulator v{r}"
+        );
+    }
     let fp8_contract = fa_prefill::fp8_contract(ARCH, e);
     let q8_contract = fa_prefill::contract(ARCH, &q8);
     for m in [

@@ -1218,7 +1218,7 @@ fn prologue(b: &mut Builder, fp8: bool) -> R {
     )?;
     // Fresh online state: O = +0, m = -inf, l = +0; Q fragments zero (invalid lanes stay zero).
     for r in 0..128u8 {
-        vmov0(b, O + r)?;
+        vmov0(b, regs(fp8).o + r)?;
     }
     for r in 0..16u8 {
         vmov0(b, QF + r)?;
