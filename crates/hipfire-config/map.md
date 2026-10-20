@@ -33,7 +33,7 @@ Typed configuration schema and deterministic layer resolution for the operator p
   | `developer.gdn_chunk_prep_pm` | `HIPFIRE_GDN_CHUNK_PREP_PM` | `GdnChunkPrepPm`; opt-in PM prep nested beneath admitted 16/32 MoE chunk scan |
   | `developer.moe_shared_down_sigmoid_epi` | `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI` | `MoeSharedDownSigmoidEpi`; opt-in shared-down HIP V3 epilogue |
 
-- The first eleven routes retain their accepted exact-gfx1201 `QUALIFIED` rows; explicit `0` kills and `1` opts in only where admission permits. PM attention and F5 resolve via `Gpu::fa_prefill_pm_flag` / `fa_prefill_pm_qprep_flag` for the actual codec: Q8 keeps those defaults, but `FP8_KV_QUALIFIED` is empty, so native FP8 needs explicit PM `1` and, for F5, explicit Q-prep `1` too. A parent PM `0` always refuses F5. The four late-H routes have raw inventory only, no qualified row: unset is off everywhere. These keys neither select the KV storage mode nor promote native FP8 or late-H defaults.
+- The first eleven routes retain their accepted exact-gfx1201 `QUALIFIED` rows; explicit `0` kills and `1` opts in only where admission permits. PM attention and F5 resolve via `Gpu::fa_prefill_pm_flag` / `fa_prefill_pm_qprep_flag` for the actual codec: Q8 keeps its qualification and the existing two `FP8_KV_QUALIFIED` rows enable H16/KV2/D256 native-FP8 PM attention and Qprep on exact gfx1201. These rows qualify F16 Q with FP8 KV, not FP8-quantized Q. A parent PM `0` always refuses F5. The four late-H routes still have raw inventory only and no qualified row: unset is off everywhere. These keys do not select KV storage; KV selection and FA2 selection remain independent and stackable, with all existing admission guards retained.
 
 ## Crate map
 
