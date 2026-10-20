@@ -1576,26 +1576,35 @@ function acceptTriple(c, showNow) {
  * over the life of the process -- so a best/recent/now line built on it would print the same
  * number three times and call it a trend. The per-position counters the acceptance chart already
  * reads are cumulative too, and the DIFFERENCE between two polls is exact acceptance over that
- * interval, which is the only figure a detail line can move on. Each sample covers 10 s of
- * drafting; `recent` averages the last RECENT samples AT THAT CONCURRENCY and `now` is
- * the newest one -- different windows, free to disagree.
+ * interval, which is the only figure a detail line can move on. Each sample is one poll's delta
+ * (~500 ms, and only when it drafted); `recent` POOLS the last RECENT such deltas AT THAT
+ * CONCURRENCY and `now` is the newest one -- different windows, free to disagree.
  * The counters go backwards when the engine restarts; that poll resets the window rather than
  * reporting a negative draft. */
-const ACC_WIN = 20;                                   /* 10 s of drafting at the 500 ms poll */
 const accPool = {};          /* per concurrency: ring of {dr, da} for the pooled tile window */
-let accPrev = null;
-const accDelta = [];
+let accPrev = null, accUp = -1, accRestart = false;
 function accWindow(s) {
   let reach = 0, hit = 0;
   for (const p of (s.draft_positions || [])) { reach += p.reached || 0; hit += p.accepted || 0; }
-  if (accPrev === null || reach < accPrev.r || hit < accPrev.a) {
-    accPrev = { r: reach, a: hit }; accDelta.length = 0; return null;
+  /* RESTART DETECTION (2026-10-20, Turnstone audit). Counters going BACKWARDS catches a restart
+   * the page was watching. uptime_s going backwards catches the one it missed: a backgrounded
+   * tab whose accPrev froze while a new process drafted past the old process's lifetime total,
+   * where the delta is positive and the first guard never fires. Either clears every pooled
+   * ring -- a pre-restart pair must not pool with a post-restart one -- and asks update() to
+   * dash the headline, so a dead process's ratio never masquerades as the new one's. */
+  const up = s.uptime_s;
+  const restart = accPrev !== null && (reach < accPrev.r || hit < accPrev.a ||
+                                       (typeof up === "number" && up < accUp));
+  if (typeof up === "number") accUp = up;
+  if (accPrev === null || restart) {
+    accPrev = { r: reach, a: hit };
+    if (restart) { for (const k in accPool) delete accPool[k]; accRestart = true; }
+    return null;
   }
   const dr = reach - accPrev.r, da = hit - accPrev.a;
   accPrev = { r: reach, a: hit };
   if (dr <= 0) return null;
-  accDelta.push({ r: dr, a: da }); if (accDelta.length > ACC_WIN) accDelta.shift();
-  return { ratio: dr > 0 ? da / dr : null, dr: dr, da: da };
+  return { ratio: da / dr, dr: dr, da: da };
 }
 
 
@@ -1980,6 +1989,7 @@ function update(s, dt) {
       : "";
   const aw = accWindow(s);
   const awR = aw ? aw.ratio : null;
+  const restarted = accRestart; accRestart = false;
   if (awR != null) noteSample("accept", s.running > 0 ? s.running : lastActiveC, awR);
   /* POOLED ACCEPTANCE WINDOW (2026-10-20, math audit before the production roll).
    * triple()'s `recent` averages the per-poll RATIOS; polls carry unequal draft counts, so a
@@ -2005,6 +2015,7 @@ function update(s, dt) {
    * THE SPARKLINE'S SCALE DIFFERS from the other tiles: its samples are 10 s drafting windows, not
    * 500 ms polls, so this box spans up to 120 windows of actual drafting rather than 60 s. */
   if (!(s.draft_positions && s.draft_positions.length)) setMetric("accept", null, DASH);
+  else if (restarted) setMetric("accept", null, DASH);
   else if (awR != null) setMetric("accept", 100 * awR, pctn(awR, 0));
   $("m-acceptdet").textContent = acceptTriple(cNow, busy);
   M.flight.u.textContent = "/ " + s.queue_cap;
@@ -2103,7 +2114,8 @@ function update(s, dt) {
      * is these two lines. What must not happen is the average returning as the headline with no
      * bullet left behind, because then the live figure is the thing nobody can see.
      * Undefined when nothing was drafted -- freeze rather than print 0 or repaint the last value. */
-    if (awR != null) $("acc_n").firstChild.nodeValue = pctn(awR, 0);
+    if (restarted) $("acc_n").firstChild.nodeValue = "\u2013";
+    else if (awR != null) $("acc_n").firstChild.nodeValue = pctn(awR, 0);
     $("specaside").textContent = "depth " + dp.length;
     spec["Drafter"].textContent       = drafterName;
     spec["Depth"].textContent         = dp.length;
