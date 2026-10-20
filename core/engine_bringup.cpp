@@ -1306,9 +1306,10 @@ int Engine::declare() {
     drafter_short_ = drafter_.kind == RAD_DRAFT_BLOCK && cfg_.draft_short_from > 0
                    ? p0.drafter_short_block : 0;
     if (cfg_.draft_short_from > 0 && drafter_.kind != RAD_DRAFT_NONE && !drafter_short_)
-        RAD_WARN("--draft-short-from %lld: '%s' declares no shorter block, so its block stays %lld",
-                 (long long)cfg_.draft_short_from, drafter_name_.c_str(),
-                 (long long)drafter_.block);
+        RAD_WARN("--draft-short-from %lld: '%s' %s", (long long)cfg_.draft_short_from,
+                 drafter_name_.c_str(),
+                 drafter_.kind == RAD_DRAFT_BLOCK ? "declares no shorter block, so its block stays"
+                                                  : "is a serial head, which proposes no block");
     if (drafter_short_)
         RAD_INFO("speculation: from %lld decoding sequences on, '%s' runs its short block of %lld "
                  "row(s), %lld token(s), on the host's block driver", (long long)cfg_.draft_short_from,

@@ -1780,6 +1780,13 @@ int Builder::declare_drafter(const RadDrafterDecl* d) {
             (long long)d->proposal_pitch);
         return RAD_E_INVAL;
     }
+    if (d->kind == RAD_DRAFT_BLOCK && d->proposal_pitch > 0 && d->proposal_pitch < d->depth) {
+        err(RAD_E_INVAL, "declare_drafter '%s': proposal_pitch %lld under depth %d. A block pass "
+                         "writes each sequence's %d proposals into one row of the proposal buffer, "
+                         "so a row must hold them.", nm, (long long)d->proposal_pitch, d->depth,
+            d->depth);
+        return RAD_E_INVAL;
+    }
     /* A block pass embeds the mask id at every unfilled position, so it needs one. */
     if (d->kind == RAD_DRAFT_BLOCK && d->mask_token < 0) {
         err(RAD_E_INVAL, "declare_drafter '%s': RAD_DRAFT_BLOCK with no mask_token. Every "
@@ -1823,7 +1830,11 @@ int Builder::declare_drafter(const RadDrafterDecl* d) {
     prog_.drafter_name = nm;
     prog_.drafter.name = nullptr;
     prog_.drafter.block = block;
-    if (prog_.drafter.proposal_pitch == 0) prog_.drafter.proposal_pitch = 1;
+    /* A block drafter's proposal row holds its whole block's tokens, and the engine reads row s
+     * at s * pitch (a short block fills only its front), so its pitch defaults to depth; a serial
+     * one writes a token a pass, at pitch 1 by default. */
+    if (prog_.drafter.proposal_pitch == 0)
+        prog_.drafter.proposal_pitch = prog_.drafter.kind == RAD_DRAFT_BLOCK ? prog_.drafter.depth : 1;
     return RAD_OK;
 }
 

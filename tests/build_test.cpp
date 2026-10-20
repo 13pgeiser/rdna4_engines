@@ -1105,6 +1105,36 @@ TEST(a_block_drafters_short_block_is_shorter_and_still_proposes) {
     }
 }
 
+/* A block drafter's proposal pitch is its row pitch, which the engine reads row s at: left at 0 it
+ * defaults to depth, and under depth it is refused, since a row could not hold the proposals. */
+TEST(a_block_drafters_proposal_pitch_holds_its_proposals) {
+    Registry reg;
+    RadBufDecl bd{};
+    bd.dtype = RAD_I32; bd.rank = 2; bd.shape[0] = 256; bd.shape[1] = 4;
+    {
+        Builder b(reg, make_meta(), make_ctx());
+        RadDrafterDecl d{};
+        d.kind = RAD_DRAFT_BLOCK; d.name = "df"; d.depth = 4; d.mask_token = 5;
+        d.proposal = rad_decl_buffer(&b, "prop", &bd);
+        CHECK_OK(rad_declare_drafter(&b, &d));
+        CHECK_EQ(b.program().drafter.proposal_pitch, 4);
+    }
+    {
+        Builder b(reg, make_meta(), make_ctx());
+        RadDrafterDecl d{};
+        d.kind = RAD_DRAFT_BLOCK; d.name = "df"; d.depth = 4; d.mask_token = 5;
+        d.proposal = rad_decl_buffer(&b, "prop", &bd); d.proposal_pitch = 3;
+        CHECK_EQ(rad_declare_drafter(&b, &d), RAD_E_INVAL);
+    }
+    {
+        Builder b(reg, make_meta(), make_ctx());
+        RadDrafterDecl d{};
+        d.kind = RAD_DRAFT_SERIAL; d.name = "mtp"; d.depth = 4;
+        CHECK_OK(rad_declare_drafter(&b, &d));
+        CHECK_EQ(b.program().drafter.proposal_pitch, 1);
+    }
+}
+
 /* rad_drafter_shared_kv applies only to a declared serial drafter. With none declared, a block
  * drafter, or a position no head occupies, it is refused at declare; a head staged the wrong way
  * silently costs acceptance. */

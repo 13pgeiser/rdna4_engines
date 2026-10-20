@@ -365,9 +365,8 @@ struct ChainOn {
 
 extern "C" int rad_drafter_short_block(RadBuilder* b, int64_t block) {
     const int64_t full = b ? (b->drafter.block > 0 ? b->drafter.block : b->drafter.depth + 1) : 0;
-    if (!b || b->drafter.kind != RAD_DRAFT_BLOCK || block >= full ||
-        block - (full - b->drafter.depth) < 1)
-        return RAD_E_STATE;
+    if (!b || b->drafter.kind != RAD_DRAFT_BLOCK) return RAD_E_STATE;
+    if (block >= full || block - (full - b->drafter.depth) < 1) return RAD_E_INVAL;
     b->drafter_short = block;
     return RAD_OK;
 }

@@ -2374,8 +2374,12 @@ void Scheduler::serial_end(int rounds_done) {
  * also propose. Called while plan() still describes that step, because the context pass mirrors
  * it exactly, rejected suffix included: the drafter reads hidden states positionally from its
  * own buffer, so batch row i must be buffer row i. The rejected positions lie in [n_computed,
- * n_computed + block), which the query pass overwrites before anything reads them, and the
- * ensure() below covers them since n_computed + block reaches the trunk step's own end.
+ * n_computed + the trunk step's block), which a query pass overwrites before anything reads them.
+ * The ensure() below covers n_computed + `block`; with the block the trunk step verified that
+ * reaches its end. A short block (rad_drafter_short_block) after a long one does not: rejected
+ * rows past it fall on pages the commit's rollback freed, whose slot is -1, and every kv_store
+ * drops a negative slot. That rule is what keeps such a step from writing into another
+ * sequence's pages.
  *
  * On the card the step has not committed yet. The step began at n_computed (a row issued ahead
  * was staged at its furthest reach; it really continued from the committed end, as commit()
