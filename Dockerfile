@@ -11,8 +11,9 @@
 #
 # Stages:
 #   ffmpeg   FFmpeg with only the demuxers core/mm/media.cpp admits, the decoders their streams
-#            need (pictures, video, audio with swresample) and the three encoders the images API
-#            writes (png, mjpeg, libwebp); the distribution's build pulls ~200 unused packages
+#            need (pictures, video, audio with swresample), the three encoders the images API writes
+#            (png, mjpeg, libwebp) and those the videos API writes (core/mm/video_out.cpp): H.264 +
+#            AAC for mp4, VP9 + AV1 + Opus for WebM; all BSD/Apache, no GPL; docs/DOCKER.md
 #   llvm     ROCm's libLLVM rebuilt from ROCm's llvm-project at the commit the image's clang
 #            reports, with docker/llvm-vopd-pairing.patch, which makes LLVM 24's device code
 #            repeatable across builds (cmake/RadAddPlugin.cmake, rad_hip_repeatable)

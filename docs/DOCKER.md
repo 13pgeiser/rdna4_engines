@@ -37,7 +37,7 @@ The `Dockerfile` stages:
 
 | stage | what it does |
 |---|---|
-| `ffmpeg` | FFmpeg 8.1 with only the demuxers `core/mm/media.cpp` admits, the decoders their streams carry (still images, H.264, HEVC, VP8, VP9, AV1 through dav1d, MPEG-1/2/4, Theora, FLV/H.263, and audio) and the three encoders the images API writes (PNG, JPEG, WebP). The distribution's build brings about 200 packages the engine never uses |
+| `ffmpeg` | FFmpeg 8.1 with only the demuxers `core/mm/media.cpp` admits, the decoders their streams carry (still images, H.264, HEVC, VP8, VP9, AV1 through dav1d, MPEG-1/2/4, Theora, FLV/H.263, and audio), the three encoders the images API writes (PNG, JPEG, WebP) and those the videos API writes through `core/mm/video_out.cpp` (H.264 + AAC for MP4; VP9, AV1 + Opus for WebM). The distribution's build brings about 200 packages the engine never uses |
 | `llvm` | ROCm's `libLLVM` rebuilt from ROCm's llvm-project at the commit the image's `clang --version` names, configured as ROCm ships it, with `docker/llvm-vopd-pairing.patch` applied. ROCm 10.1's clang does not compile the same source to the same code twice (its VOPD pairing follows heap addresses); the patch makes it repeatable. This library is the only compiler file that changes |
 | `build` | `rocm/dev-ubuntu-24.04:10.1.0-full` plus cmake, ninja and g++-14. Device code is compiled by ROCm's clang from `/opt/rocm-repeatable`, a shadow of the ROCm tree whose `libLLVM` is the `llvm` stage's (`-DRAD_HIP_VOPD_REPEATABLE=ON`, `--rocm-path=/opt/rocm`); the HIP runtime and comgr in the image are ROCm's own. Configures with kernels for `GPU_TARGETS`, builds, and installs to `/opt/radiance` with the recipes. Device code is not stored compressed: the engine's AQL backend reads the fat binaries itself and refuses a compressed bundle |
 | `test` | `docker/llvm-check.sh`, then `ctest -LE 'gpu\|oot'`: every suite that runs without a card. The check recompiles one kernel file four ways: with pairing off, the image's compiler must emit ROCm's device code byte for byte; with pairing on, two compiles must match the build's own object. The image is produced only if both pass |
@@ -65,6 +65,61 @@ docker/build.sh --target build
 docker run --rm --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined \
     radiance-build ctest --test-dir /build -L gpu --output-on-failure
 ```
+
+## Video output: MP4 and WebM
+
+`/v1/videos` writes the file in the container the request's `format` asks for: `mp4` (the default,
+H.264 video + AAC audio), `webm` (VP9 + Opus) and `webm-av1` (AV1 + Opus). The writer is
+`core/mm/video_out.cpp`. It looks every encoder and the muxer up by name at run time
+(`avcodec_find_encoder_by_name`, `avformat_alloc_output_context2`), so the image must actually hold
+the codecs a format needs — there is no compile-time link to `radiance` itself that would force it.
+
+WebM is here for the same reason the reference workflow ships it: browsers play it and older CPUs
+decode it. VP9 is the old-hardware-friendly default; AV1 is the codec the DaSiWa example prefers and
+is opt-in (`webm-av1`) — slower to encode, but it decodes in software on an AVX2-only CPU, no
+hardware block or AVX-512 required.
+
+For the image to emit WebM the `ffmpeg` stage must build in VP9, AV1 and Opus. That is already in the
+`Dockerfile`: `--enable-libvpx --enable-libaom --enable-libopus` in the configure line,
+`libvpx-vp9,libaom-av1,libopus` in `--enable-encoder`, `webm,matroska` in `--enable-muxer`, and
+`libvpx-dev libaom-dev libopus-dev` in the stage's build packages. **Nothing GPL is pulled**: libvpx,
+libaom and libopus are BSD, the same posture as `libopenh264` and the FFmpeg-native `aac`, so the
+build turns on no `--enable-gpl` and does not use x264 (MP4 encodes through `libopenh264`).
+`docker/licenses.sh` therefore needs no GPL entry for them; it only needs each package to carry a
+`copyright` file, which all three do.
+
+These are **link-time** dependencies of `libavcodec` (they appear in its `ldd`), not loaded by
+`dlopen`. So the `rootfs` stage — which resolves every ELF from inside a chroot of the tree and
+fails the build on a library it cannot find — pulls `libvpx`, `libaom` and `libopus` in on its own,
+exactly as it already does for `libdav1d7`, `libwebp7` and `libopenh264-7`. The runtime `apt-get`
+installs their shared libraries by the Ubuntu 24.04 package names — **`libvpx9 libaom3 libopus0`** —
+kept in the same list as those three. If a future base image bumps a SONAME, rename the package here
+the way those were renamed before; a wrong or missing name fails the `rootfs` chroot check, so it
+cannot ship silently broken.
+
+The graceful path is worth knowing even though the image should never need it: because the codecs are
+found at run time, if one is ever absent the `mp4` default still writes and a `webm` request fails
+that single request cleanly with an `encoding_failed` naming the missing encoder — the engine does not
+crash. So the image is safe before the libraries land; WebM output simply does not work until they do.
+
+One non-obvious detail the writer handles so the build needs no extra flag: the model's audio is
+stereo at **32 kHz**, which Opus cannot encode (it supports 8/12/16/24/48 kHz). For WebM the writer
+resamples to 48 kHz through `libswresample` — already in the build for audio decode — while MP4 keeps
+AAC at the native rate. That is why a WebM file reports `opus` at 48 kHz and an MP4 reports `aac` at
+32 kHz.
+
+To confirm a built image ships the codecs, no card needed — look at what `libavcodec` links against:
+
+```sh
+docker run --rm --entrypoint sh radiance -c \
+  'for l in $(find /opt/radiance -name "libavcodec.so*" 2>/dev/null); do ldd "$l"; done \
+   | grep -E "vpx|aom|opus"'        # libvpx / libaom / libopus must all appear
+```
+
+For a functional check, serve a model and request a three-second clip: `format=webm` then
+`format=webm-av1`, and `ffprobe` the downloaded file — expect `vp9` + `opus` and `av1` + `opus` in a
+`matroska,webm` container. The host `videos_test` already covers the router's format handling without
+a card.
 
 ## Run it
 
