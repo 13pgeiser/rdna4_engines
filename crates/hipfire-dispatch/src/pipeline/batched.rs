@@ -159,7 +159,7 @@ pub struct BatchScratch<'a> {
 /// Weights of one dense SwiGLU FFN sublayer (the rows > 1 view of
 /// [`crate::pipeline::hybrid::SwigluFfnOp`]).
 #[derive(Clone, Copy)]
-pub struct FfnLayerView<'a> {
+pub(crate) struct FfnLayerView<'a> {
     pub ffn_norm: &'a GpuTensor,
     pub w_gate: WeightRef<'a>,
     pub w_up: WeightRef<'a>,
@@ -2504,7 +2504,7 @@ fn swiglu_ffn_down_batched(
     Ok(())
 }
 
-pub fn execute_swiglu_ffn_batched(
+pub(crate) fn execute_swiglu_ffn_batched(
     gpu: &mut Gpu,
     layer: &FfnLayerView<'_>,
     norm_eps: f32,

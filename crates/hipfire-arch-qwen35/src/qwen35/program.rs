@@ -5,7 +5,8 @@
 //! Declarative Qwen3.5 decoder-layer program.
 //!
 //! Each layer is one mixer step (gated DeltaNet or gated full attention)
-//! followed by one FFN step (dense SwiGLU or sealed MoE). This module only
+//! followed by one FFN step (dense `GatedMlp` on the `Product` ladder, or
+//! sealed MoE). This module only
 //! binds resident weights, recurrent state, KV storage and scratch to the
 //! shared `hipfire_dispatch::pipeline::hybrid` operations; route selection and
 //! executor bodies live in dispatch.
@@ -19,18 +20,23 @@ use super::weights::{
 use crate::speculative::GdnTape;
 use hip_bridge::HipResult;
 use hipfire_dispatch::families::kv_tier::KvTierInputs;
-use hipfire_dispatch::pipeline::batched::{BatchScratch, FfnLayerView};
+use hipfire_dispatch::pipeline::batched::{BatchScratch, DenseBatchMath, DflashFusionCtx};
 use hipfire_dispatch::pipeline::batched_attention::{
     AttentionLayerView, BatchedAttentionTap, FlashScratch, KvView,
 };
 use hipfire_dispatch::pipeline::batched_deltanet::{
     DeltaNetLayerView, DeltaNetStateView, GdnTapeView,
 };
+use hipfire_dispatch::pipeline::gated_mlp::{
+    execute_product_rows, Activation, GatedMlpOp, GatedMlpScratch, MlpLadder, MlpOutput,
+    MlpStorage, ProductRows, RmsNorm,
+};
 use hipfire_dispatch::pipeline::hybrid::{
     AttentionKv, AttentionRow, AttentionTap, DeltaNetMixerOp, GatedAttentionOp, GdnState,
-    HybridDims, SwigluFfnOp,
+    HybridDims,
 };
 use hipfire_dispatch::pipeline::Step;
+use hipfire_runtime::llama::WeightTensor;
 use hipfire_runtime::llama::{self, KvCacheExt};
 use rdna_compute::{Gpu, GpuTensor};
 
@@ -230,30 +236,48 @@ impl<'a> DecodeBinding<'a> {
             }
         }
     }
+}
 
-    /// The dense FFN step of `layer`; `None` for MoE layers, whose sealed call
-    /// the caller builds (it borrows a dispatch context and MoE scratch).
-    pub fn dense_ffn(&self, layer: &'a LayerWeights) -> Option<Step<'a>> {
-        let s = self.s;
-        let (norm, gate, up, down) = match layer {
-            LayerWeights::DeltaNet(l) => (&l.ffn_norm, &l.w_gate, &l.w_up, &l.w_down),
-            LayerWeights::FullAttn(l) => (&l.ffn_norm, &l.w_gate, &l.w_up, &l.w_down),
-            LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => return None,
-        };
-        Some(Step::SwigluFfn(SwigluFfnOp {
-            eps: self.dims.norm_eps,
-            x: &s.x,
-            norm,
-            w_gate: gate.dispatch_ref(),
-            w_up: up.dispatch_ref(),
-            w_down: down.dispatch_ref(),
-            plain: &s.tmp,
-            x_rot: &s.x_rot,
+/// The dense FFN op of `layer` on the decode scratch `s`, writing `output`
+/// (`Residual` on one device, `Write` of a tensor-parallel partial); `None`
+/// for MoE layers, whose sealed call the caller builds (it borrows a dispatch
+/// context and MoE scratch).
+pub(crate) fn dense_ffn<'a>(
+    dims: &HybridDims,
+    s: &'a Qwen35Scratch,
+    layer: &'a LayerWeights,
+    output: MlpOutput<'a>,
+) -> Option<GatedMlpOp<'a>> {
+    let (norm, gate, up, down) = match layer {
+        LayerWeights::DeltaNet(l) => (&l.ffn_norm, &l.w_gate, &l.w_up, &l.w_down),
+        LayerWeights::FullAttn(l) => (&l.ffn_norm, &l.w_gate, &l.w_up, &l.w_down),
+        LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => return None,
+    };
+    let gate = gate.dispatch_ref();
+    Some(GatedMlpOp {
+        rows: 1,
+        hidden: dims.dim,
+        intermediate: gate.m,
+        x: &s.x,
+        pre_norm: Some(RmsNorm {
+            weight: norm,
+            eps: dims.norm_eps,
+            normed: &s.tmp,
+        }),
+        gate,
+        up: up.dispatch_ref(),
+        down: down.dispatch_ref(),
+        activation: Activation::Silu,
+        storage: MlpStorage::F32,
+        output,
+        ladder: MlpLadder::Product,
+        scratch: GatedMlpScratch {
             gate: &s.gate_ffn,
             up: &s.up,
-            hidden: &s.ffn_hidden,
-        }))
-    }
+            act: &s.ffn_hidden,
+            x_rot: &s.x_rot,
+        },
+    })
 }
 
 // ── Batched (prefill / verify) bindings ─────────────────────────────────────
@@ -318,14 +342,30 @@ impl DeltaNetLayerWeights {
         }
     }
 
-    pub(crate) fn ffn_view(&self) -> FfnLayerView<'_> {
-        FfnLayerView {
-            ffn_norm: &self.ffn_norm,
-            w_gate: self.w_gate.dispatch_ref(),
-            w_up: self.w_up.dispatch_ref(),
-            w_down: self.w_down.dispatch_ref(),
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn ffn_rows(
+        &self,
+        gpu: &mut Gpu,
+        eps: f32,
+        batch: &BatchScratch<'_>,
+        n: usize,
+        dim: usize,
+        q8_wmma_arch: bool,
+        arch_has_wmma: bool,
+        output: MlpOutput<'_>,
+        fusion: DflashFusionCtx,
+        math: DenseBatchMath,
+    ) -> HipResult<()> {
+        let rows = ProductRows {
+            batch: *batch,
+            q8_wmma_arch,
+            arch_has_wmma,
+            fusion,
+            math,
             kind: "LA",
-        }
+        };
+        let ffn = [&self.w_gate, &self.w_up, &self.w_down];
+        dense_ffn_rows(gpu, &self.ffn_norm, ffn, eps, &rows, n, dim, output)
     }
 }
 
@@ -343,15 +383,73 @@ impl FullAttnLayerWeights {
         }
     }
 
-    pub(crate) fn ffn_view(&self) -> FfnLayerView<'_> {
-        FfnLayerView {
-            ffn_norm: &self.ffn_norm,
-            w_gate: self.w_gate.dispatch_ref(),
-            w_up: self.w_up.dispatch_ref(),
-            w_down: self.w_down.dispatch_ref(),
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn ffn_rows(
+        &self,
+        gpu: &mut Gpu,
+        eps: f32,
+        batch: &BatchScratch<'_>,
+        n: usize,
+        dim: usize,
+        q8_wmma_arch: bool,
+        arch_has_wmma: bool,
+        output: MlpOutput<'_>,
+        fusion: DflashFusionCtx,
+        math: DenseBatchMath,
+    ) -> HipResult<()> {
+        let rows = ProductRows {
+            batch: *batch,
+            q8_wmma_arch,
+            arch_has_wmma,
+            fusion,
+            math,
             kind: "FA",
-        }
+        };
+        let ffn = [&self.w_gate, &self.w_up, &self.w_down];
+        dense_ffn_rows(gpu, &self.ffn_norm, ffn, eps, &rows, n, dim, output)
     }
+}
+
+/// The dense FFN of a layer over `n` rows of `rows.batch` (prefill, verify,
+/// TP prefill partial) as one `GatedMlp` `Product` op.
+#[allow(clippy::too_many_arguments)]
+fn dense_ffn_rows(
+    gpu: &mut Gpu,
+    norm: &GpuTensor,
+    [gate, up, down]: [&WeightTensor; 3],
+    eps: f32,
+    rows: &ProductRows<'_>,
+    n: usize,
+    dim: usize,
+    output: MlpOutput<'_>,
+) -> HipResult<()> {
+    let b = &rows.batch;
+    let gate = gate.dispatch_ref();
+    let op = GatedMlpOp {
+        rows: n,
+        hidden: dim,
+        intermediate: gate.m,
+        x: b.x_batch,
+        pre_norm: Some(RmsNorm {
+            weight: norm,
+            eps,
+            normed: b.x_rot_batch,
+        }),
+        gate,
+        up: up.dispatch_ref(),
+        down: down.dispatch_ref(),
+        activation: Activation::Silu,
+        storage: MlpStorage::F32,
+        output,
+        ladder: MlpLadder::Product,
+        scratch: GatedMlpScratch {
+            gate: b.gate_ffn_batch,
+            up: b.up_batch,
+            act: b.ffn_hidden_batch,
+            x_rot: b.x_rot_batch,
+        },
+    };
+    execute_product_rows(gpu, &op, rows)
 }
 
 /// The batched executors' view of the KV cache.

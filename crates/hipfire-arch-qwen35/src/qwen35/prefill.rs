@@ -46,11 +46,10 @@ use hipfire_dispatch::families::moe::{
     codebook_batched_admit_enabled_from_env, mq6_batched_admit_enabled_from_env,
 };
 use hipfire_dispatch::pipeline::batched::{
-    execute_swiglu_ffn_batched, mq_f16_projection_fast_route, plain_gemm_key_for,
-    q8_prefill_wmma_enabled, run_fused_qkv_key, run_fused_qkvza_key, run_plain_gemm_key,
-    run_residual_gemm_key, s4_residual_fast, try_iu4_rotate_prepared_no_epilogue, valid_lane_mask,
-    verify_dense_math, BatchEpilogue, BatchSemantics, DenseBatchMath, DflashFusionCtx,
-    TreeVerifyCtx,
+    mq_f16_projection_fast_route, plain_gemm_key_for, q8_prefill_wmma_enabled, run_fused_qkv_key,
+    run_fused_qkvza_key, run_plain_gemm_key, run_residual_gemm_key, s4_residual_fast,
+    try_iu4_rotate_prepared_no_epilogue, valid_lane_mask, verify_dense_math, BatchEpilogue,
+    BatchSemantics, DenseBatchMath, DflashFusionCtx, TreeVerifyCtx,
 };
 use hipfire_dispatch::pipeline::batched_attention::{
     batch_chunk_fa_attend, batch_chunk_fa_pm_qprep_direct, batch_chunk_fa_pm_qprep_prep,
@@ -70,6 +69,7 @@ use hipfire_dispatch::pipeline::batched_deltanet::{
 };
 use hipfire_dispatch::pipeline::dump_hidden_localize;
 use hipfire_dispatch::pipeline::execute_steps;
+use hipfire_dispatch::pipeline::gated_mlp::MlpOutput;
 use hipfire_dispatch::pipeline::GemvInput;
 use hipfire_dispatch::pipeline::Step;
 use hipfire_runtime::llama;
@@ -8656,17 +8656,15 @@ fn forward_prefill_chunk_pair(
                         None,  // commit_stride: pair halves keep legacy cadence
                         false, // Paired halves retain the incumbent route
                     )?;
-                    execute_swiglu_ffn_batched(
+                    layer.ffn_rows(
                         gpu,
-                        &layer.ffn_view(),
                         config.norm_eps,
                         &half_pbs.view(),
                         n,
                         dim,
-                        hidden_dim,
                         q8_wmma_arch,
                         arch_has_wmma,
-                        BatchEpilogue::Residual,
+                        MlpOutput::Residual,
                         fusion,
                         DenseBatchMath::Product,
                     )?;
@@ -8776,17 +8774,15 @@ fn forward_prefill_chunk_pair(
                         None,
                         DenseBatchMath::Product,
                     )?;
-                    execute_swiglu_ffn_batched(
+                    layer.ffn_rows(
                         gpu,
-                        &layer.ffn_view(),
                         config.norm_eps,
                         &pbs_c.view(),
                         n,
                         dim,
-                        hidden_dim,
                         q8_wmma_arch,
                         arch_has_wmma,
-                        BatchEpilogue::Residual,
+                        MlpOutput::Residual,
                         fusion,
                         DenseBatchMath::Product,
                     )?;
@@ -8803,17 +8799,15 @@ fn forward_prefill_chunk_pair(
                         None,
                         DenseBatchMath::Product,
                     )?;
-                    execute_swiglu_ffn_batched(
+                    layer.ffn_rows(
                         gpu,
-                        &layer.ffn_view(),
                         config.norm_eps,
                         &pbs_n.view(),
                         n,
                         dim,
-                        hidden_dim,
                         q8_wmma_arch,
                         arch_has_wmma,
-                        BatchEpilogue::Residual,
+                        MlpOutput::Residual,
                         fusion,
                         DenseBatchMath::Product,
                     )?;
@@ -8842,17 +8836,15 @@ fn forward_prefill_chunk_pair(
                         None, // commit_stride: pair halves keep legacy cadence
                         tap,
                     )?;
-                    execute_swiglu_ffn_batched(
+                    layer.ffn_rows(
                         gpu,
-                        &layer.ffn_view(),
                         config.norm_eps,
                         &pbs_c.view(),
                         n,
                         dim,
-                        hidden_dim,
                         q8_wmma_arch,
                         arch_has_wmma,
-                        BatchEpilogue::Residual,
+                        MlpOutput::Residual,
                         fusion,
                         DenseBatchMath::Product,
                     )?;
@@ -8880,17 +8872,15 @@ fn forward_prefill_chunk_pair(
                         None, // commit_stride: pair halves keep legacy cadence
                         tap,
                     )?;
-                    execute_swiglu_ffn_batched(
+                    layer.ffn_rows(
                         gpu,
-                        &layer.ffn_view(),
                         config.norm_eps,
                         &pbs_n.view(),
                         n,
                         dim,
-                        hidden_dim,
                         q8_wmma_arch,
                         arch_has_wmma,
-                        BatchEpilogue::Residual,
+                        MlpOutput::Residual,
                         fusion,
                         DenseBatchMath::Product,
                     )?;
@@ -9499,17 +9489,15 @@ pub(crate) fn forward_batch_chunk_impl(
                     commit_stride,
                     gdn_chunk_scan_admitted,
                 )?;
-                execute_swiglu_ffn_batched(
+                layer.ffn_rows(
                     gpu,
-                    &layer.ffn_view(),
                     config.norm_eps,
                     &batch,
                     n,
                     dim,
-                    hidden_dim,
                     q8_wmma_arch,
                     arch_has_wmma,
-                    BatchEpilogue::Residual,
+                    MlpOutput::Residual,
                     fusion,
                     math,
                 )?;
@@ -9546,17 +9534,15 @@ pub(crate) fn forward_batch_chunk_impl(
                     commit_stride,
                     tap,
                 )?;
-                execute_swiglu_ffn_batched(
+                layer.ffn_rows(
                     gpu,
-                    &layer.ffn_view(),
                     config.norm_eps,
                     &batch,
                     n,
                     dim,
-                    hidden_dim,
                     q8_wmma_arch,
                     arch_has_wmma,
-                    BatchEpilogue::Residual,
+                    MlpOutput::Residual,
                     fusion,
                     math,
                 )?;

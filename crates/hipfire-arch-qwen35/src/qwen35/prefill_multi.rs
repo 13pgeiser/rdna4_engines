@@ -1302,7 +1302,6 @@ pub fn forward_prefill_batch_multi(
     }
 
     let dim = config.dim;
-    let hidden_dim = config.hidden_dim;
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
     let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
     let n_v_heads = config.linear_num_value_heads;
@@ -1721,17 +1720,15 @@ pub fn forward_prefill_batch_multi(
                             GdnScanOut::F32,
                             DenseBatchMath::Product,
                         )?;
-                        execute_swiglu_ffn_batched(
+                        layer.ffn_rows(
                             gpu,
-                            &layer.ffn_view(),
                             config.norm_eps,
                             &view.view(),
                             n,
                             dim,
-                            hidden_dim,
                             q8_wmma_arch,
                             arch_has_wmma,
-                            BatchEpilogue::Residual,
+                            MlpOutput::Residual,
                             r.fusion,
                             DenseBatchMath::Product,
                         )?;
@@ -1751,17 +1748,15 @@ pub fn forward_prefill_batch_multi(
                         GdnScanOut::F32,
                         math,
                     )?;
-                    execute_swiglu_ffn_batched(
+                    layer.ffn_rows(
                         gpu,
-                        &layer.ffn_view(),
                         config.norm_eps,
                         &batch,
                         total,
                         dim,
-                        hidden_dim,
                         q8_wmma_arch,
                         arch_has_wmma,
-                        BatchEpilogue::Residual,
+                        MlpOutput::Residual,
                         shared_fusion,
                         math,
                     )?;
@@ -1988,17 +1983,15 @@ pub fn forward_prefill_batch_multi(
                             None,
                             DenseBatchMath::Product,
                         )?;
-                        execute_swiglu_ffn_batched(
+                        layer.ffn_rows(
                             gpu,
-                            &layer.ffn_view(),
                             config.norm_eps,
                             &view.view(),
                             n,
                             dim,
-                            hidden_dim,
                             q8_wmma_arch,
                             arch_has_wmma,
-                            BatchEpilogue::Residual,
+                            MlpOutput::Residual,
                             r.fusion,
                             DenseBatchMath::Product,
                         )?;
@@ -2017,17 +2010,15 @@ pub fn forward_prefill_batch_multi(
                         None,
                         math,
                     )?;
-                    execute_swiglu_ffn_batched(
+                    layer.ffn_rows(
                         gpu,
-                        &layer.ffn_view(),
                         config.norm_eps,
                         &batch,
                         total,
                         dim,
-                        hidden_dim,
                         q8_wmma_arch,
                         arch_has_wmma,
-                        BatchEpilogue::Residual,
+                        MlpOutput::Residual,
                         shared_fusion,
                         math,
                     )?;

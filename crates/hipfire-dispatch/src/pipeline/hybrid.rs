@@ -19,12 +19,10 @@
 
 use crate::context::DispatchCtx;
 use crate::families::attention::{AttentionFamily, AttnParams};
-use crate::families::gemv::{GemvFamily, GemvParams, WeightRef};
+use crate::families::gemv::WeightRef;
 use crate::families::kv_tier::{KvTierInputs, KvTierPlan};
 use crate::pipeline::steps::{execute_steps, GemvInput, Step};
-use crate::types::{
-    dtype_needs_rotation, dtype_rotation_plan, DispatchError, GemvVariant, KernelKey, RotationPlan,
-};
+use crate::types::{dtype_rotation_plan, DispatchError, KernelKey, RotationPlan};
 use hip_bridge::DeviceBuffer;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::sync::LazyLock;
@@ -37,7 +35,6 @@ fn developer_var(name: &str) -> Option<String> {
     hipfire_config::developer_var(name).ok()
 }
 
-static GEMV: LazyLock<GemvFamily> = LazyLock::new(GemvFamily::new);
 static ATTENTION: LazyLock<AttentionFamily> = LazyLock::new(AttentionFamily::new);
 
 /// Model-level geometry of a hybrid decoder. Route selection reads only these
@@ -466,139 +463,6 @@ pub fn normed_projection<const N: usize>(
         gemv(3),
     ];
     execute_steps(gpu, ctx, &steps[..=N])
-}
-
-fn mq_rotation_scratch(gpu: &Gpu) -> Result<GpuTensor, DispatchError> {
-    let scratch = gpu
-        .scratch
-        .mq_x_rot
-        .as_ref()
-        .ok_or_else(|| DispatchError::Hip("MQ rotation scratch is not allocated".into()))?;
-    Ok(GpuTensor {
-        buf: unsafe { scratch.buf.alias() },
-        shape: vec![scratch.buf.size() / 4],
-        dtype: DType::F32,
-    })
-}
-
-/// `x += W_down · (silu(gate) ⊙ up)`. MQ weights fuse SiLU·mul with the input
-/// rotation and run the SwiGLU-residual GEMV; HFQ weights run the residual
-/// GEMV; every other format is a plain GEMV (with its own input rotation and
-/// AWQ sidecar) plus an in-place add.
-#[allow(clippy::too_many_arguments)]
-pub fn swiglu_down_residual(
-    gpu: &mut Gpu,
-    ctx: &DispatchCtx,
-    w_down: &WeightRef<'_>,
-    gate: &GpuTensor,
-    up: &GpuTensor,
-    hidden: &GpuTensor,
-    x: &GpuTensor,
-) -> Result<(), DispatchError> {
-    super::reject_mq4g128v2(w_down.dtype, "swiglu_down_residual")?;
-    // Calibration tap: down_proj input is `hidden` (post-SiLU), K = w_down.k.
-    // For MQ4 this will be rotated inside; we capture PRE-rotation.
-    gpu.maybe_capture_activation(w_down.buf, hidden, 1, w_down.k);
-    let wr = WeightRef {
-        row_stride: 0,
-        rotation: None,
-        awq_scale: None,
-        ..*w_down
-    };
-    match w_down.dtype {
-        // Host-executed offload (`memory.offload_exec=cpu|passback`): the SiLU
-        // stays on the GPU; the down projection and its residual accumulate are
-        // one `Step::GemvResidual` over the host-mapped weight bytes, which the
-        // generic seam runs on the CPU (or splits by rows for pass-back).
-        _ if crate::host_mapped_cpu_capable(gpu, &wr) => {
-            gpu.silu_mul_f32(gate, up, hidden).map_err(hip)?;
-            // The CPU path divides the AWQ sidecar itself; the activation here
-            // is the raw SiLU output the fused GPU arm would divide.
-            let wr_cpu = WeightRef {
-                awq_scale: w_down.awq_scale,
-                ..wr
-            };
-            execute_steps(
-                gpu,
-                ctx,
-                &[Step::GemvResidual {
-                    w: &wr_cpu,
-                    input: GemvInput::Raw(hidden),
-                    residual: x,
-                    out: x,
-                }],
-            )
-        }
-        DType::MQ4G256
-        | DType::MQ4G256V2
-        // qt=52: same FWHT input contract as qt=44; the residual GEMV is the
-        // LUT twin (family branches on dtype).
-        | DType::MQ4G256V2Lloyd
-        | DType::MQ4CG256
-        | DType::MQ6G256
-        | DType::MQ6G256V2
-        | DType::MQ5G256V2
-        | DType::MQ3G256
-        | DType::MQ3G256V2
-        | DType::MQ2G256V2
-        | DType::MQ3G256Lloyd
-        | DType::MQ4G256Lloyd => {
-            gpu.ensure_mq_signs().map_err(hip)?;
-            let xr = mq_rotation_scratch(gpu)?;
-            match w_down.awq_scale {
-                Some(awq) => gpu.fused_silu_mul_rotate_mq_awq(gate, up, awq, &xr, w_down.k),
-                None => gpu.fused_silu_mul_rotate_mq(gate, up, &xr, w_down.k),
-            }
-            .map_err(hip)?;
-            GEMV.run(
-                ctx,
-                gpu,
-                &GemvParams {
-                    w: &wr,
-                    x: &xr,
-                    y: x,
-                    variant: GemvVariant::WithSwiGLUResidual,
-                    residual: Some(x),
-                    gate: Some(&xr),
-                    up: None,
-                },
-            )
-        }
-        DType::HFQ4G256 | DType::HFQ3G256 | DType::HFQ6G256 => {
-            gpu.silu_mul_f32(gate, up, hidden).map_err(hip)?;
-            gpu.maybe_capture_activation(w_down.buf, hidden, 1, w_down.k);
-            GEMV.run(
-                ctx,
-                gpu,
-                &GemvParams {
-                    w: &wr,
-                    x: hidden,
-                    y: x,
-                    variant: GemvVariant::WithResidual,
-                    residual: None,
-                    gate: None,
-                    up: None,
-                },
-            )
-        }
-        dtype => {
-            gpu.silu_mul_f32(gate, up, hidden).map_err(hip)?;
-            // Two taps, as the runtime twin's residual-then-GEMV fallback
-            // (`weight_gemv_residual` + `weight_gemv`) takes: calibration
-            // weighting must not depend on which decode path ran.
-            gpu.maybe_capture_activation(w_down.buf, hidden, 1, w_down.k);
-            gpu.maybe_capture_activation(w_down.buf, hidden, 1, w_down.k);
-            // Rotated formats (MQ8, G128, Givens, FP4, ...) keep their rotation
-            // and AWQ sidecar so `run_auto` rotates the input first; it also
-            // prepares that rotation's own sign tables and scratch.
-            let w = if dtype_needs_rotation(dtype) { w_down } else { &wr };
-            let tmp = gpu.alloc_tensor(&[w_down.m], DType::F32).map_err(hip)?;
-            let run = GEMV.run_auto(ctx, gpu, w, hidden, &tmp);
-            let add = run.and_then(|_| gpu.add_inplace_f32(x, &tmp).map_err(hip));
-            let free = gpu.free_tensor(tmp).map_err(hip);
-            add.and(free)
-        }
-    }
 }
 
 // ── Gated DeltaNet mixer ──────────────────────────────────────────────────
@@ -1261,60 +1125,6 @@ pub fn execute_gated_attention(
     op.project(gpu, ctx)?;
     let prerotated = op.attend(gpu, ctx)?;
     op.output(gpu, ctx, prerotated)
-}
-
-// ── Dense SwiGLU FFN ──────────────────────────────────────────────────────
-
-/// Dense FFN sublayer: norm → gate/up projection → SwiGLU down projection
-/// added into `x`.
-pub struct SwigluFfnOp<'a> {
-    pub eps: f32,
-    pub x: &'a GpuTensor,
-    pub norm: &'a GpuTensor,
-    pub w_gate: WeightRef<'a>,
-    pub w_up: WeightRef<'a>,
-    pub w_down: WeightRef<'a>,
-    pub plain: &'a GpuTensor,
-    pub x_rot: &'a GpuTensor,
-    pub gate: &'a GpuTensor,
-    pub up: &'a GpuTensor,
-    pub hidden: &'a GpuTensor,
-}
-
-impl SwigluFfnOp<'_> {
-    pub fn project(&self, gpu: &mut Gpu, ctx: &DispatchCtx) -> Result<(), DispatchError> {
-        normed_projection(
-            gpu,
-            ctx,
-            self.x,
-            self.norm,
-            self.plain,
-            self.x_rot,
-            self.eps,
-            [(self.w_gate, self.gate), (self.w_up, self.up)],
-        )
-    }
-
-    pub fn down(&self, gpu: &mut Gpu, ctx: &DispatchCtx) -> Result<(), DispatchError> {
-        swiglu_down_residual(
-            gpu,
-            ctx,
-            &self.w_down,
-            self.gate,
-            self.up,
-            self.hidden,
-            self.x,
-        )
-    }
-}
-
-pub fn execute_swiglu_ffn(
-    gpu: &mut Gpu,
-    ctx: &DispatchCtx,
-    op: &SwigluFfnOp<'_>,
-) -> Result<(), DispatchError> {
-    op.project(gpu, ctx)?;
-    op.down(gpu, ctx)
 }
 
 #[cfg(test)]

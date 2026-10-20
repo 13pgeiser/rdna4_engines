@@ -28,6 +28,7 @@ use hipfire_dispatch::families::moe::{routed_codebook_pair_batched_supported, Mo
 use hipfire_dispatch::pipeline::batched::{BatchEpilogue, DenseBatchMath};
 use hipfire_dispatch::pipeline::dump_hidden_localize;
 use hipfire_dispatch::pipeline::execute_steps;
+use hipfire_dispatch::pipeline::gated_mlp::{execute_gated_mlp, GatedMlpOp, MlpOutput};
 use hipfire_dispatch::pipeline::hybrid;
 use hipfire_dispatch::pipeline::hybrid::AttentionTap;
 use hipfire_dispatch::pipeline::sealed_moe::MoeRouteProducerProof;
@@ -2365,7 +2366,7 @@ fn forward_scratch_layers(
     mrope: Option<&MropeCtx>,
 ) -> HipResult<()> {
     // Single-GPU decode runs the declarative layer program (`super::program`:
-    // hybrid `DeltaNetMixer`/`GatedAttention` + `SwigluFfn`/MoE Steps) unless
+    // hybrid `DeltaNetMixer`/`GatedAttention` + `GatedMlp`/MoE Steps) unless
     // `HIPFIRE_FORWARD_LOWERED=0` opts out. Skipped when a hidden-state ring
     // buffer is active (spec-decode capture engages only the hand path for now).
     //
@@ -4095,43 +4096,6 @@ pub(crate) fn kv_cache_attention_dispatch(
     .map_err(|e| HipError::new(0, &e.to_string()))
 }
 
-fn dense_tp_ffn_partial(
-    gpu: &mut Gpu,
-    ctx: &DispatchCtx,
-    norm: &GpuTensor,
-    gate: &WeightTensor,
-    up: &WeightTensor,
-    down: &WeightTensor,
-    config: &Qwen35Config,
-    s: &Qwen35Scratch,
-) -> HipResult<()> {
-    gate_up_via_execute_steps(
-        gpu,
-        ctx,
-        gate,
-        up,
-        norm,
-        &s.x,
-        &s.tmp,
-        &s.x_rot,
-        &s.gate_ffn,
-        &s.up,
-        config.norm_eps,
-    )?;
-    gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)?;
-    let wr = down.dispatch_ref();
-    execute_steps(
-        gpu,
-        ctx,
-        &[Step::Gemv {
-            w: &wr,
-            input: GemvInput::Raw(&s.ffn_hidden),
-            out: &s.ffn_out,
-        }],
-    )
-    .map_err(|e| HipError::new(0, &e.to_string()))
-}
-
 fn deltanet_sigmoid_alpha_gate(
     gpu: &mut Gpu,
     beta: &GpuTensor,
@@ -4507,26 +4471,17 @@ fn dense_tp_local_ffn(
     scratches: &[Qwen35Scratch],
 ) -> HipResult<()> {
     for rank in 0..gpus.devices.len() {
-        let (norm, gate, up, down) = match &weights[rank].layers[layer_idx] {
-            LayerWeights::DeltaNet(layer) => {
-                (&layer.ffn_norm, &layer.w_gate, &layer.w_up, &layer.w_down)
-            }
-            LayerWeights::FullAttn(layer) => {
-                (&layer.ffn_norm, &layer.w_gate, &layer.w_up, &layer.w_down)
-            }
-            _ => return Err(HipError::new(0, "dense TP received a MoE/mismatched layer")),
-        };
+        let s = &scratches[rank];
+        let ffn = super::program::dense_ffn(
+            &super::program::hybrid_dims(&configs[rank]),
+            s,
+            &weights[rank].layers[layer_idx],
+            MlpOutput::Write(&s.ffn_out),
+        )
+        .ok_or_else(|| HipError::new(0, "dense TP received a MoE/mismatched layer"))?;
         let ctx = DispatchCtx::new(&gpus.devices[rank]);
-        dense_tp_ffn_partial(
-            &mut gpus.devices[rank],
-            &ctx,
-            norm,
-            gate,
-            up,
-            down,
-            &configs[rank],
-            &scratches[rank],
-        )?;
+        execute_gated_mlp(&mut gpus.devices[rank], &ctx, &ffn)
+            .map_err(|e| HipError::new(0, &e.to_string()))?;
     }
     Ok(())
 }
@@ -5318,22 +5273,18 @@ fn forward_prefill_dense_tp_batched(
                             else {
                                 unreachable!();
                             };
-                            if let Err(e) =
-                                hipfire_dispatch::pipeline::batched::execute_swiglu_ffn_batched(
-                                    &mut gpus.devices[rank],
-                                    &layer.ffn_view(),
-                                    configs[rank].norm_eps,
-                                    &pbs_vec[rank].view(),
-                                    n,
-                                    dim,
-                                    configs[rank].hidden_dim,
-                                    q8_flags[rank],
-                                    q8_flags[rank],
-                                    BatchEpilogue::Partial(partials[rank]),
-                                    DflashFusionCtx::Off,
-                                    DenseBatchMath::Product,
-                                )
-                            {
+                            if let Err(e) = layer.ffn_rows(
+                                &mut gpus.devices[rank],
+                                configs[rank].norm_eps,
+                                &pbs_vec[rank].view(),
+                                n,
+                                dim,
+                                q8_flags[rank],
+                                q8_flags[rank],
+                                MlpOutput::Write(partials[rank]),
+                                DflashFusionCtx::Off,
+                                DenseBatchMath::Product,
+                            ) {
                                 process_res = Err(e);
                                 break;
                             }
@@ -5458,22 +5409,18 @@ fn forward_prefill_dense_tp_batched(
                             else {
                                 unreachable!();
                             };
-                            if let Err(e) =
-                                hipfire_dispatch::pipeline::batched::execute_swiglu_ffn_batched(
-                                    &mut gpus.devices[rank],
-                                    &layer.ffn_view(),
-                                    configs[rank].norm_eps,
-                                    &pbs_vec[rank].view(),
-                                    n,
-                                    dim,
-                                    configs[rank].hidden_dim,
-                                    q8_flags[rank],
-                                    q8_flags[rank],
-                                    BatchEpilogue::Partial(partials[rank]),
-                                    DflashFusionCtx::Off,
-                                    DenseBatchMath::Product,
-                                )
-                            {
+                            if let Err(e) = layer.ffn_rows(
+                                &mut gpus.devices[rank],
+                                configs[rank].norm_eps,
+                                &pbs_vec[rank].view(),
+                                n,
+                                dim,
+                                q8_flags[rank],
+                                q8_flags[rank],
+                                MlpOutput::Write(partials[rank]),
+                                DflashFusionCtx::Off,
+                                DenseBatchMath::Product,
+                            ) {
                                 process_res = Err(e);
                                 break;
                             }
@@ -5885,11 +5832,14 @@ impl Qwen35Bindings<'_> {
         )
     }
 
-    fn dense_ffn(&self) -> Result<hybrid::SwigluFfnOp<'_>, DispatchError> {
-        match self.program().dense_ffn(self.layer) {
-            Some(Step::SwigluFfn(op)) => Ok(op),
-            _ => Err(DispatchError::Hip("dense FFN stage on a MoE layer".into())),
-        }
+    fn dense_ffn(&self) -> Result<GatedMlpOp<'_>, DispatchError> {
+        super::program::dense_ffn(
+            &super::program::hybrid_dims(self.config),
+            self.s,
+            self.layer,
+            MlpOutput::Residual,
+        )
+        .ok_or_else(|| DispatchError::Hip("dense FFN stage on a MoE layer".into()))
     }
 }
 
@@ -6401,7 +6351,7 @@ fn moe_combine_next_rms_enabled(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwe
 
 /// Single-GPU decode layer loop over the declarative layer program
 /// (`super::program`): per layer one mixer step (`DeltaNetMixer` or
-/// `GatedAttention`) and one FFN step (`SwigluFfn`, or the sealed MoE call).
+/// `GatedAttention`) and one FFN step (`GatedMlp`, or the sealed MoE call).
 fn forward_scratch_layers_lowered(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -6460,10 +6410,9 @@ fn forward_scratch_layers_lowered(
             tap,
         );
         execute_steps(gpu, &ctx, &[mixer]).map_err(|e| HipError::new(0, &e.to_string()))?;
-        match binding.dense_ffn(layer) {
-            Some(ffn) => {
-                execute_steps(gpu, &ctx, &[ffn]).map_err(|e| HipError::new(0, &e.to_string()))?
-            }
+        match super::program::dense_ffn(&binding.dims, s, layer, MlpOutput::Residual) {
+            Some(ffn) => execute_steps(gpu, &ctx, &[Step::GatedMlp(ffn)])
+                .map_err(|e| HipError::new(0, &e.to_string()))?,
             None => {
                 let (ffn, ffn_norm) = match layer {
                     LayerWeights::DeltaNetMoe(l) => (&l.ffn, &l.ffn_norm),

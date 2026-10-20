@@ -136,9 +136,6 @@ pub enum Step<'a> {
     /// Hybrid decoder gated full-attention sublayer.
     #[cfg(feature = "deltanet")]
     GatedAttention(crate::pipeline::hybrid::GatedAttentionOp<'a>),
-    /// Dense SwiGLU FFN sublayer.
-    #[cfg(feature = "deltanet")]
-    SwigluFfn(crate::pipeline::hybrid::SwigluFfnOp<'a>),
     /// Complete validated MoE program; granular operands come from its shared lowerer.
     Moe(sealed_moe::SealedMoeCall<'a>),
     /// Validated granular MoE stage; the sealed call is still the public authority.
@@ -180,7 +177,7 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
         | Step::Scale(_)
         | Step::Softcap(_) => None,
         #[cfg(feature = "deltanet")]
-        Step::DeltaNetMixer(_) | Step::GatedAttention(_) | Step::SwigluFfn(_) => None,
+        Step::DeltaNetMixer(_) | Step::GatedAttention(_) => None,
     }
 }
 
@@ -1733,8 +1730,6 @@ pub(crate) fn launch_op_rows(
         Step::DeltaNetMixer(op) => crate::pipeline::hybrid::execute_deltanet_mixer(gpu, ctx, op),
         #[cfg(feature = "deltanet")]
         Step::GatedAttention(op) => crate::pipeline::hybrid::execute_gated_attention(gpu, ctx, op),
-        #[cfg(feature = "deltanet")]
-        Step::SwigluFfn(op) => crate::pipeline::hybrid::execute_swiglu_ffn(gpu, ctx, op),
     }
 }
 fn rmsnorm_out<'a>(step: &Step<'a>) -> &'a rdna_compute::GpuTensor {

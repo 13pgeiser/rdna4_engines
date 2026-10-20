@@ -97,8 +97,6 @@ pub enum OpKind {
     DeltaNetMixer = 29,
     /// [`Step::GatedAttention`] (hybrid decoder full attention).
     GatedAttention = 30,
-    /// [`Step::SwigluFfn`] (hybrid decoder dense FFN).
-    SwigluFfn = 31,
     /// Hand-route ops with no `Step` variant yet (dense TP decode): residual add.
     ResidualAdd = 1000,
     /// [`Step::SiluMul`]; also the hand-route SiLU-mul.
@@ -141,8 +139,6 @@ pub fn op_kind_of(step: &Step<'_>) -> OpKind {
         Step::DeltaNetMixer(..) => OpKind::DeltaNetMixer,
         #[cfg(feature = "deltanet")]
         Step::GatedAttention(..) => OpKind::GatedAttention,
-        #[cfg(feature = "deltanet")]
-        Step::SwigluFfn(..) => OpKind::SwigluFfn,
         Step::SiluMul { .. } => OpKind::SiluMul,
     }
 }
@@ -555,7 +551,6 @@ mod tests {
             (OpKind::GatedMlp, 28),
             (OpKind::DeltaNetMixer, 29),
             (OpKind::GatedAttention, 30),
-            (OpKind::SwigluFfn, 31),
             (OpKind::ResidualAdd, 1000),
             (OpKind::SiluMul, 1001),
             (OpKind::Argmax, 1002),

@@ -21,18 +21,29 @@ crate keeps:
 
 Single-GPU decode (`forward_scratch_layers_lowered`) runs each layer as
 
-    [DeltaNetMixer | GatedAttention, SwigluFfn | Moe]
+    [DeltaNetMixer | GatedAttention, GatedMlp | Moe]
 
-The new ops live in `hipfire-dispatch/src/pipeline/hybrid.rs`:
+The mixers live in `hipfire-dispatch/src/pipeline/hybrid.rs`; the dense FFN
+is the shared `GatedMlp` op on its `Product` ladder
+(`hipfire-dispatch/src/pipeline/gated_mlp.rs`, HIPF-142, design note
+`docs/design/gated-mlp-op.md` slice 4):
 
-| Step | Stages | Route choices owned by `hybrid` |
+| Step | Stages | Route choices owned by dispatch |
 |---|---|---|
 | `DeltaNetMixer` | `project` → `prepare` → `recur` → `gated_norm` → `output` | QKVZA scalar prep, conv + QK norm, conv scalar prep, compact QK (2:1, 3:1), FP32/Q8/Q8-compact/Q4 state, fused gated norm + MQ rotate |
 | `GatedAttention` | `project` → `attend` → `output` | fused FA prep, Q8 KV-write fold, TriAttention tap, compaction offset, fused gate + MQ-rotate epilogue |
-| `SwigluFfn` | `project` → `down` | MQ SiLU·rotate + SwiGLU-residual GEMV, HFQ residual GEMV, plain GEMV + add for the rotated formats (MFP4, MQ8, MQ4G128, ParoQ4G128, …), `memory.offload_exec=cpu` split |
+| `GatedMlp` (`Product`) | `project` → `down` | `Residual`: MQ SiLU·rotate + SwiGLU-residual GEMV, HFQ residual GEMV, plain GEMV + add for the rotated formats (MFP4, MQ8, MQ4G128, ParoQ4G128, …), `memory.offload_exec=cpu` split. `Write` (dense-TP partial): SiLU·mul + plain GEMV |
 
 MoE layers keep `moe_ffn_dispatch` (the sealed MoE program with its CPU
 expert splice).
+
+The same `Product` op serves the batched rows (prefill, DFlash verify, the
+dense-TP prefill partial): `gated_mlp::execute_product_rows` takes it with a
+`ProductRows` context (the chunk's `BatchScratch`, the WMMA flags,
+`DflashFusionCtx`, `DenseBatchMath`) and runs slice 2's batched producer/GEMM
+ladder, `Residual` as the residual epilogue and `Write(partial)` as the TP
+`Partial` epilogue. It is the only entry to that ladder; the qwen35 binding is
+`{DeltaNet,FullAttn}LayerWeights::ffn_rows`.
 
 The executor bodies were moved from current beta's `Qwen35Bindings` super-op
 handlers. Every gate exists once:
@@ -60,8 +71,8 @@ Left for later slices: the hand arms (`HIPFIRE_FORWARD_LOWERED=0`, DFlash
 hidden-state capture, VL mrope, `memory.offload_exec=cpu` spills that own
 host CPU weights) and the MTP head.
 `hipfire_runtime::llama::weight_gemv_swiglu_residual` still serves those
-hand arms and the other architectures. `hybrid::swiglu_down_residual` is
-its dispatch twin: same kernels, the same calibration taps per token
+hand arms and the other architectures. The `Product` ladder's residual down
+is its dispatch twin: same kernels, the same calibration taps per token
 (one for MQ, two for HFQ, three for the plain-GEMV fallback). In the
 fallback arm, `GemvFamily::run_auto` prepares each rotation's own sign
 tables where the runtime's `weight_gemv` does it explicitly.
