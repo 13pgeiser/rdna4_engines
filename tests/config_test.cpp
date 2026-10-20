@@ -435,7 +435,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--placement", { "all_vram" } }, { "--checkpoint-interval", { "256" } },
         { "--prefill-span", { "2" } },
         { "--checkpoint-slots", { "4" } }, { "--checkpoint-policy", { "tip-only" } },
-        { "--num-speculative-tokens", { "2" } }, { "--draft-window", { "fixed" } },
+        { "--num-speculative-tokens", { "2" } }, { "--draft-window", { "fixed" } }, { "--draft-short-from", { "4" } },
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
         { "--served-model-name", { "m" } }, { "--mm-max-patches", { "1024" } },
         { "--control-vector", { "off" } },

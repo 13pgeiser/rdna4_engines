@@ -117,6 +117,7 @@ struct RadBuilder {
     std::string    drafter_name;
     bool           drafter_shared = false;
     int            drafter_pos = -1;
+    int64_t        drafter_short = 0;     /* rad_drafter_short_block */
 
     /* The buffers named to rad_buf_concurrent: the ones a second lane touches. */
     std::vector<rad_buf> concurrent;
@@ -361,6 +362,15 @@ struct ChainOn {
     explicit ChainOn(int on) { g_chain_on = on; }
     ~ChainOn() { g_chain_on = 0; }
 };
+
+extern "C" int rad_drafter_short_block(RadBuilder* b, int64_t block) {
+    const int64_t full = b ? (b->drafter.block > 0 ? b->drafter.block : b->drafter.depth + 1) : 0;
+    if (!b || b->drafter.kind != RAD_DRAFT_BLOCK || block >= full ||
+        block - (full - b->drafter.depth) < 1)
+        return RAD_E_STATE;
+    b->drafter_short = block;
+    return RAD_OK;
+}
 extern "C" int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d) {
     if (!b || !d || !d->name || !d->modalities) return RAD_E_INVAL;
     if (d->modalities == RAD_MM_AUDIO) {

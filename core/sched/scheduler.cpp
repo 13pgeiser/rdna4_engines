@@ -2491,6 +2491,17 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
     return n_draft_rows;
 }
 
+int Scheduler::decoded_seqs() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    int n = 0;
+    for (const StepEntry& e : plan_.e) {
+        if (!e.produces_token || e.slot < 0 || (size_t)e.slot >= reqs_.size()) continue;
+        const SchedReq& s = *reqs_[(size_t)e.slot];
+        if (s.req && s.req->state == ReqState::Running && s.running) ++n;
+    }
+    return n;
+}
+
 const Request* Scheduler::block_req(const BlockSeq& d) const { return live_req(d.slot, d.seq); }
 const Request* Scheduler::serial_req(const SerialSeq& m) const { return live_req(m.slot, m.seq); }
 

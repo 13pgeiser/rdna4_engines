@@ -392,6 +392,8 @@ public:
      * for drafters that did not ask. */
     bool           drafter_shared_kv = false;
     int32_t        drafter_pos_offset = 0;
+    /* A block drafter's shorter block (rad_drafter_short_block), 0 when it serves only its own. */
+    int64_t        drafter_short_block = 0;
 
     /* The declared media encoder (rad_declare_encoder). `modalities == 0` when none: every
      * text-only program, and every deployment with RadBuildCtx::max_enc_patches 0.
@@ -898,6 +900,9 @@ struct Config {
      * VRAM and still decode one token a step. */
     int     n_spec = -1;                /* --num-speculative-tokens; -1 = auto, 0 = off */
     DraftWindow draft_window = kDraftWindowDefault;   /* --draft-window */
+    /* A block drafter's short block (rad_drafter_short_block) from this many decoding sequences in
+     * the step just run; 0 never. Ignored without a drafter that declares one. */
+    int64_t draft_short_from = 0;       /* --draft-short-from */
 
     /* ---------------- KL DIVERGENCE AGAINST A REFERENCE (core/kld.h) ----------------
      *

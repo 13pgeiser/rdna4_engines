@@ -338,6 +338,9 @@ private:
      * string because RadDrafterDecl::name points into the Program. */
     RadDrafterDecl       drafter_{};
     std::string          drafter_name_;
+    /* The block drafter's shorter block (rad_drafter_short_block), 0 when it has none or
+     * --draft-short-from is 0. */
+    int64_t              drafter_short_ = 0;
 
     /* Serial driver (spec §10): `depth` dependent passes after the step commits, each embedding
      * the previous proposal. MTP, EAGLE and Medusa-serial have this shape. */

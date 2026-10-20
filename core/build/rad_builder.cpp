@@ -1915,6 +1915,33 @@ int Builder::lora_alias(const char* native, const char* from, const char* to, in
     return RAD_OK;
 }
 
+/* A block drafter's shorter block (rad_builder.h). Validated at declare: the core stages the block
+ * from it, and a block the plugin did not declare its ops at would fail the step. */
+int Builder::drafter_short_block(int64_t block) {
+    if (finished_) {
+        err(RAD_E_STATE, "drafter_short_block after declare finished");
+        return RAD_E_STATE;
+    }
+    if (prog_.drafter.kind != RAD_DRAFT_BLOCK) {
+        err(RAD_E_STATE, "drafter_short_block: %s. Only a BLOCK drafter proposes a block; declare "
+                         "it with rad_declare_drafter first.",
+            prog_.drafter.kind == RAD_DRAFT_NONE ? "no drafter is declared"
+                                                 : "the declared drafter is a SERIAL head");
+        return RAD_E_STATE;
+    }
+    const int64_t full = prog_.drafter.block > 0 ? prog_.drafter.block : prog_.drafter.depth + 1;
+    const int64_t lead = full - prog_.drafter.depth;     /* rows ahead of the proposing ones */
+    if (block >= full || block - lead < 1) {
+        err(RAD_E_INVAL, "drafter_short_block '%s': %lld rows. The short block must be shorter "
+                         "than the drafter's own (%lld) and still propose a token (more than %lld "
+                         "rows).", prog_.drafter_name.c_str(), (long long)block, (long long)full,
+            (long long)lead);
+        return RAD_E_INVAL;
+    }
+    prog_.drafter_short_block = block;
+    return RAD_OK;
+}
+
 void Builder::note_v(const char* f, va_list ap) {
     char msg[1024];
     vsnprintf(msg, sizeof msg, f ? f : "", ap);
@@ -2400,6 +2427,11 @@ int rad_lora_alias(RadBuilder* b, const char* native, const char* from, const ch
 }
 
 int rad_chain_on(void) { return rad_dev_chain_enabled(); }
+
+int rad_drafter_short_block(RadBuilder* b, int64_t block) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->drafter_short_block(block);
+}
 
 int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d) {
     if (!b) return RAD_E_INVAL;

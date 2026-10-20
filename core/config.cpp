@@ -158,6 +158,9 @@ static const Flag g_flags[] = {
     "                                    own operating point, which the plugin states. A container\n"
     "                                    with no draft head is unaffected -- auto resolves to 0." },
     { "--draft-window",       "MODE",   g_draft_window_help.c_str() },
+    { "--draft-short-from",   "N",      "a block drafter that also serves a shorter block runs it\n"
+                                        "from N decoding sequences on (0 never, the default): the\n"
+                                        "long block pays at one sequence, the short one at many" },
     { "--draft-model",        "PATH",   "NOT IMPLEMENTED -- merge the drafter at convert time" },
 
     { "--host",               "ADDR",   "listen address" },
@@ -652,6 +655,7 @@ int config_parse(int argc, char** argv, Config* c) {
                 return RAD_E_INVAL;
             }
         }
+        else if (S("--draft-short-from"))      { if (!num(0, INT32_MAX, &c->draft_short_from)) return RAD_E_INVAL; }
         else if (S("--draft-model")) {
             /* Refused, not ignored: separate draft models are not supported (spec §10), and the
              * drafter comes from the container (rad-convert --draft-model merges one in; an MTP
@@ -1087,6 +1091,8 @@ const ShowRow kShow[] = {
     { "--checkpoint-policy",  [](const Config& c) { return c.checkpoint_policy; } },
     { "--num-speculative-tokens", [](const Config& c) { return c.n_spec < 0 ? std::string("auto") : num(c.n_spec); } },
     { "--draft-window",       [](const Config& c) { return std::string(draft_window_name(c.draft_window)); } },
+    { "--draft-short-from",   [](const Config& c) {
+          return c.draft_short_from > 0 ? num(c.draft_short_from) : std::string("0 (never)"); } },
     { "--draft-model",        [](const Config&) { return std::string("not implemented (the container's own drafter)"); } },
     { "--host",               [](const Config& c) { return c.host; } },
     { "--port",               [](const Config& c) { return num(c.port); } },

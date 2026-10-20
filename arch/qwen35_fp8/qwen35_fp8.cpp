@@ -264,6 +264,7 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
     RAD_ARCH_TRY(drafter_geom(dg, m.g, meta, "DFlash2"));
 
     Dflash2::Config dc{};
+    dc.short_block = 1;   /* rad_drafter_short_block below */
     dc.n_taps   = m.n_taps;
     dc.block    = ctx->max_spec + 1;
     dc.taps     = rad_meta_geti(meta, "draft.dflash_config.conv_kernel_size", 2);
@@ -414,6 +415,7 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
         return RAD_E_FORMAT;
     }
     RAD_ARCH_TRY(rad_declare_drafter(b, &drf));
+    if (m.df.block_lo > 0) RAD_ARCH_TRY(rad_drafter_short_block(b, m.df.block_lo));
 
     rad_note(b, "DFlash2 drafter: %lld layers at absolute %d..%d, %lld heads / %lld kv x %lld, "
                 "ffn %lld, %s attention with a %lld-token window, %d trunk tap(s); one forward "

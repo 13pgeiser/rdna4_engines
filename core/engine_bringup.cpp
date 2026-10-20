@@ -1303,6 +1303,20 @@ int Engine::declare() {
     drafter_name_  = p0.drafter_name;
     drafter_.name  = drafter_name_.c_str();
     if (cfg_.n_spec <= 0) drafter_ = RadDrafterDecl{};
+    drafter_short_ = drafter_.kind == RAD_DRAFT_BLOCK && cfg_.draft_short_from > 0
+                   ? p0.drafter_short_block : 0;
+    if (cfg_.draft_short_from > 0 && drafter_.kind != RAD_DRAFT_NONE && !drafter_short_)
+        RAD_WARN("--draft-short-from %lld: '%s' declares no shorter block, so its block stays %lld",
+                 (long long)cfg_.draft_short_from, drafter_name_.c_str(),
+                 (long long)drafter_.block);
+    if (drafter_short_)
+        RAD_INFO("speculation: from %lld decoding sequences on, '%s' runs its short block of %lld "
+                 "row(s), %lld token(s), on the host's block driver", (long long)cfg_.draft_short_from,
+                 drafter_name_.c_str(),
+                 (long long)drafter_short_,
+                 (long long)(drafter_short_ - ((drafter_.block > 0 ? drafter_.block
+                                                                   : drafter_.depth + 1) -
+                                               drafter_.depth)));
     if (drafter_.kind != RAD_DRAFT_NONE) {
         /* A zero proposal handle means the sampler's token buffer: the head's logits go through
          * the ordinary sampler chain. */

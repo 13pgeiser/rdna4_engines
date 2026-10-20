@@ -6149,6 +6149,26 @@ void lint_qwen35_fp8_family(Fn declare, StepFn step, const RadModelMeta* meta, i
             const auto v = run_passes(b, step, all, rank, world);
             CHECK_PASSES(b, v);
             for (size_t i = 1; i < v.size(); ++i) CHECK(each_gemm_nt_once(b, *v[i]));
+            if (!block_drafter || block <= 4) continue;
+            /* The short block (rad_drafter_short_block): a query pass staged at 4 rows a sequence
+             * runs the short ops, its selector proposing 3; a block with no ops fails the step. */
+            CHECK_EQ(b.drafter_short, 4);
+            const auto ctx2 = context_pass(b, *ver);
+            const auto qs = query_pass(b, 4, b.drafter_short, b.drafter_short - 1);
+            const auto vs = run_passes(b, step, { ver.get(), ctx2.get(), qs.get() }, rank, world);
+            CHECK_PASSES(b, vs);
+            CHECK(vs[2]->step_fail.empty());
+            int64_t sel_steps = -1, sel_stride = -1;
+            for (const RecIssue& i : vs[2]->issues)
+                if (const RecOp* o = b.op_of(i.op); o && o->op == "dflash_select") {
+                    sel_steps = pint(o, "steps");
+                    sel_stride = pint(o, "anchor_stride");
+                }
+            CHECK_EQ(sel_steps, 3);
+            CHECK_EQ(sel_stride, 4);
+            const auto qbad = query_pass(b, 4, 6, 5);
+            const auto vb = run_passes(b, step, { qbad.get() }, rank, world);
+            CHECK(!vb[0]->step_fail.empty());
         }
 }
 

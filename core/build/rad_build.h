@@ -128,6 +128,7 @@ public:
     int         lora_root(const char* native, const char* spellings);
     int         lora_alias(const char* native, const char* from, const char* to, int64_t from_lo,
                            int64_t from_hi, int64_t to_lo);
+    int         drafter_short_block(int64_t block);
     int         declare_encoder(const RadEncoderDecl* d);
     int         declare_generator(const RadGeneratorDecl* d);
     int         declare_audio_generator(const RadAudioGenDecl* d);

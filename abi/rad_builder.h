@@ -686,6 +686,19 @@ int rad_drafter_shared_kv(RadBuilder* b, int pos_offset);
  * that decision. Additive export; RAD_ABI_VERSION does not move. */
 int rad_chain_on(void);
 
+/* A block drafter that also serves a shorter block: the plugin declared its query pass at `block`
+ * rows a sequence as well as at RadDrafterDecl::block, with the same anchor convention, so the
+ * core may stage a step's block at either. The short block proposes
+ * `block - (RadDrafterDecl::block - depth)` tokens. Called once, after rad_declare_drafter.
+ * Additive export; RAD_ABI_VERSION does not move.
+ *
+ * Why: the block is proposed whole, so its length is paid for every drafting sequence whatever
+ * each verifies. At one sequence a long block's extra drafts are nearly free and accepted often
+ * enough to pay; at many, the long block's drafter rows and its weaker first positions cost more
+ * than they bring (Qwen3.8-27B + DFlash2 at 16 streams: block 4 900 t/s, block 8 750-790). The
+ * core picks per step (--draft-short-from). */
+int rad_drafter_short_block(RadBuilder* b, int64_t block);
+
 /* ================================================================== the encoder */
 /* A media encoder the plugin runs on an encoder pass (RadBatch::enc). The core drives the pass and
  * reads its result, so the plugin declares it. A plugin that declares none serves text only, and

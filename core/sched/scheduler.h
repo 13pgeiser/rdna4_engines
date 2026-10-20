@@ -361,6 +361,9 @@ public:
      * in the order block_query() emits them. */
     int block_begin(int block, int depth, int window, int32_t mask, BlockRow* out, int max,
                     bool on_card = false);
+    /* How many running sequences the step just run decoded (produced a token for), the load a
+     * block drafter's block length is chosen by. Read before block_begin(). */
+    int decoded_seqs() const;
     const RadBatch* block_context(int step);
     const RadBatch* block_query(int step);
     void block_end();
