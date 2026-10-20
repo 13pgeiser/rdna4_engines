@@ -6614,10 +6614,38 @@ TEST(gemma3_a_wide_prefill_runs_in_two_pieces_with_its_boundaries_on_the_second_
                 CHECK_EQ(wide_taps, 0);
                 CHECK(!c.joins.empty());
                 for (const gemma3::Layer& l : m.layers) {
-                    CHECK(l.attn.ln_q.q8 == m.pipe_in.q8);
-                    CHECK(l.mlp.ln_gu.q8 == m.pipe_in.q8);
+                    CHECK(l.attn.ln_q.q8 == m.pipe_in.q8 && !l.attn.ln_q.shared_in && l.attn.ln_q.op_q);
+                    CHECK(l.mlp.ln_gu.q8 == m.pipe_in.q8 && !l.mlp.ln_gu.shared_in && l.mlp.ln_gu.op_q);
                 }
             }
+}
+
+/* Where the fused fp8 junctions do not resolve, a pipelined deployment falls back to the unfused
+ * step with every linear quantising its own input -- into the shared pair, which it therefore still
+ * fills: each q|k|v and gate|up GEMM is issued behind a quantiser writing its pair. */
+TEST(gemma3_without_fused_junctions_every_linear_quantises_into_what_it_reads) {
+    MetaKV mk = gemma3_meta();
+    const RadEncoding mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, rad::arch::RAD_MX_GROUP);
+    RadBuilder b;
+    b.encs = { { "blk.", mx } };
+    b.refuse = { "rmsnorm_quant_fp8" };
+    RadBuildCtx ctx = build_ctx(0, 2);
+    ctx.max_tok = 2048;
+    REQUIRE_EQ(stderr_of_rc([&] { return gemma3::declare(&b, mk.meta(), &ctx); }), RAD_OK);
+    const gemma3::Model& m = gemma3::g_model[0];
+    CHECK(!m.fuse_mx);
+    CHECK(!m.pipe_on);
+    const auto pf = kit(b, {}, { 64 });
+    const auto v = run_passes(b, gemma3::step, { pf.get() }, 0, 2);
+    CHECK_PASSES(b, v);
+    for (const gemma3::Layer& l : m.layers) {
+        CHECK(l.attn.ln_q.q8 == m.pipe_in.q8 && l.attn.ln_q.op_q && !l.attn.ln_q.shared_in);
+        CHECK(l.mlp.ln_gu.q8 == m.pipe_in.q8 && l.mlp.ln_gu.op_q && !l.mlp.ln_gu.shared_in);
+    }
+    int quant = 0;
+    for (const RecIssue& i : v[0]->issues)
+        if (const RecOp* o = b.op_of(i.op); o && o->op == "quant_act_fp8") ++quant;
+    CHECK(quant >= 2 * (int)m.layers.size());
 }
 
 /* The DFlash2 drafter: a block of 8 (depth 7, fixed), taps copied out after the named layers into

@@ -95,6 +95,10 @@ struct G3Linear {
     bool       mx = false;
     bool       a4 = false;       /* asymmetric int4 over the per-(row, 128) int8 activation */
     bool       shared_in = false;
+    /* Set before declare: an E4M3 (MXFP4) linear's input pair given by the caller (the pipelined
+     * prefill's one pair for every block) instead of one of its own. It keeps its own quantiser
+     * into it, so a step that does not write the pair by a fused junction still fills it. */
+    rad_buf    q8_into = 0, s8_into = 0;
 
     int  declare(RadBuilder* b, Names& nm, const Geom& g, const char* base,
                  std::initializer_list<const char*> src,
@@ -247,8 +251,8 @@ inline int G3Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
             s8 = in_from->s8;
             shared_in = true;
         } else {
-            q8 = decl_b(b, nm.f("%s.q8", base), mx ? RAD_F8E4M3 : RAD_I8, { g.max_tok, K });
-            s8 = decl_b(b, nm.f("%s.s8", base), RAD_F32, { g.max_tok, K / RAD_FP8_BLOCK });
+            q8 = mx && q8_into ? q8_into : decl_b(b, nm.f("%s.q8", base), mx ? RAD_F8E4M3 : RAD_I8, { g.max_tok, K });
+            s8 = mx && s8_into ? s8_into : decl_b(b, nm.f("%s.s8", base), RAD_F32, { g.max_tok, K / RAD_FP8_BLOCK });
             if (!q8 || !s8) return RAD_E_INVAL;
             op_q = rw(b, RAD_OP(b, mx ? "quant_act_fp8" : "quant_act_i8g",
                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", K),
@@ -391,6 +395,7 @@ int Gemma3Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
     g = geom; cls = cgeo; layer = l; kv = group; w = wire; attn_scale = scale;
     const int64_t qd = cls.q_dim(), kvd = cls.kv_dim();
     const char* pre = kLayers;
+    if (pipe_in) { ln_q.q8_into = pipe_in->q8; ln_q.s8_into = pipe_in->s8; }
 
     RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_norm.weight", l),      nm.ckpt("%s.%lld.input_layernorm.weight",   pre, (long long)l)));
     RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_q_norm.weight", l),    nm.ckpt("%s.%lld.self_attn.q_norm.weight",   pre, (long long)l)));
@@ -407,7 +412,7 @@ int Gemma3Attn::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const
 
     RAD_ARCH_TRY(ln_q.declare(b, nm, g, nm.f("blk.%d.attn_q", l),
                               { nm.ckpt("%s.%lld.self_attn.q_proj.weight", pre, (long long)l) },
-                              qd, g.n_embd, RAD_SHARD_ROW, grp_layer(l), w.h, w.q, {}, pipe_in));
+                              qd, g.n_embd, RAD_SHARD_ROW, grp_layer(l), w.h, w.q));
     const G3Linear* qin = &ln_q;   /* k and v read q's int8 pair */
     RAD_ARCH_TRY(ln_k.declare(b, nm, g, nm.f("blk.%d.attn_k", l),
                               { nm.ckpt("%s.%lld.self_attn.k_proj.weight", pre, (long long)l) },
@@ -654,6 +659,7 @@ struct Gemma3Mlp {
 int Gemma3Mlp::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Wire& wire) {
     g = geom; layer = l; w = wire;
     const char* pre = kLayers;
+    if (pipe_in) { ln_gu.q8_into = pipe_in->q8; ln_gu.s8_into = pipe_in->s8; }
 
     RAD_ARCH_TRY(map_copy (b, nm.f("blk.%d.ffn_norm.weight", l), nm.ckpt("%s.%lld.pre_feedforward_layernorm.weight", pre, (long long)l)));
     RAD_ARCH_TRY(map_copy (b, nm.f("blk.%d.ffn_post_norm.weight", l), nm.ckpt("%s.%lld.post_feedforward_layernorm.weight", pre, (long long)l)));
@@ -666,7 +672,7 @@ int Gemma3Mlp::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const 
                                { nm.ckpt("%s.%lld.mlp.gate_proj.weight", pre, (long long)l),
                                  nm.ckpt("%s.%lld.mlp.up_proj.weight", pre, (long long)l) },
                                2 * g.n_ff, g.n_embd, RAD_SHARD_ROW, grp_layer(l), w.h, w.gu,
-                               { g.n_ff, g.n_ff }, pipe_in));
+                               { g.n_ff, g.n_ff }));
     RAD_ARCH_TRY(ln_down.declare(b, nm, g, nm.f("blk.%d.ffn_down", l),
                                  { nm.ckpt("%s.%lld.mlp.down_proj.weight", pre, (long long)l) },
                                  g.n_embd, g.n_ff, RAD_SHARD_COL, grp_layer(l), w.ffn, w.h));
@@ -796,12 +802,10 @@ struct G3JunctionFP8 {
     rad_weight w = 0, wp = 0;
     int64_t    n = 0;
 
-    /* `shared_ok`: `into` reads the pipelined prefill's shared input pair, which this junction is
-     * then the writer of. */
     int declare(RadBuilder* b, const Geom& g, rad_buf x_, rad_buf res_, rad_weight w_,
-                const G3Linear& into, rad_weight wp_ = 0, bool shared_ok = false) {
+                const G3Linear& into, rad_weight wp_ = 0) {
         x = x_; res = res_; w = w_; wp = wp_; q = into.q8; s = into.s8; n = g.n_embd;
-        if (!into.mx || (into.shared_in && !shared_ok) || !q || !s || !w) return RAD_E_INVAL;
+        if (!into.mx || into.shared_in || !q || !s || !w) return RAD_E_INVAL;
         if (!rad_op_declared(b, "rmsnorm_quant_fp8")) return RAD_OK;
         op = RAD_OP(b, "rmsnorm_quant_fp8",
                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", n), RAD_F64("eps", g.eps),
@@ -1256,25 +1260,20 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* ---- the MXFP4 trunk's junctions, when every block's inputs are E4M3 pairs it can write. */
     if (g.n_layer > 0 && !m.fuse && !calib_dir()) {
         bool ok = true;
-        /* Under the pipelined prefill every q and gate|up reads the shared pair, which the
-         * junctions write; otherwise each owns its own. */
-        const bool own = !m.pipe_on;
         for (const Layer& lay : m.layers)
-            ok = ok && lay.attn.ln_q.mx && lay.attn.ln_q.shared_in != own && lay.attn.ln_k.shared_in &&
-                 lay.attn.ln_v.shared_in && lay.mlp.ln_gu.mx && lay.mlp.ln_gu.shared_in != own;
+            ok = ok && lay.attn.ln_q.mx && !lay.attn.ln_q.shared_in && lay.attn.ln_k.shared_in &&
+                 lay.attn.ln_v.shared_in && lay.mlp.ln_gu.mx && !lay.mlp.ln_gu.shared_in;
         if (ok) {
-            RAD_ARCH_TRY(m.jf0.declare(b, g, m.b_x, 0, m.layers[0].attn.w_norm, m.layers[0].attn.ln_q,
-                                       0, !own));
+            RAD_ARCH_TRY(m.jf0.declare(b, g, m.b_x, 0, m.layers[0].attn.w_norm, m.layers[0].attn.ln_q));
             ok = m.jf0.op != 0;
             for (int64_t l = 0; ok && l < g.n_layer; ++l) {
                 Layer& lay = m.layers[(size_t)l];
                 RAD_ARCH_TRY(lay.jf_am.declare(b, g, m.b_h, m.b_x, lay.mlp.w_norm, lay.mlp.ln_gu,
-                                               lay.attn.w_post, !own));
+                                               lay.attn.w_post));
                 ok = lay.jf_am.op != 0;
                 if (ok && l + 1 < g.n_layer) {
                     RAD_ARCH_TRY(lay.jf_ma.declare(b, g, m.b_h, m.b_x, m.layers[(size_t)l + 1].attn.w_norm,
-                                                   m.layers[(size_t)l + 1].attn.ln_q, lay.mlp.w_post,
-                                                   !own));
+                                                   m.layers[(size_t)l + 1].attn.ln_q, lay.mlp.w_post));
                     ok = lay.jf_ma.op != 0;
                 }
             }
@@ -1293,6 +1292,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         /* ... and the pieces' row-sliced linears are the E4M3 (MXFP4) path throughout. */
         for (const Layer& lay : m.layers)
             ok = ok && lay.attn.op_ar_ov && lay.mlp.op_ar_ov && lay.attn.ln_o.mx && lay.mlp.ln_down.mx;
+        if (!ok)
+            rad_note(b, "the pipelined prefill is off: it needs an MXFP4 trunk with the fused fp8 "
+                        "junctions and an overlap all-reduce for every block");
         m.pipe_on = ok;
     }
     if (m.pipe_on) {
@@ -1314,6 +1316,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             rad_op_writes(b, m.op_pipe_used, wr, 1);
         } else {
             m.pipe_on = false;   /* no way to put the first piece's seqused on the card */
+            rad_note(b, "the pipelined prefill is off: no plugin serves sub_i32");
         }
     }
 
@@ -1465,7 +1468,11 @@ static const int32_t* pipe_ready(RadCtx* c, const RadBatch* batch, Model& m, boo
         !kvg->block_table || !kvs->seqused || !kvg->seqused)
         return serial("a KV group without slots, tables or lengths");
     int32_t* d = (int32_t*)rad_buf_ptr(c, m.b_pipe_cu);
-    if (!d || !rad_buf_ptr(c, m.b_pipe_used)) return nullptr;
+    if (!d || !rad_buf_ptr(c, m.b_pipe_used)) {
+        rad_step_fail(c, "gemma3: the pipelined prefill's bounds have no storage");
+        *failed = true;
+        return nullptr;
+    }
     if (!m.pipe_tbl_tried) {
         m.pipe_tbl_tried = true;
         const int64_t n = m.g.max_tok + 1;
