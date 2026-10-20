@@ -164,6 +164,11 @@ void r4d_gemm_mxfp4a8_gemv_kernel(
 // each activation fragment once for both. r4d_selftest --perfmx, clocks warmed, TN 1 -> 2: 17408 x 5120
 // at 32 rows 125 -> 85 us, at 64 157 -> 122; 5120 x 8704 75 -> 56, 95 -> 75; 21504 x 5376 154 -> 111,
 // 183 -> 150; at 16 to 24 rows within a few percent either way. Four tiles spill past 32 rows.
+// Narrow or shallow weights lose with two (fewer blocks than the part has units, a short K a wave):
+// at 32..64 rows 1024 x 2048 +7..30 %, 2048 x 2048 +6..28 %, 2048 x 4096 +4..37 %, 6144 x 1536 at 32
+// rows +14..30 % (two repetitions each), so the launcher takes two from N 4096 and K 3072 only, where
+// every measured shape gained or held (4096 x 2048 even, 14336 x 4096 64 rows 120 -> 90 us,
+// 4096 x 7168 67 -> 55).
 template <bool ABLK, int RT, int TN = 1>
 __global__ __launch_bounds__(R4D_MXG_KW * 32)
 void r4d_gemm_mxfp4a8_gemvw_kernel(
@@ -279,8 +284,9 @@ void mxg_launch(long a, long ascale, long wq, long ws, long wref, long c, int M,
   const dim3 block(R4D_MXG_KW * 32);
   if (K % 128 == 0) {
     const int rt = (M + 15) / 16;
-    // Two column tiles a block from 25 rows (see the kernel); an odd tile count keeps one.
-    const bool tn2 = M > 24 && tiles % 2 == 0;
+    // Two column tiles a block from 25 rows on a wide and deep enough weight (see the kernel); an
+    // odd tile count keeps one.
+    const bool tn2 = M > 24 && tiles % 2 == 0 && N >= 4096 && K >= 3072;
 #define MXW_L(AB_, RT_, TN_) hipLaunchKernelGGL((r4d_gemm_mxfp4a8_gemvw_kernel<AB_, RT_, TN_>), \
                                                 dim3(tiles / TN_), block, 0, st, Ap, Sp, Wp, Zp, Rp, \
                                                 Cp, M, K, as_rs, lda, ldws, ldc)
