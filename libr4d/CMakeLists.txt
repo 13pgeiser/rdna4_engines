@@ -175,9 +175,6 @@ set(R4D_UNITS
   # Gemma 4's sandwich-norm joins (norm_add_norm, norm_add_norm_route, join_add_scale) and
   # expert_scale, each one kernel for a chain of small ones.
   "r4d_norm_join_bf16|"
-  # The experimental speed projection (core/cvec.h): one pass of h[s] -= s (h[s].v) v over the wide
-  # stream, with a per-row switch.
-  "r4d_hc_project|"
   "r4d_expert_scale_bf16|"
   # Runtime LoRA's two halves (lora_shrink, lora_expand), per-row adapter slot: scalar and tiled rows.
   "r4d_lora_bf16|"
