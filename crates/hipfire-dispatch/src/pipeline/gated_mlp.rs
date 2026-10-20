@@ -84,6 +84,18 @@ pub enum MlpLadder {
     SandwichWide,
 }
 
+impl MlpLadder {
+    /// Whether the ladder runs unchanged on an intermediate shard of its
+    /// weights (gate/up rows, down columns) and writes a partial sum. `Trunk`
+    /// admits only the `Write` output, which its consumer reduces.
+    /// `SandwichWide` is refused: its standalone use (Gemma 4 dense layers) is
+    /// the `PostNorm` epilogue, which norms the output before the residual
+    /// add, so a partial sum cannot pass it.
+    pub fn tp_shardable(self) -> bool {
+        matches!(self, Self::Trunk)
+    }
+}
+
 /// Fixed scratch of one op.
 #[derive(Clone, Copy)]
 pub struct GatedMlpScratch<'a> {

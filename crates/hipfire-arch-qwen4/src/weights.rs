@@ -3009,6 +3009,101 @@ impl Qwen4Weights {
             after_bytes: after,
         }))
     }
+
+    /// Keep only TP rank `rank` of `parts` of every dense FFN layer: gate/up
+    /// rows and down columns along the intermediate, as their manifest
+    /// policies (`ColumnShard { axis: 0 }`, `RowShard { axis: 1 }`) declare,
+    /// so the forward runs each layer at `intermediate / parts` and writes
+    /// this rank's partial sum. Every other weight stays whole (replicated).
+    /// The dense FFN is source-exact BF16 (unpacked), so a slice is plain
+    /// bytes. Run after any load-time replacement (requant, trunk overlay:
+    /// they read the source projection shape) and before the first forward
+    /// (the Gpu keys its lazy F16 weight shadows on the device pointer).
+    pub fn shard_dense_ffn(
+        &mut self,
+        gpu: &mut Gpu,
+        rank: usize,
+        parts: usize,
+    ) -> Result<(), String> {
+        if rank >= parts {
+            return Err(format!("TP rank {rank} is outside {parts} parts"));
+        }
+        for index in 0..self.layer_refs.len() {
+            let Qwen4FfnWeights::Dense(dense) = &self.layer_refs[index].ffn else {
+                continue;
+            };
+            let mut shards = Vec::with_capacity(3);
+            for reference in [&dense.gate, &dense.up, &dense.down] {
+                let context = &reference.name;
+                let policy = &self
+                    .manifest
+                    .entry(&reference.name, reference.layer)
+                    .ok_or_else(|| format!("{context}: no manifest entry"))?
+                    .policy;
+                let tensor = self.resident(reference).map_err(|e| e.to_string())?;
+                let [rows, cols] = reference.shape[..] else {
+                    return Err(format!(
+                        "{context}: shape {:?} is not a matrix",
+                        reference.shape
+                    ));
+                };
+                if tensor.dtype != DType::BF16 {
+                    return Err(format!("{context}: {:?} is not BF16", tensor.dtype));
+                }
+                let split = match policy {
+                    ShardPolicy::ColumnShard { axis: 0 } => rows,
+                    ShardPolicy::RowShard { axis: 1 } => cols,
+                    other => {
+                        return Err(format!("{context}: policy {other:?} is not an FFN split"))
+                    }
+                };
+                if split % parts != 0 {
+                    return Err(format!(
+                        "{context}: intermediate {split} is not divisible by {parts}"
+                    ));
+                }
+                let (start, end) = (rank * split / parts, (rank + 1) * split / parts);
+                let bytes = gpu.download_raw_bytes(tensor).map_err(|e| e.to_string())?;
+                let (bytes, shape) = if split == rows {
+                    let rows_bytes =
+                        hipfire_runtime::tp_shard::slice_uniform_rows(&bytes, rows, start, end)?;
+                    (rows_bytes, vec![end - start, cols])
+                } else {
+                    let cols_bytes = hipfire_runtime::tp_shard::slice_uniform_group_cols(
+                        &bytes, rows, cols, start, end, 1,
+                    )?;
+                    (cols_bytes, vec![rows, end - start])
+                };
+                let slot = self
+                    .taken_by_name
+                    .get(&reference.name)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .find(|&slot| {
+                        let key = &self.taken[slot].key;
+                        key.layer == reference.layer && key.device == self.device
+                    })
+                    .ok_or_else(|| format!("{context}: no resident handle"))?;
+                shards.push((slot, bytes, shape));
+            }
+            // Every slice of the layer is checked before any is installed.
+            for (slot, bytes, shape) in &shards {
+                let mut tensor = gpu.upload_raw(bytes, shape).map_err(|e| e.to_string())?;
+                tensor.dtype = DType::BF16;
+                replace_resident(gpu, &mut self.taken[*slot], Replacement::Tensor(tensor))?;
+            }
+            if let Qwen4FfnWeights::Dense(dense) = &mut self.layer_refs[index].ffn {
+                for (reference, (_, _, shape)) in [&mut dense.gate, &mut dense.up, &mut dense.down]
+                    .into_iter()
+                    .zip(shards)
+                {
+                    reference.shape = shape;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// What [`Qwen4Weights::apply_trunk_overlay`] did.

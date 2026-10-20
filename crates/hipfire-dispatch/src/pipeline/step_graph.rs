@@ -23,6 +23,7 @@
 //! retired (`18` `DenseFfn` and `20` `SandwichMlp`, both now `GatedMlp`). The
 //! `op_kind_ids_frozen` test pins every value.
 
+use super::gated_mlp::MlpLadder;
 use super::steps::Step;
 
 /// Dense op handle: the index of the op in [`StepGraph::ops`].
@@ -231,8 +232,30 @@ pub enum SplitRule {
         /// KV heads.
         kv_heads: usize,
     },
-    /// No declared split point (compound sandwich/MoE/DenseFfn): every operand
-    /// must be Whole.
+    /// Dense gated MLP `output = down(act(gate(n)) * up(n))`, `n` the
+    /// optional pre-norm of `input`. `input` must be Whole (the pre-norm needs
+    /// complete rows). gate and up `ColumnShard { axis: 0 }` with down
+    /// `RowShard { axis: 1 }` split the intermediate: every rank runs `ladder`
+    /// on its `intermediate / parts` slice and `output` is a Partial, which its
+    /// consumer reduces (an `Accumulate` fuses one `AllReduceAdd`, any other
+    /// Whole reader takes an `AllReduce`). All-`Replicate` weights, or a single
+    /// TP part, keep `output` Whole.
+    GatedMlp {
+        /// FFN input (pre-norm input when the op norms).
+        input: ResourceId,
+        /// `[intermediate, hidden]` gate weight.
+        gate: ResourceId,
+        /// `[intermediate, hidden]` up weight.
+        up: ResourceId,
+        /// `[hidden, intermediate]` down weight.
+        down: ResourceId,
+        /// Down-projection output.
+        output: ResourceId,
+        /// The kernel ladder the op runs; only a shard-safe ladder may split.
+        ladder: MlpLadder,
+    },
+    /// No declared split point (compound sandwich/MoE): every operand must be
+    /// Whole.
     Opaque,
 }
 
@@ -275,7 +298,8 @@ pub enum StepGraphError {
         /// The undeclared operand.
         operand: ResourceId,
     },
-    /// `Project.weight` is not a [`ResourceClass::Weight`] resource.
+    /// A `Project.weight` or `GatedMlp` weight is not a
+    /// [`ResourceClass::Weight`] resource.
     NotAWeight(ResourceId),
     /// More resources or ops than fit a dense `u32` id.
     TooMany,
@@ -355,7 +379,7 @@ impl StepGraph {
 
     /// Append an op in issue order; its id is its index. Every referenced
     /// resource must exist, rule operands must be a subset of `reads ∪ writes`,
-    /// and `Project.weight` must be a Weight resource.
+    /// and `Project.weight` and the `GatedMlp` weights must be Weight resources.
     pub fn add_op(&mut self, decl: OpDecl) -> Result<OpId, StepGraphError> {
         let id = OpId(u32::try_from(self.ops.len()).map_err(|_| StepGraphError::TooMany)?);
         let n = self.resources.len();
@@ -378,6 +402,13 @@ impl StepGraph {
                 Err(StepGraphError::RuleOperandNotDeclared { operand: r })
             }
         };
+        let check_weight = |r: ResourceId| -> Result<(), StepGraphError> {
+            check_operand(r)?;
+            match self.resources[r.0 as usize].class {
+                ResourceClass::Weight { .. } => Ok(()),
+                _ => Err(StepGraphError::NotAWeight(r)),
+            }
+        };
         match decl.rule {
             SplitRule::Project {
                 weight,
@@ -387,11 +418,20 @@ impl StepGraph {
                 check_operand(weight)?;
                 check_operand(input)?;
                 check_operand(output)?;
-                if !matches!(
-                    self.resources[weight.0 as usize].class,
-                    ResourceClass::Weight { .. }
-                ) {
-                    return Err(StepGraphError::NotAWeight(weight));
+                check_weight(weight)?;
+            }
+            SplitRule::GatedMlp {
+                input,
+                gate,
+                up,
+                down,
+                output,
+                ..
+            } => {
+                check_operand(input)?;
+                check_operand(output)?;
+                for weight in [gate, up, down] {
+                    check_weight(weight)?;
                 }
             }
             SplitRule::Accumulate { dst, src } => {
@@ -683,5 +723,31 @@ mod tests {
             g.add_op(op(rule, &[x.0], &[x.0])).unwrap();
         }
         assert_eq!(g.ops().len(), 4);
+    }
+
+    #[test]
+    fn gated_mlp_weights_must_be_declared_weights() {
+        let mut g = StepGraph::new();
+        let x = g.add_resource(act(&[8])).unwrap();
+        let w = g.add_resource(weight(&[4, 8])).unwrap();
+        let y = g.add_resource(act(&[8])).unwrap();
+        let rule = |down| SplitRule::GatedMlp {
+            input: x,
+            gate: w,
+            up: w,
+            down,
+            output: y,
+            ladder: MlpLadder::Trunk,
+        };
+        assert_eq!(
+            g.add_op(op(rule(y), &[0, 1, 2], &[2])),
+            Err(StepGraphError::NotAWeight(y))
+        );
+        assert_eq!(
+            g.add_op(op(rule(w), &[0], &[2])),
+            Err(StepGraphError::RuleOperandNotDeclared { operand: w })
+        );
+        assert!(g.ops().is_empty());
+        g.add_op(op(rule(w), &[0, 1], &[2])).unwrap();
     }
 }

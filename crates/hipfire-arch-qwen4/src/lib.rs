@@ -53,6 +53,7 @@ pub mod lab_window;
 pub mod lane;
 pub mod lane_exec;
 pub mod mesh_bindings;
+pub mod mesh_tp;
 pub mod mtp_gpu;
 pub mod mtp_lanes;
 pub mod mtp_spec;
