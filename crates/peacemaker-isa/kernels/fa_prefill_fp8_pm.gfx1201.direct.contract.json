@@ -7,8 +7,8 @@
     "global_load_b32": 65,
     "global_load_u16": 8,
     "global_store_b32": 128,
-    "s_barrier_signal": 2,
-    "s_barrier_wait": 2,
+    "s_barrier_signal": 4,
+    "s_barrier_wait": 4,
     "s_endpgm": 1,
     "s_load_b128": 1,
     "s_load_b256": 1,
@@ -55,11 +55,11 @@
     "v_cvt_sr_*"
   ],
   "group_segment_fixed_bytes": 0,
-  "launch_dynamic_lds_bytes": 65536,
+  "launch_dynamic_lds_bytes": 32768,
   "require_wave32": true,
   "require_zero_private": true,
   "require_zero_spills": true,
   "sgpr_max": 104,
   "symbol": "attention_fp8_e4m3_fa2_gqa_f16_pm_gfx1201",
-  "vgpr_max": 256
+  "vgpr_max": 224
 }
