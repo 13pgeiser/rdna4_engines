@@ -917,7 +917,8 @@ TEST(plugin_surface) {
  * longer has a fallback or an oracle, which must be a decision, not an oversight (docs/OPS.md). */
 TEST(op_vocabulary) {
     static const char* kOps[] = {
-        "rmsnorm", "rmsnorm_p", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "mtp_enter",
+        "rmsnorm", "rmsnorm_p", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "hc_project",
+        "mtp_enter",
         "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract", "swiglu_clamped", "router_sigmoid_topk", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
         "kda_update",
         "layernorm", "add", "mul", "mul_weight", "silu_mul", "gelu_mul", "act_mul", "seg_mean",
@@ -5279,6 +5280,29 @@ TEST(hc_write_adds_into_the_unnormed_stream) {
     for (int i = 0; i < 8; ++i) CHECK_EQ(h.at(i), want[i]);
 }
 
+/* hc_project removes each stream's component along the layer's unit direction, and leaves a row
+ * whose switch is 0 untouched. The second half is the property the feature leans on: a request that
+ * did not ask for the vector computes exactly what it computes with no vector loaded. */
+TEST(hc_project_removes_the_direction_per_stream_and_skips_off_rows) {
+    /* Two rows, hc 2, n 2: v = (3,4)/5 is unit; the first stream of row 0 is entirely along it. */
+    T h(RAD_F32, {2, 4}); h.f({ 0.6f, 0.8f, 1.0f, 0.0f, 2.0f, 3.0f, 4.0f, 5.0f });
+    T v(RAD_F32, {2});    v.f({ 0.6f, 0.8f });
+    T on(RAD_I32, {2});   on.n({ 1, 0 });
+    A a; a.t(h).t(v).t(on).i("M", 2).i("n", 2).i("hc", 2).d("scale", 1.0).s("dtype", "f32");
+    CHECK_OK(run("hc_project", a));
+    /* Row 0, stream 0: (0.6, 0.8) is v itself, dot 1, so it becomes (0, 0). */
+    CHECK_NEAR(h.at(0), 0.0f, 1e-6);
+    CHECK_NEAR(h.at(1), 0.0f, 1e-6);
+    /* Row 0, stream 1: (1, 0) has dot 0.6, leaving (1, 0) - 0.6 * (0.6, 0.8). */
+    CHECK_NEAR(h.at(2), 0.64f, 1e-6);
+    CHECK_NEAR(h.at(3), -0.48f, 1e-6);
+    /* Row 1 asked for the stock model: bit for bit what it was. */
+    CHECK_EQ(h.at(4), 2.0f);
+    CHECK_EQ(h.at(5), 3.0f);
+    CHECK_EQ(h.at(6), 4.0f);
+    CHECK_EQ(h.at(7), 5.0f);
+}
+
 /* With `group`, hc_read also emits x as block-scaled fp8 taken over the stored (narrowed) x, and
  * with `rotate` the Hadamard-rotated twin: byte for byte what quant_act_fp8 and had_quant_act_fp8
  * produce from the stored x. */
@@ -7912,6 +7936,7 @@ std::vector<Geo> geometries() {
         G("hc_read", "M", 2, a.i("M", R).i("n", 8).i("hc", 2).i("lowrank", 2).d("eps", 1e-6)
                              .s("dtype", "f32").i("group", 4).i("rotate", 1)),
         G("hc_write", "M", 2, a.i("M", R).i("n", 8).i("hc", 2).s("dtype", "f32")),
+        G("hc_project", "M", 2, a.i("M", R).i("n", 8).i("hc", 2).d("scale", 1.0).s("dtype", "f32")),
         G("mtp_enter", "M", 2, a.i("M", R).i("n", 8).i("hc", 2).d("eps", 1e-6).s("dtype", "f32")),
         G("grid_embed", "M", 3, a.i("M", R).i("n", 8).i("side", 4).s("dtype", "f32")),
         G("grid_embed_aa", "M", 3, a.i("M", R).i("n", 8).i("side", 4).s("dtype", "f32")),
