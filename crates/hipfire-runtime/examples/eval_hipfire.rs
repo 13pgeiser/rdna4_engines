@@ -17,17 +17,33 @@
 //!                [--variant <name>=auto-from-model-path] \
 //!                [--arch <name>=auto-from-gpu] \
 //!                [--kv-mode <mode>=asym3] \
-//!                [--scoring-mode <per-token|prefill|prefill-whole>=prefill]
+//!                [--scoring-mode <per-token|prefill|prefill-whole|prefill-prompt>=prefill]
 //!
-//! Scoring modes (per `docs/plans/issue-113-quant-quality-eval.md` §5):
+//! Scoring modes (per `docs/plans/issue-113-quant-quality-eval.md` §5), with
+//! the kernel admission each one runs (qwen35). Hidden rows are captured
+//! either through `forward_prefill_batch`'s verify capture
+//! (`per_token_hidden_out`), which selects the speculative-verify kernels
+//! (`DispatchWorkload::SpeculativeVerify`; the GDN chunk scan is never
+//! admitted — the sequential GDN recurrence runs), or through
+//! `forward_prefill_batch_capture_hidden`, which is a plain prompt prefill
+//! plus output rows (`DispatchWorkload::Standard`, GDN chunk scan admitted
+//! wherever a plain prefill admits it):
 //!   prefill:   (default, canonical since 2026-05-11) forward_prefill_batch
 //!              (transformer stack batched, lm_head fan-out per scored
 //!              position). ~7× wall-clock vs per-token on gfx1100/gfx1151
 //!              9B Q3/Q4. Requires the model's LA dtype to be in
 //!              `is_batchable_la`'s OK set; auto-falls-back to per-token
 //!              inside `forward_prefill_batch` otherwise (e.g., MQ4-Lloyd,
-//!              HFP4G32, MFP4G32 — no batched kernel yet).
-//!   per-token: forward_scratch in a per-position loop. Historical baseline,
+//!              HFP4G32, MFP4G32 — no batched kernel yet). Split in two
+//!              calls (prefix, then the scored region): the prefix call
+//!              captures nothing and has plain prompt-prefill admission
+//!              (`DispatchWorkload::Standard`, GDN chunk scan admissible);
+//!              the scored-region call captures hidden rows through the
+//!              verify capture, so it runs the speculative-verify kernels
+//!              (`DispatchWorkload::SpeculativeVerify`, no GDN chunk scan).
+//!   per-token: forward_scratch in a per-position loop (single-token decode
+//!              kernels; no batched prefill admission, no GDN chunk scan,
+//!              no verify workload). Historical baseline,
 //!              retained for direct comparison against the 2026-05-08 kldseqs
 //!              under `results/2026-05-08/per-seq/*__per-token.kldseq`.
 //!   prefill-whole: (opt-in, qwen35 only) the whole window — prefix, scored
@@ -45,6 +61,18 @@
 //!              hipfire-runtime --lib eval_common`). Results
 //!              are NOT comparable with split-`prefill` kldseqs: KV/state
 //!              commit cadence differs, so compare like with like.
+//!              Its hidden rows are captured through `forward_prefill_batch`'s
+//!              verify capture, which selects the speculative-verify kernels
+//!              (`DispatchWorkload::SpeculativeVerify`, e.g. the sequential
+//!              GDN recurrence, never the chunk scan).
+//!   prefill-prompt: (opt-in, qwen35 only) the same whole-window plan as
+//!              `prefill-whole`, but captured through
+//!              `forward_prefill_batch_capture_hidden`, whose chunk planning,
+//!              admission (GDN chunk scan included) and dispatch workload
+//!              (`DispatchWorkload::Standard`) are exactly a plain prompt
+//!              prefill's. This is the mode that measures the production
+//!              prompt route; not comparable with `prefill-whole` kldseqs
+//!              where a route is capture-gated.
 //!
 //! Output: HFKSEQ format (see kldref_format.py) — per-sequence (mean, p99)
 //! KLD as fp64 pairs.
@@ -84,6 +112,21 @@ fn main() {
         scoring_mode: String,
         max_chunks: Option<usize>,
     }
+    // Every mode's kernel admission, shared by the --scoring-mode error and
+    // --help text (kept in sync with the module docs above).
+    const SCORING_MODE_HELP: &str = "\
+  scoring modes (qwen35 admission; prefill-whole / prefill-prompt are qwen35 only):
+    prefill         (default) two forward_prefill_batch calls: the prefix call is a plain
+                    prompt prefill (Standard workload, GDN chunk scan admissible); the
+                    scored-region call captures hidden rows through the verify capture
+                    (SpeculativeVerify kernels, no GDN chunk scan)
+    per-token       forward_scratch per position: single-token decode kernels, no batched
+                    prefill admission or GDN chunk scan
+    prefill-whole   whole window in ONE forward_prefill_batch call with verify capture
+                    (SpeculativeVerify kernels, no GDN chunk scan)
+    prefill-prompt  whole window in ONE forward_prefill_batch_capture_hidden call: plain
+                    production prompt-prefill admission (Standard workload, GDN chunk
+                    scan admitted where a plain prefill admits it)";
     let argv: Vec<String> = std::env::args().collect();
     let mut model: Option<PathBuf> = None;
     let mut ref_path: Option<PathBuf> = None;
@@ -139,9 +182,12 @@ fn main() {
             }
             "--scoring-mode" => {
                 let v = argv[i + 1].clone();
-                if !matches!(v.as_str(), "per-token" | "prefill" | "prefill-whole") {
+                if !matches!(
+                    v.as_str(),
+                    "per-token" | "prefill" | "prefill-whole" | "prefill-prompt"
+                ) {
                     eprintln!(
-                        "--scoring-mode must be one of: per-token prefill prefill-whole (got {v})"
+                        "--scoring-mode must be one of: per-token prefill prefill-whole prefill-prompt (got {v})\n{SCORING_MODE_HELP}"
                     );
                     std::process::exit(1);
                 }
@@ -153,7 +199,7 @@ fn main() {
                 i += 2;
             }
             "-h" | "--help" => {
-                eprintln!("Usage: eval_hipfire --model <path> --ref <path> --output <path> [--kv-mode asym3] [--kv-v q8] [--scoring-mode prefill|prefill-whole|per-token] [--max-chunks N]");
+                eprintln!("Usage: eval_hipfire --model <path> --ref <path> --output <path> [--kv-mode asym3] [--kv-v q8] [--scoring-mode prefill|prefill-whole|prefill-prompt|per-token] [--max-chunks N]\n{SCORING_MODE_HELP}");
                 std::process::exit(0);
             }
             other => {
@@ -204,6 +250,9 @@ fn main() {
             std::env::set_var("HIPFIRE_PREFILL_REUSE_PBS", "1");
         }
         if args.scoring_mode == "prefill-whole" {
+            std::env::set_var("HIPFIRE_PREFILL_REUSE_PBS", "1");
+        }
+        if args.scoring_mode == "prefill-prompt" {
             std::env::set_var("HIPFIRE_PREFILL_REUSE_PBS", "1");
         }
     }
@@ -298,14 +347,18 @@ fn main() {
     // row-count-gated prefill routes see the full window. It always pads the
     // final token and scores the same reference positions
     // (`eval_common::whole_window_plan`).
-    let whole_window = args.scoring_mode == "prefill-whole";
+    let whole_window =
+        args.scoring_mode == "prefill-whole" || args.scoring_mode == "prefill-prompt";
+    let prompt_capture = args.scoring_mode == "prefill-prompt";
     let pad_scoring_tail =
         hipfire_runtime::eval_common::scoring_tail_padded(whole_window, pad_scoring_tail);
     if pad_scoring_tail {
         eprintln!("eval_hipfire: quality-only final-token padding; scored positions unchanged");
     }
     if whole_window && !is_qwen35 {
-        eprintln!("eval_hipfire: --scoring-mode prefill-whole is implemented for qwen35 only");
+        eprintln!(
+            "eval_hipfire: --scoring-mode prefill-whole / prefill-prompt is implemented for qwen35 only"
+        );
         std::process::exit(1);
     }
     let effective_n_chunk = match args.max_chunks {
@@ -634,24 +687,42 @@ fn main() {
                 let h_buf = hidden_buf.as_ref().expect("hidden_buf in prefill mode");
                 let whole_scored;
                 let h_buf = if let Some(plan) = whole_plan.as_ref() {
-                    // prefill-whole: prefix, scored region and the final token
-                    // in one call; score rows `first_scored_row..` (the same
-                    // reference positions as the split mode).
-                    qwen35::forward_prefill_batch(
-                        &mut gpu,
-                        &weights,
-                        &config,
-                        &chunk_tokens[plan.rows.clone()],
-                        0,
-                        &mut kv_cache,
-                        &mut dn_state,
-                        &scratch,
-                        None,
-                        Some(h_buf),
-                        None,
-                        None,
-                    )
-                    .expect("forward_prefill_batch whole window");
+                    // prefill-whole / prefill-prompt: prefix, scored region and
+                    // the final token in one call; score rows
+                    // `first_scored_row..` (the same reference positions as the
+                    // split mode). prefill-prompt captures through the plain
+                    // prompt-prefill entry (production route); prefill-whole
+                    // keeps the verify capture.
+                    if prompt_capture {
+                        qwen35::forward_prefill_batch_capture_hidden(
+                            &mut gpu,
+                            &weights,
+                            &config,
+                            &chunk_tokens[plan.rows.clone()],
+                            0,
+                            &mut kv_cache,
+                            &mut dn_state,
+                            &scratch,
+                            h_buf,
+                        )
+                        .expect("forward_prefill_batch_capture_hidden whole window");
+                    } else {
+                        qwen35::forward_prefill_batch(
+                            &mut gpu,
+                            &weights,
+                            &config,
+                            &chunk_tokens[plan.rows.clone()],
+                            0,
+                            &mut kv_cache,
+                            &mut dn_state,
+                            &scratch,
+                            None,
+                            Some(h_buf),
+                            None,
+                            None,
+                        )
+                        .expect("forward_prefill_batch whole window");
+                    }
                     whole_scored = h_buf.sub_offset(
                         plan.first_scored_row * config.dim,
                         plan.scored_rows * config.dim,
