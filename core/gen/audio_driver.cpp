@@ -129,6 +129,9 @@ int64_t carve(const Sizes& z, int64_t (*bytes)[2], int n) {
         z.S * I,             /* R_ACC */
         z.NG * z.S * I,      /* R_SBT */
         z.NG * z.S * AudioDriver::kMaxStateWidth * I,   /* R_SIDX */
+        z.S * I,             /* R_PSLOT */
+        z.S * I,             /* R_PPOS */
+        z.S * I,             /* R_PUSED */
     };
     int64_t off = 0;
     for (int r = 0; r < n; ++r) {
@@ -499,6 +502,9 @@ void AudioDriver::base_batches(int64_t n_tok, int64_t n_seq, int32_t max_q, int3
         A.slot = dptr<int32_t>(ri, R_ESLOT);
         A.last_row = dptr<int32_t>(ri, R_LROW);
         A.prefix = dptr<int32_t>(ri, R_PREFIX);
+        A.prev_slot = dptr<int32_t>(ri, R_PSLOT);
+        A.prev_pos = dptr<int32_t>(ri, R_PPOS);
+        A.prev_used = dptr<int32_t>(ri, R_PUSED);
         B.agen_b = &A;
     }
 }
@@ -716,6 +722,11 @@ const RadBatch* AudioDriver::build_frame(const std::vector<Job*>& js, int step) 
             for (int64_t k = 0; k < pitch; ++k)
                 btab[e * pitch + k] = k < (int64_t)bt.size() ? bt[(size_t)k] : -1;
             used[e] = (int32_t)(p + 1);
+            /* The row before, whose hidden state the frame is sampled from: the prompt's last
+             * row for the first frame. */
+            hptr<int32_t>(R_PSLOT)[e] = slot_of(bt, p - 1, block_size_);
+            hptr<int32_t>(R_PPOS)[e] = (int32_t)(p - 1);
+            hptr<int32_t>(R_PUSED)[e] = (int32_t)p;
             hptr<int32_t>(R_ESLOT)[e] = nb_ * j.lane + b;
             hptr<int32_t>(R_LROW)[e] = (int32_t)e;
             max_ctx = std::max<int32_t>(max_ctx, (int32_t)(p + 1));
@@ -738,6 +749,7 @@ const RadBatch* AudioDriver::build_frame(const std::vector<Job*>& js, int step) 
     reg_[R_LANE].used = reg_[R_FRAME].used = reg_[R_CFG].used = L * 4;
     reg_[R_SEED].used = 2 * L * 4;
     reg_[R_ESLOT].used = reg_[R_LROW].used = S * 4;
+    reg_[R_PSLOT].used = reg_[R_PPOS].used = reg_[R_PUSED].used = S * 4;
     if (upload() < 0) return nullptr;
     base_batches(S, S, 1, max_ctx, step, true, pitch);
     for (size_t r = 0; r < ranks_.size(); ++r) {

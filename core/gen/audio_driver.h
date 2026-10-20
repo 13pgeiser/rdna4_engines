@@ -124,7 +124,8 @@ private:
     struct Region { int64_t off = 0, bytes = 0, used = 0; };
     enum { R_TOK, R_POS, R_CU, R_SLOT, R_BT, R_USED, R_LANE, R_LAST, R_FRAME, R_SEED,
            R_T, R_TN, R_CFG, R_PAIR, R_WLANE, R_FLAGS, R_WIDX, R_WF0, R_WNF, R_LCU, R_LSRC,
-           R_ESLOT, R_LROW, R_PREFIX, R_CTX, R_ACC, R_SBT, R_SIDX, R_N };
+           R_ESLOT, R_LROW, R_PREFIX, R_CTX, R_ACC, R_SBT, R_SIDX, R_PSLOT, R_PPOS, R_PUSED,
+           R_N };
     /* A hybrid model's stateful groups (linear-attention state, convolution history), each staged
      * as one block-table word a sequence (its slot) and its state_index row. */
     struct StateGroup { int32_t g = 0; int64_t width = 1; };

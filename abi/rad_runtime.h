@@ -466,6 +466,15 @@ typedef struct RadAudioGenBatch {
     /* VOCODE with RadAudioGenDecl::voc_chunk: the lane's first frame the pass reads, counted
      * from the first kept frame. 64 bits so that it starts past the struct's ABI 18 end. */
     int64_t         voc_frame0;
+
+    /* FRAME, one value per entry ([n_seq]): the row before the frame's own row -- the one whose
+     * hidden state the frame is sampled from -- as its KV slot, its position, and the context
+     * through it (position + 1). A model whose frame head attends at that row (Fish Audio
+     * drama-3's codebook tower, layers bound to the language model's full-attention group) issues
+     * those layers there, before the language model runs at the frame's own row. */
+    const int32_t*  prev_slot;
+    const int32_t*  prev_pos;
+    const int32_t*  prev_used;
 } RadAudioGenBatch;
 
 /* A window entry's flags on a WINDOW pass. FIRST is RAD_GEN_F_FIRST's bit and the others are clear

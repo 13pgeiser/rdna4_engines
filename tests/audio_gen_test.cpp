@@ -267,6 +267,10 @@ TEST(a_hybrid_model_of_one_branch_stages_its_state_groups) {
     CHECK_EQ(b->n_tok, (int64_t)1);
     CHECK_EQ(b->positions[0], 4);                          /* after the four prompt rows */
     CHECK_EQ(b->ctx_lens[0], 4);
+    /* The row the frame is sampled from: the prompt's last, at its slot. */
+    CHECK_EQ(b->agen_b->prev_pos[0], 3);
+    CHECK_EQ(b->agen_b->prev_used[0], 4);
+    CHECK_EQ(b->agen_b->prev_slot[0], b->kv[0].slot_mapping[0] - 1);
     CHECK_EQ(b->num_accepted[0], 1);
     int32_t st1 = 0, cv1 = 0;
     state_rows(b, &st1, &cv1);
