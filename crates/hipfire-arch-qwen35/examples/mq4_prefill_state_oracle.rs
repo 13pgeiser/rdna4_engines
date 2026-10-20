@@ -85,18 +85,18 @@ struct Manifest {
     entries: Vec<Entry>,
     // ---- Required codec/backend evidence (no inferred defaults) ----
     // Old manifests missing these fields fail to parse and fail closed.
-    codec: String,          // "q8" | "fp8": ACTUAL cache codec
-    backend: String,        // "vmm"
-    k_stride: usize,        // actual K bytes per token row
-    v_stride: usize,        // actual V bytes per token row
-    n_kv_heads: usize,      // geometry
-    head_dim: usize,        // geometry
-    max_seq: usize,         // logical bound used at construction
-    physical_cap: usize,    // physical token capacity used at construction
-    compact_offset: usize,  // must be 0: compacted caches are refused
-    prompt_text: String,    // exact prompt-file bytes (identity, not tokens)
+    codec: String,             // "q8" | "fp8": ACTUAL cache codec
+    backend: String,           // "vmm"
+    k_stride: usize,           // actual K bytes per token row
+    v_stride: usize,           // actual V bytes per token row
+    n_kv_heads: usize,         // geometry
+    head_dim: usize,           // geometry
+    max_seq: usize,            // logical bound used at construction
+    physical_cap: usize,       // physical token capacity used at construction
+    compact_offset: usize,     // must be 0: compacted caches are refused
+    prompt_text: String,       // exact prompt-file bytes (identity, not tokens)
     continuation_steps: usize, // teacher-forced continuation length
-    requested_mode: String, // "eager" | "graph": derived from GraphEnv
+    requested_mode: String,    // "eager" | "graph": derived from GraphEnv
     graph_env: GraphEnv,
     graph_witnesses: Vec<GraphWitness>,
 }
@@ -131,7 +131,11 @@ fn e4m3_decode(code: u8) -> f32 {
     } else {
         2f32.powi(e - 7) * (1.0 + m / 8.0)
     };
-    if s { -v } else { v }
+    if s {
+        -v
+    } else {
+        v
+    }
 }
 
 /// Checked Q8_0 token stride: n_kv_heads * (head_dim/32) * 34.
@@ -165,7 +169,9 @@ fn fp8_stride_checked(n_kv_heads: usize, head_dim: usize) -> Result<usize> {
     let scales = n_kv_heads
         .checked_mul(2)
         .ok_or("fp8 scales bytes overflow")?;
-    codes.checked_add(scales).ok_or_else(|| "fp8 row bytes overflow".into())
+    codes
+        .checked_add(scales)
+        .ok_or_else(|| "fp8 row bytes overflow".into())
 }
 
 /// Checked addressed-prefix bytes. Rejects wrapping before any readback so a
@@ -294,11 +300,9 @@ fn decode_checked(kind: &str, bytes: &[u8], geom: Option<(usize, usize)>) -> Res
             let (heads, dim) = geom.ok_or("fp8_kv_row needs geometry")?;
             let stride = fp8_stride_checked(heads, dim)?;
             if bytes.is_empty() || bytes.len() % stride != 0 {
-                return Err(format!(
-                    "fp8_kv_row wrong length {} (stride {stride})",
-                    bytes.len()
-                )
-                .into());
+                return Err(
+                    format!("fp8_kv_row wrong length {} (stride {stride})", bytes.len()).into(),
+                );
             }
             let mut v = Vec::with_capacity(bytes.len() / stride * heads * dim);
             for row in bytes.chunks_exact(stride) {
@@ -328,8 +332,7 @@ fn save(
     }
     let mut raw = vec![0u8; bytes];
     gpu.hip.memcpy_dtoh(&mut raw, &tensor.buf)?;
-    let values =
-        decode_checked(kind, &raw, None).map_err(|e| format!("{name}: {e}"))?;
+    let values = decode_checked(kind, &raw, None).map_err(|e| format!("{name}: {e}"))?;
     eprintln!("dump {name}: {} values, nonfinite=0", values.len());
     let file = format!("{:04}.bin", entries.len());
     fs::write(dir.join(&file), &raw)?;
@@ -415,7 +418,10 @@ fn cache_layout(kv: &KvCache) -> Result<(String, usize, usize)> {
         return Err("oracle requires a VMM-backed KV cache".into());
     }
     if kv.compact_offset != 0 {
-        return Err("oracle refuses a compacted KV cache (absolute addressing needs compact_offset == 0)".into());
+        return Err(
+            "oracle refuses a compacted KV cache (absolute addressing needs compact_offset == 0)"
+                .into(),
+        );
     }
     match kv.current_kv_mode()? {
         KvMode::Fp8 => {
@@ -567,10 +573,15 @@ fn snapshot(
             la += 1;
         } else {
             if k_bytes > kv.k_gpu[layer].buf.size() {
-                return Err(format!("{prefix}/key: addressed prefix exceeds mapped K allocation").into());
+                return Err(
+                    format!("{prefix}/key: addressed prefix exceeds mapped K allocation").into(),
+                );
             }
             if v_bytes > kv.v_gpu[layer].buf.size() {
-                return Err(format!("{prefix}/value: addressed prefix exceeds mapped V allocation").into());
+                return Err(format!(
+                    "{prefix}/value: addressed prefix exceeds mapped V allocation"
+                )
+                .into());
             }
             save_packed_kv(
                 gpu,
@@ -678,7 +689,10 @@ fn dump(args: &[String]) -> Result<()> {
     }
     let (codec_id, k_stride, v_stride) = cache_layout(&kv)?;
     if k_stride != v_stride {
-        return Err("K/V stride divergence: this oracle only qualifies indivisible same-stride codecs".into());
+        return Err(
+            "K/V stride divergence: this oracle only qualifies indivisible same-stride codecs"
+                .into(),
+        );
     }
     // Cross-check the pure stride helper against the live allocator stride.
     let helper_stride = if codec_id == "fp8" {
@@ -721,7 +735,9 @@ fn dump(args: &[String]) -> Result<()> {
         graph_witnesses: vec![],
     };
     eprintln!("oracle pre-call admitted ceiling={ceiling}; consult executed prefill receipt");
-    eprintln!("oracle codec={codec_id} mode={run_mode} k_stride={k_stride} v_stride={v_stride} cap={cap}");
+    eprintln!(
+        "oracle codec={codec_id} mode={run_mode} k_stride={k_stride} v_stride={v_stride} cap={cap}"
+    );
     qwen35::forward_prefill_batch(
         &mut gpu,
         &weights,
@@ -864,7 +880,9 @@ fn validate_manifest_pair(a: &Manifest, b: &Manifest) -> Result<()> {
             .into());
         }
         if m.backend != "vmm" {
-            return Err(format!("{side}: backend {} is not qualified (need vmm)", m.backend).into());
+            return Err(
+                format!("{side}: backend {} is not qualified (need vmm)", m.backend).into(),
+            );
         }
         if m.k_stride == 0 || m.v_stride == 0 {
             return Err(format!("{side}: manifest missing stride evidence").into());
@@ -873,7 +891,11 @@ fn validate_manifest_pair(a: &Manifest, b: &Manifest) -> Result<()> {
             return Err(format!("{side}: manifest missing capacity evidence").into());
         }
         if m.compact_offset != 0 {
-            return Err(format!("{side}: compacted cache (offset {}) is refused", m.compact_offset).into());
+            return Err(format!(
+                "{side}: compacted cache (offset {}) is refused",
+                m.compact_offset
+            )
+            .into());
         }
         if m.requested_mode != "eager" && m.requested_mode != "graph" {
             return Err(format!("{side}: unknown execution mode {:?}", m.requested_mode).into());
@@ -937,10 +959,10 @@ fn compare(args: &[String]) -> Result<()> {
             return Err(format!("truncated tensor dump: {}", x.name).into());
         }
         // Any nonfinite decoded value (including identical NaNs) is Err.
-        let va = decode_checked(&x.kind, &xb, geom)
-            .map_err(|e| format!("baseline {}: {e}", x.name))?;
-        let vb = decode_checked(&y.kind, &yb, geom)
-            .map_err(|e| format!("candidate {}: {e}", y.name))?;
+        let va =
+            decode_checked(&x.kind, &xb, geom).map_err(|e| format!("baseline {}: {e}", x.name))?;
+        let vb =
+            decode_checked(&y.kind, &yb, geom).map_err(|e| format!("candidate {}: {e}", y.name))?;
         if va.len() != vb.len() {
             failures.push(format!("{}: decoded lengths differ", x.name));
             continue;
@@ -1029,7 +1051,9 @@ fn compare(args: &[String]) -> Result<()> {
 /// model payload and initializes no GPU.
 fn plan() -> Result<()> {
     println!("mq4_prefill_state_oracle plan (diagnostic only, no model payload read):");
-    println!("codecs: explicit q8 or fp8 via existing config kv_mode; auto/other refused, no new key");
+    println!(
+        "codecs: explicit q8 or fp8 via existing config kv_mode; auto/other refused, no new key"
+    );
     println!(
         "q8 stride at Hkv2/D256: 2*(256/32)*34 = {}",
         q8_stride_checked(2, 256)?
@@ -1047,7 +1071,9 @@ fn plan() -> Result<()> {
     println!("  residual_hidden_x = scratch.x numel*4 f32 (residual pre-final-norm hidden;");
     println!("  normalized hidden is scratch.tmp, never mislabeled)");
     println!("guards: require_mapped_capacity(rows), rows<=physical_cap, checked rows*stride,");
-    println!("  per-tensor mapped allocation, mapped prefix capacity; packed rows decoded natively");
+    println!(
+        "  per-tensor mapped allocation, mapped prefix capacity; packed rows decoded natively"
+    );
     println!("  (head-major codes + f16 scales, finite-checked); corrupted scale/NaN code/wrong");
     println!("  length/nonfinite state or logits return Err");
     println!("graph arm requires: HIPFIRE_REPLAY_BACKEND=hip HIPFIRE_GRAPH=1 HIPFIRE_AR_GRAPH=1");
@@ -1058,9 +1084,15 @@ fn plan() -> Result<()> {
     println!("  trace lines at distinct advancing positions with successful calls and unchanged");
     println!("  binding (Main gate); flags or wrapper completion alone never qualify");
     println!("compare rules: same actual codec/backend/strides/geometry/capacity, same prompt");
-    println!("  bytes/tokens/prefill rows/teacher-forced continuation, same tensor names/kinds/extents,");
-    println!("  opposite eager/graph mode; ANY changed raw byte/truncation/missing tensor/nonfinite");
-    println!("  value (identical NaNs included) returns Err; never Q8-vs-FP8, never prefill-vs-AR;");
+    println!(
+        "  bytes/tokens/prefill rows/teacher-forced continuation, same tensor names/kinds/extents,"
+    );
+    println!(
+        "  opposite eager/graph mode; ANY changed raw byte/truncation/missing tensor/nonfinite"
+    );
+    println!(
+        "  value (identical NaNs included) returns Err; never Q8-vs-FP8, never prefill-vs-AR;"
+    );
     println!("  old manifests missing codec evidence are refused, never defaulted");
     Ok(())
 }
@@ -1221,7 +1253,9 @@ fn self_check() -> Result<()> {
     if oracle_capacity(KvMode::Q8, 1000, 0)? != (1016, 1016) {
         return Err("self-check: q8 historical rule changed".into());
     }
-    println!("self-check ok: strides 544/516, geometry + overflow rejections, derived 16640 fixture");
+    println!(
+        "self-check ok: strides 544/516, geometry + overflow rejections, derived 16640 fixture"
+    );
 
     // --- Comparator suite on synthetic dumps (host-only, no GPU) ---
     let root = std::env::temp_dir().join(format!("mq4_oracle_selfcheck_{}", std::process::id()));

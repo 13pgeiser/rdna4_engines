@@ -17,10 +17,10 @@
 //! therefore rotate by the identical angle values as the incumbent, with no libm reimplementation.
 //! Positions are physical `pbs.positions` plus the cache `compact_offset`, exactly the incumbent's.
 
+use crate::fa_prefill_pm::FaPrefillKvCodec;
 use crate::{DType, Gpu, GpuTensor};
 use hip_bridge::{HipError, HipResult};
 use std::ffi::c_void;
-use crate::fa_prefill_pm::FaPrefillKvCodec;
 
 pub const MODULE: &str = "fa_qprep_pm_gfx1201";
 pub const SYMBOL: &str = "attention_fa2_qprep_pm_gfx1201";
@@ -112,7 +112,13 @@ fn kernargs(
     eps: f32,
 ) -> [u8; KERNARG_BYTES] {
     let mut args = [0; KERNARG_BYTES];
-    for (offset, ptr) in [(0, interleaved), (8, q16), (16, gate), (24, q_norm), (32, angles)] {
+    for (offset, ptr) in [
+        (0, interleaved),
+        (8, q16),
+        (16, gate),
+        (24, q_norm),
+        (32, angles),
+    ] {
         args[offset..offset + 8].copy_from_slice(&(ptr as u64).to_le_bytes());
     }
     args[40..44].copy_from_slice(&(rows as i32).to_le_bytes());
@@ -235,7 +241,9 @@ impl Gpu {
 
     fn fa_pm_qprep_require_eager(&self) -> HipResult<()> {
         if self.graphs.capture_mode || self.replay.is_recording() {
-            return Err(err("eager only: capture and replay recording are unsupported"));
+            return Err(err(
+                "eager only: capture and replay recording are unsupported",
+            ));
         }
         if self.arch != "gfx1201" {
             return Err(err("requires gfx1201; no HIP fallback"));
@@ -335,8 +343,14 @@ mod tests {
             1e-6,
         );
         assert_eq!(args.len(), 48);
-        for (i, value) in [0x1000u64, 0x2000, 0x3000, 0x4000, 0x5000].into_iter().enumerate() {
-            assert_eq!(u64::from_le_bytes(args[i * 8..i * 8 + 8].try_into().unwrap()), value);
+        for (i, value) in [0x1000u64, 0x2000, 0x3000, 0x4000, 0x5000]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                u64::from_le_bytes(args[i * 8..i * 8 + 8].try_into().unwrap()),
+                value
+            );
         }
         assert_eq!(i32::from_le_bytes(args[40..44].try_into().unwrap()), 8191);
         assert_eq!(f32::from_le_bytes(args[44..48].try_into().unwrap()), 1e-6);
@@ -349,39 +363,95 @@ mod tests {
     #[test]
     fn admission_requires_every_gate_in_order() {
         use FaPrefillPmQprepRefusal as R;
-        let ok = |q: bool, pm: bool, arch: &str, rec: bool, cap: bool, legacy: bool, q8: bool,
-                  shape: (usize, usize, usize), rot: usize, rows: usize, ctx: usize| {
+        let ok = |q: bool,
+                  pm: bool,
+                  arch: &str,
+                  rec: bool,
+                  cap: bool,
+                  legacy: bool,
+                  q8: bool,
+                  shape: (usize, usize, usize),
+                  rot: usize,
+                  rows: usize,
+                  ctx: usize| {
             Gpu::fa_prefill_pm_qprep_admission(
-                q, pm, arch, rec, cap, legacy, q8.then_some(FaPrefillKvCodec::Q8_0),
-                shape.0, shape.1, shape.2, rot, rows, ctx,
+                q,
+                pm,
+                arch,
+                rec,
+                cap,
+                legacy,
+                q8.then_some(FaPrefillKvCodec::Q8_0),
+                shape.0,
+                shape.1,
+                shape.2,
+                rot,
+                rows,
+                ctx,
             )
         };
         let shape = (16, 2, 256);
-        assert_eq!(ok(true, true, "gfx1201", false, false, false, true, shape, 64, 64, 64), Ok(()));
-        assert_eq!(ok(true, true, "gfx1201", false, false, false, true, shape, 64, 8192, 262_144), Ok(()));
-        assert_eq!(ok(false, true, "gfx1201", false, false, false, true, shape, 64, 64, 64), Err(R::Disabled));
-        assert_eq!(ok(true, false, "gfx1201", false, false, false, true, shape, 64, 64, 64), Err(R::PmDisabled));
+        assert_eq!(
+            ok(true, true, "gfx1201", false, false, false, true, shape, 64, 64, 64),
+            Ok(())
+        );
+        assert_eq!(
+            ok(true, true, "gfx1201", false, false, false, true, shape, 64, 8192, 262_144),
+            Ok(())
+        );
+        assert_eq!(
+            ok(false, true, "gfx1201", false, false, false, true, shape, 64, 64, 64),
+            Err(R::Disabled)
+        );
+        assert_eq!(
+            ok(true, false, "gfx1201", false, false, false, true, shape, 64, 64, 64),
+            Err(R::PmDisabled)
+        );
         for arch in ["gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown"] {
             assert_eq!(
                 ok(true, true, arch, false, false, false, true, shape, 64, 64, 64),
                 Err(R::InventoryUnavailable)
             );
         }
-        assert_eq!(ok(true, true, "gfx1201", true, false, false, true, shape, 64, 64, 64), Err(R::Recording));
-        assert_eq!(ok(true, true, "gfx1201", false, true, false, true, shape, 64, 64, 64), Err(R::Capture));
-        assert_eq!(ok(true, true, "gfx1201", false, false, true, true, shape, 64, 64, 64), Err(R::LegacyRope));
-        assert_eq!(ok(true, true, "gfx1201", false, false, false, false, shape, 64, 64, 64), Err(R::KvFormat));
+        assert_eq!(
+            ok(true, true, "gfx1201", true, false, false, true, shape, 64, 64, 64),
+            Err(R::Recording)
+        );
+        assert_eq!(
+            ok(true, true, "gfx1201", false, true, false, true, shape, 64, 64, 64),
+            Err(R::Capture)
+        );
+        assert_eq!(
+            ok(true, true, "gfx1201", false, false, true, true, shape, 64, 64, 64),
+            Err(R::LegacyRope)
+        );
+        assert_eq!(
+            ok(true, true, "gfx1201", false, false, false, false, shape, 64, 64, 64),
+            Err(R::KvFormat)
+        );
         for bad in [(24, 4, 256), (16, 4, 256), (16, 2, 128)] {
-            assert_eq!(ok(true, true, "gfx1201", false, false, false, true, bad, 64, 64, 64), Err(R::Shape));
+            assert_eq!(
+                ok(true, true, "gfx1201", false, false, false, true, bad, 64, 64, 64),
+                Err(R::Shape)
+            );
         }
         for rot in [0, 32, 128] {
-            assert_eq!(ok(true, true, "gfx1201", false, false, false, true, shape, rot, 64, 64), Err(R::Rotary));
+            assert_eq!(
+                ok(true, true, "gfx1201", false, false, false, true, shape, rot, 64, 64),
+                Err(R::Rotary)
+            );
         }
         for rows in [0, 1, 63, 8193] {
-            assert_eq!(ok(true, true, "gfx1201", false, false, false, true, shape, 64, rows, 64), Err(R::Rows));
+            assert_eq!(
+                ok(true, true, "gfx1201", false, false, false, true, shape, 64, rows, 64),
+                Err(R::Rows)
+            );
         }
         for ctx in [0, 262_145] {
-            assert_eq!(ok(true, true, "gfx1201", false, false, false, true, shape, 64, 64, ctx), Err(R::Context));
+            assert_eq!(
+                ok(true, true, "gfx1201", false, false, false, true, shape, 64, 64, ctx),
+                Err(R::Context)
+            );
         }
     }
 
@@ -415,7 +485,10 @@ mod tests {
         assert_eq!(admit("gfx1201", Some(true), None), Ok(()));
         // The fold nests beneath PM: an explicit PM 0 refuses it whatever Q-prep says.
         assert_eq!(admit("gfx1201", Some(false), None), Err(R::PmDisabled));
-        assert_eq!(admit("gfx1201", Some(false), Some(true)), Err(R::PmDisabled));
+        assert_eq!(
+            admit("gfx1201", Some(false), Some(true)),
+            Err(R::PmDisabled)
+        );
         // An explicit Q-prep 0 kills the fold whatever PM says.
         assert_eq!(admit("gfx1201", None, Some(false)), Err(R::Disabled));
         assert_eq!(admit("gfx1201", Some(true), Some(false)), Err(R::Disabled));
@@ -441,7 +514,17 @@ mod tests {
             Gpu::fa_prefill_pm_qprep_admission(
                 enabled_fp8_kv(qprep, arch, PrefillRoute::FaPrefillPmQprep),
                 enabled_fp8_kv(pm, arch, PrefillRoute::FaPrefillPm),
-                arch, false, false, false, fp8, shape.0, shape.1, shape.2, 64, 4096, 4096,
+                arch,
+                false,
+                false,
+                false,
+                fp8,
+                shape.0,
+                shape.1,
+                shape.2,
+                64,
+                4096,
+                4096,
             )
         };
         // Unset follows the fp8 qualification: on at exact gfx1201 for both keys.
@@ -452,7 +535,10 @@ mod tests {
         assert_eq!(admit("gfx1201", None, Some(false)), Err(R::Disabled));
         // Explicit opt-in of both keys admits; an explicit PM 0 or Q-prep 0 refuses.
         assert_eq!(admit("gfx1201", Some(true), Some(true)), Ok(()));
-        assert_eq!(admit("gfx1201", Some(false), Some(true)), Err(R::PmDisabled));
+        assert_eq!(
+            admit("gfx1201", Some(false), Some(true)),
+            Err(R::PmDisabled)
+        );
         assert_eq!(admit("gfx1201", Some(true), Some(false)), Err(R::Disabled));
         // Other architectures: unset is off for both flags; an explicit pair lacks the inventory.
         for arch in ["gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown"] {
@@ -464,19 +550,34 @@ mod tests {
                 "{arch}"
             );
         }
-        let gate = |rec: bool, cap: bool, kv: Option<FaPrefillKvCodec>, shape: (usize, usize, usize),
-                    rot: usize, rows: usize, ctx: usize| {
+        let gate = |rec: bool,
+                    cap: bool,
+                    kv: Option<FaPrefillKvCodec>,
+                    shape: (usize, usize, usize),
+                    rot: usize,
+                    rows: usize,
+                    ctx: usize| {
             Gpu::fa_prefill_pm_qprep_admission(
-                true, true, "gfx1201", rec, cap, false, kv, shape.0, shape.1, shape.2, rot, rows, ctx,
+                true, true, "gfx1201", rec, cap, false, kv, shape.0, shape.1, shape.2, rot, rows,
+                ctx,
             )
         };
         assert_eq!(gate(false, false, fp8, shape, 64, 64, 64), Ok(()));
         assert_eq!(gate(true, false, fp8, shape, 64, 64, 64), Err(R::Recording));
         assert_eq!(gate(false, true, fp8, shape, 64, 64, 64), Err(R::Capture));
-        assert_eq!(gate(false, false, None, shape, 64, 64, 64), Err(R::KvFormat));
-        assert_eq!(gate(false, false, fp8, (24, 4, 256), 64, 64, 64), Err(R::Shape));
+        assert_eq!(
+            gate(false, false, None, shape, 64, 64, 64),
+            Err(R::KvFormat)
+        );
+        assert_eq!(
+            gate(false, false, fp8, (24, 4, 256), 64, 64, 64),
+            Err(R::Shape)
+        );
         assert_eq!(gate(false, false, fp8, shape, 32, 64, 64), Err(R::Rotary));
         assert_eq!(gate(false, false, fp8, shape, 64, 63, 64), Err(R::Rows));
-        assert_eq!(gate(false, false, fp8, shape, 64, 64, 262_145), Err(R::Context));
+        assert_eq!(
+            gate(false, false, fp8, shape, 64, 64, 262_145),
+            Err(R::Context)
+        );
     }
 }

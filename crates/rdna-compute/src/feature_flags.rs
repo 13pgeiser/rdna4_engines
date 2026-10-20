@@ -2691,12 +2691,21 @@ mod tests {
     #[test]
     fn fa_prefill_pm_defaults_to_qualification_with_explicit_override() {
         use crate::prefill_route_capabilities::{qualified, PrefillRoute};
-        for arch in ["gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown"] {
+        for arch in [
+            "gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown",
+        ] {
             let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
-            assert_eq!(unset.fa_prefill_pm, qualified(arch, PrefillRoute::FaPrefillPm));
+            assert_eq!(
+                unset.fa_prefill_pm,
+                qualified(arch, PrefillRoute::FaPrefillPm)
+            );
             assert_eq!(unset.fa_prefill_pm, arch == "gfx1201");
             assert!(!FeatureFlags::for_test(arch).fa_prefill_pm);
-            assert_eq!(unset.fa_prefill_pm_fp8_kv, arch == "gfx1201", "{arch}: fp8 default");
+            assert_eq!(
+                unset.fa_prefill_pm_fp8_kv,
+                arch == "gfx1201",
+                "{arch}: fp8 default"
+            );
             assert!(!FeatureFlags::for_test(arch).fa_prefill_pm_fp8_kv);
             for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
                 let flags = FeatureFlags::from_lookup(arch, |name| {
@@ -2716,7 +2725,9 @@ mod tests {
     fn moe_iu4_wide_tiles_defaults_to_qualification_with_explicit_override() {
         use crate::prefill_route_capabilities::{qualified, raw_inventory, PrefillRoute};
         const ROUTE: PrefillRoute = PrefillRoute::MoeIu4WideTiles;
-        for arch in ["gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown"] {
+        for arch in [
+            "gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown",
+        ] {
             let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
             assert_eq!(unset.moe_iu4_wide_tiles, qualified(arch, ROUTE), "{arch}");
             assert_eq!(unset.moe_iu4_wide_tiles, arch == "gfx1201", "{arch}");
@@ -2801,7 +2812,9 @@ mod tests {
     #[test]
     fn fa_prefill_pm_qprep_defaults_to_qualification_with_explicit_override() {
         use crate::prefill_route_capabilities::{qualified, PrefillRoute};
-        for arch in ["gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown"] {
+        for arch in [
+            "gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown",
+        ] {
             let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
             assert_eq!(
                 unset.fa_prefill_pm_qprep,
@@ -2809,7 +2822,11 @@ mod tests {
             );
             assert_eq!(unset.fa_prefill_pm_qprep, arch == "gfx1201");
             assert!(!FeatureFlags::for_test(arch).fa_prefill_pm_qprep);
-            assert_eq!(unset.fa_prefill_pm_qprep_fp8_kv, arch == "gfx1201", "{arch}: fp8 default");
+            assert_eq!(
+                unset.fa_prefill_pm_qprep_fp8_kv,
+                arch == "gfx1201",
+                "{arch}: fp8 default"
+            );
             assert!(!FeatureFlags::for_test(arch).fa_prefill_pm_qprep_fp8_kv);
             for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
                 let flags = FeatureFlags::from_lookup(arch, |name| {
@@ -2841,7 +2858,9 @@ mod tests {
                 _ => Err(()),
             })
         };
-        for arch in ["gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown"] {
+        for arch in [
+            "gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown",
+        ] {
             let gfx1201 = arch == "gfx1201";
             // Both unset: each resolves to its own qualification (on only on exact gfx1201),
             // so the pair is admitted by default exactly there.
@@ -2870,10 +2889,22 @@ mod tests {
             for (pm, want_pm) in [("0", false), ("1", true)] {
                 for (qprep, want_qprep) in [("0", false), ("1", true)] {
                     let flags = with(arch, Some(pm), Some(qprep));
-                    assert_eq!(flags.fa_prefill_pm, want_pm, "{arch}: pm={pm} qprep={qprep}");
-                    assert_eq!(flags.fa_prefill_pm_fp8_kv, want_pm, "{arch}: fp8 pm={pm} qprep={qprep}");
-                    assert_eq!(flags.fa_prefill_pm_qprep, want_qprep, "{arch}: pm={pm} qprep={qprep}");
-                    assert_eq!(flags.fa_prefill_pm_qprep_fp8_kv, want_qprep, "{arch}: fp8 pm={pm} qprep={qprep}");
+                    assert_eq!(
+                        flags.fa_prefill_pm, want_pm,
+                        "{arch}: pm={pm} qprep={qprep}"
+                    );
+                    assert_eq!(
+                        flags.fa_prefill_pm_fp8_kv, want_pm,
+                        "{arch}: fp8 pm={pm} qprep={qprep}"
+                    );
+                    assert_eq!(
+                        flags.fa_prefill_pm_qprep, want_qprep,
+                        "{arch}: pm={pm} qprep={qprep}"
+                    );
+                    assert_eq!(
+                        flags.fa_prefill_pm_qprep_fp8_kv, want_qprep,
+                        "{arch}: fp8 pm={pm} qprep={qprep}"
+                    );
                 }
             }
             // Q-prep 0 kills the fold whatever the PM flag says.

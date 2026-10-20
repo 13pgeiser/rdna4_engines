@@ -62,8 +62,8 @@ use hipfire_runtime::llama::fused_rmsnorm_rotate_for_mq;
 use hipfire_runtime::llama::fused_rmsnorm_rotate_mq_batched_for;
 use hipfire_runtime::llama::fused_rmsnorm_rotate_mq_f16_batched_for;
 use hipfire_runtime::llama::fused_silu_mul_rotate_mq_batched_for;
-use rdna_compute::norm::GdnScanOut;
 use rdna_compute::fa_prefill_pm::FaPrefillKvCodec;
+use rdna_compute::norm::GdnScanOut;
 use rdna_compute::prefill_route_capabilities;
 use rdna_compute::prefill_route_capabilities::PrefillRoute;
 
@@ -12592,10 +12592,7 @@ fn gfx12_fa_prep_admitted(
 fn fa_pm_kv_codec(kv_cache: &llama::KvCache) -> Option<FaPrefillKvCodec> {
     if kv_cache.quant_fp8 {
         Some(FaPrefillKvCodec::Fp8E4M3)
-    } else if kv_cache.quant_q8
-        && !kv_cache.quant_fp8
-        && kv_cache.tier_inputs().v_mode_bits == 8
-    {
+    } else if kv_cache.quant_q8 && !kv_cache.quant_fp8 && kv_cache.tier_inputs().v_mode_bits == 8 {
         Some(FaPrefillKvCodec::Q8_0)
     } else {
         None
@@ -12977,27 +12974,27 @@ pub(crate) fn batch_chunk_full_attn_attn(
         batch_chunk_fa_pm_qprep_prep(gpu, &layer.q_norm, &layer.k_norm, config, pbs, kv_cache, n)?;
         batch_chunk_fa_pm_qprep_direct(gpu, config, pbs, kv_cache, n, max_ctx_len, layer_idx)?;
     } else {
-    batch_chunk_full_attn_prepare(
-        gpu,
-        fa_attn_multirow,
-        layer,
-        config,
-        pbs,
-        s,
-        kv_cache,
-        n,
-        start_pos,
-        max_ctx_len,
-        ctx,
-        batch_semantics,
-        tree_verify,
-        kv_layer_idx,
-        layer_idx,
-        fusion,
-        gfx12_fa_prep,
-        gfx12_fa_prep_fp8q,
-        fa_gate_in_place,
-    )?;
+        batch_chunk_full_attn_prepare(
+            gpu,
+            fa_attn_multirow,
+            layer,
+            config,
+            pbs,
+            s,
+            kv_cache,
+            n,
+            start_pos,
+            max_ctx_len,
+            ctx,
+            batch_semantics,
+            tree_verify,
+            kv_layer_idx,
+            layer_idx,
+            fusion,
+            gfx12_fa_prep,
+            gfx12_fa_prep_fp8q,
+            fa_gate_in_place,
+        )?;
     }
 
     // 6–7. Batched KV write + flash attention (via dispatch). Split out of
@@ -13022,24 +13019,24 @@ pub(crate) fn batch_chunk_full_attn_attn(
         None => {
             // The F5 route already wrote K/V and ran the PM direct attention.
             if !fa_pm_qprep {
-            batch_chunk_fa_attend(
-                gpu,
-                config,
-                pbs,
-                s,
-                kv_cache,
-                n,
-                start_pos,
-                max_ctx_len,
-                ctx,
-                batch_semantics,
-                tree_verify,
-                layer_idx,
-                fa_attn_multirow,
-                commit_stride,
-                gfx12_fa_prep_fp8q,
-                pair_q8_writes,
-            )?;
+                batch_chunk_fa_attend(
+                    gpu,
+                    config,
+                    pbs,
+                    s,
+                    kv_cache,
+                    n,
+                    start_pos,
+                    max_ctx_len,
+                    ctx,
+                    batch_semantics,
+                    tree_verify,
+                    layer_idx,
+                    fa_attn_multirow,
+                    commit_stride,
+                    gfx12_fa_prep_fp8q,
+                    pair_q8_writes,
+                )?;
             }
             None
         }
@@ -14054,17 +14051,17 @@ fn batch_chunk_delta_net_moe(
             )?;
         }
         if iu4_prep.is_none() {
-        // AWQ-aware: next linear is LA's fused wqkv.
-        fused_rmsnorm_rotate_mq_batched_for(
-            gpu,
-            &pbs.x_batch,
-            &layer.attn_norm,
-            &layer.wqkv,
-            &pbs.x_rot_batch,
-            dim,
-            config.norm_eps,
-            n,
-        )?;
+            // AWQ-aware: next linear is LA's fused wqkv.
+            fused_rmsnorm_rotate_mq_batched_for(
+                gpu,
+                &pbs.x_batch,
+                &layer.attn_norm,
+                &layer.wqkv,
+                &pbs.x_rot_batch,
+                dim,
+                config.norm_eps,
+                n,
+            )?;
         }
     } else if is_paro {
         // PARO: need un-rotated x_norm available for per-weight
@@ -14697,7 +14694,7 @@ fn batch_chunk_delta_net_moe(
                         dn_state.ef_residual(delta_layer_idx),
                     )?
                 }
-                }
+            }
             StateQuant::Q4 => gpu.gated_delta_net_q4(
                 &pbs.dn_q_batch,
                 &pbs.dn_k_batch,
@@ -15199,17 +15196,17 @@ fn batch_chunk_full_attn_moe_prep(
             )?;
         }
         if iu4_prep.is_none() {
-        // AWQ-aware: next linear is wq (Q/K/V share input → same AWQ scale).
-        fused_rmsnorm_rotate_mq_batched_for(
-            gpu,
-            &pbs.x_batch,
-            &layer.attn_norm,
-            &layer.wq,
-            &pbs.x_rot_batch,
-            dim,
-            config.norm_eps,
-            n,
-        )?;
+            // AWQ-aware: next linear is wq (Q/K/V share input → same AWQ scale).
+            fused_rmsnorm_rotate_mq_batched_for(
+                gpu,
+                &pbs.x_batch,
+                &layer.attn_norm,
+                &layer.wq,
+                &pbs.x_rot_batch,
+                dim,
+                config.norm_eps,
+                n,
+            )?;
         }
     } else if qkv_is_paro {
         // PARO: rmsnorm into x_norm_batch (un-rotated). x_rot_batch
@@ -15547,24 +15544,24 @@ fn batch_chunk_full_attn_moe_finish(
         // exact chunk by the single-chunk wrapper; never set by the paired-chunk path).
         batch_chunk_fa_pm_qprep_direct(gpu, config, pbs, kv_cache, n, max_ctx_len, layer_idx)?;
     } else {
-    batch_chunk_fa_attend(
-        gpu,
-        config,
-        pbs,
-        s,
-        kv_cache,
-        n,
-        start_pos,
-        max_ctx_len,
-        ctx,
-        batch_semantics,
-        tree_verify,
-        layer_idx,
-        fa_attn_multirow,
-        None, // commit_stride: MoE finish keeps legacy cadence
-        false,
-        false,
-    )?;
+        batch_chunk_fa_attend(
+            gpu,
+            config,
+            pbs,
+            s,
+            kv_cache,
+            n,
+            start_pos,
+            max_ctx_len,
+            ctx,
+            batch_semantics,
+            tree_verify,
+            layer_idx,
+            fa_attn_multirow,
+            None, // commit_stride: MoE finish keeps legacy cadence
+            false,
+            false,
+        )?;
     }
     gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
     // wo + residual. Mirrors the dense FA wo dispatch at
@@ -21430,7 +21427,8 @@ mod tests {
             false,
             false,
         );
-        let policy = kv_mode::qwen35_policy_for_native(&kv_mode::QWEN35_HFQ_POLICY, "auto", auto_native);
+        let policy =
+            kv_mode::qwen35_policy_for_native(&kv_mode::QWEN35_HFQ_POLICY, "auto", auto_native);
         let pair = kv_mode::resolve_kv_pair("auto", None, None, &policy, arch, true)
             .expect("default kv pair");
         kv_tier_flags_for_pair(pair)

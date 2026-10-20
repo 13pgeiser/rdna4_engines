@@ -37,7 +37,12 @@ const ROW: usize = 516;
 const SCALE_OFF: usize = 512;
 
 fn spec() -> FaPrefillSpec {
-    FaPrefillSpec { heads: 16, kv_heads: 2, head_dim: 256, kv: FaKvCodec::Fp8E4M3 }
+    FaPrefillSpec {
+        heads: 16,
+        kv_heads: 2,
+        head_dim: 256,
+        kv: FaKvCodec::Fp8E4M3,
+    }
 }
 
 // ------------------------------------------------------------------------------------------------ f16 / E4M3FN model
@@ -105,7 +110,13 @@ fn e4m3fn(code: u8) -> Option<f32> {
     if e == 15 && code & 7 == 7 {
         return None;
     }
-    Some(sign * if e == 0 { m * 2f32.powi(-9) } else { (1.0 + m / 8.0) * 2f32.powi(e - 7) })
+    Some(
+        sign * if e == 0 {
+            m * 2f32.powi(-9)
+        } else {
+            (1.0 + m / 8.0) * 2f32.powi(e - 7)
+        },
+    )
 }
 fn finite_codes() -> Vec<u8> {
     (0..=255u8).filter(|&c| e4m3fn(c).is_some()).collect()
@@ -140,10 +151,18 @@ fn the_e4m3fn_model_is_pinned_by_known_bit_patterns() {
     ] {
         assert_eq!(e4m3fn(code), Some(value), "{code:#04x}");
     }
-    assert_eq!(e4m3fn(0x80).map(f32::to_bits), Some(0x8000_0000), "0x80 is OCP negative zero, never a NaN");
+    assert_eq!(
+        e4m3fn(0x80).map(f32::to_bits),
+        Some(0x8000_0000),
+        "0x80 is OCP negative zero, never a NaN"
+    );
     assert_eq!(e4m3fn(0x7f), None);
     assert_eq!(e4m3fn(0xff), None);
-    assert_eq!(finite_codes().len(), 254, "exactly the two S.1111.111 codes are NaN");
+    assert_eq!(
+        finite_codes().len(),
+        254,
+        "exactly the two S.1111.111 codes are NaN"
+    );
     // Strictly increasing magnitudes over 0x00..=0x7e, mirrored for the negative half.
     for c in 0u8..0x7e {
         assert!(e4m3fn(c).unwrap() < e4m3fn(c + 1).unwrap(), "{c:#04x}");
@@ -154,8 +173,17 @@ fn the_e4m3fn_model_is_pinned_by_known_bit_patterns() {
         let v = e4m3fn(c).unwrap();
         assert_eq!(f16_to_f32(f16_rne(v)), v, "{c:#04x}");
     }
-    assert!(exact_v_codes().len() > 100, "enough exact V codes for a full-range operand");
-    for (x, bits) in [(1.0f32, 0x3c00u16), (65504.0, 0x7bff), (65520.0, 0x7c00), (f32::from_bits(0x3380_0000), 0x0001), (f32::from_bits(0x3300_0000), 0x0000)] {
+    assert!(
+        exact_v_codes().len() > 100,
+        "enough exact V codes for a full-range operand"
+    );
+    for (x, bits) in [
+        (1.0f32, 0x3c00u16),
+        (65504.0, 0x7bff),
+        (65520.0, 0x7c00),
+        (f32::from_bits(0x3380_0000), 0x0001),
+        (f32::from_bits(0x3300_0000), 0x0000),
+    ] {
         assert_eq!(f16_rne(x), bits, "{x:e}");
     }
 }
@@ -174,11 +202,18 @@ fn all_256_codes_match_an_independent_f32_bit_construction() {
             Some(sign)
         } else if exponent == 0 {
             let leading = 31 - mantissa.leading_zeros();
-            Some(sign | ((127 - 9 + leading) << 23) | ((mantissa - (1 << leading)) << (23 - leading)))
+            Some(
+                sign | ((127 - 9 + leading) << 23)
+                    | ((mantissa - (1 << leading)) << (23 - leading)),
+            )
         } else {
             Some(sign | ((exponent + 120) << 23) | (mantissa << 20))
         };
-        assert_eq!(e4m3fn(code).map(f32::to_bits), want, "OCP E4M3FN byte {code:#04x}");
+        assert_eq!(
+            e4m3fn(code).map(f32::to_bits),
+            want,
+            "OCP E4M3FN byte {code:#04x}"
+        );
     }
 }
 
@@ -190,7 +225,11 @@ fn stage(cache: &[u8], pos: usize, g: usize, d: usize) -> Option<u16> {
     let scale = u16::from_le_bytes([cache[scale_at], cache[scale_at + 1]]);
     e4m3fn(cache[pos * ROW + g * 256 + d]).map(|v| f16_rne(f16_to_f32(scale) * v))
 }
-fn build_cache(npos: usize, code: impl Fn(usize, usize, usize) -> u8, scale: impl Fn(usize, usize) -> u16) -> Vec<u8> {
+fn build_cache(
+    npos: usize,
+    code: impl Fn(usize, usize, usize) -> u8,
+    scale: impl Fn(usize, usize) -> u16,
+) -> Vec<u8> {
     let mut out = vec![0u8; npos * ROW];
     for p in 0..npos {
         for g in 0..2 {
@@ -213,20 +252,33 @@ fn le32(v: &[i32]) -> Vec<u8> {
 fn row_layout_is_head_major_codes_then_two_scales() {
     // Every byte of a row has exactly one role: 512 codes (head 0 then head 1), then scale 0, scale 1.
     let npos = 3;
-    let cache = build_cache(npos, |p, g, d| ((p * 7 + g * 131 + d) % 253) as u8, |p, g| 0x3c00 + (p * 2 + g) as u16);
+    let cache = build_cache(
+        npos,
+        |p, g, d| ((p * 7 + g * 131 + d) % 253) as u8,
+        |p, g| 0x3c00 + (p * 2 + g) as u16,
+    );
     assert_eq!(cache.len(), npos * ROW);
     assert_eq!(ROW, 2 * 256 + 2 * 2);
     for p in 0..npos {
         for g in 0..2 {
             for d in 0..256 {
-                assert_eq!(cache[p * 516 + g * 256 + d], ((p * 7 + g * 131 + d) % 253) as u8, "code p{p} g{g} d{d}");
+                assert_eq!(
+                    cache[p * 516 + g * 256 + d],
+                    ((p * 7 + g * 131 + d) % 253) as u8,
+                    "code p{p} g{g} d{d}"
+                );
             }
-            let s = u16::from_le_bytes([cache[p * 516 + 512 + 2 * g], cache[p * 516 + 513 + 2 * g]]);
+            let s =
+                u16::from_le_bytes([cache[p * 516 + 512 + 2 * g], cache[p * 516 + 513 + 2 * g]]);
             assert_eq!(s, 0x3c00 + (p * 2 + g) as u16, "scale p{p} g{g}");
         }
     }
     // The staged element of head 1 reads head 1's scale at +514, never head 0's at +512.
-    let c2 = build_cache(1, |_, _, _| 0x38, |_, g| if g == 0 { 0x3c00 } else { 0x4000 });
+    let c2 = build_cache(
+        1,
+        |_, _, _| 0x38,
+        |_, g| if g == 0 { 0x3c00 } else { 0x4000 },
+    );
     assert_eq!(stage(&c2, 0, 0, 7), Some(0x3c00));
     assert_eq!(stage(&c2, 0, 1, 7), Some(0x4000));
 }
@@ -252,7 +304,11 @@ fn winner_case(batch: usize, positions: Vec<i32>, scale: f32, qmag: f32, salt: u
     let q16 = (0..batch * 4096)
         .map(|i| {
             let (r, h, d) = (i / 4096, (i / 256) % 16, i % 256);
-            let sign = if (r * 5 + h * 3 + salt) % 4 < 2 { 1.0 } else { -1.0 };
+            let sign = if (r * 5 + h * 3 + salt) % 4 < 2 {
+                1.0
+            } else {
+                -1.0
+            };
             f16_rne(sign * qmag * (1 + d % 3) as f32)
         })
         .collect();
@@ -266,11 +322,28 @@ fn winner_case(batch: usize, positions: Vec<i32>, scale: f32, qmag: f32, salt: u
             };
             code ^ if g == 0 { 0 } else { 0x80 }
         },
-        |p, g| f16_rne(if g == 0 { 0.25 * (1 + p) as f32 } else { 0.25 * (200 - p) as f32 }),
+        |p, g| {
+            f16_rne(if g == 0 {
+                0.25 * (1 + p) as f32
+            } else {
+                0.25 * (200 - p) as f32
+            })
+        },
     );
     let vcodes = exact_v_codes();
-    let v = build_cache(npos, |p, g, d| vcodes[(p * 29 + d * 7 + g * 61 + salt * 13) % vcodes.len()], |_, _| 0x3c00);
-    Case { batch, positions, q16, k, v, scale }
+    let v = build_cache(
+        npos,
+        |p, g, d| vcodes[(p * 29 + d * 7 + g * 61 + salt * 13) % vcodes.len()],
+        |_, _| 0x3c00,
+    );
+    Case {
+        batch,
+        positions,
+        q16,
+        k,
+        v,
+        scale,
+    }
 }
 /// The exact expected output words. Every case must be well posed: all live keys either tie the row's maximum score
 /// exactly or sit at least 200 below it (so `exp` underflows to exactly 0 and the online rescale `alpha` is exactly 0),
@@ -278,27 +351,44 @@ fn winner_case(batch: usize, positions: Vec<i32>, scale: f32, qmag: f32, salt: u
 fn expected(c: &Case) -> Vec<u32> {
     let npos = c.k.len() / ROW;
     assert_eq!(c.v.len(), c.k.len());
-    let kst: Vec<Vec<u16>> =
-        (0..2 * npos).map(|i| (0..256).map(|d| stage(&c.k, i % npos, i / npos, d).expect("finite K")).collect()).collect();
+    let kst: Vec<Vec<u16>> = (0..2 * npos)
+        .map(|i| {
+            (0..256)
+                .map(|d| stage(&c.k, i % npos, i / npos, d).expect("finite K"))
+                .collect()
+        })
+        .collect();
     let vst: Vec<Vec<f32>> = (0..2 * npos)
-        .map(|i| (0..256).map(|d| f16_to_f32(stage(&c.v, i % npos, i / npos, d).expect("finite V"))).collect())
+        .map(|i| {
+            (0..256)
+                .map(|d| f16_to_f32(stage(&c.v, i % npos, i / npos, d).expect("finite V")))
+                .collect()
+        })
         .collect();
     let mut out = vec![0u32; c.batch * 4096];
     for r in 0..c.batch {
         let pos = c.positions[r] as usize;
         for h in 0..16 {
             let g = h / 8;
-            let q: Vec<f64> = (0..256).map(|d| f64::from(f16_to_f32(c.q16[(r * 16 + h) * 256 + d]))).collect();
+            let q: Vec<f64> = (0..256)
+                .map(|d| f64::from(f16_to_f32(c.q16[(r * 16 + h) * 256 + d])))
+                .collect();
             let scores: Vec<f32> = (0..=pos)
                 .map(|j| {
-                    let dot: f64 = (0..256).map(|d| q[d] * f64::from(f16_to_f32(kst[g * npos + j][d]))).sum();
+                    let dot: f64 = (0..256)
+                        .map(|d| q[d] * f64::from(f16_to_f32(kst[g * npos + j][d])))
+                        .sum();
                     (dot as f32) * c.scale
                 })
                 .collect();
             let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let ties: Vec<usize> = (0..=pos).filter(|&j| scores[j] == m).collect();
             for j in 0..=pos {
-                assert!(scores[j] == m || m - scores[j] >= 200.0, "ill-posed case: row {r} head {h} key {j} gap {}", m - scores[j]);
+                assert!(
+                    scores[j] == m || m - scores[j] >= 200.0,
+                    "ill-posed case: row {r} head {h} key {j} gap {}",
+                    m - scores[j]
+                );
             }
             let inv = 1.0f32 / ties.len() as f32;
             for d in 0..256 {
@@ -308,7 +398,11 @@ fn expected(c: &Case) -> Vec<u32> {
                     sum += v;
                     exact += f64::from(v);
                 }
-                assert_eq!(f64::from(sum), exact, "inexact V sum: row {r} head {h} dim {d}");
+                assert_eq!(
+                    f64::from(sum),
+                    exact,
+                    "inexact V sum: row {r} head {h} dim {d}"
+                );
                 out[(r * 16 + h) * 256 + d] = (sum * inv).to_bits();
             }
         }
@@ -334,12 +428,22 @@ impl Rig {
     fn new() -> Self {
         let (_, text, _) = fa_prefill::emit_fp8_module(ARCH, &spec()).unwrap();
         let elf = native::assemble(&text, ARCH).unwrap();
-        let lifted = peacemaker_lift::lift_object(&elf, peacemaker_lift::Options { frontend: Frontend::Builder }).unwrap();
-        Rig { program: lifted.program }
+        let lifted = peacemaker_lift::lift_object(
+            &elf,
+            peacemaker_lift::Options {
+                frontend: Frontend::Builder,
+            },
+        )
+        .unwrap();
+        Rig {
+            program: lifted.program,
+        }
     }
 }
 fn grid(batch: usize) -> Vec<[u32; 3]> {
-    (0..2u32).flat_map(|y| (0..batch.div_ceil(8) as u32).map(move |x| [x, y, 0])).collect()
+    (0..2u32)
+        .flat_map(|y| (0..batch.div_ceil(8) as u32).map(move |x| [x, y, 0]))
+        .collect()
 }
 fn region<'a>(mem: &'a Memory, name: &str) -> &'a peacemaker_ir::emu::Region {
     mem.regions.iter().find(|r| r.name == name).unwrap()
@@ -357,7 +461,13 @@ enum Initial {
 /// One launch set on freshly mapped, exactly sized buffers: kernarg exactly 60 bytes, Q16 / K / V / positions exactly
 /// their extents (any out-of-range read is an unmapped fault), the output between sentinel guards. `args` overrides
 /// `[n_heads, n_kv_heads, head_dim, batch_size]` in the kernarg block.
-fn run_direct(rig: &Rig, c: &Case, initial: &Initial, args: Option<[i32; 4]>, wgs: &[[u32; 3]]) -> Result<Run, String> {
+fn run_direct(
+    rig: &Rig,
+    c: &Case,
+    initial: &Initial,
+    args: Option<[i32; 4]>,
+    wgs: &[[u32; 3]],
+) -> Result<Run, String> {
     let out_bytes = c.batch * 4096 * 4;
     let [nh, nkv, hd, bs] = args.unwrap_or([16, 2, 256, c.batch as i32]);
     let mut karg = Vec::new();
@@ -393,47 +503,84 @@ fn run_direct(rig: &Rig, c: &Case, initial: &Initial, args: Option<[i32; 4]>, wg
     let emu = Emulator::new(&rig.program, SYMBOL)?;
     for wg in wgs {
         emu.run_workgroup(
-            &Launch { kernarg_ptr: E_KARG, workgroup: *wg, block: [DIRECT_BLOCK, 1, 1], dynamic_lds: DIRECT_LDS },
+            &Launch {
+                kernarg_ptr: E_KARG,
+                workgroup: *wg,
+                block: [DIRECT_BLOCK, 1, 1],
+                dynamic_lds: DIRECT_LDS,
+            },
             &mut mem,
         )?;
     }
-    let inputs_untouched = [("kernarg", &karg), ("q16", &q), ("k", &c.k), ("v", &c.v), ("pos", &pos)].iter().all(|(name, bytes)| {
+    let inputs_untouched = [
+        ("kernarg", &karg),
+        ("q16", &q),
+        ("k", &c.k),
+        ("v", &c.v),
+        ("pos", &pos),
+    ]
+    .iter()
+    .all(|(name, bytes)| {
         let r = region(&mem, name);
         r.bytes == **bytes && r.written.count() == 0
     });
     let o = region(&mem, "out");
     Ok(Run {
         out: o.bytes[GUARD..GUARD + out_bytes].to_vec(),
-        guards_intact: o.bytes[..GUARD] == before[..GUARD] && o.bytes[GUARD + out_bytes..] == before[GUARD + out_bytes..],
+        guards_intact: o.bytes[..GUARD] == before[..GUARD]
+            && o.bytes[GUARD + out_bytes..] == before[GUARD + out_bytes..],
         out_written: o.written.count(),
         inputs_untouched,
     })
 }
 fn words(bytes: &[u8]) -> Vec<u32> {
-    bytes.chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect()
+    bytes
+        .chunks_exact(4)
+        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+        .collect()
 }
 fn assert_matches(name: &str, run: &Run, want: &[u32], batch: usize) {
-    assert!(run.guards_intact, "{name}: a store escaped the output (tail-row lane or helper wave wrote)");
-    assert!(run.inputs_untouched, "{name}: Q16 / K / V / positions / kernarg changed");
-    assert_eq!(run.out_written, batch * 4096 * 4, "{name}: exactly the live output bytes are written");
+    assert!(
+        run.guards_intact,
+        "{name}: a store escaped the output (tail-row lane or helper wave wrote)"
+    );
+    assert!(
+        run.inputs_untouched,
+        "{name}: Q16 / K / V / positions / kernarg changed"
+    );
+    assert_eq!(
+        run.out_written,
+        batch * 4096 * 4,
+        "{name}: exactly the live output bytes are written"
+    );
     assert_eq!(run.out.len(), batch * 4096 * 4, "{name}: output extent");
     assert_eq!(want.len(), batch * 4096, "{name}: reference extent");
     for (i, (g, w)) in words(&run.out).iter().zip(want).enumerate() {
         assert_eq!(
-            g, w,
+            g,
+            w,
             "{name}: row {} head {} dim {}: got {:#010x} ({}), want {:#010x} ({})",
-            i / 4096, (i / 256) % 16, i % 256, g, f32::from_bits(*g), w, f32::from_bits(*w)
+            i / 4096,
+            (i / 256) % 16,
+            i % 256,
+            g,
+            f32::from_bits(*g),
+            w,
+            f32::from_bits(*w)
         );
     }
 }
 fn check(rig: &Rig, name: &str, c: &Case) {
-    let run = run_direct(rig, c, &Initial::Poison(POISON), None, &grid(c.batch)).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let run = run_direct(rig, c, &Initial::Poison(POISON), None, &grid(c.batch))
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
     assert_matches(name, &run, &expected(c), c.batch);
 }
 
 // ------------------------------------------------------------------------------------------------ 1. emission
 fn mnemonics(text: &str) -> Vec<&str> {
-    text.lines().filter_map(|l| l.trim().split_whitespace().next()).collect()
+    text.lines()
+        .filter_map(|l| l.trim().split_whitespace().next())
+        .collect()
 }
 #[test]
 fn emission_is_deterministic_and_exports_only_the_fp8_direct() {
@@ -446,41 +593,97 @@ fn emission_is_deterministic_and_exports_only_the_fp8_direct() {
     assert_eq!(fa_prefill::FP8_ROW_BYTES as usize, ROW);
     assert_eq!(fa_prefill::FP8_SCALE_OFFSET as usize, SCALE_OFF);
     assert!(text.contains(SYMBOL));
-    assert!(!text.contains(fa_prefill::SYMBOL_PRECONVERT), "the Q16 preconvert stays in the Q8 module");
-    assert!(!text.contains(fa_prefill::SYMBOL_DIRECT), "no Q8 direct export in the fp8 module");
+    assert!(
+        !text.contains(fa_prefill::SYMBOL_PRECONVERT),
+        "the Q16 preconvert stays in the Q8 module"
+    );
+    assert!(
+        !text.contains(fa_prefill::SYMBOL_DIRECT),
+        "no Q8 direct export in the fp8 module"
+    );
     // The module holds only the fp8 direct: lifting it yields exactly that kernel.
     let rig = Rig::new();
-    let symbols: Vec<&str> = rig.program.kernels.iter().map(|k| k.symbol.0.as_str()).collect();
+    let symbols: Vec<&str> = rig
+        .program
+        .kernels
+        .iter()
+        .map(|k| k.symbol.0.as_str())
+        .collect();
     assert_eq!(symbols, [SYMBOL]);
     // Native gfx1201 OCP decode: both pair-convert forms, none of the Q8 sign extension or any other fp8 route.
     let mn = mnemonics(&text);
-    assert!(mn.iter().any(|m| *m == "v_cvt_pk_f32_fp8_e32"), "no low-half native pair convert");
-    assert!(mn.iter().any(|m| *m == "v_cvt_pk_f32_fp8_e64"), "no high-half (op_sel) native pair convert");
-    for forbidden in ["v_cvt_f32_i32", "v_cvt_f32_fp8", "v_cvt_f32_bf8", "v_cvt_pk_f32_bf8", "v_cvt_pk_fp8_f32", "v_cvt_pk_bf8_f32", "v_cvt_sr_fp8_f32", "v_cvt_sr_bf8_f32"] {
-        assert!(!mn.iter().any(|m| m.starts_with(forbidden)), "{forbidden} appears in the fp8 direct");
+    assert!(
+        mn.iter().any(|m| *m == "v_cvt_pk_f32_fp8_e32"),
+        "no low-half native pair convert"
+    );
+    assert!(
+        mn.iter().any(|m| *m == "v_cvt_pk_f32_fp8_e64"),
+        "no high-half (op_sel) native pair convert"
+    );
+    for forbidden in [
+        "v_cvt_f32_i32",
+        "v_cvt_f32_fp8",
+        "v_cvt_f32_bf8",
+        "v_cvt_pk_f32_bf8",
+        "v_cvt_pk_fp8_f32",
+        "v_cvt_pk_bf8_f32",
+        "v_cvt_sr_fp8_f32",
+        "v_cvt_sr_bf8_f32",
+    ] {
+        assert!(
+            !mn.iter().any(|m| m.starts_with(forbidden)),
+            "{forbidden} appears in the fp8 direct"
+        );
     }
     // Rows are 516 bytes: the tile stride literal is present, the Q8 544 / 1088 strides are not the fill base.
-    assert!(text.contains("516") || text.contains("0x204"), "the 516-byte fp8 row stride does not appear in the emission");
+    assert!(
+        text.contains("516") || text.contains("0x204"),
+        "the 516-byte fp8 row stride does not appear in the emission"
+    );
 }
 #[test]
 fn spec_admits_only_h16_kv2_d256_for_the_fp8_codec() {
     assert!(spec().validate().is_ok());
-    for (h, kv, d) in [(24, 4, 256), (16, 4, 256), (16, 2, 128), (8, 2, 256), (32, 2, 256), (16, 1, 256)] {
-        let bad = FaPrefillSpec { heads: h, kv_heads: kv, head_dim: d, kv: FaKvCodec::Fp8E4M3 };
+    for (h, kv, d) in [
+        (24, 4, 256),
+        (16, 4, 256),
+        (16, 2, 128),
+        (8, 2, 256),
+        (32, 2, 256),
+        (16, 1, 256),
+    ] {
+        let bad = FaPrefillSpec {
+            heads: h,
+            kv_heads: kv,
+            head_dim: d,
+            kv: FaKvCodec::Fp8E4M3,
+        };
         assert!(bad.validate().is_err(), "{h}/{kv}/{d}");
-        assert!(fa_prefill::emit_fp8_module(ARCH, &bad).is_err(), "{h}/{kv}/{d}");
+        assert!(
+            fa_prefill::emit_fp8_module(ARCH, &bad).is_err(),
+            "{h}/{kv}/{d}"
+        );
     }
-    assert!(fa_prefill::emit_fp8_module(Arch::Gfx1100, &spec()).is_err(), "gfx1201 only");
+    assert!(
+        fa_prefill::emit_fp8_module(Arch::Gfx1100, &spec()).is_err(),
+        "gfx1201 only"
+    );
     // The Q8 module refuses an fp8 spec and the fp8 module a Q8 spec: no cross-codec emission.
     assert!(fa_prefill::emit_module(ARCH, &spec()).is_err());
-    let q8 = FaPrefillSpec { kv: FaKvCodec::Q8_0, ..spec() };
+    let q8 = FaPrefillSpec {
+        kv: FaKvCodec::Q8_0,
+        ..spec()
+    };
     assert!(fa_prefill::emit_fp8_module(ARCH, &q8).is_err());
     // Launch validation is codec independent: 1..=8192 rows and one position per row.
     for rows in [1usize, 7, 63, 64, 65, 8192] {
         assert!(fa_prefill::validate(&spec(), rows, rows).is_ok(), "{rows}");
     }
     for (rows, pos) in [(0usize, 0usize), (8193, 8193), (8, 7), (8, 9)] {
-        assert!(fa_prefill::validate(&spec(), rows, pos).is_err(), "{rows}/{pos}");
+        assert!(
+            fa_prefill::validate(&spec(), rows, pos).is_err(),
+            "{rows}/{pos}"
+        );
     }
 }
 
@@ -496,16 +699,37 @@ fn causal_bounds_and_tail_masks_on_native_fp8_rows() {
         ("1 row pos 65", vec![65]),
         ("7 rows non-monotone", vec![31, 0, 15, 63, 16, 48, 47]),
         ("8 rows around tiles", vec![64, 0, 65, 32, 15, 16, 31, 48]),
-        ("9 rows, short first group, lone tail row", vec![0, 1, 2, 3, 4, 5, 6, 7, 65]),
+        (
+            "9 rows, short first group, lone tail row",
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 65],
+        ),
         ("63 rows ramp", (0..63).collect()),
         ("64 rows strided", (0..64).map(|r| (r * 5) % 66).collect()),
-        ("65 rows boundary cycle", (0..65).map(|r| B[(r * 7) % 10]).collect()),
-        ("duplicate positions in a group", vec![9, 9, 9, 9, 2, 2, 2, 2]),
-        ("unaligned start, same group", vec![63, 63, 62, 62, 61, 61, 60, 60]),
+        (
+            "65 rows boundary cycle",
+            (0..65).map(|r| B[(r * 7) % 10]).collect(),
+        ),
+        (
+            "duplicate positions in a group",
+            vec![9, 9, 9, 9, 2, 2, 2, 2],
+        ),
+        (
+            "unaligned start, same group",
+            vec![63, 63, 62, 62, 61, 61, 60, 60],
+        ),
     ];
-    let cases = cases.into_iter().chain((2usize..=6).map(|batch| {
-        ("remaining row-tail remainder", (0..batch).map(|r| B[(r * 7) % B.len()]).collect())
-    })).chain(std::iter::once(("third key tile", vec![127, 128, 129, 0, 64, 65, 15, 16])));
+    let cases = cases
+        .into_iter()
+        .chain((2usize..=6).map(|batch| {
+            (
+                "remaining row-tail remainder",
+                (0..batch).map(|r| B[(r * 7) % B.len()]).collect(),
+            )
+        }))
+        .chain(std::iter::once((
+            "third key tile",
+            vec![127, 128, 129, 0, 64, 65, 15, 16],
+        )));
     for (name, positions) in cases {
         let batch = positions.len();
         check(&rig, name, &winner_case(batch, positions, 1.0, 1.0, 0));
@@ -526,7 +750,11 @@ fn single_key_case(scales: [u16; 2], shift: usize) -> Case {
             code
         }
     };
-    c.v = build_cache(1, |_, g, d| safe(scales[g], table[(d + 31 * shift + 128 * g) % table.len()]), |_, g| scales[g]);
+    c.v = build_cache(
+        1,
+        |_, g, d| safe(scales[g], table[(d + 31 * shift + 128 * g) % table.len()]),
+        |_, g| scales[g],
+    );
     c
 }
 #[test]
@@ -534,18 +762,33 @@ fn single_live_key_covers_every_finite_staged_product_at_f16_scale_boundaries() 
     let rig = Rig::new();
     // Signed zeros, subnormal / normal boundaries, RNE-sensitive scales, large scales and negative scales. All 254
     // finite codes occur on each head whenever all products remain finite; otherwise every non-overflowing code does.
-    const SCALES: [u16; 12] = [0x0000, 0x8000, 0x0001, 0x03ff, 0x0400, 0x3c00, 0x3c01, 0x7bff, 0x2800, 0x6000, 0xbc01, 0xfbff];
+    const SCALES: [u16; 12] = [
+        0x0000, 0x8000, 0x0001, 0x03ff, 0x0400, 0x3c00, 0x3c01, 0x7bff, 0x2800, 0x6000, 0xbc01,
+        0xfbff,
+    ];
     for shift in 0..SCALES.len() {
         let scales = [SCALES[shift], SCALES[(shift + 3) % SCALES.len()]];
         let c = single_key_case(scales, shift);
         for g in 0..2 {
-            let admitted: std::collections::BTreeSet<u8> = finite_codes().into_iter().filter(|&code| {
-                f16_rne(f16_to_f32(scales[g]) * e4m3fn(code).unwrap()) & 0x7c00 != 0x7c00
-            }).collect();
-            let seen: std::collections::BTreeSet<u8> = c.v[g * 256..(g + 1) * 256].iter().copied().collect();
-            assert_eq!(seen, admitted, "head {g} scale {:#06x}: actual emitted operand code coverage", scales[g]);
+            let admitted: std::collections::BTreeSet<u8> = finite_codes()
+                .into_iter()
+                .filter(|&code| {
+                    f16_rne(f16_to_f32(scales[g]) * e4m3fn(code).unwrap()) & 0x7c00 != 0x7c00
+                })
+                .collect();
+            let seen: std::collections::BTreeSet<u8> =
+                c.v[g * 256..(g + 1) * 256].iter().copied().collect();
+            assert_eq!(
+                seen, admitted,
+                "head {g} scale {:#06x}: actual emitted operand code coverage",
+                scales[g]
+            );
         }
-        check(&rig, &format!("single key scales {scales:#06x?} shift {shift}"), &c);
+        check(
+            &rig,
+            &format!("single key scales {scales:#06x?} shift {shift}"),
+            &c,
+        );
     }
     // Distinct K / V scaling across the two heads of one key: swap the scale order, the outputs must follow the head.
     let a = single_key_case([0x3c00, 0x4000], 1);
@@ -569,7 +812,10 @@ fn the_k_decode_selects_the_winner_per_kv_head_with_separate_code_and_scale_base
         swapped.k.swap(a, b);
         swapped.k.swap(a + 1, b + 1);
     }
-    assert!(expected(&base) != expected(&swapped), "the reference does not depend on which scale slot belongs to which head");
+    assert!(
+        expected(&base) != expected(&swapped),
+        "the reference does not depend on which scale slot belongs to which head"
+    );
     check(&rig, "k scale slots swapped", &swapped);
     // Moving the code planes instead (head 0 <-> head 1 codes) is equally observable.
     let mut codes_swapped = base.clone();
@@ -585,14 +831,38 @@ fn the_k_decode_selects_the_winner_per_kv_head_with_separate_code_and_scale_base
 fn emitted_attention_preserves_state_and_layout() {
     let rig = Rig::new();
     // Zero-score / uniform probabilities: every live key ties exactly, probabilities are 1, O = exact V sums.
-    check(&rig, "uniform scale +0", &winner_case(9, (0..9).collect(), 0.0, 1.0, 0));
-    check(&rig, "uniform scale -0", &winner_case(8, vec![64, 0, 63, 17, 5, 31, 32, 9], -0.0, 1.0, 1));
+    check(
+        &rig,
+        "uniform scale +0",
+        &winner_case(9, (0..9).collect(), 0.0, 1.0, 0),
+    );
+    check(
+        &rig,
+        "uniform scale -0",
+        &winner_case(8, vec![64, 0, 63, 17, 5, 31, 32, 9], -0.0, 1.0, 1),
+    );
     // Single live key (every row position 0): the output is that key's dequantized V.
-    check(&rig, "single live key", &winner_case(8, vec![0; 8], 1.0, 1.0, 2));
+    check(
+        &rig,
+        "single live key",
+        &winner_case(8, vec![0; 8], 1.0, 1.0, 2),
+    );
     // `scale_attn` is the argument, never a constant: the sign and magnitude select the winner of each row.
     let positions = vec![3, 0, 17, 16, 5, 31, 32, 9];
-    for (scale, qmag) in [(1.0f32, 1.0f32), (-1.0, 1.0), (0.0625, 16.0), (-0.0625, 16.0), (8.0, 0.125), (1.0e20, 1.0), (-1.0e20, 1.0)] {
-        check(&rig, &format!("scale {scale:e}"), &winner_case(8, positions.clone(), scale, qmag, 0));
+    for (scale, qmag) in [
+        (1.0f32, 1.0f32),
+        (-1.0, 1.0),
+        (0.0625, 16.0),
+        (-0.0625, 16.0),
+        (8.0, 0.125),
+        (1.0e20, 1.0),
+        (-1.0e20, 1.0),
+    ] {
+        check(
+            &rig,
+            &format!("scale {scale:e}"),
+            &winner_case(8, positions.clone(), scale, qmag, 0),
+        );
     }
     // Replay on a previously used output: changed Q / K / V / positions, the previous result left in place, then a
     // NaN-poisoned output: all three agree byte for byte with the reference (no dependence on retained scratch).
@@ -602,22 +872,52 @@ fn emitted_attention_preserves_state_and_layout() {
     let run1 = run_direct(&rig, &first, &Initial::Poison(POISON), None, &grid(8)).unwrap();
     assert_matches("replay, first launch", &run1, &expected(&first), 8);
     let want = expected(&second);
-    let run2 = run_direct(&rig, &second, &Initial::Bytes(run1.out.clone()), None, &grid(8)).unwrap();
+    let run2 = run_direct(
+        &rig,
+        &second,
+        &Initial::Bytes(run1.out.clone()),
+        None,
+        &grid(8),
+    )
+    .unwrap();
     assert_matches("replay on the previous output", &run2, &want, 8);
     let run3 = run_direct(&rig, &second, &Initial::Poison(POISON), None, &grid(8)).unwrap();
     assert_matches("replay on a poisoned output", &run3, &want, 8);
     assert!(run2.out == run3.out && run2.out != run1.out);
     // Workgroup-uniform launch guards: a wrong compiled shape, an empty / negative batch, a KV head or row group past
     // the launch store nothing, read nothing past the exact buffers and leave every input untouched.
-    for args in [[15, 2, 256, 8], [16, 1, 256, 8], [16, 3, 256, 8], [16, 2, 128, 8], [16, 2, 512, 8], [24, 4, 256, 8], [16, 2, 256, 0], [16, 2, 256, -1]] {
-        let run = run_direct(&rig, &first, &Initial::Poison(POISON), Some(args), &grid(8)).unwrap_or_else(|e| panic!("{args:?}: {e}"));
-        assert!(run.guards_intact && run.inputs_untouched && run.out_written == 0, "{args:?}");
-        assert!(words(&run.out).iter().all(|&w| w == POISON), "{args:?}: output changed");
+    for args in [
+        [15, 2, 256, 8],
+        [16, 1, 256, 8],
+        [16, 3, 256, 8],
+        [16, 2, 128, 8],
+        [16, 2, 512, 8],
+        [24, 4, 256, 8],
+        [16, 2, 256, 0],
+        [16, 2, 256, -1],
+    ] {
+        let run = run_direct(&rig, &first, &Initial::Poison(POISON), Some(args), &grid(8))
+            .unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        assert!(
+            run.guards_intact && run.inputs_untouched && run.out_written == 0,
+            "{args:?}"
+        );
+        assert!(
+            words(&run.out).iter().all(|&w| w == POISON),
+            "{args:?}: output changed"
+        );
     }
     for wg in [[1u32, 0, 0], [0, 2, 0], [7, 1, 0], [0, 255, 0]] {
-        let run = run_direct(&rig, &first, &Initial::Poison(POISON), None, &[wg]).unwrap_or_else(|e| panic!("{wg:?}: {e}"));
-        assert!(run.guards_intact && run.inputs_untouched && run.out_written == 0, "{wg:?}");
-        assert!(words(&run.out).iter().all(|&w| w == POISON), "{wg:?}: output changed");
+        let run = run_direct(&rig, &first, &Initial::Poison(POISON), None, &[wg])
+            .unwrap_or_else(|e| panic!("{wg:?}: {e}"));
+        assert!(
+            run.guards_intact && run.inputs_untouched && run.out_written == 0,
+            "{wg:?}"
+        );
+        assert!(
+            words(&run.out).iter().all(|&w| w == POISON),
+            "{wg:?}: output changed"
+        );
     }
 }
 #[test]
@@ -637,7 +937,8 @@ fn future_cache_bytes_never_reach_a_row_whose_horizon_precedes_them() {
                 for d in 0..256 {
                     loud.v[p * ROW + g * 256 + d] = 0x7e;
                 }
-                loud.v[p * ROW + SCALE_OFF + 2 * g..p * ROW + SCALE_OFF + 2 * g + 2].copy_from_slice(&0x3c00u16.to_le_bytes());
+                loud.v[p * ROW + SCALE_OFF + 2 * g..p * ROW + SCALE_OFF + 2 * g + 2]
+                    .copy_from_slice(&0x3c00u16.to_le_bytes());
             }
         }
     }
@@ -648,7 +949,10 @@ fn future_cache_bytes_never_reach_a_row_whose_horizon_precedes_them() {
     for h in 0..16 {
         for d in 0..256 {
             let i = (16 + h) * 256 + d;
-            assert_eq!(got[i], want[i], "row 1 head {h} dim {d} saw a key above its horizon");
+            assert_eq!(
+                got[i], want[i],
+                "row 1 head {h} dim {d} saw a key above its horizon"
+            );
         }
     }
 }
@@ -662,20 +966,36 @@ fn nan_codes_are_classified_separately_from_the_finite_gate() {
     let rig = Rig::new();
     // V NaN at a live key: the NaN lands exactly in that KV head's dim for all of its heads; every other output word
     // stays bit-exact with the finite reference (the NaN code is never an infinity or a finite stand-in).
-    for (code, g, d0) in [(0x7fu8, 0usize, 5usize), (0xff, 1, 200), (0x7f, 1, 0), (0xff, 0, 255)] {
+    for (code, g, d0) in [
+        (0x7fu8, 0usize, 5usize),
+        (0xff, 1, 200),
+        (0x7f, 1, 0),
+        (0xff, 0, 255),
+    ] {
         let mut c = winner_case(8, vec![0; 8], 1.0, 1.0, 7);
         let clean = expected(&c);
         c.v[g * 256 + d0] = code;
         let run = run_direct(&rig, &c, &Initial::Poison(POISON), None, &grid(8)).unwrap();
-        assert!(run.guards_intact && run.inputs_untouched, "V NaN {code:#04x} g{g} d{d0}");
-        assert_eq!(run.out_written, c.batch * 4096 * 4, "V NaN: every output byte must be written");
+        assert!(
+            run.guards_intact && run.inputs_untouched,
+            "V NaN {code:#04x} g{g} d{d0}"
+        );
+        assert_eq!(
+            run.out_written,
+            c.batch * 4096 * 4,
+            "V NaN: every output byte must be written"
+        );
         let got = words(&run.out);
         for r in 0..8 {
             for h in 0..16 {
                 for d in 0..256 {
                     let i = (r * 16 + h) * 256 + d;
                     if h / 8 == g && d == d0 {
-                        assert!(is_nan_word(got[i]), "V {code:#04x} g{g}: row {r} head {h} dim {d} is not NaN ({:#010x})", got[i]);
+                        assert!(
+                            is_nan_word(got[i]),
+                            "V {code:#04x} g{g}: row {r} head {h} dim {d} is not NaN ({:#010x})",
+                            got[i]
+                        );
                     } else {
                         assert_eq!(got[i], clean[i], "V NaN leaked: row {r} head {h} dim {d}");
                     }
@@ -690,16 +1010,30 @@ fn nan_codes_are_classified_separately_from_the_finite_gate() {
         let clean = expected(&c);
         c.k[256 + 17] = code;
         let run = run_direct(&rig, &c, &Initial::Poison(POISON), None, &grid(8)).unwrap();
-        assert!(run.guards_intact && run.inputs_untouched, "K NaN {code:#04x}");
-        assert_eq!(run.out_written, c.batch * 4096 * 4, "K NaN: every output byte must be written");
+        assert!(
+            run.guards_intact && run.inputs_untouched,
+            "K NaN {code:#04x}"
+        );
+        assert_eq!(
+            run.out_written,
+            c.batch * 4096 * 4,
+            "K NaN: every output byte must be written"
+        );
         let got = words(&run.out);
         for r in 0..8 {
             for h in 0..16 {
                 let row = &got[(r * 16 + h) * 256..(r * 16 + h + 1) * 256];
                 if h / 8 == 1 {
-                    assert!(row.iter().any(|&w| is_nan_word(w)), "K {code:#04x}: row {r} head {h} has no NaN");
+                    assert!(
+                        row.iter().any(|&w| is_nan_word(w)),
+                        "K {code:#04x}: row {r} head {h} has no NaN"
+                    );
                 } else {
-                    assert_eq!(row, &clean[(r * 16 + h) * 256..(r * 16 + h + 1) * 256], "K NaN leaked into KV head 0: row {r} head {h}");
+                    assert_eq!(
+                        row,
+                        &clean[(r * 16 + h) * 256..(r * 16 + h + 1) * 256],
+                        "K NaN leaked into KV head 0: row {r} head {h}"
+                    );
                 }
             }
         }

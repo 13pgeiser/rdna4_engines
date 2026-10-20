@@ -13,8 +13,8 @@ use crate::tables::KernelRegistry;
 use crate::traits::KernelFamily;
 use crate::types::*;
 use hip_bridge::DeviceBuffer;
-use rdna_compute::fa_prefill_pm::FaPrefillKvCodec;
 use rdna_compute::attention::GFX12_QUERY16_MAX_CTX;
+use rdna_compute::fa_prefill_pm::FaPrefillKvCodec;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 pub struct AttnParams<'a> {

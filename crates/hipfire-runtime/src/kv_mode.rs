@@ -99,7 +99,9 @@ pub fn qwen35_native_refusal(
     adaptive: bool,
     cask: bool,
 ) -> Option<String> {
-    if qwen35_native_supported(mode, arch, n_heads, n_kv_heads, head_dim, pp, adaptive, cask) {
+    if qwen35_native_supported(
+        mode, arch, n_heads, n_kv_heads, head_dim, pp, adaptive, cask,
+    ) {
         return None;
     }
     let shapes = qwen35_native_shapes(mode)
@@ -933,7 +935,11 @@ mod tests {
 
         // Dense 27B: unchanged. auto/unset and explicit fp8/bf16 native; q8 override.
         for raw in ["", "auto", "fp8"] {
-            assert_eq!(ok(raw, "gfx1201", DENSE, 1, false, false), Ok(Fp8), "dense {raw}");
+            assert_eq!(
+                ok(raw, "gfx1201", DENSE, 1, false, false),
+                Ok(Fp8),
+                "dense {raw}"
+            );
         }
         assert_eq!(ok("bf16", "gfx1201", DENSE, 1, false, false), Ok(Bf16));
         assert_eq!(ok("q8", "gfx1201", DENSE, 1, false, false), Ok(Q8));
@@ -941,7 +947,11 @@ mod tests {
         // Exact A3B H16/Hkv2/D256: auto/unset and explicit fp8 are qualified;
         // q8 override honored, bf16 NOT widened.
         for raw in ["", "auto", "fp8"] {
-            assert_eq!(ok(raw, "gfx1201", A3B, 1, false, false), Ok(Fp8), "a3b {raw}");
+            assert_eq!(
+                ok(raw, "gfx1201", A3B, 1, false, false),
+                Ok(Fp8),
+                "a3b {raw}"
+            );
         }
         assert_eq!(ok("q8", "gfx1201", A3B, 1, false, false), Ok(Q8));
         assert!(ok("bf16", "gfx1201", A3B, 1, false, false).is_err());
@@ -958,10 +968,17 @@ mod tests {
             (16, 2, 512),
         ] {
             for raw in ["fp8", "bf16"] {
-                assert!(ok(raw, "gfx1201", shape, 1, false, false).is_err(), "{shape:?} {raw}");
+                assert!(
+                    ok(raw, "gfx1201", shape, 1, false, false).is_err(),
+                    "{shape:?} {raw}"
+                );
             }
             for raw in ["", "auto"] {
-                assert_eq!(ok(raw, "gfx1201", shape, 1, false, false), Ok(Q8), "{shape:?} {raw}");
+                assert_eq!(
+                    ok(raw, "gfx1201", shape, 1, false, false),
+                    Ok(Q8),
+                    "{shape:?} {raw}"
+                );
             }
         }
 
@@ -1005,11 +1022,20 @@ mod tests {
             assert!(!sup(m, (24, 4, 256)) && !sup(m, (16, 2, 256)), "{m:?}");
         }
         // Auto qualification includes both exact supported FP8 geometries.
-        assert!(qwen35_native_auto_eligible("gfx1201", 24, 4, 256, 1, false, false));
-        assert!(qwen35_native_auto_eligible("gfx1201", 16, 2, 256, 1, false, false));
+        assert!(qwen35_native_auto_eligible(
+            "gfx1201", 24, 4, 256, 1, false, false
+        ));
+        assert!(qwen35_native_auto_eligible(
+            "gfx1201", 16, 2, 256, 1, false, false
+        ));
         for arch in ["gfx1201", "gfx1100"] {
             for (h, kv, d) in [(24, 4, 256), (16, 2, 256), (8, 2, 256)] {
-                for (pp, ad, cask) in [(1, false, false), (2, false, false), (1, true, false), (1, false, true)] {
+                for (pp, ad, cask) in [
+                    (1, false, false),
+                    (2, false, false),
+                    (1, true, false),
+                    (1, false, true),
+                ] {
                     if qwen35_native_auto_eligible(arch, h, kv, d, pp, ad, cask) {
                         assert!(qwen35_native_supported(Fp8, arch, h, kv, d, pp, ad, cask));
                     }

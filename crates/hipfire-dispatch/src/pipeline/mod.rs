@@ -4944,7 +4944,6 @@ fn decode_gate_side_stage(
                 xr,
                 p.router_logits,
                 scalar_buf,
-
                 &shared_gate,
                 &shared_up,
                 p.router.m,

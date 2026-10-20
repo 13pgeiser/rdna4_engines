@@ -367,7 +367,9 @@ pub fn enabled_fp8_kv(explicit: Option<bool>, arch: &str, route: PrefillRoute) -
 mod tests {
     use super::*;
 
-    const ARCHES: [&str; 6] = ["gfx1201", "gfx1151", "gfx1100", "gfx942", "gfx906", "gfx1030"];
+    const ARCHES: [&str; 6] = [
+        "gfx1201", "gfx1151", "gfx1100", "gfx942", "gfx906", "gfx1030",
+    ];
 
     /// The expected raw inventory, written independently of [`raw_inventory`].
     fn expected_raw(arch: &str, route: PrefillRoute) -> bool {
@@ -492,7 +494,10 @@ mod tests {
         let modules = registry_modules(PrefillRoute::GdnMoeChunkScan);
         assert_eq!(modules.len(), CHUNK_MODULE_SOURCES.len());
         for (module, expected) in CHUNK_MODULE_SOURCES {
-            assert!(modules.contains(&module), "{module} is not an anchored module");
+            assert!(
+                modules.contains(&module),
+                "{module} is not an anchored module"
+            );
             for arch in ARCHES {
                 let entries = crate::kernel_registry::entries(arch, "");
                 let found = entries
@@ -571,7 +576,10 @@ mod tests {
             }
         }
         for arch in ["gfx1151", "gfx1100", "gfx942", "gfx906", "gfx1030"] {
-            assert!(!raw_inventory(arch, PrefillRoute::PrefillIu4ProducerFused), "{arch}");
+            assert!(
+                !raw_inventory(arch, PrefillRoute::PrefillIu4ProducerFused),
+                "{arch}"
+            );
             assert!(!raw_inventory(arch, PrefillRoute::MoeRotateI4Pm), "{arch}");
             assert!(!raw_inventory(arch, PrefillRoute::GdnChunkPrepPm), "{arch}");
         }
@@ -728,10 +736,22 @@ mod tests {
 
     /// The five phase-3 routes: position in `ALL` and the oracle named by the row evidence.
     const PHASE3: [(usize, PrefillRoute, &str); 5] = [
-        (6, PrefillRoute::MoeRouterTopkMultirow, "moe_router_topk_multirow_oracle"),
+        (
+            6,
+            PrefillRoute::MoeRouterTopkMultirow,
+            "moe_router_topk_multirow_oracle",
+        ),
         (7, PrefillRoute::MoeCombineV2, "moe_combine_v2_oracle"),
-        (8, PrefillRoute::MoeIu4WideTiles, "moe_iu4_wide_tiles_oracle"),
-        (9, PrefillRoute::PrefillIu4ProducerFused, "prefill_iu4_producer_oracle"),
+        (
+            8,
+            PrefillRoute::MoeIu4WideTiles,
+            "moe_iu4_wide_tiles_oracle",
+        ),
+        (
+            9,
+            PrefillRoute::PrefillIu4ProducerFused,
+            "prefill_iu4_producer_oracle",
+        ),
         (10, PrefillRoute::FaPrefillPmQprep, "fa_pm_qprep_oracle"),
     ];
 
@@ -758,13 +778,30 @@ mod tests {
                 "Ornith 13649->15095 / Qwen 13651->15076",
                 "pp8192 Ornith 12935->13957",
             ] {
-                assert!(cell.evidence.contains(needle), "{route:?} evidence lacks {needle}");
+                assert!(
+                    cell.evidence.contains(needle),
+                    "{route:?} evidence lacks {needle}"
+                );
             }
             for arch in ARCHES {
-                assert_eq!(qualified(arch, route), arch == "gfx1201", "{route:?} on {arch}");
-                assert_eq!(enabled(None, arch, route), arch == "gfx1201", "{route:?} on {arch}");
-                assert!(enabled(Some(true), arch, route), "{route:?} {arch}: 1 opts in");
-                assert!(!enabled(Some(false), arch, route), "{route:?} {arch}: 0 kills");
+                assert_eq!(
+                    qualified(arch, route),
+                    arch == "gfx1201",
+                    "{route:?} on {arch}"
+                );
+                assert_eq!(
+                    enabled(None, arch, route),
+                    arch == "gfx1201",
+                    "{route:?} on {arch}"
+                );
+                assert!(
+                    enabled(Some(true), arch, route),
+                    "{route:?} {arch}: 1 opts in"
+                );
+                assert!(
+                    !enabled(Some(false), arch, route),
+                    "{route:?} {arch}: 0 kills"
+                );
             }
         }
     }
@@ -774,7 +811,11 @@ mod tests {
         let multirow = PrefillRoute::MoeRouterTopkMultirow;
         let fused = PrefillRoute::MoeRouterFusedPrefill;
         for arch in ARCHES {
-            assert_eq!(raw_inventory(arch, multirow), raw_inventory(arch, fused), "{arch}");
+            assert_eq!(
+                raw_inventory(arch, multirow),
+                raw_inventory(arch, fused),
+                "{arch}"
+            );
             assert_eq!(qualified(arch, multirow), arch == "gfx1201", "{arch}");
             assert_eq!(qualified(arch, fused), arch == "gfx1201", "{arch}");
         }
@@ -835,7 +876,10 @@ mod tests {
                     "{arch}: {route:?}"
                 );
                 assert!(enabled_fp8_kv(Some(true), arch, route), "{arch}: {route:?}");
-                assert!(!enabled_fp8_kv(Some(false), arch, route), "{arch}: {route:?}");
+                assert!(
+                    !enabled_fp8_kv(Some(false), arch, route),
+                    "{arch}: {route:?}"
+                );
             }
             assert!(qualified("gfx1201", route));
         }
@@ -846,11 +890,16 @@ mod tests {
 mod moe_iu4_wide_tiles_bundle_tests {
     use super::*;
 
-    const ARCHES: [&str; 6] = ["gfx1201", "gfx1151", "gfx1100", "gfx942", "gfx906", "gfx1030"];
+    const ARCHES: [&str; 6] = [
+        "gfx1201", "gfx1151", "gfx1100", "gfx942", "gfx906", "gfx1030",
+    ];
     const ROUTE: PrefillRoute = PrefillRoute::MoeIu4WideTiles;
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-        !needle.is_empty() && haystack.windows(needle.len()).any(|window| window == needle)
+        !needle.is_empty()
+            && haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
     }
 
     /// The embedded PeaceMaker IU4 symmetric MoE bundle of `arch` (None: no such bundle).
@@ -907,7 +956,10 @@ mod moe_iu4_wide_tiles_bundle_tests {
     fn gfx1151_bundle_has_no_nt8_entry_and_no_other_arch_is_inventoried() {
         let image = crate::kernels::QWEN4_MOE_IU4_SYM_PM_GFX1151;
         for symbol in nt8_symbols("gfx1151") {
-            assert!(!contains(image, symbol.as_bytes()), "{symbol} unexpectedly present");
+            assert!(
+                !contains(image, symbol.as_bytes()),
+                "{symbol} unexpectedly present"
+            );
         }
         assert!(!contains(image, b"_nt8"));
         for arch in ARCHES {
@@ -917,7 +969,10 @@ mod moe_iu4_wide_tiles_bundle_tests {
 
     #[test]
     fn wide_tiles_are_qualified_exactly_where_the_nt8_bundle_is_inventoried() {
-        assert_eq!(QUALIFIED.iter().filter(|cell| cell.route == ROUTE).count(), 1);
+        assert_eq!(
+            QUALIFIED.iter().filter(|cell| cell.route == ROUTE).count(),
+            1
+        );
         for arch in ARCHES {
             assert_eq!(qualified(arch, ROUTE), raw_inventory(arch, ROUTE), "{arch}");
             assert_eq!(enabled(None, arch, ROUTE), arch == "gfx1201", "{arch}");
