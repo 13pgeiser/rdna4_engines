@@ -123,11 +123,11 @@ engine would load. It checks, in order: schema agreement (a copy of the loader's
 before any arithmetic, because the loader refuses the whole plugin on one disagreement), coverage,
 the numbers, and every ISA level. Each level prints:
 
-    807 checked, 807 passed, 0 failed, 0 declined, 0 skipped, 0 missing.  worst rel_l2 = 3.556e-04
+    924 checked, 924 passed, 0 failed, 0 declined, 0 skipped, 0 missing.  worst rel_l2 = 3.556e-04
     worst case: rmsnorm M=3 n=645 eps=1e-05 dtype=bf16 wadd=1
-    807 rerun on 4 threads, byte for byte
-    hand-built: 429 checked, 0 failed
-    zero rows: 155 ops checked, 0 failed
+    924 rerun on 4 threads, byte for byte
+    hand-built: 449 checked, 0 failed
+    zero rows: 188 ops checked, 0 failed, 2 not reducible to zero rows
 
 against `rad-kbench`'s tolerance table, ids (i32, u32, i64 outputs) exactly; the worst case differs
 per level. Every conversion is also checked exhaustively: all 256 or 65536 bit patterns of each
