@@ -407,10 +407,12 @@ fn main() {
             .unwrap(),
             "fp8" => {
                 // Stage-b Q0: native fp8 KV (E4M3FN + f16 scale per
-                // token/head, 1032 B rows at Hkv4/D256). Admission is exact
-                // and fails before allocation: gfx1201 only, dense Qwen
-                // H24/Hkv4/D256, neutral V (`--kv-v q8` spelling identifies
-                // fp8/fp8); never falls through to a q8 reader.
+                // token/head). Admission is the shared mode-specific guard
+                // before allocation: neutral V (`--kv-v q8` spelling
+                // identifies fp8/fp8) plus qwen35_native_refusal for Fp8
+                // (exact gfx1201, single GPU, no adaptive/CASK; H24/KV4/D256
+                // dense or H16/KV2/D256 MoE); never falls through to a q8
+                // reader.
                 if args.kv_v != "q8" {
                     eprintln!(
                         "eval_hipfire: --kv-mode fp8 requires --kv-v q8 (neutral V spelling); got --kv-v {}",
@@ -418,25 +420,17 @@ fn main() {
                     );
                     std::process::exit(1);
                 }
-                if config.num_experts != 0 {
-                    eprintln!(
-                        "eval_hipfire: --kv-mode fp8 admitted only for dense Qwen (num_experts={})",
-                        config.num_experts
-                    );
-                    std::process::exit(1);
-                }
-                if config.n_heads != 24 || config.n_kv_heads != 4 || config.head_dim != 256 {
-                    eprintln!(
-                        "eval_hipfire: --kv-mode fp8 admitted only for H24/Hkv4/D256 (got H{}/Hkv{}/D{})",
-                        config.n_heads, config.n_kv_heads, config.head_dim
-                    );
-                    std::process::exit(1);
-                }
-                if gpu.arch != "gfx1201" {
-                    eprintln!(
-                        "eval_hipfire: --kv-mode fp8 admitted only on gfx1201 (got {})",
-                        gpu.arch
-                    );
+                if let Some(reason) = hipfire_runtime::kv_mode::qwen35_native_refusal(
+                    hipfire_runtime::kv_mode::KvMode::Fp8,
+                    gpu.arch.as_str(),
+                    config.n_heads,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    1,
+                    false,
+                    false,
+                ) {
+                    eprintln!("eval_hipfire: --kv-mode fp8 refused: {reason}");
                     std::process::exit(1);
                 }
                 eprintln!("eval_hipfire: fp8/fp8 native KV (E4M3FN + f16/token/head)");
@@ -451,9 +445,11 @@ fn main() {
             }
             "bf16" => {
                 // Quality control: unscaled bf16 K/V (stride D*2 per head,
-                // no scales). Same exact admission as fp8 (gfx1201, dense
-                // Qwen H24/Hkv4/D256, neutral V); never falls through to a
-                // q8 reader. Expected to read ≈ the f32 reference.
+                // no scales). Admission is the shared mode-specific guard
+                // before allocation: neutral V, dense only, plus
+                // qwen35_native_refusal for Bf16 (exact gfx1201, single GPU,
+                // no adaptive/CASK, dense H24/Hkv4/D256); never falls through
+                // to a q8 reader. Expected to read ≈ the f32 reference.
                 if args.kv_v != "q8" {
                     eprintln!(
                         "eval_hipfire: --kv-mode bf16 requires --kv-v q8 (neutral V spelling); got --kv-v {}",
@@ -468,18 +464,17 @@ fn main() {
                     );
                     std::process::exit(1);
                 }
-                if config.n_heads != 24 || config.n_kv_heads != 4 || config.head_dim != 256 {
-                    eprintln!(
-                        "eval_hipfire: --kv-mode bf16 admitted only for H24/Hkv4/D256 (got H{}/Hkv{}/D{})",
-                        config.n_heads, config.n_kv_heads, config.head_dim
-                    );
-                    std::process::exit(1);
-                }
-                if gpu.arch != "gfx1201" {
-                    eprintln!(
-                        "eval_hipfire: --kv-mode bf16 admitted only on gfx1201 (got {})",
-                        gpu.arch
-                    );
+                if let Some(reason) = hipfire_runtime::kv_mode::qwen35_native_refusal(
+                    hipfire_runtime::kv_mode::KvMode::Bf16,
+                    gpu.arch.as_str(),
+                    config.n_heads,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    1,
+                    false,
+                    false,
+                ) {
+                    eprintln!("eval_hipfire: --kv-mode bf16 refused: {reason}");
                     std::process::exit(1);
                 }
                 eprintln!("eval_hipfire: bf16/bf16 unscaled KV (quality control)");
