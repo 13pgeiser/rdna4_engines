@@ -25,8 +25,14 @@
 //   - slab: 128, or 64 where LDS per block would cost a wide or deeply split grid its resident
 //     blocks (see mxd_plan). A K not a multiple of 128 takes 64 (and a 2-way split widens to 4).
 //     The rule was tuned when the weight was staged through LDS too, (16*DTM + 128) * (DBK+8)
-//     bytes a block; the multi-fragment kernel now takes 2 * 16*DTM * (DBK+8), the same at DTM 8
-//     and less below, so the DTM 4 arm may no longer pay. Not re-tuned.
+//     bytes a block; the multi-fragment kernel now takes 2 * 16*DTM * (DBK+8).
+//   - past 64 rows, re-tuned for the register kernel (r4d_selftest --perfmx, warmed, every split
+//     1..8 at both slabs on the 27B's and TranslateGemma's per-rank shapes at 96 and 128 rows): the
+//     128-wide slab always (it never lost to 64), and a split only while every split keeps 16 slabs,
+//     towards a 48-block grid or, at K >= 8192, regardless, up to ks*M = 512 split rows. Against the
+//     old rule at 96 / 128 rows: 5120 x 8704 116 / 160 -> 116 / 149 us (a split of 4), 6144 x 5120
+//     97 / 105 -> 87 / 109, 5120 x 3072 79 / 67 -> 60 / 69 (none), 17408 x 5120 187 / 215 -> 175 / 197
+//     (the wide slab). A different split changes a split row's summation order, so bits move here.
 //   - non-temporal weight loads for weights of 4 MiB or more.
 //
 // No state is keyed on the stream, since a recorded pass may replay on another stream. The split
@@ -520,14 +526,24 @@ MxdPlan mxd_plan(int M, int K, int N, int KS, int BK, int NT) {
   const int tm = (M + R4D_MXD_MTILE - 1) / R4D_MXD_MTILE;
   MxdPlan p;
   int ks = 1;
-  const int fill = M <= 16 ? 48 : (M <= 96 ? 56 : 40);
-  while (ks < R4D_MXD_MAX_KS && nblk * ks < fill && 2 * ks * M <= 512) ks <<= 1;
-  if (K >= 8192)                       // a deep K: a split of 24 or more slabs still waits on them
-    while (ks < R4D_MXD_MAX_KS && (K / 128) / ks >= 24 && 2 * ks * M <= 512) ks <<= 1;
+  bool slab64 = false;
+  if (tm > 4) {
+    // Past 64 rows (the register kernel; see the header): split only while every split keeps 16
+    // 128-wide slabs, towards a 48-block grid, or at a deep K regardless.
+    const int slabs = K / 128;
+    while (ks < R4D_MXD_MAX_KS && (nblk * ks < 48 || K >= 8192) && slabs / (2 * ks) >= 16 &&
+           2 * ks * M <= 1024)
+      ks <<= 1;
+  } else {
+    const int fill = M <= 16 ? 48 : (M <= 96 ? 56 : 40);
+    while (ks < R4D_MXD_MAX_KS && nblk * ks < fill && 2 * ks * M <= 512) ks <<= 1;
+    if (K >= 8192)                     // a deep K: a split of 24 or more slabs still waits on them
+      while (ks < R4D_MXD_MAX_KS && (K / 128) / ks >= 24 && 2 * ks * M <= 512) ks <<= 1;
+    // 64-wide slabs where LDS per block would cost resident blocks: DTM 4 unsplit on 110+ column
+    // blocks.
+    slab64 = tm == 4 && ks == 1 && nblk >= 110;
+  }
   p.ks = KS > 0 ? KS : ks;
-  // 64-wide slabs where LDS per block would cost resident blocks: DTM 4 unsplit on 110+ column
-  // blocks, and DTM 8 on those or at a split of 4 or more.
-  const bool slab64 = (tm == 4 && p.ks == 1 && nblk >= 110) || (tm == 8 && (nblk >= 110 || p.ks >= 4));
   p.bk = BK > 0 ? BK : (slab64 ? 64 : 128);
   p.nt = NT == 1 || (NT == 0 && (long)N * K / 2 >= (4l << 20));
   if (K % p.bk) {                      // a slab may not run past K
