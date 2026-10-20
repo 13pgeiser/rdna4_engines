@@ -1559,12 +1559,12 @@ function triple(key, c, label, fmt, showNow) {
  * (an extreme is an extreme), but recent and now are POOLED ratios of sums (see above). */
 function acceptTriple(c, showNow) {
   const e = extAt["accept"];
-  const p = accPool[c];
-  if (!e || !(c in e) || !p || !p.length) return "";
+  const ring = accPool[c];
+  if (!e || !(c in e) || !ring || !ring.length) return "";
   let R = 0, A = 0;
-  for (const d of p) { R += d.r; A += d.a; }
+  for (const d of ring) { R += d.r; A += d.a; }
   if (R <= 0) return "";
-  const last = p[p.length - 1];
+  const last = ring[ring.length - 1];
   const tag = typeof c === "number" && c > 1 ? "@c" + c : "";
   let out = "highest " + pct(e[c], 0) + " \u00b7 recent " + pct(A / R, 0);
   if (showNow !== false && e[c] > 0 && last.r > 0)
@@ -1989,8 +1989,8 @@ function update(s, dt) {
    * the same span, so the tile keeps its own ring of delta pairs per concurrency. */
   if (aw != null && aw.dr > 0) {
     const c = s.running > 0 ? s.running : lastActiveC;
-    const p = accPool[c] || (accPool[c] = []);
-    p.push(aw); if (p.length > RECENT) p.shift();
+    const ring = accPool[c] || (accPool[c] = []);
+    ring.push(aw); if (ring.length > RECENT) ring.shift();
   }
   /* THE HEADLINE IS THE LIVE WINDOW, not the cumulative ratio. The engine's figure is exact but
    * cumulative, so on a process that has been up for hours it cannot move: 559 fresh drafts moved
