@@ -1097,6 +1097,17 @@ def apply_observed_kv_backend(cfg, txt):
         if m:
             cfg["kv_mode_effective"] = m.group(1)
             cfg["kv_mode_effective_src"] = "serve log 'KV cache: ... effective KV'"
+        else:
+            # Resolved split fallback: the producer actually emits per-tensor
+            # "effective K=<mode>, effective V=<mode>" (or space-joined
+            # "effective K=<mode> V=<mode>"); stamp only when K and V agree.
+            ms = re.search(
+                r"KV cache: requested mode=\S+?, effective K=([A-Za-z0-9_.+-]+),? +(?:effective )?V=([A-Za-z0-9_.+-]+)(?=\s|$)",
+                txt or "",
+            )
+            if ms and ms.group(1) == ms.group(2):
+                cfg["kv_mode_effective"] = ms.group(1)
+                cfg["kv_mode_effective_src"] = "serve log effective K/V"
 
     _emit_legacy_kv_backend_notice(cfg, log_txt=txt)
     return cfg.get("kv_backend_effective"), cfg.get("kv_backend_effective_reason")
@@ -1793,6 +1804,30 @@ def _self_test_load_defaults():
         cfg_log = build_config(_ns())
         apply_observed_kv_backend(cfg_log, "  KV cache: requested mode=auto, effective KV=fp8\n")
         assert "kv_mode_resolved=fp8 (observed in serve log" in kv_mode_report_line(cfg_log)
+        # Split effective K/V grammar the producer actually emits (comma and space forms).
+        cfg_q8 = build_config(_ns())
+        apply_observed_kv_backend(cfg_q8, "  KV cache: requested mode=q8, effective K=q8, effective V=q8\n")
+        assert cfg_q8["kv_mode_effective"] == "q8"
+        assert stamp_kv_backend_out_fields([{}], cfg_q8)[0]["kv_mode"] == "q8"
+        cfg_q8sp = build_config(_ns())
+        apply_observed_kv_backend(cfg_q8sp, "  KV cache: requested mode=q8, effective K=q8 V=q8\n")
+        assert cfg_q8sp["kv_mode_effective"] == "q8"
+        # Auto request still resolves from the effective K/V pair, never the requested token.
+        cfg_aq8 = build_config(_ns())
+        apply_observed_kv_backend(cfg_aq8, "  KV cache: requested mode=auto, effective K=q8, effective V=q8\n")
+        assert cfg_aq8["kv_mode_effective"] == "q8"
+        # Mismatch / partial / requested-only lines fail closed: UNOBSERVED, no row stamp.
+        for _bad in (
+            "  KV cache: requested mode=q8, effective K=q8, effective V=fp8\n",
+            "  KV cache: requested mode=q8, effective K=q8\n",
+            "  KV cache: requested mode=q8\n",
+            "diagnostic effective K=q8, effective V=q8\n",
+            "  KV cache: requested mode=q8, effective K=q8, effective V=q8-unknown\n",
+        ):
+            _cfg_bad = build_config(_ns())
+            apply_observed_kv_backend(_cfg_bad, _bad)
+            assert _cfg_bad.get("kv_mode_effective") is None
+            assert stamp_kv_backend_out_fields([{}], _cfg_bad)[0]["kv_mode"] is None
 
         # Once-per-load legacy warning + --out row metadata (list shape preserved).
         cfg_leg = build_config(_ns(kv_backend="legacy"))
