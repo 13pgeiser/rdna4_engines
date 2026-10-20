@@ -993,10 +993,14 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
      * set reads_x). The model must have declared the pair (ActFP8::declare_qs's `i8`). */
     i8 = known && linear_is_w8(enc);
     if (i8) {
-        if (!a.x || !a.q8 || !a.s8) {
-            fprintf(stderr, "radiance: '%s' is an int8 weight and its input lacks the bf16 plane "
-                            "or the int8 code pair (the model declared its input before learning "
-                            "the trunk is int8)\n", wn);
+        /* The codes come from the producer (`q8_fed`, which declares no `op_q` and so needs no bf16
+         * plane) or from this linear's own `op_q` over `a.x`. Either way the int8 pair must exist;
+         * the bf16 plane is required only when this linear quantises, exactly as the fp8 branch
+         * needs `a.q`/`a.s` without demanding `a.x`. */
+        if (!a.q8 || !a.s8 || (!a.q8_fed && !a.x)) {
+            fprintf(stderr, "radiance: '%s' is an int8 weight and its input lacks the int8 code "
+                            "pair%s (the model declared its input before learning the trunk is "
+                            "int8)\n", wn, a.q8_fed ? "" : " or the bf16 plane it quantises");
             return RAD_E_DTYPE;
         }
         if (N % 16 || K % RAD_FP8_BLOCK) {

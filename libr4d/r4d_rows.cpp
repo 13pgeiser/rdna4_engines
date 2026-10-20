@@ -3041,6 +3041,9 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("rms_mod_quant_fp8", pRmsModQ, oRmsModQ,
            "rms_mod with the chain in bf16, then (q, scale) = quant_act_fp8(z, group); z written "
            "when bound."),
+    SCHEMA("rms_mod_quant_i8", pRmsModQ, oRmsModQ,
+           "rms_mod with the chain in bf16, then (q, scale) = quant_act_i8g(z, group) -- int8 codes "
+           "a quarter of E4M3's error on the same byte; z written when bound."),
     SCHEMA("flow_x0_step", pGenMn, oFlowX0,
            "x = r x + (1 - r) (x + (1 - t) v), r = sigma_next / sigma, each step one f32 "
            "rounding."),
@@ -7290,6 +7293,14 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cRmsModQ), NOTUNE,
   nullptr, nullptr, r4d_rad_rms_mod_quant_fp8 },
+
+{ "rms_mod_quant_i8_bf16", "rms_mod_quant_i8", "norm",
+  "gated residual, modulated RMS norm and quant_act_i8g in one pass: a workgroup a row",
+  "n % 128 == 0, n <= 8192, group 128; s a column slice at its own pitch",
+  "bf16 rows, gain and table, int8 codes and f32 scales",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cRmsModQ), NOTUNE,
+  nullptr, nullptr, r4d_rad_rms_mod_quant_i8 },
 
 { "flow_x0_step_f32", "flow_x0_step", "elem",
   "a sampler step toward the clean estimate", "any M, row pitches honoured",

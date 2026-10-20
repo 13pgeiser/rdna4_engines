@@ -77,7 +77,9 @@ __device__ __forceinline__ float rdv(const float*, float v) { return v; }
 // r4d_q8.h's. `s` is a column slice of the modulation table, [shift | scale] in each entry's row.
 constexpr int kRmChunks = 4;   // 8-wide chunks a thread keeps: n <= kT * 8 * 4 = 8192
 
-template <bool GATED, bool QUANT>
+// QMODE: 0 writes the bf16 chain to `z`, 1 also quantises it to E4M3 (q, scale), 2 to int8. The two
+// quantising modes differ only in r4d_q8.h's `q8_top` / `q8_pack4` specialisation.
+template <bool GATED, int QMODE>
 __global__ __launch_bounds__(kT) void rms_mod_kernel(
     const uint16_t* __restrict__ yd, const uint16_t* __restrict__ g, const uint16_t* __restrict__ s,
     const uint16_t* __restrict__ w, const int* __restrict__ cu, uint16_t* __restrict__ x,
@@ -125,7 +127,7 @@ __global__ __launch_bounds__(kT) void rms_mod_kernel(
             o[j] = bfr(bfr(n2 * bfr(1.0f + scf[j])) + shf[j]);
         }
         if (z) st8(z + (size_t)r * z_ld + i, o);
-        if (QUANT) {
+        if (QMODE) {
             float m = 0.0f;
             #pragma unroll
             for (int j = 0; j < 8; ++j) m = fmaxf(m, fabsf(o[j]));
@@ -133,12 +135,12 @@ __global__ __launch_bounds__(kT) void rms_mod_kernel(
             m = fmaxf(m, r4d_xor_lane<4>(m));
             m = fmaxf(m, r4d_xor_lane<2>(m));
             m = fmaxf(m, r4d_xor_lane<1>(m));
-            const float sc = m > 0.0f ? m * (1.0f / q8_top<false>()) : 1.0f;
+            const float sc = m > 0.0f ? m * (1.0f / q8_top<QMODE == 2>()) : 1.0f;
             const float inv = 1.0f / sc;
             if ((threadIdx.x & 15) == 0) qs[(size_t)r * qs_ld + i / 128] = sc;
             *(uint2*)(q + (size_t)r * q_ld + i) =
-                make_uint2(q8_pack4<false>(o[0], o[1], o[2], o[3], inv),
-                           q8_pack4<false>(o[4], o[5], o[6], o[7], inv));
+                make_uint2(q8_pack4<QMODE == 2>(o[0], o[1], o[2], o[3], inv),
+                           q8_pack4<QMODE == 2>(o[4], o[5], o[6], o[7], inv));
         }
     }
 }
@@ -425,22 +427,22 @@ int parse_f32_list(const char* s, float* out, int max) {
 
 // rms_mod (QUANT false: y, g, s, w, cu, x, z) and rms_mod_quant_fp8 (y, g, s, w, cu, x, q, scale,
 // z), one shim.
-static int rms_mod_launch(const RadArgs* a, RadStream st, bool quant) {
+static int rms_mod_launch(const RadArgs* a, RadStream st, int qmode) {
     const RadTensor *y = r4d_opt(a, 0), *g = r4d_opt(a, 1), *sc = r4d_opt(a, 2);
     const RadTensor *w = r4d_opt(a, 3), *cu = r4d_opt(a, 4), *x = r4d_opt(a, 5);
-    const RadTensor* q = quant ? r4d_opt(a, 6) : nullptr;
-    const RadTensor* qs = quant ? r4d_opt(a, 7) : nullptr;
-    const RadTensor* z = r4d_opt(a, quant ? 8 : 6);
-    if (!sc || !w || !cu || !x || (quant ? (!q || !qs) : !z)) return R4D_NO(RAD_E_INVAL);
+    const RadTensor* q = qmode ? r4d_opt(a, 6) : nullptr;
+    const RadTensor* qs = qmode ? r4d_opt(a, 7) : nullptr;
+    const RadTensor* z = r4d_opt(a, qmode ? 8 : 6);
+    if (!sc || !w || !cu || !x || (qmode ? (!q || !qs) : !z)) return R4D_NO(RAD_E_INVAL);
     const bool gated = r4d_geti_or(a, "gated", 0) != 0;
     if (gated && (!y || !g)) return R4D_NO(RAD_E_INVAL);
     if (!is_bf16(x) || !is_bf16(sc) || !is_bf16(w) || !is_i32(cu) ||
         (gated && (!is_bf16(y) || !is_bf16(g))) || (z && !is_bf16(z)) ||
-        (quant && (q->dtype != RAD_F8E4M3 || qs->dtype != RAD_F32)))
+        (qmode && (q->dtype != (qmode == 2 ? RAD_I8 : RAD_F8E4M3) || qs->dtype != RAD_F32)))
         return R4D_NO(RAD_E_DTYPE);
     const long long n = r4d_geti_or(a, "n", 0);
     if (n <= 0 || (n & 7) || n > (long long)kT * 8 * kRmChunks ||
-        (quant && (n % 128 || r4d_geti_or(a, "group", 0) != 128)))
+        (qmode && (n % 128 || r4d_geti_or(a, "group", 0) != 128)))
         return R4D_NO(RAD_E_SHAPE);
     long long rx = 0, xl = 0, ry = 0, yl = 0, rg = 0, gl = 0, rs = 0, sl = 0, rz = 0, zl = 0;
     long long rq = 0, rqs = 0, ql = 0, qsl = 0;
@@ -449,14 +451,14 @@ static int rms_mod_launch(const RadArgs* a, RadStream st, bool quant) {
         (gated && (!rows8(y, n, &ry, &yl) || !rows8(g, n, &rg, &gl))) ||
         (z && !rows8(z, n, &rz, &zl)))
         return R4D_NO(RAD_E_STRIDE);
-    if (quant) {
+    if (qmode) {
         ql = r4d_rows_pitch(q, n, &rq);
         qsl = r4d_rows_pitch(qs, n / 128, &rqs);
         if (ql < 0 || (ql & 7) || ((uintptr_t)q->data & 7) || qsl < 0) return R4D_NO(RAD_E_STRIDE);
     }
-    const long long n_seq = r4d_numel(cu) - 1, rows = quant ? rq : rz;
+    const long long n_seq = r4d_numel(cu) - 1, rows = qmode ? rq : rz;
     if (rows <= 0 || n_seq <= 0 || rx < rows || rs < n_seq || r4d_numel(w) < n ||
-        (quant && rqs < rows) || (gated && (ry < rows || rg < n_seq)) || (z && rz < rows))
+        (qmode && rqs < rows) || (gated && (ry < rows || rg < n_seq)) || (z && rz < rows))
         return R4D_NO(RAD_E_SHAPE);
     const float eps = (float)r4d_getf(a, "eps", 1e-6);
 #define R4D_RMQ(G, Q)                                                                             \
@@ -464,24 +466,31 @@ static int rms_mod_launch(const RadArgs* a, RadStream st, bool quant) {
                        (hipStream_t)st, G ? (const uint16_t*)y->data : nullptr,                   \
                        G ? (const uint16_t*)g->data : nullptr, (const uint16_t*)sc->data,         \
                        (const uint16_t*)w->data, (const int*)cu->data, (uint16_t*)x->data,        \
-                       Q ? (uint8_t*)q->data : nullptr, Q ? (float*)qs->data : nullptr,           \
+                       (Q) ? (uint8_t*)q->data : nullptr, (Q) ? (float*)qs->data : nullptr,       \
                        z ? (uint16_t*)z->data : nullptr, (int)n, (int)n_seq, eps, (int)yl,        \
                        (int)gl, (int)sl, (int)xl, (int)ql, (int)qsl, (int)zl)
-    if (quant) {
-        if (gated) R4D_RMQ(true, true);
-        else       R4D_RMQ(false, true);
+    if (qmode == 2) {
+        if (gated) R4D_RMQ(true, 2);
+        else       R4D_RMQ(false, 2);
+    } else if (qmode == 1) {
+        if (gated) R4D_RMQ(true, 1);
+        else       R4D_RMQ(false, 1);
     } else {
-        if (gated) R4D_RMQ(true, false);
-        else       R4D_RMQ(false, false);
+        if (gated) R4D_RMQ(true, 0);
+        else       R4D_RMQ(false, 0);
     }
 #undef R4D_RMQ
     return st_of(hipGetLastError());
 }
 
-extern "C" int r4d_rad_rms_mod(const RadArgs* a, RadStream s) { return rms_mod_launch(a, s, false); }
+extern "C" int r4d_rad_rms_mod(const RadArgs* a, RadStream s) { return rms_mod_launch(a, s, 0); }
 
 extern "C" int r4d_rad_rms_mod_quant_fp8(const RadArgs* a, RadStream s) {
-    return rms_mod_launch(a, s, true);
+    return rms_mod_launch(a, s, 1);
+}
+
+extern "C" int r4d_rad_rms_mod_quant_i8(const RadArgs* a, RadStream s) {
+    return rms_mod_launch(a, s, 2);
 }
 
 extern "C" int r4d_rad_flow_x0_step(const RadArgs* a, RadStream s) {
