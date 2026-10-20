@@ -2018,10 +2018,21 @@ const int kVEncGeomN = 25, kAEncGeomN = 13;
 
 static bool venc_geom(int64_t frames, int64_t h, int64_t w, int32_t* out) {
     if (frames < 1 || frames > kEncMaxFrames || h < kVaeRatio || w < kVaeRatio ||
-        h > kEncMaxSide || w > kEncMaxSide || h % kVaeRatio || w % kVaeRatio)
+        h % kVaeRatio || w % kVaeRatio)
         return false;
     const int64_t clip = frames == 1 ? 1 : kVaeClipLength;
     const int64_t n_clips = frames == 1 ? 1 : (frames + kVaeClipLength - 1) / kVaeClipLength;
+    /* The side the buffers set the ceiling on, not a flat number: they hold ONE clip's pixels at
+     * a time, sized for a full kVaeClipLength-frame clip at kEncMaxSide, so a media fits while
+     * clip * h * w stays within that volume. A multi-frame reference video is unchanged -- clip
+     * is kVaeClipLength, so the volume cap forces each side back to kEncMaxSide exactly as before.
+     * A ONE-frame media -- a reference picture, or an endpoint KEYFRAME -- is a single-frame clip
+     * and therefore rides at a far larger side. Keyframes must: the pack shares their latent rows
+     * across the TARGET grid (they are resized to the target canvas before the VAE, rad_ref2va_pack
+     * ref2va_build), so an endpoint pin at output resolution is what the DiT attends to; the flat
+     * kEncMaxSide cap used to refuse them at any output above 256. The slot-latent check below and
+     * step_venc's own overflow check bound the result; nothing here enlarges a buffer. */
+    if (clip * h * w > (int64_t)kVaeClipLength * kEncMaxSide * kEncMaxSide) return false;
     const int64_t lat = vae_latent_frames(frames);
     const int64_t full = vae_clip_latents(clip);
     const int64_t last = lat - full * (n_clips - 1);
@@ -3671,6 +3682,20 @@ static void step_upscale(RadCtx* c, const RadBatch* batch, const Model& m) {
                 brow_slice(m.b_astate, lane * m.maxA, arows, kAudioC));
 }
 
+/* The encoder's debug shadows (b_vcin / b_vl[] / b_vtrunk / b_vnout) are read back only when the
+ * driver's R4D_ENC_DEBUG readback runs -- but the casts that fill them were issued on EVERY encode.
+ * Their buffers are sized for one kEncMaxSide-sized frame plane (PF[]), so a ONE-frame media at a
+ * larger side -- an endpoint keyframe resized to the target canvas, up to 512 and above -- issues a
+ * cast whose M (the frame plane) falls outside the op's declared band and faults. Gate the shadows
+ * on the same env the readback uses: when it is unset nothing reads them, so skipping the issue is
+ * a no-op for the production latent and keeps the shared encoder clear of the oversized plane. The
+ * driver gates its R4D_ENC_SEL readback on R4D_ENC_DEBUG too, so debug-on still populates them.
+ * Scaffolding, stripped at PR time. */
+static bool venc_dbg_shadows() {
+    static const bool on = std::getenv("R4D_ENC_DEBUG") != nullptr;
+    return on;
+}
+
 /* The video VAE encoder over one media item: its clip-padded frames in `enc_pixels`, each clip
  * through the six levels to the 48-column moments, the first 24 quantised and folded into the
  * lane's `b_evc` at the media's slot. The volumes come from the same geometry the driver staged
@@ -3719,8 +3744,9 @@ static void step_venc(RadCtx* c, const RadBatch* batch, const Model& m) {
         RAD_ISSUE_N(c, m.op_ve_pcast, R0, brows(m.b_epix32, R0), brows(m.b_epix, R0));
         RAD_ISSUE_N(c, m.op_ve_cin, R0, brows(m.b_epix, R0), RAD_W(m.ve_cinw), RAD_W(m.ve_cinb),
                     gg[0], RAD_NONE, brows(m.v_lv[0].a, R0));
-        RAD_ISSUE_N(c, m.op_ve_cindbg, (int64_t)g[1] * g[2],
-                    brows(m.v_lv[0].a, R0), brows(m.b_vcin, (int64_t)g[1] * g[2])); /* frame-0 shadow */
+        if (venc_dbg_shadows())
+            RAD_ISSUE_N(c, m.op_ve_cindbg, (int64_t)g[1] * g[2],
+                        brows(m.v_lv[0].a, R0), brows(m.b_vcin, (int64_t)g[1] * g[2])); /* frame-0 shadow */
         for (int L = 0; L < 6; ++L) {
             const Model::VEncLevel& E = m.v_lv[(size_t)L];
             const int64_t R = (int64_t)g[kVOrg[L]] * g[kVOrg[L] + 1] * g[kVOrg[L] + 2];
@@ -3746,7 +3772,7 @@ static void step_venc(RadCtx* c, const RadBatch* batch, const Model& m) {
                 RAD_ISSUE_N(c, B.op_c2, R, brows(E.b, R), RAD_W(B.c2w), RAD_W(B.c2b), gg[L],
                             brows(E.a, R), brows(E.a, R));
             }
-            if (L <= 4 && m.op_ve_ldbg[L]) {   /* frame-0 post-resnet shadow (levels 0..4) */
+            if (venc_dbg_shadows() && L <= 4 && m.op_ve_ldbg[L]) {   /* frame-0 post-resnet shadow (levels 0..4) */
                 const int64_t pf = (int64_t)g[kVOrg[L] + 1] * g[kVOrg[L] + 2];
                 RAD_ISSUE_N(c, m.op_ve_ldbg[L], pf, brows(E.a, R), brows(m.b_vl[L], pf));
             }
@@ -3759,10 +3785,12 @@ static void step_venc(RadCtx* c, const RadBatch* batch, const Model& m) {
             }
         }
         const int64_t R5 = (int64_t)g[12] * g[13] * g[14];
-        RAD_ISSUE_N(c, m.op_ve_trunkdbg, R5, brows(m.v_lv[5].a, R5), brows(m.b_vtrunk, R5)); /* shadow */
+        if (venc_dbg_shadows())
+            RAD_ISSUE_N(c, m.op_ve_trunkdbg, R5, brows(m.v_lv[5].a, R5), brows(m.b_vtrunk, R5)); /* shadow */
         RAD_ISSUE_N(c, m.op_ve_nout, R5, brows(m.v_lv[5].a, R5), RAD_W(m.ve_now), RAD_W(m.ve_nob),
                     RAD_NONE, st, brows(m.v_lv[5].b, R5));
-        RAD_ISSUE_N(c, m.op_ve_noutdbg, R5, brows(m.v_lv[5].b, R5), brows(m.b_vnout, R5)); /* shadow */
+        if (venc_dbg_shadows())
+            RAD_ISSUE_N(c, m.op_ve_noutdbg, R5, brows(m.v_lv[5].b, R5), brows(m.b_vnout, R5)); /* shadow */
         RAD_ISSUE_N(c, m.op_ve_cout, R5, brows(m.v_lv[5].b, R5), RAD_W(m.ve_coutw),
                     RAD_W(m.ve_coutb), gg[5], RAD_NONE, brows(m.b_eq48, R5));
         RAD_ISSUE_N(c, m.op_ve_q, R5, brows(m.b_eq48, R5), RAD_W(m.ve_qw), RAD_W(m.ve_qb), gg[5],
