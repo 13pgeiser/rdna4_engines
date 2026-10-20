@@ -36,8 +36,8 @@
 //!
 //! Native gates: EVERY finite Winner/Kt48/Random candidate output must match
 //! the quantized independent HIP reference byte-for-byte and be finite.
-//! Closed-form winner expectations are secondary checks only. NaN fixtures
-//! require the independently specified NaN mask and exact unaffected bytes.
+//! Closed-form winner expectations are secondary; KV-NaN fixtures need the mask.
+//! Q-nonfinite `expected` NaNs are INPUT-TAINT markers: BOTH arms strict +0 + equality.
 //! Actual `qwen35_fa_prep_batched_gfx1201` F32 and FP8 gated/nogate launches
 //! share inputs; CPU per-head amax/448 + E4M3 RNE + permute checks every
 //! downloaded code and F32 scale. Normalization/RoPE reuse the exact existing
@@ -2155,7 +2155,7 @@ fn native_prepare(cell: &NativeCell, round: usize) -> Result<NativePrepared> {
         // V NaNs at always-live key0 taint only their dimensions, including
         // low-horizon rows. Finite unaffected bytes remain meaningful.
         if max_ctx > 4 {
-            k_cache[3 * POS_BYTES + 0 * D + 5] = 0x7f;
+            k_cache[3 * POS_BYTES + 5] = 0x7f;
             k_cache[3 * POS_BYTES + 1 * D + 200] = 0xff;
             v_cache[0] = 0x7f;
             v_cache[D + 255] = 0xff;
@@ -2197,6 +2197,9 @@ fn native_prepare(cell: &NativeCell, round: usize) -> Result<NativePrepared> {
                 })
             })
             .collect(),
+        // INPUT-TAINT markers for Q heads poisoned BEFORE prep (values kept
+        // byte-identical): the scalar DAG derives a strict +0 OUTPUT
+        // requirement on finite K/V, not a required-output-NaN. Bytes kept.
         NativeKind::QNan | NativeKind::QInf => q_f32
             .chunks_exact(D)
             .flat_map(|head| {
@@ -2683,8 +2686,15 @@ fn native_producer_proof(gpu: &mut Gpu) -> Result<Value> {
 }
 
 /// Every finite output gates against the independent quantized HIP reference.
-/// Winner closed forms are additional checks; NaN masks come from fixtures,
+/// Winner closed forms are additional checks; KV-NaN masks come from fixtures,
 /// not from candidate output. Every unaffected word must be finite and exact.
+/// Q-nonfinite (`QNan`/`QInf`) words carrying an INPUT-TAINT `expected` NaN
+/// marker gate differently: the scalar DAG derives strict +0 output on finite
+/// K/V (all valid QK scores unordered => fmax stays -Inf => frame never
+/// initializes => e/l/P/O stay 0), so BOTH candidate and reference words must
+/// be exactly +0 bits, and masked words never bypass candidate/reference
+/// equality. `expected_nan_words` counts only true required-output-NaN (KV
+/// `Nan`) words; Q taint/required-+0 words are reported separately.
 fn native_out_compare(
     kind: NativeKind,
     expected: &[f32],
@@ -2699,10 +2709,13 @@ fn native_out_compare(
     {
         return json!({"pass":false, "error":"output/expectation extent mismatch"});
     }
+    let is_q = matches!(kind, NativeKind::QNan | NativeKind::QInf);
     let mut mismatches = 0usize;
     let mut nonfinite = 0usize;
     let mut nan_mismatches = 0usize;
     let mut affected_nan = 0usize;
+    let mut q_taint = 0usize;
+    let mut zero_mismatches = 0usize;
     let mut secondary_mismatches = 0usize;
     let mut first = None;
     for (i, (cb, rb)) in cand_bytes
@@ -2712,7 +2725,23 @@ fn native_out_compare(
     {
         let c = f32::from_ne_bytes(cb.try_into().unwrap());
         let r = f32::from_ne_bytes(rb.try_into().unwrap());
-        if kind.nonfinite() && expected[i].is_nan() {
+        if is_q && expected[i].is_nan() {
+            // INPUT-TAINT marker for a Q head poisoned before prep: require
+            // strict +0 on BOTH arms plus candidate/reference equality.
+            q_taint += 1;
+            if c.to_bits() != 0 || r.to_bits() != 0 {
+                zero_mismatches += 1;
+                first.get_or_insert(i);
+            }
+            if cb != rb {
+                mismatches += 1;
+                first.get_or_insert(i);
+            }
+            if !c.is_finite() || !r.is_finite() {
+                nonfinite += 1;
+                first.get_or_insert(i);
+            }
+        } else if kind.nonfinite() && expected[i].is_nan() {
             affected_nan += 1;
             if !c.is_nan() || !r.is_nan() {
                 nan_mismatches += 1;
@@ -2738,15 +2767,54 @@ fn native_out_compare(
     let ok = mismatches == 0
         && nonfinite == 0
         && nan_mismatches == 0
+        && zero_mismatches == 0
         && secondary_mismatches == 0
-        && (!kind.nonfinite() || affected_nan > 0);
-    json!({"classification":if kind.nonfinite() {"nonfinite_positions_separate"} else {"finite_byte_gate"},
+        && (!kind.nonfinite() || affected_nan + q_taint > 0);
+    json!({"classification":if is_q {"q_taint_strict_positive_zero"} else if kind.nonfinite() {"nonfinite_positions_separate"} else {"finite_byte_gate"},
         "reference":"independent_quantized_HIP", "gate":true, "words":words,
         "candidate_reference_word_mismatches":mismatches,
         "unexpected_nonfinite_words":nonfinite, "expected_nan_words":affected_nan,
         "nan_mask_mismatches":nan_mismatches,
+        "input_q_taint_words":q_taint,
+        "expected_positive_zero_words":q_taint,
+        "zero_word_mismatches":zero_mismatches,
         "secondary_closed_winner_mismatches":secondary_mismatches,
         "first_mismatch":first, "pass":ok})
+}
+/// Consumed-input representation gate for the EXISTING QNan/QInf native
+/// rounds: asserts the actual uploaded Q-plane bytes (`NativePrepared`
+/// `q_codes`/`q_scales` forming the two-plane buffer) show E4M3 NaN code(s)
+/// (`code & 0x7f == 0x7f`) on every input-tainted D256 Q head — finite scales
+/// for QNan, +Inf scales for QInf (Inf/Inf quantizes to NaN codes via
+/// `prep_q_row`; other dims quantize to signed zero). Counts must equal a
+/// NONZERO tainted-head count. Caller couples this to the EXISTING
+/// before/after `q_two_plane` device-input integrity equality.
+fn native_q_nonfinite_repr(kind: NativeKind, p: &NativePrepared) -> Value {
+    let heads = p.q_f32.len() / D;
+    let mut tainted = 0usize;
+    let mut bad = 0usize;
+    let mut first = None;
+    for h in 0..heads {
+        let poisoned = p.q_f32[h * D..(h + 1) * D].iter().any(|v| !v.is_finite());
+        if !poisoned {
+            continue;
+        }
+        tainted += 1;
+        let base = h * D;
+        let has_nan = p.q_codes[base..base + D].iter().any(|c| c & 0x7f == 0x7f);
+        let scale_ok = match kind {
+            NativeKind::QInf => p.q_scales[h].is_infinite() && p.q_scales[h].is_sign_positive(),
+            _ => p.q_scales[h].is_finite(),
+        };
+        if !has_nan || !scale_ok {
+            bad += 1;
+            first.get_or_insert(h);
+        }
+    }
+    let ok = tainted > 0 && bad == 0;
+    json!({"classification": "consumed_q_plane_representation",
+        "tainted_q_heads": tainted, "representation_mismatches": bad,
+        "first_mismatch_head": first, "pass": ok})
 }
 /// Native future-cache poison probe: rows at or below each probe row's causal
 /// horizon stay byte-identical on BOTH arms when every later key is zeroed or
@@ -2938,6 +3006,12 @@ fn native_round(gpu: &mut Gpu, a: &NativeArena, cell: &NativeCell, round: usize)
     let initial_integrity = native_integrity(gpu, a, &p, &p.k_cache, &p.v_cache)?;
     let probes = native_poison_probe(gpu, a, cell, &p, &whole, total, round)?;
     let integ = native_integrity(gpu, a, &p, &p.k_cache, &p.v_cache)?;
+    let is_q = matches!(cell.kind, NativeKind::QNan | NativeKind::QInf);
+    let q_repr = if is_q {
+        native_q_nonfinite_repr(cell.kind, &p)
+    } else {
+        Value::Null
+    };
     let ok = pass(&attention)
         && wrap_eq
         && ref_wrap_eq
@@ -2947,10 +3021,12 @@ fn native_round(gpu: &mut Gpu, a: &NativeArena, cell: &NativeCell, round: usize)
         && reference_q_unchanged
         && pass(&initial_integrity)
         && pass(&probes)
-        && pass(&integ);
+        && pass(&integ)
+        && (!is_q || (pass(&q_repr) && pass(&initial_integrity) && pass(&integ)));
     Ok(json!({"round": round, "seed": p.seed, "total_rows": total,
         "q_input":"host fixture; actual GPU producer proof gates the whole native family",
         "attention": attention,
+        "consumed_q_representation": q_repr,
         "wrapper_range_offset0_reproduces_direct": wrap_eq,
         "reference_range_offset0_reproduces_direct": ref_wrap_eq,
         "range_nonzero_offset": range_gate,
@@ -3883,7 +3959,60 @@ fn self_check() -> usize {
         inf.q_scales[0].is_infinite()
             && inf.q_codes[0] & 0x7f == 0x7f
             && inf.expected[..D].iter().all(|v| v.is_nan()),
-        "F32 Inf analog: Inf scale, Inf/Inf NaN code, independently tainted output head",
+        "F32 Inf fixture: +Inf scale with Inf/Inf NaN code and INPUT-TAINT markers (not expected-output-NaN)",
+    );
+    // Q-nonfinite comparator regression: taint markers require strict +0 on
+    // BOTH arms plus candidate/reference equality (masked words never agree
+    // by fiat).
+    let taint = vec![f32::NAN; ROW];
+    let zeros = vec![0.0f32; ROW];
+    ok(
+        pass(&native_out_compare(
+            NativeKind::QNan,
+            &taint,
+            bytes(&zeros),
+            bytes(&zeros),
+        )),
+        "Q taint: matching +0 words pass",
+    );
+    let nonzero = vec![1.0f32; ROW];
+    ok(
+        !pass(&native_out_compare(
+            NativeKind::QNan,
+            &taint,
+            bytes(&nonzero),
+            bytes(&nonzero),
+        )),
+        "Q taint: matching nonzero finite words fail despite reference agreement",
+    );
+    let nans = vec![f32::NAN; ROW];
+    ok(
+        !pass(&native_out_compare(
+            NativeKind::QNan,
+            &taint,
+            bytes(&nans),
+            bytes(&nans),
+        )),
+        "Q taint: matching NaNs fail the required-+0 gate",
+    );
+    // Consumed-plane representation regression: QNan finite scales, QInf +Inf
+    // scales, both with NaN codes on tainted heads and NONZERO taint counts.
+    let nan_fixture = native_prepare(
+        &NativeCell {
+            rows: 8,
+            start: 0,
+            kind: NativeKind::QNan,
+        },
+        0,
+    )
+    .expect("F32 NaN fixture");
+    ok(
+        pass(&native_q_nonfinite_repr(NativeKind::QNan, &nan_fixture)),
+        "QNan consumed plane: NaN codes with finite scales on nonzero tainted heads",
+    );
+    ok(
+        pass(&native_q_nonfinite_repr(NativeKind::QInf, &inf)),
+        "QInf consumed plane: NaN codes with +Inf scales on nonzero tainted heads",
     );
     let (nan_codes, nan_scale) = prep_q_row(&vec![f32::NAN; D]);
     ok(
@@ -3959,7 +4088,9 @@ fn run() -> Result<bool> {
         .filter
         .as_ref()
         .map_or(false, |f| f.contains("a3b_native"));
-    let native_selected: Vec<NativeCell> = native_cells()
+    let native_candidates = native_cells();
+    let native_total = native_candidates.len();
+    let native_selected: Vec<NativeCell> = native_candidates
         .into_iter()
         .filter(|c| {
             native_requested
@@ -3968,6 +4099,7 @@ fn run() -> Result<bool> {
                     .map_or(false, |f| c.name().contains(f.as_str()))
         })
         .collect();
+    let native_full_selection = native_selected.len() == native_total;
     if native_requested && native_selected.is_empty() {
         return Err("requested a3b_native filter selected zero cases".into());
     }
@@ -4128,19 +4260,22 @@ fn run() -> Result<bool> {
             }
         }
     }
-    // All selected finite/NaN cases and the ACTUAL GPU fused-prep proof are
-    // mandatory. Errors, early failure and unexecuted selected cases fail closed.
+    // Every selected case is mandatory. Complete-family runs also require the
+    // actual fused-prep proof; cell-only continuations must join its unchanged
+    // source-bound prior receipt externally and cannot claim family completion.
     let mut native_producer = Value::Null;
     let (mut native_cells_n, mut native_passed, mut native_finite, mut native_finite_ok) =
         (0usize, 0usize, 0usize, 0usize);
     if !native_selected.is_empty() {
-        native_producer = native_producer_proof(&mut gpu)?;
-        println!(
-            "{}",
-            json!({"kind":"native_gpu_producer", "result":native_producer})
-        );
-        if !pass(&native_producer) {
-            return Err("actual native fused-prep producer gate failed".into());
+        if native_full_selection {
+            native_producer = native_producer_proof(&mut gpu)?;
+            println!(
+                "{}",
+                json!({"kind":"native_gpu_producer", "result":native_producer})
+            );
+            if !pass(&native_producer) {
+                return Err("actual native fused-prep producer gate failed".into());
+            }
         }
         let native_arena = NativeArena::new(&mut gpu, &native_selected)?;
         println!(
@@ -4196,7 +4331,7 @@ fn run() -> Result<bool> {
         .count();
     let native_acceptance = native_requested
         && !native_selected.is_empty()
-        && pass(&native_producer)
+        && (!native_full_selection || pass(&native_producer))
         && native_cells_n == native_selected.len()
         && native_passed == native_selected.len()
         && native_finite == native_finite_selected
@@ -4219,6 +4354,10 @@ fn run() -> Result<bool> {
             "native_requested":native_requested,"native_selected":native_selected.len(),
             "native_finite_selected":native_finite_selected,"native_gpu_producer":native_producer,
             "native_acceptance":native_acceptance,
+            "native_total":native_total,
+            "native_producer_executed":native_full_selection && native_requested,
+            "native_family_complete_this_run":native_full_selection && native_acceptance,
+            "prior_producer_join_required_for_family_closure":native_requested && !native_full_selection,
             "native_coverage":if native_requested {native_coverage_map()} else {Value::Null},
             "native_reference_sha256":native_src_sha})
     );
