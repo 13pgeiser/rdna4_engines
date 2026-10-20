@@ -204,8 +204,7 @@ fn qwen36_27b_gfx1201_plans_match_frozen_recipe_manifests() {
         let got = manifest(&plan);
         // HIP source-text hashes are historical capture provenance, not current
         // recipe identities. Embedded binary image hashes remain strict.
-        let mut want: BTreeMap<String, (String, Value, Value, BTreeSet<String>)> =
-            BTreeMap::new();
+        let mut want: BTreeMap<String, (String, Value, Value, BTreeSet<String>)> = BTreeMap::new();
         for e in route["entries"].as_array().unwrap() {
             if e["kind"].as_str() == Some("embedded") {
                 assert_eq!(
@@ -235,11 +234,19 @@ fn qwen36_27b_gfx1201_plans_match_frozen_recipe_manifests() {
             .map(|(module, (kind, _, flags, profile, symbols))| {
                 (
                     module.clone(),
-                    (kind.clone(), flags.clone(), profile.clone(), symbols.clone()),
+                    (
+                        kind.clone(),
+                        flags.clone(),
+                        profile.clone(),
+                        symbols.clone(),
+                    ),
                 )
             })
             .collect();
-        assert_eq!(got_recipe, want, "{spec:?} plan drifted from its frozen manifest");
+        assert_eq!(
+            got_recipe, want,
+            "{spec:?} plan drifted from its frozen manifest"
+        );
         let symbols: usize = got.values().map(|v| v.4.len()).sum();
         assert_eq!(symbols, route["symbol_count"].as_u64().unwrap() as usize);
     }
@@ -268,7 +275,11 @@ fn every_historical_route_symbol_is_planned_with_current_identity() {
                 assert_eq!(flags, &o["flags"], "{module}: observed recipe flags differ");
                 assert_eq!(profile, &o["scheduler_profile"], "{module}");
             } else {
-                assert_eq!(digest, o["sha256"].as_str().unwrap(), "{module}: embedded image differs");
+                assert_eq!(
+                    digest,
+                    o["sha256"].as_str().unwrap(),
+                    "{module}: embedded image differs"
+                );
             }
         }
     }
