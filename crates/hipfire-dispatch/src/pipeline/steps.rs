@@ -792,6 +792,7 @@ pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchE
             Step::Project(op) => op.validate_for_gpu(gpu)?,
             Step::BroadcastAdd(op) => op.validate_for_gpu(gpu)?,
             Step::GatedMlp(op) => op.validate_for_gpu(gpu)?,
+            Step::ParallelMoeMlp(op) => op.validate_for_gpu(gpu)?,
             _ => {}
         }
     }

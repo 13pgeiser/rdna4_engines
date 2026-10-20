@@ -87,7 +87,9 @@ pub enum MlpLadder {
 /// Fixed scratch of one op.
 #[derive(Clone, Copy)]
 pub struct GatedMlpScratch<'a> {
-    /// F32 `[rows, intermediate]` each; `act` may alias `gate`.
+    /// F32 `[rows, intermediate]` each. `gate` and `up` must be distinct
+    /// buffers, and `act` must not alias `up` (the activation writes `act`
+    /// before the product reads `up`); `act` may alias `gate`.
     pub gate: &'a GpuTensor,
     pub up: &'a GpuTensor,
     pub act: &'a GpuTensor,
@@ -153,7 +155,7 @@ impl GatedMlpOp<'_> {
         )))
     }
 
-    fn validate_layout(&self) -> Result<(), DispatchError> {
+    pub(super) fn validate_layout(&self) -> Result<(), DispatchError> {
         let (rows, hidden, inner_width) = (self.rows, self.hidden, self.intermediate);
         if rows == 0 || hidden == 0 || inner_width == 0 {
             return Err(DispatchError::Hip("gated MLP has empty geometry".into()));
