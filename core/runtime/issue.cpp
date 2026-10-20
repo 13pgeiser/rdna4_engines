@@ -82,15 +82,17 @@ void* Ctx::resolve_weight(rad_weight w) {
     const WeightSlot* s = residency_->lookup(w);       /* never blocks -- residency.h */
     if (s) {
         p = s->ptr;
-        /* Wait once per generation, not per issue; a stream wait orders everything issued after
-         * it. Sound because the mover bumps `generation` per transfer (residency.h). */
-        if (s->ready && waited_gen_[w] != s->generation) {
+        /* Wait once per generation and lane, not per issue; a stream wait orders everything
+         * issued after it on that stream, and nothing on the other lane. Sound because the mover
+         * bumps `generation` per transfer (residency.h). */
+        std::vector<uint32_t>& waited = waited_gen_[lane_];
+        if (s->ready && waited[w] != s->generation) {
             /* Kept out of a recording: it orders every later play too, and moving a weight a
              * pass names directly re-keys the pass. */
             if (rec_) tape_pause(true);
             rad_event_wait(cur_stream(), s->ready);         /* the stream waits, not the host */
             if (rec_) tape_pause(false);
-            waited_gen_[w] = s->generation;
+            waited[w] = s->generation;
             ++n_stream_waits_;
         }
     }

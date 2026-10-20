@@ -271,7 +271,7 @@ int Ctx::bind_weights() {
     Program& P = *program_;
     w_tmpl_.assign(P.weights.size(), RadTensor{});
     w_bits_.assign(P.weights.size(), 0);
-    waited_gen_.assign(P.weights.size(), UINT32_MAX);
+    for (auto& g : waited_gen_) g.assign(P.weights.size(), UINT32_MAX);
     w_direct_.assign(P.weights.size(), 0);
 
     for (size_t i = 1; i < P.weights.size(); ++i) {

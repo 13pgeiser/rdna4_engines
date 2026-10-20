@@ -2153,7 +2153,10 @@ unsigned int* hc_mix_ctr(RadStream s) {
     if (fi < 0) return nullptr;
     void* p = nullptr;
     if (hipMalloc(&p, (size_t)kMaxMixCtr * sizeof(unsigned int)) != hipSuccess) return nullptr;
-    if (hipMemset(p, 0, (size_t)kMaxMixCtr * sizeof(unsigned int)) != hipSuccess) {
+    /* Zero before any launch reads it: the memset is on the null stream, which the engine's
+     * streams need not wait for, so wait here (as r4d_moe.hip's router counters do). */
+    if (hipMemset(p, 0, (size_t)kMaxMixCtr * sizeof(unsigned int)) != hipSuccess ||
+        hipDeviceSynchronize() != hipSuccess) {
         (void)hipFree(p);
         return nullptr;
     }
