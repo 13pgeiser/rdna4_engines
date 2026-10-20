@@ -155,6 +155,19 @@ fn load_inner(
     let scratch_mode =
         crate::artifact::source_forward_scratch_mode(gpu, &hfq, &receipt.config, &receipt.manifest)
             .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
+    // The one artifact scan the symmetric IU4 window route
+    // (`HIPFIRE_QWEN4_MOE_SYM_IU4=1`) needs: the source-byte symmetry of every routed trunk
+    // layer, read from the HFQ before the model source takes ownership of it, and only when the
+    // route's other terms hold (`SymIu4RouteFacts::scan_needed`). A unified-memory load never
+    // selects S1 and may have dropped its mapping.
+    let routed_symmetric: Option<Result<bool, String>> = (!gpu.is_uma()
+        && crate::slowlink_admission::SymIu4RouteFacts::of_gpu(gpu).scan_needed(
+            crate::slowlink_admission::window_route_of(&receipt.manifest.weights),
+        ))
+    .then(|| {
+        crate::artifact::routed_headers_symmetric(&hfq, &receipt.manifest)
+            .map_err(|error| error.to_string())
+    });
     let unified = gpu.is_uma();
     if unified {
         hfq.drop_mmap();
@@ -215,6 +228,7 @@ fn load_inner(
     let mut weights = receipt.manifest.weights.clone();
     let explicit = residency::expert_vram_layers_from_env()?;
     let mut weight_arenas = None;
+    let mut resident_layer_set = None;
     let (resident_layers, placement, profile) = if !product_fallback
         && (unified || matches!(explicit, Some(residency::ExpertVramLayers::Layers(_))))
     {
@@ -260,6 +274,7 @@ fn load_inner(
             state_format,
             scratch_mode,
             purpose,
+            routed_source_symmetric: &|| routed_symmetric.clone().unwrap_or(Ok(false)),
         };
         // Device free memory just before the host-link initialization. The
         // selector runs the link closure only after its probe-free
@@ -317,7 +332,19 @@ fn load_inner(
                 .unwrap_or(load.config.num_hidden_layers)
             }
         };
-        residency::place_routed_experts(&mut weights, layers);
+        if profile.is_some()
+            && s1::resident_layer_switch_is_override(
+                hipfire_config::developer_var(s1::S1_RESIDENT_LAYERS_ENV)
+                    .ok()
+                    .as_deref(),
+            )
+        {
+            let resident = s1::s1_resident_layer_set(receipt.config.num_hidden_layers, layers)?;
+            residency::place_routed_experts_set(&mut weights, &resident);
+            resident_layer_set = Some(resident);
+        } else {
+            residency::place_routed_experts(&mut weights, layers);
+        }
         let placement = if profile.is_some() {
             "slowlink-profile"
         } else {
@@ -407,10 +434,18 @@ fn load_inner(
         );
         bundle.attach_session_cache(cache);
     }
-    eprintln!(
-        "qwen4 slowlink load: placement={placement} resident layers={resident_layers} \
-         host-mapped tensors={host_mapped_tensors} slowlink profile={slowlink_profile}"
-    );
+    if let Some(resident) = &resident_layer_set {
+        eprintln!(
+            "qwen4 slowlink load: placement={placement} resident layers={resident_layers} \
+             resident_layer_set={resident:?} host-mapped tensors={host_mapped_tensors} \
+             slowlink profile={slowlink_profile}"
+        );
+    } else {
+        eprintln!(
+            "qwen4 slowlink load: placement={placement} resident layers={resident_layers} \
+             host-mapped tensors={host_mapped_tensors} slowlink profile={slowlink_profile}"
+        );
+    }
     Ok(Some(SlowlinkLoaded {
         bundle,
         vocab,
