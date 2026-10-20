@@ -766,8 +766,10 @@ int  r4d_ar_rmsnorm_quant_i8(long peer_scratch, long my_scratch, long peer_flags
                              float wadd, int w_f32, int r_ld, int y_ld, long stream, int nblocks,
                              int drain, int acq);
 // ...and at four ranks, on the wide family's transport: r4d_ar_oneshot_4rank_exact's IPC
-// arguments (peers in ascending rank, this rank's own, the counters, the slot stride), `pub`, and
-// the engine's link gate with the instance's landed counter (0 for none; r4d_ar_seq.h).
+// arguments (peers in ascending rank, this rank's own, the counters, the slot stride), `pub`, the
+// engine's link gate with the instance's landed counter (0 for none; r4d_ar_seq.h), and, with
+// `tail_nbt` blocks (positive), the standalone two-shot on that many with the junction as its tail,
+// counting on the two words at `tail_ctr` (ar_rmsnorm_quant_i8_tail_kernel).
 int  r4d_ar_rmsnorm_quant_i8_4rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                                    long peer_flags0, long peer_flags1, long peer_flags2,
                                    long my_scratch, long my_flags, long seq_ctrs,
@@ -775,7 +777,7 @@ int  r4d_ar_rmsnorm_quant_i8_4rank(long peer_scratch0, long peer_scratch1, long 
                                    int sc_f32, long y, long q, long s, int M, int n, float eps,
                                    float wadd, int w_f32, int r_ld, int y_ld, int rank,
                                    long stream, int nblocks, int drain, int acq, int pub,
-                                   long gate, long gate_ctr);
+                                   long gate, long gate_ctr, long tail_ctr, int tail_nbt);
 
 // ---- sampling ----------------------------------------------------------------------------------
 //

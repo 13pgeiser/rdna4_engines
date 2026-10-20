@@ -2152,6 +2152,12 @@ one rounding to bf16), so it is byte-identical to `all_reduce` + `rmsnorm_quant_
 sends (ranks - 1) times the message a rank, so it is for decode heights; above them a caller
 issues the pair, whose `all_reduce` goes two-shot.
 
+From 5 to 32 rows (the `tail` axis, on by default) the four-rank row takes a third form: the
+standalone exact two-shot over words, on the blocks the standalone `all_reduce` takes for that
+message, with the junction as its tail -- one more block a row, which waits on a card-local count
+of the transport blocks (no cross-card handshake), acquires, and runs `rmsnorm_quant_i8`'s row at
+its own width. The bytes are the pair's; the launch the junction would take is saved.
+
 ## Vocabulary edges
 
 | op | params | operands |

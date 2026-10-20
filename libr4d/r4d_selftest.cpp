@@ -21553,8 +21553,11 @@ static void ar_wide_pattern(const Plugin& pl, const std::vector<int>& devs, cons
         runs = {
             /* bf16: 524288 the one-shot band's top, 524352 the first message the two-shot's rows
              * take (numel % 64 == 0 either way, so both divide); the shipped chunk sizes; and
-             * 4194304 again to close the run on a size already folded. */
-            { "bf16", { 4194304, 128, 524288, 524352, 4196352, 20971520, 46137344, 4194304 }, 2 },
+             * 4194304 again to close the run on a size already folded. 86016, a 16-row verify at
+             * 5376, and 524288 are past the one-shot row's default ts_min, so that row hands them
+             * to the two-shot; 128 and 43008 (eight rows) stay on the one-shot. */
+            { "bf16", { 4194304, 128, 43008, 86016, 524288, 524352, 4196352, 20971520, 46137344,
+                        4194304 }, 2 },
             /* fp32: words = numel / 4, whole groups of four either side of the same edge. */
             { "fp32", { 1048580 - 4, 524352 }, 0 },
         };
@@ -22638,6 +22641,7 @@ struct ArQ8 {
     bool res = false, scal = false;
     bool gated = false;                            /* hand the launch an odd `link_gate` word */
     long long gate_after = -1;                     /* ...and what the launch left in it */
+    int tail = -1;                                 /* the `tail` axis pinned, or -1: the default */
     void* inst = nullptr;
     int rc_init = RAD_E_STATE, rc_launch = RAD_OK;
     const std::vector<uint16_t>* r_in = nullptr;   /* the replicated residual, w and w_post */
@@ -22657,6 +22661,8 @@ static void ar_q8_worker(ArQ8* t) {
                                  PS("dtype", "bf16"), PF("wadd", 0.0) };
     t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, 4, &t->inst);
     if (t->rc_init != RAD_OK) return;
+    /* The tuned point arrives as a parameter of the launch, as the core appends it. */
+    if (t->tail >= 0) ps.push_back(PI("tail", t->tail));
 
     /* Allocated here and not through dalloc, whose list four rank threads would race on. */
     void* x = nullptr; void* r = nullptr; void* w = nullptr; void* wp = nullptr; void* sc = nullptr;
@@ -22724,8 +22730,13 @@ static void ar_rmsnorm_quant_i8_wide_case(const Plugin& pl, const std::vector<in
     if ((int)devs.size() < 4) { skip(name, "needs 4 gfx1201 cards"); return; }
     const int world = 4;
     const bool host = nm_ends_with(name, "_host");   /* the mailbox twin leaves the hold alone */
-    struct Shape { int64_t M, K; };
-    const Shape shapes[] = { { 1, 5376 }, { 8, 5376 }, { 40, 5376 }, { 97, 5376 }, { 64, 2816 } };
+    /* tail: the `tail` axis pinned (1 from 5 to 32 rows: the standalone two-shot with the junction
+     * as its tail) */
+    struct Shape { int64_t M, K; int tail; };
+    const Shape shapes[] = { { 1, 5376, 0 }, { 8, 5376, 0 }, { 40, 5376, 0 }, { 97, 5376, 0 },
+                             { 64, 2816, 0 },
+                             { 5, 5376, 1 }, { 8, 5376, 1 }, { 16, 5376, 1 }, { 32, 5376, 1 },
+                             { 8, 2816, 1 } };
     const std::string nm(name);
     for (const Shape& sh : shapes) {
         const int64_t M = sh.M, K = sh.K;
@@ -22761,7 +22772,8 @@ static void ar_rmsnorm_quant_i8_wide_case(const Plugin& pl, const std::vector<in
             const bool res = form > 0, scal = form == 2;
             const std::string at = " M=" + std::to_string(M) + " n=" + std::to_string(K) +
                                    (form == 0 ? ", plain" : form == 1 ? ", junction"
-                                                                      : ", junction with scalar");
+                                                                      : ", junction with scalar") +
+                                   (sh.tail ? ", two-shot with the junction as its tail" : ", one-shot");
 
             /* The chain on the first card: rmsnorm_quant_i8 over the reduced sum. */
             st_set_device(devs[0]);
@@ -22805,6 +22817,7 @@ static void ar_rmsnorm_quant_i8_wide_case(const Plugin& pl, const std::vector<in
                 ArQ8& x = t[(size_t)r];
                 x.row = row; x.rank = r; x.dev = devs[(size_t)r];
                 x.M = M; x.K = K; x.res = res; x.scal = scal; x.gated = scal;
+                x.tail = sh.tail;
                 x.r_in = &hr; x.w = &hw; x.wp = &hp; x.sc = hs;
                 x.x_in = hx[(size_t)r];
                 th.emplace_back(ar_q8_worker, &x);

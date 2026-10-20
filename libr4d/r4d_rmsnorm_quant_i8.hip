@@ -124,6 +124,30 @@ __device__ __forceinline__ float scalar_of(const void* sc, uint32_t f32) {
     return f32 ? ((const float*)sc)[0] : bf2f(((const uint16_t*)sc)[0]);
 }
 
+// The exact all-reduce's fold of one 16-byte word (eight bf16): every source's word loaded first,
+// then per element fp32 from 0.0f, the sources in ascending rank, one rounding through
+// bf16_hi_rne_nan -- ar_vsum's arithmetic, so the word is the standalone exact all-reduce's.
+template <int WS>
+__device__ __forceinline__ int4 fold_word8(const int4* const* src4, size_t k) {
+    int4 v[WS];
+#pragma unroll
+    for (int r = 0; r < WS; ++r) v[r] = src4[r][k];
+    float acc[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[j] = 0.0f;
+#pragma unroll
+    for (int r = 0; r < WS; ++r) {
+        const uint16_t* pv = reinterpret_cast<const uint16_t*>(&v[r]);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[j] += bf2f(pv[j]);
+    }
+    int4 a;
+    uint16_t* pa = reinterpret_cast<uint16_t*>(&a);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) pa[j] = (uint16_t)(bf16_hi_rne_nan(acc[j]) >> 16);
+    return a;
+}
+
 template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR>
 __global__ __launch_bounds__(THR) void rmsnorm_quant_i8_kernel(
     const uint16_t* __restrict__ x, uint16_t* __restrict__ res, const void* __restrict__ w,
@@ -157,19 +181,14 @@ __global__ __launch_bounds__(THR) void rmsnorm_quant_i8_kernel(
 // t takes columns t, t+THR, ...), so each thread keeps its own columns in registers and none needs
 // another's; only the fragment-order store crosses threads, through `ybuf` as before. The sums,
 // the order they are taken in and every element's arithmetic are junction_row's, so the bytes are.
+// One row of it, for this kernel and for the all-reduce's tail (ar_rmsnorm_quant_i8_tail_kernel).
 template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR, uint32_t EPT>
-__global__ __launch_bounds__(THR) void rmsnorm_quant_i8_reg_kernel(
-    const uint16_t* __restrict__ x, uint16_t* __restrict__ res, const void* __restrict__ w,
+__device__ __forceinline__ void junction_reg_row(
+    const uint16_t* __restrict__ xr, uint16_t* __restrict__ rr, const void* __restrict__ w,
     const void* __restrict__ wp, const void* __restrict__ sc, uint32_t sc_f32,
-    signed char* __restrict__ q, float* __restrict__ S, uint16_t* __restrict__ yo,
-    uint32_t n, float eps, float wadd, uint32_t x_ld, uint32_t r_ld, uint32_t y_ld) {
-    extern __shared__ uint16_t ybuf[];
-    __shared__ float l1[THR / kWave], l2[THR / kWave], lm[THR / kWave];
-    const uint32_t row = blockIdx.x, tid = threadIdx.x;
-    const uint16_t* __restrict__ xr = x + (size_t)row * x_ld;
-    uint16_t* __restrict__ rr = RES ? res + (size_t)row * r_ld : nullptr;
-    uint16_t* __restrict__ yr = yo ? yo + (size_t)row * y_ld : nullptr;
-
+    signed char* __restrict__ qr, float* __restrict__ Sr, uint16_t* __restrict__ yr, uint32_t n,
+    float eps, float wadd, uint16_t* ybuf, float* l1, float* l2, float* lm) {
+    const uint32_t tid = threadIdx.x;
     uint16_t xv[EPT], rv[EPT];
     float gp[EPT], gw[EPT];
 #pragma unroll
@@ -235,16 +254,30 @@ __global__ __launch_bounds__(THR) void rmsnorm_quant_i8_reg_kernel(
     for (uint32_t i = 1; i < THR / kWave; i++) m = fmaxf(m, lm[i]);
     const float scale = fmaxf(m, 1e-8f) / 127.f;
     const float inv = 1.f / scale;
-    if (tid == 0) S[row] = scale;
+    if (tid == 0) *Sr = scale;
 
     // ---- the codes, in junction_row's fragment order
-    signed char* __restrict__ qr = q + (size_t)row * n;
     for (uint32_t i = tid; i < n; i += THR) {
         const uint32_t s = i >> 4, j = i & 15;
         const uint32_t src = (s << 4) + 8 * ((j & 7) >> 2) + 4 * (j >> 3) + (j & 3);
         const int t = __float2int_rn(bf2f(ybuf[src]) * inv);
         qr[i] = (signed char)(t < -128 ? -128 : (t > 127 ? 127 : t));
     }
+}
+
+template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR, uint32_t EPT>
+__global__ __launch_bounds__(THR) void rmsnorm_quant_i8_reg_kernel(
+    const uint16_t* __restrict__ x, uint16_t* __restrict__ res, const void* __restrict__ w,
+    const void* __restrict__ wp, const void* __restrict__ sc, uint32_t sc_f32,
+    signed char* __restrict__ q, float* __restrict__ S, uint16_t* __restrict__ yo,
+    uint32_t n, float eps, float wadd, uint32_t x_ld, uint32_t r_ld, uint32_t y_ld) {
+    extern __shared__ uint16_t ybuf[];
+    __shared__ float l1[THR / kWave], l2[THR / kWave], lm[THR / kWave];
+    const uint32_t row = blockIdx.x;
+    junction_reg_row<WF32, RES, POST, SCL, THR, EPT>(
+        x + (size_t)row * x_ld, RES ? res + (size_t)row * r_ld : nullptr, w, wp, sc, sc_f32,
+        q + (size_t)row * n, S + row, yo ? yo + (size_t)row * y_ld : nullptr, n, eps, wadd, ybuf,
+        l1, l2, lm);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -256,6 +289,9 @@ __global__ __launch_bounds__(THR) void rmsnorm_quant_i8_reg_kernel(
 // commutes, so both ranks agree) during the post-norm's sum-of-squares pass. A block owns whole
 // rows, one per block at decode.
 #define R4D_ARQ8_SPIN_MAX 4000000000ULL
+/* The all-reduce's tail form serves up to this many rows: a block a row beside the transport's,
+ * far under one block a CU on the cards it runs on. */
+#define R4D_ARQ8_TAIL_MAX_ROWS 32
 
 __device__ __forceinline__ void arq8_store_rel(unsigned int* p, unsigned int v) {
     __hip_atomic_store(p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
@@ -385,31 +421,167 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_i8_wide_kernel(
 
     /* the sources in ascending global rank, this rank's own from `x` (its own slot is never
      * written), the peers' from their slots in my scratch */
-    const uint16_t* src[WS];
+    const int4* src4[WS];
 #pragma unroll
     for (int r = 0; r < WS; ++r)
-        src[r] = r == rank ? (const uint16_t*)x
-                           : (const uint16_t*)(my_base + ((size_t)parity * WS + r) *
-                                                             (size_t)slot_stride16);
+        src4[r] = r == rank ? (const int4*)x
+                            : my_base + ((size_t)parity * WS + r) * (size_t)slot_stride16;
     const float sv = SCL ? scalar_of(sc, sc_f32) : 1.0f;
     for (int row = r0; row < r1; ++row) {
         const size_t o = (size_t)row * n;
         uint16_t* __restrict__ xr = x + o;
+        /* The fold a 16-byte word a thread, every source's word in flight at once (the peers' are
+         * in fine-grained memory, a round trip each), stored back into `x`; then the post-norm's
+         * sum of squares over the stored row in the norm's partition. Per element it is the fold
+         * fold_word8 documents, and the sum reads the same rounded values in the same order, so
+         * the bytes are those of the fold and the sum taken in one pass. */
+        for (int k = (int)tid; k < wpr; k += (int)THR)
+            ((int4*)xr)[k] = fold_word8<WS>(src4, (size_t)row * wpr + k);
         float ss = 0.0f;
-        for (uint32_t i = tid; i < n; i += THR) {
-            float acc = 0.0f;
-#pragma unroll
-            for (int r = 0; r < WS; ++r) acc += bf2f(src[r][o + i]);
-            const uint16_t a = (uint16_t)(bf16_hi_rne_nan(acc) >> 16);
-            xr[i] = a;
-            if (POST) { const float v = bf2f(a); ss += v * v; }
+        if (POST) {
+            __syncthreads();   /* the folded row, read across the block's threads */
+            for (uint32_t i = tid; i < n; i += THR) { const float v = bf2f(xr[i]); ss += v * v; }
         }
         float s1 = 0.0f;
         if (POST) s1 = rsqrtf(block_sum<THR / kWave>(ss, l1) / (float)n + eps);
+        else __syncthreads();   /* junction_row reads the folded row across threads too */
         junction_row<WF32, RES, POST, SCL, THR>(
             xr, RES ? res + (size_t)row * r_ld : nullptr, w, wp, sv, q + (size_t)row * n, S + row,
             yo ? yo + (size_t)row * y_ld : nullptr, n, eps, wadd, s1, ybuf, l2, lm);
         __syncthreads();   /* the planes and ybuf are re-used by the next row this block owns */
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------
+// The junction as the tail of the standalone exact two-shot, in one launch. Blocks [0, nbt) run
+// r4d_ar_twoshot_wide_exact_kernel's body over x in place (r4d_ar_twoshot_Nrank_exact.hip): the same
+// shards, words, fold (fp32 from 0.0f in ascending rank, one rounding) and handshakes, so x ends as
+// the standalone all-reduce leaves it; each then counts itself in on a word of the instance's
+// counter allocation, at agent scope behind a release. Blocks [nbt, nbt + M) are the junction, one
+// row each as rmsnorm_quant_i8_reg_kernel runs it (junction_reg_row, the same width and partition):
+// each waits for every transport block's count, acquires, and runs its row; the last of them zeroes
+// both counts for the next launch. So the junction takes neither a cross-card handshake nor a
+// launch of its own: the pair's bytes, one dependent launch fewer. Blocks are dispatched in index
+// order, so the transport blocks are resident before any junction block spins; the grid is kept far
+// under one block a CU.
+//
+// tail[0] counts the transport blocks done, tail[1] the junction blocks done; both start at zero
+// (the counter allocation is zeroed at init) and the last junction block returns them there.
+template <bool WF32, bool RES, bool POST, bool SCL, uint32_t EPT, int WS>
+__global__ __launch_bounds__(1024) void ar_rmsnorm_quant_i8_tail_kernel(
+    uint16_t* __restrict__ x, uint16_t* __restrict__ res, const void* __restrict__ w,
+    const void* __restrict__ wp, const void* __restrict__ sc, uint32_t sc_f32,
+    signed char* __restrict__ q, float* __restrict__ S, uint16_t* __restrict__ yo,
+    R4DArWidePeers<int4, WS - 1> peers, const int4* __restrict__ my_base,
+    unsigned int* __restrict__ my_flags, unsigned int* __restrict__ seq_ctrs,
+    unsigned int* __restrict__ tail, int M, uint32_t n, float eps, float wadd, uint32_t r_ld,
+    uint32_t y_ld, int slot_stride16, int rank, int nbt, int drain, int acq, int pub,
+    long long* gate, unsigned int* gate_ctr) {
+    constexpr uint32_t THR = 1024;
+    constexpr int NPEERS = WS - 1;
+    extern __shared__ uint16_t ybuf[];
+    __shared__ float l1[THR / kWave], l2[THR / kWave], lm[THR / kWave];
+    __shared__ unsigned int s_seq, s_slot;
+    const int b = (int)blockIdx.x, tid = (int)threadIdx.x, nt = (int)THR;
+
+    if (b < nbt) {
+        // ---- the standalone exact two-shot, x in place, block b of nbt
+        const long long gate_word = r4d_ar_link_word(gate, (unsigned int)tid);
+        r4d_ar_seq_take(seq_ctrs, R4D_AR_WIDE_MAX_BLOCKS, s_seq, s_slot);
+        const unsigned int s = s_seq;
+        const int parity = (int)s_slot;
+        int4* const x4 = (int4*)x;
+        const int n16 = (int)(((long)M * n) >> 3);
+        const int base = n16 / WS, rem = n16 % WS;
+        const int sh_max = base + (rem ? 1 : 0);
+#define R4D_TT_OFF(o) ((o) * base + ((o) < rem ? (o) : rem))
+#define R4D_TT_LEN(o) (base + ((o) < rem ? 1 : 0))
+        const int wd = (sh_max + nbt - 1) / nbt;
+        const int w0 = b * wd;
+        int w1 = w0 + wd; if (w1 > sh_max) w1 = sh_max;
+        int4* pa[NPEERS];
+#pragma unroll
+        for (int p = 0; p < NPEERS; ++p)
+            pa[p] = peers.scratch[p] + ((size_t)parity * WS + rank) * (size_t)slot_stride16;
+        for (int p = 0; p < NPEERS; ++p) {
+            const int owner = peers.rank[p];
+            const int4* src = x4 + (size_t)R4D_TT_OFF(owner);
+            int4* dst = pa[p];
+            const int lim = w1 < R4D_TT_LEN(owner) ? w1 : R4D_TT_LEN(owner);
+            for (int k = w0 + tid; k < lim; k += nt) dst[k] = src[k];
+        }
+        r4d_ar_handshake<WS>(peers, my_flags, b, rank, 2u * s - 1u, drain, acq, pub);
+        const int4* src[WS];
+#pragma unroll
+        for (int r = 0; r < WS; ++r)
+            src[r] = (r == rank) ? (x4 + (size_t)R4D_TT_OFF(rank))
+                                 : (my_base + ((size_t)parity * WS + r) * (size_t)slot_stride16);
+        int4* my_out = x4 + (size_t)R4D_TT_OFF(rank);
+        const int my_lim = w1 < R4D_TT_LEN(rank) ? w1 : R4D_TT_LEN(rank);
+        for (int k = w0 + tid; k < my_lim; k += nt) {
+            float acc[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) acc[j] = 0.0f;
+#pragma unroll
+            for (int r = 0; r < WS; ++r) {
+                const int4 v = src[r][k];
+                const __hip_bfloat16* pv = reinterpret_cast<const __hip_bfloat16*>(&v);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) acc[j] += r4d_ar_to_f(pv[j]);
+            }
+            int4 o;
+            __hip_bfloat16* po = reinterpret_cast<__hip_bfloat16*>(&o);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) r4d_ar_from_f(acc[j], po[j]);
+            my_out[k] = o;
+#pragma unroll
+            for (int p = 0; p < NPEERS; ++p) pa[p][sh_max + k] = o;
+        }
+        r4d_ar_handshake<WS>(peers, my_flags, b, rank, 2u * s, drain, acq, pub);
+        r4d_ar_link_landed(gate, gate_word, gate_ctr, (unsigned int)nbt, (unsigned int)tid);
+        for (int p = 0; p < NPEERS; ++p) {
+            const int owner = peers.rank[p];
+            const int4* srcB = my_base + ((size_t)parity * WS + owner) * (size_t)slot_stride16 + sh_max;
+            int4* dst = x4 + (size_t)R4D_TT_OFF(owner);
+            const int lim = w1 < R4D_TT_LEN(owner) ? w1 : R4D_TT_LEN(owner);
+            for (int k = w0 + tid; k < lim; k += nt) dst[k] = srcB[k];
+        }
+#undef R4D_TT_OFF
+#undef R4D_TT_LEN
+        // ---- every word this block stored in x, published, then counted in
+        __syncthreads();
+        if (tid == 0) {
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+            __hip_atomic_fetch_add(&tail[0], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        }
+        return;
+    }
+
+    // ---- the junction, row b - nbt, once x is whole on this card
+    const int row = b - nbt;
+    if (tid == 0) {
+        unsigned long long z = 0;
+        while (__hip_atomic_load(&tail[0], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) <
+               (unsigned int)nbt) {
+            __builtin_amdgcn_s_sleep(1);
+            if (++z > R4D_AR_SPIN_MAX) __builtin_trap();
+        }
+    }
+    __syncthreads();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    junction_reg_row<WF32, RES, POST, SCL, THR, EPT>(
+        x + (size_t)row * n, RES ? res + (size_t)row * r_ld : nullptr, w, wp, sc, sc_f32,
+        q + (size_t)row * n, S + row, yo ? yo + (size_t)row * y_ld : nullptr, n, eps, wadd, ybuf,
+        l1, l2, lm);
+    __syncthreads();
+    if (tid == 0) {
+        const unsigned int prev =
+            __hip_atomic_fetch_add(&tail[1], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        if (prev + 1u == (unsigned int)M) {
+            __hip_atomic_store(&tail[0], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __hip_atomic_store(&tail[1], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        }
     }
 }
 
@@ -559,6 +731,8 @@ extern "C" int r4d_ar_rmsnorm_quant_i8(long peer_scratch, long my_scratch, long 
 // and the per-source slot stride -- and the rest is the junction's. The checks are the wide
 // launchers' (rank range, the message inside one slot, the grid inside the flag array, every
 // allocation's extent), returned as codes rather than thrown, for the reason this file gives.
+// The all-reduce is the one-shot. With `tail_nbt` blocks (positive) it is instead the standalone two-shot over words on that many blocks with the junction as its tail,
+// a block a row (ar_rmsnorm_quant_i8_tail_kernel), counting on the two words at `tail_ctr`.
 extern "C" int r4d_ar_rmsnorm_quant_i8_4rank(long peer_scratch0, long peer_scratch1,
                                              long peer_scratch2, long peer_flags0,
                                              long peer_flags1, long peer_flags2, long my_scratch,
@@ -567,7 +741,8 @@ extern "C" int r4d_ar_rmsnorm_quant_i8_4rank(long peer_scratch0, long peer_scrat
                                              int sc_f32, long y, long q, long s, int M, int n,
                                              float eps, float wadd, int w_f32, int r_ld, int y_ld,
                                              int rank, long stream, int nblocks, int drain, int acq,
-                                             int pub, long gate, long gate_ctr) {
+                                             int pub, long gate, long gate_ctr,
+                                             long tail_ctr, int tail_nbt) {
     constexpr int WS = 4, NPEERS = WS - 1;
     const long ps[NPEERS] = { peer_scratch0, peer_scratch1, peer_scratch2 };
     const long pf[NPEERS] = { peer_flags0, peer_flags1, peer_flags2 };
@@ -610,6 +785,50 @@ extern "C" int r4d_ar_rmsnorm_quant_i8_4rank(long peer_scratch0, long peer_scrat
 
     const int thr = r4d_act_threads(M, n);
     const size_t lds = (size_t)n * sizeof(uint16_t);
+
+    /* The junction as the standalone two-shot's tail (ar_rmsnorm_quant_i8_tail_kernel): at the
+     * junction's register width (1024 threads), up to R4D_ARQ8_TAIL_MAX_ROWS rows. */
+    const int ept = n <= 4096 ? 4 : n <= 6144 ? 6 : n <= 8192 ? 8 : 0;
+    if (tail_nbt > 0 && tail_ctr && thr == 1024 && ept > 0 && M <= R4D_ARQ8_TAIL_MAX_ROWS &&
+        tail_nbt <= R4D_AR_WIDE_MAX_BLOCKS) {
+        try {
+            r4d_ar_check_extent(my_flags, (long)tail_nbt * WS * (long)sizeof(unsigned int),
+                                "ar_rmsnorm_quant_i8", "my_flags");
+            r4d_ar_check_extent(tail_ctr, 2L * (long)sizeof(unsigned int), "ar_rmsnorm_quant_i8",
+                                "tail counters");
+            for (int i = 0; i < NPEERS; ++i)
+                r4d_ar_check_extent(pf[i], (long)tail_nbt * WS * (long)sizeof(unsigned int),
+                                    "ar_rmsnorm_quant_i8", "peer flags");
+        } catch (...) {
+            return -8;
+        }
+#define R4D_ARQ8T_K(WF, RS, PO, SC, E)                                                            \
+        hipLaunchKernelGGL((ar_rmsnorm_quant_i8_tail_kernel<WF, RS, PO, SC, E, WS>),              \
+                           dim3((uint32_t)(tail_nbt + M)), dim3(1024), lds, (hipStream_t)stream,  \
+                           (uint16_t*)x, (uint16_t*)res, (const void*)w, (const void*)wp,         \
+                           (const void*)sc, (uint32_t)sc_f32, (signed char*)q, (float*)s,         \
+                           (uint16_t*)y, peers, (const int4*)my_scratch, (unsigned int*)my_flags, \
+                           (unsigned int*)seq_ctrs, (unsigned int*)tail_ctr, M, (uint32_t)n, eps,  \
+                           wadd, (uint32_t)r_ld, (uint32_t)y_ld, (int)slot_stride16, rank,         \
+                           tail_nbt, drain, acq, pub, (long long*)gate, (unsigned int*)gate_ctr)
+#define R4D_ARQ8T_E(WF, RS, PO, SC)                                                               \
+        do { if (ept == 4)      R4D_ARQ8T_K(WF, RS, PO, SC, 4);                                   \
+             else if (ept == 6) R4D_ARQ8T_K(WF, RS, PO, SC, 6);                                   \
+             else               R4D_ARQ8T_K(WF, RS, PO, SC, 8); } while (0)
+#define R4D_ARQ8T_W(WF)                                                                           \
+        do { if (!res)            R4D_ARQ8T_E(WF, false, false, false);                           \
+             else if (!wp && !sc) R4D_ARQ8T_E(WF, true, false, false);                            \
+             else if (wp && !sc)  R4D_ARQ8T_E(WF, true, true, false);                             \
+             else if (wp && sc)   R4D_ARQ8T_E(WF, true, true, true);                              \
+             else                 R4D_ARQ8T_E(WF, true, false, true); } while (0)
+        if (w_f32) R4D_ARQ8T_W(true);
+        else       R4D_ARQ8T_W(false);
+#undef R4D_ARQ8T_W
+#undef R4D_ARQ8T_E
+#undef R4D_ARQ8T_K
+        return hipGetLastError() == hipSuccess ? 0 : -4;
+    }
+
 #define R4D_ARQ8W_T(WF, RS, PO, SC, T)                                                            \
     hipLaunchKernelGGL((ar_rmsnorm_quant_i8_wide_kernel<WF, RS, PO, SC, T, WS>), dim3((uint32_t)nb), \
                        dim3(T), lds, (hipStream_t)stream, (uint16_t*)x, (uint16_t*)res,          \

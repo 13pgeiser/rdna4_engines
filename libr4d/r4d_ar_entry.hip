@@ -399,7 +399,9 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
      * changes: kernels touch other ranks only through those two, so no card addresses another's
      * VRAM. A message then crosses two links instead of one; only rows requiring device.p2p == 0
      * take this path (r4d_rows.cpp). Sequence counters stay in VRAM, since only their own rank
-     * reads them. */
+     * reads them, and coarse-grained: only this rank's kernels touch them, with device- and
+     * agent-scope atomics, which then complete in L2 rather than past it -- the first returning
+     * atomic of every launch (r4d_ar_seq_take) is on the push's path. */
     R4D_TRY("ar_ipc_alloc",
         if (hipGetDevice(&dev) != hipSuccess) return RAD_E_DEVICE;
         if (host) {
@@ -409,7 +411,7 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
             sc = r4d_ar_ipc_alloc((long)nslots * in->slot_bytes, 1, handle, &hlen);
             fl = r4d_ar_ipc_alloc(flag_words * 4, 1, handle, &hlen);
         }
-        sq = r4d_ar_ipc_alloc(kSeqWords(maxb) * 4, 1, handle, &hlen));
+        sq = r4d_ar_ipc_alloc(kSeqWords(maxb) * 4, 0, handle, &hlen));
 
     /* This rank's own packed copy, for the rotated 6-bit wire only: the reduce must fold exactly
      * the bytes it sent. The 6-bit payload is 3/8 of the bf16 message and the scales 1/64, so half
@@ -662,6 +664,22 @@ static int nb_for(long words16, int max_nb) {
     if (nb < 4) nb = 4;
     if (nb > max_nb) nb = max_nb;
     if (nb > words16) nb = words16 > 0 ? words16 : 1;
+    return (int)nb;
+}
+
+/* The four-rank exact one-shot's two-shot band (r4d_rad_ar_oneshot_4rank_exact from ts_min), over
+ * the words of one shard: one block per 672 words, floor 2,
+ * ceiling max_nb. A two-shot takes two handshakes, each a PCIe round trip a block, so small shards
+ * want fewer blocks than nb_for's floor of 4: at a DFlash2 verify's 8 rows of 5376 at tp 4 (1344
+ * words a shard) two blocks run the exact two-shot in 20.2 us against 22.8 at four, and from 16
+ * rows (2688 words, four blocks either way) the two rules agree (4x R9700, a four-card
+ * microbenchmark of this kernel, 2026-10-17). The block count moves no byte: every word is folded
+ * by one thread in ascending rank order whatever the grid. */
+static int nb_for_shard(long shard16, int max_nb) {
+    long nb = shard16 / 672;
+    if (nb < 2) nb = 2;
+    if (nb > max_nb) nb = max_nb;
+    if (nb > shard16) nb = shard16 > 0 ? shard16 : 1;
     return (int)nb;
 }
 
@@ -959,6 +977,31 @@ extern "C" int r4d_rad_ar_oneshot_4rank_exact(const RadArgs* a, RadStream s) {
     if (rc != RAD_OK) return rc;
     if (c.in->world != 4) return RAD_E_SHAPE;
     const ArInst* in = c.in;
+    /* From `ts_min` elements, the exact two-shot on this instance: the same fold per element, so
+     * the same bytes, for half the bytes a rank (a 16-row verify's message, 516 KiB a card at
+     * 3x, is what the link waits on). It shares the wide family's flags, counters and slots, and
+     * a shard pair fits any slot that holds the whole message. */
+    const long ts_min = r4d_cfg_ar_ts_min(a);
+    const long words16 = c.numel * in->esize / 16;
+    if (ts_min > 0 && c.numel >= ts_min && words16 % in->world == 0 &&
+        2 * (c.numel * in->esize) / in->world <= in->slot_bytes &&
+        c.numel <= R4D_AR_TWOSHOT_WIDE_MAX_ELEMS) {
+        R4dArCfg cfgv;
+        r4d_cfg_ar(a, &cfgv);
+        int nb = cfgv.nblocks > 0 ? cfgv.nblocks
+                                  : nb_for_shard(words16 / in->world,
+                                                 in->nb_cap > 24 ? 24 : in->nb_cap);
+        if (nb > in->max_blocks) nb = in->max_blocks;
+        const long gate = link_gate(a), early = in->host ? 0L : gate;
+        R4D_TRY("ar_oneshot_4rank_exact (two-shot)",
+            r4d_ar_twoshot_4rank_exact(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
+                                       in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
+                                       in->my_scratch, in->my_flags, in->my_seq, in->slot16,
+                                       c.inp, c.out, c.numel, in->dtype, in->rank,
+                                       (long)(uintptr_t)s, nb, c.nthreads, c.drain, c.acq,
+                                       c.pub, early, early ? in->gate_ctr : 0L));
+        return early ? RAD_LINK_ENDED : RAD_OK;
+    }
     /* The wide release, the two-rank family's rule: over P2P the kernel ends the engine's hold
      * itself once the peers' pushes have landed (the kernel after the handshake is local VRAM
      * traffic); through the host mailbox the reduce reads the bytes across the link, so early
@@ -1458,7 +1501,18 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_i8_4rank(const RadArgs* a, RadStream s) 
     }
     int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : (int)v.M;
     if (nblocks > in->max_blocks) nblocks = in->max_blocks;
-    /* One handshake, the junction after it local: the release is the one-shot's. */
+    /* Above one-shot heights (the plugin's fold band at 5 rows and up), the `tail` axis's form:
+     * the standalone two-shot over words on the blocks the standalone all_reduce would take for
+     * this message (nb_for_shard), with the junction as its tail; its two counters are words of the
+     * instance's zeroed sequence allocation past the landed counter (r4d_ar_seq.h). P2P only. */
+    int tail_nbt = 0;
+    if (r4d_cfg_ar_tail(a) && v.M >= 5 && !in->host) {
+        const long words16 = (long)v.M * v.K / 8;
+        tail_nbt = nb_for_shard(words16 / in->world, in->nb_cap > 24 ? 24 : in->nb_cap);
+        if (tail_nbt > in->max_blocks) tail_nbt = in->max_blocks;
+    }
+    const long tail_ctr = in->my_seq + (2L * in->max_blocks + 8) * 4;
+    /* The junction after the last handshake is local, so either form releases there. */
     const long gate = link_gate(a), early = in->host ? 0L : gate;
     const int e = r4d_ar_rmsnorm_quant_i8_4rank(
         in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
@@ -1468,7 +1522,7 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_i8_4rank(const RadArgs* a, RadStream s) 
         v.sl ? (v.sl->dtype == RAD_F32) : 0, r4d_addr(v.ob), r4d_addr(v.q), r4d_addr(v.sc),
         (int)v.M, (int)v.K, (float)r4d_getf(a, "eps", 1e-6), (float)r4d_getf(a, "wadd", 0.0),
         v.w->dtype == RAD_F32, (int)v.rp, (int)v.yp, (int)in->rank, (long)(uintptr_t)s, nblocks,
-        cfgv.drain, cfgv.acq, cfgv.pub, early, early ? in->gate_ctr : 0L);
+        cfgv.drain, cfgv.acq, cfgv.pub, early, early ? in->gate_ctr : 0L, tail_ctr, tail_nbt);
     if (e != 0) return RAD_E_SHAPE;
     return early ? RAD_LINK_ENDED : RAD_OK;
 }

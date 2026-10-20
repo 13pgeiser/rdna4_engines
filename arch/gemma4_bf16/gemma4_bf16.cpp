@@ -563,10 +563,15 @@ void Gemma4Mlp::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool tai
  * decode step (1 row) ran 5.6% slower without it (89 against 94 tok/s), and a DFlash verify
  * (16 rows) 9% faster (300 against 276): at 16 rows the standalone all-reduce is the exact
  * two-shot, while the fold's one block a row each takes a fenced handshake. The per-row costs
- * cross near 4-5 rows, so the fold serves up to kAr4FoldRows rows and a taller step issues the
- * pair. */
+ * cross near 4-5 rows. From 5 rows libr4d's four-rank row takes its tail form instead (axis
+ * `tail`): the standalone two-shot with the junction run after it in the same launch, behind a
+ * card-local count, so the junction costs neither a handshake nor a launch. With it a DFlash2
+ * verify (8 rows) folds and gains ~1% (348 / 258 / 187 / 516 against 345 / 255 / 185 / 511 tok/s,
+ * code / prose / story / long, 4x R9700; replies identical), where the one-shot fold there lost
+ * 6%. So the fold serves up to kAr4FoldRows rows, a z-lab DFlash verify's 16 included, and a
+ * taller step issues the pair. */
 static constexpr int64_t kArOneShotElems = 524288;
-static constexpr int64_t kAr4FoldRows = 4;
+static constexpr int64_t kAr4FoldRows = 16;
 
 struct G4Junction {
     rad_op     op = 0;

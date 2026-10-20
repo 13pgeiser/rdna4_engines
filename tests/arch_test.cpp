@@ -4598,10 +4598,10 @@ TEST(gemma4_attention_join_writes_the_routed_inputs_on_fp8_experts) {
 
 /* At four ranks the junctions carry their reductions at decode heights, in the same issue order as
  * at two ranks (only the embedding's and the last layer's feed-forward reduction stand alone),
- * through ar_rmsnorm_quant_i8 declared at world_size 4 up to 4 rows (kAr4FoldRows: where the fold
- * still beats the pair, inside libr4d's one-shot band of 524288 / 5376 = 97). A taller step, a DFlash
- * verify's 16 rows included, issues each reduction and its junction apart, and where no library
- * declares the fold every step issues the pair. */
+ * through ar_rmsnorm_quant_i8 declared at world_size 4 up to 16 rows (kAr4FoldRows: a DFlash
+ * verify's rows, which libr4d folds in its tail form, inside its one-shot band of 524288 / 5376 =
+ * 97). A taller step issues each reduction and its junction apart, and where no library declares
+ * the fold every step issues the pair. */
 TEST(a_gemma4_w4a8_step_at_four_ranks_folds_the_all_reduce_into_the_junction_at_decode_heights) {
     const int L = 12;
     std::vector<std::string> folded = { "embed_lookup", "all_reduce", "rmsnorm_quant_i8" };
@@ -4641,7 +4641,7 @@ TEST(a_gemma4_w4a8_step_at_four_ranks_folds_the_all_reduce_into_the_junction_at_
     };
     RadBuilder b;
     CHECK_OK(declare4(b));
-    CHECK(noted(b, "folded in at steps of 4 rows or fewer"));
+    CHECK(noted(b, "folded in at steps of 16 rows or fewer"));
     auto fold_hi = [](const RadBuilder& bb, int* n) {
         int64_t hi = -1;
         *n = 0;
@@ -4655,17 +4655,17 @@ TEST(a_gemma4_w4a8_step_at_four_ranks_folds_the_all_reduce_into_the_junction_at_
         return hi;
     };
     int n_ar = 0;
-    CHECK_EQ(fold_hi(b, &n_ar), 4);
+    CHECK_EQ(fold_hi(b, &n_ar), 16);
     CHECK_EQ(n_ar, 2 * L - 1);
 
-    /* a verify's height and a step past the one-shot's band both issue the pair */
+    /* a verify's height folds (libr4d's tail form) and a step past 16 rows issues the pair */
     const int32_t out[1] = { 127 };
     for (int rows : { 16, 128 }) {
         RadBatch tall = one_prompt(rows, out);
         RadCtx c; c.b = &b; c.rank = 0; c.world = 4; c.batch = &tall;
         gemma4_bf16::step(&c, &tall);
         CHECK(c.step_fail.empty());
-        CHECK_EQ(join(issued_ops(b, c)), join(apart));
+        CHECK_EQ(join(issued_ops(b, c)), join(rows <= 16 ? folded : apart));
     }
 
 

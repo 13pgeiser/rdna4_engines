@@ -4717,15 +4717,25 @@ static const RadTunable tAttnSplit[] = {
  * On the fp8 fused row only drain and acq apply: it forces `nthreads` to the norm's width for
  * bit-exactness, and pinning `nblocks` would undo r4d_ar_entry.hip's cap. No axis changes the
  * result. */
-static const int64_t kArNblocks[]  = { 0, 8, 16, 24 };
+static const int64_t kArNblocks[]  = { 0, 2, 4, 8, 16, 24 };
 static const int64_t kArNthreads[] = { 256, 512, 1024 };
 static const int64_t kArDrain[]    = { 1, 3 };
 static const int64_t kArAcq[]      = { 0, 1 };
+/* `ts_min`: from this many elements the four-rank exact one-shot hands the message to the exact
+ * two-shot on the same instance (the same per-element fold, so the same bytes): a rank then sends
+ * 1.5x the message instead of 3x, for a second handshake. 32768 is about six rows of 5376, so an
+ * 8-row DFlash2 verify's all-reduces take the two-shot too (on 4x R9700, 2026-10-17: 297 -> 303
+ * tok/s code, long decode 447 -> 460, against 65536 that kept them one-shot); a 16-row verify's
+ * already did. 0 keeps the one-shot to its band's top. Read only by that
+ * adapter; declared by every all-reduce table so one RADIANCE_TUNE=all_reduce:ts_min=N pin is legal
+ * for every row the op resolves to. */
+static const int64_t kArTsMin[]    = { 0, 16384, 32768, 65536, 131072, 262144 };
 static const RadTunable tAr[] = {
   { "nblocks",  kArNblocks,  NELEM(kArNblocks),  0, "blocks in the grid. 0 = scale with the message and clamp" },
   { "nthreads", kArNthreads, NELEM(kArNthreads), 1024, "threads per block; the fused fp8 row overrides this for bit-exactness" },
   { "drain",    kArDrain,    NELEM(kArDrain),    3, "store-drain wait before the flag: 3 = s_wait_storecnt, 1 = vmcnt" },
   { "acq",      kArAcq,      NELEM(kArAcq),      0, "acquire fence after the flag read" },
+  { "ts_min",   kArTsMin,    NELEM(kArTsMin),    32768, "elements from which the four-rank one-shot takes the exact two-shot; 0 = never" },
 };
 /* The four-rank fused junction (ar_rmsnorm_quant_i8_4rank): tAr's axes, its own value sets.
  * On 4x R9700 over PCIe P2P a junction costs about 22 us at one row of 5376 and 57 us at sixteen
@@ -4739,6 +4749,7 @@ static const RadTunable tAr[] = {
  * call takes: fewer blocks (2 or 4, each owning several rows) take fewer. The defaults are the
  * forms that have run on cards; the others are for RADIANCE_TUNE until they have. None of them
  * changes the result. */
+static const int64_t kArQ84Tail[]  = { 1, 0 };
 static const int64_t kArQ84Nblocks[] = { 0, 2, 4, 8, 16, 24 };
 static const int64_t kArQ84Acq[]     = { 0, 1 };
 static const int64_t kArQ84Pub[]     = { 1 };
@@ -4748,6 +4759,7 @@ static const RadTunable tArQ84[] = {
   { "drain",    kArDrain,    NELEM(kArDrain),    3, "store-drain wait before the flag: 3 = s_wait_storecnt, 1 = vmcnt" },
   { "acq",      kArQ84Acq,   NELEM(kArQ84Acq),   0, "acquire after the flag read: 0 system invalidate a wave, 1 full fence" },
   { "pub",      kArQ84Pub,   NELEM(kArQ84Pub),   1, "release before the flag store: 1 one system writeback" },
+  { "tail",     kArQ84Tail,  NELEM(kArQ84Tail),  1, "from 5 to 32 rows: the standalone two-shot with the junction as its tail, a block a row (no handshake or launch of its own); 0 = the one-shot" },
 };
 /* The four-rank two-shots beside compute: four blocks of 1024. A pipelined Flash-Next prefill at
  * TP4 (qwen4exp_fp8) runs each all-reduce of a 2048-row piece beside the other piece's MoE passes,
@@ -4759,6 +4771,7 @@ static const RadTunable tArTs4Lane[] = {
   { "nthreads", kArNthreads, NELEM(kArNthreads), 1024, "threads per block" },
   { "drain",    kArDrain,    NELEM(kArDrain),    3, "store-drain wait before the flag: 3 = s_wait_storecnt, 1 = vmcnt" },
   { "acq",      kArAcq,      NELEM(kArAcq),      0, "acquire fence after the flag read" },
+  { "ts_min",   kArTsMin,    NELEM(kArTsMin),    32768, "unused here (tAr says why it is declared)" },
 };
 /* The same axes with narrow defaults, for a collective issued beside compute (`overlap` 1). The
  * wide launch (up to 24 blocks of 1024 threads spinning on peer flags) suits an all-reduce that has
@@ -4770,6 +4783,7 @@ static const RadTunable tArLane[] = {
   { "nthreads", kArNthreads, NELEM(kArNthreads), 256, "threads per block" },
   { "drain",    kArDrain,    NELEM(kArDrain),    3, "store-drain wait before the flag: 3 = s_wait_storecnt, 1 = vmcnt" },
   { "acq",      kArAcq,      NELEM(kArAcq),      0, "acquire fence after the flag read" },
+  { "ts_min",   kArTsMin,    NELEM(kArTsMin),    32768, "unused here (tAr says why it is declared)" },
 };
 
 /* --------------------------------------------------------------------------------- row top-k
@@ -7686,7 +7700,8 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "the four-rank exact one-shot all-reduce and the junction after it -- post-norm of the reduced "
   "sum, residual add, scalar, RMS norm and quant_act_i8's quantiser -- in one kernel",
   "exactly 4 ranks; n a multiple of 16, x unpitched (it is the message); a block owns whole rows; "
-  "exact wire; one-shot, so (ranks - 1) x the message a rank -- for decode heights",
+  "exact wire; one-shot ((ranks - 1) x the message a rank) -- for decode heights; from 5 to 32 "
+  "rows (axis `tail`) the standalone two-shot with the junction as its tail",
   "bf16 in, int8 out in the w4a8 GEMM's fragment order with an f32 per-row scale; the reduced sum "
   "rounded to bf16 as the standalone exact all-reduce stores it",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
@@ -9012,6 +9027,12 @@ extern "C" void r4d_cfg_ar(const RadArgs* a, R4dArCfg* out) {
     out->acq      = TUNE(a, tAr, "acq");
     /* An axis of the four-rank junction only (tArQ84); 1 for every other row, as before. */
     out->pub      = TUNE(a, tArQ84, "pub");
+}
+extern "C" int r4d_cfg_ar_tail(const RadArgs* a) {
+    return TUNE(a, tArQ84, "tail");
+}
+extern "C" long r4d_cfg_ar_ts_min(const RadArgs* a) {
+    return (long)tune_i(a, tAr, NELEM(tAr), "ts_min");
 }
 extern "C" void r4d_cfg_topk(const RadArgs* a, R4dTopkCfg* out) {
     out->rc  = 0;                      /* derived from pt1 at issue; see the note at tTopk */

@@ -357,6 +357,11 @@ void r4d_cfg_mxfp4_tiled(const RadArgs*, struct R4dMxTileCfg*);
 void r4d_cfg_mxfp4_decode(const RadArgs*, struct R4dMxDecCfg*);
 void r4d_cfg_split  (const RadArgs*, struct R4dSplitCfg*);
 void r4d_cfg_ar     (const RadArgs*, struct R4dArCfg*);
+/* Whether the four-rank fused junction takes its tail form from 5 rows (the row's `tail` axis). */
+int  r4d_cfg_ar_tail(const RadArgs*);
+/* The four-rank exact one-shot's size, in elements, from which it takes the exact two-shot instead
+ * (0: never); the all-reduce rows' `ts_min` axis. */
+long r4d_cfg_ar_ts_min(const RadArgs*);
 void r4d_cfg_topk   (const RadArgs*, struct R4dTopkCfg*);
 void r4d_cfg_mv     (const RadArgs*, struct R4dMvCfg*);
 /* rmsnorm_quant_i8's decode form: 1 the row's operands in registers before the reductions, 0 the
