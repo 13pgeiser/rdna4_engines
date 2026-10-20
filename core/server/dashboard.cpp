@@ -1671,14 +1671,14 @@ function kvPanel(host, keys) {
   return out;
 }
 const totals = kvPanel($("totals"), ["Requests", "Steps"]);
-/* "Average" is the LIFETIME MARGINAL ratio -- upstream's figure, unchanged, and the one this
- * panel used to carry as its headline. A bullet now rather than the big number: see the note at
- * the accept tile. It divides by every token DRAFTED, so it is not comparable with the live
- * figure above it, which divides by the positions actually REACHED -- the two bases are worked
- * through in README.md, section "Draft acceptance", and both are derivable from the log. Deliberately not spelled out on the
- * face of the panel: the distinction is an analysis-time concern, and a tooltip is invisible on
- * the phone anyway. */
-const spec = kvPanel($("spec"), ["Drafter", "Depth", "Average"]);
+/* "Accepted of drafted" is the LIFETIME MARGINAL ratio -- the engine's figure, unchanged, and
+ * the one this panel used to carry as its headline. A bullet now rather than the big number:
+ * see the note at the accept tile. It divides by every token DRAFTED, so it is not comparable
+ * with the live figure above it, which divides by the positions actually REACHED; the two bases
+ * are worked through in README.md, section "Draft acceptance", and both are derivable from the
+ * log. Each label names its own denominator, which is the whole distinction -- so neither needs
+ * a tooltip, and a tooltip would be invisible on the phone anyway. */
+const spec = kvPanel($("spec"), ["Drafter", "Depth", "Accepted of drafted"]);
 
 /* ---------------------------------------------------------------- meters */
 /* `split` gives the track a second segment for a fill that is two things -- see setSplit. */
@@ -2150,7 +2150,7 @@ function update(s, dt) {
      * with "drafts made, all rejected" -- a drafter that accepts nothing is exactly the case a
      * reader needs to see, and a dash hid it. 0 is the honest figure for both, and the README's
      * "Draft acceptance" section says which question this bullet answers. */
-    spec["Average"].textContent        = pct(s.draft_accept, 0);
+    spec["Accepted of drafted"].textContent = pct(s.draft_accept, 0);
   }
 
   /* ---- devices, in the same panel as the cache meter: they are one question. */
