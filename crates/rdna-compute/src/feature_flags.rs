@@ -2821,7 +2821,6 @@ mod tests {
                 });
                 assert_eq!(flags.fa_prefill_pm_qprep, want, "{arch}: {raw}");
                 assert_eq!(flags.fa_prefill_pm_qprep_fp8_kv, want, "{arch}: fp8 {raw}");
-                assert!(!flags.fa_prefill_pm_fp8_kv, "{arch}: Q-prep must not enable fp8 attention");
                 // Independent of the PM attention flag: the PM flag stays the resolved
                 // qualification (on only on exact gfx1201), whatever the Q-prep flag says.
                 assert_eq!(
@@ -2867,10 +2866,16 @@ mod tests {
             assert!(!pm_off_on.fa_prefill_pm, "{arch}");
             assert!(!pm_off_on.fa_prefill_pm_fp8_kv, "{arch}");
             assert!(pm_off_on.fa_prefill_pm_qprep_fp8_kv, "{arch}");
-            // PM 1 + Q-prep 1: both explicit.
-            let both = with(arch, Some("1"), Some("1"));
-            assert!(both.fa_prefill_pm && both.fa_prefill_pm_qprep, "{arch}");
-            assert!(both.fa_prefill_pm_fp8_kv && both.fa_prefill_pm_qprep_fp8_kv, "{arch}");
+            // Explicit PM and Q-prep values resolve independently for both KV codecs.
+            for (pm, want_pm) in [("0", false), ("1", true)] {
+                for (qprep, want_qprep) in [("0", false), ("1", true)] {
+                    let flags = with(arch, Some(pm), Some(qprep));
+                    assert_eq!(flags.fa_prefill_pm, want_pm, "{arch}: pm={pm} qprep={qprep}");
+                    assert_eq!(flags.fa_prefill_pm_fp8_kv, want_pm, "{arch}: fp8 pm={pm} qprep={qprep}");
+                    assert_eq!(flags.fa_prefill_pm_qprep, want_qprep, "{arch}: pm={pm} qprep={qprep}");
+                    assert_eq!(flags.fa_prefill_pm_qprep_fp8_kv, want_qprep, "{arch}: fp8 pm={pm} qprep={qprep}");
+                }
+            }
             // Q-prep 0 kills the fold whatever the PM flag says.
             for pm in [None, Some("0"), Some("1")] {
                 let flags = with(arch, pm, Some("0"));
