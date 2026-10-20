@@ -473,10 +473,7 @@ inline int NormQuantFP8::declare(RadBuilder* b, const Geom& g, rad_weight gain, 
     return RAD_OK;
 }
 
-/* `r0`/`rows` select a row slice, defaulting to the whole step (`brow_slice` at offset 0 equals
- * `brows`). Slicing lets a block run in passes (the routed feed-forward). Each slice must land in
- * the same bucket-table band as the whole (core/runtime/ctx.h), or a different kernel with a
- * different summation order would run. */
+/* step() below with the plain op, whatever the wire. */
 inline void NormQuantFP8::step_plain(RadCtx* c, int64_t T, int64_t r0, int64_t rows) const {
     if (rows <= 0) rows = T - r0;
     RAD_ISSUE_N(c, op, rows, brow_slice(src, r0, rows, n),
@@ -486,6 +483,10 @@ inline void NormQuantFP8::step_plain(RadCtx* c, int64_t T, int64_t r0, int64_t r
                 brow_slice(a.x, r0, rows, n));
 }
 
+/* `r0`/`rows` select a row slice, defaulting to the whole step (`brow_slice` at offset 0 equals
+ * `brows`). Slicing lets a block run in passes (the routed feed-forward). Each slice must land in
+ * the same bucket-table band as the whole (core/runtime/ctx.h), or a different kernel with a
+ * different summation order would run. */
 inline void NormQuantFP8::step(RadCtx* c, int64_t T, int64_t r0, int64_t rows) const {
     if (rows <= 0) rows = T - r0;
     RAD_ISSUE_N(c, pick(rows), rows, brow_slice(src, r0, rows, n),

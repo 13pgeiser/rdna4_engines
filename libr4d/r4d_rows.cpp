@@ -4930,11 +4930,11 @@ static const RadTunable tGemmPrefill[] = {
 };
 
 /* The MXFP4 tiled GEMM's one axis: compiled arms of one template. 0 is the M crossover (TN=4 from
- * M >= 2048), which needs M. */
+ * M >= 1024), which needs M. */
 static const int64_t kMxTn[] = { 0, 2, 4 };
 static const RadTunable tGemmMxfp4Tiled[] = {
   { "tn", kMxTn, NELEM(kMxTn), 0,
-    "16-column fragments per wave: 2 = 256x64 block, 4 = 256x128. 0 = TN 4 from M >= 2048" },
+    "16-column fragments per wave: 2 = 256x64 block, 4 = 256x128. 0 = TN 4 from M >= 1024" },
 };
 
 /* The MXFP4 decode GEMM's axes. 0 on each is the kernel's own rule (r4d_gemm_mxfp4a8_decode.hip);

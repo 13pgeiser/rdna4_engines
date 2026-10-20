@@ -449,6 +449,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
 
     Model& m = g_model[ctx->rank];
+    if (m.pipe_tbl) rad_dev_free(m.pipe_tbl, RAD_MEM_HOST_PINNED);
     m = Model{};
     m.nm = Names(ctx->scope);
     RAD_ARCH_TRY(check_format(meta));
@@ -1274,9 +1275,10 @@ static void pipe_hand(void* u, int64_t r0, int64_t n) {
 }
 
 /* The bounds of this step's pieces on the card, {0, pipe_rows(T), T}, if the step is pipelined;
- * null for a serial step. Copied on the step's stream ahead of every layer from the pinned table,
- * whose rows never change, so a captured step replays the same copy. */
-static const int32_t* pipe_ready(RadCtx* c, const RadBatch* batch, Model& m) {
+ * null for a serial step, and null with `failed` set when the step has been failed. Copied on the
+ * step's stream ahead of every layer from the pinned table, whose rows never change, so a captured
+ * step replays the same copy. */
+static const int32_t* pipe_ready(RadCtx* c, const RadBatch* batch, Model& m, bool* failed) {
     const int64_t T = batch->n_tok;
     if (!m.pipe_on || !m.b_pipe_cu || T < kPipeMinRows || T > m.g.max_tok ||
         batch->phase != RAD_PHASE_PREFILL)
@@ -1319,10 +1321,19 @@ static const int32_t* pipe_ready(RadCtx* c, const RadBatch* batch, Model& m) {
             }
         }
     }
-    if (!m.pipe_tbl) return serial("no pinned host memory for the piece bounds");
-    if (rad_memcpy_async(d, m.pipe_tbl + 3 * T, 3 * (int64_t)sizeof(int32_t), rad_stream(c)) !=
-        RAD_OK)
+    /* Everything above depends only on the batch and the build, the same on every rank; what
+     * follows is this rank's own, and falling back to the serial step here would leave the other
+     * rank pipelining, the two issuing different collectives on the shared all-reduce instance
+     * (a hang or a wrong sum). So it fails the step. */
+    if (!m.pipe_tbl ||
+        rad_memcpy_async(d, m.pipe_tbl + 3 * T, 3 * (int64_t)sizeof(int32_t), rad_stream(c)) !=
+            RAD_OK) {
+        rad_step_fail(c, "qwen35: the pipelined prefill's piece bounds could not be put on the card "
+                         "(no pinned host memory, or the copy failed); RADIANCE_QWEN35_PIPE=0 runs "
+                         "prefill serially");
+        *failed = true;
         return nullptr;
+    }
     return d;
 }
 
@@ -1424,10 +1435,12 @@ static void step(RadCtx* c, const RadBatch* batch) {
     }
 
 #if !QWEN35_MOE
-    if (const int32_t* pcu = pipe_ready(c, batch, m)) {
+    bool pipe_failed = false;
+    if (const int32_t* pcu = pipe_ready(c, batch, m, &pipe_failed)) {
         step_pipelined(c, batch, m, pcu);
         return;
     }
+    if (pipe_failed) return;
 #endif
 
     RAD_ISSUE(c, m.op_embed,
