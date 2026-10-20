@@ -39,6 +39,8 @@ struct AttnLlamaBF16 {
         rad_buf h    = 0;   /* [max_tok, n_embd] normed input, then the o output */
         rad_buf q    = 0;   /* [max_tok, q_dim + 2*kv_dim] fused q|k|v plane; q, k, v are the
                              * column views [0, q_dim), [q_dim, q_dim+kv_dim), [q_dim+kv_dim, ...) */
+        rad_buf qs   = 0;   /* [max_tok, q_dim] dense q lifted out of the fused plane for
+                             * attn_paged, whose kernels read q only contiguous (see step) */
         rad_buf k    = 0;   /* the same plane: the rope/kv_store readers take the k columns */
         rad_buf v    = 0;   /* the same plane: the v columns */
         rad_buf attn = 0;   /* [max_tok, q_dim] */
@@ -61,6 +63,7 @@ struct AttnLlamaBF16 {
     rad_weight w_norm = 0, w_qkv = 0, w_o = 0;
     rad_op op_norm = 0, op_qkv = 0;
     rad_op op_rope_q = 0, op_rope_k = 0;
+    rad_op op_qs = 0;                  /* cast: lift the fused plane's q slice into dense qs */
     rad_op op_attn = 0, op_kv_store = 0, op_o = 0, op_ar = 0, op_add = 0;
 
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l, rad_kvgroup group,
@@ -130,6 +133,17 @@ inline int AttnLlamaBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, in
     op_rope_k = rw(b, decl_rope(b, g, g.max_tok, g.head_dim, g.n_head_kv, 0, n_rot, "neox"),
                    {w.k}, {w.k});
 
+    /* attn_paged's prefill kernels read q only contiguous, and here q is a column slice of the
+     * fused q|k|v plane (row pitch q_dim + 2*kv_dim), so the slice is lifted into a dense
+     * [T, q_dim] buffer first (gemma4.cpp's `q_s` cast when attn_paged_qrow is not served).
+     * attn_paged_qrow would read the pitch in place, but libr4d's qrow rows cover only head_dim
+     * 256/512 (r4d_rows.cpp R4D_WIN_PAIR), not this decoder's head_dim 128. */
+    op_qs = rw(b, RAD_OP(b, "cast",
+                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", q_dim),
+                                RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
+                     RAD_NOWEIGHTS),
+                 {w.q}, {w.qs});
+
     /* Declared before kv_store so block_size derives from the resolved attention kernel (spec
      * §7.2), pinned to RAD_KV_BLOCK for the same reason rad_arch.h states. This op keeps the
      * plain causal rule through the R-SWA ring: the ring's visible set is the block table's
@@ -144,7 +158,7 @@ inline int AttnLlamaBF16::declare(RadBuilder* b, Names& nm, const Geom& geom, in
                                 RAD_INT("max_ctx", g.max_ctx),
                                 RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype)),
                      RAD_NOWEIGHTS),
-                 {w.q}, {w.attn});
+                 {w.qs}, {w.attn});
 
     op_kv_store = rw(b, RAD_OP(b, "kv_store",
                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
@@ -189,10 +203,13 @@ inline void AttnLlamaBF16::step(RadCtx* c, const RadBatch* batch) const {
     RAD_ISSUE(c, op_norm, brows(w.x, T), RAD_W(w_norm), brows(w.h, T));
     RAD_ISSUE(c, op_qkv,   brows(w.h, T), RAD_W(w_qkv),   brows(w.q, T));
 
-    /* q, k and v are column views of the fused plane, walked by its row pitch: the rope,
-     * kv_store and attention kernels take the slice's pitch (r4d_rows_pitch). */
+    /* q, k and v are column views of the fused plane, walked by its row pitch: the rope and
+     * kv_store kernels take the slice's pitch (r4d_rows_pitch). Attention does not -- it needs
+     * q dense -- so the q slice is lifted into qs after rope and before the store. */
     RAD_ISSUE(c, op_rope_q, bcol(w.q, 0, g.q_dim(), T), rope_posmc(g, batch, T));
     RAD_ISSUE(c, op_rope_k, bcol(w.q, g.q_dim(), g.kv_dim(), T), rope_posmc(g, batch, T));
+
+    RAD_ISSUE(c, op_qs, bcol(w.q, 0, g.q_dim(), T), brows(w.qs, T));
 
     RAD_ISSUE(c, op_kv_store,
               bcol(w.q, g.q_dim(), g.kv_dim(), T),
@@ -200,7 +217,7 @@ inline void AttnLlamaBF16::step(RadCtx* c, const RadBatch* batch) const {
               praw(slot, RAD_I32, T), kv_cache(kv, layer));
 
     RAD_ISSUE_N(c, op_attn, batch->max_q_len,
-                bcol(w.q, 0, g.q_dim(), T), kv_cache(kv, layer),
+                brows(w.qs, T), kv_cache(kv, layer),
                 praw2(table, RAD_I32, batch->n_seq, kvb ? kvb->block_table_pitch : 0),
                 praw(used, RAD_I32, batch->n_seq),
                 RAD_NONE, RAD_NONE,

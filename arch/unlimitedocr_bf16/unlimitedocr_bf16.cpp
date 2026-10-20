@@ -76,7 +76,7 @@ struct Model {
     /* the residual stream and the vocabulary edges */
     rad_buf b_x = 0, b_h = 0, b_hout = 0, b_logits = 0;
     /* attention */
-    rad_buf b_qkv = 0, b_attn = 0;
+    rad_buf b_qkv = 0, b_qs = 0, b_attn = 0;
     /* dense feed-forward (layer 0) */
     rad_buf b_gate_up = 0, b_ffn = 0;
     /* routing -- one row per token */
@@ -295,6 +295,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.b_h    = decl_b(b, nm.f("h"),      g.act_dtype, {g.max_tok, g.n_embd});
     m.b_qkv  = decl_b(b, nm.f("attn_qkv"), g.act_dtype,
                       {g.max_tok, g.q_dim() + 2 * g.kv_dim()});
+    /* The dense q lifted out of the fused plane for attn_paged (attn_llama.h's cast). */
+    m.b_qs   = decl_b(b, nm.f("attn_q"),   g.act_dtype, {g.max_tok, g.q_dim()});
     m.b_attn = decl_b(b, nm.f("attn_out"), g.act_dtype, {g.max_tok, g.q_dim()});
 
     m.b_gate_up = decl_b(b, nm.f("gate_up"), g.act_dtype, {g.max_tok, 2 * g.n_ff});
@@ -386,6 +388,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     AttnLlamaBF16::Wire aw{};
     aw.x = m.b_x; aw.h = m.b_h; aw.q = m.b_qkv; aw.k = m.b_qkv; aw.v = m.b_qkv;
+    aw.qs = m.b_qs;
     aw.attn = m.b_attn;
 
     MlpBF16::Wire mw{};
