@@ -302,6 +302,365 @@ fn planned_entries_take_k_and_experts_at_run_time_and_down_has_the_odd_tail() {
     }
 }
 
+/// The shipped gfx1201 down-NT8 two-slot stream: only two activation tiles
+/// resident (d in v154..155, X in v160..175), SUM72..135 and both weight sets
+/// W136..153 unchanged. The live top is at most v175, granule-aligned to the
+/// 176-VGPR descriptor; the kernel-independent descriptors keep the 64-byte
+/// ABI, wave32, no LDS and no spills/private traffic.
+#[test]
+fn down_nt8_stream_keeps_two_slots_resident_in_176_vgprs() {
+    let spec = Spec {
+        arch: Arch::Gfx1201,
+        kind: Kind::Down,
+        nt: 8,
+        rr: 1,
+        codec: qwen4_moe_sym::WeightCodec::Mq4Sym,
+    };
+    let e = qwen4_moe_sym::emit(spec).unwrap();
+    assert_eq!(e.proof.arch, Arch::Gfx1201);
+    // `Builder::finish` checks every range's lifetime ordering and the
+    // 256-VGPR budget; emission succeeding is the validity exercise, and the
+    // live-top assertion below pins the streamed shape.
+    let vgprs: Vec<_> = e
+        .proof
+        .reg_plan
+        .iter()
+        .filter(|r| r.kind == peacemaker_isa::reg::Kind::V)
+        .collect();
+    let top = vgprs
+        .iter()
+        .map(|r| u16::from(r.base) + u16::from(r.len))
+        .max()
+        .unwrap();
+    assert!(top <= 176, "down NT8 stream: live VGPR top {top}");
+    assert_eq!(top, 176, "down NT8 stream: streamed plan tops at X v160..175");
+    assert_eq!(e.shape.next_free_vgpr, 176, "down NT8 stream: VGPR plan");
+    assert!(
+        e.shape.next_free_sgpr <= 104,
+        "down NT8 stream: SGPR plan {}",
+        e.shape.next_free_sgpr
+    );
+    // Only the d fragments (one dword each) and the X fragments (four dword
+    // pairs each) of slots 0 and 1 are kernel-live; slots 2..7 stream
+    // through the same physical pair in turn (`G::plan`: `p.v::<2>("x",
+    // self.x(j) + 2 * c)` for `c` in 0..4).
+    let d: Vec<_> = e
+        .proof
+        .reg_plan
+        .iter()
+        .filter(|r| r.kind == peacemaker_isa::reg::Kind::V && r.name.as_ref() == "d")
+        .collect();
+    assert_eq!(
+        d.iter().map(|r| (r.base, r.len)).collect::<Vec<_>>(),
+        [(154, 1), (155, 1)],
+        "down NT8 stream: d fragments"
+    );
+    let mut x: Vec<_> = e
+        .proof
+        .reg_plan
+        .iter()
+        .filter(|r| r.kind == peacemaker_isa::reg::Kind::V && r.name.as_ref() == "x")
+        .map(|r| (r.base, r.len))
+        .collect();
+    x.sort();
+    assert_eq!(
+        x,
+        [
+            (160, 2),
+            (162, 2),
+            (164, 2),
+            (166, 2),
+            (168, 2),
+            (170, 2),
+            (172, 2),
+            (174, 2)
+        ],
+        "down NT8 stream: resident X pair"
+    );
+    // Descriptor and kernel-independent shape: the granule-aligned 176-VGPR
+    // reservation, the unchanged 104-SGPR plan, wave32, no LDS, no spills
+    // and no private traffic.
+    assert_eq!(e.shape.barriers, 0, "down NT8 stream: no barrier");
+    assert_eq!(spec.lds_bytes(), 0, "down NT8 stream: no static LDS");
+    let text = &e.s_text;
+    let field = |key: &str| -> Vec<u32> {
+        text.lines()
+            .filter_map(|l| l.trim().strip_prefix(key))
+            .map(|v| v.trim().parse().unwrap())
+            .collect()
+    };
+    assert_eq!(
+        field(".amdhsa_next_free_vgpr"),
+        [176],
+        "down NT8 stream: VGPR descriptor"
+    );
+    assert_eq!(
+        u32::from(e.shape.next_free_vgpr),
+        field(".amdhsa_next_free_vgpr")[0],
+        "down NT8 stream: shape/descriptor VGPRs"
+    );
+    assert!(
+        text.contains(".vgpr_count: 176\n"),
+        "down NT8 stream: metadata VGPRs"
+    );
+    let sgprs = field(".amdhsa_next_free_sgpr");
+    assert_eq!(sgprs.len(), 1, "down NT8 stream: one SGPR descriptor");
+    assert!(
+        sgprs[0] <= 104 && u32::from(e.shape.next_free_sgpr) == sgprs[0],
+        "down NT8 stream: {} SGPRs",
+        sgprs[0]
+    );
+    assert_eq!(spec.threads(), 128, "down NT8 stream: block is four waves");
+    for needle in [
+        ".amdhsa_wavefront_size32 1\n",
+        ".wavefront_size: 32\n",
+        ".group_segment_fixed_size: 0\n",
+        ".amdhsa_group_segment_fixed_size 0\n",
+        ".private_segment_fixed_size: 0\n",
+        ".sgpr_spill_count: 0\n",
+        ".vgpr_spill_count: 0\n",
+        ".kernarg_segment_size: 64\n",
+        ".max_flat_workgroup_size: 128\n",
+    ] {
+        assert!(text.contains(needle), "down NT8 stream: {needle:?}");
+    }
+    for forbidden in [
+        "scratch_",
+        "flat_",
+        "global_",
+        "ds_load",
+        "ds_store",
+        "s_barrier",
+        "s_waitcnt",
+    ] {
+        assert!(
+            !text.lines().any(|l| {
+                let code = l.split("//").next().unwrap_or("");
+                code.split_whitespace().next().is_some_and(|t| t.starts_with(forbidden))
+            }),
+            "down NT8 stream: no {forbidden} traffic"
+        );
+    }
+    // Same 64-byte ABI as every other entry: the M/K load, the n_experts
+    // guard and the 60-byte-by-value layout.
+    assert!(
+        text.contains("s_load_b64 s[18:19], s[0:1], 0x28"),
+        "down NT8 stream: M/K kernarg"
+    );
+    assert!(
+        text.contains("s_load_b32 s5, s[0:1], 0x3c"),
+        "down NT8 stream: n_experts kernarg"
+    );
+    let down_nt4 = Spec {
+        arch: Arch::Gfx1151,
+        kind: Kind::Down,
+        nt: 4,
+        rr: 1,
+        codec: qwen4_moe_sym::WeightCodec::Mq4Sym,
+    };
+    // Same 64-byte ABI value layout as the rest of the family: size 64 and
+    // the identical address-space/value-kind entries (pointer, hidden M/K,
+    // x_row_div, m_total, x_src_rows, n_experts).
+    let abi = |s: Spec| {
+        (
+            s.kernargs().size,
+            s.kernargs().args.iter().map(|a| (a.offset, a.size)).collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(abi(spec), abi(down_nt4), "down NT8 stream: ABI layout");
+    assert_eq!(spec.kernargs().size, 64, "down NT8 stream: ABI bytes");
+}
+
+/// The stream folds and refills per fold: the per-fold WMMA/FMA census, the
+/// streamed tile-load census (b32 52, b64 168), per-tile waits beside the
+/// paired folds, no extra math ops, and the split epoch advance
+/// (`s[24:25] += 136` then X0 before compute1, X1 advanced after it).
+fn down_nt8_stream_fold_census_and_split_epoch_advance() {
+    let spec = Spec {
+        arch: Arch::Gfx1201,
+        kind: Kind::Down,
+        nt: 8,
+        rr: 1,
+        codec: qwen4_moe_sym::WeightCodec::Mq4Sym,
+    };
+    let e = qwen4_moe_sym::emit(spec).unwrap();
+    let text = &e.s_text;
+    let mnemonic = |l: &str| {
+        l.split("//")
+            .next()
+            .unwrap_or("")
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    };
+    // Static census: the streamed schedule issues 52 b32 / 168 b64 tile
+    // loads (the contract's counts), with math identical to the resident
+    // schedule.
+    for (name, n) in [
+        ("buffer_load_b32", 52),
+        ("buffer_load_b64", 168),
+        ("buffer_store_b128", 8),
+        ("ds_swizzle_b32", 40),
+        ("s_endpgm", 1),
+        ("v_dual_fmac_f32", 160),
+        ("v_dual_mul_f32", 320),
+        ("v_wmma_i32_16x16x32_iu4", 160),
+    ] {
+        assert_eq!(count(name), n, "down NT8 stream: {name}");
+    }
+    // No extra math relative to the shipped down-NT8 contract: every counted
+    // math op matches the committed census byte for byte.
+    let committed: serde_json::Value = serde_json::from_str(include_str!(
+        "../kernels/qwen4_moe_sym.gfx1201.down_nt8.contract.json"
+    ))
+    .unwrap();
+    for math in [
+        "v_wmma_i32_16x16x32_iu4",
+        "v_dual_fmac_f32",
+        "v_dual_mul_f32",
+    ] {
+        assert_eq!(
+            committed["counts"][math].as_u64(),
+            Some(count(math)),
+            "down NT8 stream: committed {math} census"
+        );
+    }
+    // Per-row WMMA in ascending tile order: each fold's four K32 WMMA steps
+    // read the fold tile's resident X dword pair (even tiles v160..167, odd
+    // tiles v168..175). Every compute pass folds tiles 0..7 in order, so
+    // fold f reads tile f%8; within the WMMA steps, only odd-tile folds
+    // address `v[17..]` (the v170+ pairs).
+    let wmma: Vec<&str> = text
+        .lines()
+        .filter(|l| mnemonic(l) == "v_wmma_i32_16x16x32_iu4")
+        .collect();
+    assert_eq!(wmma.len(), 160, "down NT8 stream: 40 folds x 4 steps");
+    assert!(
+        wmma.chunks(4).enumerate().all(|(f, chunk)| {
+            let odd = f % 8 % 2 == 1;
+            chunk.iter().any(|l| l.contains("v[17")) == odd
+        }),
+        "down NT8 stream: tile order with the resident pair"
+    );
+    // Per-row scale products (`fold_pass`: `t_j = d * sc_j`): each of the 40
+    // folds contributes eight dual-mul packets, all reading the fold's own d
+    // slot (v154 even tiles, v155 odd tiles); together a fold's packets
+    // cover every row scale v64..71.
+    let mul: Vec<&str> = text
+        .lines()
+        .filter(|l| mnemonic(l) == "v_dual_mul_f32")
+        .collect();
+    assert_eq!(mul.len(), 320, "down NT8 stream: 40 folds x 8 products");
+    assert!(
+        mul.iter().all(|l| l.contains("v154") || l.contains("v155")),
+        "down NT8 stream: every scale product reads a d slot"
+    );
+    assert!(
+        mul.chunks(8).all(|chunk| (64..72u8).all(|s| {
+            let needle = format!("v{s}");
+            chunk.iter().any(|l| l.contains(&needle))
+        })),
+        "down NT8 stream: each fold covers every row scale"
+    );
+    // Per-row FMA (`fold_pass`: `sum_j = fma(t_j, C_j, sum_j)`): each of the
+    // 40 folds contributes four dual-FMAC packets accumulating the sums
+    // v72..135 from the fold products v56..63 (TPROD) and the chain v48..55
+    // (CACC) — never the d slot, which only the scale products above read.
+    let fmac: Vec<&str> = text
+        .lines()
+        .filter(|l| mnemonic(l) == "v_dual_fmac_f32")
+        .collect();
+    assert_eq!(fmac.len(), 160, "down NT8 stream: 40 folds x 4 packets");
+    assert!(
+        fmac.iter().all(|l| !l.contains("v154") && !l.contains("v155")),
+        "down NT8 stream: no FMA reads the d slots"
+    );
+    assert!(
+        fmac.chunks(4).all(|chunk| (56..64u8).all(|p| {
+            let needle = format!("v{p}");
+            chunk.iter().any(|l| l.contains(&needle))
+        }) && (48..56u8).all(|c| {
+            let needle = format!("v{c}");
+            chunk.iter().any(|l| l.contains(&needle))
+        }) && (72..136u8).all(|s| {
+            let needle = format!("v{s}");
+            chunk.iter().any(|l| l.contains(&needle))
+        })),
+        "down NT8 stream: each fold reads TPROD and CACC and writes the sums"
+    );
+    // Per-tile waits ride with the paired folds: each even tile's wait
+    // retires its pair's loads before either slot is overwritten. Check the
+    // pair-relevant window: the first fold has its wait before it, and every
+    // even tile's first WMMA has a load wait after the previous fold's WMMA
+    // and before itself — no assumption about epilogue waits after the
+    // last fold.
+    let lines: Vec<&str> = text.lines().collect();
+    let waits: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| {
+            let m = mnemonic(l);
+            m == "s_wait_loadcnt_dscnt" || m == "s_wait_loadcnt"
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let wmma_lines: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| mnemonic(l) == "v_wmma_i32_16x16x32_iu4")
+        .map(|(i, _)| i)
+        .collect();
+    assert!(!waits.is_empty(), "down NT8 stream: pair waits exist");
+    assert!(
+        waits[0] < wmma_lines[0],
+        "down NT8 stream: first pair wait guards the first fold"
+    );
+    assert!(
+        wmma_lines
+            .chunks(4)
+            .enumerate()
+            .filter(|(f, _)| f % 8 % 2 == 0)
+            .all(|(_, chunk)| {
+                let start = chunk[0];
+                let prev_end = wmma_lines
+                    .iter()
+                    .filter(|&&w| w < start)
+                    .max()
+                    .copied()
+                    .unwrap_or(0);
+                waits.iter().any(|&w| prev_end < w && w < start)
+            }),
+        "down NT8 stream: every even tile fold has its pair wait in-window"
+    );
+    // Split epoch advance (`kloop` stream arm): the weight descriptor steps
+    // one epoch (136, `0x88`) first, then X0 follows it, both before the
+    // second-half compute, while X1 still addresses the old epoch and
+    // advances after it. Each appears exactly once (the K loop body is
+    // emitted once).
+    let at = |needle: &str| {
+        assert_eq!(
+            lines.iter().filter(|l| l.contains(needle)).count(),
+            1,
+            "down NT8 stream: one {needle}"
+        );
+        lines.iter().position(|l| l.contains(needle)).unwrap()
+    };
+    let (w, x0, x1) = (
+        at("s_add_co_u32 s24, s24, 0x88"),
+        at("s_add_co_u32 s32, s32, s45"),
+        at("s_add_co_u32 s36, s36, s45"),
+    );
+    assert!(
+        w < x0 && x0 < x1,
+        "down NT8 stream: split advance W+X0 then X1"
+    );
+}
+
 /// The runtime embeds one certified module per arch: it must be exactly
 /// what the builder emits today.
 #[test]

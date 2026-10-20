@@ -54,14 +54,17 @@
 //!
 //! FP8 variant (`fa_prefill_fp8_pm`, [`FaKvCodec::Fp8E4M3`], [`emit_fp8_module`]): one direct export
 //! `attention_fp8_e4m3_fa2_gqa_f16_pm_gfx1201`, the PeaceMaker twin of the production Q0 hipcc entry
-//! (`attention_q8_0_fa2_gqa.gfx1201.hip`, `KMODE=8`, `-DHIPFIRE_FA2_Q0_A3B`). Same 60-byte ABI, grid, block, LDS plane
-//! layout, QK, softmax, PV and epilogue as the Q8 direct entry; only the K/V global addressing and the fill-time
-//! dequantisation differ. K and V rows are 516-byte native-fp8 token rows `[512 head-major E4M3 code bytes][2 f16
-//! scales]`: code byte `key*516 + head*256 + d`, scale at `key*516 + 512 + head*2`. The code and scale
-//! bases are separate per-lane VGPR offsets (`head*256` versus `512 + head*2`) over one 64-bit tile base
-//! (`k_cache + ktile*516`). Decode: `v_cvt_pk_f32_fp8` (gfx1201 OCP E4M3FN, no FNUZ fold) of two bytes per instruction
-//! (`e32 .l`, `e64 .h op_sel:[1,0]`) to f32, f32 value of the f16 scale, then the unchanged
-//! [`dequant_pair`] (`v_fma_mixlo_f16 .., neg(0)`: exact product, one rounding, as the hipcc `(_Float16)(sf * d)`).
+//! (`attention_q8_0_fa2_gqa.gfx1201.hip`, `KMODE=8`, `-DHIPFIRE_FA2_Q0_A3B`). Same 60-byte ABI, grid, block,
+//! QK, softmax, PV and epilogue shape as the Q8 direct entry; only the K/V global addressing, the fill-time
+//! dequantisation and the LDS/register staging differ. K and V rows are 516-byte native-fp8 token rows `[512
+//! head-major E4M3 code bytes][2 f16 scales]`: code byte `key*516 + head*256 + d`, scale at `key*516 + 512 +
+//! head*2`. The code and scale bases are separate per-lane VGPR offsets (`head*256` versus `512 + head*2`) over
+//! one 64-bit tile base (`k_cache + ktile*516`). Decode: `v_cvt_pk_f32_fp8` (gfx1201 OCP E4M3FN, no FNUZ fold)
+//! of two bytes per instruction (`e32 .l`, `e64 .h op_sel:[1,0]`) to f32, f32 value of the f16 scale, then the
+//! unchanged [`dequant_pair`] (`v_fma_mixlo_f16 .., neg(0)`: exact product, one rounding, as the hipcc
+//! `(_Float16)(sf * d)`). One 32-KiB LDS stage (base 0, [`FP8_DYNAMIC_LDS_BYTES`]) is reused sequentially
+//! for K then V: `fill K -> Ready -> QK -> Retire -> fill V -> Ready -> [softmax -> PV] -> Retire`, four
+//! barrier pairs per KT64 tile, max 224 VGPRs. Scores 16..47 survive V-fill; Q 48..63 whole; O 96..223 whole.
 //! The Q preconvert export is not part of this module: it is the Q8 module's `attention_fa2_q_preconvert_pm_gfx1201`.
 //!
 
@@ -99,6 +102,8 @@ pub const DIRECT_BLOCK: u32 = 160;
 pub const PRECONVERT_BLOCK: u32 = 128;
 /// Direct launch dynamic LDS bytes (K plane + V plane).
 pub const DYNAMIC_LDS_BYTES: u32 = 65_536;
+/// FP8 direct launch dynamic LDS bytes: one 32-KiB stage reused sequentially for K then V.
+pub const FP8_DYNAMIC_LDS_BYTES: u32 = 32_768;
 /// Direct kernarg segment bytes (the oracle's, not rounded).
 pub const DIRECT_KERNARG_BYTES: u32 = 60;
 /// Preconvert kernarg segment bytes.
@@ -165,17 +170,29 @@ fn admit(arch: Arch, spec: &FaPrefillSpec) -> R {
 
 // ------------------------------------------------------------------ labels
 // Labels are unique per kernel: the module combiner shares one assembler unit.
+// Q8 keeps the two-barrier schedule (D_LOOP, D_FILL_DONE, D_QK, D_TURN). FP8
+// reuses one 32-KiB stage sequentially (D_LOOP, D_KFILL_DONE, D_KREADY, D_QK,
+// D_QK_DONE, D_VFILL_DONE, D_VREADY, D_TURN): K-fill, QK, V-fill, softmax/PV,
+// with all five waves joining all four barriers.
 const D_LOOP: &str = ".Lfapd_tile";
 const D_FILL_DONE: &str = ".Lfapd_fill_done";
+const D_KFILL_DONE: &str = ".Lfapd_kfill_done";
+const D_KREADY: &str = ".Lfapd_kready";
 const D_QK: &str = ".Lfapd_qk";
+const D_QK_DONE: &str = ".Lfapd_qk_done";
+const D_VFILL_DONE: &str = ".Lfapd_vfill_done";
+const D_VREADY: &str = ".Lfapd_vready";
 const D_TURN: &str = ".Lfapd_turn";
 const D_EPI: &str = ".Lfapd_epi";
 const D_END: &str = ".Lfapd_end";
 const P_END: &str = ".Lfapc_end";
 
-// LDS slots (ids follow declaration order).
+// LDS slots (ids follow declaration order). Q8 declares two simultaneously
+// resident 32768-byte planes (L_K, L_V). FP8 declares one 32768-byte stage
+// (L_STAGE, id 0) reused sequentially for K then V.
 const L_K: usize = 0;
 const L_V: usize = 1;
+const L_STAGE: usize = 0;
 
 // ------------------------------------------------------------------ VGPR map (direct)
 const TID: u8 = 0;
@@ -214,6 +231,26 @@ const FSC: u8 = 64; // K scales 64 + t, V scales 68 + 2t' (+1)
 const FV: u8 = 72; // V codes: slot t' u0 = 72 + 16t', u1 = 80 + 16t'
 const FOUT: u8 = 104; // store-data ring
 const FTMP: u8 = 112; // integer / float temporaries
+                   // FP8 sequential-stage aliases (max 224; Q8 aliases above are untouched).
+                   // K-fill (live D_LOOP..D_KREADY): codes 16..47, scales 64..67,
+                   // output ring 68..71 (pairs (68,69),(70,71)), temporaries 72..79.
+const FK8: u8 = 16;
+const FSC8: u8 = 64;
+const FOUT8: u8 = 68;
+const FTMP8: u8 = 72;
+                   // V-fill streamed one t' group at a time (live D_QK_DONE..D_VREADY):
+                   // codes 64..79, scales 80..81, output ring 84..87, temporaries 88..95.
+const VFC8: u8 = 64;
+const VFSC8: u8 = 80;
+const VFOUT8: u8 = 84;
+const VFTMP8: u8 = 88;
+                   // Softmax/PV (live D_VREADY..D_TURN): temporaries 64..71, packed
+                   // probabilities 80..83, V fragment buffers 84..87/88..91, O 96..223.
+const SMX8: u8 = 64;
+const SPRO8: u8 = 80;
+const SVFA8: u8 = 84;
+const SVFB8: u8 = 88;
+const O8: u8 = 96;
 
 // ------------------------------------------------------------------ SGPR map (direct)
 const KARG: u8 = 0;
@@ -561,13 +598,18 @@ fn add64(b: &mut Builder, dst: u8, base: u8, lo: u8, hi: Option<u8>) -> R {
 
 // ------------------------------------------------------------------ plans
 fn plan_direct(fp8: bool) -> Result<RegPlan, String> {
-    let mut p = RegPlan::new(256, 104)?;
+    let mut p = RegPlan::new(if fp8 { 224 } else { 256 }, 104)?;
     let w = || Live::Whole;
     let between = |a: &str, z: &str| Live::Between(a.into(), z.into());
     let pro = || between("entry", D_LOOP);
     let fill = || between(D_LOOP, D_QK);
     let tile = || between(D_QK, D_TURN);
     let epi = || between(D_EPI, D_END);
+    // FP8 sequential-stage lifetimes: K-fill, QK, V-fill, softmax/PV.
+    let kfill = || between(D_LOOP, D_KREADY);
+    let qk = || between(D_KREADY, D_QK_DONE);
+    let vfill = || between(D_QK_DONE, D_VREADY);
+    let sm = || between(D_VREADY, D_TURN);
     p.v::<1>("tid", TID, pro())?;
     for (name, base) in [
         ("lds_k_store", V_LK),
@@ -594,10 +636,47 @@ fn plan_direct(fp8: bool) -> Result<RegPlan, String> {
             p.v::<1>("spare", n, w())?;
         }
     }
-    // Prologue temporaries (v16..v47).
-    for i in 0..4u8 {
-        p.v::<8>("prologue_temp", S0 + 8 * i, pro())?;
-    }
+    if fp8 {
+        // Prologue temporaries (v16..v47).
+        for i in 0..4u8 {
+            p.v::<8>("prologue_temp", S0 + 8 * i, pro())?;
+        }
+        // K-fill only: codes 16..47, scales 64..67, output ring 68..71, temps 72..79.
+        for i in 0..4u8 {
+            p.v::<8>("fill_k_codes", FK8 + 8 * i, kfill())?;
+        }
+        p.v::<4>("fill_k_scales", FSC8, kfill())?;
+        p.v::<4>("fill_k_out_ring", FOUT8, kfill())?;
+        p.v::<8>("fill_k_temp", FTMP8, kfill())?;
+        // Scores span QK through softmax consumption.
+        for i in 0..4u8 {
+            p.v::<8>("score", S0 + 8 * i, between(D_KREADY, D_TURN))?;
+        }
+        for i in 0..4u8 {
+            p.v::<4>("q_frag", QF + 4 * i, w())?;
+        }
+        // QK only: K fragments 64..79.
+        for i in 0..4u8 {
+            p.v::<4>("k_frag", KF + 4 * i, qk())?;
+        }
+        // V-fill streams one t' group: codes 64..79, scales 80..81, ring 84..87, temps 88..95.
+        p.v::<8>("fill_v_codes_lo", VFC8, vfill())?;
+        p.v::<8>("fill_v_codes_hi", VFC8 + 8, vfill())?;
+        p.v::<2>("fill_v_scales", VFSC8, vfill())?;
+        p.v::<4>("fill_v_out_ring", VFOUT8, vfill())?;
+        p.v::<8>("fill_v_temp", VFTMP8, vfill())?;
+        // Softmax/PV: temporaries 64..71, probabilities 80..83, V buffers 84..91.
+        p.v::<8>("sm_temp", SMX8, sm())?;
+        p.v::<4>("prow", SPRO8, sm())?;
+        p.v::<4>("v_frag_a", SVFA8, sm())?;
+        p.v::<4>("v_frag_b", SVFB8, sm())?;
+        for i in 0..16u8 {
+            p.v::<8>("o", O8 + 8 * i, w())?;
+        }
+        // Epilogue temporaries.
+        p.v::<8>("epilogue_temp", S0, epi())?;
+        p.v::<8>("epilogue_temp", S0 + 8, epi())?;
+    } else {
     // Fill phase.
     for i in 0..4u8 {
         p.v::<8>("fill_k_codes", FK + 8 * i, fill())?;
@@ -639,6 +718,7 @@ fn plan_direct(fp8: bool) -> Result<RegPlan, String> {
     // Epilogue temporaries.
     p.v::<8>("epilogue_temp", S0, epi())?;
     p.v::<8>("epilogue_temp", S0 + 8, epi())?;
+    }
     // SGPRs.
     p.s::<2>("kernarg_ptr", KARG, w())?;
     p.s::<8>("kernarg_ptrs", SQ16, w())?;
@@ -1195,7 +1275,10 @@ fn tile_setup(b: &mut Builder, fp8: bool) -> R {
 
 /// Cooperative KT64 fill by the 128 filler threads (waves 0..3); wave 4 skips the
 /// stores but not the rendezvous. Masked keys produce exact +0 halves.
+/// Q8 fills K and V jointly (two planes); FP8 fills K then (after QK) V into
+/// the single reused stage via [`fill_k_fp8`] / [`fill_v_fp8`].
 fn fill(b: &mut Builder, fp8: bool) -> R {
+    let _ = fp8;
     sop(b, format!("s_cmp_ge_u32 s{WAVE}, 4"), &[], &[WAVE])?;
     op(b, format!("s_cbranch_scc1 {D_FILL_DONE}"), &[], &[])?;
     // K masks: key vk + 16t is live iff vk < rem + 1 - 16t.
@@ -1229,33 +1312,17 @@ fn fill(b: &mut Builder, fp8: bool) -> R {
     }
     for t in 0..4u8 {
         exec_and(b, fm(t))?;
-        if fp8 {
-            // Row 516*16*t; the scale offset (`512 + 2*head`) and the code offset (`256*head + 32*a`) are separate.
-            let row = 16 * FP8_ROW_BYTES * u32::from(t);
-            gload(b, "u16", v(FSC + t), V_GSK, KB, row)?;
-            for w in 0..8u8 {
-                gload(
-                    b,
-                    "b32",
-                    v(FK + 8 * t + w),
-                    V_GK,
-                    KB,
-                    row + 4 * u32::from(w),
-                )?;
-            }
-        } else {
-            let row = 8704 * u32::from(t);
-            gload(b, "u16", v(FSC + t), V_GK, KB, row)?;
-            for w in 0..8u8 {
-                gload(
-                    b,
-                    "b32",
-                    v(FK + 8 * t + w),
-                    V_GK,
-                    KB,
-                    row + 2 + 4 * u32::from(w),
-                )?;
-            }
+        let row = 8704 * u32::from(t);
+        gload(b, "u16", v(FSC + t), V_GK, KB, row)?;
+        for w in 0..8u8 {
+            gload(
+                b,
+                "b32",
+                v(FK + 8 * t + w),
+                V_GK,
+                KB,
+                row + 2 + 4 * u32::from(w),
+            )?;
         }
         exec_restore(b)?;
     }
@@ -1308,26 +1375,17 @@ fn fill(b: &mut Builder, fp8: bool) -> R {
             let scale = FSC + 4 + 2 * t + half;
             let codes = FV + 16 * t + 8 * half;
             exec_and(b, mask)?;
-            if fp8 {
-                // Key pair stride 2 * 516; the odd key is one row (516 B) further.
-                let block = 32 * FP8_ROW_BYTES * u32::from(t) + FP8_ROW_BYTES * u32::from(half);
-                gload(b, "u16", v(scale), V_GSV, VB, block)?;
-                for w in 0..8u8 {
-                    gload(b, "b32", v(codes + w), V_GV, VB, block + 4 * u32::from(w))?;
-                }
-            } else {
-                let block = 17_408 * u32::from(t) + 544 * u32::from(half);
-                gload(b, "u16", v(scale), V_GV, VB, block)?;
-                for w in 0..8u8 {
-                    gload(
-                        b,
-                        "b32",
-                        v(codes + w),
-                        V_GV,
-                        VB,
-                        block + 2 + 4 * u32::from(w),
-                    )?;
-                }
+            let block = 17_408 * u32::from(t) + 544 * u32::from(half);
+            gload(b, "u16", v(scale), V_GV, VB, block)?;
+            for w in 0..8u8 {
+                gload(
+                    b,
+                    "b32",
+                    v(codes + w),
+                    V_GV,
+                    VB,
+                    block + 2 + 4 * u32::from(w),
+                )?;
             }
             exec_restore(b)?;
         }
@@ -1345,13 +1403,8 @@ fn fill(b: &mut Builder, fp8: bool) -> R {
         for w in 0..8u8 {
             let word = FK + 8 * t + w;
             let [a0, a1, a2, a3] = [FTMP, FTMP + 1, FTMP + 2, FTMP + 3];
-            if fp8 {
-                fp8_pair(b, a0, word, false)?;
-                fp8_pair(b, a2, word, true)?;
-            } else {
-                for (k, a) in [a0, a1, a2, a3].into_iter().enumerate() {
-                    code_f32(b, a, word, k as u8)?;
-                }
+            for (k, a) in [a0, a1, a2, a3].into_iter().enumerate() {
+                code_f32(b, a, word, k as u8)?;
             }
             let out = FOUT + 2 * (quad % 4);
             quad += 1;
@@ -1373,28 +1426,6 @@ fn fill(b: &mut Builder, fp8: bool) -> R {
         }
         for w in 0..8u8 {
             let (u0, u1) = (FV + 16 * t + w, FV + 16 * t + 8 + w);
-            if fp8 {
-                // Two code bytes of each key per pair conversion: (p0, p1) = bytes 2cp, 2cp+1 of the even key,
-                // (q0, q1) the odd key's; dims 4w + 2cp + k.
-                for cp in 0..2u8 {
-                    let (p, q) = (FTMP, FTMP + 2);
-                    fp8_pair(b, p, u0, cp == 1)?;
-                    fp8_pair(b, q, u1, cp == 1)?;
-                    for k in 0..2u8 {
-                        let c = 2 * cp + k;
-                        let out = FOUT + (word_no % 8);
-                        word_no = word_no.wrapping_add(1);
-                        dequant_pair(b, out, (s0, p + k), (s1, q + k), FTMP + 4, FTMP + 5)?;
-                        let imm = 32_768
-                            + 16_384 * u32::from(t)
-                            + 512 * u32::from(w >> 2)
-                            + 64 * u32::from(w & 3)
-                            + 16 * u32::from(c);
-                        dstore(b, L_V, "b32", V_LV, v(out), imm)?;
-                    }
-                }
-                continue;
-            }
             for c in 0..4u8 {
                 let base = FTMP + 4 * (word_no % 2);
                 let out = FOUT + (word_no % 8);
@@ -1413,15 +1444,246 @@ fn fill(b: &mut Builder, fp8: bool) -> R {
     }
     Ok(())
 }
+/// FP8 K-fill into the reused stage (base 0): codes 16..47, scales 64..67,
+/// output ring 68..71 as pairs (68,69),(70,71), temporaries 72..79.
+/// Same global loads and conversion/dequant sequence as the Q8-joined path's
+/// fp8 branch, with the plane base removed from the store immediates.
+fn fill_k_fp8(b: &mut Builder) -> R {
+    sop(b, format!("s_cmp_ge_u32 s{WAVE}, 4"), &[], &[WAVE])?;
+    op(b, format!("s_cbranch_scc1 {D_KFILL_DONE}"), &[], &[])?;
+    // K masks: key vk + 16t is live iff vk < rem + 1 - 16t.
+    for t in 0..4u8 {
+        sop(
+            b,
+            format!(
+                "s_add_co_i32 s{}, s{REM}, {}",
+                T[t as usize],
+                imm_i32(1 - 16 * i32::from(t))
+            ),
+            &[T[t as usize]],
+            &[REM],
+        )?;
+    }
+    wait_alu(b, "depctr_sa_sdst(0)")?;
+    for t in 0..4u8 {
+        op(
+            b,
+            format!("v_cmp_gt_i32_e64 s{}, s{}, v{V_VK}", fm(t), T[t as usize]),
+            &[m(fm(t))],
+            &[s(T[t as usize]), v(V_VK)],
+        )?;
+    }
+    wait_alu(b, "depctr_va_sdst(0)")?;
+    for r in 0..32u8 {
+        vmov0(b, FK8 + r)?;
+    }
+    for t in 0..4u8 {
+        vmov0(b, FSC8 + t)?;
+    }
+    for t in 0..4u8 {
+        exec_and(b, fm(t))?;
+        // Row 516*16*t; the scale offset (`512 + 2*head`) and the code offset (`256*head + 32*a`) are separate.
+        let row = 16 * FP8_ROW_BYTES * u32::from(t);
+        gload(b, "u16", v(FSC8 + t), V_GSK, KB, row)?;
+        for w in 0..8u8 {
+            gload(
+                b,
+                "b32",
+                v(FK8 + 8 * t + w),
+                V_GK,
+                KB,
+                row + 4 * u32::from(w),
+            )?;
+        }
+        exec_restore(b)?;
+    }
+    // The half-writes below preserve the other half of their destination: define the whole
+    // temporary block first.
+    for r in 0..8u8 {
+        vmov0(b, FTMP8 + r)?;
+    }
+    // K dequantisation into the fragment plane: one 8-byte store per code quad.
+    for t in 0..4u8 {
+        let scale = FSC8 + t;
+        scale_f32(b, scale)?;
+        for w in 0..8u8 {
+            let word = FK8 + 8 * t + w;
+            let (a0, a2) = (FTMP8, FTMP8 + 2);
+            fp8_pair(b, a0, word, false)?;
+            fp8_pair(b, a2, word, true)?;
+            // Ring holds two quads: out (68,69) then out+1 (70,71), alternating per quad.
+            let pair = (4 * t + w) % 2;
+            let out = FOUT8 + 2 * pair;
+            dequant_pair(b, out, (scale, a0), (scale, a0 + 1), FTMP8 + 4, FTMP8 + 5)?;
+            dequant_pair(b, out + 1, (scale, a2), (scale, a2 + 1), FTMP8 + 4, FTMP8 + 5)?;
+            let imm = 512 * u32::from(t)
+                + 2048 * u32::from(w >> 2)
+                + 256 * u32::from((w >> 1) & 1)
+                + 8 * u32::from(w & 1);
+            dstore(b, L_STAGE, "b64", V_LK, vr(out, 2), imm)?;
+        }
+    }
+    Ok(())
+}
+
+/// FP8 V-fill into the reused stage (base 0), streamed one t' group at a time:
+/// codes 64..79, scales 80..81, output ring 84..87, temporaries 88..95.
+/// Same global loads and conversion/dequant sequence as the Q8-joined path's
+/// fp8 branch, with the 32768 plane base removed from the store immediates.
+fn fill_v_fp8(b: &mut Builder) -> R {
+    sop(b, format!("s_cmp_ge_u32 s{WAVE}, 4"), &[], &[WAVE])?;
+    op(b, format!("s_cbranch_scc1 {D_VFILL_DONE}"), &[], &[])?;
+    for tp in 0..2u8 {
+        // V masks: pair m = vk + 16t', even key live iff 2vk < rem + 1 - 32t', odd iff 2vk < rem - 32t'.
+        let a = T[4 + 2 * tp as usize];
+        let c = T[5 + 2 * tp as usize];
+        sop(
+            b,
+            format!("s_add_co_i32 s{a}, s{REM}, {}", imm_i32(1 - 32 * i32::from(tp))),
+            &[a],
+            &[REM],
+        )?;
+        sop(
+            b,
+            format!("s_add_co_i32 s{c}, s{REM}, {}", imm_i32(-32 * i32::from(tp))),
+            &[c],
+            &[REM],
+        )?;
+        wait_alu(b, "depctr_sa_sdst(0)")?;
+        op(
+            b,
+            format!("v_cmp_gt_i32_e64 s{}, s{a}, v{V_VK2}", fm(2 * tp)),
+            &[m(fm(2 * tp))],
+            &[s(a), v(V_VK2)],
+        )?;
+        op(
+            b,
+            format!("v_cmp_gt_i32_e64 s{}, s{c}, v{V_VK2}", fm(2 * tp + 1)),
+            &[m(fm(2 * tp + 1))],
+            &[s(c), v(V_VK2)],
+        )?;
+        wait_alu(b, "depctr_va_sdst(0)")?;
+        for r in 0..2u8 {
+            vmov0(b, VFSC8 + r)?;
+        }
+        for r in 0..16u8 {
+            vmov0(b, VFC8 + r)?;
+        }
+        for (half, mask) in [(0u8, fm(2 * tp)), (1u8, fm(2 * tp + 1))] {
+            let scale = VFSC8 + half;
+            let codes = VFC8 + 8 * half;
+            exec_and(b, mask)?;
+            // Key pair stride 2 * 516; the odd key is one row (516 B) further.
+            let block = 32 * FP8_ROW_BYTES * u32::from(tp) + FP8_ROW_BYTES * u32::from(half);
+            gload(b, "u16", v(scale), V_GSV, VB, block)?;
+            for w in 0..8u8 {
+                gload(b, "b32", v(codes + w), V_GV, VB, block + 4 * u32::from(w))?;
+            }
+            exec_restore(b)?;
+        }
+        // The half-writes below preserve the other half of their destination: define the whole
+        // temporary block first.
+        for r in 0..8u8 {
+            vmov0(b, VFTMP8 + r)?;
+        }
+        // V dequantisation: (even key, odd key) halves of one dimension share a dword.
+        let (s0, s1) = (VFSC8, VFSC8 + 1);
+        scale_f32(b, s0)?;
+        scale_f32(b, s1)?;
+        // Two code bytes of each key per pair conversion: (p0, p1) = bytes 2cp, 2cp+1 of the even key,
+        // (q0, q1) the odd key's; dims 4w + 2cp + k.
+        let mut word_no = 0u8;
+        for w in 0..8u8 {
+            let (u0, u1) = (VFC8 + w, VFC8 + 8 + w);
+            for cp in 0..2u8 {
+                let (p, q) = (VFTMP8, VFTMP8 + 2);
+                fp8_pair(b, p, u0, cp == 1)?;
+                fp8_pair(b, q, u1, cp == 1)?;
+                for k in 0..2u8 {
+                    let c = 2 * cp + k;
+                    let out = VFOUT8 + (word_no % 4);
+                    word_no = word_no.wrapping_add(1);
+                    dequant_pair(b, out, (s0, p + k), (s1, q + k), VFTMP8 + 4, VFTMP8 + 5)?;
+                    let imm = 16_384 * u32::from(tp)
+                        + 512 * u32::from(w >> 2)
+                        + 64 * u32::from(w & 3)
+                        + 16 * u32::from(c);
+                    dstore(b, L_STAGE, "b32", V_LV, v(out), imm)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Ordered QK: S^T = K * Q^T. Each Q fragment group is loaded once and shared by
 /// the live subtiles; every subtile accumulates dc = 0..15 in order.
-fn qk(b: &mut Builder) -> R {
+/// `fp8`: O lives at 96 (`O8`), V buffers/temps excluded; Q8 uses 128 (`O`) with
+/// its own fragment/softmax registers.
+struct CodecRegs {
+    qf: u8,
+    kf: u8,
+    scores: u8,
+    o: u8,
+    prow: u8,
+    vfa: u8,
+    vfb: u8,
+    smx: u8,
+    swz: u8,
+    smn: u8,
+    sal: u8,
+    ssum: u8,
+    st1: u8,
+    skey: u8,
+    skj: u8,
+    slot: usize,
+}
+const Q8_REGS: CodecRegs = CodecRegs {
+    qf: QF,
+    kf: KF,
+    scores: S0,
+    o: O,
+    prow: PROW,
+    vfa: VFA,
+    vfb: VFB,
+    smx: V_MX,
+    swz: V_SWZ,
+    smn: V_MN,
+    sal: V_AL,
+    ssum: V_SUM,
+    st1: V_T1,
+    skey: V_KEY,
+    skj: V_KJ,
+    slot: L_K,
+};
+const FP8_REGS: CodecRegs = CodecRegs {
+    qf: QF,
+    kf: KF,
+    scores: S0,
+    o: O8,
+    prow: SPRO8,
+    vfa: SVFA8,
+    vfb: SVFB8,
+    smx: SMX8,
+    swz: SMX8 + 1,
+    smn: SMX8 + 2,
+    sal: SMX8 + 3,
+    ssum: SMX8 + 4,
+    st1: SMX8 + 5,
+    skey: SMX8 + 6,
+    skj: SMX8 + 7,
+    slot: L_STAGE,
+};
+fn regs(fp8: bool) -> CodecRegs {
+    if fp8 { FP8_REGS } else { Q8_REGS }
+}
+fn qk(b: &mut Builder, fp8: bool) -> R {
+    let r = regs(fp8);
     for dg in 0..4u8 {
         exec_and(b, QOK)?;
         for u in 0..4u8 {
             let dc = u32::from(4 * dg + u);
-            gload(b, "b128", vr(QF + 4 * u, 4), V_QO, SQ16, dc * 32)?;
+            gload(b, "b128", vr(r.qf + 4 * u, 4), V_QO, SQ16, dc * 32)?;
         }
         exec_restore(b)?;
         let end = format!(".Lfapd_dg{dg}_end");
@@ -1437,10 +1699,10 @@ fn qk(b: &mut Builder) -> R {
             }
             for u in 0..4u8 {
                 let dc = u32::from(4 * dg + u);
-                dload128(b, L_K, KF + 4 * u, V_LF, (dc * 4 + u32::from(sub)) * 512)?;
+                dload128(b, r.slot, r.kf + 4 * u, V_LF, (dc * 4 + u32::from(sub)) * 512)?;
             }
             for u in 0..4u8 {
-                wmma(b, S0 + 8 * sub, KF + 4 * u, QF + 4 * u, dg > 0 || u > 0)?;
+                wmma(b, r.scores + 8 * sub, r.kf + 4 * u, r.qf + 4 * u, dg > 0 || u > 0)?;
             }
         }
         b.label(&end)?;
@@ -1449,8 +1711,14 @@ fn qk(b: &mut Builder) -> R {
 }
 
 /// One live subtile: mask + scale, online softmax update, O rescale, PV.
-fn softmax_sub(b: &mut Builder, sub: u8) -> R {
-    let sb = S0 + 8 * sub;
+/// `fp8`: O at 96, softmax temps 64..71, probabilities 80..83, V buffers
+/// 84..91, V reads from the reused stage (base 0); Q8 keeps its own map and V plane.
+fn softmax_sub(b: &mut Builder, sub: u8, fp8: bool) -> R {
+    let r = regs(fp8);
+    let sb = r.scores + 8 * sub;
+    let (smx, swz, smn, sal, ssum, st1, skey, skj) =
+        (r.smx, r.swz, r.smn, r.sal, r.ssum, r.st1, r.skey, r.skj);
+    let (prow, vfa, vfb, ob) = (r.prow, r.vfa, r.vfb, r.o);
     if sub > 0 {
         sop(
             b,
@@ -1480,21 +1748,21 @@ fn softmax_sub(b: &mut Builder, sub: u8) -> R {
     wait_alu(b, "depctr_sa_sdst(0)")?;
     op(
         b,
-        format!("v_add_nc_u32_e32 v{V_KEY}, s{}, v{V_KG8}", T[0]),
-        &[v(V_KEY)],
+        format!("v_add_nc_u32_e32 v{skey}, s{}, v{V_KG8}", T[0]),
+        &[v(skey)],
         &[s(T[0]), v(V_KG8)],
     )?;
     for j in 0..8u8 {
         let key = if j == 0 {
-            V_KEY
+            skey
         } else {
             op(
                 b,
-                format!("v_add_nc_u32_e32 v{V_KJ}, {j}, v{V_KEY}"),
-                &[v(V_KJ)],
-                &[v(V_KEY)],
+                format!("v_add_nc_u32_e32 v{skj}, {j}, v{skey}"),
+                &[v(skj)],
+                &[v(skey)],
             )?;
-            V_KJ
+            skj
         };
         op(
             b,
@@ -1537,33 +1805,33 @@ fn softmax_sub(b: &mut Builder, sub: u8) -> R {
     // Row max: serial chain, then the other key half through lane XOR 16.
     op(
         b,
-        format!("v_max3_num_f32 v{V_MX}, v{sb}, 0xff800000, v{}", sb + 1),
-        &[v(V_MX)],
+        format!("v_max3_num_f32 v{smx}, v{sb}, 0xff800000, v{}", sb + 1),
+        &[v(smx)],
         &[v(sb), v(sb + 1)],
     )?;
     for j in [2u8, 4, 6] {
         op(
             b,
             format!(
-                "v_max3_num_f32 v{V_MX}, v{V_MX}, v{}, v{}",
+                "v_max3_num_f32 v{smx}, v{smx}, v{}, v{}",
                 sb + j,
                 sb + j + 1
             ),
-            &[v(V_MX)],
-            &[v(V_MX), v(sb + j), v(sb + j + 1)],
+            &[v(smx)],
+            &[v(smx), v(sb + j), v(sb + j + 1)],
         )?;
     }
     op(
         b,
-        format!("v_permlanex16_b32 v{V_SWZ}, v{V_MX}, s{PSEL}, 0xfedcba98"),
-        &[v(V_SWZ)],
-        &[v(V_MX), s(PSEL)],
+        format!("v_permlanex16_b32 v{swz}, v{smx}, s{PSEL}, 0xfedcba98"),
+        &[v(swz)],
+        &[v(smx), s(PSEL)],
     )?;
     op(
         b,
-        format!("v_max3_num_f32 v{V_MN}, v{V_M}, v{V_MX}, v{V_SWZ}"),
-        &[v(V_MN)],
-        &[v(V_M), v(V_MX), v(V_SWZ)],
+        format!("v_max3_num_f32 v{smn}, v{V_M}, v{smx}, v{swz}"),
+        &[v(smn)],
+        &[v(V_M), v(smx), v(swz)],
     )?;
     // alpha = (m_old == -inf) ? 0 : expf(m_old - m_new)
     op(
@@ -1574,60 +1842,60 @@ fn softmax_sub(b: &mut Builder, sub: u8) -> R {
     )?;
     op(
         b,
-        format!("v_sub_f32_e32 v{V_AL}, v{V_M}, v{V_MN}"),
-        &[v(V_AL)],
-        &[v(V_M), v(V_MN)],
+        format!("v_sub_f32_e32 v{sal}, v{V_M}, v{smn}"),
+        &[v(sal)],
+        &[v(V_M), v(smn)],
     )?;
     op(
         b,
-        format!("v_mul_f32_e32 v{V_AL}, 0x3fb8aa3b, v{V_AL}"),
-        &[v(V_AL)],
-        &[v(V_AL)],
+        format!("v_mul_f32_e32 v{sal}, 0x3fb8aa3b, v{sal}"),
+        &[v(sal)],
+        &[v(sal)],
     )?;
     op(
         b,
-        format!("v_exp_f32_e32 v{V_AL}, v{V_AL}"),
-        &[v(V_AL)],
-        &[v(V_AL)],
+        format!("v_exp_f32_e32 v{sal}, v{sal}"),
+        &[v(sal)],
+        &[v(sal)],
     )?;
     op(
         b,
-        format!("v_cmp_eq_f32_e64 s{CMPB}, 0xff800000, v{V_MN}"),
+        format!("v_cmp_eq_f32_e64 s{CMPB}, 0xff800000, v{smn}"),
         &[m(CMPB)],
-        &[v(V_MN)],
+        &[v(smn)],
     )?;
     wait_alu(b, "depctr_va_sdst(0)")?;
     op(
         b,
-        format!("v_cndmask_b32_e64 v{V_AL}, 0, v{V_AL}, s{CMPA}"),
-        &[v(V_AL)],
-        &[v(V_AL), m(CMPA)],
+        format!("v_cndmask_b32_e64 v{sal}, 0, v{sal}, s{CMPA}"),
+        &[v(sal)],
+        &[v(sal), m(CMPA)],
     )?;
     op(
         b,
-        format!("v_mov_b32_e32 v{V_M}, v{V_MN}"),
+        format!("v_mov_b32_e32 v{V_M}, v{smn}"),
         &[v(V_M)],
-        &[v(V_MN)],
+        &[v(smn)],
     )?;
     // Exponent origin only: V_M already holds the real running maximum.
     // Existing s54 means m_new == -inf (compared above, waited above), so
-    // sanitize the V_MN scratch to +0 there; masked (-inf) scores stay +0
-    // while a live NaN score survives subtraction and EXP. V_MN's only
+    // sanitize the smn scratch to +0 there; masked (-inf) scores stay +0
+    // while a live NaN score survives subtraction and EXP. smn's only
     // remaining uses are the probability subtractions; the next subtile
     // reduction overwrites it. Never stored back to V_M.
     op(
         b,
-        format!("v_cndmask_b32_e64 v{V_MN}, v{V_MN}, 0, s{CMPB}"),
-        &[v(V_MN)],
-        &[v(V_MN), m(CMPB)],
+        format!("v_cndmask_b32_e64 v{smn}, v{smn}, 0, s{CMPB}"),
+        &[v(smn)],
+        &[v(smn), m(CMPB)],
     )?;
     for j in 0..8u8 {
         let x = sb + j;
         op(
             b,
-            format!("v_sub_f32_e32 v{x}, v{x}, v{V_MN}"),
+            format!("v_sub_f32_e32 v{x}, v{x}, v{smn}"),
             &[v(x)],
-            &[v(x), v(V_MN)],
+            &[v(x), v(smn)],
         )?;
         op(
             b,
@@ -1638,94 +1906,127 @@ fn softmax_sub(b: &mut Builder, sub: u8) -> R {
         op(b, format!("v_exp_f32_e32 v{x}, v{x}"), &[v(x)], &[v(x)])?;
     }
     for r in 0..4u8 {
-        vmov0(b, PROW + r)?;
+        vmov0(b, prow + r)?;
     }
     for j in 0..8u8 {
-        cvt_half(b, PROW + j / 2, j % 2 == 1, sb + j)?;
+        cvt_half(b, prow + j / 2, j % 2 == 1, sb + j)?;
     }
     // sum = e0 + e1 + ... + e7 (ascending), + XOR-16 peer, l = fma(l, alpha, sum).
     op(
         b,
-        format!("v_add_f32_e32 v{V_SUM}, v{sb}, v{}", sb + 1),
-        &[v(V_SUM)],
+        format!("v_add_f32_e32 v{ssum}, v{sb}, v{}", sb + 1),
+        &[v(ssum)],
         &[v(sb), v(sb + 1)],
     )?;
     for j in 2..8u8 {
         op(
             b,
-            format!("v_add_f32_e32 v{V_SUM}, v{}, v{V_SUM}", sb + j),
-            &[v(V_SUM)],
-            &[v(sb + j), v(V_SUM)],
+            format!("v_add_f32_e32 v{ssum}, v{}, v{ssum}", sb + j),
+            &[v(ssum)],
+            &[v(sb + j), v(ssum)],
         )?;
     }
     op(
         b,
-        format!("v_permlanex16_b32 v{V_T1}, v{V_SUM}, s{PSEL}, 0xfedcba98"),
-        &[v(V_T1)],
-        &[v(V_SUM), s(PSEL)],
+        format!("v_permlanex16_b32 v{st1}, v{ssum}, s{PSEL}, 0xfedcba98"),
+        &[v(st1)],
+        &[v(ssum), s(PSEL)],
     )?;
     op(
         b,
-        format!("v_add_f32_e32 v{V_SUM}, v{V_SUM}, v{V_T1}"),
-        &[v(V_SUM)],
-        &[v(V_SUM), v(V_T1)],
+        format!("v_add_f32_e32 v{ssum}, v{ssum}, v{st1}"),
+        &[v(ssum)],
+        &[v(ssum), v(st1)],
     )?;
     op(
         b,
-        format!("v_fmac_f32_e32 v{V_SUM}, v{V_L}, v{V_AL}"),
-        &[v(V_SUM)],
-        &[v(V_SUM), v(V_L), v(V_AL)],
+        format!("v_fmac_f32_e32 v{ssum}, v{V_L}, v{sal}"),
+        &[v(ssum)],
+        &[v(ssum), v(V_L), v(sal)],
     )?;
     op(
         b,
-        format!("v_mov_b32_e32 v{V_L}, v{V_SUM}"),
+        format!("v_mov_b32_e32 v{V_L}, v{ssum}"),
         &[v(V_L)],
-        &[v(V_SUM)],
+        &[v(ssum)],
     )?;
     // PV: O^T = V^T * P^T, O rescaled by this lane's own alpha before each dc update.
-    let buf = |dc: u8| if dc % 2 == 0 { VFA } else { VFB };
-    let vo = |dc: u8| 32_768 + (16 * u32::from(sub) + u32::from(dc)) * 512;
-    dload128(b, L_V, VFA, V_LF, vo(0))?;
+    let buf = |dc: u8| if dc % 2 == 0 { vfa } else { vfb };
+    let vbase: u32 = if fp8 { 0 } else { 32_768 };
+    let vslot = r.slot;
+    let vo = |dc: u8| vbase + (16 * u32::from(sub) + u32::from(dc)) * 512;
+    dload128(b, vslot, vfa, V_LF, vo(0))?;
     for dc in 0..16u8 {
         if dc + 1 < 16 {
-            dload128(b, L_V, buf(dc + 1), V_LF, vo(dc + 1))?;
+            dload128(b, vslot, buf(dc + 1), V_LF, vo(dc + 1))?;
         }
         for i in 0..8u8 {
-            let r = O + 8 * dc + i;
+            let r = ob + 8 * dc + i;
             op(
                 b,
-                format!("v_mul_f32_e32 v{r}, v{V_AL}, v{r}"),
+                format!("v_mul_f32_e32 v{r}, v{sal}, v{r}"),
                 &[v(r)],
-                &[v(V_AL), v(r)],
+                &[v(sal), v(r)],
             )?;
         }
-        wmma(b, O + 8 * dc, buf(dc), PROW, true)?;
+        wmma(b, ob + 8 * dc, buf(dc), prow, true)?;
     }
     Ok(())
 }
 
 fn body(b: &mut Builder, fp8: bool) -> R {
     tile_setup(b, fp8)?;
-    fill(b, fp8)?;
-    b.label(D_FILL_DONE)?;
-    b.barrier(&[Transition::Ready(L_K), Transition::Ready(L_V)])?;
-    b.label(D_QK)?;
-    sop(b, format!("s_cmp_ge_u32 s{WAVE}, 4"), &[], &[WAVE])?;
-    op(b, format!("s_cbranch_scc1 {D_TURN}"), &[], &[])?;
-    qk(b)?;
-    for sub in 0..4u8 {
-        softmax_sub(b, sub)?;
+    if !fp8 {
+        fill(b, fp8)?;
+        b.label(D_FILL_DONE)?;
+        b.barrier(&[Transition::Ready(L_K), Transition::Ready(L_V)])?;
+        b.label(D_QK)?;
+        sop(b, format!("s_cmp_ge_u32 s{WAVE}, 4"), &[], &[WAVE])?;
+        op(b, format!("s_cbranch_scc1 {D_TURN}"), &[], &[])?;
+        qk(b, fp8)?;
+        for sub in 0..4u8 {
+            softmax_sub(b, sub, fp8)?;
+        }
+        b.label(D_TURN)?;
+        b.barrier(&[Transition::Retire(L_K), Transition::Retire(L_V)])?;
+        sop(b, format!("s_add_co_i32 s{KT}, s{KT}, 64"), &[KT], &[KT])?;
+        // Continue while ktile <= gmax (`s_cmp_gt_i32` + scc0: the compare the emulator models).
+        sop(b, format!("s_cmp_gt_i32 s{KT}, s{GMAX}"), &[], &[KT, GMAX])?;
+        op(b, format!("s_cbranch_scc0 {D_LOOP}"), &[], &[])
+    } else {
+        // Sequential single-stage schedule: K-fill, QK, V-fill, softmax/PV.
+        // All five waves join every barrier; causal exits target D_TURN,
+        // which retires the stage after the final tile's V use.
+        fill_k_fp8(b)?;
+        b.label(D_KFILL_DONE)?;
+        b.barrier(&[Transition::Ready(L_STAGE)])?;
+        b.label(D_KREADY)?;
+        sop(b, format!("s_cmp_ge_u32 s{WAVE}, 4"), &[], &[WAVE])?;
+        op(b, format!("s_cbranch_scc1 {D_TURN}"), &[], &[])?;
+        qk(b, fp8)?;
+        b.label(D_QK_DONE)?;
+        b.barrier(&[Transition::Retire(L_STAGE)])?;
+        fill_v_fp8(b)?;
+        b.label(D_VFILL_DONE)?;
+        b.barrier(&[Transition::Ready(L_STAGE)])?;
+        b.label(D_VREADY)?;
+        sop(b, format!("s_cmp_ge_u32 s{WAVE}, 4"), &[], &[WAVE])?;
+        op(b, format!("s_cbranch_scc1 {D_TURN}"), &[], &[])?;
+        for sub in 0..4u8 {
+            softmax_sub(b, sub, fp8)?;
+        }
+        b.label(D_TURN)?;
+        b.barrier(&[Transition::Retire(L_STAGE)])?;
+        sop(b, format!("s_add_co_i32 s{KT}, s{KT}, 64"), &[KT], &[KT])?;
+        // Continue while ktile <= gmax (`s_cmp_gt_i32` + scc0: the compare the emulator models).
+        sop(b, format!("s_cmp_gt_i32 s{KT}, s{GMAX}"), &[], &[KT, GMAX])?;
+        op(b, format!("s_cbranch_scc0 {D_LOOP}"), &[], &[])
     }
-    b.label(D_TURN)?;
-    b.barrier(&[Transition::Retire(L_K), Transition::Retire(L_V)])?;
-    sop(b, format!("s_add_co_i32 s{KT}, s{KT}, 64"), &[KT], &[KT])?;
-    // Continue while ktile <= gmax (`s_cmp_gt_i32` + scc0: the compare the emulator models).
-    sop(b, format!("s_cmp_gt_i32 s{KT}, s{GMAX}"), &[], &[KT, GMAX])?;
-    op(b, format!("s_cbranch_scc0 {D_LOOP}"), &[], &[])
 }
-
 /// Compute waves: out = O * (l > 0 ? 1/l : 0) for live queries only.
-fn epilogue(b: &mut Builder) -> R {
+/// `fp8`: O at 96; Q8 at 128.
+fn epilogue(b: &mut Builder, fp8: bool) -> R {
+    let ob = if fp8 { O8 } else { O };
     b.label(D_EPI)?;
     sop(b, format!("s_cmp_ge_u32 s{WAVE}, 4"), &[], &[WAVE])?;
     op(b, format!("s_cbranch_scc1 {D_END}"), &[], &[])?;
@@ -1747,9 +2048,9 @@ fn epilogue(b: &mut Builder) -> R {
     for i in 0..128u8 {
         op(
             b,
-            format!("v_mul_f32_e32 v{0}, v{div}, v{0}", O + i),
-            &[v(O + i)],
-            &[v(div), v(O + i)],
+            format!("v_mul_f32_e32 v{0}, v{div}, v{0}", ob + i),
+            &[v(ob + i)],
+            &[v(div), v(ob + i)],
         )?;
     }
     op(
@@ -1760,8 +2061,8 @@ fn epilogue(b: &mut Builder) -> R {
     )?;
     exec_and(b, QOK)?;
     for dc in 0..16u8 {
-        gstore128(b, oo, O + 8 * dc, SO, u32::from(dc) * 64)?;
-        gstore128(b, oo, O + 8 * dc + 4, SO, u32::from(dc) * 64 + 16)?;
+        gstore128(b, oo, ob + 8 * dc, SO, u32::from(dc) * 64)?;
+        gstore128(b, oo, ob + 8 * dc + 4, SO, u32::from(dc) * 64 + 16)?;
     }
     exec_restore(b)?;
     b.wait_all()?;
@@ -1806,17 +2107,24 @@ pub fn emit(arch: Arch, spec: &FaPrefillSpec) -> Result<Emitted, String> {
     };
     let mut b = Builder::new(kspec, plan_direct(fp8)?);
     b.enable_delay_alu();
-    for (id, (name, base)) in [("k_plane", 0u32), ("v_plane", 32_768)]
-        .into_iter()
-        .enumerate()
-    {
-        if b.lds_slot(name, base, 32_768)? != id {
+    if fp8 {
+        // One 32-KiB stage reused sequentially for K then V.
+        if b.lds_slot("stage", 0, 32_768)? != L_STAGE {
             return Err("LDS slot order".into());
+        }
+    } else {
+        for (id, (name, base)) in [("k_plane", 0u32), ("v_plane", 32_768)]
+            .into_iter()
+            .enumerate()
+        {
+            if b.lds_slot(name, base, 32_768)? != id {
+                return Err("LDS slot order".into());
+            }
         }
     }
     prologue(&mut b, fp8)?;
     b.loop_(D_LOOP, |b| body(b, fp8))?;
-    epilogue(&mut b)?;
+    epilogue(&mut b, fp8)?;
     b.finish()
 }
 
@@ -2124,9 +2432,9 @@ pub fn fp8_contract(arch: Arch, emitted: &Emitted) -> serde_json::Value {
                       "ds_bpermute*", "ds_swizzle*", "v_writelane*", "s_setpc*", "s_swappc*", "s_call*", "s_waitcnt*",
                       "v_cvt_f32_i32*", "v_cvt_f32_fp8*", "v_cvt_f32_bf8*", "v_cvt_pk_f32_bf8*", "v_cvt_pk_fp8_f32*",
                       "v_cvt_pk_bf8_f32*", "v_cvt_sr_*"],
-        "vgpr_max": 256, "sgpr_max": 104,
+        "vgpr_max": 224, "sgpr_max": 104,
         "require_wave32": true, "require_zero_spills": true, "require_zero_private": true,
-        "launch_dynamic_lds_bytes": DYNAMIC_LDS_BYTES,
+        "launch_dynamic_lds_bytes": FP8_DYNAMIC_LDS_BYTES,
         "group_segment_fixed_bytes": 0,
     })
 }

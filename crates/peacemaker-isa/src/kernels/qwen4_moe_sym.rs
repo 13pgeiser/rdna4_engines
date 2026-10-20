@@ -1555,6 +1555,16 @@ pub const NT_GATE_BYTES: u32 = 2048;
 /// until the reload. Pending stores are drained (`vscnt`) before the K loop
 /// so its entry and exit ledgers agree. The register plan gives every block
 /// its own adjacent body/epilogue intervals on the aliased registers.
+///
+/// The shipped gfx1201 down NT8 schedule keeps only two activation tiles
+/// resident: d in v154..155 and X in v160..175. A pair is waited together;
+/// each tile's slot is refilled only after its guarded fold, with tile j+2
+/// of the same epoch (or tile j%2 of the next epoch at the last pair).
+/// Sums v72..135 and both weight sets v136..153 are unchanged. X1's
+/// descriptor advances after the odd epoch's streamed loads, while X0
+/// advances before its next-epoch reload; weight epoch advancement is
+/// unchanged. This is not resident-NT8 admission: the measured old resident
+/// NT8 regression remains a tombstone until changed-byte and timing gates.
 mod nt {
     use super::*;
     use peacemaker_author::{End, Free, LdsRegion, StoreTarget, Wave};
@@ -1562,7 +1572,7 @@ mod nt {
     /// The gate/up handoff region: RNE(gate) of every tile.
     enum Gate {}
 
-    // VGPRs (the gfx12 NT8 maximum is v231).
+    // VGPRs (resident-X gfx12 NT8 tops at v231; streamed down at v175).
     const XOFF: u8 = 16; // + j: activation row offset of tile j (or X_OOB)
     const XQOFF: u8 = 24; // + j: gfx12 nibble offset (+ 8*hi)
     const WOFF: u8 = 32;
@@ -1626,6 +1636,12 @@ mod nt {
         }
         fn rr(&self) -> u8 {
             self.spec.rr
+        }
+        /// Only the shipped gfx1201 down-NT8 schedule streams two X tiles.
+        fn stream_x(&self) -> bool {
+            self.arch() == Arch::Gfx1201 && !self.gate_up() && self.nt() == 8
+                && self.spec.codec == WeightCodec::Mq4Sym
+                && self.rr() == 1 && !self.experimental()
         }
         /// Row block `blk` of the same entry.
         fn at(&self, blk: u8) -> G {
@@ -1694,10 +1710,14 @@ mod nt {
             self.wh_set(p ^ self.flip())
         }
         fn d(&self, j: u8) -> u8 {
-            self.sums_end() + 2 * self.aw() + 2 + j
+            self.sums_end() + 2 * self.aw() + 2 + if self.stream_x() { j % 2 } else { j }
         }
         fn x(&self, j: u8) -> u8 {
-            (self.d(self.nt())).div_ceil(8) * 8 + self.aw() * j
+            if self.stream_x() {
+                160 + self.aw() * (j % 2)
+            } else {
+                (self.d(self.nt())).div_ceil(8) * 8 + self.aw() * j
+            }
         }
         fn live(&self, j: u8) -> u8 {
             LIVE0 + 2 * j
@@ -1815,16 +1835,18 @@ mod nt {
                     p.v::<1>("xq_off", XQOFF + j, kernel())?;
                 }
                 p.v::<8>("sum", self.sum(j), Live::Whole)?;
-                p.v::<1>("d", self.d(j), kernel())?;
-                for c in 0..4u8 {
-                    if gfx12 {
-                        p.v::<2>("x", self.x(j) + 2 * c, kernel())?;
-                    } else if j == 0 && c == 0 {
-                        for b in 0..rr {
-                            p.v::<4>("x", self.x(0), body(b))?;
+                if !self.stream_x() || j < 2 {
+                    p.v::<1>("d", self.d(j), kernel())?;
+                    for c in 0..4u8 {
+                        if gfx12 {
+                            p.v::<2>("x", self.x(j) + 2 * c, kernel())?;
+                        } else if j == 0 && c == 0 {
+                            for b in 0..rr {
+                                p.v::<4>("x", self.x(0), body(b))?;
+                            }
+                        } else {
+                            p.v::<4>("x", self.x(j) + 4 * c, kernel())?;
                         }
-                    } else {
-                        p.v::<4>("x", self.x(j) + 4 * c, kernel())?;
                     }
                 }
                 p.s::<2>("live", self.live(j), Live::Whole)?;
@@ -2393,7 +2415,9 @@ mod nt {
                     &[v(4), v(XOFF + j)],
                 )?;
             }
-            load_x_init(wg, g, j)?;
+            if !g.stream_x() || j < 2 {
+                load_x_init(wg, g, j)?;
+            }
         }
         let b = wg.isa();
         for j in 0..8u8 {
@@ -2646,12 +2670,26 @@ mod nt {
         let a = g.arch();
         // Experimental schedules reload only live tiles, inside the live
         // branch; the original reloads every tile after its (maybe skipped) fold.
-        let (inside, outside) = if g.experimental() {
+        let (inside, outside) = if g.stream_x() {
+            (None, None)
+        } else if g.experimental() {
             (reload, None)
         } else {
             (None, reload)
         };
         for j in 0..g.nt() {
+            // Wait once per pair, before either slot can be overwritten.
+            // The odd slot remains live while the even slot prefetches j+2.
+            if g.stream_x() && j % 2 == 0 {
+                let b = w.isa();
+                let pair = Instruction::new("", vec![], vec![
+                    crate::reg::RegRef { kind: crate::reg::Kind::V, base: g.d(j), len: 2 },
+                    crate::reg::RegRef { kind: crate::reg::Kind::V, base: g.x(j), len: 16 },
+                ]);
+                for (c, n, _) in b.ledger.required(&pair) {
+                    b.wait(c, n)?;
+                }
+            }
             let fold = |w: &mut Wave<'_, T, Builder>, ()| -> Result<(), String> {
                 let b = w.isa();
                 for i in 0..g.aw() / 2 {
@@ -2685,8 +2723,10 @@ mod nt {
                         },
                     ],
                 );
-                for (c, n, _) in b.ledger.required(&x) {
-                    b.wait(c, n)?;
+                if !g.stream_x() {
+                    for (c, n, _) in b.ledger.required(&x) {
+                        b.wait(c, n)?;
+                    }
                 }
                 let live = w.scmp(Instruction::new(
                     format!("s_cmp_gt_u32 s{CNT}, {j}"),
@@ -2699,6 +2739,14 @@ mod nt {
             }
             if let Some(srd) = outside {
                 load_x(w.isa(), g, j, srd)?;
+            }
+            if g.stream_x() {
+                if j + 2 < g.nt() {
+                    load_x(w.isa(), g, j + 2, SRD_X[p])?;
+                } else if let Some(srd) = reload {
+                    // Only slots 0 and 1 cross the epoch boundary.
+                    load_x(w.isa(), g, j % 2, srd)?;
+                }
             }
         }
         Ok(())
@@ -2722,9 +2770,19 @@ mod nt {
                 if g.prefetch {
                     load_w(wg.isa(), g, 1)?;
                     compute(wg, g, 0, "l0", Some(SRD_X[1]))?;
-                    advance(wg.isa())?;
+                    if g.stream_x() {
+                        // X1 must still address this epoch while its later
+                        // tiles stream; only X0 is needed for the reload.
+                        add64_imm(wg.isa(), SRD_W, 136)?;
+                        add64(wg.isa(), SRD_X[0], SRD_X[0], XS2)?;
+                    } else {
+                        advance(wg.isa())?;
+                    }
                     load_w(wg.isa(), g, 0)?;
                     compute(wg, g, 1, "l1", Some(SRD_X[0]))?;
+                    if g.stream_x() {
+                        add64(wg.isa(), SRD_X[1], SRD_X[1], XS2)?;
+                    }
                 } else {
                     compute(wg, g, 0, "l0", None)?;
                     load_epoch(wg, g, 1, "l0x")?;

@@ -31,7 +31,7 @@ const SYMBOL: &str = "attention_fp8_e4m3_fa2_gqa_f16_pm_gfx1201";
 const MODULE: &str = "fa_prefill_fp8_pm_gfx1201";
 const DIRECT_KERNARG: u32 = 60;
 const DIRECT_BLOCK: u32 = 160;
-const DIRECT_LDS: u32 = 65_536;
+const DIRECT_LDS: u32 = 32_768;
 /// Bytes per position of one K or V allocation: 2 KV heads x (256 codes) + 2 f16 scales.
 const ROW: usize = 516;
 const SCALE_OFF: usize = 512;
@@ -640,6 +640,136 @@ fn emission_is_deterministic_and_exports_only_the_fp8_direct() {
         text.contains("516") || text.contains("0x204"),
         "the 516-byte fp8 row stride does not appear in the emission"
     );
+}
+
+#[test]
+fn fp8_direct_resources_match_the_single_stage_layout() {
+    // One 32-KiB LDS stage reused sequentially for K then V: four tile
+    // rendezvous sites (K publish, K retire, V publish, V retire), VGPR
+    // ceiling 224, zero spills/private, unchanged 60-byte ABI and block 160.
+    let (emitted, text, _) = fa_prefill::emit_fp8_module(ARCH, &spec()).unwrap();
+    assert_eq!(emitted.len(), 1, "the fp8 module holds exactly one export");
+    let e = &emitted[0];
+    let count = |name: &str| {
+        text.lines()
+            .filter(|l| l.trim().split_whitespace().next() == Some(name))
+            .count()
+    };
+    assert_eq!(
+        (count("s_barrier_signal"), count("s_barrier_wait")),
+        (4, 4),
+        "fp8 direct: four tile rendezvous sites (K publish/retire, V publish/retire)"
+    );
+    assert_eq!(
+        e.proof.barriers.len(),
+        4,
+        "fp8 direct: proof barrier sites"
+    );
+    // Single LDS stage, base 0 length 32768: the ten sequential-stage labels
+    // are all present, in K-ready / K-retire / V-ready / V-retire order.
+    let labels = [
+        ".Lfapd_tile",
+        ".Lfapd_kfill_done",
+        ".Lfapd_kready",
+        ".Lfapd_qk",
+        ".Lfapd_qk_done",
+        ".Lfapd_vfill_done",
+        ".Lfapd_vready",
+        ".Lfapd_turn",
+        ".Lfapd_epi",
+        ".Lfapd_end",
+    ];
+    let mut cursor = 0;
+    for label in labels {
+        let at = text[cursor..]
+            .find(label)
+            .unwrap_or_else(|| panic!("fp8 direct: missing label {label}"));
+        cursor += at + label.len();
+    }
+    let field = |key: &str| -> Vec<u32> {
+        text.lines()
+            .filter_map(|l| l.trim().strip_prefix(key))
+            .map(|v| v.trim().parse().unwrap())
+            .collect()
+    };
+    let vgprs = field(".amdhsa_next_free_vgpr");
+    assert_eq!(vgprs.len(), 1, "{SYMBOL}");
+    assert_eq!(vgprs[0], 224, "{SYMBOL}: O96..223 packs to next_free 224");
+    assert_eq!(
+        u32::from(e.shape.next_free_vgpr),
+        vgprs[0],
+        "{SYMBOL}: shape/descriptor VGPRs"
+    );
+    assert!(
+        text.contains(&format!(".vgpr_count: {}\n", vgprs[0])),
+        "{SYMBOL}: metadata VGPRs"
+    );
+    let sgprs = field(".amdhsa_next_free_sgpr");
+    assert_eq!(sgprs.len(), 1, "{SYMBOL}");
+    assert_eq!(sgprs[0], 82, "{SYMBOL}: SGPR budget unchanged (84 in lifted metadata)");
+    assert!(
+        sgprs[0] <= 104 && u32::from(e.shape.next_free_sgpr) == sgprs[0],
+        "{SYMBOL}: {} SGPRs",
+        sgprs[0]
+    );
+    // Unchanged arithmetic: the QK/softmax/PV opcode census is identical to
+    // the Q8 direct body (only K/V fill addressing and decode differ).
+    let q8 = fa_prefill::emit(ARCH, &FaPrefillSpec { kv: FaKvCodec::Q8_0, ..spec() }).unwrap();
+    let fp8_contract = fa_prefill::fp8_contract(ARCH, e);
+    let q8_contract = fa_prefill::contract(ARCH, &q8);
+    for m in [
+        "v_wmma_f32_16x16x16_f16",
+        "v_fma_mixlo_f16",
+        "v_exp_f32_e32",
+        "v_max3_num_f32",
+        "v_cvt_f16_f32_e32",
+        "v_fmac_f32_e32",
+        "v_div_scale_f32",
+        "v_div_fmas_f32",
+        "v_div_fixup_f32",
+        "v_rcp_f32_e32",
+        "v_mul_f32_e32",
+    ] {
+        assert_eq!(
+            fp8_contract["counts"][m], q8_contract["counts"][m],
+            "fp8 direct: arithmetic count {m} differs from the Q8 body"
+        );
+    }
+    // Frozen exact conversion/WMMA census: 64 e32 + 64 e64 packed FP8 pair
+    // converts (K 32/32, V 32/32), 256 mixlo dequant products, 128 f16 WMMA.
+    assert_eq!(
+        fp8_contract["counts"]["v_wmma_f32_16x16x16_f16"].as_u64(),
+        Some(128),
+        "fp8 direct: WMMA count"
+    );
+    assert_eq!(
+        fp8_contract["counts"]["v_fma_mixlo_f16"].as_u64(),
+        Some(256),
+        "fp8 direct: mixlo count"
+    );
+    assert_eq!(
+        fp8_contract["counts"]["v_cvt_pk_f32_fp8_e32"].as_u64(),
+        Some(64),
+        "fp8 direct: low-half pair converts (K 32 + V 32)"
+    );
+    assert_eq!(
+        fp8_contract["counts"]["v_cvt_pk_f32_fp8_e64"].as_u64(),
+        Some(64),
+        "fp8 direct: high-half pair converts (K 32 + V 32)"
+    );
+    for (c, symbol, dynamic) in [(&fp8_contract, SYMBOL, DIRECT_LDS)] {
+        assert_eq!(c["symbol"], symbol);
+        assert_eq!(c["launch_dynamic_lds_bytes"], dynamic, "{symbol}");
+        assert_eq!(c["group_segment_fixed_bytes"], 0, "{symbol}");
+        assert_eq!(c["require_wave32"], true, "{symbol}");
+        assert_eq!(c["require_zero_spills"], true, "{symbol}");
+        assert_eq!(c["require_zero_private"], true, "{symbol}");
+        assert_eq!(c["vgpr_max"].as_u64(), Some(224), "{symbol}");
+        assert!(
+            c["sgpr_max"].as_u64().unwrap() <= 104,
+            "{symbol}"
+        );
+    }
 }
 #[test]
 fn spec_admits_only_h16_kv2_d256_for_the_fp8_codec() {
