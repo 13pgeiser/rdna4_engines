@@ -281,12 +281,16 @@ AVX_QB_TARGET __attribute__((target("bmi2"))) static void qb_codes_zp(
             const int64_t nb = left >= 32 ? 20 : left <= 0 ? 0 : (left * 5 + 7) / 8;
             alignas(8) uint8_t buf[24] = {};
             std::memcpy(buf, row + i / 8 * 5, (size_t)nb);
-            const unsigned long long kLow5 = 0x1f1f1f1f1f1f1f1full;
+            /* Eight 5-bit codes spread to eight bytes. Not _pdep_u64: BMI2 is not in this level's
+             * flag set (avx_dispatch.cpp checks only F + BW + DQ + VL), and clang refuses to
+             * inline the intrinsic without it. */
             uint64_t q[4];
             for (int r = 0; r < 4; ++r) {
                 uint64_t v = 0;
                 std::memcpy(&v, buf + 5 * r, 8);
-                q[r] = _pdep_u64(v & 0xffffffffffull, kLow5);
+                uint64_t s = 0;
+                for (int k = 0; k < 8; ++k) s |= ((v >> (5 * k)) & 0x1fu) << (8 * k);
+                q[r] = s;
             }
             x = _mm256_set_epi64x((long long)q[3], (long long)q[2], (long long)q[1],
                                   (long long)q[0]);
