@@ -475,6 +475,7 @@ fn down_nt8_stream_keeps_two_slots_resident_in_176_vgprs() {
 /// streamed tile-load census (b32 52, b64 168), per-tile waits beside the
 /// paired folds, no extra math ops, and the split epoch advance
 /// (`s[24:25] += 136` then X0 before compute1, X1 advanced after it).
+#[test]
 fn down_nt8_stream_fold_census_and_split_epoch_advance() {
     let spec = Spec {
         arch: Arch::Gfx1201,
@@ -497,6 +498,9 @@ fn down_nt8_stream_fold_census_and_split_epoch_advance() {
             .next()
             .unwrap_or("")
             .to_string()
+    };
+    let count = |name: &str| -> u64 {
+        text.lines().filter(|line| mnemonic(line) == name).count() as u64
     };
     // Static census: the streamed schedule issues 52 b32 / 168 b64 tile
     // loads (the contract's counts), with math identical to the resident
