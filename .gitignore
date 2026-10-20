@@ -2,3 +2,4 @@
 .radiance-cache-*
 docker
 radiance-vmemoff/vmemoff.so
+.vscode/

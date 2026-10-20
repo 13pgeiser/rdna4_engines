@@ -97,7 +97,7 @@ docker run --name hipfire_server --network host --device /dev/kfd --device /dev/
 
 # qwen3.8:27b-mq4-xts
 #
-#phoenix@debian00d861dabdae:~/ai/my_ai_scripts$ llm-bench run --openai-base-url http://localhost:9931/v1 --models openai:qwen3.8:27b-mq4-xts --prompts "Write a rust function to parse JSON safely."
+# $ llm-bench run --openai-base-url http://localhost:9931/v1 --models openai:qwen3.8:27b-mq4-xts --prompts "Write a rust function to parse JSON safely."
 #→ Benchmarking 1 model(s) × 1 prompt(s) × 3 run(s) = 3 total requests
 #
 #Results: 3 succeeded, 0 failed (100% success rate)

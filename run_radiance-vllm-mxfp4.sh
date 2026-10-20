@@ -124,7 +124,7 @@ else
 	CHAT_TEMPLATE="../radiance-vllm-mxfp4-scripts/chat_template.jinja" MODELS=/models/radiance-vllm-mxfp4 SNAP=/models/radiance-vllm-mxfp4/Qwen3.8-27B-MXFP4-mtpfp8-pertoken SERVED_NAMES="qwen3.8" NAME="r9700-qwen3.8-mxfp4" PORT=9931 TP=1 MAXLEN=220000 MAXSEQS=1 CHUNK=4096 KV_MEM=9126805504 SINGLE_GPU_PROFILE=1 FAST_DRAFT=0 ./serve-mxfp4.sh
 fi
 
-#phoenix@debian00d861dabdae:~/ai/my_ai_scripts$ llm-bench run --openai-base-url http://localhost:9931 --models openai:qwen3.8 --prompts "Write a rust function to parse JSON safely."
+# $ llm-bench run --openai-base-url http://localhost:9931 --models openai:qwen3.8 --prompts "Write a rust function to parse JSON safely."
 #→ Benchmarking 1 model(s) × 1 prompt(s) × 3 run(s) = 3 total requests
 #
 #Results: 3 succeeded, 0 failed (100% success rate)

@@ -201,7 +201,7 @@ docker run --name radiance_server --network host --init --ulimit memlock=-1 \
 
 # qwen3.8-27b-mxfp4.rad
 # 
-# phoenix@debian00d861dabdae:~/ai/my_ai_scripts$ llm-bench run --openai-base-url http://localhost:9931/v1 --models openai:qwen3.8:27b-mq4-xts --prompts "Write a rust function to parse JSON safely."
+# $ llm-bench run --openai-base-url http://localhost:9931/v1 --models openai:qwen3.8:27b-mq4-xts --prompts "Write a rust function to parse JSON safely."
 # → Benchmarking 1 model(s) × 1 prompt(s) × 3 run(s) = 3 total requests
 # 
 # Results: 3 succeeded, 0 failed (100% success rate)
@@ -214,7 +214,7 @@ docker run --name radiance_server --network host --init --ulimit memlock=-1 \
 
 # qwen3.8-next-flash-fp8-iq4r-moe.rad
 # 
-# phoenix@debian00d861dabdae:~/ai/my_ai_scripts$ llm-bench run --openai-base-url http://localhost:9931/v1 --models openai:qwen3.8:27b-mq4-xts --prompts "Write a rust function to parse JSON safely."
+# $ llm-bench run --openai-base-url http://localhost:9931/v1 --models openai:qwen3.8:27b-mq4-xts --prompts "Write a rust function to parse JSON safely."
 # → Benchmarking 1 model(s) × 1 prompt(s) × 3 run(s) = 3 total requests
 # 
 # Results: 3 succeeded, 0 failed (100% success rate)

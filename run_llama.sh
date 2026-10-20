@@ -79,7 +79,7 @@ docker run -it --name llama_cpp_server --network host --device=/dev/kfd --device
  -c 262144 --ctx-checkpoints 64 -b 1024 -ub 512 --reasoning-preserve --reasoning-effort high -ncmoe 36 --flash-attn on \
  --temperature 1.0 --top-p 0.95 --top-k 40
 
-#phoenix@debian00d861dabdae:~/ai/my_ai_scripts$ llm-bench run --openai-base-url http://localhost:9931/v1 --models openai:qwen3.8:27b-mq4-xts --prompts "Write a rust function to parse JSON safely."
+# $ llm-bench run --openai-base-url http://localhost:9931/v1 --models openai:qwen3.8:27b-mq4-xts --prompts "Write a rust function to parse JSON safely."
 #→ Benchmarking 1 model(s) × 1 prompt(s) × 3 run(s) = 3 total requests
 #
 #Results: 3 succeeded, 0 failed (100% success rate)
