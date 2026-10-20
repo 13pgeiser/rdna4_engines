@@ -1476,9 +1476,9 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
             const uint64_t t0 = rad_mono_ns();
             PrefixCache& pc = ranks_[0]->prefix;
             std::vector<MMContentKey> mk;
-            media_keys(req, &mk);
+            media_keys(req, &mk, cvec_salt_for(req.sp.use_control_vector));
             const std::vector<BlockHash> want =
-                pc.restorable_from(req.prompt, mk, cvec_salt_for(req.sp.use_control_vector));
+                pc.restorable_from(req.prompt, mk);
             if (want.empty()) return;
             /* The whole chain in one restore. With 4-token blocks a long conversation is tens of
              * thousands of entries; batched, it is one launch per (group, layer) per staging batch

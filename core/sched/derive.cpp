@@ -2,6 +2,8 @@
  */
 #include "derive.h"
 
+#include "rad_core.h"
+
 #include <cstring>
 
 namespace rad {
@@ -81,6 +83,32 @@ static int d_state_chunk_seq(const DeriveInput& in, int32_t* out, int64_t cap, i
     return chunk_walk<true>(in, out, cap, n_out);
 }
 
+/* ------------------------------------------------------- projection_on_rows */
+/* [n_tok] -- whether each token's residual stream takes the control vector this step.
+ *
+ * The switch itself is a per-request choice (SamplingParams::use_control_vector) and the step
+ * kernel reads one row's flag, so the mask is expanded here once per step from the plan rather
+ * than searched per layer: an architecture issues one projection op after every block's write, and
+ * a per-layer search over the sequence bounds would repeat on every one of them.
+ *
+ * All zeros is the ordinary model, byte for byte: the op skips a zero row without writing, so a
+ * request that did not ask for the vector computes what it computes with no vector loaded. */
+static int d_projection_on_rows(const DeriveInput& in, int32_t* out, int64_t cap, int64_t* n_out) {
+    if (in.n_tok > cap) return RAD_E_FULL;
+    /* Zero first. The ranges below cover every row a step carries today, but the region is reused
+     * across steps and a row outside them would otherwise keep the previous step's flag -- which
+     * would project a request that did not ask for it. The fill is a memset of a few KiB. */
+    std::memset(out, 0, (size_t) in.n_tok * sizeof(int32_t));
+    for (int64_t i = 0; i < in.n_seq; ++i) {
+        const StepEntry& e = in.plan->e[(size_t) i];
+        const int32_t on = (e.req && e.req->sp.use_control_vector) ? 1 : 0;
+        const int64_t b = in.cu_seqlens[i], end = in.cu_seqlens[i + 1];
+        for (int64_t k = b; k < end && k < in.n_tok; ++k) out[k] = on;
+    }
+    *n_out = in.n_tok;
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ the table */
 static const DeriveRow g_rows[] = {
     { "seq_start_index",  d_seq_start_index,
@@ -91,6 +119,9 @@ static const DeriveRow g_rows[] = {
       "[n_chunks+1] token indices bounding each linear-state chunk; never crosses a sequence" },
     { "state_chunk_seq",    d_state_chunk_seq,
       "[n_chunks] the sequence each chunk belongs to" },
+    { "projection_on_rows", d_projection_on_rows,
+      "[n_tok] 1 where this token's request applies the loaded control vector, 0 for the stock "
+      "model" },
 };
 
 int derive_index(const char* name) {
