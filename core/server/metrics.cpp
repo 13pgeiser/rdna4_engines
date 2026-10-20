@@ -337,11 +337,14 @@ std::string Metrics::render() const {
     if (g_step_best_.get() > 0)
         w.gauge("radiance:decode_step_seconds_best",
                 "Fastest single-sequence decode step window this process has run, in seconds "
-                "per token. A mean over 32 consecutive single-stream steps, not a stopwatch "
-                "reading. Resets on restart.", L, g_step_best_.get());
+                "PER STEP. A mean over 32 consecutive single-stream steps, not a stopwatch "
+                "reading. Not seconds per token: with speculation a step can emit several "
+                "tokens, so divide by the accepted-per-step figure to compare against a "
+                "token rate. Resets on restart.", L, g_step_best_.get());
     if (g_step_recent_.get() > 0)
         w.gauge("radiance:decode_step_seconds_recent",
-                "Most recent single-sequence decode step window, in seconds per token. The gap "
+                "Most recent single-sequence decode step window, in seconds PER STEP (see "
+                "_best: not a token rate). The gap "
                 "to _best tracks what else the machine is doing, not wear; see docs/GUIDE.md. "
                 "Freezes while the lane is idle, because no window is completing.",
                 L, g_step_recent_.get());

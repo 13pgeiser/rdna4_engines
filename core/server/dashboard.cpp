@@ -1523,15 +1523,21 @@ function setMetric(key, value, text) {
  * diluting it. The engine's own figure is already a windowed rate (its help text: "over the
  * scheduler's recent window"), so this window sits on top of the engine's smoothing -- it
  * decides how long the page remembers, not how sharply the engine measures. */
-const RECENT = 30;                                    /* 15 s at the 500 ms poll */
+const RECENT = 30;   /* 15 s at the 500 ms poll WHILE the quantity keeps updating; a quantity
+                      that skips polls (acceptance, which only samples when it drafts) spans
+                      30 UPDATES, which under sparse drafting is minutes, not 15 s. */
 const RECENT_PREFILL = 10;   /* 5 s: shorter than the shortest prefill event (see above) */
 const extAt = {}, winAt = {};
 let lastActiveC = 0;
-function noteSample(key, c, value, cap) {
+/* `win` false records the extreme only. Acceptance keeps its own pooled ring (accPool) and
+ * reads `highest` from extAt, so a window here would be a second, never-read copy of the
+ * same samples -- dead weight that a reviewer reasonably reads as a second figure. */
+function noteSample(key, c, value, cap, win) {
   if (value == null || !finite(value)) return;
   const e = extAt[key] || (extAt[key] = {});
-  const w = winAt[key] || (winAt[key] = {});
   if (!(c in e) || value > e[c]) e[c] = value;
+  if (win === false) return;
+  const w = winAt[key] || (winAt[key] = {});
   const s = w[c] || (w[c] = []);
   s.push(value); if (s.length > (cap || RECENT)) s.shift();
 }
@@ -1990,7 +1996,7 @@ function update(s, dt) {
   const aw = accWindow(s);
   const awR = aw ? aw.ratio : null;
   const restarted = accRestart; accRestart = false;
-  if (awR != null) noteSample("accept", s.running > 0 ? s.running : lastActiveC, awR);
+  if (awR != null) noteSample("accept", s.running > 0 ? s.running : lastActiveC, awR, null, false);
   /* POOLED ACCEPTANCE WINDOW (2026-10-20, math audit before the production roll).
    * triple()'s `recent` averages the per-poll RATIOS; polls carry unequal draft counts, so a
    * quiet poll and a 500-draft poll would weigh the same -- a mean of ratios, not a ratio of
