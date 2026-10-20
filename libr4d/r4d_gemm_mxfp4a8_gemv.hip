@@ -286,7 +286,9 @@ void mxg_launch(long a, long ascale, long wq, long ws, long wref, long c, int M,
                                                 Cp, M, K, as_rs, lda, ldws, ldc)
 #define MXW_TN(AB_, RT_) { if (tn2) MXW_L(AB_, RT_, 2); else MXW_L(AB_, RT_, 1); }
 #define MXW_AB(RT_) { if (ablk) MXW_TN(true, RT_) else MXW_TN(false, RT_) }
-    if (rt <= 1) MXW_AB(1) else if (rt == 2) MXW_AB(2) else if (rt == 3) MXW_AB(3) else MXW_AB(4)
+    // One row tile is at most 16 rows, below the two-column threshold.
+    if (rt <= 1) { if (ablk) MXW_L(true, 1, 1); else MXW_L(false, 1, 1); }
+    else if (rt == 2) MXW_AB(2) else if (rt == 3) MXW_AB(3) else MXW_AB(4)
 #undef MXW_AB
 #undef MXW_TN
 #undef MXW_L

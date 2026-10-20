@@ -22,9 +22,11 @@
 //   - split: the smallest power of two whose grid reaches 48 blocks at M <= 16, 56 at M <= 96 and
 //     40 above; for K >= 8192 keep doubling while a split has >= 24 128-wide slabs; never past
 //     ks*M = 512, where partial traffic outweighs the gain.
-//   - slab: 128, or 64 where LDS per block, (16*DTM + 128) * (DBK+8) bytes, would cost a wide or
-//     deeply split grid its resident blocks (see mxd_plan). A K not a multiple of 128 takes 64 (and
-//     a 2-way split widens to 4).
+//   - slab: 128, or 64 where LDS per block would cost a wide or deeply split grid its resident
+//     blocks (see mxd_plan). A K not a multiple of 128 takes 64 (and a 2-way split widens to 4).
+//     The rule was tuned when the weight was staged through LDS too, (16*DTM + 128) * (DBK+8)
+//     bytes a block; the multi-fragment kernel now takes 2 * 16*DTM * (DBK+8), the same at DTM 8
+//     and less below, so the DTM 4 arm may no longer pay. Not re-tuned.
 //   - non-temporal weight loads for weights of 4 MiB or more.
 //
 // No state is keyed on the stream, since a recorded pass may replay on another stream. The split
@@ -79,8 +81,9 @@ static __device__ __forceinline__ T mxd_ld(const T* p) {
 // and writes its eight outputs as one 16-byte store (one 32-byte store of partials).
 
 // The (row, 128) scale grid: thread t < ROWS owns row t, loads the next boundary's two scales a
-// boundary early and writes s_prev / s_next to LDS at the boundary (published by the staging
-// barrier). A zero next block keeps the carried scale; after a zero block the carried scale is
+// boundary early and writes s_prev / s_next to LDS for the boundary's slab (the one-fragment kernel
+// at that slab, published by its staging barrier; the multi-fragment kernel a slab early into the
+// other half of its double buffer, published by the slab's closing barrier). A zero next block keeps the carried scale; after a zero block the carried scale is
 // looked up from the grid.
 static __device__ __forceinline__ float mxd_ratio(float ns, float np, const float* __restrict__ row,
                                                   int kb) {
@@ -336,8 +339,8 @@ void r4d_gemm_mxfp4a8_decode_kernel(
 }
 
 // The one-fragment form (M <= 16), every single-sequence verify step. Same tile, fold and split as
-// above, with the weight staged through LDS, plus: the next slab's A, codes and exponents are loaded into registers while this slab
-// computes, keeping loads in flight across barriers; a thread takes four adjacent slots (one 16 B
+// above, with the weight staged through LDS, plus: the next slab's A, codes and exponents are loaded
+// into registers while this slab computes, keeping loads in flight across barriers; a thread takes four adjacent slots (one 16 B
 // load); and each row's reference exponent is read once. Bit-identical to the kernel above.
 template <int DBK, int DKS, bool NT, bool ABLK>
 __global__ __launch_bounds__(R4D_MXD_DWN * 32) R4D_WAVES(DBK == 64 ? 16 : 12)
