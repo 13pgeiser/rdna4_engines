@@ -7,10 +7,17 @@
  * declare), with a second norm on each projection's output before its residual, a weightless RMS
  * norm on the value, and a GELU (not SwiGLU) feed-forward. The final logits are soft-capped to
  * cap * tanh(x / cap).
+ *
+ * Two draft models, whichever the container carries under `draft.`: Google's assistant head (a
+ * serial head over the trunk's own cache, the Gemma4Head below) or z-lab's DFlash drafter (a
+ * five-layer block drafter with its own cache, reading the trunk's residual stream at six layers,
+ * arch/common/rad_gemma4_dflash.h) -- the 31B's z-lab/gemma-4-31B-it-DFlash proposes 15 tokens a
+ * pass where the assistant proposes one a round.
  */
 #include <arch/rad_arch.h>
 #include <arch/rad_block_gemma4_vision.h>
 #include <arch/rad_gemma4_chat.h>
+#include <arch/rad_gemma4_dflash.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -19,12 +26,6 @@
 #include <cstring>
 #include <string>
 #include <vector>
-
-/* sqrt(n_embd) rounded to bf16: the reference's embedding module multiplies the looked-up rows by
- * `embed_scale.to(bf16)`, 73.5 at 5376 and not 73.32. */
-static double embed_scale(int64_t n) {
-    return rad_bf16_to_f32(rad_f32_to_bf16((float)std::sqrt((double)n)));
-}
 
 namespace gemma4_bf16 {
 
@@ -839,7 +840,7 @@ int Gemma4Head::declare(RadBuilder* b, Names& nm, const RadModelMeta* meta, cons
                     RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n_embd", n_trunk),
                                RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
                                RAD_INT("vocab_offset", g.vocab_off),
-                               RAD_F64("mult", embed_scale(n_trunk))),
+                               RAD_F64("mult", gemma4::embed_scale(n_trunk))),
                     RAD_WEIGHTS(w_tok)),
                   {}, {b_e});
     if (g.world > 1)
@@ -1098,6 +1099,8 @@ struct Layer {
      * The last layer has no j_ma: its stream goes to the final norm, which feeds the lm_head, not
      * a quantiser. */
     G4Junction j_am{}, j_ma{};
+    /* the DFlash drafter's tap: this layer's output into its column slice of `dflash_src` */
+    rad_op     op_tap = 0;
 };
 
 struct Model {
@@ -1133,6 +1136,17 @@ struct Model {
     bool       fuse = false;
     bool       fuse_ar = false;   /* every junction also carries the all-reduce in front of it */
     int64_t    ar_rows = 0;       /* ...in a step of at most this many rows (G4Junction::ar_rows) */
+
+    /* z-lab's DFlash drafter (arch/common/rad_gemma4_dflash.h), declared only when the container
+     * carries one and the deployment speculates: the trunk layers it taps, the [max_tok, taps x
+     * n_embd] plane the taps fill, the block and its own KV group. */
+    enum { MAX_TAPS = gemma4::Dflash1::MAX_TAPS };
+    int             n_taps = 0;
+    int             tap_layer[MAX_TAPS] = {};
+    rad_buf         b_dfsrc = 0;
+    gemma4::Dflash1 df{};
+    rad_kvgroup     kv_draft = 0;
+    bool            have_df = false;
 };
 
 static Model g_model[MAX_RANKS];
@@ -1255,6 +1269,18 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.b_logits = decl_b(b, nm.f("logits"), RAD_F32,     {g.max_logit_rows, g.n_vocab});
     RAD_ARCH_TRY(rad_declare_logits(b, m.b_logits));
 
+    /* ---- the DFlash drafter's taps, declared when the container carries z-lab's drafter and this
+     * serve speculates. The plane is declared here and written by an op declared inside each layer
+     * it taps, because the buffer planner's liveness is declaration order (the tap below). */
+    {
+        const int n = gemma4::Dflash1::taps(meta, ctx, g.n_layer, m.tap_layer, Model::MAX_TAPS);
+        if (n < 0) return n;
+        m.n_taps = n;
+        if (n > 0)
+            m.b_dfsrc = decl_b(b, nm.f("dflash_src"), g.act_dtype,
+                               {g.max_tok, (int64_t)n * g.n_embd});
+    }
+
     /* ---- the vocabulary edges. Gemma 4 ties the head to the embedding. */
     const char* pre = "model.language_model.layers";
     RAD_ARCH_TRY(map_copy(b, nm.f("token_embd.weight"), nm.ckpt("model.language_model.embed_tokens.weight")));
@@ -1276,14 +1302,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* The embedding is scaled by sqrt(n_embd) at the lookup, not in the table (as in llama.cpp's
      * build_inp_embd and HF's ScaledWordEmbedding), so the plain table stays tied to the head.
      * Without it the token signal in the residual stream would be ~73x too small. The scale is
-     * sqrt(n_embd) rounded to bf16, as the reference multiplies by it (embed_scale: 73.5
+     * sqrt(n_embd) rounded to bf16, as the reference multiplies by it (gemma4::embed_scale: 73.5
      * at 5376, not 73.32). The first norm hides the difference but the residual stream does not,
      * and the DFlash drafter was trained on the reference's hidden states. */
     m.op_embed = rw(b, RAD_OP(b, "embed_lookup",
                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n_embd", g.n_embd),
                                RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
                                RAD_INT("vocab_offset", g.vocab_off),
-                               RAD_F64("mult", embed_scale(g.n_embd))),
+                               RAD_F64("mult", gemma4::embed_scale(g.n_embd))),
                     RAD_WEIGHTS(m.w_tok)),
                    {}, {m.b_x});
     if (g.world > 1)
@@ -1329,6 +1355,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                        RAD_STR("dtype", g.dtype)),
                             RAD_WEIGHTS(lay.w_scalar)),
                            {mw.x}, {mw.x});
+
+        /* The tap: a row copy of the layer's output (after the scalar, HF's hidden_states[l + 1])
+         * into the column slice the tap owns. It is declared here, in the layer it is issued
+         * after, because the buffer planner's liveness is declaration order. A tap declared once
+         * after the trunk made `dflash_src` look born at its end and free to share with what every
+         * layer writes, which on arch/gemma4 cost 98% of the drafts with the reply still fluent. */
+        for (int t = 0; t < m.n_taps; ++t)
+            if (m.tap_layer[t] == (int)l && !lay.op_tap)
+                lay.op_tap = rw(b, RAD_OP(b, "cast",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                                               RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
+                                    RAD_NOWEIGHTS),
+                                {m.b_x}, {m.b_dfsrc});
     }
 
     /* ---- the junctions, declared once every layer exists (j_ma reads the next layer's gain).
@@ -1414,10 +1453,31 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         RAD_ARCH_TRY(rad_drafter_shared_kv(b, kHeadPosOffset));
     }
 
-    /* ---- the vision tower, its weight groups past the trunk's and the head's (counted even when
-     * the head is not declared, so the groups do not move with max_spec). */
+    /* ---- or z-lab's DFlash drafter, past the trunk's layers. It is declared last because
+     * declaration order is the buffer planner's liveness. It reads the taps the trunk copied into
+     * `dflash_src` and the trunk's tied table, as its embedding and, where the container holds no
+     * 8-bit copy, as its head. */
+    if (m.n_taps > 0) {
+        gemma4::Dflash1::Trunk t{};
+        t.n_taps     = m.n_taps;
+        t.escale     = gemma4::embed_scale(g.n_embd);
+        t.src        = m.b_dfsrc;
+        t.w_tok      = m.w_tok;
+        t.tok_src    = nm.ckpt("model.language_model.embed_tokens.weight");
+        t.base_layer = (int)m.n_main;
+        RAD_ARCH_TRY(gemma4::Dflash1::declare_drafter(b, meta, ctx, nm, g, t, &m.df, &m.kv_draft));
+        m.have_df = true;
+    }
+
+    /* ---- the vision tower, its weight groups past the trunk's and the draft model's: the
+     * assistant's layers and its exit, or the DFlash drafter's layers. They are counted even when
+     * the draft model is not declared, so the groups do not move with max_spec. */
     {
-        const int64_t head_groups = has_assistant(meta) ? meta_text_geti(meta, "num_hidden_layers", 0, "draft.") + 1 : 0;
+        int64_t head_groups = 0;
+        if (has_assistant(meta))
+            head_groups = meta_text_geti(meta, "num_hidden_layers", 0, "draft.") + 1;
+        else if (gemma4::dflash_kind(meta) == 1)
+            head_groups = rad_meta_geti(meta, "draft.num_hidden_layers", 0);
         RAD_ARCH_TRY(m.vis.declare(b, meta, ctx, nm, g.n_embd, (int)(m.n_main + head_groups),
                                    "model.", "gemma4_bf16"));
     }
@@ -1448,12 +1508,19 @@ static void step(RadCtx* c, const RadBatch* batch) {
         m.vis.step(c, batch);
         return;
     }
-    /* A draft pass runs only the head. The trunk already left its final-normed hidden state in
-     * `h`, which the head's history pass gathers from. */
+    /* A draft pass runs only the draft model. The trunk already left its final-normed hidden state
+     * in `h`, which the assistant's history pass gathers from, and its taps in `dflash_src`, which
+     * the DFlash drafter's context pass reads. */
     if (batch->draft_pass != 0) {
+        if (m.have_df) {
+            if (batch->draft_pass > 0) m.df.step(c, batch);
+            else                       m.df.context(c, batch);
+            return;
+        }
         if (!m.have_head) {
             rad_step_fail(c, "the batch asks for a drafter pass and no drafter is declared: the "
-                             "container carries no `draft.` assistant, or declare ran at max_spec 0");
+                             "container carries no `draft.` assistant or DFlash drafter, or declare "
+                             "ran at max_spec 0");
             return;
         }
         m.head.step(c, batch);
@@ -1483,13 +1550,20 @@ static void step(RadCtx* c, const RadBatch* batch) {
         if (m.fuse && !last) {
             /* [all-reduce,] post-norm, add, layer scalar, next block's norm and quantiser: one op */
             l.j_ma.step(c, T, far);
-            continue;
+        } else {
+            /* The per-layer scalar, `cur = cur * scalar` over the residual stream, applied after
+             * the mlp add, as vLLM's `hidden_states = hidden_states * self.layer_scalar`. The
+             * checkpoint's values (0.03-0.99) are trained weights that rescale the residual toward
+             * O(1). */
+            RAD_ISSUE(c, l.op_scale, brows(m.b_x, batch->n_tok), RAD_W(l.w_scalar),
+                      brows(m.b_x, batch->n_tok));
         }
-        /* The per-layer scalar, `cur = cur * scalar` over the residual stream, applied after the
-         * mlp add, as vLLM's `hidden_states = hidden_states * self.layer_scalar`. The checkpoint's
-         * values (0.03-0.99) are trained weights that rescale the residual toward O(1). */
-        RAD_ISSUE(c, l.op_scale, brows(m.b_x, batch->n_tok), RAD_W(l.w_scalar),
-                  brows(m.b_x, batch->n_tok));
+        /* The drafter's taps, once the layer's output is whole. Either way that is after the
+         * scalar, since the junction applies it to the stream it writes. */
+        for (int t = 0; t < m.n_taps && l.op_tap; ++t)
+            if (m.tap_layer[t] == (int)li)
+                RAD_ISSUE(c, l.op_tap, brows(m.b_x, T),
+                          bcol(m.b_dfsrc, (int64_t)t * m.g.n_embd, m.g.n_embd, T));
     }
 
     RAD_ISSUE(c, m.op_final,
@@ -1513,13 +1587,16 @@ static void step(RadCtx* c, const RadBatch* batch) {
 const RadChatFormat* chat_format(const RadModelMeta*) { return gemma4_chat_format(); }
 
 /* The default draft depth for `--num-speculative-tokens auto`. A serial head's depth is an
- * operating point, not a trained depth: every depth runs. */
+ * operating point, not a trained depth: every depth runs. A DFlash drafter's is the block it was
+ * trained at, fixed. */
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
     if (has_assistant(meta)) {
         out->draft_depth = kHeadDepth;
         out->draft_depth_fixed = 0;
     }
+    /* A DFlash drafter names the block it was trained at, and only that (rad_gemma4_dflash.h). */
+    (void)gemma4::dflash_probe(meta, out);
     /* The tower's pooling window, so a pass size the core picks itself is whole windows. */
     if (Gemma4Vision::present(meta)) {
         const int64_t k = rad_meta_geti(meta, "vision_config.pooling_kernel_size", 0);
@@ -1530,9 +1607,10 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
 
 #ifndef RAD_ARCH_NO_EXPORTS
 RAD_ARCH_PLUGIN(gemma4_bf16, "gemma4", "compressed-tensors", "0.1.0",
-                "Gemma 4 dense (text and images), w4a8 from its bf16 or its CT-INT4 (QAT) release: "
-                "sliding-window and proportional-RoPE global attention over a plain RMSNorm stream "
-                "with GELU feed-forward, per-layer scalar scaling and soft-capped logits")
+                "Gemma 4 dense (text and images), w4a8 or w8a8 from its bf16 or its CT-INT4 (QAT) "
+                "release: sliding-window and proportional-RoPE global attention over a plain "
+                "RMSNorm stream with GELU feed-forward, per-layer scalar scaling and soft-capped "
+                "logits; Google's assistant head or z-lab's DFlash drafter")
 RAD_ARCH_CHAT_FORMAT(gemma4_bf16)
 RAD_ARCH_PROBE(gemma4_bf16)
 #endif

@@ -29,6 +29,8 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | MiniCPM5-2B bf16, DSpark drafter | `minicpm5-2b-bf16.rad` (5 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-bf16) | `minicpm5-2b-bf16.yaml` |
 | Gemma 4 31B: GPTQ int4 trunk, int8 activations, MTP, vision | `gemma4-31b-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-w4a8) | `gemma4-31b-w4a8.yaml` |
 | Gemma 4 31B heretic-ara (refusals removed): GPTQ int4 trunk, int8 activations, MTP, vision | `gemma4-31b-heretic-ara-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-heretic-ara-w4a8) | `gemma4-31b-heretic-ara-w4a8.yaml` |
+| Gemma 4 31B: int4 trunk, int8 activations and lm_head, DFlash drafter, vision | `gemma4-31b-dense-w4a8-df.rad` (20 GiB) | [convert](#convert-a-checkpoint) | `gemma4-31b-w4a8-df.yaml` |
+| Gemma 4 31B Q8: int8 trunk and lm_head (Q8_0's grid at group 128), int8 DFlash drafter, vision | `gemma4-31b-dense-q8-df.rad` (33 GiB) | [convert](#convert-a-checkpoint) | `gemma4-31b-q8-df.yaml` |
 | Qwen-Image 2.1 FP8: text to image and image edits | `qwen-image-2.1-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-fp8) | `qwen-image-2.1.yaml` |
 | Qwen-Image 2.1 Turbo FP8: the same in 8 steps | `qwen-image-2.1-turbo-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-turbo-fp8) | `qwen-image-2.1-turbo.yaml` |
 | Krea 2 Turbo FP8: text to image, one card | `krea-2-turbo-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/krea-2-turbo-radiance-fp8) | `krea-2-turbo.yaml` |
@@ -256,6 +258,14 @@ build/bin/rad-convert /srv/models/hf/google/gemma-4-31B-it -o gemma4-31b-w4a8.ra
     --recipe data/recipes/gemma4-31b-dense-bf16-w4a8.recipe \
     --set quantization_config.quant_method=compressed-tensors \
     --draft-model /srv/models/hf/google/gemma-4-31B-it-assistant
+build/bin/rad-convert /srv/models/hf/google/gemma-4-31B-it -o gemma4-31b-dense-w4a8-df.rad \
+    --recipe data/recipes/gemma4-31b-dense-bf16-w4a8-df.recipe \
+    --set quantization_config.quant_method=compressed-tensors \
+    --draft-model /srv/models/hf/z-lab/gemma-4-31B-it-DFlash
+build/bin/rad-convert /srv/models/hf/google/gemma-4-31B-it -o gemma4-31b-dense-q8-df.rad \
+    --recipe data/recipes/gemma4-31b-dense-bf16-q8-df.recipe \
+    --set quantization_config.quant_method=compressed-tensors \
+    --draft-model /srv/models/hf/z-lab/gemma-4-31B-it-DFlash
 build/bin/rad-convert /srv/models/hf/z-lab/Qwen3.8-27B-PARO -o qwen3.8-27b-paro-int4.rad \
     --recipe data/recipes/q38-27b-paro-mxfp4-df2.recipe \
     --draft-model /srv/models/hf/z-lab/Qwen3.8-27B-DFlash2

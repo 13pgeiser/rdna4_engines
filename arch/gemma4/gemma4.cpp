@@ -90,8 +90,7 @@
 #include <arch/rad_arch.h>
 #include <arch/rad_fp8.h>
 #include <arch/rad_gemma4_chat.h>
-
-#include "gemma4_dflash.h"
+#include <arch/rad_gemma4_dflash.h>
 
 #include <cmath>
 #include <cstdint>
@@ -223,16 +222,15 @@ struct Model {
     rad_weight w_tok = 0, w_onorm = 0;
     rad_op op_embed = 0, op_embed_ar = 0, op_onorm = 0, op_gather = 0, op_logits = 0, op_cap = 0;
 
-    enum { MAX_TAPS = 8 };
+    enum { MAX_TAPS = Dflash1::MAX_TAPS };
     int     n_taps = 0;
     int     tap_layer[MAX_TAPS] = {};
     rad_buf b_dfsrc = 0;
 
     Dflash1       df{};
-    Dflash1::Wire dfw{};
     rad_kvgroup   kv_draft = 0;
     bool          have_df = false;
-    const char*   tok_src = nullptr;   /* the checkpoint's table, which the fp8 draft head copies */
+    const char*   tok_src = nullptr;   /* the checkpoint's table, which the 8-bit draft head copies */
 
     std::vector<Layer> layers;
 };
@@ -301,159 +299,19 @@ static rad_op decl_full_rope(RadBuilder* b, const Kind& k, int64_t rows, int64_t
 
 /* ============================================================== the drafter */
 
+/* z-lab's DFlash drafter (arch/common/rad_gemma4_dflash.h), past the trunk's layers, reading the
+ * taps the trunk copies into `dflash_src` and the trunk's tied table. */
 static int declare_dflash(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx,
                           Model& m, int base_layer) {
-    Names& nm = m.nm;
-    Geom   dg{};
-    RAD_ARCH_TRY(drafter_geom(dg, m.g, meta, "gemma4 DFlash"));
-    if (rad_meta_geti(meta, "draft.hidden_size", dg.n_embd) != dg.n_embd) {
-        fprintf(stderr, "radiance: gemma4: the drafter is %lld wide and the target %lld; it reads "
-                        "the target's embedding and head, so it is not this target's drafter\n",
-                (long long)rad_meta_geti(meta, "draft.hidden_size", 0), (long long)dg.n_embd);
-        return RAD_E_UNSUPPORTED;
-    }
-
-    Dflash1::Config dc{};
-    dc.n_taps = m.n_taps;
-    dc.escale = m.escale;
-    /* v1 states its block at the top level; a SpecForge config nests it under dflash_config. */
-    long long trained = rad_meta_geti(meta, "draft.block_size", 0);
-    if (trained <= 0) trained = rad_meta_geti(meta, "draft.dflash_config.block_size", 0);
-    if (trained < 2) {
-        fprintf(stderr, "radiance: gemma4: the DFlash checkpoint states no block_size\n");
-        return RAD_E_FORMAT;
-    }
-    if ((long long)ctx->max_spec + 1 != trained) {
-        fprintf(stderr, "radiance: gemma4: the DFlash drafter was trained at block_size %lld, "
-                        "which is %lld draft tokens, and this serve asks for %d. A block-diffusion "
-                        "drafter denoises a fixed number of mask positions; run it at "
-                        "--num-speculative-tokens %lld (or `auto`).\n",
-                trained, trained - 1, ctx->max_spec, trained - 1);
-        return RAD_E_UNSUPPORTED;
-    }
-    dc.block = trained;
-    if (dg.n_layer > Dflash1::MAX_LAYERS) return RAD_E_UNSUPPORTED;
-    {
-        std::vector<int> full;
-        const char* lt = rad_meta_gets(meta, "draft.layer_types", nullptr);
-        if (lt) {
-            RAD_ARCH_TRY(parse_layer_kinds("gemma4", lt, {"full_attention"}, "sliding_attention",
-                                          &full));
-            if ((int64_t)full.size() != dg.n_layer) {
-                fprintf(stderr, "radiance: gemma4: the drafter's layer_types names %zu layers and "
-                                "it has %lld\n", full.size(), (long long)dg.n_layer);
-                return RAD_E_INVAL;
-            }
-        } else {
-            full.assign((size_t)dg.n_layer, 1);
-        }
-        bool any_swa = false;
-        for (int64_t l = 0; l < dg.n_layer; ++l) {
-            dc.full[l] = full[(size_t)l];
-            any_swa = any_swa || !full[(size_t)l];
-        }
-        if (any_swa) {
-            dc.window = rad_meta_geti(meta, "draft.dflash_config.swa_window_size",
-                                      rad_meta_geti(meta, "draft.sliding_window", 0));
-            if (!rad_meta_geti(meta, "draft.use_sliding_window", 1) || dc.window <= 0) {
-                fprintf(stderr, "radiance: gemma4: the drafter names sliding layers and no "
-                                "window\n");
-                return RAD_E_INVAL;
-            }
-        }
-    }
-
-    /* One unbounded cache for all the drafter's layers, because its full layer reads every
-     * position. The sliding layers bound themselves with their attention op's `window`, so the
-     * declared drafter window is 0 and the core stages the whole context. A separate window group
-     * for the sliding layers would save memory. */
-    RAD_ARCH_TRY(drafter_kv_group(b, nm, ctx, dg, 0, base_layer, &m.kv_draft));
-
-    const int64_t qd  = dg.n_head * dg.head_dim;
-    const int64_t kvd = dg.n_head_kv * dg.head_dim;
-    int64_t qr = dg.max_seqs * dc.block;
-    if (qr > dg.max_tok) qr = dg.max_tok;
-    const int64_t sr = dg.max_seqs * dc.steps();
-    const int64_t tw = dc.n_taps * dg.n_embd;
-
-    Dflash1::Wire& dw = m.dfw;
-    dw.src   = m.b_dfsrc;
-    dw.srcq  = decl_b(b, nm.f("df_srcq"), RAD_F8E4M3, {dg.max_tok, tw});
-    dw.srcs  = decl_b(b, nm.f("df_srcs"), RAD_F32,    {dg.max_tok, fp8_blocks(tw)});
-    dw.c     = decl_b(b, nm.f("df_c"),    dg.act_dtype, {dg.max_tok, dg.n_embd});
-    dw.cq    = decl_b(b, nm.f("df_cq"),   RAD_F8E4M3, {dg.max_tok, dg.n_embd});
-    dw.cs    = decl_b(b, nm.f("df_cs"),   RAD_F32,    {dg.max_tok, fp8_blocks(dg.n_embd)});
-    dw.ck    = decl_b(b, nm.f("df_ck"),   dg.act_dtype, {dg.max_tok, kvd});
-    dw.cv    = decl_b(b, nm.f("df_cv"),   dg.act_dtype, {dg.max_tok, kvd});
-    dw.x     = decl_b(b, nm.f("df_x"),    dg.act_dtype, {qr, dg.n_embd});
-    dw.h     = decl_b(b, nm.f("df_h"),    dg.act_dtype, {qr, dg.n_embd});
-    dw.hq    = decl_b(b, nm.f("df_hq"),   RAD_F8E4M3, {qr, dg.n_embd});
-    dw.hs    = decl_b(b, nm.f("df_hs"),   RAD_F32,    {qr, fp8_blocks(dg.n_embd)});
-    dw.q     = decl_b(b, nm.f("df_q"),    dg.act_dtype, {qr, qd});
-    dw.k     = decl_b(b, nm.f("df_k"),    dg.act_dtype, {qr, kvd});
-    dw.v     = decl_b(b, nm.f("df_v"),    dg.act_dtype, {qr, kvd});
-    dw.attn  = decl_b(b, nm.f("df_attn"), dg.act_dtype, {qr, qd});
-    dw.atq   = decl_b(b, nm.f("df_atq"),  RAD_F8E4M3, {qr, qd});
-    dw.ats   = decl_b(b, nm.f("df_ats"),  RAD_F32,    {qr, fp8_blocks(qd)});
-    dw.gate_up = decl_b(b, nm.f("df_gate_up"), dg.act_dtype, {qr, 2 * dg.n_ff});
-    dw.ffn   = decl_b(b, nm.f("df_ffn"),  dg.act_dtype, {qr, dg.n_ff});
-    dw.ffq   = decl_b(b, nm.f("df_ffq"),  RAD_F8E4M3, {qr, dg.n_ff});
-    dw.ffs   = decl_b(b, nm.f("df_ffs"),  RAD_F32,    {qr, fp8_blocks(dg.n_ff)});
-    dw.sel_h = decl_b(b, nm.f("df_selh"), dg.act_dtype, {sr, dg.n_embd});
-    dw.dlog  = decl_b(b, nm.f("df_dlog"), dg.act_dtype, {sr, dg.n_vocab});
-    if (Dflash1::head_sharded(dg)) {
-        const int64_t R = Dflash1::kTopR;
-        dw.cand  = decl_b(b, nm.f("df_cand"), RAD_I32, {sr, R});
-        dw.unary = decl_b(b, nm.f("df_unary"), RAD_F32, {sr, R});
-        dw.dpair = decl_b(b, nm.f("df_dpair"), RAD_F32, {sr, R, 2});
-        dw.dgath = decl_b(b, nm.f("df_dgath"), RAD_F32, {sr, (int64_t)dg.world * R, 2});
-    } else {
-        dw.unary = decl_b(b, nm.f("df_unary"), RAD_F32, {sr, 1});
-    }
-    if (!Dflash1::head_sharded(dg) && dg.world > 1) {
-        fprintf(stderr, "radiance: gemma4: the vocabulary (%lld) does not split evenly into whole "
-                        "16-row blocks over %d ranks, which the drafter's sharded head needs\n",
-                (long long)dg.n_vocab_all, dg.world);
-        return RAD_E_UNSUPPORTED;
-    }
-    /* The draft, one row per draft position: [n_seq * steps, 1], i.e. [n_seq, steps] with pitch
-     * `steps`, read by the engine through the drafter declaration below. */
-    dw.tokens = decl_b(b, nm.f("dflash_tokens"), RAD_I32, {sr, 1});
-
-    RAD_ARCH_TRY(m.df.declare(b, nm, dg, dc, base_layer, m.kv_draft, m.w_tok, "draft", dw,
-                              m.tok_src));
+    Dflash1::Trunk t{};
+    t.n_taps     = m.n_taps;
+    t.escale     = m.escale;
+    t.src        = m.b_dfsrc;
+    t.w_tok      = m.w_tok;
+    t.tok_src    = m.tok_src;
+    t.base_layer = base_layer;
+    RAD_ARCH_TRY(Dflash1::declare_drafter(b, meta, ctx, m.nm, m.g, t, &m.df, &m.kv_draft));
     m.have_df = true;
-
-    RadDrafterDecl drf{};
-    drf.name           = "dflash";
-    drf.kind           = RAD_DRAFT_BLOCK;
-    drf.depth          = ctx->max_spec;
-    drf.block          = dc.block;          /* the anchor predicts nothing: block = depth + 1 */
-    drf.proposal       = dw.tokens;
-    drf.proposal_pitch = dc.steps();
-    drf.window         = 0;                 /* the full layer reads everything; see the group */
-    drf.mask_token     = (int32_t)rad_meta_geti(meta, "draft.dflash_config.mask_token_id",
-                                                rad_meta_geti(meta, "draft.mask_token_id", -1));
-    if (drf.mask_token < 0) {
-        fprintf(stderr, "radiance: gemma4: the DFlash checkpoint declares no mask_token_id\n");
-        return RAD_E_FORMAT;
-    }
-    RAD_ARCH_TRY(rad_declare_drafter(b, &drf));
-
-    int nfull = 0;
-    for (int64_t l = 0; l < dg.n_layer; ++l) nfull += dc.full[l];
-    rad_note(b, "the DFlash drafter is declared: %lld layers at absolute %d..%d (%d full, %lld "
-                "sliding over %lld causal), %lld heads / %lld kv x %lld, ffn %lld, reading the "
-                "trunk at %d tap(s). ONE forward over %lld rows proposes %lld tokens; the head is "
-                "%s, argmax %s",
-             (long long)dg.n_layer, base_layer, base_layer + (int)dg.n_layer - 1, nfull,
-             (long long)(dg.n_layer - nfull), (long long)dc.window, (long long)dg.n_head,
-             (long long)dg.n_head_kv, (long long)dg.head_dim, (long long)dg.n_ff, m.n_taps,
-             (long long)dc.block, (long long)dc.steps(),
-             m.df.fp8_head
-                 ? "the container's block-fp8 copy of the target's table (dflash.draft_head)"
-                 : "the target's tied bf16 table",
-             Dflash1::head_sharded(dg) ? "per vocab shard, merged" : "over the whole vocabulary");
     return RAD_OK;
 }
 
@@ -662,7 +520,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* ---- the embedding scale and the rotary scaling the converter may have written. The scale
      * is rounded to bf16 because the reference holds it in a bf16 buffer: sqrt(2816) = 53.066
      * multiplies as 53.0. */
-    m.escale = rad_bf16_to_f32(rad_f32_to_bf16((float)std::sqrt((double)E)));
+    m.escale = embed_scale(E);
     RAD_ARCH_TRY(yarn_from(g, meta, "", m.ks.hd));
     if (g.yarn.factor != 0.0f || g.rope_scale != 1.0f) {
         fprintf(stderr, "radiance: gemma4: --rope-scaling is not implemented for this family's "
@@ -794,24 +652,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* ---- the drafter's taps, declared when the container carries a DFlash drafter and this
      * serve speculates. DFlash2 is refused by name: its convolutions and selector are another
      * block. */
-    if (ctx->max_spec > 0) {
-        const char* da = rad_meta_gets(meta, "draft.architectures", "");
-        if (da && std::strstr(da, "DFlash2")) {
-            fprintf(stderr, "radiance: gemma4: the container carries a DFlash2 drafter; this plugin "
-                            "serves the DFlash (v1) block z-lab publishes for Gemma 4\n");
-            return RAD_E_UNSUPPORTED;
-        }
-        if (da && std::strstr(da, "DFlash")) {
-            const char* ids = rad_meta_gets(meta, "draft.dflash_config.target_layer_ids", nullptr);
-            if (!ids) ids = rad_meta_gets(meta, "draft.target_layer_ids", nullptr);
-            m.n_taps = parse_layer_ids(ids, m.n_layer, m.tap_layer, Model::MAX_TAPS);
-            if (m.n_taps <= 0) {
-                fprintf(stderr, "radiance: gemma4: the drafter names no trunk layer this model "
-                                "has; it is paired with a different target\n");
-                return RAD_E_UNSUPPORTED;
-            }
-            m.b_dfsrc = decl_b(b, nm.f("dflash_src"), RAD_BF16, {T, (int64_t)m.n_taps * E});
-        }
+    {
+        const int n = Dflash1::taps(meta, ctx, m.n_layer, m.tap_layer, Model::MAX_TAPS);
+        if (n < 0) return n;
+        m.n_taps = n;
+        if (n > 0) m.b_dfsrc = decl_b(b, nm.f("dflash_src"), RAD_BF16, {T, (int64_t)n * E});
     }
 
     m.b_logits = decl_b(b, nm.f("logits"), RAD_F32, {g.max_logit_rows, g.n_vocab});
@@ -1869,15 +1714,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
     out->draft_depth = 0;
-    const char* da = rad_meta_gets(meta, "draft.architectures", "");
-    if (da && std::strstr(da, "DFlash") && !std::strstr(da, "DFlash2")) {
-        long long bs = rad_meta_geti(meta, "draft.block_size", 0);
-        if (bs <= 0) bs = rad_meta_geti(meta, "draft.dflash_config.block_size", 0);
-        if (bs > 1) {
-            out->draft_depth = (int)(bs - 1);
-            out->draft_depth_fixed = 1;
-        }
-    }
+    (void)dflash_probe(meta, out);
     return RAD_OK;
 }
 

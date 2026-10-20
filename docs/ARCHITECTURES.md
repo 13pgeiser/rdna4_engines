@@ -17,7 +17,7 @@ plugin claims.
 | `arch/glm5next` | `glm5next` | *(empty)* | GLM-5.3-Flash from AMD's Quark MXFP4 export: four mHC residual streams over 34 KDA and 11 sparse latent-attention (MLA) layers with a DSA indexer, 288 MXFP4 experts at top-8 under sigmoid routing, block-FP8 attention and dense layers at f32 scales, each weight served as stored; its MTP layer is a serial drafter. Text only, bf16 KV |
 | `arch/lfm2_bf16` | `lfm2` | *(empty)* | LiquidAI's LFM2 and LFM2-VL, bf16, one rank |
 | `arch/embgemma2` | `embeddinggemma2` | *(empty)* | EmbeddingGemma 2: a bidirectional encoder with Gemma 4's vision tower and audio conformer, pooled to one vector |
-| `arch/gemma4_bf16` | `gemma4` | `compressed-tensors` | Gemma 4 31B dense with its vision tower: sliding-window and proportional-RoPE global (`attention_k_eq_v`) attention, GELU ffn, softcapped logits; int4 codes with an f16 scale per 128 from Google's CT-INT4 (QAT) release, served w4a8. Optional draft head: Google's assistant (`rad-convert --draft-model`), with no cache of its own (`rad_drafter_shared_kv`) |
+| `arch/gemma4_bf16` | `gemma4` | `compressed-tensors` | Gemma 4 31B dense with its vision tower: sliding-window and proportional-RoPE global (`attention_k_eq_v`) attention, GELU ffn, softcapped logits; int4 codes with an f16 scale per 128 from Google's CT-INT4 (QAT) release or from bf16, served w4a8, or int8 codes on the same grid from bf16 (w8a8, the Q8 container). Optional draft model (`rad-convert --draft-model`): Google's assistant, with no cache of its own (`rad_drafter_shared_kv`), or z-lab's DFlash drafter, the block `arch/gemma4` serves (`arch/common/rad_gemma4_dflash.h`) |
 | `arch/gemma3` | `gemma3` | *(empty)* | Gemma 3 dense text (TranslateGemma 27B) from the bf16 checkpoint: sliding-window and global attention at one head geometry, GemmaRMSNorm, GELU ffn; linears bf16, or int8, MXFP4 or asymmetric int4 over an activation scaled per (row, 128), as the recipe stores them. Optional DFlash2 drafter (`rad-convert --draft-model`) |
 | `arch/gemma4` | `gemma4` | *(empty)* | Gemma 4 text from Google's bf16 checkpoint (the 26B-A4B MoE and the dense sizes without per-layer embeddings) with z-lab's DFlash drafter; routed experts bf16 or block fp8 |
 | `arch/qwenimage21` | `qwenimage21` | *(empty)* | Qwen-Image 2.1 and 2.1-Turbo, an image generator, from the diffusers pipeline directory; DiT and text encoder bf16 or block fp8 |
@@ -637,8 +637,10 @@ Traps:
 `arch/gemma4` serves a container converted from Google's bf16 checkpoint
 (`Gemma4ForConditionalGeneration` or `Gemma4ForCausalLM`), the recipe choosing what is fp8:
 gemma-4-26B-A4B-it, and the dense sizes without per-layer embeddings. The CT-INT4 31B release is
-`arch/gemma4_bf16`'s. A z-lab DFlash drafter is merged at convert time (`--draft-model`); the
-recipes are `data/recipes/gemma4-26b-a4b-df*.recipe`. The reference is transformers'
+`arch/gemma4_bf16`'s, and so is the 31B quantised from bf16 at w4a8 or w8a8, which takes the same
+DFlash drafter (see "The 31B" below). A z-lab DFlash drafter is merged at convert time
+(`--draft-model`); the recipes are `data/recipes/gemma4-26b-a4b-df*.recipe` and
+`data/recipes/gemma4-31b-dense-bf16-*-df.recipe`. The reference is transformers'
 `modeling_gemma4`.
 
 ```
@@ -705,13 +707,43 @@ and cannot show it, so time a prefill without it. A step that runs whole (every 
 step) puts the dense arm on the second lane instead, beside the routed arm, with its reductions on
 lane 0. The startup notes say which form each step takes.
 
-**The draft head in fp8.** The drafter's head is the widest read on the draft path: the target's
+**The draft head in 8 bits.** The drafter's head is the widest read on the draft path: the target's
 bf16 table, 352 MiB per rank at tp 4, every draft pass. A container converted with the line
-`dflash.draft_head.weight rtn codes=fp8_e4m3 block=128x128 scale=bf16` (the three `-df` recipes
-carry it) stores a block-fp8 copy under that name, and the head reads it at fp8a8 instead: half
-the bytes, for 176 MiB per rank more. Drafts are verified, so the coarser logits can change what is
-proposed, never what is accepted; `draft_n_accepted` shows whether they propose worse. Without the
-copy the head reads the bf16 table, and the startup note names which head is in use.
+`dflash.draft_head.weight rtn codes=fp8_e4m3 block=128x128 scale=bf16` (the 26B `-df` recipes and
+the 31B w4a8 one carry it) stores a block-fp8 copy under that name, and the head reads it at fp8a8
+instead: half the bytes, for 176 MiB per rank more. With `codes=i8 group=128 scale=f16 clamp=sym`
+(the 31B Q8 recipe) the copy is int8, read at w8a8. Drafts are verified, so the coarser logits can
+change what is proposed, never what is accepted; `draft_n_accepted` shows whether they propose
+worse. Without the copy the head reads the bf16 table, and the startup note names which head is in
+use.
+
+**The drafter's linears on either 8-bit grid.** The seven linears (fc and six per layer) are on the
+E4M3 grid (block fp8 or MXFP4, at fp8a8 / mxfp4a8 over an E4M3 activation with a scale per (row,
+128)) or on the int8 one (`codes=i8 group=128 scale=f16`, at w8a8 over `quant_act_i8`'s activation
+with a scale per row, and `rmsnorm_quant_i8` folding each residual add, norm and quantiser as
+`rmsnorm_quant_fp8` does on the other). `fc`'s encoding picks the grid. One quantised activation
+feeds several linears, so a linear on the other grid is refused by name. The gate_up|silu|quant
+fold (`gemm_nt_q_gated`) is fp8a8 only, so the int8 grid keeps `silu_mul` and the quantiser, one
+launch per layer more. Above 64 rows the w8a8 GEMM is the tiled one, which takes N in 256s; the
+31B drafter's k and v are 256 rows per rank at tp 4, the narrowest that still fits.
+
+**The 31B.** z-lab's `gemma-4-31B-it-DFlash` is the same block at 5376 (64 heads / 8 kv x 128,
+ffn 10752, five layers, taps 1 12 23 35 46 57 of 60, block 16), and `arch/gemma4_bf16` serves it
+beside its w4a8 or w8a8 trunk. The taps are copies of the stream each tapped layer's junction
+leaves (`rmsnorm_quant_i8` adds the feed-forward and applies the layer scalar, so the copy is
+`hidden_states[l + 1]`), declared in the layer they copy for the liveness reason below. The drafter
+is declared after the trunk, its layers at 60..64 on a KV group of its own. Its 64 heads over 8 kv
+heads are gqa 8 at every rank count, and libr4d's head-128 attention (the one the 26B's gqa-4
+drafter runs on, causal over a window or not) takes 4 queries per kv head at a block of 16. So the
+cache holds each kv head twice, written by a head-wide copy of k and v after the projection, and
+the attention runs at gqa 4. It is exact: query head q reads a copy of kv head q / 8. A container carries the
+assistant head or the drafter under `draft.`, not both. The recipes are
+`gemma4-31b-dense-bf16-w4a8-df.recipe` (int4 trunk, int8 lm_head, block-fp8 drafter, ~20 GiB)
+and `gemma4-31b-dense-bf16-q8-df.recipe` (Q8_0's grid at libr4d's group of 128 for the trunk, its
+lm_head and the drafter, ~33 GiB). Both start from bf16, because the drafter reads the trunk's
+hidden states and was trained beside the bf16 trunk. Both plugins scale the embedding by
+sqrt(hidden) rounded to bf16, as the reference's embedding module does (73.5 at 5376, not 73.32),
+and the drafter reads it through the same scale.
 
 **The 31B's junctions at four ranks.** At two ranks every junction carries the all-reduce in front
 of it (`ar_rmsnorm_quant_i8`). At four it does too, at decode heights. libr4d's

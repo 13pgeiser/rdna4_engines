@@ -1515,10 +1515,12 @@ struct DenseFP8 {
     /* The caller made the name map (a row range of a checkpoint tensor); declare() does not. */
     bool       mapped = false;
 
+    /* `mapped`: the caller made the name map already, to ask the encoding before choosing this
+     * struct over another grid's -- a COPY map declared twice is refused (rad_builder.cpp). */
     int declare(RadBuilder* b, Names& nm, const char* base, int64_t N, int64_t K,
                 int access, int shard, RadWeightGroup grp,
                 std::initializer_list<const char*> src,
-                std::initializer_list<int64_t> row_parts = {});
+                std::initializer_list<int64_t> row_parts = {}, bool mapped = false);
     /* `gemm_nt_q` over this weight, `fp8a8` or `mxfp4a8` as it was declared, ranged M 1..hi. */
     rad_op gemm(RadBuilder* b, int64_t hi, int64_t N, int64_t K,
                 std::initializer_list<rad_buf> reads, std::initializer_list<rad_buf> writes) const {
@@ -1541,7 +1543,7 @@ struct DenseFP8 {
 inline int DenseFP8::declare(RadBuilder* b, Names& nm, const char* base, int64_t N, int64_t K,
                              int access, int shard, RadWeightGroup grp,
                              std::initializer_list<const char*> src,
-                             std::initializer_list<int64_t> row_parts) {
+                             std::initializer_list<int64_t> row_parts, bool mapped) {
     if (N <= 0 || K <= 0 || src.size() == 0) return RAD_E_INVAL;
 
     /* ---- OCP-MXFP4, from the weight's encoding. The exponent grid is one row tall, so parts need
