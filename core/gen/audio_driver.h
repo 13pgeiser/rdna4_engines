@@ -125,7 +125,7 @@ private:
     enum { R_TOK, R_POS, R_CU, R_SLOT, R_BT, R_USED, R_LANE, R_LAST, R_FRAME, R_SEED,
            R_T, R_TN, R_CFG, R_PAIR, R_WLANE, R_FLAGS, R_WIDX, R_WF0, R_WNF, R_LCU, R_LSRC,
            R_ESLOT, R_LROW, R_PREFIX, R_CTX, R_ACC, R_SBT, R_SIDX, R_PSLOT, R_PPOS, R_PUSED,
-           R_N };
+           R_RAUD, R_RCU, R_RFRM, R_N };
     /* A hybrid model's stateful groups (linear-attention state, convolution history), each staged
      * as one block-table word a sequence (its slot) and its state_index row. */
     struct StateGroup { int32_t g = 0; int64_t width = 1; };
@@ -190,7 +190,7 @@ private:
     bool                          frame_turn_ = true;   /* FRAME goes first when both are due */
     /* Host arrays a pass's plugin reads on the host (the _h fields), for the life of the pass. */
     std::vector<int32_t>          h_lane_, h_last_, h_frame_, h_wlane_, h_flags_, h_widx_,
-                                  h_wf0_, h_wnf_, h_lcu_;
+                                  h_wf0_, h_wnf_, h_lcu_, h_rcu_, h_rfrm_;
 
     mutable std::mutex              mu_;
     std::deque<std::unique_ptr<Job>> jobs_;  /* arrival order */

@@ -214,7 +214,7 @@ bool Server::speech_stream_loop(SpeechSession& s, WsConn& ws) {
         static const char* kFields[] = {
             "type", "model", "instructions", "voice", "response_format", "speed", "seed",
             "max_new_tokens", "duration", "num_inference_steps", "guidance_scale", "user",
-            "stream_audio", "split_granularity", "text_input_mode",
+            "references", "stream_audio", "split_granularity", "text_input_mode",
         };
         json fields = json::object();
         for (auto it = j.begin(); it != j.end(); ++it) {

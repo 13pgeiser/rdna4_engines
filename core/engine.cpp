@@ -2501,6 +2501,12 @@ int Engine::run_server() {
         in.max_lanes = ad.max_lanes;
         in.branches = ad.branches == 1 ? 1 : 2;
         in.input_special = ad.input_special != 0;
+        in.tmpl_ref = pg.agen_str.tmpl_ref;
+        in.ref_item = pg.agen_str.ref_item;
+        in.ref_rate = ad.ref_rate;
+        in.ref_hop = ad.ref_hop;
+        in.ref_max_samples = ad.ref_max_samples;
+        in.ref_max = ad.ref_max;
         audio_bridge.drv = aud_gen_;
         audio_bridge.plugins = &plugins_;
         d.audio = &audio_bridge;

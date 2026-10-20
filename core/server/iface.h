@@ -653,6 +653,11 @@ struct AudioGenInfo {
      * tokenised with special tokens). */
     int32_t branches = 2;
     bool    input_special = false;
+    /* RadAudioGenDecl's references: the prompt with them and one reference ("" when the model
+     * takes none), the clips' rate and frame, and the most of them and their samples. */
+    std::string tmpl_ref, ref_item;
+    int64_t ref_rate = 0, ref_hop = 0, ref_max_samples = 0;
+    int32_t ref_max = 0;
 };
 
 class IAudioGen {

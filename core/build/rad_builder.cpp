@@ -1376,6 +1376,33 @@ int Builder::declare_audio_generator(const RadAudioGenDecl* d) {
                          "instructions and needs {input} alone", nm);
         return RAD_E_INVAL;
     }
+    /* References: a template with both of its slots, an item with one transcript before its one
+     * clip, and the clips' geometry; read whole by one branch's prompt (an unconditional branch
+     * would need references of its own). */
+    if (d->tmpl_ref) {
+        auto once = [](const char* t, const char* k) {
+            const char* a = t ? std::strstr(t, k) : nullptr;
+            return a && !std::strstr(a + 1, k);
+        };
+        const char* au = d->ref_item ? std::strstr(d->ref_item, "{audio}") : nullptr;
+        const char* tx = d->ref_item ? std::strstr(d->ref_item, "{text}") : nullptr;
+        if (!once(d->tmpl_ref, "{references}") || !once(d->tmpl_ref, "{input}") ||
+            std::strstr(d->tmpl_ref, "{instructions}") || !once(d->ref_item, "{audio}") ||
+            !once(d->ref_item, "{text}") || !au || !tx || tx > au) {
+            err(RAD_E_INVAL, "declare_audio_generator '%s': tmpl_ref needs {references} and "
+                             "{input} once each, and ref_item {text} before its one {audio}", nm);
+            return RAD_E_INVAL;
+        }
+        if (d->branches != 1 || !d->prompt_whole || d->ref_rate <= 0 || d->ref_hop <= 0 ||
+            d->ref_max <= 0 || d->ref_max_samples < d->ref_hop) {
+            err(RAD_E_INVAL, "declare_audio_generator '%s': references are read by a model of one "
+                             "branch from whole prompts, clips at a rate (%lld Hz) in frames of "
+                             "%lld samples, at most %d of them and %lld samples a request", nm,
+                (long long)d->ref_rate, (long long)d->ref_hop, (int)d->ref_max,
+                (long long)d->ref_max_samples);
+            return RAD_E_INVAL;
+        }
+    }
     if (d->branches != 0 && d->branches != 1 && d->branches != 2) {
         err(RAD_E_INVAL, "declare_audio_generator '%s': branches is %d; a request runs 1 sequence "
                          "or 2 (0 means 2)", nm, (int)d->branches);
@@ -1468,12 +1495,21 @@ int Builder::declare_audio_generator(const RadAudioGenDecl* d) {
     prog_.agen_str.tmpl = d->tmpl ? d->tmpl : "";
     prog_.agen_str.tmpl_plain = d->tmpl_plain ? d->tmpl_plain : "";
     prog_.agen_str.neg_tmpl = d->neg_tmpl ? d->neg_tmpl : "";
+    prog_.agen_str.tmpl_ref = d->tmpl_ref ? d->tmpl_ref : "";
+    prog_.agen_str.ref_item = d->tmpl_ref && d->ref_item ? d->ref_item : "";
     prog_.audio_gen = *d;
     /* As for the image generator: the Program is moved after declare; strings live in agen_str. */
     prog_.audio_gen.name = nullptr;
     prog_.audio_gen.tmpl = nullptr;
     prog_.audio_gen.tmpl_plain = nullptr;
     prog_.audio_gen.neg_tmpl = nullptr;
+    prog_.audio_gen.tmpl_ref = nullptr;
+    prog_.audio_gen.ref_item = nullptr;
+    /* Without references the clips' geometry is nothing: the driver stages none. */
+    if (!d->tmpl_ref) {
+        prog_.audio_gen.ref_rate = prog_.audio_gen.ref_hop = prog_.audio_gen.ref_max_samples = 0;
+        prog_.audio_gen.ref_max = 0;
+    }
     return RAD_OK;
 }
 

@@ -69,6 +69,7 @@ int64_t align_up(int64_t v) { return (v + kAlign - 1) / kAlign * kAlign; }
 struct Sizes {
     int64_t T = 0, S = 0, L = 0, NB = 0;
     int64_t NG = 0;    /* stateful KV groups */
+    int64_t RS = 0, RN = 0;   /* references: samples and clips a request */
 };
 
 /* The paged full-attention group, and how many stateful groups sit beside it. */
@@ -92,6 +93,8 @@ Sizes sizes_of(const Program& prog, int64_t block_size) {
     z.L  = d.max_lanes;
     z.NB = block_size > 0 ? (AudioDriver::max_seq_rows(d) + block_size - 1) / block_size : 0;
     full_group(prog, &z.NG);
+    z.RS = d.ref_max_samples;
+    z.RN = d.ref_max;
     return z;
 }
 
@@ -132,6 +135,9 @@ int64_t carve(const Sizes& z, int64_t (*bytes)[2], int n) {
         z.S * I,             /* R_PSLOT */
         z.S * I,             /* R_PPOS */
         z.S * I,             /* R_PUSED */
+        z.RS * 4,            /* R_RAUD */
+        z.RN > 0 ? (z.RN + 1) * I : 0,   /* R_RCU */
+        z.RN > 0 ? z.T * I : 0,          /* R_RFRM */
     };
     int64_t off = 0;
     for (int r = 0; r < n; ++r) {
@@ -286,6 +292,25 @@ int AudioDriver::submit(std::unique_ptr<AudioRequest> r, std::string* why) {
                   " seconds)");
     if (r->steps < 0 || r->steps > 1000) return no("num_inference_steps must be 1..1000");
     if (r->cfg != 0.0f && !(r->cfg >= 1.0f)) return no("guidance_scale must be >= 1");
+    /* References: the clips the declaration allows, each a whole number of frames, and a frame
+     * for every row that names one. */
+    if (!r->ref_cu.empty() || !r->ref_frame.empty() || !r->ref_audio.empty()) {
+        const int64_t n_ref = (int64_t)r->ref_cu.size() - 1, hop = d.ref_hop;
+        bool ok = d.ref_max > 0 && n_ref >= 1 && n_ref <= d.ref_max && r->ref_cu[0] == 0 &&
+                  r->ref_cu.back() == (int64_t)r->ref_audio.size() &&
+                  (int64_t)r->ref_audio.size() <= d.ref_max_samples &&
+                  (int64_t)r->ref_frame.size() == T;
+        for (int64_t i = 0; ok && i < n_ref; ++i)
+            ok = r->ref_cu[(size_t)i + 1] > r->ref_cu[(size_t)i] && r->ref_cu[(size_t)i + 1] % hop == 0;
+        const int64_t frames = ok ? r->ref_cu.back() / hop : 0;
+        for (int64_t t = 0; ok && t < T; ++t)
+            ok = r->ref_frame[(size_t)t] >= -1 && r->ref_frame[(size_t)t] < frames;
+        if (!ok)
+            return no(d.ref_max > 0 ? "the references do not fit this model: at most " +
+                                          std::to_string(d.ref_max) + " clips of whole frames, " +
+                                          std::to_string(d.ref_max_samples) + " samples together"
+                                    : std::string("this model takes no reference audio"));
+    }
     if (!kv_->can_ever_fit(std::max(T, Tn) + r->max_frames + 1))
         return no("a piece of " + std::to_string(r->max_frames) + " frames after a " +
                   std::to_string(T) + "-token prompt does not fit the KV cache even when it is "
@@ -669,6 +694,22 @@ const RadBatch* AudioDriver::build_prompt(Job& j, int step) {
     reg_[R_USED].used = nb_ * 4;
     reg_[R_LANE].used = reg_[R_LAST].used = 4;
     reg_[R_SEED].used = 8;
+    /* The references: their clips, bounds and each row's frame (a whole prompt, so the rows are
+     * the prompt's own). */
+    const AudioRequest& q = *j.req;
+    const int64_t n_ref = q.ref_cu.empty() ? 0 : (int64_t)q.ref_cu.size() - 1;
+    h_rcu_.clear();
+    h_rfrm_.clear();
+    if (n_ref > 0) {
+        std::memcpy(hptr<float>(R_RAUD), q.ref_audio.data(), q.ref_audio.size() * 4);
+        std::memcpy(hptr<int32_t>(R_RCU), q.ref_cu.data(), q.ref_cu.size() * 4);
+        std::memcpy(hptr<int32_t>(R_RFRM), q.ref_frame.data() + p0, (size_t)cb[0] * 4);
+        reg_[R_RAUD].used = (int64_t)q.ref_audio.size() * 4;
+        reg_[R_RCU].used = (int64_t)q.ref_cu.size() * 4;
+        reg_[R_RFRM].used = cb[0] * 4;
+        h_rcu_ = q.ref_cu;
+        h_rfrm_.assign(q.ref_frame.begin() + p0, q.ref_frame.begin() + p0 + cb[0]);
+    }
     if (upload() < 0) return nullptr;
     base_batches(rows, nb_, (int32_t)cmax, (int32_t)(p0 + cmax), step, true, pitch);
     h_lane_.assign(1, j.lane);
@@ -679,6 +720,16 @@ const RadBatch* AudioDriver::build_prompt(Job& j, int step) {
         A.n_lane = 1;
         A.lane_h = h_lane_.data();
         A.last_h = h_last_.data();
+        if (n_ref > 0) {
+            const int ri = (int)r;
+            A.n_ref = n_ref;
+            A.ref_samples = (int64_t)q.ref_audio.size();
+            A.ref_audio = dptr<float>(ri, R_RAUD);
+            A.ref_cu = dptr<int32_t>(ri, R_RCU);
+            A.ref_cu_h = h_rcu_.data();
+            A.ref_frame = dptr<int32_t>(ri, R_RFRM);
+            A.ref_frame_h = h_rfrm_.data();
+        }
     }
     pass_.kind = RAD_GEN_PASS_PROMPT;
     pass_.jobs.assign(1, j.id);

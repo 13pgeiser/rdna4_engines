@@ -475,6 +475,20 @@ typedef struct RadAudioGenBatch {
     const int32_t*  prev_slot;
     const int32_t*  prev_pos;
     const int32_t*  prev_used;
+
+    /* PROMPT of a request with references (RadAudioGenDecl::tmpl_ref; n_ref 0 without): its
+     * clips' samples end to end (`ref_samples` f32 on the device), the clips' bounds in samples
+     * ([n_ref + 1], each a whole number of RadAudioGenDecl::ref_hop), and for every row of the
+     * pass the frame of the clips it is or -1 for a token row ([n_tok]), frames counted over the
+     * clips in order, frame f the samples [f ref_hop, (f + 1) ref_hop). A frame's row stages
+     * token 0; the plugin embeds the frame there instead. */
+    int64_t         n_ref;
+    int64_t         ref_samples;
+    const float*    ref_audio;
+    const int32_t*  ref_cu;
+    const int32_t*  ref_cu_h;
+    const int32_t*  ref_frame;
+    const int32_t*  ref_frame_h;
 } RadAudioGenBatch;
 
 /* A window entry's flags on a WINDOW pass. FIRST is RAD_GEN_F_FIRST's bit and the others are clear

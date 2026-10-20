@@ -411,7 +411,8 @@ public:
      * strings point at `agen_str`, as the image generator's do at `gen_str`. */
     RadAudioGenDecl audio_gen{};
     struct AudioGenStrings {
-        std::string name, tmpl, tmpl_plain, neg_tmpl;   /* "" for an absent template */
+        /* "" for an absent template; tmpl_ref and ref_item RadAudioGenDecl's references */
+        std::string name, tmpl, tmpl_plain, neg_tmpl, tmpl_ref, ref_item;
     } agen_str;
     bool is_audio_generator() const { return audio_gen.max_lanes != 0; }
     /* The declared video generator (rad_declare_video_generator); `max_lanes` 0 when none. */

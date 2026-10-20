@@ -974,6 +974,24 @@ typedef struct RadAudioGenDecl {
      * text always is, so a caller can write the model's speaker tags. The plugin's
      * rad_arch_text_prepare then refuses the control tokens a caller must not write. */
     int32_t     input_special;
+    /* References (voice cloning): with `tmpl_ref`, a request may carry up to `ref_max` of them,
+     * each a transcript and a clip of the voice saying it, which the plugin encodes into frames
+     * in the request's PROMPT pass (whole prompts only: `prompt_whole`). `tmpl_ref` is the prompt
+     * of a request with references, `{references}` each of them rendered from `ref_item` in turn
+     * and `{input}` as in `tmpl_plain`. `ref_item` is one reference: `{index}` its number from 1,
+     * `{text}` its transcript (rewritten by rad_arch_text_prepare as RAD_TEXT_REFERENCE) and
+     * `{audio}` its frames, one prompt row each (RadAudioGenBatch::ref_frame); the text before
+     * `{audio}` is tokenised as one segment with its special tokens (the transcript's own, which
+     * prepare() has limited to those a caller may write), and so is the text after it. A clip is
+     * mono f32 in [-1, 1] at `ref_rate`, right-padded with zeros to a whole number of `ref_hop`
+     * samples, each `ref_hop` samples one frame; a request's clips hold at most `ref_max_samples`
+     * samples together. NULL `tmpl_ref`: references are refused. */
+    const char* tmpl_ref;
+    const char* ref_item;
+    int64_t     ref_rate;
+    int64_t     ref_hop;
+    int64_t     ref_max_samples;
+    int32_t     ref_max;
 } RadAudioGenDecl;
 
 int rad_declare_audio_generator(RadBuilder* b, const RadAudioGenDecl* d);
@@ -1429,12 +1447,13 @@ const RadAudioFormat* rad_arch_audio_format(const RadModelMeta* meta);
  * as given. Training data has conventions a client does not know -- section tags on lines of
  * their own and lower case, no markdown in a description -- and only the plugin knows them.
  *
- * `field` is RAD_TEXT_*, `in` NUL-terminated UTF-8. Writes at most `cap` bytes, the NUL included,
- * and returns the length the whole result needs without its NUL (call again with more room when
- * it is >= cap), or a negative status for text the model cannot take, with the reason in `out`
- * (NUL-terminated within `cap`) when it has one to give the caller. Called on HTTP threads, so it
- * keeps no state. */
-enum { RAD_TEXT_INSTRUCTIONS = 1, RAD_TEXT_INPUT = 2 };
+ * `field` is RAD_TEXT_*, `in` NUL-terminated UTF-8: the instructions, the input, or a
+ * reference's transcript (RadAudioGenDecl::ref_item's `{text}`). Writes at most `cap` bytes, the
+ * NUL included, and returns the length the whole result needs without its NUL (call again with
+ * more room when it is >= cap), or a negative status for text the model cannot take, with the
+ * reason in `out` (NUL-terminated within `cap`) when it has one to give the caller. Called on
+ * HTTP threads, so it keeps no state. */
+enum { RAD_TEXT_INSTRUCTIONS = 1, RAD_TEXT_INPUT = 2, RAD_TEXT_REFERENCE = 3 };
 int64_t rad_arch_text_prepare(int field, const char* in, char* out, int64_t cap);
 
 /* The layout of a video generator's passes (rad_declare_video_generator), which only the model
