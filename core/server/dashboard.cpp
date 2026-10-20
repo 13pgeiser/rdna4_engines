@@ -563,7 +563,16 @@ h1 { margin:0; font-size:13.5px; font-weight:600; letter-spacing:-.005em; }
 #view-dash.boot > .strip { opacity:.45; }
 .strip { transition:opacity .18s linear; }
 .stack { display:grid; gap:14px; }
-@media (max-width:1000px) { .body { grid-template-columns:minmax(0,1fr); } }
+@media (max-width:1000px) {
+  .body { grid-template-columns:minmax(0,1fr); }
+  /* On a phone the page is one column you drag with your thumb. A nested scroller that
+   * refuses to chain (overscroll-behavior:contain, set for the desktop wheel so a scroll
+   * over the request table does not move the page behind it) traps the drag here: you
+   * scroll the card, it bottoms out, and the page will not follow, so you reach for the
+   * margins where no scroller lives to get the page moving again. On narrow screens let
+   * the scroll chain to the document; the desktop containment stays. */
+  .body .panel > .pbody, .hold { overscroll-behavior:auto; }
+}
 
 /* the request table */
 table { width:100%; border-collapse:collapse; font-family:var(--mono); font-size:11.5px;
@@ -1102,7 +1111,7 @@ nav button.on { color:var(--fg); background:var(--track); }
               <div><div class="n" id="tps_n">–<u>tok</u></div>
                    <span class="cap">per step</span></div>
               <div><div class="n" id="acc_n">–<u>%</u></div>
-                   <span class="cap">accepted now</span></div>
+                   <span class="cap">conditionally accepted</span></div>
             </div>
             <div class="kv" id="spec"></div>
           </div>

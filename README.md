@@ -299,7 +299,7 @@ produced. A position is verified only when every earlier position survived, so t
 admit two ratios, and they differ only in the denominator:
 
 - **Conditional** -- accepted / *reached*: of the drafts actually verified at a position, how
-  many passed. The dashboard's live "accepted now" figure and the per-position bars are
+  many passed. The dashboard's live "conditionally accepted" figure and the per-position bars are
   conditional. Always the higher number, and it moves with the workload.
 - **Marginal** -- accepted / *drafted*: of everything the drafter proposed, how much survived.
   The engine's `draft_accept` (/stats, and `radiance:draft_acceptance_ratio` on /metrics) is
