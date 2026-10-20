@@ -713,17 +713,18 @@ AVX_KERNEL(rvq_embed) {
     const int64_t D = p_int(a, "n_embd", 0), K = p_int(a, "n_codes", 0);
     const int64_t voc = p_int(a, "vocab", 0), off0 = p_int(a, "off0", 0);
     const float scale = p_f32(a, "scale", 1.0f);
-    const int64_t round1 = p_int(a, "round", 0);
-    if (D <= 0 || K < 1 || voc <= 0 || round1 < 0 || round1 > 1) return RAD_E_SHAPE;
+    const int64_t round1 = p_int(a, "round", 0), clamp = p_int(a, "clamp", 0);
+    if (D <= 0 || K < 1 || voc <= 0 || round1 < 0 || round1 > 1 || clamp < 0) return RAD_E_SHAPE;
     const int64_t rows = rows_of(Y, D);
     if (rows <= 0 || numel(codes) < K * rows) return RAD_E_SHAPE;
     const int64_t n0 = rows_of(t0, D), n1 = rows_of(t1, D);
+    auto cl = [clamp](int64_t c) { return clamp > 0 && c > clamp - 1 ? clamp - 1 : c; };
     /* Code (k, r): a codebook's row at the plane's own pitch, a frame's code at its own stride. */
     const int64_t kp = codes->rank >= 2 ? codes->stride[codes->rank - 2] : rows;
     const int64_t rp = codes->rank >= 1 ? codes->stride[codes->rank - 1] : 1;
     AVX_PARALLEL_FOR_IF(rows * D * K >= AVX_PAR_MIN)
     for (int64_t r = 0; r < rows; ++r) {
-        const int64_t c0 = ld_int_dt(codes->dtype, codes->data, r * rp) + off0;
+        const int64_t c0 = cl(ld_int_dt(codes->dtype, codes->data, r * rp)) + off0;
         if (c0 < 0 || c0 >= n0) continue;
         float* acc = scratch_f32((size_t)D + 16);
         float* buf = scratch_f32_b((size_t)D + 16);
@@ -736,7 +737,7 @@ AVX_KERNEL(rvq_embed) {
         }
         for (int64_t k = 1; k < K; ++k) {
             const int64_t cb =
-                ld_int_dt(codes->dtype, codes->data, k * kp + r * rp) + (k - 1) * voc;
+                cl(ld_int_dt(codes->dtype, codes->data, k * kp + r * rp)) + (k - 1) * voc;
             if (cb < 0 || cb >= n1) continue;
             const float* tr = in_row(t1, rowoff(t1, cb, D), D, buf);
             for (int64_t d = 0; d < D; ++d) acc[d] += tr[d];

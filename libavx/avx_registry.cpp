@@ -705,7 +705,7 @@ static const RadOperandSpec oCfgTopk[] = { OPD("logits"), OPD("seed"), OPD("fram
                                            OPD_O("cfg"), OPD_O("lane"), INOUT_O("hist") };
 static const RadParamSpec pRvqEmbed[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_codes"),
                                           P_INT("vocab"), P_INT("off0"), P_F64("scale"),
-                                          P_STR("dtype"), P_INTO("round") };
+                                          P_STR("dtype"), P_INTO("round"), P_INTO("clamp") };
 static const RadOperandSpec oRvqEmbed[] = { OPD("codes"), WGT("t0"), WGT("t1"), OUT("y") };
 static const RadParamSpec pFrameMix[] = { P_INT("M"), P_INT("n_embd"), P_INT("L"), P_INT("stride"),
                                           P_INTO("rep"), P_STR("dtype") };

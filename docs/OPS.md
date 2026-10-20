@@ -1172,7 +1172,7 @@ libref function says which (`libref/ref_audio.cpp`).
 | `snake` | `M`(range) `n` `dtype` `log`/opt | `x`, `alpha`w → `y`; `beta`w? |
 | `snake_aa` | `M`(range) `n` `ratio` `k` `log`/opt `dtype` | `x`, `alpha`w, `beta`w, `f_up`w, `f_down`w, `cu_seqlens` → `y` |
 | `cfg_topk_sample` | `M`(range) `n_vocab` `k` `rep` `cond_k`/opt `cfg`:f64 `temp`:f64/opt `stream` `dtype` `sup_lo`/opt `sup_hi`/opt `penalty`:f64/opt `top_p`:f64/opt | `logits`, `seed`, `frame` → `ids`; `cfg`?, `lane`?, `hist`:inout? |
-| `rvq_embed` | `M`(range) `n_embd` `n_codes` `vocab` `off0` `scale`:f64 `dtype` `round`/opt | `codes`, `t0`w, `t1`w → `y` |
+| `rvq_embed` | `M`(range) `n_embd` `n_codes` `vocab` `off0` `scale`:f64 `dtype` `round`/opt `clamp`/opt | `codes`, `t0`w, `t1`w → `y` |
 | `frame_mix_store` | `M`(range) `n_embd` `L` `stride` `rep`/opt `dtype` | `hid`, `logits`w, `scale`w, `lane`, `frame`, `status`, `dst`:inout |
 | `end_status` | `M`(range) `end` `rep` | `ids`, `lane`, `status`:inout |
 | `ras_pick` | `M`(range) `win` `lo` `hi` `rep`/opt `clear`/opt | `first`, `alt`, `lane`, `hist`:inout → `ids` |
@@ -1216,6 +1216,9 @@ conditional first, then the unconditional) are consecutive rows, `rep` of them a
   `y = bf16(bf16(t0[c_0 + off0] + bf16(sum_k t1[c_k + (k - 1) vocab])) * scale)`, or with `round` 1
   one f32 sum of every codebook's row in codebook order, times `scale`, rounded once to `y`'s dtype.
   A first code outside `t0` leaves its row unwritten; a later code outside `t1` adds nothing.
+  With `clamp` n > 0 a code above `n - 1` reads row `n - 1` (before `off0` and the codebook's
+  offset; a negative code still reads nothing): a codec whose codebooks are smaller than the heads
+  that write its codes, as Fish Audio's 1024-entry residual codebooks under 4096-way heads.
 - `frame_store`: `dst[(lane n_codes + k) stride + frame - skip] = codes[k, rep i]` for every `k`,
   when `frame >= skip` and `status[lane] >= 0`: a frame's codes into its lane's history, each
   codebook a row over the lane's frames, so a run of a lane's frames is a block of `n_codes`

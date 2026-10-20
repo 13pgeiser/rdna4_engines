@@ -2400,7 +2400,7 @@ static const RadOperandSpec oCfgTopk[] = {
 };
 static const RadParamSpec pRvqEmbed[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_codes"),
                                           P_INT("vocab"), P_INT("off0"), P_F64("scale"),
-                                          P_STR("dtype"), P_INTO("round") };
+                                          P_STR("dtype"), P_INTO("round"), P_INTO("clamp") };
 static const RadOperandSpec oRvqEmbed[] = {
     { "codes", RAD_OPD_IN, 0 }, { "t0", RAD_OPD_WEIGHT, 0 }, { "t1", RAD_OPD_WEIGHT, 0 },
     { "y", RAD_OPD_OUT, 0 },

@@ -1015,6 +1015,9 @@ std::vector<Case> build_cases() {
         for (double sc : { 1.0, 0.7 })
             add("rvq_embed", { HI("M", 7), HI("n_embd", 645), HI("n_codes", 8), HI("vocab", 64),
                                HI("off0", 5), HF("scale", sc), HS("dtype", dt) });
+        /* Codes past a codebook smaller than its heads read its last row (Fish Audio's codec). */
+        add("rvq_embed", { HI("M", 7), HI("n_embd", 645), HI("n_codes", 4), HI("vocab", 64),
+                           HI("off0", 0), HF("scale", 1.0), HI("clamp", 40), HS("dtype", dt) });
         /* One rounding of the whole sum: sixteen codebooks, as a speech model's frame embedding. */
         for (double sc : { 1.0, 0.7 })
             add("rvq_embed", { HI("M", 7), HI("n_embd", 645), HI("n_codes", 16), HI("vocab", 64),

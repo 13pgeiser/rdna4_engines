@@ -788,15 +788,16 @@ __device__ __forceinline__ float ldtab(const void* t, int f32, size_t i) {
 __global__ __launch_bounds__(kT) void rvq_embed_kernel(
     const int* __restrict__ codes, int64_t kp, int64_t rp, const void* __restrict__ t0,
     int t0_f32, const void* __restrict__ t1, int t1_f32, void* __restrict__ y, int y_f32, int D,
-    int K, int voc, int off0, int r0, int r1, float scale, int y_ld, int round1) {
+    int K, int voc, int off0, int r0, int r1, float scale, int y_ld, int round1, int clamp) {
     const int r = blockIdx.x;
-    const int c0 = codes[(size_t)r * rp] + off0;
+    auto cl = [clamp](int c) { return clamp > 0 && c > clamp - 1 ? clamp - 1 : c; };
+    const int c0 = cl(codes[(size_t)r * rp]) + off0;
     if (c0 < 0 || c0 >= r0) return;
     for (int d = threadIdx.x; d < D; d += kT) {
         const float e0 = ldtab(t0, t0_f32, (size_t)c0 * D + d);
         float acc = round1 ? e0 : 0.0f;
         for (int k = 1; k < K; ++k) {
-            const int ck = codes[(size_t)k * kp + (size_t)r * rp] + (k - 1) * voc;
+            const int ck = cl(codes[(size_t)k * kp + (size_t)r * rp]) + (k - 1) * voc;
             if (ck >= 0 && ck < r1) acc += ldtab(t1, t1_f32, (size_t)ck * D + d);
         }
         const float v = (round1 ? acc : bfr(e0 + bfr(acc))) * scale;
@@ -1412,9 +1413,10 @@ extern "C" int r4d_rad_rvq_embed(const RadArgs* a, RadStream s) {
         return R4D_NO(RAD_E_DTYPE);
     const long long D = r4d_geti_or(a, "n_embd", 0), K = r4d_geti_or(a, "n_codes", 0);
     const long long voc = r4d_geti_or(a, "vocab", 0), off0 = r4d_geti_or(a, "off0", 0);
-    const long long round1 = r4d_geti_or(a, "round", 0);
+    const long long round1 = r4d_geti_or(a, "round", 0), clamp = r4d_geti_or(a, "clamp", 0);
     const double scale = r4d_getf(a, "scale", 1.0);
-    if (D <= 0 || K < 1 || voc <= 0 || round1 < 0 || round1 > 1) return R4D_NO(RAD_E_SHAPE);
+    if (D <= 0 || K < 1 || voc <= 0 || round1 < 0 || round1 > 1 || clamp < 0)
+        return R4D_NO(RAD_E_SHAPE);
     long long ry = 0;
     const long long yl = r4d_rows_pitch(y, D, &ry);
     if (yl < 0 || !r4d_contig(t0) || !r4d_contig(t1)) return R4D_NO(RAD_E_STRIDE);
@@ -1427,7 +1429,7 @@ extern "C" int r4d_rad_rvq_embed(const RadArgs* a, RadStream s) {
                        t0->dtype == RAD_F32 ? 1 : 0, t1->data, t1->dtype == RAD_F32 ? 1 : 0,
                        y->data, y->dtype == RAD_F32 ? 1 : 0, (int)D, (int)K, (int)voc, (int)off0,
                        (int)(r4d_numel(t0) / D), (int)(r4d_numel(t1) / D), (float)scale, (int)yl,
-                       (int)round1);
+                       (int)round1, (int)clamp);
     return st_of(hipGetLastError());
 }
 

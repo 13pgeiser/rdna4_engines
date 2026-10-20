@@ -385,24 +385,26 @@ int ref_rvq_embed(const RadArgs* a, RadStream) {
     const int64_t D = p_int(a, "n_embd", 0), K = p_int(a, "n_codes", 0);
     const int64_t voc = p_int(a, "vocab", 0), off0 = p_int(a, "off0", 0);
     const float scale = p_f32(a, "scale", 1.0f);
-    const int64_t round1 = p_int(a, "round", 0);
-    if (D <= 0 || K < 1 || voc <= 0 || round1 < 0 || round1 > 1) return RAD_E_SHAPE;
+    const int64_t round1 = p_int(a, "round", 0), clamp = p_int(a, "clamp", 0);
+    if (D <= 0 || K < 1 || voc <= 0 || round1 < 0 || round1 > 1 || clamp < 0) return RAD_E_SHAPE;
     const int64_t rows = rows_of(y, D);
     if (rows <= 0 || numel(codes) < K * rows) return RAD_E_SHAPE;
     const int64_t r0 = rows_of(t0, D), r1 = rows_of(t1, D);
+    /* `clamp`: a code above clamp - 1 reads row clamp - 1 (a negative one still reads nothing). */
+    auto cl = [clamp](int64_t c) { return clamp > 0 && c > clamp - 1 ? clamp - 1 : c; };
     /* Code (k, r): a codebook's row at the plane's own pitch, a frame's code at its own stride. */
     const int64_t kp = codes->rank >= 2 ? codes->stride[codes->rank - 2] : rows;
     const int64_t rp = codes->rank >= 1 ? codes->stride[codes->rank - 1] : 1;
     REF_PAR_FOR(rows * D * K)
     for (int64_t r = 0; r < rows; ++r) {
-        const int64_t c0 = ld_int(codes->dtype, codes->data, r * rp) + off0;
+        const int64_t c0 = cl(ld_int(codes->dtype, codes->data, r * rp)) + off0;
         if (c0 < 0 || c0 >= r0) continue;
         std::vector<float> acc((size_t)D, 0.0f);
         const int64_t b0 = rowoff(t0, c0, D), yb = rowoff(y, r, D);
         if (round1)
             for (int64_t d = 0; d < D; ++d) acc[(size_t)d] = ldt(t0, b0 + d * laststride(t0));
         for (int64_t k = 1; k < K; ++k) {
-            const int64_t ck = ld_int(codes->dtype, codes->data, k * kp + r * rp) + (k - 1) * voc;
+            const int64_t ck = cl(ld_int(codes->dtype, codes->data, k * kp + r * rp)) + (k - 1) * voc;
             if (ck < 0 || ck >= r1) continue;
             const int64_t tb = rowoff(t1, ck, D);
             for (int64_t d = 0; d < D; ++d) acc[(size_t)d] += ldt(t1, tb + d * laststride(t1));

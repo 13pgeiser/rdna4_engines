@@ -6009,9 +6009,12 @@ void rvq_embed_cases(const Plugin& pl) {
     const RadKernelInfo* r = find(pl, "rvq_embed_bf16");
     if (!r) { ok("rvq_embed_bf16", false, "row absent"); return; }
     const int64_t D = 96, K = 5, voc = 11, off0 = 3, rows = 6, lanes = 2, stride = 9;
-    struct C { int round1; bool f32tab, f32y, block; };
+    /* The last case clamps every code at 8 (`clamp`): codes 8..10 read row 7, and the later code
+     * past t1 reads its codebook's row 7 instead of nothing. */
+    struct C { int round1; bool f32tab, f32y, block; int clamp = 0; };
     for (const C& c : { C{ 0, false, false, false }, C{ 1, false, false, false },
-                        C{ 1, true, true, true }, C{ 1, false, true, true } }) {
+                        C{ 1, true, true, true }, C{ 1, false, true, true },
+                        C{ 0, false, false, false, 8 } }) {
         std::vector<float> t0 = randv((size_t)((voc + off0) * D), 1.0f);
         std::vector<float> t1 = randv((size_t)((K - 1) * voc * D), 1.0f);
         void* d0 = c.f32tab ? up_f32(t0) : up_bf16(t0);
@@ -6045,10 +6048,12 @@ void rvq_embed_cases(const Plugin& pl) {
         const float scale = 0.5f;
         std::vector<RadParam> ps = { PI("M", rows), PI("n_embd", D), PI("n_codes", K),
                                      PI("vocab", voc), PI("off0", off0), PF("scale", scale),
-                                     PS("dtype", c.f32y ? "f32" : "bf16"), PI("round", c.round1) };
-        const std::string nm = fmt("rvq_embed_bf16 round %d %s tables -> %s%s", c.round1,
+                                     PS("dtype", c.f32y ? "f32" : "bf16"), PI("round", c.round1),
+                                     PI("clamp", c.clamp) };
+        const std::string nm = fmt("rvq_embed_bf16 round %d %s tables -> %s%s clamp %d", c.round1,
                                    c.f32tab ? "f32" : "bf16", c.f32y ? "f32" : "bf16",
-                                   c.block ? ", codes a history block" : "");
+                                   c.block ? ", codes a history block" : "", c.clamp);
+        auto cl = [&](int64_t v) { return c.clamp > 0 && v > c.clamp - 1 ? c.clamp - 1 : v; };
         const int rc = launch(r, { tc, T(d0, c.f32tab ? RAD_F32 : RAD_BF16, { voc + off0, D }),
                                    T(d1, c.f32tab ? RAD_F32 : RAD_BF16, { (K - 1) * voc, D }),
                                    T(dy, ydt, { rows, D }) },
@@ -6056,13 +6061,13 @@ void rvq_embed_cases(const Plugin& pl) {
         if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
         std::vector<float> want = sentinel;
         for (int64_t i = 0; i < rows; ++i) {
-            const int64_t c0 = code[(size_t)i] + off0;
+            const int64_t c0 = cl(code[(size_t)i]) + off0;
             if (c0 < 0 || c0 >= voc + off0) continue;
             for (int64_t d = 0; d < D; ++d) {
                 const float e0 = t0[(size_t)(c0 * D + d)];
                 float acc = c.round1 ? e0 : 0.0f;
                 for (int64_t k = 1; k < K; ++k) {
-                    const int64_t ck = code[(size_t)(k * rows + i)] + (k - 1) * voc;
+                    const int64_t ck = cl(code[(size_t)(k * rows + i)]) + (k - 1) * voc;
                     if (ck >= 0 && ck < (K - 1) * voc) acc += t1[(size_t)(ck * D + d)];
                 }
                 const float s = c.round1 ? acc : bfr(e0 + bfr(acc));
