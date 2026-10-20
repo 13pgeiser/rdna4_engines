@@ -1,4 +1,4 @@
-# my_ai_scripts
+# RDNA4 Engines
 
 Host-orchestration repo for serving LLMs on an **AMD Radeon AI PRO R9700**
 (gfx1201 / RDNA4, 32 GiB) box. It is *not* an engine: it is the set of
@@ -51,17 +51,6 @@ The rewrite in `radiance-vllm-mxfp4-scripts/` is mandatory:
 
 1. `fp8_mtp.py <src> <dst>` → `Qwen3.8-27B-MXFP4-mtpfp8` (needs torch)
 2. `mtpfp8-pertoken.py <src config.json> <dst config.json>` → `-pertoken` variant (config-only)
-
-## radiance-vmemoff (host-specific shim)
-
-On this host (kernel 6.12.113+deb13 + gfx1201) the HSA runtime's KMT path hangs
-in a DRM syncobj wait whose KIQ TLB-flush fence is never signalled, so plain
-`radiance` dies at startup. `radiance-vmemoff/vmemoff.c` is a self-contained
-`LD_PRELOAD` shim that zeroes one HSA pool field so radiance falls back to its
-supported "no virtual memory management" allocation path. `run_radiance.sh`
-enables it with `VMEMOFF=1` (the `.so` is gitignored and rebuilt from source
-when missing). See the long comment block in `run_radiance.sh` for the full
-diagnosis.
 
 ## Requirements
 
