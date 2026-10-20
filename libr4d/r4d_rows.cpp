@@ -5699,7 +5699,8 @@ static const RadKernelInfo kKernels[] = {
   "the lm_head projection over an fp8 head: C[M, n_vocab] f32 = x[M, n_embd] @ dequant(W)^T, "
   "one wave a vocabulary row, the row's own scales in its tail",
   "any M -- one pass to 32 rows, instantiated exactly to 8 and rounded up to a multiple of 4 above "
-  "it, then chunked; n_embd a multiple of 128, which is the group the scales are taken over. The "
+  "it, to 64 rows in four tiles a wave, to 128 in two M halves of four that share the staged head "
+  "tile, then chunked by 128; n_embd a multiple of 128, which is the group the scales are taken over. The "
   "stored row is padded to 16 bytes so the uint4 load stays aligned at any such n_embd",
   "bf16 x, E4M3 head with a bf16 scale per 128x128 tile stored PER ROW, F32 LOGITS OUT, fp32 "
   "accumulate",

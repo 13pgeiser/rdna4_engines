@@ -12370,6 +12370,8 @@ static void fp8_real(const Plugin& pl, const char* file, long long woff, long lo
 static void perf_row(const Plugin& pl, const char* name, std::vector<RadTensor> ts,
                      std::vector<RadParam> ps, void* wbase, size_t wbytes, int copies,
                      double bytes, int iters, int widx = 2, const char* point = nullptr) {
+    /* R4D_PERF_ONLY=<row>: time that row alone (a sweep over one row skips the rest). */
+    if (const char* only = std::getenv("R4D_PERF_ONLY"); only && *only && std::strcmp(only, name)) return;
     const RadKernelInfo* r = find(pl, name);
     if (!r) { std::printf("  %-22s row absent\n", name); return; }
     /* The label is the row, or the tuned point in a sweep. `ps` already carries that point; this
@@ -17730,7 +17732,7 @@ static void fp8_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iter
     /* The lm head, a decode GEMM too. Its weight is [N][K + 2*nkb] E4M3 with each row's bf16
      * scales in its tail (r4d_fp8_layout.cpp), so it has its own buffer, and the weight is the
      * second operand. */
-    if (M <= 64) {
+    if (M <= 256) {
         const int64_t lstride = r4d_fp8::lm_row_bytes(K);
         const size_t  lwb = (size_t)N * (size_t)lstride;
         int lcopies = (int)(((size_t)768 << 20) / lwb) + 1;
@@ -26951,6 +26953,11 @@ static void device_phase(const Plugin& pl) {
         for (const int64_t M : { (int64_t)1, (int64_t)8, (int64_t)13, (int64_t)32, (int64_t)33,
                                  (int64_t)64 })
             fp8_logits_numeric(pl, 5120, 5120, M);
+        /* Past 64 rows a pass is the two-half tile (MH = 2), whose second half may be partial; past
+         * 128 a second pass follows. */
+        for (const int64_t M : { (int64_t)65, (int64_t)80, (int64_t)128, (int64_t)150 })
+            fp8_logits_numeric(pl, 5120, 5120, M);
+        fp8_logits_numeric(pl, 2560, 2560, 100);
         /* And K = 2560, the padded row: its stored width 2600 is not a multiple of 16, so
          * r4d_fp8_lm.h rounds it to 2608 (5120's 5200 needs no pad). M = 1 takes the matvec, M = 8
          * the WMMA tile, which index the row differently. */
@@ -26966,7 +26973,7 @@ static void device_phase(const Plugin& pl) {
     }
     /* The int8 head over the same stored row: both forms, and the padded K = 2560 row. */
     if (sel("logits_gemm_i8") || sel("logit_rerank_i8")) {
-        for (const int64_t M : { (int64_t)1, (int64_t)8, (int64_t)33, (int64_t)64 })
+        for (const int64_t M : { (int64_t)1, (int64_t)8, (int64_t)33, (int64_t)64, (int64_t)100 })
             fp8_logits_numeric(pl, 5120, 5120, M, true);
         for (const int64_t M : { (int64_t)1, (int64_t)8 })
             fp8_logits_numeric(pl, 2560, 2560, M, true);
