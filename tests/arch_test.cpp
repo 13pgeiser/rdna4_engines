@@ -7675,15 +7675,21 @@ int w8a8_declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx
 
 }  /* namespace */
 
-/* Every trunk linear of a rotated int8 container is an i8a8h GEMM right behind its own
- * had_quant_act_i8g, at one rank and two: 2 attention layers of four linears, 6 delta-net layers
- * of two and 8 feed-forwards of two. None is left at fp8, which is what a linear that missed the
- * encoding falls back to, and the MLP declares no gated fold (an fp8a8 tile over E4M3 codes). The
- * four trunk activations carry an int8 pair; the delta net's `gdn_in` feeds no int8 linear. */
+/* The `_had_quant_i8g` producers, which libr4d serves and libref does not. */
+const char* const kW8a8Fused[] = { "rmsnorm_had_quant_i8g", "ar_rmsnorm_had_quant_i8g",
+                                   "gated_had_quant_i8g" };
+
+/* Where the `_had_quant_i8g` producers are not served, every trunk linear of a rotated int8
+ * container is an i8a8h GEMM right behind its own had_quant_act_i8g, at one rank and two: 2
+ * attention layers of four linears, 6 delta-net layers of two and 8 feed-forwards of two. None is
+ * left at fp8, which is what a linear that missed the encoding falls back to, and the MLP declares
+ * no gated fold (an fp8a8 tile over E4M3 codes). The four trunk activations carry an int8 pair;
+ * the delta net's `gdn_in` feeds no int8 linear. */
 TEST(qwen35_w8a8_serves_every_trunk_linear_rotated_int8) {
     MetaKV mk = q35w8a8_meta();
     for (int world : { 1, 2 }) {
         RadBuilder b;
+        for (const char* op : kW8a8Fused) b.undeclared.insert(op);
         w8a8_encs(&b);
         RadBuildCtx ctx = build_ctx(0, world);
         REQUIRE_EQ(qwen35_w8a8::declare(&b, mk.meta(), &ctx), RAD_OK);
@@ -7703,6 +7709,31 @@ TEST(qwen35_w8a8_serves_every_trunk_linear_rotated_int8) {
         for (const char* a : { "h.q8", "attn_out.q8", "gdn_o.q8", "ffn.q8" })
             CHECK(find_b(b, a) != nullptr);
         CHECK(find_b(b, "gdn_in.q8") == nullptr);
+    }
+}
+
+/* Where they are served, the norms and the gated product write had_quant_act_i8g's codes into the
+ * int8 pair, and the projections reading them declare no quantiser: had_quant_act_i8g is left only
+ * before the attention and delta-net output projections (2 + 6), every norm is the rotated twin (at
+ * two ranks with its fused all-reduce form beside it), and every feed-forward's product is
+ * gated_had_quant_i8g. No E4M3 norm or gated quantiser is left, and the 36 GEMMs are unchanged. */
+TEST(qwen35_w8a8_feeds_its_rotated_codes_from_the_producers_where_libr4d_serves_them) {
+    MetaKV mk = q35w8a8_meta();
+    for (int world : { 1, 2 }) {
+        RadBuilder b;
+        w8a8_encs(&b);
+        RadBuildCtx ctx = build_ctx(0, world);
+        REQUIRE_EQ(qwen35_w8a8::declare(&b, mk.meta(), &ctx), RAD_OK);
+        int rot = 0;
+        for (const RecOp& o : b.ops) rot += o.op == "gemm_nt_q" && pstr(&o, "dtype") == "i8a8h";
+        CHECK_EQ(rot, 2 * 4 + 6 * 2 + 8 * 2);
+        CHECK_EQ(count_op(b, "had_quant_act_i8g"), 2 + 6);
+        CHECK_EQ(count_op(b, "rmsnorm_had_quant_i8g"), 8 + 8);
+        CHECK_EQ(count_op(b, "gated_had_quant_i8g"), 8);
+        for (const char* op : { "rmsnorm_quant_fp8", "ar_rmsnorm_quant_fp8", "gated_quant_fp8",
+                                "quant_act_i8g" })
+            CHECK_EQ(count_op(b, op), 0);
+        CHECK_EQ(count_op(b, "ar_rmsnorm_had_quant_i8g") > 0, world == 2);
     }
 }
 
@@ -8994,10 +9025,10 @@ struct ArchCases {
             qwen35_fp8::step, 7, {}, 0xb5691456a0ce7e9dull);
         add("qwen35_w8a8 + DFlash2", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 7); return w8a8_declare(b, q35w8df.meta(), &c); },
-            qwen35_w8a8::step, 7, {}, 0x88e964c824896422ull);
+            qwen35_w8a8::step, 7, {}, 0xed8219da9fcc0ceaull);
         add("qwen35_w8a8 + DFlash2, two ranks", [this, sc](RadBuilder* b) {
                 auto c = sc(2, 7); return w8a8_declare(b, q35w8df.meta(), &c); },
-            nullptr, 7, { "ar_rmsnorm_quant_fp8" }, 0x7c73e987c475e40dull);
+            nullptr, 7, { "ar_rmsnorm_quant_fp8" }, 0x2c00f131709dedcfull);
         add("qwen35moe_fp8 + MTP", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 3); return qwen35moe_fp8::declare(b, q35moe.meta(), &c); },
             qwen35moe_fp8::step, 3, {}, 0x3157a986f13a9a72ull);

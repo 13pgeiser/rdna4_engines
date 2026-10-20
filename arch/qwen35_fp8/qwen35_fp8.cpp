@@ -750,6 +750,20 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     RAD_ARCH_TRY(m.a_ffn.declare_qs(b, nm, g, "ffn", g.n_ff, 0, m.trunk_i8));
 #endif
 
+#if QWEN35_W8A8
+    /* ---- the rotated trunk's quantisers in their producers. Every reader of `h`'s codes is a
+     * rotated int8 projection (q, k, v; the delta net's qkv|z; gate_up), and of `ffn`'s the down
+     * projection, so where libr4d serves the `_had_quant_i8g` forms the norms and the gated
+     * product write had_quant_act_i8g's codes themselves (ActFP8::q8_rot) and those projections
+     * declare no quantiser: one launch for q, k and v instead of three, and none before down. The
+     * codes are the same bytes. Where the forms are not declared (the CPU kernels), each
+     * projection quantises its own input from the bf16 plane, as before. */
+    if (rad_op_declared(b, "rmsnorm_had_quant_i8g") &&
+        (g.world != 2 || rad_op_declared(b, "ar_rmsnorm_had_quant_i8g")))
+        m.a_h.q8_fed = m.a_h.q8_rot = true;
+    if (rad_op_declared(b, "gated_had_quant_i8g")) m.a_ffn.q8_fed = m.a_ffn.q8_rot = true;
+#endif
+
     m.b_hout    = decl_b(b, nm.f("h_out"),    g.act_dtype, {g.max_logit_rows, g.n_embd});
 
     /* The auxiliary taps, only when the container carries the drafter and the deployment
