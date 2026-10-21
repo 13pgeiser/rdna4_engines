@@ -107,8 +107,9 @@ struct SchedReq {
      * fit would inflate the prompt and hit totals. */
     int32_t  hit_attn = 0;
     bool     hit_owed = false;
-    /* Why that hit was cut to nothing, for the counters (SchedMetrics::hit_cut_*). */
-    enum class HitCut : uint8_t { None, NoSnapshot, Window, Adopt };
+    /* Why that hit was cut, for the counters (SchedMetrics::hit_cut_*): to nothing, or to a
+     * snapshot more than an interval below it. */
+    enum class HitCut : uint8_t { None, NoSnapshot, Window, Adopt, ResumedBelow };
     HitCut   hit_cut = HitCut::None;
 
     /* The whole sequence is prompt ++ output; n_computed indexes into it. */

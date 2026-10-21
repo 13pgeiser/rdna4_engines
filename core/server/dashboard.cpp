@@ -131,6 +131,7 @@ HttpResponse Server::handle_sessions(const HttpRequest&) {
     o["moved"] = { { "to_host", c.to_host }, { "dropped", c.dropped },
                    { "promoted", c.promoted }, { "host_drops", c.host_drops },
                    { "held_back", c.held_back },
+                   { "restore_cuts", sm.prefix_restore_cuts },
                    { "failures", c.failures } };
     /* Snapshot store on a hybrid model: bytes per snapshot and slot count. `bytes_each` is 0
      * on a model with no recurrent state. */
@@ -150,7 +151,8 @@ HttpResponse Server::handle_sessions(const HttpRequest&) {
                     { "refused", sm.prefix_ckpt_refused },
                     { "hit_cuts", { { "no_snapshot", sm.hit_cut_no_snapshot },
                                     { "windowed_group", sm.hit_cut_window },
-                                    { "adopt_failed", sm.hit_cut_adopt } } },
+                                    { "adopt_failed", sm.hit_cut_adopt },
+                                    { "resumed_below", sm.hit_cut_resumed_below } } },
                     { "hit_cut_tokens", sm.hit_cut_tokens } };
     /* Whether a tier exists to move sessions to. A session is recorded whether or not it can be
      * demoted, so a non-empty table only says something is held. */
@@ -222,7 +224,8 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         o["ckpt_refused"]    = m.prefix_ckpt_refused;
         o["hit_cuts"]        = { { "no_snapshot", m.hit_cut_no_snapshot },
                                  { "windowed_group", m.hit_cut_window },
-                                 { "adopt_failed", m.hit_cut_adopt } };
+                                 { "adopt_failed", m.hit_cut_adopt },
+                                 { "resumed_below", m.hit_cut_resumed_below } };
         o["hit_cut_tokens"]  = (double)m.hit_cut_tokens;
         o["prefill_tps"]     = m.prefill_tps;
         o["decode_tps"]      = m.decode_tps;

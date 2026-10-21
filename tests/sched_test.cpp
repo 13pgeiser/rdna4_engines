@@ -824,6 +824,7 @@ TEST(a_prefix_hit_starts_the_request_at_the_last_usable_checkpoint) {
     /* The checkpoint shortfall: the 48 cached tokens above the snapshot are computed again. */
     CHECK_EQ(m.hit_cut_tokens, 48);
     CHECK_EQ(m.hit_cut_no_snapshot, 0);
+    CHECK_EQ(m.hit_cut_resumed_below, 0);    /* within an interval: a turn's ordinary tail */
 
     /* The snapshot this step takes is not offered to anyone until the step has run: the
      * reservation happens when the chunk is planned, the state exists only afterwards. */
@@ -831,6 +832,26 @@ TEST(a_prefix_hit_starts_the_request_at_the_last_usable_checkpoint) {
     f.commit_plain();
     CHECK_EQ((int)f.pc.committed.size(), 1);
     CHECK_EQ(f.pc.committed[0], 512);        /* ctx_len 256 + ckpt_tok 255 + 1 */
+}
+
+/* A hit that resumes more than an interval below the attention blocks is counted with its own
+ * reason: the snapshots in between are gone, or a restore brought back only part of the chain,
+ * and hit_cut_tokens alone would not say how many admissions it was. */
+TEST(a_hit_resuming_far_below_its_blocks_is_counted_as_cut) {
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+    f.pc.seed(784);       /* 49 blocks */
+    f.pc.lin = 256;       /* 528 tokens below, past the 256-token interval */
+    f.pc.src = 3;
+
+    uint64_t a = f.submit(1000, 8);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.find(a)->n_computed, 256);
+    const SchedMetrics m = f.sch.metrics();
+    CHECK_EQ(m.hit_cut_resumed_below, 1);
+    CHECK_EQ(m.hit_cut_no_snapshot, 0);
+    CHECK_EQ(m.hit_cut_tokens, 528);
 }
 
 /* A hit that skipped tokens with no snapshot to resume from would corrupt the linear state, so it

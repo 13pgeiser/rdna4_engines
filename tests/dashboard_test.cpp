@@ -122,6 +122,8 @@ struct Dash {
         sched.m.prefix_ckpt_lru = 3;
         sched.m.hit_cut_no_snapshot = 2;
         sched.m.hit_cut_tokens = 9000;
+        sched.m.hit_cut_resumed_below = 4;
+        sched.m.prefix_restore_cuts = 1;
         sched.m.draft_depth_seen = 2;
         sched.m.draft_pos_reached[0] = 10; sched.m.draft_pos_accepted[0] = 8;
         sched.m.draft_pos_reached[1] = 8;  sched.m.draft_pos_accepted[1] = 2;
@@ -239,6 +241,8 @@ TEST(sessions_lists_each_conversation_and_what_the_tiers_did) {
     CHECK(s.value("enabled", false));
     CHECK_EQ(s["linear"]["evictions"].value("store_full", (int64_t)0), (int64_t)3);
     CHECK_EQ(s["linear"]["hit_cuts"].value("no_snapshot", (int64_t)0), (int64_t)2);
+    CHECK_EQ(s["linear"]["hit_cuts"].value("resumed_below", (int64_t)0), (int64_t)4);
+    CHECK_EQ(s["moved"].value("restore_cuts", (int64_t)0), (int64_t)1);
     CHECK_EQ(s["linear"].value("hit_cut_tokens", (int64_t)0), (int64_t)9000);
 }
 

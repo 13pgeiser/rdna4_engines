@@ -973,6 +973,11 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
             RAD_DEBUG("admit %llu: prefix hit of %lld tokens reuses nothing -- no snapshot at or "
                       "below it", (unsigned long long)r.id, (long long)h.n_attn_tokens);
         } else if (reuse < h.n_attn_tokens) {
+            /* Within an interval of the hit is the ordinary case: a turn's tail past its last
+             * checkpoint. Further down, the snapshots in between are gone, or the attention
+             * blocks reach past what the tiers could restore of the chain. */
+            if (geo_.checkpoints() && h.n_attn_tokens - reuse > geo_.checkpoint_interval)
+                s.hit_cut = SchedReq::HitCut::ResumedBelow;
             RAD_DEBUG("admit %llu: prefix hit of %lld tokens resumes at the snapshot at %lld",
                       (unsigned long long)r.id, (long long)h.n_attn_tokens, (long long)reuse);
         }
@@ -1092,6 +1097,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
                 case SchedReq::HitCut::NoSnapshot: ++m_.hit_cut_no_snapshot; break;
                 case SchedReq::HitCut::Window:     ++m_.hit_cut_window;      break;
                 case SchedReq::HitCut::Adopt:      ++m_.hit_cut_adopt;       break;
+                case SchedReq::HitCut::ResumedBelow: ++m_.hit_cut_resumed_below; break;
                 case SchedReq::HitCut::None:       break;
             }
         }
@@ -2625,6 +2631,7 @@ SchedMetrics Scheduler::metrics_locked() const {
                m.prefix_ckpt_refused = cc.refused;
                m.prefix_expired = pc_->expired();
                m.prefix_ckpt_expired = pc_->ckpt_expired();
+               m.prefix_restore_cuts = pc_->restore_cuts();
                m.prefix_held_tokens = pc_->held_tokens(); }
     m.attn_hit_rate = m.prompt_tokens
         ? (float)((double)m.attn_cached_tokens / (double)m.prompt_tokens) : 0.0f;

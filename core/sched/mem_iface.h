@@ -170,6 +170,8 @@ struct IPrefixCache {
     virtual CkptCounts ckpt_counts() const { return {}; }
     /* Entries expired by --prefix-cache-ttl; not counted as evictions. */
     virtual int64_t expired() const { return 0; }
+    /* Restores the pool could not hold whole (PrefixCache::Stats::restore_cuts). */
+    virtual int64_t restore_cuts() const { return 0; }
     virtual int64_t ckpt_expired() const { return 0; }
 
     /* Tokens of context held only by the cache right now. Blocks a running sequence also reads
@@ -346,6 +348,21 @@ struct PCBinding final : IPrefixCache {
     void restore(const Request& r) override {
         if (restore_fn) restore_fn(r);
     }
+    /* The entries restore_fn brings back, in chain order: the whole chain if the pool can be made
+     * to hold it, otherwise cut (PrefixCache::restorable_from). Room is made as evict() makes it,
+     * dropping entries with a landed host copy, then landing pending copies and dropping those, but
+     * never erasing one: a restore is worth no lost conversation. The pool's free quarter can go
+     * to it; the reserve's trim after the next publish frees it again. */
+    std::vector<BlockHash> restore_plan(const Request& r, uint64_t salt) {
+        media_keys(r, &mm_, salt);
+        std::vector<BlockHash> want = m->restorable_from(r.prompt, mm_);
+        const int64_t need = (int64_t)want.size() - m->restore_room();
+        if (need <= 0) return want;
+        const int64_t k = m->trim_for(r.prompt, mm_, need);
+        if (k < need && flush_fn && flush_fn()) (void)m->trim_for(r.prompt, mm_, need - k);
+        /* Landing copies may have moved records; take the chain again against the room made. */
+        return m->restorable_from(r.prompt, mm_, m->restore_room());
+    }
     void begin_step() override { m->begin_step(); }
     void hold(const Request& r) override {
         media_keys(r, &mm_, salt_id);
@@ -405,6 +422,7 @@ struct PCBinding final : IPrefixCache {
         return { st.ckpt_retired, st.ckpt_lru, st.ckpt_refused };
     }
     int64_t expired() const override { return m->stats().expired; }
+    int64_t restore_cuts() const override { return m->stats().restore_cuts; }
     int64_t ckpt_expired() const override { return m->stats().ckpt_expired; }
     int64_t held_tokens() const override { return m->unshared_tokens(); }
 

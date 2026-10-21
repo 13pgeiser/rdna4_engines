@@ -196,6 +196,8 @@ void Metrics::sample(const SchedMetrics& m) {
     c_cut_no_snapshot_.advance_to(m.hit_cut_no_snapshot);
     c_cut_window_.advance_to(m.hit_cut_window);
     c_cut_adopt_.advance_to(m.hit_cut_adopt);
+    c_cut_resumed_below_.advance_to(m.hit_cut_resumed_below);
+    c_restore_cuts_.advance_to(m.prefix_restore_cuts);
     c_cut_tokens_.advance_to(m.hit_cut_tokens);
     g_linear_hit_.set(m.linear_hit_rate);
 }
@@ -449,13 +451,20 @@ std::string Metrics::render() const {
                   "Checkpoints not written because every snapshot slot was in use by a restore "
                   "in the same step.", L, c_ckpt_refused_.get());
         w.help("radiance:prefix_hit_cuts_total",
-               "Admissions whose prefix hit reused nothing, by reason: no snapshot at or below "
-               "the hit, a windowed group no window snapshot covers, or blocks that could not be "
-               "adopted.", "counter");
+               "Admissions whose prefix hit was cut, by reason: reused nothing for want of a "
+               "snapshot at or below the hit, for a windowed group no window snapshot covers, or "
+               "for blocks that could not be adopted; or resumed at a snapshot more than one "
+               "checkpoint interval below the hit.", "counter");
         labelled("radiance:prefix_hit_cuts_total", "reason", "no_snapshot",
                  c_cut_no_snapshot_.get());
         labelled("radiance:prefix_hit_cuts_total", "reason", "windowed_group", c_cut_window_.get());
         labelled("radiance:prefix_hit_cuts_total", "reason", "adopt_failed", c_cut_adopt_.get());
+        labelled("radiance:prefix_hit_cuts_total", "reason", "resumed_below",
+                 c_cut_resumed_below_.get());
+        w.counter("radiance:prefix_restore_cuts_total",
+                  "Restores from the host tier the pool could not hold whole, even after giving "
+                  "up the VRAM copies of other stored conversations; each came back to a "
+                  "snapshot short of its end.", L, c_restore_cuts_.get());
         w.counter("radiance:prefix_hit_cut_tokens_total",
                   "Prompt tokens the attention cache held and admission computed again, because "
                   "the hit resumed at a snapshot below it or reused nothing.", L,

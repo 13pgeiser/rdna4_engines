@@ -153,7 +153,8 @@ private:
     Counter c_prefix_evict_, c_prefix_ckpt_evict_;
     Counter c_prefix_expired_, c_prefix_ckpt_expired_;
     Counter c_ckpt_retired_, c_ckpt_lru_, c_ckpt_refused_;
-    Counter c_cut_no_snapshot_, c_cut_window_, c_cut_adopt_, c_cut_tokens_;
+    Counter c_cut_no_snapshot_, c_cut_window_, c_cut_adopt_, c_cut_resumed_below_, c_cut_tokens_;
+    Counter c_restore_cuts_;
     Gauge   g_linear_hit_;
     Counter c_success_[(size_t)SuccessReason::N_];
     Counter c_rejected_, c_disconnect_, c_overflow_;

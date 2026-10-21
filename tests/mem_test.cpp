@@ -6101,8 +6101,7 @@ TEST(the_cache_tiers_and_pool_agree_over_random_interleavings) {
 /* The engine's restore (the binding's restore_fn) without the transfer: which entries come back,
  * into which blocks, and what the tiers and the cache are told. Returns how many came back. */
 static int64_t engine_restore(TierFixture& x, PCBinding<PrefixCache>& b, const Request& r) {
-    (void)b;
-    const std::vector<BlockHash> want = x.f.pc.restorable_from(r.prompt, {});
+    const std::vector<BlockHash> want = b.restore_plan(r, 0);
     std::vector<TierJob> jobs;
     for (const BlockHash& h : want) {
         TierJob j;
@@ -6184,6 +6183,7 @@ TEST(a_restore_gives_up_other_clean_copies_to_bring_the_whole_chain_back) {
     CHECK_EQ(x.f.pc.stats().evictions, evictions);
     CHECK_EQ(x.f.pc.size(), 2 * s.n);
     CHECK_EQ((int64_t)x.f.pc.restorable_from(s.b, {}).size(), 2 * s.n - x.f.pc.resident());
+    CHECK_EQ(x.f.pc.stats().restore_cuts, 0ll);
 }
 
 /* With recurrent state the hit resumes at the deepest snapshot the restored prefix reaches. Cut
@@ -6201,6 +6201,7 @@ TEST(a_restored_hybrid_conversation_resumes_at_its_tip_snapshot) {
     const CacheHit hit = x.f.pc.lookup(s.a, {});
     CHECK_EQ(hit.n_attn_tokens, (int32_t)(s.n * 16));
     CHECK_EQ(hit.n_linear_tokens, (int32_t)(s.n * 16));
+    CHECK_EQ(x.f.pc.stats().restore_cuts, 0ll);
 }
 
 /* When the pool cannot be made to hold the chain, what comes back ends at a snapshot: blocks past
@@ -6233,6 +6234,30 @@ TEST(a_restore_the_pool_cannot_hold_stops_at_a_snapshot_and_spares_its_own_chain
     CHECK_EQ(hit.n_linear_tokens, (int32_t)snap);
     CHECK_EQ(hit.n_attn_tokens, (int32_t)std::max<int64_t>(snap, resident * 16));
     CHECK_EQ(x.f.pc.lookup(s.b, {}).n_attn_tokens, (int32_t)(s.n * 16));
+    CHECK_EQ(x.f.pc.stats().restore_cuts, 1ll);
+}
+
+/* A chain another waiting request holds is kept too: that request restored it and was refused,
+ * and taking it would only have its next attempt restore it again. */
+TEST(a_restore_does_not_take_a_chain_a_waiting_request_holds) {
+    TierFixture x;
+    CHECK_OK(x.build());
+    const TwoSessions s = two_sessions(x, /*b_live=*/false, /*a_snapshots=*/false);
+    copy_now(x.t);                                  /* B is clean, so a trim could take it */
+    x.f.pc.hold(9, s.b, {});
+    const int64_t room = x.f.kv.total_blocks(G_FULL) - x.f.kv.held_blocks(G_FULL);
+    const int64_t drops = x.f.pc.stats().drops;
+
+    PCBinding<PrefixCache> b(&x.f.pc);
+    CHECK_EQ(engine_restore(x, b, turn(3, s.a, {})), room);
+    CHECK_EQ(x.f.pc.stats().drops, drops);
+    CHECK_EQ(x.f.pc.lookup(s.b, {}).n_attn_tokens, (int32_t)(s.n * 16));
+    CHECK_EQ(x.f.pc.stats().restore_cuts, 1ll);
+
+    x.f.pc.release(9);
+    const int64_t rest = (int64_t)x.f.pc.restorable_from(s.a, {}).size();
+    CHECK_EQ(engine_restore(x, b, turn(3, s.a, {})), rest);
+    CHECK_EQ(x.f.pc.lookup(s.a, {}).n_attn_tokens, (int32_t)(s.n * 16));
 }
 
 /* Tools and tests build and tear down the tier executors and pools repeatedly, and on a card every

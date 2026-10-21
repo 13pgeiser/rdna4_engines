@@ -72,7 +72,10 @@ struct SchedMetrics {
     /* Admissions whose prefix hit was cut to nothing, by reason, and the checkpoint shortfall:
      * attention-cached prompt tokens computed again (rad::SchedMetrics::hit_cut_tokens). */
     int64_t hit_cut_no_snapshot = 0, hit_cut_window = 0, hit_cut_adopt = 0;
+    int64_t hit_cut_resumed_below = 0;   /* resumed more than an interval below the hit */
     int64_t hit_cut_tokens = 0;
+    /* Host-tier restores the pool could not hold whole (rad::SchedMetrics::prefix_restore_cuts). */
+    int64_t prefix_restore_cuts = 0;
     /* Removed by --prefix-cache-ttl, cumulative. Not evictions: nothing wanted the memory. */
     int64_t prefix_expired = 0, prefix_ckpt_expired = 0;
     /* Decoupled prefix caching (spec §7.3). `prefix_hit_rate` is the attention hit rate, as in

@@ -2391,6 +2391,7 @@ TEST(snapshot_evictions_and_cut_hits_are_counted_by_reason) {
     server::SchedMetrics s;
     s.prefix_ckpt_retired = 5;  s.prefix_ckpt_lru = 3;  s.prefix_ckpt_refused = 1;
     s.hit_cut_no_snapshot = 2;  s.hit_cut_window = 0;  s.hit_cut_adopt = 4;
+    s.hit_cut_resumed_below = 6;  s.prefix_restore_cuts = 7;
     s.hit_cut_tokens = 76092;
     m.sample(s);
     PromDoc d = parse_prom(m.render());
@@ -2411,6 +2412,8 @@ TEST(snapshot_evictions_and_cut_hits_are_counted_by_reason) {
     CHECK_NEAR(value(C + ",reason=\"no_snapshot\"}"), 2.0, 1e-9);
     CHECK_NEAR(value(C + ",reason=\"windowed_group\"}"), 0.0, 1e-9);
     CHECK_NEAR(value(C + ",reason=\"adopt_failed\"}"), 4.0, 1e-9);
+    CHECK_NEAR(value(C + ",reason=\"resumed_below\"}"), 6.0, 1e-9);
+    CHECK_NEAR(value("radiance:prefix_restore_cuts_total" + L + "}"), 7.0, 1e-9);
     CHECK_NEAR(value("radiance:prefix_hit_cut_tokens_total" + L + "}"), 76092.0, 1e-9);
 }
 

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <unordered_set>
 
 namespace rad {
 
@@ -241,6 +242,22 @@ std::vector<BlockHash> PrefixCache::chain_all(const std::vector<int32_t>& tokens
     return hs;
 }
 
+/* A snapshot is on the chain when its key equals the chain hash at its position. */
+std::unordered_map<BlockHash, PrefixCache::Ckpt, BlockHashHash>::iterator
+PrefixCache::deepest_ckpt(const std::vector<BlockHash>& hs, int64_t limit) const {
+    auto best = ck_by_prefix_.end();
+    for (auto it = ck_by_prefix_.begin(); it != ck_by_prefix_.end(); ++it) {
+        const Ckpt& c = it->second;
+        if (!c.valid || c.slot < 0 || c.pos <= 0 || c.pos > limit || c.pos % block_size_ != 0 ||
+            c.pos / block_size_ > (int64_t)hs.size())
+            continue;
+        if (best != ck_by_prefix_.end() && c.pos <= best->second.pos) continue;
+        if (hs[(size_t)(c.pos / block_size_ - 1)] != it->first) continue;
+        best = it;
+    }
+    return best;
+}
+
 void PrefixCache::touch(const BlockHash& h, uint64_t now_ns) const {
     auto it = map_.find(h);
     if (it == map_.end() || !it->second.in_lru) return;
@@ -274,23 +291,7 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
     /* Back a full hit off by one block so one token remains to compute a logit from. */
     if (matched * block_size_ >= (int64_t)tokens.size() && matched > 0) --matched;
 
-    /* Deepest valid snapshot at or below `limit` on this chain. Checkpoints sit on the interval or
-     * at a prompt's tail (Scheduler::plan_chunk), i.e. on any block boundary, so iterate the
-     * snapshots (a few hundred) rather than the block positions (tens of thousands); a snapshot is
-     * on this chain when its key equals the chain hash at its position. */
-    auto deepest = [&](int64_t limit) {
-        auto best = ck_by_prefix_.end();
-        for (auto it = ck_by_prefix_.begin(); it != ck_by_prefix_.end(); ++it) {
-            const Ckpt& c = it->second;
-            if (!c.valid || c.slot < 0 || c.pos <= 0 || c.pos > limit ||
-                c.pos % block_size_ != 0)
-                continue;
-            if (best != ck_by_prefix_.end() && c.pos <= best->second.pos) continue;
-            if (hs[(size_t)(c.pos / block_size_ - 1)] != it->first) continue;
-            best = it;
-        }
-        return best;
-    };
+    auto deepest = [&](int64_t limit) { return deepest_ckpt(hs, limit); };
     /* Tokens a hit of `m` blocks lets a sequence skip: all of them, or with recurrent state only
      * up to the deepest checkpoint (Scheduler::admit_one resumes there). */
     auto reusable = [&](int64_t m) -> int64_t {
@@ -460,7 +461,8 @@ void PrefixCache::take_over(uint64_t session, const std::vector<BlockHash>& hs,
 /* ------------------------------------------------------------------ idle session tiers */
 
 std::vector<BlockHash> PrefixCache::restorable_from(const std::vector<int32_t>& tokens,
-                                                    const std::vector<MMContentKey>& mm) const {
+                                                    const std::vector<MMContentKey>& mm,
+                                                    int64_t fit) const {
     std::vector<BlockHash> out;
     if (!enabled_ || !tiers_ || tokens.empty()) return out;
 
@@ -474,13 +476,43 @@ std::vector<BlockHash> PrefixCache::restorable_from(const std::vector<int32_t>& 
      * how far the maintenance pass had got; the scheduler chunks the rest of the prefill against
      * that length, and greedy output is tie-level sensitive to the GEMM shapes (§19). Restoring
      * the whole chain makes the hit length a function of the prompt. */
+    std::vector<int64_t> at;     /* each entry's block on the chain */
     for (int64_t b = 0; b < n_full; ++b) {
         auto it = map_.find(hs[(size_t)b]);
         if (it == map_.end()) break;
         if (!same_tokens(it->second, tokens.data() + b * block_size_)) break;
-        if (tiers_->resident_off_device(hs[(size_t)b])) out.push_back(hs[(size_t)b]);
+        if (!tiers_->resident_off_device(hs[(size_t)b])) continue;
+        out.push_back(hs[(size_t)b]);
+        at.push_back(b);
     }
+    if (out.empty() || (int64_t)out.size() <= fit) return out;
+
+    /* Restored up to `fit`, the hit ends at the first entry left behind. */
+    ++stats_.restore_cuts;
+    int64_t keep = std::max<int64_t>(0, fit);
+    if (has_linear_) {
+        const auto best = deepest_ckpt(hs, at[(size_t)keep] * block_size_);
+        const int64_t upto = best == ck_by_prefix_.end() ? 0 : best->second.pos / block_size_;
+        keep = std::lower_bound(at.begin(), at.begin() + keep, upto) - at.begin();
+    }
+    out.resize((size_t)keep);
     return out;
+}
+
+int64_t PrefixCache::restore_room() const {
+    if (!kv_ || groups_.empty()) return 0;
+    int64_t room = INT64_MAX;
+    for (int32_t g : groups_) room = std::min(room, kv_->total_blocks(g) - kv_->held_blocks(g));
+    return std::max<int64_t>(0, room);
+}
+
+int64_t PrefixCache::trim_for(const std::vector<int32_t>& tokens,
+                              const std::vector<MMContentKey>& mm, int64_t n_blocks) {
+    if (!enabled_ || n_blocks <= 0) return 0;
+    const std::vector<BlockHash> hs = chain_all(tokens, mm, (int64_t)tokens.size() / block_size_);
+    std::unordered_set<BlockHash, BlockHashHash> spare(hs.begin(), hs.end());
+    for (const auto& h : held_) spare.insert(h.first);
+    return trim_sparing(n_blocks, &spare);
 }
 
 void PrefixCache::drop_offdevice(const BlockHash& key) {
@@ -569,7 +601,10 @@ int64_t PrefixCache::evict_lru(int64_t n) {
     return done;
 }
 
-int64_t PrefixCache::trim(int64_t n_blocks) {
+int64_t PrefixCache::trim(int64_t n_blocks) { return trim_sparing(n_blocks, nullptr); }
+
+int64_t PrefixCache::trim_sparing(int64_t n_blocks,
+                                  const std::unordered_set<BlockHash, BlockHashHash>* spare) {
     /* Tiers attached but off count as no tiers: no copy will ever land, so do not wait for one. */
     const bool keep = tiers_ && tiers_->host_on();
     const uint64_t now = rad_mono_ns();
@@ -581,6 +616,7 @@ int64_t PrefixCache::trim(int64_t n_blocks) {
         auto m = map_.find(h);
         if (m == map_.end()) { it = lru_.erase(it); continue; }
         Entry& e = m->second;
+        if (spare && spare->count(h)) { ++it; continue; }
         if (shared_with_live(e)) {
             /* In use: to the back, as in evict_lru. */
             auto next = std::next(it);

@@ -1479,13 +1479,14 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         auto* b = static_cast<PCBinding<PrefixCache>*>(pc_iface_.get());
         /* Called inside Scheduler::step() under its lock, which makes touching the cache and rank
          * 0's manager safe; nothing here may call back into the scheduler. */
-        b->restore_fn = [this](const Request& req) {
+        b->restore_fn = [this, b](const Request& req) {
             const uint64_t t0 = rad_mono_ns();
             PrefixCache& pc = ranks_[0]->prefix;
-            std::vector<MMContentKey> mk;
-            media_keys(req, &mk, cvec_salt_for(req.sp.use_control_vector));
+            /* Room is made before anything is planned (PCBinding::restore_plan): a chain the free
+             * list cannot hold would otherwise come back only as far as it reaches. One block
+             * table serves every rank, so what rank 0's cache gives up is room on every rank. */
             const std::vector<BlockHash> want =
-                pc.restorable_from(req.prompt, mk);
+                b->restore_plan(req, cvec_salt_for(req.sp.use_control_vector));
             if (want.empty()) return;
             /* The whole chain in one restore. With 4-token blocks a long conversation is tens of
              * thousands of entries; batched, it is one launch per (group, layer) per staging batch
