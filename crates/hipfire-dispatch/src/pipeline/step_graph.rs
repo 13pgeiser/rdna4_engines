@@ -301,6 +301,9 @@ pub enum StepGraphError {
     /// A `Project.weight` or `GatedMlp` weight is not a
     /// [`ResourceClass::Weight`] resource.
     NotAWeight(ResourceId),
+    /// A rule that writes one declared operand (`GatedMlp.output`) lists
+    /// another write, whose layout the split rule would not track.
+    UndeclaredWrite(ResourceId),
     /// More resources or ops than fit a dense `u32` id.
     TooMany,
 }
@@ -327,6 +330,9 @@ impl std::fmt::Display for StepGraphError {
                 write!(f, "rule operand {} not in op reads/writes", operand.0)
             }
             Self::NotAWeight(r) => write!(f, "resource {} is not a weight", r.0),
+            Self::UndeclaredWrite(r) => {
+                write!(f, "resource {} is written but not a rule operand", r.0)
+            }
             Self::TooMany => write!(f, "too many resources or ops for u32 ids"),
         }
     }
@@ -432,6 +438,9 @@ impl StepGraph {
                 check_operand(output)?;
                 for weight in [gate, up, down] {
                     check_weight(weight)?;
+                }
+                if let Some(&extra) = decl.writes.iter().find(|&&w| w != output) {
+                    return Err(StepGraphError::UndeclaredWrite(extra));
                 }
             }
             SplitRule::Accumulate { dst, src } => {
@@ -746,6 +755,11 @@ mod tests {
         assert_eq!(
             g.add_op(op(rule(w), &[0], &[2])),
             Err(StepGraphError::RuleOperandNotDeclared { operand: w })
+        );
+        // A second write (here the input) has no tracked layout.
+        assert_eq!(
+            g.add_op(op(rule(w), &[0, 1], &[2, 0])),
+            Err(StepGraphError::UndeclaredWrite(x))
         );
         assert!(g.ops().is_empty());
         g.add_op(op(rule(w), &[0, 1], &[2])).unwrap();

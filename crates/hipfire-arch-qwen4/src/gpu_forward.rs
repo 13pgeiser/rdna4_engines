@@ -6872,7 +6872,8 @@ impl<'a> LayerPhaseEnv<'a> {
     }
 
     /// The dense FFN step (a non-MoE layer): reads `scratch.hc_mixed`, writes
-    /// `scratch.ffn_output`.
+    /// `scratch.ffn_output`. A TP rank's sharded FFN writes its F32 partial
+    /// (`Bf16SourcePartial`): the reduction's consumer rounds the sum once.
     pub(crate) fn dense_step(&self, dense: &Qwen4DenseBinding<'a>) -> Step<'a> {
         let scratch = self.scratch;
         Step::GatedMlp(GatedMlpOp {
@@ -6885,7 +6886,10 @@ impl<'a> LayerPhaseEnv<'a> {
             up: dense.up,
             down: dense.down,
             activation: Activation::Silu,
-            storage: MlpStorage::Bf16Source,
+            storage: match self.bundle.weights.tp_shard() {
+                Some(_) => MlpStorage::Bf16SourcePartial,
+                None => MlpStorage::Bf16Source,
+            },
             output: MlpOutput::Write(&scratch.ffn_output),
             ladder: crate::program::QWEN4_DENSE_LADDER,
             scratch: GatedMlpScratch {
@@ -7020,6 +7024,9 @@ pub struct Qwen4GpuForward {
     mesh_route_rows: Option<usize>,
     /// `Some` only inside [`Self::forward_mesh_chunk`]: the segment it runs.
     mesh_segment: Option<MeshSegment>,
+    /// The first op of the next segment while a mesh band program is part
+    /// way through; `None` between programs.
+    mesh_next_op: Option<u32>,
     /// Fenced async upload of a mesh input band's token ids.
     mesh_tokens: PleHostStage,
     /// Op ids of this band's trunk program (see [`mesh_trunk_op_range`]).
@@ -8358,6 +8365,7 @@ impl Qwen4GpuForward {
             scope,
             mesh_route_rows: None,
             mesh_segment: None,
+            mesh_next_op: None,
             mesh_tokens: PleHostStage::new(vec![0u8; max_chunk * std::mem::size_of::<i32>()], true),
             mesh_trunk_ops,
             slowlink: Default::default(),
@@ -9866,6 +9874,14 @@ impl Qwen4GpuForward {
                 "mesh op range {ops:?} is not a segment of the band program {full:?}"
             )));
         }
+        // Segments run in order, each once: a program starts at `full.start`
+        // and continues where the previous segment ended.
+        let expected = self.mesh_next_op.unwrap_or(full.start);
+        if ops.start != expected {
+            return Err(invalid(format!(
+                "mesh op range {ops:?} does not continue the band program at op {expected}"
+            )));
+        }
         // Op ids map onto the trunk steps after the input band's `Embed`.
         let first_step = trunk.start + u32::from(self.scope.input);
         let step = |op: u32| (op.clamp(first_step, trunk.end) - first_step) as usize;
@@ -9937,7 +9953,15 @@ impl Qwen4GpuForward {
         );
         (self.prefill_scope, self.mesh_route_rows) = prior;
         self.mesh_segment = None;
+        // A failed segment abandons the program (nothing was committed).
+        self.mesh_next_op = (result.is_ok() && ops.end != full.end).then_some(ops.end);
         result
+    }
+
+    /// Forget a band program left part way through (a reset after a failed
+    /// epoch): the next mesh call starts a new program.
+    pub(crate) fn abandon_mesh_program(&mut self) {
+        self.mesh_next_op = None;
     }
 
     /// Set the Gpu routing scopes one forward of `rows` rows runs under and

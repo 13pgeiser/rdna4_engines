@@ -1109,14 +1109,18 @@ weight, and a ladder with no shard-safe form (`SandwichWide`: its post-norm
 epilogue cannot take a partial sum).
 
 The first end-to-end use is the Qwen4 dense developer profile: each rank
-holds the whole model with only its FFN slice
-(`Qwen4Weights::shard_dense_ffn`), `qwen4_tp_plan` reduces each layer's FFN
-output before its `HyperWrite`, and `Qwen4TpBindings` runs a rank's program
-in one segment per collective. Everything except the FFN is replicated.
-Sessions, checkpoints and prefix repair are not admitted on TP yet, and the
-loader has no Qwen4 TP route. Oracle (tokens and logits byte-identical to a
-single-device run of the same rank shards that sums the FFN partials in rank
-order, and reported against the plain single card):
+holds the whole model with only its BF16 FFN slice
+(`Qwen4Weights::shard_dense_ffn`, which records `(rank, parts)`),
+`qwen4_tp_plan` reduces each layer's FFN output before its `HyperWrite`
+(and refuses a packed FFN), and `Qwen4TpBindings` runs a rank's program in
+one segment per collective after checking the plan is that of exactly its
+shards. A rank's FFN hands its F32 partial to the reduction
+(`MlpStorage::Bf16SourcePartial`); the HC write rounds the sum once, as the
+unsharded FFN output is rounded once. Everything except the FFN is
+replicated. Sessions, checkpoints and prefix repair are not admitted on TP
+yet, and the loader has no Qwen4 TP route. Oracle (tokens and logits
+byte-identical to a single-device run of the same rank shards that sums the
+FFN partials in rank order, and reported against the plain single card):
 
 ```sh
 cargo test --release -p hipfire-arch-qwen4 --features qwen4-dev-profiles --lib --no-run

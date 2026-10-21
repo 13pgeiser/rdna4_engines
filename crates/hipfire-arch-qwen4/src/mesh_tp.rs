@@ -25,23 +25,39 @@ use hipfire_runtime::multi_gpu::executor::{
 };
 use hipfire_runtime::multi_gpu::transport::EdgeDescriptor;
 use hipfire_runtime::weight_manifest::plan_manifest;
-use rdna_compute::Gpu;
+use rdna_compute::{DType, Gpu};
 
 type Result<T, E = String> = std::result::Result<T, E>;
 
 /// The TP split plan of the trunk program (`head`/`top1` as in
-/// [`qwen4_step_graph_with_output`]) on a pure TP `mesh`. The splitter plans
-/// only the graph's declared weights (the dense FFN); the manifest's other TP
-/// declarations (attention, GDN, HC) are not run by this slice, so they are
-/// left out of the plan rather than admitted as if split.
+/// [`qwen4_step_graph_with_output`]) on a pure TP `mesh`, for a dense FFN
+/// loaded as `ffn_dtype`. The splitter plans only the graph's declared weights
+/// (the dense FFN); the manifest's other TP declarations (attention, GDN, HC)
+/// are not run by this slice, so they are left out of the plan rather than
+/// admitted as if split.
+///
+/// Only a source-exact BF16 dense FFN is admitted: it is what
+/// [`crate::weights::Qwen4Weights::shard_dense_ffn`] slices, and the graph
+/// declares it unpacked (`group: 1`). A packed FFN (Q8F16, ...) is refused
+/// here, before anything is allocated, rather than planned with the wrong
+/// group and refused at sharding.
 pub fn qwen4_tp_plan(
     config: &Qwen4Config,
+    ffn_dtype: DType,
     mesh: &DeviceMesh,
     head: bool,
     top1: bool,
 ) -> Result<SplitPlan> {
     if mesh.size_of(DimKind::Tp) != mesh.n_devices() {
         return Err("Qwen4 TP plan needs a pure TP mesh".into());
+    }
+    if !matches!(config.ffn, Qwen4FfnConfig::Dense { .. }) {
+        return Err("Qwen4 TP splits a dense FFN; a MoE profile has no TP plan".into());
+    }
+    if ffn_dtype != DType::BF16 {
+        return Err(format!(
+            "Qwen4 TP shards a source-exact BF16 dense FFN; {ffn_dtype:?} has no shard form"
+        ));
     }
     let graph = qwen4_step_graph_with_output(config, MeshRoute::Prefill, head, top1)?;
     let declared = |name: &str, layer: Option<usize>| {
@@ -69,6 +85,8 @@ pub struct Qwen4TpBindings<'a> {
     tokens: &'a [u32],
     /// One head per rank (every rank computes the replicated head).
     heads: Vec<Option<Qwen4MeshHead<'a>>>,
+    /// `(head, top1)` of the plan these bindings were checked against.
+    plan_output: (bool, bool),
     tp_epoch: u64,
     prepared: Option<ForwardEpoch>,
     /// Per rank, the first op id its next segment must start at.
@@ -76,10 +94,17 @@ pub struct Qwen4TpBindings<'a> {
 }
 
 impl<'a> Qwen4TpBindings<'a> {
-    /// Validate before any submission: two or more whole-model ranks of one
-    /// config, no EP or lanes, and every dense FFN layer sharded into exactly
-    /// `ranks.len()` parts. `tp_epoch` is `Gpus::mesh_tp_epoch()`.
-    pub fn new(ranks: Vec<Qwen4RankBand<'a>>, tp_epoch: u64) -> Result<Self> {
+    /// Validate before any submission:
+    /// - two or more whole-model ranks of one dense config, no EP or lanes;
+    /// - rank `i` holds dense FFN slice `i` of `ranks.len()`
+    ///   (`Qwen4Weights::tp_shard`), every layer's gate/up `[I/parts, H]` and
+    ///   down `[H, I/parts]`, all BF16;
+    /// - `plan` is the [`qwen4_tp_plan`] of exactly these shards (rank
+    ///   programs and collectives: one `AllReduce` of the FFN output after
+    ///   every dense `GatedMlp`, over `0..parts`), with or without the head.
+    ///
+    /// `tp_epoch` is `Gpus::mesh_tp_epoch()`.
+    pub fn new(ranks: Vec<Qwen4RankBand<'a>>, plan: &SplitPlan, tp_epoch: u64) -> Result<Self> {
         let parts = ranks.len();
         let config = &ranks
             .first()
@@ -89,13 +114,14 @@ impl<'a> Qwen4TpBindings<'a> {
         if parts < 2 || tp_epoch == 0 {
             return Err("Qwen4 TP needs two or more ranks and a provisioned TP group".into());
         }
-        let intermediate = match config.ffn {
-            Qwen4FfnConfig::Dense {
-                intermediate_size, ..
-            } => Some(intermediate_size),
-            Qwen4FfnConfig::Moe { .. } => None,
+        let Qwen4FfnConfig::Dense {
+            intermediate_size, ..
+        } = config.ffn
+        else {
+            return Err("Qwen4 TP splits a dense FFN; a MoE profile has no TP route".into());
         };
-        for rank in &ranks {
+        let (inter, hidden) = (intermediate_size / parts, config.hidden_size);
+        for (index, rank) in ranks.iter().enumerate() {
             let bundle = &*rank.bundle;
             if &bundle.config != config
                 || *bundle.weights.band_scope() != Qwen4BandScope::single(config)
@@ -108,22 +134,40 @@ impl<'a> Qwen4TpBindings<'a> {
                         .into(),
                 );
             }
-            let sharded = bundle.weights.layer_refs.iter().all(|layer| {
-                match (layer.ffn.dense(), intermediate) {
-                    (Some(dense), Some(full)) => dense.gate.shape[0] * parts == full,
-                    (None, None) => true,
-                    _ => false,
-                }
+            let weights = &bundle.weights;
+            let slice_ok = weights.layer_refs.iter().all(|layer| {
+                layer.ffn.dense().is_some_and(|dense| {
+                    dense.gate.shape == [inter, hidden]
+                        && dense.up.shape == [inter, hidden]
+                        && dense.down.shape == [hidden, inter]
+                        && [&dense.gate, &dense.up, &dense.down].iter().all(|r| {
+                            weights
+                                .resident(r)
+                                .is_ok_and(|tensor| tensor.dtype == DType::BF16)
+                        })
+                })
             });
-            if !sharded {
+            if weights.tp_shard() != Some((index, parts)) || !slice_ok {
                 return Err(format!(
-                    "Qwen4 TP rank dense FFN is not sharded into {parts} parts"
+                    "Qwen4 TP rank {index} does not hold BF16 dense FFN slice {index} of {parts} \
+                     (holds {:?})",
+                    weights.tp_shard()
                 ));
             }
         }
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, parts)]).map_err(|e| format!("{e:?}"))?;
+        let mut plan_output = None;
+        for (head, top1) in [(false, false), (true, false), (true, true)] {
+            let expected = qwen4_tp_plan(config, DType::BF16, &mesh, head, top1)?;
+            if expected.ranks == plan.ranks && expected.collectives == plan.collectives {
+                plan_output = Some((head, top1));
+            }
+        }
+        let plan_output = plan_output.ok_or("Qwen4 TP plan is not the plan of these shards")?;
         Ok(Self {
             next_op: vec![0; parts],
             heads: vec![None; parts],
+            plan_output,
             ranks,
             tokens: &[],
             tp_epoch,
@@ -137,14 +181,16 @@ impl<'a> Qwen4TpBindings<'a> {
         self.prepared = None;
     }
 
-    /// One head per rank, or `None` everywhere to commit the trunk only.
+    /// One head per rank, all of one shape (rows, top-1), or `None` everywhere
+    /// to commit the trunk only. Must match the plan's head ops.
     pub fn set_heads(&mut self, heads: Vec<Option<Qwen4MeshHead<'a>>>) -> Result<()> {
+        let shape = |head: &Option<Qwen4MeshHead<'_>>| {
+            head.as_ref().map(|head| (head.rows, head.top1.is_some()))
+        };
         if heads.len() != self.ranks.len()
-            || heads
-                .iter()
-                .any(|head| head.is_some() != heads[0].is_some())
+            || heads.iter().any(|head| shape(head) != shape(&heads[0]))
         {
-            return Err("Qwen4 TP needs one head per rank, or none".into());
+            return Err("Qwen4 TP needs one head of one shape per rank, or none".into());
         }
         self.heads = heads;
         self.prepared = None;
@@ -173,11 +219,15 @@ impl<'a> Qwen4TpBindings<'a> {
 impl MeshStepBindings for Qwen4TpBindings<'_> {
     fn prepare_epoch(&mut self, epoch: &ForwardEpoch) -> Result<()> {
         self.prepared = None;
+        let head = self.heads[0].as_ref();
         if epoch.actual_rows == 0
             || self.tokens.len() != epoch.actual_rows
             || (epoch.route == MeshRoute::Decode && epoch.actual_rows != 1)
         {
             return Err("invalid Qwen4 TP rows or tokens".into());
+        }
+        if (head.is_some(), head.is_some_and(|head| head.top1.is_some())) != self.plan_output {
+            return Err("Qwen4 TP heads do not match the plan's head ops".into());
         }
         let end = epoch
             .start_position
@@ -275,6 +325,7 @@ impl MeshStepBindings for Qwen4TpBindings<'_> {
     fn reset_rank(&mut self, owner: usize, gpu: &mut Gpu, _epoch: &ForwardEpoch) -> Result<()> {
         self.prepared = None;
         let rank = self.ranks.get_mut(owner).ok_or("unknown Qwen4 TP rank")?;
+        rank.forward.abandon_mesh_program();
         rank.bundle.reset(gpu).map_err(|error| error.to_string())
     }
 
@@ -371,7 +422,7 @@ mod tests {
         let graph = qwen4_step_graph_with_output(&config, MeshRoute::Prefill, true, true).unwrap();
         for parts in [2, 4] {
             let mesh = DeviceMesh::rect(&[(DimKind::Tp, parts)]).unwrap();
-            let plan = qwen4_tp_plan(&config, &mesh, true, true).unwrap();
+            let plan = qwen4_tp_plan(&config, DType::BF16, &mesh, true, true).unwrap();
             assert_eq!(plan.collectives.len(), config.num_hidden_layers);
             for (layer, c) in plan.collectives.iter().enumerate() {
                 assert_eq!(c.kind, CollectiveKind::AllReduce);
@@ -404,17 +455,24 @@ mod tests {
     }
 
     /// The tiny FFN (intermediate 8) splits two and four ways; three parts
-    /// leave a remainder and are refused by the manifest.
+    /// leave a remainder and are refused by the manifest. A packed FFN and a
+    /// MoE profile have no plan.
     #[test]
-    fn tp_plan_refuses_an_indivisible_intermediate() {
+    fn tp_plan_refusals() {
         let config = dense_config();
+        let tp2 = DeviceMesh::rect(&[(DimKind::Tp, 2)]).unwrap();
         for parts in [2, 4] {
             let mesh = DeviceMesh::rect(&[(DimKind::Tp, parts)]).unwrap();
-            assert!(qwen4_tp_plan(&config, &mesh, true, false).is_ok());
+            assert!(qwen4_tp_plan(&config, DType::BF16, &mesh, true, false).is_ok());
         }
         let mesh = DeviceMesh::rect(&[(DimKind::Tp, 3)]).unwrap();
-        let error = qwen4_tp_plan(&config, &mesh, true, false).unwrap_err();
+        let error = qwen4_tp_plan(&config, DType::BF16, &mesh, true, false).unwrap_err();
         assert!(error.contains("not divisible by Tp=3"), "{error}");
+        let error = qwen4_tp_plan(&config, DType::Q8_0, &tp2, true, false).unwrap_err();
+        assert!(error.contains("Q8_0 has no shard form"), "{error}");
+        let moe = crate::config::compact_test_config();
+        let error = qwen4_tp_plan(&moe, DType::BF16, &tp2, true, false).unwrap_err();
+        assert!(error.contains("MoE"), "{error}");
     }
 }
 
@@ -438,7 +496,8 @@ mod hw_tests {
     const ARTIFACT_ENV: &str = "HIPFIRE_QWEN4_DEV_ARTIFACT";
     const MAX_SEQ: usize = 64;
     const PROMPT: usize = 12;
-    const GREEDY: usize = 16;
+    /// Decode epochs after the prompt epoch: fills the 64-row context.
+    const GREEDY: usize = 48;
 
     /// The developer artifact assembled on `gpu` (as `dev_profiles_hw`).
     fn load(gpu: &mut Gpu) -> Qwen4Bundle {
@@ -581,6 +640,17 @@ mod hw_tests {
         layout.route_rows
     }
 
+    fn bands<'a>(
+        ranks: &'a mut [Qwen4Bundle],
+        forwards: &'a mut [Qwen4GpuForward],
+    ) -> Vec<Qwen4RankBand<'a>> {
+        ranks
+            .iter_mut()
+            .zip(forwards)
+            .map(|(bundle, forward)| Qwen4RankBand { bundle, forward })
+            .collect()
+    }
+
     fn head(logits: &GpuTensor) -> Option<Qwen4MeshHead<'_>> {
         Some(Qwen4MeshHead {
             logits,
@@ -616,7 +686,7 @@ mod hw_tests {
         // The rank shards on one device, FFN partials summed in rank order.
         gpu.ensure_capture_stream().unwrap();
         let mesh = DeviceMesh::rect(&[(DimKind::Tp, parts)]).unwrap();
-        let plan = qwen4_tp_plan(&config, &mesh, true, false).unwrap();
+        let plan = qwen4_tp_plan(&config, DType::BF16, &mesh, true, false).unwrap();
         let mut shards: Vec<Qwen4Bundle> = (0..parts)
             .map(|rank| {
                 let mut bundle = load(&mut gpu);
@@ -715,7 +785,7 @@ mod hw_tests {
             MAX_SEQ * config.hidden_size * std::mem::size_of::<f32>(),
         )
         .unwrap();
-        let tp_plan = qwen4_tp_plan(&config, &tp_mesh, true, false).unwrap();
+        let tp_plan = qwen4_tp_plan(&config, DType::BF16, &tp_mesh, true, false).unwrap();
         let mut ranks: Vec<Qwen4Bundle> = Vec::with_capacity(parts);
         let mut rank_logits: Vec<GpuTensor> = Vec::with_capacity(parts);
         for (rank, gpu) in gpus.devices.iter_mut().enumerate() {
@@ -746,12 +816,31 @@ mod hw_tests {
                 route_rows,
                 policy_id: 1,
             };
-            let bands = ranks
-                .iter_mut()
-                .zip(&mut forwards)
-                .map(|(bundle, forward)| Qwen4RankBand { bundle, forward })
-                .collect();
-            let mut bindings = Qwen4TpBindings::new(bands, tp_epoch).unwrap();
+            if op_id == 1 {
+                // Bindings refuse a plan that is not these shards' plan and
+                // ranks that do not hold their own slice, before any launch.
+                let mut replicated = tp_plan.clone();
+                replicated.collectives.clear();
+                for rank in &mut replicated.ranks {
+                    rank.items.retain(|item| matches!(item, RankItem::Op(_)));
+                }
+                let error =
+                    Qwen4TpBindings::new(bands(&mut ranks, &mut forwards), &replicated, tp_epoch)
+                        .err()
+                        .expect("a replicated plan over sharded ranks is refused");
+                assert!(error.contains("not the plan of these shards"), "{error}");
+                let mut swapped = bands(&mut ranks, &mut forwards);
+                swapped.swap(0, 1);
+                let error = Qwen4TpBindings::new(swapped, &tp_plan, tp_epoch)
+                    .err()
+                    .expect("rank 0 holding slice 1 is refused");
+                assert!(
+                    error.contains("does not hold BF16 dense FFN slice 0"),
+                    "{error}"
+                );
+            }
+            let bands = bands(&mut ranks, &mut forwards);
+            let mut bindings = Qwen4TpBindings::new(bands, &tp_plan, tp_epoch).unwrap();
             bindings.set_tokens(tokens);
             bindings
                 .set_heads(rank_logits.iter().map(head).collect())

@@ -2553,6 +2553,8 @@ pub struct Qwen4Weights {
     pub expert_tiers: Option<crate::expert_tier_owners::ExpertTierLease>,
     scope: Qwen4BandScope,
     device: usize,
+    /// `Some((rank, parts))` once [`Self::shard_dense_ffn`] kept that slice.
+    tp_shard: Option<(usize, usize)>,
 }
 
 impl Qwen4Weights {
@@ -2739,6 +2741,7 @@ impl Qwen4Weights {
             expert_tiers,
             scope: scope.clone(),
             device,
+            tp_shard: None,
         })
     }
 
@@ -2750,6 +2753,12 @@ impl Qwen4Weights {
     /// The validated endpoint and trunk ownership used during assembly.
     pub fn band_scope(&self) -> &Qwen4BandScope {
         &self.scope
+    }
+
+    /// `(rank, parts)` of the dense FFN slice these weights hold, `None` when
+    /// unsharded.
+    pub fn tp_shard(&self) -> Option<(usize, usize)> {
+        self.tp_shard
     }
 
     /// Resolve an absolute layer ID to its compact rank-local reference.
@@ -3025,8 +3034,12 @@ impl Qwen4Weights {
         rank: usize,
         parts: usize,
     ) -> Result<(), String> {
-        if rank >= parts {
-            return Err(format!("TP rank {rank} is outside {parts} parts"));
+        if parts < 2 || rank >= parts || self.tp_shard.is_some() {
+            return Err(format!(
+                "TP rank {rank} of {parts} parts: needs two or more parts, a rank inside them \
+                 and unsharded weights (already {:?})",
+                self.tp_shard
+            ));
         }
         for index in 0..self.layer_refs.len() {
             let Qwen4FfnWeights::Dense(dense) = &self.layer_refs[index].ffn else {
@@ -3102,6 +3115,7 @@ impl Qwen4Weights {
                 }
             }
         }
+        self.tp_shard = Some((rank, parts));
         Ok(())
     }
 }
