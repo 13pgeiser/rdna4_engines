@@ -90,7 +90,7 @@ pub enum MlpLadder {
     /// rows, fused post-norm residual on one row; greedy-EAGLE strict kernels
     /// inside. Gemma 4.
     SandwichWide,
-    /// The hybrid-decoder ladder (Qwen3.5/3.6/3.8 dense layers and MTP head).
+    /// The hybrid-decoder ladder (Qwen3.5/3.6/3.8 dense layers).
     /// One row: norm + gate/up through the fusion table (`normed_projection`),
     /// then the fused SiLU·mul + rotation and the SwiGLU-residual GEMV
     /// (`Residual`), or SiLU·mul + a plain GEMV (`Write`, the dense-TP
@@ -207,6 +207,12 @@ impl GatedMlpOp<'_> {
     }
 
     pub(super) fn validate_layout(&self) -> Result<(), DispatchError> {
+        self.validate_with_act_rows(self.rows)
+    }
+
+    /// [`Self::validate_layout`] with the `act` scratch required to hold
+    /// `act_rows` rows; every other tensor is checked over `rows`.
+    fn validate_with_act_rows(&self, act_rows: usize) -> Result<(), DispatchError> {
         let (rows, hidden, inner_width) = (self.rows, self.hidden, self.intermediate);
         if rows == 0 || hidden == 0 || inner_width == 0 {
             return Err(DispatchError::Hip("gated MLP has empty geometry".into()));
@@ -239,7 +245,8 @@ impl GatedMlpOp<'_> {
         }
         require_tensor(sc.gate, inner, DType::F32, "gated MLP gate scratch")?;
         require_tensor(sc.up, inner, DType::F32, "gated MLP up scratch")?;
-        require_tensor(sc.act, inner, DType::F32, "gated MLP act scratch")?;
+        let act = checked_mul(act_rows, inner_width, "gated MLP act rows")?;
+        require_tensor(sc.act, act, DType::F32, "gated MLP act scratch")?;
         match self.output {
             MlpOutput::Write(out) => require_tensor(out, wide, DType::F32, "gated MLP output")?,
             MlpOutput::Residual => {}
@@ -447,20 +454,34 @@ impl GatedMlpOp<'_> {
             MlpOutput::Residual => {
                 swiglu_down_residual(gpu, ctx, &self.down, sc.gate, sc.up, sc.act, self.x)
             }
-            MlpOutput::Write(out) => {
-                gpu.silu_mul_f32(sc.gate, sc.up, sc.act).map_err(hip)?;
-                super::steps::execute_steps(
-                    gpu,
-                    ctx,
-                    &[super::steps::Step::Gemv {
-                        w: &self.down,
-                        input: super::steps::GemvInput::Raw(sc.act),
-                        out,
-                    }],
-                )
-            }
+            MlpOutput::Write(_) => self.write_partial(gpu, ctx).map_err(hip),
             MlpOutput::PostNorm { .. } => unreachable!("Product refuses the post-norm output"),
         }
+    }
+
+    /// The `Write` down half: SiLU·mul, then a plain GEMV into the output
+    /// (the dense-TP FFN partial). HIP errors keep their codes; dispatch
+    /// errors become code 0, as the hand route's `map_err` did.
+    pub fn write_partial(&self, gpu: &mut Gpu, ctx: &DispatchCtx) -> hip_bridge::HipResult<()> {
+        let code0 = |e: DispatchError| hip_bridge::HipError::new(0, &e.to_string());
+        self.require_product().map_err(code0)?;
+        let MlpOutput::Write(out) = self.output else {
+            return Err(code0(DispatchError::Hip(
+                "gated MLP: write_partial needs a Write output".into(),
+            )));
+        };
+        let sc = &self.scratch;
+        gpu.silu_mul_f32(sc.gate, sc.up, sc.act)?;
+        super::steps::execute_steps(
+            gpu,
+            ctx,
+            &[super::steps::Step::Gemv {
+                w: &self.down,
+                input: super::steps::GemvInput::Raw(sc.act),
+                out,
+            }],
+        )
+        .map_err(code0)
     }
 
     fn require_product(&self) -> Result<(), DispatchError> {
@@ -495,7 +516,10 @@ pub struct ProductRows<'a> {
 /// Validate `op` (a `Product` op) against `rows`, then run the batched
 /// ladder over `op.rows` rows: `Residual` adds into `x_batch`,
 /// `Write(partial)` is the tensor-parallel partial epilogue. HIP errors keep
-/// their codes.
+/// their codes. On a lean batch scratch the `act` plane holds only the
+/// fallback rows: wider chunks run the fused producers, which never read it,
+/// and the caller admits them (`lean_pbs_route`), so its capacity is not
+/// checked against `op.rows`.
 #[cfg(feature = "deltanet")]
 pub fn execute_product_rows(
     gpu: &mut Gpu,
@@ -504,7 +528,9 @@ pub fn execute_product_rows(
 ) -> hip_bridge::HipResult<()> {
     use super::batched::{execute_swiglu_ffn_batched, BatchEpilogue, FfnLayerView};
     let refuse = |msg: String| hip_bridge::HipError::new(0, &msg);
-    op.validate_layout().map_err(|e| refuse(e.to_string()))?;
+    let act_rows = if rows.batch.lean { 0 } else { op.rows };
+    op.validate_with_act_rows(act_rows)
+        .map_err(|e| refuse(e.to_string()))?;
     let norm = match (op.ladder, op.pre_norm) {
         (MlpLadder::Product, Some(norm)) => norm,
         _ => {

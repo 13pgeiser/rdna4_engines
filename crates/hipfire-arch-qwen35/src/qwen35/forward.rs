@@ -28,7 +28,7 @@ use hipfire_dispatch::families::moe::{routed_codebook_pair_batched_supported, Mo
 use hipfire_dispatch::pipeline::batched::{BatchEpilogue, DenseBatchMath};
 use hipfire_dispatch::pipeline::dump_hidden_localize;
 use hipfire_dispatch::pipeline::execute_steps;
-use hipfire_dispatch::pipeline::gated_mlp::{execute_gated_mlp, GatedMlpOp, MlpOutput};
+use hipfire_dispatch::pipeline::gated_mlp::{GatedMlpOp, MlpOutput};
 use hipfire_dispatch::pipeline::hybrid;
 use hipfire_dispatch::pipeline::hybrid::AttentionTap;
 use hipfire_dispatch::pipeline::sealed_moe::MoeRouteProducerProof;
@@ -4480,8 +4480,10 @@ fn dense_tp_local_ffn(
         )
         .ok_or_else(|| HipError::new(0, "dense TP received a MoE/mismatched layer"))?;
         let ctx = DispatchCtx::new(&gpus.devices[rank]);
-        execute_gated_mlp(&mut gpus.devices[rank], &ctx, &ffn)
+        let gpu = &mut gpus.devices[rank];
+        ffn.project(gpu, &ctx)
             .map_err(|e| HipError::new(0, &e.to_string()))?;
+        ffn.write_partial(gpu, &ctx)?;
     }
     Ok(())
 }

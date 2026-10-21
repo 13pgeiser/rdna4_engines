@@ -156,8 +156,8 @@ pub struct BatchScratch<'a> {
     pub rope_positions: &'a GpuTensor,
 }
 
-/// Weights of one dense SwiGLU FFN sublayer (the rows > 1 view of
-/// [`crate::pipeline::hybrid::SwigluFfnOp`]).
+/// Weights of one dense SwiGLU FFN sublayer, as the rows route of
+/// [`crate::pipeline::gated_mlp::execute_product_rows`] binds them.
 #[derive(Clone, Copy)]
 pub(crate) struct FfnLayerView<'a> {
     pub ffn_norm: &'a GpuTensor,

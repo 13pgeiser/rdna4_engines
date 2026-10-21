@@ -90,7 +90,7 @@ executors of the slice-1 ops:
 
 | Module | Executor (slice-1 op) | Stages and library |
 |---|---|---|
-| `pipeline::batched` | `execute_swiglu_ffn_batched` (`SwigluFfn`) | gate/up and down stages; the IU4/A8/FP8-stream activation producers, `dispatch_batched_gemm_epilogue`, the key-selected GEMM runners (`run_*_key`), `DenseBatchMath`/`verify_dense_math` with the explicit `*VerifyExact` keys, packed-MQ4 and F1-lite routes |
+| `pipeline::batched` | `execute_swiglu_ffn_batched` (now behind `GatedMlp` `Product` rows, `gated_mlp::execute_product_rows`) | gate/up and down stages; the IU4/A8/FP8-stream activation producers, `dispatch_batched_gemm_epilogue`, the key-selected GEMM runners (`run_*_key`), `DenseBatchMath`/`verify_dense_math` with the explicit `*VerifyExact` keys, packed-MQ4 and F1-lite routes |
 | `pipeline::batched_attention` | `batch_chunk_full_attn_attn` (`GatedAttention`) | input projection, prepare (fused FA prep, TriAttention tap), attend (tile attend, ragged FP8Q packets, multirow Q8, gfx1100 split verify, A4 epilogue), output projection |
 | `pipeline::batched_deltanet` | `batch_chunk_delta_net_attn` (`DeltaNetMixer`) | qkvza projection, pre-GDN (conv, gates, DFlash tape copies), sequential / chunk-scan / tree recurrence, gated norm and output projection |
 
