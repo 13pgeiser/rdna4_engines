@@ -121,26 +121,47 @@ fn gemm_q8_0_batched_short_buffers_fail_in_bounds_check() {
     // the last row of the second chunk's window, so the first 64-row chunk
     // launches, then the second chunk's `sub_offset` bounds check fails.
     let x_full: Vec<f32> = (0..65 * K).map(|i| i as f32).collect();
-    let short_x = gpu.upload_f32(&x_full[..64 * K], &[64 * K]).expect("upload x");
+    let short_x = gpu
+        .upload_f32(&x_full[..64 * K], &[64 * K])
+        .expect("upload x");
     let full_y = sentinel(&mut gpu, 65 * M);
-    let err = format!(
-        "{:?}",
+    // `sub_offset` asserts (dispatch.rs), so the second chunk's out-of-range
+    // view panics after the first 64-row chunk has launched; catch the unwind
+    // instead of expecting `Err`, then sync before reusing the stream.
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         gpu.gemm_q8_0_batched(&w, &short_x, &full_y, M, K, 65)
-            .expect_err("short x must fail")
-    );
+    }));
+    let msg = match caught {
+        Ok(_) => panic!("short x must panic in the sub_offset bounds check"),
+        Err(payload) => panic_payload_text(&payload),
+    };
     assert!(
-        err.contains("accessible buffer prefix"),
-        "short x must fail in the sub_offset bounds check, got: {err}"
+        msg.contains("accessible buffer prefix"),
+        "short x must panic in the sub_offset bounds check, got: {msg}"
     );
+    gpu.hip.device_synchronize().expect("sync after short x");
     let full_x = gpu.upload_f32(&x_full, &[65 * K]).expect("upload x");
     let short_y = sentinel(&mut gpu, 64 * M);
-    let err = format!(
-        "{:?}",
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         gpu.gemm_q8_0_batched(&w, &full_x, &short_y, M, K, 65)
-            .expect_err("short y must fail")
-    );
+    }));
+    let msg = match caught {
+        Ok(_) => panic!("short y must panic in the sub_offset bounds check"),
+        Err(payload) => panic_payload_text(&payload),
+    };
     assert!(
-        err.contains("accessible buffer prefix"),
-        "short y must fail in the sub_offset bounds check, got: {err}"
+        msg.contains("accessible buffer prefix"),
+        "short y must panic in the sub_offset bounds check, got: {msg}"
     );
+    gpu.hip.device_synchronize().expect("sync after short y");
+}
+
+fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        panic!("unexpected panic payload type");
+    }
 }
