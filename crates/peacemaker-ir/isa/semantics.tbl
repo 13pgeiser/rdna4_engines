@@ -49,6 +49,7 @@ s_cmp_eq_u32	alu
 s_cmp_ge_i32	alu
 s_cmp_ge_u32	alu
 s_cmp_gt_u32	alu
+s_cmp_le_i32	alu
 s_cmp_lg_u32	alu
 s_cmp_lt_i32	alu
 s_cmp_lt_u32	alu
@@ -92,6 +93,7 @@ v_cmp_eq_u32_e64	alu
 v_cmp_ge_f32_e64	alu
 v_cmp_gt_f32_e64	alu
 v_cmp_gt_i32_e64	alu
+v_cmp_gt_u32_e32	alu
 v_cmp_gt_u32_e64	alu
 v_cmp_le_f32_e64	alu
 v_cmp_le_i32_e64	alu
@@ -99,6 +101,7 @@ v_cmp_le_u32_e64	alu
 v_cmp_le_u32_e32	alu
 v_cmp_lt_f32_e64	alu
 v_cmp_lt_i32_e64	alu
+v_cmp_lt_u32_e32	alu
 v_cmp_lt_u32_e64	alu
 v_cmp_ne_u32_e64	alu
 v_cmp_neq_f32_e64	alu
@@ -108,6 +111,7 @@ v_cndmask_b32_e64	alu
 v_cvt_f16_f32_e32	alu
 v_cvt_f32_f16_e64	alu
 v_cvt_f32_u32_e32	alu
+v_cvt_f32_ubyte0_e32	alu
 v_cvt_i32_f32_e32	alu
 v_cvt_pk_f32_fp8_e32	alu
 v_cvt_pk_f32_fp8_e64	alu
@@ -120,6 +124,7 @@ v_dual_fmac_f32	alu
 v_dual_mul_f32	alu
 v_exp_f32_e32	alu
 v_fma_f32	alu
+v_fma_mix_f32	alu
 v_fma_mixlo_f16	alu
 v_fmac_f32_e32	alu
 v_fmamk_f32	alu
@@ -127,6 +132,7 @@ v_ldexp_f32	alu
 v_lshl_add_u32	alu
 v_lshl_or_b32	alu
 v_lshlrev_b32_e32	alu
+v_lshlrev_b32_e64	alu
 v_lshrrev_b32_e32	alu
 v_mad_u32_u24	alu
 v_max3_f32	alu
