@@ -8479,6 +8479,34 @@ impl Qwen4GpuForward {
         Ok(())
     }
 
+    /// [`Self::begin_npu_trunk_request`]'s request runs the GPU-only
+    /// schedule: no NPU pair is planned or selected for it.
+    pub(crate) fn npu_trunk_request_gpu_only(&mut self, why: &str) {
+        #[cfg(target_os = "linux")]
+        if let Some(npu) = &mut self.npu_trunk {
+            npu.force_gpu_request(why);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = why;
+    }
+
+    /// The modes the NPU trunk pair executor (layer-major, outside the step
+    /// interpreter) cannot run, checked before a selected pair runs.
+    fn refuse_npu_pair(&self) -> Result<(), Qwen4GpuForwardError> {
+        if self.cut_layers.is_some() {
+            return Err(invalid(format!(
+                "{CUT_LAYERS_ENV} cannot run with the NPU trunk pair route"
+            )));
+        }
+        if self.layer_capture.is_some() {
+            return Err(invalid(
+                "the DFlash2 layer capture cannot run with the NPU trunk pair route \
+                 (its prefill must be planned GPU-only)",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn plan_npu_trunk_request(
         &mut self,
         gpu: &Gpu,
@@ -9402,11 +9430,7 @@ impl Qwen4GpuForward {
             if let Some(banks) =
                 self.npu_trunk_pair(bundle.state.position, tokens.len() - offset, max_chunk)
             {
-                if self.cut_layers.is_some() || self.layer_capture.is_some() {
-                    return Err(invalid(format!(
-                        "{CUT_LAYERS_ENV} and the DFlash2 layer capture cannot run with the NPU trunk pair route"
-                    )));
-                }
+                self.refuse_npu_pair()?;
                 let rows = banks[0] + banks[1];
                 self.note_npu_trunk_pair(banks, bundle.state.position);
                 let final_pair =
@@ -9536,11 +9560,7 @@ impl Qwen4GpuForward {
             if let Some(banks) =
                 self.npu_trunk_pair(bundle.state.position, tokens.len() - offset, max_chunk)
             {
-                if self.cut_layers.is_some() || self.layer_capture.is_some() {
-                    return Err(invalid(format!(
-                        "{CUT_LAYERS_ENV} and the DFlash2 layer capture cannot run with the NPU trunk pair route"
-                    )));
-                }
+                self.refuse_npu_pair()?;
                 let rows = banks[0] + banks[1];
                 self.note_npu_trunk_pair(banks, bundle.state.position);
                 self.set_tile_ple_lookahead(tokens, offset, rows, &mut caller_lookahead);

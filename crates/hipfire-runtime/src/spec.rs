@@ -550,6 +550,24 @@ pub trait SpecTarget {
     /// stays `None`).
     fn set_dflash_extract_layers(&mut self, _layers: Vec<usize>) {}
 
+    /// The drafter reads only the last `rows` rows of the `hidden_out` sink
+    /// of [`spec_advance`](Self::spec_advance): the target may drop leading
+    /// rows of the sink while it appends, keeping at least `rows` (the drafter
+    /// re-derives its base from the end position). Default: keep every row.
+    fn set_dflash_feature_window(&mut self, _rows: usize) {}
+
+    /// Roll back a verify whose window will not reach
+    /// [`commit_prefix`](Self::commit_prefix) (the drafter failed after the
+    /// verify ran): restore whatever the verify snapshotted into `scratch`.
+    /// A no-op when no verify is outstanding. Default: nothing to restore.
+    fn abandon_verify(
+        &mut self,
+        _gpu: &mut Gpu,
+        _scratch: &mut dyn SpecScratch,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Capture the target's residual hidden states at `layers` for a freshly-
     /// committed `seed` token at absolute `position`, returning the concatenated
     /// `[layers.len() * hidden]` F32 vector (the DSpark `main_hidden`).
@@ -623,6 +641,10 @@ pub trait SpecScratch {
     /// `DeviceBuffer` have no `Drop` in this codebase — a bare `drop` of the box
     /// would orphan device memory. Called from the speculator's `free`.
     fn free(self: Box<Self>, gpu: &mut Gpu);
+
+    /// Forget per-window state that names target state a reset discarded
+    /// (an outstanding verify ticket). Default: nothing to forget.
+    fn clear(&mut self) {}
 }
 
 /// Outcome of [`SpecTarget::spec_advance`].

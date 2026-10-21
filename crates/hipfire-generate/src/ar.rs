@@ -1688,6 +1688,9 @@ pub struct GenerationRouteInputs {
     pub pp: usize,
     pub has_speculator: bool,
     pub speculator_is_mtp: bool,
+    /// The loaded speculator is the shared DFlash2 drafter (`name() ==
+    /// "dflash2"`), the one non-MTP speculator a Qwen4 load admits.
+    pub speculator_is_dflash2: bool,
     pub deepseek4_spec_requested: bool,
     pub ngram_can_sample: bool,
     pub temp: f32,
@@ -1764,11 +1767,12 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
                 && i.speculator_is_mtp
                 && (i.temp <= 1e-6 || i.supports_temp_swor)
                 && (!i.nonneutral_penalties || (i.temp > 1e-6 && i.supports_temp_swor));
-            // The only other Qwen4 speculator is DFlash2 (`--spec dflash`,
-            // single card): it verifies greedy picks, or sampled rows with the
-            // AR sampler's law (temperature, top_k, top_p, min_p), and applies
-            // no token penalties, so a penalized request keeps the AR producer.
-            let dflash2_ok = !i.speculator_is_mtp
+            // The other Qwen4 speculator is DFlash2 (`--spec dflash`, single
+            // card): it verifies greedy picks, or sampled rows with the AR
+            // sampler's law (temperature, top_k, top_p, min_p), and applies
+            // no token penalties, so a penalized request keeps the AR
+            // producer. Any other speculator stays on AR.
+            let dflash2_ok = i.speculator_is_dflash2
                 && i.pp <= 1
                 && !i.nonneutral_penalties
                 && (i.temp <= 1e-6 || i.supports_temp_swor);
@@ -2454,6 +2458,7 @@ pub fn generate(
         pp: m.pp,
         has_speculator: m.speculator.is_some(),
         speculator_is_mtp: m.speculator.as_ref().is_some_and(|s| s.name() == "mtp"),
+        speculator_is_dflash2: m.speculator.as_ref().is_some_and(|s| s.name() == "dflash2"),
         deepseek4_spec_requested: deepseek4_spec_requested(m),
         ngram_can_sample,
         temp,
@@ -6934,6 +6939,7 @@ mod qwen4_pp_route_tests {
             pp,
             has_speculator: false,
             speculator_is_mtp: false,
+            speculator_is_dflash2: false,
             deepseek4_spec_requested: false,
             ngram_can_sample: false,
             temp: 0.0,
@@ -6998,24 +7004,6 @@ mod qwen4_pp_route_tests {
             i.temp = 0.7;
             assert_eq!(select_generation_route(&i), GenerationRoute::Qwen4Ar);
         }
-    }
-
-    #[test]
-    fn qwen4_dflash2_takes_the_spec_route_single_card_without_penalties() {
-        let mut i = inputs(16, 1);
-        i.has_speculator = true;
-        i.supports_temp_swor = true;
-        assert_eq!(select_generation_route(&i), GenerationRoute::Qwen4Spec);
-        i.temp = 1.0;
-        assert_eq!(select_generation_route(&i), GenerationRoute::Qwen4Spec);
-        // DFlash2 applies no token penalties at any temperature.
-        i.nonneutral_penalties = true;
-        assert_eq!(select_generation_route(&i), GenerationRoute::Qwen4Ar);
-        i.temp = 0.0;
-        assert_eq!(select_generation_route(&i), GenerationRoute::Qwen4Ar);
-        i.nonneutral_penalties = false;
-        i.pp = 2;
-        assert_eq!(select_generation_route(&i), GenerationRoute::Qwen4Ar);
     }
 
     #[test]

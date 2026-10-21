@@ -906,7 +906,7 @@ impl Carrier for Qwen4Carrier {
                 &mut loaded.bundle,
                 max_seq,
                 cpu_splice,
-                ctx.spec.dflash_block,
+                qwen4_dflash2_block(ctx.spec, verify_rows),
                 verify_rows,
             ) {
                 Ok(speculator) => Some(speculator),
@@ -1108,18 +1108,33 @@ fn qwen4_native_mtp_k(spec: SpecLoadCfg, gpu_arch: &str) -> usize {
         .unwrap_or_else(|| qwen4_auto_mtp_k(gpu_arch, None))
 }
 
+/// Qwen4 DFlash2 width under `speculation.dflash_block = auto`: B=4 (three
+/// drafts) is the fastest measured width on gfx1151 and the model card's.
+const QWEN4_DFLASH2_AUTO_BLOCK: usize = 4;
+
+/// The proposal width of a Qwen4 DFlash2 load: an explicit
+/// `speculation.dflash_block`, else [`QWEN4_DFLASH2_AUTO_BLOCK`], clamped to
+/// the rows a verify runs row-exact (`verify_rows`: 8 on gfx1151) so greedy
+/// output stays the AR stream.
+fn qwen4_dflash2_block(spec: SpecLoadCfg, verify_rows: usize) -> usize {
+    match spec.dflash_block {
+        Some(block) if !spec.dflash_block_auto => block,
+        _ => QWEN4_DFLASH2_AUTO_BLOCK,
+    }
+    .min(verify_rows)
+}
+
 /// The shared DFlash2 speculator (`--spec dflash --model-draft <draft>`) on
-/// a single-card Qwen4 bundle. The proposal width is `speculation.dflash_block`
-/// (`auto` = 16) clamped to the rows a verify runs row-exact (`verify_rows`:
-/// 8 on gfx1151), so greedy output stays the AR stream. CPU-hosted routed
-/// experts (a 4-row verify window) are refused rather than guessed at.
+/// a single-card Qwen4 bundle at proposal width `block`
+/// ([`qwen4_dflash2_block`]). CPU-hosted routed experts (a 4-row verify
+/// window) are refused rather than guessed at.
 fn qwen4_dflash2_speculator(
     gpu: &mut rdna_compute::Gpu,
     draft: &str,
     bundle: &mut hipfire_arch_qwen4::bundle::Qwen4Bundle,
     max_seq: usize,
     cpu_splice: bool,
-    dflash_block: Option<usize>,
+    block: usize,
     verify_rows: usize,
 ) -> Result<Box<dyn hipfire_runtime::spec::Speculator>, String> {
     if cpu_splice {
@@ -1142,9 +1157,6 @@ fn qwen4_dflash2_speculator(
             config.hidden, config.vocab_size, bundle.config.hidden_size, bundle.config.vocab_size
         ));
     }
-    let block = dflash_block
-        .unwrap_or(hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED)
-        .min(verify_rows);
     let speculator =
         hipfire_runtime::dflash2_spec::build_dflash2_speculator(gpu, draft, bundle, max_seq, block)
             .map_err(|error| format!("qwen4: DFlash2 speculator: {error}"))?;
@@ -7348,6 +7360,27 @@ mod qwen4_admission_tests {
         assert!(Qwen4Carrier
             .admit_options(Some("draft.hfq"), defaults)
             .is_err());
+    }
+
+    #[test]
+    fn qwen4_dflash2_width_is_four_under_auto_and_explicit_otherwise_within_exact_rows() {
+        let width = |dflash_block, dflash_block_auto, rows| {
+            super::qwen4_dflash2_block(
+                SpecLoadCfg {
+                    dflash_block,
+                    dflash_block_auto,
+                    ..SpecLoadCfg::default()
+                },
+                rows,
+            )
+        };
+        // The daemon resolves `auto` to 16 (8 batched); Qwen4 keeps its 4.
+        assert_eq!(width(Some(16), true, 8), 4);
+        assert_eq!(width(None, false, 8), 4);
+        assert_eq!(width(Some(6), false, 8), 6);
+        // Never past the row-exact verify rows.
+        assert_eq!(width(Some(16), false, 8), 8);
+        assert_eq!(width(None, false, 3), 3);
     }
 
     #[test]

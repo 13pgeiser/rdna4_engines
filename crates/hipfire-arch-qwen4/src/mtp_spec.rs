@@ -466,6 +466,10 @@ impl SpecScratch for Qwen4SpecScratch {
             "Qwen4 verify scratch dropped with an active target snapshot"
         );
     }
+
+    fn clear(&mut self) {
+        self.target_snapshot = None;
+    }
 }
 
 /// The operations of the one native MTP driver that touch the target (and
@@ -1090,6 +1094,11 @@ impl Qwen4Bundle {
             .session_lineage_after(start_pos)
             .map_or(end_pos, |p| p.min(end_pos));
         if let Some(forward) = &mut self.execution {
+            // The pair executor runs layer-major outside the step
+            // interpreter, where the DFlash2 layer capture has no hook.
+            if capture {
+                forward.npu_trunk_request_gpu_only("DFlash2 layer capture");
+            }
             forward
                 .plan_npu_trunk_request(gpu, plan_end - start_pos, start_pos)
                 .map_err(|error| error.to_string())?;
@@ -1122,6 +1131,8 @@ impl Qwen4Bundle {
             if let Some(out) = hidden_out.as_deref_mut() {
                 self.read_dflash_capture(gpu, rows, out)
                     .map_err(|error| error.to_string())?;
+                // A long prompt keeps only the rows the draft reads.
+                self.trim_dflash_rows(out);
             }
             if self.session_next_boundary() == Some(start_pos + end) {
                 self.spec_advance_session_boundary(gpu, start_pos + end)
@@ -1391,6 +1402,29 @@ impl SpecTarget for Qwen4Bundle {
     fn embed_row(&mut self, gpu: &mut Gpu, token_id: u32) -> Result<Vec<f32>, String> {
         self.dflash_embed_row(gpu, token_id)
             .map_err(|error| error.to_string())
+    }
+
+    fn set_dflash_feature_window(&mut self, rows: usize) {
+        self.set_dflash_window(rows);
+    }
+
+    fn abandon_verify(
+        &mut self,
+        gpu: &mut Gpu,
+        scratch: &mut dyn SpecScratch,
+    ) -> Result<(), String> {
+        let ticket = scratch
+            .as_any_mut()
+            .downcast_mut::<Qwen4SpecScratch>()
+            .ok_or("Qwen4 abandon_verify: scratch is not Qwen4SpecScratch")?
+            .target_snapshot
+            .take();
+        match ticket {
+            None => Ok(()),
+            Some(ticket) => self
+                .restore(gpu, ticket.local()?)
+                .map_err(|error| error.to_string()),
+        }
     }
 
     fn lm_head_logits_device(

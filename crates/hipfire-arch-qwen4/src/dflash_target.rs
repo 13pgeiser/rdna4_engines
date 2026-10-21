@@ -22,6 +22,9 @@ pub(crate) struct Qwen4DflashTarget {
     capture_rows: usize,
     /// One-row embedding lookup: token id (i32), F32 row, rotation staging.
     embed: Option<[GpuTensor; 3]>,
+    /// Rows of the drafter's feature sink a prefill keeps (its window);
+    /// `None` keeps every row.
+    window: Option<usize>,
 }
 
 impl Qwen4DflashTarget {
@@ -54,11 +57,26 @@ impl Qwen4Bundle {
             capture: None,
             capture_rows: 0,
             embed: None,
+            window: None,
         });
     }
 
     pub(crate) fn dflash_layers(&self) -> Option<&[usize]> {
         self.dflash.as_ref().map(|target| target.layers.as_slice())
+    }
+
+    /// The drafter reads only the last `rows` feature rows.
+    pub(crate) fn set_dflash_window(&mut self, rows: usize) {
+        if let Some(target) = self.dflash.as_mut() {
+            target.window = Some(rows);
+        }
+    }
+
+    /// Drop leading rows of the drafter's feature sink past its window.
+    pub(crate) fn trim_dflash_rows(&self, out: &mut Vec<f32>) {
+        if let Some(window) = self.dflash.as_ref().and_then(|target| target.window) {
+            hipfire_runtime::dflash2_spec::trim_feature_rows(out, self.dflash_row_width(), window);
+        }
     }
 
     /// Feature row width: `layers × hidden` F32.

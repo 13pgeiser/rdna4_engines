@@ -25,7 +25,7 @@
 //! to the draft rows on the device ([`SpecTarget::lm_head_logits_device`]).
 //! Chain only: there is no tree arm (the selector is the proposal).
 
-use crate::dflash::{draft_forward, propose_candidates_device, DflashConfig, DflashScratch};
+use crate::dflash::{draft_forward_based, propose_candidates_device, DflashConfig, DflashScratch};
 use crate::dflash::{DflashWeights, DFLASH_BLOCK_MAX};
 use crate::hfq::HfqFile;
 use crate::spec::{
@@ -43,9 +43,15 @@ pub struct Dflash2Speculator {
     weights: DflashWeights,
     scratch: DflashScratch,
     config: DflashConfig,
-    /// Feature rows of every committed position, in order: grows by exactly
-    /// `accepted + 1` rows per window (the bonus row arrives as the next seed).
+    /// Feature rows of committed positions `host_base..`, in order: grows by
+    /// exactly `accepted + 1` rows per window (the bonus row arrives as the
+    /// next seed). With a windowed draft only the window is kept
+    /// ([`trim_feature_rows`]); otherwise `host_base` stays 0.
     target_hidden_host: Vec<f32>,
+    host_base: usize,
+    /// Rows the draft reads (its declared sliding window); `None` keeps every
+    /// row.
+    feature_window: Option<usize>,
     verify_scratch: Option<Box<dyn SpecScratch>>,
     block_size: usize,
     ctx_capacity: usize,
@@ -86,15 +92,66 @@ impl Dflash2Speculator {
             .ok_or_else(|| "Dflash2Speculator: verify scratch already freed".to_string())
     }
 
+    /// Committed positions the host rows end at.
+    fn host_end(&self) -> usize {
+        self.host_base + self.target_hidden_host.len() / self.row_elems()
+    }
+
     fn check_host_rows(&self, position: usize) -> Result<(), String> {
-        let expected = position * self.row_elems();
-        if self.target_hidden_host.len() == expected {
+        if self.target_hidden_host.len() % self.row_elems() == 0 && self.host_end() == position {
             Ok(())
         } else {
             Err(format!(
-                "Dflash2Speculator: {} feature floats, expected {position} rows ({expected})",
-                self.target_hidden_host.len()
+                "Dflash2Speculator: {} feature floats from row {}, expected rows up to {position}",
+                self.target_hidden_host.len(),
+                self.host_base
             ))
+        }
+    }
+
+    /// After the target appended rows through position `end` (and may have
+    /// trimmed leading rows itself): re-derive the base, then keep the window.
+    fn rebase_host(&mut self, end: usize) -> Result<(), String> {
+        let rows = self.target_hidden_host.len() / self.row_elems();
+        self.host_base = end.checked_sub(rows).ok_or_else(|| {
+            format!("Dflash2Speculator: {rows} feature rows end past position {end}")
+        })?;
+        self.trim_host();
+        Ok(())
+    }
+
+    fn trim_host(&mut self) {
+        if let Some(window) = self.feature_window {
+            let row_elems = self.row_elems();
+            self.host_base += trim_feature_rows(&mut self.target_hidden_host, row_elems, window);
+        }
+    }
+
+    fn clear_host(&mut self) {
+        self.target_hidden_host.clear();
+        self.target_hidden_host.shrink_to_fit();
+        self.host_base = 0;
+        self.scratch.reset_upload_tracking();
+    }
+
+    /// A window that failed after its verify started must not leave the
+    /// target holding the verify's rollback ticket (the next verify would
+    /// refuse): roll the target back to the window's start.
+    fn settle<T>(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        result: Result<T, String>,
+    ) -> Result<T, String> {
+        let Err(error) = result else {
+            return result;
+        };
+        match self.verify_scratch.as_mut() {
+            Some(vs) => match target.abandon_verify(gpu, vs.as_mut()) {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(format!("{error}; target rollback failed: {rollback}")),
+            },
+            None => Err(error),
         }
     }
 
@@ -132,6 +189,7 @@ impl Dflash2Speculator {
             ));
         }
         self.target_hidden_host.extend_from_slice(&rows[..elems]);
+        self.trim_host();
         Ok(())
     }
 }
@@ -155,8 +213,11 @@ impl Speculator for Dflash2Speculator {
         let (fill, start) = if cache_hit {
             (prefill_tokens, prefill_start)
         } else {
-            self.target_hidden_host.clear();
-            self.scratch.reset_upload_tracking();
+            // A cold prefill resets the target: any verify ticket is gone.
+            self.clear_host();
+            if let Some(vs) = self.verify_scratch.as_mut() {
+                vs.clear();
+            }
             (prompt_tokens, 0)
         };
         self.check_host_rows(start)?;
@@ -175,6 +236,7 @@ impl Speculator for Dflash2Speculator {
                 last_logits,
             } => (last_argmax, last_logits),
         };
+        self.rebase_host(start + fill.len())?;
         self.check_host_rows(start + fill.len())?;
         let first_token = if self.sampled() {
             let logits = last_logits.ok_or(
@@ -212,7 +274,8 @@ impl Speculator for Dflash2Speculator {
         }
         self.check_host_rows(position)?;
         if max_emit == 1 {
-            return self.step_one_token(gpu, target, position, seed);
+            let result = self.step_one_token(gpu, target, position, seed);
+            return self.settle(gpu, target, result);
         }
         // Block of b rows: b-1 drafts + bonus never exceed the budget.
         let b = self.block_size.min(max_emit).max(2);
@@ -238,17 +301,19 @@ impl Speculator for Dflash2Speculator {
         // Context rows sit at their absolute positions, the block after them.
         let positions_q: Vec<i32> = (position as i32..(position + b) as i32).collect();
         let positions_k: Vec<i32> = (0..(position + b) as i32).collect();
-        draft_forward(
+        draft_forward_based(
             gpu,
             &self.weights,
             &self.config,
             Some(&noise),
             Some(self.target_hidden_host.as_slice()),
+            self.host_base,
             &positions_q,
             &positions_k,
             b,
             position,
             &mut self.scratch,
+            false,
         )
         .map_err(|e| format!("Dflash2Speculator draft_forward: {e}"))?;
 
@@ -277,38 +342,8 @@ impl Speculator for Dflash2Speculator {
         let mut block = Vec::with_capacity(b);
         block.push(seed);
         block.extend_from_slice(&drafts);
-
-        let mut rows = Vec::with_capacity(b * self.row_elems());
-        let mut vs = self.verify_scratch.take().ok_or("verify scratch freed")?;
-        let verdict = if sampled {
-            target
-                .verify_block_logits(gpu, &block, position, vs.as_mut(), Some(&mut rows))
-                .and_then(|logits| self.accept_sampled(&proposal, &drafts, &logits))
-        } else {
-            target
-                .verify_block(gpu, &block, position, vs.as_mut(), Some(&mut rows))
-                .map(|picks| accept_greedy_prefix(&drafts, &picks, None))
-        };
-        self.verify_scratch = Some(vs);
-        let verdict = verdict?;
-        let accepted = verdict.accepted;
-        let bonus = *verdict
-            .committed
-            .last()
-            .ok_or("Dflash2Speculator: empty verdict")?;
-        target.commit_prefix(
-            gpu,
-            &block,
-            accepted,
-            position,
-            self.verify_scratch()?.as_mut(),
-        )?;
-        self.append_rows(&rows, accepted + 1)?;
-        let emit = drafts[..accepted]
-            .iter()
-            .copied()
-            .chain(std::iter::once(bonus));
-        Ok(SpecStep::new(emit, bonus, drafts_n, accepted).cap_emit(max_emit))
+        let result = self.verify_window(gpu, target, position, &block, &proposal, max_emit);
+        self.settle(gpu, target, result)
     }
 
     fn on_forced_advance(
@@ -333,14 +368,18 @@ impl Speculator for Dflash2Speculator {
             abort,
             Some(&mut self.target_hidden_host),
         )? {
+            self.rebase_host(start_pos + tokens.len())?;
             self.check_host_rows(start_pos + tokens.len())?;
         }
         Ok(true)
     }
 
     fn reset(&mut self, _gpu: &mut Gpu) -> Result<(), String> {
-        self.target_hidden_host.clear();
-        self.scratch.reset_upload_tracking();
+        self.clear_host();
+        // The target was reset with the drafter: drop a stale verify ticket.
+        if let Some(vs) = self.verify_scratch.as_mut() {
+            vs.clear();
+        }
         Ok(())
     }
 
@@ -396,6 +435,51 @@ impl Speculator for Dflash2Speculator {
 }
 
 impl Dflash2Speculator {
+    /// Verify `block` (`[seed, drafts…]`), accept, commit the kept prefix
+    /// and append its feature rows.
+    fn verify_window(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        block: &[u32],
+        proposal: &crate::dflash::DflashCandidateProposal,
+        max_emit: usize,
+    ) -> Result<SpecStep, String> {
+        let drafts = &block[1..];
+        let mut rows = Vec::with_capacity(block.len() * self.row_elems());
+        let mut vs = self.verify_scratch.take().ok_or("verify scratch freed")?;
+        let verdict = if self.sampled() {
+            target
+                .verify_block_logits(gpu, block, position, vs.as_mut(), Some(&mut rows))
+                .and_then(|logits| self.accept_sampled(proposal, drafts, &logits))
+        } else {
+            target
+                .verify_block(gpu, block, position, vs.as_mut(), Some(&mut rows))
+                .map(|picks| accept_greedy_prefix(drafts, &picks, None))
+        };
+        self.verify_scratch = Some(vs);
+        let verdict = verdict?;
+        let accepted = verdict.accepted;
+        let bonus = *verdict
+            .committed
+            .last()
+            .ok_or("Dflash2Speculator: empty verdict")?;
+        target.commit_prefix(
+            gpu,
+            block,
+            accepted,
+            position,
+            self.verify_scratch()?.as_mut(),
+        )?;
+        self.append_rows(&rows, accepted + 1)?;
+        let emit = drafts[..accepted]
+            .iter()
+            .copied()
+            .chain(std::iter::once(bonus));
+        Ok(SpecStep::new(emit, bonus, drafts.len(), accepted).cap_emit(max_emit))
+    }
+
     /// Sampled acceptance of one window against the verify's `logits`
     /// (`(drafts + 1) × vocab`): the selector's sparse `q` per draft row.
     fn accept_sampled(
@@ -503,7 +587,13 @@ pub fn build_dflash2_speculator(
             return Err(format!("{e}"));
         }
     };
+    // An all-sliding draft reads only its last `W` context rows: the host and
+    // the target keep just those (a split draft's full layer reads them all).
+    let feature_window = config.declared_window.filter(|_| config.all_layers_sliding);
     target.set_dflash_extract_layers(config.target_layer_ids.clone());
+    if let Some(window) = feature_window {
+        target.set_dflash_feature_window(window);
+    }
     let verify_scratch = match target.new_spec_scratch(gpu, block) {
         Ok(vs) => vs,
         Err(e) => {
@@ -518,6 +608,8 @@ pub fn build_dflash2_speculator(
         scratch,
         config,
         target_hidden_host: Vec::new(),
+        host_base: 0,
+        feature_window,
         verify_scratch: Some(verify_scratch),
         block_size: block,
         ctx_capacity,
@@ -525,6 +617,19 @@ pub fn build_dflash2_speculator(
         request: SpecRequestConfig::default(),
         rng: SpecRng::new(0),
     }))
+}
+
+/// Keep the last `keep` rows of `rows_elems`-wide feature rows once the
+/// buffer holds more than `2 * keep` rows (amortized one copy per `keep`
+/// appended rows). Returns the rows dropped from the front.
+pub fn trim_feature_rows(rows: &mut Vec<f32>, row_elems: usize, keep: usize) -> usize {
+    let held = rows.len() / row_elems;
+    if keep == 0 || held <= 2 * keep {
+        return 0;
+    }
+    let drop = held - keep;
+    rows.drain(..drop * row_elems);
+    drop
 }
 
 #[cfg(test)]
@@ -612,5 +717,29 @@ mod tests {
         );
         assert_eq!((q[1].prob(9), q[1].prob(8), q[1].prob(3)), (0.6, 0.4, 0.0));
         assert!(selector_q(&proposal, 3).is_err(), "shape is checked");
+    }
+
+    /// The host keeps at most `2 * keep` rows, and after a trim exactly the
+    /// last `keep`, in order: the draft's window always survives.
+    #[test]
+    fn trimmed_feature_rows_keep_the_last_window_in_order() {
+        let row = 3;
+        let mut rows: Vec<f32> = Vec::new();
+        let mut base = 0usize;
+        for position in 0..100u32 {
+            rows.extend((0..row).map(|i| (position * 10 + i as u32) as f32));
+            base += trim_feature_rows(&mut rows, row, 8);
+            let held = rows.len() / row;
+            assert!(held <= 16, "position {position}: {held} rows");
+            assert_eq!(base + held, position as usize + 1);
+            // Row r of the buffer is position base + r.
+            assert_eq!(rows[0], (base as u32 * 10) as f32);
+            assert!(held >= 8.min(position as usize + 1));
+        }
+        assert_eq!(
+            trim_feature_rows(&mut rows, row, 0),
+            0,
+            "keep 0 never trims"
+        );
     }
 }

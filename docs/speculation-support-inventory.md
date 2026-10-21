@@ -118,12 +118,16 @@ a new arm.
   `speculation.dflash = on` with `--model-draft`; native MTP stays the default and the two never load
   together. The target captures the drafter's `target_layer_ids` as each layer's completed output
   averaged over the 4 hyper-connection streams (`hc_mean_capture_f32`, run between interpreter steps
-  so the verify program is unchanged) in prefill and every verify. Block width
-  `speculation.dflash_block` (`auto` = 16) is clamped to the GPU's row-exact verify rows (8 on
-  gfx1151); B = 4 matches the model card. Chain only: greedy is the selector's argmax walk (output =
-  AR); sampled draws from the selector's softmax over its top-16 and accepts with sparse-q
-  rejection sampling against the AR sampler's law (temperature, top_k, top_p, min_p). Penalized
-  requests stay AR. EP, PP and CPU-hosted routed experts refuse DFlash2.
+  so the verify program is unchanged) in prefill and every verify; a capturing prefill is planned
+  GPU-only (the NPU trunk pair executor and the S1 layer-major prefill build their own steps, so
+  they are bypassed). Block width: `speculation.dflash_block`, Qwen4 `auto` = 4 (the card's width
+  and the fastest measured on gfx1151), an explicit width clamped to the GPU's row-exact verify rows
+  (8 on gfx1151). The host keeps only the draft's 2048-row window of feature rows (≤ 2 × 2048 ×
+  51,200 B). Chain only: greedy is the selector's argmax walk (output = AR); sampled draws from the
+  selector's softmax over its top-16 and accepts with sparse-q rejection sampling against the AR
+  sampler's law (temperature, top_k, top_p, min_p). Penalized requests stay AR. EP, PP and
+  CPU-hosted routed experts refuse DFlash2. **Known gap:** the DFlash2 route never reuses the Qwen4
+  session / prefix cache (every request prefills cold; HIPF-143).
 - **muse-glimmer 14:** a distinct arch-23 draft (not a `dflash_convert` arch-20 artifact), loaded via
   `HIPFIRE_DFLASH_DRAFT` / `params.draft` while `dflash_mode != off`.
 - **Genre conditionality** is a measured property (see the historical table in
