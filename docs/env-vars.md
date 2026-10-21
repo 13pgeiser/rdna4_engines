@@ -459,7 +459,7 @@ refused at load under PP; Single and EP session behavior is unchanged.
 | Variable | Status | Scope |
 |---|---|---|
 | `HIPFIRE_LFM2_GRAPH` | LFM graph experiments | Source in LFM crate/daemon |
-| `HIPFIRE_FORWARD_LOWERED` | default on (several other arches); `=0` opts out | Shared lowered forward escape hatch. **LFM no longer reads it**: its decode is one typed step program with no hand loop to fall back to. Qwen3.5-family single-token forwards automatically use the CPU-splice-capable hand executor when the loaded model owns CPU-executed host weights, including enabled MTP forced advances and terminal flushes; no override is required. Device-resident and PCIe-offloaded Qwen models retain the lowered route. The sealed LFM [`admissions.yml`](admissions.yml) evidence row still records `=0` as a historical knob of that screen; **not** an automatic Redline runtime-default opt-out. |
+| `HIPFIRE_FORWARD_LOWERED` | default on (several other arches); `=0` opts out | Shared lowered forward escape hatch. **LFM and the Qwen3.5 family no longer read it**: their decode is one typed step program with no hand loop to fall back to (for Qwen3.5 this includes DFlash hidden capture, VL mrope and CPU-spilled models, whose GEMV steps take the CPU splice). The sealed LFM [`admissions.yml`](admissions.yml) evidence row still records `=0` as a historical knob of that screen; **not** an automatic Redline runtime-default opt-out. |
 | Other `HIPFIRE_LFM*` | diag/trace | Inventory |
 
 `HIPFIRE_LFM2_PREFILL_BATCH`, `HIPFIRE_LFM2_PREFILL_MAX_BATCH`, and `HIPFIRE_LFM2_GFX1201_DECODE_FUSION` have **no reader under `crates/`** in this tree: setting them changes nothing, LFM prefill is the eager loop, and there is no batched-prefill or decode-fusion selector. They appear only in design/planning docs, the sealed [`admissions.yml`](admissions.yml) evidence row (historical `explicit_opt_outs`, not runtime opt-outs), and branch-pinned wording (`lfm-redline@692a726dde53508cb53de1a74c720e75a7c9f33e`, absent from `origin/beta@202282de…`). [`admissions.yml`](admissions.yml) remains the sole product-admission authority (schema v2; exactly one earned retained-PM4 product row).
@@ -963,7 +963,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_CONTAINER` | scripts/container-gate.sh, scripts/test_container_gate.py | harness |
 | `HIPFIRE_CONTINUOUS_BATCH` | crates/hipfire-arch-qwen35/src/carrier.rs | developer |
 | `HIPFIRE_CONTINUOUS_BATCH_SIZE` | crates/hipfire-config/src/lib.rs | stable |
-| `HIPFIRE_CONV_QKNORM` | crates/hipfire-dispatch/src/pipeline/hybrid.rs | developer |
+| `HIPFIRE_CONV_QKNORM` | crates/hipfire-dispatch/src/pipeline/hybrid.rs, crates/rdna-compute/tests/conv_qknorm_parity.rs | developer |
 | `HIPFIRE_CONV_QKNORM_SHAPE` | crates/hipfire-dispatch/src/pipeline/hybrid.rs, crates/rdna-compute/src/norm.rs | developer |
 | `HIPFIRE_CONV_SCALAR_PREP` | crates/hipfire-dispatch/src/pipeline/hybrid.rs | developer |
 | `HIPFIRE_CPU_EXEC_TRACE` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
@@ -2030,7 +2030,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN35_A3B_RESET_MODEL` | crates/hipfire-generate/tests/qwen35_reset_hw.rs | harness |
 | `HIPFIRE_QWEN35_DSPARK_CONF_THRESHOLD` | crates/hipfire-loader/src/lib.rs | developer |
 | `HIPFIRE_QWEN35_FA_EPILOGUE_FUSE` | crates/hipfire-dispatch/src/pipeline/hybrid.rs | developer |
-| `HIPFIRE_QWEN35_FA_PREP_FUSE` | crates/hipfire-dispatch/src/pipeline/hybrid.rs | developer |
+| `HIPFIRE_QWEN35_FA_PREP_FUSE` | crates/hipfire-dispatch/src/pipeline/hybrid.rs, crates/rdna-compute/tests/fa_prep_parity.rs | developer |
 | `HIPFIRE_QWEN35_FA_PREP_KERNEL` | crates/rdna-compute/src/kernel_registry.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_QWEN35_FINITE_TRACE` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs | developer |
 | `HIPFIRE_QWEN35_FIXTURE` | crates/hipfire-arch-qwen35/src/qwen35/load.rs, crates/hipfire-arch-qwen35/tests/route_oracle_mesh.rs | developer |

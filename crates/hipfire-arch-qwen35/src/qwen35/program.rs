@@ -30,7 +30,7 @@ use hipfire_dispatch::pipeline::batched_deltanet::{
 use hipfire_dispatch::pipeline::batched_moe::{AttentionMoeLayerView, DeltaNetMoeLayerView};
 use hipfire_dispatch::pipeline::hybrid::{
     AttentionKv, AttentionRow, AttentionTap, DeltaNetMixerOp, GatedAttentionOp, GdnState,
-    HybridDims, SwigluFfnOp,
+    HybridDims, MropeRope, SwigluFfnOp,
 };
 use hipfire_dispatch::pipeline::Step;
 use hipfire_runtime::llama::{self, KvCacheExt};
@@ -113,6 +113,8 @@ pub(crate) struct DecodeBinding<'a> {
     pub kv_cache: &'a llama::KvCache,
     pub dn_state: &'a DeltaNetState,
     pub position: usize,
+    /// Vision-language step: (t, h, w) RoPE sections read from `s.pos_buf3`.
+    pub mrope_section: Option<[usize; 3]>,
 }
 
 impl<'a> DecodeBinding<'a> {
@@ -228,6 +230,10 @@ impl<'a> DecodeBinding<'a> {
                     x_rot: &s.x_rot,
                     q_gate: &s.fa_q_full,
                     tap,
+                    mrope: self.mrope_section.map(|section| MropeRope {
+                        positions: &s.pos_buf3,
+                        section,
+                    }),
                 })
             }
         }
