@@ -1174,6 +1174,8 @@ extern "C" int r4d_rad_ar_twoshot_8rank_exact(const RadArgs* a, RadStream s) {
     const long long asked = r4d_pgeti_or(a->p, a->n_p, "pieces", in->pieces);
     if (asked < 0 || asked > R4D_AR_TS_MAX_PIECES) return RAD_E_INVAL;
     const long long pieces = ar8_pieces_for(in, c.numel, asked);
+    /* A diagnostic: a device buffer of nblocks * R4D_AR_TL_WORDS int64 stamps (r4d.h). */
+    const long long timeline = r4d_pgeti_or(a->p, a->n_p, "timeline", 0);
     R4D_TRY("ar_twoshot_8rank_exact",
         r4d_ar_twoshot_8rank_exact(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
                                    in->peer_scratch[3], in->peer_scratch[4], in->peer_scratch[5],
@@ -1184,7 +1186,7 @@ extern "C" int r4d_rad_ar_twoshot_8rank_exact(const RadArgs* a, RadStream s) {
                                    in->my_scratch, in->my_flags, in->my_seq, in->slot16,
                                    c.inp, c.out, c.numel, in->dtype, in->rank,
                                    (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
-                                   c.pub, weights, (long)pieces));
+                                   c.pub, weights, (long)pieces, (long)timeline));
     return RAD_OK;
 }
 

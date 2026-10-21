@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 #include "r4d_ar_seq.h"
+#include "r4d_ar_shards.h"
 
 #define R4D_AR_SPIN_MAX 4000000000ULL
 #define R4D_AR_WIDE_MAX_BLOCKS 64
@@ -66,14 +67,19 @@ __device__ __forceinline__ void r4d_ar_acquire(int acq) {
 // words has reached or passed it (peers may be a step ahead; counters only grow). One spin lane
 // per source, wrap-safe monotonic compare, never equality. Every rank publishes before it waits,
 // so there is no cycle; a handshake that cannot complete traps.
+//
+// `tl`, when not null, takes two wall-clock stamps: when the whole block has issued and drained
+// its stores, and when every peer's flag has been seen. A diagnostic: the eight-rank two-shot
+// passes it only for a launch asking for its timeline (r4d_ar_tl_stamp).
 template <int WS, typename S, int NPEERS>
 __device__ __forceinline__ void r4d_ar_handshake(const R4DArWidePeers<S, NPEERS>& peers,
                                                  unsigned int* __restrict__ my_flags, int b,
                                                  int rank, unsigned int val, int drain, int acq,
-                                                 int pub) {
+                                                 int pub, long long* tl = nullptr) {
   r4d_ar_drain(drain);
   __syncthreads();
   const int tid = threadIdx.x;
+  if (tl && tid == 0) tl[0] = (long long)wall_clock64();
   if (tid == 0) {
     if (drain == 2) __threadfence_system();
     if (pub == 2) {
@@ -107,7 +113,14 @@ __device__ __forceinline__ void r4d_ar_handshake(const R4DArWidePeers<S, NPEERS>
     }
   }
   __syncthreads();
+  if (tl && tid == 0) tl[1] = (long long)wall_clock64();
   r4d_ar_acquire(acq);
+}
+
+// The two-shot timeline (layout in r4d_ar_shards.h), one stamp of the device wall clock.
+static_assert(R4D_AR_TL_BLOCKS == R4D_AR_WIDE_MAX_BLOCKS, "r4d_ar_shards.h restates the ceiling");
+__device__ __forceinline__ void r4d_ar_tl_stamp(long long* tl, int i) {
+  if (tl && threadIdx.x == 0) tl[i] = (long long)wall_clock64();
 }
 
 // Host side: checks stride and grid against the real allocations. Every scratch, flag and seq

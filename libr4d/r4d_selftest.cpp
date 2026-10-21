@@ -403,6 +403,9 @@ static void cross_check(const Plugin& pl) {
 /* ================================================================== the device phase */
 /* --cold MIB: bytes read through the caches before every timed launch; see st_time_us. */
 static int64_t g_cold = 0;
+/* --timeline: --perfar8 also records the two-shot's per-block stamps (r4d.h) and prints where each
+ * rank's time goes. */
+static bool g_timeline = false;
 
 /* R4D_SELFTEST_ONE_CARD=1 runs the eight-rank collectives as eight ranks on the first card, each
  * on its own non-blocking stream: the protocol, the shard table and the arithmetic, with VRAM in
@@ -22364,12 +22367,15 @@ struct Ar8Perf {
     std::vector<int64_t> bad;
     std::vector<float> period;
     std::vector<std::vector<float>> cold;
+    /* --timeline: per config, the two-shot's stamps (nblocks x R4D_AR_TL_WORDS, -1 unset). */
+    std::vector<std::vector<long long>> tl;
 };
 
 static void ar8_perf_worker(Ar8Perf* t) {
     const size_t ncfg = t->sizes.size() * t->rows.size() * t->nbs.size();
     t->rc.assign(ncfg, RAD_E_STATE); t->bad.assign(ncfg, 0); t->period.assign(ncfg, 0.0f);
     t->cold.assign(ncfg, {});
+    t->tl.assign(ncfg, {});
     if (st_set_device(t->dev) != hipSuccess) t->rc_init = RAD_E_DEVICE;
     if (t->rc_init == RAD_OK && st_one_card() &&
         hipStreamCreateWithFlags(&t->st, hipStreamNonBlocking) != hipSuccess)
@@ -22384,10 +22390,12 @@ static void ar8_perf_worker(Ar8Perf* t) {
     };
     for (size_t j = 0; j < t->rows.size() && t->rc_init == RAD_OK; ++j)
         t->rc_init = t->rows[j]->init(ip.data(), (int)ip.size(), t->rank, t->world, &inst[j]);
-    void *in = nullptr, *out = nullptr, *csrc = nullptr, *cdst = nullptr;
+    void *in = nullptr, *out = nullptr, *csrc = nullptr, *cdst = nullptr, *tlbuf = nullptr;
+    const size_t tl_words = (size_t)R4D_AR_TL_BLOCKS * R4D_AR_TL_WORDS;
     if (t->rc_init == RAD_OK &&
         (hipMalloc(&in, (size_t)most * esz) != hipSuccess ||
          hipMalloc(&out, (size_t)most * esz) != hipSuccess ||
+         (g_timeline && hipMalloc(&tlbuf, tl_words * sizeof(long long)) != hipSuccess) ||
          (g_cold > 0 && (hipMalloc(&csrc, (size_t)g_cold) != hipSuccess ||
                          hipMalloc(&cdst, (size_t)std::min(g_cold, kColdChunk)) != hipSuccess))))
         t->rc_init = RAD_E_NOMEM;
@@ -22484,6 +22492,23 @@ static void ar8_perf_worker(Ar8Perf* t) {
                     }
                 }
                 t->bar->wait();
+                /* One more launch, warm, with the stamps on: a two-shot row reads `timeline`, the
+                 * one-shot ignores it and leaves the buffer unset. */
+                if (timed && g_timeline && tlbuf) {
+                    std::vector<RadParam> pt = ps;
+                    pt.push_back(PI("timeline", (int64_t)(uintptr_t)tlbuf));
+                    a.p = pt.data(); a.n_p = (int)pt.size();
+                    hip_ck(hipMemsetAsync(tlbuf, 0xff, tl_words * sizeof(long long), t->st),
+                           "hipMemsetAsync", __LINE__);
+                    t->bar->wait();
+                    t->rows[j]->launch(&a, t->st);
+                    st_stream_sync(t->st);
+                    t->tl[cfg].resize(tl_words);
+                    st_memcpy(t->tl[cfg].data(), tlbuf, tl_words * sizeof(long long),
+                              hipMemcpyDeviceToHost);
+                    a.p = ps.data(); a.n_p = (int)ps.size();
+                }
+                t->bar->wait();
                 ++cfg;
             }
         }
@@ -22493,8 +22518,61 @@ static void ar8_perf_worker(Ar8Perf* t) {
     t->bar->wait();
     for (size_t j = 0; j < t->rows.size(); ++j)
         if (inst[j] && t->rows[j]->fini) t->rows[j]->fini(inst[j]);
-    for (void* p : { in, out, csrc, cdst }) if (p) st_free(p);
+    for (void* p : { in, out, csrc, cdst, tlbuf }) if (p) st_free(p);
     if (t->st) hip_ck(hipStreamDestroy(t->st), "hipStreamDestroy", __LINE__);
+}
+
+/* The two-shot's stamps for one config as each rank's phases, in microseconds. A rank's event is
+ * its last block's (the rank has issued everything only when every block has); the start is its
+ * first block's. Steps follow the kernel: push the first piece, wait for every peer's flag, then a
+ * step a piece (push the next piece's first hop, reduce and send this piece's second, assemble the
+ * previous one) and its wait, then the last assemble. With one piece the first push is the
+ * reduce-scatter's send, the first wait its receipt, the step the reduce and the all-gather's
+ * send, the second wait its receipt and the tail the local assemble. */
+static void ar8_print_timeline(const std::vector<Ar8Perf>& t, size_t cfg, double khz) {
+    if (khz <= 0) return;
+    const int W = (int)t.size();
+    for (int r = 0; r < W; ++r) {
+        const std::vector<long long>& v = t[(size_t)r].tl[cfg];
+        if (v.empty()) return;
+        int nb = 0, nst = 0;
+        for (int b = 0; b < R4D_AR_TL_BLOCKS; ++b) {
+            int k = 0;
+            while (k < R4D_AR_TL_WORDS && v[(size_t)b * R4D_AR_TL_WORDS + k] >= 0) ++k;
+            if (k == 0) break;
+            nb = b + 1;
+            nst = nst ? std::min(nst, k) : k;
+        }
+        if (nb == 0 || nst < 4) { std::printf("      timeline r%d: no stamps\n", r); continue; }
+        const int pieces = (nst - 4) / 2;   /* start, K + 1 pairs, end */
+        auto ev = [&](int k, bool first) {
+            long long m = v[(size_t)k];
+            for (int b = 1; b < nb; ++b) {
+                const long long x = v[(size_t)b * R4D_AR_TL_WORDS + k];
+                m = first ? std::min(m, x) : std::max(m, x);
+            }
+            return m;
+        };
+        const double us = 1000.0 / khz;
+        const long long t0 = ev(0, true);
+        std::string line;
+        double work = 0, wait = 0;
+        long long prev = t0;
+        for (int h = 0; h <= pieces; ++h) {
+            const long long arr = ev(1 + 2 * h, false), rel = ev(2 + 2 * h, false);
+            const double w1 = (double)(arr - prev) * us, w2 = (double)(rel - arr) * us;
+            work += w1; wait += w2;
+            line += fmt("%s%s %.1f wait %.1f", h ? " | " : "", h ? fmt("s%d", h).c_str() : "push",
+                        w1, w2);
+            prev = rel;
+        }
+        const long long end = ev(3 + 2 * pieces, false);
+        const double tail = (double)(end - prev) * us;
+        work += tail;
+        std::printf("      timeline r%d (%d blocks, K%d): %s | tail %.1f = %.1f us "
+                    "(work %.1f, wait %.1f)\n", r, nb, pieces, line.c_str(), tail,
+                    (double)(end - t0) * us, work, wait);
+    }
 }
 
 /* The eight-rank two-shot's weights as the plugin derives them at init (r4d_ar_entry.hip,
@@ -22564,6 +22642,10 @@ static void ar8_perf(const Plugin& pl, int64_t numel, int iters, const char* dty
     }
     if ((int)devs.size() < W) { std::printf("--perfar8: needs 8 gfx1201 cards, found %zu\n",
                                              devs.size()); return; }
+    int wall_khz_i = 0;
+    if (hipDeviceGetAttribute(&wall_khz_i, hipDeviceAttributeWallClockRate, devs[0]) != hipSuccess)
+        wall_khz_i = 0;
+    const double wall_khz = (double)wall_khz_i;
     std::vector<const RadKernelInfo*> rows;
     std::vector<int> ks;
     /* The two-shot once a piece count; its instances share one key, so they are one buffer set. */
@@ -22698,6 +22780,7 @@ static void ar8_perf(const Plugin& pl, int64_t numel, int iters, const char* dty
                             bad ? fmt("%lld elements differ from the fold", (long long)bad).c_str()
                                 : "= fold on every rank");
                 std::printf("      us by rank:%s\n", per_rank.c_str());
+                if (g_timeline && two) ar8_print_timeline(t, cfg, wall_khz);
                 ++cfg;
             }
         }
@@ -27099,7 +27182,9 @@ static void usage(void) {
                 "             a card: one-shot and two-shot at the block rule and at 4..64 blocks,\n"
                 "             each checked against the rank-order fold; numel 0 runs the decode\n"
                 "             and prefill messages at 4096 wide. dtype bf16 (default) or fp32.\n"
-                "             R4D_SELFTEST_ONE_CARD=1 runs the eight ranks on one card.\n"
+                "             With --timeline each two-shot point is launched once more with its\n"
+                "             per-block stamps on, and every rank's push, waits, steps and tail\n"
+                "             are printed. R4D_SELFTEST_ONE_CARD=1 runs the eight ranks on one card.\n"
                 "  --perfmxf8 M [iters] [experts] [top_k] [skew]:  the same at the FP8 experts with f32\n"
                 "             block scales (moe_gemm_fp8a8_f32scale, GLM's MTP layer).\n"
                 "  --perfmhcpre M [iters]:  mhc_pre (whole, partials alone, finish alone) and\n"
@@ -27272,6 +27357,8 @@ int main(int argc, char** argv) {
         } else if (!std::strcmp(argv[i], "--cold")) {
             if (i + 1 >= argc) { usage(); return 2; }
             g_cold = std::strtoll(argv[++i], nullptr, 0) << 20;
+        } else if (!std::strcmp(argv[i], "--timeline")) {
+            g_timeline = true;
         } else if (!std::strcmp(argv[i], "--perfmoe")) {
             /* The routed-expert GEMM at a prefill chunk of M tokens, every prefill form. */
             if (i + 1 >= argc) { usage(); return 2; }

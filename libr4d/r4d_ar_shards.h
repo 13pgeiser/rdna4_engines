@@ -109,3 +109,9 @@ inline long r4d_ar_shard_max_bound(long n16, int ws, const int* w) {
   const long b = n16 * wmax / sum + 1;
   return b < n16 ? b : n16;
 }
+
+// The two-shot timeline, a diagnostic (r4d.h, `timeline`): per block R4D_AR_TL_WORDS stamps of the
+// device wall clock (hipDeviceAttributeWallClockRate), [0] after the sequence step, an (arrive,
+// release) pair per handshake, then the end of the block's last local work, so a launch in K
+// pieces fills 2 + 2 * (K + 1). R4D_AR_TL_BLOCKS is the wide family's block ceiling.
+enum { R4D_AR_TL_WORDS = 2 + 2 * (16 + 1), R4D_AR_TL_BLOCKS = 64 };
