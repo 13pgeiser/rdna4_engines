@@ -1927,6 +1927,56 @@ extern "C" __global__ void hyper_write_bf16x2(
         (unsigned int)bf16_round(lo).data | ((unsigned int)bf16_round(hi).data << 16);
 }
 
+// hyper_write_bf16x8_gfx1201: production eight-columns-per-thread widening of
+// hyper_write_bf16x2 (four BF16 pairs = one uint4 stream transaction, mixed as
+// two float4 loads).  EXACT same seven-argument ABI as hyper_write_bf16x2; the
+// per-column arithmetic and operand order are the incumbent's verbatim
+// (injection + stream), NOT the row-fold reversed add or BF16-staged mixed.
+// The gate is evaluated once for the eight columns.  Production geometry:
+// branches == 4, hidden == 2560 (hidden % 8 == 0, so no 8-column block crosses
+// a branch).  Grid [5, rows, 1] (wide = 10240 = 1280 units of 8), block
+// [256, 1, 1], LDS 0.  The host launcher fails closed unless the stream/mixed
+// pointers are 16-byte aligned for the uint4/float4 transactions; unaligned
+// subviews stay on the x2 production path.
+extern "C" __global__ void hyper_write_bf16x8_gfx1201(
+    const unsigned int* input,
+    const float* mixed,
+    const float* gates,
+    unsigned int* output,
+    int branches,
+    int hidden,
+    int rows) {
+    const int unit = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    const int column = 8 * unit;
+    const int row = (int)blockIdx.y;
+    const int wide = branches * hidden;
+    if (row >= rows || column >= wide) return;
+    const int branch = column / hidden;
+    const float gate_logit =
+        bf16_to_f32(bf16_round(gates[row * branches + branch]));
+    const float gate_scaled = bf16_to_f32(
+        bf16_round(gate_logit / (float)branches));
+    const float gate = bf16_to_f32(bf16_round(
+        2.0f * bf16_to_f32(bf16_round(
+            1.0f / (1.0f + expf(-gate_scaled))))));
+    const float4 m0 = *(const float4*)(mixed + row * hidden + column % hidden);
+    const float4 m1 = *(const float4*)(mixed + row * hidden + column % hidden + 4);
+    const uint4 stream = *(const uint4*)(input + ((row * wide + column) >> 1));
+    const unsigned int wv[4] = {stream.x, stream.y, stream.z, stream.w};
+    const float mv[8] = {m0.x, m0.y, m0.z, m0.w, m1.x, m1.y, m1.z, m1.w};
+    unsigned int out[4];
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+        const float lo = bf16_to_f32(bf16_round(gate * bf16_to_f32(bf16_round(mv[2 * p]))))
+            + __uint_as_float(wv[p] << 16);
+        const float hi = bf16_to_f32(bf16_round(gate * bf16_to_f32(bf16_round(mv[2 * p + 1]))))
+            + __uint_as_float(wv[p] & 0xFFFF0000u);
+        out[p] = (unsigned int)bf16_round(lo).data | ((unsigned int)bf16_round(hi).data << 16);
+    }
+    *(uint4*)(output + ((row * wide + column) >> 1)) =
+        make_uint4(out[0], out[1], out[2], out[3]);
+}
+
 // `normalized16`, when non-null, also receives each normalized value rounded
 // to F16 (RNE, as convert_f32_to_f16) for the F16 WMMA projection, and
 // `normalized`, when non-null, then holds the (already BF16-rounded) values

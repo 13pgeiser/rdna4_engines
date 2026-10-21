@@ -2019,6 +2019,69 @@ pub struct HyperWrite<'a> {
     pub state_bf16: bool,
 }
 
+/// BF16 HC-write kernel selection. [`hyper_write`] validates everything, then
+/// picks [`HyperWriteBf16Kernel::X8Gfx1201`] automatically when the measured
+/// crossover gate holds; tests force [`HyperWriteBf16Kernel::X2`] for the
+/// incumbent reference, or [`HyperWriteBf16Kernel::X8Gfx1201`] below crossover
+/// so timing labels stay truthful.
+#[derive(Clone, Copy)]
+enum HyperWriteBf16Kernel {
+    X2,
+    X8Gfx1201,
+}
+
+/// Shared seven-argument BF16 HC-write launcher (input/mixed/gates/output
+/// pointers + branches/hidden/rows i32 + 16-byte padding; block `[256, 1, 1]`,
+/// LDS 0, recorded funnel). X2 covers `wide / 2` pairs per row; X8 covers the
+/// fixed `wide = 10240` geometry as grid `[5, rows, 1]`.
+fn launch_hyper_write_bf16(
+    gpu: &mut Gpu,
+    p: &HyperWrite<'_>,
+    rows: usize,
+    kernel: HyperWriteBf16Kernel,
+) -> HipResult<()> {
+    let wide = checked_product(p.branches, p.hidden, "HC write width")?;
+    let branches = checked_i32(p.branches, "HC write branch count")?;
+    let hidden = checked_i32(p.hidden, "HC write hidden width")?;
+    let rows_i = checked_i32(rows, "HC write row count")?;
+    let grid_y = checked_u32(rows, "HC write row grid")?;
+    let (name, grid_x) = match kernel {
+        HyperWriteBf16Kernel::X2 => ("hyper_write_bf16x2", blocks(wide / 2)?),
+        HyperWriteBf16Kernel::X8Gfx1201 => ("hyper_write_bf16x8_gfx1201", 5),
+    };
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, name)?;
+    let mut args = KernargBlob::new();
+    for tensor in [p.input, p.mixed, p.gates, p.output] {
+        args.push_ptr(tensor.buf.as_ptr());
+    }
+    args.push_i32(branches);
+    args.push_i32(hidden);
+    args.push_i32(rows_i);
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        name,
+        [grid_x, grid_y, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )
+}
+
+/// Measured-crossover gate for the x8 widening: exact `gfx1201`,
+/// `branches == 4`, `hidden == 2560`, 16-byte aligned `input`/`mixed`/`output`
+/// bases (the kernel moves streams as `uint4` and mixed as `float4`), and
+/// `rows >= 16`.
+fn hyper_write_bf16x8_eligible(gpu: &Gpu, p: &HyperWrite<'_>, rows: usize) -> bool {
+    gpu.arch == "gfx1201"
+        && p.branches == 4
+        && p.hidden == 2560
+        && rows >= 16
+        && (p.input.buf.as_ptr() as usize) % 16 == 0
+        && (p.mixed.buf.as_ptr() as usize) % 16 == 0
+        && (p.output.buf.as_ptr() as usize) % 16 == 0
+}
+
 pub fn hyper_write(gpu: &mut Gpu, p: &HyperWrite<'_>) -> HipResult<()> {
     for tensor in [p.input, p.normalized, p.mixed, p.gates, p.output] {
         ensure_f32(tensor)?;
@@ -2047,27 +2110,17 @@ pub fn hyper_write(gpu: &mut Gpu, p: &HyperWrite<'_>) -> HipResult<()> {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
     if p.state_bf16 {
-        // Two columns (one BF16 pair) per thread.
+        // Two columns (one BF16 pair) per thread; the x8 widening covers eight
+        // columns per thread when the measured-crossover gate holds.
         if p.hidden % 2 != 0 {
             return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
         }
-        gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, "hyper_write_bf16x2")?;
-        let mut args = KernargBlob::new();
-        for tensor in [p.input, p.mixed, p.gates, p.output] {
-            args.push_ptr(tensor.buf.as_ptr());
-        }
-        args.push_i32(branches);
-        args.push_i32(hidden);
-        args.push_i32(rows_i);
-        args.pad_to(16);
-        return gpu.launch_blob_recorded(
-            "hyper_write_bf16x2",
-            [blocks(wide / 2)?, grid_y, 1],
-            [256, 1, 1],
-            0,
-            args.as_mut_slice(),
-            crate::dispatch::ReplayLaunchBindings::NONE,
-        );
+        let kernel = if hyper_write_bf16x8_eligible(gpu, p, rows) {
+            HyperWriteBf16Kernel::X8Gfx1201
+        } else {
+            HyperWriteBf16Kernel::X2
+        };
+        return launch_hyper_write_bf16(gpu, p, rows, kernel);
     }
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, "hyper_write_f32")?;
     let mut args = KernargBlob::new();
@@ -11405,6 +11458,312 @@ mod tests {
         assert_eq!(results[0].2, results[1].2, "written streams differ");
         for tensor in [f32_state, bf16_state, norm, gate_weight, mixed] {
             gpu.free_tensor(tensor).expect("free");
+        }
+    }
+    /// HC-write x8 auto-select oracle: the public [`hyper_write`] candidate must
+    /// equal the unchanged x2 production kernel FULL BF16 bytes (not an
+    /// F32-widened proxy), over rows {1,15,16,17,37,64,131,530,16384} (the
+    /// 15/16/17 neighbors bracket the measured rows>=16 crossover) x
+    /// {in-place, disjoint} x {random, adversarial} payloads, with untouched
+    /// guard tails, deterministic repeats, a one-bit negative control, and a
+    /// real HIP-graph capture + two replays kept byte-equal to eager.
+    /// The incumbent reference always forces
+    /// [`HyperWriteBf16Kernel::X2`]; the candidate, repeat and capture always
+    /// go through public [`hyper_write`]. `#[ignore]`: needs an exact gfx1201
+    /// GPU.
+    /// `cargo test -p rdna-compute --lib hyper_write_bf16x8_prototype_matches_x2 -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs an exact gfx1201 GPU: cargo test -p rdna-compute --lib hyper_write_bf16x8_prototype_matches_x2 -- --ignored --nocapture"]
+    fn hyper_write_bf16x8_prototype_matches_x2() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if gpu.arch != "gfx1201" {
+            eprintln!("skip: exact gfx1201 only");
+            return;
+        }
+        const BRANCHES: usize = 4;
+        const HIDDEN: usize = 2560;
+        const WIDE: usize = BRANCHES * HIDDEN;
+        const GUARD_WORDS: usize = 64;
+        const ROWS: [usize; 9] = [1, 15, 16, 17, 37, 64, 131, 530, 16384];
+        let rng_words = |seed: u64, n: usize| -> Vec<u32> {
+            let mut state = seed;
+            (0..n)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    (state >> 33) as u32
+                })
+                .collect()
+        };
+        let stream_payload = |rows: usize, seed: u64, adversarial: bool| -> Vec<u8> {
+            let mut words = rng_words(seed ^ (rows as u64).wrapping_mul(7919), rows * WIDE);
+            if adversarial {
+                // Signed zeros, infinities, mixed-sign and payload NaNs, then the
+                // stream continues with random bits; every entry is a BF16 pair.
+                let edge: [u32; 8] = [
+                    0x0000_0000,
+                    0x8000_0000,
+                    0x7F80_7F80,
+                    0xFF80_FF80,
+                    0x7FC1_3F80,
+                    0xFFC1_BF80,
+                    0x7FFF_FFFF,
+                    0xFFFF_0001,
+                ];
+                for (i, e) in edge.iter().enumerate() {
+                    if i < words.len() {
+                        words[i] = *e;
+                    }
+                }
+            }
+            words.iter().flat_map(|w| w.to_le_bytes()).collect()
+        };
+        let bytes_of = |gpu: &mut Gpu, t: &GpuTensor| -> Vec<u8> {
+            gpu.hip.device_synchronize().expect("sync download");
+            let mut out = vec![0u8; t.byte_size()];
+            gpu.hip
+                .memcpy_dtoh(&mut out, &t.buf)
+                .expect("download bytes");
+            out
+        };
+        let check_aligned = |t: &GpuTensor, what: &str| {
+            assert!(
+                (t.buf.as_ptr() as usize) % 16 == 0,
+                "x8 gate needs 16-byte {what} base, got {:p}",
+                t.buf.as_ptr()
+            );
+        };
+        let mk_state = |gpu: &mut Gpu, rows: usize, payload: &[u8]| -> GpuTensor {
+            let mut t = gpu
+                .upload_raw(payload, &[payload.len()])
+                .expect("state upload");
+            t.dtype = DType::F32;
+            t.shape = vec![rows * WIDE];
+            check_aligned(&t, "input");
+            t
+        };
+        // Disjoint output: exact-size view over an owner with a GUARD_WORDS
+        // sentinel tail; the kernel must leave the tail untouched. Returns the
+        // owner (frees exactly once) and the view (never freed).
+        let mk_guarded = |gpu: &mut Gpu, rows: usize| -> (GpuTensor, GpuTensor) {
+            let owner = gpu
+                .zeros(&[rows * WIDE + GUARD_WORDS], DType::F32)
+                .expect("guarded out");
+            check_aligned(&owner, "output");
+            let sentinel = vec![0x5Au8; GUARD_WORDS * 4];
+            gpu.hip
+                .memcpy_htod_offset(&owner.buf, rows * WIDE * 4, &sentinel)
+                .expect("sentinel tail");
+            let view = owner.sub_offset(0, rows * WIDE);
+            (owner, view)
+        };
+        for rows in ROWS {
+            let norm = gpu.zeros(&[rows * WIDE], DType::F32).expect("normalized");
+            let mixed_host: Vec<f32> = rng_words(0x2000_0000 + rows as u64, rows * HIDDEN)
+                .iter()
+                .map(|w| f32::from_bits(*w))
+                .collect();
+            let mixed = gpu
+                .upload_f32(&mixed_host, &[mixed_host.len()])
+                .expect("mixed");
+            check_aligned(&mixed, "mixed");
+            let gates_host: Vec<f32> = rng_words(0x3000_0000 + rows as u64, rows * BRANCHES)
+                .iter()
+                .map(|w| f32::from_bits(*w))
+                .collect();
+            let gates = gpu
+                .upload_f32(&gates_host, &[gates_host.len()])
+                .expect("gates");
+            for adversarial in [false, true] {
+                let payload = stream_payload(rows, 0x1000_0000, adversarial);
+                let tag = if adversarial { "adversarial" } else { "random" };
+                // In-place: explicit-X2 reference vs public-candidate on identical copies.
+                let ref_state = mk_state(&mut gpu, rows, &payload);
+                let ref_p = HyperWrite {
+                    input: &ref_state,
+                    normalized: &norm,
+                    mixed: &mixed,
+                    gates: &gates,
+                    output: &ref_state,
+                    branches: BRANCHES,
+                    hidden: HIDDEN,
+                    state_bf16: true,
+                };
+                launch_hyper_write_bf16(&mut gpu, &ref_p, rows, HyperWriteBf16Kernel::X2)
+                    .expect("x2 production launch");
+                let want = bytes_of(&mut gpu, &ref_state);
+                assert!(
+                    want.iter().any(|b| *b != 0),
+                    "rows={rows} in-place {tag}: x2 reference wrote all zeros"
+                );
+                let cand_state = mk_state(&mut gpu, rows, &payload);
+                let cand_p = HyperWrite {
+                    input: &cand_state,
+                    normalized: &norm,
+                    mixed: &mixed,
+                    gates: &gates,
+                    output: &cand_state,
+                    branches: BRANCHES,
+                    hidden: HIDDEN,
+                    state_bf16: true,
+                };
+                hyper_write(&mut gpu, &cand_p).expect("public candidate launch");
+                let got = bytes_of(&mut gpu, &cand_state);
+                assert!(
+                    got == want,
+                    "rows={rows} in-place {tag}: public candidate bytes differ from x2"
+                );
+                let mut bad = got.clone();
+                bad[0] ^= 1;
+                assert!(
+                    bad != want,
+                    "rows={rows} in-place {tag}: one-bit control equal"
+                );
+                // Deterministic repeat: refill and rerun the public candidate.
+                gpu.hip
+                    .memcpy_htod(&cand_state.buf, &payload)
+                    .expect("refill state");
+                hyper_write(&mut gpu, &cand_p).expect("public repeat");
+                let repeat = bytes_of(&mut gpu, &cand_state);
+                assert!(
+                    repeat == want,
+                    "rows={rows} in-place {tag}: public repeat differs"
+                );
+                for tensor in [ref_state, cand_state] {
+                    gpu.free_tensor(tensor).expect("free in-place");
+                }
+                // Disjoint: explicit x2 vs public candidate into guarded outputs; tails must survive.
+                let input = mk_state(&mut gpu, rows, &payload);
+                let (ref_owner, ref_out) = mk_guarded(&mut gpu, rows);
+                let (cand_owner, cand_out) = mk_guarded(&mut gpu, rows);
+                let ref_dp = HyperWrite {
+                    input: &input,
+                    normalized: &norm,
+                    mixed: &mixed,
+                    gates: &gates,
+                    output: &ref_out,
+                    branches: BRANCHES,
+                    hidden: HIDDEN,
+                    state_bf16: true,
+                };
+                let cand_dp = HyperWrite {
+                    input: &input,
+                    normalized: &norm,
+                    mixed: &mixed,
+                    gates: &gates,
+                    output: &cand_out,
+                    branches: BRANCHES,
+                    hidden: HIDDEN,
+                    state_bf16: true,
+                };
+                launch_hyper_write_bf16(&mut gpu, &ref_dp, rows, HyperWriteBf16Kernel::X2)
+                    .expect("x2 disjoint");
+                hyper_write(&mut gpu, &cand_dp).expect("public disjoint");
+                gpu.hip.device_synchronize().expect("sync disjoint");
+                let ref_full = bytes_of(&mut gpu, &ref_owner);
+                let cand_full = bytes_of(&mut gpu, &cand_owner);
+                let split = rows * WIDE * 4;
+                assert!(
+                    cand_full[..split] == ref_full[..split],
+                    "rows={rows} disjoint {tag}: public bytes differ from x2"
+                );
+                for (what, full) in [("x2", &ref_full), ("public", &cand_full)] {
+                    assert!(
+                        full[split..].iter().all(|b| *b == 0x5A),
+                        "rows={rows} disjoint {tag}: {what} guard tail overwritten"
+                    );
+                }
+                let mut bad = cand_full[..split].to_vec();
+                bad[split / 2] ^= 1;
+                assert!(
+                    bad != ref_full[..split],
+                    "rows={rows} disjoint {tag}: one-bit control equal"
+                );
+                gpu.free_tensor(input).expect("free input");
+                for owner in [ref_owner, cand_owner] {
+                    gpu.free_tensor(owner).expect("free guarded");
+                }
+            }
+            for tensor in [norm, mixed, gates] {
+                gpu.free_tensor(tensor).expect("free case");
+            }
+        }
+        // Real HIP-graph capture of the public candidate (row 530 is eligible,
+        // so the captured graph takes the x8 arm): eager bytes, then capture,
+        // instantiate, refill, and two replays, all byte-equal. The taken blob
+        // vec stays alive across both replays.
+        {
+            const CAP_ROWS: usize = 530;
+            let payload = stream_payload(CAP_ROWS, 0xC0FFEE, true);
+            let norm = gpu.zeros(&[CAP_ROWS * WIDE], DType::F32).expect("norm");
+            let mixed_host: Vec<f32> = rng_words(77, CAP_ROWS * HIDDEN)
+                .iter()
+                .map(|w| f32::from_bits(*w))
+                .collect();
+            let mixed = gpu
+                .upload_f32(&mixed_host, &[mixed_host.len()])
+                .expect("mixed");
+            let gates_host: Vec<f32> = rng_words(78, CAP_ROWS * BRANCHES)
+                .iter()
+                .map(|w| f32::from_bits(*w))
+                .collect();
+            let gates = gpu
+                .upload_f32(&gates_host, &[gates_host.len()])
+                .expect("gates");
+            let eager = mk_state(&mut gpu, CAP_ROWS, &payload);
+            let eager_p = HyperWrite {
+                input: &eager,
+                normalized: &norm,
+                mixed: &mixed,
+                gates: &gates,
+                output: &eager,
+                branches: BRANCHES,
+                hidden: HIDDEN,
+                state_bf16: true,
+            };
+            hyper_write(&mut gpu, &eager_p).expect("eager public");
+            let eager_bytes = bytes_of(&mut gpu, &eager);
+            gpu.ensure_capture_stream().expect("capture stream");
+            let cap_state = mk_state(&mut gpu, CAP_ROWS, &payload);
+            let cap_p = HyperWrite {
+                input: &cap_state,
+                normalized: &norm,
+                mixed: &mixed,
+                gates: &gates,
+                output: &cap_state,
+                branches: BRANCHES,
+                hidden: HIDDEN,
+                state_bf16: true,
+            };
+            gpu.hip.device_synchronize().expect("sync pre-capture");
+            gpu.begin_stream_capture().expect("begin capture");
+            let captured = hyper_write(&mut gpu, &cap_p);
+            let graph = gpu.end_stream_capture().expect("end capture");
+            captured.expect("captured public launch");
+            let exec = gpu.hip.graph_instantiate(&graph).expect("instantiate");
+            let blobs = std::mem::take(&mut gpu.graphs.capture_blobs);
+            for replay in 0..2 {
+                gpu.hip
+                    .memcpy_htod(&cap_state.buf, &payload)
+                    .expect("refill capture");
+                gpu.launch_graph(&exec).expect("graph replay");
+                gpu.hip.device_synchronize().expect("sync replay");
+                let replayed = bytes_of(&mut gpu, &cap_state);
+                assert!(
+                    replayed == eager_bytes,
+                    "capture replay {replay}: replayed bytes differ from eager public"
+                );
+            }
+            let _ = blobs.len();
+            gpu.hip.graph_exec_destroy(exec).expect("destroy exec");
+            gpu.hip.graph_destroy(graph).expect("destroy graph");
+            for tensor in [eager, cap_state, norm, mixed, gates] {
+                gpu.free_tensor(tensor).expect("free capture");
+            }
         }
     }
 
