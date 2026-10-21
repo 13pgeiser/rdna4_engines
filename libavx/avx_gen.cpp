@@ -406,7 +406,10 @@ AVX_KERNEL(rms_mod_quant_fp8) { return rms_mod_run(a, true); }
 
 /* ------------------------------------------------------------------ timestep_embed */
 /* y[m] = [cos(t' f_0) .. cos(t' f_{h-1}) | sin(t' f_0) .. sin(t' f_{h-1})] with libref's libm
- * calls: a pass embeds one row per entry, so this is a few thousand transcendentals. */
+ * calls: a pass embeds one row per entry, so this is a few thousand transcendentals. With
+ * `curve` = G > 0 and a `table` [G, n] f32 operand, y[m] is that table sampled at
+ * clamp01(max(t[m], clamp_min)) * (G - 1) and lerped between the two rows around it instead --
+ * the precomputed adaln curve a curve-form checkpoint ships in place of the sinusoid + MLP. */
 AVX_KERNEL(timestep_embed) {
     if (!rad_args_have(a, 2)) return RAD_E_INVAL;
     const RadTensor *T = &a->t[0], *Y = &a->t[1];
@@ -415,9 +418,33 @@ AVX_KERNEL(timestep_embed) {
     const double mp = p_f32(a, "max_period", 10000.0f);
     const int round = (int)p_int(a, "round", 0);
     const float clamp = p_f32(a, "clamp_min", 0.0f);
-    if (n <= 0 || (n & 1)) return RAD_E_SHAPE;
+    const int64_t grid = p_int(a, "curve", 0);
+    if (n <= 0 || (!grid && (n & 1))) return RAD_E_SHAPE;
     const int64_t rows = rows_of(Y, n);
     if (rows <= 0 || numel(T) < rows) return RAD_E_SHAPE;
+    if (grid > 0) {
+        /* The precomputed adaln curve: y[m] = table sampled at clamp01(max(t, clamp_min)) *
+         * (grid - 1), lerped between the two rows around that position. */
+        const RadTensor* tab = rad_arg_in(a, 2);
+        if (!tab) return RAD_E_INVAL;
+        if (tab->dtype != (uint32_t)RAD_F32 || numel(tab) < grid * n) return RAD_E_SHAPE;
+        float* buf = scratch_f32((size_t)n + 16);
+        for (int64_t m = 0; m < rows; ++m) {
+            const float tv = std::fmax(ldt(T, offlin(T, m)), clamp);
+            const float pos = std::fmin(std::fmax(tv, 0.0f), 1.0f) * (float)(grid - 1);
+            float i0f = std::floor(pos);
+            if (i0f > (float)(grid - 2)) i0f = (float)(grid - 2);
+            const float fr = pos - i0f;
+            const int64_t i0 = (int64_t)i0f;
+            for (int64_t i = 0; i < n; ++i) {
+                const float a0 = ldt(tab, offlin(tab, i0 * n + i));
+                const float a1 = ldt(tab, offlin(tab, (i0 + 1) * n + i));
+                buf[i] = a0 + fr * (a1 - a0);
+            }
+            out_row(Y, rowoff(Y, m, n), n, buf);
+        }
+        return RAD_OK;
+    }
     const int64_t h = n / 2;
     const float coef = (float)(-std::log(mp));
     float* buf = scratch_f32((size_t)(2 * n + 16));

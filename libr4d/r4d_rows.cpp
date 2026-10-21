@@ -2133,8 +2133,10 @@ static const RadOperandSpec oGateAdd[] = {
     { "x", RAD_OPD_INOUT, 0 },
 };
 static const RadParamSpec pTimestep[] = { P_INT("M"), P_INT("n"), P_F64("scale"), P_F64("max_period"),
-                                          P_INTO("round"), P_F64O("clamp_min"), P_STR("dtype") };
-static const RadOperandSpec oTimestep[] = { { "t", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 } };
+                                          P_INTO("round"), P_F64O("clamp_min"), P_INTO("curve"),
+                                          P_STR("dtype") };
+static const RadOperandSpec oTimestep[] = { { "t", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 },
+                                            { "table", RAD_OPD_WEIGHT, 1 } };
 static const RadOperandSpec oGather2[] = {
     { "a", RAD_OPD_IN, 0 }, { "b", RAD_OPD_IN, 0 }, { "idx", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 },
 };
@@ -2969,7 +2971,10 @@ static const RadOpSchema kSchemas[] = {
            "x = bf16(x + bf16(bf16(tanh(g[seq])) * y)): a residual through its sequence's gate; "
            "with `act` none the gate is g itself, x = bf16(x + bf16(g[seq] * y))."),
     SCHEMA("timestep_embed", pTimestep, oTimestep,
-           "the sinusoidal timestep embedding, [cos | sin] of t' * exp(-ln(max_period) * i / (n/2))."),
+           "the sinusoidal timestep embedding, [cos | sin] of t' * exp(-ln(max_period) * i / (n/2)). "
+           "With `curve` > 0 and a `table` [curve, n] f32 operand instead: y[m] is `table` sampled at "
+           "pos = clamp01(max(t[m], clamp_min)) * (curve - 1), linearly between the two rows around "
+           "pos -- an adaln time-embedding curve precomputed at convert."),
     SCHEMA("gather_rows2", pGenMn, oGather2,
            "y[i] = idx[i] >= 0 ? a[idx[i]] : b[-1 - idx[i]]."),
     SCHEMA("lane_gather", pLane, oLaneGather, "y[cu[e] + k] = src[lane[e] * stride + k]."),
@@ -4295,8 +4300,12 @@ static const RadConstraint cGenLanes[] = { C_IN("dtype", "bf16 f32") };
 /* The two lists are kernel arguments, 64 floats each at most (r4d_gen.hip). */
 static const RadConstraint cGenAffine[] = { C_IN("dtype", "bf16"), C_LE("n", 64) };
 static const RadConstraint cGenAffineF32[] = { C_IN("dtype", "f32"), C_LE("n", 64) };
-static const RadConstraint cGenTimestep[] = { C_IN("dtype", "bf16"), C_DIV("n", 2) };
-static const RadConstraint cGenTimestepF32[] = { C_IN("dtype", "f32"), C_DIV("n", 2) };
+/* No parity clause on `n` on either timestep row: a row's constraints are unconditional, and the
+ * sinusoid's parity floor (n is its angle pair count) would exclude a curve table, whose n is just
+ * the embedding's column count and can be odd. r4d_rad_timestep_embed checks parity itself when
+ * curve is 0, and returns RAD_E_SHAPE at issue for a sinusoid with odd n. */
+static const RadConstraint cGenTimestep[] = { C_IN("dtype", "bf16") };
+static const RadConstraint cGenTimestepF32[] = { C_IN("dtype", "f32") };
 /* The paged prefix at libr4d's block of 16, both caches bf16, up to eight query heads a KV head
  * (the shim takes 1, 2, 4 and 8). */
 static const RadConstraint cAttnPrefixSelf[] = {

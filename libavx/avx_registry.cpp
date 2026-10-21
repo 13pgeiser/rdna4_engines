@@ -488,8 +488,9 @@ static const RadOperandSpec oFlowX0[] = { OPD("v"), OPD("t"), OPD("sigma"), OPD(
 static const RadOperandSpec oFlowRM[] = { OPD("v"), INOUT("x0"), OPD("sigma"), OPD("r"),
                                           OPD("hb1"), OPD("hb2"), OPD("order"), INOUT("x") };
 static const RadParamSpec pTimestep[] = { P_INT("M"), P_INT("n"), P_F64("scale"), P_F64("max_period"),
-                                          P_INTO("round"), P_F64O("clamp_min"), P_STR("dtype") };
-static const RadOperandSpec oTimestep[] = { OPD("t"), OUT("y") };
+                                          P_INTO("round"), P_F64O("clamp_min"), P_INTO("curve"),
+                                          P_STR("dtype") };
+static const RadOperandSpec oTimestep[] = { OPD("t"), OUT("y"), WGT_O("table") };
 static const RadOperandSpec oGather2[]  = { OPD("a"), OPD("b"), OPD("idx"), OUT("y") };
 static const RadParamSpec pLane[] = { P_INT("M"), P_INT("n"), P_INT("stride"), P_STR("dtype") };
 static const RadOperandSpec oLaneGather[] = { OPD("src"), OPD("lane"), OPD("cu_seqlens"), OUT("y") };

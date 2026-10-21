@@ -1037,6 +1037,22 @@ typedef struct RadVideoGenDecl {
     int64_t       dbg_ve_l3_bytes;
     rad_buf       dbg_ve_l4;
     int64_t       dbg_ve_l4_bytes;
+    /* #45 DiT value-parity: an f32 PERSIST twin of the DiT stream entering block 0 (b_h, post
+     * video_patch_proj / condition_proj / audio_patch_proj -- the JOINT [text|audio|video] rows),
+     * and of the velocity head output (b_vel), both written by debug-only cast ops so the bf16 arena
+     * scratch (b_h) lag does not corrupt the readback (the b_ax2 lesson). Read with R4D_DIT_SEL on a
+     * generation pass: replay the identical h0 through the reference DiT (comfy model.py) and compare
+     * the velocity to localize where Radiance's forward over-gains. The t_emb / modulation / rope the
+     * pass actually used are dumped alongside so the torch replay needs no re-derivation. Trailing
+     * debug fields; an older plugin declares none and keeps the 0 default. */
+    rad_buf       dbg_dit_h0;      /* [T, D] f32: stream into block 0 */
+    int64_t       dbg_dit_h0_bytes;
+    rad_buf       dbg_dit_vel;     /* [maxV, kPatchVals] f32: velocity head output */
+    int64_t       dbg_dit_vel_bytes;
+    rad_buf       dbg_dit_temb;    /* [TT, td] f32: silu(t_emb) the adaln projections consume */
+    int64_t       dbg_dit_temb_bytes;
+    rad_buf       dbg_dit_mod;     /* modulation table (b_modg) f32, this step */
+    int64_t       dbg_dit_mod_bytes;
 } RadVideoGenDecl;
 
 int rad_declare_video_generator(RadBuilder* b, const RadVideoGenDecl* d);

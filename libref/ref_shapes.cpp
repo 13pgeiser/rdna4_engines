@@ -2276,10 +2276,11 @@ int ref_gate_add_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     return o.finish("gate_add", operand, out);
 }
 int ref_timestep_embed_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
-    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), G = gi(p, n_p, "curve", 0);
     Opd o;
     o.t_fill((uint32_t)RAD_F32, { M }, (uint32_t)RAD_FILL_SIGMOID, 0);   /* t: a sigma in (0, 1) */
     o.t(act_dt(p, n_p), { M, n });                                    /* y */
+    if (G > 0) o.t((uint32_t)RAD_F32, { G, n }); else o.skip();        /* table (curve mode) */
     return o.finish("timestep_embed", operand, out);
 }
 int ref_gather_rows2_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

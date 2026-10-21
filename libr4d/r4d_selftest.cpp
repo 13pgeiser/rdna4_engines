@@ -7638,6 +7638,35 @@ void timestep_f32_case(const Plugin& pl) {
     }
 }
 
+/* The curve form: y[m] lerps the [G, n] f32 table at clamp01(max(t[m], clamp_min)) * (G - 1),
+ * clamping the lower row index to G - 2 -- the device mirror of comfy's adaln curve sampling. */
+void timestep_curve_case(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "timestep_embed_f32");
+    if (!r) { ok("timestep_embed_f32 curve", false, "row absent"); return; }
+    const int64_t M = 33, n = 8, G = 1025;
+    std::vector<float> t((size_t)M), tab = randv((size_t)(G * n), 1.0f);
+    for (int64_t m = 0; m < M; ++m) t[(size_t)m] = (float)m / (float)(M - 1);   /* spans [0, 1] */
+    void* dt = up_f32(t);
+    void* dtab = up_f32(tab);
+    void* dy = dalloc((size_t)(M * n) * 4);
+    const int rc = launch(r, { T(dt, RAD_F32, { M }), T(dy, RAD_F32, { M, n }),
+                               T(dtab, RAD_F32, { G, n }) },
+                          { PI("M", M), PI("n", n), PI("curve", G), PS("dtype", "f32") });
+    if (rc != RAD_OK) { ok("timestep_embed_f32 curve", false, "rc " + std::to_string(rc)); return; }
+    std::vector<float> want((size_t)(M * n));
+    for (int64_t m = 0; m < M; ++m) {
+        const float pos = std::fmin(std::fmax(t[(size_t)m], 0.0f), 1.0f) * (float)(G - 1);
+        int64_t i0 = (int64_t)std::floor(pos);
+        if (i0 > G - 2) i0 = G - 2;
+        const float fr = pos - (float)i0;
+        for (int64_t i = 0; i < n; ++i) {
+            const float a0 = tab[(size_t)(i0 * n + i)], a1 = tab[(size_t)((i0 + 1) * n + i)];
+            want[(size_t)(m * n + i)] = a0 + fr * (a1 - a0);
+        }
+    }
+    check_f32("timestep_embed_f32 curve numerics", down_f32(dy, want.size()), want, 1e-6);
+}
+
 void randn_f32_case(const Plugin& pl) {
     const RadKernelInfo* r = find(pl, "randn_lanes_f32");
     if (!r) { ok("randn_lanes_f32", false, "row absent"); return; }
@@ -19520,7 +19549,7 @@ static void device_phase(const Plugin& pl) {
     if (sel("silu_f32")) vg::silu_f32_cases(pl);
     if (sel("rmsnorm_bf16")) vg::norm_f32_rows_cases(pl, false);
     if (sel("layernorm_bf16")) vg::norm_f32_rows_cases(pl, true);
-    if (sel("timestep_embed_f32")) vg::timestep_f32_case(pl);
+    if (sel("timestep_embed_f32")) { vg::timestep_f32_case(pl); vg::timestep_curve_case(pl); }
     if (sel("randn_lanes_f32")) vg::randn_f32_case(pl);
     if (sel("interleave2_bf16")) vg::interleave2_f32_case(pl);
     if (sel("chan_affine_f32")) vg::chan_affine_cases(pl, "chan_affine_f32");

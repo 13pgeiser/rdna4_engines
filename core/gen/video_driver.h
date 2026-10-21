@@ -226,6 +226,17 @@ private:
     int64_t               enc_dbg_used_ = 0;    /* bytes the last encode readback filled */
     const char*           enc_dbg_sel_ = "";    /* R4D_ENC_SEL: "", "mp" or "pre" (audio) */
 
+    /* Debug-only (#61, R4D_DIT_SEL): a pinned slab holding the DiT step-0 dump -- the f32 shadows
+     * (h0 | temb | mod) the plugin declares when it sees the same env, plus the step's velocity
+     * head output b_vel -- so done() can write them to R4D_ENC_DUMPDIR for the CPU reference DiT
+     * replay. Staged only on a plain request's step 0; a plugin without the env leaves
+     * decl_.dbg_dit_h0 null and dit_dbg_ stays false, so a normal run never touches these. */
+    bool                  dit_dbg_ = false;
+    char*                 dit_host_ = nullptr;
+    int64_t               dit_h0_b_ = 0, dit_vel_b_ = 0, dit_temb_b_ = 0, dit_mod_b_ = 0;
+    bool                  dit_used_ = false;    /* the running pass staged a dump */
+    int64_t               dit_rows_ = 0;        /* packed rows R of the dumped step */
+
     std::vector<RadBatch>         out_;      /* one per rank */
     std::vector<RadVideoGenBatch> vout_;
     Pass                          pass_;

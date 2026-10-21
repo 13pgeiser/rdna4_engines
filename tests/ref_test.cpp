@@ -305,7 +305,8 @@ TEST(op_vocabulary) {
         /* The video generator's (MiniMax-H3): its DiT's modulated norm and sampler step, its
          * decoder's patch unfold, tiles, stitch and positions, and the vocoder's alias-free
          * activation. */
-        "rms_mod", "rms_mod_quant_fp8", "flow_x0_step", "patch_unfold", "vtile_gather",
+        "rms_mod", "rms_mod_quant_fp8", "flow_x0_step", "flow_res_multistep", "patch_unfold",
+        "vtile_gather",
         "vtile_stitch", "grid_pos3", "snake_aa",
         /* Its step-distilled form's video sparse attention: the tile selection and the
          * block-sparse attention over it. */
@@ -7123,6 +7124,9 @@ std::vector<Geo> geometries() {
         G("gate_add", "M", 4, a.i("M", R).i("n", 8).s("dtype", "bf16")),
         G("timestep_embed", "M", 3, a.i("M", R).i("n", 8).d("scale", 1000.0)
                                     .d("max_period", 10000.0).d("clamp_min", 0.3).s("dtype", "f32")),
+        /* The curve form: the same op over a precomputed table instead of the sinusoid. */
+        G("timestep_embed", "M", 3, a.i("M", R).i("n", 8).i("curve", 5).d("clamp_min", 0.3)
+                                    .s("dtype", "f32")),
         G("gather_rows2", "M", 4, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("lane_gather", "M", 4, a.i("M", R).i("n", 8).i("stride", 4).s("dtype", "bf16")),
         G("lane_store", "M", 4, a.i("M", R).i("n", 8).i("stride", 8).s("dtype", "bf16")),
@@ -7169,6 +7173,7 @@ std::vector<Geo> geometries() {
         G("rms_mod_quant_fp8", "M", 4, a.i("M", R).i("n", 32).d("eps", 1e-6).i("group", 16)
                                        .i("gated", 1).s("dtype", "bf16")),
         G("flow_x0_step", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
+        G("flow_res_multistep", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("patch_unfold", "M", 32, a.i("M", R).i("C", 3).i("pt", 1).i("ph", 2).i("pw", 2)
                                    .s("mul", "1 2 3").s("add", "0 1 2").s("dtype", "f32")),
         G("vtile_gather", "M", 60, a.i("M", R).i("n", 8).i("tile", 2).i("overlap", 1)

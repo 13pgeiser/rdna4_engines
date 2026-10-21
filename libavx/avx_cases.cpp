@@ -665,6 +665,8 @@ std::vector<Case> build_cases() {
             add("timestep_embed", { HI("M", 3), HI("n", 256), HF("scale", 1000.0),
                                     HF("max_period", 10000.0), HI("round", round),
                                     HS("dtype", dt) });
+        for (int g : { 5, 1025 })
+            add("timestep_embed", { HI("M", 3), HI("n", 8), HI("curve", g), HS("dtype", dt) });
         add("lane_gather", { HI("M", 24), HI("n", 64), HI("stride", 16), HI("n_seq", 2),
                              HS("dtype", dt) });
         add("lane_store",  { HI("M", 12), HI("n", 64), HI("stride", 16), HS("dtype", dt) });

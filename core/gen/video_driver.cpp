@@ -308,6 +308,32 @@ int VideoDriver::init(const Program& prog, PositionsFn positions,
             RAD_ERR("video generator: R4D_ENC_DEBUG set but no pinned host for the %lld-byte "
                     "encoder readback", (long long)enc_dbg_bytes_);
     }
+    /* Debug-only DiT step dump (#61, R4D_DIT_SEL): the slab for the step-0 readback -- the plugin's
+     * f32 shadows (h0 | temb | mod) plus the step's velocity head output. The plugin declares the
+     * shadows only when it sees the same env, so a mismatch shows up as dbg_dit_h0 == 0 and simply
+     * disables the dump. The value of R4D_DIT_SEL names the step to dump; only step 0 (what the
+     * shadows carry) is honoured, anything else warns and stays off. */
+    if (const char* sel = std::getenv("R4D_DIT_SEL")) {
+        const long want = std::strtol(sel, nullptr, 10);
+        if (want != 0)
+            RAD_ERR("video generator: R4D_DIT_SEL=%s: only step 0 is dumped (the shadows are "
+                    "issued at step 0); ignoring", sel);
+        else if (decl_.dbg_dit_h0 && decl_.dbg_dit_vel) {
+            dit_h0_b_ = decl_.dbg_dit_h0_bytes;
+            dit_vel_b_ = decl_.dbg_dit_vel_bytes;
+            dit_temb_b_ = decl_.dbg_dit_temb_bytes;
+            dit_mod_b_ = decl_.dbg_dit_mod_bytes;
+            const int64_t sum = dit_h0_b_ + dit_vel_b_ + dit_temb_b_ + dit_mod_b_;
+            dit_host_ = static_cast<char*>(rad_dev_alloc(sum, RAD_MEM_HOST_PINNED));
+            dit_dbg_ = dit_host_ != nullptr;
+            if (!dit_dbg_)
+                RAD_ERR("video generator: R4D_DIT_SEL set but no pinned host for the %lld-byte "
+                        "DiT dump", (long long)sum);
+        } else {
+            RAD_ERR("video generator: R4D_DIT_SEL set but the plugin exported no DiT shadows -- "
+                    "restart it with the same env so declare_dit sees it");
+        }
+    }
     return RAD_OK;
 }
 
@@ -323,10 +349,12 @@ void VideoDriver::fini() {
     if (frames_host_) rad_dev_free(frames_host_, RAD_MEM_HOST_PINNED);
     if (audio_host_) rad_dev_free(audio_host_, RAD_MEM_HOST_PINNED);
     if (enc_dbg_host_) rad_dev_free(enc_dbg_host_, RAD_MEM_HOST_PINNED);
+    if (dit_host_) rad_dev_free(dit_host_, RAD_MEM_HOST_PINNED);
     host_ = nullptr;
     frames_host_ = nullptr;
     audio_host_ = nullptr;
     enc_dbg_host_ = nullptr;
+    dit_host_ = nullptr;
 }
 
 /* ================================================================== requests */
@@ -1132,6 +1160,18 @@ void VideoDriver::stage_seed(const Job& j) {
     reg_[R_SEED].used = 4 * 4;
 }
 
+/* DiT step dump (#61, R4D_DIT_SEL + R4D_ENC_DUMPDIR): write one raw file named verbatim. Separate
+ * from enc_dbg_dump_file because the harness names carry their own dtype suffixes (.f32 / .i32). */
+static void dit_dump_file(const std::string& name, const void* p, size_t bytes) {
+    const char* dir = std::getenv("R4D_ENC_DUMPDIR");
+    if (!dir || !p || bytes == 0) return;
+    const std::string path = std::string(dir) + "/" + name;
+    if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+        std::fwrite(p, 1, bytes, f);
+        std::fclose(f);
+    }
+}
+
 const RadBatch* VideoDriver::build_step(Job& j, int step) {
     for (int g = 0; g < R_N; ++g) reg_[g].used = 0;
     const bool small = small_now(j);
@@ -1154,6 +1194,28 @@ const RadBatch* VideoDriver::build_step(Job& j, int step) {
     if (upload() < 0) return nullptr;
     base_batches(j, g, rows, step);
     for (auto& B : out_) B.gen = RAD_GEN_PASS_VSTEP;
+    /* DiT step dump (#61, R4D_DIT_SEL): the step-0 readback of the plugin's f32 shadows and the
+     * velocity head, plus the host-side bytes the CPU reference replay needs (the planar RoPE
+     * positions and the packed segment boundaries -- final in their regions since upload() ran).
+     * Plain step 0 only: the harness replays the fixed [text | audio | video] layout and the full
+     * grid, and the arch issues the shadows only under the same conditions. */
+    dit_used_ = false;
+    if (dit_dbg_ && j.step == 0 && !small && !j.ref_wide && j.ref_tab.empty()) {
+        char* p = dit_host_;
+        int64_t off = 0;
+        const rad_buf hh[4] = { decl_.dbg_dit_h0, decl_.dbg_dit_temb, decl_.dbg_dit_mod,
+                                decl_.dbg_dit_vel };
+        const int64_t nn[4] = { dit_h0_b_, dit_temb_b_, dit_mod_b_, dit_vel_b_ };
+        for (int i = 0; i < 4; ++i)
+            if (hh[i] && nn[i] > 0) {
+                rb_.push_back(Readback{ hh[i], nn[i], p + off });
+                off += nn[i];
+            }
+        dit_used_ = true;
+        dit_rows_ = rows;
+        dit_dump_file("dit_pos.f32", pos.data(), (size_t)pos.size() * 4);
+        dit_dump_file("dit_seg_cu.i32", hptr<int32_t>(R_SEG), (size_t)reg_[R_SEG].used);
+    }
     pass_.kind = RAD_GEN_PASS_VSTEP;
     pass_.job = j.id;
     return &out_[0];
@@ -1441,6 +1503,34 @@ int VideoDriver::done() {
         break;
     case RAD_GEN_PASS_VSTEP: {
         ++j->step;
+        if (dit_used_) {
+            /* The step-0 dump landed: slab (h0 | temb | mod | vel) to raw files, plus the few
+             * facts the driver knows (R4D_ENC_DUMPDIR; the prep script supplies D=5376 and the
+             * harness .meta files). */
+            char* p = dit_host_;
+            dit_dump_file("dit_h0.f32", p, (size_t)dit_h0_b_);
+            p += dit_h0_b_;
+            dit_dump_file("dit_temb.f32", p, (size_t)dit_temb_b_);
+            p += dit_temb_b_;
+            dit_dump_file("dit_mod.f32", p, (size_t)dit_mod_b_);
+            p += dit_mod_b_;
+            dit_dump_file("dit_vel.f32", p, (size_t)dit_vel_b_);
+            if (std::getenv("R4D_ENC_DUMPDIR")) {
+                const std::string path =
+                    std::string(std::getenv("R4D_ENC_DUMPDIR")) + "/dit_info.txt";
+                if (std::FILE* f = std::fopen(path.c_str(), "w")) {
+                    std::fprintf(f, "rows %lld\nn_text %lld\nn_audio %lld\nsteps %d\nseed %llu\n",
+                                 (long long)dit_rows_, (long long)j->geom.n_text,
+                                 (long long)j->geom.n_audio, (int)j->sched.steps,
+                                 (unsigned long long)j->req->seed);
+                    std::fclose(f);
+                }
+            }
+            RAD_ERR("dit_dbg: dumped step 0 -- rows %lld h0 %lld temb %lld mod %lld vel %lld",
+                    (long long)dit_rows_, (long long)dit_h0_b_, (long long)dit_temb_b_,
+                    (long long)dit_mod_b_, (long long)dit_vel_b_);
+            dit_used_ = false;
+        }
         VideoEvent e;
         e.kind = VideoEvent::STEP;
         e.steps_done = j->step;

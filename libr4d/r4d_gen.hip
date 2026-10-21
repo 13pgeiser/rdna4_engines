@@ -216,6 +216,27 @@ __global__ __launch_bounds__(kT) void timestep_kernel(
     }
 }
 
+// The curve form: y[m] = table sampled at clamp01(max(t[m], clamp_min)) * (grid - 1), lerped
+// between the two rows around that position -- the precomputed adaln curve a curve-form
+// checkpoint ships in place of the sinusoid + MLP. `table` is contiguous [grid, n] f32.
+template <typename TY>
+__global__ __launch_bounds__(kT) void timestep_curve_kernel(
+    const float* __restrict__ t, const float* __restrict__ table, TY* __restrict__ y,
+    int grid, int n, float clamp_min, int y_ld) {
+    const int m = blockIdx.x;
+    const float tv = fmaxf(t[m], clamp_min);
+    const float pos = fminf(fmaxf(tv, 0.0f), 1.0f) * (float)(grid - 1);
+    float i0f = floorf(pos);
+    if (i0f > (float)(grid - 2)) i0f = (float)(grid - 2);   /* torch lerp's clamp(max=G-2) */
+    const float fr = pos - i0f;
+    const int i0 = (int)i0f;
+    for (int i = threadIdx.x; i < n; i += kT) {
+        const float a0 = table[(size_t)i0 * n + i];
+        const float a1 = table[(size_t)(i0 + 1) * n + i];
+        st1(y + (size_t)m * y_ld + i, a0 + fr * (a1 - a0));
+    }
+}
+
 // ---------------------------------------------------------------------------- row moves
 __global__ __launch_bounds__(kT) void gather2_kernel(
     const uint16_t* __restrict__ a, const uint16_t* __restrict__ b, const int* __restrict__ idx,
@@ -753,18 +774,36 @@ extern "C" int r4d_rad_gate_add(const RadArgs* a, RadStream s) {
 }
 
 /* Both rows: a bf16 embedding (timestep_embed_bf16) or an f32 one (timestep_embed_f32, a timestep
- * MLP kept in f32). */
+ * MLP kept in f32). With `curve` = G > 0 and a `table` [G, n] f32 operand the sinusoid is replaced
+ * by a lerp over that precomputed adaln curve. */
 extern "C" int r4d_rad_timestep_embed(const RadArgs* a, RadStream s) {
     const RadTensor *t = r4d_opt(a, 0), *y = r4d_opt(a, 1);
     if (!t || !y) return R4D_NO(RAD_E_INVAL);
     if (t->dtype != RAD_F32 || !r4d_contig(t) || (!is_bf16(y) && y->dtype != RAD_F32))
         return R4D_NO(RAD_E_DTYPE);
     const long long n = r4d_geti_or(a, "n", 0);
-    if (n <= 0 || (n & 1)) return R4D_NO(RAD_E_SHAPE);
+    const long long grid = r4d_geti_or(a, "curve", 0);
+    if (n <= 0 || (!grid && (n & 1))) return R4D_NO(RAD_E_SHAPE);
     long long ry = 0;
     const long long yl = r4d_rows_pitch(y, n, &ry);
     if (yl < 0) return R4D_NO(RAD_E_STRIDE);
     if (ry <= 0 || r4d_numel(t) < ry) return R4D_NO(RAD_E_SHAPE);
+    if (grid > 0) {
+        const RadTensor* tab = r4d_opt(a, 2);
+        if (!tab) return R4D_NO(RAD_E_INVAL);
+        if (tab->dtype != RAD_F32 || !r4d_contig(tab) || r4d_numel(tab) < grid * n)
+            return R4D_NO(RAD_E_SHAPE);
+        const float clamp = (float)r4d_getf(a, "clamp_min", 0.0);
+        if (y->dtype == RAD_F32)
+            hipLaunchKernelGGL(timestep_curve_kernel<float>, dim3((unsigned)ry), dim3(kT), 0,
+                               (hipStream_t)s, (const float*)t->data, (const float*)tab->data,
+                               (float*)y->data, (int)grid, (int)n, clamp, (int)yl);
+        else
+            hipLaunchKernelGGL(timestep_curve_kernel<uint16_t>, dim3((unsigned)ry), dim3(kT), 0,
+                               (hipStream_t)s, (const float*)t->data, (const float*)tab->data,
+                               (uint16_t*)y->data, (int)grid, (int)n, clamp, (int)yl);
+        return st_of(hipGetLastError());
+    }
     const float mp = (float)r4d_getf(a, "max_period", 10000.0);
     const float coef = (float)(-std::log((double)mp));
     const float scale = (float)r4d_getf(a, "scale", 1000.0);

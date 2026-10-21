@@ -298,9 +298,10 @@ struct DitBlock {
     rad_op     op_sel = 0;         /* video sparse attention's tile selection */
     rad_op     op_kq = 0;          /* the keys to int8 codes for the attention's scores */
     rad_op     op_vq = 0;          /* the values to E4M3 codes for the attention's P.V */
-    /* The three modulation projections, one a modality, this rank's share of their rows. */
+    /* The three modulation projections, one a modality, this rank's share of their rows. A
+     * curve-form checkpoint's are plain bf16 K=8 lines (ada_w), not fp8-quantised. */
     DenseFP8   ada[3];
-    rad_weight ada_b[3] = {};
+    rad_weight ada_w[3] = {}, ada_b[3] = {};
     rad_op     op_ada[3] = {};
 };
 
@@ -419,8 +420,12 @@ struct Model {
     ActFP8  a_rh{}, a_rattn{}, a_rffn{};
     RefBlock rb[2];
 
-    /* ---- the timestep MLP and the per-step tables */
-    rad_weight w_t1 = 0, b_t1 = 0, w_t2 = 0, b_t2 = 0, w_no = 0, b_no = 0;
+    /* ---- the timestep MLP and the per-step tables. A curve-form checkpoint replaces the sinusoid
+     * and the MLP with a precomputed adaln curve: `curve` is that table's row count (0 for the
+     * sinusoid + MLP path), `w_ttable` its f32 weight, and `temb_w` the embedding width (meta's
+     * time_embed_dim, whichever form produced it) every projection below reads. */
+    int64_t curve = 0, temb_w = 2688;
+    rad_weight w_t1 = 0, b_t1 = 0, w_t2 = 0, b_t2 = 0, w_no = 0, b_no = 0, w_ttable = 0;
     rad_op  op_temb = 0, op_temb_pv = 0, op_temb_pa = 0, op_t1 = 0, op_ts = 0, op_t2 = 0,
             op_ts2 = 0, op_no = 0;
     QuantFP8 q_temb{};
@@ -567,6 +572,24 @@ struct Model {
     rad_buf b_vl[6] = { 0 };
     rad_op  op_ve_ldbg[6] = { 0 };
     int64_t ve_l_bytes[6] = { 0 };
+
+    /* ---- the DiT step dump (R4D_DIT_SEL): the f32 shadows that let a step be replayed on the CPU
+     * reference DiT. All declared only when the env is set, so a production run pays nothing. */
+    bool dit_dbg = false;
+    /* b_h right after the input projections -- the stream entering block 0 -- cast to f32 before the
+     * block loop recycles the bf16 scratch. [cap, D] f32 PERSIST (capped: see declare_dit). */
+    int64_t dit_h0cap = 0;
+    rad_buf b_dh0 = 0;
+    rad_op  op_dh0 = 0;
+    /* The whole timestep-embedding table (b_temb, all 4*S rows), cast to f32 in the conditioning
+     * pass so the step pass can read it back without touching the arena. [4*S, td] f32 PERSIST. */
+    rad_buf b_tembd = 0;
+    rad_op  op_tembd = 0;
+    /* The step's gathered modulation table (b_modg) cast to f32: every block's and segment's cell,
+     * both ranks' column halves, the exact vectors the norms consume. PERSIST f32 twin of a bf16
+     * scratch (the b_ax2 lesson). [world * L * kMaxSegs, Ws] f32. */
+    rad_buf b_modd = 0;
+    rad_op  op_modd = 0;
 
     /* ---- the audio VAE encoder, when the container carries it. f32 like its decoder: per
      * channel one sequence, conv_in and five strided blocks of three [snake, conv7, snake,
@@ -999,9 +1022,12 @@ static int declare_tables(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     const int64_t fd = rad_meta_geti(meta, "transformer.freq_dim", 256);
     const int64_t hd1 = rad_meta_geti(meta, "transformer.time_embed_hidden_dim", 5376);
     const int64_t td = rad_meta_geti(meta, "transformer.time_embed_dim", 2688);
+    const int64_t G = rad_meta_geti(meta, "transformer.adaln_curve_grid", 0);
+    m.curve = G;
+    m.temb_w = td;
     const int acc = RAD_ACCESS_PER_REQUEST;
     const int gx = kGrpTemb;
-    if (td % RAD_FP8_BLOCK) {
+    if (!G && td % RAD_FP8_BLOCK) {
         fprintf(stderr, "radiance: minimaxh3: the timestep embedding is %lld wide, not whole "
                         "%d-column blocks\n", (long long)td, RAD_FP8_BLOCK);
         return RAD_E_INVAL;
@@ -1016,45 +1042,90 @@ static int declare_tables(RadBuilder* b, const RadModelMeta* meta, Model& m) {
      * byte-identical -- just S*2 unused rows through the MLP. */
     const int64_t TT = 4 * S;
     const double kVisualPin = 0.999, kAudioPin = 1.0;
-    m.b_tproj = decl_b(b, nm.f("tmb.proj"), RAD_F32, { TT, fd });
-    m.b_te1 = decl_b(b, nm.f("tmb.h1"), RAD_F32, { TT, hd1 });
-    m.b_te1s = decl_b(b, nm.f("tmb.h1s"), RAD_F32, { TT, hd1 });
-    m.b_temb = decl_b(b, nm.f("tmb.emb"), RAD_F32, { TT, td });
-    m.op_temb = rw(b, RAD_OP(b, "timestep_embed",
-                             RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("n", fd),
-                                        RAD_F64("scale", 1.0), RAD_F64("max_period", 10000.0),
-                                        RAD_STR("dtype", "f32")),
-                             RAD_NOWEIGHTS),
-                   {}, { m.b_tproj });
-    /* The two clamped schedule passes: the same op, the pin as `clamp_min`, into the pinned blocks. */
-    m.op_temb_pv = rw(b, RAD_OP(b, "timestep_embed",
-                                RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("n", fd),
-                                           RAD_F64("scale", 1.0), RAD_F64("max_period", 10000.0),
-                                           RAD_F64("clamp_min", kVisualPin),
-                                           RAD_STR("dtype", "f32")),
-                                RAD_NOWEIGHTS),
-                      {}, { m.b_tproj });
-    m.op_temb_pa = rw(b, RAD_OP(b, "timestep_embed",
-                                RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("n", fd),
-                                           RAD_F64("scale", 1.0), RAD_F64("max_period", 10000.0),
-                                           RAD_F64("clamp_min", kAudioPin),
-                                           RAD_STR("dtype", "f32")),
-                                RAD_NOWEIGHTS),
-                      {}, { m.b_tproj });
-    m.op_t1 = dense_bias(b, nm, "tmb.l1", "transformer.time_embedder.linear_1", RAD_F32, "f32", hd1,
-                         fd, TT, m.b_tproj, m.b_te1, &m.w_t1, &m.b_t1, acc, gx);
-    m.op_ts = unary(b, "silu", TT, hd1, "f32", m.b_te1, m.b_te1s);
-    m.op_t2 = dense_bias(b, nm, "tmb.l2", "transformer.time_embedder.linear_2", RAD_F32, "f32", td,
-                         hd1, TT, m.b_te1s, m.b_temb, &m.w_t2, &m.b_t2, acc, gx);
-    /* silu(temb) in f32, rounded once to the bf16 the projections take. */
-    Geom gs = g;
-    gs.max_tok = TT;
-    m.a_temb.x = decl_b(b, nm.f("tmb.act"), RAD_BF16, { TT, td });
-    m.op_ts2 = unary(b, "silu", TT, td, "f32", m.b_temb, m.a_temb.x);
-    RAD_ARCH_TRY(m.a_temb.declare_qs(b, nm, gs, "tmb.act", td, TT));
-    RAD_ARCH_TRY(m.q_temb.declare(b, gs, m.a_temb, td));
-    if (!m.op_temb || !m.op_temb_pv || !m.op_temb_pa || !m.op_t1 || !m.op_ts || !m.op_t2
-        || !m.op_ts2) return RAD_E_INVAL;
+    if (G > 0) {
+        /* A curve-form checkpoint: a timestep's embedding is not computed but READ -- the f32
+         * table the checkpoint ships, sampled at the timestep's sigma and lerped between the two
+         * rows around it. The four schedule blocks -- video, audio, and each re-embedded with its
+         * reference pin as a floor -- are four issues of the same op, and b_temb is written
+         * bf16 outright: what every projection below reads IS the op's output, so the MLP, the
+         * silus and the fp8 activation plane all vanish, and the activation alias a_temb.x is
+         * the buffer itself. */
+        m.w_ttable = wcopy(b, nm.f("tmb.table"), nm.ckpt("transformer.adaln_t_table"),
+                           RAD_F32, { G, td }, acc, gx);
+        m.b_temb = decl_b(b, nm.f("tmb.emb"), RAD_BF16, { TT, td });
+        m.a_temb.x = m.b_temb;
+        if (!m.w_ttable || !m.b_temb) return RAD_E_INVAL;
+        /* scale/max_period stay on the schema's required-parameter list -- the sinusoid reads
+         * them -- but the curve branch of every kernel ignores them, so they are given as the
+         * sinusoid defaults and mean nothing. */
+        m.op_temb = rw(b, RAD_OP(b, "timestep_embed",
+                                 RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("n", td),
+                                            RAD_F64("scale", 1.0), RAD_F64("max_period", 10000.0),
+                                            RAD_INT("curve", G), RAD_STR("dtype", "bf16")),
+                                 RAD_WEIGHTS(m.w_ttable)),
+                       {}, { m.b_temb });
+        /* The two clamped schedule passes: the same op, the pin as `clamp_min`, into the pinned
+         * blocks -- the same floors the sinusoid path gives the reference cells. */
+        m.op_temb_pv = rw(b, RAD_OP(b, "timestep_embed",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("n", td),
+                                               RAD_F64("scale", 1.0),
+                                               RAD_F64("max_period", 10000.0),
+                                               RAD_INT("curve", G),
+                                               RAD_F64("clamp_min", kVisualPin),
+                                               RAD_STR("dtype", "bf16")),
+                                    RAD_WEIGHTS(m.w_ttable)),
+                          {}, { m.b_temb });
+        m.op_temb_pa = rw(b, RAD_OP(b, "timestep_embed",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("n", td),
+                                               RAD_F64("scale", 1.0),
+                                               RAD_F64("max_period", 10000.0),
+                                               RAD_INT("curve", G),
+                                               RAD_F64("clamp_min", kAudioPin),
+                                               RAD_STR("dtype", "bf16")),
+                                    RAD_WEIGHTS(m.w_ttable)),
+                          {}, { m.b_temb });
+        if (!m.op_temb || !m.op_temb_pv || !m.op_temb_pa) return RAD_E_INVAL;
+    } else {
+        m.b_tproj = decl_b(b, nm.f("tmb.proj"), RAD_F32, { TT, fd });
+        m.b_te1 = decl_b(b, nm.f("tmb.h1"), RAD_F32, { TT, hd1 });
+        m.b_te1s = decl_b(b, nm.f("tmb.h1s"), RAD_F32, { TT, hd1 });
+        m.b_temb = decl_b(b, nm.f("tmb.emb"), RAD_F32, { TT, td });
+        m.op_temb = rw(b, RAD_OP(b, "timestep_embed",
+                                 RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("n", fd),
+                                            RAD_F64("scale", 1.0), RAD_F64("max_period", 10000.0),
+                                            RAD_STR("dtype", "f32")),
+                                 RAD_NOWEIGHTS),
+                       {}, { m.b_tproj });
+        /* The two clamped schedule passes: the same op, the pin as `clamp_min`, into the pinned blocks. */
+        m.op_temb_pv = rw(b, RAD_OP(b, "timestep_embed",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("n", fd),
+                                               RAD_F64("scale", 1.0), RAD_F64("max_period", 10000.0),
+                                               RAD_F64("clamp_min", kVisualPin),
+                                               RAD_STR("dtype", "f32")),
+                                    RAD_NOWEIGHTS),
+                          {}, { m.b_tproj });
+        m.op_temb_pa = rw(b, RAD_OP(b, "timestep_embed",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("n", fd),
+                                               RAD_F64("scale", 1.0), RAD_F64("max_period", 10000.0),
+                                               RAD_F64("clamp_min", kAudioPin),
+                                               RAD_STR("dtype", "f32")),
+                                    RAD_NOWEIGHTS),
+                          {}, { m.b_tproj });
+        m.op_t1 = dense_bias(b, nm, "tmb.l1", "transformer.time_embedder.linear_1", RAD_F32, "f32",
+                             hd1, fd, TT, m.b_tproj, m.b_te1, &m.w_t1, &m.b_t1, acc, gx);
+        m.op_ts = unary(b, "silu", TT, hd1, "f32", m.b_te1, m.b_te1s);
+        m.op_t2 = dense_bias(b, nm, "tmb.l2", "transformer.time_embedder.linear_2", RAD_F32, "f32",
+                             td, hd1, TT, m.b_te1s, m.b_temb, &m.w_t2, &m.b_t2, acc, gx);
+        /* silu(temb) in f32, rounded once to the bf16 the projections take. */
+        Geom gs = g;
+        gs.max_tok = TT;
+        m.a_temb.x = decl_b(b, nm.f("tmb.act"), RAD_BF16, { TT, td });
+        m.op_ts2 = unary(b, "silu", TT, td, "f32", m.b_temb, m.a_temb.x);
+        RAD_ARCH_TRY(m.a_temb.declare_qs(b, nm, gs, "tmb.act", td, TT));
+        RAD_ARCH_TRY(m.q_temb.declare(b, gs, m.a_temb, td));
+        if (!m.op_temb || !m.op_temb_pv || !m.op_temb_pa || !m.op_t1 || !m.op_ts || !m.op_t2
+            || !m.op_ts2) return RAD_E_INVAL;
+    }
 
     /* The lane's tables: kMaxSegs segment columns so a reference-conditioned pack has a cell each;
      * the plain three fill columns 0,1,2 byte-identically and leave the rest unread. */
@@ -1076,17 +1147,32 @@ static int declare_tables(RadBuilder* b, const RadModelMeta* meta, Model& m) {
             const char* bn = nm.f("%s.bias", base);
             RAD_ARCH_TRY(map_rows(b, wn, { { src_w, (int)(md * ada_rows), ada_rows } }));
             RAD_ARCH_TRY(map_rows(b, bn, { { src_b, (int)(md * ada_rows), ada_rows } }));
-            B.ada[md].mapped = true;
-            RAD_ARCH_TRY(B.ada[md].declare(b, nm, base, m.Ws, td, acc, RAD_SHARD_ROW,
-                                           grp_layer(grp), { src_w }));
             B.ada_b[md] = decl_w(b, bn, RAD_BF16, { m.Ws }, acc, RAD_SHARD_ROW, grp_layer(grp));
             if (!B.ada_b[md]) return RAD_E_INVAL;
-            B.op_ada[md] = rw(b, RAD_OP(b, "gemm_nt_q_bias",
-                                        RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("N", m.Ws),
-                                                   RAD_INT("K", td), RAD_INT("group", RAD_FP8_BLOCK),
-                                                   RAD_STR("dtype", "fp8a8")),
-                                        RAD_WEIGHTS(B.ada[md].w, B.ada[md].s, B.ada_b[md])),
-                              { m.a_temb.q, m.a_temb.s }, { m.b_ada });
+            if (G > 0) {
+                /* A curve checkpoint's modulation is an 8-column bf16 read of the embedding: the
+                 * K=8 projection loses nothing to quantisation, so the weight stays plain bf16 and
+                 * the activation is the curve's bf16 output itself -- no code planes either way. */
+                B.ada_w[md] = decl_w(b, wn, RAD_BF16, { m.Ws, td }, acc, RAD_SHARD_ROW,
+                                     grp_layer(grp));
+                if (!B.ada_w[md]) return RAD_E_INVAL;
+                B.op_ada[md] = rw(b, RAD_OP(b, "gemm_nt_bias",
+                                            RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("N", m.Ws),
+                                                       RAD_INT("K", td), RAD_STR("dtype", "bf16")),
+                                            RAD_WEIGHTS(B.ada_w[md], B.ada_b[md])),
+                                  { m.a_temb.x }, { m.b_ada });
+            } else {
+                B.ada[md].mapped = true;
+                RAD_ARCH_TRY(B.ada[md].declare(b, nm, base, m.Ws, td, acc, RAD_SHARD_ROW,
+                                               grp_layer(grp), { src_w }));
+                B.op_ada[md] = rw(b, RAD_OP(b, "gemm_nt_q_bias",
+                                            RAD_PARAMS(RAD_RANGE("M", 1, S), RAD_INT("N", m.Ws),
+                                                       RAD_INT("K", td),
+                                                       RAD_INT("group", RAD_FP8_BLOCK),
+                                                       RAD_STR("dtype", "fp8a8")),
+                                            RAD_WEIGHTS(B.ada[md].w, B.ada[md].s, B.ada_b[md])),
+                                  { m.a_temb.q, m.a_temb.s }, { m.b_ada });
+            }
             if (!B.op_ada[md]) return RAD_E_INVAL;
         }
     }
@@ -1143,6 +1229,45 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     /* ---- the packed sequence: the lane's prompt rows, the soundtrack's and the video's latents
      * through their f32 projections, rounded to bf16 as the reference packs them */
     m.b_h = decl_b(b, nm.f("dit.h"), RAD_BF16, { T, D });
+    /* ---- the DiT step dump (R4D_DIT_SEL, #61): the f32 shadows a CPU reference replay reads
+     * back. Declared only when the driver-side env is set -- both halves read the same
+     * environment -- so a production run reserves nothing. All bf16→f32 casts (no f32→f32 cast
+     * row exists), hence the temb shadow is curve-form only, where b_temb is bf16. */
+    m.dit_dbg = std::getenv("R4D_DIT_SEL") != nullptr;
+    if (m.dit_dbg) {
+        /* The h0 shadow is capped: max_tok is the whole batch ceiling (a video serve runs past a
+         * hundred thousand rows), and a full [max_tok, D] f32 twin is gigabytes the arena has no
+         * room for -- the KV budget resolver sees 0 and startup aborts. The dump request is a
+         * small plain render; anything wider than the cap fails the step below with a clear word. */
+        const int64_t h0cap = std::min(T, (int64_t)8192);
+        m.b_dh0 = decl_b(b, nm.f("dit.h0dbg"), RAD_F32, { h0cap, D }, RAD_BUF_PERSIST);
+        m.op_dh0 = rw(b, RAD_OP(b, "cast",
+                                RAD_PARAMS(RAD_RANGE("M", 1, h0cap), RAD_INT("n", D),
+                                           RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
+                                RAD_NOWEIGHTS),
+                       { m.b_h }, { m.b_dh0 });
+        m.dit_h0cap = h0cap;
+        rad_note(b, "rank %d/%d: DiT step dump on (R4D_DIT_SEL): h0 shadow capped at %lld rows",
+                 m.gt.rank, m.gt.world, (long long)h0cap);
+        m.b_modd = decl_b(b, nm.f("dit.moddbg"), RAD_F32,
+                          { (int64_t)g.world * L * kMaxSegs, m.Ws }, RAD_BUF_PERSIST);
+        m.op_modd = rw(b, RAD_OP(b, "cast",
+                                 RAD_PARAMS(RAD_RANGE("M", 1, (int64_t)g.world * L * kMaxSegs),
+                                            RAD_INT("n", m.Ws),
+                                            RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
+                                 RAD_NOWEIGHTS),
+                        { m.b_modg }, { m.b_modd });
+        if (m.curve > 0) {
+            m.b_tembd = decl_b(b, nm.f("dit.tembdbg"), RAD_F32, { 4 * m.S, m.temb_w },
+                               RAD_BUF_PERSIST);
+            m.op_tembd = rw(b, RAD_OP(b, "cast",
+                                      RAD_PARAMS(RAD_RANGE("M", 1, 4 * m.S), RAD_INT("n", m.temb_w),
+                                                 RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
+                                      RAD_NOWEIGHTS),
+                             { m.b_temb }, { m.b_tembd });
+        }
+        if (!m.op_dh0 || !m.op_modd || (m.curve > 0 && !m.op_tembd)) return RAD_E_INVAL;
+    }
     /* Learn the trunk's weight format from one linear before declaring the activation code planes.
      * An int8 (W8A8) denoiser quantises its per-token activations to int8 too -- E4M3's three
      * mantissa bits band the smooth activations that carry detail, and its 448 clamp clips
@@ -3087,6 +3212,27 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             d.dbg_ve_l2 = m.b_vl[2]; d.dbg_ve_l2_bytes = m.venc ? m.ve_l_bytes[2] : 0;
             d.dbg_ve_l3 = m.b_vl[3]; d.dbg_ve_l3_bytes = m.venc ? m.ve_l_bytes[3] : 0;
             d.dbg_ve_l4 = m.b_vl[4]; d.dbg_ve_l4_bytes = m.venc ? m.ve_l_bytes[4] : 0;
+            /* The DiT step dump (#61, R4D_DIT_SEL, read by BOTH halves -- the plugin declares the
+             * shadows only when it sees the env, so the driver must check dbg_dit_h0 is non-null
+             * before staging). All f32:
+             *   dbg_dit_h0  -- b_dh0, the input projections' output (the stream entering block 0),
+             *                  plain requests only; the driver readbacks step 0's first R rows.
+             *   dbg_dit_vel -- b_vel as-is: written by this step's head and read back in the same
+             *                  pass, so the arena cannot have moved under it.
+             *   dbg_dit_temb-- b_tembd, the whole 4*S-row timestep table widened to f32 (curve form
+             *                  only -- the full form's b_temb is already f32; no f32->f32 cast).
+             *   dbg_dit_mod -- b_modd, step 0's gathered modulation table: row
+             *                  rank * (L * kMaxSegs) + l * kMaxSegs + e, columns rank * Ws + c of
+             *                  the full-W cell, exactly the bf16 vectors the norms consumed. */
+            d.dbg_dit_h0 = m.b_dh0;
+            d.dbg_dit_h0_bytes = m.b_dh0 ? m.dit_h0cap * m.D * 4 : 0;
+            d.dbg_dit_vel = m.b_vel;
+            d.dbg_dit_vel_bytes = m.maxV * kPatchVals * 4;
+            d.dbg_dit_temb = m.b_tembd;
+            d.dbg_dit_temb_bytes = m.b_tembd ? 4 * m.S * m.temb_w * 4 : 0;
+            d.dbg_dit_mod = m.b_modd;
+            d.dbg_dit_mod_bytes =
+                m.b_modd ? (int64_t)gd.world * gd.n_layer * kMaxSegs * m.Ws * 4 : 0;
         }
         RAD_ARCH_TRY(rad_declare_video_generator(b, &d));
     }
@@ -3247,21 +3393,41 @@ static void step_cond(RadCtx* c, const RadBatch* batch, const Model& m) {
     /* ---- every step's timestep embedding: the two streams' schedules, then each re-embedded with
      * its reference pin as a floor (clamp_min) into the two pinned blocks the reference cells read.
      * At its own rows: QuantFP8::step bands by the rows it is issued for. */
-    const int64_t fd = 256, td = 2688, TT = 4 * S;
-    RAD_ISSUE_N(c, m.op_temb, S, praw(V->t_video, RAD_F32, S), brow_slice(m.b_tproj, 0, S, fd));
-    RAD_ISSUE_N(c, m.op_temb, S, praw(V->t_audio, RAD_F32, S), brow_slice(m.b_tproj, S, S, fd));
-    RAD_ISSUE_N(c, m.op_temb_pv, S, praw(V->t_video, RAD_F32, S),
-                brow_slice(m.b_tproj, 2 * S, S, fd));
-    RAD_ISSUE_N(c, m.op_temb_pa, S, praw(V->t_audio, RAD_F32, S),
-                brow_slice(m.b_tproj, 3 * S, S, fd));
-    RAD_ISSUE_N(c, m.op_t1, TT, brows(m.b_tproj, TT), RAD_W(m.w_t1), RAD_W(m.b_t1), RAD_NONE,
-                brows(m.b_te1, TT));
-    RAD_ISSUE_N(c, m.op_ts, TT, brows(m.b_te1, TT), brows(m.b_te1s, TT));
-    RAD_ISSUE_N(c, m.op_t2, TT, brows(m.b_te1s, TT), RAD_W(m.w_t2), RAD_W(m.b_t2), RAD_NONE,
-                brows(m.b_temb, TT));
-    RAD_ISSUE_N(c, m.op_ts2, TT, brows(m.b_temb, TT), brows(m.a_temb.x, TT));
-    RAD_ISSUE_N(c, m.q_temb.op, TT, brows(m.a_temb.x, TT), brows(m.a_temb.cq(), TT),
-                brows(m.a_temb.cs(), TT));
+    const int64_t fd = 256, td = m.temb_w, TT = 4 * S;
+    if (m.curve > 0) {
+        /* The curve form reads the embedding straight out of the checkpoint's table: one op per
+         * block, the table as its weight operand, b_temb as its bf16 output. Operand order follows
+         * the op's IN/OUT sequence -- t, y, table -- like every other op: the kernel reads the
+         * table at operand 2, after the output. */
+        RAD_ISSUE_N(c, m.op_temb, S, praw(V->t_video, RAD_F32, S),
+                    brow_slice(m.b_temb, 0, S, td), RAD_W(m.w_ttable));
+        RAD_ISSUE_N(c, m.op_temb, S, praw(V->t_audio, RAD_F32, S),
+                    brow_slice(m.b_temb, S, S, td), RAD_W(m.w_ttable));
+        RAD_ISSUE_N(c, m.op_temb_pv, S, praw(V->t_video, RAD_F32, S),
+                    brow_slice(m.b_temb, 2 * S, S, td), RAD_W(m.w_ttable));
+        RAD_ISSUE_N(c, m.op_temb_pa, S, praw(V->t_audio, RAD_F32, S),
+                    brow_slice(m.b_temb, 3 * S, S, td), RAD_W(m.w_ttable));
+    } else {
+        RAD_ISSUE_N(c, m.op_temb, S, praw(V->t_video, RAD_F32, S), brow_slice(m.b_tproj, 0, S, fd));
+        RAD_ISSUE_N(c, m.op_temb, S, praw(V->t_audio, RAD_F32, S), brow_slice(m.b_tproj, S, S, fd));
+        RAD_ISSUE_N(c, m.op_temb_pv, S, praw(V->t_video, RAD_F32, S),
+                    brow_slice(m.b_tproj, 2 * S, S, fd));
+        RAD_ISSUE_N(c, m.op_temb_pa, S, praw(V->t_audio, RAD_F32, S),
+                    brow_slice(m.b_tproj, 3 * S, S, fd));
+        RAD_ISSUE_N(c, m.op_t1, TT, brows(m.b_tproj, TT), RAD_W(m.w_t1), RAD_W(m.b_t1), RAD_NONE,
+                    brows(m.b_te1, TT));
+        RAD_ISSUE_N(c, m.op_ts, TT, brows(m.b_te1, TT), brows(m.b_te1s, TT));
+        RAD_ISSUE_N(c, m.op_t2, TT, brows(m.b_te1s, TT), RAD_W(m.w_t2), RAD_W(m.b_t2), RAD_NONE,
+                    brows(m.b_temb, TT));
+        RAD_ISSUE_N(c, m.op_ts2, TT, brows(m.b_temb, TT), brows(m.a_temb.x, TT));
+        RAD_ISSUE_N(c, m.q_temb.op, TT, brows(m.a_temb.x, TT), brows(m.a_temb.cq(), TT),
+                    brows(m.a_temb.cs(), TT));
+    }
+    /* The dump's temb shadow (R4D_DIT_SEL, curve form -- the full form's b_temb is already f32 and
+     * has no f32→f32 cast row): every row of the table the adaln projections read, widened to f32
+     * into a PERSIST buffer so the step pass can read it back without touching the arena. */
+    if (m.dit_dbg && m.curve > 0)
+        RAD_ISSUE_N(c, m.op_tembd, TT, brows(m.b_temb, TT), brows(m.b_tembd, TT));
 
     /* ---- the modulation table: block l, segment e from its modality's projection of its
      * timestep's rows, at the table's column block (l, e). A plain request has exactly the three
@@ -3300,10 +3466,15 @@ static void step_cond(RadCtx* c, const RadBatch* batch, const Model& m) {
         for (int64_t e = 0; e < ncell; ++e) {
             const int md = cell[(size_t)e].first;
             const int64_t r0 = cell[(size_t)e].second;
-            RAD_ISSUE_N(c, B.op_ada[md], S, brow_slice(m.a_temb.q, r0, S, td),
-                        brow_slice(m.a_temb.s, r0, S, td / RAD_FP8_BLOCK), RAD_W(B.ada[md].w),
-                        RAD_W(B.ada[md].s), RAD_W(B.ada_b[md]),
-                        bcol_at(m.b_ada, base, L * kMaxSegs * m.Ws, (l * kMaxSegs + e) * m.Ws, m.Ws, S));
+            const RadOperand out =
+                bcol_at(m.b_ada, base, L * kMaxSegs * m.Ws, (l * kMaxSegs + e) * m.Ws, m.Ws, S);
+            if (m.curve > 0)
+                RAD_ISSUE_N(c, B.op_ada[md], S, brow_slice(m.a_temb.x, r0, S, td),
+                            RAD_W(B.ada_w[md]), RAD_W(B.ada_b[md]), RAD_NONE, out);
+            else
+                RAD_ISSUE_N(c, B.op_ada[md], S, brow_slice(m.a_temb.q, r0, S, td),
+                            brow_slice(m.a_temb.s, r0, S, td / RAD_FP8_BLOCK), RAD_W(B.ada[md].w),
+                            RAD_W(B.ada[md].s), RAD_W(B.ada_b[md]), out);
         }
     }
     for (int64_t e = 0; e < ncell; ++e) {
@@ -3375,6 +3546,13 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
     else
         RAD_ISSUE_N(c, m.op_modg, 1, brow_slice(m.b_ada, ti, 1, row),
                     RAD_P_T2(rad_buf_ptr(c, m.b_modg), RAD_BF16, 1, row));
+    /* The dump's modulation shadow (R4D_DIT_SEL): the gathered table -- every block's and merged
+     * cell's vectors, both ranks' column halves -- widened to f32 into a PERSIST buffer. The step
+     * the driver readbacks on is the dump's step (0); the blocks below never touch b_modd. */
+    if (m.dit_dbg && V->step == 0)
+        RAD_ISSUE_N(c, m.op_modd, (int64_t)g.world * L * kMaxSegs,
+                    brows(m.b_modg, (int64_t)g.world * L * kMaxSegs),
+                    brows(m.b_modd, (int64_t)g.world * L * kMaxSegs));
 
     RAD_ISSUE_N(c, m.op_text, nt, brows(m.b_text, La * kMaxText), lane_d,
                 praw(V->seg_cu, RAD_I32, 2), brows(m.b_h, nt));
@@ -3421,6 +3599,19 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
                             RAD_W(m.w_ain), RAD_W(m.b_ain), RAD_NONE,
                             brow_slice(m.b_h, s.start, n, D));
         }
+    }
+
+    /* The dump's h0 shadow (R4D_DIT_SEL): b_h exactly as the input projections and scatters left
+     * it -- the stream entering block 0 -- widened to f32 before the first block recycles the
+     * bf16 scratch. Plain requests only: the harness replays the fixed [text | audio | video]
+     * order, and the driver readbacks only plain step-0 requests (R4D_DIT_SEL). */
+    if (m.dit_dbg && V->step == 0 && !refc) {
+        if (R > m.dit_h0cap) {
+            rad_step_fail(c, "minimaxh3: the DiT dump request packs more rows than the h0 shadow "
+                             "holds (8192) -- render the dump smaller");
+            return;
+        }
+        RAD_ISSUE_N(c, m.op_dh0, R, brows(m.b_h, R), brows(m.b_dh0, R));
     }
 
     const RadOperand segs = praw(V->seg_cu, RAD_I32, nfine + 1);

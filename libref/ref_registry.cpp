@@ -680,8 +680,9 @@ static const RadOperandSpec oFlowX0[] = { OPD("v"), OPD("t"), OPD("sigma"), OPD(
 static const RadOperandSpec oFlowRM[] = { OPD("v"), INOUT("x0"), OPD("sigma"), OPD("r"),
                                           OPD("hb1"), OPD("hb2"), OPD("order"), INOUT("x") };
 static const RadParamSpec pTimestep[] = { P_INT("M"), P_INT("n"), P_F64("scale"), P_F64("max_period"),
-                                          P_INTO("round"), P_F64O("clamp_min"), P_STR("dtype") };
-static const RadOperandSpec oTimestep[] = { OPD("t"), OUT("y") };
+                                          P_INTO("round"), P_F64O("clamp_min"), P_INTO("curve"),
+                                          P_STR("dtype") };
+static const RadOperandSpec oTimestep[] = { OPD("t"), OUT("y"), WGT_O("table") };
 static const RadOperandSpec oGather2[]  = { OPD("a"), OPD("b"), OPD("idx"), OUT("y") };
 static const RadParamSpec pLane[] = { P_INT("M"), P_INT("n"), P_INT("stride"), P_STR("dtype") };
 static const RadOperandSpec oLaneGather[] = { OPD("src"), OPD("lane"), OPD("cu_seqlens"), OUT("y") };
@@ -1379,7 +1380,9 @@ static const RadOpSchema kSchemas[] = {
 { "timestep_embed", ARR(pTimestep), ARR(oTimestep),
   "the sinusoidal timestep embedding, [cos | sin] of t' * exp(-ln(max_period) * i / (n/2)) with "
   "t' = scale * t; `round` 1 takes t through bf16 at scale and back first, as diffusers' "
-  "pipeline hands it to its transformer." },
+  "pipeline hands it to its transformer. With `curve` > 0 and a `table` [curve, n] f32 operand: "
+  "y[m] = table sampled at clamp01(max(t[m], clamp_min)) * (curve - 1), lerped between the two "
+  "rows around that position -- a precomputed adaln time-embedding curve." },
 { "gather_rows2", ARR(pMnD), ARR(oGather2),
   "y[i] = idx[i] >= 0 ? a[idx[i]] : b[-1 - idx[i]]: a sequence assembled from two sources." },
 { "lane_gather", ARR(pLane), ARR(oLaneGather),

@@ -867,7 +867,7 @@ says which (`libref/ref_gen.cpp`).
 | `ln_mod` | `M`(range) `n` `eps`:f64 `dtype` | `x`, `s`, `cu_seqlens` → `y` |
 | `gate_add` | `M`(range) `n` `dtype` `act`/opt | `y`, `g`, `cu_seqlens`, `x`:inout |
 | `ln_mod_quant_fp8` | `M`(range) `n` `eps`:f64 `group` `gated` `dtype` | `y`?, `g`?, `s`, `cu_seqlens`, `x`:inout → `q`, `scale`, `z`? |
-| `timestep_embed` | `M`(range) `n` `scale`:f64 `max_period`:f64 `round`/opt `clamp_min`:f64/opt `dtype` | `t` → `y` |
+| `timestep_embed` | `M`(range) `n` `scale`:f64 `max_period`:f64 `round`/opt `clamp_min`:f64/opt `curve`/opt `dtype` | `t` → `y`, `table`w? |
 | `gather_rows2` | `M`(range) `n` `dtype` | `a`, `b`, `idx` → `y` |
 | `lane_gather` | `M`(range) `n` `stride` `dtype` | `src`, `lane`, `cu_seqlens` → `y` |
 | `lane_store` | `M`(range) `n` `stride` `dtype` | `src`, `lane`, `dst`:inout |
@@ -903,6 +903,11 @@ source into every listed lane (a repainted picture's latent into each of its ima
   diffusers' pipeline hands its transformer. `t` is f32 `[M]`. With `clamp_min`, each `t` is first
   raised to that floor (`t = max(t, clamp_min)`) -- the reference conditioning's near-clean pin
   timesteps, which sit above the sampler's decaying schedule. `0` (default) leaves `t` untouched.
+  With `curve` = G > 0 and the `table` weight (f32 `[G, n]`) bound, the sinusoid is replaced:
+  `y[m] = table` sampled at `clamp01(max(t[m], clamp_min)) * (G - 1)`, linearly between the two
+  rows around that position (the lower row index capped at `G - 2`), the precomputed adaln curve
+  a curve-form checkpoint ships in place of the sinusoid and its MLP. `scale`, `max_period` and
+  `round` are ignored in that mode, and `n` need not be even.
 - `gather_rows2`: `y[i] = idx[i] >= 0 ? a[idx[i]] : b[-1 - idx[i]]`, zeros past either source.
 - `randn_lanes`: for entries whose `flags` carry 1, the lane's rows become the entry's seed's
   standard-normal stream (`abi/rad_philox.h`), element `(k, c)` the stream's `k * n + c`. `seed` is
@@ -1097,7 +1102,9 @@ bf16 tensor and keeps f32 where it computes in f32; the libref function says whi
 |---|---|---|
 | `rms_mod` | `M`(range) `n` `eps`:f64 `gated`/opt `dtype` | `y`?, `g`?, `s`, `w`w, `cu_seqlens`, `x`:inout → `z` |
 | `rms_mod_quant_fp8` | `M`(range) `n` `eps`:f64 `group` `gated` `dtype` | `y`?, `g`?, `s`, `w`w, `cu_seqlens`, `x`:inout → `q`, `scale`, `z`? |
+| `rms_mod_quant_i8` | `M`(range) `n` `eps`:f64 `group` `gated` `dtype` | `y`?, `g`?, `s`, `w`w, `cu_seqlens`, `x`:inout → `q`, `scale`, `z`? |
 | `flow_x0_step` | `M`(range) `n` `dtype` | `v`, `t`, `sigma`, `sigma_next`, `x`:inout |
+| `flow_res_multistep` | `M`(range) `n` `dtype` | `v`, `x0`:inout, `sigma`, `r`, `hb1`, `hb2`, `order`, `x`:inout |
 | `patch_unfold` | `M`(range) `C` `pt` `ph` `pw` `mul` `add` `dtype` | `x`, `geom` → `y` |
 | `vtile_gather` | `M`(range) `n` `tile` `overlap` `frames` `period` `n_reg` `dtype` | `x`, `reg`w, `geom` → `y` |
 | `vtile_stitch` | `M`(range) `tile` `overlap` `scale` `pt` `skip` `keep` `blend` `period` `mean` `std` | `x`, `geom`, `prev`:inout → `y` |
@@ -1115,12 +1122,24 @@ reads its entry's rows of `s` and `g`.
   The residual rounds to `x`'s dtype and the norm chain to `z`'s.
 - `rms_mod_quant_fp8` is `rms_mod` with the norm chain in bf16, then `quant_act_fp8` of that bf16
   row per `group` as `ln_mod_quant_fp8` takes it; `z` written when bound.
+- `rms_mod_quant_i8` is the same with `quant_act_i8g` in place of `quant_act_fp8`: symmetric int8
+  codes on a per-row `group` grid, a quarter of E4M3's quantisation error on the same one byte a
+  value; read by the int8 GEMMs. `z` written when bound.
 - `flow_x0_step` is MiniMax-H3's sampler step over a lane's rows, all f32, each product and sum
   one rounding: the velocity points at the data, so the clean estimate is `d = x + (1 - t) v` and
   the step blends toward it, `st = f32(1 - t)`, `d = f32(x + f32(st v))`,
   `r = f32(sigma_next / sigma)`, `x = f32(f32(r x) + f32(f32(1 - r) d))`. `t` (the timestep the
   transformer was conditioned on), `sigma` and `sigma_next` (the schedule's entries) are one f32
   value each; `v` is f32 or bf16, `x` f32.
+- `flow_res_multistep` is the same sampler's second-order form (DPM-Solver++2M data-prediction,
+  k-diffusion's `res_multistep` at eta 0): the clean estimate `d = x + sigma v` again, but the step
+  also leans on the previous step's estimate, `x = r x + hb1 d + hb2 x0`, `r = sigma_next / sigma`.
+  `x0` is read then overwritten with this step's `d` (both f32, INOUT: the latent and its estimate
+  history). `order >= 1.5` selects the two-estimate form; below it the step is Euler,
+  `x = r x + (1 - r) d` -- the driver sets order 1 on the first step, after a schedule restart and
+  on the last. The driver's `hb1` and `hb2` keep `hb1 + hb2 == 1 - r` exactly, so the two branches
+  share the Euler limit and the difference is the second-order correction alone. `sigma`, `r`,
+  `hb1`, `hb2` and `order` are one f32 value each; `v` f32 or bf16.
 
 **The decoder** runs over a request's latent geometry, which `geom`, i32 on the device, carries
 (the parameters are fixed at declare). `mul`, `add`, `mean` and `std` are space-separated lists

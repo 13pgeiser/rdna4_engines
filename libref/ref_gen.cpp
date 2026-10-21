@@ -268,7 +268,10 @@ int ref_rms_mod_quant_fp8(const RadArgs* a, RadStream) {
 /* y[m] = [cos(t' f_0) .. cos(t' f_{h-1}) | sin(t' f_0) .. sin(t' f_{h-1})], h = n / 2, where
  * f_i = exp(-ln(max_period) * i / h) in f32 and t' = scale * t -- or, with `round` 1, the value
  * diffusers' pipeline hands its transformer: t rounded to bf16 at scale, divided back and rounded
- * again, then scaled: scale * bf16(bf16(t * scale) / scale). */
+ * again, then scaled: scale * bf16(bf16(t * scale) / scale).
+ * With `curve` = G > 0 and a `table` [G, n] f32 operand instead: y[m] = table sampled at
+ * clamp01(max(t[m], clamp_min)) * (G - 1), lerped between the two rows around that position -- the
+ * precomputed adaln time curve a curve-form checkpoint ships in place of the sinusoid + MLP. */
 int ref_timestep_embed(const RadArgs* a, RadStream) {
     if (!have(a, 2)) return RAD_E_INVAL;
     const RadTensor *t = &a->t[0], *y = &a->t[1];
@@ -277,9 +280,33 @@ int ref_timestep_embed(const RadArgs* a, RadStream) {
     const double mp = p_f32(a, "max_period", 10000.0f);
     const int round = (int)p_int(a, "round", 0);
     const float clamp = p_f32(a, "clamp_min", 0.0f);
-    if (n <= 0 || (n & 1)) return RAD_E_SHAPE;
+    if (n <= 0) return RAD_E_SHAPE;
+    const int64_t grid = p_int(a, "curve", 0);
+    if (!grid && (n & 1)) return RAD_E_SHAPE;
     const int64_t rows = rows_of(y, n);
     if (rows <= 0 || numel(t) < rows) return RAD_E_SHAPE;
+    if (grid > 0) {
+        /* The precomputed adaln curve: y[m] = table sampled at clamp01(max(t, clamp_min)) *
+         * (grid - 1), lerped between the two rows around that position. */
+        const RadTensor* tab = t_in(a, 2);
+        if (!tab) return RAD_E_INVAL;
+        if (tab->dtype != (uint32_t)RAD_F32 || numel(tab) < grid * n) return RAD_E_SHAPE;
+        for (int64_t m = 0; m < rows; ++m) {
+            const float tv = std::fmax(ldt(t, offlin(t, m)), clamp);
+            const float pos = std::fmin(std::fmax(tv, 0.0f), 1.0f) * (float)(grid - 1);
+            float i0f = std::floor(pos);
+            if (i0f > (float)(grid - 2)) i0f = (float)(grid - 2);
+            const float fr = pos - i0f;
+            const int64_t i0 = (int64_t)i0f;
+            const int64_t yb = rowoff(y, m, n), ys = laststride(y);
+            for (int64_t i = 0; i < n; ++i) {
+                const float a0 = ldt(tab, offlin(tab, i0 * n + i));
+                const float a1 = ldt(tab, offlin(tab, (i0 + 1) * n + i));
+                stt(y, yb + i * ys, a0 + fr * (a1 - a0));
+            }
+        }
+        return RAD_OK;
+    }
     const int64_t h = n / 2;
     const float coef = (float)(-std::log(mp));
     for (int64_t m = 0; m < rows; ++m) {
