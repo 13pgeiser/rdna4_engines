@@ -580,6 +580,22 @@ wherever a loaded library serves the fused op (the separate launches otherwise):
 the eight R9700s below, greedy text at a fixed draft depth of 3 is identical with and without
 them, and eight agent streams decode 456 tok/s against 452, one 144 against 140.
 
+**Decode at a few rows.** A verify pass of one stream carries two to six rows (the draft window
+and one), a draft pass one; there a step is a chain of short launches, each bound by its own
+latency rather than by bandwidth. Five changes serve those rows, each byte-identical to what it
+replaces. Kernel times on one R9700 at the TP8 slices (r4d_selftest's perf modes, `--cold 256`):
+
+| change | where it applies | before / after, us |
+|---|---|---|
+| `moe_gemm_q` mxfp4a8 takes the small-M form (`moe_mxfp4_small_kernel`): blocks walk the touched experts only, weight codes stay packed in LDS, gate_up stages 512 of K, down reads its rows whole | gate_up to 384 routed rows, down to 32 | gate_up at 1 / 4 / 6 / 16 / 48 tokens: 36.8 / 31.4, 90.0 / 79.7, 120.5 / 101.4, 230.3 / 206.8, 416.7 / 390.0; down at 1 / 2 / 4: 21.2 / 16.4, 26.0 / 22.5, 39.5 / 37.9 |
+| `moe_gemm_q` fp8a8f32 takes the same form (`fp8_f32scale_small`) for the MTP layer's gate_up | to 384 routed rows | at 1 / 2 / 8 tokens: 73.6 / 36.7, 83.6 / 65.8, 214.0 / 203.9 |
+| `gemm_nt_f32` keeps 16 steps of k in flight a lane (8 from 17 rows at the router's width) | below 64 rows | router (N 288) at 1 / 4 / 8 / 24 rows: 28.1 / 14.4, 36.0 / 14.5, 36.3 / 15.0, 45.4 / 21.6; index head gates (N 32) at 1 / 24: 27.3 / 9.8, 36.2 / 10.0 |
+| `logits_gemm` takes `logits_gemm_bf16_cols`, a wave per four vocabulary columns | n_embd 4096 | at 1 / 6 / 8 / 24 / 48 rows: 239.1 / 235.5, 303.2 / 247.5, 378.2 / 250.4, 1133.2 / 635.6, 2354.5 / 1220.1 |
+| KDA issues both low-rank down-projections before either up-projection, so a recorded pass orders the four readers of the layer input once and the two up-projections once | every KDA layer | one ordered point fewer a layer |
+
+`r4d_emu` holds both expert forms and the f32 tiles to the host restatement of their per-element
+sequence, and `r4d_selftest` compares the head's column form with the block row byte for byte.
+
 **Measured** on eight R9700s (gfx1201, 32 GB; four on PCIe Gen5 x16, four on Gen5 x8) at TP8 with
 the flags of `deploy/compose/glm53-flash.yaml` (32768 tokens of context, eight sequences, MTP with
 an adaptive window up to 5, reasoning effort low). BetterBench quick, temperature 0.7, cold
