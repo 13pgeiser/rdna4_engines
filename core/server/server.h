@@ -329,6 +329,7 @@ private:
      * {"enabled": bool} sets the default for requests that name no choice. Guarded by the API key
      * like every other route but the health probes and the page. */
     HttpResponse handle_control_vector(const HttpRequest& req);
+    HttpResponse handle_session_release(const HttpRequest& req);
 
     HttpResponse error_response(const ApiError& e, const std::string& peer,
                                 ApiShape shape = ApiShape::OpenAI);

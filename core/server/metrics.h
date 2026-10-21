@@ -152,6 +152,7 @@ private:
     Counter c_attn_cached_, c_linear_cached_, c_checkpoints_;
     Counter c_prefix_evict_, c_prefix_ckpt_evict_;
     Counter c_prefix_expired_, c_prefix_ckpt_expired_;
+    Counter c_prefix_released_, c_prefix_ckpt_released_;
     Counter c_ckpt_retired_, c_ckpt_lru_, c_ckpt_refused_;
     Counter c_cut_no_snapshot_, c_cut_window_, c_cut_adopt_, c_cut_resumed_below_, c_cut_tokens_;
     Counter c_restore_cuts_;

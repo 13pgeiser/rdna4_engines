@@ -92,6 +92,7 @@ struct SchedMetrics {
      * and reservations that went without a snapshot. */
     int64_t prefix_ckpt_retired = 0, prefix_ckpt_lru = 0, prefix_ckpt_refused = 0;
     int64_t prefix_expired = 0, prefix_ckpt_expired = 0;   /* --prefix-cache-ttl */
+    int64_t prefix_released = 0, prefix_ckpt_released = 0; /* DELETE /sessions */
     /* Admissions whose attention hit was cut to nothing: no snapshot at or below it (recurrent
      * state or a window snapshot), a windowed trunk group no window snapshot covers, or blocks
      * that could not be adopted. `hit_cut_resumed_below` counts those that resumed at a

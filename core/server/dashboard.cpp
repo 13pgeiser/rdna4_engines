@@ -138,6 +138,8 @@ HttpResponse Server::handle_sessions(const HttpRequest&) {
     o["snapshot_store"] = { { "bytes_each", c.ck_bytes }, { "slots", c.ck_slots } };
     /* Entries and snapshots removed by --prefix-cache-ttl, from whichever tier held them. */
     o["expired"] = { { "entries", sm.prefix_expired }, { "snapshots", sm.prefix_ckpt_expired } };
+    /* And the ones a client gave up on purpose (DELETE /sessions). */
+    o["released"] = { { "entries", sm.prefix_released }, { "snapshots", sm.prefix_ckpt_released } };
     /* Step-thread time spent on tier moves; every request waits through it. */
     o["stall"] = { { "restores", c.restores }, { "restore_ms", (double)c.restore_ns / 1e6 },
                    { "flushes", c.flushes }, { "flush_ms", (double)c.flush_ns / 1e6 } };
@@ -164,6 +166,83 @@ HttpResponse Server::handle_sessions(const HttpRequest&) {
      * model, read `linear.hit_rate`. */
     o["prefix_hit_rate"] = sm.prefix_hit_rate;
     o["enabled"] = c.host_on;
+    return HttpResponse::json_body(200, json_dump(o));
+}
+
+/* ------------------------------------------------------------------ DELETE /sessions
+ *
+ * A client that deletes a conversation, or replaces everything past a prefix of it, knows the
+ * rest is dead before the TTL does. Named by the label it sent (`session_id`, or Anthropic's
+ * `metadata.user_id`), or by the engine id `/sessions` shows. `keep_tokens` keeps the chain's
+ * start. Shared blocks and blocks a live request reads stay; a request of the same conversation
+ * in flight is a 409, since its close would publish the chain again. */
+HttpResponse Server::handle_session_release(const HttpRequest& req) {
+    if (!deps_.sched)
+        return error_response(err_not_implemented("the server has no engine attached"), req.peer);
+
+    const std::string label = req.param("label");
+    uint64_t id = 0;
+    const std::string id_s = req.param("id");
+    if (!id_s.empty()) {
+        if (id_s.find_first_not_of("0123456789") != std::string::npos || id_s.size() > 19)
+            return error_response(err_bad("id", "expected the session's engine id, a decimal "
+                                                "integer as /sessions reports it"), req.peer);
+        id = std::stoull(id_s);
+        if (id == 0) return error_response(err_bad("id", "0 names no session"), req.peer);
+    }
+    if (label.empty() && id == 0)
+        return error_response(err_bad("label", "name the session: DELETE /sessions/<label>, "
+                                               "?label=<label> or ?id=<engine id>"), req.peer);
+    int64_t keep_tokens = 0;
+    const std::string keep_s = req.param("keep_tokens");
+    if (!keep_s.empty()) {
+        if (keep_s.find_first_not_of("0123456789") != std::string::npos || keep_s.size() > 12)
+            return error_response(err_bad("keep_tokens", "expected a non-negative integer: the "
+                                                         "prefix to keep, in tokens"), req.peer);
+        keep_tokens = std::stoll(keep_s);
+    }
+
+    SessionReleased r;
+    const int rc = deps_.sched->release_session(label, id, keep_tokens, &r);
+    if (rc == RAD_E_UNSUPPORTED)
+        return error_response(err_not_implemented(
+            "this engine has no prefix cache (started with --no-prefix-cache, or the model "
+            "declares no cacheable KV group)"), req.peer);
+    const std::string who = label.empty() ? "id " + std::to_string(id) : "'" + label + "'";
+    if (rc == RAD_E_NOTFOUND) {
+        ApiError e;
+        e.status = 404;
+        e.type = "not_found_error";
+        e.param = label.empty() ? "id" : "label";
+        e.message = "no stored session " + who + "; GET /sessions lists them";
+        return error_response(e, req.peer);
+    }
+    if (rc == RAD_E_STATE) {
+        ApiError e;
+        e.status = 409;
+        e.type = "conflict_error";
+        e.code = "session_in_use";
+        e.message = "a request of session " + who + " is queued or running; cancel it or wait "
+                    "for it to finish, then release again";
+        return error_response(e, req.peer);
+    }
+    if (rc == RAD_E_INVAL)
+        return error_response(err_bad("keep_tokens", rad_strerror(rc)), req.peer);
+    if (rc < 0) return error_response(err_internal(rad_strerror(rc)), req.peer);
+
+    json o;
+    if (!label.empty()) o["label"] = label;
+    if (id != 0) o["id"] = id;
+    o["keep_tokens"]  = keep_tokens;
+    o["sessions"]     = r.sessions;
+    o["entries"]      = r.entries;
+    o["tokens"]       = r.tokens;
+    o["device_bytes"] = r.device_bytes;
+    o["host_bytes"]   = r.host_bytes;
+    o["snapshots"]    = r.snapshots;
+    o["kept"] = { { "tokens", r.kept_tokens }, { "shared", r.kept_shared },
+                  { "live", r.kept_live } };
+    metrics_.observe_http(200);
     return HttpResponse::json_body(200, json_dump(o));
 }
 
@@ -222,6 +301,8 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         o["ckpt_evictions"]  = { { "retention", m.prefix_ckpt_retired },
                                  { "store_full", m.prefix_ckpt_lru } };
         o["ckpt_refused"]    = m.prefix_ckpt_refused;
+        o["released"]        = { { "entries", m.prefix_released },
+                                 { "snapshots", m.prefix_ckpt_released } };
         o["hit_cuts"]        = { { "no_snapshot", m.hit_cut_no_snapshot },
                                  { "windowed_group", m.hit_cut_window },
                                  { "adopt_failed", m.hit_cut_adopt },

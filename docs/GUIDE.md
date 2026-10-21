@@ -1214,6 +1214,26 @@ whichever tier holds it (VRAM blocks to the pool, host slot to the arena, snapsh
 hit or a new turn counts as a use, and a system prompt shared by several conversations stays while
 any of them is used.
 
+A client that knows a conversation is dead need not wait for the TTL: `DELETE /sessions/<label>`
+forgets it now, with `<label>` the `session_id` (or Anthropic `metadata.user_id`) its requests
+carried, or `DELETE /sessions?id=<id>` by the engine id `GET /sessions` lists (`?label=` works for
+a label the path cannot carry). `?keep_tokens=N` keeps the first N tokens of the chain, rounded up
+to whole blocks, for a client that replaced everything past a prefix (a compaction) and wants the
+prefix to keep hitting. The chain goes from the tip inwards like expiry, host copy and the
+session's snapshots with it; a block another stored conversation also walks (the shared system
+prompt) stays, as does one a running request reads. A request of the same conversation in flight
+is refused with 409: finish or cancel it first. The answer says what went and what stayed:
+
+```json
+{"label":"chat-7","keep_tokens":0,"sessions":1,"entries":2048,"tokens":32768,
+ "device_bytes":417792000,"host_bytes":835584000,"snapshots":6,
+ "kept":{"tokens":0,"shared":64,"live":0}}
+```
+
+An unknown label or id is 404; an engine without a prefix cache answers 501. `/sessions` and
+`/stats` count what was released under `released`, `/metrics` as
+`prefix_cache_released_total{what}`.
+
 ```sh
 radiance --model m.rad --prefix-cache-mib 8192 --prefix-cache-ttl 3600
 ```
@@ -1787,6 +1807,7 @@ flags are refused on it, and so are the pixel bands.
 | `POST /tokenize`, `POST /detokenize` | vLLM's shape (`prompt` or `messages` in, `prompt` out) and llama-server's (`content` in and out, `with_pieces`) |
 | `GET /get_tokenizer_info` | the tokeniser's configuration |
 | `POST /reset_prefix_cache` | drop every cached prefix |
+| `DELETE /sessions/<label>`, `DELETE /sessions?id=<id>` | forget one stored conversation (§4.8) |
 | `GET /` or `/dashboard` | the web dashboard |
 | `GET /stats`, `/graph`, `/sessions` | the JSON the dashboard is drawn from |
 
@@ -2134,7 +2155,7 @@ passes but not launches (the UNet runs once per image and branch), so two take t
 | `stream`, `stream_options.include_usage` | |
 | `timings_per_token`, `return_progress` | llama-server's: `timings` on every chunk, and `prompt_progress` chunks while the prompt is read |
 | `samplers` | llama-server's sampler order, names or letters. A stage it leaves out is off. The chain here is penalties, DRY, top-k, top-p, min-p, typical, XTC, with temperature first (the default) or last (llama-server's default), so a list in either order is honoured and any other is refused by name |
-| `session_id` | OpenRouter's conversation id: labels the conversation on `/sessions` and the dashboard |
+| `session_id` | OpenRouter's conversation id: labels the conversation on `/sessions` and the dashboard, and names it for `DELETE /sessions/<label>` (§4.8) |
 | `control_vector` | `true` applies the control vector this deployment found to this request's steps, `false` leaves them on the stock model; absent takes the deployment's runtime default (off unless flipped in the dashboard's Model view). `experimental_speed_projection` is Strata's spelling of the same field and is accepted as an alias. A deployment with no vector refuses `true` by name. On a compatible container (Qwen3.8-Flash-Next), a refusal-direction vector makes the model decline far fewer requests -- that is a safety behaviour removed, and you own what it writes (§4.10, "Control vectors") |
 | `logprobs`, `top_logprobs`, `n_probs` | each generated token's logprob and up to 20 alternatives (§5.12). Chat: `logprobs: true` with `top_logprobs` alternatives (0 when absent); completions: `logprobs: N`; any endpoint: llama-server's `n_probs: N`, which wins. Not with `echo` (the prompt's logprobs are not computed) |
 | `tools`, `tool_choice`, `parallel_tool_calls` | chat only. `tool_choice` is `auto`, `none`, `required` or `{"type":"function","function":{"name":...}}`; the last two hold the whole reply to calls (after the reasoning block), the named form to that one function, and cannot be combined with `response_format` or `grammar` |
@@ -2338,7 +2359,7 @@ each field is read, taken without effect, or refused by name.
 | `output_config` | `effort` (`low`, `medium`, `high`, `xhigh`, `max`) is the chat request's `reasoning_effort`, which the template reads in its own level names: a level it does not take is refused with the ones it does, and `--reasoning-effort-map` renames them (§4.9). `format` (`{"type": "json_schema", "schema": ...}`, or the older top-level `output_format`) is a `response_format` (§5.5). `task_budget` is taken |
 | `context_management` | validated; the conversation is served as sent, and the answer says so: `"context_management": {"applied_edits": []}`, on `message_delta` in a stream |
 | `thread` | `create` is served as any request; `continue` is refused, since no conversation is stored |
-| `metadata` | `user_id` is the conversation's label on `/sessions` |
+| `metadata` | `user_id` is the conversation's label on `/sessions` and its name for `DELETE /sessions/<label>` (§4.8) |
 | `service_tier`, `inference_geo`, `speed`, `cache_control`, `diagnostics`, `safeguards`, `fallbacks`, `context_hint` | taken; none can change the answer here. `cache_control` on a block is dropped too |
 | `mcp_servers`, `container` | refused |
 | anything else | refused: `"<field>: Extra inputs are not permitted ..."`, Anthropic's own words, which Claude Code matches to retry without a beta field it can drop |
@@ -2886,6 +2907,7 @@ scheduler clamps reuse to the last linear checkpoint. That verdict is the tab's 
 ```sh
 curl -s localhost:8000/stats | jq          # counters, memory, throughput
 curl -s localhost:8000/sessions | jq       # what is stored and where
+curl -s -X DELETE localhost:8000/sessions/chat-7 | jq   # forget one stored conversation (§4.8)
 curl -s localhost:8000/graph | jq          # the resolved kernel graph
 curl -s localhost:8000/server_info | jq    # model, cards, KV, draft depth, wire
 curl -s localhost:8000/diagnostics | jq    # the startup report, hardware read again now (§7.1)
@@ -2933,6 +2955,7 @@ there is none.
 | `prefix_hit_cuts_total{reason}`, `prefix_hit_cut_tokens_total` | admissions whose hit reused nothing (`no_snapshot`, `windowed_group`, `adopt_failed`) or resumed at a snapshot more than one checkpoint interval below it (`resumed_below`), and the checkpoint shortfall: cached prompt tokens computed again because the hit resumed at a snapshot below it. `/stats` and `/sessions` carry the same counts; `RADIANCE_LOG=debug` logs each eviction and each cut hit |
 | `prefix_restore_cuts_total` | restores from the host tier the pool could not hold whole, even after giving up other conversations' VRAM copies (§4.8) |
 | `prefix_cache_expired_total`, `prefix_cache_ckpt_expired_total` | what `--prefix-cache-ttl` removed (§4.8) |
+| `prefix_cache_released_total{what}` | entries and snapshots clients forgot through `DELETE /sessions` (§4.8) |
 | `num_requests_preempted` | |
 | `http_queue_depth`, `http_responses_total`, `http_admission_rejected_total` | |
 | `client_disconnect_total`, `stream_overflow_total` | |

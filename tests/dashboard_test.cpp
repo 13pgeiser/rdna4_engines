@@ -56,6 +56,23 @@ struct StatsScheduler : FakeScheduler {
         occ->host_cap_bytes = 64 << 20;
         return 1;
     }
+    /* The one stored conversation is "conv-7" (engine id 7); "busy" has a request in flight. */
+    std::vector<std::pair<std::string, int64_t>> released;
+    int release_session(const std::string& label, uint64_t id, int64_t keep_tokens,
+                        SessionReleased* out) override {
+        if (label == "busy") return RAD_E_STATE;
+        if (label != "conv-7" && id != 7) return RAD_E_NOTFOUND;
+        released.push_back({ label.empty() ? "id" : label, keep_tokens });
+        out->sessions = 1;
+        out->entries = 48 - keep_tokens / 16;
+        out->tokens = out->entries * 16;
+        out->device_bytes = out->entries * 4096;
+        out->host_bytes = out->entries * 2048;
+        out->snapshots = 2;
+        out->kept_tokens = keep_tokens;
+        out->kept_shared = 2;
+        return RAD_OK;
+    }
     TierCounters tier_counters() const override {
         TierCounters c;
         c.to_host = 3; c.dropped = 2; c.promoted = 1; c.host_drops = 4; c.failures = 0;
@@ -244,6 +261,69 @@ TEST(sessions_lists_each_conversation_and_what_the_tiers_did) {
     CHECK_EQ(s["linear"]["hit_cuts"].value("resumed_below", (int64_t)0), (int64_t)4);
     CHECK_EQ(s["moved"].value("restore_cuts", (int64_t)0), (int64_t)1);
     CHECK_EQ(s["linear"].value("hit_cut_tokens", (int64_t)0), (int64_t)9000);
+}
+
+/* DELETE /sessions forgets one stored conversation by its label or engine id and answers with
+ * what went and what stayed; an unknown session is 404, one with a request in flight 409, a
+ * malformed count 400, and an engine without a prefix cache 501. */
+TEST(a_session_is_released_by_label_or_id_and_the_answer_says_what_went) {
+    Dash d(false);
+    HttpResponse r = d.srv->router().call("DELETE", "/sessions/conv-7");
+    CHECK_EQ(r.status, 200);
+    json o = json::parse(r.body, nullptr, false);
+    CHECK_EQ(o.value("label", ""), std::string("conv-7"));
+    CHECK_EQ(o.value("entries", (int64_t)0), (int64_t)48);
+    CHECK_EQ(o.value("tokens", (int64_t)0), (int64_t)768);
+    CHECK_EQ(o.value("snapshots", (int64_t)0), (int64_t)2);
+    CHECK_EQ(o["kept"].value("shared", (int64_t)0), (int64_t)2);
+    CHECK_EQ(o["kept"].value("tokens", (int64_t)0), (int64_t)0);
+    REQUIRE_EQ(d.sched.released.size(), 1u);
+    CHECK_EQ(d.sched.released[0].second, (int64_t)0);
+
+    /* keep_tokens reaches the scheduler and comes back in the answer. */
+    r = d.srv->router().call("DELETE", "/sessions/conv-7?keep_tokens=160");
+    CHECK_EQ(r.status, 200);
+    o = json::parse(r.body, nullptr, false);
+    CHECK_EQ(o.value("keep_tokens", (int64_t)0), (int64_t)160);
+    CHECK_EQ(o.value("entries", (int64_t)0), (int64_t)38);
+    CHECK_EQ(o["kept"].value("tokens", (int64_t)0), (int64_t)160);
+    REQUIRE_EQ(d.sched.released.size(), 2u);
+    CHECK_EQ(d.sched.released[1].second, (int64_t)160);
+
+    /* By engine id, and by a label the path cannot carry. */
+    r = d.srv->router().call("DELETE", "/sessions?id=7");
+    CHECK_EQ(r.status, 200);
+    o = json::parse(r.body, nullptr, false);
+    CHECK_EQ(o.value("id", (int64_t)0), (int64_t)7);
+    CHECK(!o.contains("label"));
+    r = d.srv->router().call("DELETE", "/sessions?label=conv-7");
+    CHECK_EQ(r.status, 200);
+
+    CHECK_EQ(d.srv->router().call("DELETE", "/sessions/conv-8").status, 404);
+    CHECK_EQ(d.srv->router().call("DELETE", "/sessions?id=8").status, 404);
+    CHECK_EQ(d.srv->router().call("DELETE", "/sessions/busy").status, 409);
+    CHECK_EQ(d.srv->router().call("DELETE", "/sessions").status, 400);
+    CHECK_EQ(d.srv->router().call("DELETE", "/sessions?id=seven").status, 400);
+    CHECK_EQ(d.srv->router().call("DELETE", "/sessions/conv-7?keep_tokens=-1").status, 400);
+    CHECK_EQ(d.sched.released.size(), 4u);
+
+    /* The stored-sessions view carries the counters beside the expiry ones. */
+    const json s = d.get("/sessions");
+    CHECK(s.contains("released"));
+    CHECK(s["released"].contains("entries"));
+    CHECK(s["released"].contains("snapshots"));
+}
+
+TEST(a_session_release_without_a_prefix_cache_is_not_implemented) {
+    FakeScheduler sched;      /* the base: no release_session */
+    FakeTokenizer tok;
+    Deps dd;
+    dd.sched = &sched;
+    dd.tok = &tok;
+    ServerOptions o;
+    o.model_id = "dash";
+    Server srv(dd, o);
+    CHECK_EQ(srv.router().call("DELETE", "/sessions/conv-7").status, 501);
 }
 
 /* ================================================================== the page's field contract */

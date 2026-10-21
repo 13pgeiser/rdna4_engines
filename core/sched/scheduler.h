@@ -254,6 +254,13 @@ public:
      * cache. Takes the step lock because the step path inserts into the map (live sequences hold
      * their own block references). See IScheduler::reset_prefix_cache. */
     int64_t  reset_prefix_cache();
+    /* Forget one stored conversation, by label or engine id, keeping its first `keep_tokens`
+     * (IPrefixCache::release_session). Refused with RAD_E_STATE while a request of that
+     * conversation is queued or running: its blocks would be skipped as live and its close
+     * would publish the chain again, so the release would be half done and undone at once.
+     * Takes the step lock like reset_prefix_cache. */
+    int      release_session(const std::string& label, uint64_t id, int64_t keep_tokens,
+                             SessionRelease* out);
 
     /* ---------------------------------------------------------- the step path */
     /* One decision, one batch. Null when there is nothing to run, which is not an error. */

@@ -424,6 +424,16 @@ struct FakePC : IPrefixCache {
     std::vector<uint64_t> holds, releases;
     void hold(const Request& r) override { holds.push_back(r.id); }
     void release(const Request& r) override { releases.push_back(r.id); }
+    /* What the scheduler asked to be released, recorded; the answer is canned. */
+    struct Released { std::string label; uint64_t id; int64_t keep_tokens; };
+    std::vector<Released> released_calls;
+    int release_rc = RAD_OK;
+    int release_session(const std::string& label, uint64_t id, int64_t keep_tokens,
+                        SessionRelease* out) override {
+        released_calls.push_back({ label, id, keep_tokens });
+        if (out) { *out = SessionRelease{}; out->sessions = 1; out->entries = 5; out->tokens = 80; }
+        return release_rc;
+    }
     /* What the reserve asked for, call by call. */
     std::vector<int64_t> trims;
     int64_t trim(int64_t n) override {

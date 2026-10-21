@@ -107,6 +107,8 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.hit_cut_tokens = m.hit_cut_tokens;
     o.prefix_expired = m.prefix_expired;
     o.prefix_ckpt_expired = m.prefix_ckpt_expired;
+    o.prefix_released = m.prefix_released;
+    o.prefix_ckpt_released = m.prefix_ckpt_released;
 
     o.prefill_tps = m.prefill_tps;
     o.decode_tps = m.decode_tps;
@@ -201,6 +203,24 @@ public:
     void reap(uint64_t id) override { s_->reap(id); }
 
     int64_t reset_prefix_cache() override { return s_->reset_prefix_cache(); }
+
+    int release_session(const std::string& label, uint64_t id, int64_t keep_tokens,
+                        SessionReleased* out) override {
+        SessionRelease r;
+        const int rc = s_->release_session(label, id, keep_tokens, &r);
+        if (out) {
+            out->sessions = r.sessions;
+            out->entries = r.entries;
+            out->tokens = r.tokens;
+            out->device_bytes = r.device_bytes;
+            out->host_bytes = r.host_bytes;
+            out->snapshots = r.snapshots;
+            out->kept_tokens = r.kept_tokens;
+            out->kept_shared = r.kept_shared;
+            out->kept_live = r.kept_live;
+        }
+        return rc;
+    }
 
     /* The stored conversations. The tiers keep monotonic timestamps; idle and age are converted
      * to "seconds ago" here, so only the monotonic clock is authoritative. */

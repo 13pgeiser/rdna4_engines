@@ -385,6 +385,40 @@ int64_t Scheduler::reset_prefix_cache() {
     return dropped;
 }
 
+int Scheduler::release_session(const std::string& label, uint64_t id, int64_t keep_tokens,
+                               SessionRelease* out) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!pc_ || !cfg_.prefix_cache) return RAD_E_UNSUPPORTED;
+    if (label.empty() && id == 0) return RAD_E_INVAL;
+    for (const auto& p : reqs_) {
+        if (!p || !p->req) continue;
+        const Request& r = *p->req;
+        if (r.state == ReqState::Finished || r.state == ReqState::Failed ||
+            r.state == ReqState::Cancelled)
+            continue;
+        if ((id != 0 && r.id == id) || (!label.empty() && r.session_label == label))
+            return RAD_E_STATE;
+    }
+    const int rc = pc_->release_session(label, id, keep_tokens, out);
+    if (rc == RAD_OK && out) {
+        if (label.empty())
+            RAD_INFO("prefix cache: session %llu released: %lld entries (%lld tokens), %lld "
+                     "snapshots; kept %lld tokens as asked, %lld blocks shared, %lld live",
+                     (unsigned long long)id, (long long)out->entries, (long long)out->tokens,
+                     (long long)out->snapshots, (long long)out->kept_tokens,
+                     (long long)out->kept_shared, (long long)out->kept_live);
+        else
+            RAD_INFO("prefix cache: session '%s' released (%lld rows): %lld entries (%lld "
+                     "tokens), %lld snapshots; kept %lld tokens as asked, %lld blocks shared, "
+                     "%lld live",
+                     label.c_str(), (long long)out->sessions, (long long)out->entries,
+                     (long long)out->tokens, (long long)out->snapshots,
+                     (long long)out->kept_tokens, (long long)out->kept_shared,
+                     (long long)out->kept_live);
+    }
+    return rc;
+}
+
 void Scheduler::trim_prefix_cache() {
     if (!pc_ || !cfg_.prefix_cache) return;
     const std::vector<int32_t>& cg = pc_->cached_groups();
@@ -2632,6 +2666,8 @@ SchedMetrics Scheduler::metrics_locked() const {
                m.prefix_expired = pc_->expired();
                m.prefix_ckpt_expired = pc_->ckpt_expired();
                m.prefix_restore_cuts = pc_->restore_cuts();
+               m.prefix_released = pc_->released();
+               m.prefix_ckpt_released = pc_->ckpt_released();
                m.prefix_held_tokens = pc_->held_tokens(); }
     m.attn_hit_rate = m.prompt_tokens
         ? (float)((double)m.attn_cached_tokens / (double)m.prompt_tokens) : 0.0f;

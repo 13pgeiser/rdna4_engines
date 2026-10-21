@@ -1265,6 +1265,49 @@ TEST(cancellation_frees_blocks_immediately) {
     CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Cancelled);
 }
 
+/* A release of a conversation with a request of it in flight is refused, whether that request
+ * is queued or running: the cache would skip its blocks as live and the request's close would
+ * publish the whole chain again, so the client would have been told of a release that did not
+ * happen. Once the request is gone the release reaches the cache with what the client asked. */
+TEST(a_session_release_waits_for_the_conversations_own_request) {
+    Fixture f;
+    f.build(/*blocks=*/40, /*states=*/64);
+    CHECK_OK(f.start());
+
+    auto r = f.request(160, 64);
+    r->session_label = "chat-7";
+    const uint64_t a = f.add(std::move(r));
+    CHECK(a != 0);
+
+    SessionRelease out;
+    /* Queued, not yet admitted. */
+    CHECK_EQ(f.sch.release_session("chat-7", 0, 0, &out), RAD_E_STATE);
+    CHECK_EQ(f.sch.release_session("", a, 0, &out), RAD_E_STATE);
+    CHECK_EQ(f.pc.released_calls.size(), 0u);
+
+    /* Running. */
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK_EQ(f.sch.release_session("chat-7", 0, 32, &out), RAD_E_STATE);
+    /* Another conversation is not in its way. */
+    CHECK_OK(f.sch.release_session("chat-8", 0, 0, &out));
+    REQUIRE_EQ(f.pc.released_calls.size(), 1u);
+    CHECK(f.pc.released_calls[0].label == "chat-8");
+
+    /* Finished: the release goes through with label, id and the kept prefix as given. */
+    CHECK_OK(f.sch.cancel(a));
+    CHECK_OK(f.sch.reap(a));
+    CHECK_OK(f.sch.release_session("chat-7", 0, 48, &out));
+    REQUIRE_EQ(f.pc.released_calls.size(), 2u);
+    CHECK(f.pc.released_calls[1].label == "chat-7");
+    CHECK_EQ(f.pc.released_calls[1].keep_tokens, 48ll);
+    CHECK_EQ(out.entries, 5ll);
+
+    /* Nothing named is a bad request, not a cache call. */
+    CHECK_EQ(f.sch.release_session("", 0, 0, &out), RAD_E_INVAL);
+    CHECK_EQ(f.pc.released_calls.size(), 2u);
+}
+
 /* A reap while the step is still on the device. Common: the server reaps as soon as a sink
  * finishes, and cancelling finishes it, so every mid-decode disconnect lands here. Releasing the
  * Request now would destroy it under commit(); returning its slot now would let a newly admitted

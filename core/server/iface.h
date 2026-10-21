@@ -78,6 +78,7 @@ struct SchedMetrics {
     int64_t prefix_restore_cuts = 0;
     /* Removed by --prefix-cache-ttl, cumulative. Not evictions: nothing wanted the memory. */
     int64_t prefix_expired = 0, prefix_ckpt_expired = 0;
+    int64_t prefix_released = 0, prefix_ckpt_released = 0;
     /* Decoupled prefix caching (spec §7.3). `prefix_hit_rate` is the attention hit rate, as in
      * vLLM. The linear side hits at a different granularity (whole checkpoints, not blocks), so
      * it is reported separately, with token counts and checkpoints written. */
@@ -168,6 +169,17 @@ struct SessionOccupancy {
     int64_t host_cap_bytes = 0;
 };
 
+/* What a release took out of the store and what it left (PrefixCache::release_session). The
+ * kept counts are apart on purpose: `shared` blocks belong to another stored conversation too,
+ * `live` ones to a request still reading them. */
+struct SessionReleased {
+    int64_t sessions = 0;
+    int64_t entries = 0, tokens = 0;
+    int64_t device_bytes = 0, host_bytes = 0;
+    int64_t snapshots = 0;
+    int64_t kept_tokens = 0, kept_shared = 0, kept_live = 0;
+};
+
 /* One in-flight request, for the live request table: shows which request is stuck, e.g. one
  * waiting on a prompt that will never fit, which no aggregate metric reveals. */
 struct RequestStat {
@@ -224,6 +236,15 @@ public:
      * cache's references is safe against a running step (blocks a live sequence holds stay
      * allocated), but it takes the scheduler's lock because a step may be inserting into the map. */
     virtual int64_t reset_prefix_cache() { return RAD_E_UNSUPPORTED; }
+
+    /* Forgets one stored conversation (DELETE /sessions): every row carrying `label`, or with
+     * `id` nonzero the row of that engine id; `keep_tokens` leaves the chain's start standing.
+     * RAD_E_NOTFOUND when nothing matches (404), RAD_E_STATE while a request of that
+     * conversation is queued or running (409), RAD_E_UNSUPPORTED without a prefix cache (501). */
+    virtual int release_session(const std::string& /*label*/, uint64_t /*id*/,
+                                int64_t /*keep_tokens*/, SessionReleased* /*out*/) {
+        return RAD_E_UNSUPPORTED;
+    }
 
     /* The live request table, oldest first; returns the count. Default: none kept. */
     virtual int requests(std::vector<RequestStat>* /*out*/) const { return 0; }
