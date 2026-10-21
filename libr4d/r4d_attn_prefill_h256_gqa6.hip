@@ -30,7 +30,9 @@
 #define O_F16     1
 #define O_MSKIP   2
 // QK8/PV8 (ported from radiance-vllm-mxfp4 r4d_radiance_extras.patch): Q and P as e4m3,
-// K and V stay raw bytes in LDS, both matmuls as fp8 WMMA. fp8 KV only, not with V4/K6.
+// K and V as e4m3 bytes in LDS, both matmuls as fp8 WMMA. Not with bf16 KV. On the fp8 cache (and
+// fp8_v4's K) the bytes are the cache's own; k6_v4's K and the int4 V of fp8_v4/k6_v4 are widened
+// to the value times its group scale and rounded once to e4m3 at staging.
 #define O_QK8    32
 #define O_PV8    64
 #define O_FOLDQ   8
@@ -67,6 +69,18 @@ __device__ __forceinline__ uint32_t pk_fp8x4(float a, float b, float c, float d)
     const uint32_t w = __builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0u, false);
     return __builtin_amdgcn_cvt_pk_fp8_f32(c, d, w, true);
 }
+// two f16 dwords (four values in element order) -> four e4m3 bytes
+__device__ __forceinline__ uint32_t pk_fp8x4_h(uint32_t lo, uint32_t hi) {
+    typedef _Float16 h2 __attribute__((ext_vector_type(2)));
+    const h2 a = __builtin_bit_cast(h2, lo), b = __builtin_bit_cast(h2, hi);
+    return pk_fp8x4((float)a[0], (float)a[1], (float)b[0], (float)b[1]);
+}
+// one f16 dword -> two e4m3 bytes in the low half
+__device__ __forceinline__ uint32_t pk_fp8x2_h(uint32_t w) {
+    typedef _Float16 h2 __attribute__((ext_vector_type(2)));
+    const h2 a = __builtin_bit_cast(h2, w);
+    return (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32((float)a[0], (float)a[1], 0u, false) & 0xffffu;
+}
 
 // bf16 dword -> 16-bit dword in the target format, optionally scaled. Used once per kernel on Q.
 template<class D, int FOLDQ, int F16>
@@ -101,8 +115,8 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     constexpr int GPREV = ((OPT & O_GPREV) && !V4) ? 1 : 0;
     constexpr int LDSB  = (OPT & O_LDSB)  ? 1 : 0;
     constexpr int KWIDE = (OPT & O_KWIDE) ? 1 : 0;
-    constexpr int QK8   = ((OPT & O_QK8) && !KVP && !V4) ? 1 : 0;
-    constexpr int PV8   = ((OPT & O_PV8) && !KVP && !V4) ? 1 : 0;
+    constexpr int QK8   = ((OPT & O_QK8) && !KVP) ? 1 : 0;
+    constexpr int PV8   = ((OPT & O_PV8) && !KVP) ? 1 : 0;
     static_assert(!QK8 || KWIDE, "QK8 raw-byte staging is written for the wide K fetch");
     typedef DT16<F16> D;
     typedef typename D::frag frag16;
@@ -258,6 +272,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                 const h2 s2 = __builtin_bit_cast(h2, v4s[r]);
                 const h2 bias = { (_Float16)1032.0f, (_Float16)1032.0f };
                 uint16_t* dst = &sV16[(o * 8) * VSTR + 2 * kp];
+                uint8_t* dst8 = &sV8[(o * 8) * VSTR8 + 2 * kp];
                 #pragma unroll
                 for (int b = 0; b < 4; ++b) {
                     // Byte b of the first key's word low, of the second key's word in the high half:
@@ -268,6 +283,12 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                     const uint32_t hi = __builtin_amdgcn_perm(m1, m0, sel) | 0x64006400u;   // dim 2b+1
                     const h2 vl = (__builtin_bit_cast(h2, lo) - bias) * s2;
                     const h2 vh = (__builtin_bit_cast(h2, hi) - bias) * s2;
+                    if constexpr (PV8) {
+                        // [dim][key] bytes: the pair's two keys as one 16-bit store a dim
+                        *(uint16_t*)(dst8 + (2 * b) * VSTR8)     = (uint16_t)pk_fp8x2_h(__builtin_bit_cast(uint32_t, vl));
+                        *(uint16_t*)(dst8 + (2 * b + 1) * VSTR8) = (uint16_t)pk_fp8x2_h(__builtin_bit_cast(uint32_t, vh));
+                        continue;
+                    }
                     *(uint32_t*)(dst + (2 * b) * VSTR)     = __builtin_bit_cast(uint32_t, vl);
                     *(uint32_t*)(dst + (2 * b + 1) * VSTR) = __builtin_bit_cast(uint32_t, vh);
                 }
@@ -336,7 +357,18 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
                 const int key = KWIDE ? (2 * (i >> 5) + (i & 1)) : (i / (HEAD_DIM / KEL));
                 const int ch  = KWIDE ? ((i & 31) >> 1) : (i - key * (HEAD_DIM / KEL));
                 if (KWIDE && key >= TILE) continue;
-                if constexpr (QK8) {
+                if constexpr (QK8 && K6) {
+                    // k6_v4: widen to f16 as below, then round each value once to e4m3
+                    const uint4 r = kreg[p];
+                    #pragma unroll
+                    for (int q = 0; q < 2; ++q) {
+                        uint32_t w4[4];
+                        k6x8_to_f16x4w(q ? r.y : r.x, r.z, q, r.w | (r.w << 16), w4);
+                        *(uint2*)(&sK8[key * KSTR8 + ch * KEL + 8 * q]) =
+                            make_uint2(pk_fp8x4_h(w4[0], w4[1]), pk_fp8x4_h(w4[2], w4[3]));
+                    }
+                    continue;
+                } else if constexpr (QK8) {
                     *(uint4*)(&sK8[key * KSTR8 + ch * KEL]) = kreg[p];
                     continue;
                 }
