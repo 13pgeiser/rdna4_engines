@@ -17756,6 +17756,104 @@ static void vsa_perf(const Plugin& pl, int iters, bool local) {
  * rows at a TP2 rank's 28 heads, with the rate it reaches (4 M^2 head_dim heads FLOPs), and a
  * decoder pass's per-tile attention. Warm: one set of operands, launched back to back; contents
  * are bounded random values, so the softmax takes its rescale path as real data does. */
+/* --perfpaged Q CTX [iters]: the paged prefill attention rows at Qwen3.8-27B's per-rank geometry under TP2
+ * (head_dim 256, 12 query heads over 2 KV heads, gqa 6, 16-token blocks): one sequence whose last Q of CTX
+ * tokens are the queries, causal, at every KV layout the rows serve (fp8, fp8 K + 4-bit V, 6-bit K + 4-bit
+ * V, bf16). A long prompt's prefill step is this at Q = the chunk (or a pipelined piece) and CTX = the
+ * tokens so far. Bounded random contents as attn_numeric_case draws them, warm, timing only; the rate is
+ * 4 head_dim heads FLOPs per visible (query, key) pair. */
+static void paged_perf(const Plugin& pl, int64_t Q, int64_t CTX, int iters) {
+    if (iters <= 0) iters = 10;
+    if (Q < 1 || CTX < Q) { std::printf("--perfpaged: need 1 <= Q <= CTX\n"); return; }
+    const int64_t head_dim = 256, gqa = 6, kv_heads = 2, bs = 16, q_heads = kv_heads * gqa;
+    const int64_t max_blocks = (CTX + bs - 1) / bs;
+    const double pairs = (double)Q * (double)(CTX - Q) + (double)Q * (double)(Q + 1) / 2.0;
+    const double flop = 4.0 * (double)head_dim * (double)q_heads * pairs;
+    struct Row { const char* name; const char* kv; };
+    const Row rows[] = {
+        { "attn_prefill_h256_gqa6_fp8kv", "fp8_e4m3" }, { "attn_prefill_h256_gqa6_fp8v4", "fp8_v4" },
+        { "attn_prefill_h256_gqa6_k6v4", "k6_v4" },     { "attn_prefill_h256_gqa6_bf16kv", "bf16" },
+    };
+    std::printf("paged prefill attention, %lld query rows at the end of %lld tokens, %lld q heads / %lld kv "
+                "heads x %lld, %d launches each\n", (long long)Q, (long long)CTX, (long long)q_heads,
+                (long long)kv_heads, (long long)head_dim, iters);
+    for (const Row& rw : rows) {
+        dfree_all();
+        const RadKernelInfo* r = find(pl, rw.name);
+        if (!r) { std::printf("  %-32s absent\n", rw.name); continue; }
+        const int kv_is_fp8 = std::strcmp(rw.kv, "bf16") != 0;
+        const int kvq = !std::strcmp(rw.kv, "fp8_v4") ? 1 : !std::strcmp(rw.kv, "k6_v4") ? 2 : 0;
+        const int v4 = kvq != 0;
+        const uint32_t kvdt = kv_is_fp8 ? RAD_F8E4M3 : RAD_BF16;
+        const int ew = kv_is_fp8 ? 1 : 2;
+        const int64_t rowe = kvq == 2 ? 22 * head_dim / 16 : v4 ? 25 * head_dim / 16 : 2 * head_dim;
+        const int64_t voff = kvq == 2 ? head_dim * 3 / 4 : head_dim;
+        const int64_t vsoff = kvq == 2 ? head_dim * 21 / 16 : head_dim * 3 / 2;
+        std::vector<uint16_t> qh((size_t)(Q * q_heads * head_dim));
+        for (size_t i = 0; i < qh.size(); ++i) qh[i] = st_rand_bf16(i);
+        const int64_t nelem = max_blocks * kv_heads * bs * rowe;
+        std::vector<uint8_t> kv((size_t)(nelem * ew));
+        for (int64_t e = 0; e < nelem; ++e) {
+            const size_t bo = (size_t)e * ew;
+            if (kv_is_fp8) kv[bo] = st_rand_e4m3(e);
+            else { const uint16_t h = st_rand_bf16(e); kv[bo] = (uint8_t)h; kv[bo + 1] = (uint8_t)(h >> 8); }
+        }
+        if (v4)
+            for (int64_t r0 = 0; r0 < nelem; r0 += rowe) {
+                uint8_t* row = &kv[(size_t)r0];
+                for (int64_t g = 0; g < head_dim / 32; ++g) {
+                    const _Float16 sc = (_Float16)(0.015625f * (float)(1 + (st_rand_e4m3(r0 + g) & 15)));
+                    std::memcpy(row + vsoff + g * 2, &sc, 2);
+                }
+                if (kvq == 2)
+                    for (int64_t g = 0; g < head_dim / 32; ++g) {
+                        const _Float16 sc = (_Float16)(0.00390625f * (float)(1 + (st_rand_e4m3(r0 + g + 7) & 15)));
+                        std::memcpy(row + head_dim * 5 / 4 + g * 2, &sc, 2);
+                    }
+            }
+        (void)voff;
+        void* d_q = dalloc(qh.size() * 2);
+        void* d_kv = dalloc(kv.size());
+        void* d_out = dalloc(qh.size() * 2);
+        if (!d_q || !d_kv || !d_out) { std::printf("  %-32s hipMalloc failed\n", rw.name); continue; }
+        st_memcpy(d_q, qh.data(), qh.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_kv, kv.data(), kv.size(), hipMemcpyHostToDevice);
+        std::vector<RadTensor> ts = {
+            T(d_q,   RAD_BF16, { Q, q_heads, head_dim }),
+            T(d_kv,  kvdt,     { max_blocks, kv_heads, bs, rowe }),
+            TI32({ 1, max_blocks }, iota_i32(max_blocks)),
+            TI32({ 1 }, rep_i32(1, (int32_t)CTX)),
+            TF32({ 1, kv_heads }, 1.0f),
+            TF32({ 1, kv_heads }, 1.0f),
+            T(nullptr, RAD_I32,  { 2 }),
+            T(d_out, RAD_BF16, { Q, q_heads, head_dim }),
+        };
+        if (kvdt == RAD_BF16) { absent(ts[4]); absent(ts[5]); }
+        absent(ts[6]);
+        std::vector<RadParam> ps = {
+            PI("q_len", Q), PI("head_dim", head_dim), PI("gqa", gqa), PI("block_size", bs),
+            PI("causal", 1), PI("window", 0), PS("q_dtype", "bf16"), PS("kv_dtype", rw.kv),
+        };
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        a.world_size = 1;
+        if (r->scratch) {
+            const int64_t need = r->scratch(&a);
+            if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+        }
+        const int rc = r->launch(&a, nullptr);
+        if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
+            std::printf("  %-32s rc %d\n", rw.name, rc);
+            continue;
+        }
+        const double us = st_time_us([&](int) { r->launch(&a, nullptr); }, iters, nullptr);
+        std::printf("  %-32s %-8s %9.3f ms  %7.1f TFLOP/s\n", rw.name, rw.kv, us / 1000.0, flop / (us * 1e6));
+    }
+    dfree_all();
+}
+
 /* --perfattn M HEADS [iters]: one long non-causal sequence of M rows through the head-128 dense
  * attention at HEADS heads -- attn_dense, and attn_prefix_self without a prefix at bf16 and int8
  * scores -- with q, k and v as columns of one fused projection, as a DiT step issues them. */
@@ -28480,6 +28578,9 @@ static void usage(void) {
                 "             default), every form compared with the first; `distinct` weight\n"
                 "             planes back the table, and fewer than the experts is a cache-resident\n"
                 "             floor rather than the real traffic.\n"
+                "  --perfpaged Q CTX [iters]:  the paged prefill attention rows (head 256, gqa 6) at\n"
+                "                       Qwen3.8's TP2 rank, Q query rows ending a CTX-token context,\n"
+                "                       every KV layout.\n"
                 "  --perfattn M HEADS [iters]:  the head-128 dense attention over one M-row\n"
                 "                       sequence: attn_dense and attn_prefix_self without a prefix at\n"
                 "                       bf16 and int8 scores, bf16 and fp8 P.V, and quant_cols_fp8\n"
@@ -28585,6 +28686,8 @@ int main(int argc, char** argv) {
     int conv_it = 0;
     long long attn_m = 0, attn_h = 0;
     int attn_it = 5;
+    long long pg_q = 0, pg_ctx = 0;
+    int pg_it = 10;
     int vsa_it = 0;
     bool vsa_local = false;
     const char* video_sec = nullptr;
@@ -28797,6 +28900,11 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { usage(); return 2; }
             hc_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) hc_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfpaged")) {
+            if (i + 2 >= argc) { usage(); return 2; }
+            pg_q = std::strtoll(argv[++i], nullptr, 0);
+            pg_ctx = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != '-') pg_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfattn")) {
             if (i + 2 >= argc) { usage(); return 2; }
             attn_m = std::strtoll(argv[++i], nullptr, 0);
@@ -28838,6 +28946,15 @@ int main(int argc, char** argv) {
     Plugin pl;
 
     /* Timing modes run alone, without the catalogue. */
+    if (pg_q > 0 && pg_ctx > 0) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        paged_perf(pl, pg_q, pg_ctx, pg_it);
+#else
+        skip("paged attention timing", "built without HIP");
+#endif
+        return 0;
+    }
     if (attn_m > 0 && attn_h > 0) {
         if (!load(&pl, path)) return 1;
 #ifdef RAD_HAVE_HIP
