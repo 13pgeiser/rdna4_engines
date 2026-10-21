@@ -4995,6 +4995,7 @@ static const RadConstraint cSampleCand[] = { C_GE("n_cand", 1), C_LE("n_cand", 4
 static const RadConstraint cSampleLogprobs[] = { C_GE("n_vocab", 1), C_GE("k", 1), C_LE("k", 64) };
 /* The activation width the column loop vectorises over; M is unbounded -- the kernel chunks rows. */
 static const RadConstraint cLogitsGemm[] = { C_DIV("n_embd", 8), C_IN("dtype", "bf16") };
+static const RadConstraint cLogitsGemmCols[] = { C_EQ("n_embd", 4096), C_IN("dtype", "bf16") };
 /* The fp8 head: n_embd on the 128 scale block, and no cap on M. The row relayouts the weight, so
  * it must cover the whole range; above a cap the bf16 projection would read the E4M3 codes as bf16.
  * The kernel chunks above 32, and core/build/rad_builder.cpp refuses a capped arrangement.
@@ -5682,6 +5683,16 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cLogitsGemm), NOTUNE,
   nullptr, nullptr, r4d_rad_logits_gemm, nullptr, nullptr, nullptr,
+  r4d_shape_logits_gemm },
+
+{ "logits_gemm_bf16_cols", "logits_gemm", "vocab",
+  "logits_gemm_bf16 with a wave per four vocabulary columns: lane l runs that row's threads 32q + l "
+  "in turn, so each column keeps its k chunks, lane butterfly and wave order",
+  "any M and any vocabulary; n_embd 4096 exactly; the activation's row pitch whole 16 bytes",
+  "bf16 x and lm_head, F32 LOGITS OUT, fp32 accumulate. BYTE-IDENTICAL to logits_gemm_bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_LOGITS_COLS,
+  ROW(cLogitsGemmCols), NOTUNE,
+  nullptr, nullptr, r4d_rad_logits_gemm_cols, nullptr, nullptr, nullptr,
   r4d_shape_logits_gemm },
 
 { "logits_gemm_fp8", "logits_gemm", "vocab",

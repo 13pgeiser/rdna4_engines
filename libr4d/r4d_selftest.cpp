@@ -14994,6 +14994,72 @@ static void mx_experts_check(const Plugin& pl, int M, int parts, bool pooled, co
     dlclose(ref);
 }
 
+/* logits_gemm_bf16_cols against logits_gemm_bf16 on the same operands: the column form must give
+ * the block-per-column row's bytes. M from one row to past the 8-row chunk, a vocabulary not a
+ * multiple of the four columns a wave takes, an activation row pitch past n_embd, and a NaN and
+ * signed zeros in the activation, which the per-thread sums must carry the same way. With `iters`
+ * both rows are also timed at GLM-5.3's TP8 slice, where the weight is past the last-level cache
+ * and every launch reads it from memory. */
+static void logits_cols_check(const Plugin& pl, int64_t M, int64_t N, int iters = 0) {
+    const RadKernelInfo* ref = find(pl, "logits_gemm_bf16");
+    const RadKernelInfo* cols = find(pl, "logits_gemm_bf16_cols");
+    if (!ref || !cols) {
+        ok("logits_gemm_bf16_cols", false, "row absent");
+        return;
+    }
+    const int64_t K = 4096, xp = K + 8;
+    std::vector<uint16_t> hx((size_t)(M * xp), 0), hw((size_t)(N * K));
+    for (int64_t r = 0; r < M; ++r)
+        for (int64_t k = 0; k < K; ++k)
+            hx[(size_t)(r * xp + k)] = st_rand_bf16((uint32_t)(r * K + k));
+    hx[3] = 0x8000;
+    if (M > 1) hx[(size_t)(xp + 7)] = 0x7fc0;
+    for (size_t i = 0; i < hw.size(); ++i) hw[i] = st_rand_bf16((uint32_t)i + 0x51ed27u);
+    void* dx = dalloc(hx.size() * 2);
+    void* dw = dalloc(hw.size() * 2);
+    void* dy = dalloc((size_t)(M * N) * 4);
+    if (!dx || !dw || !dy) {
+        ok("logits_gemm_bf16_cols allocation", false);
+        dfree_all();
+        return;
+    }
+    st_memcpy(dx, hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(dw, hw.data(), hw.size() * 2, hipMemcpyHostToDevice);
+    std::vector<RadTensor> ts = { T(dx, RAD_BF16, { M, K }), T(dw, RAD_BF16, { N, K }),
+                                  T(dy, RAD_F32, { M, N }) };
+    ts[0].stride[0] = xp;
+    std::vector<RadParam> ps = { PI("M", M), PI("n_vocab", N), PI("n_embd", K),
+                                 PS("dtype", "bf16") };
+    std::vector<uint8_t> want((size_t)(M * N) * 4), got(want.size());
+    st_memset(dy, 0xa5, want.size());
+    run_case(ref, ts, ps);
+    st_memcpy(want.data(), dy, want.size(), hipMemcpyDeviceToHost);
+    st_memset(dy, 0x5a, got.size());
+    run_case(cols, ts, ps);
+    st_memcpy(got.data(), dy, got.size(), hipMemcpyDeviceToHost);
+    ok(fmt("logits_gemm_bf16_cols M=%lld N=%lld: the bytes of logits_gemm_bf16", (long long)M,
+           (long long)N)
+           .c_str(),
+       got == want);
+    if (iters > 0) {
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data();
+        a.n_t = (int)ts.size();
+        a.p = ps.data();
+        a.n_p = (int)ps.size();
+        a.world_size = 1;
+        const double bytes = (double)(N * K * 2);
+        for (const RadKernelInfo* r : { ref, cols }) {
+            for (int i = 0; i < 3; ++i) r->launch(&a, nullptr);
+            const double us = st_time_us([&](int) { r->launch(&a, nullptr); }, iters, nullptr);
+            std::printf("  %-22s M=%-3lld %9.1f us  %6.1f GB/s of weight\n", r->name, (long long)M,
+                        us, bytes / (us * 1e3));
+        }
+    }
+    dfree_all();
+}
+
 /* The MXFP4 expert GEMM at GLM's TP8 slices (mx_experts_check's model shapes 3 and 4): gate_up
  * 512 x 4096 over token rows (parts 2), down 4096 x 256 over sorted rows, over an M-token chunk.
  *
@@ -26705,6 +26771,13 @@ static void device_phase(const Plugin& pl) {
         for (const int64_t M : { (int64_t)1, (int64_t)8, (int64_t)33 })
             fp8_logits_numeric(pl, 2560, 2560, M);
     }
+    /* The bf16 head's column form against the block-per-column row, to past one 8-row chunk. */
+    if (sel("logits_gemm_bf16_cols")) {
+        for (const int64_t M : { (int64_t)1, (int64_t)2, (int64_t)6, (int64_t)8, (int64_t)9,
+                                 (int64_t)17 })
+            logits_cols_check(pl, M, 2051);
+        logits_cols_check(pl, 6, 19360);
+    }
     /* The int8 head over the same stored row: both forms, and the padded K = 2560 row. */
     if (sel("logits_gemm_i8") || sel("logit_rerank_i8")) {
         for (const int64_t M : { (int64_t)1, (int64_t)8, (int64_t)33, (int64_t)64 })
@@ -27008,6 +27081,8 @@ static void usage(void) {
                 "  --perfkda M [iters]:  kda_update at GLM's TP8 shape: prefill of M tokens (one\n"
                 "             sequence, and three anchored) and the 8x6 verify step, timed.\n"
                 "  --perfproject M [iters]:  mla_project at GLM's TP8 shape, both modes, timed.\n"
+                "  --perflogits M [iters]:  logits_gemm_bf16 and logits_gemm_bf16_cols at\n"
+                "             GLM-5.3's TP8 head slice (19360 x 4096), M rows, bytes compared.\n"
                 "  --perfmx M [iters] [experts] [top_k] [skew]:  the MXFP4 expert GEMM at GLM's\n"
                 "             TP8 slices (gate_up 512 x 4096, down 4096 x 256) over a routing of an\n"
                 "             M-token chunk (288 experts, top 8 by default; uniform, or `skew` a Gamma\n"
@@ -27072,6 +27147,8 @@ int main(int argc, char** argv) {
     long long ar8_n = -1;
     int ar8_it = 200;
     const char* ar8_dt = "bf16";
+    long long lg_m = 0;
+    int lg_it = 200;
     long long mx_m = 0, mx_e = 288, mx_k = 8;
     const char* mx_skew = nullptr;
     bool mx_f8 = false;
@@ -27238,6 +27315,11 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mx_e = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mx_k = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mx_skew = argv[++i];
+        } else if (!std::strcmp(argv[i], "--perflogits")) {
+            /* Both bf16 head rows at GLM-5.3's TP8 slice over M rows. */
+            if (i + 1 >= argc) { usage(); return 2; }
+            lg_m = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) lg_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfhc")) {
             /* The gated residual's read at M rows. */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -27411,6 +27493,15 @@ int main(int argc, char** argv) {
         dfree_all();
 #else
         skip("kda_update and mla_project timing", "built without HIP");
+#endif
+        return 0;
+    }
+    if (lg_m) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        logits_cols_check(pl, lg_m, 19360, lg_it);
+#else
+        skip("bf16 head timing", "built without HIP");
 #endif
         return 0;
     }

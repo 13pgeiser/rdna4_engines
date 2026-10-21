@@ -67,6 +67,9 @@ enum {
      * these rows' layout hooks refuse a bf16 head, and the bf16 row has no hook for a scaled
      * one. */
     R4D_PRIO_LOGITS_FP8     = 60,
+    /* The bf16 head's column form, above the block-per-column row whose bytes it gives, at the
+     * n_embd it is built for. */
+    R4D_PRIO_LOGITS_COLS    = 55,
 
     /* Runtime LoRA: the tiled rows serve a subset of the scalar rows' dtypes at every M, so they
      * must outrank them to be reached; the scalar rows keep f16 / f32 activations (no exact WMMA)
@@ -718,6 +721,7 @@ int r4d_rad_kv_store_fp8    (const RadArgs*, RadStream);
 int r4d_rad_kv_store_fp8v4  (const RadArgs*, RadStream);
 int r4d_rad_kv_store_k6v4   (const RadArgs*, RadStream);
 int r4d_rad_logits_gemm     (const RadArgs*, RadStream);
+int r4d_rad_logits_gemm_cols(const RadArgs*, RadStream);
 
 /* -- the decomposed sampler chain (r4d_sample_stages_f32.hip) --
  *
