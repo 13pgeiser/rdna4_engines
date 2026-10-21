@@ -541,10 +541,26 @@ int run_split(const char* name, int world, int fresh_rows, std::mt19937& rng) {
     std::vector<uint16_t> heads_out((size_t)T * H * D, 0xffff), rows_out((size_t)T * H * D, 0xffff);
     const int per_heads = H / world, run = (T + world - 1) / world;
     int fails = 0;
+    /* What each rank's run buffer holds after its rows: written through the same launches into
+     * the plane at the run's rows, then copied out as the all_gather moves it, rank r's run of
+     * `run` rows to rows [r * run, (r + 1) * run) of a [world * run] output. */
+    std::vector<uint16_t> gathered((size_t)world * run * H * D, 0xffff);
     for (int rank = 0; rank < world; ++rank) {
         fails += launch(false, 0, T, rank * per_heads, per_heads, heads_out) != RAD_OK;
         const int first = rank * run, n = std::min(run, T - first);
         if (n > 0) fails += launch(true, first, n, 0, H, rows_out) != RAD_OK;
+        std::vector<uint16_t> part((size_t)run * H * D, 0xeeee);
+        for (int r = 0; r < n; ++r)
+            std::copy(rows_out.begin() + (size_t)(first + r) * H * D,
+                      rows_out.begin() + (size_t)(first + r + 1) * H * D,
+                      part.begin() + (size_t)r * H * D);
+        std::copy(part.begin(), part.end(), gathered.begin() + (size_t)rank * run * H * D);
+    }
+    bool placed = true;
+    for (size_t i = 0; i < (size_t)T * H * D; ++i) placed = placed && gathered[i] == rows_out[i];
+    if (!placed) {
+        std::printf("%-40s the gathered runs do not land on their rows  FAIL\n", name);
+        ++fails;
     }
     long bad[2] = { 0, 0 };
     double max_err[2] = { 0, 0 }, apart = 0;
@@ -563,6 +579,87 @@ int run_split(const char* name, int world, int fresh_rows, std::mt19937& rng) {
                 name, T, world, run, T - (world - 1) * run, max_err[0], bad[0], max_err[1], bad[1],
                 apart, ok ? "PASS" : "FAIL");
     return !ok;
+}
+
+/* The head form against the row form, row by row and bit by bit, on a TP8 prefill chunk past the
+ * DSA budget: the head form is the paired union tile (eight heads of rows 2i and 2i+1), the row
+ * form's two kernels are the 16-head matrix tile (RADIANCE_MLA_ROWS_FORM=4) and the rows kernel.
+ * The union's first row of a pair walks its own table in its own order, as the 16-head tile does,
+ * so it must agree to the bit; the second row and the rows kernel sum in other orders, within
+ * rounding. Printed: rows bit-identical, elements differing, and the largest step in bf16 units. */
+int run_rowwise(std::mt19937& rng) {
+    constexpr int H = 64, B = 65, M = 16;
+    std::vector<int> bt, len;
+    int pages = 0;
+    topk_tables(M, B, 1200, 16, rng, bt, len, pages);
+    std::normal_distribution<float> nrm(0.f, 1.f);
+    std::vector<uint16_t> qb((size_t)M * H * D), kvb((size_t)pages * BS * D);
+    for (auto& v : qb) v = rad_f32_to_bf16(0.25f * nrm(rng));
+    for (auto& v : kvb) v = rad_f32_to_bf16(nrm(rng));
+    auto launch = [&](int kernel, int h0, int heads, std::vector<uint16_t>& out) {
+        RadTensor t[5] = { tens(qb.data() + (size_t)h0 * D, RAD_BF16, { M, heads, D }),
+                           tens(kvb.data(), RAD_BF16, { pages, 1, BS, D }),
+                           tens(bt.data(), RAD_I32, { M, B }), tens(len.data(), RAD_I32, { M }),
+                           tens(out.data() + (size_t)h0 * D, RAD_BF16, { M, heads, D }) };
+        t[0].stride[0] = t[4].stride[0] = (int64_t)H * D;
+        RadParam p[6]{};
+        const char* keys[5] = { "M", "latent_dim", "heads", "blocks", "block_size" };
+        const long long vals[5] = { M, D, heads, B, BS };
+        for (int i = 0; i < 5; ++i) {
+            p[i].key = keys[i];
+            p[i].kind = RAD_P_INT;
+            p[i].ival = vals[i];
+        }
+        p[5].key = "scale";
+        p[5].kind = RAD_P_F64;
+        p[5].dval = 0.0625;
+        RadArgs a{};
+        a.t = t;
+        a.n_t = 5;
+        a.p = p;
+        a.n_p = 6;
+        if (kernel < 2) return r4d_rad_mla_attn_matrix(&a, nullptr);
+        r4d_mla_rows_pin_form(3);
+        const int rc = r4d_rad_mla_attn_rows(&a, nullptr);
+        r4d_mla_rows_pin_form(0);
+        return rc;
+    };
+    std::vector<uint16_t> head((size_t)M * H * D), m16((size_t)M * H * D), rows((size_t)M * H * D);
+    int rc = 0;
+    for (int r = 0; r < 8; ++r) rc |= launch(0, r * 8, 8, head);
+    rc |= launch(1, 0, H, m16);
+    rc |= launch(2, 0, H, rows);
+    auto ord = [](uint16_t h) { return (h & 0x8000) ? -(int)(h & 0x7fff) : (int)h; };
+    int fails = rc != RAD_OK;
+    for (const auto& [name, got] : { std::pair<const char*, const std::vector<uint16_t>*>{
+                                         "16-head tile", &m16 },
+                                     { "rows kernel", &rows } }) {
+        int same_even = 0, same_odd = 0, max_ulp = 0;
+        long diff = 0;
+        double max_abs = 0;
+        for (size_t i = 0; i < head.size(); ++i)
+            max_abs = std::max(max_abs, (double)std::fabs(rad_bf16_to_f32((*got)[i]) -
+                                                          rad_bf16_to_f32(head[i])));
+        for (int r = 0; r < M; ++r) {
+            bool same = true;
+            for (size_t i = (size_t)r * H * D; i < (size_t)(r + 1) * H * D; ++i) {
+                const int u = std::abs(ord((*got)[i]) - ord(head[i]));
+                same = same && !u;
+                diff += u != 0;
+                max_ulp = std::max(max_ulp, u);
+            }
+            (r % 2 ? same_odd : same_even) += same;
+        }
+        /* The 16-head tile must give the union's first rows bit for bit. */
+        const bool ok = std::strcmp(name, "16-head tile") || same_even == M / 2;
+        std::printf("rowwise: %-12s vs head form (union pairs): rows bit-identical %d/%d first, "
+                    "%d/%d second of a pair; %ld of %d elements differ, at most %d bf16 steps, "
+                    "max abs %.2e  %s\n",
+                    name, same_even, M / 2, same_odd, M / 2, diff, M * H * D, max_ulp, max_abs,
+                    ok ? "PASS" : "FAIL");
+        fails += !ok;
+    }
+    return fails;
 }
 
 /* The launcher prints the running totals every 1024th counted launch and must leave them
@@ -669,11 +766,16 @@ int main(int argc, char** argv) {
         std::mt19937 rng(20261020u + (unsigned)i);
         fails += run_rows(rows_cases[i], rng);
     }
+    if (!filter || std::strstr("rowwise", filter)) {
+        std::mt19937 rng(20261022u);
+        fails += run_rowwise(rng);
+    }
     /* T 45 over eight ranks: runs of 6, the last of 3; 37 over four: 10 and 7; 48: whole runs. */
     const struct {
         const char* name;
         int world, fresh;
     } splits[] = { { "split: heads vs rows, 8 ranks", 8, 15 },
+                   { "split: heads vs rows, 8 ranks, T 300", 8, 270 },
                    { "split: heads vs rows, 4 ranks", 4, 7 },
                    { "split: heads vs rows, whole runs", 8, 18 } };
     for (size_t i = 0; i < sizeof splits / sizeof splits[0]; ++i) {
