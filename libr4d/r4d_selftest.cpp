@@ -12660,6 +12660,122 @@ static void qsa_perf(const Plugin& pl, int64_t ctx, int64_t M, int iters) {
         (double)M * live * 8.0);
 }
 
+/* ------------------------------------------------------------- GLM's DSA indexer, timed at length
+ *
+ * dsa_score scores every complete block of a row's sequence and qsa_select ranks them, so both
+ * grow with context, in decode as in prefill. Timed whole at M rows, and as one rank's run of a
+ * step split over 2, 4 and 8 ranks by rows (`row_part`, R = 4 * ceil(M / (4 * ranks)) rows): the
+ * difference is what a split saves before its two all_gathers. The packed cache form, the
+ * declared width the live reach plus one, as glm5next issues them. */
+static void dsa_perf(const Plugin& pl, int64_t ctx, int64_t M, int iters) {
+    if (iters <= 0) iters = 100;
+    const int64_t heads = 32, n = 128, ratio = 4, topk = 512;
+    const int64_t live = ctx / ratio, nb = live + 2, pages = live + 1;
+    if (live < 1 || M < 1) { std::printf("--perfdsa: ctx or M out of range\n"); return; }
+    const int64_t rows = std::max<int64_t>(M, 8 * 4 * ((M + 31) / 32));   /* every run fits */
+    std::printf("dsa indexer at ctx=%lld (%lld blocks), M=%lld, %d launches\n", (long long)ctx,
+                (long long)live, (long long)M, iters);
+    std::vector<uint8_t> qh((size_t)(rows * heads * n)), kh((size_t)(pages * 136), 0);
+    for (size_t i = 0; i < qh.size(); ++i) qh[i] = (uint8_t)((i * 37 + 11) % 0x7e);
+    for (int64_t p = 0; p < pages; ++p) {
+        for (int64_t d = 0; d < n; ++d) kh[(size_t)(p * 136 + d)] = (uint8_t)((p * 29 + d * 7) % 0x7e);
+        const float sc = std::ldexp(1.0f, -6 - (int)(p % 3));
+        std::memcpy(&kh[(size_t)(p * 136 + 128)], &sc, 4);
+    }
+    std::vector<float> qsh((size_t)(rows * heads)), gh((size_t)(rows * heads));
+    for (size_t i = 0; i < qsh.size(); ++i) {
+        qsh[i] = std::ldexp(1.0f, -5 - (int)(i % 3));
+        gh[i] = (float)((int)((i * 53) % 201) - 100) / 100.0f;
+    }
+    std::vector<int32_t> bth((size_t)nb, -1), nch(1, (int32_t)live), cuh = { 0, (int32_t)M },
+                                               posh((size_t)rows);
+    for (int64_t b = 0; b <= live; ++b) bth[(size_t)b] = (int32_t)((b * 7919 + 13) % pages);
+    for (int64_t m = 0; m < rows; ++m) posh[(size_t)m] = (int32_t)(ctx - M + std::min(m, M - 1));
+    void *d_q = dalloc(qh.size()), *d_qs = dalloc(qsh.size() * 4), *d_g = dalloc(gh.size() * 4),
+         *d_k = dalloc(kh.size()), *d_bt = dalloc(bth.size() * 4), *d_nc = dalloc(4),
+         *d_cu = dalloc(8), *d_cp = dalloc(8), *d_po = dalloc(posh.size() * 4),
+         *d_sc = dalloc((size_t)(rows * nb) * 4), *d_se = dalloc((size_t)(rows * (topk + 1)) * 4),
+         *d_ns = dalloc((size_t)rows * 4), *d_su = dalloc((size_t)rows * 4);
+    if (!d_q || !d_qs || !d_g || !d_k || !d_bt || !d_nc || !d_cu || !d_cp || !d_po || !d_sc ||
+        !d_se || !d_ns || !d_su) {
+        std::printf("  alloc failed\n");
+        return;
+    }
+    st_memcpy(d_q, qh.data(), qh.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_qs, qsh.data(), qsh.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_g, gh.data(), gh.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_k, kh.data(), kh.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_bt, bth.data(), bth.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_nc, nch.data(), 4, hipMemcpyHostToDevice);
+    st_memcpy(d_cu, cuh.data(), 8, hipMemcpyHostToDevice);
+    st_memcpy(d_po, posh.data(), posh.size() * 4, hipMemcpyHostToDevice);
+    auto run = [&](const char* row, std::vector<RadTensor> ts, std::vector<RadParam> ps) {
+        const RadKernelInfo* r = find(pl, row);
+        if (!r) return -1.0;
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        if (r->scratch) {
+            const int64_t need = r->scratch(&a);
+            if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+        }
+        if (r->launch(&a, nullptr) != RAD_OK || st_stream_sync(nullptr) != hipSuccess) return -1.0;
+        hipEvent_t w0, w1;   /* clocks up first, as in qsa_perf */
+        st_ev_create(&w0); st_ev_create(&w1);
+        st_ev_record(w0, nullptr);
+        float wms = 0.0f;
+        for (int guard = 0; guard < 100000 && wms < 300.0f; ++guard) {
+            for (int i = 0; i < 32; ++i) r->launch(&a, nullptr);
+            st_ev_record(w1, nullptr);
+            st_ev_sync(w1);
+            st_ev_elapsed(&wms, w0, w1);
+        }
+        st_ev_destroy(w0); st_ev_destroy(w1);
+        return st_time_us([&](int) { r->launch(&a, nullptr); }, iters, nullptr);
+    };
+    auto score = [&](int64_t R, bool part) {
+        RadTensor sc = T(d_sc, RAD_F32, { R, nb });
+        sc.shape[1] = live + 1;
+        std::vector<RadTensor> ts = { T(d_q, RAD_F8E4M3, { rows * heads, n }),
+                                      T(d_qs, RAD_F32, { rows * heads, 1 }),
+                                      T(d_g, RAD_F32, { rows, heads }),
+                                      T(d_k, RAD_U8, { pages, 1, 4, 34 }), RadTensor{},
+                                      T(d_bt, RAD_I32, { 1, nb }), T(d_cu, RAD_I32, { 2 }),
+                                      T(d_nc, RAD_I32, { 1 }), sc,
+                                      part ? T(d_cp, RAD_I32, { 2 }) : RadTensor{} };
+        std::vector<RadParam> ps = { PI("M", R), PI("n", n), PI("heads", heads),
+                                     PI("blocks", nb), PI("seqs", 1), PS("dtype", "fp8_e4m3") };
+        if (part) ps.push_back(PI("row_part", 0));
+        else {
+            ts[0].shape[0] = R * heads;   /* whole: the query planes are the step's M rows */
+            ts[1].shape[0] = R * heads;
+            ts[2].shape[0] = R;
+        }
+        return run("dsa_score_fp8", ts, ps);
+    };
+    auto select = [&](int64_t R) {
+        RadTensor sc = T(d_sc, RAD_F32, { R, nb });
+        sc.shape[1] = live + 1;
+        return run("qsa_select_i32",
+                   { sc, T(d_bt, RAD_I32, { 1, nb }), T(d_nc, RAD_I32, { 1 }),
+                     T(d_po, RAD_I32, { R }), T(d_cu, RAD_I32, { 2 }),
+                     T(d_se, RAD_I32, { R, topk + 1 }), T(d_ns, RAD_I32, { R }),
+                     T(d_su, RAD_I32, { R }) },
+                   { PI("M", R), PI("blocks", nb), PI("topk", topk), PI("ratio", ratio),
+                     PI("seqs", 1), PI("signed", 1) });
+    };
+    const double s_all = score(M, false), q_all = select(M);
+    std::printf("  whole, %5lld rows        dsa_score %9.2f us  qsa_select %9.2f us\n",
+                (long long)M, s_all, q_all);
+    for (int64_t world : { 2, 4, 8 }) {
+        const int64_t R = 4 * ((M + 4 * world - 1) / (4 * world)), have = std::min(R, M);
+        const double s = score(R, true), q = select(have);
+        std::printf("  run of %lld ranks, %5lld rows dsa_score %9.2f us  qsa_select %9.2f us  "
+                    "saves %8.2f us before its gathers\n",
+                    (long long)world, (long long)R, s, q, s_all + q_all - s - q);
+    }
+}
 
 /* The routed-expert GEMM at a prefill chunk, both projections, every prefill form.
  *
@@ -26900,6 +27016,9 @@ static void usage(void) {
                 "             own top blocks-1 in block order, d blocks exchanged between\n"
                 "             neighbours (context 16*(blocks-1) tokens by default). Each matrix\n"
                 "             form also reports its second passes.\n"
+                "  --perfdsa CTX [M] [iters]:  GLM's DSA indexer (dsa_score, qsa_select) at a\n"
+                "             real context length and M rows, whole and as one rank's run of a\n"
+                "             step split over 2, 4 and 8 ranks by rows.\n"
                 "  --perfqsa CTX [M] [iters]:  the QSA indexer at a real context length. It is\n"
                 "             the only decode op that grows with context, and at 200K it is\n"
                 "             about a third of the step. M is 1 + n_spec.\n"
@@ -26916,7 +27035,8 @@ int main(int argc, char** argv) {
     int perf_it = 50, perf_w2 = 0, perf_bf = 0, perf_w8 = 0, perf_f32 = 0, perf_q = 0;
     long long sop_m = 0, sop_k = 0;
     int sop_it = 2000;
-    long long qsa_ctx = 0, qsa_m = 4;
+    long long qsa_ctx = 0, qsa_m = 4, dsa_ctx = 0, dsa_m = 6;
+    int dsa_it = 100;
     long long mla_m = 0, mla_blocks = 0, mla_heads = 0;
     int mla_it = 20;
     const char* mla_fill = "prefill";
@@ -27008,6 +27128,12 @@ int main(int argc, char** argv) {
             perf_k = std::strtoll(argv[++i], nullptr, 0);
             perf_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != '-') perf_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfdsa")) {
+            /* GLM's DSA indexer at a real context length, whole and as a rank's run. */
+            if (i + 1 >= argc) { usage(); return 2; }
+            dsa_ctx = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) dsa_m = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) dsa_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfqsa")) {
             /* The indexer at a real context length (the only decode op that grows with it). */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -27296,6 +27422,16 @@ int main(int argc, char** argv) {
         dfree_all();
 #else
         skip("MLA attention timing", "built without HIP");
+#endif
+        return 0;
+    }
+    if (dsa_ctx) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        dsa_perf(pl, dsa_ctx, dsa_m, dsa_it);
+        dfree_all();
+#else
+        skip("dsa indexer timing", "built without HIP");
 #endif
         return 0;
     }
