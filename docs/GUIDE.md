@@ -1184,6 +1184,16 @@ before that resumes from VRAM; one that returns after is restored from host memo
 copy, so its next turn copies only what that turn added. A full host tier drops its least recently
 used conversations. Nothing is written to a drive.
 
+A restore is one of the requests VRAM is given up for. The cache keeps a quarter of the pool free
+after each turn, and a returning conversation larger than that takes the VRAM copies of other
+stored conversations too, the way an admission under pressure does: those with a host copy first,
+then those whose copy was still on its way, once it lands. Nothing is lost by it, since each keeps
+its host copy, and it never takes the returning conversation's own blocks, a conversation a
+running request reads, or one a waiting request has just brought back. Only when the pool cannot
+hold the whole conversation even then does it come back in part, and on a hybrid model it then ends
+at the deepest snapshot it reaches, where its next turn resumes; `radiance:prefix_restore_cuts_total`
+counts these (`/sessions` `moved.restore_cuts`).
+
 Every stored conversation expires: one unused for `--prefix-cache-ttl` seconds is removed from
 whichever tier holds it (VRAM blocks to the pool, host slot to the arena, snapshots to the store). A
 hit or a new turn counts as a use, and a system prompt shared by several conversations stays while
@@ -2886,7 +2896,8 @@ there is none.
 | `linear_checkpoints_written_total`, `linear_prefix_cache_hit_rate` | |
 | `prefix_cache_evictions_total`, `prefix_cache_ckpt_evictions_total` | |
 | `prefix_cache_ckpt_evictions_by_reason_total{reason}`, `prefix_cache_ckpt_refused_total` | snapshots released by `--checkpoint-policy` (`retention`) or as the least recently used of a full store (`store_full`); checkpoints not written for want of a slot |
-| `prefix_hit_cuts_total{reason}`, `prefix_hit_cut_tokens_total` | admissions whose hit reused nothing (`no_snapshot`, `windowed_group`, `adopt_failed`), and the checkpoint shortfall: cached prompt tokens computed again because the hit resumed at a snapshot below it. `/stats` and `/sessions` carry the same counts; `RADIANCE_LOG=debug` logs each eviction and each cut hit |
+| `prefix_hit_cuts_total{reason}`, `prefix_hit_cut_tokens_total` | admissions whose hit reused nothing (`no_snapshot`, `windowed_group`, `adopt_failed`) or resumed at a snapshot more than one checkpoint interval below it (`resumed_below`), and the checkpoint shortfall: cached prompt tokens computed again because the hit resumed at a snapshot below it. `/stats` and `/sessions` carry the same counts; `RADIANCE_LOG=debug` logs each eviction and each cut hit |
+| `prefix_restore_cuts_total` | restores from the host tier the pool could not hold whole, even after giving up other conversations' VRAM copies (§4.8) |
 | `prefix_cache_expired_total`, `prefix_cache_ckpt_expired_total` | what `--prefix-cache-ttl` removed (§4.8) |
 | `num_requests_preempted` | |
 | `http_queue_depth`, `http_responses_total`, `http_admission_rejected_total` | |
