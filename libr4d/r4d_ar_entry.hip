@@ -440,7 +440,9 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
 
     /* Peer access is per context, so each rank enables its own, after the publish barrier where
      * peer device ordinals are known. A host can expose more HIP devices than ranks (e.g. an
-     * integrated GPU), so the ordinal comes from the peer rather than the rank. */
+     * integrated GPU), so the ordinal comes from the peer rather than the rank. A peer on this
+     * rank's own card needs none (the runtime refuses to enable it): r4d_selftest runs eight ranks
+     * on one card that way, each on its own stream. */
     int j = 0;
     for (int r = 0; r < world; ++r) {
         if (r == rank) continue;
@@ -448,7 +450,8 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
         in->peer_scratch[j] = g_rv.scratch[r];
         in->peer_flags[j]   = g_rv.flags[r];
         ++j;
-        if (!host) R4D_TRY("ar_ipc_enable_peer", r4d_ar_ipc_enable_peer((long)g_rv.dev[r]));
+        if (!host && g_rv.dev[r] != dev)
+            R4D_TRY("ar_ipc_enable_peer", r4d_ar_ipc_enable_peer((long)g_rv.dev[r]));
     }
 
     /* Second barrier: no rank may launch until every rank has enabled peer access, or the first

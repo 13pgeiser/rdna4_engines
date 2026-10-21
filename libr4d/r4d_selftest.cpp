@@ -404,6 +404,17 @@ static void cross_check(const Plugin& pl) {
 /* --cold MIB: bytes read through the caches before every timed launch; see st_time_us. */
 static int64_t g_cold = 0;
 
+/* R4D_SELFTEST_ONE_CARD=1 runs the eight-rank collectives as eight ranks on the first card, each
+ * on its own non-blocking stream: the protocol, the shard table and the arithmetic, with VRAM in
+ * place of the links, on a box with fewer cards. The streams need hardware queues of their own,
+ * so main() raises GPU_MAX_HW_QUEUES before the runtime starts. For bits only: the card runs the
+ * eight queues in time slices of several milliseconds, so a launch's time is mostly waiting for
+ * the other ranks' turn. */
+static bool st_one_card() {
+    const char* e = std::getenv("R4D_SELFTEST_ONE_CARD");
+    return e && *e && std::strcmp(e, "0") != 0;
+}
+
 #ifdef RAD_HAVE_HIP
 
 /* Every hipError_t in this file is checked. A kernel fault leaves a sticky error, so the
@@ -22337,6 +22348,9 @@ private:
 
 struct Ar8Perf {
     int rank = 0, dev = 0, world = 8, iters = 0;
+    /* The legacy stream with a card a rank; a non-blocking stream of its own when the ranks share
+     * a card (st_one_card), where one stream would serialise ranks that wait for each other. */
+    hipStream_t st = nullptr;
     const char* dtype = "bf16";
     std::vector<int64_t> sizes;
     std::vector<const RadKernelInfo*> rows;
@@ -22357,6 +22371,9 @@ static void ar8_perf_worker(Ar8Perf* t) {
     t->rc.assign(ncfg, RAD_E_STATE); t->bad.assign(ncfg, 0); t->period.assign(ncfg, 0.0f);
     t->cold.assign(ncfg, {});
     if (st_set_device(t->dev) != hipSuccess) t->rc_init = RAD_E_DEVICE;
+    if (t->rc_init == RAD_OK && st_one_card() &&
+        hipStreamCreateWithFlags(&t->st, hipStreamNonBlocking) != hipSuccess)
+        t->rc_init = RAD_E_DEVICE;
     const bool bf = !std::strcmp(t->dtype, "bf16");
     const int esz = bf ? 2 : 4;
     int64_t most = 0;
@@ -22414,9 +22431,10 @@ static void ar8_perf_worker(Ar8Perf* t) {
                 t->bar->wait();
                 int rc = t->rc_init;
                 if (rc == RAD_OK) {
-                    st_memset(out, 0, (size_t)n * esz);
-                    rc = t->rows[j]->launch(&a, nullptr);
-                    if (st_stream_sync(nullptr) != hipSuccess && rc == RAD_OK) rc = RAD_E_DEVICE;
+                    hip_ck(hipMemsetAsync(out, 0, (size_t)n * esz, t->st), "hipMemsetAsync",
+                           __LINE__);
+                    rc = t->rows[j]->launch(&a, t->st);
+                    if (st_stream_sync(t->st) != hipSuccess && rc == RAD_OK) rc = RAD_E_DEVICE;
                 }
                 t->rc[cfg] = rc;
                 t->bar->wait();
@@ -22434,15 +22452,15 @@ static void ar8_perf_worker(Ar8Perf* t) {
                  * clock (the block rule read slower than the same count pinned). */
                 if (timed) {
                     for (int i = 0; i < std::max(t->iters, 50); ++i)
-                        t->rows[j]->launch(&a, nullptr);
-                    st_stream_sync(nullptr);
+                        t->rows[j]->launch(&a, t->st);
+                    st_stream_sync(t->st);
                 }
                 t->bar->wait();
                 if (timed) {
                     if (g_cold <= 0) {
-                        st_ev_record(ev[0], nullptr);
-                        for (int i = 0; i < t->iters; ++i) t->rows[j]->launch(&a, nullptr);
-                        st_ev_record(ev[1], nullptr);
+                        st_ev_record(ev[0], t->st);
+                        for (int i = 0; i < t->iters; ++i) t->rows[j]->launch(&a, t->st);
+                        st_ev_record(ev[1], t->st);
                         st_ev_sync(ev[1]);
                         float ms = 0.0f;
                         st_ev_elapsed(&ms, ev[0], ev[1]);
@@ -22452,11 +22470,11 @@ static void ar8_perf_worker(Ar8Perf* t) {
                             for (int64_t off = 0; off < g_cold; off += kColdChunk)
                                 hip_ck(hipMemcpyAsync(cdst, (const char*)csrc + off,
                                                       (size_t)std::min(kColdChunk, g_cold - off),
-                                                      hipMemcpyDeviceToDevice, nullptr),
+                                                      hipMemcpyDeviceToDevice, t->st),
                                        "hipMemcpyAsync", __LINE__);
-                            st_ev_record(ev[2 * (size_t)i], nullptr);
-                            t->rows[j]->launch(&a, nullptr);
-                            st_ev_record(ev[2 * (size_t)i + 1], nullptr);
+                            st_ev_record(ev[2 * (size_t)i], t->st);
+                            t->rows[j]->launch(&a, t->st);
+                            st_ev_record(ev[2 * (size_t)i + 1], t->st);
                         }
                         st_ev_sync(ev[2 * (size_t)t->iters - 1]);
                         t->cold[cfg].resize((size_t)t->iters);
@@ -22471,9 +22489,12 @@ static void ar8_perf_worker(Ar8Perf* t) {
         }
     }
     for (hipEvent_t e : ev) st_ev_destroy(e);
+    /* Frees and fini synchronise the card, which ranks sharing it must reach together. */
+    t->bar->wait();
     for (size_t j = 0; j < t->rows.size(); ++j)
         if (inst[j] && t->rows[j]->fini) t->rows[j]->fini(inst[j]);
     for (void* p : { in, out, csrc, cdst }) if (p) st_free(p);
+    if (t->st) hip_ck(hipStreamDestroy(t->st), "hipStreamDestroy", __LINE__);
 }
 
 /* The eight-rank two-shot's weights as the plugin derives them at init (r4d_ar_entry.hip,
@@ -22535,6 +22556,12 @@ static void ar8_perf(const Plugin& pl, int64_t numel, int iters, const char* dty
             !std::strncmp(p.gcnArchName, "gfx1201", 7))
             devs.push_back(d);
     }
+    if ((int)devs.size() < W && st_one_card() && !devs.empty()) {
+        std::printf("eight ranks on device %d (R4D_SELFTEST_ONE_CARD): the bits are checked as on "
+                    "eight cards; the times are not a board's, the card time-slices the ranks' "
+                    "queues\n", devs[0]);
+        devs.assign((size_t)W, devs[0]);
+    }
     if ((int)devs.size() < W) { std::printf("--perfar8: needs 8 gfx1201 cards, found %zu\n",
                                              devs.size()); return; }
     std::vector<const RadKernelInfo*> rows;
@@ -22549,7 +22576,11 @@ static void ar8_perf(const Plugin& pl, int64_t numel, int iters, const char* dty
             ks.push_back(k);
         }
     }
-    const std::vector<int> nbs = { 0, 4, 8, 16, 32, 64 };
+    /* Ranks sharing a card must have every block resident at once, since a block spins until its
+     * twins on the other ranks arrive: eight ranks of at most 8 blocks of 1024 threads fit an R9700,
+     * and the block rule can ask for 16. */
+    const std::vector<int> nbs = devs[0] == devs[W - 1] ? std::vector<int>{ 4, 8 }
+                                                        : std::vector<int>{ 0, 4, 8, 16, 32, 64 };
     std::printf("eight-rank exact all-reduce, %s, %d launches a point, %s\n", dtype, iters,
                 g_cold > 0 ? fmt("cold (%lld MiB read before each; last arriver / with skew, "
                                  "medians)", (long long)(g_cold >> 20)).c_str()
@@ -27068,6 +27099,7 @@ static void usage(void) {
                 "             a card: one-shot and two-shot at the block rule and at 4..64 blocks,\n"
                 "             each checked against the rank-order fold; numel 0 runs the decode\n"
                 "             and prefill messages at 4096 wide. dtype bf16 (default) or fp32.\n"
+                "             R4D_SELFTEST_ONE_CARD=1 runs the eight ranks on one card.\n"
                 "  --perfmxf8 M [iters] [experts] [top_k] [skew]:  the same at the FP8 experts with f32\n"
                 "             block scales (moe_gemm_fp8a8_f32scale, GLM's MTP layer).\n"
                 "  --perfmhcpre M [iters]:  mhc_pre (whole, partials alone, finish alone) and\n"
@@ -27112,6 +27144,8 @@ static void usage(void) {
 }
 
 int main(int argc, char** argv) {
+    /* Before the runtime starts: eight ranks on one card need a hardware queue each. */
+    if (st_one_card() && !std::getenv("GPU_MAX_HW_QUEUES")) setenv("GPU_MAX_HW_QUEUES", "16", 0);
     const char* path = nullptr;
     const char* real_file = nullptr;
     long long real_woff = 0, real_soff = 0, real_n = 0, real_k = 0;
