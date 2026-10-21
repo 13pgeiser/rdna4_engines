@@ -683,6 +683,30 @@ mod tests {
             )
             .unwrap();
             assert_eq!(st.v[0][0], 0x8180_1234, "{arch:?}");
+            // Low-half merge: loaded 0x8180 replaces the low bits, high half preserved.
+            st.v[0][0] = 0xabcd_1234;
+            st.v[0][1] = 0xdead_beef; // lane 1 inactive under default exec mask
+            st.vcc = 0xcafe_1234;
+            st.scc = true;
+            st.m0 = 0x1357_9bdf;
+            run(&mut st, &mut mem, "flat_load_d16_b16", reg(Kind::V, 0, 1)).unwrap();
+            assert_eq!(st.v[0][0], 0xabcd_8180, "{arch:?}");
+            assert_eq!(st.v[0][1], 0xdead_beef, "{arch:?}");
+            assert_eq!((st.v[2][0], st.v[3][0]), (0x1000, 0), "{arch:?}");
+            assert_eq!(
+                (st.vcc, st.scc, st.m0, st.exec),
+                (0xcafe_1234, true, 0x1357_9bdf, 1)
+            );
+            // Full dword loads replace both halves through the same generic flat handler.
+            st.v[0][0] = 0xabcd_1234;
+            run(&mut st, &mut mem, "flat_load_b32", reg(Kind::V, 0, 1)).unwrap();
+            assert_eq!(st.v[0][0], 0x8382_8180, "{arch:?}");
+            assert_eq!(st.v[0][1], 0xdead_beef, "{arch:?}");
+            assert_eq!((st.v[2][0], st.v[3][0]), (0x1000, 0), "{arch:?}");
+            assert_eq!(
+                (st.vcc, st.scc, st.m0, st.exec),
+                (0xcafe_1234, true, 0x1357_9bdf, 1)
+            );
         }
     }
     // K1-C1's SADDR global loads: `global_load_b128` / `_b64` read 4 / 2 dwords at `saddr + voffset` (+ imm offset) per lane.

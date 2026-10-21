@@ -257,6 +257,7 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
         _ if super::wide::handles(name) => super::wide::execute(arch, name, i, s),
         "v_permlane16_b32" | "v_permlanex16_b32" => permlane(name, i, s),
         "v_div_scale_f32" => div_scale(arch, i, s),
+        "v_add_co_u32" | "v_add_co_ci_u32_e64" => add_carry(name, i, s),
         "v_cvt_pk_f32_fp8_e32" | "v_cvt_pk_f32_fp8_e64" => cvt_pk_f32_fp8(arch, i, s),
         _ if name.starts_with("v_cmp") => compare(name, i, s),
         _ => lanes(arch, name, i, s),
@@ -357,6 +358,34 @@ fn vopd(arch: Arch, x: &str, y: &str, split: usize, i: &Inst, s: &mut State) -> 
         s.put(&oy[0], lane, 0, out[lane][1])?;
     }
     Ok(())
+}
+
+/// VOP3 carry add: read all source lanes and the incoming mask before either destination is written.
+/// Inactive lanes retain their VGPR and contribute zero bits to the outgoing wave32 carry mask.
+fn add_carry(name: &str, i: &Inst, s: &mut State) -> Result<()> {
+    plain(i)?;
+    if i.mods.dpp.is_some() || i.mods.sdwa.is_some() || i.mods.op_sel != 0 {
+        return Err(format!("{name}: DPP/SDWA/op_sel is not modeled"));
+    }
+    let o = &i.operands;
+    let has_cin = name == "v_add_co_ci_u32_e64";
+    if o.len() != if has_cin { 5 } else { 4 } {
+        return Err(format!("{name}: missing or extra carry operand"));
+    }
+    let cin = if has_cin { s.read(&o[4], 0, 0)? } else { 0 };
+    let mut out = [0u32; 32];
+    let mut carry = 0u32;
+    for lane in active(s) {
+        let sum = u64::from(s.read(&o[2], lane, 0)?)
+            + u64::from(s.read(&o[3], lane, 0)?)
+            + u64::from(cin >> lane & 1);
+        out[lane] = sum as u32;
+        carry |= ((sum >> 32) as u32) << lane;
+    }
+    for lane in active(s) {
+        s.put(&o[0], lane, 0, out[lane])?;
+    }
+    s.put(&o[1], 0, 0, carry)
 }
 
 fn readfirstlane(i: &Inst, s: &mut State) -> Result<()> {
@@ -1105,6 +1134,17 @@ fn vector(
             }
             (Class::Own, u32::from(h))
         }
+        // RDNA4: D.u16 = S1.u16 >> S0[3:0]; true16 writes preserve the other half.
+        "v_lshrrev_b16" => {
+            half_dst(o)?;
+            plain_16(i, d, false)?;
+            if m.clamp {
+                return Err("clamp on v_lshrrev_b16 is not modeled".into());
+            }
+            let shift = half_src(s, o.get(1).ok_or("missing vector operand")?, i, lane, 0)?;
+            let value = half_src(s, o.get(2).ok_or("missing vector operand")?, i, lane, 1)?;
+            (Class::Own, u32::from(value >> (shift & 15)))
+        }
         // 16-bit integer: D.u16 = S0.u16 - S1.u16 / S0.u16 * S1.u16 (low bits); CLAMP saturates in the unsigned domain.
         "v_sub_nc_u16" | "v_mul_lo_u16" => {
             half_dst(o)?;
@@ -1781,6 +1821,40 @@ fn scalar(name: &str, i: &Inst, s: &mut State) -> Result<()> {
             if s.scc { a } else { b },
         );
     }
+    if name == "s_mov_b64" {
+        let value = s.read_wide(o.get(1).ok_or("missing scalar operand")?, 0, Wide::Unsigned)?;
+        return s.put_wide(o.first().ok_or("missing scalar operand")?, 0, value);
+    }
+    // RDNA4 SOP2: low 64 bits of unsigned add/multiply, no SCC input or output.
+    // Read both pairs before writing: the native address arithmetic aliases its destination.
+    if matches!(name, "s_mul_u64" | "s_add_nc_u64") {
+        let a = s.read_wide(o.get(1).ok_or("missing scalar operand")?, 0, Wide::Unsigned)?;
+        let b = s.read_wide(o.get(2).ok_or("missing scalar operand")?, 0, Wide::Unsigned)?;
+        let value = if name == "s_mul_u64" {
+            a.wrapping_mul(b)
+        } else {
+            a.wrapping_add(b)
+        };
+        return s.put_wide(o.first().ok_or("missing scalar operand")?, 0, value);
+    }
+    // SOP2: D.u64 = S0.u64 << S1[5:0]; SCC reports a nonzero 64-bit result.
+    if name == "s_lshl_b64" {
+        let a = s.read_wide(o.get(1).ok_or("missing scalar operand")?, 0, Wide::Unsigned)?;
+        let value = a << (rd(s, 2)? & 63);
+        s.put_wide(o.first().ok_or("missing scalar operand")?, 0, value)?;
+        s.scc = value != 0;
+        return Ok(());
+    }
+    // Save the old wave32 EXEC, then intersect EXEC with S0 and report nonempty EXEC.
+    // Capture S0 first because native divergence masks can alias the saved destination.
+    if name == "s_and_saveexec_b32" {
+        let mask = rd(s, 1)?;
+        let old = s.exec;
+        s.put(o.first().ok_or("missing scalar operand")?, 0, 0, old)?;
+        s.exec = old & mask;
+        s.scc = s.exec != 0;
+        return Ok(());
+    }
     if let Some(rest) = name.strip_prefix("s_cmp_") {
         let (p, ty) = rest
             .split_once('_')
@@ -1812,7 +1886,8 @@ fn scalar(name: &str, i: &Inst, s: &mut State) -> Result<()> {
     let b = if o.len() > 2 { rd(s, 2)? } else { 0 };
     let nonzero = |v: u32| (v, Some(v != 0));
     let (value, flag) = match name {
-        "s_mov_b32" => (a, None),
+        // SOPK immediates are already sign-extended by State::read.
+        "s_mov_b32" | "s_movk_i32" => (a, None),
         "s_cselect_b32" => (if s.scc { a } else { b }, None),
         "s_add_u32" | "s_add_co_u32" | "s_addc_u32" | "s_add_co_ci_u32" => {
             let carry = u64::from((name == "s_addc_u32" || name == "s_add_co_ci_u32") && s.scc);
@@ -1830,6 +1905,10 @@ fn scalar(name: &str, i: &Inst, s: &mut State) -> Result<()> {
             let (v, f) = (a as i32).overflowing_add(b as i32);
             (v as u32, Some(f))
         }
+        "s_addk_i32" | "s_addk_co_i32" => {
+            let (v, overflow) = (rd(s, 0)? as i32).overflowing_add(a as i32);
+            (v as u32, Some(overflow))
+        }
         "s_sub_i32" | "s_sub_co_i32" => {
             let (v, f) = (a as i32).overflowing_sub(b as i32);
             (v as u32, Some(f))
@@ -1837,6 +1916,10 @@ fn scalar(name: &str, i: &Inst, s: &mut State) -> Result<()> {
         "s_mul_i32" => (a.wrapping_mul(b), None),
         "s_mulk_i32" => (s.read(&o[0], 0, 0)?.wrapping_mul(a), None),
         "s_mul_hi_u32" => ((u64::from(a) * u64::from(b) >> 32) as u32, None),
+        "s_mul_hi_i32" => (
+            ((i64::from(a as i32) * i64::from(b as i32)) >> 32) as u32,
+            None,
+        ),
         "s_and_b32" => nonzero(a & b),
         "s_or_b32" => nonzero(a | b),
         "s_xor_b32" => nonzero(a ^ b),
@@ -2100,6 +2183,355 @@ mod tests {
             (2f32.to_bits(), 3f32.to_bits()),
             "inactive lane untouched"
         );
+    }
+
+    #[test]
+    fn current_c1_dual_integer_halves_read_old_registers_and_keep_flags() {
+        for (name, rhs, want) in [
+            ("v_dual_and_b32", vec![lit(15), v(0)], 5),
+            ("v_dual_mov_b32", vec![v(0)], 0x8000_0005),
+            ("v_dual_lshlrev_b32", vec![lit(34), v(0)], 20),
+        ] {
+            let table = crate::isa::gfx12();
+            let x = table.iter().find(|r| r.name == "v_dual_mov_b32").unwrap();
+            let y = table.iter().find(|r| r.name == name).unwrap();
+            let mut ops = vec![v(0), v(1), v(1)];
+            ops.extend(rhs);
+            let i = Inst::from_parts(
+                Arch::Gfx1201,
+                x.op,
+                x.form,
+                FormFields::Vopd {
+                    y_op: y.op,
+                    x_operands: 2,
+                },
+                ops.into_iter().collect(),
+                Default::default(),
+                None,
+                Default::default(),
+            )
+            .unwrap();
+            let mut st = state();
+            st.exec = 1;
+            st.vcc = 0x1234_5678;
+            st.scc = true;
+            st.v[0][0] = 0x8000_0005;
+            st.v[1][0] = 0xdead_beef;
+            st.v[0][1] = 17;
+            st.v[1][1] = 19;
+            run("v_dual_mov_b32", &i, &mut st).unwrap();
+            assert_eq!((st.v[0][0], st.v[1][0]), (0xdead_beef, want), "{name}");
+            assert_eq!((st.v[0][1], st.v[1][1]), (17, 19), "{name}");
+            assert_eq!((st.exec, st.vcc, st.scc), (1, 0x1234_5678, true));
+        }
+    }
+
+    #[test]
+    fn current_c1_lshrrev_b16_masks_count_and_preserves_other_half() {
+        for (dst, src, sel, initial, shift, want) in [
+            (Half::Hi, Half::Lo, 0b1000, 0xabcd_ff80, 8, 0x00ff_ff80),
+            (Half::Lo, Half::Hi, 0b0010, 0x8001_abcd, 15, 0x8001_0001),
+            (Half::Lo, Half::Lo, 0, 0xabcd_ff80, 16, 0xabcd_ff80),
+            (Half::Hi, Half::Lo, 0b1000, 0xabcd_ff80, 31, 0x0001_ff80),
+        ] {
+            let mut i = insn(
+                "v_lshrrev_b16",
+                vec![half(11, dst), lit(shift), half(11, src)],
+            );
+            i.mods.op_sel = sel;
+            let mut st = state();
+            st.exec = 1;
+            st.vcc = 0xa5a5_5a5a;
+            st.scc = true;
+            st.v[11][0] = initial;
+            st.v[11][1] = 0x1234_5678;
+            run("v_lshrrev_b16", &i, &mut st).unwrap();
+            assert_eq!(st.v[11][0], want, "count {shift}");
+            assert_eq!(st.v[11][1], 0x1234_5678);
+            assert_eq!((st.exec, st.vcc, st.scc), (1, 0xa5a5_5a5a, true));
+        }
+    }
+
+    #[test]
+    fn current_c1_carry_add_masks_inactive_lanes_and_reads_old_carry() {
+        for arch in [Arch::Gfx1151, Arch::Gfx1201] {
+            for name in ["v_add_co_u32", "v_add_co_ci_u32_e64"] {
+                let has_cin = name == "v_add_co_ci_u32_e64";
+                for exec in [0u32, 0x8000_0003] {
+                    for dst in [
+                        sreg(2),
+                        Operand::Special(Special::VccLo),
+                        Operand::Special(Special::Null),
+                    ] {
+                        let mut ops = vec![v(0), dst.clone(), v(0), v(1)];
+                        if has_cin {
+                            ops.push(Operand::Special(Special::VccLo));
+                        }
+                        let i = insn_on(arch, name, ops);
+                        let mut st = state();
+                        st.exec = exec;
+                        st.vcc = 0x8000_0001;
+                        st.scc = true;
+                        st.s[2] = 0xdead_beef;
+                        for lane in 0..32 {
+                            st.v[0][lane] = u32::MAX;
+                            st.v[1][lane] = if lane == 1 { 0 } else { 1 };
+                        }
+                        execute(arch, name, &i, &mut st).unwrap();
+                        for lane in 0..32 {
+                            let want = if exec >> lane & 1 == 0 || lane == 1 {
+                                u32::MAX
+                            } else if has_cin {
+                                1
+                            } else {
+                                0
+                            };
+                            assert_eq!(st.v[0][lane], want, "{arch:?} {name} lane {lane}");
+                            assert_eq!(st.v[1][lane], if lane == 1 { 0 } else { 1 });
+                        }
+                        let carry = if exec == 0 { 0 } else { 0x8000_0001 };
+                        match dst {
+                            Operand::Reg(_) => {
+                                assert_eq!(st.s[2], carry);
+                                assert_eq!(st.vcc, 0x8000_0001);
+                            }
+                            Operand::Special(Special::VccLo) => {
+                                assert_eq!(st.vcc, carry);
+                                assert_eq!(st.s[2], 0xdead_beef);
+                            }
+                            _ => {
+                                assert_eq!(st.vcc, 0x8000_0001);
+                                assert_eq!(st.s[2], 0xdead_beef);
+                            }
+                        }
+                        assert_eq!((st.exec, st.scc), (exec, true));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn current_c1_mov_b64_reads_overlapping_pair_before_writing_and_keeps_flags() {
+        for arch in [Arch::Gfx1151, Arch::Gfx1201] {
+            for scc in [false, true] {
+                let i = insn_on(arch, "s_mov_b64", vec![pair(Kind::S, 1), pair(Kind::S, 0)]);
+                let mut st = state();
+                st.s[..4].copy_from_slice(&[0x89ab_cdef, 0x0123_4567, 0xdead_beef, 0xcafe_babe]);
+                st.exec = 0;
+                st.vcc = 0x8000_0001;
+                st.scc = scc;
+                execute(arch, "s_mov_b64", &i, &mut st).unwrap();
+                assert_eq!(
+                    &st.s[..4],
+                    &[0x89ab_cdef, 0x89ab_cdef, 0x0123_4567, 0xcafe_babe]
+                );
+                assert_eq!((st.exec, st.vcc, st.scc), (0, 0x8000_0001, scc));
+            }
+        }
+    }
+
+    #[test]
+    fn current_c1_addk_wraps_signed_immediate_and_sets_overflow_not_carry() {
+        for (arch, name) in [
+            (Arch::Gfx1151, "s_addk_i32"),
+            (Arch::Gfx1201, "s_addk_co_i32"),
+        ] {
+            for (a, k, want, overflow) in [
+                (0x7fff_ffffu32, 1i16, 0x8000_0000u32, true),
+                (0x8000_0000, -1, 0x7fff_ffff, true),
+                (u32::MAX, 1, 0, false),
+                (0, -128, 0xffff_ff80, false),
+            ] {
+                let i = insn_on(
+                    arch,
+                    name,
+                    vec![sreg(2), Operand::Imm(crate::operand::ImmField::Sopk(k))],
+                );
+                let mut st = state();
+                st.s[2] = a;
+                st.exec = 0;
+                st.vcc = 0x1234_5678;
+                st.scc = !overflow;
+                execute(arch, name, &i, &mut st).unwrap();
+                assert_eq!((st.s[2], st.scc), (want, overflow));
+                assert_eq!((st.exec, st.vcc), (0, 0x1234_5678));
+            }
+        }
+    }
+
+    #[test]
+    fn current_c1_signed_mul_high_preserves_flags_and_low_sources() {
+        for arch in [Arch::Gfx1151, Arch::Gfx1201] {
+            for (a, b, want) in [
+                (0xffff_ffffu32, 2u32, 0xffff_ffffu32),
+                (0x8000_0000, 0x8000_0000, 0x4000_0000),
+                (0x7fff_ffff, 0x7fff_ffff, 0x3fff_ffff),
+                (0, 0x8000_0000, 0),
+            ] {
+                let i = insn_on(arch, "s_mul_hi_i32", vec![sreg(0), sreg(0), sreg(1)]);
+                let mut st = state();
+                st.s[0] = a;
+                st.s[1] = b;
+                st.exec = 0;
+                st.vcc = 0x1234_5678;
+                st.scc = true;
+                execute(arch, "s_mul_hi_i32", &i, &mut st).unwrap();
+                assert_eq!((st.s[0], st.s[1]), (want, b));
+                assert_eq!((st.exec, st.vcc, st.scc), (0, 0x1234_5678, true));
+            }
+        }
+    }
+
+    #[test]
+    fn current_c1_saveexec_preserves_old_mask_and_reads_aliased_source() {
+        for arch in [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201] {
+            for (old, mask, want) in [
+                (0xf0f0_00ffu32, 0xaaaa_5555u32, 0xa0a0_0055u32),
+                (0, u32::MAX, 0),
+                (u32::MAX, 0, 0),
+                (0x8000_0000, u32::MAX, 0x8000_0000),
+            ] {
+                for scc in [false, true] {
+                    let i = insn_on(arch, "s_and_saveexec_b32", vec![sreg(2), sreg(2)]);
+                    let mut st = state();
+                    st.exec = old;
+                    st.vcc = 0x1234_5678;
+                    st.scc = scc;
+                    st.s[2] = mask;
+                    st.s[3] = 0xdead_beef;
+                    execute(arch, "s_and_saveexec_b32", &i, &mut st).unwrap();
+                    assert_eq!(st.s[2], old, "{arch:?}");
+                    assert_eq!((st.exec, st.scc), (want, want != 0));
+                    assert_eq!((st.vcc, st.s[3]), (0x1234_5678, 0xdead_beef));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn current_c1_movk_sign_extends_sopk_immediate_and_keeps_flags() {
+        for arch in [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201] {
+            for (imm, want) in [
+                (0i16, 0u32),
+                (0x7fff, 0x7fff),
+                (-32768, 0xffff_8000),
+                (-70, 0xffff_ffba),
+            ] {
+                let i = insn_on(
+                    arch,
+                    "s_movk_i32",
+                    vec![sreg(2), Operand::Imm(crate::operand::ImmField::Sopk(imm))],
+                );
+                for scc in [false, true] {
+                    let mut st = state();
+                    st.exec = 0;
+                    st.vcc = 0x1234_5678;
+                    st.scc = scc;
+                    st.s[2] = 0xdead_beef;
+                    execute(arch, "s_movk_i32", &i, &mut st).unwrap();
+                    assert_eq!(st.s[2], want, "{arch:?}");
+                    assert_eq!((st.exec, st.vcc, st.scc), (0, 0x1234_5678, scc));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn current_c1_scalar_lshl_b64_masks_count_wraps_and_sets_scc() {
+        for arch in [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201] {
+            for (a, count, want) in [
+                (0x0000_0000_8000_0001u64, 1u32, 0x0000_0001_0000_0002u64),
+                (u64::MAX, 63, 0x8000_0000_0000_0000),
+                (0x8000_0000_0000_0000, 1, 0),
+                (0x1234_5678_9abc_def0, 64, 0x1234_5678_9abc_def0),
+                (1, 65, 2),
+                (0, u32::MAX, 0),
+            ] {
+                for scc in [false, true] {
+                    let i = insn_on(
+                        arch,
+                        "s_lshl_b64",
+                        vec![pair(Kind::S, 0), pair(Kind::S, 0), sreg(2)],
+                    );
+                    let mut st = state();
+                    st.s[0] = a as u32;
+                    st.s[1] = (a >> 32) as u32;
+                    st.s[2] = count;
+                    st.exec = 0;
+                    st.vcc = 0xa5a5_5a5a;
+                    st.scc = scc;
+                    execute(arch, "s_lshl_b64", &i, &mut st).unwrap();
+                    assert_eq!(
+                        u64::from(st.s[0]) | (u64::from(st.s[1]) << 32),
+                        want,
+                        "{arch:?} {a:#x} << {count}"
+                    );
+                    assert_eq!(st.s[2], count);
+                    assert_eq!((st.exec, st.vcc, st.scc), (0, 0xa5a5_5a5a, want != 0));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn current_c1_scalar_u64_wraps_with_aliased_sources_and_no_scc_effect() {
+        for (name, a, b, want) in [
+            ("s_add_nc_u64", 0xffff_ffffu64, 1u64, 0x1_0000_0000u64),
+            ("s_add_nc_u64", u64::MAX, 1, 0),
+            ("s_mul_u64", 0x1_0000_0001, 0x1_0000_0001, 0x2_0000_0001),
+            ("s_mul_u64", u64::MAX, 2, u64::MAX - 1),
+        ] {
+            for scc in [false, true] {
+                for dst in [0, 2] {
+                    let i = insn(
+                        name,
+                        vec![pair(Kind::S, dst), pair(Kind::S, 0), pair(Kind::S, 2)],
+                    );
+                    let mut st = state();
+                    st.s[..4].copy_from_slice(&[
+                        a as u32,
+                        (a >> 32) as u32,
+                        b as u32,
+                        (b >> 32) as u32,
+                    ]);
+                    st.s[4] = 0xdead_beef;
+                    st.exec = 0;
+                    st.vcc = 0xa5a5_5a5a;
+                    st.scc = scc;
+                    run(name, &i, &mut st).unwrap();
+                    let d = usize::from(dst);
+                    assert_eq!(
+                        u64::from(st.s[d]) | (u64::from(st.s[d + 1]) << 32),
+                        want,
+                        "{name}"
+                    );
+                    let (other, unchanged) = if dst == 0 { (2, b) } else { (0, a) };
+                    assert_eq!(
+                        u64::from(st.s[other]) | (u64::from(st.s[other + 1]) << 32),
+                        unchanged
+                    );
+                    assert_eq!(st.s[4], 0xdead_beef);
+                    assert_eq!((st.exec, st.vcc, st.scc), (0, 0xa5a5_5a5a, scc));
+                }
+            }
+        }
+        // Unsigned 32-bit literals zero-extend; signed inline integers sign-extend.
+        for (rhs, want) in [
+            (lit(u32::MAX), 0x1_ffff_fffeu64),
+            (Operand::Inline(InlineConst::Integer(-1)), 0xffff_fffe),
+        ] {
+            let i = insn(
+                "s_add_nc_u64",
+                vec![pair(Kind::S, 0), pair(Kind::S, 0), rhs],
+            );
+            let mut st = state();
+            st.s[0] = u32::MAX;
+            st.scc = true;
+            run("s_add_nc_u64", &i, &mut st).unwrap();
+            assert_eq!(u64::from(st.s[0]) | (u64::from(st.s[1]) << 32), want);
+            assert!(st.scc);
+        }
     }
 
     // Permlane supports only FI=OPSEL[0] and BC=OPSEL[1]; every other modifier errors, even with EXEC=0.
