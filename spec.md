@@ -1082,6 +1082,18 @@ moving blocks one at a time would be all dispatch cost. Within a layer blocks ar
 packing a set is `gather_rows` and restoring is `scatter_rows` (`docs/OPS.md`): one launch per
 (group, layer) for a whole batch.
 
+**Under tensor parallelism** the policy describes conversations, which are not sharded, and the
+transfer is per rank. One host slot holds the whole engine's entry: a group every rank holds whole
+(`rad_kv_group_replicated`, an MLA latent cache) once, in one window at the slot's front that rank
+0 writes and every rank reads back; then each rank's own shard of the sharded groups, one window
+per rank, which can differ in width (uneven heads, `rad_kv_group_zero`). `TierExec::slot_layout`
+is the one place the arithmetic lives, and bringup refuses a group replicated on one rank but zero,
+unflagged or another width on another. The leader plans and reports; a follower moves only its own
+window and, under `RADIANCE_DEBUG_TIER_VERIFY`, also gathers the replicated groups so the leader
+can compare its window with every follower's hash once the batch has landed everywhere, which is
+how the plugin's claim is checked. On GLM-5.3-Flash at eight ranks, whose two cached groups are
+both replicated, a slot is 49.59 KiB rather than 396.75 KiB.
+
 **Recurrent state.** On a hybrid model a session is blocks plus recurrent state. The state lives in
 a slot of the snapshot store (pinned host memory, `--checkpoint-slots`), copied off the card after
 the step that produced it and back before the step that resumes from it, so it never holds VRAM.
@@ -1143,7 +1155,10 @@ shows every collective where the plugin put it.
 
 The residual stream is replicated: every rank holds the whole hidden state between blocks. Weights
 that act only on the stream, such as hyper-connection mixing (`arch/common/rad_block_hc.h`), are
-replicated too, since sharding them would add a collective at each use.
+replicated too, since sharding them would add a collective at each use. A KV group every rank
+holds whole, such as an MLA latent cache computed from a replicated projection, is declared
+`rad_kv_group_replicated`, and the idle session tiers (§7.3) then keep it once a host slot instead
+of once a rank; the core cannot tell from the graph, so the plugin says it.
 
 `lm_head` is vocabulary-sharded like any column-parallel weight, so the sampler (§13) runs a
 distributed top-k: each rank reduces its own shard and only the candidate sets are combined. Full

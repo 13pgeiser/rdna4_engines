@@ -1246,6 +1246,18 @@ void Engine::tier_tick() {
         }
         if (ranks_.size() > 1) (void)rad_dev_set(lead.device);
         if (all) {
+            /* RADIANCE_DEBUG_TIER_VERIFY: now that every rank's window has landed, each
+             * follower's hash of the replicated groups it gathered is held against the window
+             * the leader wrote (rad_kv_group_replicated's claim). The sums are taken either way,
+             * so a failed batch leaves none behind. */
+            if (lead.tierx.verifying_replicated()) {
+                for (size_t i = 1; i < ranks_.size(); ++i)
+                    for (const TierJob& j : P.copy) {
+                        uint64_t sum = 0;
+                        if (ranks_[i]->tierx.take_replicated_sum(j.key, &sum) && good)
+                            (void)lead.tierx.verify_replicated(j, (int)i, sum);
+                    }
+            }
             /* A copy is good only if every rank's shard landed; otherwise the host copy is
              * partly stale, so the whole batch fails and every slot goes back. */
             const std::vector<char> ok(P.copy.size(), good ? 1 : 0);

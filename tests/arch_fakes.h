@@ -71,7 +71,7 @@ struct RecMap {
     std::vector<std::string> src;
     int                      concat_dim = 0;
 };
-struct RecKV    { std::string name; RadKVGroupDecl d{}; bool zero = false; };
+struct RecKV    { std::string name; RadKVGroupDecl d{}; bool zero = false; bool replicated = false; };
 struct RecIssue {
     rad_op                  op = 0;
     std::vector<RadOperand> opd;
@@ -325,7 +325,18 @@ extern "C" int rad_weight_shard_span_parts(RadBuilder* b, rad_weight w, const in
 }
 extern "C" int rad_kv_group_zero(RadBuilder* b, rad_kvgroup g) {
     if (!b || g == 0 || g > b->kv_groups.size()) return RAD_E_INVAL;
+    if (b->kv_groups[g - 1].replicated) return RAD_E_INVAL;
     b->kv_groups[g - 1].zero = true;
+    return RAD_OK;
+}
+/* Recorded like zero, and like the real builder refused on a zero or unpaged group. Not part of
+ * graph_hash(): the flag changes what a host tier slot holds, not the graph, so the pinned
+ * graphs stand. */
+extern "C" int rad_kv_group_replicated(RadBuilder* b, rad_kvgroup g) {
+    if (!b || g == 0 || g > b->kv_groups.size()) return RAD_E_INVAL;
+    RecKV& k = b->kv_groups[g - 1];
+    if (k.zero || (k.d.kind != RAD_KV_FULL && k.d.kind != RAD_KV_WINDOW)) return RAD_E_INVAL;
+    k.replicated = true;
     return RAD_OK;
 }
 extern "C" int rad_declare_drafter(RadBuilder* b, const RadDrafterDecl* d) {

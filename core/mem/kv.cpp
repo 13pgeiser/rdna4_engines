@@ -228,6 +228,7 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
             p.bytes_per_block = 0;
             p.bytes_per_state = 0;
         }
+        p.replicated = g.replicated && p.paged() && !g.zero;
         plans_.push_back(std::move(p));
     }
     bundling_ = compare_bundling(bundles);

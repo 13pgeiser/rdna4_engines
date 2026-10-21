@@ -451,6 +451,16 @@ int rad_weight_shard_span_parts(RadBuilder* b, rad_weight w, const int64_t* lo, 
  * at issue. Additive export. */
 int rad_kv_group_zero(RadBuilder* b, rad_kvgroup g);
 
+/* Every rank holds the same bytes for this paged group, so a tier stores it once. Under tensor
+ * parallelism a host slot for a cached entry is otherwise every rank's shard end to end; a group
+ * declared replicated takes one window at the front of the slot, written by rank 0 and read by
+ * every rank on a restore. The plugin asserts the replication (an MLA latent cache that every
+ * rank computes whole, an indexer's key cache every rank pools into); the engine moves bytes and
+ * cannot know. RADIANCE_DEBUG_TIER_VERIFY checks the claim: each follower hashes what it would
+ * have written and the leader compares. Paged groups only, and never a group this rank declared
+ * zero. No effect at one rank. Additive export; RAD_ABI_VERSION does not move. */
+int rad_kv_group_replicated(RadBuilder* b, rad_kvgroup g);
+
 #define RAD_BUFS(...)  ((const rad_buf[]){ __VA_ARGS__ }), \
                        (int)(sizeof((const rad_buf[]){ __VA_ARGS__ }) / sizeof(rad_buf))
 

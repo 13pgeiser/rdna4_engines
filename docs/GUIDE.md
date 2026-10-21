@@ -1213,6 +1213,22 @@ radiance --model m.rad --prefix-cache-mib 8192 --prefix-cache-ttl 3600
 - `--prefix-cache-ttl S`: seconds an unused conversation is kept (default 3600); `0` keeps it until
   the memory is wanted.
 
+**What a slot holds under tensor parallelism.** One host slot holds the whole engine's entry: each
+rank's shard of every cached group, end to end, so a slot is as many entries wide as there are
+ranks. A group every rank holds whole, which the architecture plugin declares with
+`rad_kv_group_replicated`, is in the slot once: rank 0 writes it and every rank reads it back on a
+restore. GLM-5.3-Flash declares both of its cached groups so (the MLA latent, which every rank
+computes whole, and the DSA index cache, which every rank pools into), so at `--tp 8` a 4-token
+block costs 49.59 KiB a slot (`kv_latent` 48.00 KiB over its 12 layers, `kv_dsa_index` 1.59 KiB)
+rather than the 396.75 KiB of eight copies: 12.4 KiB a token rather than 99.2 KiB.
+`--prefix-cache-mib 32768` then holds 2.7M tokens rather than 338K, and 80 GiB hold 6.8M rather
+than 846K. The startup log names what is held once (`kv tiers: kv_latent, kv_dsa_index ... held
+once a slot`) and the tokens the tier holds either way. The claim is the plugin's; under
+`RADIANCE_DEBUG_TIER_VERIFY` every follower also hashes what it would have written and the leader
+compares, logging `kv tiers: the replicated groups of ... differ between rank 0 and rank N` when
+a rank holds other bytes. Sharded groups (a GQA model's K/V heads) are unaffected and still take a
+window per rank.
+
 Restoring a 200K-token turn costs a copy over PCIe; recomputing it costs minutes.
 
 On a hybrid model the recurrent state matters as much as the attention blocks: restoring the blocks

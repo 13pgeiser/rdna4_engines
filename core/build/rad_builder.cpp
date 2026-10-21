@@ -928,7 +928,35 @@ int Builder::kv_group_zero(rad_kvgroup h) {
             prog_.kv_groups[h].name.c_str());
         return RAD_E_INVAL;
     }
+    if (prog_.kv_groups[h].replicated) {
+        err(RAD_E_INVAL, "kv group '%s': kv_group_zero on a group declared replicated; a "
+            "replicated group is held whole on every rank", prog_.kv_groups[h].name.c_str());
+        return RAD_E_INVAL;
+    }
     prog_.kv_groups[h].zero = true;
+    return RAD_OK;
+}
+
+int Builder::kv_group_replicated(rad_kvgroup h) {
+    if (finished_) {
+        err(RAD_E_STATE, "kv_group_replicated after declare finished");
+        return RAD_E_STATE;
+    }
+    if (h == 0 || h >= prog_.kv_groups.size()) return RAD_E_INVAL;
+    /* Paged groups only: the tiers move blocks. A linear or conv group's state travels in the
+     * checkpoint store, which has no such window. */
+    const int kind = prog_.kv_groups[h].decl.kind;
+    if (kind != RAD_KV_FULL && kind != RAD_KV_WINDOW) {
+        err(RAD_E_INVAL, "kv group '%s': kv_group_replicated on a group that is not paged",
+            prog_.kv_groups[h].name.c_str());
+        return RAD_E_INVAL;
+    }
+    if (prog_.kv_groups[h].zero) {
+        err(RAD_E_INVAL, "kv group '%s': kv_group_replicated on a group declared zero; a zero "
+            "rank holds none of it", prog_.kv_groups[h].name.c_str());
+        return RAD_E_INVAL;
+    }
+    prog_.kv_groups[h].replicated = true;
     return RAD_OK;
 }
 
@@ -2317,6 +2345,11 @@ int rad_weight_shard_span_parts(RadBuilder* b, rad_weight w, const int64_t* lo, 
 int rad_kv_group_zero(RadBuilder* b, rad_kvgroup g) {
     if (!b) return RAD_E_INVAL;
     return B(b)->kv_group_zero(g);
+}
+
+int rad_kv_group_replicated(RadBuilder* b, rad_kvgroup g) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->kv_group_replicated(g);
 }
 
 int rad_decl_name_map(RadBuilder* b, const RadNameMap* m) {

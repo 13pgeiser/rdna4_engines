@@ -73,6 +73,10 @@ struct KVGroupPlan {
      * block count (one block table serves every rank); its costs are zero and nothing is carved.
      * No op on this rank names it (issue refuses a group with no pool bound). */
     bool        zero = false;
+    /* rad_kv_group_replicated: every rank holds the same bytes, so a tier slot carries this
+     * group once, in a window at its front that rank 0 writes and every rank reads
+     * (TierExec::slot_layout). The pool is carved as for any group. */
+    bool        replicated = false;
     int64_t     n_states = 0;          /* LINEAR/CONV: n_seq_states * state_copies */
     /* Physical slots per logical state: 1, or 2 under speculation. A verify runs 1 + n_spec
      * tokens through the recurrence before acceptance is known; libr4d keeps the committed state

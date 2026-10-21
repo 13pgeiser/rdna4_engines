@@ -3050,21 +3050,17 @@ int Engine::configure_kv() {
     {
         const bool tier_asked = cfg_.prefix_cache_mib > 0;
         const std::vector<int32_t>& cg = ranks_[0]->prefix.cached_groups();
-        /* One slot holds every rank's shard of an entry; each rank writes only its window. Shards
-         * can differ or be empty (uneven heads, rad_kv_group_zero), so a slot is the sum and each
-         * window starts where the previous ends. TierExec::sizes uses the largest rank's entry,
-         * since the staging ring is per rank. */
-        std::vector<int64_t> rank_entry(ranks_.size(), 0), entry_off(ranks_.size(), 0);
-        int64_t entry_bytes = 0, slot_bytes = 0;
-        for (size_t i = 0; i < ranks_.size(); ++i) {
-            for (int32_t g : cg) {
-                const KVGroupPlan* p = ranks_[i]->kv.plan(g);
-                if (p && p->paged()) rank_entry[i] += p->bytes_per_block;
-            }
-            entry_off[i] = slot_bytes;
-            slot_bytes += rank_entry[i];
-            entry_bytes = std::max(entry_bytes, rank_entry[i]);
-        }
+        /* One slot holds the whole engine's entry: the groups every rank holds alike
+         * (rad_kv_group_replicated) once, at the front, then every rank's own shard in its own
+         * window. Shards can differ or be empty (uneven heads, rad_kv_group_zero). The layout is
+         * TierExec's, so the arithmetic here and the copies agree; TierExec::sizes takes the
+         * largest rank's entry, since the staging ring is per rank. */
+        std::vector<const KVManager*> rank_kv;
+        for (auto& r : ranks_) rank_kv.push_back(&r->kv);
+        TierExec::SlotLayout layout;
+        RAD_TRY(TierExec::slot_layout(rank_kv, cg, &layout));
+        const std::vector<int64_t>& entry_off = layout.own_off;
+        const int64_t entry_bytes = layout.entry_bytes, slot_bytes = layout.slot_bytes;
 
         /* Snapshots live in the checkpoint store (--checkpoint-slots); --prefix-cache-mib is for
          * blocks only. */
@@ -3092,6 +3088,20 @@ int Engine::configure_kv() {
                  * fit is right after the turn. */
                 const int64_t held = T.arena().capacity() * tc.block_tokens;
                 const int64_t ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : meta_.n_ctx_train;
+                if (layout.rep_bytes > 0 && ranks_.size() > 1) {
+                    /* What the slot would be with every rank's copy of the replicated groups. */
+                    const int64_t each = slot_bytes + layout.rep_bytes * (int64_t)(ranks_.size() - 1);
+                    std::string names;
+                    for (const std::string& n : layout.replicated)
+                        names += (names.empty() ? "" : ", ") + n;
+                    RAD_INFO("kv tiers: %s (%s of each entry) is the same on every rank and held "
+                             "once a slot: %s a slot rather than %s, so --prefix-cache-mib %lld "
+                             "holds %lld tokens rather than %lld",
+                             names.c_str(), humanb(layout.rep_bytes).c_str(),
+                             humanb(slot_bytes).c_str(), humanb(each).c_str(),
+                             (long long)cfg_.prefix_cache_mib, (long long)held,
+                             (long long)(tc.host_cap_bytes / each * tc.block_tokens));
+                }
                 if (held < ctx)
                     RAD_WARN("kv tiers: --prefix-cache-mib %lld holds %lld tokens of context (%s "
                              "per %lld-token block), less than one --max-model-len %lld "

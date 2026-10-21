@@ -28,7 +28,6 @@ int TierExec::configure(Registry* reg, KVManager* kv, IdleTiers* tiers,
     shared_        = shared;
     RAD_TRY(rad_dev_set(device_));
 
-    int64_t off = 0;
     for (int32_t g : groups) {
         const KVGroupPlan* p = kv->plan(g);
         if (!p || !p->paged()) continue;
@@ -39,7 +38,7 @@ int TierExec::configure(Registry* reg, KVManager* kv, IdleTiers* tiers,
         gi.layer_stride = p->layer_stride();
         gi.n_blocks = p->n_blocks;
         gi.base = p->base;
-        gi.off = off;
+        gi.replicated = p->replicated;
         if (p->zero) {
             gi.zero = true;
             gi_.push_back(gi);
@@ -60,10 +59,18 @@ int TierExec::configure(Registry* reg, KVManager* kv, IdleTiers* tiers,
             close();
             return RAD_E_UNSUPPORTED;
         }
-        off += gi.n_layers * gi.frag;
         gi_.push_back(gi);
     }
     if (gi_.empty()) return RAD_E_UNSUPPORTED;
+    /* The staging entry is the replicated groups first, then this rank's own, each in cached-group
+     * order, so the two windows of the slot are each one contiguous run of the entry. */
+    int64_t off = 0;
+    for (GroupInfo& gi : gi_)
+        if (gi.replicated && !gi.zero) { gi.off = off; off += gi.n_layers * gi.frag; }
+    rep_bytes_ = off;
+    for (GroupInfo& gi : gi_)
+        if (!gi.replicated && !gi.zero) { gi.off = off; off += gi.n_layers * gi.frag; }
+    own_bytes_ = off - rep_bytes_;
     /* Every cached group is zero on this rank, so its entry would be empty. One rank that cannot
      * take part turns the tiers off for all. */
     if (off == 0) {
@@ -75,15 +82,73 @@ int TierExec::configure(Registry* reg, KVManager* kv, IdleTiers* tiers,
     entry_bytes_ = off;
 
     /* Nothing is built on the device here; see device_init(). */
-    verify_ = leader && std::getenv("RADIANCE_DEBUG_TIER_VERIFY") != nullptr;
+    verify_ = std::getenv("RADIANCE_DEBUG_TIER_VERIFY") != nullptr;
+    verify_rep_ = verify_ && !leader_ && rep_bytes_ > 0;
 
-    char buf[320];
+    char buf[400];
     std::snprintf(buf, sizeof buf,
-                  "kv tier transfer: %zu paged group(s), %s an entry, batches of %d through "
+                  "kv tier transfer: %zu paged group(s), %s an entry%s%s%s, batches of %d through "
                   "gather_rows/scatter_rows at u8",
-                  gi_.size(), humanb(entry_bytes_).c_str(), max_batch_);
+                  gi_.size(), humanb(entry_bytes_).c_str(),
+                  rep_bytes_ > 0 ? " (" : "",
+                  rep_bytes_ > 0 ? humanb(rep_bytes_).c_str() : "",
+                  rep_bytes_ > 0 ? " of it replicated on every rank and held once a slot)" : "",
+                  max_batch_);
     report_ = buf;
     enabled_ = true;
+    return RAD_OK;
+}
+
+int TierExec::slot_layout(const std::vector<const KVManager*>& ranks,
+                          const std::vector<int32_t>& groups, SlotLayout* out) {
+    if (!out || ranks.empty()) return RAD_E_INVAL;
+    for (const KVManager* kv : ranks) if (!kv) return RAD_E_INVAL;
+    SlotLayout L;
+    L.own_off.assign(ranks.size(), 0);
+    L.own_bytes.assign(ranks.size(), 0);
+    for (int32_t g : groups) {
+        const KVGroupPlan* p0 = ranks[0]->plan(g);
+        if (!p0 || !p0->paged()) continue;
+        bool replicated = false;
+        for (size_t i = 0; i < ranks.size(); ++i) {
+            const KVGroupPlan* p = ranks[i]->plan(g);
+            replicated = replicated || (p && p->replicated);
+        }
+        if (!replicated) {
+            for (size_t i = 0; i < ranks.size(); ++i) {
+                const KVGroupPlan* p = ranks[i]->plan(g);
+                if (p && p->paged()) L.own_bytes[i] += p->bytes_per_block;
+            }
+            continue;
+        }
+        /* Every rank reads the one window back into its own pool, so the group must be the same
+         * width everywhere, declared replicated everywhere and carved everywhere. */
+        for (size_t i = 0; i < ranks.size(); ++i) {
+            const KVGroupPlan* p = ranks[i]->plan(g);
+            const char* why = !p || !p->paged()        ? "does not hold it as a paged group"
+                              : p->zero                ? "declares it zero (rad_kv_group_zero)"
+                              : !p->replicated         ? "does not declare it replicated"
+                              : p->bytes_per_block != p0->bytes_per_block
+                                                       ? "holds it at another width"
+                                                       : nullptr;
+            if (!why) continue;
+            RAD_ERR("kv tiers: KV group '%s' is declared replicated (rad_kv_group_replicated) on "
+                    "one rank, but rank %zu %s. A replicated group is held whole and alike on "
+                    "every rank, since every rank restores it from the one copy a slot holds.",
+                    p0->name.c_str(), i, why);
+            return RAD_E_STATE;
+        }
+        L.rep_bytes += p0->bytes_per_block;
+        L.replicated.push_back(p0->name);
+    }
+    int64_t slot = L.rep_bytes;
+    for (size_t i = 0; i < ranks.size(); ++i) {
+        L.own_off[i] = slot;
+        slot += L.own_bytes[i];
+        L.entry_bytes = std::max(L.entry_bytes, L.rep_bytes + L.own_bytes[i]);
+    }
+    L.slot_bytes = slot;
+    *out = std::move(L);
     return RAD_OK;
 }
 
@@ -118,6 +183,10 @@ void TierExec::close() {
     order_.clear();
     verify_pending_.clear();
     entry_bytes_ = 0;
+    rep_bytes_ = own_bytes_ = 0;
+    verify_ = verify_rep_ = false;
+    out_sum_.clear();
+    rep_sum_.clear();
     enabled_ = false;
     leader_ = false;
     reg_ = nullptr; kv_ = nullptr; tiers_ = nullptr;
@@ -128,6 +197,7 @@ void TierExec::release_device() {
     if (stage_)    { rad_dev_free(stage_, RAD_MEM_DEVICE); stage_ = nullptr; }
     if (idx_dev_)  { rad_dev_free(idx_dev_, RAD_MEM_DEVICE); idx_dev_ = nullptr; }
     if (idx_host_) { rad_dev_free(idx_host_, RAD_MEM_HOST_PINNED); idx_host_ = nullptr; }
+    if (vrep_)     { rad_dev_free(vrep_, RAD_MEM_HOST_PINNED); vrep_ = nullptr; }
     for (int i = 0; i < kRing; ++i) {
         if (ring_ev_[i]) rad_event_destroy(ring_ev_[i]);
         ring_ev_[i] = nullptr;
@@ -156,7 +226,11 @@ int TierExec::device_init() {
     bool ev = rad_event_create(&ev_compute_) == RAD_OK && rad_event_create(&ev_copy_) == RAD_OK &&
               rad_event_create(&ev_restore_) == RAD_OK;
     for (int i = 0; i < kRing && ev; ++i) ev = rad_event_create(&ring_ev_[i]) == RAD_OK;
-    if (!stage_ || !idx_dev_ || !idx_host_ || !ev) { release_device(); return RAD_E_NOMEM; }
+    if (verify_rep_) vrep_ = (char*)rad_dev_alloc(copy_idx_ * rep_bytes_, RAD_MEM_HOST_PINNED);
+    if (!stage_ || !idx_dev_ || !idx_host_ || !ev || (verify_rep_ && !vrep_)) {
+        release_device();
+        return RAD_E_NOMEM;
+    }
     /* Borrow the mover's maintenance stream if there is one; both move bytes nobody waits for,
      * and a fourth hardware queue costs about 13 ms per decode step. Never the step's own
      * stream, or a copy out would become a dependency of the next token. */
@@ -212,27 +286,60 @@ int TierExec::run_rows(const Resolved& r, bool scatter, const GroupInfo& gi, int
 
 /* ------------------------------------------------------------------ RADIANCE_DEBUG_TIER_VERIFY */
 
-static uint64_t tier_fnv(const void* p, int64_t n) {
-    uint64_t h = 1469598103934665603ull;
+/* FNV-1a, continued from `h` so one sum can run over the two windows of a slot. */
+static uint64_t tier_fnv_from(uint64_t h, const void* p, int64_t n) {
     const unsigned char* b = (const unsigned char*)p;
     for (int64_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
     return h;
 }
-
-void TierExec::verify_note(const BlockHash& key, const void* p, int64_t n) {
-    if (!verify_ || !leader_ || !p || n <= 0) return;
-    out_sum_[key] = tier_fnv(p, n);
+static uint64_t tier_fnv(const void* p, int64_t n) {
+    return tier_fnv_from(1469598103934665603ull, p, n);
 }
 
-void TierExec::verify_check(const BlockHash& key, const void* p, int64_t n) {
-    if (!verify_ || !leader_ || !p || n <= 0) return;
+/* One sum over the entry as the slot holds it: the replicated window, then this rank's own. */
+uint64_t TierExec::entry_sum(const char* slot) const {
+    const uint64_t h = tier_fnv(slot, rep_bytes_);
+    return tier_fnv_from(h, slot + slot_off_, own_bytes_);
+}
+
+void TierExec::verify_note(const BlockHash& key, const char* slot) {
+    if (!verify_ || !leader_ || !slot) return;
+    out_sum_[key] = entry_sum(slot);
+}
+
+void TierExec::verify_check(const BlockHash& key, const char* slot) {
+    if (!verify_ || !leader_ || !slot) return;
     auto it = out_sum_.find(key);
     if (it == out_sum_.end()) return;               /* never went out through this process */
-    const uint64_t back = tier_fnv(p, n);
+    const uint64_t back = entry_sum(slot);
     if (back == it->second) return;
     RAD_ERR("kv tiers: the attention blocks for %s came back different (%016llx out, %016llx in); "
             "the tier moved the wrong bytes",
             key.str().c_str(), (unsigned long long)it->second, (unsigned long long)back);
+}
+
+bool TierExec::take_replicated_sum(const BlockHash& key, uint64_t* sum) {
+    auto it = rep_sum_.find(key);
+    if (it == rep_sum_.end()) return false;
+    if (sum) *sum = it->second;
+    rep_sum_.erase(it);
+    return true;
+}
+
+bool TierExec::verify_replicated(const TierJob& j, int rank, uint64_t follower_sum) {
+    if (!verify_ || !leader_ || rep_bytes_ <= 0 || !tiers_ || j.host_slot < 0) return false;
+    const char* slot = (const char*)tiers_->arena().at(j.host_slot);
+    if (!slot) return false;
+    ++st_.rep_checked;
+    const uint64_t mine = tier_fnv(slot, rep_bytes_);
+    if (mine == follower_sum) return true;
+    ++st_.rep_mismatch;
+    RAD_ERR("kv tiers: the replicated groups of %s differ between rank 0 (%016llx) and rank %d "
+            "(%016llx). The plugin declared them replicated (rad_kv_group_replicated) and rank %d "
+            "holds other bytes; its restore would read rank 0's.",
+            j.key.str().c_str(), (unsigned long long)mine, rank, (unsigned long long)follower_sum,
+            rank);
+    return false;
 }
 
 /* ------------------------------------------------------------------ helpers */
@@ -276,11 +383,28 @@ int TierExec::copy_runs(const std::vector<TierJob*>& order, size_t first, int64_
         while (k + run < n && order[first + (size_t)(k + run)]->host_slot == s0 + run) ++run;
         char* host = (char*)tiers_->arena().at(s0);
         if (!host) return RAD_E_STATE;
-        host += slot_off_;
         char* dev = (char*)stage_ + k * entry_bytes_;
-        const int st = out
-            ? rad_memcpy_2d_async(host, slot_bytes_, dev, entry_bytes_, entry_bytes_, run, stream_)
-            : rad_memcpy_2d_async(dev, entry_bytes_, host, slot_bytes_, entry_bytes_, run, stream_);
+        int st = RAD_OK;
+        if (out) {
+            /* The replicated window is the leader's to write; a verifying follower keeps its own
+             * gather beside the copy, indexed by the job's place in the pass. */
+            if (rep_bytes_ > 0 && leader_)
+                st = rad_memcpy_2d_async(host, slot_bytes_, dev, entry_bytes_, rep_bytes_, run,
+                                         stream_);
+            if (st == RAD_OK && verify_rep_ && vrep_)
+                st = rad_memcpy_2d_async(vrep_ + (int64_t)(first + (size_t)k) * rep_bytes_,
+                                         rep_bytes_, dev, entry_bytes_, rep_bytes_, run, stream_);
+            if (st == RAD_OK && own_bytes_ > 0)
+                st = rad_memcpy_2d_async(host + slot_off_, slot_bytes_, dev + rep_bytes_,
+                                         entry_bytes_, own_bytes_, run, stream_);
+        } else {
+            if (rep_bytes_ > 0)
+                st = rad_memcpy_2d_async(dev, entry_bytes_, host, slot_bytes_, rep_bytes_, run,
+                                         stream_);
+            if (st == RAD_OK && own_bytes_ > 0)
+                st = rad_memcpy_2d_async(dev + rep_bytes_, entry_bytes_, host + slot_off_,
+                                         slot_bytes_, own_bytes_, run, stream_);
+        }
         if (st != RAD_OK) return st;
         k += run;
     }
@@ -326,22 +450,27 @@ int TierExec::enqueue_copy(std::vector<TierJob>& jobs, RadStream compute) {
         for (int64_t s = 0; s < n; s += max_batch_) {
             const int64_t c = std::min<int64_t>(max_batch_, n - s);
             for (size_t gidx = 0; gidx < gi_.size(); ++gidx)
-                for (int64_t l = 0; l < gi_[gidx].n_layers && !gi_[gidx].zero; ++l)
+                for (int64_t l = 0; l < gi_[gidx].n_layers && gathers(gi_[gidx]); ++l)
                     TIER_TRY(run_rows(gi_[gidx].gather, /*scatter=*/false, gi_[gidx], l, stage_,
                                       idx_dev_ + (int64_t)gidx * n + s, c),
                              "the gather out of the pool");
             TIER_TRY(copy_runs(order_, (size_t)s, c, /*out=*/true), "the copy to host memory");
         }
-        st_.bytes_out += n * entry_bytes_;
+        st_.bytes_out += n * (leader_ ? entry_bytes_ : own_bytes_);
     }
 
     TIER_TRY(rad_event_record(ev_copy_, stream_), "marking the copy");
     copy_out_ = true;
     ++st_.passes;
     st_.jobs += (int64_t)jobs.size();
-    if (verify_)
-        for (const TierJob& j : jobs)
-            verify_pending_.push_back({j.key, j.blocks.empty() ? -1 : j.host_slot});
+    if (verify_) {
+        int64_t ord = 0;
+        for (const TierJob& j : jobs) {
+            const bool moved = !j.blocks.empty();
+            verify_pending_.push_back({j.key, moved ? j.host_slot : -1, moved ? ord : -1});
+            if (moved) ++ord;
+        }
+    }
     return RAD_OK;
 }
 
@@ -353,9 +482,11 @@ int TierExec::copy_state() {
     copy_out_ = false;
     if (q > 0 && verify_) {
         for (const VerifyNote& v : verify_pending_) {
-            if (v.host_slot >= 0)
-                verify_note(v.key, (char*)tiers_->arena().at(v.host_slot) + slot_off_,
-                            entry_bytes_);
+            if (v.host_slot < 0) continue;
+            if (leader_)
+                verify_note(v.key, (const char*)tiers_->arena().at(v.host_slot));
+            else if (verify_rep_ && vrep_ && v.ord >= 0)
+                rep_sum_[v.key] = tier_fnv(vrep_ + v.ord * rep_bytes_, rep_bytes_);
         }
     }
     verify_pending_.clear();
@@ -432,8 +563,7 @@ int TierExec::issue_restore(std::vector<TierJob>& jobs, RadStream compute,
     order_.clear();
     for (size_t i = 0; i < m; ++i) order_.push_back(&jobs[i]);
     for (size_t i = 0; i < m; ++i)
-        verify_check(jobs[i].key, (char*)tiers_->arena().at(jobs[i].host_slot) + slot_off_,
-                     entry_bytes_);
+        verify_check(jobs[i].key, (const char*)tiers_->arena().at(jobs[i].host_slot));
 
     /* From here a failure leaves blocks partly overwritten. Mark jobs started first, so report()
      * drops a failed started job instead of trusting its host copy. The compute stream waits on
