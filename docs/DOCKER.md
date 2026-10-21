@@ -131,6 +131,9 @@ the cards the engine runs on.
 | `flashnext-bf16.yaml` | `qwen3.8-flash-next-bf16.rad` | Qwen3.8-Flash-Next in bf16, streamed from the disk tier. A reference, not a production server |
 | `qwen3.6-35b-a3b.yaml` | `qwen3.6-35b-a3b-fp8.rad` | Qwen3.6-35B-A3B, FP8 |
 | `ornith-1.5-35b-a3b.yaml` | `ornith-1.5-35b-a3b-fp8.rad` | Ornith-1.5-35B-A3B, FP8, MTP, vision |
+| `sage-a1.5.yaml` | `sage-a1.5-fp8.rad` | Sage-A1.5, FP8, MTP, vision |
+| `sage-a1.5-tp1.yaml` | `sage-a1.5-fp8.rad` | The same on one card: the expert plane partly in an 8 GiB pinned host pool, one 262,144-token session |
+| `sage-a1.5-df2.yaml` | `sage-a1.5-fp8-df2.rad` | Sage-A1.5 with incoai's Qwen3.6-35B-A3B DFlash2 drafter in place of the MTP head, vision |
 | `qwen3.8-27b-fp8.yaml` | `qwen3.8-27b-fp8.rad` | Qwen3.8-27B FP8 with its DFlash2 drafter and vision tower |
 | `qwen3.8-27b-mxfp4.yaml` | `qwen3.8-27b-mxfp4.rad` | Qwen3.8-27B with AMD's Quark AWQ-MXFP4 trunk, its DFlash2 drafter and vision tower |
 | `qwen3.8-27b-paro.yaml` | `qwen3.8-27b-paro-int4.rad` | Qwen3.8-27B ParoQuant int4 (learned rotations) with its DFlash2 drafter and vision tower, on one card; the int5 and MXFP4 containers serve from it too |

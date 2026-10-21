@@ -6055,6 +6055,26 @@ MetaKV q35moe_meta() {
     return k;
 }
 
+/* The 35B-A3B-VL: the routed trunk with the Qwen3.5 vision tower beside it, as Sage-A1.5 and
+ * Ornith-1.5 carry it. The fixture's trunk is q35fp8_meta's (5120 wide), so the tower emits
+ * that width; the shipped checkpoints' tower is 2048, the real trunk's width. */
+MetaKV q35moe_vl_meta() {
+    MetaKV k = q35moe_meta();
+    k.set("vision_config.depth", "2")
+     .set("vision_config.hidden_size", "1152")
+     .set("vision_config.num_heads", "16")
+     .set("vision_config.intermediate_size", "4304")
+     .set("vision_config.patch_size", "16")
+     .set("vision_config.temporal_patch_size", "2")
+     .set("vision_config.in_channels", "3")
+     .set("vision_config.spatial_merge_size", "2")
+     .set("vision_config.out_hidden_size", "5120")
+     .set("vision_config.num_position_embeddings", "2304")
+     .set("vision_config.deepstack_visual_indexes", "")
+     .set("vision_config.hidden_act", "gelu_pytorch_tanh");
+    return k;
+}
+
 /* A DFlash2 drafter merged under `draft.`: two layers reading trunk layers 1, 3 and 5, a block
  * of 8 (seven drafts), the selector of rank 64 over 8 candidates. */
 MetaKV with_dflash2(MetaKV k) {
@@ -6699,6 +6719,46 @@ TEST(qwen35moe_fp8_routes_every_expert_and_folds_the_shared_arm) {
 TEST(qwen35moe_fp8_steps_lint_clean_with_its_routed_mtp_head) {
     MetaKV mk = q35moe_meta();
     lint_qwen35_fp8_family(qwen35moe_fp8::declare, qwen35moe_fp8::step, mk.meta(), 3, false, 0);
+}
+
+/* The 35B-A3B-VL: the routed trunk and the vision tower declare together, the tower once and
+ * not a copy a rank, and the routed MTP head beside them -- Sage-A1.5's shape, which no fixture
+ * covered before (the MoE fixture had no tower, the VL fixture was dense). */
+TEST(qwen35moe_fp8_declares_the_vision_tower_beside_the_routed_trunk) {
+    MetaKV mk = q35moe_vl_meta();
+    /* With no encoder budget the tower is not declared, whatever the container carries. */
+    {
+        RadBuilder b;
+        RadBuildCtx ctx = vl_ctx(0);
+        REQUIRE_EQ(qwen35moe_fp8::declare(&b, mk.meta(), &ctx), RAD_OK);
+        CHECK(b.encoder_name.empty());
+        CHECK(find_w(b, "v.patch.weight") == nullptr);
+        CHECK_EQ(count_op(b, "router_topk"), 8);
+    }
+    RadBuilder b;
+    RadBuildCtx ctx = vl_ctx(1024);
+    ctx.max_spec = 3;
+    REQUIRE_EQ(qwen35moe_fp8::declare(&b, mk.meta(), &ctx), RAD_OK);
+
+    CHECK_EQ(b.encoder_name, std::string("vision"));
+    CHECK_EQ(b.encoder.modalities, (uint32_t)(RAD_MM_IMAGE | RAD_MM_VIDEO));
+    CHECK_EQ(b.encoder.max_patches, 1024);
+    CHECK_EQ(b.encoder.n_embd, 5120);
+    CHECK_EQ(b.encoder.merge, 4);
+
+    /* The trunk is still the routed one (eight blocks, plus the MTP layer's own router under
+     * --max-spec 3), and the shared expert is still folded in. */
+    CHECK_EQ(count_op(b, "router_topk"), 9);
+    CHECK(count_op(b, "moe_gemm_q") >= 16);
+
+    /* 3 stem + 12 a block + 6 merger, each mapped from the checkpoint's model.visual.*. */
+    int nv = 0;
+    for (const auto& w : b.weights)
+        if (w.name.rfind("v.", 0) == 0) {
+            ++nv;
+            CHECK(find_map(b, w.name) != nullptr);
+        }
+    CHECK_EQ(nv, 3 + 12 * 2 + 6);
 }
 
 /* `layer_types` is checked against the interval rule, not ignored: a model built with the wrong

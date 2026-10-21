@@ -263,6 +263,16 @@ and every difference is behind `#if QWEN35_MOE` in the shared source. It is a se
 unit rather than a branch on `n_expert` because the id is half the selection key, and one `.so`
 cannot claim both ids.
 
+**Drafters.** The container's own MTP head is the default, and `rad-convert --draft-model` can
+replace it with a DFlash2 block drafter; the shared source declares it (`declare_dflash2`) and
+does not declare the MTP head when a DFlash2 drafter is present, so the routed trunk carries a dense drafter
+without further work. `sage-a1.5-fp8-df2.rad` is such a container: Sage-A1.5's routed trunk with
+`incoai/Qwen3.6-35B-A3B-DFlash2`, whose six 2048-wide layers read eight taps
+(`target_layer_ids` 1 6 11 16 22 27 32 37) and propose a block of seven tokens in one pass. At
+depth 7 it accepts ~49% of the proposals and decodes 1.40x faster than the same trunk with its MTP
+head (393 against 282 tok/s on two R9700s). `--num-speculative-tokens auto` takes the depth the
+drafter states.
+
 ## `qwen35_w8a8`
 
 The dense build again, behind `#if QWEN35_W8A8`, for a container `data/recipes/q38-27b-w8a8-df2.recipe`

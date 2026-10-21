@@ -25,6 +25,8 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | Qwen3.6-35B-A3B FP8, MTP | `qwen3.6-35b-a3b-fp8.rad` (35 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.6-35b-a3b-fp8) | `qwen3.6-35b-a3b.yaml` |
 | Ornith-1.5-35B-A3B FP8, MTP, vision | `ornith-1.5-35b-a3b-fp8.rad` (35 GiB) | [download](https://huggingface.co/keptn/ornith-1.5-35b-a3b-fp8) | `ornith-1.5-35b-a3b.yaml` |
 | Ornith-1.5-35B-A3B w4a8: 4-bit experts (GPTQ), MTP, vision, fits one card | `ornith-1.5-35b-a3b-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/ornith-1.5-35b-a3b-w4a8) | `ornith-1.5-35b-a3b-w4a8.yaml` |
+| Sage-A1.5 FP8, MTP, vision | `sage-a1.5-fp8.rad` (35 GiB) | [download](https://huggingface.co/Aijuus/sage-a1.5-fp8) | `sage-a1.5.yaml`, `sage-a1.5-tp1.yaml` |
+| Sage-A1.5 FP8, DFlash2 drafter, vision | `sage-a1.5-fp8-df2.rad` (34 GiB) | [download](https://huggingface.co/Aijuus/sage-a1.5-fp8-df2) | `sage-a1.5-df2.yaml` |
 | MiniCPM5-2B FP8, DSpark drafter | `minicpm5-2b-fp8.rad` (3 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-fp8) | `minicpm5-2b.yaml` |
 | MiniCPM5-2B bf16, DSpark drafter | `minicpm5-2b-bf16.rad` (5 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-bf16) | `minicpm5-2b-bf16.yaml` |
 | Gemma 4 31B: GPTQ int4 trunk, int8 activations, MTP, vision | `gemma4-31b-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-w4a8) | `gemma4-31b-w4a8.yaml` |
