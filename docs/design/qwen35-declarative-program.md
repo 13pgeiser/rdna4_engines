@@ -134,7 +134,6 @@ Remaining arch-side batched paths (slice 3):
 
 - `batch_chunk_full_attn_fallback` / `run_fa_layer_body`: the per-token
   full-attention fallback for weights the batched path does not admit;
-- `dense_tp_attention_partial` (dense TP decode);
 - the MoE layer bodies `batch_chunk_delta_net_moe` and
   `batch_chunk_full_attn_moe{,_prep,_finish}` (they call the moved stages,
   but their projections, PARO arms and always-residual output projection
@@ -194,7 +193,8 @@ by its consumer. The alternative, `HeadLocal` plus a separate row-split
 graph resource between two ops. The hybrid mixers fuse that boundary
 (fused gate + MQ-rotate attention epilogue feeding a prerotated GEMV,
 gated norm + MQ rotate in DeltaNet), and `HeadLocal` has no partial output.
-Qwen4's attention and GDN blocks are the second consumer of the same rule.
+Qwen4's attention and GDN blocks are the intended second consumer; they are
+still `Opaque` today.
 
 ### The `MixerOutput::Write` arm
 

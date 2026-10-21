@@ -422,7 +422,8 @@ fn gated_mlp_admission(
 /// and every other placed weight of the op is a head split
 /// (`HeadSharded`, `FusedQkv`, `ColumnShard { axis: 0 }`); then `heads` and
 /// `kv_heads` must split evenly over `parts` and every split weight passes
-/// [`weight_geometry`]. A weight missing from the plan is left to the walk.
+/// [`weight_geometry`]. Every weight the op reads (including `out_proj`) must
+/// be planned, else `UnknownWeight`.
 #[allow(clippy::too_many_arguments)]
 fn head_mixer_admission(
     graph: &StepGraph,
@@ -434,12 +435,15 @@ fn head_mixer_admission(
     heads: usize,
     kv_heads: usize,
 ) -> Result<(), SplitError> {
-    let placement = |w: ResourceId| {
-        graph
-            .resources()
-            .get(w.0 as usize)
-            .and_then(|r| find_weight(plan, &r.class))
-    };
+    let resource = |w: ResourceId| graph.resources().get(w.0 as usize);
+    let placement = |w: ResourceId| resource(w).and_then(|r| find_weight(plan, &r.class));
+    // A split rank would otherwise run a head projection it holds no slice of.
+    for &w in decl.reads.iter().chain([&out_proj]) {
+        let weight = resource(w).is_some_and(|r| matches!(r.class, ResourceClass::Weight { .. }));
+        if weight && placement(w).is_none() {
+            return Err(SplitError::UnknownWeight { op, resource: w });
+        }
+    }
     let Some(out) = placement(out_proj) else {
         return Ok(());
     };
@@ -2721,5 +2725,26 @@ mod tests {
             split_program(&b.g, &plan, &mesh).unwrap_err(),
             SplitError::NeedsGather { op, resource: a }
         );
+        // Every weight the op reads must be planned, split or replicated.
+        for missing in ["qkv", "wo"] {
+            for split in [true, false] {
+                let (qkv_policy, out_policy) = if split {
+                    (qkv_heads(MIX_KV), row_policy())
+                } else {
+                    (ShardPolicy::Replicate, ShardPolicy::Replicate)
+                };
+                let mut b = B::new();
+                let x = b.act(MLP_H);
+                let (op, _, qkv, wo) = head_mixer(&mut b, 0, x, qkv_policy, out_policy, MIX_KV);
+                b.ws.retain(|entry| entry.name != missing);
+                let plan = b.plan(&mesh, 1);
+                let resource = if missing == "qkv" { qkv } else { wo };
+                assert_eq!(
+                    split_program(&b.g, &plan, &mesh).unwrap_err(),
+                    SplitError::UnknownWeight { op, resource },
+                    "{missing} missing, split {split}"
+                );
+            }
+        }
     }
 }

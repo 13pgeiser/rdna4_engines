@@ -859,6 +859,11 @@ fn deltanet_shard(
     op: &DeltaNetMixerOp<'_>,
     out: &GpuTensor,
 ) -> Result<(), DispatchError> {
+    if op.prerotated_input {
+        return Err(DispatchError::Hip(
+            "deltanet shard: a prerotated input is not admitted".into(),
+        ));
+    }
     let dims = &op.dims;
     let (k_dim, v_dim) = (dims.key_width(), dims.value_width());
     let n_v_heads = dims.linear_value_heads;
