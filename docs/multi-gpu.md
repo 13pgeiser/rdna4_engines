@@ -1027,6 +1027,107 @@ token. The first decode token after load runs direct and the second captures
 `HIPFIRE_TP2_GRAPH_REPLAYS`) and with greedy transcript identity against
 `HIPFIRE_TP_FULL_GRAPH=0`.
 
+### Generic mesh executor: TP collectives (developer)
+
+`Gpus::provision_mesh_edges` admits pure PP meshes (TP = EP = 1) and pure TP
+meshes (PP = EP = 1). TP×PP and any EP axis are refused before any mesh state
+is written. For a pure TP mesh the executor runs the splitter's `AllReduceAdd`
+and `AllReduce` collectives over the group of every rank in rank order, with
+the hand dense-TP routes' numeric contract: `x + (p0 + p1 + …)` and
+`p0 + p1 + …`, the same bytes on every rank. The transport is chosen once at
+provisioning, and each transport has exactly one route (no per-call choice;
+`peer_access_enabled`, `HIPFIRE_TP_PEER_DIRECT` and `hardware.tp_use_rccl` do
+not apply to it):
+
+- **Peer**: every rank pair is one device under `HIPFIRE_EMULATE_GPUS` or
+  passes `qualify_peer`. Each rank pulls every partial with the same kernel
+  copy that `qualify_peer` byte-checks (never `hipMemcpyPeer`, which writes
+  nothing into allocations made after peer enable) and folds the sum locally.
+  Producer and read events order the cross-rank reads; nothing waits on the
+  host.
+- **Host**: some pair is not peer-qualified. The hand route's host-staged
+  rank-order reduction (`Gpus::all_reduce_sum_f32_host`), then `x + sum` on
+  each rank. It synchronizes the rank streams. RCCL is never used, as in the
+  hand dense-TP route (`qwen35` `dense_tp_all_reduce_sum_f32`).
+
+Scratch, events, host staging and kernels are prepared at provisioning. The
+whole epoch is validated before the first enqueue (group = every rank
+ascending, one occurrence per rank, F32 descriptors equal on every rank,
+16-byte aligned, no overlapping operands or targets, the replaced
+`Accumulate` not scheduled), and a failed drain quarantines the mesh exactly
+as for PP edges. Family bindings return the operand as `BoundaryIo::view`, the
+`AllReduceAdd` target as `BoundaryIo::into`, and `Gpus::mesh_tp_epoch()` as
+the descriptor epoch. An `AllReduceAdd` operand's contents are unspecified
+afterwards.
+
+Oracle: byte identity against the single-device rank-order sum over three
+undrained epochs with distinct partials, for the provisioned transport and the
+forced host transport, plus a TP×EP refusal. Every oracle buffer is allocated
+after provisioning has enabled peer access. On one device:
+
+```sh
+cargo test -p hipfire-runtime --lib --no-run   # prints the unittests binary
+for n in 2 4; do HIPFIRE_EMULATE_GPUS=$n <binary> \
+  multi_gpu::executor::tests::tp_collectives_match_single_device_rank_order_sum \
+  --ignored --nocapture --test-threads=1; done
+```
+
+Physical runbook (gfx1201, not run on a single-device box). Run the same
+binary without `HIPFIRE_EMULATE_GPUS`: every visible device is one rank.
+
+1. **Peer reads into post-enable allocations (the arm that guards the Peer
+   transport).** `HIP_VISIBLE_DEVICES` = two, then four peer-capable cards.
+   Pass: the `provisioned transport Peer` line (not `Host`) and the `host`
+   line both report byte identity on every rank. Provisioning enables peer
+   access before the oracle allocates its activations, so a copy mechanism
+   that does not reach post-enable allocations fails the `x`/`n` comparison
+   (the partials differ per epoch, so a stale read fails too). A `Host`
+   provisioned line on cards expected to be peer-capable means `qualify_peer`
+   refused the pair; record it.
+2. **Optional reference.** The same arm with the binary from the first PR head
+   (`99853a2db`, rooted `hipMemcpyPeerAsync` route) shows whether the
+   `hipMemcpyPeer` trap reproduces on that ROCm; arm 1 must pass either way.
+3. **Host transport.** Arm 1's `host` line already runs it on the same cards.
+   If the box has a pair without peer access, run that pair too: its
+   provisioned line must read `Host`.
+
+Record per arm the `TP<n> oracle` lines (FNV-64 digests of `x` and `n`), the
+binary MD5, `HIP_VISIBLE_DEVICES` and the ROCm version.
+
+### Dense FFN tensor parallelism: `GatedMlp` split (developer)
+
+`SplitRule::GatedMlp` splits a dense gated MLP along its intermediate: gate
+and up `ColumnShard { axis: 0 }`, down `RowShard { axis: 1 }`. Every rank
+runs the op's kernel ladder unchanged on its `intermediate / parts` slice
+with the input whole (the pre-norm needs complete rows), and the output is a
+partial sum that its consumer reduces: an `Accumulate` fuses one
+`AllReduceAdd`, any other whole reader takes an `AllReduce`. All-`Replicate`
+weights, or a single TP part (a PP stage), keep the op whole and local.
+Admission refuses, without allocating, a mixed policy, gate/up/down that do
+not share one intermediate, `intermediate % (parts * group)` on the down
+weight, and a ladder with no shard-safe form (`SandwichWide`: its post-norm
+epilogue cannot take a partial sum).
+
+The first end-to-end use is the Qwen4 dense developer profile: each rank
+holds the whole model with only its BF16 FFN slice
+(`Qwen4Weights::shard_dense_ffn`, which records `(rank, parts)`),
+`qwen4_tp_plan` reduces each layer's FFN output before its `HyperWrite`
+(and refuses a packed FFN), and `Qwen4TpBindings` runs a rank's program in
+one segment per collective after checking the plan is that of exactly its
+shards. A rank's FFN hands its F32 partial to the reduction
+(`MlpStorage::Bf16SourcePartial`); the HC write rounds the sum once, as the
+unsharded FFN output is rounded once. Everything except the FFN is
+replicated. Sessions, checkpoints and prefix repair are not admitted on TP
+yet, and the loader has no Qwen4 TP route. Oracle (tokens and logits
+byte-identical to a single-device run of the same rank shards that sums the
+FFN partials in rank order, and reported against the plain single card):
+
+```sh
+cargo test --release -p hipfire-arch-qwen4 --features qwen4-dev-profiles --lib --no-run
+for n in 2 4; do HIPFIRE_EMULATE_GPUS=$n HIPFIRE_QWEN4_DEV_ARTIFACT=<tiny-dense-dev .hfq> \
+  <binary> mesh_tp::hw_tests --ignored --nocapture --test-threads=1; done
+```
+
 ### Architectural limits (current)
 
 - Homogeneous **exact arch string** by default (`ALLOW_MIXED_ARCH` is opt-in).
