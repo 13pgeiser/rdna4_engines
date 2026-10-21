@@ -21986,6 +21986,19 @@ static float ar_pattern_value(int rank, int64_t i) {
     return (float)((int)((i * 37 + (int64_t)rank * 101) % 509) - 254) / 64.0f;
 }
 
+/* The exact all-reduces' input. ar_pattern_value's sums are exact in fp32 in any order (eight
+ * values of 8 significant bits within 2^8 of each other), so a fold in another order would pass
+ * against them. These are bf16 values (8 significant bits) whose exponents span 2^-12 to 2^12,
+ * so an fp32 partial sum rounds and only the order the oracle uses, ascending rank from 0.0f,
+ * gives its bits: whoever owns a word, in however many pieces, must fold it that way. */
+static float ar_rough_value(int rank, int64_t i) {
+    uint64_t h = (uint64_t)i * 0x9E3779B97F4A7C15ull ^ ((uint64_t)rank + 1) * 0xC2B2AE3D27D4EB4Full;
+    h ^= h >> 29; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 32;
+    const float m = (float)(128 + (int)(h & 127)) / 128.0f;
+    const int e = (int)((h >> 7) % 25) - 12;
+    return ((h >> 12) & 1 ? -1.0f : 1.0f) * std::ldexp(m, e);
+}
+
 /* The pattern for the two-shot's coded form (r4d_ar_twoshot_Nrank_exact.hip), which codes a group
  * of 64 consecutive values on a shared exponent and sends a group it cannot code raw: the
  * per-element pattern, with groups sent down each path -- an exponent range of exactly 14 (coded)
@@ -22007,7 +22020,7 @@ static float ar_coded_value(int rank, int64_t i) {
     }
 }
 static float ar_value(int coded_pattern, int rank, int64_t i) {
-    return coded_pattern ? ar_coded_value(rank, i) : ar_pattern_value(rank, i);
+    return coded_pattern ? ar_coded_value(rank, i) : ar_rough_value(rank, i);
 }
 
 static void ar_pattern_worker(ArPattern* t) {
@@ -22102,7 +22115,7 @@ static bool ar_pattern_check(const RadKernelInfo* row, const std::vector<int>& d
             for (int64_t i = 0; i < n; ++i) {
                 float acc = 0.0f;
                 for (int r = 0; r < world; ++r) {
-                    const float v = ar_pattern_value(r, i);
+                    const float v = ar_rough_value(r, i);
                     acc += bf ? h_bf16(h_to_bf16(v)) : v;
                 }
                 const float want = bf ? h_bf16(h_to_bf16(acc)) : acc;
@@ -22440,10 +22453,10 @@ static void ar8_perf_worker(Ar8Perf* t) {
         for (int64_t i = 0; i < n; ++i) {
             float acc = 0.0f;
             for (int r = 0; r < t->world; ++r) {
-                const float v = ar_pattern_value(r, i);
+                const float v = ar_rough_value(r, i);
                 acc += bf ? h_bf16(h_to_bf16(v)) : v;
             }
-            const float v = ar_pattern_value(t->rank, i);
+            const float v = ar_rough_value(t->rank, i);
             if (bf) {
                 const uint16_t b = h_to_bf16(v), w = h_to_bf16(acc);
                 std::memcpy(&h[(size_t)i * 2], &b, 2); std::memcpy(&want[(size_t)i * 2], &w, 2);
