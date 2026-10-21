@@ -2,7 +2,7 @@
  * one MLA + indexer + MoE layer the plugin declares and steps itself.
  *
  *   h = gather(the trunk's final hidden states, at the rows this pass continues from)
- *   e = embed(the token one position on)
+ *   e = embed(the token one position on), the encoder's rows over its placeholders
  *   x = eh_proj( concat( enorm(e), hnorm(h) ) )            the normalized embedding first
  *   x += attention(norm(x)); the proposal rows: x += moe(norm(x))        <- the plugin's layer
  *   h' = shared_head.norm(x);  logits = the trunk's lm_head over h'
@@ -20,6 +20,7 @@
 #ifndef RAD_BLOCK_GLM_MTP_H
 #define RAD_BLOCK_GLM_MTP_H
 #include "rad_glm_tp.h"
+#include "rad_block_vit.h"
 
 namespace rad {
 namespace arch {
@@ -38,9 +39,13 @@ struct GlmMtp {
     rad_op op_prev = 0, op_embed = 0, op_embed_ar = 0, op_en = 0, op_hn = 0, op_eh = 0;
     rad_op op_residual = 0, op_select = 0, op_back = 0;
     rad_op op_norm = 0, op_copy = 0, op_head = 0;
+    MediaRows mrows{};
 
-    /* The buffers, the weights, and the ops up to the layer's input. */
-    int declare_inputs(RadBuilder* b, const Geom& geom, const Wire& wire) {
+    /* The buffers, the weights, and the ops up to the layer's input. `media`: the encoder's rows
+     * replace the placeholders' embeddings, as the target's do (SGLang feeds its draft model the
+     * target's image rows); without them the drafts read the placeholder's embedding and
+     * acceptance falls on a prompt with a picture. */
+    int declare_inputs(RadBuilder* b, const Geom& geom, const Wire& wire, bool media) {
         g = geom;
         w = wire;
         if (!b || !w.final_hidden || !w.logits || !w.token || !w.head || g.max_spec < 1)
@@ -78,6 +83,7 @@ struct GlmMtp {
                                         RAD_INT("vocab_offset", g.vocab_off)),
                              RAD_WEIGHTS(w.token)),
                       {}, { embedding });
+        if (media) RAD_ARCH_TRY(mrows.declare(b, g.max_tok, 4096, embedding));
         op_embed_ar = GlmTp::reduce(b, g, embedding, true);
         op_en = rmsnorm(b, en, embedding, concat);
         op_hn = rmsnorm(b, hn, hidden, concat);
@@ -143,6 +149,7 @@ struct GlmMtp {
                         praw(batch->out_ids, RAD_I32, batch->n_out), brows(hidden, batch->n_out));
         RAD_ISSUE_N(c, op_embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(w.token),
                     brows(embedding, T));
+        mrows.step(c, batch, embedding, T);
         if (op_embed_ar) RAD_ISSUE_N(c, op_embed_ar, T * 4096, brows(embedding, T), RAD_NONE);
         RAD_ISSUE_N(c, op_en, T, brows(embedding, T), RAD_W(en), bcol(concat, 0, 4096, T));
         RAD_ISSUE_N(c, op_hn, T, brows(hidden, T), RAD_W(hn), bcol(concat, 4096, 4096, T));

@@ -1383,11 +1383,12 @@ TEST(glm53_is_the_pinned_graph_and_steps) {
     }
 }
 
-/* ==================================================================== fixtures */
+/* ==================================================================== GLM-5.3's vision tower */
 namespace {
 
-/* GLM-5.3-Flash's container keys, the four the plugin reads. */
-MetaKV glm53_meta() {
+/* GLM-5.3-Flash's container keys with its vision_config, the tower cut to two blocks at the real
+ * widths, enough to see a block repeat. */
+MetaKV glm53_vl_meta() {
     RadModelMeta m{};
     m.n_layers = 45;
     m.n_embd = 4096;
@@ -1395,12 +1396,25 @@ MetaKV glm53_meta() {
     m.rms_eps = 1e-5f;
     MetaKV k(m);
     k.set("num_nextn_predict_layers", "1").set("hc_mult", "4").set("n_routed_experts", "288")
-     .set("index_topk", "2048");
+     .set("index_topk", "2048")
+     .set("vision_config.model_type", "glm5_next_vision")
+     .set("vision_config.depth", "2")
+     .set("vision_config.hidden_size", "1024")
+     .set("vision_config.num_heads", "16")
+     .set("vision_config.intermediate_size", "4096")
+     .set("vision_config.patch_size", "14")
+     .set("vision_config.temporal_patch_size", "2")
+     .set("vision_config.in_channels", "3")
+     .set("vision_config.spatial_merge_size", "2")
+     .set("vision_config.out_hidden_size", "4096")
+     .set("vision_config.projection_intermediate_size", "10240")
+     .set("vision_config.swiglu_limit", "10")
+     .set("vision_config.hidden_act", "silu")
+     .set("vision_config.attention_bias", "1")
+     .set("vision_config.rms_norm_eps", "1.0000000000000001e-05");
     return k;
 }
 
-/* The served container's encodings: block fp8 at f32 scales for the attention and dense linears
- * and the MTP layer's experts, MXFP4 for the trunk's experts. */
 void glm53_encs(RadBuilder& b) {
     const auto mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
     const auto fp8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 128, 128);
@@ -1415,16 +1429,309 @@ void glm53_encs(RadBuilder& b) {
                { "ffn_down.weight", fp8 } };
 }
 
-/* A deployment of 512 rows a step, four sequences, 4k of context. */
-RadBuildCtx glm53_ctx(int rank, int world, int max_spec = 3) {
+RadBuildCtx glm53_vl_ctx(int rank, int world, int64_t patches, int max_spec = 3) {
     RadBuildCtx c = spec_ctx(rank, world, max_spec);
     c.max_tok = 512;
     c.max_seqs = 4;
     c.max_ctx = 4096;
+    c.max_enc_patches = patches;
     return c;
 }
 
 }  /* namespace */
+
+/* The tower is declared only with an encoder budget, last, its weights replicated in their own
+ * groups past the 45 layers and the MTP layer's, its 2-D rotary the axial one at sixteen
+ * frequencies an axis, gate and up joined gate first; one scatter over the trunk's embedding and
+ * one over the draft head's. */
+TEST(glm53_declares_its_vision_tower_when_the_engine_asks_for_it) {
+    MetaKV mk = glm53_vl_meta();
+    for (int world : { 1, 8 }) {
+        const int rank = world - 1;
+        {
+            RadBuilder b;
+            glm53_encs(b);
+            RadBuildCtx ctx = glm53_vl_ctx(rank, world, 0);
+            REQUIRE_EQ(glm5next::declare(&b, mk.meta(), &ctx), RAD_OK);
+            CHECK(b.encoder_name.empty());
+            CHECK(find_w(b, "v.patch.weight") == nullptr);
+            CHECK_EQ(count_op(b, "scatter_rows"), 0);
+        }
+        RadBuilder b;
+        glm53_encs(b);
+        RadBuildCtx ctx = glm53_vl_ctx(rank, world, 1024);
+        REQUIRE_EQ(glm5next::declare(&b, mk.meta(), &ctx), RAD_OK);
+        const auto& m = *glm5next::models[rank];
+        CHECK_EQ(b.encoder_name, std::string("vision"));
+        CHECK_EQ(b.encoder.modalities, (uint32_t)RAD_MM_IMAGE);
+        CHECK_EQ(b.encoder.patch_dim, 3 * 2 * 14 * 14);
+        CHECK_EQ(b.encoder.merge, 4);
+        CHECK_EQ(b.encoder.max_patches, 1024);
+        CHECK_EQ(b.encoder.n_embd, 4096);
+        const RecBuf* out = find_b(b, "v.out");
+        REQUIRE(out != nullptr);
+        CHECK_EQ(out->d.shape[0], 256);
+        CHECK_EQ(out->d.shape[1], 4096);
+        CHECK_EQ(count_op(b, "scatter_rows"), 2);
+        CHECK(m.mrows.op < m.embed_ar || world == 1);
+        CHECK(m.mtp.mrows.op > m.mtp.op_embed);
+        /* Declared after every text and draft op. */
+        CHECK(m.vit.op_patch > m.mtp.op_head);
+
+        /* 2 stem + 12 a block + 8 downsample and merger, each from model.visual.*. */
+        int nv = 0;
+        for (const auto& w : b.weights)
+            if (w.name.rfind("v.", 0) == 0) {
+                ++nv;
+                const RecMap* mp = find_map(b, w.name);
+                REQUIRE(mp != nullptr);
+                for (const auto& s : mp->src) CHECK(s.rfind("model.visual.", 0) == 0);
+                CHECK_EQ(w.d.shard, (int)RAD_SHARD_NONE);
+                CHECK(w.d.group.layer == -1 || w.d.group.layer >= 46);
+            }
+        CHECK_EQ(nv, 2 + 12 * 2 + 8);
+        const RecWeight* blk1 = find_w(b, "v.blk.1.qkv.weight");
+        REQUIRE(blk1 != nullptr);
+        CHECK_EQ(blk1->d.group.layer, 47);
+        const RecMap* gu = find_map(b, "v.blk.1.gate_up.weight");
+        REQUIRE(gu != nullptr);
+        CHECK_EQ(gu->mode, (int)RAD_MAP_CONCAT);
+        REQUIRE_EQ(gu->src.size(), (size_t)2);
+        CHECK_EQ(gu->src[0], std::string("model.visual.blocks.1.mlp.gate_proj.weight"));
+        CHECK_EQ(gu->src[1], std::string("model.visual.blocks.1.mlp.up_proj.weight"));
+        const RecWeight* ds = find_w(b, "v.downsample.weight");
+        REQUIRE(ds != nullptr);
+        CHECK_EQ(ds->d.shape[0], 4096);
+        CHECK_EQ(ds->d.shape[1], 4096);
+        const RecWeight* pe = find_w(b, "v.patch.weight");
+        REQUIRE(pe != nullptr);
+        CHECK_EQ(pe->d.shape[1], 1176);
+
+        int qk = 0;
+        for (const auto& o : b.ops)
+            if (o.op == "qk_norm_rope") {
+                ++qk;
+                CHECK_EQ(pstr(&o, "mode"), std::string("axial"));
+                CHECK_EQ(pstr(&o, "sections"), std::string("16 16"));
+                CHECK_EQ(pint(&o, "head_dim"), 64);
+                CHECK_EQ(pint(&o, "rotary_dim"), 64);
+                CHECK_EQ(pint(&o, "n_head"), 16);
+                CHECK_EQ(pflt(&o, "theta"), 10000.0);
+                CHECK_EQ(o.w.size(), (size_t)2);
+            }
+        CHECK_EQ(qk, 2);
+        const RecOp* unf = find_op(b, "conv2d_unfold");
+        REQUIRE(unf != nullptr);
+        CHECK_EQ(pint(unf, "width"), 2);
+        CHECK_EQ(pint(unf, "cin"), 1024);
+        CHECK_EQ(pint(unf, "kh"), 2);
+        CHECK_EQ(pint(unf, "stride"), 2);
+        CHECK_EQ(pint(unf, "cu_div"), 2);
+        int clipped_tower = 0, clipped_merger = 0;
+        for (const auto& o : b.ops)
+            if (o.op == "swiglu_clamped") {
+                clipped_tower += pint(&o, "n") == 4096;
+                clipped_merger += pint(&o, "n") == 10240;
+                CHECK_EQ(pflt(&o, "limit"), 10.0);
+            }
+        CHECK_EQ(clipped_tower, 2);
+        CHECK_EQ(clipped_merger, 1);
+        CHECK_EQ(count_op(b, "gelu"), 1);
+        int merger_ln = 0;
+        for (const auto& o : b.ops) merger_ln += o.op == "layernorm" && pint(&o, "n") == 4096;
+        CHECK_EQ(merger_ln, 1);
+    }
+    /* Without speculation the draft head and its scatter are not declared. */
+    RadBuilder nb;
+    glm53_encs(nb);
+    RadBuildCtx nc = glm53_vl_ctx(0, 1, 1024, 0);
+    REQUIRE_EQ(glm5next::declare(&nb, mk.meta(), &nc), RAD_OK);
+    CHECK_EQ(count_op(nb, "scatter_rows"), 1);
+    RadArchProbe p{};
+    CHECK_OK(glm5next::probe(mk.meta(), &p));
+    CHECK_EQ(p.enc_merge, 4);
+}
+
+/* What the tower does not serve is refused by name at declare, not computed as another model. */
+TEST(glm53_refuses_a_vision_tower_it_does_not_serve) {
+    const struct { const char* key; const char* val; int rc; } kCases[] = {
+        { "vision_config.hidden_act", "gelu", RAD_E_UNSUPPORTED },
+        { "vision_config.rope_parameters.rope_type", "default", RAD_E_UNSUPPORTED },
+        { "vision_config.out_hidden_size", "2048", RAD_E_INVAL },
+    };
+    for (const auto& kc : kCases) {
+        MetaKV mk = glm53_vl_meta();
+        mk.set(kc.key, kc.val);
+        RadBuilder b;
+        glm53_encs(b);
+        RadBuildCtx ctx = glm53_vl_ctx(0, 1, 1024);
+        const int rc = stderr_of_rc([&] { return glm5next::declare(&b, mk.meta(), &ctx); });
+        if (rc != kc.rc) fprintf(stderr, "    %s = %s: %d\n", kc.key, kc.val, rc);
+        CHECK_EQ(rc, kc.rc);
+    }
+}
+
+/* An encoder pass issues the tower and nothing else: the stem, two blocks, the post-norm, the
+ * downsample's unfold and GEMM, and the merger, over two pictures of 8 x 8 patches. The rotary
+ * reads the row and column planes, attention and the unfold the segment bounds. */
+TEST(a_glm53_encoder_pass_issues_the_tower_and_nothing_else) {
+    MetaKV mk = glm53_vl_meta();
+    for (int world : { 1, 8 }) {
+        const int rank = world - 1;
+        RadBuilder b;
+        glm53_encs(b);
+        RadBuildCtx ctx = glm53_vl_ctx(rank, world, 1024);
+        REQUIRE_EQ(glm5next::declare(&b, mk.meta(), &ctx), RAD_OK);
+        static uint16_t pix[128 * 1176];
+        static int32_t coord[4 * 128];
+        static const int32_t cu[] = { 0, 64, 128 };
+        RadBatch batch{};
+        batch.enc         = 1;
+        batch.enc_n_patch = 128;
+        batch.enc_pixels  = pix;
+        batch.enc_coord   = coord;
+        batch.enc_n_seg   = 2;
+        batch.enc_cu      = cu;
+        batch.enc_max_seg = 64;
+        RadCtx c{ .b = &b, .batch = &batch };
+        c.rank = rank;
+        c.world = world;
+        glm5next::step(&c, &batch);
+        CHECK_LINT(b, &c);
+        CHECK(c.step_fail.empty());
+
+        std::vector<std::string> want = { "gemm_nt_bias" };
+        for (int l = 0; l < 2; ++l)
+            for (const char* s : { "rmsnorm", "gemm_nt_bias", "qk_norm_rope", "attn_dense",
+                                   "gemm_nt_bias", "rmsnorm", "gemm_nt_bias", "swiglu_clamped",
+                                   "gemm_nt_bias" })
+                want.push_back(s);
+        for (const char* s : { "rmsnorm", "conv2d_unfold", "gemm_nt_bias", "gemm_nt", "layernorm",
+                               "gelu", "gemm_nt", "swiglu_clamped", "gemm_nt" })
+            want.push_back(s);
+        CHECK_EQ(join(issued_ops(b, c)), join(want));
+        CHECK_EQ(c.issues.back().n, 32);
+        const RecIssue* qk = issue_of(b, c, "qk_norm_rope");
+        REQUIRE(qk != nullptr);
+        CHECK(qk->opd[1].raw == coord);
+        CHECK_EQ(qk->opd[1].rows, 2);
+        CHECK_EQ(qk->opd[1].cols, 128);
+        const RecIssue* at = issue_of(b, c, "attn_dense");
+        REQUIRE(at != nullptr);
+        CHECK_EQ(at->opd[0].cols, 1024);
+        CHECK_EQ(at->opd[1].offset, 1024);
+        CHECK_EQ(at->opd[2].offset, 2048);
+        CHECK(at->opd[3].raw == cu);
+        /* The unfold reads the post-norm as 64 rows of two patches and writes 32 merged rows. */
+        const RecIssue* un = issue_of(b, c, "conv2d_unfold");
+        REQUIRE(un != nullptr);
+        CHECK_EQ(un->n, 64);
+        CHECK_EQ(un->opd[0].rows, 64);
+        CHECK(un->opd[1].raw == cu);
+        CHECK_EQ(un->opd[3].rows, 32);
+
+        RadBatch big = batch;
+        big.enc_n_patch = 2048;
+        RadCtx c2{ .b = &b, .batch = &big };
+        glm5next::step(&c2, &big);
+        CHECK(!c2.step_fail.empty());
+        CHECK(c2.issues.empty());
+    }
+}
+
+/* A prefill chunk whose tokens 1..4 are a picture's rows: the trunk writes them over the lookup
+ * before the embedding's all-reduce, and so does the draft head's history pass over its own
+ * lookup; a text-only step on the same program issues no scatter. */
+TEST(a_glm53_step_with_a_picture_scatters_its_rows_in_the_trunk_and_the_draft_head) {
+    MetaKV mk = glm53_vl_meta();
+    for (int world : { 1, 4 }) {
+        RadBuilder b;
+        glm53_encs(b);
+        RadBuildCtx ctx = glm53_vl_ctx(0, world, 1024);
+        REQUIRE_EQ(glm5next::declare(&b, mk.meta(), &ctx), RAD_OK);
+        static const int32_t rows[] = { 1, 2, 3, 4 };
+        static uint16_t embd[4 * 4096];
+        auto pf = kit(b, {}, { 6 });
+        pf->b.n_mm_rows = 4;
+        pf->b.mm_rows = rows;
+        pf->b.mm_embd = embd;
+        auto his = history_pass(b, *pf);
+        his->b.n_mm_rows = 4;
+        his->b.mm_rows = rows;
+        his->b.mm_embd = embd;
+        auto v = run_passes(b, glm5next::step, { pf.get(), his.get() }, 0, world);
+        CHECK_PASSES(b, v);
+        for (int p = 0; p < 2; ++p) {
+            const std::vector<std::string> ops = issued_ops(b, *v[(size_t)p]);
+            REQUIRE(ops.size() > 3);
+            const size_t at = (size_t)(std::find(ops.begin(), ops.end(), "embed_lookup") -
+                                       ops.begin());
+            REQUIRE(at + 1 < ops.size());
+            CHECK_EQ(ops[at + 1], std::string("scatter_rows"));
+            if (world > 1) CHECK_EQ(ops[at + 2], std::string("all_reduce"));
+            const RecIssue* sc = issue_of(b, *v[(size_t)p], "scatter_rows");
+            REQUIRE(sc != nullptr);
+            CHECK_EQ(sc->n, 4);
+            CHECK(sc->opd[0].raw == embd);
+            CHECK_EQ(sc->opd[0].cols, 4096);
+            CHECK(sc->opd[1].raw == rows);
+            CHECK_EQ(sc->opd[2].rows, 6);
+            CHECK_EQ(count_issued(ops, "scatter_rows"), 1);
+        }
+        auto dc = kit(b, { 1, 1 }, {});
+        auto t = run_passes(b, glm5next::step, { dc.get() }, 0, world);
+        CHECK_PASSES(b, t);
+        CHECK(issue_of(b, *t[0], "scatter_rows") == nullptr);
+    }
+}
+
+/* A sizing declare with the tower is the real graph at fewer rows: the same ops with the same
+ * fixed parameters (the attention's longest segment included), and nothing declared to the core. */
+TEST(glm53_sizing_declares_with_the_vision_tower_match_the_real_graph) {
+    MetaKV mk = glm53_vl_meta();
+    for (int64_t R : { 256 }) {
+        RadBuildCtx c = glm53_vl_ctx(3, 8, 16384);
+        c.max_tok = 4096;
+        c.max_seqs = 8;
+        c.max_ctx = 32768;
+        RadBuilder full;
+        glm53_encs(full);
+        REQUIRE_EQ(glm5next::declare(&full, mk.meta(), &c), RAD_OK);
+        CHECK_EQ(full.encoder_name, std::string("vision"));
+        RadBuildCtx p = c;
+        p.max_tok = R;
+        p.shape_probe = 1;
+        RadBuilder small;
+        glm53_encs(small);
+        REQUIRE_EQ(glm5next::declare(&small, mk.meta(), &p), RAD_OK);
+        CHECK(small.encoder_name.empty());
+        REQUIRE_EQ(small.ops.size(), full.ops.size());
+        int differ = 0;
+        for (size_t i = 0; i < full.ops.size(); ++i) {
+            if (small.ops[i].op != full.ops[i].op) { ++differ; continue; }
+            REQUIRE_EQ(small.ops[i].p.size(), full.ops[i].p.size());
+            for (size_t k = 0; k < full.ops[i].p.size(); ++k) {
+                const RecParam& a = full.ops[i].p[k];
+                const RecParam& q = small.ops[i].p[k];
+                if (a.kind == RAD_P_RANGE) continue;
+                if (full.ops[i].op == "qsa_work" && a.key == "work" && q.ival <= a.ival) continue;
+                if (a.ival != q.ival || a.sval != q.sval || a.dval != q.dval) {
+                    fprintf(stderr, "    R %lld: op %zu '%s' param '%s': %lld real, %lld small\n",
+                            (long long)R, i, full.ops[i].op.c_str(), a.key.c_str(), a.ival,
+                            q.ival);
+                    ++differ;
+                }
+            }
+        }
+        CHECK_EQ(differ, 0);
+        REQUIRE_EQ(small.bufs.size(), full.bufs.size());
+        for (size_t i = 0; i < full.bufs.size(); ++i) {
+            for (uint32_t d = 1; d < full.bufs[i].d.rank; ++d)
+                CHECK_EQ(small.bufs[i].d.shape[d], full.bufs[i].d.shape[d]);
+            CHECK(small.bufs[i].d.shape[0] <= full.bufs[i].d.shape[0]);
+        }
+    }
+}
 
 RAD_TEST_MAIN()
 
@@ -1537,13 +1844,13 @@ TEST(glm53_issues_every_op_with_the_operand_count_its_schema_declares) {
         fprintf(stderr, "    no kernel library under $RADIANCE_HOME/kernels; nothing to count\n");
         return;
     }
-    MetaKV mk = glm53_meta();
+    MetaKV mk = glm53_vl_meta();
     std::set<std::string> uncovered, wrong;
     for (int world : { 8, 1 }) {
         const int rank = world == 8 ? 3 : 0;
         RadBuilder b;
         glm53_encs(b);
-        RadBuildCtx ctx = glm53_ctx(rank, world, 5);
+        RadBuildCtx ctx = glm53_vl_ctx(rank, world, 1024, 5);
         ctx.max_tok = 4096;
         ctx.max_seqs = 8;
         ctx.max_ctx = 65536;
@@ -1616,11 +1923,11 @@ TEST(glm53_issues_every_op_with_the_operand_count_its_schema_declares) {
 /* ==================================================================== the container's names */
 namespace {
 
-/* The served container, GLM-5.3-Flash-Quark-MXFP4.rad, as `rad-info -v` lists it: each weight's
- * name and stored encoding, for the model, one KDA layer (0, with the dense feed-forward of
- * layers 0 to 2), one MLA layer (3, with its experts 0 and 287) and the MTP layer under its
- * `mtp.` scope (the fp8 linears of its layer under `mtp.mtp.`, as the converter wrote them). The
- * other layers of a kind carry the same names at their own index. */
+/* The served container, GLM-5.3-Flash-Quark-MXFP4-vision.rad, as `rad-info -v` lists it: each
+ * weight's name and stored encoding, for the model, one KDA layer (0, with the dense feed-forward
+ * of layers 0 to 2), one MLA layer (3, with its experts 0 and 287), the MTP layer under its
+ * `mtp.` scope (the fp8 linears of its layer under `mtp.mtp.`, as the converter wrote them) and
+ * the tower's first block. The other layers of a kind carry the same names at their own index. */
 struct ContainerWeight {
     const char* name;
     const char* enc;
@@ -1629,6 +1936,16 @@ const ContainerWeight kGlm53Container[] = {
     { "output.weight", "bf16" },
     { "output_norm.weight", "bf16" },
     { "token_embd.weight", "bf16" },
+    { "v.downsample.bias", "bf16" },
+    { "v.downsample.weight", "bf16" },
+    { "v.merger.down.weight", "bf16" },
+    { "v.merger.gate_up.weight", "bf16" },
+    { "v.merger.norm.bias", "bf16" },
+    { "v.merger.norm.weight", "bf16" },
+    { "v.merger.proj.weight", "bf16" },
+    { "v.patch.bias", "bf16" },
+    { "v.patch.weight", "bf16" },
+    { "v.post_norm.weight", "bf16" },
     { "blk.0.attn_beta.weight", "bf16" },
     { "blk.0.attn_forget_a.weight", "bf16" },
     { "blk.0.attn_forget_b.weight", "bf16" },
@@ -1706,6 +2023,18 @@ const ContainerWeight kGlm53Container[] = {
     { "mtp.blk.45.ffn_down_exps.0.weight", "fp8_e4m3*f32[128x128]" },
     { "mtp.blk.45.ffn_gate_up_exps.287.weight", "fp8_e4m3*f32[128x128]" },
     { "mtp.blk.45.ffn_down_exps.287.weight", "fp8_e4m3*f32[128x128]" },
+    { "v.blk.0.down.bias", "bf16" },
+    { "v.blk.0.down.weight", "bf16" },
+    { "v.blk.0.gate_up.bias", "bf16" },
+    { "v.blk.0.gate_up.weight", "bf16" },
+    { "v.blk.0.k_norm.weight", "bf16" },
+    { "v.blk.0.norm1.weight", "bf16" },
+    { "v.blk.0.norm2.weight", "bf16" },
+    { "v.blk.0.proj.bias", "bf16" },
+    { "v.blk.0.proj.weight", "bf16" },
+    { "v.blk.0.q_norm.weight", "bf16" },
+    { "v.blk.0.qkv.bias", "bf16" },
+    { "v.blk.0.qkv.weight", "bf16" },
 };
 
 RadEncoding container_enc(const std::string& e) {
@@ -1718,7 +2047,7 @@ RadEncoding container_enc(const std::string& e) {
 
 /* The table above expanded to every layer: a KDA layer's names from layer 0 (its dense
  * feed-forward in layers 0 to 2 only), an MLA layer's from layer 3, the MoE's from layer 3 into
- * every layer from 3. `encs` answers rad_weight_encoding as
+ * every layer from 3, the tower's 24 blocks from block 0. `encs` answers rad_weight_encoding as
  * the container would; an expert's key stands without its index, so every expert matches it,
  * and the keys run longest first, because the fake matches a key anywhere in the name asked
  * (`output.weight` is inside `blk.3.attn_output.weight`). */
@@ -1755,6 +2084,8 @@ const Glm53Container& glm53_container() {
                              n.find(".glm_router.") != std::string::npos;
             for (int l = 3; l < 45; ++l)
                 if (moe || l % 4 == 3) put(at_layer(n, 6, l), w.enc);
+        } else if (n.rfind("v.blk.0.", 0) == 0) {
+            for (int l = 0; l < 24; ++l) put("v.blk." + std::to_string(l) + "." + n.substr(8), w.enc);
         } else {
             put(n, w.enc);
         }
@@ -1784,12 +2115,12 @@ std::string as_expert_zero(std::string n) {
  * the eight-card start. */
 TEST(glm53_declares_the_served_containers_names_and_their_encodings) {
     const Glm53Container& c = glm53_container();
-    MetaKV mk = glm53_meta();
+    MetaKV mk = glm53_vl_meta();
     for (int world : { 8, 1 }) {
         RadBuilder b;
         b.kv_block = 4;
         b.encs = c.encs;
-        RadBuildCtx ctx = glm53_ctx(world == 8 ? 5 : 0, world);
+        RadBuildCtx ctx = glm53_vl_ctx(world == 8 ? 5 : 0, world, 1024);
         REQUIRE_EQ(glm5next::declare(&b, mk.meta(), &ctx), RAD_OK);
         std::map<std::string, const RecWeight*> declared;
         for (const RecWeight& w : b.weights) declared[w.name] = &w;

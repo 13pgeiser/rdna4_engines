@@ -1,8 +1,9 @@
 /* glm5next -- GLM-5.3-Flash (`model_type: glm5_next`) from AMD's Quark MXFP4 export: four mHC
  * residual streams over 34 KDA and 11 sparse latent-attention (MLA) layers behind a DSA indexer,
  * 288 MXFP4 experts at top-8 under sigmoid routing, block-FP8 attention and dense layers at f32
- * scales, each weight served as the container stores it; its MTP layer is a serial drafter.
- * docs/ARCHITECTURES.md describes the model and its traps.
+ * scales, each weight served as the container stores it; its MTP layer is a serial drafter, and
+ * its vision tower is declared when the container carries it and the deployment asks for an
+ * encoder. docs/ARCHITECTURES.md describes the model and its traps.
  *
  * The blocks live in arch/common (installed as <arch/...>), one a file:
  *
@@ -12,6 +13,7 @@
  *   rad_block_glm_indexer.h   GlmIndexer     the DSA indexer, DsaCache its key cache and selection
  *   rad_block_glm_router.h    GlmRouter      the correction-bias router (through MoeFP8)
  *   rad_block_glm_mtp.h       GlmMtp         the draft head around the plugin's layer 45
+ *   rad_block_glm_vision.h    GlmVision      the tower, MediaRows its rows over the embeddings
  *   rad_glm_tp.h              GlmTp          the shards, the row runs and the split thresholds
  *
  * This file declares the buffers the blocks share, places the blocks and issues the step's
@@ -23,6 +25,7 @@
 #include <arch/rad_block_glm_mla.h>
 #include <arch/rad_block_glm_indexer.h>
 #include <arch/rad_block_glm_mtp.h>
+#include <arch/rad_block_glm_vision.h>
 #include <arch/rad_block_mlp_fp8.h>
 #include <arch/rad_block_moe_fp8.h>
 #include <memory>
@@ -61,6 +64,10 @@ struct Model {
     bool have_mtp = false;
     GlmMtp mtp{};
     Layer draft{};
+    /* Media: the tower, and its rows over the trunk's embedding (the draft head scatters its own). */
+    bool media = false;
+    GlmVision vit{};
+    MediaRows mrows{};
 };
 static std::unique_ptr<Model> models[MAX_RANKS];
 static thread_local std::unique_ptr<Model> probe_model;
@@ -416,6 +423,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                    RAD_INT("vocab_offset", g.vocab_off)),
                         RAD_WEIGHTS(m.token)),
                  {}, { m.x });
+    // The encoder's rows overwrite the lookup before its reduction (MediaRows).
+    m.media = GlmVision::present(meta) && ctx->max_enc_patches > 0;
+    if (m.media) RAD_ARCH_TRY(m.mrows.declare(b, g.max_tok, 4096, m.x));
     m.embed_ar = GlmTp::reduce(b, g, m.x, true);
     m.expand = copy(b, g, m.x, m.h0);
     m.layers.resize(45);
@@ -442,14 +452,18 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
            { m.logit_input }, { m.logits });
     if (g.max_spec > 0) {
         GlmMtp::Wire tw{ m.final_hidden, m.logits, m.token, m.head };
-        RAD_ARCH_TRY(m.mtp.declare_inputs(b, g, tw));
+        RAD_ARCH_TRY(m.mtp.declare_inputs(b, g, tw, m.media));
         RAD_ARCH_TRY(layer(b, m, m.draft, m.mtp.nm, 45, true));
         RAD_ARCH_TRY(m.mtp.declare_head(b));
         m.have_mtp = true;
     }
+    // The tower, last: an encoder pass issues nothing else, so its activations share the arena
+    // with every buffer above. Its weight groups follow the 45 layers and the MTP layer's.
+    if (m.media) RAD_ARCH_TRY(m.vit.declare(b, meta, ctx, nm, 4096, 46));
     rad_note(b,
-             "GLM-5.3: TP%d, 45 mHC layers, 34 KDA + 11 sparse MLA, mixed MXFP4/FP8, native MTP %s",
-             world, m.have_mtp ? "enabled" : "disabled");
+             "GLM-5.3: TP%d, 45 mHC layers, 34 KDA + 11 sparse MLA, mixed MXFP4/FP8, native MTP "
+             "%s, vision %s",
+             world, m.have_mtp ? "enabled" : "disabled", m.media ? "enabled" : "disabled");
     return RAD_OK;
 }
 
@@ -484,8 +498,9 @@ static void draft_pass(RadCtx* c, Model& m, const RadBatch* batch) {
 static void step(RadCtx* c, const RadBatch* batch) {
     auto& m = *models[rad_rank(c)];
     const int64_t T = batch->n_tok;
+    // An encoder pass runs only the vision tower (RadBatch::enc).
     if (batch->enc) {
-        rad_step_fail(c, "GLM vision is not implemented by this text plugin");
+        m.vit.step(c, batch);
         return;
     }
     if (batch->draft_pass) {
@@ -493,6 +508,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
         return;
     }
     RAD_ISSUE_N(c, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.x, T));
+    m.mrows.step(c, batch, m.x, T);
     if (m.embed_ar) RAD_ISSUE_N(c, m.embed_ar, T * 4096, brows(m.x, T), RAD_NONE);
     for (int i = 0; i < 4; ++i)
         RAD_ISSUE_N(c, m.expand, T, brows(m.x, T), bcol(m.h0, i * 4096, 4096, T));
@@ -521,6 +537,11 @@ static void step(RadCtx* c, const RadBatch* batch) {
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
     if (cfg(meta, "num_nextn_predict_layers", 0) == 1) out->draft_depth = GlmMtp::kDepth;
+    // The tower's merged block, so a pass size the core picks itself is whole output rows.
+    if (GlmVision::present(meta)) {
+        const int64_t k = rad_meta_geti(meta, "vision_config.spatial_merge_size", 0);
+        if (k > 0) out->enc_merge = k * k;
+    }
     out->shape_probe_ok = 1;
     return RAD_OK;
 }
