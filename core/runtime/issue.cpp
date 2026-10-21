@@ -595,8 +595,12 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                               : "has no device kernel for this band");
     /* The second lane's window (rad_lane1_window_begin): its concurrent buffers are live only across
      * it, so lane 1 runs nothing outside it, and lane 0 joins lane 1 before it runs an op outside
-     * it, on either side: a transient of such an op may share bytes with a concurrent buffer. */
-    if (program_ && program_->lane1_w1 >= 0) {
+     * it, on either side: a transient of such an op may share bytes with a concurrent buffer. An op
+     * that names no buffer (a weight read into the cache, prefetch_beside) touches nothing the window
+     * keeps live and has no transient: it runs on lane 1 anywhere and leaves no window work to join. */
+    bool names_buf = false;
+    for (int i = 0; i < n_opd && !names_buf; ++i) names_buf = opd[i].kind == RAD_OPK_BUF;
+    if (program_ && program_->lane1_w1 >= 0 && names_buf) {
         const bool outside = p.order < program_->lane1_w0 || p.order > program_->lane1_w1;
         if (lane_ == 1 && outside)
             return abort_step_msg(h, RAD_E_STATE,
@@ -610,7 +614,7 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                 return abort_step_msg(h, js, "joining the second lane outside its window failed");
         }
     }
-    if (lane_ == 1) lane1_pending_ = true;
+    if (lane_ == 1 && names_buf) lane1_pending_ = true;
 
     /* The row's DIV on the ranged parameter held at the band's upper bound, maybe not here. */
     if (ip.ranged_div > 1 && n % ip.ranged_div != 0)
