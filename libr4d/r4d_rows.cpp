@@ -4811,9 +4811,21 @@ static const RadConstraint cGemmMxfp4A8Gemv[] = {
 };
 /* gemm_mxfp4a8_gemv_wide: the same entry at 9..64 rows, where only the WMMA form serves (K % 128).
  * The form's sum order for a row is its 16-row tile's chain alone, so a row's bits are the same in
- * both rows at every M. Several streams with speculation (4 x 1 + 7 drafts = 32) land here. */
+ * both rows at every M. Several streams with speculation (4 x 1 + 7 drafts = 32) land here, except
+ * the decode kernel's short-K corner below. */
 static const RadConstraint cGemmMxfp4A8GemvWide[] = {
     C_GE("M", 9), C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "mxfp4a8"),
+};
+/* gemm_mxfp4a8_decode_shortk: the decode entry at 33..64 rows of a wide, short weight, above
+ * gemv_wide by priority. There gemv_wide's blocks hold three or four row tiles over a short K each,
+ * so the cross-wave reduction of a block weighs more than its WMMAs, and the decode kernel's split
+ * wins (R9700, each row alone, ours' gemv_wide / decode / upstream's decode, us: 19456 x 2560 at 64
+ * rows 131.8 / 93.3 / 104.5, 16384 x 2048 92.8 / 68.6 / 76.1, 9728 x 2560 74.1 / 52.5 / 67.4).
+ * Narrower N stays with gemv_wide (5120 x 2176 at 40 rows 39.2 against the decode kernel's 52.8),
+ * as does K past 2560 (17408 x 5120 at 40 rows 119.3 against 129.0). */
+static const RadConstraint cGemmMxfp4A8DecodeShortK[] = {
+    C_GE("M", 33), C_LE("M", 64), C_GE("N", 8192), C_LE("N", 36864), C_LE("K", 2560), C_DIV("K", 64),
+    C_DIV("N", 16), C_IN("dtype", "mxfp4a8"),
 };
 /* r4d_gemm_mxfp4a8_tiled. Entry point: N % 16 (the fragment-order weight), K % 64 (its narrowest
  * K slab), M >= 1. The decode and skinny rows outrank it in their bands by priority, so the band
@@ -7551,6 +7563,20 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "into the element against a per-row reference, bf16 C, fp32 accumulate",
   RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_MXDEC,
   ROW(cGemmMxfp4A8Decode), ROW(tGemmMxfp4Decode), nullptr,
+  nullptr, nullptr, r4d_rad_gemm_mxfp4a8_decode, r4d_rad_gemm_mxfp4a8_decode_scratch,
+  r4d_rad_layout_mxfp4, r4d_rad_relayout_mxfp4 },
+
+{ "gemm_mxfp4a8_decode_shortk", "gemm_nt_q", "gemm",
+  "the decode row's kernel at 33 to 64 rows of a wide, short weight (N >= 8192, K <= 2560), where "
+  "its split-K beats gemv_wide, whose blocks there spend more on the cross-wave reduction than on "
+  "the WMMAs",
+  "33 <= M <= 64; 8192 <= N <= 36864, a multiple of 16; K <= 2560, a multiple of 64; the skinny "
+  "kernel's fragment-order weight, [K/32][N] E8M0 exponents and per-row reference exponent; the "
+  "split partial in the op's scratch",
+  "e4m3 A with an f32 scale per row or per (row, 128), e2m1 W with an E8M0 scale per 32 K folded "
+  "into the element against a per-row reference, bf16 C, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_MXDEC_SHORTK,
+  ROW(cGemmMxfp4A8DecodeShortK), ROW(tGemmMxfp4Decode), nullptr,
   nullptr, nullptr, r4d_rad_gemm_mxfp4a8_decode, r4d_rad_gemm_mxfp4a8_decode_scratch,
   r4d_rad_layout_mxfp4, r4d_rad_relayout_mxfp4 },
 

@@ -51,6 +51,9 @@ enum {
     R4D_PRIO_GEMM_MXDEC   = 55,
     /* The MXFP4 gemv row (one to eight rows) outranks the decode row, whose band it shares there. */
     R4D_PRIO_GEMM_MXGEMV  = 58,
+    /* The decode kernel's short-K row outranks gemv_wide in the one corner of its band where the
+     * decode kernel is faster (33..64 rows, N >= 8192, K <= 2560). */
+    R4D_PRIO_GEMM_MXDEC_SHORTK = 59,
     /* The skinny m64 row has no upper bound on M, so the tiled bf16 row (M > 64 only) must outrank
      * it, and stays below m16, whose band it never enters. */
     R4D_PRIO_GEMM_BF16_TILED = 55,

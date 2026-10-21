@@ -26921,6 +26921,13 @@ static void device_phase(const Plugin& pl) {
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv_wide", 64, 10288, 640, 0, false);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv_wide", 33, 16, 128, 0, true);
         mxfp4a8_numeric(pl, "gemm_mxfp4a8_gemv_wide", 24, 34816, 5120, 0, true, {}, 17408);
+        /* decode_shortk: the decode kernel over its corner, both activation grids, a tile partly
+         * live, and parts. */
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode_shortk", 33, 16384, 2048, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode_shortk", 48, 9728, 2560, 0, false);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode_shortk", 64, 19456, 2560, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode_shortk", 50, 8192, 576, 0, true);
+        mxfp4a8_numeric(pl, "gemm_mxfp4a8_decode_shortk", 40, 19456, 2560, 0, true, {}, 9728);
         mxfp4a8_m_invariant(pl, "gemm_mxfp4a8_gemv", 5120, 5120, true);
         mxfp4a8_m_invariant(pl, "gemm_mxfp4a8_gemv", 1088, 576, true);
         mxfp4a8_m_invariant(pl, "gemm_mxfp4a8_gemv", 1056, 576, false);

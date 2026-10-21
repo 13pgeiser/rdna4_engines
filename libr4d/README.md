@@ -53,6 +53,7 @@ The table lists a selection; `r4d_rows.cpp` and `r4d.h` hold the full set.
 | `gemm_w2a8_nt` | 2-bit weight against int8 activation: the DFlash2 draft head |
 | `gemm_mxfp4a8_nt_m64` | OCP-MXFP4 weight, fp8 activation, skinny |
 | `gemm_mxfp4a8_decode` | the same operands for the decode band (M ≤ 128): split-K across workgroups with a last-arriver reduction, the partial in the op's scratch |
+| `gemm_mxfp4a8_decode_shortk` | the decode kernel at 33..64 rows of a wide, short weight (N ≥ 8192, K ≤ 2560), above `gemm_mxfp4a8_gemv_wide`, which loses there |
 | `gemm_mxfp4a8_tiled` | the prefill sibling: the activation re-tiled into fragment order in the op's scratch and read straight into registers, the weight unpacked once per K slab for a 256-row block |
 | `attn_decode_h128_gqa4_fp8kv` / `..._bf16kv` | head_dim 128, 4 queries per KV head, sliding window: a block-diffusion drafter's geometry. Decode only; there is no prefill row at this geometry |
 | `rowtopk_bf16` / `rowtopk_bf16_chunks` | exact per-row top-K over a bf16 matrix, two-stage |
