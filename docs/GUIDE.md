@@ -536,8 +536,9 @@ CALIB=/srv/calib/translategemma rad-convert /srv/models/google/translategemma-27
     --recipe data/recipes/translategemma-27b-mxfp4-gptq.recipe -o translategemma-27b-mxfp4-gptq.rad
 
 # GLM-5.3-Flash from AMD's Quark export: MXFP4 experts and block-FP8 attention kept as stored,
-# the latent attention's kv_b decoded to bf16; text only, the vision tower is not converted.
-# 171 GiB, served on eight 32 GB cards (docs/ARCHITECTURES.md)
+# the latent attention's kv_b decoded to bf16, the vision tower bf16 as it ships.
+# 172 GiB, served on eight 32 GB cards (docs/ARCHITECTURES.md). A container converted without the
+# tower gains it with --reuse <old container> (1.05 GiB written; --in-place extends the old one)
 rad-convert /srv/models/amd/GLM-5.3-Flash-Quark-MXFP4 \
     --recipe data/recipes/glm53-mxfp4.recipe -o glm53-flash-mxfp4.rad
 
@@ -1651,7 +1652,7 @@ The published vector, its JSON and the llama.cpp patches it was built against ar
 | `--port N` | 8000 | listen port |
 | `--api-key KEY` | none | require `Authorization: Bearer KEY` or `X-Api-Key: KEY` on every request but `/health`, `/v1/health`, `/ping` and the dashboard page (§6.6) |
 | `--served-model-name NAME` | container's name | the model id `/v1/models` lists, the metrics carry and a response names when its request named none. A request may name any model; the loaded one serves it |
-| `--mm-max-patches N` | auto | patches one vision-encoder pass carries, and so the largest image (a patch is 16x16 pixels). `auto` is 16384 when the container carries a vision tower; 0 serves text only and keeps the tower off the card |
+| `--mm-max-patches N` | auto | patches one vision-encoder pass carries, and so the largest image (a patch is 16x16 pixels, 14x14 on GLM-5.3). `auto` is 16384 when the container carries a vision tower; 0 serves text only and keeps the tower off the card |
 | `--override-chat-template PATH` | container's | a Jinja chat template file served in place of the container's. The reply format (reasoning markers, tool calls) is derived from it too, unless the architecture plugin declares one. An unreadable or empty file stops startup |
 | `--max-queued-requests N` | 8 × `--max-num-seqs` | requests admitted and unfinished at once; past it, 429 |
 | `--http-threads N` | one per hardware thread, at least 4 | HTTP workers kept while idle |
@@ -1686,7 +1687,8 @@ The published vector, its JSON and the llama.cpp patches it was built against ar
 
 **Media.** Each replaces what the container's preprocessor configuration states, and does nothing for
 a model that takes no images or video. A Qwen-VL container that states none uses 2 frames a second,
-4 to 768 frames and 768 tokens a frame.
+4 to 768 frames and 768 tokens a frame. GLM-5.3 takes pictures only, budgeted in tokens: the video
+flags are refused on it, and so are the pixel bands.
 
 | flag | default | |
 |---|---|---|
@@ -1695,7 +1697,7 @@ a model that takes no images or video. A Qwen-VL container that states none uses
 | `--video-fps F` | container's | frames sampled per second of video |
 | `--video-min-frames N`, `--video-max-frames N` | container's | the fewest and most frames sampled from a video |
 | `--video-max-frame-tokens N` | container's | the most prompt tokens one frame may become; 0 is no cap. A token-budget processor (Gemma 4's) takes 70, 140, 280, 560 or 1120 |
-| `--image-tokens N` | container's | a token-budget processor's image budget (Gemma 4's: 70, 140, 280, 560, 1120); a request's `image_tokens` overrides it. The pixel-band flags are refused on such a model |
+| `--image-tokens N` | container's | a token-budget processor's image budget: Gemma 4's 70, 140, 280, 560 or 1120, which a request's `image_tokens` overrides; GLM-5.3's ceiling, at most `--mm-max-patches` / 4 (the checkpoint states 8000, which `auto` lowers to 4096). The pixel-band flags are refused on such a model |
 | `--max-source-pixels N` | 67108864 | the largest image or frame the decoder accepts, before any resize |
 
 **Quality measurement**, instead of serving; see [TOOLS.md](TOOLS.md#the-kl-mode)

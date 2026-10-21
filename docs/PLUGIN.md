@@ -362,8 +362,9 @@ says so with `RAD_ARCH_SERVES_IMPORTS(0)` (`qwen35_w8a8` does), and imports keep
   `qk_norm_rope_gate`.
 - **Read §8** if the model has a linear or recurrent block.
 - **Media preprocessing is the core's** (`core/mm`): resizing, patching, placeholder-token
-  expansion and positions, in three processor families (Qwen-VL, Gemma 4, LFM2-VL) chosen by the
-  container's `vision_config.model_type`. A vision model with another pipeline needs a core change.
+  expansion and positions, in four processor families (Qwen-VL, Gemma 4, LFM2-VL, GLM-5.3) chosen
+  by the container's `vision_config.model_type`. A vision model with another pipeline needs a core
+  change.
   Audio goes through one of two feature extractors, Gemma 4's and Qwen3-ASR's (Whisper's), chosen
   by `audio_config.model_type`.
 - **A speech model says how it hears**, through the optional

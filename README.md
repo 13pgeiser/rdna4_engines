@@ -46,7 +46,7 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | Breeze-TTS-2 bf16: speech, whole, streamed or live, one card | `breeze-tts2-bf16.rad` (5.5 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-breeze-tts2-bf16) | `breeze-tts2.yaml` |
 | Qwen3.8-27B ParoQuant int4, int5 or MXFP4 (learned rotations), DFlash2 drafter, vision | `qwen3.8-27b-paro-int4.rad` (19 GiB; int5 22 GiB) | [convert](#convert-a-checkpoint) | `qwen3.8-27b-paro.yaml` |
 | TranslateGemma 27B MXFP4 (GPTQ), translation; optional DFlash2 drafter | `translategemma-27b-mxfp4-gptq.rad` (17 GiB) | [convert](#convert-a-checkpoint) | `translategemma-27b.yaml` |
-| GLM-5.3-Flash: MXFP4 experts and block-FP8 attention (AMD Quark), MTP, eight cards | `glm53-flash-mxfp4.rad` (171 GiB) | [convert](#convert-a-checkpoint) | `glm53-flash.yaml` |
+| GLM-5.3-Flash: MXFP4 experts and block-FP8 attention (AMD Quark), MTP, vision, eight cards | `glm53-flash-mxfp4.rad` (172 GiB) | [convert](#convert-a-checkpoint) | `glm53-flash.yaml` |
 | Qwen3.8-27B bf16 | `qwen3.8-27b-bf16.rad` (50 GiB) | [convert](#convert-a-checkpoint) | `qwen3.8-27b-bf16.yaml` |
 | Qwen3.8-Flash-Next bf16, a disk-streamed reference | `qwen3.8-flash-next-bf16.rad` (335 GiB) | [convert](#convert-a-checkpoint) | `flashnext-bf16.yaml` |
 | Stable Diffusion XL bf16 and its finetunes (Illustrious, NoobAI, Pony): text to image, one card | `illustrious-xl-v2.0-bf16.rad` (6.4 GiB), from any single-file SDXL checkpoint | [convert](#convert-a-checkpoint) | `sdxl.yaml` |
@@ -81,10 +81,12 @@ client sends on `/v1/completions` the prompt the checkpoint's template renders.
 
 GLM-5.3-Flash is converted from AMD's Quark export (`amd/GLM-5.3-Flash-Quark-MXFP4`) with
 `data/recipes/glm53-mxfp4.recipe`, which keeps every weight as stored except the latent
-attention's small kv_b, decoded to bf16. At 171 GiB it takes eight R9700s (`--tp 8`), every expert
+attention's small kv_b, decoded to bf16. At 172 GiB it takes eight R9700s (`--tp 8`), every expert
 resident, and its own MTP layer drafts. On eight R9700s it prefills 3958 tok/s at 6k tokens,
 decodes 166 tok/s on one stream and 426 over eight, and 506 under eight streams of agent turns.
-It serves text only, with a bf16 KV cache. Its template knows the reasoning efforts `low` and
+Pictures go through its own vision tower, up to 4096 tokens an image at the default encoder pass
+(`--mm-max-patches 32000` serves the checkpoint's 8000); the KV cache is bf16. Its template knows
+the reasoning efforts `low` and
 `high` and renders any other as its maximum, so `glm53-flash.yaml` maps `medium` and `xhigh`
 to `high`.
 

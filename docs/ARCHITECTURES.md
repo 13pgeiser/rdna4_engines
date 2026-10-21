@@ -14,7 +14,7 @@ plugin claims.
 | `arch/qwen35_w8a8` | `qwen35` | `w8a8_fwht128` | `qwen35_fp8` with an int8 trunk: i8 weights with a bf16 scale per 128 of K, rotated by a 128-wide Hadamard, against int8 activations under the same rotation (`data/recipes/q38-27b-w8a8-df2.recipe`) |
 | `arch/qwen35moe_fp8` | `qwen35moe` | `fp8_e4m3` | `qwen35_fp8` with the feed-forward routed |
 | `arch/qwen4exp_fp8` | `qwen4exp` | *(empty)* | Qwen4-Exp (Qwen3.8-Flash-Next), a bf16 checkpoint quantised at convert |
-| `arch/glm5next` | `glm5next` | *(empty)* | GLM-5.3-Flash from AMD's Quark MXFP4 export: four mHC residual streams over 34 KDA and 11 sparse latent-attention (MLA) layers with a DSA indexer, 288 MXFP4 experts at top-8 under sigmoid routing, block-FP8 attention and dense layers at f32 scales, each weight served as stored; its MTP layer is a serial drafter. Text only, bf16 KV |
+| `arch/glm5next` | `glm5next` | *(empty)* | GLM-5.3-Flash from AMD's Quark MXFP4 export: four mHC residual streams over 34 KDA and 11 sparse latent-attention (MLA) layers with a DSA indexer, 288 MXFP4 experts at top-8 under sigmoid routing, block-FP8 attention and dense layers at f32 scales, each weight served as stored; its MTP layer is a serial drafter. Pictures through its vision tower (`arch/common/rad_block_glm_vision.h`); bf16 KV |
 | `arch/lfm2_bf16` | `lfm2` | *(empty)* | LiquidAI's LFM2 and LFM2-VL, bf16, one rank |
 | `arch/embgemma2` | `embeddinggemma2` | *(empty)* | EmbeddingGemma 2: a bidirectional encoder with Gemma 4's vision tower and audio conformer, pooled to one vector |
 | `arch/gemma4_bf16` | `gemma4` | `compressed-tensors` | Gemma 4 31B dense with its vision tower: sliding-window and proportional-RoPE global (`attention_k_eq_v`) attention, GELU ffn, softcapped logits; int4 codes with an f16 scale per 128 from Google's CT-INT4 (QAT) release or from bf16, served w4a8, or int8 codes on the same grid from bf16 (w8a8, the Q8 container). Optional draft model (`rad-convert --draft-model`): Google's assistant, with no cache of its own (`rad_drafter_shared_kv`), or z-lab's DFlash drafter, the block `arch/gemma4` serves (`arch/common/rad_gemma4_dflash.h`), or RedHatAI's DFlash2 speculator (`arch/common/rad_block_dflash2.h`) |
@@ -411,9 +411,10 @@ The vision tower is declared when the container carries one and `--mm-max-patche
 `arch/glm5next` serves the language model of GLM-5.3-Flash (`model_type: glm5_next`) from AMD's
 Quark export, `amd/GLM-5.3-Flash-Quark-MXFP4`. Quark is an import path, not an execution format:
 the plugin claims the empty descriptor and reads each weight's encoding from the container
-(`data/recipes/glm53-mxfp4.recipe` changes one weight a layer, below). The vision tower is not
-mapped, so never converted, and an image request fails its step. The reference is SGLang's
-`glm5_next.py` and `glm5_next_nextn.py` at AMD's pinned commit 654df43.
+(`data/recipes/glm53-mxfp4.recipe` changes one weight a layer, below). Its vision tower is
+declared beside it when the container carries the tower and the deployment asks for an encoder
+(below). The reference is SGLang's `glm5_next.py` and `glm5_next_nextn.py` at AMD's pinned commit
+654df43; for the tower and its processor, transformers' `glm5_next`.
 
 The plugin is one file over blocks in `arch/common`, one block a file; it declares the buffers
 the blocks share, places them and issues the step's order.
@@ -426,6 +427,7 @@ the blocks share, places them and issues the step's order.
 | `rad_block_glm_indexer.h` | `GlmIndexer`, `DsaCache` | the DSA indexer, its key cache and selection |
 | `rad_block_glm_router.h` | `GlmRouter` | the correction-bias router, through `MoeFP8` |
 | `rad_block_glm_mtp.h` | `GlmMtp` | the draft head around the plugin's layer 45 |
+| `rad_block_glm_vision.h` | `GlmVision`, `MediaRows` | the tower, and its rows over the embeddings |
 | `rad_glm_tp.h` | `GlmTp`, `SplitF32Proj` | the shards, the split threshold, the column split of a replicated f32 projection |
 
 ```
@@ -510,8 +512,8 @@ hybrid, so a prefix-cache hit is usable only from a state checkpoint at or below
 | router, index head gates, mHC projections | f32 | `gemm_nt_f32`, `mhc_pre` |
 | embedding, lm_head, MTP eh_proj | bf16 | `embed_lookup`, `logits_gemm`, `gemm_nt` |
 
-The container holds 25845 weights, 171.32 GiB; at eight ranks each card holds 22.06 GiB of them,
-19.67 GiB the routed experts.
+The text container holds 25845 weights, 171.32 GiB, the one with the tower 26143 and 172.37 GiB;
+at eight ranks each card holds 22.06 GiB of them, 19.67 GiB the routed experts.
 
 **MTP.** The plugin declares checkpoint layer 45 as a serial drafter (`RAD_DRAFT_SERIAL`), depth
 3 unless `--num-speculative-tokens` says otherwise (at most 31). Its history pass writes the draft
@@ -566,6 +568,70 @@ decode, the collective costs more than it saves and every rank runs the replicat
   into eight 2048-column chunks, whose partials `mhc_pre_finish` completes on every rank, and the
   head gates go with the indexer's rows (above). Below the threshold, as in decode, the
   collective costs more than it saves.
+
+**Vision.** The tower (`arch/common/rad_block_glm_vision.h`, transformers' `Glm5NextVisionModel`)
+is declared last, so an encoder pass shares the arena with the step's buffers. Every rank runs it
+whole: its weights are replicated, `RAD_ACCESS_PER_REQUEST`, a group a block from 46, past the MTP
+layer's. Its rows replace the `<|image|>` placeholders' embeddings unscaled, before the embedding's
+reduction (`MediaRows`), in the trunk and in the draft head's lookup, as SGLang feeds its draft
+model the target's image rows.
+
+```
+24 blocks, width 1024, 16 heads of 64, SwiGLU 4096; patch 14 x 14, two frames: 1176-wide rows
+patch embedding: the Conv3d as a linear with bias; no position table
+block: RMSNorm; qkv with bias; q and k RMS-normed per head with a gain; a 2-D rotary over
+  (row, column), 16 frequencies an axis at theta 10000; attention within a picture at 1/8; proj
+  with bias; RMSNorm; gate|up with bias, silu(min(g, 10)) * clamp(u, -10, 10), down with bias
+post_layernorm (RMSNorm), then a 2 x 2 stride-2 Conv2d 1024 -> 4096 over each merged block
+merger: proj 4096 -> 4096, LayerNorm (affine, eps 1e-5), exact GELU, the clipped SwiGLU through
+  10240; no biases but the norm's. One row a merged block: an image of P patches is P / 4 tokens
+```
+
+The processor is `core/mm`'s `Glm5Next` family (`core/mm/processor.h`). A picture's canvas has sides
+in multiples of 28 and 16 to `max_image_tokens` tokens; the picture keeps its aspect ratio, is
+resized only when it is under the floor or over the budget (torchvision's bicubic), and the rest
+of the canvas, right and bottom, is black. It is spelled `<|begin_of_image|>`, one `<|image|>` a
+token, `<|end_of_image|>`. The checkpoint allows 8000 tokens (32000 patches); one encoder pass
+bounds it, so `--mm-max-patches auto` (16384) serves at most 4096, and `--mm-max-patches 32000`
+the checkpoint's budget. `--image-tokens` lowers it. Video is refused.
+
+Traps:
+
+- **The downsample reads the processor's merge-block order as stored.** The reference views the
+  post-norm rows as `[blocks, 2, 2, 1024]`, which in merge-block order is four consecutive rows;
+  `conv2d_unfold` (width 2, two input rows a block) writes each block as one row in the weight's
+  own column order `(channel, kernel row, kernel column)`, so the checkpoint's `[4096, 1024, 2, 2]`
+  is read as a `[4096, 4096]` linear unchanged. The 4096-wide view of the four rows without the
+  unfold is `(kernel row, kernel column, channel)`, and multiplied by the stored weight it is another
+  model.
+- **The rotary pairs across the whole head.** NeoX pairs `(i, i + 32)`, the row on frequencies
+  0-15 and the column on 16-31, each section on its own ladder `theta^(-2j / 32)`: `qk_norm_rope`'s
+  `axial`, not the `blocks` mode of Gemma 4's tower, which rotates each half on its own.
+- **No rotary in the language model.** An image's tokens take their token positions
+  (`Item::rope_1d`), and the indexer pools and selects them as text.
+- **Without the image rows in the draft head's lookup** the drafts read the placeholder's
+  embedding: the text stays the trunk's, only acceptance falls on a prompt with a picture.
+- **The canvas is padded, not stretched**, and an image under the budget is not resampled at all:
+  its patches are the reference processor's bit for bit (`tests/mm_test.cpp`, every case of
+  `tests/glm5_golden.h`, the resampled ones included).
+
+An existing container gains the tower with `rad-convert --reuse <container>` (298 weights,
+1.05 GiB, all bf16 as the checkpoint holds them); `--in-place` extends the container itself.
+
+**Measured** against transformers' tower on the CPU (`tests/glm5_vision_reference.py`), the tower
+alone, on libref, libavx and one R9700 (libr4d). Three pictures in one pass (1024, 4144 and 792
+patches, the last padded): the staged patches are the reference processor's bit for bit; the
+merger's rows reach a cosine of 0.9955 to 0.9970 against the f32 reference, a median per-row
+relative error of 0.029 to 0.044, where transformers in bf16 reaches 0.9967 to 0.9984 and 0.029 to
+0.044; against the bf16 reference, 0.9959 to 0.9983. Through block 11 the engine is nearer f32 than
+the bf16 reference (block 0 3.6e-3 against 3.8e-3 relative, q and k after the rotary 3.1e-3
+against 3.8e-3); the residual stream then carries a few rows of very large magnitude, and in both a
+handful of output rows with a small norm differ by 0.3 to 1.2 relative. A picture's rows are the
+same alone and beside two others in its pass. At 16384 patches (a 2048 x 2048 picture at 4096
+tokens) the engine reaches 0.9940 to 0.9947 against f32, transformers in bf16 0.9928; at 32000
+(8000 tokens), 0.994 against the bf16 reference. On one R9700 a pass of 5960 patches takes 92 ms,
+16384 patches 0.49 s and 32000 1.5 s, with an activation arena of 0.56 and 1.10 GiB, beside the
+tower's 1.05 GiB of weights on every card.
 
 **MoE decode fusions.** Three, each byte-identical to the launches it replaces, declared
 wherever a loaded library serves the fused op (the separate launches otherwise):

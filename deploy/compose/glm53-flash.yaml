@@ -1,6 +1,7 @@
 # GLM-5.3-Flash from AMD's Quark export (data/recipes/glm53-mxfp4.recipe): MXFP4 experts,
 # block-FP8 attention, the native MTP layer as the drafter. It takes eight 32 GB cards with the
-# whole expert plane in VRAM; text only. The KV cache is bf16, the only one the plugin declares.
+# whole expert plane in VRAM; a container with the vision tower serves pictures too, at the
+# default encoder pass. The KV cache is bf16, the only one the plugin declares.
 #
 # A hybrid reuses a cached prefix only from a recurrent-state checkpoint at or below it, so the
 # interval is 1024, which keeps a 1.5k-token system prompt's first 1024 tokens; --prefill-span 4
