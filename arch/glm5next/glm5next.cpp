@@ -12,7 +12,7 @@
  *   rad_block_glm_indexer.h   GlmIndexer     the DSA indexer, DsaCache its key cache and selection
  *   rad_block_glm_router.h    GlmRouter      the correction-bias router (through MoeFP8)
  *   rad_block_glm_mtp.h       GlmMtp         the draft head around the plugin's layer 45
- *   rad_glm_tp.h              GlmTp          the shards and the split threshold
+ *   rad_glm_tp.h              GlmTp          the shards, the row runs and the split thresholds
  *
  * This file declares the buffers the blocks share, places the blocks and issues the step's
  * order. Declaration order is liveness (the buffer plan takes lifetimes from it) and the issue
@@ -125,7 +125,9 @@ static int kda_buffers(RadBuilder* b, Model& m) {
     kw.core.out = bf("recurrent_out", W);
     return RAD_OK;
 }
-/* The head form's buffers, then the selection planes the indexer writes and the MLA reads. */
+/* The head form's buffers, then the selection planes the indexer writes and the MLA reads. Under
+ * TP the selection planes hold every rank's run of rows, which can reach past the step
+ * (DsaCache::part_rows). */
 static int mla_buffers(RadBuilder* b, Model& m) {
     auto& g = m.g;
     auto& nm = m.nm;
@@ -147,14 +149,18 @@ static int mla_buffers(RadBuilder* b, Model& m) {
     aw.attn.x = bf("expanded", Q);
     RAD_ARCH_TRY(aw.attn.declare_qs(b, nm, g, "expanded", Q));
     aw.core.out = aw.attn.x;
-    aw.core.selected = decl_b(b, nm.f("selected"), RAD_I32, { T, 513 });
-    aw.core.length = decl_b(b, nm.f("length"), RAD_I32, { T });
+    const int64_t part = g.world > 1 ? DsaCache::part_rows(T, g.world) : 0;
+    const int64_t TQ = g.world > 1 ? std::max(T, g.world * part) : T;
+    aw.core.selected = decl_b(b, nm.f("selected"), RAD_I32, { TQ, 513 });
+    aw.core.length = decl_b(b, nm.f("length"), RAD_I32, { TQ });
     return RAD_OK;
 }
 static int indexer_buffers(RadBuilder* b, Model& m) {
     auto& g = m.g;
     auto& nm = m.nm;
     const int64_t T = g.max_tok;
+    const int64_t part = g.world > 1 ? DsaCache::part_rows(T, g.world) : 0;
+    const int64_t TQ = g.world > 1 ? std::max(T, g.world * part) : T;
     const int64_t work = (T + 3) / 4 + g.max_seqs, blocks = (g.max_ctx + 3) / 4 + 1;
     auto bf = [&](const char* n, int64_t width) {
         return decl_b(b, nm.f("%s", n), RAD_BF16, { T, width });
@@ -166,9 +172,9 @@ static int indexer_buffers(RadBuilder* b, Model& m) {
     iw.kg_raw = bf("index_key_gate", 256);
     auto& c = iw.cache;
     c.query = decl_b(b, nm.f("index_heads"), RAD_BF16, { T * 32, 128 });
-    c.codes = decl_b(b, nm.f("index_codes"), RAD_F8E4M3, { T * 32, 128 });
-    c.scales = decl_b(b, nm.f("index_scales"), RAD_F32, { T * 32, 1 });
-    c.gate = decl_b(b, nm.f("index_head_weights"), RAD_F32, { T, 32 });
+    c.codes = decl_b(b, nm.f("index_codes"), RAD_F8E4M3, { TQ * 32, 128 });
+    c.scales = decl_b(b, nm.f("index_scales"), RAD_F32, { TQ * 32, 1 });
+    c.gate = decl_b(b, nm.f("index_head_weights"), RAD_F32, { TQ, 32 });
     c.kg = bf("index_normalized_key_gate", 256);
     c.stage = decl_b(b, nm.f("pool_stage"), RAD_BF16, { work * 4, 256 });
     c.page = decl_b(b, nm.f("pool_page"), RAD_I32, { work });
@@ -176,10 +182,18 @@ static int indexer_buffers(RadBuilder* b, Model& m) {
     c.nc = decl_b(b, nm.f("pool_count"), RAD_I32, { g.max_seqs });
     c.pooled = decl_b(b, nm.f("pool_codes"), RAD_F8E4M3, { work, 128 });
     c.pool_scale = decl_b(b, nm.f("pool_scales"), RAD_F32, { work, 1 });
-    c.score = decl_b(b, nm.f("index_scores"), RAD_F32, { T, blocks });
+    /* A split step scores one run of rows a rank and an unsplit one is under GlmTp::kSplitRows:
+     * at 64k of context the whole step's plane would be 256 MiB. */
+    const int64_t scored = g.world > 1 ? std::min(T, std::max(part, GlmTp::kSplitRows)) : T;
+    c.score = decl_b(b, nm.f("index_scores"), RAD_F32, { scored, blocks });
     c.selected = m.aw.core.selected;
     c.length = m.aw.core.length;
     c.nsel = decl_b(b, nm.f("selected_count"), RAD_I32, { T });
+    if (g.world > 1) {
+        c.cu_part = decl_b(b, nm.f("index_part_bounds"), RAD_I32, { g.max_seqs + 1 });
+        c.sel_part = decl_b(b, nm.f("selected_part"), RAD_I32, { part, 513 });
+        c.len_part = decl_b(b, nm.f("length_part"), RAD_I32, { part });
+    }
     return RAD_OK;
 }
 static int ffn_buffers(RadBuilder* b, Model& m) {

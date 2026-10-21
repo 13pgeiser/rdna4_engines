@@ -519,9 +519,18 @@ layer's latent, index and tail for every row and runs its MoE on the proposal ro
 
 **Tensor parallelism.** At 1, 2, 4 or 8 ranks; declare refuses any other. `tests/glm5next_test.cpp`
 declares and steps the whole plugin at 1, 4 and 8, against pinned graph and step hashes at 1 and
-8, the connection, router and index-gate splits at 1, 2, 4 and 8, each issue's operand count
-against the loaded kernel libraries' schemas, and every declared weight against the served
-container's names and encodings.
+8, the connection, router and index-gate splits at 1, 2, 4 and 8, the indexer's row split at 2
+and 8, the row rule at every world, each issue's operand count against the loaded kernel
+libraries' schemas, and every declared weight against the served container's names and encodings.
+
+One row rule (`GlmTp::run_rows`): from a pass of `GlmTp::kSplitRows` = 256 rows, a replicated
+piece of work splits by rows over the ranks instead, each rank taking one run of ceil(T / world)
+rows rounded up to whole 16-byte words of the row it gathers, because an `all_gather` moves whole
+words: multiples of four rows for the indexer's one i32 length a row. The last run may be short;
+a rank whose run lies wholly past a small step takes the first run and computes dead rows, so
+every plane it gathers is written (`GlmTp::run_of`). The indexer also splits a smaller step, from
+16 rows once rows x live blocks reach 2^18 (`GlmTp::kSplitWork`). Below the thresholds, as in
+decode, the collective costs more than it saves and every rank runs the replicated form.
 
 - The routed and the shared experts split their 2048 width into equal contiguous slices, 256 a
   rank at eight; each rank computes its slice of every expert, and the block's all-reduce sums
@@ -530,15 +539,33 @@ container's names and encodings.
   of o. q_a, kv_a and the latent are replicated.
 - KDA splits its 64 heads, with them the q/k/v rows, the convolution taps and the state; the two
   rank-128 projections into the gates are replicated.
-- The indexer is replicated whole.
+- The indexer's key side is replicated: every rank keeps the whole index cache and its tail. Its
+  query side splits by rows from the threshold: each rank scores its run under the row rule,
+  R = 4 * ceil(T / (4 * ranks)) query rows (`DsaCache::part_rows`), against the whole cache
+  (`dsa_score` with `row_part`, the last run's rows past the step scoring `-inf`) and selects for
+  the rows of its run that exist, under the bounds the scorer rebased to the run's first row
+  (`cu_part`, docs/OPS.md); two `all_gather`s lay the runs' page tables and lengths end to end,
+  513 and 1 i32 a row, 8 MiB a layer at a 4096-row chunk. The run's queries are all a rank needs,
+  so the query projection, its quantiser and the head gates run on the run's rows too, and the
+  gates need no gather; the bf16 projection stays on the step's rows where a run would be 64 rows
+  or fewer, the skinny band whose split count a tuned configuration may set. Each row's selection
+  is the same kernels' answer to the same operands, so the joined table is bit-identical to one
+  rank's and MLA reads it unchanged. The scoring grows with the context (every row scores every
+  complete block of its sequence), so this is where long prompts gain: the score plane shrinks to
+  one run (256 MiB to 32 MiB at 64k of context and a 4096-row chunk). A smaller step splits too
+  from 16 rows once rows x live blocks reach 2^18 (`GlmTp::kSplitWork`): eight sequences
+  verifying five drafts from about 22k of context, where the scoring of 48 rows outweighs the two
+  gathers; a single sequence's decode never does, and below both thresholds the indexer runs
+  whole.
 - The vocabulary is row-sharded, 19360 rows a rank at eight; the embedding's all-reduce is exact.
 - The f32 projections (the router's 288 x 4096, the index head gates' 32 x 4096, each
   connection's mHC projection of 24 x 16384) are replicated. From a pass of 256 rows
   (`GlmTp::kSplitRows`; `SplitF32Proj` in `arch/common/rad_glm_tp.h`), each rank computes a disjoint part
   with the replicated kernel and an `all_gather` joins the parts, so every value is
-  bit-identical: the router and the head gates split their output columns, the mHC projection
-  its 16384-wide input into eight 2048-column chunks, whose partials `mhc_pre_finish` completes
-  on every rank. Below the threshold, as in decode, the collective costs more than it saves.
+  bit-identical: the router splits its output columns, the mHC projection its 16384-wide input
+  into eight 2048-column chunks, whose partials `mhc_pre_finish` completes on every rank, and the
+  head gates go with the indexer's rows (above). Below the threshold, as in decode, the
+  collective costs more than it saves.
 
 **MoE decode fusions.** Three, each byte-identical to the launches it replaces, declared
 wherever a loaded library serves the fused op (the separate launches otherwise):

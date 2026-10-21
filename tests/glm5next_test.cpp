@@ -433,8 +433,9 @@ TEST(
             CHECK_EQ(std::count(ops.begin(), ops.end(), "all_gather"), 0);
             // The split is declared on every rank whatever its step size; only rank 0 issues it here.
             const bool split = world > 1;
-            // 43 routers and 12 index heads (MTP included), and the 90 mHC reads.
-            CHECK_EQ(count_op(b, "all_gather"), split ? 55 + 90 : 0);
+            // 43 routers (MTP included), the 90 mHC reads, and each of the 12 indexers' page
+            // tables and lengths; the index head gates follow the indexer's rows, ungathered.
+            CHECK_EQ(count_op(b, "all_gather"), split ? 43 + 90 + 24 : 0);
             CHECK_EQ(count_op(b, "mhc_pre_partial"), split ? 90 : 0);
             ctx.issues.clear();
             batch.draft_pass = -1;
@@ -480,12 +481,13 @@ TEST(
                 glm5next::step(&ctx, &batch);
                 CHECK(ctx.step_fail.empty());
                 {
-                    // 512 rows reach the split: each projection runs on its column slice and each
-                    // mHC read on its chunks, both gathered; at TP1 nothing changes.
+                    // 512 rows reach the split: each router runs on its column slice, each mHC
+                    // read on its chunks and each indexer, its head gates included, on its run
+                    // of query rows, all gathered but the gates; at TP1 nothing changes.
                     const auto long_ops = issued_ops(b, ctx);
                     CHECK_EQ(std::count(long_ops.begin(), long_ops.end(), "gemm_nt_f32"), 53);
                     CHECK_EQ(std::count(long_ops.begin(), long_ops.end(), "all_gather"),
-                             world > 1 ? 53 + 90 : 0);
+                             world > 1 ? 42 + 90 + 22 : 0);
                     CHECK_EQ(std::count(long_ops.begin(), long_ops.end(), "mhc_pre"),
                              world > 1 ? 0 : 90);
                     CHECK_EQ(std::count(long_ops.begin(), long_ops.end(), "mhc_pre_finish"),
@@ -493,12 +495,14 @@ TEST(
                     for (const auto& issue : ctx.issues) {
                         if (b.ops[issue.op - 1].op != "gemm_nt_f32") continue;
                         const int64_t n = pint(&b.ops[issue.op - 1], "N");
-                        if (world == 1)
+                        if (world == 1 || n == 32)
                             CHECK(n == 288 || n == 32);
                         else {
-                            CHECK(n == 288 / world || n == 32 / world);
+                            CHECK_EQ(n, 288 / world);
                             CHECK_EQ(issue.opd[1].rows, n);
                         }
+                        if (world > 1 && n == 32)
+                            CHECK_EQ(issue.opd[0].rows, DsaCache::part_rows(512, world));
                     }
                 }
                 for (int l = 3; l < 45; ++l) {
@@ -543,6 +547,177 @@ TEST(
                 for (auto& thread : probes) thread.join();
                 for (int status : results) CHECK_EQ(status, RAD_OK);
                 CHECK_EQ(glm5next::models[rank].get(), live);
+            }
+        }
+}
+
+/* From the split threshold each rank scores its run of the step's query rows (rows past the step
+ * included, which score -inf) and selects for the rows of it that exist, against the bounds the
+ * scorer rebased to the run's first row; two all_gathers join the runs' page tables and lengths
+ * into planes that hold every run. The query side (projection, cast, quantiser, head gates) runs
+ * on the run's rows that exist. Below the threshold the indexer stays replicated. */
+TEST(glm53_indexer_scores_and_selects_one_run_of_query_rows_per_rank) {
+    using namespace rad::arch;
+    const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
+                           "index_topk" };
+    const char* vals[] = { "1", "4", "288", "2048" };
+    RadModelMeta meta{};
+    meta.n_layers = 45;
+    meta.n_embd = 4096;
+    meta.n_vocab = 154880;
+    meta.rms_eps = 1e-5f;
+    meta.n_kv = 4;
+    meta.kv_key = keys;
+    meta.kv_val = vals;
+    const auto mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
+    const auto fp8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 128, 128);
+    for (int world : { 2, 8 })
+        for (int rank : { 0, world - 1 }) {
+            RadBuilder b;
+            b.kv_block = 4;
+            b.encs = { { "mtp.blk.45.ffn_gate_up_exps", fp8 },
+                       { "mtp.blk.45.ffn_down_exps", fp8 },
+                       { "ffn_gate_up_exps", mx },
+                       { "ffn_down_exps", mx },
+                       { "ffn_gate_up_shexp", mx },
+                       { "ffn_down_shexp", mx },
+                       { "ffn_gate_up.weight", fp8 },
+                       { "ffn_down.weight", fp8 } };
+            RadBuildCtx build{};
+            build.rank = rank;
+            build.world_size = world;
+            build.max_tok = 512;
+            build.max_seqs = 8;
+            build.max_ctx = 65536;
+            build.max_spec = 5;
+            REQUIRE_EQ(glm5next::declare(&b, &meta, &build), RAD_OK);
+            const auto& m = *glm5next::models[rank];
+            const auto& cache = m.layers[3].index.cache;
+            const auto& w = m.iw.cache;
+            const int64_t most = DsaCache::part_rows(512, world);
+            const RecOp* score = b.op_of(cache.op_score_part);
+            const RecOp* sel = b.op_of(cache.op_gather_sel);
+            const RecOp* len = b.op_of(cache.op_gather_len);
+            REQUIRE(score && sel && len && cache.op_select_part);
+            CHECK_EQ(pint(score, "row_part"), rank);
+            CHECK_EQ(param(score, "M")->ihi, most);
+            CHECK(score->writes == std::vector<rad_buf>({ w.score, w.cu_part }));
+            CHECK_EQ(param(sel, "numel")->ival, 4 * 513);
+            CHECK_EQ(param(sel, "numel")->ihi, most * 513);
+            CHECK_EQ(param(len, "numel")->ihi, most);
+            CHECK(sel->reads == std::vector<rad_buf>({ w.sel_part }));
+            CHECK(sel->writes == std::vector<rad_buf>({ w.selected }));
+            CHECK(len->writes == std::vector<rad_buf>({ w.length }));
+            CHECK_EQ(b.bufs[w.selected - 1].d.shape[0], world * most);
+            CHECK_EQ(b.bufs[w.codes - 1].d.shape[0], world * most * 32);
+            CHECK_EQ(b.bufs[w.sel_part - 1].d.shape[0], most);
+            // Two decode rows beside a 498-row chunk: 500 rows, runs of R.
+            auto k = kit(b, { 1, 1 }, { 498 }, 100);
+            const int64_t T = 500, R = DsaCache::part_rows(T, world), r0 = rank * R,
+                          have = std::min(R, T - r0);
+            auto passes = run_passes(b, glm5next::step, { k.get() }, rank, world);
+            CHECK_PASSES(b, passes);
+            const auto& index = m.layers[3].index;
+            // The bf16 query projection follows the runs only where every run is over 64 rows.
+            const bool projected = T - (world - 1) * R > 64;
+            int scored = 0, selected = 0, gathered = 0, replicated = 0, fronts = 0;
+            for (const auto& issue : passes[0]->issues) {
+                if (issue.op == index.query.op) {
+                    ++fronts;
+                    CHECK_EQ(issue.opd[0].rows, projected ? have : T);
+                    CHECK_EQ(issue.opd[0].offset, projected ? r0 * 1536 : 0);
+                }
+                if (issue.op == index.op_query_copy || issue.op == cache.op_query) {
+                    ++fronts;
+                    CHECK_EQ(issue.n, have * 32);
+                    CHECK_EQ(issue.opd[1].offset, r0 * 32 * 128);
+                }
+                if (issue.op == index.op_head) {
+                    ++fronts;
+                    CHECK_EQ(issue.n, have);
+                    CHECK_EQ(issue.opd[0].offset, r0 * 4096);
+                    CHECK_EQ(issue.opd[2].offset, r0 * 32);
+                }
+                if (issue.op == cache.op_score) ++replicated;
+                if (issue.op == cache.op_score_part) {
+                    ++scored;
+                    CHECK_EQ(issue.n, R);
+                    CHECK_EQ(issue.opd[0].rows, world * R * 32);
+                    CHECK_EQ(issue.opd[2].rows, world * R);
+                    CHECK_EQ(issue.opd[8].rows, R);
+                    CHECK_EQ(issue.opd[9].handle, w.cu_part);
+                }
+                if (issue.op == cache.op_select_part) {
+                    ++selected;
+                    CHECK_EQ(issue.n, have);
+                    CHECK(issue.opd[3].raw == (void*)(k->pos.data() + r0));
+                    CHECK_EQ(issue.opd[3].rows, have);
+                    CHECK_EQ(issue.opd[4].handle, w.cu_part);
+                    CHECK_EQ(issue.opd[5].handle, w.sel_part);
+                    CHECK_EQ(issue.opd[7].handle, w.len_part);
+                }
+                if (issue.op == cache.op_gather_sel) {
+                    ++gathered;
+                    CHECK_EQ(issue.n, R * 513);
+                    CHECK_EQ(issue.opd[1].rows, world * R);
+                }
+                if (issue.op == cache.op_gather_len) CHECK_EQ(issue.n, R);
+            }
+            // The handles are layer 3's: one issue each.
+            CHECK_EQ(scored, 1);
+            CHECK_EQ(selected, have > 0 ? 1 : 0);
+            CHECK_EQ(gathered, 1);
+            CHECK_EQ(replicated, 0);
+            CHECK_EQ(fronts, 4);
+            // Under the threshold every rank scores and selects the whole step.
+            auto small = kit(b, {}, { 255 });
+            auto under = run_passes(b, glm5next::step, { small.get() }, rank, world);
+            CHECK_PASSES(b, under);
+            int whole = 0;
+            for (const auto& issue : under[0]->issues) {
+                CHECK(issue.op != cache.op_score_part && issue.op != cache.op_gather_sel);
+                whole += issue.op == cache.op_score;
+                // The engine refuses an issue whose operand count is not the schema's: dsa_score
+                // declares ten (cu_part optional, passed absent).
+                if (issue.op == cache.op_score || issue.op == cache.op_score_part)
+                    CHECK_EQ(issue.opd.size(), (size_t)10);
+                if (issue.op == index.op_head) CHECK_EQ(issue.n, 255);
+            }
+            CHECK_EQ(whole, 1);
+            // A verify of eight sequences at 32k of context (48 rows x 8014 blocks) splits too, a
+            // single sequence's six rows do not; a rank whose run lies past the step still writes
+            // the runs it gathers.
+            for (int seqs : { 8, 1 }) {
+                auto dec = kit(b, std::vector<int>((size_t)seqs, 6), {});
+                const int64_t pitch = 8192;
+                dec->table.resize((size_t)(seqs * pitch));
+                for (int64_t i = 0; i < seqs * pitch; ++i) dec->table[(size_t)i] = (int32_t)i;
+                for (auto& g : dec->kv) {
+                    g.block_table = dec->table.data();
+                    g.block_table_pitch = g.max_blocks = pitch;
+                }
+                dec->b.max_ctx_len = 32000;
+                auto v = run_passes(b, glm5next::step, { dec.get() }, rank, world);
+                CHECK_PASSES(b, v);
+                const int64_t Td = 6 * seqs, Rd = DsaCache::part_rows(Td, world);
+                const bool split_d = seqs == 8;
+                int parts = 0, gathers = 0, wholes = 0;
+                for (const auto& issue : v[0]->issues) {
+                    parts += issue.op == cache.op_score_part;
+                    gathers += issue.op == cache.op_gather_sel;
+                    wholes += issue.op == cache.op_score;
+                    if (issue.op == cache.op_score_part) CHECK_EQ(issue.n, Rd);
+                    if (issue.op == cache.op_score || issue.op == cache.op_score_part)
+                        CHECK_EQ(issue.opd.size(), (size_t)10);
+                    if (split_d &&
+                        (issue.op == cache.op_select_part || issue.op == cache.op_query)) {
+                        const int64_t rows_d = rank * Rd < Td ? std::min(Rd, Td - rank * Rd) : Rd;
+                        CHECK_EQ(issue.n, issue.op == cache.op_query ? rows_d * 32 : rows_d);
+                    }
+                }
+                CHECK_EQ(gathers, split_d ? 1 : 0);
+                CHECK_EQ(parts, split_d ? 1 : 0);
+                CHECK_EQ(wholes, split_d ? 0 : 1);
             }
         }
 }
@@ -1176,8 +1351,8 @@ TEST(glm53_is_the_pinned_graph_and_steps) {
         int world;
         uint64_t graph, steps;
     };
-    const Case cases[] = { { 1, 0xed3fc26c486ea1b5ull, 0x98ba2952bb37b075ull },
-                           { 8, 0x8204e073efdeee0cull, 0x1279aecfe4e32d9aull } };
+    const Case cases[] = { { 1, 0xed3fc26c486ea1b5ull, 0x33e5f136f0dbba15ull },
+                           { 8, 0x712f01858dbe1047ull, 0xf9e357b1333c638full } };
     for (const Case& cs : cases) {
         RadBuilder b;
         b.kv_block = 4;
@@ -1248,6 +1423,48 @@ RadBuildCtx glm53_ctx(int rank, int world, int max_spec = 3) {
 
 RAD_TEST_MAIN()
 
+/* ==================================================================== the row rule */
+
+/* GlmTp::run_rows is the one rule the indexer's runs follow, and it is the formula it replaced:
+ * 4 * ceil(T / (4 * world)) for the indexer's 4-byte lengths, ceil(T / world) for a row of whole
+ * 16-byte words. At the split threshold, around a chunk and at the largest step, for every
+ * world: run_of covers the step once with no overlap, the last run short where the step ends
+ * inside it, and a rank whose run lies wholly past a small step takes the first run instead, so
+ * the planes it writes and gathers are never unwritten. */
+TEST(glm_tp_row_rule_is_the_old_formula_and_covers_a_step_once) {
+    using namespace rad::arch;
+    for (int world : { 1, 2, 4, 8 })
+        for (int64_t T : { 1, 5, 6, 48, 255, 256, 257, 300, 2047, 2048, 2049, 4096 }) {
+            const int64_t wide = GlmTp::run_rows(T, world, 8192);
+            const int64_t narrow = GlmTp::run_rows(T, world, 4);
+            CHECK_EQ(wide, (T + world - 1) / world);
+            CHECK_EQ(narrow, 4 * ((T + 4 * world - 1) / (4 * world)));
+            CHECK_EQ(DsaCache::part_rows(T, world), narrow);
+            CHECK(world * wide >= T);
+            CHECK(world * narrow >= T);
+            CHECK_EQ(narrow % 4, 0);
+            for (int64_t row_bytes : { 8192, 4 }) {
+                const int64_t run = GlmTp::run_rows(T, world, row_bytes);
+                int64_t covered = 0, next = 0;
+                for (int rank = 0; rank < world; ++rank) {
+                    const GlmTp::Run r = GlmTp::run_of(T, world, rank, row_bytes);
+                    CHECK_EQ(r.run, run);
+                    CHECK(r.rows >= 1 && r.rows <= run);
+                    if ((int64_t)rank * run < T) {
+                        CHECK_EQ(r.first, next);
+                        CHECK_EQ(r.rows, std::min(run, T - r.first));
+                        next = r.first + r.rows;
+                        covered += r.rows;
+                    } else {
+                        CHECK_EQ(r.first, 0);
+                        CHECK_EQ(r.rows, run);
+                    }
+                }
+                CHECK_EQ(covered, T);
+            }
+        }
+}
+
 /* ==================================================================== the op schemas */
 namespace {
 
@@ -1305,9 +1522,10 @@ const LoadedSchemas& loaded_schemas() {
  * declares names as many weights as rad_builder.cpp admits. The steps: at eight ranks and at
  * one, a mixed step over the split threshold (two decode rows beside a 498-row chunk), a step
  * under it, a six-row verify and six single-row decodes, each with its history pass and a draft
- * round, and a verify of eight sequences at 32k of context. The engine refuses a step at the
- * first mismatch, and the fakes alone cannot see one: an issue short of an optional operand
- * passes every host test and stops a served engine at its first step through that op. */
+ * round, and a verify of eight sequences at 32k of context, where the indexer splits a decode.
+ * The engine refuses a step at the first mismatch, and the fakes alone cannot see one: a
+ * replicated dsa_score issued with nine operands passed every host test and stopped a served
+ * engine at its first long prompt. */
 TEST(glm53_issues_every_op_with_the_operand_count_its_schema_declares) {
     const LoadedSchemas& lib = loaded_schemas();
     if (lib.ops.empty()) {

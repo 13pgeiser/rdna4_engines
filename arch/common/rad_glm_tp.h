@@ -1,18 +1,26 @@
 /* GLM-5.3's tensor parallelism in one place: what a rank's shard of the model is, from which step
- * size a replicated piece of work splits over the ranks instead, and the column split of a
- * replicated F32 projection.
+ * size a replicated or head-split piece of work splits over the ranks instead, how a step's rows
+ * fall into one run a rank, and the column split of a replicated F32 projection.
  *
- * The residual stream is replicated (spec.md §9). Two kinds of split share the ranks' work:
+ * The residual stream is replicated (spec.md §9). Three kinds of split share the ranks' work:
  *
  *   heads     the MLA and KDA heads, with them the rows of their projections, the KDA state and
  *             the convolution history; the experts' and the dense feed-forward's width
  *             (`heads`, `kda_width`, `expert_width`, `dense_width`); joined by an all_reduce
- *   columns   a replicated F32 projection's output columns (SplitF32Proj), or the mHC read's
- *             input chunks (ManifoldConn); joined by an all_gather, bit for bit the replicated
- *             computation */
+ *   rows      a prefill-sized step's rows, one run a rank, each rank computing its run with the
+ *             unsplit kernels (`run_rows`, `run_of`); joined by an all_gather of whole runs
+ *   columns   a replicated F32 projection's output columns (SplitF32Proj); joined by a
+ *             row-interleaved all_gather, bit for bit the replicated projection
+ *
+ * The one rule for a run: ceil(T / world) rows, rounded up to whole 16-byte words of the gathered
+ * row, because an all_gather moves whole words. The indexer gathers one i32 length a row beside
+ * its page tables, so its runs are multiples of four rows. The last rank's run may be short, or
+ * lie wholly past a small step (`run_of`). */
 #ifndef RAD_GLM_TP_H
 #define RAD_GLM_TP_H
 #include "rad_arch.h"
+#include <algorithm>
+#include <numeric>
 
 namespace rad {
 namespace arch {
@@ -28,10 +36,44 @@ struct GlmTp {
     static int64_t expert_width(int world) { return kExpertFF / world; }
     static int64_t dense_width(int world) { return kDenseFF / world; }
 
-    /* Rows from which a replicated piece of work splits over the ranks. Below it, as in decode,
-     * the collective's latency outweighs the saved arithmetic and every rank runs the replicated
-     * form. */
+    /* Rows from which a step splits by rows or columns over the ranks. Below it, as in decode, the
+     * collective's latency outweighs the saved arithmetic and every rank runs the replicated or
+     * head-split form. */
     static constexpr int64_t kSplitRows = 256;
+    /* Rows x live blocks from which the indexer splits a smaller step as well: a decode step at
+     * long context, where scoring every query row against every block of its sequence outweighs
+     * the two gathers. On one R9700 48 rows over 8000 blocks (32k of context) score and select in
+     * about 250 us and a run of 8 in 50, against roughly 50 us for the two eight-rank gathers;
+     * over 4000 blocks the saving is about the gathers' cost, and six rows never pay. From 16
+     * rows, so that at least four ranks share the work and every run fits in the step. */
+    static constexpr int64_t kSplitWork = 1 << 18, kSplitWorkRows = 16;
+    static bool splits(int64_t rows, int world) { return world > 1 && rows >= kSplitRows; }
+
+    /* A rank's run of a step of `rows`, gathered as rows of `row_bytes`: ceil(rows / world) rounded
+     * up to whole 16-byte words of the gathered row. Every rank but possibly the last takes a whole
+     * run; the planes a split writes hold world runs, which can reach past the step. */
+    static int64_t run_rows(int64_t rows, int world, int64_t row_bytes) {
+        const int64_t word = 16 / std::gcd<int64_t>(16, row_bytes);
+        return word * ((rows + word * world - 1) / (word * world));
+    }
+    struct Run {
+        int64_t run = 0, first = 0, rows = 0;
+    };
+    /* Rank `rank`'s rows [first, first + rows) of a step of `rows`. A rank whose run lies wholly
+     * past a small step takes the step's first run instead, so every plane it computes from and
+     * gathers is written; what it computes there is dead rows past the step, and the gather lays
+     * them past T, where nothing reads them. */
+    static Run run_of(int64_t rows, int world, int rank, int64_t row_bytes) {
+        Run r;
+        r.run = run_rows(rows, world, row_bytes);
+        r.first = rank * r.run;
+        r.rows = std::min(r.run, rows - r.first);
+        if (r.rows <= 0) {
+            r.first = 0;
+            r.rows = r.run;
+        }
+        return r;
+    }
 
     /* The all_reduce of a replicated 4096-wide bf16 row over the ranks: the embedding's (exact)
      * and each head-split block's (the deployment's wire). */
