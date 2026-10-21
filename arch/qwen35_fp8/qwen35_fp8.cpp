@@ -106,11 +106,30 @@ using Ffn    = MlpFP8;
 using MtpHead = MtpFP8;
 #endif
 
+/* The weight reads beside the decode all-reduces (prefetch_beside, rad_arch.h): a weight's first
+ * kPrefetchBytes, on decode steps of up to kPrefetchStepRows rows. Qwen3.8-27B MXFP4 + DFlash2 at tp 2
+ * on 2x R9700 (Gen5 x8), one round each, no speculation, x1 / x4 / x8 / x16 tok/s against none
+ * (61.2 / 225.0 / 403.7 / 650.8): 8 MB 65.1 / 246.4 / 410.9 / 663.3; 10 MB 66.0 / 250.1 / 425.0 /
+ * 668.5; 12 MB 67.9 / 251.2 / 438.6 / 668.1; 14 MB 67.8 / 249.5 / 432.4 / 659.1; 16 MB 67.0 / 244.9 /
+ * 422.7 / 649.4; 20 MB 63.4 / 232.0 / 408.1 / 630.7; 32 MB 57.9 / 210.2 / 372.8 / 605.9 -- past
+ * ~12 MB the read outlasts the reduction and takes bandwidth from the GEMM it should feed. Reads up
+ * to 128 rows: x32 963.8 against 956.0, x64 1206.7 against 1216.6, so the ceiling is 32 rows (a
+ * verify of four sequences at speculation 7). With speculation 7 (three rounds) x1..x16 +0.1..+1.9 %.
+ * The drafter's reads (Dflash2::Config::prefetch) take the same size: speculation 7, eight rounds,
+ * median x1 +6 %, x16 unchanged. */
+constexpr int64_t kPrefetchBytes    = (int64_t)12 << 20;
+constexpr int64_t kPrefetchStepRows = 32;
+
 struct Layer {
     int          full = 0;
     AttnGatedFP8 attn;
     GdnFP8       gdn;
     Ffn          mlp;
+    /* The reads beside the decode all-reduces (prefetch_beside, rad_arch.h): gate_up's leading
+     * bytes beside the mixer's reduction, the next layer's first projection's beside the
+     * feed-forward's. 0 where none is declared. */
+    rad_op       op_pf_gu = 0, op_pf_next = 0;
+    rad_weight   pf_gu_w = 0, pf_next_w = 0;
 };
 
 struct Model {
@@ -283,6 +302,7 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
 
     Dflash2::Config dc{};
     dc.short_block = 1;   /* rad_drafter_short_block below */
+    dc.prefetch    = kPrefetchBytes;   /* reads beside the drafter's all-reduces (at tp > 1) */
     dc.n_taps   = m.n_taps;
     dc.block    = ctx->max_spec + 1;
     dc.taps     = rad_meta_geti(meta, "draft.dflash_config.conv_kernel_size", 2);
@@ -1026,6 +1046,27 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     for (int64_t l = 0; l + 1 < m.n_main; ++l) m.layers[(size_t)l].mlp.xp_next = &m.layers[(size_t)l + 1].mlp;
 #endif
 
+#if !QWEN35_MOE
+    /* ---- the weight reads beside the decode all-reduces (prefetch_beside, rad_arch.h). At decode
+     * heights each block's reduction leaves the card's memory idle for its round trip over the link,
+     * so the GEMM behind it has its weight's leading bytes read into the on-die cache there: gate_up
+     * behind the mixer's reduction, the next layer's first projection (the delta net's in-projection,
+     * an attention layer's q|gate) behind the feed-forward's. Only at more than one rank;
+     * RADIANCE_PREFETCH=0 declares none (decl_prefetch). */
+    if (g.world > 1 && rad_op_declared(b, "prefetch")) {
+        for (int64_t l = 0; l < m.n_main; ++l) {
+            Layer& lay = m.layers[(size_t)l];
+            lay.pf_gu_w  = lay.mlp.gate_up.w;
+            lay.op_pf_gu = decl_prefetch(b, lay.pf_gu_w, kPrefetchBytes);
+            if (l + 1 < m.n_main) {
+                const Layer& nx = m.layers[(size_t)l + 1];
+                lay.pf_next_w  = nx.full ? nx.attn.qg.w : nx.gdn.in.w;
+                lay.op_pf_next = decl_prefetch(b, lay.pf_next_w, kPrefetchBytes);
+            }
+        }
+    }
+#endif
+
     m.op_final_norm = rw(b, RAD_OP(b, "rmsnorm",
                              RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                                         RAD_F64("eps", g.eps), RAD_F64("wadd", final_wadd), RAD_STR("dtype", g.dtype)),
@@ -1497,12 +1538,19 @@ static void step(RadCtx* c, const RadBatch* batch) {
         RAD_ISSUE_N(c, m.op_rope_cs, batch->n_tok,
                     rope_pos1(batch, batch->n_tok), RAD_B(m.b_rope_cs));
 
+    /* The reads beside the reductions go on decode steps of up to kPrefetchStepRows rows, none on a
+     * step that carries a prompt's rows. This ceiling, not prefetch_beside's own (16), decides: it
+     * is passed a height of 1 where the step qualifies. */
+    const int64_t pf_h =
+        batch->phase == RAD_PHASE_DECODE && batch->n_tok <= kPrefetchStepRows ? 1 : INT64_MAX;
     for (int64_t li = 0; li < (int64_t)m.layers.size(); ++li) {
         const Layer& l = m.layers[(size_t)li];
         if (l.full) l.attn.step(c, batch);
         else        l.gdn.step(c, batch);
+        prefetch_beside(c, l.op_pf_gu, l.pf_gu_w, pf_h);
         dbg_resid(c, (int)li, "mix", m.g.n_embd, m.b_x, m.a_h.x);
         l.mlp.step(c, batch);
+        prefetch_beside(c, l.op_pf_next, l.pf_next_w, pf_h);
         dbg_resid(c, (int)li, "ffn", m.g.n_embd, m.b_x, m.a_h.x);
 
         /* The tap, after the layer: the drafter conditions on this layer's output, which the next
