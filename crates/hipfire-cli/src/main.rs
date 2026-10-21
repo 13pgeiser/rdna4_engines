@@ -64,11 +64,10 @@ mod process_identity;
 mod pull_select;
 mod serve;
 mod setup;
-mod verified_cache;
 use crate::serve::complete::next_attempt_id;
 use crate::serve::http::request_id;
 use crate::serve::{detach_serve, parse_host_port, parse_pid_record, ServePidRecord};
-use crate::verified_cache::VerifiedCache;
+use hipfire_runtime::verified_cache::{self, VerifiedCache};
 use setup::setup_command;
 
 use hipfire_registry::{is_listable_model_file, MODEL_SUFFIXES};
@@ -23502,10 +23501,11 @@ effort = "high"
             1,
             "one hash; every spelling reuses the record"
         );
-        let record = VerifiedCache::in_home(&paths.root)
-            .record_of(&installed)
+        let stat = verified_cache::StatKey::of(&fs::metadata(&installed).unwrap());
+        let digest = VerifiedCache::in_home(&paths.root)
+            .verified_digest(&installed, &stat)
             .expect("the verification is cached");
-        assert!(record.sha256.eq_ignore_ascii_case(retired_rtn_sha()));
+        assert!(digest.eq_ignore_ascii_case(retired_rtn_sha()));
         assert_eq!(
             find_local_model_path(&paths, &registry, pin.tag),
             Some(installed.clone())
@@ -23587,9 +23587,24 @@ effort = "high"
                 assert!(card.retired().is_some());
                 assert!(card.pullable().is_none());
             }
-            assert!(VerifiedCache::in_home(&paths.root)
-                .record_of(&installed)
-                .is_none());
+            match fs::read(paths.root.join("cache/verified-artifacts.json")) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("unexpected cache IO: {error}"),
+                Ok(raw) => {
+                    let cache: serde_json::Value =
+                        serde_json::from_slice(&raw).expect("cache must stay well-formed");
+                    assert_eq!(
+                        cache["version"],
+                        serde_json::json!(1),
+                        "cache schema version"
+                    );
+                    let records = cache["records"].as_object().expect("records object");
+                    assert!(
+                        !records.contains_key(installed.to_string_lossy().as_ref()),
+                        "failed verification creates no record"
+                    );
+                }
+            }
         }
         assert_eq!(
             download_count(),

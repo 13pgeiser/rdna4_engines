@@ -2,18 +2,23 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Verification cache: remembers that a large local artifact (the 125 GB pinned
-//! Flash-Next monolithic) already hashed to its pin, so resolving it on every
-//! load does not read it end to end again.
+//! Shared metadata verification authority for local artifacts. The CLI records
+//! digests after verifying artifact bytes; CLI and runtime callers reuse those
+//! records only while the path's complete stat key still matches.
 //!
 //! One JSON file under the hipfire home (`<HIPFIRE_HOME>/cache/verified-artifacts.json`)
 //! holds one record per verified path: device, inode, size, mtime (seconds and
-//! nanoseconds), the verified SHA-256 and when it was verified. A lookup is a
-//! hit only when the file's current stat equals the record **and** the record's
-//! SHA-256 equals the digest the caller expects, so a record for another pin
-//! never satisfies. Anything else hashes, then writes the record atomically
-//! (temporary file + rename). The cache is an optimisation: a missing, corrupt
-//! or unwritable cache file is ignored and never fails a resolve.
+//! nanoseconds), the verified SHA-256 and when it was verified. [`VerifiedCache::satisfies`]
+//! requires both an exact stat match and the caller's expected digest, so a
+//! record for another pin never satisfies. On a miss, the CLI verifies the bytes
+//! before calling [`VerifiedCache::remember`], which writes atomically (temporary
+//! file + rename). Missing, corrupt or unwritable cache files never fail a
+//! cache operation; callers decide whether a miss requires verification or refusal.
+//!
+//! The loader reuses receipts without hashing through
+//! [`VerifiedCache::verified_digest`]: one read-only lookup per path at load
+//! time, returning the recorded digest only on exact stat equality plus a
+//! syntactically valid SHA-256.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -25,7 +30,7 @@ const CACHE_VERSION: u32 = 1;
 
 /// The stat fields a record is keyed by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct StatKey {
+pub struct StatKey {
     pub dev: u64,
     pub ino: u64,
     pub size: u64,
@@ -34,7 +39,8 @@ pub(crate) struct StatKey {
 }
 
 impl StatKey {
-    pub(crate) fn of(metadata: &fs::Metadata) -> Self {
+    /// The [`StatKey`] of live file metadata: device, inode, size and mtime.
+    pub fn of(metadata: &fs::Metadata) -> Self {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -65,12 +71,12 @@ impl StatKey {
 
 /// One verified path.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Record {
+struct Record {
     #[serde(flatten)]
-    pub stat: StatKey,
-    pub sha256: String,
+    stat: StatKey,
+    sha256: String,
     /// Unix seconds when the bytes were hashed.
-    pub verified_at: u64,
+    verified_at: u64,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -81,24 +87,23 @@ struct CacheFile {
 
 /// The on-disk verification cache, or a disabled stand-in.
 #[derive(Clone, Debug)]
-pub(crate) struct VerifiedCache {
+pub struct VerifiedCache {
     file: Option<PathBuf>,
 }
 
 impl VerifiedCache {
     /// The cache of the hipfire home `root`: `<root>/cache/verified-artifacts.json`.
-    pub(crate) fn in_home(root: &Path) -> Self {
+    pub fn in_home(root: &Path) -> Self {
         Self::at(root.join("cache").join("verified-artifacts.json"))
     }
 
     /// A cache stored in `file`.
-    pub(crate) fn at(file: PathBuf) -> Self {
+    pub fn at(file: PathBuf) -> Self {
         Self { file: Some(file) }
     }
 
     /// A cache that never hits and never writes.
-    #[cfg(test)]
-    pub(crate) fn disabled() -> Self {
+    pub fn disabled() -> Self {
         Self { file: None }
     }
 
@@ -117,22 +122,42 @@ impl VerifiedCache {
 
     /// The record of `path`, if any (test and diagnostics access).
     #[cfg(test)]
-    pub(crate) fn record_of(&self, path: &Path) -> Option<Record> {
+    fn record_of(&self, path: &Path) -> Option<Record> {
         self.load().remove(&key_of(path))
     }
 
     /// True when `path` (whose current stat is `current`) was verified against
     /// `expected_sha256`: the record's stat equals `current` and its digest
     /// equals the expected one.
-    pub(crate) fn satisfies(&self, path: &Path, current: &StatKey, expected_sha256: &str) -> bool {
+    pub fn satisfies(&self, path: &Path, current: &StatKey, expected_sha256: &str) -> bool {
         self.load().get(&key_of(path)).is_some_and(|record| {
             record.stat == *current && record.sha256.eq_ignore_ascii_case(expected_sha256)
         })
     }
 
+    /// The verified digest of `path` (whose current stat is `current`) with no
+    /// expected digest to compare against: `Some` lowercase hex only when the
+    /// record's stat equals `current` and its digest is a syntactically valid
+    /// SHA-256 (64 hex digits). Read-only: never hashes, writes, or trusts
+    /// registry state, so the loader calls this once at load time. Anything
+    /// else — missing or corrupt file, unknown path, changed stat, malformed
+    /// digest — is a miss (`None`).
+    pub fn verified_digest(&self, path: &Path, current: &StatKey) -> Option<String> {
+        let record = self.load().remove(&key_of(path))?;
+        if record.stat != *current {
+            return None;
+        }
+        let digest = record.sha256.to_ascii_lowercase();
+        if digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            Some(digest)
+        } else {
+            None
+        }
+    }
+
     /// Record that `path`, whose stat at hashing time was `stat`, hashed to
     /// `sha256`. Written atomically; any failure leaves the cache as it was.
-    pub(crate) fn remember(&self, path: &Path, stat: StatKey, sha256: &str) {
+    pub fn remember(&self, path: &Path, stat: StatKey, sha256: &str) {
         let Some(file) = &self.file else {
             return;
         };
@@ -312,6 +337,94 @@ mod tests {
         assert_eq!(first, StatKey::of(&fs::metadata(&file).unwrap()));
         fs::write(&file, b"longer payload").unwrap();
         assert_ne!(first, StatKey::of(&fs::metadata(&file).unwrap()));
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn verified_digest_needs_no_expected_digest_and_reads_back_lowercase() {
+        let home = scratch("digest-hit");
+        let cache = VerifiedCache::in_home(&home);
+        let model = Path::new("/models/x.mq4-xts");
+        assert_eq!(cache.verified_digest(model, &stat(1)), None);
+        cache.remember(model, stat(1), SHA);
+        assert_eq!(
+            cache.verified_digest(model, &stat(1)),
+            Some(SHA.to_string())
+        );
+        // An uppercase record still reads back lowercase.
+        cache.remember(model, stat(2), &SHA.to_ascii_uppercase());
+        assert_eq!(
+            cache.verified_digest(model, &stat(2)),
+            Some(SHA.to_string())
+        );
+        // Another stat, or another path, is a miss.
+        assert_eq!(cache.verified_digest(model, &stat(3)), None);
+        assert_eq!(
+            cache.verified_digest(Path::new("/models/other"), &stat(1)),
+            None
+        );
+        // Read-only: the lookup leaves no files beside the cache itself.
+        let entries: Vec<_> = fs::read_dir(home.join("cache"))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn verified_digest_rejects_malformed_sha_and_corrupt_files() {
+        let home = scratch("digest-bad");
+        let file = home.join("cache/verified-artifacts.json");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let cache = VerifiedCache::in_home(&home);
+        let model = Path::new("/m/x");
+        let record = |sha: &str| {
+            serde_json::json!({
+                "version": 1,
+                "records": {
+                    "/m/x": {
+                        "dev": 7,
+                        "ino": 1,
+                        "size": 125,
+                        "mtime_sec": 1_700_000_000,
+                        "mtime_nsec": 123_456_789,
+                        "sha256": sha,
+                        "verified_at": 1,
+                    }
+                }
+            })
+        };
+        // Empty, short, long, or non-hex digests never satisfy and never digest.
+        let malformed = [
+            String::from(""),
+            "z".repeat(64),
+            "a".repeat(63),
+            "a".repeat(65),
+            "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f20097g".to_string(),
+        ];
+        for sha in &malformed {
+            fs::write(&file, serde_json::to_vec(&record(sha)).unwrap()).unwrap();
+            assert!(!cache.satisfies(model, &stat(1), SHA), "{sha:?}");
+            assert_eq!(cache.verified_digest(model, &stat(1)), None, "{sha:?}");
+        }
+        // A well-formed uppercase record digests to lowercase.
+        fs::write(
+            &file,
+            serde_json::to_vec(&record(&SHA.to_ascii_uppercase())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            cache.verified_digest(model, &stat(1)),
+            Some(SHA.to_string())
+        );
+        // A missing or corrupt file is a miss, never an error.
+        fs::remove_file(&file).unwrap();
+        assert_eq!(cache.verified_digest(model, &stat(1)), None);
+        for bytes in [&b"{ this is not json"[..], b"", b"[]"] {
+            fs::write(&file, bytes).unwrap();
+            assert_eq!(cache.verified_digest(model, &stat(1)), None, "{bytes:?}");
+        }
         fs::remove_dir_all(&home).unwrap();
     }
 }

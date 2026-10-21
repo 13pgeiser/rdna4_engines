@@ -111,6 +111,7 @@ pub mod tp_shard;
 #[cfg(feature = "deltanet")]
 pub mod triattn;
 pub mod trunk_overlay;
+pub mod verified_cache;
 /// Shared-weight host protocol v1 (`HIPFIRE_WEIGHT_HOST`): identities, typed
 /// manifest, source certificates and the `SCM_RIGHTS` handshake. Linux only.
 #[cfg(target_os = "linux")]
