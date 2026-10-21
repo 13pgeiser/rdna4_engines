@@ -1764,6 +1764,12 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
+        function: "gfx12_fa_prep_fp8q_admitted",
+        occurrences: 2,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
         function: "mq_f16_projection_fast_route",
         occurrences: 2,
         decisions: &["gfx1100-f16-projection-fast-route"],
