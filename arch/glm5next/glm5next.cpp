@@ -430,6 +430,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.expand = copy(b, g, m.x, m.h0);
     m.layers.resize(45);
     for (int l = 0; l < 45; ++l) RAD_ARCH_TRY(layer(b, m, m.layers[l], nm, l, false));
+    // Every rank computes the whole normed latent and pools into the whole index cache
+    // (rad_block_glm_mla.h, rad_block_glm_indexer.h), so the host tier keeps each once a slot.
+    RAD_ARCH_TRY(rad_kv_group_replicated(b, m.latent));
+    if (m.index) RAD_ARCH_TRY(rad_kv_group_replicated(b, m.index));
     m.contract = rw(b,
                     RAD_OP(b, "mhc_contract",
                            RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", 4096),

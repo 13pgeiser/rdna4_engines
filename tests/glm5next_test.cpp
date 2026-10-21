@@ -1440,6 +1440,35 @@ RadBuildCtx glm53_vl_ctx(int rank, int world, int64_t patches, int max_spec = 3)
 
 }  /* namespace */
 
+/* The latent and the index cache are computed whole on every rank (rad_block_glm_mla.h,
+ * rad_block_glm_indexer.h) and the plugin says so, which lets the host tier keep each once a slot
+ * under tensor parallelism instead of once a rank. The linear groups travel in the checkpoint
+ * store and carry no such flag. The flag is outside graph_hash(), so the pinned graphs stand. */
+TEST(glm53_declares_its_latent_and_index_caches_replicated) {
+    MetaKV mk = glm53_vl_meta();
+    auto ends_with = [](const std::string& s, const char* t) {
+        const size_t n = std::strlen(t);
+        return s.size() >= n && s.compare(s.size() - n, n, t) == 0;
+    };
+    for (int world : { 1, 2, 8 }) {
+        for (int rank : { 0, world - 1 }) {
+            RadBuilder b;
+            glm53_encs(b);
+            RadBuildCtx ctx = glm53_vl_ctx(rank, world, 0);
+            REQUIRE_EQ(glm5next::declare(&b, mk.meta(), &ctx), RAD_OK);
+            REQUIRE_EQ(b.kv_groups.size(), 5u);
+            int replicated = 0;
+            for (const RecKV& g : b.kv_groups) {
+                const bool want = ends_with(g.name, "kv_latent") || ends_with(g.name, "kv_dsa_index");
+                CHECK(g.replicated == want);
+                CHECK(!g.zero);
+                replicated += g.replicated;
+            }
+            CHECK_EQ(replicated, 2);
+        }
+    }
+}
+
 /* The tower is declared only with an encoder budget, last, its weights replicated in their own
  * groups past the 45 layers and the MTP layer's, its 2-D rotary the axial one at sixteen
  * frequencies an axis, gate and up joined gate first; one scatter over the trunk's embedding and

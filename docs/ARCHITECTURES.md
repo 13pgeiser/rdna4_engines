@@ -506,9 +506,13 @@ declare.
 | `kv_kda` | `RAD_KV_LINEAR`, f32, 128 x 128 a head | the recurrent state, 64 / tp heads a rank | 34 KDA |
 | `kv_kda_conv` | `RAD_KV_CONV`, bf16, width 4 | the convolution history, 3 x 8192 / tp channels a rank | 34 KDA |
 
-The latent and the index are replicated: every rank keeps the whole latent cache. The model is a
-hybrid, so a prefix-cache hit is usable only from a state checkpoint at or below it, and
-`--checkpoint-interval` decides how much of a shared system prompt is reused.
+The latent and the index are replicated: every rank keeps the whole latent cache, and the plugin
+declares both so (`rad_kv_group_replicated`), which lets the host tier (`--prefix-cache-mib`) hold
+each once a slot: 49.59 KiB a 4-token block at any rank count (`kv_latent` 48.00 KiB over its 12
+layers, `kv_dsa_index` 1.59 KiB), 12.4 KiB a token, where a copy per rank would make a slot
+396.75 KiB at eight. The model is a hybrid, so a prefix-cache hit is usable only from a state
+checkpoint at or below it, and `--checkpoint-interval` decides how much of a shared system prompt
+is reused.
 
 **Linears.** Each weight is served as the export stores it:
 
