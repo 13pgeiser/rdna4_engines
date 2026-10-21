@@ -2569,7 +2569,7 @@ order, not a slow one.
 | `qsa_block_key` | `M`(range) `n` `ratio` `rotary_dim` `pos0`/opt `block_size`/opt `eps`:f64 `theta`:f64 `scale`:f64/opt `wadd`:f64/opt `dtype` `mode`/opt `sections`/opt `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt | `k`, `w`w, `page`?, `pos`? → `out` |
 | `dsa_pool` | `M`(range) `n` `ratio` `dtype` `block_size`/opt | `kg`, `ape`w → `q`, `scale`; `page`?, `cache`:inout? |
 | `dsa_query` | `M`(range) `n` `dtype` | `x` → `q`, `scale` |
-| `dsa_score` | `M`(range) `n` `heads` `blocks` `seqs` `dtype` | `q`, `q_scale`, `gate`, `k`, `k_scale`?, `bt`, `cu`, `nc` → `score` |
+| `dsa_score` | `M`(range) `n` `heads` `blocks` `seqs` `dtype` `row_part`/opt | `q`, `q_scale`, `gate`, `k`, `k_scale`?, `bt`, `cu`, `nc` → `score`, `cu_part`? |
 | `mla_attn` | `M`(range) `latent_dim` `heads` `blocks` `block_size` `scale`:f64 `dtype` | `q`, `kv`, `bt`, `length` → `out` |
 | `mla_project` | `M`(range) `heads` `head_dim` `latent_dim` `mode` `dtype` | `a`, `b`w → `y` |
 | `qsa_score` | `M`(range) `n` `heads` `blocks` `seqs` `dtype` | `q`, `bk`, `bt`, `cu`, `nc` → `score` |
@@ -2813,10 +2813,19 @@ history makes no future block eligible.
 embedded scale are read in place. `q` may be flattened `[M*heads, n]` with `q_scale`
 `[M*heads, 1]`, each with its own row pitch, which is `dsa_query`'s output as written.
 
-libr4d's `dsa_score_fp8` serves `n` 128 and 32 heads, `M` up to 65535, both key forms and both
-query forms. A block of two waves covers the 32 heads of one query row against one or two 16-key
-tiles (two past 32 blocks); the dot products run on fp8 WMMA, and scales and gates fold only after
-each head's ReLU.
+`row_part` scores one run of a step's query rows, for an indexer split over tensor-parallel ranks
+by rows. With `row_part` p, `score` holds R rows and score row i is query row `p * R + i`; `q`,
+`q_scale` and `gate` are the whole step's and hold at least `(p + 1) * R` rows, so a run is the
+unsplit op's rows, bit for bit. A row past the last sequence in `cu` scores `-inf` everywhere,
+which lets every rank's run be the same length whatever the step's. `cu_part`, `[seqs + 1]` i32
+and only with `row_part`, receives `cu - p * R`: the bounds rebased to the run's first row, under
+which an op that reads `cu` over the run's own rows (`qsa_select`, with `pos` offset by `p * R`)
+finds each row's sequence unchanged.
+
+libr4d's `dsa_score_fp8` serves `n` 128 and 32 heads, `M` up to 65535, both key forms, both
+query forms and `row_part`. A block of two waves covers the 32 heads of one query row against one
+or two 16-key tiles (two past 32 blocks); the dot products run on fp8 WMMA, and scales and gates
+fold only after each head's ReLU.
 
 `mla_attn` is absorbed latent attention: one latent vector per token is both key and value.
 `q` and `out` are `[M, heads, latent_dim]`, `kv` is `[pages, 1, block_size, latent_dim]`, and

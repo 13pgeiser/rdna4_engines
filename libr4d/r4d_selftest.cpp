@@ -13481,6 +13481,43 @@ static void dsa_score_check(const Plugin& pl, int64_t rows, int64_t blocks, bool
            .c_str(),
        matches);
     ok("DSA scorer guards and pitched output", guards);
+    if (matches) {
+        /* The rows split into `parts` equal runs, each scored with `row_part` into its own
+         * plane: every run must be the unsplit rows' bytes, and cu_part the rebased bounds. */
+        int64_t parts = rows;
+        for (int64_t d = 2; d < rows; ++d)
+            if (rows % d == 0) {
+                parts = d;
+                break;
+            }
+        const int64_t R = rows / parts, S = host[6].shape[0];
+        bool same = true;
+        for (int64_t part = 0; part < parts && same; ++part) {
+            std::vector<RadTensor> split = device;
+            split.push_back(T(nullptr, RAD_I32, { S }));
+            split[8] = T(nullptr, RAD_F32, { R, blocks });
+            std::vector<RadParam> sp = ps;
+            sp[0] = PI("M", R);
+            sp.push_back(PI("row_part", part));
+            run_case(row, split, sp);
+            std::vector<float> plane((size_t)(R * blocks));
+            std::vector<int32_t> cu_part((size_t)S);
+            st_memcpy(plane.data(), split[8].data, plane.size() * 4, hipMemcpyDeviceToHost);
+            st_memcpy(cu_part.data(), split[9].data, cu_part.size() * 4, hipMemcpyDeviceToHost);
+            for (int64_t r = 0; r < R; ++r)
+                same = same && std::memcmp(&plane[(size_t)(r * blocks)],
+                                           got.data() + 128 +
+                                               (size_t)((part * R + r) * out.stride[0]) * 4,
+                                           (size_t)blocks * 4) == 0;
+            for (int64_t i = 0; i < S; ++i)
+                same = same && cu_part[(size_t)i] ==
+                                   ((int32_t*)host[6].data)[i * host[6].stride[0]] - part * R;
+        }
+        ok(fmt("DSA scorer split into %lld row parts: each the unsplit rows' bytes, cu rebased",
+               (long long)parts)
+               .c_str(),
+           same);
+    }
     if (packed) {
         std::vector<uint8_t> after(packed_bytes.size());
         st_memcpy(after.data(), packed_device, after.size(), hipMemcpyDeviceToHost);

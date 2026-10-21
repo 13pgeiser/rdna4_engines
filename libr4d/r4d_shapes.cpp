@@ -674,7 +674,8 @@ extern "C" int r4d_shape_dsa_score(const RadParam* p, int n_p, int operand, RadO
                              opd_idx(S, B, pages),
                              opd_idx(S + 1, 0, M, -1, RAD_OPD_F_IDX_CU),
                              opd_idx(S, 0, 0, B),
-                             opd((uint32_t)RAD_F32, M, B) };
+                             opd((uint32_t)RAD_F32, M, B),
+                             opd_none() };
     R4D_PICK(l);
 }
 extern "C" int r4d_shape_mla_attn(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

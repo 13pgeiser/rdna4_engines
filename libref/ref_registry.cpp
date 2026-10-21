@@ -170,9 +170,9 @@ static const RadParamSpec pMlaProject[] = { P_INT("M"), P_INT("heads"), P_INT("h
     P_INT("latent_dim"), P_STR("mode"), P_STR("dtype") };
 static const RadOperandSpec oMlaAttn[] = { OPD("q"), OPD("kv"), OPD("bt"), OPD("length"), OUT("out") };
 static const RadParamSpec pDsaScore[] = { P_INT("M"), P_INT("n"), P_INT("heads"),
-    P_INT("blocks"), P_INT("seqs"), P_STR("dtype") };
+    P_INT("blocks"), P_INT("seqs"), P_STR("dtype"), P_INTO("row_part") };
 static const RadOperandSpec oDsaScore[] = { OPD("q"), OPD("q_scale"), OPD("gate"), OPD("k"),
-    OPD_O("k_scale"), OPD("bt"), OPD("cu"), OPD("nc"), OUT("score") };
+    OPD_O("k_scale"), OPD("bt"), OPD("cu"), OPD("nc"), OUT("score"), OUT_O("cu_part") };
 static const RadOperandSpec oDsaPool[] = { OPD("kg"), WGT("ape"), OUT("q"), OUT("scale"),
     OPD_O("page"), INOUT_O("cache") };
 static const RadParamSpec pRouterSigmoid[] = { P_INT("M"), P_INT("n_expert"), P_INT("top_k"),

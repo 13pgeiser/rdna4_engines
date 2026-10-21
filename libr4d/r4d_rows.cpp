@@ -1748,11 +1748,13 @@ static const RadOperandSpec oMlaAttn[] = { { "q", RAD_OPD_IN, 0 },
                                            { "length", RAD_OPD_IN, 0 },
                                            { "out", RAD_OPD_OUT, 0 } };
 static const RadParamSpec pDsaScore[] = { P_INT("M"),      P_INT("n"),    P_INT("heads"),
-                                          P_INT("blocks"), P_INT("seqs"), P_STR("dtype") };
+                                          P_INT("blocks"), P_INT("seqs"), P_STR("dtype"),
+                                          P_INTO("row_part") };
 static const RadOperandSpec oDsaScore[] = {
     { "q", RAD_OPD_IN, 0 },  { "q_scale", RAD_OPD_IN, 0 }, { "gate", RAD_OPD_IN, 0 },
     { "k", RAD_OPD_IN, 0 },  { "k_scale", RAD_OPD_IN, 1 }, { "bt", RAD_OPD_IN, 0 },
-    { "cu", RAD_OPD_IN, 0 }, { "nc", RAD_OPD_IN, 0 },      { "score", RAD_OPD_OUT, 0 }
+    { "cu", RAD_OPD_IN, 0 }, { "nc", RAD_OPD_IN, 0 },      { "score", RAD_OPD_OUT, 0 },
+    { "cu_part", RAD_OPD_OUT, 1 }
 };
 static const RadOperandSpec oDsaPool[] = {
     { "kg", RAD_OPD_IN, 0 },     { "ape", RAD_OPD_WEIGHT, 0 }, { "q", RAD_OPD_OUT, 0 },

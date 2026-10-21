@@ -737,6 +737,7 @@ int ref_dsa_score_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out
     o.t_idx({ S + 1 }, M, -1, RAD_OPD_F_IDX_CU);
     o.t_idx({ S }, 0, B, 0);
     o.t(RAD_F32, { M, B });
+    o.skip();   // cu_part: a part's rebased bounds, exercised by the split's own tests.
     return o.finish("dsa_score", operand, out);
 }
 int ref_mla_attn_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

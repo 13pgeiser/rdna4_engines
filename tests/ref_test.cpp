@@ -486,6 +486,49 @@ TEST(dsa_score_relu_is_per_head_before_signed_weights_and_masks_invalid_history)
     CHECK_EQ(out.at(0), -INFINITY);
 }
 
+TEST(dsa_score_row_part_scores_its_run_of_rows_and_rebases_cu) {
+    T q(RAD_F8E4M3, { 2, 2, 2 }), qs(RAD_F32, { 2, 2 }), gate(RAD_F32, { 2, 2 });
+    T k(RAD_F8E4M3, { 3, 2 }), ks(RAD_F32, { 3 }), bt(RAD_I32, { 2, 3 });
+    T cu(RAD_I32, { 3 }), nc(RAD_I32, { 2 }), out(RAD_F32, { 1, 3 }), cu_part(RAD_I32, { 3 });
+    q.f({ 1, 0, 0, 1, -1, 0, 0, -1 });
+    qs.f({ 2, 0.5, 1, 1 });
+    gate.f({ -1, 4, 2, -1 });
+    k.f({ 1, -1, 2, 3, -2, -4 });
+    ks.f({ 0.25, 0.5, 1 });
+    bt.n({ 0, 1, -1, 2, 0, 1 });
+    cu.n({ 0, 1, 2 });
+    nc.n({ 2, 1 });
+    A a;
+    a.t(q).t(qs).t(gate).t(k).t(ks).t(bt).t(cu).t(nc).t(out).t(cu_part);
+    a.i("M", 1).i("n", 2).i("heads", 2).i("blocks", 3).i("seqs", 2).s("dtype", "fp8_e4m3");
+    a.i("row_part", 1);
+    REQUIRE_EQ(run("dsa_score", a), RAD_OK);
+    CHECK_EQ(out.at(0), 0);
+    CHECK_EQ(out.at(1), -INFINITY);
+    CHECK_EQ(out.at(2), -INFINITY);
+    CHECK_EQ(cu_part.at(0), -1);
+    CHECK_EQ(cu_part.at(1), 0);
+    CHECK_EQ(cu_part.at(2), 1);
+    /* Part 2 of one-row runs is past the step: no sequence holds its row. */
+    T q3(RAD_F8E4M3, { 3, 2, 2 }), qs3(RAD_F32, { 3, 2 }), gate3(RAD_F32, { 3, 2 });
+    q3.f({ 1, 0, 0, 1, -1, 0, 0, -1, 1, 1, 1, 1 });
+    qs3.f({ 2, 0.5, 1, 1, 1, 1 });
+    gate3.f({ -1, 4, 2, -1, 1, 1 });
+    A past;
+    past.t(q3).t(qs3).t(gate3).t(k).t(ks).t(bt).t(cu).t(nc).t(out).t(cu_part);
+    past.i("M", 1).i("n", 2).i("heads", 2).i("blocks", 3).i("seqs", 2).s("dtype", "fp8_e4m3");
+    past.i("row_part", 2);
+    REQUIRE_EQ(run("dsa_score", past), RAD_OK);
+    for (int i : { 0, 1, 2 }) CHECK_EQ(out.at(i), -INFINITY);
+    CHECK_EQ(cu_part.at(2), 0);
+    /* A part needs query rows for its whole run. */
+    A short_q;
+    short_q.t(q).t(qs).t(gate).t(k).t(ks).t(bt).t(cu).t(nc).t(out).t(cu_part);
+    short_q.i("M", 1).i("n", 2).i("heads", 2).i("blocks", 3).i("seqs", 2).s("dtype", "fp8_e4m3");
+    short_q.i("row_part", 2);
+    CHECK_EQ(run("dsa_score", short_q), RAD_E_SHAPE);
+}
+
 TEST(kda_anchor_replays_only_the_accepted_prefix_of_the_previous_window) {
     constexpr int D = 128;
     for (int accepted : { 1, 2, 3 }) {
