@@ -1,8 +1,8 @@
 /* tests/r4d_emu: gemm_nt_f32 (r4d_glm.hip) on the host SIMT emulator. The form the launcher picks
- * at each shape (one wave an output at one row, else a tile of rows x columns a wave, by M; the
- * shapes reach every one) must match the arithmetic written out here bit for bit: lane l folds
- * k = l, l+32, ... with fmaf, then the xor butterfly over 16, 8, 4, 2, 1. Tail rows and columns
- * and the pitch's padding stay untouched.
+ * at each shape (a tile of rows x columns a wave with its steps of k in flight, by M and N; the
+ * shapes reach every one, with K past and short of whole groups of steps) must match the
+ * arithmetic written out here bit for bit: lane l folds k = l, l+32, ... with fmaf, then the xor
+ * butterfly over 16, 8, 4, 2, 1. Tail rows and columns and the pitch's padding stay untouched.
  *
  * router_sigmoid_topk from the same unit: the wave-per-row select must match a serial scan written
  * out here bit for bit, on random and on tied ranks, with the outputs' pitch padding untouched. */
@@ -147,9 +147,10 @@ int main() {
         int M, N, K;
     };
     // One wave an output (M 1), the 2x1, 4x1 (M under 16 or N up to 8), 4x4 and 8x4 tiles.
-    const Shape shapes[] = { { 1, 288, 512 }, { 2, 288, 129 }, { 3, 36, 129 },
-                             { 8, 288, 129 }, { 33, 32, 512 }, { 70, 36, 129 },
-                             { 70, 4, 512 },  { 7, 31, 129 },  { 65, 13, 130 } };
+    const Shape shapes[] = { { 1, 288, 512 },  { 2, 288, 129 },  { 3, 36, 129 },
+                             { 8, 288, 129 },  { 33, 32, 512 },  { 70, 36, 129 },
+                             { 70, 4, 512 },   { 7, 31, 129 },   { 65, 13, 130 },
+                             { 16, 288, 1056 }, { 24, 288, 1040 }, { 40, 36, 1024 } };
     int fails = 0, cases = 0;
     for (const Shape& sh : shapes) {
         const int M = sh.M, N = sh.N, K = sh.K, xp = K + 5, yp = N + 3;
