@@ -7,10 +7,10 @@
 //! call on row r (the kernel's per-row reduction does not depend on B). Rows
 //! cross the 64-row boundary (0/1/63/64/65/70) and several chunks
 //! (128/129/256). A zero-row call launches nothing and leaves its sentinel
-//! output untouched; short inputs fail in the wrapper's `sub_offset` bounds
-//! check (`accessible buffer prefix`), before any launch. The output starts
-//! as a NaN sentinel with one canary row past the end, so a row the call
-//! skips, misplaces or writes past the end fails.
+//! output untouched; short input/output buffers surface an error instead of
+//! silently truncating, while rows from already-launched chunks stay written.
+//! The output starts as a NaN sentinel with one canary row past the end, so
+//! a row the call skips, misplaces or writes past the end fails.
 //!
 //! `#[ignore]`d: needs a HIP GPU. Run explicitly:
 //!
@@ -108,7 +108,7 @@ fn gemm_q8_0_batched_zero_rows_launches_nothing() {
 
 #[test]
 #[ignore = "needs a HIP GPU"]
-fn gemm_q8_0_batched_short_buffers_fail_in_bounds_check() {
+fn gemm_q8_0_batched_short_buffers_error() {
     let mut gpu = Gpu::init().expect("gpu init");
     let mut seed = 0x0732_0053_0048u64;
     let mut w = Vec::with_capacity(M * Q8_ROW_BYTES);
@@ -117,51 +117,49 @@ fn gemm_q8_0_batched_short_buffers_fail_in_bounds_check() {
         w.extend((0..32).map(|_| next(&mut seed) as u8));
     }
     let w = gpu.upload_raw(&w, &[M * Q8_ROW_BYTES]).expect("upload w");
-    // 65 rows need two chunks: rows 0..64 then row 64. The truncation drops
+    // 65 rows need two chunks: rows 0..64 then row 64. Each truncation drops
     // the last row of the second chunk's window, so the first 64-row chunk
-    // launches, then the second chunk's `sub_offset` bounds check fails.
+    // launches and writes its rows before the short buffer errors.
     let x_full: Vec<f32> = (0..65 * K).map(|i| i as f32).collect();
     let short_x = gpu
         .upload_f32(&x_full[..64 * K], &[64 * K])
         .expect("upload x");
     let full_y = sentinel(&mut gpu, 65 * M);
-    // `sub_offset` asserts (dispatch.rs), so the second chunk's out-of-range
-    // view panics after the first 64-row chunk has launched; catch the unwind
-    // instead of expecting `Err`, then sync before reusing the stream.
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         gpu.gemm_q8_0_batched(&w, &short_x, &full_y, M, K, 65)
     }));
-    let msg = match caught {
-        Ok(_) => panic!("short x must panic in the sub_offset bounds check"),
-        Err(payload) => panic_payload_text(payload.as_ref()),
-    };
     assert!(
-        msg.contains("accessible buffer prefix"),
-        "short x must panic in the sub_offset bounds check, got: {msg}"
+        caught.is_err(),
+        "short x must surface an error, not silently truncate"
     );
     gpu.hip.device_synchronize().expect("sync after short x");
+    let got = bits(&gpu, &full_y);
+    assert!(
+        got[..64 * M].iter().all(|&v| v != SENTINEL),
+        "short x: the launched first 64 rows must be written"
+    );
+    assert!(
+        got[64 * M..].iter().all(|&v| v == SENTINEL),
+        "short x: the missing row and canary must stay sentinel"
+    );
     let full_x = gpu.upload_f32(&x_full, &[65 * K]).expect("upload x");
-    let short_y = sentinel(&mut gpu, 64 * M);
+    let backing_y = sentinel(&mut gpu, 65 * M);
+    let short_y = backing_y.sub_offset(0, 64 * M);
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         gpu.gemm_q8_0_batched(&w, &full_x, &short_y, M, K, 65)
     }));
-    let msg = match caught {
-        Ok(_) => panic!("short y must panic in the sub_offset bounds check"),
-        Err(payload) => panic_payload_text(payload.as_ref()),
-    };
     assert!(
-        msg.contains("accessible buffer prefix"),
-        "short y must panic in the sub_offset bounds check, got: {msg}"
+        caught.is_err(),
+        "short y must surface an error, not silently truncate"
     );
     gpu.hip.device_synchronize().expect("sync after short y");
-}
-
-fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        panic!("unexpected panic payload type");
-    }
+    let got = bits(&gpu, &backing_y);
+    assert!(
+        got[..64 * M].iter().all(|&v| v != SENTINEL),
+        "short y: the launched first 64 rows must be written"
+    );
+    assert!(
+        got[64 * M..].iter().all(|&v| v == SENTINEL),
+        "short y: the missing row and canary must stay sentinel"
+    );
 }
