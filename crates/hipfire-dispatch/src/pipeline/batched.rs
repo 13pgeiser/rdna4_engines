@@ -22,7 +22,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use std::sync::LazyLock;
 
 static GEMM: LazyLock<GemmFamily> = LazyLock::new(GemmFamily::new);
-static FUSED_QKV: LazyLock<FusedQkvFamily> = LazyLock::new(FusedQkvFamily::new);
+pub(crate) static FUSED_QKV: LazyLock<FusedQkvFamily> = LazyLock::new(FusedQkvFamily::new);
 
 pub(crate) fn hip_err(e: DispatchError) -> HipError {
     HipError::new(0, &e.to_string())
@@ -119,6 +119,8 @@ pub struct BatchScratch<'a> {
     /// Small-arena scratch: the packed MQ4 routes need full-size planes.
     pub lean: bool,
     pub x_batch: &'a GpuTensor,
+    /// Un-rotated RMSNorm rows: the PARO Givens projections rotate from it.
+    pub x_norm_batch: &'a GpuTensor,
     pub x_rot_batch: &'a GpuTensor,
     pub x_rot_f16_batch: &'a GpuTensor,
     pub gate_ffn_batch: &'a GpuTensor,

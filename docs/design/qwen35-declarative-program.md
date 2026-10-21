@@ -1,9 +1,9 @@
 # Qwen3.5 declarative layer program (#666 G8)
 
-Status: slice 1 (single-GPU decode layers, HIPF-117) and slice 2 (batched
-prefill/verify bodies, HIPF-118) are branch-implemented. They recut #795 from
-current `beta`. #795 is the design reference only, and none of its bodies
-are cherry-picked.
+Status: slice 1 (single-GPU decode layers, HIPF-117), slice 2 (batched
+prefill/verify bodies, HIPF-118) and slice 3 (MoE-layer batched mixers,
+HIPF-119) are branch-implemented. They recut #795 from current `beta`. #795
+is the design reference only, and none of its bodies are cherry-picked.
 
 ## Goal
 
@@ -119,15 +119,49 @@ once in dispatch. The TriAttention tap is one arch binding
 is enabled), passed to the attention executor and shared with the MoE
 attention prep.
 
-Remaining arch-side batched paths (slice 3):
+## Slice 3: MoE-layer batched mixers
+
+The batched mixers of the MoE layers moved from `qwen35/prefill.rs` into
+`pipeline::batched_moe`, verbatim from current beta:
+
+| Executor | Body |
+|---|---|
+| `execute_deltanet_moe_layer_batched` | DeltaNet-MoE linear attention: norm (exact gfx1201 IU4 producer or FWHT), PARO / IU4-prepared / 6-bit / Q8 / low-bit / fused QKVZA projection, MoE chunk scan, fused GDN preamble or indexed Q/K or the legacy conv / QK-norm / repeat sequence, tree / sequential / chunked / lane-batched recurrence, gated norm and its gfx11/gfx12 quant producers, always-residual output projection; then the MoE FFN |
+| `attention_moe_prep_batched` | FA-MoE norm, PARO / IU4-prepared / fused / plain / mixed-format QKV projection, then the A3B native FP8 FA2 Q prep (gfx1201), or Q/K norm, TriAttention tap and the A3B F5 PM Q-prep or RoPE |
+| `attention_moe_finish_batched` | KV write + attend (or the F5 PM direct attend), sigmoid gate, always-residual output projection (incl. the exact gfx1201 rotate producer); then the MoE FFN |
+| `execute_attention_moe_layer_batched` | FP8 Q-prep and F5 admission (FP8 wins), prep, finish, per-layer MoE trace span |
+
+The MoE-only route gates moved with them and exist once:
+`HIPFIRE_PREFILL_IU4_PRODUCER_FUSED` (exact IU4 producers),
+`HIPFIRE_GDN_MOE_PRE_FUSED`, `HIPFIRE_GDN_QK_INDEXED`, the MoE GDN route
+order and the chunk-scan output plane. The per-chunk MoE chunk-scan
+admission stays in the chunk loop, beside the dense one, and reaches the
+executor as a bool, as in slice 2.
+
+They stay separate executors from the dense ones: the output projection
+always accumulates into the residual, the PARO Givens arms rotate the
+un-rotated norm in `x_norm_batch` (now a `BatchScratch` field) by each
+projection's own tables, and the conv / QK-norm launch sequence differs, so
+merging them would change numerics. MQ3G256 / MQ3-Lloyd projections are
+refused inside the executors as well as by the arch's MoE MQ3 guard.
+
+The MoE FFN stays an arch binding: the executors take it as a `moe_ffn`
+callback, bound to `prefill_moe_ffn_body_batched_with_route_layered` (sealed
+prefill MoE program, EP route, `routed_out`). The CPU expert splice for
+`memory.offload_exec=cpu` runs inside that sealed program
+(`MoeStage::CpuSplice`), so it comes along unchanged.
+
+The F2 chunk pair runs the prep for both halves, its merged attend, then the
+finish per half. The finish runs its own attend, so it rewrites the merged
+attend's output, as on beta; the pair is admitted only for 24 query / 4 KV
+heads at head_dim 256 (`fa_pair_env_admitted`), which no MoE fixture on
+gfx1151 has.
+
+Remaining arch-side batched paths (HIPF-128):
 
 - `batch_chunk_full_attn_fallback` / `run_fa_layer_body`: the per-token
   full-attention fallback for weights the batched path does not admit;
 - `dense_tp_attention_partial` (dense TP decode);
-- the MoE layer bodies `batch_chunk_delta_net_moe` and
-  `batch_chunk_full_attn_moe{,_prep,_finish}` (they call the moved stages,
-  but their projections, PARO arms and always-residual output projection
-  stay in the arch);
 - the F2 chunk pair (`forward_prefill_chunk_pair`, `FaPairStage`,
   `batch_chunk_fa_attend_merged`), which stages two chunks into one attend.
 
@@ -150,4 +184,12 @@ prefill) are token-identical moves (Loki `fnaudit.py`: 57 token-identical fns,
 port is audited the same way in HIPF-118); their hardware receipts are
 outstanding: a hiptrx runbook (`cb_vmm_state_oracle` k=1,2,3, a 27B DFlash
 serve A/B, and an A3B native FP8 prefill A/B beta vs stack) and a hipx row
-(27B DFlash with split verify).
+(27B DFlash with split verify). HIPF-119 (slice 3) adds the A3B/Ornith
+oracle rows, the sealed MoE oracle, the emulated EP route oracles, A3B MTP
+serve and PARO (Qwen3.5-35B-A3B-PARO stays per-token: its shared expert is
+F32; shisa-Qwen3.6-35B-A3B-PARO reaches the moved PARO arms). Its gfx1201-only
+routes (exact IU4 producers, fused GDN preamble, indexed Q/K, MoE chunk scan,
+A3B F5, the A3B native FP8 FA2 Q prep of the MoE attention) and the Q8 / 6-bit /
+low-bit / mixed-format attention arms have no gfx1151 fixture: the move is
+checked token by token against beta (`move-audit.diff`), not on hardware; the
+A3B native FP8 prefill A/B above covers the MoE attention too.

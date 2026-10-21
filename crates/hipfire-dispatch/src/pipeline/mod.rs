@@ -40,6 +40,8 @@ pub mod batched_attention;
 #[cfg(feature = "deltanet")]
 pub mod batched_deltanet;
 #[cfg(feature = "deltanet")]
+pub mod batched_moe;
+#[cfg(feature = "deltanet")]
 pub mod hybrid;
 pub(crate) mod layer_ops;
 pub mod sandwich;

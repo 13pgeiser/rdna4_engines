@@ -1527,7 +1527,7 @@ fn fa_pm_kv_keys(codec: FaPrefillKvCodec) -> (KernelKey, KernelKey) {
 }
 
 /// Admission of the A3B F5 exact Q-prep route for one chunk of the single-chunk dense
-/// ([`batch_chunk_full_attn_attn`]) or MoE (`batch_chunk_full_attn_moe`) wrapper. Every
+/// ([`batch_chunk_full_attn_attn`]) or MoE (`execute_attention_moe_layer_batched`) wrapper. Every
 /// condition of the existing whole-chunk PM attend in `batch_chunk_fa_attend` (which runs
 /// before and bypasses the multirow-tile fallback, so `fa_attn_multirow` is not a refusal): no
 /// tree, no independent lanes, whole-chunk `start_pos + n == max_ctx_len` within the physical
