@@ -5,7 +5,9 @@
  * blocks and neighbours share most blocks but rarely a table position. The conflict counters
  * (RADIANCE_MLA_CONFLICT_STATS) show which of the two the pairing saw. Both pairings run on the
  * same operands: the union at the case's table width, the positional pairing on the table
- * widened past the union's lists (kUnionBlocks, 520 entries) with absent entries no row reaches. */
+ * widened past the union's lists (kUnionBlocks, 520 entries) with absent entries no row reaches.
+ * The rows row (attend_rows, 64 heads of one row a workgroup) runs on its own cases, and a mixed
+ * TP step runs both ways, split by heads over the matrix row and by rows over the rows row. */
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "r4d_plugin.h"
@@ -21,6 +23,7 @@
 
 extern "C" void r4d_mla_matrix_pin_form(int form);
 extern "C" void r4d_mla_matrix_stats(unsigned long long* out);
+extern "C" void r4d_mla_rows_pin_form(int form);
 
 namespace {
 
@@ -106,9 +109,9 @@ void topk_tables(int rows, int blocks, int context, int swaps, std::mt19937& rng
     }
 }
 
-int run(const Case& c, std::mt19937& rng) {
-    const int M = c.rows, H = c.heads, B = c.blocks;
-    std::vector<int> bt, len;
+/* The case's page tables and visible lengths; returns the pages the cache holds. */
+int fill_tables(const Case& c, std::mt19937& rng, std::vector<int>& bt, std::vector<int>& len) {
+    const int M = c.rows, B = c.blocks;
     int pages = 0;
     if (c.fill == Fill::topk) {
         topk_tables(M, B, c.context, c.swaps, rng, bt, len, pages);
@@ -144,25 +147,73 @@ int run(const Case& c, std::mt19937& rng) {
             len[r] = r % 5 == 4 ? 0 : B * BS - 1 - r % 7;
         }
     }
+    return pages;
+}
+
+RadTensor tens(void* p, uint32_t dt, std::vector<int64_t> shape) {
+    RadTensor t{};
+    t.data = p;
+    t.dtype = dt;
+    t.rank = (uint32_t)shape.size();
+    int64_t st = 1;
+    for (int i = (int)shape.size() - 1; i >= 0; --i) {
+        t.shape[i] = shape[i];
+        t.stride[i] = st;
+        st *= shape[i];
+    }
+    return t;
+}
+
+/* An f64 softmax over each row's own table. */
+std::vector<double> reference(int M, int H, int B, int pages, const std::vector<int>& bt,
+                              const std::vector<int>& len, const std::vector<uint16_t>& qb,
+                              const std::vector<uint16_t>& kvb, double scale) {
+    std::vector<double> want((size_t)M * H * D);
+    std::vector<double> sc;
+    for (int r = 0; r < M; ++r)
+        for (int h = 0; h < H; ++h) {
+            const int live = std::min(std::max(len[r], 0), B * BS);
+            sc.assign(live, -INFINITY);
+            double mx = -INFINITY;
+            auto row_of = [&](int j) -> const uint16_t* {
+                const int pg = bt[(size_t)r * B + j / BS];
+                return pg >= 0 && pg < pages ? &kvb[((size_t)pg * BS + j % BS) * D] : nullptr;
+            };
+            const uint16_t* qr = &qb[((size_t)r * H + h) * D];
+            for (int j = 0; j < live; ++j) {
+                const uint16_t* k = row_of(j);
+                if (!k) continue;
+                double dot = 0;
+                for (int d = 0; d < D; ++d)
+                    dot += (double)rad_bf16_to_f32(qr[d]) * rad_bf16_to_f32(k[d]);
+                sc[j] = dot * scale;
+                mx = std::max(mx, sc[j]);
+            }
+            std::vector<double> acc(D, 0.0);
+            double sum = 0;
+            for (int j = 0; j < live; ++j) {
+                if (sc[j] == -INFINITY) continue;
+                const double w = std::exp(sc[j] - mx);
+                sum += w;
+                const uint16_t* k = row_of(j);
+                for (int d = 0; d < D; ++d) acc[d] += w * rad_bf16_to_f32(k[d]);
+            }
+            for (int d = 0; d < D; ++d)
+                want[((size_t)r * H + h) * D + d] = sum > 0 ? acc[d] / sum : 0.0;
+        }
+    return want;
+}
+
+int run(const Case& c, std::mt19937& rng) {
+    const int M = c.rows, H = c.heads, B = c.blocks;
+    std::vector<int> bt, len;
+    const int pages = fill_tables(c, rng, bt, len);
     std::normal_distribution<float> nrm(0.f, 1.f);
     std::vector<uint16_t> qb((size_t)M * H * D), kvb((size_t)pages * BS * D);
     for (auto& v : qb) v = rad_f32_to_bf16(0.25f * nrm(rng));
     for (auto& v : kvb) v = rad_f32_to_bf16(nrm(rng));
     std::vector<uint16_t> out((size_t)M * H * D, 0xffff);
 
-    auto tens = [](void* p, uint32_t dt, std::vector<int64_t> shape) {
-        RadTensor t{};
-        t.data = p;
-        t.dtype = dt;
-        t.rank = (uint32_t)shape.size();
-        int64_t st = 1;
-        for (int i = (int)shape.size() - 1; i >= 0; --i) {
-            t.shape[i] = shape[i];
-            t.stride[i] = st;
-            st *= shape[i];
-        }
-        return t;
-    };
     RadTensor t[5] = { tens(qb.data(), RAD_BF16, { M, H, D }),
                        tens(kvb.data(), RAD_BF16, { pages, 1, BS, D }),
                        tens(bt.data(), RAD_I32, { M, B }), tens(len.data(), RAD_I32, { M }),
@@ -202,40 +253,7 @@ int run(const Case& c, std::mt19937& rng) {
         a.scratch_bytes = need;
     }
 
-    /* the f64 reference */
-    std::vector<double> want((size_t)M * H * D);
-    std::vector<double> sc;
-    for (int r = 0; r < M; ++r)
-        for (int h = 0; h < H; ++h) {
-            const int live = std::min(std::max(len[r], 0), B * BS);
-            sc.assign(live, -INFINITY);
-            double mx = -INFINITY;
-            auto row_of = [&](int j) -> const uint16_t* {
-                const int pg = bt[(size_t)r * B + j / BS];
-                return pg >= 0 && pg < pages ? &kvb[((size_t)pg * BS + j % BS) * D] : nullptr;
-            };
-            const uint16_t* qr = &qb[((size_t)r * H + h) * D];
-            for (int j = 0; j < live; ++j) {
-                const uint16_t* k = row_of(j);
-                if (!k) continue;
-                double dot = 0;
-                for (int d = 0; d < D; ++d)
-                    dot += (double)rad_bf16_to_f32(qr[d]) * rad_bf16_to_f32(k[d]);
-                sc[j] = dot * scale;
-                mx = std::max(mx, sc[j]);
-            }
-            std::vector<double> acc(D, 0.0);
-            double sum = 0;
-            for (int j = 0; j < live; ++j) {
-                if (sc[j] == -INFINITY) continue;
-                const double w = std::exp(sc[j] - mx);
-                sum += w;
-                const uint16_t* k = row_of(j);
-                for (int d = 0; d < D; ++d) acc[d] += w * rad_bf16_to_f32(k[d]);
-            }
-            for (int d = 0; d < D; ++d)
-                want[((size_t)r * H + h) * D + d] = sum > 0 ? acc[d] / sum : 0.0;
-        }
+    const std::vector<double> want = reference(M, H, B, pages, bt, len, qb, kvb, scale);
 
     /* Both pairings on the same operands: the positional one, on the table widened past the
      * union's lists, and at the case's own width the launcher's choice, the union, which must
@@ -326,6 +344,227 @@ int run(const Case& c, std::mt19937& rng) {
     return fails;
 }
 
+/* The rows row (attend_rows): one query row and 64 heads a workgroup, as GLM's prefill runs MLA
+ * split by rows. Each form against the f64 softmax and the forms bit for bit against each other
+ * (the element-wise key load; 32 heads a workgroup, whose heads sum alike); unsplit, a run of the
+ * rows against the same rows of the whole batch, since a rank computing its run must produce the
+ * bytes the batch would. */
+int run_rows(const Case& c, std::mt19937& rng) {
+    const int M = c.rows, H = c.heads, B = c.blocks;
+    std::vector<int> bt, len;
+    const int pages = fill_tables(c, rng, bt, len);
+    std::normal_distribution<float> nrm(0.f, 1.f);
+    std::vector<uint16_t> qb((size_t)M * H * D), kvb((size_t)pages * BS * D);
+    for (auto& v : qb) v = rad_f32_to_bf16(0.25f * nrm(rng));
+    for (auto& v : kvb) v = rad_f32_to_bf16(nrm(rng));
+    const double scale = 0.0625;
+    const std::vector<double> want = reference(M, H, B, pages, bt, len, qb, kvb, scale);
+    std::vector<char> scratch;
+    auto launch = [&](int first, int rows, int form, std::vector<uint16_t>& out) {
+        const size_t q0 = (size_t)first * H * D;
+        RadTensor t[5] = { tens(qb.data() + q0, RAD_BF16, { rows, H, D }),
+                           tens(kvb.data(), RAD_BF16, { pages, 1, BS, D }),
+                           tens(bt.data() + (size_t)first * B, RAD_I32, { rows, B }),
+                           tens(len.data() + first, RAD_I32, { rows }),
+                           tens(out.data() + q0, RAD_BF16, { rows, H, D }) };
+        RadParam p[6]{};
+        const char* keys[5] = { "M", "latent_dim", "heads", "blocks", "block_size" };
+        const long long vals[5] = { rows, D, H, B, BS };
+        for (int i = 0; i < 5; ++i) {
+            p[i].key = keys[i];
+            p[i].kind = RAD_P_INT;
+            p[i].ival = vals[i];
+        }
+        p[5].key = "scale";
+        p[5].kind = RAD_P_F64;
+        p[5].dval = scale;
+        RadArgs a{};
+        a.t = t;
+        a.n_t = 5;
+        a.p = p;
+        a.n_p = 6;
+        if (c.scratch) {
+            const int64_t need = r4d_rad_mla_attn_matrix_scratch(&a);
+            scratch.assign((size_t)need + 16, 0);
+            a.scratch = scratch.data() + ((16 - ((uintptr_t)scratch.data() & 15)) & 15);
+            a.scratch_bytes = need;
+        }
+        if (form < 0) return r4d_rad_mla_attn_matrix(&a, nullptr);
+        r4d_mla_rows_pin_form(form);
+        const int rc = r4d_rad_mla_attn_rows(&a, nullptr);
+        r4d_mla_rows_pin_form(0);
+        return rc;
+    };
+    int fails = 0;
+    std::vector<uint16_t> rule;
+    for (int form : { 3, 1, 2, 0 }) {
+        std::vector<uint16_t> out((size_t)M * H * D, 0xffff);
+        const int rc = launch(0, M, form, out);
+        if (rc != RAD_OK) {
+            std::printf("%-40s form %d launch returned %d  FAIL\n", c.name.c_str(), form, rc);
+            ++fails;
+            continue;
+        }
+        double max_err = 0;
+        long bad = 0;
+        for (size_t i = 0; i < out.size(); ++i) {
+            const float got = rad_bf16_to_f32(out[i]);
+            const double e = std::fabs(got - want[i]);
+            if (!std::isfinite(got) || e > 1e-5 + 0.008 * std::fabs(want[i])) ++bad;
+            if (std::isfinite(got)) max_err = std::max(max_err, e);
+        }
+        bool ok = bad == 0;
+        std::string note;
+        /* A split follows the workgroup count, which 32 heads a workgroup doubles; under 32 rows
+         * the rule is the matrix row's kernel. */
+        if (form == 3)
+            rule = out;
+        else if (form == 0 && M < 32) {
+            std::vector<uint16_t> matrix((size_t)M * H * D, 0xffff);
+            const int mrc = launch(0, M, -1, matrix);
+            if (mrc != RAD_OK || matrix != out) {
+                note = "  (the rule under 32 rows is not the matrix row)";
+                ok = false;
+            }
+        } else if ((form == 1 || !c.scratch) && out != rule) {
+            note = "  (differs from form 3)";
+            ok = false;
+        }
+        std::printf("%-40s form %d M %3d H %2d blocks %3d  max_abs %.2e  bad %ld%s  %s\n",
+                    c.name.c_str(), form, M, H, B, max_err, bad, note.c_str(), ok ? "PASS" : "FAIL");
+        fails += !ok;
+    }
+    if (!c.scratch && M >= 3 && !rule.empty()) {
+        std::vector<uint16_t> out((size_t)M * H * D, 0xffff);
+        const int rc = launch(1, M - 2, 3, out);
+        bool same = rc == RAD_OK, untouched = true;
+        for (int r = 0; r < M; ++r)
+            for (size_t i = (size_t)r * H * D; i < (size_t)(r + 1) * H * D; ++i) {
+                if (r == 0 || r == M - 1)
+                    untouched = untouched && out[i] == 0xffff;
+                else
+                    same = same && out[i] == rule[i];
+            }
+        std::printf("%-40s rows 1..%d alone: %s, rows outside %s  %s\n", c.name.c_str(), M - 2,
+                    same ? "bit-identical to the batch" : "DIFFER from the batch",
+                    untouched ? "untouched" : "WRITTEN", same && untouched ? "PASS" : "FAIL");
+        fails += !(same && untouched);
+    }
+    return fails;
+}
+
+/* A TP step's attention both ways on one operand set: by heads, each of `world` ranks running
+ * the matrix row on its heads of every row (views into the whole [T, 64, 512]), and by rows, each
+ * rank the rows row on its run of ceil(T / world) rows with every head, the last run short. The
+ * step mixes what a step batch carries, decode rows first: single-row decodes on scattered tables,
+ * a verify window of four rows on one table, then a prefill continuing past the DSA budget and a
+ * fresh prompt's first chunk. Both forms against the f64 softmax; how far apart they are is
+ * printed. */
+int run_split(const char* name, int world, int fresh_rows, std::mt19937& rng) {
+    constexpr int H = 64, B = 65;
+    std::vector<int> bt, len;
+    int pages = 0;
+    auto append = [&](const std::vector<int>& t, const std::vector<int>& l, int segment_pages) {
+        for (int v : t) bt.push_back(v >= 0 ? v + pages : v);
+        len.insert(len.end(), l.begin(), l.end());
+        pages += segment_pages;
+    };
+    {   /* three decodes, each its own table with holes */
+        std::vector<int> t((size_t)3 * B), l(3);
+        for (int r = 0; r < 3; ++r) {
+            for (int b = 0; b < B; ++b) t[(size_t)r * B + b] = b % 13 == 5 ? -1 : (b * 5 + r * 17) % (3 * B);
+            l[r] = B * BS - 1 - 3 * r;
+        }
+        append(t, l, 3 * B);
+    }
+    {   /* a verify window: four rows of one sequence on one table */
+        std::vector<int> t((size_t)4 * B), l(4);
+        for (int r = 0; r < 4; ++r) {
+            for (int b = 0; b < B; ++b) t[(size_t)r * B + b] = (b * 3 + 1) % B;
+            l[r] = B * BS - 4 + r + 1;
+        }
+        append(t, l, B);
+    }
+    {   /* a prefill past the DSA budget: every row its own top blocks */
+        std::vector<int> t, l;
+        int segment = 0;
+        topk_tables(23, B, 1200, 4, rng, t, l, segment);
+        append(t, l, segment);
+    }
+    {   /* a fresh prompt's chunk: causal on one table, rows starting at position 0 */
+        std::vector<int> t((size_t)fresh_rows * B, -1), l(fresh_rows);
+        for (int r = 0; r < fresh_rows; ++r) {
+            for (int b = 0; b <= r / BS && b < B; ++b) t[(size_t)r * B + b] = b;
+            l[r] = r + 1;
+        }
+        append(t, l, B);
+    }
+    const int T = (int)len.size();
+    std::normal_distribution<float> nrm(0.f, 1.f);
+    std::vector<uint16_t> qb((size_t)T * H * D), kvb((size_t)pages * BS * D);
+    for (auto& v : qb) v = rad_f32_to_bf16(0.25f * nrm(rng));
+    for (auto& v : kvb) v = rad_f32_to_bf16(nrm(rng));
+    const double scale = 0.0625;
+    const std::vector<double> want = reference(T, H, B, pages, bt, len, qb, kvb, scale);
+    auto launch = [&](bool by_rows, int first, int rows, int h0, int heads,
+                      std::vector<uint16_t>& out) {
+        const size_t at = ((size_t)first * H + h0) * D;
+        RadTensor t[5] = { tens(qb.data() + at, RAD_BF16, { rows, heads, D }),
+                           tens(kvb.data(), RAD_BF16, { pages, 1, BS, D }),
+                           tens(bt.data() + (size_t)first * B, RAD_I32, { rows, B }),
+                           tens(len.data() + first, RAD_I32, { rows }),
+                           tens(out.data() + at, RAD_BF16, { rows, heads, D }) };
+        t[0].stride[0] = t[4].stride[0] = (int64_t)H * D;
+        RadParam p[6]{};
+        const char* keys[5] = { "M", "latent_dim", "heads", "blocks", "block_size" };
+        const long long vals[5] = { rows, D, heads, B, BS };
+        for (int i = 0; i < 5; ++i) {
+            p[i].key = keys[i];
+            p[i].kind = RAD_P_INT;
+            p[i].ival = vals[i];
+        }
+        p[5].key = "scale";
+        p[5].kind = RAD_P_F64;
+        p[5].dval = scale;
+        RadArgs a{};
+        a.t = t;
+        a.n_t = 5;
+        a.p = p;
+        a.n_p = 6;
+        if (!by_rows) return r4d_rad_mla_attn_matrix(&a, nullptr);
+        /* Runs this short take the matrix kernel by rule; the rows kernel is what is under test. */
+        r4d_mla_rows_pin_form(3);
+        const int rc = r4d_rad_mla_attn_rows(&a, nullptr);
+        r4d_mla_rows_pin_form(0);
+        return rc;
+    };
+    std::vector<uint16_t> heads_out((size_t)T * H * D, 0xffff), rows_out((size_t)T * H * D, 0xffff);
+    const int per_heads = H / world, run = (T + world - 1) / world;
+    int fails = 0;
+    for (int rank = 0; rank < world; ++rank) {
+        fails += launch(false, 0, T, rank * per_heads, per_heads, heads_out) != RAD_OK;
+        const int first = rank * run, n = std::min(run, T - first);
+        if (n > 0) fails += launch(true, first, n, 0, H, rows_out) != RAD_OK;
+    }
+    long bad[2] = { 0, 0 };
+    double max_err[2] = { 0, 0 }, apart = 0;
+    for (size_t i = 0; i < want.size(); ++i) {
+        const float got[2] = { rad_bf16_to_f32(heads_out[i]), rad_bf16_to_f32(rows_out[i]) };
+        for (int f = 0; f < 2; ++f) {
+            const double e = std::fabs(got[f] - want[i]);
+            if (!std::isfinite(got[f]) || e > 1e-5 + 0.008 * std::fabs(want[i])) ++bad[f];
+            if (std::isfinite(got[f])) max_err[f] = std::max(max_err[f], e);
+        }
+        apart = std::max(apart, (double)std::fabs(got[0] - got[1]));
+    }
+    const bool ok = !fails && !bad[0] && !bad[1];
+    std::printf("%-40s T %3d world %d run %2d last %2d  heads max_abs %.2e bad %ld  rows max_abs "
+                "%.2e bad %ld  apart %.2e  %s\n",
+                name, T, world, run, T - (world - 1) * run, max_err[0], bad[0], max_err[1], bad[1],
+                apart, ok ? "PASS" : "FAIL");
+    return !ok;
+}
+
 /* The launcher prints the running totals every 1024th counted launch and must leave them
  * standing: 1024 one-chunk launches of a pair, then the hook reads exactly 1024 passes. */
 int periodic_report() {
@@ -406,12 +645,41 @@ int main(int argc, char** argv) {
         { "ragged, holes and bad pages", 7, 8, 17, Fill::ragged, 0, 0, false, 0, -1 },
         { "ragged, split", 3, 8, 17, Fill::ragged, 0, 0, true, 0, -1, false },
     };
+    /* The rows row at 64 heads, and at 32, which it serves with two groups a workgroup. */
+    std::vector<Case> rows_cases = {
+        { "rows: prefill, one table", 8, 64, 65, Fill::prefill },
+        { "rows: topk d=4", 8, 64, 65, Fill::topk, 4, 600 },
+        { "rows: topk d=16, 513 blocks", 3, 64, 513, Fill::topk, 16, 8192 },
+        { "rows: repeated pages", 6, 64, 33, Fill::repeat },
+        { "rows: ragged, holes and bad pages", 7, 64, 17, Fill::ragged },
+        { "rows: ragged, split", 3, 64, 17, Fill::ragged, 0, 0, true },
+        { "rows: prefill, one row, split", 1, 64, 65, Fill::prefill, 0, 0, true },
+        { "rows: 32 heads", 5, 32, 33, Fill::prefill },
+        { "rows: 32 heads, topk d=4, split", 2, 32, 33, Fill::topk, 4, 400, true },
+    };
     const char* filter = argc > 1 ? argv[1] : nullptr;
     int fails = 0;
     for (size_t i = 0; i < cases.size(); ++i) {
         if (filter && cases[i].name.find(filter) == std::string::npos) continue;
         std::mt19937 rng(20261018u + (unsigned)i);
         fails += run(cases[i], rng);
+    }
+    for (size_t i = 0; i < rows_cases.size(); ++i) {
+        if (filter && rows_cases[i].name.find(filter) == std::string::npos) continue;
+        std::mt19937 rng(20261020u + (unsigned)i);
+        fails += run_rows(rows_cases[i], rng);
+    }
+    /* T 45 over eight ranks: runs of 6, the last of 3; 37 over four: 10 and 7; 48: whole runs. */
+    const struct {
+        const char* name;
+        int world, fresh;
+    } splits[] = { { "split: heads vs rows, 8 ranks", 8, 15 },
+                   { "split: heads vs rows, 4 ranks", 4, 7 },
+                   { "split: heads vs rows, whole runs", 8, 18 } };
+    for (size_t i = 0; i < sizeof splits / sizeof splits[0]; ++i) {
+        if (filter && !std::strstr(splits[i].name, filter)) continue;
+        std::mt19937 rng(20261021u + (unsigned)i);
+        fails += run_split(splits[i].name, splits[i].world, splits[i].fresh, rng);
     }
     if (!filter) fails += periodic_report();
     std::printf("%d failure(s)\n", fails);

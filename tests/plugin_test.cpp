@@ -996,7 +996,8 @@ TEST(libr4d_resolves_the_vision_attention_without_a_window) {
 }
 
 /* GLM-5.3-Flash's MLA at eight heads a rank: the matrix row ranks above the wave row and serves
- * every M up to its bound, a decode step's rows and a prefill chunk alike. */
+ * every M up to its bound, a decode step's rows and a prefill chunk alike. At 64 heads the rows
+ * row ranks above both. */
 TEST(libr4d_resolves_the_mla_attention_by_rows) {
     const std::string so = libr4d();
     if (so.empty()) return;
@@ -1010,6 +1011,11 @@ TEST(libr4d_resolves_the_mla_attention_by_rows) {
     g.set_s("dtype", "bf16");
     CHECK_EQ(band_names(r.build_bands("mla_attn", "M", 1, 2048, g)), "2048:mla_attn_matrix_bf16 ");
     CHECK_EQ(band_names(r.build_bands("mla_attn", "M", 1, 48, g)), "48:mla_attn_matrix_bf16 ");
+    // All 64 heads of a row, as GLM's prefill split by rows runs it: the rows row.
+    g.set_i("heads", 64);
+    CHECK_EQ(band_names(r.build_bands("mla_attn", "M", 1, 512, g)), "512:mla_attn_rows_bf16 ");
+    g.set_i("heads", 16);
+    CHECK_EQ(band_names(r.build_bands("mla_attn", "M", 1, 512, g)), "512:mla_attn_matrix_bf16 ");
 }
 
 /* ================================================================== constraints that are not intervals */

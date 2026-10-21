@@ -144,6 +144,7 @@ struct Plugin {
     void (*pin_qsel)(int) = nullptr;
     void (*pin_mla)(int) = nullptr;
     void (*mla_stats)(unsigned long long*) = nullptr;
+    void (*pin_mla_rows)(int) = nullptr;
     int (*record)(const void**, int) = nullptr;
 };
 
@@ -181,6 +182,7 @@ static bool load(Plugin* pl, const char* path) {
     okall &= sym(pl->h, "r4d_qsa_select_pin_form", &pl->pin_qsel);
     okall &= sym(pl->h, "r4d_mla_matrix_pin_form", &pl->pin_mla);
     okall &= sym(pl->h, "r4d_mla_matrix_stats", &pl->mla_stats);
+    okall &= sym(pl->h, "r4d_mla_rows_pin_form", &pl->pin_mla_rows);
     okall &= sym(pl->h, "r4d_record_dispatches", &pl->record);
     return okall;
 }
@@ -14008,25 +14010,28 @@ static void mla_check(const Plugin& pl, int64_t rows, int64_t heads, int64_t blo
     const int rc = oracle->launch(&args, nullptr);
     ok("MLA host oracle", rc == RAD_OK);
     args.t = device.data();
-    /* The head-tiled row serves tiles of 16 heads or of 8 heads from two requests (cMlaMatrix);
-     * other head counts must be refused rather than computed. */
-    if (std::strstr(name, "matrix") && heads % 8) {
+    /* The head-tiled row serves tiles of 16 heads or of 8 heads from two requests (cMlaMatrix),
+     * the rows row groups of 32 or 64 heads; other head counts must be refused rather than
+     * computed. */
+    const bool by_rows = std::strstr(name, "rows") != nullptr;
+    auto* const pin = by_rows ? pl.pin_mla_rows : pl.pin_mla;
+    if ((std::strstr(name, "matrix") && heads % 8) || (by_rows && heads % 32)) {
         args.scratch = nullptr;
         args.scratch_bytes = 0;
         const int grc = row->launch(&args, nullptr);
         st_stream_sync(nullptr);
-        ok(fmt("MLA %s refuses heads=%lld (not a multiple of 8) with RAD_E_UNSUPPORTED, no launch",
-               name, (long long)heads)
+        ok(fmt("MLA %s refuses heads=%lld (not a multiple of %d) with RAD_E_UNSUPPORTED, no launch",
+               name, (long long)heads, by_rows ? 32 : 8)
                .c_str(),
            grc == RAD_E_UNSUPPORTED);
         dlclose(ref);
         return;
     }
-    if (form && pl.pin_mla) pl.pin_mla(form);
+    if (form && pin) pin(form);
     const int64_t need = row->scratch ? row->scratch(&args) : 0;
     void* scratch = need > 0 ? dalloc((size_t)need + 256) : nullptr;
     if (need <= 0 || !scratch) {
-        if (form && pl.pin_mla) pl.pin_mla(0);
+        if (form && pin) pin(0);
         ok("MLA scratch allocation", false);
         dlclose(ref);
         return;
@@ -14095,7 +14100,7 @@ static void mla_check(const Plugin& pl, int64_t rows, int64_t heads, int64_t blo
                         versus, base, name, base / us, shape);
         }
     }
-    if (form && pl.pin_mla) pl.pin_mla(0);
+    if (form && pin) pin(0);
     dlclose(ref);
 }
 
@@ -14205,17 +14210,19 @@ static void mla_perf(const Plugin& pl, int64_t M, int64_t blocks, int64_t heads,
                                  PS("dtype", "bf16") };
     std::vector<uint16_t> base, rule;
     auto run = [&](const char* name, int form, const char* label) {
+        const bool by_rows = std::strstr(name, "rows") != nullptr;
+        auto* const pin = by_rows ? pl.pin_mla_rows : pl.pin_mla;
         const RadKernelInfo* r = find(pl, name);
         if (!r) {
             std::printf("  %-34s row absent\n", label);
             return;
         }
         if (form >= 0) {
-            if (!pl.pin_mla) {
+            if (!pin) {
                 std::printf("  %-34s no pin hook\n", label);
                 return;
             }
-            pl.pin_mla(form);
+            pin(form);
         }
         RadArgs a;
         std::memset(&a, 0, sizeof(a));
@@ -14232,7 +14239,7 @@ static void mla_perf(const Plugin& pl, int64_t M, int64_t blocks, int64_t heads,
         const int rc = r->launch(&a, nullptr);
         if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
             std::printf("  %-34s rc=%d (shape not served)\n", label, rc);
-            if (form >= 0) pl.pin_mla(0);
+            if (form >= 0) pin(0);
             return;
         }
         std::vector<uint16_t> got(qh.size());
@@ -14253,7 +14260,7 @@ static void mla_perf(const Plugin& pl, int64_t M, int64_t blocks, int64_t heads,
             st_ev_destroy(w1);
         }
         const double us = st_time_us([&](int) { r->launch(&a, nullptr); }, iters, nullptr);
-        if (form >= 0) pl.pin_mla(0);
+        if (form >= 0) pin(0);
         char diff[192] = "reference";
         if (base.empty())
             base = got;
@@ -14279,7 +14286,7 @@ static void mla_perf(const Plugin& pl, int64_t M, int64_t blocks, int64_t heads,
         }
         if (form == 0) rule = got;
         std::printf("  %-34s %10.2f us  %7.2f TFLOP/s  %s\n", label, us, flops / (us * 1e6), diff);
-        if (form >= 0 && pl.mla_stats) {
+        if (form >= 0 && !by_rows && pl.mla_stats) {
             /* One more launch with the conflict counters on, outside the timing. */
             ScopedEnv counting("RADIANCE_MLA_CONFLICT_STATS", "1");
             unsigned long long v[3];
@@ -14307,6 +14314,11 @@ static void mla_perf(const Plugin& pl, int64_t M, int64_t blocks, int64_t heads,
     } else {
         run("mla_attn_matrix_bf16", 0, "matrix 16 heads, vector load");
         run("mla_attn_matrix_bf16", 1, "matrix 16 heads, element load");
+    }
+    if (heads == 64) {
+        run("mla_attn_rows_bf16", 0, "rows 64 heads, vector load");
+        run("mla_attn_rows_bf16", 1, "rows 64 heads, element load");
+        run("mla_attn_rows_bf16", 2, "rows 32 heads, vector load");
     }
 }
 
@@ -26662,6 +26674,26 @@ static void device_phase(const Plugin& pl) {
             for (int64_t rows : { 1, 4, 33 })
                 for (int64_t heads : { 8, 16 }) mla_project_check(pl, rows, heads, mode, true);
         }
+    }
+    if (sel("mla_attn_rows_bf16")) {
+        /* A rank's run of rows with all 64 heads (GLM's prefill split by rows), against the matrix
+         * row on the same operands. Under 32 rows the rule runs the matrix kernel, so the rows
+         * kernel is pinned there (form 3). */
+        for (int requests : { 1, 2, 7, 33 })
+            for (int64_t blocks : { 17, 513 })
+                mla_check(pl, requests, 64, blocks, "mla_attn_rows_bf16", MlaFill::ragged,
+                          "mla_attn_matrix_bf16", requests < 32 ? 3 : 0);
+        mla_check(pl, 7, 64, 513, "mla_attn_rows_bf16", MlaFill::full, "mla_attn_matrix_bf16", 3);
+        mla_check(pl, 2, 64, 513, "mla_attn_rows_bf16", MlaFill::prefill, "mla_attn_matrix_bf16", 3);
+        mla_check(pl, 33, 64, 513, "mla_attn_rows_bf16", MlaFill::prefill, "mla_attn_matrix_bf16");
+        for (int64_t swaps : { 0, 4, 16, 64 })
+            mla_check(pl, 33, 64, 65, "mla_attn_rows_bf16", MlaFill::topk, "mla_attn_matrix_bf16",
+                      0, swaps);
+        mla_check(pl, 7, 64, 513, "mla_attn_rows_bf16", MlaFill::prefill, nullptr, 1);
+        mla_check(pl, 33, 64, 65, "mla_attn_rows_bf16", MlaFill::topk, nullptr, 2, 16);
+        mla_check(pl, 7, 64, 65, "mla_attn_rows_bf16", MlaFill::topk, "mla_attn_matrix_bf16", 0, 4);
+        mla_check(pl, 7, 32, 65, "mla_attn_rows_bf16", MlaFill::ragged, nullptr, 3);
+        mla_check(pl, 4, 40, 17, "mla_attn_rows_bf16");
     }
     if (sel("mla_attn_matrix_bf16")) {
         mla_check(pl, 7, 16, 17, "mla_attn_matrix_bf16");

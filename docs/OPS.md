@@ -2836,7 +2836,7 @@ contributes nothing, and a row with no visible key outputs zero. The softmax is 
 rounded once. `scale` is positive and finite and comes from the original query/key head width,
 not the latent width (GLM: `1/sqrt(256)` against a latent of 512).
 
-libr4d has two `mla_attn` rows, both at `latent_dim` 512, `block_size` 4 and up to 64 heads. The
+libr4d has three `mla_attn` rows, all at `latent_dim` 512, `block_size` 4 and up to 64 heads. The
 matrix row, `mla_attn_matrix_bf16`, ranks above the wave row and takes heads in multiples of 8: the
 heads are the WMMA tile's rows, so all of them share each latent load, and the probabilities enter
 it as bf16 high and low parts with f32 accumulation. At a multiple of 16 a tile holds 16 heads of
@@ -2847,6 +2847,18 @@ by table position, with a second pass where the two differ. Other head counts ta
 `mla_attn_bf16`: a wave per head with an online softmax. Both split a short batch's history across
 workgroups and merge the f32 partials before narrowing, into the fixed scratch their hooks
 reserve; without scratch they compute unsplit.
+
+At exactly 64 heads the rows row, `mla_attn_rows_bf16`, ranks above both. A workgroup takes one
+query row and all its heads, four waves to each group of sixteen, and loads each 16-token key chunk
+once for all of them, where the matrix row loads it once a tile of sixteen. The scores are
+`K Q^T`, tokens as the tile's rows and heads as its columns, so a head's running maximum and
+denominator stay in its lane; the four waves of a group each take a quarter of the latent's dot
+products and add the four partials in one order, and the probabilities reach the value product
+through a lane swap instead of LDS. The next chunk's keys are fetched while the current one is
+multiplied. A row's output does not depend on the other rows of the batch, so a run of rows gives
+the bytes the whole batch would. Under 32 rows (a decode step at one rank) too few workgroups fill the card, and its launcher
+runs the matrix row's kernel instead. It also takes multiples of 32 heads (two groups a
+workgroup), which no constraint routes to it.
 
 `mla_project` moves a query into the latent and a latent result out of it, through the bf16
 weight `b` `[heads*2*head_dim, latent_dim]` that stores each head's key rows, then its value rows.

@@ -698,6 +698,7 @@ int r4d_rad_mla_attn(const RadArgs*, RadStream);
 int64_t r4d_rad_mla_attn_scratch(const RadArgs*);
 int r4d_rad_mla_attn_matrix(const RadArgs*, RadStream);
 int64_t r4d_rad_mla_attn_matrix_scratch(const RadArgs*);
+int r4d_rad_mla_attn_rows(const RadArgs*, RadStream);
 int r4d_shape_mla_attn(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_router_sigmoid_topk(const RadArgs*, RadStream);
 int r4d_shape_router_sigmoid_topk(const RadParam*, int, int, RadOpdDesc*);

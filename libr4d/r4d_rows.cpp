@@ -4266,6 +4266,16 @@ static const RadConstraint cMlaMatrix[] = { C_GE("M", 1),
                                             C_GE("blocks", 1),
                                             C_EQ("block_size", 4),
                                             C_IN("dtype", "bf16") };
+/* GLM's prefill splits MLA by rows, a rank holding every head of its rows: the rows row loads a
+ * key chunk once for a workgroup of 64 heads and outranks the matrix row there. Measured on gfx1201
+ * (r4d_selftest --perfmla 512 513 64 20 topk:16:16000), a rank's run of 512 rows takes 3.9 ms
+ * against 12.3 ms on the matrix row, and the 4096 rows x 8 heads it replaces 14.0 ms on the paired
+ * matrix row. Under 32 rows its launcher runs the matrix row's kernel (r4d_mla.hip); a bound on M
+ * here would cut every mla_attn band at 32, the eight-head ones too. */
+static const RadConstraint cMlaRows[] = { C_GE("M", 1),         C_LE("M", 65535),
+                                          C_EQ("latent_dim", 512), C_EQ("heads", 64),
+                                          C_GE("blocks", 1),       C_EQ("block_size", 4),
+                                          C_IN("dtype", "bf16") };
 /* `n` is bounded by LDS: nh (hc*n) and ne (n) are both bf16 and live through the second phase;
  * 28672 elements is that budget at hc 4. */
 static const RadConstraint cMtpEnter[] = {
@@ -5541,6 +5551,12 @@ static const RadKernelInfo kKernels[] = {
    nullptr, nullptr, r4d_rad_scale, nullptr, nullptr, nullptr,
    r4d_shape_scale },
 
+{ "mla_attn_rows_bf16", "mla_attn", "attn", "row-tiled WMMA latent attention, one key load for 64 heads",
+  "latent_dim=512, heads=64, block_size=4",
+  "bf16 operands; FP32 probabilities via high/low BF16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY + 2, ROW(cMlaRows), NOTUNE,
+  nullptr, nullptr, r4d_rad_mla_attn_rows, r4d_rad_mla_attn_matrix_scratch, nullptr, nullptr,
+  r4d_shape_mla_attn },
 { "mla_attn_matrix_bf16", "mla_attn", "attn", "head-tiled WMMA latent attention with FP32 softmax",
   "latent_dim=512, heads a multiple of 8 (heads%16==8 pairs two requests a tile), block_size=4",
   "bf16 operands; FP32 probabilities via high/low BF16",
