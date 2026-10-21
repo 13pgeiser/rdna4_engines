@@ -2311,6 +2311,13 @@ curl -s http://localhost:8000/v1/videos/video_.../content -o fox.mp4
   evaluations, by default; at most 65). The model is guidance-distilled, so there is no guidance
   scale and no negative prompt. A step-distilled release (FastH3, below) runs only the schedule it
   was trained on: 9 grid points, and any other count is refused with a 400.
+- **`sampler`** is `euler` (default, first order) or `res_multistep` (second order on the clean
+  estimate; the DasiWa workflow's choice). **`shift`** and **`audio_shift`** override the exponential
+  shift of the video and soundtrack sigma grids, each a number in `(0, 100]`; omitted, each runs the
+  model's trained shift (a model card's `video_shift` / `video_audio_shift` report those, e.g. 12 / 3).
+  These reshape the noise schedule the driver stages — they reach the kernels as sigmas, not as a new
+  batch field — and never change the model's trained look, which is fixed by its VAE decode and
+  quantisation, not the schedule.
 - Only text is read: `input_reference` and non-empty `conditions` are refused, as is a `task`
   other than `t2va`. Fields are JSON or a multipart form (OpenAI's clients send the form).
 

@@ -60,6 +60,7 @@ struct Server::VideoJob {
     int64_t     created_at = 0;
     uint64_t    seed = 0;
     int32_t     sampler = 0;   /* the request's RAD_SAMPLER_* */
+    double      shift_video = 0, shift_audio = 0;   /* the request's shift override; 0: the model's */
     std::shared_ptr<gen::VideoTicket> ticket;
     std::thread worker;
     /* Under Server::videos_m_ from here on. */
@@ -274,6 +275,10 @@ void Server::video_caps(json& caps, const IVideoGen* gen) {
     caps["video_formats"] = json::array({ "mp4", "webm", "webm-av1" });
     /* The samplers `sampler` accepts; euler is the default and always available. */
     caps["video_samplers"] = json::array({ "euler", "res_multistep" });
+    /* The schedule shift `shift` (video) and `audio_shift` accept: these are the model's trained
+     * values, which a request that omits the fields runs; a request overrides one or both. */
+    caps["video_shift"]       = info.shift_video;
+    caps["video_audio_shift"] = info.shift_audio;
 }
 
 HttpResponse Server::handle_video_create(const HttpRequest& req) {
@@ -350,7 +355,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     static const char* kKnown[] = {
         "model", "prompt", "seconds", "size", "input_reference", "seed", "num_inference_steps",
         "task", "target", "conditions", "user", "latent_upscale", "upscale_refine_steps", "format",
-        "sampler",
+        "sampler", "shift", "audio_shift",
     };
     for (auto it = body.begin(); it != body.end(); ++it) {
         bool known = false;
@@ -572,6 +577,24 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
             e.supported = { "euler", "res_multistep" };
             return error_response(e, req.peer);
         }
+    }
+    /* The schedule shift per stream. 0 (omitted) runs the model's trained shift; a given value
+     * re-shapes that stream's sigma grid. (0, 100] bounds typos without clipping a real setting;
+     * the shift is safe for any positive value, it only bunches the grid toward the noisy end. */
+    if (has(body, "shift")) {
+        double v = 0;
+        if (!number(body["shift"], &v) || !(v > 0.0) || v > 100.0)
+            return bad("shift", "the video schedule shift: a number in (0, 100], or omit it to run "
+                                "the model's trained shift " + rad::fmt("%g", info.shift_video));
+        r->shift_video = v;
+    }
+    if (has(body, "audio_shift")) {
+        double v = 0;
+        if (!number(body["audio_shift"], &v) || !(v > 0.0) || v > 100.0)
+            return bad("audio_shift", "the soundtrack schedule shift: a number in (0, 100], or "
+                                      "omit it to run the model's trained shift " +
+                                      rad::fmt("%g", info.shift_audio));
+        r->shift_audio = v;
     }
     if (has(body, "latent_upscale")) {
         double v = 0;
@@ -807,6 +830,8 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     j->created_at = unix_now();
     j->seed = r->seed;
     j->sampler = r->sampler;
+    j->shift_video = r->shift_video;
+    j->shift_audio = r->shift_audio;
     j->fmt = fmt;
     for (const gen::VideoRefMedia& m : r->refs) j->refs.push_back(m.name);
     j->ticket = std::make_shared<gen::VideoTicket>();
@@ -993,6 +1018,8 @@ json Server::video_json(const VideoJob& j) {
     o["seed"] = j.seed;
     o["format"] = format_name(j.fmt);   /* what /content will return */
     o["sampler"] = j.sampler == RAD_SAMPLER_RES_MULTISTEP ? "res_multistep" : "euler";
+    if (j.shift_video > 0.0) o["shift"] = j.shift_video;             /* 0: the model's trained shift */
+    if (j.shift_audio > 0.0) o["audio_shift"] = j.shift_audio;
     if (j.refine > 0) {
         o["latent_upscale"] = j.upscale;
         o["upscale_refine_steps"] = j.refine;

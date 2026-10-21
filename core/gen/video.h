@@ -130,6 +130,13 @@ struct VideoRequest {
     /* The sampler: a RAD_SAMPLER_* value (abi/rad_runtime.h). 0 = Euler, the default; 1 =
      * res_multistep, the second-order step on the clean estimate. */
     int32_t  sampler = 0;
+    /* The schedule shift of each stream; 0 = the declaration's shift_video/shift_audio. Overriding
+     * it re-shapes the sigma grid the driver stages into RadVideoGenBatch::sched -- the plugin
+     * reads only the shifted sigmas and timesteps, never a shift scalar, so this is NOT an ABI
+     * field and needs no plugin rebuild. The DasiWa workflow runs the video at shift 12 and the
+     * soundtrack at 3; the container may carry a different pair, which is what 0 keeps. */
+    double   shift_video = 0.0;
+    double   shift_audio = 0.0;
     /* Latent upscaling (abi/rad_builder.h, RadVideoGenDecl): the factor, 0 for none, and the
      * evaluations at the full size after it, 0 for the model's default. */
     double   upscale = 0.0;
@@ -165,12 +172,16 @@ void video_small_size(const RadVideoGenDecl& d, int32_t width, int32_t height, d
 
 /* The two schedules a request of `steps` grid points runs (RadVideoGenDecl, "The sampler"): each
  * the f32 sigmas, last 0, and the model evaluations it takes, the shorter of the two. With a
- * trained schedule any other step count than n_rungs + 1 gives no steps. */
+ * trained schedule any other step count than n_rungs + 1 gives no steps. `shift_video`/`shift_audio`
+ * above 0 override the declaration's per-stream shift for the exponential sigma shift; 0 keeps the
+ * declaration's. The shift only re-shapes the staged sigmas, so it reaches the plugin through the
+ * schedule region, not the batch. */
 struct VideoSchedule {
     std::vector<float> sig_v, sig_a;
     int32_t            steps = 0;
 };
-VideoSchedule video_schedule(const RadVideoGenDecl& d, int32_t steps);
+VideoSchedule video_schedule(const RadVideoGenDecl& d, int32_t steps, double shift_video = 0.0,
+                             double shift_audio = 0.0);
 
 }  /* namespace gen */
 }  /* namespace rad */

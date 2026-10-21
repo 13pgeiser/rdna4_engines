@@ -48,6 +48,8 @@ struct FakeVideoGen : IVideoGen {
         inf.max_ref_images = 9;
         inf.max_ref_videos = 3;
         inf.max_ref_audios = 3;
+        inf.shift_video = 12.0;
+        inf.shift_audio = 3.0;
     }
     const VideoGenInfo& info() const override { return inf; }
     int submit(std::unique_ptr<gen::VideoRequest> r, std::string*) override {
@@ -161,6 +163,12 @@ TEST(a_video_request_that_cannot_be_served_names_its_field) {
     CHECK_EQ(v.refused(Videos::body({ { "task", "fl2va" } })), std::string("first_frame"));
     CHECK_EQ(v.refused(Videos::body({ { "conditions", json::array({ json::object() }) } })),
              std::string("conditions"));
+    /* The shift: (0, 100], a number; 0 / negative / over the cap / non-numeric are refused. */
+    CHECK_EQ(v.refused(Videos::body({ { "shift", 0 } })), std::string("shift"));
+    CHECK_EQ(v.refused(Videos::body({ { "shift", -1 } })), std::string("shift"));
+    CHECK_EQ(v.refused(Videos::body({ { "shift", 200 } })), std::string("shift"));
+    CHECK_EQ(v.refused(Videos::body({ { "shift", "hot" } })), std::string("shift"));
+    CHECK_EQ(v.refused(Videos::body({ { "audio_shift", 0 } })), std::string("audio_shift"));
     CHECK_EQ(v.refused({ { "prompt", "p" }, { "target", { { "aspect_ratio", "wide" } } } }),
              std::string("target"));
     CHECK_EQ(v.refused(Videos::body({ { "target", { { "aspect_ratio", "16:9" } } } })),
@@ -214,6 +222,30 @@ TEST(the_generator_gets_the_size_the_chunks_and_the_steps) {
     CHECK_EQ(v.gen.last().height, 1344);
     CHECK_EQ(v.gen.last().chunks, 14);     /* 240 frames: 17 * 14 + 5 = 243 */
     v.wait(str_at(json::parse(r.body, nullptr, false), "id"));
+}
+
+/* `shift`/`audio_shift` thread to the request and echo back; omitted, the request carries 0 (the
+ * driver keeps the model's trained shift) and the echo adds neither field. */
+TEST(the_shift_threads_to_the_request_and_echoes) {
+    Videos v;
+    HttpResponse r = v.create(Videos::body({ { "shift", 6 }, { "audio_shift", 2 } }));
+    REQUIRE_EQ(r.status, 200);
+    CHECK_EQ(v.gen.last().shift_video, 6.0);
+    CHECK_EQ(v.gen.last().shift_audio, 2.0);
+    json o = json::parse(r.body, nullptr, false);
+    CHECK(o.contains("shift"));
+    CHECK_EQ(o["shift"].get<double>(), 6.0);
+    CHECK_EQ(o["audio_shift"].get<double>(), 2.0);
+    v.wait(str_at(o, "id"));
+
+    r = v.create(Videos::body());
+    REQUIRE_EQ(r.status, 200);
+    CHECK_EQ(v.gen.last().shift_video, 0.0);
+    CHECK_EQ(v.gen.last().shift_audio, 0.0);
+    o = json::parse(r.body, nullptr, false);
+    CHECK(!o.contains("shift"));
+    CHECK(!o.contains("audio_shift"));
+    v.wait(str_at(o, "id"));
 }
 
 /* Latent upscaling: refused by a model without an upscaler; with one, the factor and the refine

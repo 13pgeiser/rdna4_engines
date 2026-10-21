@@ -123,17 +123,21 @@ static std::vector<float> rung_sigmas(double shift, const double* rungs, int32_t
     return s;
 }
 
-VideoSchedule video_schedule(const RadVideoGenDecl& d, int32_t steps) {
+VideoSchedule video_schedule(const RadVideoGenDecl& d, int32_t steps, double shift_video,
+                             double shift_audio) {
+    /* A request's shift overrides the declaration's per stream; 0 keeps the trained value. */
+    const double sv = shift_video > 0.0 ? shift_video : d.shift_video;
+    const double sa = shift_audio > 0.0 ? shift_audio : d.shift_audio;
     VideoSchedule v;
     if (d.n_rungs > 0) {
         if (steps != d.n_rungs + 1) return v;
-        v.sig_v = rung_sigmas(d.shift_video, d.rungs, d.n_rungs);
-        v.sig_a = rung_sigmas(d.shift_audio, d.rungs, d.n_rungs);
+        v.sig_v = rung_sigmas(sv, d.rungs, d.n_rungs);
+        v.sig_a = rung_sigmas(sa, d.rungs, d.n_rungs);
         v.steps = d.n_rungs;
         return v;
     }
-    v.sig_v = shifted_sigmas(d.shift_video, steps);
-    v.sig_a = shifted_sigmas(d.shift_audio, steps);
+    v.sig_v = shifted_sigmas(sv, steps);
+    v.sig_a = shifted_sigmas(sa, steps);
     const size_t n = std::min(v.sig_v.size(), v.sig_a.size());
     v.steps = n > 0 ? (int32_t)(n - 1) : 0;
     return v;
@@ -637,7 +641,7 @@ int VideoDriver::submit(std::unique_ptr<VideoRequest> r, std::string* why) {
             return no("the model could not lay this video out");
         j->step_rows = j->rows;
     }
-    j->sched = video_schedule(d, steps);
+    j->sched = video_schedule(d, steps, r->shift_video, r->shift_audio);
     if (j->sched.steps < 1) return no("the schedule has no steps");
     if (r->upscale > 1.0) {
         if (!(d.upscale_max > 1.0)) return no("this model has no latent upscaler");

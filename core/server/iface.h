@@ -683,6 +683,10 @@ struct VideoGenInfo {
     int64_t sample_rate = 0, channels = 0;
     int64_t default_steps = 0, max_steps = 0, max_lanes = 1;
     bool    fixed_steps = false;   /* a trained schedule: max_steps grid points and no other */
+    /* The trained per-stream schedule shift (RadVideoGenDecl). The `shift`/`audio_shift` request
+     * fields override these; a request that omits them gets these values, so a client can learn the
+     * baseline the model was converted with. */
+    double  shift_video = 0.0, shift_audio = 0.0;
     /* A latent upscaler: the largest factor (0: none) and the full-size evaluations by default. */
     double  upscale_max = 0.0;
     int64_t upscale_refine = 0;

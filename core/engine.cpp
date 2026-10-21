@@ -2497,6 +2497,8 @@ int Engine::run_server() {
         in.default_steps = vd.default_steps;
         in.max_steps = vd.max_steps;
         in.fixed_steps = vd.n_rungs > 0;
+        in.shift_video = vd.shift_video;
+        in.shift_audio = vd.shift_audio;
         in.upscale_max = vd.upscale_max;
         in.upscale_refine = vd.upscale_refine;
         in.max_lanes = vd.max_lanes;

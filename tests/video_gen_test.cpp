@@ -334,6 +334,21 @@ TEST(the_schedule_counts_grid_points_and_shifts_each_modality) {
     CHECK_EQ(gen::video_schedule(d, 2).steps, 1);
 }
 
+/* A request's shift re-shapes ONLY the stream it names; the stream it leaves at 0 keeps the
+ * declaration's trained shift (decl_small is video 12, audio 3). */
+TEST(a_request_shift_overrides_the_declaration_per_stream) {
+    const RadVideoGenDecl d = decl_small();
+    const gen::VideoSchedule base = gen::video_schedule(d, 50);
+    const gen::VideoSchedule s = gen::video_schedule(d, 50, 6.0, 0.0);   /* video -> 6, audio keep 3 */
+    REQUIRE_EQ(s.sig_v.size(), base.sig_v.size());
+    REQUIRE_EQ(s.sig_a.size(), base.sig_a.size());
+    const double b = 1.0 - 30.0 / 49.0;
+    CHECK(std::fabs(s.sig_v[30] - 6.0 * b / (1.0 + 5.0 * b)) < 1e-6);    /* re-shifted by 6 */
+    CHECK(std::fabs(s.sig_a[30] - 3.0 * b / (1.0 + 2.0 * b)) < 1e-6);    /* still the decl's 3 */
+    CHECK(s.sig_v[30] != base.sig_v[30]);                                /* video actually moved */
+    CHECK(std::fabs(s.sig_a[30] - base.sig_a[30]) < 1e-9);               /* audio untouched */
+}
+
 /* A trained schedule (a distilled checkpoint's): its rungs in f32, each modality's shift applied
  * as the reference's tensor arithmetic does (f32 throughout), then the terminal 0; one evaluation a
  * rung, and no other step count. */

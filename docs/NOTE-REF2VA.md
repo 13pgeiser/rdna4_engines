@@ -604,3 +604,41 @@ step·seed 1234, `first`=standing, `last`=riding; `index.tsv` records status/wal
 | REF2VA | `ref2va.mp4` | 214 s | 2 image refs (`last`,`first`), not keyframes |
 
 Each has a matching `.thumb.webp`. These are SEQUENCE clips (single generated run), not loops.
+
+## cont.20 (2026-10-21) — per-request `shift`, and the "fried" look localized to decode/quant
+
+The full-resolution frames of a workflow-prompt review batch showed a **blown-highlight / crushed-black
+"watercolor" look** (the user's "fried"). Measured with HSV + Laplacian-variance across time on native-512
+frames, versus the reference clips (same `dasiwaHybridV4` finetune, via ComfyUI):
+
+| render | black% | clip% (blown) |
+|---|---|---|
+| reference snow | 1.5–4.7 | **~4.5** |
+| Radiance snow T2VA (this batch) | 11–15 | **54–79** |
+| Radiance snow T2VA (old ex10) | 13.7 | 51 |
+
+Key facts established by this pass:
+1. **It is in the text-only T2VA control too** — so it is NOT the keyframe/vision-tower path (#52), and
+   the old ex10 T2VA has the same clip% → **not a regression**. The earlier "T2VA is clean" read was an
+   artifact of judging 256² downscaled strips; at native res it was never clean.
+2. **Sampler is not the lever**: same-seed euler vs res_multistep gives clip 53–61% vs 56–65% — no
+   meaningful change (matches the user's eye).
+3. **The container already runs shift 12 / 3** (`/v1/models` `video_shift`=12.0, `video_audio_shift`=3.0)
+   — the reference's exact settings. And rendering at `shift=4` leaves clip at ~54%. So shift is not the
+   lever either. CFG is not implemented (single conditioning pass = CFG 1), which already matches the
+   reference's BasicGuider scale-1.
+4. With sampler, shift and CFG all matched, Radiance still blows ~55% where the reference blows ~4.5% on
+   the same content ⇒ the gap is **downstream of the schedule: the video VAE decode (scale/shift factor
+   value parity) and/or the DiT int8 quant**, i.e. #37/#44/#45 — the deep fidelity work, needing the stock
+   / golden-latent box (#44). Not a schedule, keyframe, downscale or source-compression issue.
+
+**Shipped anyway** (the user asked for it, and it is correct and useful for other checkpoints/workflows):
+`shift` (video) and `audio_shift` (soundtrack) are now per-request `/v1/videos` fields, `(0,100]`, each
+defaulting to the model's trained shift; echoed in the video object and advertised in the model card as
+`video_shift`/`video_audio_shift`. Implementation is **ABI-invisible**: `VideoRequest` carries the two
+doubles, `video_schedule()` re-shifts that stream's sigma grid, and the shifted sigmas are staged through
+`RadVideoGenBatch::sched` — the plugin reads only sigmas/timesteps, never a shift scalar, so
+`RAD_ABI_VERSION` stays 24 and no plugin rebuilds. Files: `core/gen/video.h`, `core/gen/video_driver.cpp`,
+`core/server/iface.h` (`VideoGenInfo` shift), `core/engine.cpp` (populate), `core/server/videos.cpp`
+(allowlist/parse/echo/caps); tests in `videos_test.cpp`, `video_gen_test.cpp` (host, green). Device:
+`shift=4` accepted+echoed+renders.
