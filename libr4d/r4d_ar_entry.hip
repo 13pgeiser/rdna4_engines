@@ -79,6 +79,7 @@ struct Rendezvous {
         int       w[R4D_MAX_RANKS] = { 0 };
         int       pieces = 0;
         long long weights_min = 0, pieces_min = 0;
+        int       form = 0;
         R4DArLink link;
     } ar8[R4D_MAX_RANKS];
     int  failed = 0;
@@ -134,6 +135,8 @@ struct ArInst {
     /* Messages under these sizes (elements) run even and in one piece, whatever is configured. */
     long long weights_min = R4D_AR8_MIN_ELEMS_DEFAULT;
     long long pieces_min  = R4D_AR8_MIN_ELEMS_DEFAULT;
+    /* Its form (RADIANCE_AR8_FORM); a launch's `form` parameter overrides it. */
+    int  form = R4D_AR8_FORM_LOCKSTEP;
 };
 
 /* A parameter that may be declared as a range: init gets one band's frozen geometry, and buffers
@@ -217,6 +220,21 @@ long long ar8_min_elems(const char* name, std::once_flag* said) {
     return v;
 }
 
+/* RADIANCE_AR8_FORM: lockstep (or unset), ring or split. Anything else is lockstep, with one
+ * warning. */
+int ar8_form() {
+    const char* e = std::getenv(R4D_AR8_FORM_ENV);
+    if (!e || !*e) return R4D_AR8_FORM_LOCKSTEP;
+    const int f = r4d_ar8_form_parse(e);
+    if (f >= 0) return f;
+    static std::once_flag said;
+    std::call_once(said, [e] {
+        std::fprintf(stderr, "[r4d] %s=\"%s\" ignored (needs lockstep, ring or split); the "
+                     "eight-rank two-shot runs in lockstep\n", R4D_AR8_FORM_ENV, e);
+    });
+    return R4D_AR8_FORM_LOCKSTEP;
+}
+
 /* The eight-rank two-shot's choice for one message, a function of its size and the instance
  * alone: a recorded launch keeps the table and piece count it was recorded with, and replays of
  * the same size agree with it. */
@@ -240,6 +258,7 @@ int ar8_settle(ArInst* in, int rank, int world) {
     me.pieces = ar8_pieces();
     me.weights_min = ar8_min_elems(R4D_AR8_SHARD_WEIGHTS_MIN_ENV, &said_w);
     me.pieces_min = ar8_min_elems(R4D_AR8_PIECES_MIN_ENV, &said_p);
+    me.form = ar8_form();
     if ((me.mode == AR8_AUTO || me.mode == AR8_DUPLEX) && !ar8_own_link(&me.link))
         me.link = R4DArLink();
     {
@@ -253,15 +272,24 @@ int ar8_settle(ArInst* in, int rank, int world) {
     for (int r = 0; r < world; ++r)
         if (all[r].mode != me.mode || std::memcmp(all[r].w, me.w, sizeof(me.w)) ||
             all[r].pieces != me.pieces || all[r].weights_min != me.weights_min ||
-            all[r].pieces_min != me.pieces_min) {
+            all[r].pieces_min != me.pieces_min || all[r].form != me.form) {
             std::fprintf(stderr, "[r4d] ranks %d and %d read different eight-rank two-shot "
-                         "settings (%s, %s and their _MIN_ELEMS)\n", rank, r,
-                         R4D_AR8_SHARD_WEIGHTS_ENV, R4D_AR8_PIECES_ENV);
+                         "settings (%s, %s and their _MIN_ELEMS, %s)\n", rank, r,
+                         R4D_AR8_SHARD_WEIGHTS_ENV, R4D_AR8_PIECES_ENV, R4D_AR8_FORM_ENV);
             return RAD_E_STATE;
         }
     in->pieces = me.pieces;
     in->weights_min = me.weights_min;
     in->pieces_min = me.pieces_min;
+    in->form = me.form;
+    if (me.form != R4D_AR8_FORM_LOCKSTEP) {
+        static std::once_flag said_form;
+        const int f = me.form;
+        std::call_once(said_form, [f] {
+            std::fprintf(stderr, "[r4d] eight-rank two-shot form: %s (%s)\n",
+                         f == R4D_AR8_FORM_RING ? "ring" : "split", R4D_AR8_FORM_ENV);
+        });
+    }
 
     int w[R4D_MAX_RANKS] = { 0 };
     if (me.mode == AR8_SET) {
@@ -1183,6 +1211,8 @@ extern "C" int r4d_rad_ar_twoshot_8rank_exact(const RadArgs* a, RadStream s) {
     const long long pieces = ar8_pieces_for(in, c.numel, asked);
     /* A diagnostic: a device buffer of nblocks * R4D_AR_TL_WORDS int64 stamps (r4d.h). */
     const long long timeline = r4d_pgeti_or(a->p, a->n_p, "timeline", 0);
+    const long long form = r4d_pgeti_or(a->p, a->n_p, "form", in->form);
+    if (form < R4D_AR8_FORM_LOCKSTEP || form > R4D_AR8_FORM_SPLIT) return RAD_E_INVAL;
     R4D_TRY("ar_twoshot_8rank_exact",
         r4d_ar_twoshot_8rank_exact(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
                                    in->peer_scratch[3], in->peer_scratch[4], in->peer_scratch[5],
@@ -1193,7 +1223,7 @@ extern "C" int r4d_rad_ar_twoshot_8rank_exact(const RadArgs* a, RadStream s) {
                                    in->my_scratch, in->my_flags, in->my_seq, in->slot16,
                                    c.inp, c.out, c.numel, in->dtype, in->rank,
                                    (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
-                                   c.pub, weights, (long)pieces, (long)timeline));
+                                   c.pub, weights, (long)pieces, (long)timeline, (long)form));
     return RAD_OK;
 }
 

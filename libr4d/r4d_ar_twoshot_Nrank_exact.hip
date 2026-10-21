@@ -23,6 +23,17 @@
 // piece j+1's phase 1 shares the link with piece j's phase 2. A rank with a short shard then
 // sends and receives at once instead of one direction per phase.
 //
+// Also at 8 ranks, two more forms of the same work (RADIANCE_AR8_FORM, the `form` parameter):
+//  * ring sends the first hop to the peers in ring order from rank + 1 instead of ascending, so
+//    at any moment each card receives from one peer rather than all seven from the same one;
+//  * split also replaces the one handshake a step, which waits for every peer to finish the whole
+//    step, by a flag after each half (the first hop of the next piece, the reduce of this one),
+//    each awaited only before its data is read: before reducing piece j the peers' first hop of
+//    j, before assembling j their reduce of j. A rank whose own half is done goes on with the
+//    next piece's first hop while a slower one still reduces, so the links run at their own pace
+//    instead of in lockstep. 2 * pieces + 1 flag values, pieces + 1 steps reserved.
+// The words, their owners and their folds are the lockstep form's, so the bits are too.
+//
 // Shares the wide family's flag/seq/scratch set (r4d_ar_wide.h): it publishes in the 2*seq flag
 // space plus the 2s-1 half-step (with pieces: pieces+1 values from 2s-1 on, after reserving one
 // step a piece), so one buffer set can carry any mix of one-shot and two-shot launches. The slot
@@ -46,7 +57,7 @@ struct R4DArShardOff {
 // PIECED false fixes pieces at 1, so the unpipelined launch keeps the straight-line kernel.
 // CHAIN: the chained form's wait (before the sequence take, so a block of the next launch on the
 // instance never starts ahead of this one's) and add (r4d_chain.h); no block returns early.
-template <typename T, int LANES, int WS, bool PIECED, bool CHAIN>
+template <typename T, int LANES, int WS, bool PIECED, int FORM, bool CHAIN>
 __device__ __forceinline__ void r4d_ar_twoshot_wide_exact_body(
     const int4* __restrict__ in4, R4DArWidePeers<int4, WS - 1> peers,
     const int4* __restrict__ my_base, unsigned int* __restrict__ my_flags,
@@ -60,10 +71,14 @@ __device__ __forceinline__ void r4d_ar_twoshot_wide_exact_body(
   __shared__ unsigned int s_seq, s_slot;
   const long long gate_word = r4d_ar_link_word(gate, (unsigned int)tid);
   // device-resident, replay-safe; `pieces` steps reserve the 2*pieces flag values this launch uses
-  r4d_ar_seq_take(seq_ctrs, R4D_AR_WIDE_MAX_BLOCKS, s_seq, s_slot, (unsigned int)pieces);
+  // (the split form publishes 2 * pieces + 1 and reserves one step more)
+  r4d_ar_seq_take(seq_ctrs, R4D_AR_WIDE_MAX_BLOCKS, s_seq, s_slot,
+                  (unsigned int)(FORM == R4D_AR8_FORM_SPLIT ? pieces + 1 : pieces));
   const unsigned int v0 = 2u * s_seq - 1u;
   const int parity = (int)s_slot;
-  long long* const tl = tl_all ? tl_all + (size_t)b * R4D_AR_TL_WORDS : nullptr;
+  // the split form awaits 2 * pieces times, which the timeline holds up to 8 pieces
+  long long* const tl = tl_all && (FORM != R4D_AR8_FORM_SPLIT || 4 * pieces + 2 <= R4D_AR_TL_WORDS)
+                            ? tl_all + (size_t)b * R4D_AR_TL_WORDS : nullptr;
   r4d_ar_tl_stamp(tl, 0);
 
   const int sh_max = sh.sh_max;
@@ -91,7 +106,8 @@ __device__ __forceinline__ void r4d_ar_twoshot_wide_exact_body(
   // phase 1: my contribution to each peer-owned shard -> owner's region A
   auto push1 = [&](int j) {
     const int p0 = w0 + j * pw, p1 = p0 + pw < w1 ? p0 + pw : w1;
-    for (int p = 0; p < NPEERS; ++p) {
+    for (int i = 0; i < NPEERS; ++i) {
+      const int p = FORM == R4D_AR8_FORM_LOCKSTEP ? i : (i + rank) % NPEERS;
       const int owner = peers.rank[p];
       const int4* s1 = in4 + (size_t)R4D_TS_OFF(owner);
       int4* dst = pa[p];
@@ -143,25 +159,59 @@ __device__ __forceinline__ void r4d_ar_twoshot_wide_exact_body(
    * overlap one direction idles in each phase. With one piece the sequence is push, flag 2s-1,
    * reduce, flag 2s, assemble. A word is touched by the same thread in all three steps, which keeps
    * the in-place form safe. */
-  push1(0);
-  r4d_ar_handshake<WS>(peers, my_flags, b, rank, v0, drain, acq, pub, tl ? tl + 1 : nullptr);
-  for (int j = 0; j < pieces; ++j) {
-    if (j + 1 < pieces) push1(j + 1);
-    reduce2(j);
-    if (j > 0) assemble(j - 1);
-    r4d_ar_handshake<WS>(peers, my_flags, b, rank, v0 + 1u + (unsigned int)j, drain, acq, pub,
-                         tl ? tl + 3 + 2 * j : nullptr);
-  }
-  /* The hold ends after the last handshake, not the first: the reduce is fused with the phase-2
-   * push (every reduced word goes to each peer's region B), so until then the link still carries
-   * this launch's phase-2 bytes. Here every phase-1 and phase-2 remote store has retired behind
-   * its flag store and every peer's pushes to this rank have been waited on; only the local
-   * assemble of the last piece is left (r4d_ar_seq.h). */
-  r4d_ar_link_landed(gate, gate_word, gate_ctr, (unsigned int)nb, (unsigned int)tid);
-  assemble(pieces - 1);
-  if (tl) {
-    __syncthreads();
-    r4d_ar_tl_stamp(tl, 3 + 2 * pieces);
+  if constexpr (FORM != R4D_AR8_FORM_SPLIT) {
+    push1(0);
+    r4d_ar_handshake<WS>(peers, my_flags, b, rank, v0, drain, acq, pub, tl ? tl + 1 : nullptr);
+    for (int j = 0; j < pieces; ++j) {
+      if (j + 1 < pieces) push1(j + 1);
+      reduce2(j);
+      if (j > 0) assemble(j - 1);
+      r4d_ar_handshake<WS>(peers, my_flags, b, rank, v0 + 1u + (unsigned int)j, drain, acq, pub,
+                           tl ? tl + 3 + 2 * j : nullptr);
+    }
+    /* The hold ends after the last handshake, not the first: the reduce is fused with the phase-2
+     * push (every reduced word goes to each peer's region B), so until then the link still carries
+     * this launch's phase-2 bytes. Here every phase-1 and phase-2 remote store has retired behind
+     * its flag store and every peer's pushes to this rank have been waited on; only the local
+     * assemble of the last piece is left (r4d_ar_seq.h). */
+    r4d_ar_link_landed(gate, gate_word, gate_ctr, (unsigned int)nb, (unsigned int)tid);
+    assemble(pieces - 1);
+    if (tl) {
+      __syncthreads();
+      r4d_ar_tl_stamp(tl, 3 + 2 * pieces);
+    }
+  } else {
+    /* The same steps with a flag after each half. Published in program order on one monotone
+     * word: first hop of piece 0 at v0, of piece j + 1 at v0 + 2j + 1, the reduce of piece j at
+     * v0 + 2j + 2; so "peer's first hop of j done" is the word at v0 (j = 0) or v0 + 2j - 1, and
+     * "peer's reduce of j done" at v0 + 2j + 2. A launch completes only after every peer has
+     * published its last reduce, which it does inside this launch, so the slot parity argument
+     * of the lockstep form holds unchanged (r4d_ar_seq.h). */
+    int n = 0;
+    auto tlp = [&]() { long long* p = tl ? tl + 1 + 2 * n : nullptr; ++n; return p; };
+    push1(0);
+    r4d_ar_publish<WS>(peers, b, rank, v0, drain, pub);
+    for (int j = 0; j < pieces; ++j) {
+      if (j + 1 < pieces) {
+        push1(j + 1);
+        r4d_ar_publish<WS>(peers, b, rank, v0 + 2u * (unsigned int)j + 1u, drain, pub);
+      }
+      r4d_ar_await<WS>(peers, my_flags, b, j == 0 ? v0 : v0 + 2u * (unsigned int)j - 1u, acq,
+                       tlp());
+      reduce2(j);
+      r4d_ar_publish<WS>(peers, b, rank, v0 + 2u * (unsigned int)j + 2u, drain, pub);
+      if (j > 0) {
+        r4d_ar_await<WS>(peers, my_flags, b, v0 + 2u * (unsigned int)j, acq, tlp());
+        assemble(j - 1);
+      }
+    }
+    r4d_ar_await<WS>(peers, my_flags, b, v0 + 2u * (unsigned int)pieces, acq, tlp());
+    r4d_ar_link_landed(gate, gate_word, gate_ctr, (unsigned int)nb, (unsigned int)tid);
+    assemble(pieces - 1);
+    if (tl) {
+      __syncthreads();
+      r4d_ar_tl_stamp(tl, 1 + 2 * n);
+    }
   }
 #undef R4D_TS_OFF
 #undef R4D_TS_LEN
@@ -391,13 +441,13 @@ __device__ __forceinline__ void r4d_ar_twoshot_coded_body(
     unsigned int* gate_ctr, int pieces_arg, long long* tl_all
 #define R4D_ARTS_ARGS in4, peers, my_base, my_flags, out4, seq_ctrs, sh, slot_stride16, rank,    \
     drain, acq, pub, gate, gate_ctr, pieces_arg, tl_all
-template <typename T, int LANES, int WS, bool PIECED>
+template <typename T, int LANES, int WS, bool PIECED, int FORM>
 __global__ void r4d_ar_twoshot_wide_exact_kernel(R4D_ARTS_PARAMS) {
-  r4d_ar_twoshot_wide_exact_body<T, LANES, WS, PIECED, false>(R4D_ARTS_ARGS);
+  r4d_ar_twoshot_wide_exact_body<T, LANES, WS, PIECED, FORM, false>(R4D_ARTS_ARGS);
 }
-template <typename T, int LANES, int WS, bool PIECED>
+template <typename T, int LANES, int WS, bool PIECED, int FORM>
 __global__ void r4dchain_ar_twoshot_wide_exact(R4D_ARTS_PARAMS) {
-  r4d_ar_twoshot_wide_exact_body<T, LANES, WS, PIECED, true>(R4D_ARTS_ARGS);
+  r4d_ar_twoshot_wide_exact_body<T, LANES, WS, PIECED, FORM, true>(R4D_ARTS_ARGS);
 }
 #undef R4D_ARTS_ARGS
 #undef R4D_ARTS_PARAMS
@@ -427,7 +477,7 @@ static void ar_twoshot_launch(const long* peer_scratch, const long* peer_flags, 
                               long out, long n_elem, long dtype, long rank, long stream_i,
                               long nblocks, long nthreads, long drain, long acq, long pub,
                               long gate, long gate_ctr, const int* shard_weights,
-                              long pieces, long timeline, bool chain = false) {
+                              long pieces, long timeline, long form, bool chain = false) {
   constexpr int NPEERS = WS - 1;
   if (rank < 0 || rank >= WS)
     throw std::runtime_error("all_reduce: rank " + std::to_string(rank) +
@@ -476,6 +526,10 @@ static void ar_twoshot_launch(const long* peer_scratch, const long* peer_flags, 
   if (pieces < 1 || pieces > R4D_AR_TS_MAX_PIECES)
     throw std::runtime_error("all_reduce: pieces " + std::to_string(pieces) + " outside 1.." +
                              std::to_string((int)R4D_AR_TS_MAX_PIECES));
+  if (form < R4D_AR8_FORM_LOCKSTEP || form > R4D_AR8_FORM_SPLIT ||
+      (WS != 8 && form != R4D_AR8_FORM_LOCKSTEP))
+    throw std::runtime_error("all_reduce: form " + std::to_string(form) + " at " +
+                             std::to_string(WS) + " ranks (ring and split are eight-rank forms)");
   // a block's share of the longest shard bounds the pieces worth a handshake each
   const long words_a_block = (sh_max + nb - 1) / nb;
   const int np = (int)(pieces < words_a_block ? pieces : words_a_block);
@@ -504,13 +558,26 @@ static void ar_twoshot_launch(const long* peer_scratch, const long* peer_flags, 
   }
 
   hipStream_t st = (hipStream_t)stream_i;
-#define R4D_AR_TS_LAUNCH_P(T, LN, P)                                                  \
-  (chain ? r4dchain_ar_twoshot_wide_exact<T, LN, WS, P>                               \
-         : r4d_ar_twoshot_wide_exact_kernel<T, LN, WS, P>)<<<nb, nt, 0, st>>>(        \
+#define R4D_AR_TS_LAUNCH_F(T, LN, P, F)                                               \
+  (chain ? r4dchain_ar_twoshot_wide_exact<T, LN, WS, P, F>                            \
+         : r4d_ar_twoshot_wide_exact_kernel<T, LN, WS, P, F>)<<<nb, nt, 0, st>>>(     \
       (const int4*)inp, peers, (const int4*)my_scratch, (unsigned int*)my_flags,      \
       (int4*)out, (unsigned int*)seq_ctrs, sh, (int)slot_stride16,                    \
       (int)rank, (int)drain, (int)acq, (int)pub, (long long*)gate,                    \
       (unsigned int*)gate_ctr, np, (long long*)timeline)
+#define R4D_AR_TS_LAUNCH_P(T, LN, P)                                                  \
+  do {                                                                                \
+    if constexpr (WS == 8) {                                                          \
+      if (form == R4D_AR8_FORM_RING)                                                  \
+        R4D_AR_TS_LAUNCH_F(T, LN, P, R4D_AR8_FORM_RING);                              \
+      else if (form == R4D_AR8_FORM_SPLIT)                                            \
+        R4D_AR_TS_LAUNCH_F(T, LN, P, R4D_AR8_FORM_SPLIT);                             \
+      else                                                                            \
+        R4D_AR_TS_LAUNCH_F(T, LN, P, R4D_AR8_FORM_LOCKSTEP);                          \
+    } else {                                                                          \
+      R4D_AR_TS_LAUNCH_F(T, LN, P, R4D_AR8_FORM_LOCKSTEP);                            \
+    }                                                                                 \
+  } while (0)
 #define R4D_AR_TS_LAUNCH(T, LN)                                                       \
   do {                                                                                \
     if (np > 1) R4D_AR_TS_LAUNCH_P(T, LN, true);                                      \
@@ -522,6 +589,7 @@ static void ar_twoshot_launch(const long* peer_scratch, const long* peer_flags, 
   else throw std::runtime_error("all_reduce: bad dtype");
 #undef R4D_AR_TS_LAUNCH
 #undef R4D_AR_TS_LAUNCH_P
+#undef R4D_AR_TS_LAUNCH_F
 }
 
 void r4d_ar_twoshot_3rank_exact(long peer_scratch0, long peer_scratch1, long peer_flags0,
@@ -534,7 +602,7 @@ void r4d_ar_twoshot_3rank_exact(long peer_scratch0, long peer_scratch1, long pee
   /* No link gate at three ranks: the row answers 1, the engine releases by barrier. */
   ar_twoshot_launch<3>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, inp, out, n_elem,
                        dtype, rank, stream, nblocks, nthreads, drain, acq, pub, 0L, 0L, nullptr,
-                       1L, 0L);
+                       1L, 0L, 0L);
 }
 
 void r4d_ar_twoshot_4rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,
@@ -547,7 +615,7 @@ void r4d_ar_twoshot_4rank_exact(long peer_scratch0, long peer_scratch1, long pee
   const long pf[3] = {peer_flags0, peer_flags1, peer_flags2};
   ar_twoshot_launch<4>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, inp, out, n_elem,
                        dtype, rank, stream, nblocks, nthreads, drain, acq, pub, gate, gate_ctr,
-                       nullptr, 1L, 0L, chain != 0);
+                       nullptr, 1L, 0L, 0L, chain != 0);
 }
 
 /* The coded form's conditions: bf16, a message that shards evenly into whole waves' 32 chunks
@@ -602,7 +670,8 @@ void r4d_ar_twoshot_8rank_exact(long peer_scratch0, long peer_scratch1, long pee
                                 long my_flags, long seq_ctrs, long slot_stride16, long inp,
                                 long out, long n_elem, long dtype, long rank, long stream,
                                 long nblocks, long nthreads, long drain, long acq, long pub,
-                                const int* shard_weights, long pieces, long timeline) {
+                                const int* shard_weights, long pieces, long timeline,
+                                long form) {
   const long ps[7] = {peer_scratch0, peer_scratch1, peer_scratch2, peer_scratch3,
                       peer_scratch4, peer_scratch5, peer_scratch6};
   const long pf[7] = {peer_flags0, peer_flags1, peer_flags2, peer_flags3,
@@ -610,5 +679,5 @@ void r4d_ar_twoshot_8rank_exact(long peer_scratch0, long peer_scratch1, long pee
   /* No link gate at eight ranks: the row answers 1, the engine releases by barrier. */
   ar_twoshot_launch<8>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, inp, out, n_elem,
                        dtype, rank, stream, nblocks, nthreads, drain, acq, pub, 0L, 0L,
-                       shard_weights, pieces, timeline);
+                       shard_weights, pieces, timeline, form);
 }

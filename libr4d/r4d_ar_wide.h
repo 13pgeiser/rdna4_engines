@@ -117,6 +117,50 @@ __device__ __forceinline__ void r4d_ar_handshake(const R4DArWidePeers<S, NPEERS>
   r4d_ar_acquire(acq);
 }
 
+// The two halves of r4d_ar_handshake, for a kernel that tells its peers how far it has come before
+// it needs to know how far they have (the eight-rank two-shot's split form). Publish: once this
+// block's stores have drained, every peer's word [b][rank] takes `val`.
+template <int WS, typename S, int NPEERS>
+__device__ __forceinline__ void r4d_ar_publish(const R4DArWidePeers<S, NPEERS>& peers, int b,
+                                               int rank, unsigned int val, int drain, int pub) {
+  r4d_ar_drain(drain);
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    if (drain == 2) __threadfence_system();
+    if (pub) {
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+#pragma unroll
+      for (int p = 0; p < NPEERS; ++p)
+        r4d_ar_store_sys_rlx(&peers.flags[p][(size_t)b * WS + rank], val);
+    } else {
+#pragma unroll
+      for (int p = 0; p < NPEERS; ++p)
+        r4d_ar_store_sys_rel(&peers.flags[p][(size_t)b * WS + rank], val);
+    }
+  }
+}
+
+// Await: wait until each of this block's words from every peer has reached `val`, then acquire
+// what they published before it. `tl` as r4d_ar_handshake's, stamped on entry and on release.
+template <int WS, typename S, int NPEERS>
+__device__ __forceinline__ void r4d_ar_await(const R4DArWidePeers<S, NPEERS>& peers,
+                                             unsigned int* __restrict__ my_flags, int b,
+                                             unsigned int val, int acq, long long* tl = nullptr) {
+  const int tid = threadIdx.x;
+  if (tl && tid == 0) tl[0] = (long long)wall_clock64();
+  if (tid < NPEERS) {
+    const unsigned int* f = &my_flags[(size_t)b * WS + peers.rank[tid]];
+    unsigned long long z = 0;
+    while ((int)(r4d_ar_load_sys_rlx(f) - val) < 0) {
+      __builtin_amdgcn_s_sleep(2);
+      if (++z > R4D_AR_SPIN_MAX) __builtin_trap();  // lockstep violation
+    }
+  }
+  __syncthreads();
+  if (tl && tid == 0) tl[1] = (long long)wall_clock64();
+  r4d_ar_acquire(acq);
+}
+
 // The two-shot timeline (layout in r4d_ar_shards.h), one stamp of the device wall clock.
 static_assert(R4D_AR_TL_BLOCKS == R4D_AR_WIDE_MAX_BLOCKS, "r4d_ar_shards.h restates the ceiling");
 __device__ __forceinline__ void r4d_ar_tl_stamp(long long* tl, int i) {

@@ -451,8 +451,10 @@ void r4d_ar_twoshot_8rank_exact(long peer_scratch0, long peer_scratch1, long pee
                                 long my_flags, long seq_ctrs, long slot_stride16, long inp,
                                 long out, long n_elem, long dtype, long rank, long stream,
                                 long nblocks, long nthreads, long drain, long acq, long pub,
-                                const int* shard_weights, long pieces, long timeline);
-// `timeline`, a diagnostic, is 0 or a device buffer of nblocks * R4D_AR_TL_WORDS int64 that every
+                                const int* shard_weights, long pieces, long timeline,
+                                long form);
+// `form` is R4D_AR8_FORM_* (r4d_ar_shards.h), the same on every rank: lockstep, ring or split,
+// all with the same bits. `timeline`, a diagnostic, is 0 or a device buffer of nblocks * R4D_AR_TL_WORDS int64 that every
 // block of the eight-rank two-shot fills with wall-clock stamps (r4d_ar_wide.h): its start, each
 // handshake's arrival and release, its end. r4d_selftest --perfar8 with --timeline reads it.
 // The tiered int8 wire on both two-shot hops (r4d_ar_twoshot_Nrank_ti8.hip; codec in

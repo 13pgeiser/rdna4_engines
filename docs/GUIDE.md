@@ -1166,6 +1166,12 @@ checked against the fold (warm, the slowest rank):
 With the two Gen4 links retrained to Gen5 x8 the weights read 4,1,1,4,1,1,4,4 and the 16 MiB
 message takes 1360 µs.
 
+That is 56% of the time the x8 cards' links need for its bytes (763 µs). `--perfar8 N iters bf16
+lockstep,ring,split` times the forms below side by side, and `--timeline` adds every rank's first
+push, each step's work and wait and the final assemble, which in one piece are the reduce-scatter
+and the all-gather apart; `R4D_SELFTEST_ONE_CARD=1` runs the eight ranks on one card, for their
+bits only.
+
 The links are read once, at startup: a link that drops to a lower speed while the server runs
 keeps its weight until the next start. `RADIANCE_AR8_SHARD_WEIGHTS` overrides them: `off` keeps
 the shards even, eight comma-separated integers set them, unset or `auto` reads the links.
@@ -1173,8 +1179,13 @@ the shards even, eight comma-separated integers set them, unset or `auto` reads 
 same time's bytes when both directions run at once (`r4d_ar_weights_duplex`): x16 64 and x8 8 on
 the repaired board, whose link time it puts 10% under the `auto` weights', a Gen4 x8 card nothing.
 `RADIANCE_AR8_PIECES` (1 to 16) fixes the piece count, and `RADIANCE_AR8_SHARD_WEIGHTS_MIN_ELEMS`
-and `RADIANCE_AR8_PIECES_MIN_ELEMS` move the two sizes they start at. Every rank must read the
-same values; where they differ, every rank stops at startup.
+and `RADIANCE_AR8_PIECES_MIN_ELEMS` move the two sizes they start at. `RADIANCE_AR8_FORM` chooses
+how the steps run, with the same bits: `lockstep` (unset) as above; `ring` sends the first hop to
+the other cards in ring order from the next rank, so no card receives from all seven at once;
+`split` does that and replaces each step's handshake, which waits for every card to finish the
+whole step, by a flag after each half of it, awaited only where its data is read, so a card whose
+half is done goes on with the next piece while a slower one still reduces. Every rank must read
+the same values; where they differ, every rank stops at startup.
 
 ### 4.8 Host tier for finished conversations
 

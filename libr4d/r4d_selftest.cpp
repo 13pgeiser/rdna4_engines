@@ -22258,10 +22258,39 @@ static void ar_wide_weighted(const Plugin& pl, const std::vector<int>& devs, con
                              mixed);
         }
     }
-    /* The weights from this box's links ("auto", the default) and switched off, at the default
-     * floors and piece rule: what the engine runs without settings. Bits only, since what auto
-     * derives depends on the box (the startup line names it). */
-    for (const char* mode : { "auto", "off" }) {
+    /* The ring and split forms (RADIANCE_AR8_FORM) over the same shards and piece counts: other
+     * link schedules of the same folds, so the oracle is unchanged. The split form takes two flag
+     * values a piece, so the run changing the piece count from launch to launch is the one a
+     * wrong reservation would fail. */
+    {
+        ScopedEnv floor_w(R4D_AR8_SHARD_WEIGHTS_MIN_ENV, "0"), floor_k(R4D_AR8_PIECES_MIN_ENV, "0");
+        for (const char* form : { "ring", "split" }) {
+            ScopedEnv env_f(R4D_AR8_FORM_ENV, form);
+            for (const char* k : { "1", "4", "8" }) {
+                ScopedEnv env_k(R4D_AR8_PIECES_ENV, k);
+                for (const char* w : { "", "0,3,1,0,5,1,2,4", "1,0,0,0,0,0,0,0", "4,1,0,4,0,1,4,4" }) {
+                    ScopedEnv env_w(R4D_AR8_SHARD_WEIGHTS_ENV, *w ? w : "off");
+                    const std::string label =
+                        std::string(name) + " form " + form + " pieces " + k +
+                        (*w ? std::string(" weights ") + w : std::string(" even"));
+                    for (const ArPatternRun& run : *w ? uneven : even)
+                        if (!ar_pattern_check(row, devs, label, W, run)) return;
+                }
+            }
+            ScopedEnv env_k(R4D_AR8_PIECES_ENV, nullptr);
+            ScopedEnv env_w(R4D_AR8_SHARD_WEIGHTS_ENV, "4,1,0,4,0,1,4,4");
+            const ArPatternRun mixed = {
+                "bf16", { 4194304, 4194304, 8256, 4196352, 72, 4194304, 4194304 }, 3,
+                { 1, 4, 2, 8, 16, 3, 1 } };
+            if (!ar_pattern_check(row, devs, std::string(name) + " form " + form +
+                                  " weights 4,1,0,4,0,1,4,4, pieces per launch", W, mixed))
+                return;
+        }
+    }
+    /* The weights from this box's links ("auto", the default, and "duplex") and switched off, at
+     * the default floors and piece rule: what the engine runs without settings. Bits only, since
+     * what auto and duplex derive depends on the box (the startup line names it). */
+    for (const char* mode : { "auto", "duplex", "off" }) {
         ScopedEnv env_w(R4D_AR8_SHARD_WEIGHTS_ENV, mode);
         ScopedEnv env_k(R4D_AR8_PIECES_ENV, nullptr);
         ScopedEnv floor_w(R4D_AR8_SHARD_WEIGHTS_MIN_ENV, nullptr);
@@ -22358,6 +22387,7 @@ struct Ar8Perf {
     std::vector<int64_t> sizes;
     std::vector<const RadKernelInfo*> rows;
     std::vector<int> ks;               /* per row: the `pieces` parameter, 0 or -1 none */
+    std::vector<int> forms;            /* per row: the `form` parameter, -1 none */
     std::vector<int> nbs;
     StBarrier* bar = nullptr;
     int rc_init = RAD_OK;
@@ -22428,6 +22458,7 @@ static void ar8_perf_worker(Ar8Perf* t) {
                 std::vector<RadParam> ps = ip;
                 if (nb > 0) ps.push_back(PI("nblocks", nb));
                 if (t->ks[j] > 0) ps.push_back(PI("pieces", t->ks[j]));
+                if (t->forms[j] >= 0) ps.push_back(PI("form", t->forms[j]));
                 RadTensor ts[2] = { T(in, dt, { n }), T(out, dt, { n }) };
                 RadArgs a;
                 std::memset(&a, 0, sizeof(a));
@@ -22544,7 +22575,8 @@ static void ar8_print_timeline(const std::vector<Ar8Perf>& t, size_t cfg, double
             nst = nst ? std::min(nst, k) : k;
         }
         if (nb == 0 || nst < 4) { std::printf("      timeline r%d: no stamps\n", r); continue; }
-        const int pieces = (nst - 4) / 2;   /* start, K + 1 pairs, end */
+        /* start, a pair a synchronisation (K + 1 handshakes in lockstep, 2K awaits split), end */
+        const int syncs = (nst - 2) / 2;
         auto ev = [&](int k, bool first) {
             long long m = v[(size_t)k];
             for (int b = 1; b < nb; ++b) {
@@ -22558,7 +22590,7 @@ static void ar8_print_timeline(const std::vector<Ar8Perf>& t, size_t cfg, double
         std::string line;
         double work = 0, wait = 0;
         long long prev = t0;
-        for (int h = 0; h <= pieces; ++h) {
+        for (int h = 0; h < syncs; ++h) {
             const long long arr = ev(1 + 2 * h, false), rel = ev(2 + 2 * h, false);
             const double w1 = (double)(arr - prev) * us, w2 = (double)(rel - arr) * us;
             work += w1; wait += w2;
@@ -22566,11 +22598,11 @@ static void ar8_print_timeline(const std::vector<Ar8Perf>& t, size_t cfg, double
                         w1, w2);
             prev = rel;
         }
-        const long long end = ev(3 + 2 * pieces, false);
+        const long long end = ev(1 + 2 * syncs, false);
         const double tail = (double)(end - prev) * us;
         work += tail;
-        std::printf("      timeline r%d (%d blocks, K%d): %s | tail %.1f = %.1f us "
-                    "(work %.1f, wait %.1f)\n", r, nb, pieces, line.c_str(), tail,
+        std::printf("      timeline r%d (%d blocks, %d syncs): %s | tail %.1f = %.1f us "
+                    "(work %.1f, wait %.1f)\n", r, nb, syncs, line.c_str(), tail,
                     (double)(end - t0) * us, work, wait);
     }
 }
@@ -22609,7 +22641,8 @@ static bool ar8_weights_as_plugin(const std::vector<int>& devs, int* w, std::str
     return false;
 }
 
-static void ar8_perf(const Plugin& pl, int64_t numel, int iters, const char* dtype) {
+static void ar8_perf(const Plugin& pl, int64_t numel, int iters, const char* dtype,
+                     const char* form_list) {
     constexpr int W = 8;
     if (iters <= 0) iters = 200;
     const bool bf = !std::strcmp(dtype, "bf16");
@@ -22647,17 +22680,38 @@ static void ar8_perf(const Plugin& pl, int64_t numel, int iters, const char* dty
     if (hipDeviceGetAttribute(&wall_khz_i, hipDeviceAttributeWallClockRate, devs[0]) != hipSuccess)
         wall_khz_i = 0;
     const double wall_khz = (double)wall_khz_i;
-    std::vector<const RadKernelInfo*> rows;
-    std::vector<int> ks;
-    /* The two-shot once a piece count; its instances share one key, so they are one buffer set. */
-    for (const char* name : { "ar_oneshot_8rank_exact", "ar_twoshot_8rank_exact" }) {
-        const RadKernelInfo* r = find(pl, name);
-        if (!r) { std::printf("--perfar8: row %s absent\n", name); return; }
-        const bool two = !std::strcmp(name, "ar_twoshot_8rank_exact");
-        for (int k : two ? std::vector<int>{ -1, 1, 2, 4, 8 } : std::vector<int>{ 0 }) {
-            rows.push_back(r);
-            ks.push_back(k);
+    /* The forms to time beside each other: "lockstep" alone (the default) passes no `form`, so
+     * RADIANCE_AR8_FORM decides as in the engine; a list passes each explicitly. */
+    std::vector<int> fl;
+    {
+        std::string all = form_list ? form_list : "lockstep";
+        size_t at = 0;
+        while (at <= all.size()) {
+            const size_t comma = all.find(',', at);
+            const std::string one = all.substr(at, comma == std::string::npos ? std::string::npos
+                                                                                : comma - at);
+            const int f = r4d_ar8_form_parse(one.c_str());
+            if (f < 0) { std::printf("--perfar8: form '%s' (lockstep, ring or split)\n",
+                                     one.c_str()); return; }
+            fl.push_back(f);
+            if (comma == std::string::npos) break;
+            at = comma + 1;
         }
+    }
+    const bool explicit_forms = !(fl.size() == 1 && fl[0] == R4D_AR8_FORM_LOCKSTEP);
+    std::vector<const RadKernelInfo*> rows;
+    std::vector<int> ks, forms;
+    /* The two-shot once a piece count and form; its instances share one key, so they are one
+     * buffer set. */
+    {
+        const RadKernelInfo* one = find(pl, "ar_oneshot_8rank_exact");
+        const RadKernelInfo* two = find(pl, "ar_twoshot_8rank_exact");
+        if (!one || !two) { std::printf("--perfar8: an eight-rank exact row is absent\n"); return; }
+        rows.push_back(one); ks.push_back(0); forms.push_back(-1);
+        for (int f : fl)
+            for (int k : { -1, 1, 2, 4, 8 }) {
+                rows.push_back(two); ks.push_back(k); forms.push_back(explicit_forms ? f : -1);
+            }
     }
     /* Ranks sharing a card must have every block resident at once, since a block spins until its
      * twins on the other ranks arrive: eight ranks of at most 8 blocks of 1024 threads fit an R9700,
@@ -22704,7 +22758,7 @@ static void ar8_perf(const Plugin& pl, int64_t numel, int iters, const char* dty
     for (int r = 0; r < W; ++r) {
         Ar8Perf& x = t[(size_t)r];
         x.rank = r; x.dev = devs[(size_t)r]; x.iters = iters; x.dtype = dtype;
-        x.sizes = sizes; x.rows = rows; x.ks = ks; x.nbs = nbs; x.bar = &bar;
+        x.sizes = sizes; x.rows = rows; x.ks = ks; x.forms = forms; x.nbs = nbs; x.bar = &bar;
         th.emplace_back(ar8_perf_worker, &x);
     }
     for (std::thread& x : th) x.join();
@@ -22735,10 +22789,14 @@ static void ar8_perf(const Plugin& pl, int64_t numel, int iters, const char* dty
             /* The piece count the shim runs (before the launcher's words-a-block clamp). */
             const int keff = n < kmin ? 1 : ks[j] > 0 ? ks[j]
                                           : kenv ? (int)kenv : r4d_ar8_auto_pieces(n);
+            const char* fam = forms[j] == R4D_AR8_FORM_RING    ? "ring"
+                            : forms[j] == R4D_AR8_FORM_SPLIT   ? "split"
+                            : forms[j] == R4D_AR8_FORM_LOCKSTEP ? "lockstep"
+                                                                : "two-shot";
             const std::string rname = !two ? std::string("one-shot")
-                                    : ks[j] < 0 ? fmt("two-shot set K%d", keff)
-                                    : keff != ks[j] ? fmt("two-shot K%d>%d", ks[j], keff)
-                                                    : fmt("two-shot K%d", ks[j]);
+                                    : ks[j] < 0 ? fmt("%s set K%d", fam, keff)
+                                    : keff != ks[j] ? fmt("%s K%d>%d", fam, ks[j], keff)
+                                                    : fmt("%s K%d", fam, ks[j]);
             const double sent = two ? 2.0 * (W - 1) / W * bytes : (double)(W - 1) * bytes;
             for (int nb : nbs) {
                 const Ar8Perf& r0 = t[0];
@@ -27179,10 +27237,12 @@ static void usage(void) {
                 "             or runs (S contiguous runs). a=bf16 (default) or a=fp8_e4m3 (scale\n"
                 "             every 128); y=bf16 (default), y=f16 or y=f32. Each row's t and y are\n"
                 "             compared with the first row's; --cold applies.\n"
-                "  --perfar8 numel [iters] [dtype]:  the eight-rank exact all-reduce, one thread\n"
+                "  --perfar8 numel [iters] [dtype] [forms]:  the eight-rank exact all-reduce, one thread\n"
                 "             a card: one-shot and two-shot at the block rule and at 4..64 blocks,\n"
                 "             each checked against the rank-order fold; numel 0 runs the decode\n"
                 "             and prefill messages at 4096 wide. dtype bf16 (default) or fp32.\n"
+                "             forms: the two-shot's, comma-separated (lockstep, ring, split;\n"
+                "             default lockstep, which leaves RADIANCE_AR8_FORM in charge).\n"
                 "             With --timeline each two-shot point is launched once more with its\n"
                 "             per-block stamps on, and every rank's push, waits, steps and tail\n"
                 "             are printed. R4D_SELFTEST_ONE_CARD=1 runs the eight ranks on one card.\n"
@@ -27269,6 +27329,7 @@ int main(int argc, char** argv) {
     const char* ar8_dt = "bf16";
     long long lg_m = 0;
     int lg_it = 200;
+    const char* ar8_forms = "lockstep";
     long long mx_m = 0, mx_e = 288, mx_k = 8;
     const char* mx_skew = nullptr;
     bool mx_f8 = false;
@@ -27407,6 +27468,7 @@ int main(int argc, char** argv) {
             ar8_n = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) ar8_it = (int)std::strtol(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) ar8_dt = argv[++i];
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) ar8_forms = argv[++i];
         } else if (!std::strcmp(argv[i], "--perfmhcpre")) {
             /* mhc_pre and mhc_post at GLM's shape, 16-byte rows against pitched ones. */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -27570,7 +27632,7 @@ int main(int argc, char** argv) {
     if (ar8_n >= 0) {
         if (!load(&pl, path)) return 1;
 #ifdef RAD_HAVE_HIP
-        ar8_perf(pl, ar8_n, ar8_it, ar8_dt);
+        ar8_perf(pl, ar8_n, ar8_it, ar8_dt, ar8_forms);
         dfree_all();
 #else
         skip("eight-rank all-reduce timing", "built without HIP");

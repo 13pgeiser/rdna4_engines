@@ -13,12 +13,18 @@
 
 #define R4D_AR8_SHARD_WEIGHTS_ENV "RADIANCE_AR8_SHARD_WEIGHTS"
 #define R4D_AR8_PIECES_ENV "RADIANCE_AR8_PIECES"
+// The eight-rank two-shot's form (r4d_ar_twoshot_Nrank_exact.hip): lockstep (unset, the one
+// handshake a step), ring (the first hop sent to the ranks in ring order from the next one) or
+// split (ring, and a flag after each half of a step, each awaited only where its data is read).
+// Every form folds the same words in the same order, so all give the same bits.
+#define R4D_AR8_FORM_ENV "RADIANCE_AR8_FORM"
 // Below these message sizes (elements) the weights and the pieces do not apply: a decode-sized
 // message pays more for the extra handshakes and the uneven split than its link time saves
 // (measured on the eight R9700: 196608 elements run fastest even and in one piece, 524288 already
 // gain from weights and two pieces).
 #define R4D_AR8_SHARD_WEIGHTS_MIN_ENV "RADIANCE_AR8_SHARD_WEIGHTS_MIN_ELEMS"
 #define R4D_AR8_PIECES_MIN_ENV "RADIANCE_AR8_PIECES_MIN_ELEMS"
+enum { R4D_AR8_FORM_LOCKSTEP = 0, R4D_AR8_FORM_RING = 1, R4D_AR8_FORM_SPLIT = 2 };
 enum {
   R4D_AR_SHARD_WEIGHT_MAX = 65535,
   R4D_AR8_MIN_ELEMS_DEFAULT = 262144,
@@ -34,6 +40,19 @@ inline int r4d_ar8_auto_pieces(long long numel) {
   if (numel < 1048576) return 2;
   if (numel < 4194304) return 4;
   return 8;
+}
+
+// "lockstep", "ring" or "split" as R4D_AR8_FORM_*; -1 for anything else.
+inline int r4d_ar8_form_parse(const char* s) {
+  if (!s) return -1;
+  const char* names[3] = { "lockstep", "ring", "split" };
+  for (int f = 0; f < 3; ++f) {
+    const char* a = names[f];
+    const char* b = s;
+    while (*a && *a == *b) { ++a; ++b; }
+    if (!*a && !*b) return f;
+  }
+  return -1;
 }
 
 // A non-negative decimal integer of at most `max`, nothing else.
