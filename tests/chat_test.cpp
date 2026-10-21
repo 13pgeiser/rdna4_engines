@@ -1032,6 +1032,9 @@ TEST(a_dotted_integer_is_an_index_as_in_jinja2) {
         "{%- if add_generation_prompt %}<assistant>{% endif %}", "", ""));
     CHECK(glm.caps().tools);
     CHECK(glm.caps().tool_calls);
+    /* The string-content probe hands the template an empty tools array, not [null]: this
+     * template iterates `tools`, threw on the null, and lost string content. */
+    CHECK(glm.caps().string_content);
 
     ChatTemplate first;
     CHECK_OK(first.load("{{ messages.0.content }}|{{ messages.1.role }}", "", ""));
