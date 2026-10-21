@@ -162,3 +162,19 @@ port is audited the same way in HIPF-118); their hardware receipts are
 outstanding: a hiptrx runbook (`cb_vmm_state_oracle` k=1,2,3, a 27B DFlash
 serve A/B, and an A3B native FP8 prefill A/B beta vs stack) and a hipx row
 (27B DFlash with split verify).
+
+## Dense tensor parallelism on the generic engine (#927 item 4, HIPF-142)
+
+`qwen35::mesh_tp` declares one step program for prefill and decode: per layer
+the mixer (replicated, `Opaque`), `GatedMlp` (`SplitRule::GatedMlp`, `Product`
+ladder, gate/up `ColumnShard { axis: 0 }`, down `RowShard { axis: 1 }` in
+whole G256 groups) writing `ffn_out`, and the residual `Accumulate`
+(`OpKind::ResidualAdd`). On a pure TP mesh the splitter turns each
+`Accumulate` into one rank-ordered `AllReduceAdd` into `x`, so a rank runs
+`[embed, mixer, ffn] AllReduceAdd [mixer, ffn] AllReduceAdd … [head]`. A
+decode epoch binds it to the decode scratch; a prefill epoch to the rank's
+batch scratch (batched mixers, `Product` rows with the TP `Partial`
+epilogue, last-row logits). Each rank holds every attention and DeltaNet head
+and its even block of the FFN intermediate (`ffn_rank_layout`).
+`Qwen35TpBindings` is tied to the plan of exactly those shards and refuses a
+prefill past the batch scratch, sessions, checkpoints and prefix repair.

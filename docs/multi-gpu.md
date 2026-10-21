@@ -1128,6 +1128,49 @@ for n in 2 4; do HIPFIRE_EMULATE_GPUS=$n HIPFIRE_QWEN4_DEV_ARTIFACT=<tiny-dense-
   <binary> mesh_tp::hw_tests --ignored --nocapture --test-threads=1; done
 ```
 
+The second use is Qwen3.5/3.6/3.8 dense prefill and decode (`qwen35::mesh_tp`,
+#927 item 4). Each rank holds every attention and DeltaNet head and its even
+block of the FFN intermediate in whole G256 groups (`ffn_rank_layout`, loaded
+through `load_weights_dense_tp_rank`). Each layer's `GatedMlp` on the
+`Product` ladder writes the rank's partial, and the residual `Accumulate`
+after it becomes one rank-ordered `AllReduceAdd` into `x`. A decode epoch is
+one token; a prefill epoch is up to the rank's batch-scratch rows (the
+provisioned `max_bytes` must hold `rows * dim * 4`). `Qwen35TpBindings` is
+checked against the plan of exactly its shards; a prefill past the batch
+scratch, sessions, checkpoints and prefix repair are refused before any
+launch. Attention and DeltaNet are replicated, so this is not yet the hand
+dense-TP route's work split, and the loader has no generic Qwen3.5 TP route.
+Oracle (a 16-token prefill epoch, then 16 decode epochs teacher-forced to the
+plain card's greedy tokens; byte identity against the single-device
+rank-order sum, reported against the plain card):
+
+```sh
+cargo test --release -p hipfire-arch-qwen35 --lib --no-run
+for n in 2 4; do HIPFIRE_EMULATE_GPUS=$n HIPFIRE_QWEN35_TP_MODEL=<dense .mq4> \
+  <binary> qwen35::mesh_tp::hw_tests --ignored --nocapture --test-threads=1; done
+```
+
+Physical TP2 runbook (gfx1201, e.g. hiptrx; not runnable on a one-card box).
+Fixtures: `qwen3.5-9b.mq4` (sha256 `ba83acf5…28ad`, 5313750016 B) and
+`qwen3.8-27b.mq4-xt` (`9f91556f…eeb7`, 14980361216 B). Without
+`HIPFIRE_EMULATE_GPUS`, the rank count comes from `HIPFIRE_QWEN35_TP_PARTS`
+and rank `i` runs on visible device `i`; the oracle and the plain card run on
+device 0.
+
+```sh
+for model in qwen3.5-9b.mq4 qwen3.8-27b.mq4-xt; do
+  HIP_VISIBLE_DEVICES=0,1 HIPFIRE_QWEN35_TP_PARTS=2 HIPFIRE_QWEN35_TP_MODEL=<models>/$model \
+    <binary> qwen35::mesh_tp::hw_tests --ignored --nocapture --test-threads=1
+done
+```
+
+Pass: each `TP2 <model>` line shows the oracle and TP FNV-64 equal (the test
+asserts it) on the transport `provision_mesh_edges` chose (Peer on
+peer-qualified cards, else Host). Record per model the two `TP2` lines, the
+binary MD5, `HIP_VISIBLE_DEVICES`, the ROCm version and, from the gfx1201
+emulated arm (`HIPFIRE_EMULATE_GPUS=2`, one card), the same lines for a
+same-box reference. Repeat with `0,1,2,3` and `HIPFIRE_QWEN35_TP_PARTS=4`.
+
 ### Architectural limits (current)
 
 - Homogeneous **exact arch string** by default (`ALLOW_MIXED_ARCH` is opt-in).
