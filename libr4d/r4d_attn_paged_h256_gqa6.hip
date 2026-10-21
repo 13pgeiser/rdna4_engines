@@ -19,6 +19,7 @@
 #include "r4d_attn_args.h"
 #include "r4d_common.h"
 #include <cmath>
+#include <cstdlib>
 #include <algorithm>
 using std::max;
 #include "r4d_attn_prefill_h256_gqa6.hip"
@@ -56,9 +57,25 @@ static int prefill_launch(const R4DArgs* a, hipStream_t s) {
     if (a->q_heads / a->kv_heads != A_GQA) return -2;
     constexpr int BQ = (P_NWARPS * 16) / A_GQA;
     dim3 grid((a->q_len + BQ - 1) / BQ, a->kv_heads, a->num_seqs);
-    hipLaunchKernelGGL((r4d_attn_prefill_kernel<P_NWARPS, P_TILE, A_HEAD_DIM, A_GQA, A_BLOCK_SIZE,
-                                                KVP, P_OPT | XOPT>),
-                       grid, dim3(P_NWARPS * 32), 0, s, *a);
+    // R4D_ATTN_FP8: 0 = f16 (default), 1 = O_QK8, 2 = O_PV8, 3 = both; fp8 KV without V4/K6 only.
+    int fp8mode = 0;
+    if constexpr (KVP == 0 && XOPT == 0) {
+        static const int m = [] { const char* e = getenv("R4D_ATTN_FP8"); return e ? atoi(e) : 0; }();
+        fp8mode = m;
+    }
+#define P_LAUNCH(OPTX)                                                                            \
+    hipLaunchKernelGGL((r4d_attn_prefill_kernel<P_NWARPS, P_TILE, A_HEAD_DIM, A_GQA, A_BLOCK_SIZE, \
+                                                KVP, OPTX>),                                      \
+                       grid, dim3(P_NWARPS * 32), 0, s, *a)
+    if constexpr (KVP == 0 && XOPT == 0) {
+        if (fp8mode == 3)      P_LAUNCH(P_OPT | O_QK8 | O_PV8);
+        else if (fp8mode == 2) P_LAUNCH(P_OPT | O_PV8);
+        else if (fp8mode == 1) P_LAUNCH(P_OPT | O_QK8);
+        else                   P_LAUNCH(P_OPT | XOPT);
+    } else {
+        P_LAUNCH(P_OPT | XOPT);
+    }
+#undef P_LAUNCH
     CHK();
     return 0;
 }
