@@ -45,8 +45,8 @@ const USAGE: &str = "usage:
   peacemaker-rip help
 
 check:   compile every (arch, variant) and report diagnostics; exit 0 ok (warnings allowed), 1 errors, 2 usage.
-         --arch LIST|all   comma list of gfx1100,gfx1151,gfx1201 (default gfx1151,gfx1201; all = all three)
-         --variant LIST    comma list (default: the variants of the script's `enum Kind`)
+         --arch LIST|all   comma list of gfx1100,gfx1151,gfx1201 (default: the script's `const ARCHES`, else gfx1151,gfx1201; all = declared ARCHES, else all three)
+         --variant LIST    comma list (default: the script's `const VARIANTS`, else its `enum Kind`)
          --json            one JSON document on stdout
 build:   write assembly; ARCH is gfx1151, gfx1201, gfx1100 or both. --certify assembles, links and certifies.
          The legacy form `peacemaker-rip [--certify] [--module] SOURCE ARCH ...` is `build`.
@@ -58,16 +58,25 @@ fn usage_error(msg: &str) -> u8 {
     2
 }
 
-/// Comma list of arches, `both` (gfx1151, gfx1201) or `all` (gfx1100, gfx1151, gfx1201).
-fn arches(a: &str) -> Result<Vec<Arch>, String> {
+/// Parse `--arch`: a comma list of arches, `both` (gfx1151, gfx1201) or
+/// `all`. Bare `all` expands to `declared` when the script declares `const
+/// ARCHES`, else to every arch; an explicit list never consults the const.
+fn arches(a: &str, declared: Option<&[Arch]>) -> Result<Vec<Arch>, String> {
     match a {
         "both" => return Ok(vec![Arch::Gfx1151, Arch::Gfx1201]),
-        "all" => return Ok(vec![Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201]),
+        "all" => {
+            return Ok(match declared {
+                Some(ds) => ds.to_vec(),
+                None => peacemaker_rip::ALL_ARCHES.to_vec(),
+            })
+        }
         _ => {}
     }
     let mut out = Vec::new();
     for part in a.split(',') {
-        let arch = part.parse::<Arch>()?;
+        let arch = part
+            .parse::<Arch>()
+            .map_err(|_| format!("unsupported architecture {part}"))?;
         if !out.contains(&arch) {
             out.push(arch);
         }
@@ -160,10 +169,6 @@ fn check(mut args: Vec<String>) -> u8 {
         return usage_error("`check` takes exactly one FILE");
     }
     let file = args.remove(0);
-    let arches = match arches(arch_arg.as_deref().unwrap_or("gfx1151,gfx1201")) {
-        Ok(a) => a,
-        Err(e) => return usage_error(&e),
-    };
     let source = match std::fs::read_to_string(&file) {
         Ok(s) => s,
         Err(e) => {
@@ -178,7 +183,20 @@ fn check(mut args: Vec<String>) -> u8 {
             return 1;
         }
     };
-    let variants: Vec<String> = match variant_arg {
+    // Discovery runs over the source twice (variants, arches) so a failure
+    // of either is reported with its own location before any compile.
+    let failed = |raw: String| {
+        let d = Diagnostic::from_raw(&raw, &file, &source, Severity::Error);
+        if json {
+            print_json(
+                &serde_json::json!({"file": file, "ok": false, "results": [], "diagnostics": [d.to_json()]}),
+            );
+        } else {
+            print_diagnostic(&d, &source);
+        }
+        1
+    };
+    let variants: Vec<String> = match &variant_arg {
         Some(list) => list
             .split(',')
             .filter(|v| !v.is_empty())
@@ -186,22 +204,44 @@ fn check(mut args: Vec<String>) -> u8 {
             .collect(),
         None => match peacemaker_rip::variants(&source, &file) {
             Ok(v) => v,
-            Err(raw) => {
-                let d = Diagnostic::from_raw(&raw, &file, &source, Severity::Error);
-                if json {
-                    print_json(
-                        &serde_json::json!({"file": file, "ok": false, "results": [], "diagnostics": [d.to_json()]}),
-                    );
-                } else {
-                    print_diagnostic(&d, &source);
-                }
-                return 1;
-            }
+            Err(raw) => return failed(raw),
         },
     };
     if variants.is_empty() {
         return usage_error(&format!(
-            "{file} declares no `enum Kind` variants; pass `--variant NAME[,NAME..]`"
+            "{file} declares no `VARIANTS` (nor `enum Kind` variants); pass `--variant NAME[,NAME..]`"
+        ));
+    }
+    // An explicit `--arch` list wins over the script; without one the
+    // declared `ARCHES` (when present and well-formed) is the target list.
+    let declared: Option<Vec<Arch>> = match peacemaker_rip::arches(&source, &file) {
+        Ok(None) => None,
+        Ok(Some(names)) => {
+            let mut ds = Vec::new();
+            for n in &names {
+                match peacemaker_rip::parse_arch(n) {
+                    Ok(a) => {
+                        if !ds.contains(&a) {
+                            ds.push(a);
+                        }
+                    }
+                    Err(e) => return usage_error(&format!("{file}: const ARCHES: {e}")),
+                }
+            }
+            Some(ds)
+        }
+        Err(raw) => return failed(raw),
+    };
+    let arches = match &arch_arg {
+        Some(list) => match arches(list, declared.as_deref()) {
+            Ok(a) => a,
+            Err(e) => return usage_error(&format!("{file}: {e}")),
+        },
+        None => declared.unwrap_or_else(|| peacemaker_rip::DEFAULT_ARCHES.to_vec()),
+    };
+    if arches.is_empty() {
+        return usage_error(&format!(
+            "{file} declares an empty `ARCHES`; pass `--arch NAME[,NAME..]`"
         ));
     }
 
@@ -418,7 +458,7 @@ fn build(mut args: Vec<String>) -> u8 {
             )
         }
     };
-    let arch_list = match arches(&b.args[1]) {
+    let arch_list = match arches(&b.args[1], None) {
         Ok(a) => a,
         Err(e) => return report_build_failure(&b, &file, &source, vec![tool_error(&file, e)]),
     };

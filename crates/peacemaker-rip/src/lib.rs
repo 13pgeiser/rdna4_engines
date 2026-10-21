@@ -14,6 +14,11 @@
 //!   variant of the script's own `enum Kind` named like `variant`
 //!   (case-insensitive), else the string itself. `fn emit(arch, variant)` is
 //!   accepted too.
+//! - Discovery: `const VARIANTS: &[&str]` names the channel's variants
+//!   (else the script's `enum Kind`), `const ARCHES: &[&str]` its arches
+//!   (else the default arch list). Explicit `--variant` / `--arch` flags
+//!   beat both consts; `--arch all` means the declared `ARCHES` when
+//!   present, else every arch.
 //! - Item keywords (token-level, see [`preprocess`]): `tile T { .. }` is a
 //!   register-tile layout, `chain f(..) { .. }` an emission routine,
 //!   `region R;` an LDS region tag.
@@ -316,13 +321,52 @@ pub fn check(source: &str, name: &str, arch: Arch, variant: &str) -> Checked {
     }
 }
 
-/// The variants declared by the script's `enum Kind`, with the declared
-/// spelling ([`compile`] matches them case-insensitively); empty without one.
+/// Check every (arch, variant) of a `.rip` source without cargo: the default
+/// arches and variants below, unless the caller passes explicit lists.
+///
+/// - `const VARIANTS: &[&str]`: the channel's variant names. When absent,
+///   the variants of the script's own `enum Kind` (case-insensitive at the
+///   call site), else an empty list. An empty list is a usage error naming
+///   `VARIANTS`: pass `--variant`.
+/// - `const ARCHES: &[&str]`: the channel's architectures (any of
+///   `gfx1100`, `gfx1151`, `gfx1201`). When absent, the default arch list.
+///   An unknown name is a usage error; `--arch all` means the declared
+///   `ARCHES` when present, else all three arches.
+/// - Explicit `--arch` / `--variant` flags beat both consts. A refusal the
+///   script's own `emit` returns (an arch or variant it does not build) is
+///   an error, even when the arch came from an explicit flag.
+pub const DEFAULT_ARCHES: [Arch; 2] = [Arch::Gfx1151, Arch::Gfx1201];
+
+/// Every arch a `--arch` list or `--arch all` may name.
+pub const ALL_ARCHES: [Arch; 3] = [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201];
+
+/// Parse one arch name of a `--arch` list or a script's `const ARCHES`.
+pub fn parse_arch(name: &str) -> Result<Arch, String> {
+    name.parse::<Arch>()
+        .map_err(|_| format!("unsupported architecture {name}"))
+}
+
+/// The variants declared by the script's `const VARIANTS`, else by its `enum
+/// Kind` with the declared spelling ([`compile`] matches them
+/// case-insensitively); empty only when the script declares neither.
 pub fn variants(source: &str, name: &str) -> Result<Vec<String>, String> {
     big_stack(|| {
         let file = parse(source, name)?;
         let it = Interp::load(&file, name);
-        Ok(it.enum_variants("Kind").unwrap_or_default())
+        match it.const_str_list("VARIANTS")? {
+            Some(v) => Ok(v),
+            None => Ok(it.enum_variants("Kind").unwrap_or_default()),
+        }
+    })
+}
+
+/// The arches declared by the script's `const ARCHES` (`None` when it
+/// declares none); a declared-but-malformed const is an error.
+pub fn arches(source: &str, name: &str) -> Result<Option<Vec<String>>, String> {
+    big_stack(|| {
+        let file = parse(source, name)?;
+        let it = Interp::load(&file, name);
+        it.const_str_list("ARCHES")
     })
 }
 
