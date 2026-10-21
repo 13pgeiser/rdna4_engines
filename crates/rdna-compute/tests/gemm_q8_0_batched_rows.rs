@@ -133,7 +133,7 @@ fn gemm_q8_0_batched_short_buffers_fail_in_bounds_check() {
     }));
     let msg = match caught {
         Ok(_) => panic!("short x must panic in the sub_offset bounds check"),
-        Err(payload) => panic_payload_text(&payload),
+        Err(payload) => panic_payload_text(payload.as_ref()),
     };
     assert!(
         msg.contains("accessible buffer prefix"),
@@ -147,7 +147,7 @@ fn gemm_q8_0_batched_short_buffers_fail_in_bounds_check() {
     }));
     let msg = match caught {
         Ok(_) => panic!("short y must panic in the sub_offset bounds check"),
-        Err(payload) => panic_payload_text(&payload),
+        Err(payload) => panic_payload_text(payload.as_ref()),
     };
     assert!(
         msg.contains("accessible buffer prefix"),
