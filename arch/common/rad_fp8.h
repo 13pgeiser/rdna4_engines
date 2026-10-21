@@ -798,8 +798,10 @@ struct LinearFP8 {
     rad_weight decl_dense(RadBuilder* b, Names& nm, const char* base, const char* wn, const RadEncoding& enc,
                           int64_t K,
                           RadWeightGroup grp);
+    /* Rows [r0, r0 + rows) of the input into the same rows of `y`, or from row `y0` of `y` when
+     * that is set: a rank's run of a step's rows written to a buffer sized for the run. */
     void step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, int64_t r0 = 0,
-              int64_t rows = 0) const;
+              int64_t rows = 0, int64_t y0 = -1) const;
     /* A span per stacked row part (rad_weight_shard_span_parts), in weight rows; the scale plane
      * gets the same spans in its rows. Call after declare(). With a 1/128 plane every span and
      * total must be whole scale blocks. */
@@ -1428,10 +1430,11 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
  * asymmetric integer and mxfp4 grids) are passed as RAD_NONE when unused, since the runtime checks
  * the operand count against the schema (core/runtime/issue.cpp). */
 inline void LinearFP8::step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, int64_t r0,
-                            int64_t rows) const {
+                            int64_t rows, int64_t y0) const {
     if (rows <= 0) rows = T - r0;
+    const int64_t yr = y0 < 0 ? r0 : y0;
     if (bf16) {
-        RAD_ISSUE_N(c, op, rows, brow_slice(a.x, r0, rows, K), RAD_W(w), brow_slice(y, r0, rows, N));
+        RAD_ISSUE_N(c, op, rows, brow_slice(a.x, r0, rows, K), RAD_W(w), brow_slice(y, yr, rows, N));
         return;
     }
     if (i8) {
@@ -1440,7 +1443,7 @@ inline void LinearFP8::step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, in
                         brow_slice(a.s8, r0, rows, K / RAD_FP8_BLOCK));
         RAD_ISSUE_N(c, op, rows, brow_slice(a.q8, r0, rows, K),
                     brow_slice(a.s8, r0, rows, K / RAD_FP8_BLOCK),
-                    RAD_W(w), RAD_W(ws), brow_slice(y, r0, rows, N), RAD_NONE, RAD_NONE);
+                    RAD_W(w), RAD_W(ws), brow_slice(y, yr, rows, N), RAD_NONE, RAD_NONE);
         return;
     }
     /* The 4-bit weight's copies of the input start at their buffers' first row: they live only
@@ -1450,13 +1453,13 @@ inline void LinearFP8::step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, in
                     brow_slice(a8s, 0, rows, K / RAD_FP8_BLOCK));
         RAD_ISSUE_N(c, op2, rows, brow_slice(a8q, 0, rows, K),
                     brow_slice(a8s, 0, rows, K / RAD_FP8_BLOCK), RAD_W(w), RAD_W(ws),
-                    brow_slice(y, r0, rows, N), RAD_NONE, RAD_NONE);
+                    brow_slice(y, yr, rows, N), RAD_NONE, RAD_NONE);
         return;
     }
     if (w4) {
         RAD_ISSUE_N(c, op_a16, rows, brow_slice(a.x, r0, rows, K), brow_slice(a16, 0, rows, K));
         RAD_ISSUE_N(c, op, rows, brow_slice(a16, 0, rows, K), RAD_NONE, RAD_W(w), RAD_W(ws),
-                    brow_slice(y, r0, rows, N), RAD_NONE, RAD_NONE);
+                    brow_slice(y, yr, rows, N), RAD_NONE, RAD_NONE);
         return;
     }
     if (paro5 && rot_split && rows > rot_split) {
@@ -1465,14 +1468,14 @@ inline void LinearFP8::step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, in
                     brow_slice(rot_s2, r0, rows, rot_parts * (K / RAD_FP8_BLOCK)));
         RAD_ISSUE_N(c, op2, rows, brow_slice(rot_q2, r0, rows, rot_parts * K),
                     brow_slice(rot_s2, r0, rows, rot_parts * (K / RAD_FP8_BLOCK)),
-                    RAD_W(w), RAD_W(ws), brow_slice(y, r0, rows, N), RAD_NONE, RAD_NONE);
+                    RAD_W(w), RAD_W(ws), brow_slice(y, yr, rows, N), RAD_NONE, RAD_NONE);
         return;
     }
     if (paro5) {
         RAD_ISSUE_N(c, op_rot, rows, brow_slice(a.x, r0, rows, K), RAD_W(rot_pairs),
                     RAD_W(rot_angle), RAD_W(rot_scale), brow_slice(rot_q, r0, rows, rot_parts * K));
         RAD_ISSUE_N(c, op, rows, brow_slice(rot_q, r0, rows, rot_parts * K), RAD_NONE,
-                    RAD_W(w), RAD_W(ws), brow_slice(y, r0, rows, N), RAD_NONE, RAD_NONE);
+                    RAD_W(w), RAD_W(ws), brow_slice(y, yr, rows, N), RAD_NONE, RAD_NONE);
         return;
     }
     if (mx) {
@@ -1486,12 +1489,12 @@ inline void LinearFP8::step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, in
                         brow_slice(as, r0, rows, ak / RAD_FP8_BLOCK));
         RAD_ISSUE_N(c, op, rows, brow_slice(aq, r0, rows, ak),
                     brow_slice(as, r0, rows, ak / RAD_FP8_BLOCK),
-                    RAD_W(w), RAD_W(ws), brow_slice(y, r0, rows, N), RAD_NONE, RAD_W(wref));
+                    RAD_W(w), RAD_W(ws), brow_slice(y, yr, rows, N), RAD_NONE, RAD_W(wref));
         return;
     }
     RAD_ISSUE_N(c, op, rows, brow_slice(a.q, r0, rows, K),
                 brow_slice(a.s, r0, rows, K / RAD_FP8_BLOCK),
-                RAD_W(w), RAD_W(ws), brow_slice(y, r0, rows, N), RAD_NONE, RAD_NONE);
+                RAD_W(w), RAD_W(ws), brow_slice(y, yr, rows, N), RAD_NONE, RAD_NONE);
 }
 
 /* ================================================== an fp8 weight with no op of its own
