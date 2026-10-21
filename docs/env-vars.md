@@ -822,7 +822,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1701
+**Count:** 1703
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -2038,8 +2038,10 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN35_NGRAM_LEN_MIN` | crates/hipfire-arch-qwen35/src/grammar_config.rs | developer |
 | `HIPFIRE_QWEN35_NGRAM_MIN_REPEATS` | crates/hipfire-arch-qwen35/src/grammar_config.rs | developer |
 | `HIPFIRE_QWEN35_RESET_MODEL` | crates/hipfire-generate/tests/qwen35_reset_hw.rs | harness |
+| `HIPFIRE_QWEN35_TP_CHUNK` | crates/hipfire-arch-qwen35/src/qwen35/mesh_tp.rs, scripts/check-env-docs.py | developer |
 | `HIPFIRE_QWEN35_TP_MODEL` | crates/hipfire-arch-qwen35/src/qwen35/mesh_tp.rs, scripts/check-env-docs.py | developer |
 | `HIPFIRE_QWEN35_TP_PARTS` | crates/hipfire-arch-qwen35/src/qwen35/mesh_tp.rs, scripts/check-env-docs.py | developer |
+| `HIPFIRE_QWEN35_TP_ROWS` | crates/hipfire-arch-qwen35/src/qwen35/mesh_tp.rs, scripts/check-env-docs.py | developer |
 | `HIPFIRE_QWEN36_MOE_FIXTURE` | crates/hipfire-arch-qwen35/tests/route_oracle_single.rs | harness |
 | `HIPFIRE_QWEN3_BENCH_MODE` | crates/hipfire-arch-llama/examples/qwen3_dspark_bench.rs | harness |
 | `HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD` | crates/hipfire-arch-llama/examples/qwen3_dspark_bench.rs, crates/hipfire-loader/src/carriers.rs | developer |

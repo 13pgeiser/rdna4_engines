@@ -296,22 +296,136 @@ pub fn ffn_dtypes(weights: &Qwen35Weights) -> Result<Vec<[DType; 3]>> {
         .collect()
 }
 
-/// One TP rank's model shard and state, resident on the rank's device.
+/// One TP rank's model shard and state, resident on the rank's device. Only
+/// [`Self::load`] builds one: it derives the rank's layout and loads the
+/// weights with exactly that layout, so the layout [`Qwen35TpBindings::new`]
+/// checks is the slice the rank holds.
 pub struct Qwen35TpRank {
     /// Rank-local config: the global one with the FFN intermediate of the shard.
-    pub config: Qwen35Config,
-    pub layout: DenseTpRankLayout,
-    pub weights: Qwen35Weights,
-    pub kv: llama::KvCache,
-    pub dn: DeltaNetState,
+    config: Qwen35Config,
+    layout: DenseTpRankLayout,
+    weights: Qwen35Weights,
+    kv: llama::KvCache,
+    dn: DeltaNetState,
     /// Decode scratch; its `logits` are the rank's output on both routes.
-    pub scratch: Qwen35Scratch,
+    scratch: Qwen35Scratch,
     /// Prefill rows (`max_batch` bounds a prefill epoch).
-    pub pbs: PrefillBatchScratch,
+    pbs: PrefillBatchScratch,
     /// F32 `[pbs.max_batch, dim]`: a prefill epoch's FFN partial.
-    pub partial: rdna_compute::GpuTensor,
+    partial: rdna_compute::GpuTensor,
     /// Tokens committed so far.
-    pub position: usize,
+    position: usize,
+}
+
+impl Qwen35TpRank {
+    /// Rank `rank` of a `parts`-way TP mesh of `global` on `gpu`: derives the
+    /// rank's layout, loads its weight slice with that layout and allocates
+    /// its state (`kv_mode` KV and `state` DeltaNet state over `max_seq`
+    /// positions) and scratch (prefill epochs up to `max_batch` rows). On
+    /// error everything allocated so far is freed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load(
+        hfq: &mut hipfire_runtime::hfq::HfqFile,
+        global: &Qwen35Config,
+        gpu: &mut Gpu,
+        rank: usize,
+        parts: usize,
+        kv_mode: hipfire_runtime::kv_mode::KvMode,
+        state: super::weights::StateQuant,
+        max_seq: usize,
+        max_batch: usize,
+    ) -> Result<Self> {
+        use hipfire_runtime::llama::{KvCacheExt, KvDims, KvLayers, KvTarget};
+        let hip = |e: hip_bridge::HipError| e.to_string();
+        gpu.bind_thread().map_err(hip)?;
+        let layout = ffn_rank_layout(global, rank, parts)?;
+        let config = super::config::local_dense_tp_config(global, &layout);
+        let weights =
+            super::load::load_weights_dense_tp_rank(hfq, global, gpu, &layout).map_err(hip)?;
+        let mut weights = Some(weights);
+        let mut scratch = None;
+        let mut pbs = None;
+        let mut partial = None;
+        let mut kv = None;
+        let built = (|| -> hip_bridge::HipResult<DeltaNetState> {
+            scratch = Some(Qwen35Scratch::new_with_kv_max(gpu, &config, 64, max_seq)?);
+            pbs = Some(PrefillBatchScratch::new_opt(
+                gpu, &config, max_batch, false,
+            )?);
+            partial = Some(gpu.zeros(&[max_batch * config.dim], DType::F32)?);
+            let mask = config
+                .layer_types
+                .iter()
+                .map(|layer| *layer == LayerType::FullAttention)
+                .collect();
+            let dims = KvDims {
+                layers: KvLayers::Mask(mask),
+                n_kv_heads: config.n_kv_heads,
+                head_dim: config.head_dim,
+                max_seq,
+                physical_cap: Some(max_seq),
+            };
+            kv = Some(<llama::KvCache as KvCacheExt>::from_mode(
+                kv_mode,
+                KvTarget::Single(gpu),
+                &dims,
+            )?);
+            DeltaNetState::new_with_quant(gpu, &config, state)
+        })();
+        match built {
+            Ok(dn) => Ok(Self {
+                config,
+                layout,
+                weights: weights.take().expect("loaded"),
+                kv: kv.take().expect("allocated"),
+                dn,
+                scratch: scratch.take().expect("allocated"),
+                pbs: pbs.take().expect("allocated"),
+                partial: partial.take().expect("allocated"),
+                position: 0,
+            }),
+            Err(error) => {
+                if let Some(kv) = kv {
+                    let _ = kv.free_gpu(gpu);
+                }
+                if let Some(partial) = partial {
+                    let _ = gpu.free_tensor(partial);
+                }
+                if let Some(pbs) = pbs {
+                    let _ = pbs.free_gpu(gpu);
+                }
+                if let Some(scratch) = scratch {
+                    let _ = scratch.free_gpu(gpu);
+                }
+                if let Some(weights) = weights {
+                    weights.free_gpu(gpu);
+                }
+                Err(format!("Qwen3.5 TP rank {rank}: {error}"))
+            }
+        }
+    }
+
+    /// The rank's logits (last row of a prefill epoch, or the decode token).
+    pub fn logits(&self) -> &rdna_compute::GpuTensor {
+        &self.scratch.logits
+    }
+
+    /// Tokens committed so far.
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    /// Free everything the rank holds on `gpu`.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.bind_thread();
+        let _ = self.scratch.free_gpu(gpu);
+        let _ = self.pbs.free_gpu(gpu);
+        let _ = gpu.free_tensor(self.partial);
+        self.dn.free_gpu(gpu);
+        let _ = self.kv.free_gpu(gpu);
+        self.weights.free_gpu(gpu);
+        gpu.drain_pool();
+    }
 }
 
 /// One epoch adapter over the TP ranks (rank `i` on device `i`): borrows the
@@ -331,8 +445,9 @@ pub struct Qwen35TpBindings<'a> {
 
 impl<'a> Qwen35TpBindings<'a> {
     /// Validate before any submission: two or more ranks of one global config,
-    /// rank `i` holding the `i`-th FFN block of every dense layer, and `plan`
-    /// the TP plan of exactly these shards. `tp_epoch` is
+    /// rank `i` loaded (by [`Qwen35TpRank::load`]) as rank `i` of
+    /// `ranks.len()`, one weight dtype set, and `plan` the TP plan of exactly
+    /// these shards. `tp_epoch` is
     /// `Gpus::mesh_tp_epoch()`.
     pub fn new(
         global: &Qwen35Config,
@@ -346,20 +461,12 @@ impl<'a> Qwen35TpBindings<'a> {
         }
         let dtypes = ffn_dtypes(&ranks[0].weights)?;
         for (index, rank) in ranks.iter().enumerate() {
-            let layout = ffn_rank_layout(global, index, parts)?;
-            let block = layout.ffn_hidden_range.len();
-            let shapes_match = rank.weights.layers.iter().all(|layer| match layer {
-                LayerWeights::DeltaNet(l) => l.w_gate.m == block && l.w_down.k == block,
-                LayerWeights::FullAttn(l) => l.w_gate.m == block && l.w_down.k == block,
-                _ => false,
-            });
-            if rank.layout != layout
-                || rank.config.hidden_dim != block
-                || !shapes_match
+            // The layout is the one the rank's weights were loaded with.
+            if rank.layout != ffn_rank_layout(global, index, parts)?
                 || ffn_dtypes(&rank.weights)? != dtypes
             {
                 return Err(format!(
-                    "Qwen3.5 TP rank {index} does not hold FFN block {index} of {parts}"
+                    "Qwen3.5 TP rank {index} was not loaded as rank {index} of {parts}"
                 ));
             }
         }
@@ -617,7 +724,8 @@ impl MeshStepBindings for Qwen35TpBindings<'_> {
         }
         for rank in self.ranks.iter() {
             let end = rank.position.checked_add(rows);
-            if rank.position != epoch.start_position || end.is_none_or(|end| end > rank.kv.max_seq)
+            if rank.position != epoch.start_position
+                || end.is_none_or(|end| end > rank.kv.physical_cap)
             {
                 return Err("Qwen3.5 TP rank position or KV capacity disagrees".into());
             }
@@ -704,6 +812,11 @@ impl MeshStepBindings for Qwen35TpBindings<'_> {
         rank.kv.compact_offset = 0;
         rank.position = 0;
         Ok(())
+    }
+
+    /// Refused before the first callback, so the mesh stays healthy.
+    fn admits_prefix_repair(&self) -> bool {
+        false
     }
 
     fn repair_prefix_rank(
@@ -889,8 +1002,8 @@ mod tests {
 mod hw_tests {
     use super::*;
     use crate::qwen35::{
-        config_from_hfq, forward_prefill_batch, forward_scratch, load_weights,
-        load_weights_dense_tp_rank, local_dense_tp_config, HfqSource, Layout, StateQuant,
+        config_from_hfq, forward_prefill_batch, forward_scratch, load_weights, HfqSource, Layout,
+        StateQuant,
     };
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::kv_mode::KvMode;
@@ -901,12 +1014,20 @@ mod hw_tests {
     use rdna_compute::GpuTensor;
 
     const MODEL_ENV: &str = "HIPFIRE_QWEN35_TP_MODEL";
-    const MAX_SEQ: usize = 64;
-    /// Prompt rows, prefilled as one epoch; also the batch scratch rows.
-    const PROMPT: usize = 16;
     const GREEDY: usize = 16;
+    /// Forced tokens that run as 1-row Prefill epochs instead of decode: one
+    /// right after the prompt, one after decode epochs.
+    const ONE_ROW_PREFILL: [usize; 2] = [0, 8];
 
-    fn kv(gpu: &mut Gpu, config: &Qwen35Config) -> llama::KvCache {
+    /// `name` as a number, else `default`.
+    fn env_usize(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    }
+
+    fn kv(gpu: &mut Gpu, config: &Qwen35Config, max_seq: usize) -> llama::KvCache {
         let mask = config
             .layer_types
             .iter()
@@ -916,10 +1037,17 @@ mod hw_tests {
             layers: KvLayers::Mask(mask),
             n_kv_heads: config.n_kv_heads,
             head_dim: config.head_dim,
-            max_seq: MAX_SEQ,
-            physical_cap: Some(MAX_SEQ),
+            max_seq,
+            physical_cap: Some(max_seq),
         };
         <llama::KvCache as KvCacheExt>::from_mode(KvMode::Q8, KvTarget::Single(gpu), &dims).unwrap()
+    }
+
+    /// The run's rank shape: prefill epoch cap and KV positions.
+    #[derive(Clone, Copy)]
+    struct Shape {
+        chunk: usize,
+        max_seq: usize,
     }
 
     fn load_rank(
@@ -928,33 +1056,15 @@ mod hw_tests {
         gpu: &mut Gpu,
         rank: usize,
         parts: usize,
+        shape: Shape,
     ) -> Qwen35TpRank {
-        gpu.bind_thread().unwrap();
-        let layout = ffn_rank_layout(global, rank, parts).unwrap();
-        let config = local_dense_tp_config(global, &layout);
-        let weights = load_weights_dense_tp_rank(hfq, global, gpu, &layout).unwrap();
-        Qwen35TpRank {
-            scratch: Qwen35Scratch::new_with_kv_max(gpu, &config, 64, MAX_SEQ).unwrap(),
-            pbs: PrefillBatchScratch::new_opt(gpu, &config, PROMPT, false).unwrap(),
-            partial: gpu.zeros(&[PROMPT * config.dim], DType::F32).unwrap(),
-            kv: kv(gpu, &config),
-            dn: DeltaNetState::new_with_quant(gpu, &config, StateQuant::Q8).unwrap(),
-            config,
-            layout,
-            weights,
-            position: 0,
-        }
+        let (kv, state) = (KvMode::Q8, StateQuant::Q8);
+        let (max_seq, chunk) = (shape.max_seq, shape.chunk);
+        Qwen35TpRank::load(hfq, global, gpu, rank, parts, kv, state, max_seq, chunk).unwrap()
     }
 
     fn free_rank(rank: Qwen35TpRank, gpu: &mut Gpu) {
-        gpu.bind_thread().unwrap();
-        let _ = rank.scratch.free_gpu(gpu);
-        let _ = rank.pbs.free_gpu(gpu);
-        let _ = gpu.free_tensor(rank.partial);
-        rank.dn.free_gpu(gpu);
-        let _ = rank.kv.free_gpu(gpu);
-        rank.weights.free_gpu(gpu);
-        gpu.drain_pool();
+        rank.free_gpu(gpu);
     }
 
     fn download(gpu: &Gpu, t: &GpuTensor, n: usize) -> Vec<f32> {
@@ -995,25 +1105,38 @@ mod hw_tests {
         }
     }
 
-    /// The epochs of every arm: the prompt as one prefill epoch, then one
-    /// decode epoch per forced token. `run(tokens, route, start)` returns the
-    /// epoch's logits.
+    /// The epochs of the TP arms: the prompt as prefill epochs of at most
+    /// `chunk` rows (a `rows % chunk == 1` prompt ends in a 1-row epoch), then
+    /// one epoch per forced token, a 1-row Prefill at [`ONE_ROW_PREFILL`],
+    /// else a decode. `run(tokens, route, start)` returns the epoch's
+    /// logits; the result keeps the last prompt epoch's and every forced
+    /// token's, the rows the plain card also produces.
     fn rows_of(
         prompt: &[u32],
+        chunk: usize,
         forced: &[u32],
         mut run: impl FnMut(&[u32], MeshRoute, usize) -> Vec<f32>,
     ) -> Vec<Vec<f32>> {
-        let mut rows = vec![run(prompt, MeshRoute::Prefill, 0)];
+        let mut last = Vec::new();
+        for (index, epoch) in prompt.chunks(chunk).enumerate() {
+            last = run(epoch, MeshRoute::Prefill, index * chunk);
+        }
+        let mut rows = vec![last];
         for (step, token) in forced.iter().enumerate() {
-            rows.push(run(
-                std::slice::from_ref(token),
-                MeshRoute::Decode,
-                prompt.len() + step,
-            ));
+            let route = if ONE_ROW_PREFILL.contains(&step) {
+                MeshRoute::Prefill
+            } else {
+                MeshRoute::Decode
+            };
+            rows.push(run(std::slice::from_ref(token), route, prompt.len() + step));
         }
         rows
     }
 
+    /// `HIPFIRE_QWEN35_TP_ROWS` prompt rows (default 16, the text prompt
+    /// cycled) as prefill epochs of at most `HIPFIRE_QWEN35_TP_CHUNK` rows
+    /// (default 16), then 16 forced tokens, two of them as 1-row Prefill
+    /// epochs (after the prompt and after decode).
     #[test]
     #[ignore = "GPU: HIPFIRE_QWEN35_TP_MODEL=<dense .mq4> with HIPFIRE_EMULATE_GPUS=N (one card) or HIPFIRE_QWEN35_TP_PARTS=N (N cards)"]
     fn tp_prefill_decode_matches_rank_order_oracle() {
@@ -1029,9 +1152,19 @@ mod hw_tests {
         let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).unwrap();
         // Cut inside the sentence: the greedy tokens continue natural text.
         let text = "The Roman Empire was the post-Republican state of ancient Rome, ruling large territories around the Mediterranean";
-        let mut prompt = tokenizer.encode(text);
-        assert!(prompt.len() >= PROMPT, "prompt has {} tokens", prompt.len());
-        prompt.truncate(PROMPT);
+        let rows = env_usize("HIPFIRE_QWEN35_TP_ROWS", 16);
+        let chunk = env_usize("HIPFIRE_QWEN35_TP_CHUNK", 16);
+        let shape = Shape {
+            chunk,
+            max_seq: (rows + GREEDY + 16).next_multiple_of(64),
+        };
+        let prompt: Vec<u32> = tokenizer
+            .encode(text)
+            .into_iter()
+            .cycle()
+            .take(rows)
+            .collect();
+        let max_seq = shape.max_seq;
         let mut gpu = Gpu::init().unwrap();
         gpu.ensure_capture_stream().unwrap();
 
@@ -1042,8 +1175,8 @@ mod hw_tests {
             let layout = Layout::single(global.n_layers);
             load_weights(&mut source, std::slice::from_mut(&mut gpu), &layout).unwrap()
         };
-        let s = Qwen35Scratch::new_with_kv_max(&mut gpu, &global, 64, MAX_SEQ).unwrap();
-        let mut plain_kv = kv(&mut gpu, &global);
+        let s = Qwen35Scratch::new_with_kv_max(&mut gpu, &global, 64, max_seq).unwrap();
+        let mut plain_kv = kv(&mut gpu, &global, max_seq);
         let mut dn = DeltaNetState::new_with_quant(&mut gpu, &global, StateQuant::Q8).unwrap();
         let w = &weights;
         forward_prefill_batch(
@@ -1066,7 +1199,7 @@ mod hw_tests {
         for step in 0..GREEDY {
             let token = argmax(plain_rows.last().unwrap());
             forced.push(token);
-            let pos = PROMPT + step;
+            let pos = rows + step;
             forward_scratch(&mut gpu, w, &global, token, pos, &mut plain_kv, &mut dn, &s).unwrap();
             plain_rows.push(download(&gpu, &s.logits, vocab));
         }
@@ -1078,14 +1211,14 @@ mod hw_tests {
 
         // The rank shards on one device, FFN partials added in rank order.
         let mut oracle: Vec<_> = (0..parts)
-            .map(|r| load_rank(&mut hfq, &global, &mut gpu, r, parts))
+            .map(|r| load_rank(&mut hfq, &global, &mut gpu, r, parts, shape))
             .collect();
         let dtypes = ffn_dtypes(&oracle[0].weights).unwrap();
         let mesh = DeviceMesh::rect(&[(DimKind::Tp, parts)]).unwrap();
         let plan = qwen35_tp_plan(&global, &dtypes, &mesh).unwrap();
         let (_, ops, _) = tp_program(&global, &dtypes).unwrap();
-        let acc = gpu.zeros(&[PROMPT * dim], DType::F32).unwrap();
-        let oracle_rows = rows_of(&prompt, &forced, |tokens, route, start| {
+        let acc = gpu.zeros(&[chunk * dim], DType::F32).unwrap();
+        let oracle_rows = rows_of(&prompt, chunk, &forced, |tokens, route, start| {
             let e = epoch(&mesh, 1, route, start, tokens.len());
             let count = tokens.len() * dim;
             let acc = acc.sub_offset(0, count);
@@ -1165,30 +1298,31 @@ mod hw_tests {
             family: "qwen35-tp".into(),
             numerical_policy: "f32".into(),
         };
-        let max_bytes = (PROMPT * dim * std::mem::size_of::<f32>()).next_multiple_of(16);
+        let max_bytes = (chunk * dim * std::mem::size_of::<f32>()).next_multiple_of(16);
         let placement = BandPlacement::uniform(&tp_mesh, 1).unwrap();
         gpus.provision_mesh_edges(&admitted, &placement, max_bytes)
             .unwrap();
         let mut ranks: Vec<_> = (0..parts)
-            .map(|r| load_rank(&mut hfq, &global, &mut gpus.devices[r], r, parts))
+            .map(|r| load_rank(&mut hfq, &global, &mut gpus.devices[r], r, parts, shape))
             .collect();
         let tp_plan = qwen35_tp_plan(&global, &dtypes, &tp_mesh).unwrap();
         let tp_epoch = gpus.mesh_tp_epoch().unwrap();
-        // Refusals before any launch, leaving every rank at position 0: a
-        // prefill epoch past the batch scratch, an epoch whose tokens disagree
-        // with its rows, and session capture.
+        // Refusals before any launch, leaving every rank at position 0 and
+        // the mesh healthy: a prefill epoch past the batch scratch, an epoch
+        // whose tokens disagree with its rows, session capture and prefix
+        // repair.
         {
-            let long = vec![prompt[0]; PROMPT + 1];
+            let long = vec![prompt[0]; chunk + 1];
             let mut bindings =
                 Qwen35TpBindings::new(&global, &mut ranks, &tp_plan, tp_epoch).unwrap();
             bindings.set_tokens(&long);
-            let e = epoch(&tp_mesh, 1, MeshRoute::Prefill, 0, PROMPT + 1);
+            let e = epoch(&tp_mesh, 1, MeshRoute::Prefill, 0, chunk + 1);
             let error = gpus
                 .submit_mesh_epoch(&tp_plan, &e, &mut bindings)
                 .unwrap_err();
             assert!(error.contains("within the batch scratch"), "{error}");
-            bindings.set_tokens(&prompt);
-            let e = epoch(&tp_mesh, 1, MeshRoute::Prefill, 0, PROMPT - 1);
+            bindings.set_tokens(&prompt[..chunk]);
+            let e = epoch(&tp_mesh, 1, MeshRoute::Prefill, 0, chunk - 1);
             let error = gpus
                 .submit_mesh_epoch(&tp_plan, &e, &mut bindings)
                 .unwrap_err();
@@ -1198,10 +1332,19 @@ mod hw_tests {
                 .capture_session_rank(0, &mut gpus.devices[0], &e)
                 .unwrap_err();
             assert!(error.contains("does not admit session capture"), "{error}");
+            let e = epoch(&tp_mesh, 1, MeshRoute::Decode, 0, 1);
+            let error = gpus
+                .repair_mesh_prefix(&mut bindings, &e, 0, &[])
+                .unwrap_err();
+            assert!(error.contains("not admitted"), "{error}");
         }
+        assert!(
+            gpus.mesh_tp_epoch().is_some(),
+            "a refusal quarantined the mesh"
+        );
         assert!(ranks.iter().all(|rank| rank.position == 0));
         let mut op_id = 1;
-        let tp_rows = rows_of(&prompt, &forced, |tokens, route, start| {
+        let tp_rows = rows_of(&prompt, chunk, &forced, |tokens, route, start| {
             op_id += 1;
             let mut bindings =
                 Qwen35TpBindings::new(&global, &mut ranks, &tp_plan, tp_epoch).unwrap();
@@ -1219,7 +1362,7 @@ mod hw_tests {
             assert!(rows.iter().all(|row| row == &rows[0]), "TP ranks disagree");
             rows[0].clone()
         });
-        assert!(ranks.iter().all(|rank| rank.position == PROMPT + GREEDY));
+        assert!(ranks.iter().all(|rank| rank.position == rows + GREEDY));
         gpus.drain_mesh_edges().unwrap();
         for (rank, gpu) in ranks.into_iter().zip(&mut gpus.devices) {
             free_rank(rank, gpu);
@@ -1238,7 +1381,7 @@ mod hw_tests {
             .filter(|(a, b)| **a == *b)
             .count();
         eprintln!(
-            "TP{parts} {}: {} collectives/epoch; oracle fnv64 {:016x}, tp fnv64 {:016x}, plain fnv64 {:016x}; \
+            "TP{parts} {} rows={rows} chunk={chunk}: {} collectives/epoch; oracle fnv64 {:016x}, tp fnv64 {:016x}, plain fnv64 {:016x}; \
              tp argmax {:?}; plain argmax {:?} ({same}/{} equal); max |logit diff| vs plain {max_diff:e}",
             std::path::Path::new(&path).file_name().unwrap().to_string_lossy(),
             tp_plan.collectives.len(),

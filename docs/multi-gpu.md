@@ -1136,13 +1136,20 @@ through `load_weights_dense_tp_rank`). Each layer's `GatedMlp` on the
 after it becomes one rank-ordered `AllReduceAdd` into `x`. A decode epoch is
 one token; a prefill epoch is up to the rank's batch-scratch rows (the
 provisioned `max_bytes` must hold `rows * dim * 4`). `Qwen35TpBindings` is
-checked against the plan of exactly its shards; a prefill past the batch
-scratch, sessions, checkpoints and prefix repair are refused before any
-launch. Attention and DeltaNet are replicated, so this is not yet the hand
+checked against the plan of exactly its shards (ranks come only from
+`Qwen35TpRank::load`, which loads each rank's slice with the layout it
+records); a prefill past the batch scratch, sessions, checkpoints and
+prefix repair are refused before any launch. Prefix repair is refused
+through the host-only `MeshStepBindings::admits_prefix_repair` capability,
+checked before the first callback, so the mesh stays healthy. Attention and DeltaNet are replicated, so this is not yet the hand
 dense-TP route's work split, and the loader has no generic Qwen3.5 TP route.
-Oracle (a 16-token prefill epoch, then 16 decode epochs teacher-forced to the
-plain card's greedy tokens; byte identity against the single-device
-rank-order sum, reported against the plain card):
+Oracle (`HIPFIRE_QWEN35_TP_ROWS` prompt rows, default 16, as prefill epochs
+of at most `HIPFIRE_QWEN35_TP_CHUNK` rows, default 16; then 16 tokens
+teacher-forced to the plain card's greedy tokens, the first and the ninth as
+1-row Prefill epochs; byte identity against the single-device rank-order
+sum, reported against the plain card). The 1-row rows are
+`ROWS=1025 CHUNK=64` and `ROWS=577 CHUNK=96`, which end the prompt in a
+1-row epoch:
 
 ```sh
 cargo test --release -p hipfire-arch-qwen35 --lib --no-run

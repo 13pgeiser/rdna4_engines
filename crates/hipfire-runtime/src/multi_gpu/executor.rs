@@ -77,6 +77,13 @@ pub trait MeshStepBindings {
         epoch: &ForwardEpoch,
     ) -> Result<BoundaryIo<'_>>;
     fn apply_rank_marks(&mut self, owner: usize, epoch: &ForwardEpoch) -> Result<()>;
+    /// Host-only capability: whether this family implements
+    /// [`Self::repair_prefix_rank`]. `Gpus::repair_mesh_prefix` refuses a
+    /// family without it before the first callback, so the refusal leaves the
+    /// mesh healthy instead of poisoning it.
+    fn admits_prefix_repair(&self) -> bool {
+        true
+    }
     fn repair_prefix_rank(
         &mut self,
         owner: usize,
@@ -1471,6 +1478,8 @@ trait OwnerOps: DrainBackend + HasState {
     ) -> Result<()>;
     /// Host-only and infallible; touches no `Gpu`.
     fn finalize(&mut self, owner: usize, key: &MeshCheckpointKey, ticket: MeshCheckpointId);
+    /// Host-only; touches no `Gpu`.
+    fn admits_prefix_repair(&self) -> bool;
     /// Trunk owner `owner` runs on device `owner`.
     fn repair_prefix(
         &mut self,
@@ -1686,6 +1695,9 @@ fn repair_prefix_all<B: OwnerOps>(
 ) -> Result<()> {
     let owners = backend.rank_count();
     backend.state().admit_lifecycle_epoch(epoch, owners)?;
+    if !backend.admits_prefix_repair() {
+        return Err("mesh prefix repair is not admitted by this family; nothing ran".into());
+    }
     for owner in 0..owners {
         let result = backend
             .bind(owner)
@@ -1907,6 +1919,9 @@ impl OwnerOps for HipBackend<'_> {
     }
     fn finalize(&mut self, owner: usize, key: &MeshCheckpointKey, ticket: MeshCheckpointId) {
         self.bindings.finalize_rank(owner, key, ticket);
+    }
+    fn admits_prefix_repair(&self) -> bool {
+        self.bindings.admits_prefix_repair()
     }
     fn repair_prefix(
         &mut self,
@@ -4269,6 +4284,8 @@ mod lifecycle_tests {
         capture_wrong_owner: Option<usize>,
         capture_wrong_request: Option<usize>,
         repair_args: Vec<(usize, usize, Vec<u32>)>,
+        /// The family does not implement prefix repair.
+        no_repair: bool,
         poisoned: bool,
         quarantined: bool,
         state: MeshExecutionState,
@@ -4327,6 +4344,7 @@ mod lifecycle_tests {
                 capture_wrong_owner: None,
                 capture_wrong_request: None,
                 repair_args: Vec::new(),
+                no_repair: false,
                 poisoned: false,
                 quarantined: false,
                 state,
@@ -4426,6 +4444,9 @@ mod lifecycle_tests {
         }
         fn finalize(&mut self, owner: usize, _: &MeshCheckpointKey, _: MeshCheckpointId) {
             self.log.push(Ev::Finalize(owner));
+        }
+        fn admits_prefix_repair(&self) -> bool {
+            !self.no_repair
         }
         fn repair_prefix(
             &mut self,
@@ -4946,6 +4967,15 @@ mod lifecycle_tests {
         assert!(repair_prefix_all(&mut toy, &epoch(), 5, &[1]).is_err());
         assert_eq!(toy.log, vec![Ev::Bind(0)]);
         assert!(toy.fail_closed());
+
+        // A family without prefix repair is refused before any callback and
+        // the mesh stays healthy.
+        let mut toy = Toy::new(3);
+        toy.no_repair = true;
+        let error = repair_prefix_all(&mut toy, &epoch(), 5, &[1]).unwrap_err();
+        assert!(error.contains("not admitted"), "{error}");
+        assert!(toy.log.is_empty());
+        assert!(toy.healthy());
     }
 
     #[test]
