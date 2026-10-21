@@ -55,8 +55,16 @@ enum class Kind { Image, Video, Audio };
  *           is cut into tile x tile crops, min_tiles..max_tiles of them in the ratio nearest its
  *           own, followed by the whole picture at the budgeted size as a thumbnail. Patches
  *           (y, x, channel) normalised by the mean and deviation, resized with torchvision's
- *           fixed-point bicubic; images only, and the tokens rotate at their positions. */
-enum class Family { QwenVL, Gemma4, Lfm2 };
+ *           fixed-point bicubic; images only, and the tokens rotate at their positions.
+ *   Glm5Next  GLM-5.3's: a canvas whose sides are multiples of patch * merge and whose tokens fall
+ *           in [min_image_tokens, max_image_tokens] (the sides rounded up, a picture under the
+ *           floor grown, one over the budget fitted by the reference's search); the picture keeps
+ *           its aspect ratio, is never enlarged above the floor, and is resized with torchvision's
+ *           fixed-point bicubic only when its size changes; the rest of the canvas, right and
+ *           bottom, is zero bytes. Patches as QwenVL's. Images only, spelled <begin_of_image>
+ *           placeholders <end_of_image>, the tokens at their positions (the language model has no
+ *           rotary). */
+enum class Family { QwenVL, Gemma4, Lfm2, Glm5Next };
 
 struct VisionConfig {
     Family  family = Family::QwenVL;
@@ -66,6 +74,8 @@ struct VisionConfig {
     int32_t image_soft_tokens = 0, video_soft_tokens = 0;
     int64_t image_min_pixels = 0, image_max_pixels = 0;
     int64_t video_min_pixels = 0, video_max_pixels = 0;
+    /* Glm5Next: the band an image's canvas falls in, in output rows (tokens). */
+    int32_t min_image_tokens = 0, max_image_tokens = 0;
     double  fps = 2.0;
     int32_t min_frames = 4, max_frames = 768;
     /* Per-frame ceiling on a video's resolution, in output rows (the reference processor's
@@ -332,6 +342,7 @@ private:
     int image_gemma4(const Frame& f, int32_t soft, std::shared_ptr<Item>* out,
                      std::string* why) const;
     int image_lfm2(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
+    int image_glm5next(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
     /* Lfm2's markers: <|img_thumbnail|>, and <|img_row_R_col_C|> at (R-1) * max_tiles + C-1. */
     int32_t              tok_thumbnail_ = -1;
     std::vector<int32_t> tok_tiles_;
@@ -373,6 +384,12 @@ void resize_bicubic(const Frame& in, int32_t w, int32_t h, Frame* out);
 /* ...and torchvision's on a uint8 tensor (ATen's CPU kernel), which is the same filter with the
  * coefficients at the most precision 16 bits hold, chosen per axis, rather than PIL's 22. */
 void resize_bicubic_torch(const Frame& in, int32_t w, int32_t h, Frame* out);
+/* GLM-5.3's smart_resize: the (oh, ow) canvas, multiples of `factor`, for an h x w picture whose
+ * `temporal` frames take [min_tok, max_tok] tokens of temporal * factor^2 pixels each; and the
+ * (ch, cw) the picture is resized to inside it, top left, aspect ratio kept. */
+int glm5next_size(int64_t h, int64_t w, int32_t temporal, int32_t factor, int64_t min_tok,
+                  int64_t max_tok, int64_t* oh, int64_t* ow, int64_t* ch, int64_t* cw,
+                  std::string* why);
 /* LFM2-VL's smart_resize: (height, width) to multiples of `factor`, at least one each, pixels
  * within [min_px, max_px] where the rounding left them outside. */
 void lfm2_size(int64_t h, int64_t w, int32_t factor, int64_t min_px, int64_t max_px,

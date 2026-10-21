@@ -2,8 +2,9 @@
  *
  * Every expected value in mm_golden.h comes from transformers' own code (tests/mkgolden.py names
  * the function behind each table), in lfm2_golden.h from its LFM2-VL processor
- * (tests/mklfm2golden.py) and in gemma4_golden.h from its Gemma 4 processors
- * (tests/mkgemma4golden.py): smart_resize in both forms, the frames a video keeps, the patches of a
+ * (tests/mklfm2golden.py), in gemma4_golden.h from its Gemma 4 processors
+ * (tests/mkgemma4golden.py) and in glm5_golden.h from its GLM-5.3 processor
+ * (tests/mkglm5golden.py): smart_resize in both forms, the frames a video keeps, the patches of a
  * picture and a clip, the timestamps between a clip's groups, and get_rope_index's positions over
  * a prompt carrying both. A mistake in any of these still yields a model that answers, about a
  * slightly different picture or with positions a row off, so only this file can catch it.
@@ -21,10 +22,12 @@
 #include "mm/media.h"
 #include "mm/processor.h"
 #include "gemma4_golden.h"
+#include "glm5_golden.h"
 #include "imaging_golden.h"
 #include "lfm2_golden.h"
 #include "mm/resample.h"
 #include "mm_golden.h"
+#include "rad_builder.h"
 #include "rad_plugin.h"
 
 #include <algorithm>
@@ -724,6 +727,165 @@ TEST(gemma4_frames_are_sampled_as_the_reference_does) {
                          (long long)g.total, g.fps, g.max_frames, off);
         CHECK_EQ(off, 0);
     }
+}
+
+/* ================================================================== GLM-5.3's processor
+ *
+ * glm5_golden.h: Glm5NextProcessor as the checkpoint's processor_config.json sets it up
+ * (Glm5NextImageProcessor, torchvision backend): canvases, patch counts, patches as the tower reads
+ * them, and the token ids around a picture. The reference's patches are in merge-block order, as
+ * this processor's are, so they compare without reordering. */
+namespace {
+
+VisionConfig glm5_cfg(int32_t max_tok, int64_t max_patches) {
+    VisionConfig c;
+    c.family = Family::Glm5Next;
+    c.patch = kGlm5Patch;
+    c.merge = kGlm5Merge;
+    c.temporal = kGlm5Temporal;
+    c.min_image_tokens = kGlm5MinTok;
+    c.max_image_tokens = max_tok;
+    for (int i = 0; i < 3; ++i) {
+        c.mean[i] = kGlm5Mean[i];
+        c.stdv[i] = kGlm5Std[i];
+    }
+    const int64_t f2 = (int64_t)c.factor() * c.factor();
+    c.image_min_pixels = c.video_min_pixels = kGlm5MinTok * f2;
+    c.image_max_pixels = c.video_max_pixels = (int64_t)max_tok * f2;
+    c.tok_image = kGlm5Image;
+    c.tok_video = 154855;
+    c.tok_start = kGlm5Start;
+    c.tok_end = kGlm5End;
+    c.max_patches = max_patches;
+    return c;
+}
+
+}  /* namespace */
+
+/* Canvases: sides rounded up to 28, grown under 16 tokens, the budget's binary search over 8000
+ * and over the 4096 a pass of 16384 patches holds, aspect ratios to 30000:1. */
+TEST(glm5_canvases_are_the_references) {
+    for (const GoldGlm5Size& g : kGoldGlm5Size) {
+        int64_t oh = 0, ow = 0, ch = 0, cw = 0;
+        std::string why;
+        CHECK_OK(glm5next_size(g.h, g.w, kGlm5Temporal, kGlm5Patch * kGlm5Merge, kGlm5MinTok,
+                               g.budget, &oh, &ow, &ch, &cw, &why));
+        if (oh != g.oh || ow != g.ow)
+            std::fprintf(stderr, "    %lld x %lld at %d tokens: %lld x %lld, reference %lld x "
+                         "%lld\n", (long long)g.h, (long long)g.w, g.budget, (long long)oh,
+                         (long long)ow, (long long)g.oh, (long long)g.ow);
+        CHECK_EQ(oh, g.oh);
+        CHECK_EQ(ow, g.ow);
+        CHECK_EQ((oh / kGlm5Patch) * (ow / kGlm5Patch), g.patches);
+        CHECK(ch <= oh && cw <= ow);
+    }
+}
+
+/* Whole pictures: padded only (448 x 448 is the one with no padding), grown under the floor (the
+ * 1 x 1, 61 x 97 and 3 x 400 ones), shrunk to a budget (900 x 1400 at 256 tokens, 2300 x 2900 at
+ * 8000), every patch value exactly, and <|begin_of_image|>, one <|image|> a token,
+ * <|end_of_image|>, as the reference processor expands the template's triple. */
+TEST(glm5_pictures_are_the_references) {
+    for (const GoldGlm5Pic& g : kGoldGlm5Pics) {
+        Processor p;
+        REQUIRE_EQ(p.init(glm5_cfg(g.budget, 32768), [](const std::string&) {
+                              return std::vector<int32_t>{};
+                          }), RAD_OK);
+        std::shared_ptr<Item> it;
+        std::string why;
+        CHECK_OK(p.image_from(frame(g.f, g.h, g.w), &it, &why));
+        REQUIRE(it != nullptr);
+        CHECK_EQ(it->grid_t, 1);
+        CHECK_EQ(it->grid_h, g.grid_h);
+        CHECK_EQ(it->grid_w, g.grid_w);
+        CHECK(it->rope_1d);
+        REQUIRE_EQ(it->patch_dim, (int64_t)3 * kGlm5Temporal * kGlm5Patch * kGlm5Patch);
+        REQUIRE_EQ(it->pixels.size(), (size_t)it->n_patch * (size_t)it->patch_dim);
+        for (int i = 0; i < 8; ++i) CHECK_EQ(it->pixels[(size_t)i], g.head[i]);
+        if (fnv(it->pixels) != g.fnv)
+            std::fprintf(stderr, "    picture %d x %d at %d tokens: patches differ\n", g.h, g.w,
+                         g.budget);
+        CHECK_EQ(fnv(it->pixels), g.fnv);
+        const int64_t rows = (int64_t)g.grid_h * g.grid_w / (kGlm5Merge * kGlm5Merge);
+        CHECK_EQ(it->n_rows(), rows);
+        CHECK_EQ((int32_t)it->expand.size(), g.n_ids);
+        CHECK_EQ(fnv(it->expand), g.ids_fnv);
+        REQUIRE_EQ(it->expand.size(), (size_t)rows + 2);
+        CHECK_EQ(it->expand.front(), kGlm5Start);
+        CHECK_EQ(it->expand.back(), kGlm5End);
+        CHECK_EQ((int64_t)std::count(it->expand.begin(), it->expand.end(), kGlm5Image), rows);
+        REQUIRE_EQ(it->seg_at.size(), (size_t)1);
+        CHECK_EQ(it->seg_at[0], 1);
+    }
+}
+
+/* The checkpoint's budget is lowered to what one encoder pass holds (a token is four patches),
+ * as a pixel band is; a pass that holds less than the floor is refused. Video and a request's own
+ * budget are refused by name. */
+TEST(glm5_budget_is_one_pass_and_pictures_only) {
+    Processor p;
+    REQUIRE_EQ(p.init(glm5_cfg(kGlm5MaxTok, 16384), [](const std::string&) {
+                          return std::vector<int32_t>{};
+                      }), RAD_OK);
+    CHECK_EQ(p.config().max_image_tokens, 4096);
+    std::shared_ptr<Item> it;
+    std::string why;
+    CHECK_OK(p.image_from(frame(0, 2048, 2048), &it, &why));
+    REQUIRE(it != nullptr);
+    CHECK_EQ(it->grid_h, 128);
+    CHECK_EQ(it->grid_w, 128);
+    CHECK_EQ(it->n_rows(), (int64_t)4096);
+    Processor q;
+    CHECK_EQ(q.init(glm5_cfg(kGlm5MaxTok, 60), [](const std::string&) {
+                 return std::vector<int32_t>{};
+             }), RAD_E_INVAL);
+    Video v;
+    v.frames.push_back(frame(0, 64, 64));
+    v.frames.push_back(frame(1, 64, 64));
+    CHECK_EQ(p.video_from(v, &it, &why), RAD_E_UNSUPPORTED);
+    CHECK(why.find("pictures, not video") != std::string::npos);
+    const uint8_t png_magic[8] = { 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
+    CHECK_EQ(p.image(png_magic, sizeof png_magic, 280, &it, &why), RAD_E_UNSUPPORTED);
+    CHECK(why.find("--image-tokens") != std::string::npos);
+}
+
+/* A converted GLM-5.3 container states the processor under `processor.image_processor.*` and
+ * the media ids under their own names, not Qwen's vision_start / vision_end. */
+TEST(glm5_reads_its_processor_from_the_container) {
+    const char* keys[] = {
+        "vision_config.model_type", "vision_config.patch_size", "vision_config.temporal_patch_size",
+        "vision_config.spatial_merge_size", "image_token_id", "video_token_id",
+        "image_start_token_id", "image_end_token_id", "processor.image_processor.min_image_tokens",
+        "processor.image_processor.max_image_tokens", "processor.image_processor.image_mean",
+        "processor.image_processor.image_std", "processor.image_processor.patch_expand_factor",
+    };
+    const char* vals[] = {
+        "glm5_next_vision", "14", "2", "2", "154854", "154855", "154830", "154831", "16", "8000",
+        "0.48145465999999998 0.4578275 0.40821073000000002",
+        "0.26862954 0.26130258000000001 0.27577710999999999", "1",
+    };
+    RadModelMeta m{};
+    m.n_kv = (int)(sizeof(keys) / sizeof(keys[0]));
+    m.kv_key = keys;
+    m.kv_val = vals;
+    VisionConfig c;
+    std::string why;
+    CHECK_OK(c.from_meta(m, &why));
+    CHECK(c.family == Family::Glm5Next);
+    CHECK_EQ(c.patch_dim(), (int64_t)1176);
+    CHECK_EQ(c.factor(), 28);
+    CHECK_EQ(c.min_image_tokens, 16);
+    CHECK_EQ(c.max_image_tokens, 8000);
+    CHECK_EQ(c.tok_image, kGlm5Image);
+    CHECK_EQ(c.tok_start, kGlm5Start);
+    CHECK_EQ(c.tok_end, kGlm5End);
+    for (int i = 0; i < 3; ++i) {
+        CHECK_EQ(c.mean[i], kGlm5Mean[i]);
+        CHECK_EQ(c.stdv[i], kGlm5Std[i]);
+    }
+    vals[12] = "2";
+    CHECK_EQ(c.from_meta(m, &why), RAD_E_UNSUPPORTED);
+    CHECK(why.find("patch_expand_factor") != std::string::npos);
 }
 
 /* ================================================================== Pillow's arithmetic

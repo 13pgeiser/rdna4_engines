@@ -2231,7 +2231,7 @@ int Engine::run_server() {
          * are refused by name: LFM2-VL takes pictures only, and a token-budget processor (Gemma
          * 4's) sizes by soft tokens (--image-tokens, --video-max-frame-tokens), not pixel
          * bands. */
-        if (vc.family == mm::Family::Lfm2 &&
+        if ((vc.family == mm::Family::Lfm2 || vc.family == mm::Family::Glm5Next) &&
             (cfg_.video_min_pixels || cfg_.video_max_pixels || cfg_.video_min_frames ||
              cfg_.video_max_frames || cfg_.video_fps || cfg_.video_max_frame_tokens)) {
             RAD_ERR("media: this model's processor takes pictures, not video, so the --video-* "
@@ -2249,6 +2249,16 @@ int Engine::run_server() {
             }
             if (cfg_.image_tokens)           vc.image_soft_tokens = *cfg_.image_tokens;
             if (cfg_.video_max_frame_tokens) vc.video_soft_tokens = *cfg_.video_max_frame_tokens;
+        } else if (vc.family == mm::Family::Glm5Next) {
+            /* GLM-5.3 budgets an image in tokens (max_image_tokens), so --image-tokens is its
+             * ceiling and the pixel bands do not apply. */
+            if (cfg_.image_min_pixels || cfg_.image_max_pixels) {
+                RAD_ERR("media: this model's processor sizes images by a token budget, so "
+                        "--image-min-pixels and --image-max-pixels do nothing; use "
+                        "--image-tokens");
+                return RAD_E_INVAL;
+            }
+            if (cfg_.image_tokens) vc.max_image_tokens = *cfg_.image_tokens;
         } else {
             if (cfg_.image_tokens) {
                 RAD_ERR("media: --image-tokens is a token budget, and this model's processor "
@@ -2282,6 +2292,16 @@ int Engine::run_server() {
                     "'%s' encoder takes %lld-element patches merged %lld", (long long)vc.patch_dim(),
                     (long long)vc.merge * vc.merge, ranks_[0]->program.encoder_name.c_str(),
                     (long long)encd.patch_dim, (long long)encd.merge);
+            return RAD_E_INVAL;
+        }
+        /* An explicit budget past one pass is refused; the container's is lowered to fit
+         * (Processor::init), as a pixel band is. */
+        if (vc.family == mm::Family::Glm5Next && cfg_.image_tokens &&
+            (int64_t)*cfg_.image_tokens * vc.merge * vc.merge > encd.max_patches) {
+            RAD_ERR("media: --image-tokens %d is more patches than one encoder pass holds "
+                    "(--mm-max-patches %lld, %lld tokens)", *cfg_.image_tokens,
+                    (long long)encd.max_patches,
+                    (long long)(encd.max_patches / ((int64_t)vc.merge * vc.merge)));
             return RAD_E_INVAL;
         }
         if (vc.family == mm::Family::Gemma4 &&
@@ -2320,6 +2340,17 @@ int Engine::run_server() {
                      mm_proc->config().max_pixels_tolerance, mm_proc->config().min_tiles,
                      mm_proc->config().max_tiles, mm_proc->config().tile,
                      (long long)encd.max_patches);
+        else if (mm_proc->config().family == mm::Family::Glm5Next) {
+            RAD_INFO("media: images through '%s'; an image becomes %d..%d tokens, padded to its "
+                     "canvas rather than stretched; %lld patches a pass",
+                     ranks_[0]->program.encoder_name.c_str(), mm_proc->config().min_image_tokens,
+                     mm_proc->config().max_image_tokens, (long long)encd.max_patches);
+            if (mm_proc->config().max_image_tokens < vc.max_image_tokens)
+                RAD_INFO("media: the budget of %d tokens an image is lowered to %d, what one "
+                         "encoder pass holds; --mm-max-patches %lld serves it whole",
+                         vc.max_image_tokens, mm_proc->config().max_image_tokens,
+                         (long long)vc.max_image_tokens * vc.merge * vc.merge);
+        }
         else if (mm_proc->config().family == mm::Family::Gemma4)
             RAD_INFO("media: %s%s through '%s'; an image becomes at most %d soft tokens (a "
                      "request's image_tokens may ask for 70..1120), a video %d a frame at %.3g "

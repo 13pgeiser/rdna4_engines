@@ -240,8 +240,9 @@ static const Flag g_flags[] = {
     { "--video-max-frames",   "N",      "the most frames sampled from a video" },
     { "--video-max-frame-tokens", "N",  "the most prompt tokens one video frame may become; 0 is no cap (a token\n"
     "                                    budget processor -- Gemma 4's -- takes 70, 140, 280, 560 or 1120)" },
-    { "--image-tokens",       "N",      "a token-budget processor's image budget (Gemma 4: 70, 140, 280, 560, 1120;\n"
-    "                                    default the container's); a request's `image_tokens` overrides it" },
+    { "--image-tokens",       "N",      "a token-budget processor's image budget (Gemma 4: 70, 140, 280, 560, 1120,\n"
+    "                                    which a request's `image_tokens` overrides; GLM-5.3: the most tokens an\n"
+    "                                    image becomes, at most --mm-max-patches / 4; default the container's)" },
     { "--max-source-pixels",  "N",      "the largest image or video frame the decoder accepts, before any resize\n"
     "                                    (default 67108864). The media flags above default to what the container\n"
     "                                    states, and do nothing for a model that takes no media" },
