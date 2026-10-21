@@ -170,15 +170,20 @@ struct GlmKda {
         RAD_ARCH_TRY(beta.declare(b, nm, bg, nm.f("blk.%d.attn_beta", layer), heads, 4096,
                                   RAD_SHARD_ROW, group, { nm.ckpt("%s.b_proj.weight", prefix) },
                                   input, w.core.beta));
+        /* Both low-rank down-projections before either up-projection, in step() as here: the
+         * four reads of the input then share one ordered point of a recorded pass and the two
+         * up-projections the next, where forget_b between them cost a third. Declared in the
+         * issue order because the buffer plan takes lifetimes from this list, and forget_low and
+         * gate_low must not share bytes while both are live. */
         RAD_ARCH_TRY(forget_a.declare(
             b, nm, bg, nm.f("blk.%d.attn_forget_a", layer), 128, 4096, RAD_SHARD_NONE, group,
             { nm.ckpt("%s.f_a_proj.weight", prefix) }, input, w.forget_low));
-        RAD_ARCH_TRY(forget_b.declare(
-            b, nm, bg, nm.f("blk.%d.attn_forget_b", layer), width, 128, RAD_SHARD_ROW, group,
-            { nm.ckpt("%s.f_b_proj.weight", prefix) }, act(w.forget_low), w.core.a));
         RAD_ARCH_TRY(gate_a.declare(b, nm, bg, nm.f("blk.%d.attn_gate_a", layer), 128, 4096,
                                     RAD_SHARD_NONE, group,
                                     { nm.ckpt("%s.g_a_proj.weight", prefix) }, input, w.gate_low));
+        RAD_ARCH_TRY(forget_b.declare(
+            b, nm, bg, nm.f("blk.%d.attn_forget_b", layer), width, 128, RAD_SHARD_ROW, group,
+            { nm.ckpt("%s.f_b_proj.weight", prefix) }, act(w.forget_low), w.core.a));
         RAD_ARCH_TRY(gate_b.declare(b, nm, bg, nm.f("blk.%d.attn_gate_b", layer), width, 128,
                                     RAD_SHARD_ROW, group, { nm.ckpt("%s.g_b_proj.weight", prefix) },
                                     act(w.gate_low), w.core.gate));
@@ -205,8 +210,8 @@ struct GlmKda {
         qkv.step(ctx, input, w.core.qkv, T);
         beta.step(ctx, input, w.core.beta, T);
         forget_a.step(ctx, input, w.forget_low, T);
-        forget_b.step(ctx, act(w.forget_low), w.core.a, T);
         gate_a.step(ctx, input, w.gate_low, T);
+        forget_b.step(ctx, act(w.forget_low), w.core.a, T);
         gate_b.step(ctx, act(w.gate_low), w.core.gate, T);
         core.step(ctx, batch);
         output.step(ctx, act(w.core.out), w.out, T);

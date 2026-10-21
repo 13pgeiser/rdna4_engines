@@ -1234,6 +1234,11 @@ TEST(glm_kda_projects_local_heads_and_reduces_only_after_the_output_projection) 
         CHECK_EQ(std::count(ops.begin(), ops.end(), "gemm_nt"), 7);
         CHECK_EQ(std::count(ops.begin(), ops.end(), "silu"), 0);
         REQUIRE_EQ(ctx.issues.size(), (size_t)11);
+        // The input's four readers first, then both up-projections.
+        CHECK_EQ(ctx.issues[2].op, block.forget_a.op);
+        CHECK_EQ(ctx.issues[3].op, block.gate_a.op);
+        CHECK_EQ(ctx.issues[4].op, block.forget_b.op);
+        CHECK_EQ(ctx.issues[5].op, block.gate_b.op);
         CHECK_EQ(ctx.issues[9].op, block.output.op);
         CHECK_EQ(ctx.issues[10].op, block.op_ar);
         CHECK_EQ(ctx.issues[10].opd[0].handle, w.out);
@@ -1351,8 +1356,8 @@ TEST(glm53_is_the_pinned_graph_and_steps) {
         int world;
         uint64_t graph, steps;
     };
-    const Case cases[] = { { 1, 0xed3fc26c486ea1b5ull, 0x33e5f136f0dbba15ull },
-                           { 8, 0x712f01858dbe1047ull, 0xf9e357b1333c638full } };
+    const Case cases[] = { { 1, 0x906897570034f5f5ull, 0x68ffc03d2b640d51ull },
+                           { 8, 0x9f39f6f7a04dc4d3ull, 0x3818eedb4ac10d1bull } };
     for (const Case& cs : cases) {
         RadBuilder b;
         b.kv_block = 4;
