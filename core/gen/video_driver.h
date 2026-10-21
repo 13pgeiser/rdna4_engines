@@ -233,7 +233,8 @@ private:
      * decl_.dbg_dit_h0 null and dit_dbg_ stays false, so a normal run never touches these. */
     bool                  dit_dbg_ = false;
     char*                 dit_host_ = nullptr;
-    int64_t               dit_h0_b_ = 0, dit_vel_b_ = 0, dit_temb_b_ = 0, dit_mod_b_ = 0;
+    int64_t               dit_h0_b_ = 0, dit_vel_b_ = 0, dit_temb_b_ = 0, dit_mod_b_ = 0,
+                          dit_blk_b_ = 0;
     bool                  dit_used_ = false;    /* the running pass staged a dump */
     int64_t               dit_rows_ = 0;        /* packed rows R of the dumped step */
 

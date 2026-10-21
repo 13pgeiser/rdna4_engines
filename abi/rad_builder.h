@@ -1053,6 +1053,8 @@ typedef struct RadVideoGenDecl {
     int64_t       dbg_dit_temb_bytes;
     rad_buf       dbg_dit_mod;     /* modulation table (b_modg) f32, this step */
     int64_t       dbg_dit_mod_bytes;
+    rad_buf       dbg_dit_blk;     /* [n_layer, DBG_ROWS, D] f32: a row window after every block */
+    int64_t       dbg_dit_blk_bytes;
 } RadVideoGenDecl;
 
 int rad_declare_video_generator(RadBuilder* b, const RadVideoGenDecl* d);

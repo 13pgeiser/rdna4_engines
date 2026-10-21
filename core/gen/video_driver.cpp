@@ -323,7 +323,8 @@ int VideoDriver::init(const Program& prog, PositionsFn positions,
             dit_vel_b_ = decl_.dbg_dit_vel_bytes;
             dit_temb_b_ = decl_.dbg_dit_temb_bytes;
             dit_mod_b_ = decl_.dbg_dit_mod_bytes;
-            const int64_t sum = dit_h0_b_ + dit_vel_b_ + dit_temb_b_ + dit_mod_b_;
+            dit_blk_b_ = decl_.dbg_dit_blk_bytes;
+            const int64_t sum = dit_h0_b_ + dit_vel_b_ + dit_temb_b_ + dit_mod_b_ + dit_blk_b_;
             dit_host_ = static_cast<char*>(rad_dev_alloc(sum, RAD_MEM_HOST_PINNED));
             dit_dbg_ = dit_host_ != nullptr;
             if (!dit_dbg_)
@@ -1203,10 +1204,10 @@ const RadBatch* VideoDriver::build_step(Job& j, int step) {
     if (dit_dbg_ && j.step == 0 && !small && !j.ref_wide && j.ref_tab.empty()) {
         char* p = dit_host_;
         int64_t off = 0;
-        const rad_buf hh[4] = { decl_.dbg_dit_h0, decl_.dbg_dit_temb, decl_.dbg_dit_mod,
-                                decl_.dbg_dit_vel };
-        const int64_t nn[4] = { dit_h0_b_, dit_temb_b_, dit_mod_b_, dit_vel_b_ };
-        for (int i = 0; i < 4; ++i)
+        const rad_buf hh[5] = { decl_.dbg_dit_h0, decl_.dbg_dit_temb, decl_.dbg_dit_mod,
+                                decl_.dbg_dit_blk, decl_.dbg_dit_vel };
+        const int64_t nn[5] = { dit_h0_b_, dit_temb_b_, dit_mod_b_, dit_blk_b_, dit_vel_b_ };
+        for (int i = 0; i < 5; ++i)
             if (hh[i] && nn[i] > 0) {
                 rb_.push_back(Readback{ hh[i], nn[i], p + off });
                 off += nn[i];
@@ -1504,7 +1505,7 @@ int VideoDriver::done() {
     case RAD_GEN_PASS_VSTEP: {
         ++j->step;
         if (dit_used_) {
-            /* The step-0 dump landed: slab (h0 | temb | mod | vel) to raw files, plus the few
+            /* The step-0 dump landed: slab (h0 | temb | mod | blk | vel) to raw files, plus the few
              * facts the driver knows (R4D_ENC_DUMPDIR; the prep script supplies D=5376 and the
              * harness .meta files). */
             char* p = dit_host_;
@@ -1514,6 +1515,8 @@ int VideoDriver::done() {
             p += dit_temb_b_;
             dit_dump_file("dit_mod.f32", p, (size_t)dit_mod_b_);
             p += dit_mod_b_;
+            dit_dump_file("dit_blk.f32", p, (size_t)dit_blk_b_);
+            p += dit_blk_b_;
             dit_dump_file("dit_vel.f32", p, (size_t)dit_vel_b_);
             if (std::getenv("R4D_ENC_DUMPDIR")) {
                 const std::string path =
@@ -1526,9 +1529,10 @@ int VideoDriver::done() {
                     std::fclose(f);
                 }
             }
-            RAD_ERR("dit_dbg: dumped step 0 -- rows %lld h0 %lld temb %lld mod %lld vel %lld",
+            RAD_ERR("dit_dbg: dumped step 0 -- rows %lld h0 %lld temb %lld mod %lld blk %lld "
+                    "vel %lld",
                     (long long)dit_rows_, (long long)dit_h0_b_, (long long)dit_temb_b_,
-                    (long long)dit_mod_b_, (long long)dit_vel_b_);
+                    (long long)dit_mod_b_, (long long)dit_blk_b_, (long long)dit_vel_b_);
             dit_used_ = false;
         }
         VideoEvent e;

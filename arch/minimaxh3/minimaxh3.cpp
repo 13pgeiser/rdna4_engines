@@ -169,6 +169,8 @@ static const int kSegMod[kSegs] = { 1, 2, 0 };
  * container that carries the encoder tensors, and verify a ref-present-vs-ref-absent run differs. */
 enum { kMaxSegs = 8 };
 static const int kRefConsume = 1;
+/* Rows captured after every DiT block by the R4D_DIT_SEL window shadow (see b_dbgl). */
+enum { kDbgL = 64 };
 
 /* ================================================================== geometry, on the host */
 /* diffusers' AutoencoderKLMiniMaxH3._split_tiles in latents: the first latent of each tile across
@@ -585,6 +587,12 @@ struct Model {
      * pass so the step pass can read it back without touching the arena. [4*S, td] f32 PERSIST. */
     rad_buf b_tembd = 0;
     rad_op  op_tembd = 0;
+    /* The per-block window shadow: the first kDbgL rows of the stream, cast to f32 after every
+     * block. A per-block std fingerprint for the CPU-replay bisection -- full [R, D] per block is
+     * gigabytes; a 64-row window over a 5376-wide stream is 69 MB and plenty to tell whose forward
+     * diverges first. [L * kDbgL, D] f32 PERSIST. */
+    rad_buf b_dbgl = 0;
+    rad_op  op_dbgl = 0;
     /* The step's gathered modulation table (b_modg) cast to f32: every block's and segment's cell,
      * both ranks' column halves, the exact vectors the norms consume. PERSIST f32 twin of a bf16
      * scratch (the b_ax2 lesson). [world * L * kMaxSegs, Ws] f32. */
@@ -1266,7 +1274,17 @@ static int declare_dit(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                       RAD_NOWEIGHTS),
                              { m.b_temb }, { m.b_tembd });
         }
-        if (!m.op_dh0 || !m.op_modd || (m.curve > 0 && !m.op_tembd)) return RAD_E_INVAL;
+        /* The per-block window shadow: the stream's first kDbgL rows after every block. Full-width
+         * per-block capture is gigabytes; a 64-row fingerprint tells whose forward diverges first. */
+        m.b_dbgl = decl_b(b, nm.f("dit.blkdbg"), RAD_F32,
+                          { (int64_t)L * kDbgL, D }, RAD_BUF_PERSIST);
+        m.op_dbgl = rw(b, RAD_OP(b, "cast",
+                                 RAD_PARAMS(RAD_RANGE("M", 1, kDbgL), RAD_INT("n", D),
+                                            RAD_STR("from", "bf16"), RAD_STR("to", "f32")),
+                                 RAD_NOWEIGHTS),
+                        { m.b_ao }, { m.b_dbgl });
+        if (!m.op_dh0 || !m.op_modd || !m.op_dbgl || (m.curve > 0 && !m.op_tembd))
+            return RAD_E_INVAL;
     }
     /* Learn the trunk's weight format from one linear before declaring the activation code planes.
      * An int8 (W8A8) denoiser quantises its per-token activations to int8 too -- E4M3's three
@@ -3233,6 +3251,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             d.dbg_dit_mod = m.b_modd;
             d.dbg_dit_mod_bytes =
                 m.b_modd ? (int64_t)gd.world * gd.n_layer * kMaxSegs * m.Ws * 4 : 0;
+            d.dbg_dit_blk = m.b_dbgl;
+            d.dbg_dit_blk_bytes = m.b_dbgl ? gd.n_layer * kDbgL * m.D * 4 : 0;
         }
         RAD_ARCH_TRY(rad_declare_video_generator(b, &d));
     }
@@ -3669,6 +3689,12 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
         for (int h = 0; h < nh; ++h) {
             const int64_t r0 = hr0[h], n = hn[h];
             if (h > 0 && l > 0) wait_ar();
+            /* The dump's per-block window (R4D_DIT_SEL): block l-1's output rows [0, kDbgL) --
+             * exactly the rows and the ordering point this block's own norm reads them at, so no
+             * extra lane dance is needed. */
+            if (m.dit_dbg && V->step == 0 && l > 0 && h == 0 && R >= kDbgL)
+                RAD_ISSUE_N(c, m.op_dbgl, kDbgL, brow_slice(m.b_ao, 0, kDbgL, D),
+                            brow_slice(m.b_dbgl, (l - 1) * kDbgL, kDbgL, D));
             RAD_ISSUE_N(c, B.op_mq1, n, l > 0 ? brow_slice(m.b_ao, r0, n, D) : RAD_NONE,
                         l > 0 ? modh(h, l - 1, 5, 1) : RAD_NONE, modh(h, l, 0, 2),
                         RAD_W(B.w_n1), segh[h], brow_slice(m.b_h, r0, n, D),
@@ -3716,6 +3742,9 @@ static void step_dit(RadCtx* c, const RadBatch* batch, const Model& m) {
         }
     }
     wait_ar();
+    if (m.dit_dbg && V->step == 0 && R >= kDbgL)
+        RAD_ISSUE_N(c, m.op_dbgl, kDbgL, brow_slice(m.b_ao, 0, kDbgL, D),
+                    brow_slice(m.b_dbgl, (L - 1) * kDbgL, kDbgL, D));
     const char* nout = (const char*)rad_buf_ptr(c, m.b_nout) +
                        (lane * m.S + V->step) * ng * 2 * D * (int64_t)sizeof(uint16_t);
     RAD_ISSUE_N(c, m.op_nout, R, brows(m.b_ao, R), mod(L - 1, 5, 1),
