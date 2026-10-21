@@ -1,12 +1,92 @@
-/* No-RoPE GLM MLA. prepare() exposes normalized Q-lora for the replicated
- * indexer; finish() consumes its selection. The caller owns the mHC residual. */
+/* GLM-5.3's sparse latent attention (MLA, no RoPE): the projections and the latent cache store
+ * around the absorbed core (GlmMla), and the core itself over the latent cache (MlaLatent), whose
+ * complete heads shard as rows of the shared K/V weight. prepare() exposes the normalized q latent
+ * for the indexer; finish() consumes the indexer's selection. The caller owns the mHC residual.
+ *
+ * Under tensor parallelism the 64 heads split over the ranks (GlmTp::heads): the rows of q_b and
+ * kv_b, the columns of o, an all_reduce of the output; q_a, kv_a and the latent cache are
+ * replicated. */
 #ifndef RAD_BLOCK_GLM_MLA_H
 #define RAD_BLOCK_GLM_MLA_H
 #include "rad_fp8.h"
-#include "rad_block_mla_latent.h"
+#include "rad_glm_tp.h"
+#include <cmath>
 
 namespace rad {
 namespace arch {
+struct MlaLatent {
+    struct Config {
+        int64_t heads = 16, head_dim = 256, latent_dim = 512, blocks = 513;
+    };
+    struct Wire {
+        rad_buf q = 0, q_latent = 0, attn_latent = 0, out = 0, selected = 0, length = 0;
+    };
+    Geom g{};
+    Config c{};
+    Wire w{};
+    int layer = 0;
+    rad_kvgroup kv = 0;
+    rad_weight projection = 0;
+    rad_op op_absorb = 0, op_attn = 0, op_expand = 0;
+
+    int declare(RadBuilder* b, Names& nm, const Geom& geom, int l, rad_kvgroup group,
+                const Config& cfg, const Wire& wire, const char* source) {
+        g = geom;
+        c = cfg;
+        w = wire;
+        layer = l;
+        kv = group;
+        if (!b || !source || !group || c.heads < 1 || c.blocks < 1 || !w.q || !w.q_latent ||
+            !w.attn_latent || !w.out || !w.selected || !w.length || w.q == w.q_latent ||
+            w.q_latent == w.attn_latent || w.attn_latent == w.out || c.latent_dim != 512 ||
+            c.head_dim != 256)
+            return RAD_E_INVAL;
+        RAD_ARCH_TRY(rad_bind_layer_kv(b, l, group));
+        const char* name = nm.f("blk.%d.attn_kv_b.weight", l);
+        RAD_ARCH_TRY(map_copy(b, name, source));
+        // The conversion recipe decodes this small projection only.
+        projection = decl_w(b, name, RAD_BF16, { c.heads * 2 * c.head_dim, c.latent_dim },
+                            RAD_ACCESS_PER_TOKEN, RAD_SHARD_ROW, grp_layer(l));
+        if (!projection) return RAD_E_INVAL;
+        op_absorb = rw(
+            b,
+            RAD_OP(b, "mla_project",
+                   RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("heads", c.heads),
+                              RAD_INT("head_dim", c.head_dim), RAD_INT("latent_dim", c.latent_dim),
+                              RAD_STR("mode", "absorb"), RAD_STR("dtype", "bf16")),
+                   RAD_WEIGHTS(projection)),
+            { w.q }, { w.q_latent });
+        op_attn =
+            rw(b,
+               RAD_OP(b, "mla_attn",
+                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("latent_dim", c.latent_dim),
+                                 RAD_INT("heads", c.heads), RAD_INT("blocks", c.blocks),
+                                 RAD_INT("block_size", 4),
+                                 RAD_F64("scale", 1.0 / std::sqrt((double)c.head_dim)),
+                                 RAD_STR("dtype", "bf16")),
+                      RAD_NOWEIGHTS),
+               { w.q_latent, w.selected, w.length }, { w.attn_latent });
+        if (!op_attn || rad_kv_block_size(b, group) != 4) return RAD_E_INVAL;
+        op_expand = rw(
+            b,
+            RAD_OP(b, "mla_project",
+                   RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("heads", c.heads),
+                              RAD_INT("head_dim", c.head_dim), RAD_INT("latent_dim", c.latent_dim),
+                              RAD_STR("mode", "expand"), RAD_STR("dtype", "bf16")),
+                   RAD_WEIGHTS(projection)),
+            { w.attn_latent }, { w.out });
+        return op_absorb && op_attn && op_expand ? RAD_OK : RAD_E_INVAL;
+    }
+    void step(RadCtx* ctx, int64_t rows) const {
+        RAD_ISSUE_N(ctx, op_absorb, rows, brows(w.q, rows), RAD_W(projection),
+                    brows(w.q_latent, rows));
+        RAD_ISSUE_N(ctx, op_attn, rows, brows(w.q_latent, rows), kv_cache(kv, layer),
+                    brows(w.selected, rows), brows(w.length, rows), brows(w.attn_latent, rows));
+        RAD_ISSUE_N(ctx, op_expand, rows, brows(w.attn_latent, rows), RAD_W(projection),
+                    brows(w.out, rows));
+    }
+};
+
 struct GlmMla {
     struct Wire {
         ActFP8 input{}, q_low{}, attn{};
@@ -30,8 +110,8 @@ struct GlmMla {
         w = wire;
         layer = l;
         kv = group;
-        if (!b || !prefix || !kv || g.n_embd != 4096 || g.world < 1 || 64 % g.world || !w.input.x ||
-            !w.q_raw || !w.kv_raw || !w.latent || !w.out || !w.q_low.x || !w.attn.x ||
+        if (!b || !prefix || !kv || g.n_embd != 4096 || g.world < 1 || GlmTp::kHeads % g.world ||
+            !w.input.x || !w.q_raw || !w.kv_raw || !w.latent || !w.out || !w.q_low.x || !w.attn.x ||
             w.attn.x != w.core.out)
             return RAD_E_INVAL;
         const auto wg = grp_layer(l);
@@ -56,8 +136,8 @@ struct GlmMla {
                                RAD_WEIGHTS(kv_gain)),
                         { w.kv_raw }, { w.latent });
         if (!op_kv_norm) return RAD_E_INVAL;
-        RAD_ARCH_TRY(q_b.declare(b, nm, g, nm.f("blk.%d.attn_q_b", l), 16384 / g.world, 1536,
-                                 RAD_SHARD_ROW, wg, { nm.ckpt("%s.q_b_proj.weight", prefix) },
+        RAD_ARCH_TRY(q_b.declare(b, nm, g, nm.f("blk.%d.attn_q_b", l), GlmTp::mla_width(g.world),
+                                 1536, RAD_SHARD_ROW, wg, { nm.ckpt("%s.q_b_proj.weight", prefix) },
                                  w.q_low, w.core.q));
         // Cache stores contiguous halves of the normalized latent, with no duplicated K/V.
         op_store = rw(b,
@@ -72,22 +152,14 @@ struct GlmMla {
     }
     int declare_finish(RadBuilder* b, Names& nm, const char* prefix, bool reduce = true) {
         MlaLatent::Config cfg;
-        cfg.heads = 64 / g.world;
+        cfg.heads = GlmTp::heads(g.world);
         RAD_ARCH_TRY(
             core.declare(b, nm, g, layer, kv, cfg, w.core, nm.ckpt("%s.kv_b_proj.weight", prefix)));
-        RAD_ARCH_TRY(attn_quant.declare(b, g, w.attn, 16384 / g.world));
+        RAD_ARCH_TRY(attn_quant.declare(b, g, w.attn, GlmTp::mla_width(g.world)));
         RAD_ARCH_TRY(output.declare(b, nm, g, nm.f("blk.%d.attn_output", layer), 4096,
-                                    16384 / g.world, RAD_SHARD_COL, grp_layer(layer),
+                                    GlmTp::mla_width(g.world), RAD_SHARD_COL, grp_layer(layer),
                                     { nm.ckpt("%s.o_proj.weight", prefix) }, w.attn, w.out));
-        if (reduce && g.world > 1)
-            op_ar = rw(b,
-                       RAD_OP(b, "all_reduce",
-                              RAD_PARAMS(RAD_INT("world_size", g.world),
-                                         RAD_RANGE("numel", 4096, g.max_tok * 4096),
-                                         RAD_STR("dtype", "bf16"), RAD_INT("exact", g.wire_exact),
-                                         RAD_INT("min_bytes", g.wire_min_bytes)),
-                              RAD_NOWEIGHTS),
-                       { w.out }, { w.out });
+        if (reduce) op_ar = GlmTp::reduce(b, g, w.out);
         return op_store && (!(reduce && g.world > 1) || op_ar) ? RAD_OK : RAD_E_INVAL;
     }
     void prepare(RadCtx* ctx, const RadBatch* batch) const {

@@ -415,6 +415,19 @@ the plugin claims the empty descriptor and reads each weight's encoding from the
 mapped, so never converted, and an image request fails its step. The reference is SGLang's
 `glm5_next.py` and `glm5_next_nextn.py` at AMD's pinned commit 654df43.
 
+The plugin is one file over blocks in `arch/common`, one block a file; it declares the buffers
+the blocks share, places them and issues the step's order.
+
+| file | block | what |
+|---|---|---|
+| `rad_block_glm_mhc.h` | `ManifoldConn` | the four-stream residual's read and write |
+| `rad_block_glm_kda.h` | `GlmKda`, `KdaState` | the 34 linear layers and their recurrence |
+| `rad_block_glm_mla.h` | `GlmMla`, `MlaLatent` | the 11 sparse MLA layers and their absorbed core |
+| `rad_block_glm_indexer.h` | `GlmIndexer`, `DsaCache` | the DSA indexer, its key cache and selection |
+| `rad_block_glm_router.h` | `GlmRouter` | the correction-bias router, through `MoeFP8` |
+| `rad_block_glm_mtp.h` | `GlmMtp` | the draft head around the plugin's layer 45 |
+| `rad_glm_tp.h` | `GlmTp`, `SplitF32Proj` | the shards, the split threshold, the column split of a replicated f32 projection |
+
 ```
 45 layers, hidden 4096, vocab 154880 (embedding and lm_head separate, bf16)
 mHC: 4 residual streams, a 16384-wide row; 20 Sinkhorn passes, hc_eps 1e-6; the embedding is
@@ -446,7 +459,7 @@ Traps:
 - **`comb` is indexed `[source, destination]`.** Each connection's write is
   `out[dst] = post[dst] * y + sum_src comb[src, dst] * h[src]`; the transpose has every shape
   valid and is another model. `out` must be a separate buffer: each output stream reads every
-  input stream (`rad_block_mhc.h`).
+  input stream (`rad_block_glm_mhc.h`).
 - **The router and the index head gates stay f32.** Both projections are f32 weights against a
   bf16 activation with f32 results (`gemm_nt_f32`), and the routing weights reach the gather
   as f32. Rounding any of them to bf16 changes which experts and which blocks are picked, and a
@@ -504,9 +517,11 @@ The container holds 25845 weights, 171.32 GiB; at eight ranks each card holds 22
 3 unless `--num-speculative-tokens` says otherwise (at most 31). Its history pass writes the draft
 layer's latent, index and tail for every row and runs its MoE on the proposal rows only.
 
-**Tensor parallelism.** At 1, 2, 4 or 8 ranks; declare refuses any other. `arch_test` declares and
-steps the whole plugin at 1, 4 and 8, and the connection, router and indexer splits at 1, 2, 4
-and 8.
+**Tensor parallelism.** At 1, 2, 4 or 8 ranks; declare refuses any other. `tests/glm5next_test.cpp`
+declares and steps the whole plugin at 1, 4 and 8, against pinned graph and step hashes at 1 and
+8, the connection, router and index-gate splits at 1, 2, 4 and 8, each issue's operand count
+against the loaded kernel libraries' schemas, and every declared weight against the served
+container's names and encodings.
 
 - The routed and the shared experts split their 2048 width into equal contiguous slices, 256 a
   rank at eight; each rank computes its slice of every expert, and the block's all-reduce sums
@@ -519,7 +534,7 @@ and 8.
 - The vocabulary is row-sharded, 19360 rows a rank at eight; the embedding's all-reduce is exact.
 - The f32 projections (the router's 288 x 4096, the index head gates' 32 x 4096, each
   connection's mHC projection of 24 x 16384) are replicated. From a pass of 256 rows
-  (`kGlmTpSplitRows`, `arch/common/rad_tp_split.h`), each rank computes a disjoint part
+  (`GlmTp::kSplitRows`; `SplitF32Proj` in `arch/common/rad_glm_tp.h`), each rank computes a disjoint part
   with the replicated kernel and an `all_gather` joins the parts, so every value is
   bit-identical: the router and the head gates split their output columns, the mHC projection
   its 16384-wide input into eight 2048-column chunks, whose partials `mhc_pre_finish` completes
