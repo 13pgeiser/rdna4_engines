@@ -289,7 +289,7 @@ TEST(every_shipped_template_renders_as_reference_jinja_does) {
         }
     }
     /* Five templates, every case each one renders. */
-    CHECK(compared >= 73);
+    CHECK(compared >= 74);
 }
 
 /* ------------------------------------------------------------------ reading the reply back */
