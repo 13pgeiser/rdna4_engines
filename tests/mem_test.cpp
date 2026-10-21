@@ -3303,8 +3303,8 @@ struct TierFixture {
     Fixture f;
     IdleTiers t;
     int64_t per = 0;
-    int build() {
-        int s = f.build(/*with_linear=*/false, /*ckpt_slots=*/0);
+    int build(bool with_linear = false, int64_t ckpt_slots = 0) {
+        int s = f.build(with_linear, ckpt_slots);
         if (s < 0) return s;
         s = t.configure(tier_config(1 << 20, 1024));
         if (s < 0) return s;
@@ -6087,6 +6087,152 @@ TEST(the_cache_tiers_and_pool_agree_over_random_interleavings) {
     CHECK_EQ(run.x.f.kv.held_blocks(G_FULL), 0ll);
     CHECK_EQ(run.x.f.pc.unshared_tokens(), 0ll);
     CHECK_EQ(run.x.t.arena().used_slots(), 0ll);
+}
+
+/* ================================================================== a restore makes room
+ *
+ * A conversation whose blocks went to the host tier comes back whole on its next turn, when the
+ * pool can be made to hold it. The reserve's trim leaves a quarter of the pool free after every
+ * publish; a restore larger than that gives up VRAM copies other idle conversations keep on the
+ * host as well, the same way pressure does, rather than stopping where the free list ends. These
+ * drive the engine's restore against the real cache, tiers and manager, with no bytes moving.
+ */
+
+/* The engine's restore (the binding's restore_fn) without the transfer: which entries come back,
+ * into which blocks, and what the tiers and the cache are told. Returns how many came back. */
+static int64_t engine_restore(TierFixture& x, PCBinding<PrefixCache>& b, const Request& r) {
+    (void)b;
+    const std::vector<BlockHash> want = x.f.pc.restorable_from(r.prompt, {});
+    std::vector<TierJob> jobs;
+    for (const BlockHash& h : want) {
+        TierJob j;
+        if (!x.t.plan_promote(h, &j)) break;
+        jobs.push_back(std::move(j));
+    }
+    std::vector<int32_t> ids;
+    const int64_t m = x.f.kv.reserve_blocks(G_FULL, (int64_t)jobs.size(), &ids);
+    int64_t back = 0;
+    for (size_t i = 0; i < jobs.size(); ++i) {
+        TierJob& j = jobs[i];
+        const bool ok = (int64_t)i < m;
+        j.started = ok;
+        j.blocks.clear();
+        if (ok) j.blocks.push_back(ids[i]);
+        x.t.report(j, ok, rad_mono_ns());
+        if (ok) { CHECK_OK(x.f.pc.rebind(j.key, j.blocks)); ++back; }
+    }
+    return back;
+}
+
+/* Two conversations of 0.6 of the pool each, as the scheduler leaves them: A published and copied
+ * to the host, B admitted by giving up A's VRAM under pressure, published, and the reserve's trim
+ * run while B's sequence still holds its blocks (Scheduler::close_request publishes before it
+ * frees). A ends up mostly on the host with its first blocks still in VRAM. `b_live` keeps B's
+ * sequence running; otherwise it ends with no host copy yet. */
+struct TwoSessions {
+    int64_t n = 0;                       /* blocks each conversation published */
+    std::vector<int32_t> a, b;           /* prompts that hit the whole of each */
+    std::vector<BlockHash> ha;
+};
+static TwoSessions two_sessions(TierFixture& x, bool b_live, bool a_snapshots) {
+    TwoSessions s;
+    const int64_t total = x.f.kv.total_blocks(G_FULL);
+    s.n = (total * 3 / 5) & ~(int64_t)3;            /* on the 64-token checkpoint interval */
+    CHECK(2 * s.n <= x.t.arena().capacity());
+    s.a = tok_run(100000, (int)(s.n * 16 + 16));
+    s.b = tok_run(900000, (int)(s.n * 16 + 16));
+    s.ha = chain_of(s.a);
+
+    publish(x.f, 1, s.a, s.n * 16);
+    if (a_snapshots) {
+        /* A snapshot on every interval, retention after each, as a long prefill leaves them. */
+        for (int64_t pos = 64; pos <= s.n * 16; pos += 64) {
+            x.f.pc.begin_step();
+            ckpt_at(x.f, 1, s.ha, pos);
+            x.f.pc.retain(1);
+        }
+        x.f.pc.begin_step();
+    }
+    x.f.kv.free_sequence(1);
+    copy_now(x.t);
+
+    const int64_t room = total - x.f.kv.held_blocks(G_FULL);
+    CHECK_EQ(x.f.pc.trim(s.n + 1 - room), s.n + 1 - room);
+    publish(x.f, 2, s.b, s.n * 16);
+    const int64_t short_by = total / 4 - (total - x.f.kv.held_blocks(G_FULL));
+    if (short_by > 0) (void)x.f.pc.trim(short_by);
+    if (!b_live) x.f.kv.free_sequence(2);
+    return s;
+}
+
+TEST(a_restore_gives_up_other_clean_copies_to_bring_the_whole_chain_back) {
+    TierFixture x;
+    CHECK_OK(x.build());
+    const TwoSessions s = two_sessions(x, /*b_live=*/false, /*a_snapshots=*/false);
+    const int64_t off = (int64_t)x.f.pc.restorable_from(s.a, {}).size();
+    const int64_t free_now = x.f.kv.total_blocks(G_FULL) - x.f.kv.held_blocks(G_FULL);
+    REQUIRE(off > free_now);                        /* the free list alone cannot hold it */
+    const int64_t evictions = x.f.pc.stats().evictions;
+
+    PCBinding<PrefixCache> b(&x.f.pc);
+    int flushes = 0;
+    b.flush_fn = [&]() { ++flushes; return !copy_now(x.t).empty(); };
+    CHECK_EQ(engine_restore(x, b, turn(3, s.a, {})), off);
+    CHECK_EQ(x.f.pc.lookup(s.a, {}).n_attn_tokens, (int32_t)(s.n * 16));
+    /* B had no host copy yet: its copies were landed first, then its VRAM went. Nothing lost. */
+    CHECK_EQ(flushes, 1);
+    CHECK_EQ(x.f.pc.stats().evictions, evictions);
+    CHECK_EQ(x.f.pc.size(), 2 * s.n);
+    CHECK_EQ((int64_t)x.f.pc.restorable_from(s.b, {}).size(), 2 * s.n - x.f.pc.resident());
+}
+
+/* With recurrent state the hit resumes at the deepest snapshot the restored prefix reaches. Cut
+ * at the free list, that is somewhere down the retention ladder, far below the tip. */
+TEST(a_restored_hybrid_conversation_resumes_at_its_tip_snapshot) {
+    TierFixture x;
+    CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/32));
+    x.f.pc.set_policy(std::make_unique<GeometricBackoff>(64));
+    const TwoSessions s = two_sessions(x, /*b_live=*/false, /*a_snapshots=*/true);
+    REQUIRE_EQ(x.f.pc.checkpoints(1).back(), s.n * 16);
+
+    PCBinding<PrefixCache> b(&x.f.pc);
+    b.flush_fn = [&]() { return !copy_now(x.t).empty(); };
+    (void)engine_restore(x, b, turn(3, s.a, {}));
+    const CacheHit hit = x.f.pc.lookup(s.a, {});
+    CHECK_EQ(hit.n_attn_tokens, (int32_t)(s.n * 16));
+    CHECK_EQ(hit.n_linear_tokens, (int32_t)(s.n * 16));
+}
+
+/* When the pool cannot be made to hold the chain, what comes back ends at a snapshot: blocks past
+ * the deepest snapshot the shorter prefix reaches would be restored for nothing. Making room
+ * never takes the conversation's own blocks, which would only have to come back too, nor a chain
+ * a running sequence reads, which frees nothing. */
+TEST(a_restore_the_pool_cannot_hold_stops_at_a_snapshot_and_spares_its_own_chain) {
+    TierFixture x;
+    CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/32));
+    x.f.pc.set_policy(std::make_unique<GeometricBackoff>(64));
+    const TwoSessions s = two_sessions(x, /*b_live=*/true, /*a_snapshots=*/true);
+    const int64_t off = (int64_t)x.f.pc.restorable_from(s.a, {}).size();
+    const int64_t resident = s.n - off;             /* A's first blocks, still in VRAM */
+    const int64_t room = x.f.kv.total_blocks(G_FULL) - x.f.kv.held_blocks(G_FULL);
+    REQUIRE(resident > 0);
+    REQUIRE(room < off);
+    /* The deepest snapshot the prefix reaches with `room` more blocks. */
+    int64_t snap = 0;
+    for (int64_t p : x.f.pc.checkpoints(1))
+        if (p <= (resident + room) * 16) snap = p;
+    REQUIRE(snap > 0);
+    const int64_t drops = x.f.pc.stats().drops;
+
+    PCBinding<PrefixCache> b(&x.f.pc);
+    b.flush_fn = [&]() { return !copy_now(x.t).empty(); };
+    const int64_t back = engine_restore(x, b, turn(3, s.a, {}));
+    CHECK_EQ(back, std::max<int64_t>(0, snap / 16 - resident));
+    CHECK_EQ(x.f.pc.stats().drops, drops);          /* no VRAM copy given up: A's own, or B's */
+    const CacheHit hit = x.f.pc.lookup(s.a, {});
+    CHECK_EQ(hit.n_linear_tokens, (int32_t)snap);
+    CHECK_EQ(hit.n_attn_tokens, (int32_t)std::max<int64_t>(snap, resident * 16));
+    CHECK_EQ(x.f.pc.lookup(s.b, {}).n_attn_tokens, (int32_t)(s.n * 16));
 }
 
 /* Tools and tests build and tear down the tier executors and pools repeatedly, and on a card every
