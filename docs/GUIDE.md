@@ -1169,6 +1169,9 @@ message takes 1360 µs.
 The links are read once, at startup: a link that drops to a lower speed while the server runs
 keeps its weight until the next start. `RADIANCE_AR8_SHARD_WEIGHTS` overrides them: `off` keeps
 the shards even, eight comma-separated integers set them, unset or `auto` reads the links.
+`duplex` reads the same links and weights them so that every link's busier direction carries the
+same time's bytes when both directions run at once (`r4d_ar_weights_duplex`): x16 64 and x8 8 on
+the repaired board, whose link time it puts 10% under the `auto` weights', a Gen4 x8 card nothing.
 `RADIANCE_AR8_PIECES` (1 to 16) fixes the piece count, and `RADIANCE_AR8_SHARD_WEIGHTS_MIN_ELEMS`
 and `RADIANCE_AR8_PIECES_MIN_ELEMS` move the two sizes they start at. Every rank must read the
 same values; where they differ, every rank stops at startup.

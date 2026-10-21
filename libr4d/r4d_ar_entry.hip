@@ -151,18 +151,21 @@ long long pgeti_hi(const RadParam* p, int n_p, const char* k, long long dflt) {
 long align16(long v) { return (v + 15) & ~15L; }
 
 /* RADIANCE_AR8_SHARD_WEIGHTS, read at every eight-rank build so a process can change it between
- * instances: unset or "auto" derives the weights from the links, "off" keeps the shards even,
- * eight integers set them. Anything else is "off", with one warning. */
-enum { AR8_EVEN = 0, AR8_SET = 1, AR8_AUTO = 2 };
+ * instances: unset or "auto" derives the weights from the links by r4d_ar_weights_from_rates,
+ * "duplex" from the same links by r4d_ar_weights_duplex, "off" keeps the shards even, eight
+ * integers set them. Anything else is "off", with one warning. */
+enum { AR8_EVEN = 0, AR8_SET = 1, AR8_AUTO = 2, AR8_DUPLEX = 3 };
 int ar8_weights_mode(int* w) {
     const char* e = std::getenv(R4D_AR8_SHARD_WEIGHTS_ENV);
     if (!e || !*e || !std::strcmp(e, "auto")) return AR8_AUTO;
+    if (!std::strcmp(e, "duplex")) return AR8_DUPLEX;
     if (!std::strcmp(e, "off")) return AR8_EVEN;
     if (r4d_ar_shard_weights_parse(e, 8, w)) return AR8_SET;
     static std::once_flag said;
     std::call_once(said, [e] {
         std::fprintf(stderr, "[r4d] %s=\"%s\" ignored (needs auto, off or eight non-negative "
-                     "integers, comma-separated, sum > 0); eight-rank two-shot shards stay even\n",
+                     "integers, comma-separated, sum > 0, or duplex); eight-rank two-shot shards "
+                     "stay even\n",
                      R4D_AR8_SHARD_WEIGHTS_ENV, e);
     });
     return AR8_EVEN;
@@ -237,7 +240,8 @@ int ar8_settle(ArInst* in, int rank, int world) {
     me.pieces = ar8_pieces();
     me.weights_min = ar8_min_elems(R4D_AR8_SHARD_WEIGHTS_MIN_ENV, &said_w);
     me.pieces_min = ar8_min_elems(R4D_AR8_PIECES_MIN_ENV, &said_p);
-    if (me.mode == AR8_AUTO && !ar8_own_link(&me.link)) me.link = R4DArLink();
+    if ((me.mode == AR8_AUTO || me.mode == AR8_DUPLEX) && !ar8_own_link(&me.link))
+        me.link = R4DArLink();
     {
         std::lock_guard<std::mutex> lk(g_rv.m);
         g_rv.ar8[rank] = me;
@@ -267,10 +271,12 @@ int ar8_settle(ArInst* in, int rank, int world) {
                          "%d,%d,%d,%d,%d,%d,%d,%d (%s)\n", w[0], w[1], w[2], w[3], w[4], w[5],
                          w[6], w[7], R4D_AR8_SHARD_WEIGHTS_ENV);
         });
-    } else if (me.mode == AR8_AUTO) {
+    } else if (me.mode == AR8_AUTO || me.mode == AR8_DUPLEX) {
         double gbs[R4D_MAX_RANKS] = { 0 };
         for (int r = 0; r < world; ++r) gbs[r] = r4d_ar_link_gbs(all[r].link);
-        if (!r4d_ar_weights_from_rates(gbs, world, w)) {
+        const bool known = me.mode == AR8_DUPLEX ? r4d_ar_weights_duplex(gbs, world, w)
+                                                 : r4d_ar_weights_from_rates(gbs, world, w);
+        if (!known) {
             std::call_once(said_unknown, [all, world] {
                 std::string who;
                 for (int r = 0; r < world; ++r)
@@ -280,7 +286,8 @@ int ar8_settle(ArInst* in, int rank, int world) {
             });
             return RAD_OK;
         }
-        std::call_once(said_links, [all, world, &w] {
+        const bool duplex = me.mode == AR8_DUPLEX;
+        std::call_once(said_links, [all, world, duplex, &w] {
             std::string l;
             for (int r = 0; r < world; ++r) {
                 char one[96];
@@ -290,7 +297,7 @@ int ar8_settle(ArInst* in, int rank, int world) {
                 l += one;
             }
             std::fprintf(stderr, "[r4d] eight-rank two-shot shard weights from the slowest PCIe "
-                         "hop of each card:%s\n", l.c_str());
+                         "hop of each card%s:%s\n", duplex ? " (duplex)" : "", l.c_str());
         });
         bool same = true;
         for (int r = 1; r < world; ++r) same = same && w[r] == w[0];

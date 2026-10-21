@@ -22581,7 +22581,8 @@ static void ar8_print_timeline(const std::vector<Ar8Perf>& t, size_t cfg, double
  * `how` names the source and, for "auto", every rank's link. */
 static bool ar8_weights_as_plugin(const std::vector<int>& devs, int* w, std::string* how) {
     const char* e = std::getenv(R4D_AR8_SHARD_WEIGHTS_ENV);
-    if (e && *e && std::strcmp(e, "auto")) {
+    const bool duplex = e && !std::strcmp(e, "duplex");
+    if (e && *e && std::strcmp(e, "auto") && !duplex) {
         if (!std::strcmp(e, "off")) { *how = " (off)"; return false; }
         if (r4d_ar_shard_weights_parse(e, 8, w)) { *how = " (set)"; return true; }
         *how = fmt(" (%s=\"%s\" is invalid)", R4D_AR8_SHARD_WEIGHTS_ENV, e);
@@ -22599,11 +22600,11 @@ static bool ar8_weights_as_plugin(const std::vector<int>& devs, int* w, std::str
         gbs[r] = r4d_ar_link_gbs(l);
         links += fmt("%s r%d %.1f GT/s x%d", r ? "," : "", r, l.gts, l.width);
     }
-    if (!r4d_ar_weights_from_rates(gbs, 8, w)) {
-        *how = " (auto: a link is unreadable;" + links + ")";
+    if (!(duplex ? r4d_ar_weights_duplex(gbs, 8, w) : r4d_ar_weights_from_rates(gbs, 8, w))) {
+        *how = fmt(" (%s: a link is unreadable;", duplex ? "duplex" : "auto") + links + ")";
         return false;
     }
-    *how = " (auto:" + links + ")";
+    *how = fmt(" (%s:", duplex ? "duplex" : "auto") + links + ")";
     for (int r = 1; r < 8; ++r) if (w[r] != w[0]) return true;
     return false;
 }
