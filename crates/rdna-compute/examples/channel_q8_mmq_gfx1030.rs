@@ -112,17 +112,9 @@ fn main() {
                 dtype: DType::F32,
             }
         };
-        // Force legacy scalar path via env-less direct call
-        {
-            let mut off = 0;
-            while off < n {
-                let take = (n - off).min(64);
-                let xs = x_gpu.sub_offset(off * k, take * k);
-                let ys = y_leg.sub_offset(off * m, take * m);
-                gpu.gemm_q8_0_batched(&w_gpu, &xs, &ys, m, k, take).unwrap();
-                off += take;
-            }
-        }
+        // Force legacy scalar path via env-less direct call (chunks itself at 64 rows, #732)
+        gpu.gemm_q8_0_batched(&w_gpu, &x_gpu, &y_leg, m, k, n)
+            .unwrap();
         gpu.gemm_q8_0_mmq_gfx1030(&w_gpu, &x_gpu, &y_mmq, m, k, n)
             .unwrap();
         gpu.hip.device_synchronize().unwrap();
@@ -156,26 +148,14 @@ fn main() {
         let us = t0.elapsed().as_secs_f64() / trials as f64 * 1e6;
         // legacy timing
         for _ in 0..3 {
-            let mut off = 0;
-            while off < n {
-                let take = (n - off).min(64);
-                let xs = x_gpu.sub_offset(off * k, take * k);
-                let ys = y_leg.sub_offset(off * m, take * m);
-                gpu.gemm_q8_0_batched(&w_gpu, &xs, &ys, m, k, take).unwrap();
-                off += take;
-            }
+            gpu.gemm_q8_0_batched(&w_gpu, &x_gpu, &y_leg, m, k, n)
+                .unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
         let t1 = Instant::now();
         for _ in 0..trials {
-            let mut off = 0;
-            while off < n {
-                let take = (n - off).min(64);
-                let xs = x_gpu.sub_offset(off * k, take * k);
-                let ys = y_leg.sub_offset(off * m, take * m);
-                gpu.gemm_q8_0_batched(&w_gpu, &xs, &ys, m, k, take).unwrap();
-                off += take;
-            }
+            gpu.gemm_q8_0_batched(&w_gpu, &x_gpu, &y_leg, m, k, n)
+                .unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
         let us_leg = t1.elapsed().as_secs_f64() / trials as f64 * 1e6;
