@@ -427,18 +427,19 @@ declared beside it when the container carries the tower and the deployment asks 
 654df43; for the tower and its processor, transformers' `glm5_next`.
 
 The plugin is one file over blocks in `arch/common`, one block a file; it declares the buffers
-the blocks share, places them and issues the step's order.
+the blocks share, places them and issues the step's order, and reads its one deployment switch
+(`RADIANCE_GLM_MLA_ROWS`, docs/GUIDE.md) once a declare.
 
 | file | block | what |
 |---|---|---|
 | `rad_block_glm_mhc.h` | `ManifoldConn` | the four-stream residual's read and write |
 | `rad_block_glm_kda.h` | `GlmKda`, `KdaState` | the 34 linear layers and their recurrence |
-| `rad_block_glm_mla.h` | `GlmMla`, `MlaLatent` | the 11 sparse MLA layers and their absorbed core |
+| `rad_block_glm_mla.h` | `GlmMla`, `MlaLatent` | the 11 sparse MLA layers, in the head form or the row form |
 | `rad_block_glm_indexer.h` | `GlmIndexer`, `DsaCache` | the DSA indexer, its key cache and selection |
 | `rad_block_glm_router.h` | `GlmRouter` | the correction-bias router, through `MoeFP8` |
 | `rad_block_glm_mtp.h` | `GlmMtp` | the draft head around the plugin's layer 45 |
 | `rad_block_glm_vision.h` | `GlmVision`, `MediaRows` | the tower, and its rows over the embeddings |
-| `rad_glm_tp.h` | `GlmTp`, `SplitF32Proj` | the shards, the split threshold, the column split of a replicated f32 projection |
+| `rad_glm_tp.h` | `GlmTp`, `SplitF32Proj` | the shards, the one row rule, the split thresholds, the column split of a replicated f32 projection |
 
 ```
 45 layers, hidden 4096, vocab 154880 (embedding and lm_head separate, bf16)
@@ -534,45 +535,66 @@ at eight ranks each card holds 22.06 GiB of them, 19.67 GiB the routed experts.
 layer's latent, index and tail for every row and runs its MoE on the proposal rows only.
 
 **Tensor parallelism.** At 1, 2, 4 or 8 ranks; declare refuses any other. `tests/glm5next_test.cpp`
-declares and steps the whole plugin at 1, 4 and 8, against pinned graph and step hashes at 1 and
-8, the connection, router and index-gate splits at 1, 2, 4 and 8, the indexer's row split at 2
-and 8, the row rule at every world, each issue's operand count against the loaded kernel
-libraries' schemas, and every declared weight against the served container's names and encodings.
+declares and steps the whole plugin at 1 and 8 against pinned graph and step hashes (the head form,
+the row form), the connection, router and index-gate splits at 1, 2, 4 and 8,
+the indexer's row split at 2 and 8, the MLA row split at 1, 2, 4 and 8, the row rule at every
+world, each issue's operand count against the loaded kernel libraries' schemas, and every declared
+weight against the served container's names and encodings.
 
-One row rule (`GlmTp::run_rows`): from a pass of `GlmTp::kSplitRows` = 256 rows, a replicated
-piece of work splits by rows over the ranks instead, each rank taking one run of ceil(T / world)
-rows rounded up to whole 16-byte words of the row it gathers, because an `all_gather` moves whole
-words: multiples of four rows for the indexer's one i32 length a row. The last run may be short;
-a rank whose run lies wholly past a small step takes the first run and computes dead rows, so
-every plane it gathers is written (`GlmTp::run_of`). The indexer also splits a smaller step, from
-16 rows once rows x live blocks reach 2^18 (`GlmTp::kSplitWork`). Below the thresholds, as in
-decode, the collective costs more than it saves and every rank runs the replicated form.
+One row rule (`GlmTp::run_rows`): from a pass of `GlmTp::kSplitRows` = 256 rows, a replicated or
+head-split piece of work splits by rows over the ranks instead, each rank taking one run of
+ceil(T / world) rows rounded up to whole 16-byte words of the row it gathers, because an
+`all_gather` moves whole words: whole rows for the MLA's 4096-wide bf16 output, multiples of four
+rows for the indexer's one i32 length a row. The last run may be short; a rank whose run lies
+wholly past a small step takes the first run and computes dead rows, so every plane it gathers is
+written (`GlmTp::run_of`). The indexer alone also splits a smaller step, from 16 rows once rows x
+live blocks reach 2^18 (`GlmTp::kSplitWork`). Below the thresholds, as in decode, the collective
+costs more than it saves and every rank runs the replicated or head-split form.
 
 - The routed and the shared experts split their 2048 width into equal contiguous slices, 256 a
   rank at eight; each rank computes its slice of every expert, and the block's all-reduce sums
   them. The dense feed-forward splits its 12288 the same way.
 - MLA splits by whole heads: the rows of q_b and kv_b (8 heads a rank at eight) and the columns
-  of o. q_a, kv_a and the latent are replicated.
+  of o. q_a, kv_a and the latent are replicated. With `RADIANCE_GLM_MLA_ROWS=1`, from the
+  threshold, it splits by rows instead (`GlmMla::Form::rows`): each rank takes its run under the row rule, the last run shorter,
+  through q_b, absorption, attention with all 64 heads
+  (`mla_attn_rows_bf16`, docs/OPS.md), expansion and o, and an `all_gather` of whole runs takes the
+  all-reduce's place. The latent cache and the DSA selection are whole on every rank, so nothing
+  is exchanged before the attention. Each rank sends its run to seven peers, half the bytes of the
+  two-shot all-reduce, and the gather shares that all-reduce's exchange instance. The price is
+  q_b, kv_b and o at full width on every rank, 120 MiB a layer and 1.29 GiB a card over the 11
+  trunk layers (the MTP layer keeps its heads), about 0.1 GiB of activations besides; `2` is the
+  row form with o summed as the head form sums it (`GlmMla::Form::rows_sliced_o`), a test of the
+  two forms' difference. The head form is the default because the row form is not bit-identical
+  to it, and this model turns that into a measurable divergence: against the head form over a
+  43k-position corpus the row form scores a mean KL of 0.033 (median 0.004, top-1 agreement
+  93.5 %), greedy text unchanged. The projections are not the cause (q_b and o give the head
+  form's bytes when o is summed as eight rank partials, and the KL stays at 0.032); the
+  attention's rounding is: the rows kernel parts from the paired tile in about 0.1 % of every
+  row's outputs by one bf16 step, and the 16-head tile, which parts in the same share of every
+  second row only, halves the KL to 0.015. Measured
+  on eight R9700 at Gen5 links, the same build: a 20k-token prefill 5074 tok/s in the row form
+  against 4270 in the head form; BetterBench single stream 181.8 against 180.2 tok/s, eight
+  parallel 468 against 454.
 - KDA splits its 64 heads, with them the q/k/v rows, the convolution taps and the state; the two
   rank-128 projections into the gates are replicated.
 - The indexer's key side is replicated: every rank keeps the whole index cache and its tail. Its
   query side splits by rows from the threshold: each rank scores its run under the row rule,
-  R = 4 * ceil(T / (4 * ranks)) query rows (`DsaCache::part_rows`), against the whole cache
-  (`dsa_score` with `row_part`, the last run's rows past the step scoring `-inf`) and selects for
-  the rows of its run that exist, under the bounds the scorer rebased to the run's first row
-  (`cu_part`, docs/OPS.md); two `all_gather`s lay the runs' page tables and lengths end to end,
-  513 and 1 i32 a row, 8 MiB a layer at a 4096-row chunk. The run's queries are all a rank needs,
-  so the query projection, its quantiser and the head gates run on the run's rows too, and the
-  gates need no gather; the bf16 projection stays on the step's rows where a run would be 64 rows
-  or fewer, the skinny band whose split count a tuned configuration may set. Each row's selection
-  is the same kernels' answer to the same operands, so the joined table is bit-identical to one
-  rank's and MLA reads it unchanged. The scoring grows with the context (every row scores every
-  complete block of its sequence), so this is where long prompts gain: the score plane shrinks to
-  one run (256 MiB to 32 MiB at 64k of context and a 4096-row chunk). A smaller step splits too
-  from 16 rows once rows x live blocks reach 2^18 (`GlmTp::kSplitWork`): eight sequences
-  verifying five drafts from about 22k of context, where the scoring of 48 rows outweighs the two
-  gathers; a single sequence's decode never does, and below both thresholds the indexer runs
-  whole.
+  R = 4 * ceil(T / (4 * ranks)) query rows (`DsaCache::part_rows`), against the whole cache (`dsa_score` with `row_part`,
+  the last run's rows past the step scoring `-inf`) and selects for the rows of its run that exist,
+  under the bounds the scorer rebased to the run's first row (`cu_part`, docs/OPS.md); two
+  `all_gather`s lay the runs' page tables and lengths end to end, 513 and 1 i32 a row, 8 MiB a layer
+  at a 4096-row chunk. The run's queries are all a rank needs, so the query projection, its
+  quantiser and the head gates run on the run's rows too, and the gates need no gather; the bf16
+  projection stays on the step's rows where a run would be 64 rows or fewer, the skinny band whose
+  split count a tuned configuration may set. Each row's selection is the same kernels' answer to
+  the same operands, so the joined table is bit-identical to one rank's and MLA reads it unchanged.
+  The scoring grows with the context (every row scores every complete block of its sequence), so
+  this is where long prompts gain: the score plane shrinks to one run (256 MiB to 32 MiB at 64k of
+  context and a 4096-row chunk). A smaller step splits too from 16 rows once rows x live blocks
+  reach 2^18 (`GlmTp::kSplitWork`): eight sequences verifying five drafts from about 22k of
+  context, where the scoring of 48 rows outweighs the two gathers; a single sequence's decode never
+  does, and below both thresholds the indexer runs whole.
 - The vocabulary is row-sharded, 19360 rows a rank at eight; the embedding's all-reduce is exact.
 - The f32 projections (the router's 288 x 4096, the index head gates' 32 x 4096, each
   connection's mHC projection of 24 x 16384) are replicated. From a pass of 256 rows

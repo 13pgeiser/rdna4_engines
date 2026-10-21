@@ -745,6 +745,10 @@ struct LinearFP8 {
      * this is set; otherwise the linear reads unwritten arena bytes. */
     bool       reads_x = false;
     bool       mapped  = false;   /* probe() made the name map; declare() does not make it again */
+    /* The stored weight this linear's views take when it is not `<base>.weight`: a second linear
+     * over one container entry, e.g. a whole projection beside its tensor-parallel slice. Set
+     * before declare(); no name map is made, and only block fp8 is served this way. */
+    const char* stored = nullptr;
     /* The weight's access class (rad_builder.h): read every pass by default; a linear run once a
      * request (an encoder's) says so, which lets placement keep it off the card. Set before
      * declare(). */
@@ -1039,9 +1043,10 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
 
     /* Name map first: the weight's encoding, looked up through it, picks the branch below. */
     const char* wn = nm.f("%s.weight", base);
-    if (!mapped) RAD_ARCH_TRY(map_linear(b, wn, src));
+    if (!mapped && !stored) RAD_ARCH_TRY(map_linear(b, wn, src));
+    const char* sw = stored ? stored : wn;
     RadEncoding enc{};
-    const bool known = weight_enc(b, wn, &enc);
+    const bool known = weight_enc(b, sw, &enc);
     const bool plain = known && rad_enc_is(&enc, "plain") && enc.n_planes == 1 &&
                        enc.plane[0].dtype == RAD_BF16;
 
@@ -1051,6 +1056,11 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
      * constraints. */
     bf16 = g.w_bf16 || plain;
     if (bf16) {
+        if (stored) {
+            fprintf(stderr, "radiance: '%s' views '%s', which only a block-fp8 linear "
+                            "may\n", wn, stored);
+            return RAD_E_INVAL;
+        }
         if (known && !plain) {
             char en[256];
             rad_enc_format(&enc, en, sizeof en);
@@ -1089,6 +1099,11 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
     const bool rot8 = known && linear_is_w8h(enc);
     i8 = known && (linear_is_w8(enc) || rot8);
     if (i8) {
+        if (stored) {
+            fprintf(stderr, "radiance: '%s' views '%s', which only a block-fp8 linear "
+                            "may\n", wn, stored);
+            return RAD_E_INVAL;
+        }
         if (a.q8_fed && rot8 != a.q8_rot) {
             fprintf(stderr, "radiance: '%s' is a%s int8 weight and its input is fed codes its "
                             "producer wrote %s\n", wn, rot8 ? " rotated" : " plain",
@@ -1148,6 +1163,11 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
      * codes, and (scale, zero) as `b_scale`. */
     paro5 = known && linear_is_paro_w5(enc);
     if (paro5) {
+        if (stored) {
+            fprintf(stderr, "radiance: '%s' views '%s', which only a block-fp8 linear "
+                            "may\n", wn, stored);
+            return RAD_E_INVAL;
+        }
         const int bits = enc.plane[0].dtype == RAD_U4 ? 4 : 5;
         if (!a.x) {
             fprintf(stderr, "radiance: '%s' is a rotated %d-bit weight, rotated from its input's "
@@ -1214,6 +1234,11 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
      * whole 128s, the scale group. */
     w4 = known && linear_is_w4(enc);
     if (w4) {
+        if (stored) {
+            fprintf(stderr, "radiance: '%s' views '%s', which only a block-fp8 linear "
+                            "may\n", wn, stored);
+            return RAD_E_INVAL;
+        }
         if (!a.x) {
             fprintf(stderr, "radiance: '%s' is a 4-bit weight, read from its input's bf16 plane, "
                             "and its input has none\n", wn);
@@ -1284,6 +1309,11 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
     paro = known && linear_is_paro_mxfp4(enc);
     mx = known && (linear_is_mxfp4(enc) || paro);
     if (mx) {
+        if (stored) {
+            fprintf(stderr, "radiance: '%s' views '%s', which only a block-fp8 linear "
+                            "may\n", wn, stored);
+            return RAD_E_INVAL;
+        }
         if (paro) {
             /* The rotation is applied to the activation, so this linear needs the input's bf16
              * plane (probe() set reads_x) and quantises it itself. */
@@ -1395,10 +1425,10 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
     f32_scale = fp8_scale && fp8_scale->dtype == RAD_F32;
     /* One stored weight, two operands: the codes and scale plane of `<base>.weight`, block fp8 in
      * the checkpoint or made so by rad-convert's recipe. */
-    w  = decl_view(b, wn, nullptr, "codes", RAD_F8E4M3, { N, K },
+    w  = decl_view(b, wn, stored, "codes", RAD_F8E4M3, { N, K },
                    access, shard, grp, rp.w, rp.n);
     ws_row_div = RAD_FP8_BLOCK;
-    ws = decl_view(b, sn, wn, "scale", f32_scale ? RAD_F32 : RAD_BF16,
+    ws = decl_view(b, sn, sw, "scale", f32_scale ? RAD_F32 : RAD_BF16,
                    { fp8_blocks(N), fp8_blocks(K) }, access, shard, grp, rp.s, rp.n);
     if (!w || !ws) return RAD_E_INVAL;
     /* An uneven slice; the scale plane takes the same slice in blocks. */

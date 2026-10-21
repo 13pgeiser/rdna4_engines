@@ -3,14 +3,23 @@
  * complete heads shard as rows of the shared K/V weight. prepare() exposes the normalized q latent
  * for the indexer; finish() consumes the indexer's selection. The caller owns the mHC residual.
  *
- * Under tensor parallelism the 64 heads split over the ranks (GlmTp::heads): the rows of q_b and
- * kv_b, the columns of o, an all_reduce of the output; q_a, kv_a and the latent cache are
- * replicated. */
+ * Under tensor parallelism the head form splits the 64 heads over the ranks (GlmTp::heads): the
+ * rows of q_b and kv_b, the columns of o, an all_reduce of the output; q_a, kv_a and the latent
+ * cache are replicated. From GlmTp::kSplitRows a prefill-sized step takes the row form instead
+ * (Wire::rows, Form::rows): each rank runs its run of the step's rows (GlmTp::run_of) through q_b,
+ * absorption, attention, expansion and the output projection with all 64 heads, then an
+ * all_gather lays the runs out as the whole step. The latent cache and the selection are whole on
+ * every rank already, so the split needs no other exchange. The gather moves half the bytes of
+ * the head form's all-reduce, and the attention loads each key once for all 64 heads of a row.
+ * The price is the three projections at full width on every rank (126 MB a layer); RowsWire::q
+ * unset declares neither them nor the form. */
 #ifndef RAD_BLOCK_GLM_MLA_H
 #define RAD_BLOCK_GLM_MLA_H
 #include "rad_fp8.h"
 #include "rad_glm_tp.h"
+#include <algorithm>
 #include <cmath>
+#include <vector>
 
 namespace rad {
 namespace arch {
@@ -88,11 +97,33 @@ struct MlaLatent {
 };
 
 struct GlmMla {
+    /* How a prefill-sized step under tensor parallelism runs: `heads` keeps the head form at every
+     * step size and spares the full-width weights' VRAM; `rows` is the row form; `rows_sliced_o`
+     * the row form with o summed as the head form sums it (a test of how much of the two forms'
+     * difference is o's rounding). The plugin chooses; the block takes the choice through which
+     * RowsWire buffers it is given. */
+    enum class Form { heads, rows, rows_sliced_o };
+    /* The row form's buffers, `rows_for(max_tok)` rows each. `out` (Wire::out) must hold
+     * world * rows_for(T) rows, since every rank's run is gathered at full length. */
+    struct RowsWire {
+        rad_buf q = 0, q_latent = 0, attn_latent = 0, out = 0;
+        ActFP8 attn{};
+        /* Form::rows_sliced_o only: o in the head form's world K slices, each rounded to bf16
+         * ([world * rows, 4096]), summed in f32 in ascending slice order as the exact all-reduce
+         * folds ranks (two [rows, 4096] f32 planes), rounded once. */
+        rad_buf slices = 0, acc = 0, widened = 0;
+    };
     struct Wire {
         ActFP8 input{}, q_low{}, attn{};
         rad_buf q_raw = 0, kv_raw = 0, latent = 0, out = 0;
         MlaLatent::Wire core{};
+        RowsWire rows{};
     };
+    /* The gathered row of the row form: 4096 bf16, so a run is ceil(T / world) rows. */
+    static constexpr int64_t kOutRowBytes = 4096 * 2;
+    static int64_t rows_for(int64_t T, int world) {
+        return GlmTp::run_rows(T, world, kOutRowBytes);
+    }
     Geom g{};
     Wire w{};
     int layer = 0;
@@ -103,6 +134,12 @@ struct GlmMla {
     MlaLatent core{};
     rad_weight q_gain = 0, kv_gain = 0;
     rad_op op_kv_norm = 0, op_store = 0, op_ar = 0;
+    LinearFP8 rows_q_b{}, rows_output{};
+    QuantFP8 rows_quant{};
+    rad_weight rows_kv_b = 0;
+    rad_op op_rows_absorb = 0, op_rows_attn = 0, op_rows_expand = 0, op_rows_gather = 0;
+    std::vector<LinearFP8> rows_o_slices;
+    rad_op op_slice_first = 0, op_slice_widen = 0, op_slice_add = 0, op_slice_narrow = 0;
     int declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const Wire& wire,
                 const char* prefix, rad_kvgroup group, bool reduce = true,
                 bool defer_finish = false) {
@@ -160,7 +197,126 @@ struct GlmMla {
                                     GlmTp::mla_width(g.world), RAD_SHARD_COL, grp_layer(layer),
                                     { nm.ckpt("%s.o_proj.weight", prefix) }, w.attn, w.out));
         if (reduce) op_ar = GlmTp::reduce(b, g, w.out);
-        return op_store && (!(reduce && g.world > 1) || op_ar) ? RAD_OK : RAD_E_INVAL;
+        if (!op_store || ((reduce && g.world > 1) && !op_ar)) return RAD_E_INVAL;
+        return reduce ? declare_rows(b, nm, prefix) : RAD_OK;
+    }
+    /* Declared whatever the step size, as every TP split here is: arena levels declare again at a
+     * smaller max_tok and must get the same graph. The gather's message bound is the all-reduce's,
+     * so both share one exchange instance and its scratch. */
+    int declare_rows(RadBuilder* b, Names& nm, const char* prefix) {
+        const auto& r = w.rows;
+        if (!r.q || g.world < 2) return RAD_OK;
+        if (!r.q_latent || !r.attn_latent || !r.out || !r.attn.x || r.attn.x == r.q) return RAD_E_INVAL;
+        const int64_t R = rows_for(g.max_tok, g.world);
+        const auto wg = grp_layer(layer);
+        /* Whole views of the head form's container entries: one stored weight each, whose
+         * encoding (block fp8 at f32 scales, the decoded bf16 kv_b) the views inherit. */
+        rows_q_b.stored = nm.f("blk.%d.attn_q_b.weight", layer);
+        RAD_ARCH_TRY(rows_q_b.declare(b, nm, g, nm.f("blk.%d.attn_q_b_rows", layer), 16384, 1536,
+                                      RAD_SHARD_NONE, wg, { nm.ckpt("%s.q_b_proj.weight", prefix) },
+                                      w.q_low, r.q, R));
+        rows_kv_b = decl_view(b, nm.f("blk.%d.attn_kv_b_rows.weight", layer),
+                              nm.f("blk.%d.attn_kv_b.weight", layer), nullptr, RAD_BF16,
+                              { 64 * 2 * 256, 512 }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, wg);
+        if (!rows_kv_b) return RAD_E_INVAL;
+        auto project = [&](const char* mode, rad_buf in, rad_buf out) {
+            return rw(b,
+                      RAD_OP(b, "mla_project",
+                             RAD_PARAMS(RAD_RANGE("M", 1, R), RAD_INT("heads", 64),
+                                        RAD_INT("head_dim", 256), RAD_INT("latent_dim", 512),
+                                        RAD_STR("mode", mode), RAD_STR("dtype", "bf16")),
+                             RAD_WEIGHTS(rows_kv_b)),
+                      { in }, { out });
+        };
+        op_rows_absorb = project("absorb", r.q, r.q_latent);
+        op_rows_attn =
+            rw(b,
+               RAD_OP(b, "mla_attn",
+                      RAD_PARAMS(RAD_RANGE("M", 1, R), RAD_INT("latent_dim", 512),
+                                 RAD_INT("heads", 64), RAD_INT("blocks", core.c.blocks),
+                                 RAD_INT("block_size", 4), RAD_F64("scale", 1.0 / std::sqrt(256.0)),
+                                 RAD_STR("dtype", "bf16")),
+                      RAD_NOWEIGHTS),
+               { r.q_latent, w.core.selected, w.core.length }, { r.attn_latent });
+        op_rows_expand = project("expand", r.attn_latent, r.attn.x);
+        RAD_ARCH_TRY(rows_quant.declare(b, g, r.attn, 16384));
+        if (r.slices) {
+            RAD_ARCH_TRY(declare_o_slices(b, nm, prefix, R));
+        } else {
+            rows_output.stored = nm.f("blk.%d.attn_output.weight", layer);
+            RAD_ARCH_TRY(rows_output.declare(b, nm, g, nm.f("blk.%d.attn_output_rows", layer),
+                                             4096, 16384, RAD_SHARD_NONE, wg,
+                                             { nm.ckpt("%s.o_proj.weight", prefix) }, r.attn,
+                                             r.out, R));
+        }
+        op_rows_gather = rw(b,
+                            RAD_OP(b, "all_gather",
+                                   RAD_PARAMS(RAD_INT("world_size", g.world),
+                                              RAD_RANGE("numel", 4096, g.max_tok * 4096),
+                                              RAD_STR("dtype", "bf16")),
+                                   RAD_NOWEIGHTS),
+                            { r.out }, { w.out });
+        return op_rows_absorb && op_rows_attn && op_rows_expand && op_rows_gather ? RAD_OK
+                                                                                   : RAD_E_INVAL;
+    }
+    /* The test form of o: slice k is the head form's rank k slice of the stored weight's columns,
+     * a GEMM over the matching columns of the quantised input. */
+    int declare_o_slices(RadBuilder* b, Names& nm, const char* prefix, int64_t R) {
+        const auto& r = w.rows;
+        if (!r.acc || !r.widened) return RAD_E_INVAL;
+        const int64_t K = 16384 / g.world;
+        rows_o_slices.assign((size_t)g.world, LinearFP8{});
+        for (int k = 0; k < g.world; ++k) {
+            auto& lin = rows_o_slices[(size_t)k];
+            lin.stored = nm.f("blk.%d.attn_output.weight", layer);
+            RAD_ARCH_TRY(lin.declare(b, nm, g, nm.f("blk.%d.attn_output_rows%d", layer, k), 4096,
+                                     K, RAD_SHARD_COL, grp_layer(layer),
+                                     { nm.ckpt("%s.o_proj.weight", prefix) }, r.attn, r.slices, R,
+                                     {}, k * K, (k + 1) * K));
+        }
+        auto cast = [&](const char* from, const char* to, rad_buf x, rad_buf y) {
+            return rw(b,
+                      RAD_OP(b, "cast",
+                             RAD_PARAMS(RAD_RANGE("M", 1, R), RAD_INT("n", 4096),
+                                        RAD_STR("from", from), RAD_STR("to", to)),
+                             RAD_NOWEIGHTS),
+                      { x }, { y });
+        };
+        op_slice_first = cast("bf16", "f32", r.slices, r.acc);
+        op_slice_widen = cast("bf16", "f32", r.slices, r.widened);
+        op_slice_add = rw(b,
+                          RAD_OP(b, "add",
+                                 RAD_PARAMS(RAD_RANGE("M", 1, R), RAD_INT("n", 4096),
+                                            RAD_STR("dtype", "f32")),
+                                 RAD_NOWEIGHTS),
+                          { r.acc, r.widened }, { r.acc });
+        op_slice_narrow = cast("f32", "bf16", r.acc, r.out);
+        return op_slice_first && op_slice_widen && op_slice_add && op_slice_narrow ? RAD_OK
+                                                                                   : RAD_E_INVAL;
+    }
+    void step_o_slices(RadCtx* ctx, int64_t run, int64_t n) const {
+        const auto& r = w.rows;
+        const int64_t K = 16384 / g.world, G = K / RAD_FP8_BLOCK;
+        for (int k = 0; k < g.world; ++k) {
+            const auto& lin = rows_o_slices[(size_t)k];
+            RAD_ISSUE_N(ctx, lin.op, n, bcol(r.attn.q, k * K, K, n), bcol(r.attn.s, k * G, G, n),
+                        RAD_W(lin.w), RAD_W(lin.ws), brow_slice(r.slices, k * run, n, 4096),
+                        RAD_NONE, RAD_NONE);
+        }
+        RAD_ISSUE_N(ctx, op_slice_first, n, brow_slice(r.slices, 0, n, 4096), brows(r.acc, n));
+        for (int k = 1; k < g.world; ++k) {
+            RAD_ISSUE_N(ctx, op_slice_widen, n, brow_slice(r.slices, k * run, n, 4096),
+                        brows(r.widened, n));
+            RAD_ISSUE_N(ctx, op_slice_add, n, brows(r.acc, n), brows(r.widened, n),
+                        brows(r.acc, n));
+        }
+        RAD_ISSUE_N(ctx, op_slice_narrow, n, brows(r.acc, n), brows(r.out, n));
+    }
+    /* From the TP split threshold, and while the last rank's run is not empty (always at that
+     * threshold for up to 8 ranks); the same answer on every rank, as the gather needs. */
+    bool rows_take(int64_t T) const {
+        return op_rows_gather && GlmTp::splits(T, g.world) &&
+               (g.world - 1) * rows_for(T, g.world) < T;
     }
     void prepare(RadCtx* ctx, const RadBatch* batch) const {
         const auto* kb = kv_batch(batch, kv);
@@ -173,16 +329,41 @@ struct GlmMla {
         kv_a.step(ctx, w.input, w.kv_raw, T);
         q_norm.step(ctx, T);
         RAD_ISSUE_N(ctx, op_kv_norm, T, brows(w.kv_raw, T), RAD_W(kv_gain), brows(w.latent, T));
-        q_b.step(ctx, w.q_low, w.core.q, T);
+        if (!rows_take(T)) q_b.step(ctx, w.q_low, w.core.q, T);
         RAD_ISSUE_N(ctx, op_store, T, bcol(w.latent, 0, 256, T), bcol(w.latent, 256, 256, T),
                     praw(kb->slot_mapping, RAD_I32, T), kv_cache(kv, layer));
     }
     void finish(RadCtx* ctx, const RadBatch* batch) const {
         const int64_t T = batch->n_tok;
+        if (rows_take(T)) {
+            finish_rows(ctx, T);
+            return;
+        }
         core.step(ctx, T);
         attn_quant.step(ctx, T);
         output.step(ctx, w.attn, w.out, T);
         if (op_ar) RAD_ISSUE_N(ctx, op_ar, T * 4096, brows(w.out, T), RAD_NONE);
+    }
+    /* This rank's rows [first, first + n) end to end; the last rank's run may be short, and the
+     * gather sends its unwritten tail rows, which land past T. */
+    void finish_rows(RadCtx* ctx, int64_t T) const {
+        const auto& r = w.rows;
+        const GlmTp::Run run = GlmTp::run_of(T, g.world, g.rank, kOutRowBytes);
+        const int64_t first = run.first, n = run.rows;
+        rows_q_b.step(ctx, w.q_low, r.q, T, first, n, 0);
+        RAD_ISSUE_N(ctx, op_rows_absorb, n, brows(r.q, n), RAD_W(rows_kv_b), brows(r.q_latent, n));
+        RAD_ISSUE_N(ctx, op_rows_attn, n, brows(r.q_latent, n), kv_cache(kv, layer),
+                    brow_slice(w.core.selected, first, n, core.c.blocks),
+                    brow_slice(w.core.length, first, n, 1), brows(r.attn_latent, n));
+        RAD_ISSUE_N(ctx, op_rows_expand, n, brows(r.attn_latent, n), RAD_W(rows_kv_b),
+                    brows(r.attn.x, n));
+        rows_quant.step(ctx, n);
+        if (r.slices)
+            step_o_slices(ctx, run.run, n);
+        else
+            rows_output.step(ctx, r.attn, r.out, n);
+        RAD_ISSUE_N(ctx, op_rows_gather, run.run * 4096, brows(r.out, run.run),
+                    brows(w.out, g.world * run.run));
     }
 };
 }

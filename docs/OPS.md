@@ -2858,7 +2858,8 @@ through a lane swap instead of LDS. The next chunk's keys are fetched while the 
 multiplied. A row's output does not depend on the other rows of the batch, so a run of rows gives
 the bytes the whole batch would. Under 32 rows (a decode step at one rank) too few workgroups fill the card, and its launcher
 runs the matrix row's kernel instead. It also takes multiples of 32 heads (two groups a
-workgroup), which no constraint routes to it.
+workgroup), which no constraint routes to it. GLM-5.3 splits a prefill's MLA by rows under tensor
+parallelism, so each rank holds all 64 heads of its rows (ARCHITECTURES.md, `glm5next`).
 
 `mla_project` moves a query into the latent and a latent result out of it, through the bf16
 weight `b` `[heads*2*head_dim, latent_dim]` that stores each head's key rows, then its value rows.

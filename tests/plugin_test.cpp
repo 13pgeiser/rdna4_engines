@@ -1018,6 +1018,66 @@ TEST(libr4d_resolves_the_mla_attention_by_rows) {
     CHECK_EQ(band_names(r.build_bands("mla_attn", "M", 1, 512, g)), "512:mla_attn_matrix_bf16 ");
 }
 
+/* GLM-5.3-Flash's MLA split by rows at eight ranks (arch/common/rad_block_glm_mla.h), with the
+ * parameters its ops declare against the container's encodings (block fp8 at f32 scales): every
+ * band of every op the row form adds resolves on the device, up to a 4096-token step's run of
+ * 512 rows. A form libr4d does not serve would stop a TP8 start at "resolved to no kernel". */
+TEST(libr4d_resolves_every_band_of_glm_mla_split_by_rows) {
+    const std::string so = libr4d();
+    if (so.empty()) return;
+    Registry r;
+    CHECK(r.load_plugin(so, 0) >= 0);
+    r.set_device_fact(RAD_FACT_P2P, 1);
+    auto all_resolve = [&](const char* op, const char* ranged, int64_t lo, int64_t hi,
+                           const Geometry& g) {
+        const std::vector<Band> bands = r.build_bands(op, ranged, lo, hi, g);
+        bool ok = !bands.empty();
+        for (const Band& x : bands) ok = ok && x.dom[RAD_DOMAIN_DEVICE].row;
+        if (!ok) std::fprintf(stderr, "    %s: %s\n", op, band_names(bands).c_str());
+        return ok;
+    };
+    const int64_t R = 512;
+    for (const auto& [n, k] : { std::pair<int64_t, int64_t>{ 16384, 1536 }, { 4096, 16384 } }) {
+        Geometry g;
+        g.set_i("N", n);
+        g.set_i("K", k);
+        g.set_i("group", 128);
+        g.set_s("dtype", "fp8a8f32");
+        CHECK(all_resolve("gemm_nt_q", "M", 1, R, g));
+    }
+    for (const char* mode : { "absorb", "expand" }) {
+        Geometry g;
+        g.set_i("heads", 64);
+        g.set_i("head_dim", 256);
+        g.set_i("latent_dim", 512);
+        g.set_s("mode", mode);
+        g.set_s("dtype", "bf16");
+        CHECK(all_resolve("mla_project", "M", 1, R, g));
+    }
+    {
+        Geometry g;
+        g.set_i("latent_dim", 512);
+        g.set_i("heads", 64);
+        g.set_i("blocks", 513);
+        g.set_i("block_size", 4);
+        g.set_s("dtype", "bf16");
+        CHECK(all_resolve("mla_attn", "M", 1, R, g));
+    }
+    {
+        Geometry g;
+        g.set_i("n", 16384);
+        g.set_i("group", 128);
+        g.set_s("dtype", "bf16");
+        CHECK(all_resolve("quant_act_fp8", "M", 1, 4096, g));
+    }
+    {
+        Geometry g;
+        g.set_i("world_size", 8);
+        g.set_s("dtype", "bf16");
+        CHECK(all_resolve("all_gather", "numel", 4096, 4096 * 4096, g));
+    }
+}
+
 /* ================================================================== constraints that are not intervals */
 namespace {
 std::string extra_dir()   { return home() + "/testkernels/extra"; }

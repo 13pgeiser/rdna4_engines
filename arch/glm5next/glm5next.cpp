@@ -28,10 +28,26 @@
 #include <arch/rad_block_glm_vision.h>
 #include <arch/rad_block_mlp_fp8.h>
 #include <arch/rad_block_moe_fp8.h>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 
 namespace glm5next {
 using namespace rad::arch;
+
+/* The deployment switch of this plugin, read once a declare; docs/GUIDE.md lists it.
+ * RADIANCE_GLM_MLA_ROWS unset or 0 keeps the MLA's head form at every step size and declares none
+ * of the row form's full-width weights (1.29 GiB a card at eight ranks); 1 is the row form from
+ * GlmTp::kSplitRows; 2 is the row form with o summed as the head form sums it, a test of the two
+ * forms' difference (GlmMla::Form). The row form is opt-in: it is not bit-identical to the head
+ * form, and this model turns the rounding difference of a fraction of the attention outputs into
+ * a KL of 0.015 to 0.03 against it (docs/ARCHITECTURES.md). */
+static GlmMla::Form mla_form() {
+    const char* e = std::getenv("RADIANCE_GLM_MLA_ROWS");
+    if (e && !std::strcmp(e, "1")) return GlmMla::Form::rows;
+    if (e && !std::strcmp(e, "2")) return GlmMla::Form::rows_sliced_o;
+    return GlmMla::Form::heads;
+}
 
 struct Layer {
     bool full = false, draft = false;
@@ -46,6 +62,7 @@ struct Layer {
 struct Model {
     Names nm{};
     Geom g{};
+    GlmMla::Form form = GlmMla::Form::rows;
     std::vector<Layer> layers;
     rad_kvgroup latent = 0, index = 0, tail = 0, state = 0, conv = 0;
     /* The streams and the step's stream-wide buffers. */
@@ -102,7 +119,9 @@ static int stream_buffers(RadBuilder* b, Model& m) {
     m.h0 = decl_b(b, nm.f("manifold"), RAD_BF16, { T, 16384 });
     m.h1 = decl_b(b, nm.f("manifold_mid"), RAD_BF16, { T, 16384 });
     m.x = decl_b(b, nm.f("collapsed"), RAD_BF16, { T, 4096 });
-    m.y = decl_b(b, nm.f("attn_delta"), RAD_BF16, { T, 4096 });
+    /* Rounded up to whole runs: the MLA row form gathers every rank's run at full length. */
+    m.y = decl_b(b, nm.f("attn_delta"), RAD_BF16,
+                 { g.world * GlmMla::rows_for(T, g.world), 4096 });
     m.post = decl_b(b, nm.f("post"), RAD_F32, { T, 4 });
     m.comb = decl_b(b, nm.f("mix"), RAD_F32, { T, 16 });
     m.act.x = decl_b(b, nm.f("normalized"), RAD_BF16, { T, 4096 });
@@ -132,9 +151,9 @@ static int kda_buffers(RadBuilder* b, Model& m) {
     kw.core.out = bf("recurrent_out", W);
     return RAD_OK;
 }
-/* The head form's buffers, then the selection planes the indexer writes and the MLA reads. Under
- * TP the selection planes hold every rank's run of rows, which can reach past the step
- * (DsaCache::part_rows). */
+/* The head form's buffers, then the selection planes the indexer writes and the MLA reads, then
+ * the row form's (Model::form). Under TP the selection planes hold every rank's run of rows,
+ * which can reach past the step (DsaCache::part_rows). */
 static int mla_buffers(RadBuilder* b, Model& m) {
     auto& g = m.g;
     auto& nm = m.nm;
@@ -160,6 +179,21 @@ static int mla_buffers(RadBuilder* b, Model& m) {
     const int64_t TQ = g.world > 1 ? std::max(T, g.world * part) : T;
     aw.core.selected = decl_b(b, nm.f("selected"), RAD_I32, { TQ, 513 });
     aw.core.length = decl_b(b, nm.f("length"), RAD_I32, { TQ });
+    if (g.world > 1 && m.form != GlmMla::Form::heads) {
+        auto& rows = aw.rows;
+        const int64_t R = GlmMla::rows_for(T, g.world);
+        rows.q = decl_b(b, nm.f("rows_query"), RAD_BF16, { R, 16384 });
+        rows.q_latent = decl_b(b, nm.f("rows_q_latent"), RAD_BF16, { R, 64, 512 });
+        rows.attn_latent = decl_b(b, nm.f("rows_attn_latent"), RAD_BF16, { R, 64, 512 });
+        rows.attn.x = decl_b(b, nm.f("rows_expanded"), RAD_BF16, { R, 16384 });
+        RAD_ARCH_TRY(rows.attn.declare_qs(b, nm, g, "rows_expanded", 16384, R));
+        rows.out = decl_b(b, nm.f("rows_out"), RAD_BF16, { R, 4096 });
+        if (m.form == GlmMla::Form::rows_sliced_o) {
+            rows.slices = decl_b(b, nm.f("rows_o_slices"), RAD_BF16, { g.world * R, 4096 });
+            rows.acc = decl_b(b, nm.f("rows_o_sum"), RAD_F32, { R, 4096 });
+            rows.widened = decl_b(b, nm.f("rows_o_slice_f32"), RAD_F32, { R, 4096 });
+        }
+    }
     return RAD_OK;
 }
 static int indexer_buffers(RadBuilder* b, Model& m) {
@@ -292,7 +326,10 @@ static int layer(RadBuilder* b, Model& m, Layer& lay, Names& nm, int l, bool dra
         decl_w(b, nn, RAD_F32, { 4096 }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
     RAD_ARCH_TRY(lay.norm.declare(b, g, gain, input, m.act, 4096));
     if (lay.full) {
-        RAD_ARCH_TRY(lay.mla.declare(b, nm, g, l, m.aw, ap, m.latent, true, true));
+        // The MTP layer keeps the head form: its row form would cost another 126 MB a card.
+        auto aw = m.aw;
+        if (draft) aw.rows = {};
+        RAD_ARCH_TRY(lay.mla.declare(b, nm, g, l, aw, ap, m.latent, true, true));
         DsaCache::Config c;
         c.blocks = (g.max_ctx + 3) / 4 + 1;
         c.work = (g.max_tok + 3) / 4 + g.max_seqs;
@@ -398,6 +435,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     auto& g = m.g;
     m.nm = Names(ctx->scope);
     auto& nm = m.nm;
+    m.form = mla_form();
     RAD_ARCH_TRY(geometry(g, meta, ctx, world));
     RAD_ARCH_TRY(stream_buffers(b, m));
     RAD_ARCH_TRY(kda_buffers(b, m));

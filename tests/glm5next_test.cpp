@@ -331,9 +331,301 @@ TEST(absorbed_mla_shards_complete_heads_and_reads_one_latent_cache) {
     }
 }
 
+/* GLM's MLA from the TP split threshold: each rank runs its run of the step's rows with all 64
+ * heads, through q_b, kv_b and o at full width, and an all_gather lays the runs out, instead of
+ * its heads over every row and an all-reduce. Runs are ceil(T / world) rows, the last one short;
+ * the gather sends whole runs into an output of world runs. Below the threshold, and at TP1, the
+ * head form is unchanged, as it is unless the row form is opted into (the default). */
+TEST(glm_mla_splits_a_prefill_by_rows_over_ranks_from_the_row_threshold) {
+    using namespace rad::arch;
+    for (int world : { 1, 2, 4, 8 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuilder b;
+            b.kv_block = 4;
+            // The container's MLA entries; the row form's names are not among them.
+            const auto fp8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 128, 128);
+            b.encs = { { "attn_q_a.weight", fp8 },
+                       { "attn_kv_a.weight", fp8 },
+                       { "attn_q_b.weight", fp8 },
+                       { "attn_output.weight", fp8 },
+                       { "attn_kv_b.weight", rad_enc_plain(RAD_BF16) } };
+            Names nm("");
+            Geom g{};
+            g.n_embd = 4096;
+            g.max_tok = 512;
+            g.max_ctx = 4096;
+            g.eps = 1e-5;
+            g.world = world;
+            g.rank = rank;
+            RadKVGroupDecl kd{};
+            kd.kind = RAD_KV_FULL;
+            kd.dtype = RAD_BF16;
+            kd.n_head_kv = 1;
+            kd.head_dim = 256;
+            const rad_kvgroup kv = rad_decl_kv_group(&b, "latent", &kd);
+            const int64_t T = 512, R = GlmMla::rows_for(T, world), H = 64 / world;
+            auto act = [&](ActFP8& a, const char* name, int64_t rows, int64_t width) {
+                a.x = decl_b(&b, name, RAD_BF16, { rows, width });
+                return a.declare_qs(&b, nm, g, name, width, rows);
+            };
+            GlmMla::Wire w;
+            REQUIRE_EQ(act(w.input, "normalized", T, 4096), RAD_OK);
+            w.q_raw = decl_b(&b, "q_raw", RAD_BF16, { T, 1536 });
+            w.kv_raw = decl_b(&b, "kv_raw", RAD_BF16, { T, 512 });
+            REQUIRE_EQ(act(w.q_low, "q_low", T, 1536), RAD_OK);
+            w.latent = decl_b(&b, "latent", RAD_BF16, { T, 512 });
+            w.out = decl_b(&b, "attn_delta", RAD_BF16, { world * R, 4096 });
+            w.core.q = decl_b(&b, "query", RAD_BF16, { T, 16384 / world });
+            w.core.q_latent = decl_b(&b, "q_latent", RAD_BF16, { T, H, 512 });
+            w.core.attn_latent = decl_b(&b, "attn_latent", RAD_BF16, { T, H, 512 });
+            REQUIRE_EQ(act(w.attn, "expanded", T, 16384 / world), RAD_OK);
+            w.core.out = w.attn.x;
+            w.core.selected = decl_b(&b, "selected", RAD_I32, { T, 513 });
+            w.core.length = decl_b(&b, "length", RAD_I32, { T });
+            w.rows.q = decl_b(&b, "rows_query", RAD_BF16, { R, 16384 });
+            w.rows.q_latent = decl_b(&b, "rows_q_latent", RAD_BF16, { R, 64, 512 });
+            w.rows.attn_latent = decl_b(&b, "rows_attn_latent", RAD_BF16, { R, 64, 512 });
+            REQUIRE_EQ(act(w.rows.attn, "rows_expanded", R, 16384), RAD_OK);
+            w.rows.out = decl_b(&b, "rows_out", RAD_BF16, { R, 4096 });
+            GlmMla mla;
+            REQUIRE_EQ(mla.declare(&b, nm, g, 3, w, "model.layers.3.self_attn", kv), RAD_OK);
+            const bool rows = world > 1;
+            CHECK_EQ(mla.op_rows_gather != 0, rows);
+            CHECK_EQ(count_op(b, "all_gather"), rows ? 1 : 0);
+            CHECK_EQ(count_op(b, "mla_attn"), rows ? 2 : 1);
+            const RecWeight* head_q = find_w(b, "blk.3.attn_q_b.weight");
+            REQUIRE(head_q);
+            CHECK_EQ(head_q->d.shape[0], 16384 / world);
+            if (!rows) {
+                CHECK(!find_w(b, "blk.3.attn_q_b_rows.weight"));
+                continue;
+            }
+            const RecWeight* q_b = find_w(b, "blk.3.attn_q_b_rows.weight");
+            const RecWeight* kv_b = find_w(b, "blk.3.attn_kv_b_rows.weight");
+            const RecWeight* o = find_w(b, "blk.3.attn_output_rows.weight");
+            REQUIRE(q_b && kv_b && o);
+            CHECK_EQ(q_b->d.shard, RAD_SHARD_NONE);
+            CHECK_EQ(q_b->d.shape[0], 16384);
+            CHECK_EQ(q_b->d.shape[1], 1536);
+            CHECK_EQ(kv_b->d.shard, RAD_SHARD_NONE);
+            CHECK_EQ(kv_b->d.dtype, RAD_BF16);
+            CHECK_EQ(kv_b->d.shape[0], 32768);
+            CHECK_EQ(kv_b->d.shape[1], 512);
+            CHECK_EQ(o->d.shard, RAD_SHARD_NONE);
+            CHECK_EQ(o->d.shape[0], 4096);
+            CHECK_EQ(o->d.shape[1], 16384);
+            // The full-width weights are whole views of the head form's container entries, so
+            // they take its encoding (block fp8 at f32 scales) and need no name map of their own.
+            const auto source = [](const RecWeight* w) {
+                return std::string(w && w->d.source ? w->d.source : "");
+            };
+            CHECK_EQ(source(q_b), "blk.3.attn_q_b.weight");
+            CHECK_EQ(source(find_w(b, "blk.3.attn_q_b_rows.scale")), "blk.3.attn_q_b.weight");
+            CHECK_EQ(source(kv_b), "blk.3.attn_kv_b.weight");
+            CHECK_EQ(source(o), "blk.3.attn_output.weight");
+            CHECK_EQ(source(find_w(b, "blk.3.attn_output_rows.scale")), "blk.3.attn_output.weight");
+            CHECK_EQ(find_w(b, "blk.3.attn_q_b_rows.scale")->d.dtype, RAD_F32);
+            for (const auto& map : b.maps) CHECK(map.declared.find("_rows") == std::string::npos);
+            CHECK_EQ(pstr(&b.ops[mla.rows_q_b.op - 1], "dtype"), "fp8a8f32");
+            CHECK_EQ(pstr(&b.ops[mla.rows_output.op - 1], "dtype"), "fp8a8f32");
+            CHECK_EQ(pstr(&b.ops[mla.q_b.op - 1], "dtype"), "fp8a8f32");
+            const RecOp* attn = &b.ops[mla.op_rows_attn - 1];
+            CHECK_EQ(pint(attn, "heads"), 64);
+            CHECK_EQ(pint(attn, "blocks"), 513);
+            CHECK_EQ(param(attn, "M")->ihi, R);
+            CHECK(attn->reads ==
+                  std::vector<rad_buf>({ w.rows.q_latent, w.core.selected, w.core.length }));
+            const RecOp* gather = &b.ops[mla.op_rows_gather - 1];
+            const RecOp* reduce = &b.ops[mla.op_ar - 1];
+            CHECK_EQ(pint(gather, "world_size"), world);
+            CHECK_EQ(pstr(gather, "dtype"), "bf16");
+            CHECK(!param(gather, "row"));
+            // The all-reduce's message bound, so the two share one exchange instance.
+            CHECK_EQ(param(gather, "numel")->ihi, param(reduce, "numel")->ihi);
+            CHECK(gather->reads == std::vector<rad_buf>({ w.rows.out }));
+            CHECK(gather->writes == std::vector<rad_buf>({ w.out }));
+            std::vector<int32_t> slots(T);
+            RadKVGroupBatch kb{};
+            kb.group = kv;
+            kb.slot_mapping = slots.data();
+            RadBatch batch{};
+            batch.kv = &kb;
+            batch.n_kv_groups = 1;
+            for (int64_t steps : { 300, 255 }) {
+                batch.n_tok = steps;
+                RadCtx ctx;
+                ctx.b = &b;
+                ctx.rank = rank;
+                ctx.world = world;
+                mla.prepare(&ctx, &batch);
+                mla.finish(&ctx, &batch);
+                CHECK(ctx.step_fail.empty());
+                auto issued = [&](rad_op op) {
+                    return std::count_if(ctx.issues.begin(), ctx.issues.end(),
+                                         [&](const RecIssue& i) { return i.op == op; });
+                };
+                const bool split = steps >= GlmTp::kSplitRows;
+                CHECK_EQ(issued(mla.q_b.op), split ? 0 : 1);
+                CHECK_EQ(issued(mla.core.op_attn), split ? 0 : 1);
+                CHECK_EQ(issued(mla.op_ar), split ? 0 : 1);
+                CHECK_EQ(issued(mla.op_rows_attn), split ? 1 : 0);
+                CHECK_EQ(issued(mla.op_rows_gather), split ? 1 : 0);
+                if (!split) continue;
+                const int64_t run = (steps + world - 1) / world, first = rank * run,
+                              n = std::min(run, steps - first);
+                for (const auto& i : ctx.issues) {
+                    if (i.op == mla.rows_q_b.op) {
+                        CHECK_EQ(i.n, n);
+                        CHECK_EQ(i.opd[0].handle, w.q_low.q);
+                        CHECK_EQ(i.opd[0].offset, first * 1536);
+                        CHECK_EQ(i.opd[0].rows, n);
+                        CHECK_EQ(i.opd[2].handle, mla.rows_q_b.w);
+                        CHECK_EQ(i.opd[4].handle, w.rows.q);
+                        CHECK_EQ(i.opd[4].offset, 0);
+                        CHECK_EQ(i.opd[4].rows, n);
+                    } else if (i.op == mla.op_rows_attn) {
+                        CHECK_EQ(i.n, n);
+                        CHECK_EQ(i.opd[1].kind, RAD_OPK_KV);
+                        CHECK_EQ(i.opd[2].handle, w.core.selected);
+                        CHECK_EQ(i.opd[2].offset, first * 513);
+                        CHECK_EQ(i.opd[2].rows, n);
+                        CHECK_EQ(i.opd[3].handle, w.core.length);
+                        CHECK_EQ(i.opd[3].offset, first);
+                        CHECK_EQ(i.opd[3].rows, n);
+                        CHECK_EQ(i.opd[4].handle, w.rows.attn_latent);
+                    } else if (i.op == mla.rows_output.op) {
+                        CHECK_EQ(i.n, n);
+                        CHECK_EQ(i.opd[2].handle, mla.rows_output.w);
+                        CHECK_EQ(i.opd[4].handle, w.rows.out);
+                        CHECK_EQ(i.opd[4].offset, 0);
+                    } else if (i.op == mla.op_rows_gather) {
+                        CHECK_EQ(i.n, run * 4096);
+                        CHECK_EQ(i.opd[0].handle, w.rows.out);
+                        CHECK_EQ(i.opd[0].rows, run);
+                        CHECK_EQ(i.opd[1].handle, w.out);
+                        CHECK_EQ(i.opd[1].rows, world * run);
+                    }
+                }
+                // Eight ranks at 300 rows: runs of 38, the last 34.
+                if (world == 8) CHECK_EQ(n, rank == 7 ? 34 : 38);
+            }
+        }
+}
+
+/* RADIANCE_GLM_MLA_ROWS=2, a test form: the row form's o as the head form computes it, eight
+ * column slices of the stored weight (each rank's), each GEMM rounded to bf16, then widened and
+ * added in f32 in ascending slice order and rounded once, as the exact all-reduce folds. */
+TEST(glm_mla_row_form_can_sum_o_as_the_head_form_does) {
+    using namespace rad::arch;
+    const int world = 8, rank = 3;
+    RadBuilder b;
+    b.kv_block = 4;
+    // The container's MLA entries; the row form's names are not among them.
+    const auto fp8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 128, 128);
+    b.encs = { { "attn_q_a.weight", fp8 },
+               { "attn_kv_a.weight", fp8 },
+               { "attn_q_b.weight", fp8 },
+               { "attn_output.weight", fp8 },
+               { "attn_kv_b.weight", rad_enc_plain(RAD_BF16) } };
+    Names nm("");
+    Geom g{};
+    g.n_embd = 4096;
+    g.max_tok = 512;
+    g.max_ctx = 4096;
+    g.eps = 1e-5;
+    g.world = world;
+    g.rank = rank;
+    RadKVGroupDecl kd{};
+    kd.kind = RAD_KV_FULL;
+    kd.dtype = RAD_BF16;
+    kd.n_head_kv = 1;
+    kd.head_dim = 256;
+    const rad_kvgroup kv = rad_decl_kv_group(&b, "latent", &kd);
+    const int64_t T = 512, R = GlmMla::rows_for(T, world), H = 64 / world;
+    auto act = [&](ActFP8& a, const char* name, int64_t rows, int64_t width) {
+        a.x = decl_b(&b, name, RAD_BF16, { rows, width });
+        return a.declare_qs(&b, nm, g, name, width, rows);
+    };
+    GlmMla::Wire w;
+    REQUIRE_EQ(act(w.input, "normalized", T, 4096), RAD_OK);
+    w.q_raw = decl_b(&b, "q_raw", RAD_BF16, { T, 1536 });
+    w.kv_raw = decl_b(&b, "kv_raw", RAD_BF16, { T, 512 });
+    REQUIRE_EQ(act(w.q_low, "q_low", T, 1536), RAD_OK);
+    w.latent = decl_b(&b, "latent", RAD_BF16, { T, 512 });
+    w.out = decl_b(&b, "attn_delta", RAD_BF16, { world * R, 4096 });
+    w.core.q = decl_b(&b, "query", RAD_BF16, { T, 16384 / world });
+    w.core.q_latent = decl_b(&b, "q_latent", RAD_BF16, { T, H, 512 });
+    w.core.attn_latent = decl_b(&b, "attn_latent", RAD_BF16, { T, H, 512 });
+    REQUIRE_EQ(act(w.attn, "expanded", T, 16384 / world), RAD_OK);
+    w.core.out = w.attn.x;
+    w.core.selected = decl_b(&b, "selected", RAD_I32, { T, 513 });
+    w.core.length = decl_b(&b, "length", RAD_I32, { T });
+    w.rows.q = decl_b(&b, "rows_query", RAD_BF16, { R, 16384 });
+    w.rows.q_latent = decl_b(&b, "rows_q_latent", RAD_BF16, { R, 64, 512 });
+    w.rows.attn_latent = decl_b(&b, "rows_attn_latent", RAD_BF16, { R, 64, 512 });
+    REQUIRE_EQ(act(w.rows.attn, "rows_expanded", R, 16384), RAD_OK);
+    w.rows.out = decl_b(&b, "rows_out", RAD_BF16, { R, 4096 });
+    w.rows.slices = decl_b(&b, "rows_o_slices", RAD_BF16, { world * R, 4096 });
+    w.rows.acc = decl_b(&b, "rows_o_sum", RAD_F32, { R, 4096 });
+    w.rows.widened = decl_b(&b, "rows_o_slice_f32", RAD_F32, { R, 4096 });
+    GlmMla mla;
+    REQUIRE_EQ(mla.declare(&b, nm, g, 3, w, "model.layers.3.self_attn", kv), RAD_OK);
+    REQUIRE_EQ(mla.rows_o_slices.size(), (size_t)8);
+    CHECK(!find_w(b, "blk.3.attn_output_rows.weight"));
+    for (int k = 0; k < 8; ++k) {
+        const RecWeight* w = find_w(b, "blk.3.attn_output_rows" + std::to_string(k) + ".weight");
+        REQUIRE(w);
+        CHECK_EQ(w->d.shard, RAD_SHARD_COL);
+        CHECK_EQ(w->d.shape[1], 2048);
+        CHECK(w->span_set);
+        CHECK_EQ(w->span_lo, k * 2048);
+        CHECK_EQ(w->span_hi, (k + 1) * 2048);
+        CHECK_EQ(std::string(w->d.source), "blk.3.attn_output.weight");
+    }
+    std::vector<int32_t> slots(300);
+    RadKVGroupBatch kb{};
+    kb.group = kv;
+    kb.slot_mapping = slots.data();
+    RadBatch batch{};
+    batch.kv = &kb;
+    batch.n_kv_groups = 1;
+    batch.n_tok = 300;
+    RadCtx ctx;
+    ctx.b = &b;
+    ctx.rank = 3;
+    ctx.world = 8;
+    mla.finish_rows(&ctx, 300);
+    std::vector<rad_op> order;
+    for (const auto& i : ctx.issues) order.push_back(i.op);
+    const int64_t run = 38;
+    int gemm = 0, adds = 0;
+    for (const auto& i : ctx.issues) {
+        for (int k = 0; k < 8; ++k)
+            if (i.op == mla.rows_o_slices[(size_t)k].op) {
+                ++gemm;
+                CHECK_EQ(i.opd[0].offset, k * 2048);
+                CHECK_EQ(i.opd[0].cols, 2048);
+                CHECK_EQ(i.opd[1].offset, k * 16);
+                CHECK_EQ(i.opd[1].cols, 16);
+                CHECK_EQ(i.opd[4].offset, k * run * 4096);
+                CHECK_EQ(i.opd[4].rows, run);
+            }
+        adds += i.op == mla.op_slice_add;
+    }
+    CHECK_EQ(gemm, 8);
+    CHECK_EQ(adds, 7);
+    CHECK_EQ(ctx.issues.back().op, mla.op_rows_gather);
+    CHECK_EQ(ctx.issues[ctx.issues.size() - 2].op, mla.op_slice_narrow);
+}
+
 TEST(
     glm53_native_graph_declares_all_layers_preserves_mixed_formats_and_runs_mtp_only_in_draft_passes) {
     using namespace rad::arch;
+    // With the row form opted into; unset again however the case leaves.
+    struct RowsOn {
+        RowsOn() { setenv("RADIANCE_GLM_MLA_ROWS", "1", 1); }
+        ~RowsOn() { unsetenv("RADIANCE_GLM_MLA_ROWS"); }
+    } rows_on;
     const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
                            "index_topk" };
     const char* vals[] = { "1", "4", "288", "2048" };
@@ -433,9 +725,10 @@ TEST(
             CHECK_EQ(std::count(ops.begin(), ops.end(), "all_gather"), 0);
             // The split is declared on every rank whatever its step size; only rank 0 issues it here.
             const bool split = world > 1;
-            // 43 routers (MTP included), the 90 mHC reads, and each of the 12 indexers' page
-            // tables and lengths; the index head gates follow the indexer's rows, ungathered.
-            CHECK_EQ(count_op(b, "all_gather"), split ? 43 + 90 + 24 : 0);
+            // 43 routers (MTP included), the 90 mHC reads, each of the 12 indexers' page
+            // tables and lengths (the index head gates follow the indexer's rows,
+            // ungathered), and the 11 MLA row forms (the MTP layer keeps its heads).
+            CHECK_EQ(count_op(b, "all_gather"), split ? 43 + 90 + 24 + 11 : 0);
             CHECK_EQ(count_op(b, "mhc_pre_partial"), split ? 90 : 0);
             ctx.issues.clear();
             batch.draft_pass = -1;
@@ -482,12 +775,17 @@ TEST(
                 CHECK(ctx.step_fail.empty());
                 {
                     // 512 rows reach the split: each router runs on its column slice, each mHC
-                    // read on its chunks and each indexer, its head gates included, on its run
-                    // of query rows, all gathered but the gates; at TP1 nothing changes.
+                    // read on its chunks, each indexer, its head gates included, on its run
+                    // of query rows, and each MLA on its run of rows, all gathered but the
+                    // gates; at TP1 nothing changes.
                     const auto long_ops = issued_ops(b, ctx);
                     CHECK_EQ(std::count(long_ops.begin(), long_ops.end(), "gemm_nt_f32"), 53);
                     CHECK_EQ(std::count(long_ops.begin(), long_ops.end(), "all_gather"),
-                             world > 1 ? 42 + 90 + 22 : 0);
+                             world > 1 ? 42 + 90 + 22 + 11 : 0);
+                    // 1 embedding, 45 attention and 45 expert reductions, less the 11 MLA ones.
+                    CHECK_EQ(std::count(long_ops.begin(), long_ops.end(), "all_reduce"),
+                             world > 1 ? 91 - 11 : 0);
+                    CHECK_EQ(std::count(long_ops.begin(), long_ops.end(), "mla_attn"), 11);
                     CHECK_EQ(std::count(long_ops.begin(), long_ops.end(), "mhc_pre"),
                              world > 1 ? 0 : 90);
                     CHECK_EQ(std::count(long_ops.begin(), long_ops.end(), "mhc_pre_finish"),
@@ -551,6 +849,10 @@ TEST(
         }
 }
 
+/* The engine's arena levels declare again at a smaller max_tok (RadBuildCtx::shape_probe) and
+ * must get the real declare's graph: the same ops with the same fixed parameters, only ranged row
+ * counts and buffer rows smaller. The TP split declares its ops whatever the step size and its
+ * gathers' message as a range. */
 /* From the split threshold each rank scores its run of the step's query rows (rows past the step
  * included, which score -inf) and selects for the rows of it that exist, against the bounds the
  * scorer rebased to the run's first row; two all_gathers join the runs' page tables and lengths
@@ -722,10 +1024,6 @@ TEST(glm53_indexer_scores_and_selects_one_run_of_query_rows_per_rank) {
         }
 }
 
-/* The engine's arena levels declare again at a smaller max_tok (RadBuildCtx::shape_probe) and
- * must get the real declare's graph: the same ops with the same fixed parameters, only ranged row
- * counts and buffer rows smaller. The TP split declares its ops whatever the step size and its
- * gathers' message as a range. */
 TEST(glm53_sizing_declares_match_the_real_graph_at_every_arena_level) {
     const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
                            "index_topk" };
@@ -1338,6 +1636,7 @@ TEST(kda_state_core_splits_mixed_batches_and_preserves_absolute_prefill_offsets)
 
 /* GLM declares and steps the pinned graph and launches at one and eight ranks: a 4096-row prefill
  * after history, a mixed step, a decode step, a verify and its draft passes. */
+
 TEST(glm53_is_the_pinned_graph_and_steps) {
     const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
                            "index_topk" };
@@ -1355,10 +1654,16 @@ TEST(glm53_is_the_pinned_graph_and_steps) {
     struct Case {
         int world;
         uint64_t graph, steps;
+        bool heads_only = false;   /* the default: the graph before the row form */
     };
     const Case cases[] = { { 1, 0x906897570034f5f5ull, 0x68ffc03d2b640d51ull },
-                           { 8, 0x9f39f6f7a04dc4d3ull, 0x3818eedb4ac10d1bull } };
+                           { 8, 0x1d378152c40f8834ull, 0x82ed1094dbf4b637ull },
+                           { 8, 0x9f39f6f7a04dc4d3ull, 0x3818eedb4ac10d1bull, true } };
     for (const Case& cs : cases) {
+        if (cs.heads_only)
+            unsetenv("RADIANCE_GLM_MLA_ROWS");
+        else
+            setenv("RADIANCE_GLM_MLA_ROWS", "1", 1);
         RadBuilder b;
         b.kv_block = 4;
         b.encs = { { "mtp.blk.45.ffn_gate_up_exps", fp8 },
@@ -1376,11 +1681,13 @@ TEST(glm53_is_the_pinned_graph_and_steps) {
         REQUIRE_EQ(glm5next::declare(&b, &meta, &ctx), RAD_OK);
         const uint64_t g = graph_hash(b);
         const uint64_t s = pinned_steps(b, glm5next::step, 0, cs.world);
-        fprintf(stderr, "    pin: glm5next world %d: graph 0x%016llxull, steps 0x%016llxull\n",
-                cs.world, (unsigned long long)g, (unsigned long long)s);
+        fprintf(stderr, "    pin: glm5next world %d%s: graph 0x%016llxull, steps 0x%016llxull\n",
+                cs.world, cs.heads_only ? " heads only" : "",
+                (unsigned long long)g, (unsigned long long)s);
         CHECK_EQ(g, cs.graph);
         CHECK_EQ(s, cs.steps);
     }
+    unsetenv("RADIANCE_GLM_MLA_ROWS");
 }
 
 /* ==================================================================== GLM-5.3's vision tower */
@@ -1766,13 +2073,13 @@ RAD_TEST_MAIN()
 
 /* ==================================================================== the row rule */
 
-/* GlmTp::run_rows is the one rule the indexer's runs follow, and it is the formula it replaced:
- * 4 * ceil(T / (4 * world)) for the indexer's 4-byte lengths, ceil(T / world) for a row of whole
- * 16-byte words. At the split threshold, around a chunk and at the largest step, for every
- * world: run_of covers the step once with no overlap, the last run short where the step ends
- * inside it, and a rank whose run lies wholly past a small step takes the first run instead, so
- * the planes it writes and gathers are never unwritten. */
-TEST(glm_tp_row_rule_is_the_old_formula_and_covers_a_step_once) {
+/* GlmTp::run_rows is the one rule the MLA's and the indexer's runs follow, and it is the two
+ * formulas it replaced: ceil(T / world) for the MLA's 8192-byte rows, 4 * ceil(T / (4 * world))
+ * for the indexer's 4-byte lengths. At the split threshold, around a chunk and at the largest
+ * step, for every world: run_of covers the step once with no overlap, the last run short where
+ * the step ends inside it, and a rank whose run lies wholly past a small step takes the first
+ * run instead, so the planes it writes and gathers are never unwritten. */
+TEST(glm_tp_row_rule_is_the_two_old_formulas_and_covers_a_step_once) {
     using namespace rad::arch;
     for (int world : { 1, 2, 4, 8 })
         for (int64_t T : { 1, 5, 6, 48, 255, 256, 257, 300, 2047, 2048, 2049, 4096 }) {
@@ -1780,6 +2087,7 @@ TEST(glm_tp_row_rule_is_the_old_formula_and_covers_a_step_once) {
             const int64_t narrow = GlmTp::run_rows(T, world, 4);
             CHECK_EQ(wide, (T + world - 1) / world);
             CHECK_EQ(narrow, 4 * ((T + 4 * world - 1) / (4 * world)));
+            CHECK_EQ(GlmMla::rows_for(T, world), wide);
             CHECK_EQ(DsaCache::part_rows(T, world), narrow);
             CHECK(world * wide >= T);
             CHECK(world * narrow >= T);
@@ -2136,12 +2444,11 @@ std::string as_expert_zero(std::string n) {
 }  /* namespace */
 
 /* Every weight the plugin declares reads an entry the served container holds: under its own name,
- * or through `source` for a view (a scale plane), and every GEMM names the dtype its weight's
- * stored encoding calls for: `fp8a8f32` on the f32-scaled block FP8, `mxfp4a8` on the MXFP4
- * experts, `bf16` on the plain linears. The encodings come from the table, as the container would
- * answer. A weight declared under a name the container does not hold, or a GEMM at a dtype its
- * weight's encoding does not call for, passes every host test and leaves bands with no kernel at
- * the eight-card start. */
+ * or through `source` for a view (a scale plane, the row form's full-width projections), and
+ * every GEMM names the dtype its weight's stored encoding calls for: `fp8a8f32` on the f32-scaled
+ * block FP8, `mxfp4a8` on the MXFP4 experts, `bf16` on the plain linears. The encodings come
+ * from the table, as the container would answer. A full-width view declared as its own weight
+ * at `fp8a8` passed every host test and left 88 bands with no kernel at the eight-card start. */
 TEST(glm53_declares_the_served_containers_names_and_their_encodings) {
     const Glm53Container& c = glm53_container();
     MetaKV mk = glm53_vl_meta();
