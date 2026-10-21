@@ -556,11 +556,26 @@ for debug work on every encode. **Device-verified at 512²:** FL2VA 512×512 com
 survives, no band fault); host geom/video/ref2va/encoding tests green. Core ops are within their declared bands
 (a 1-frame 512 level plane is `0.235×` the 17·256² they're sized for).
 
-**Remaining fidelity gap (→ #10 / P6 bucket, not a function gap).** The pins-only path **skips `clip.tokenize`
-vision tokens** for the keyframe images (the TE-anchor tokens the reference would also feed), so a prompt that
-*contradicts* the pinned image can let the text win. Closing this = feed TE-anchor tokens for keyframe rows;
-that is a value-fidelity follow-up, and the earlier "no golden engine to diff against" limit applies to it.
-Chaining still also works independently via the ref_video slot0 path.
+**Was a remaining fidelity gap; now CLOSED (2026-10-21, task #52).** The pins-only path used to **skip
+`clip.tokenize` vision tokens** for the keyframe images (the TE-anchor tokens the reference would also feed),
+so a prompt that *contradicts* the pinned image could let the text win, and realistic I2VA/FL2VA output
+over-saturated/posterized (root cause of #37/#50, see memory `dasiwa-reference-ground-truth`). This is now
+shipped: an endpoint keyframe is fed the DiT on BOTH channels the reference uses — the VAE-latent pin AND a
+`<Picture k>` vision-tower anchor block interleaved into the text conditioning. Mechanism: `videos.cpp` now
+runs the media/`<Picture N>` block for keyframe requests (first_frame→`<Picture 1>`, last_frame→`<Picture 2>`),
+preparing each anchor through the SAME `mm::prepare`/`PromptMedia`/`mm_rows` tower path the reference images
+use (a second, independent encode of the keyframe — the tower sees the aspect-kept area-matched image, the
+pin sees the stretch/cover exact canvas), IN ADDITION to the `enc_pixels` pin at `videos.cpp:709-730`. The
+vision tower is optional: a container converted WITHOUT it still renders keyframes pin-only (`video_driver.cpp`
+tower guard now skips FIRST/LAST_FRAME; keyframes still require the VAE `encodes`). Host tests
+`fl2va_keyframes_feed_the_tower_and_pin_the_output_ends`, `fl2va_without_a_tower_pins_only` (videos_test) and
+`a_keyframe_completion_also_conditions_through_the_tower`, `a_keyframe_completion_needs_no_vision_tower`
+(video_gen_test) cover both channels and both tower-present/absent paths. The earlier "no golden engine to
+diff against" limit still bounds EXACT value-parity (→ #10/P6): the reference embeds `<Picture N>` inline in
+its prompt prose while Radiance prepends the vision block before the prompt (the repo's PORT-REF2VA §3
+convention, which the reference tokenizer also uses for the block itself); anchor PRESENCE is what this change
+delivers. Chaining also still works independently via the ref_video slot0 path. Device qualitative check (does
+the posterize drop) is the remaining validation.
 
 **Endpoint parity re-confirmed at 512 (2026-10-19, post-fix).** Same method (frame-0/last-frame cosine vs the
 resized anchor, 256² sampling space, RGB-mean-centred), on the fixed binary at 512²·12 s·25 step·seed 1234:

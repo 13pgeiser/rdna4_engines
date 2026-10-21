@@ -310,7 +310,11 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
                 gen::VideoRefMedia m;
                 m.kind = p.name == "first_frame" ? gen::VideoRefMedia::FIRST_FRAME
                                                  : gen::VideoRefMedia::LAST_FRAME;
-                m.index = 1;
+                /* The keyframe's <Picture k> ordinal, so its vision-anchor block is labelled the way
+                 * the source workflow names it (first = <Picture 1>, last = <Picture 2>). A keyframe
+                 * request carries no reference media (checked below), so these numbers cannot collide
+                 * with a reference's own <Picture k>. */
+                m.index = m.kind == gen::VideoRefMedia::FIRST_FRAME ? 1 : 2;
                 m.name = p.name;
                 m.filename = p.filename;
                 m.content_type = p.content_type;
@@ -603,9 +607,15 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     r->refs = std::move(refs);
     /* Keyframes ride the reference vector for the driver's sake (its encode queue indexes it), but
      * always AFTER every reference: the driver lays the reference rows down first, then folds each
-     * FIRST_FRAME/LAST_FRAME into the pack's keyframe table. first before last, so they keyframe-order
-     * 0 and 1 and take image slots 1 and 2. */
+     * FIRST_FRAME/LAST_FRAME into the pack's keyframe table. Sort first before last (a client may send
+     * the file parts in either order) so they keyframe-order 0 and 1, take image slots 1 and 2, and
+     * present as <Picture 1> then <Picture 2>. */
+    std::stable_sort(keys.begin(), keys.end(), [](const gen::VideoRefMedia& a,
+                                                  const gen::VideoRefMedia& b) {
+        return a.kind < b.kind;   /* FIRST_FRAME (4) before LAST_FRAME (5) */
+    });
     r->refs.insert(r->refs.end(), keys.begin(), keys.end());
+    const bool has_keys = !keys.empty();
 
     /* ---- the prompt: the template's text with special tokens, the reference media in its
      * presentation order, the prompt last (docs/PORT-REF2VA.md §3: images, then videos each
@@ -630,7 +640,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
          * soundtrack's `<Audio j>` label is emitted right before its video's `<Video k>` label, and
          * `audio_ord` counts soundtracks and standalone audios together, in the order they are
          * spoken (docs/PORT-REF2VA.md §3). */
-        if (ref2va && deps_.mm && deps_.mm->accepts(MediaKind::Image)) {
+        if ((ref2va || has_keys) && deps_.mm && deps_.mm->accepts(MediaKind::Image)) {
             /* Every picture is decoded and processed before any token is laid down. A reference
              * video or audio needs no vision item here — it reaches the model through the VAEs, so
              * it contributes only its presentation label to the prompt (the 2 fps timestamped
@@ -638,8 +648,18 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
             std::vector<std::shared_ptr<mm::Item>> pics;
             MediaOpts mo;
             mo.max_pixels = (int64_t)W * (int64_t)H;   /* `match`: scaled to the output's area */
+            /* A reference image and an endpoint keyframe are both fed to the vision tower: the keyframe
+             * gets a <Picture k> anchor block here (the soft tokens the reference also feeds) IN
+             * ADDITION to the VAE-latent pin it takes from `enc_pixels` below — the reference's own
+             * split (clip.tokenize + vae.encode). A reference picture and a keyframe never share a
+             * request, so `pics` holds one or the other. */
+            auto anchor = [](const gen::VideoRefMedia& m) {
+                return m.kind == gen::VideoRefMedia::IMAGE ||
+                       m.kind == gen::VideoRefMedia::FIRST_FRAME ||
+                       m.kind == gen::VideoRefMedia::LAST_FRAME;
+            };
             for (const gen::VideoRefMedia& m : r->refs) {
-                if (m.kind != gen::VideoRefMedia::IMAGE) continue;
+                if (!anchor(m)) continue;
                 const std::vector<uint8_t> bytes(m.data.begin(), m.data.end());
                 std::shared_ptr<mm::Item> it;
                 std::string why;
@@ -662,7 +682,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
             if (!pics.empty()) media = std::make_shared<mm::PromptMedia>();
             size_t i = 0;
             for (const gen::VideoRefMedia& m : r->refs) {   /* sorted by (kind, index): images first */
-                if (m.kind != gen::VideoRefMedia::IMAGE) continue;
+                if (!anchor(m)) continue;
                 put("<Picture " + std::to_string(m.index) + ">: ", false);
                 mm::Placed pl;
                 pl.item = pics[i++];
@@ -691,8 +711,8 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
             put(t.substr(p + kSlot.size()), true);
         }
         if ((int64_t)r->tokens.size() > info.max_text)
-            return bad("prompt", "the prompt" + std::string(ref2va ? " with its reference media"
-                                                                    : "") +
+            return bad("prompt", "the prompt" + std::string((ref2va || has_keys)
+                                                                ? " with its media" : "") +
                                      " is " + std::to_string(r->tokens.size()) +
                                      " tokens; this model takes at most " +
                                      std::to_string(info.max_text));

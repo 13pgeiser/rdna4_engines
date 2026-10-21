@@ -985,6 +985,81 @@ TEST(a_keyframe_completes_widen_the_step_and_pin_the_ends) {
     CHECK(saw_step);
 }
 
+/* The keyframe's SECOND channel: when the container carries a vision tower, a keyframe request that
+ * also carries processed media runs a conditioning pass that stages the tower's rows (the anchor
+ * tokens) ALONGSIDE the VAE pin. So a request yields BOTH a VENCODE pass (the pin at image slot 1) and
+ * a VCOND pass (the tower run), exactly as a reference picture conditions -- the keyframe is not merely
+ * a pin once a tower is present. */
+TEST(a_keyframe_completion_also_conditions_through_the_tower) {
+    VideoFixture f;
+    f.build();
+    with_tower(f, 16);
+    RadVideoGenDecl& d = f.prog.video_gen;
+    d.encodes = 1;
+    d.enc_ratio = 16;
+    d.max_enc_frames = 1;
+    d.max_enc_side = 16;
+    d.ref_rows = 1;
+    CHECK_OK(f.start_with_pack_encode(fake_pack_ref, fake_encode_geom));
+    std::string why;
+    auto r = f.req(2);
+    r->tokens = { 1, 700, 701, 2, 3 };    /* a <Picture 1> anchor run sits in the prompt */
+    gen::VideoRefMedia first = ref_part(gen::VideoRefMedia::FIRST_FRAME, "first_frame", 1);
+    first.enc_frames = 1;
+    first.enc_h = 16;
+    first.enc_w = 16;
+    first.enc_pixels.assign(16 * 16 * 3, 1.0f);
+    r->refs.push_back(first);
+    r->media = picture_media(6, 1);       /* the SAME keyframe also feeds the tower */
+    CHECK_OK(f.drv.submit(std::move(r), &why));
+
+    bool saw_cond = false, saw_pin = false;
+    for (int i = 0; i < 20; ++i) {
+        const RadBatch* b = f.drv.next(i);
+        if (!b) break;
+        if (b->gen == RAD_GEN_PASS_VCOND) {
+            saw_cond = true;
+            CHECK_EQ(b->n_mm_rows, (int64_t)2);    /* the keyframe's tower run */
+            CHECK(b->mm_rows != nullptr);
+            CHECK_EQ(b->enc_n_patch, (int64_t)8);  /* its patches staged for the tower */
+            CHECK(b->enc_pixels != nullptr);
+        } else if (b->gen == RAD_GEN_PASS_VENCODE) {
+            saw_pin = true;
+            CHECK_EQ(b->vgen_b->enc_kind, (int32_t)RAD_ENC_IMAGE);
+            CHECK_EQ(b->vgen_b->enc_slot, (int32_t)1);
+        }
+        f.answer(10 * i);
+        CHECK_OK(f.drv.done());
+    }
+    CHECK(saw_cond);                    /* the anchor channel ran ... */
+    CHECK(saw_pin);                     /* ... alongside the VAE pin */
+}
+
+/* A keyframe is a VAE-latent pin, so it conditions through the encoders, NOT the vision tower: a
+ * container converted WITHOUT its tower still renders it (pin-only). Only reference media -- whose
+ * identity soft tokens come from the tower -- are refused on such a container. */
+TEST(a_keyframe_completion_needs_no_vision_tower) {
+    VideoFixture f;
+    f.build();                          /* no with_tower: the container carries no vision tower */
+    RadVideoGenDecl& d = f.prog.video_gen;
+    d.encodes = 1;                      /* it does carry the VAE encoders, which the pin needs */
+    d.enc_ratio = 16;
+    d.max_enc_frames = 1;
+    d.max_enc_side = 16;
+    d.ref_rows = 1;
+    CHECK_OK(f.start_with_pack_encode(fake_pack_ref, fake_encode_geom));
+    std::string why;
+    auto r = f.req(2);
+    r->tokens = { 1, 2, 3 };            /* no tower run: no media placed */
+    gen::VideoRefMedia first = ref_part(gen::VideoRefMedia::FIRST_FRAME, "first_frame", 1);
+    first.enc_frames = 1;
+    first.enc_h = 16;
+    first.enc_w = 16;
+    first.enc_pixels.assign(16 * 16 * 3, 1.0f);
+    r->refs.push_back(first);
+    CHECK_OK(f.drv.submit(std::move(r), &why));   /* the pin-only path admits without a tower */
+}
+
 /* What the container cannot consume is refused at submit, naming the part or the budget it breaks —
  * never silently dropped into a weaker video. A reference video, soundtrack or audio needs the VAE
  * encoders; on a container converted without them (encodes 0) they are refused by name here, and on

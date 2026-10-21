@@ -85,7 +85,15 @@ struct VideoRefMedia {
      * each into the pack's keyframe table and encodes it into an image slot (a keyframe request
      * carries no references, so those slots are free). The server resizes each to the target canvas
      * (first a plain stretch, last a centre crop) and sets enc_pixels to one frame at that size, so
-     * its latent grid is the target's exactly and its pinned rows are frame_rows wide. */
+     * its latent grid is the target's exactly and its pinned rows are frame_rows wide.
+     *   A keyframe is fed to the DiT on TWO channels, matching the reference (clip.tokenize +
+     * vae.encode): the VAE-latent pin above, AND -- when the container carries a vision tower -- a
+     * <Picture k> anchor block through the tower (its `data` bytes are prepared as media and its
+     * soft tokens interleaved into the text conditioning). That anchor is the semantic counterpart
+     * to the low-level VAE pin; without it the DiT reconstructs the frame from pixels alone and
+     * over-saturates. `index` is the keyframe's <Picture> ordinal (first = 1, last = 2), not a
+     * per-kind count, so the block is labelled the way the source workflow names it. On a towerless
+     * container the anchor channel is absent and the pin-only path runs unchanged. */
     enum Kind : int32_t { IMAGE = 0, VIDEO = 1, VIDEO_AUDIO = 2, AUDIO = 3, FIRST_FRAME = 4, LAST_FRAME = 5 };
     Kind        kind = IMAGE;
     int32_t     index = 0;

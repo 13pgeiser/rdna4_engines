@@ -556,11 +556,14 @@ TEST(ref2va_videos_and_audios_are_encoded_and_spoken) {
 
 /* Endpoint keyframes (task fl2va): a first and a last frame reach the generator as FIRST_FRAME and
  * LAST_FRAME references, each resized to the EXACT output canvas -- a keyframe is a PIN, so its
- * latent grid must be the target's, not an aspect-kept snap like a reference's. The pins-only path
- * does not show them to the language model, so no media is built. The driver's fold into the pack's
- * keyframe rows and the device scatter are the engine/device tests; this is the server half. */
-TEST(fl2va_keyframes_pin_the_output_ends) {
+ * latent grid must be the target's, not an aspect-kept snap like a reference's. A keyframe is fed the
+ * DiT on TWO channels, matching the reference (clip.tokenize + vae.encode): the VAE pin AND a
+ * <Picture k> vision-tower anchor block interleaved into the prompt (when the container carries a
+ * tower). The driver's fold into the pack's keyframe rows and the device scatter are the engine/device
+ * tests; this is the server half. */
+TEST(fl2va_keyframes_feed_the_tower_and_pin_the_output_ends) {
     FakeMultimodal mm;
+    mm.expand = { 900, 901 };
     mm.enc_frames = 5; mm.enc_side = 16; mm.enc_n = 850;
     FakeVideoGen gen;
     std::unique_ptr<Fixture> f(new Fixture(Fixture::Tweak{ [&](ServerOptions& o, Deps& d) {
@@ -581,20 +584,73 @@ TEST(fl2va_keyframes_pin_the_output_ends) {
                FormPart{ "last_frame", "l.png", "image/png", "PL" } };
     HttpResponse r = f->srv->router().dispatch(q);
     REQUIRE_EQ(r.status, 200);
-    CHECK_EQ(mm.n_cenc, 2);                 /* both anchors canvas-resized ... */
-    CHECK_EQ(mm.n_ienc, 0);                 /* ... none snapped like a reference */
+    /* Both anchors reach the vision tower as images (the anchor channel) ... */
+    REQUIRE_EQ(mm.got.size(), (size_t)2);
+    CHECK(mm.got[0].first == MediaKind::Image);
+    CHECK(mm.got[0].second == std::vector<uint8_t>({ 'P', 'F' }));
+    CHECK(mm.got[1].second == std::vector<uint8_t>({ 'P', 'L' }));
+    /* ... and are BOTH canvas-resized for the VAE pin (the second, independent channel). */
+    CHECK_EQ(mm.n_cenc, 2);
+    CHECK_EQ(mm.n_ienc, 0);                 /* a keyframe is never snapped like a reference */
     CHECK_EQ(mm.cenc_w, 256);
     CHECK_EQ(mm.cenc_h, 256);
     CHECK(mm.cenc_cover);                    /* the last call was the last frame's centre crop */
     const gen::VideoRequest& g = gen.last();
     REQUIRE_EQ(g.refs.size(), (size_t)2);
     CHECK_EQ((int)g.refs[0].kind, (int)gen::VideoRefMedia::FIRST_FRAME);
+    CHECK_EQ(g.refs[0].index, 1);            /* <Picture 1> = first */
     CHECK_EQ((int)g.refs[1].kind, (int)gen::VideoRefMedia::LAST_FRAME);
+    CHECK_EQ(g.refs[1].index, 2);            /* <Picture 2> = last */
     CHECK_EQ(g.refs[0].enc_frames, 1);
     CHECK_EQ(g.refs[0].enc_h, 256);          /* the target canvas, exactly */
     CHECK_EQ(g.refs[0].enc_w, 256);
     CHECK_EQ(g.refs[0].enc_pixels.size(), (size_t)256 * 256 * 3);
-    CHECK(g.media == nullptr);               /* pins-only: the anchors never reach the text encoder */
+    /* The anchors also reach the text encoder: a <Picture 1>/<Picture 2> block before the prompt. */
+    REQUIRE(g.media != nullptr);
+    REQUIRE_EQ(g.media->items.size(), (size_t)2);
+    CHECK(g.media->items[0].tok < g.media->items[1].tok);
+    std::vector<int32_t> want;
+    auto chars = [&](const std::string& s) { for (unsigned char c : s) want.push_back((int32_t)c); };
+    chars("<v>");
+    chars("<Picture 1>: ");
+    want.insert(want.end(), mm.expand.begin(), mm.expand.end());
+    chars("<Picture 2>: ");
+    want.insert(want.end(), mm.expand.begin(), mm.expand.end());
+    chars("fox");
+    CHECK(g.tokens == want);
+}
+
+/* Without a vision tower the keyframe request still renders: the anchors keep their VAE pin but carry
+ * no text-encoder media (the deliberate pin-only fallback, not a silent weakening). */
+TEST(fl2va_without_a_tower_pins_only) {
+    FakeMultimodal mm;
+    mm.accept_image = false;                 /* a container converted without its vision tower */
+    mm.enc_frames = 5; mm.enc_side = 16; mm.enc_n = 850;
+    FakeVideoGen gen;
+    std::unique_ptr<Fixture> f(new Fixture(Fixture::Tweak{ [&](ServerOptions& o, Deps& d) {
+        d.videos = &gen;
+        d.mm = &mm;
+        o.video_model = true;
+        gen.inf.encodes = 1;
+        gen.inf.enc_ratio = 16;
+        gen.inf.max_enc_side = 512;
+    } }));
+    HttpRequest q;
+    q.method = "POST";
+    q.path = "/v1/videos";
+    q.form = { FormPart{ "prompt", "", "", "fox" },
+               FormPart{ "size", "", "", "256x256" },
+               FormPart{ "task", "", "", "fl2va" },
+               FormPart{ "first_frame", "f.png", "image/png", "PF" },
+               FormPart{ "last_frame", "l.png", "image/png", "PL" } };
+    HttpResponse r = f->srv->router().dispatch(q);
+    REQUIRE_EQ(r.status, 200);
+    CHECK_EQ(mm.got.size(), (size_t)0);      /* nothing reached the absent tower */
+    CHECK_EQ(mm.n_cenc, 2);                  /* both anchors still canvas-resized for the pin */
+    const gen::VideoRequest& g = gen.last();
+    CHECK(g.media == nullptr);               /* no text-encoder media on the pin-only path */
+    CHECK_EQ(g.refs[0].enc_pixels.size(), (size_t)256 * 256 * 3);
+    CHECK_EQ(g.refs[1].enc_pixels.size(), (size_t)256 * 256 * 3);
 }
 
 /* A named keyframe task must carry its frame: fl2va wants both ends. */

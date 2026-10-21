@@ -345,7 +345,15 @@ int VideoDriver::submit(std::unique_ptr<VideoRequest> r, std::string* why) {
      * pack lays those slots between the text and the target streams (RadVideoGenBatch::ref_tab).
      * Every kind the declaration allows is consumed; the guard below is only about a container
      * lacking its vision tower, which could encode nothing. */
-    if (!r->refs.empty() && max_enc_ == 0)
+    /* Reference media need the vision tower (their identity soft tokens). Endpoint keyframes do not:
+     * they condition through the VAE-latent pin, so a container converted without its tower can still
+     * render them -- the server simply lays no `media` for them and the pin-only path runs. (Keyframes
+     * still need the VAE encoders, checked just below.) */
+    bool has_ref_media = false;
+    for (const VideoRefMedia& m : r->refs)
+        if (m.kind != VideoRefMedia::FIRST_FRAME && m.kind != VideoRefMedia::LAST_FRAME)
+            has_ref_media = true;
+    if (has_ref_media && max_enc_ == 0)
         return no("this container was converted without its vision tower, so no request can "
                   "carry reference media");
     /* A reference video, soundtrack or standalone audio reaches the model only through the VAE
@@ -358,12 +366,16 @@ int VideoDriver::submit(std::unique_ptr<VideoRequest> r, std::string* why) {
             if (m.kind != VideoRefMedia::IMAGE)
                 return no("'" + m.name + "' is a reference " +
                           (m.kind == VideoRefMedia::VIDEO ? "video"
-                           : m.kind == VideoRefMedia::VIDEO_AUDIO ? "soundtrack" : "audio") +
+                           : m.kind == VideoRefMedia::VIDEO_AUDIO ? "soundtrack"
+                           : m.kind == VideoRefMedia::FIRST_FRAME ||
+                             m.kind == VideoRefMedia::LAST_FRAME ? "keyframe" : "audio") +
                           ", but this container was converted without its VAE encoders, so nothing "
                           "can condition on it");
-    /* Only reference images add language-model soft-token rows, so only they need processed media.
-     * A reference video or audio reaches the model purely through the VAE encode rows the pack lays
-     * from the reference table, so a request of those alone carries no `media` and needs none. */
+    /* Only pictures (reference images and endpoint keyframes) add language-model soft-token rows, so
+     * only they need processed media. A reference video or audio reaches the model purely through the
+     * VAE encode rows the pack lays from the reference table, so a request of those alone carries no
+     * `media` and needs none. A keyframe with no tower also carries no `media` — that is the deliberate
+     * pin-only fallback, not a silent weakening (its VAE pin still conditions the DiT). */
     bool has_image = false;
     for (const VideoRefMedia& m : r->refs)
         if (m.kind == VideoRefMedia::IMAGE) has_image = true;
