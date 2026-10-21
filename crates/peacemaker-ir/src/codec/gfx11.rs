@@ -74,6 +74,108 @@ mod tests {
         assert_eq!(add.op.name(Arch::Gfx1151), Some("s_add_f32"));
     }
 
+    /// Every low/high-half conversion in the historical gfx1151 Down C1 ELF,
+    /// disassembled by LLVM for both gfx1100 and gfx1151. The first word is the
+    /// original lift failure at 0x1aa0, not a current-source gfx1151 artifact.
+    #[test]
+    fn historical_down_c1_u32_u16_conversions_roundtrip_with_llvm() {
+        use crate::{
+            inst::Form,
+            operand::{Half, Operand},
+            reg::{Kind, RegRef},
+        };
+        use std::{
+            io::Write,
+            process::{Command, Stdio},
+        };
+        let cases: [(u32, u16, u16, Half); 7] = [
+            (0x7e12_d789, 9, 9, Half::Hi),
+            (0x7e5a_d71b, 45, 27, Half::Lo),
+            (0x7e36_d79b, 27, 27, Half::Hi),
+            (0x7e3a_d71d, 29, 29, Half::Lo),
+            (0x7e5c_d71c, 46, 28, Half::Lo),
+            (0x7e38_d79c, 28, 28, Half::Hi),
+            (0x7e14_d70a, 10, 10, Half::Lo),
+        ];
+        let mc = crate::rocm_llvm_mc();
+        let mc = if crate::rocm::tests_disabled() {
+            None
+        } else {
+            assert!(
+                mc.is_file(),
+                "required ROCm assembler missing: {}",
+                mc.display()
+            );
+            Some(mc)
+        };
+        let v = |base| RegRef {
+            kind: Kind::V,
+            base,
+            len: 1,
+        };
+        for (arch, cpu) in [(Arch::Gfx1100, "gfx1100"), (Arch::Gfx1151, "gfx1151")] {
+            for (word, dst, src, half) in cases {
+                let suffix = if half == Half::Hi { "h" } else { "l" };
+                let text = format!("v_cvt_u32_u16_e32 v{dst}, v{src}.{suffix}");
+                if let Some(mc) = &mc {
+                    let mut child = Command::new(mc)
+                        .args([
+                            "-triple=amdgcn-amd-amdhsa",
+                            &format!("-mcpu={cpu}"),
+                            "-show-encoding",
+                        ])
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .expect("pinned llvm-mc");
+                    child
+                        .stdin
+                        .take()
+                        .unwrap()
+                        .write_all(format!("{text}\n").as_bytes())
+                        .unwrap();
+                    let out = child.wait_with_output().unwrap();
+                    assert!(
+                        out.status.success(),
+                        "{cpu} {text}: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    let expected = word
+                        .to_le_bytes()
+                        .iter()
+                        .map(|b| format!("0x{b:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    assert!(
+                        String::from_utf8_lossy(&out.stdout)
+                            .contains(&format!("encoding: [{expected}]")),
+                        "{cpu} {text}"
+                    );
+                }
+                let (mut inst, used) =
+                    decode(arch, &[word]).unwrap_or_else(|e| panic!("{cpu} {text}: {e}"));
+                assert_eq!(used, 1);
+                assert_eq!(inst.form, Form::Vop1);
+                assert_eq!(inst.op.id, 0x6b);
+                assert_eq!(inst.op.name(arch), Some("v_cvt_u32_u16_e32"));
+                assert_eq!(
+                    inst.operands.as_slice(),
+                    &[Operand::Reg(v(dst)), Operand::Half(v(src), half)]
+                );
+                assert_eq!(inst.effects.defs.as_slice(), &[v(dst)]);
+                assert_eq!(inst.effects.uses.as_slice(), &[v(src)]);
+                assert_eq!(encode(arch, &inst).unwrap().as_slice(), &[word]);
+                inst.prov = crate::provenance::Provenance::default();
+                assert_eq!(encode(arch, &inst).unwrap().as_slice(), &[word]);
+            }
+            // A nearby undefined VOP1 opcode must remain rejected; adding the
+            // conversion row must not turn into generic unknown-form acceptance.
+            let error = decode(arch, &[0x7e12_ff89]).unwrap_err().to_string();
+            assert!(error.contains("undefined"), "{cpu}: {error}");
+        }
+    }
+
     /// GLOBAL atomics: GLC selects the returning form. Words 1-7 are every
     /// atomic in the DS4 gfx1151 objects; 8-10 are the opposite forms.
     #[test]

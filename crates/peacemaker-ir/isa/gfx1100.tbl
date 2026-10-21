@@ -255,6 +255,7 @@ v_cmpx_nlt_f32_e32	vopc	0x9e	SRC0:32,VSRC1:32	-	SRC0,VSRC1	exec:w	-	v_cmpx_nlt_f
 v_cndmask_b16	vop3	0x25d	VDST:16,SRC0:16,SRC1:16,SRC2:16	VDST	SRC0,SRC1,SRC2	-	-	v_cndmask_b16 v11.l, v9.l, 1, s0	D65D000B 00010309	neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
 v_cvt_f32_u32_e32	vop1	0x6	VDST:32,SRC0:32	VDST	SRC0	-	-	v_cvt_f32_u32_e32 v17, v17	7E220D11	w0_extra:ignored:0x10000:0x0
 v_cvt_f32_ubyte0_e32	vop1	0x11	VDST:32,SRC0:32	VDST	SRC0	-	-	v_cvt_f32_ubyte0_e32 v12, v11	7E18230B	w0_extra:ignored:0x10000:0x0
+v_cvt_u32_u16_e32	vop1	0x6b	VDST:32,SRC0:16	VDST	SRC0	-	-	v_cvt_u32_u16_e32 v9, v9.h	7E12D789	w0_extra:ignored:0x10000:0x0
 v_cvt_u32_f32_e32	vop1	0x7	VDST:32,SRC0:32	VDST	SRC0	-	-	v_cvt_u32_f32_e32 v1, v1	7E020F01	w0_extra:ignored:0x10000:0x0
 v_dual_fmaak_f32	vopd	0x1	VDSTX:32,SRCX0:32,VSRCX1:32,LITERAL:32,literal@last	VDSTX	SRCX0,VSRCX1,VDSTX	-	-	v_dual_fmaak_f32 v22, v15, v22, 0xbe2aaa9d :: v_dual_mul_f32 v7, v28, v7	C8462D0F 16060F1C BE2AAA9D	-
 v_dual_fmamk_f32	vopd	0x2	VDSTX:32,SRCX0:32,LITERAL:32,VSRCX1:32,literal@last	VDSTX	SRCX0,VSRCX1,VDSTX	-	-	v_dual_fmamk_f32 v10, v4, 0xb2a5705f, v10 :: v_dual_sub_f32 v9, v9, v11	C88A1504 0A081709 B2A5705F	-
