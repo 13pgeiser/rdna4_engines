@@ -69,6 +69,9 @@ __global__ void HIPFIRE_SILU_MQ_ROTATE_KERNEL(
     block_i4_128* __restrict__ x_i4,    // [K/128, N]
     int K,
     int N
+#ifdef HIPFIRE_IU4_RUNTIME_CAND
+    , int cand_mode                     // 0: compiled emit (legacy); 8: exact reference8
+#endif
 #else
     float* __restrict__ x_rot,
     int K
@@ -202,6 +205,16 @@ __global__ void HIPFIRE_SILU_MQ_ROTATE_KERNEL(
         x_rot_b[base + 6] = f6;
         x_rot_b[base + 7] = f7;
     }
+#ifdef HIPFIRE_IU4_RUNTIME_CAND
+    // Wave-uniform kernel arg: 8 = standalone-quantizer reference through
+    // the shared `emit_iu4_sidecar_from_producer8<true>`; else the
+    // compiled emit below, unchanged. The f32 body above is shared.
+    if (cand_mode == 8) {
+        emit_iu4_sidecar_from_producer8<true>(
+            f0, f1, f2, f3, f4, f5, f6, f7,
+            x_i4, group, token, N, tid);
+    } else
+#endif
     emit_iu4_sidecar_from_producer8(
         f0, f1, f2, f3, f4, f5, f6, f7,
         x_i4, group, token, N, tid);
