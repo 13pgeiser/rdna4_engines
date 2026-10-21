@@ -4206,8 +4206,8 @@ static const RadConstraint cArTsExact8[] = {
     C_P2P,
 };
 /* The three- and eight-rank two-shots at `overlap` 1, as cArTsExact4Lane: a pipelined prefill's
- * all-reduce beside the other piece's compute. Their narrow launch takes the four-rank lane's
- * defaults; neither has been tuned on three or eight cards. */
+ * all-reduce beside the other piece's compute. They launch as the wide rows unless R4D_AR_LANE_3_8=1
+ * (tArTs38Lane); neither launch has been measured on three or eight cards. */
 static const RadConstraint cArTsExact3Lane[] = {
     C_EQ("world_size", 3), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
     C_GE("numel", R4D_AR_WIDE_ONESHOT_MAX_ELEMS + 1), C_LE("numel", R4D_AR_TWOSHOT_WIDE_MAX_ELEMS),
@@ -4237,7 +4237,7 @@ static const RadConstraint cArTi8Ts3[] = {
     C_EQ("world_size", 3), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 32),
     C_P2P,
 };
-/* The same at `overlap` 1 (tArTs4Lane, untuned at three ranks). */
+/* The same at `overlap` 1 (tArTs38Lane: the wide launch unless R4D_AR_LANE_3_8=1). */
 static const RadConstraint cArTi8Ts3Lane[] = {
     C_EQ("world_size", 3), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 32),
     C_EQ("overlap", 1), C_P2P,
@@ -5043,6 +5043,24 @@ static const RadTunable tArTs4Lane[] = {
   { "drain",    kArDrain,    NELEM(kArDrain),    3, "store-drain wait before the flag: 3 = s_wait_storecnt, 1 = vmcnt" },
   { "acq",      kArAcq,      NELEM(kArAcq),      0, "acquire fence after the flag read" },
   { "ts_min",   kArTsMin,    NELEM(kArTsMin),    32768, "unused here (tAr says why it is declared)" },
+};
+
+/* The three- and eight-rank two-shots at `overlap` 1 (cArTsExact3Lane, cArTsExact8Lane, cArTi8Ts3Lane). The
+ * four-rank lane's narrow launch was measured at four ranks; at three and eight it is not, and a narrow
+ * grid can also lose there: where the all-reduce is the longer of the two (a large message, slow or shared
+ * links, seven peers to feed at eight ranks) the step waits on a slower collective. So by default these
+ * rows launch as the wide rows do (tAr's defaults: the same grid, the same bits, the same time) and the
+ * narrow launch is a deployment's choice, read once at load: R4D_AR_LANE_3_8=1 gives them the four-rank
+ * lane's four blocks of 1024. Any other value, or unset, is the default. */
+static int64_t ar_lane38_nblocks() {
+  const char* e = std::getenv("R4D_AR_LANE_3_8");
+  return e && e[0] == '1' && !e[1] ? 4 : 0;
+}
+static const RadTunable tArTs38Lane[] = {
+  { "nblocks",  kArNblocksLane4, NELEM(kArNblocksLane4), ar_lane38_nblocks(), "blocks in the grid. 0 = scale with the message and clamp (the wide rows' launch, the default); 4 under R4D_AR_LANE_3_8=1" },
+  { "nthreads", kArNthreads, NELEM(kArNthreads), 1024, "threads per block" },
+  { "drain",    kArDrain,    NELEM(kArDrain),    3, "store-drain wait before the flag: 3 = s_wait_storecnt, 1 = vmcnt" },
+  { "acq",      kArAcq,      NELEM(kArAcq),      0, "acquire fence after the flag read" },
 };
 /* The same axes with narrow defaults, for a collective issued beside compute (`overlap` 1). The
  * wide launch (up to 24 blocks of 1024 threads spinning on peer flags) suits an all-reduce that has
@@ -7112,18 +7130,18 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_twoshot_3rank_exact, nullptr, nullptr, nullptr,
   r4d_shape_all_reduce },
 
-/* The row above at `overlap` 1: the same entry point and the same arithmetic, the four-rank lane's
- * narrow launch (tArTs4Lane; not tuned on three cards). */
+/* The row above at `overlap` 1: the same entry point and the same arithmetic; the wide launch unless
+ * R4D_AR_LANE_3_8=1 gives it the four-rank lane's narrow one (tArTs38Lane; not measured on three cards). */
 { "ar_twoshot_3rank_exact_lane", "all_reduce", "ar",
-  "all-reduce (sum), reduce-scatter + all-gather over P2P IPC scratch; narrow launch beside "
-  "compute",
+  "all-reduce (sum), reduce-scatter + all-gather over P2P IPC scratch, beside compute; the wide "
+  "launch unless R4D_AR_LANE_3_8=1 makes it narrow",
   "exactly 3 ranks, all peer-accessible, overlap 1; messages above "
   R4D_XSTR(R4D_AR_WIDE_ONESHOT_MAX_ELEMS) " elements; shards as even as the word count allows; "
   "in place; cudagraph-safe",
   "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical across ranks "
   "and to the wide row",
   RAD_DOMAIN_DEVICE, R4D_PRIO_AR_TWOSHOT + 1,
-  ROW(cArTsExact3Lane), ROW(tArTs4Lane), nullptr,
+  ROW(cArTsExact3Lane), ROW(tArTs38Lane), nullptr,
   r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_twoshot_3rank_exact, nullptr, nullptr, nullptr,
   r4d_shape_all_reduce },
 
@@ -7166,18 +7184,18 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_twoshot_8rank_exact, nullptr, nullptr, nullptr,
   r4d_shape_all_reduce },
 
-/* The row above at `overlap` 1: the same entry point and the same arithmetic, the four-rank lane's
- * narrow launch (tArTs4Lane; not tuned on eight cards). */
+/* The row above at `overlap` 1: the same entry point and the same arithmetic; the wide launch unless
+ * R4D_AR_LANE_3_8=1 gives it the four-rank lane's narrow one (tArTs38Lane; not measured on eight cards). */
 { "ar_twoshot_8rank_exact_lane", "all_reduce", "ar",
-  "all-reduce (sum), reduce-scatter + all-gather over P2P IPC scratch; narrow launch beside "
-  "compute",
+  "all-reduce (sum), reduce-scatter + all-gather over P2P IPC scratch, beside compute; the wide "
+  "launch unless R4D_AR_LANE_3_8=1 makes it narrow",
   "exactly 8 ranks, all peer-accessible, overlap 1; messages above "
   R4D_XSTR(R4D_AR_WIDE_ONESHOT_MAX_ELEMS) " elements; message must shard evenly over the ranks; "
   "in place; cudagraph-safe",
   "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical across ranks "
   "and to the wide row",
   RAD_DOMAIN_DEVICE, R4D_PRIO_AR_TWOSHOT + 1,
-  ROW(cArTsExact8Lane), ROW(tArTs4Lane), nullptr,
+  ROW(cArTsExact8Lane), ROW(tArTs38Lane), nullptr,
   r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_twoshot_8rank_exact, nullptr, nullptr, nullptr,
   r4d_shape_all_reduce },
 
@@ -7308,17 +7326,17 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_twoshot_3rank_ti8, nullptr, nullptr, nullptr,
   r4d_shape_all_reduce },
 
-/* The row above at `overlap` 1: the same entry point and the same arithmetic, the four-rank lane's
- * narrow launch (tArTs4Lane; not tuned on three cards). */
+/* The row above at `overlap` 1: the same entry point and the same arithmetic; the wide launch unless
+ * R4D_AR_LANE_3_8=1 gives it the four-rank lane's narrow one (tArTs38Lane; not measured on three cards). */
 { "ar_twoshot_3rank_ti8_lane", "all_reduce", "ar",
-  "all-reduce (sum), reduce-scatter + all-gather on the tiered-int8 wire -- lossy; narrow launch "
-  "beside compute",
+  "all-reduce (sum), reduce-scatter + all-gather on the tiered-int8 wire -- lossy, beside compute; "
+  "the wide launch unless R4D_AR_LANE_3_8=1 makes it narrow",
   "exactly 3 ranks, all peer-accessible, overlap 1; groups of 32, split over the shards as evenly as "
   "they divide; under min_bytes the exact one-shot; cudagraph-safe",
   "bf16 / fp16 payload, int8 + fp16 scale + u32 record per group on the wire, fp32 accumulate in "
   "ascending rank order, bit-identical across ranks and to the wide row",
   RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT + 1,
-  ROW(cArTi8Ts3Lane), ROW(tArTs4Lane), nullptr,
+  ROW(cArTi8Ts3Lane), ROW(tArTs38Lane), nullptr,
   r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_twoshot_3rank_ti8, nullptr, nullptr, nullptr,
   r4d_shape_all_reduce },
 

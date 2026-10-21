@@ -400,6 +400,47 @@ static void cross_check(const Plugin& pl) {
     ok("every row that needs two or more ranks requires device.p2p 1 or 0", no_p2p == 0,
        p2pdetail);
 
+    /* The three- and eight-rank `overlap` rows launch as their wide rows unless R4D_AR_LANE_3_8=1
+     * (r4d_rows.cpp, tArTs38Lane): every axis default the wide row's, nblocks 4 under the variable.
+     * The four-rank lane rows keep their measured narrow launch either way. */
+    {
+        const char* env = std::getenv("R4D_AR_LANE_3_8");
+        const bool narrow = env && env[0] == '1' && !env[1];
+        auto row = [&](const char* n) -> const RadKernelInfo* {
+            for (int k = 0; k < nk; ++k)
+                if (!std::strcmp(pl.kernel_at(k)->name, n)) return pl.kernel_at(k);
+            return nullptr;
+        };
+        auto deflt = [](const RadKernelInfo* r, const char* key) -> long long {
+            for (int v = 0; v < r->n_tunables; ++v)
+                if (!std::strcmp(r->tunables[v].key, key)) return (long long)r->tunables[v].deflt;
+            return -1;
+        };
+        static const char* const pairs[][2] = {
+            { "ar_twoshot_3rank_exact_lane", "ar_twoshot_3rank_exact" },
+            { "ar_twoshot_8rank_exact_lane", "ar_twoshot_8rank_exact" },
+            { "ar_twoshot_3rank_ti8_lane", "ar_twoshot_3rank_ti8" },
+        };
+        int bad = 0;
+        std::string detail;
+        for (const auto& pr : pairs) {
+            const RadKernelInfo* l = row(pr[0]);
+            const RadKernelInfo* w = row(pr[1]);
+            if (!l || !w) { ++bad; detail += std::string(pr[0]) + " or its wide row absent; "; continue; }
+            for (const char* key : { "nblocks", "nthreads", "drain", "acq" }) {
+                const long long want = narrow && !std::strcmp(key, "nblocks") ? 4 : deflt(w, key);
+                if (deflt(l, key) != want) {
+                    ++bad;
+                    detail += std::string(pr[0]) + ":" + key + " " + std::to_string(deflt(l, key)) +
+                              " (want " + std::to_string(want) + "); ";
+                }
+            }
+        }
+        ok(narrow ? "the 3/8-rank overlap rows take the narrow launch (R4D_AR_LANE_3_8=1)"
+                  : "the 3/8-rank overlap rows launch as their wide rows (R4D_AR_LANE_3_8 unset)",
+           bad == 0, detail);
+    }
+
     /* The libr4d orderings the integer priority has to preserve. */
     int p_ts = -1, p_os = -1, p_dec = -1, p_pre = -1, p_m16 = -1, p_m64 = -1, p_bt = -1;
     int p_g2dec = -1, p_g2pre = -1, p_g2win = -1;
