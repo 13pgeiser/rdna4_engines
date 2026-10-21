@@ -76,6 +76,13 @@ MANIFEST_SCHEMA = "hipfire.qwen4.slowlink_quality.manifest.v1"
 PLAN_SCHEMA = "hipfire.qwen4.slowlink_quality.plan.v1"
 PHASE_SUMMARY_SCHEMA = "hipfire.qwen4.slowlink_quality.phase_summary.v1"
 
+RECIPE_SCHEMA = "hipfire.qwen4.slowlink_quality.execution_recipe.v1"
+RECIPE_ARCHES = ("gfx1100", "gfx1201")
+DEFAULT_ARCH = "gfx1100"
+NEW_DEVICE_E = {"arch": "gfx1201", "card": "e", "bdf": "0000:c3:00.0", "vendor_id": "0x1002",
+                "device_id": "0x744c", "uuid": "GPU-05f92432f2312a0e", "unique_id": "05f92432f2312a0e",
+                "hip_visible": "0"}
+
 R = "/home/kaden/qcal/release-0.4.3/slowlink-prefill"
 DEFAULT_PLAN = R + "/holds/stage-q1-native-40a4e3bee/inputs/plan.json"
 DEFAULT_BETA_DIR = (R + "/holds/collected/quality-q1a-40a4e3bee-native6c516939b-execution/run/"
@@ -119,8 +126,11 @@ DEFAULT_BOUNDS_FILE = R + "/holds/Q1-PAIR-EXECUTION-RESULT.json"
 PHASES = ("s1a", "s1b")
 RESIDENT_LAYERS = 9
 S1_TILE_ROWS = 768
-DEVICE = {"card": "xtx", "bdf": "0000:67:00.0", "vendor_id": "0x1002", "device_id": "0x744c",
+DEVICE = {"arch": "gfx1100", "card": "xtx", "bdf": "0000:67:00.0", "vendor_id": "0x1002", "device_id": "0x744c",
           "uuid": "GPU-43390a851e296ee5", "unique_id": "43390a851e296ee5", "hip_visible": "0"}
+PACK_REL_BY_ARCH = {"gfx1100": os.path.join("kernels", "compiled", "gfx1100"),
+                    "gfx1201": os.path.join("kernels", "compiled", "gfx1201")}
+PACK_REL = PACK_REL_BY_ARCH["gfx1100"]
 ENV_STRIP_PREFIXES = ("HIPFIRE_", "HIP_", "ROCR_", "ROC_", "HSA_", "GPU_", "AMD_")
 ENV_KEEP_EXACT = ("HIPFIRE_FABRIC_ADMISSION",)
 MAX_JOB_SECS = 1800
@@ -132,11 +142,131 @@ NATIVE_CPU_CAP_SECS = 1200
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 EXAMPLE_REL = "crates/hipfire-arch-qwen4/examples/qwen4_slowlink_quality.rs"
-PACK_REL = os.path.join("kernels", "compiled", "gfx1100")
 
 
 class Refusal(Exception):
     """Refused before any mutation (no process, no GPU)."""
+
+
+def camp_device(camp):
+    d = (camp or {}).get("device")
+    return dict(d) if isinstance(d, dict) else dict(DEVICE)
+
+
+def camp_arch(camp):
+    return camp_device(camp).get("arch", DEFAULT_ARCH)
+
+
+def pack_rel_for(arch):
+    if arch not in PACK_REL_BY_ARCH:
+        raise Refusal("unknown arch %r (one of %s)" % (arch, list(PACK_REL_BY_ARCH)))
+    return PACK_REL_BY_ARCH[arch]
+
+
+def load_execution_recipe(path):
+    need_abs(path, "--execution-recipe")
+    raw = open(path, "rb").read()
+    try:
+        r = json.loads(raw)
+    except ValueError as e:
+        raise Refusal("execution recipe is not JSON: %s" % e)
+    if r.get("schema") != RECIPE_SCHEMA:
+        raise Refusal("execution recipe schema %r is not %s" % (r.get("schema"), RECIPE_SCHEMA))
+    dev = r.get("device") or {}
+    for k in ("arch", "card", "bdf", "vendor_id", "device_id", "uuid", "unique_id", "hip_visible"):
+        if not isinstance(dev.get(k), str) or not dev[k]:
+            raise Refusal("execution recipe device.%s must be a nonempty string" % k)
+    if dev["arch"] not in RECIPE_ARCHES:
+        raise Refusal("execution recipe device.arch %r not in %s" % (dev["arch"], list(RECIPE_ARCHES)))
+    src = r.get("source") or {}
+    if not isinstance(src.get("origin"), str) or not src["origin"]:
+        raise Refusal("execution recipe source.origin must be a nonempty string")
+    for k in ("pack_dir", "pack_digest", "pack_count"):
+        if src.get(k) is None:
+            raise Refusal("execution recipe source.%s is required" % k)
+    if not os.path.isabs(src["pack_dir"]):
+        raise Refusal("execution recipe source.pack_dir must be absolute")
+    need_hex64(src["pack_digest"], "execution recipe source.pack_digest")
+    elf = src.get("elf") or {}
+    if not os.path.isabs(elf.get("path") or ""):
+        raise Refusal("execution recipe source.elf.path must be absolute")
+    need_hex64(elf.get("sha256", ""), "execution recipe source.elf.sha256")
+    if not isinstance(elf.get("size"), int) or elf["size"] <= 0:
+        raise Refusal("execution recipe source.elf.size must be a positive int")
+    need_hex64(src.get("reference_plan_sha256", ""), "execution recipe source.reference_plan_sha256")
+    pin = src.get("reference_source_pin") or {}
+    if not HEX40.match(str(pin.get("commit", ""))) or not HEX64.match(str(pin.get("example_sha256", ""))):
+        raise Refusal("execution recipe source.reference_source_pin needs 40-hex commit + 64-hex example_sha256")
+    vc = r.get("verified_cache") or {}
+    if not os.path.isabs(vc.get("home") or "") or not os.path.isabs(vc.get("path") or ""):
+        raise Refusal("execution recipe verified_cache.home/path must be absolute")
+    need_hex64(vc.get("sha256", ""), "execution recipe verified_cache.sha256")
+    for e in vc.get("entries") or []:
+        if not os.path.isabs(e.get("path") or ""):
+            raise Refusal("execution recipe verified_cache.entries[].path must be absolute")
+        need_hex64(e.get("sha256", ""), "execution recipe verified_cache entry sha256")
+        for k in ("dev", "ino", "size", "mtime_ns"):
+            if not isinstance(e.get(k), int):
+                raise Refusal("execution recipe verified_cache entry %s must be an int" % k)
+    exp = r.get("expect") or {}
+    if not isinstance(exp.get("resident_layers"), int) or exp["resident_layers"] <= 0:
+        raise Refusal("execution recipe expect.resident_layers must be a positive int")
+    if not isinstance(exp.get("placement"), str) or not exp["placement"]:
+        raise Refusal("execution recipe expect.placement must be a nonempty string")
+    if exp.get("resident_layer_set") is not None:
+        if (not isinstance(exp["resident_layer_set"], list)
+                or sorted(exp["resident_layer_set"]) != sorted(set(exp["resident_layer_set"]))):
+            raise Refusal("execution recipe expect.resident_layer_set must be a distinct list")
+        if len(exp["resident_layer_set"]) != exp["resident_layers"]:
+            raise Refusal("execution recipe expect.resident_layer_set length != resident_layers")
+    res = r.get("resources") or {}
+    for k in ("max_job_secs", "child_cap_secs", "kill_grace_secs", "drain_vram_bytes",
+              "min_mem_available_kib", "native_cpu_cap_secs"):
+        if not isinstance(res.get(k), int) or res[k] <= 0:
+            raise Refusal("execution recipe resources.%s must be a positive int" % k)
+    return r, sha256_bytes(raw)
+
+
+def verify_verified_cache(recipe):
+    vc = recipe.get("verified_cache") or {}
+    problems = []
+    try:
+        raw = open(vc["path"], "rb").read()
+    except OSError as ex:
+        return ["verified cache %s unreadable: %s" % (vc.get("path"), ex)]
+    if sha256_bytes(raw) != vc["sha256"]:
+        return ["verified cache %s sha256 differs from the recipe seal" % vc["path"]]
+    for e in vc.get("entries") or []:
+        try:
+            t = stat_tuple(e["path"])
+        except OSError as ex:
+            problems.append("verified cache entry %s unreadable: %s" % (e["path"], ex))
+            continue
+        for k in ("size", "dev", "ino", "mtime_ns"):
+            if t[k] != e[k]:
+                problems.append("verified cache entry %s: sealed %s != live %s" % (e["path"], k, t[k]))
+    return problems
+
+
+def plan_structural_equal_except_artifact_path(a, b, recipe=None):
+    """Execution-binding whitelist: candidate plan must equal the frozen original except
+    artifact.path (staged relocation, same verified sha+stat) and, ONLY when an explicit recipe
+    binds it, expect.resident_layers. The expected set lives ONLY in recipe.expect.resident_layer_set
+    (the frozen strict Expect has no set field; no new plan field is introduced, so native
+    deny_unknown_fields is untouched). baseline_env keeps the original N9 truth; all else frozen."""
+    x, y = copy.deepcopy(a), copy.deepcopy(b)
+    for p in (x, y):
+        if isinstance(p.get("artifact"), dict):
+            p["artifact"].pop("path", None)
+    if recipe is not None:
+        rexp = recipe.get("expect") or {}
+        for p in (x, y):
+            exp = p.get("expect") if isinstance(p.get("expect"), dict) else {}
+            exp.pop("resident_layers", None)
+        yexp_actual = (b.get("expect") or {})
+        if yexp_actual.get("resident_layers") != rexp.get("resident_layers"):
+            return False
+    return canonical(x) == canonical(y)
 
 
 # ------------------------------------------------------------------ utilities
@@ -250,7 +380,8 @@ def lever_env(arm):
 
 def sanitized_env(parent_env):
     """(env, unset names). FABRIC_* and the fabric admission token survive; every other HIPFIRE_/HIP_/ROCR_/
-    ROC_/HSA_/GPU_/AMD_ variable is dropped. Lever keys are applied AFTER this."""
+    ROC_/HSA_/GPU_/AMD_ variable is dropped. Lever keys are applied AFTER this. HIPFIRE_HOME is always
+    dropped: the sealed recipe home (or the private run tree) is applied afterwards, never inherited."""
     env, unset = {}, []
     for k, v in parent_env.items():
         if k in ENV_KEEP_EXACT or k.startswith("FABRIC_"):
@@ -262,14 +393,17 @@ def sanitized_env(parent_env):
     return env, sorted(unset)
 
 
-def applied_env(arm, run_dir):
-    """Exactly what the harness sets for one GPU phase (deterministic; recorded in the manifest)."""
+def applied_env(arm, run_dir, device=None, hipfire_home=None):
+    """Exactly what the harness sets for one GPU phase (deterministic; recorded in the manifest).
+    Without a recipe this is the original xtx/gfx1100 private tree; with a recipe the device binding
+    and the real HIPFIRE_HOME cache root come from the sealed recipe while HOME stays private."""
+    device = dict(device) if device is not None else dict(DEVICE)
     home = os.path.join(run_dir, "home")
     a = {
-        "HOME": home, "HIPFIRE_HOME": os.path.join(home, ".hipfire"),
+        "HOME": home, "HIPFIRE_HOME": hipfire_home or os.path.join(home, ".hipfire"),
         "HIPFIRE_LOCK_DIR": os.path.join(run_dir, "lockdir"), "HIPFIRE_KERNEL_CACHE": os.path.join(run_dir, "kcache"),
-        "HIPFIRE_DEVICES": DEVICE["uuid"], "ROCR_VISIBLE_DEVICES": DEVICE["uuid"],
-        "HIP_VISIBLE_DEVICES": DEVICE["hip_visible"], "HIPFIRE_NO_REGISTRY_FETCH": "1",
+        "HIPFIRE_DEVICES": device["uuid"], "ROCR_VISIBLE_DEVICES": device["uuid"],
+        "HIP_VISIBLE_DEVICES": device["hip_visible"], "HIPFIRE_NO_REGISTRY_FETCH": "1",
         SELECTOR_ENV: "1",
     }
     a.update(PINNED_ENV)
@@ -277,19 +411,21 @@ def applied_env(arm, run_dir):
     return dict(sorted(a.items()))
 
 
-def process_env(parent_env, arm, run_dir):
+def process_env(parent_env, arm, run_dir, device=None, hipfire_home=None):
     """(env, unset, applied): sanitize first, then apply. EXPLICIT_LAYERS_ENV must be unset afterwards."""
     env, unset = sanitized_env(parent_env)
-    applied = applied_env(arm, run_dir)
+    applied = applied_env(arm, run_dir, device, hipfire_home)
     env.update(applied)
     if EXPLICIT_LAYERS_ENV in env:
         raise Refusal("%s survived sanitizing on an S1 route" % EXPLICIT_LAYERS_ENV)
     return env, unset, applied
 
 
-def arm_plan(base_plan, arm):
+def arm_plan(base_plan, arm, recipe=None):
     """The Q1a plan with ONLY expect.env extended by the explicit lever values (three historical keys plus
-    the actual current QSA gather kill-switch pinned 0). The eight beta pins are asserted, never altered."""
+    the actual current QSA gather kill-switch pinned 0). The eight beta pins are asserted, never altered.
+    With an explicit recipe the new resident count comes ONLY from recipe.expect (which must agree with
+    the sealed plan); without a recipe the original N9/768/4096 checks are unchanged."""
     plan = copy.deepcopy(base_plan)
     if plan.get("schema") != PLAN_SCHEMA:
         raise Refusal("plan schema %r is not %s" % (plan.get("schema"), PLAN_SCHEMA))
@@ -299,9 +435,17 @@ def arm_plan(base_plan, arm):
     for k, v in PINNED_ENV.items():
         if expect["env"].get(k) != v:
             raise Refusal("base plan expect.env[%s]=%r, expected the pinned %r" % (k, expect["env"].get(k), v))
-    if expect.get("resident_layers") != RESIDENT_LAYERS or expect.get("s1_tile_rows") != S1_TILE_ROWS \
-            or expect.get("baseline_tile_rows") != 4096:
-        raise Refusal("base plan expect counts/tiles differ from N9/4096/768 (native checks are never relaxed)")
+    if recipe is None:
+        if expect.get("resident_layers") != RESIDENT_LAYERS or expect.get("s1_tile_rows") != S1_TILE_ROWS \
+                or expect.get("baseline_tile_rows") != 4096:
+            raise Refusal("base plan expect counts/tiles differ from N9/4096/768 (native checks are never relaxed)")
+    else:
+        rexp = recipe.get("expect") or {}
+        if expect.get("resident_layers") != rexp.get("resident_layers"):
+            raise Refusal("recipe expect.resident_layers %r != plan expect %r" % (rexp.get("resident_layers"),
+                                                                                  expect.get("resident_layers")))
+        if expect.get("s1_tile_rows") != S1_TILE_ROWS or expect.get("baseline_tile_rows") != 4096:
+            raise Refusal("recipe plan tiles differ from 4096/768 (native checks are never relaxed)")
     if EXPLICIT_LAYERS_ENV not in expect.get("env_absent", []):
         raise Refusal("base plan env_absent must name %s" % EXPLICIT_LAYERS_ENV)
     levers = lever_env(arm)
@@ -330,18 +474,23 @@ def native_manifest(camp, arm, phase):
     pre-seal form)."""
     a = camp["arms"][arm]["runs"][phase]
     argv = a["argv"]
-    applied = applied_env(arm, a["run_dir"])
+    device = camp_device(camp)
+    recipe_home = (camp.get("execution_recipe") or {}).get("verified_cache", {}).get("home")
+    applied = applied_env(arm, a["run_dir"], device, recipe_home)
     m = camp["model"]
+    source = {
+        "kind": "s1-quality-lever-campaign", "campaign_label": camp["label"], "arm": arm, "phase": phase,
+        "levers_on": list(ARMS[arm]), "plan_sha256": camp["arms"][arm]["plan"]["sha256"],
+        "base_plan_sha256": camp["plan"]["sha256"], "harness_sha256": camp["harness"],
+        "source_pin": camp["source_pin"], "pack_digest": camp["pack"]["digest"],
+        "config_sha256": camp["config"]["sha256"],
+    }
+    if camp.get("execution_recipe") is not None:
+        source["execution_recipe"] = camp["execution_recipe"]
     return {
         "schema": MANIFEST_SCHEMA,
         "binary": {"sha256": camp["exe"]["sha256"], "path": camp["exe"]["path"], "size_bytes": camp["exe"]["size"]},
-        "source": {
-            "kind": "s1-quality-lever-campaign", "campaign_label": camp["label"], "arm": arm, "phase": phase,
-            "levers_on": list(ARMS[arm]), "plan_sha256": camp["arms"][arm]["plan"]["sha256"],
-            "base_plan_sha256": camp["plan"]["sha256"], "harness_sha256": camp["harness"],
-            "source_pin": camp["source_pin"], "pack_digest": camp["pack"]["digest"],
-            "config_sha256": camp["config"]["sha256"],
-        },
+        "source": source,
         "launch": {
             "controller": "quality_campaign.v1", "arm": arm, "phase": phase, "route": "s1",
             "command": argv, "command_text": " ".join(shlex.quote(x) for x in argv),
@@ -349,7 +498,7 @@ def native_manifest(camp, arm, phase):
                     "unset_rule": "every HIPFIRE_/HIP_/ROCR_/ROC_/HSA_/GPU_/AMD_ variable except FABRIC_* and "
                                   "HIPFIRE_FABRIC_ADMISSION is removed before `set` is applied; "
                                   "%s is never set" % EXPLICIT_LAYERS_ENV},
-            "lever_env": lever_env(arm), "device": dict(DEVICE),
+            "lever_env": lever_env(arm), "device": device,
             "locks": "external fabric lock; private HIPFIRE_LOCK_DIR", "run_dir": a["run_dir"],
         },
         "model": {"path": m["path"], "dev": m["dev"], "ino": m["ino"], "size": m["size"],
@@ -393,8 +542,8 @@ def exe_identity(exe):
     return t
 
 
-def pack_dir_of(exe):
-    return os.path.join(os.path.dirname(exe), PACK_REL)
+def pack_dir_of(exe, arch=None):
+    return os.path.join(os.path.dirname(exe), pack_rel_for(arch or DEFAULT_ARCH))
 
 
 def verify_staging(camp, rehash=True):
@@ -594,16 +743,30 @@ def prepare(args):
     root = need_abs(args.root, "--root")
     if os.path.exists(root):
         raise Refusal("refusing existing --root %s" % root)
+    recipe, recipe_sha = (load_execution_recipe(args.execution_recipe) if args.execution_recipe else (None, None))
+    if recipe is not None and args.expect_pack_digest and args.expect_pack_digest != recipe["source"]["pack_digest"]:
+        raise Refusal("--expect-pack-digest differs from the execution recipe source.pack_digest")
     exe = need_abs(args.exe, "--exe")
     need_hex64(args.expect_exe_sha256, "--expect-exe-sha256")
     ident = exe_identity(exe)
     if ident["sha256"] != args.expect_exe_sha256:
         raise Refusal("executable sha256 %s != --expect-exe-sha256" % ident["sha256"])
-    pdir = pack_dir_of(exe)
+    arch = (recipe["device"]["arch"] if recipe else DEFAULT_ARCH)
+    device = dict(recipe["device"]) if recipe else dict(DEVICE)
+    pdir = pack_dir_of(exe, arch)
     if not os.path.isdir(pdir):
-        raise Refusal("pack %s missing (the kernel pack must sit at <exe dir>/kernels/compiled/gfx1100)" % pdir)
+        raise Refusal("pack %s missing (the kernel pack must sit at <exe dir>/%s)" % (pdir, pack_rel_for(arch)))
     files = walk_pack(pdir)
     digest = pack_digest(files)
+    if recipe is not None:
+        if recipe["source"]["pack_dir"] != pdir:
+            raise Refusal("recipe source.pack_dir %r != staged pack dir %r" % (recipe["source"]["pack_dir"], pdir))
+        if recipe["source"]["pack_digest"] != digest:
+            raise Refusal("recipe source.pack_digest differs from the staged pack digest")
+        if recipe["source"]["pack_count"] != len(files):
+            raise Refusal("recipe source.pack_count != staged file count")
+        if recipe["source"]["elf"]["sha256"] != ident["sha256"] or recipe["source"]["elf"]["size"] != ident["size"]:
+            raise Refusal("recipe source.elf identity differs from the staged executable")
     if args.expect_pack_digest and args.expect_pack_digest != digest:
         raise Refusal("pack digest %s != --expect-pack-digest" % digest)
     pin = read_json(need_abs(args.source_pin, "--source-pin"))
@@ -614,35 +777,69 @@ def prepare(args):
     example = os.path.join(w_root, EXAMPLE_REL)
     if sha256_file(example) != pin["example_sha256"]:
         raise Refusal("source pin example_sha256 differs from %s" % example)
+    if recipe is not None and recipe["source"]["reference_source_pin"] != pin:
+        raise Refusal("recipe source.reference_source_pin differs from --source-pin")
     cfg = need_abs(args.config, "--config")
     if not os.path.isfile(cfg):
         raise Refusal("--config %s is not a file" % cfg)
     plan_path = need_abs(args.plan, "--plan")
     plan_bytes = open(plan_path, "rb").read()
     plan_sha = sha256_bytes(plan_bytes)
-    if plan_sha != EXPECTED_BETA_PLAN_SHA256 and not args.allow_other_plan:
-        raise Refusal("plan sha256 %s is not the Q1a plan %s" % (plan_sha, EXPECTED_BETA_PLAN_SHA256))
+    if recipe is None:
+        if plan_sha != EXPECTED_BETA_PLAN_SHA256 and not args.allow_other_plan:
+            raise Refusal("plan sha256 %s is not the Q1a plan %s" % (plan_sha, EXPECTED_BETA_PLAN_SHA256))
+    else:
+        ref_sha = recipe["source"]["reference_plan_sha256"]
+        if ref_sha != EXPECTED_BETA_PLAN_SHA256:
+            raise Refusal("recipe source.reference_plan_sha256 is not the frozen Q1a original")
+        ref_dir = os.path.dirname(plan_path)
+        ref_candidates = [os.path.join(ref_dir, "reference-plan.json"), DEFAULT_PLAN]
+        ref_bytes = None
+        for cand in ref_candidates:
+            try:
+                ref_bytes = open(cand, "rb").read()
+            except OSError:
+                continue
+            if sha256_bytes(ref_bytes) == ref_sha:
+                break
+            ref_bytes = None
+        if ref_bytes is None and not args.allow_other_plan:
+            raise Refusal("frozen Q1a original plan %s unavailable next to --plan (or --allow-other-plan)" % ref_sha)
+        if ref_bytes is not None:
+            ref = json.loads(ref_bytes)
+            cand_plan = json.loads(plan_bytes)
+            if not plan_structural_equal_except_artifact_path(ref, cand_plan, recipe):
+                raise Refusal("candidate plan differs from the frozen original outside artifact.path and "
+                              "recipe-bound expect.resident_layers/resident_layer_set")
+            rart, cart = ref.get("artifact") or {}, cand_plan.get("artifact") or {}
+            if cart.get("sha256") != rart.get("sha256") or cart.get("size") != rart.get("size"):
+                raise Refusal("candidate plan artifact sha/size differ from the frozen original")
+            rb, cb = ref.get("expect", {}).get("baseline_env"), cand_plan.get("expect", {}).get("baseline_env")
+            if rb != cb:
+                raise Refusal("candidate plan baseline_env differs from the frozen original N9 truth")
     base = json.loads(plan_bytes)
     art = base.get("artifact") or {}
     model = cached_model_entry(args.model_receipt, art.get("path"), plan_artifact=art)
     ple = cached_model_entry(args.ple_receipt, art["path"] + ".ple-q4")
-    beta = validate_beta(args.beta_dir, plan_sha)
-    selected = parse_arms(args.arms)
-    bounds = verify_bounds_file(args.bounds_file)
-    label = args.label or "s1-quality-" + time.strftime("%Y%m%d", time.gmtime())
-    harness = {"quality_campaign_sha256": sha256_file(os.path.realpath(__file__)),
-               "quality_scorer_sha256": sha256_file(os.path.join(HERE, "quality_scorer.py")),
-               "example_sha256": pin["example_sha256"]}
+    if recipe is not None:
+        entries = {e["path"]: e for e in recipe["verified_cache"].get("entries") or []}
+        for m in (model, ple):
+            e = entries.get(m["path"])
+            if e is None or e["sha256"] != m["sha256"] or any(e[k] != m[k] for k in ("size", "dev", "ino", "mtime_ns")):
+                raise Refusal("recipe verified_cache entry for %s differs from the sealed model stat+sha" % m["path"])
+        if sha256_file(recipe["verified_cache"]["path"]) != recipe["verified_cache"]["sha256"]:
+            raise Refusal("verified cache file differs from the recipe seal")
+    beta = validate_beta(args.beta_dir, plan_sha if recipe is None else recipe["source"]["reference_plan_sha256"])
     os.makedirs(root)
     camp = {
         "schema": CAMPAIGN_SCHEMA, "label": label, "created_utc": utc_now(), "root": root, "harness": harness,
         "source_pin": pin,
         "exe": {k: ident[k] for k in ("path", "realpath", "sha256", "size", "dev", "ino", "mtime_ns")},
-        "pack": {"dir": pdir, "digest": digest, "count": len(files), "files": files},
+        "pack": {"dir": pdir, "digest": digest, "count": len(files), "files": files, "arch": arch},
         "config": {"path": cfg, "sha256": sha256_file(cfg)},
         "model": model, "ple": ple,
         "plan": {"path": plan_path, "sha256": plan_sha},
-        "beta": beta, "device": dict(DEVICE),
+        "beta": beta, "device": device,
         "reference_declaration": {
             "kind": "frozen-old-reference-cross-binary",
             "reference_binary_sha256": beta["binary_sha256"], "reference_manifest_sha256": beta["manifest_sha256"],
@@ -738,9 +935,11 @@ def check_plans(args):
     os.makedirs(home, exist_ok=True)
     env = clean_cpu_env(os.environ, home)
     rc = 0
+    cpu_cap = ((camp.get("execution_recipe") or {}).get("resources") or {}).get("native_cpu_cap_secs",
+                                                                                  NATIVE_CPU_CAP_SECS)
     for arm, a in camp["arms"].items():
         argv = [camp["exe"]["path"], "--phase", "check-plan", "--plan", a["plan"]["path"]]
-        p = subprocess.run(argv, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=NATIVE_CPU_CAP_SECS)
+        p = subprocess.run(argv, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=cpu_cap)
         ok = p.returncode == 0
         try:
             rep = json.loads(p.stdout)
@@ -759,15 +958,16 @@ def build_launch_command(camp, arm, phase, max_secs, priority, wrapper=DEFAULT_W
                          owner="S1QualG", python="python3"):
     """argv of the external detached launcher body (pure; tested)."""
     check_arm_phase(arm, phase)
-    if not isinstance(max_secs, int) or max_secs <= 0 or max_secs > MAX_JOB_SECS:
-        raise Refusal("--max-secs must be 1..%d" % MAX_JOB_SECS)
+    recipe_max = ((camp.get("execution_recipe") or {}).get("resources") or {}).get("max_job_secs", MAX_JOB_SECS)
+    if not isinstance(max_secs, int) or max_secs <= 0 or max_secs > recipe_max:
+        raise Refusal("--max-secs must be 1..%d" % recipe_max)
     if not re.match(r"^P[0-9]$", str(priority)):
         raise Refusal("--priority must look like P1")
     me = os.path.realpath(__file__)
     csha = sha256_file(os.path.join(camp["root"], "campaign.json"))
     inner = [python, "-B", me, "run-phase", "--root", camp["root"], "--expect-campaign-sha256", csha,
              "--arm", arm, "--phase", phase]
-    return ["bash", wrapper, fabric, "--class", "correct", "--card", DEVICE["card"], "--mem-gb", "22.4",
+    return ["bash", wrapper, fabric, "--class", "correct", "--card", camp_device(camp)["card"], "--mem-gb", "22.4",
             "--hostmem-gb", "67", "--hostmem-lock", "--max-secs", str(max_secs), "--priority", priority,
             "--owner", owner, "--"] + inner
 
@@ -826,29 +1026,31 @@ def wait_cmd(args):
 
 # ------------------------------------------------------------------ lifecycle
 
-def read_sysfs(host, name):
+def read_sysfs(host, name, bdf=None):
     try:
-        return host.read_text("/sys/bus/pci/devices/%s/%s" % (DEVICE["bdf"], name)).strip()
+        return host.read_text("/sys/bus/pci/devices/%s/%s" % (bdf or DEVICE["bdf"], name)).strip()
     except OSError:
         return None
 
 
-def device_state(host):
-    """(ok, problems). Any disappearance is INCOMPLETE, never retried."""
+def device_state(host, device=None):
+    """(ok, problems). Any disappearance is INCOMPLETE, never retried. Arch/uuid/bdf come from the
+    sealed recipe device when a campaign binds one, else the original xtx default."""
+    device = dict(device) if device is not None else dict(DEVICE)
     problems = []
-    vendor, device = read_sysfs(host, "vendor"), read_sysfs(host, "device")
-    if vendor != DEVICE["vendor_id"]:
-        problems.append("vendor %r != %s" % (vendor, DEVICE["vendor_id"]))
-    if device != DEVICE["device_id"]:
-        problems.append("device %r != %s" % (device, DEVICE["device_id"]))
-    uid = read_sysfs(host, "unique_id")
-    if uid is not None and uid.lower() != DEVICE["unique_id"]:
-        problems.append("unique_id %r != %s" % (uid, DEVICE["unique_id"]))
+    vendor, dev = read_sysfs(host, "vendor", device["bdf"]), read_sysfs(host, "device", device["bdf"])
+    if vendor != device["vendor_id"]:
+        problems.append("vendor %r != %s" % (vendor, device["vendor_id"]))
+    if dev != device["device_id"]:
+        problems.append("device %r != %s" % (dev, device["device_id"]))
+    uid = read_sysfs(host, "unique_id", device["bdf"])
+    if uid is not None and uid.lower() != device["unique_id"]:
+        problems.append("unique_id %r != %s" % (uid, device["unique_id"]))
     return (not problems), problems
 
 
-def vram_used(host):
-    v = read_sysfs(host, "mem_info_vram_used")
+def vram_used(host, device=None):
+    v = read_sysfs(host, "mem_info_vram_used", (device or DEVICE)["bdf"])
     try:
         return int(v)
     except (TypeError, ValueError):
@@ -942,16 +1144,18 @@ def verify_phase_dir(camp, arm, phase):
             probs.append("observed environment[%s]=%r, expected %r" % (k, env.get(k), v))
     if env.get(EXPLICIT_LAYERS_ENV, None) is not None:
         probs.append("observed %s is set" % EXPLICIT_LAYERS_ENV)
-    ld = s.get("load") or {}
-    for k, v in {"placement": "slowlink-profile", "slowlink_profile": True, "resident_layers": RESIDENT_LAYERS,
-                 "scratch_rows": S1_TILE_ROWS, "gpu_arch": "gfx1100", "ple_format": "q4"}.items():
+    arch = camp_arch(camp)
+    recipe_exp = ((camp.get("execution_recipe") or {}).get("expect")) if camp.get("execution_recipe") else None
+    want_n = recipe_exp["resident_layers"] if recipe_exp else RESIDENT_LAYERS
+    for k, v in {"placement": "slowlink-profile", "slowlink_profile": True, "resident_layers": want_n,
+                 "scratch_rows": S1_TILE_ROWS, "gpu_arch": arch, "ple_format": "q4"}.items():
         if ld.get(k) != v:
             probs.append("load.%s=%r, expected %r" % (k, ld.get(k), v))
     if ld.get("state_format") != {"gdn": "Q8", "qsa_kv": "Q8"}:
         probs.append("load.state_format is not Q8/Q8: %r" % (ld.get("state_format"),))
     prof = ld.get("profile") or {}
-    if prof.get("tile_rows") != S1_TILE_ROWS or prof.get("purpose") != "product" or prof.get("resident_layers") != RESIDENT_LAYERS:
-        probs.append("load.profile is not the product 768-tile N9 profile: %r" % (prof,))
+    if prof.get("tile_rows") != S1_TILE_ROWS or prof.get("purpose") != "product" or prof.get("resident_layers") != want_n:
+        probs.append("load.profile is not the product 768-tile N%d profile: %r" % (want_n, prof,))
     if not isinstance(ld.get("host_mapped_tensors"), int) or ld["host_mapped_tensors"] <= 0:
         probs.append("load.host_mapped_tensors must be > 0")
     want = phase_expectations(camp, arm, phase)
@@ -969,30 +1173,40 @@ def run_phase(args, host=None):
     arm, phase = args.arm, args.phase
     ent = camp["arms"][arm]["runs"][phase]
     rid = run_id(arm, phase)
+    device = camp_device(camp)
+    arch = device.get("arch", DEFAULT_ARCH)
+    recipe = camp.get("execution_recipe")
+    recipe_home = (recipe or {}).get("verified_cache", {}).get("home") if recipe else None
+    resources = (recipe or {}).get("resources") or {}
+    cap_limit = resources.get("child_cap_secs", CHILD_CAP_SECS)
+    drain_limit = resources.get("drain_vram_bytes", DRAIN_VRAM_BYTES)
+    mem_limit = resources.get("min_mem_available_kib", MIN_MEM_AVAILABLE_KIB)
     env_h = host.environ()
-    if not env_h.get("FABRIC_JOB") or DEVICE["card"] not in str(env_h.get("FABRIC_CARDS", "")):
-        raise Refusal("run-phase must run inside an admitted xtx fabric hold (FABRIC_JOB/FABRIC_CARDS missing)")
-    cap = min(args.cap_secs, CHILD_CAP_SECS)
+    if not env_h.get("FABRIC_JOB") or device["card"] not in str(env_h.get("FABRIC_CARDS", "")):
+        raise Refusal("run-phase must run inside an admitted %s fabric hold (FABRIC_JOB/FABRIC_CARDS missing)"
+                      % device["card"])
+    cap = min(args.cap_secs, cap_limit)
     if cap <= 0:
         raise Refusal("--cap-secs must be > 0")
     bad = verify_staging(camp, rehash=True) + verify_model_stat(camp) + verify_beta(camp)
+    if recipe is not None:
+        bad += verify_verified_cache(recipe)
     if bad:
         raise Refusal("identity preconditions failed: " + "; ".join(bad))
-    # the manifest on disk must be exactly what the pins say it is for this arm/phase
     if canonical(json.load(open(ent["manifest"]["path"]))) != canonical(native_manifest(camp, arm, phase)):
         raise Refusal("on-disk manifest differs from the one derived from the sealed campaign")
     for p in (ent["run_dir"], ent["out_dir"]):
         if os.path.exists(p):
             raise Refusal("refusing existing %s (fresh phase/process only; no retry)" % p)
-    ok, probs = device_state(host)
+    ok, probs = device_state(host, device)
     if not ok:
         raise Refusal("DEVICE: " + "; ".join(probs))
-    used = vram_used(host)
-    if used < 0 or used >= DRAIN_VRAM_BYTES:
+    used = vram_used(host, device)
+    if used < 0 or used >= drain_limit:
         raise Refusal("card not idle: vram used %d" % used)
     avail = mem_available_kib(host)
-    if avail < MIN_MEM_AVAILABLE_KIB:
-        raise Refusal("MemAvailable %d KiB < 80 GiB" % avail)
+    if avail < mem_limit:
+        raise Refusal("MemAvailable %d KiB < %d KiB" % (avail, mem_limit))
 
     run_dir = ent["run_dir"]
     os.makedirs(os.path.join(run_dir, "home", ".hipfire"))
@@ -1008,9 +1222,9 @@ def run_phase(args, host=None):
     os.symlink(pack_kernels_root, pack_link)
     if os.path.realpath(pack_link) != os.path.realpath(pack_kernels_root):
         raise Refusal("private HOME cold-lookup symlink %s does not resolve to the sealed kernels root" % pack_link)
-    if os.path.realpath(os.path.join(pack_link, "compiled", "gfx1100")) != os.path.realpath(camp["pack"]["dir"]):
+    if os.path.realpath(os.path.join(pack_link, "compiled", arch)) != os.path.realpath(camp["pack"]["dir"]):
         raise Refusal("private HOME cold-lookup symlink does not expose the sealed pack dir")
-    env, unset, applied = process_env(env_h, arm, run_dir)
+    env, unset, applied = process_env(env_h, arm, run_dir, device, recipe_home)
     if applied != json.load(open(ent["manifest"]["path"]))["launch"]["env"]["set"]:
         raise Refusal("applied env differs from the manifest launch.env.set")
     argv = ent["argv"]
@@ -1295,9 +1509,16 @@ def pack_binding_evidence(stderr_text, kcache_files, sealed_pack_dir, kcache_dir
     return {"cold_lookup_dirs": lookups[:4], "pack_hits": len(hits), "pack_verified": verified,
             "jit_objects": sorted(live_jits)[:8], "fallback_markers": fb[:8], "ok": not problems, "problems": problems}
 
-def route_evidence(arm, cells, stderr_text, kcache_files, *, phase="s1a", expected_cases=()):
+def route_evidence(arm, cells, stderr_text, kcache_files, *, phase="s1a", expected_cases=(), camp=None,
+                   arch=None, want_resident=None):
     """ACTUAL route evidence of one phase from raw receipts, the loader log and the private kernel cache.
-    Never inferred from the requested env. Returns {lever: {on_expected, ok, ...}, common: ...}."""
+    Never inferred from the requested env. Counts/arch parameterize the checks: the recipe expect gives
+    the genuine expected resident placement (both arms of the iu4-only/off pair use the SAME placement),
+    and the recipe device gives the arch. Raw actual-CO checks are retained."""
+    arch = arch or (camp_arch(camp) if camp else DEFAULT_ARCH)
+    recipe_exp = ((camp.get("execution_recipe") or {}).get("expect")) if camp else None
+    want_n = want_resident if want_resident is not None else (recipe_exp["resident_layers"] if recipe_exp
+                                                              else RESIDENT_LAYERS)
     on = ARMS[arm]
     if phase not in PHASES:
         raise Refusal("unknown route-evidence phase %r" % phase)
@@ -1309,7 +1530,7 @@ def route_evidence(arm, cells, stderr_text, kcache_files, *, phase="s1a", expect
     for cell, r in recs:
         if r.get("status") != "ok":
             common.append("%s: receipt status %r" % (cell, r.get("status")))
-        if r.get("resident_layers") != RESIDENT_LAYERS or r.get("tile_rows") != S1_TILE_ROWS \
+        if r.get("resident_layers") != want_n or r.get("tile_rows") != S1_TILE_ROWS \
                 or r.get("retained_scratch_rows") != S1_TILE_ROWS:
             common.append("%s: resident/tile %r/%r/%r" % (cell, r.get("resident_layers"), r.get("tile_rows"),
                                                           r.get("retained_scratch_rows")))
@@ -1343,7 +1564,10 @@ def route_evidence(arm, cells, stderr_text, kcache_files, *, phase="s1a", expect
     ev["common"] = {"ok": not common, "problems": common}
 
     # PLACE: the actual set (receipts derive it from the per-layer mappings) and the loader line.
-    want = PLACE_LAYERS if "place" in on else list(range(RESIDENT_LAYERS))
+    # Recipe expect gives the genuine expected set; off/iu4 share the same front placement.
+    recipe_set = recipe_exp.get("resident_layer_set") if recipe_exp else None
+    want = recipe_set if ("place" in on and recipe_set is not None) else (
+        PLACE_LAYERS if "place" in on else list(range(want_n)))
     sets = sorted({tuple(r["resident_layer_set"]) if isinstance(r.get("resident_layer_set"), list) else None
                    for _c, r in recs}, key=str)
     m = RE_LOAD_SET.search(stderr_text)
@@ -1356,8 +1580,8 @@ def route_evidence(arm, cells, stderr_text, kcache_files, *, phase="s1a", expect
         place_problems.append("loader log resident_layer_set %r != %r" % (logged, want))
     if "place" not in on and m is not None:
         place_problems.append("loader log reports an explicit resident_layer_set on a front-placement arm")
-    if lm is None or lm.group(1) != "slowlink-profile" or int(lm.group(2)) != RESIDENT_LAYERS:
-        place_problems.append("loader log lacks placement=slowlink-profile resident layers=9")
+    if lm is None or lm.group(1) != "slowlink-profile" or int(lm.group(2)) != want_n:
+        place_problems.append("loader log lacks placement=slowlink-profile resident layers=%d" % want_n)
     ev["place"] = {"on_expected": "place" in on, "expected_set": want, "receipt_sets": [list(s) if s else None for s in sets],
                    "loader_set": logged, "ok": not place_problems, "problems": place_problems}
 
@@ -1381,8 +1605,8 @@ def route_evidence(arm, cells, stderr_text, kcache_files, *, phase="s1a", expect
                 iu_problems.append("%s: window_route %r != %s" % (cell, mo.get("window_route"), IU4_ROUTE))
             if mo.get("requested") is not True:
                 iu_problems.append("%s: requested is not true" % cell)
-            if not isinstance(desc, dict) or desc.get("arch") != "gfx1100":
-                iu_problems.append("%s: descriptor missing / not gfx1100" % cell)
+            if not isinstance(desc, dict) or desc.get("arch") != arch:
+                iu_problems.append("%s: descriptor missing / not %s" % (cell, arch))
             if mo.get("source_headers_symmetric") is not True:
                 iu_problems.append("%s: source headers not symmetric" % cell)
             if not (isinstance(hv, list) and len(hv) == 2 and hv[0] == hv[1] and hv[0] > 0):
@@ -1585,7 +1809,7 @@ def report(args):
         for ph, cells in (("s1a", cells_a), ("s1b", cells_b)):
             stderr = open(os.path.join(a["runs"][ph]["run_dir"], "stderr.log"), "r", errors="replace").read()
             ev[ph] = route_evidence(arm, cells, stderr, rr[ph].get("kcache_files", []),
-                                    phase=ph, expected_cases=expected_cases)
+                                    phase=ph, expected_cases=expected_cases, camp=camp)
             ev[ph]["run_status"] = rr[ph]["status"]
             pack_ev = pack_binding_evidence(stderr, rr[ph].get("kcache_files", []), camp["pack"]["dir"],
                                             os.path.join(a["runs"][ph]["run_dir"], "kcache"), camp["pack"].get("files"))
@@ -1709,9 +1933,9 @@ def serial(args, host=None):
             if os.path.isdir(os.path.join(camp["root"], "runs")) else []
         if marks:
             return stop("INCOMPLETE marker(s) from %s" % marks)
-        dok, dprobs = device_state(host)
+        dok, dprobs = device_state(host, camp_device(camp))
         if not dok:
-            return stop("XTX not healthy before submitting %s: %s" % (rid, "; ".join(dprobs)))
+            return stop("%s not healthy before submitting %s: %s" % (camp_device(camp)["card"], rid, "; ".join(dprobs)))
         note("launch %s" % rid)
         launch(argparse.Namespace(root=camp["root"], expect_campaign_sha256=args.expect_campaign_sha256, arm=arm,
                                   phase=ph, max_secs=args.max_secs, priority=args.priority,
@@ -1755,6 +1979,7 @@ def build_parser():
     p.add_argument("--exe", required=True)
     p.add_argument("--expect-exe-sha256", required=True)
     p.add_argument("--expect-pack-digest")
+    p.add_argument("--execution-recipe", help="explicit execution-recipe JSON (device/pack/source/cache/expect/resources)")
     p.add_argument("--config", required=True)
     p.add_argument("--source-pin", required=True)
     p.add_argument("--plan", default=DEFAULT_PLAN)

@@ -38,8 +38,8 @@
 //! explicit N9 override `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=9` and
 //! `HIPFIRE_PREFILL_CHUNK_ROWS=4096` (placement `explicit-env`, 9 resident
 //! layers, 4096 scratch); the S1 routes (`s1a`, `s1b`, `s1-f32`) MUST leave
-//! the layer override unset (any value declines S1) and the admission chooses
-//! the 9. Values are read through `hipfire_config::developer_var`, the
+//! the layer override unset (any value declines S1) and the admission picks
+//! the plan's resident layers. Values are read through `hipfire_config::developer_var`, the
 //! process snapshot the product itself reads (every `HIPFIRE_*` variable is
 //! captured once at start; the program never sets or edits the environment).
 //!
@@ -90,11 +90,15 @@
 //! `kl-summary.json` (`scope: "f32-pair-only"`) to its own fresh `--out-dir`.
 
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
-use hipfire_arch_qwen4::slowlink_admission::{AdmissionPurpose, SlowlinkMode};
+use hipfire_arch_qwen4::slowlink_admission::{
+    resident_layer_switch_is_override, AdmissionPurpose, SlowlinkMode, S1_RESIDENT_LAYERS_ENV,
+};
 use hipfire_arch_qwen4::slowlink_load::slowlink_load_bundle;
 use hipfire_arch_qwen4::{GdnStateFormat, QsaKvFormat};
+use hipfire_config::memory::{ple_sidecar_path, PleFormat};
 use hipfire_runtime::prompt_frame::{JinjaChatFrame, Message};
 use hipfire_runtime::tokenizer::{maybe_normalize_prompt, Tokenizer};
+use hipfire_runtime::verified_cache::{StatKey, VerifiedCache};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -497,6 +501,27 @@ struct Artifact {
     path: String,
     size: u64,
     sha256: String,
+}
+
+/// Sealed execution recipe at `manifest.source.execution_recipe`: the ONLY
+/// new-target authority. `schema` + `recipe_sha256` pin the canonical recipe
+/// bytes; the `expect` triple is explicit sealed planned content the candidate
+/// plan, the actual selected placement, and every layer-major receipt MUST
+/// equal. A null `resident_layer_set` is the front placement
+/// (`0..resident_layers`); the count is genuine planned content, never a
+/// forced env value.
+const EXECUTION_RECIPE_SCHEMA: &str = "hipfire.qwen4.slowlink_quality.execution_recipe.v1";
+
+/// Sealed planned placement of one execution recipe (`expect` block only; the
+/// recipe file digest + per-entry verified-cache digests gate the artifacts).
+#[derive(Debug, Clone)]
+struct SealedExpect {
+    resident_layers: usize,
+    resident_layer_set: Option<Vec<usize>>,
+    placement: String,
+    cache_home: String,
+    cache_path: String,
+    cache_sha256: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1209,6 +1234,282 @@ fn verify_model_stat(tuple: &ModelTuple, stat: &ModelStat) -> Result<(), String>
     }
 }
 
+/// Read `manifest.source.execution_recipe` when present. `None` is the
+/// untouched original replay path (literal original N9 plan, literal original
+/// baseline_env N9 baseline, stat-only model identity). `Some` is the ONLY
+/// new-target authority: schema + recipe file sha + sealed expect triple.
+fn parse_execution_recipe(manifest: &Manifest) -> Result<Option<SealedExpect>, String> {
+    let Some(recipe) = manifest.source.get("execution_recipe") else {
+        return Ok(None);
+    };
+    let map = recipe
+        .as_object()
+        .ok_or_else(|| "manifest.source.execution_recipe must be an object".to_string())?;
+    let schema = map
+        .get("schema")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "manifest.source.execution_recipe.schema is missing".to_string())?;
+    if schema != EXECUTION_RECIPE_SCHEMA {
+        return Err(format!(
+            "manifest.source.execution_recipe.schema is {schema:?}, expected {EXECUTION_RECIPE_SCHEMA:?}"
+        ));
+    }
+    let recipe_sha = map
+        .get("recipe_sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "manifest.source.execution_recipe.recipe_sha256 is missing".to_string())?;
+    if !is_sha256_hex(recipe_sha) {
+        return Err(
+            "manifest.source.execution_recipe.recipe_sha256 is not 64 lowercase hex digits".into(),
+        );
+    }
+    let expect = map
+        .get("expect")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "manifest.source.execution_recipe.expect must be an object".to_string())?;
+    let resident_layers = expect
+        .get("resident_layers")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            "manifest.source.execution_recipe.expect.resident_layers is missing".to_string()
+        })? as usize;
+    if resident_layers == 0 {
+        return Err("manifest.source.execution_recipe.expect.resident_layers must be > 0".into());
+    }
+    let resident_layer_set = match expect.get("resident_layer_set") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(items)) => {
+            let mut set = Vec::with_capacity(items.len());
+            for item in items {
+                let layer = item.as_u64().ok_or_else(|| {
+                    "manifest.source.execution_recipe.expect.resident_layer_set holds a non-integer"
+                        .to_string()
+                })? as usize;
+                set.push(layer);
+            }
+            if set.len() != resident_layers {
+                return Err(format!(
+                    "execution_recipe resident_layer_set has {} entries, expected {resident_layers}",
+                    set.len()
+                ));
+            }
+            let mut sorted = set.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            if sorted.len() != set.len() {
+                return Err("execution_recipe resident_layer_set has duplicate layers".into());
+            }
+            if sorted != set {
+                return Err("execution_recipe resident_layer_set must be sorted ascending".into());
+            }
+            Some(set)
+        }
+        Some(_) => {
+            return Err(
+                "manifest.source.execution_recipe.expect.resident_layer_set must be an array or null"
+                    .into(),
+            );
+        }
+    };
+    let placement = expect
+        .get("placement")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            "manifest.source.execution_recipe.expect.placement is missing".to_string()
+        })?;
+    if placement.is_empty() {
+        return Err("manifest.source.execution_recipe.expect.placement must be non-empty".into());
+    }
+    let verified = map
+        .get("verified_cache")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            "manifest.source.execution_recipe.verified_cache must be an object".to_string()
+        })?;
+    let cache_home = verified
+        .get("home")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            "manifest.source.execution_recipe.verified_cache.home is missing".to_string()
+        })?;
+    let cache_path = verified
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            "manifest.source.execution_recipe.verified_cache.path is missing".to_string()
+        })?;
+    let cache_sha256 = verified
+        .get("sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            "manifest.source.execution_recipe.verified_cache.sha256 is missing".to_string()
+        })?;
+    if cache_home.is_empty() || cache_path.is_empty() {
+        return Err(
+            "manifest.source.execution_recipe.verified_cache.home/path must be non-empty".into(),
+        );
+    }
+    if !is_sha256_hex(cache_sha256) {
+        return Err(
+            "manifest.source.execution_recipe.verified_cache.sha256 is not 64 lowercase hex digits"
+                .into(),
+        );
+    }
+    Ok(Some(SealedExpect {
+        resident_layers,
+        resident_layer_set,
+        placement: placement.to_string(),
+        cache_home: cache_home.to_string(),
+        cache_path: cache_path.to_string(),
+        cache_sha256: cache_sha256.to_string(),
+    }))
+}
+
+/// Gate the candidate plan against the sealed recipe when one is present:
+/// `Plan.expect.resident_layers` MUST equal the sealed count. No-recipe plans
+/// keep the literal original validation untouched.
+fn check_plan_against_recipe(plan: &Plan, recipe: Option<&SealedExpect>) -> Result<(), String> {
+    let Some(sealed) = recipe else {
+        return Ok(());
+    };
+    if plan.expect.resident_layers != sealed.resident_layers {
+        return Err(format!(
+            "plan.expect.resident_layers is {}, the sealed recipe requires {}",
+            plan.expect.resident_layers, sealed.resident_layers
+        ));
+    }
+    if plan.expect.resident_layers == 0 {
+        return Err("plan.expect.resident_layers must be > 0".into());
+    }
+    Ok(())
+}
+
+/// Identity BEFORE any load via the REAL `VerifiedCache` (recipe path only;
+/// the untouched original replay path never calls this): the recipe's
+/// verified-cache file digest must match, the cache home must equal the real
+/// `hipfire_home()` root, and the actual model AND `<model>.ple-q4` sidecar
+/// digest AND stat must hit the cache and equal the sealed manifest recipe
+/// (model vs `manifest.model.sha256`/`artifact.sha256`; q4 via the per-entry
+/// `verified_cache.entries[]` sha + stat). Reject missing/stale/wrong digest
+/// with no hash fallback, no `remember()`, no `disabled()` substitution.
+fn verify_verified_identity(
+    manifest: &Manifest,
+    artifact: &Artifact,
+    sealed: &SealedExpect,
+    model: &Path,
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let home = hipfire_config::hipfire_home().map_err(|e| format!("hipfire_home: {e}"))?;
+    if Path::new(&sealed.cache_home) != home {
+        return Err(format!(
+            "execution_recipe verified_cache.home {:?} differs from the real hipfire home {}",
+            sealed.cache_home,
+            home.display()
+        ));
+    }
+    let cache_bytes = std::fs::read(Path::new(&sealed.cache_path))
+        .map_err(|e| format!("read verified cache {}: {e}", sealed.cache_path))?;
+    if sha256_hex(&cache_bytes) != sealed.cache_sha256 {
+        return Err("execution_recipe verified_cache.sha256 differs from the cache file".into());
+    }
+    let entries: Value = manifest
+        .source
+        .pointer("/execution_recipe/verified_cache/entries")
+        .cloned()
+        .ok_or_else(|| {
+            "manifest.source.execution_recipe.verified_cache.entries is missing".to_string()
+        })?;
+    let entries = entries.as_array().ok_or_else(|| {
+        "manifest.source.execution_recipe.verified_cache.entries must be an array".to_string()
+    })?;
+    let expected_for = |path: &Path| -> Result<String, String> {
+        let want = path.display().to_string();
+        for entry in entries {
+            let map = entry
+                .as_object()
+                .ok_or_else(|| "verified_cache.entries holds a non-object entry".to_string())?;
+            if map.get("path").and_then(Value::as_str) == Some(want.as_str()) {
+                let sha = map
+                    .get("sha256")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("verified_cache entry for {want} has no sha256"))?;
+                if !is_sha256_hex(sha) {
+                    return Err(format!(
+                        "verified_cache entry for {want} is not 64 lowercase hex digits"
+                    ));
+                }
+                let meta =
+                    std::fs::metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+                let check = |field: &str, got: u64, want: u64| -> Result<(), String> {
+                    if got != want {
+                        return Err(format!("verified_cache entry for {want} has stale {field}"));
+                    }
+                    Ok(())
+                };
+                check(
+                    "dev",
+                    meta.dev(),
+                    map.get("dev")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| format!("verified_cache entry for {want} has no dev"))?,
+                )?;
+                check(
+                    "ino",
+                    meta.ino(),
+                    map.get("ino")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| format!("verified_cache entry for {want} has no ino"))?,
+                )?;
+                check(
+                    "size",
+                    meta.size(),
+                    map.get("size")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| format!("verified_cache entry for {want} has no size"))?,
+                )?;
+                let mtime_sec = map
+                    .get("mtime_sec")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| format!("verified_cache entry for {want} has no mtime_sec"))?;
+                let mtime_nsec = map
+                    .get("mtime_nsec")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| format!("verified_cache entry for {want} has no mtime_nsec"))?;
+                if meta.mtime() != mtime_sec || meta.mtime_nsec() != mtime_nsec {
+                    return Err(format!("verified_cache entry for {want} has stale mtime"));
+                }
+                return Ok(sha.to_string());
+            }
+        }
+        Err(format!("verified_cache.entries has no entry for {want}"))
+    };
+    let check_one = |path: &Path, expected: &str, what: &str| -> Result<(), String> {
+        let meta = std::fs::metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+        let key = StatKey::of(&meta);
+        let cache = VerifiedCache::in_home(&home);
+        let digest = cache.verified_digest(path, &key).ok_or_else(|| {
+            format!(
+                "{what} {} has no verified-cache hit (missing, corrupt, stale or unrecorded): refusing load",
+                path.display()
+            )
+        })?;
+        if !digest.eq_ignore_ascii_case(expected) {
+            return Err(format!(
+                "verified {what} digest {digest} differs from the sealed manifest recipe"
+            ));
+        }
+        Ok(())
+    };
+    check_one(model, &manifest.model.sha256, "model")?;
+    if manifest.model.sha256 != artifact.sha256 {
+        return Err("manifest.model.sha256 differs from plan.artifact.sha256".into());
+    }
+    let q4 = ple_sidecar_path(model, PleFormat::Q4);
+    let q4_expected = expected_for(&q4)?;
+    check_one(&q4, &q4_expected, "PLE sidecar")?;
+    Ok(())
+}
+
 // ── numerics: row statistics, canonical bytes, KL ──────────────────────
 
 /// Top-2 of one logits row. Ties resolve to the LOWER index (the greedy
@@ -1868,6 +2169,7 @@ fn validate_load(
     state_f32: bool,
     facts: &LoadFacts,
     expect: &Expect,
+    sealed: Option<&SealedExpect>,
 ) -> Result<(), String> {
     let mut problems = Vec::new();
     if let Err(e) = check_mode(arm, facts.mode) {
@@ -1879,9 +2181,31 @@ fn validate_load(
             facts.resident_layers, expect.resident_layers
         ));
     }
+    if let Some(sealed) = sealed {
+        if facts.resident_layers != sealed.resident_layers {
+            problems.push(format!(
+                "{} resident layers, the sealed recipe requires {}",
+                facts.resident_layers, sealed.resident_layers
+            ));
+        }
+        if facts.placement != sealed.placement {
+            problems.push(format!(
+                "placement {:?}, the sealed recipe requires {:?}",
+                facts.placement, sealed.placement
+            ));
+        }
+        if matches!(
+            hipfire_config::developer_var(S1_RESIDENT_LAYERS_ENV).ok().as_deref(),
+            Some(raw) if resident_layer_switch_is_override(Some(raw))
+        ) {
+            problems.push(format!(
+                "{S1_RESIDENT_LAYERS_ENV} overrides the resident set: the sealed recipe's explicit set is the only authority"
+            ));
+        }
+    }
     if facts.host_mapped_tensors == 0 {
         problems
-            .push("no host-mapped tensors: the placement is not the N9 host-link placement".into());
+            .push("no host-mapped tensors: the placement is not the host-link placement".into());
     }
     if facts.ple_format != expect.ple_format {
         problems.push(format!(
@@ -1914,7 +2238,7 @@ fn validate_load(
         Arm::Baseline => {
             if facts.placement != "explicit-env" {
                 problems.push(format!(
-                    "placement {:?}, expected \"explicit-env\" (the N9 override)",
+                    "placement {:?}, expected \"explicit-env\" (the explicit layer-count override)",
                     facts.placement
                 ));
             }
@@ -1975,6 +2299,9 @@ fn receipt_str<'a>(receipt: &'a Value, key: &str) -> Result<&'a str, String> {
 
 /// One prefill call's actual receipt against the arm: route, selector label,
 /// entry position, rows and tile. Returns the checked fields for the record.
+/// With a sealed recipe the layer-major count AND set MUST equal the recipe's
+/// explicit planned placement (null set = front `0..count`); without one the
+/// literal original N9 checks stand untouched.
 fn validate_receipt(
     arm: Arm,
     mode: SlowlinkMode,
@@ -1982,6 +2309,7 @@ fn validate_receipt(
     receipt: &Value,
     entry: usize,
     rows: usize,
+    sealed: Option<&SealedExpect>,
 ) -> Result<Value, String> {
     let route = receipt_str(receipt, "route")?;
     let selected_by = receipt_str(receipt, "selected_by")?;
@@ -2038,6 +2366,47 @@ fn validate_receipt(
                             expect.resident_layers
                         )),
                         Err(e) => problems.push(e),
+                    }
+                    if let Some(sealed) = sealed {
+                        match receipt.get("resident_layer_set") {
+                            Some(Value::Array(items)) => {
+                                let mut got = Vec::with_capacity(items.len());
+                                let mut malformed = false;
+                                for item in items {
+                                    match item.as_u64() {
+                                        Some(layer) => got.push(layer as usize),
+                                        None => {
+                                            malformed = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if malformed {
+                                    problems.push(
+                                        "layer-major resident_layer_set holds a non-integer".into(),
+                                    );
+                                } else {
+                                    let want: Vec<usize> = match &sealed.resident_layer_set {
+                                        Some(set) => set.clone(),
+                                        None => (0..sealed.resident_layers).collect(),
+                                    };
+                                    if got != want {
+                                        problems.push(format!(
+                                            "layer-major resident_layer_set {got:?} differs from the sealed recipe {want:?}"
+                                        ));
+                                    }
+                                    if got.len() != sealed.resident_layers {
+                                        problems.push(format!(
+                                            "layer-major resident_layer_set has {} entries, the sealed recipe requires {}",
+                                            got.len(),
+                                            sealed.resident_layers
+                                        ));
+                                    }
+                                }
+                            }
+                            _ => problems
+                                .push("layer-major receipt has no resident_layer_set array".into()),
+                        }
                     }
                 }
                 "incumbent" => {
@@ -2124,6 +2493,7 @@ impl Ctx {
         arm: Arm,
         mode: SlowlinkMode,
         expect: &Expect,
+        sealed: Option<&SealedExpect>,
     ) -> Result<PrefillResult, String> {
         if prompt.is_empty() {
             return Err("empty prompt".into());
@@ -2143,7 +2513,16 @@ impl Ctx {
                 self.bundle
                     .prefill_final(&mut self.gpu, prompt, 0, &self.logits)
                     .map_err(|e| format!("prefill: {e}"))?;
-                self.record_receipt(0, &calls[0], arm, mode, expect, &mut receipts, &mut checks)?;
+                self.record_receipt(
+                    0,
+                    &calls[0],
+                    arm,
+                    mode,
+                    expect,
+                    sealed,
+                    &mut receipts,
+                    &mut checks,
+                )?;
             }
             PrefillPlan::Direct(_) => {
                 self.bundle
@@ -2159,6 +2538,7 @@ impl Ctx {
                         arm,
                         mode,
                         expect,
+                        sealed,
                         &mut receipts,
                         &mut checks,
                     )?;
@@ -2193,6 +2573,7 @@ impl Ctx {
         arm: Arm,
         mode: SlowlinkMode,
         expect: &Expect,
+        sealed: Option<&SealedExpect>,
         receipts: &mut Vec<Value>,
         checks: &mut Vec<Value>,
     ) -> Result<(), String> {
@@ -2200,8 +2581,16 @@ impl Ctx {
             .bundle
             .slowlink_receipt()
             .ok_or_else(|| format!("no slowlink receipt for prefill call {call}"))?;
-        let check = validate_receipt(arm, mode, expect, &receipt, range.0, range.1 - range.0)
-            .map_err(|e| format!("prefill call {call} ({}..{}): {e}", range.0, range.1))?;
+        let check = validate_receipt(
+            arm,
+            mode,
+            expect,
+            &receipt,
+            range.0,
+            range.1 - range.0,
+            sealed,
+        )
+        .map_err(|e| format!("prefill call {call} ({}..{}): {e}", range.0, range.1))?;
         receipts.push(receipt);
         checks.push(check);
         Ok(())
@@ -2242,7 +2631,13 @@ impl RowSource for GpuSource<'_> {
 
 /// Load the artifact the product way, assert what actually loaded, and
 /// allocate the single reused logits row.
-fn load_ctx(model: &Path, arm: Arm, state_f32: bool, plan: &Plan) -> Result<(Ctx, Value), String> {
+fn load_ctx(
+    model: &Path,
+    arm: Arm,
+    state_f32: bool,
+    plan: &Plan,
+    sealed: Option<&SealedExpect>,
+) -> Result<(Ctx, Value), String> {
     let mode = SlowlinkMode::from_env();
     check_mode(arm, mode)?;
     let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
@@ -2268,7 +2663,7 @@ fn load_ctx(model: &Path, arm: Arm, state_f32: bool, plan: &Plan) -> Result<(Ctx
         gdn_format: loaded.bundle.state_format().gdn,
         qsa_format: loaded.bundle.state_format().qsa,
     };
-    validate_load(arm, state_f32, &facts, &plan.expect)?;
+    validate_load(arm, state_f32, &facts, &plan.expect, sealed)?;
     plan.check_vocab(loaded.vocab)?;
     let profile_json = match profile {
         Some(p) => json!({
@@ -2452,6 +2847,7 @@ struct CellDone {
 
 struct Run<'a> {
     plan: &'a Plan,
+    sealed: Option<&'a SealedExpect>,
     phase: Phase,
     arm: Arm,
     mode: SlowlinkMode,
@@ -2507,7 +2903,14 @@ impl Run<'_> {
         let cell_started = Instant::now();
         let pre = self
             .ctx
-            .prefill(prompt, &how, self.arm, self.mode, &self.plan.expect)
+            .prefill(
+                prompt,
+                &how,
+                self.arm,
+                self.mode,
+                &self.plan.expect,
+                self.sealed,
+            )
             .map_err(|e| format!("cell {name}: {e}"))?;
         let base = prompt.len();
         let mut writer = CellWriter::create(&self.dir, name, self.ctx.vocab)?;
@@ -2820,6 +3223,11 @@ fn run_gpu_phase(args: &Args, plan: &Plan, plan_bytes: &[u8]) -> Result<(), Stri
     }
     let stat_before = stat_model(model)?;
     verify_model_stat(&manifest.model, &stat_before)?;
+    let recipe = parse_execution_recipe(&manifest)?;
+    check_plan_against_recipe(plan, recipe.as_ref())?;
+    if let Some(sealed) = recipe.as_ref() {
+        verify_verified_identity(&manifest, &plan.artifact, sealed, model)?;
+    }
     let env_observed = check_env(&plan.expect, arm, phase.state_f32(), &|name| {
         hipfire_config::developer_var(name).ok()
     })?;
@@ -2836,7 +3244,7 @@ fn run_gpu_phase(args: &Args, plan: &Plan, plan_bytes: &[u8]) -> Result<(), Stri
         (None, None)
     };
 
-    let (ctx, load_facts) = load_ctx(model, arm, phase.state_f32(), plan)?;
+    let (ctx, load_facts) = load_ctx(model, arm, phase.state_f32(), plan, recipe.as_ref())?;
     let mode = SlowlinkMode::from_env();
     let det_cases = if phase.runs_determinism() {
         resolve_det_cases(plan, &ctx)?
@@ -2845,6 +3253,7 @@ fn run_gpu_phase(args: &Args, plan: &Plan, plan_bytes: &[u8]) -> Result<(), Stri
     };
     let mut run = Run {
         plan,
+        sealed: recipe.as_ref(),
         phase,
         arm,
         mode,
@@ -2907,6 +3316,11 @@ fn run_gpu_phase(args: &Args, plan: &Plan, plan_bytes: &[u8]) -> Result<(), Stri
                 "s1_layer_major_min_rows": plan.expect.s1_layer_major_min_rows,
                 "ple_format": plan.expect.ple_format,
             },
+            "execution_recipe": recipe.as_ref().map(|sealed| json!({
+                "resident_layers": sealed.resident_layers,
+                "resident_layer_set": sealed.resident_layer_set,
+                "placement": sealed.placement,
+            })).unwrap_or(Value::Null),
         },
         "manifest": {
             "path": manifest_path.display().to_string(),
@@ -2932,6 +3346,11 @@ fn run_gpu_phase(args: &Args, plan: &Plan, plan_bytes: &[u8]) -> Result<(), Stri
             "path": model.display().to_string(),
             "pinned_sha256": manifest.model.sha256,
             "hashed_here": false,
+            "verified_cache": recipe.as_ref().map(|sealed| json!({
+                "home": sealed.cache_home,
+                "path": sealed.cache_path,
+                "sha256": sealed.cache_sha256,
+            })).unwrap_or(Value::Null),
             "stat": {
                 "dev": stat_before.dev,
                 "ino": stat_before.ino,
@@ -4401,24 +4820,26 @@ mod tests {
     #[test]
     fn load_assertions_fail_on_any_unexpected_placement() {
         let e = expect();
-        validate_load(Arm::Baseline, false, &baseline_facts(), &e).unwrap();
-        validate_load(Arm::S1, false, &s1_facts(), &e).unwrap();
+        validate_load(Arm::Baseline, false, &baseline_facts(), &e, None).unwrap();
+        validate_load(Arm::S1, false, &s1_facts(), &e, None).unwrap();
         let mut facts = s1_facts();
         facts.mode = SlowlinkMode::Auto;
-        validate_load(Arm::S1, false, &facts, &e).unwrap();
+        validate_load(Arm::S1, false, &facts, &e, None).unwrap();
         // The f32 diagnostic loads the exact GDN state with the KV still q8.
         let mut f32_facts = baseline_facts();
         f32_facts.gdn_format = GdnStateFormat::F32;
-        validate_load(Arm::Baseline, true, &f32_facts, &e).unwrap();
-        assert!(validate_load(Arm::Baseline, false, &f32_facts, &e)
+        validate_load(Arm::Baseline, true, &f32_facts, &e, None).unwrap();
+        assert!(validate_load(Arm::Baseline, false, &f32_facts, &e, None)
             .unwrap_err()
             .contains("expected GDN Q8"));
-        assert!(validate_load(Arm::Baseline, true, &baseline_facts(), &e)
-            .unwrap_err()
-            .contains("expected GDN F32"));
+        assert!(
+            validate_load(Arm::Baseline, true, &baseline_facts(), &e, None)
+                .unwrap_err()
+                .contains("expected GDN F32")
+        );
         let mut f32_kv = s1_facts();
         f32_kv.qsa_format = QsaKvFormat::F32;
-        assert!(validate_load(Arm::S1, false, &f32_kv, &e)
+        assert!(validate_load(Arm::S1, false, &f32_kv, &e, None)
             .unwrap_err()
             .contains("QSA K-V Q8"));
 
@@ -4429,7 +4850,7 @@ mod tests {
                 baseline_facts()
             };
             mutate(&mut facts);
-            validate_load(arm, false, &facts, &e).unwrap_err()
+            validate_load(arm, false, &facts, &e, None).unwrap_err()
         };
         assert!(bad(Arm::S1, &|f| f.resident_layers = 8).contains("8 resident layers, expected 9"));
         assert!(bad(Arm::S1, &|f| f.profile_tile_rows = Some(1024)).contains("profile tile"));
@@ -4487,6 +4908,7 @@ mod tests {
             "retained_scratch_rows": 768,
             "sweeps": 4,
             "resident_layers": layers,
+            "resident_layer_set": [0, 3, 7, 15, 19, 23, 27, 39, 43],
             "host_layers": 31,
         })
     }
@@ -4502,6 +4924,7 @@ mod tests {
             &incumbent_receipt(4096, 4096, 4096, "env0"),
             4096,
             4096,
+            None,
         )
         .unwrap();
         assert_eq!(ok["route"], "incumbent");
@@ -4513,6 +4936,7 @@ mod tests {
             &layer_major_receipt(0, 4096, "env0", 9),
             0,
             4096,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("expected \"incumbent\""), "{err}");
@@ -4523,6 +4947,7 @@ mod tests {
             &incumbent_receipt(0, 4096, 768, "env0"),
             0,
             4096,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("expected 4096"), "{err}");
@@ -4533,6 +4958,7 @@ mod tests {
             &incumbent_receipt(0, 4000, 4096, "env0"),
             0,
             4096,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("prompt_rows 4000, expected 4096"), "{err}");
@@ -4544,6 +4970,7 @@ mod tests {
             &layer_major_receipt(0, 16384, "env1", 9),
             0,
             16384,
+            None,
         )
         .unwrap();
         validate_receipt(
@@ -4553,6 +4980,7 @@ mod tests {
             &layer_major_receipt(1537, 1863, "auto", 9),
             1537,
             1863,
+            None,
         )
         .unwrap();
         let err = validate_receipt(
@@ -4562,6 +4990,7 @@ mod tests {
             &incumbent_receipt(0, 16384, 768, "env1"),
             0,
             16384,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("took the incumbent route"), "{err}");
@@ -4572,6 +5001,7 @@ mod tests {
             &layer_major_receipt(0, 16384, "env1", 8),
             0,
             16384,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("resident_layers 8, expected 9"), "{err}");
@@ -4582,6 +5012,7 @@ mod tests {
             &layer_major_receipt(0, 16384, "auto", 9),
             0,
             16384,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -4596,17 +5027,20 @@ mod tests {
             &incumbent_receipt(0, 512, 768, "env1"),
             0,
             512,
+            None,
         )
         .unwrap();
         // An aborted layer-major receipt is not accepted.
         let mut aborted = layer_major_receipt(0, 2000, "env1", 9);
         aborted["status"] = json!("aborted: boom");
-        assert!(validate_receipt(Arm::S1, SlowlinkMode::Force, &e, &aborted, 0, 2000).is_err());
+        assert!(
+            validate_receipt(Arm::S1, SlowlinkMode::Force, &e, &aborted, 0, 2000, None).is_err()
+        );
         // A missing field is an error, never a default.
         let mut missing = layer_major_receipt(0, 2000, "env1", 9);
         missing.as_object_mut().unwrap().remove("tile_rows");
         assert!(
-            validate_receipt(Arm::S1, SlowlinkMode::Force, &e, &missing, 0, 2000)
+            validate_receipt(Arm::S1, SlowlinkMode::Force, &e, &missing, 0, 2000, None)
                 .unwrap_err()
                 .contains("tile_rows")
         );
@@ -4787,6 +5221,112 @@ mod tests {
         assert!(
             Manifest::from_slice(&serde_json::to_vec(&wrong).unwrap(), &plan.artifact).is_err()
         );
+    }
+
+    fn recipe_manifest(plan: &Plan, exe_sha: &str, layers: usize, set: Value) -> Value {
+        let mut manifest = manifest_json(plan, exe_sha);
+        manifest["source"] = json!({
+            "commit": "40a4e3bee",
+            "worktree": "/wt",
+            "execution_recipe": {
+                "schema": EXECUTION_RECIPE_SCHEMA,
+                "recipe_sha256": sha256_hex(b"recipe"),
+                "device": {"arch": "gfx1201"},
+                "source": {"origin": "sealed"},
+                "verified_cache": {
+                    "home": "/home/u/.hipfire",
+                    "path": "/home/u/.hipfire/cache/verified-artifacts.json",
+                    "sha256": sha256_hex(b"cache"),
+                    "entries": [],
+                },
+                "expect": {
+                    "resident_layers": layers,
+                    "resident_layer_set": set,
+                    "placement": "slowlink-profile",
+                },
+                "resources": {},
+            },
+        });
+        manifest
+    }
+
+    #[test]
+    fn sealed_recipe_gates_plan_count_and_receipt_set() {
+        let plan = Plan::from_value(sample_plan_value()).unwrap();
+        let exe = sha256_hex(b"exe");
+        // No recipe: the untouched original N9 replay path.
+        let bytes = serde_json::to_vec(&manifest_json(&plan, &exe)).unwrap();
+        let manifest = Manifest::from_slice(&bytes, &plan.artifact).unwrap();
+        assert!(parse_execution_recipe(&manifest).unwrap().is_none());
+        check_plan_against_recipe(&plan, None).unwrap();
+        // A genuine planned count seals: plan == recipe == actual.
+        let sealed_value = recipe_manifest(&plan, &exe, 9, Value::Null);
+        let bytes = serde_json::to_vec(&sealed_value).unwrap();
+        let sealed_manifest = Manifest::from_slice(&bytes, &plan.artifact).unwrap();
+        let sealed = parse_execution_recipe(&sealed_manifest).unwrap().unwrap();
+        assert_eq!(sealed.resident_layers, 9);
+        assert!(sealed.resident_layer_set.is_none());
+        check_plan_against_recipe(&plan, Some(&sealed)).unwrap();
+        // An arbitrary count never seals: the candidate plan must equal it.
+        let other_value = recipe_manifest(&plan, &exe, 7, Value::Null);
+        let bytes = serde_json::to_vec(&other_value).unwrap();
+        let other_manifest = Manifest::from_slice(&bytes, &plan.artifact).unwrap();
+        let other = parse_execution_recipe(&other_manifest).unwrap().unwrap();
+        assert!(check_plan_against_recipe(&plan, Some(&other))
+            .unwrap_err()
+            .contains("requires 7"));
+        // An explicit set pins the layer-major receipts exactly.
+        let spread = vec![0, 3, 7, 15, 19, 23, 27, 39, 43];
+        let set_value = recipe_manifest(&plan, &exe, 9, json!(spread));
+        let bytes = serde_json::to_vec(&set_value).unwrap();
+        let set_manifest = Manifest::from_slice(&bytes, &plan.artifact).unwrap();
+        let set_sealed = parse_execution_recipe(&set_manifest).unwrap().unwrap();
+        assert_eq!(set_sealed.resident_layer_set, Some(spread.clone()));
+        let receipt = layer_major_receipt(0, 16384, "env1", 9);
+        let e = expect();
+        validate_receipt(
+            Arm::S1,
+            SlowlinkMode::Force,
+            &e,
+            &receipt,
+            0,
+            16384,
+            Some(&set_sealed),
+        )
+        .unwrap();
+        let mut wrong_set = receipt.clone();
+        wrong_set["resident_layer_set"] = json!([0, 1, 2]);
+        assert!(validate_receipt(
+            Arm::S1,
+            SlowlinkMode::Force,
+            &e,
+            &wrong_set,
+            0,
+            16384,
+            Some(&set_sealed)
+        )
+        .unwrap_err()
+        .contains("differs from the sealed recipe"));
+        // A recipe layer-major receipt with no set is refused, never defaulted.
+        let mut bare = layer_major_receipt(0, 16384, "env1", 9);
+        bare.as_object_mut().unwrap().remove("resident_layer_set");
+        assert!(validate_receipt(
+            Arm::S1,
+            SlowlinkMode::Force,
+            &e,
+            &bare,
+            0,
+            16384,
+            Some(&set_sealed)
+        )
+        .unwrap_err()
+        .contains("no resident_layer_set array"));
+        // The load itself must equal the sealed count, not the old literal.
+        let mut facts = s1_facts();
+        facts.resident_layers = 7;
+        assert!(validate_load(Arm::S1, false, &facts, &e, Some(&set_sealed))
+            .unwrap_err()
+            .contains("requires 9"));
     }
 
     #[test]
@@ -5239,6 +5779,7 @@ mod tests {
             &real_resume_first(),
             0,
             1537,
+            None,
         )
         .unwrap();
         assert_eq!(first["route"], "layer-major");
@@ -5252,6 +5793,7 @@ mod tests {
             &real_resume_second(),
             1537,
             1863,
+            None,
         )
         .unwrap();
         assert_eq!(second["entry_pos"], 1537);
@@ -5264,7 +5806,8 @@ mod tests {
             &e,
             &real_resume_second(),
             0,
-            1863
+            1863,
+            None,
         )
         .unwrap_err()
         .contains("entry_pos 1537, expected 0"));
@@ -5274,7 +5817,8 @@ mod tests {
             &e,
             &real_resume_first(),
             0,
-            1536
+            1536,
+            None,
         )
         .unwrap_err()
         .contains("prompt_rows 1537, expected 1536"));
@@ -5285,7 +5829,8 @@ mod tests {
             &e,
             &real_resume_first(),
             0,
-            1537
+            1537,
+            None,
         )
         .unwrap_err()
         .contains("selected_by \"env1\", expected \"auto\""));
@@ -5297,6 +5842,7 @@ mod tests {
             &real_p1536_bypass(),
             0,
             1536,
+            None,
         )
         .unwrap();
         assert_eq!(bypass["route"], "incumbent");
@@ -5310,7 +5856,7 @@ mod tests {
         let mut long = real_p1536_bypass();
         long["prompt_rows"] = json!(1537);
         assert!(
-            validate_receipt(Arm::S1, SlowlinkMode::Force, &e, &long, 0, 1537)
+            validate_receipt(Arm::S1, SlowlinkMode::Force, &e, &long, 0, 1537, None)
                 .unwrap_err()
                 .contains("took the incumbent route")
         );
@@ -5322,6 +5868,7 @@ mod tests {
             &real_resume_first(),
             0,
             1537,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("expected \"incumbent\""), "{err}");
@@ -5375,6 +5922,7 @@ mod tests {
                 &producer_incumbent_off(entry, rows, 4096),
                 entry as usize,
                 rows as usize,
+                None,
             )
             .unwrap();
         }
@@ -5386,7 +5934,7 @@ mod tests {
         let mut small = producer_incumbent_off(0, 3400, 768);
         small["retained_scratch_rows"] = json!(768);
         assert!(
-            validate_receipt(Arm::Baseline, SlowlinkMode::Off, &e, &small, 0, 3400)
+            validate_receipt(Arm::Baseline, SlowlinkMode::Off, &e, &small, 0, 3400, None)
                 .unwrap_err()
                 .contains("expected 4096")
         );
@@ -5397,7 +5945,8 @@ mod tests {
             &e,
             &producer_incumbent_off(0, 3400, 768),
             0,
-            3400
+            3400,
+            None,
         )
         .unwrap_err()
         .contains("selected_by \"env0\", expected \"env1\""));

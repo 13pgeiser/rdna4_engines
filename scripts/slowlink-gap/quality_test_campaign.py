@@ -56,6 +56,156 @@ def fake_camp(root="/r"):
                              "plan": {"path": "/pl/%s.json" % arm, "sha256": "f" * 64}, "runs": runs}
     return camp
 
+
+def fake_recipe(**over):
+    r = {"schema": qc.RECIPE_SCHEMA,
+         "device": {"arch": "gfx1201", "card": "e", "bdf": "0000:c3:00.0", "vendor_id": "0x1002",
+                    "device_id": "0x744c", "uuid": "GPU-05f92432f2312a0e", "unique_id": "05f92432f2312a0e",
+                    "hip_visible": "0"},
+         "source": {"origin": "fn-accepted-fa11-gfx1201-pack-20261021-001", "pack_dir": "/x/kernels/compiled/gfx1201",
+                    "pack_digest": "1" * 64, "pack_count": 3,
+                    "elf": {"path": "/x/bin/qwen4_slowlink_quality", "sha256": "c" * 64, "size": 5},
+                    "reference_plan_sha256": PLAN_SHA,
+                    "reference_source_pin": {"commit": "a" * 40, "example_sha256": "b" * 64}},
+         "verified_cache": {"home": "/real/.hipfire", "path": "/real/.hipfire/cache/verified-artifacts.json",
+                            "sha256": "2" * 64, "entries": []},
+         "expect": {"resident_layers": 9, "resident_layer_set": None, "placement": "slowlink-profile"},
+         "resources": {"max_job_secs": 1800, "child_cap_secs": 1700, "kill_grace_secs": 20,
+                       "drain_vram_bytes": 2 * 1024 ** 3, "min_mem_available_kib": 80 * 1024 * 1024,
+                       "native_cpu_cap_secs": 1200}}
+    for k, v in over.items():
+        r[k] = v
+    return r
+
+
+class ExecutionRecipe(unittest.TestCase):
+    def test_no_recipe_preserves_original_defaults(self):
+        camp = fake_camp()
+        self.assertEqual(qc.camp_device(camp), qc.DEVICE)
+        self.assertEqual(qc.camp_arch(camp), "gfx1100")
+        self.assertEqual(qc.pack_dir_of("/x/bin/q"), "/x/bin/kernels/compiled/gfx1100")
+        m = qc.native_manifest(camp, "off", "s1a")
+        self.assertNotIn("execution_recipe", m["source"])
+        self.assertEqual(m["launch"]["device"], qc.DEVICE)
+
+    def test_recipe_schema_device_source_cache_expect_resources_validated(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(fake_recipe(), f)
+        try:
+            r, sha = qc.load_execution_recipe(f.name)
+            self.assertEqual(r["schema"], qc.RECIPE_SCHEMA)
+            self.assertEqual(len(sha), 64)
+        finally:
+            os.unlink(f.name)
+        for bad in ({"schema": "other"},
+                    {"device": {"arch": "gfx900", "card": "e", "bdf": "b", "vendor_id": "v",
+                                "device_id": "d", "uuid": "u", "unique_id": "i", "hip_visible": "h"}},
+                    {"expect": {"resident_layers": 0, "placement": "slowlink-profile"}},
+                    {"resources": {"max_job_secs": 0, "child_cap_secs": 1, "kill_grace_secs": 1,
+                                  "drain_vram_bytes": 1, "min_mem_available_kib": 1,
+                                  "native_cpu_cap_secs": 1}},
+                    {"verified_cache": {"home": "rel", "path": "rel", "sha256": "2" * 64}}):
+            r = fake_recipe(**bad)
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+                json.dump(r, f)
+            try:
+                with self.assertRaises(qc.Refusal):
+                    qc.load_execution_recipe(f.name)
+            finally:
+                os.unlink(f.name)
+
+    def test_candidate_plan_whitelist_is_execution_binding_only(self):
+        base = base_plan()
+        cand = copy.deepcopy(base)
+        self.assertTrue(qc.plan_structural_equal_except_artifact_path(base, cand))
+        moved = copy.deepcopy(base)
+        moved["artifact"]["path"] = "/staged/model.mq4"
+        self.assertTrue(qc.plan_structural_equal_except_artifact_path(base, moved))
+        tampered = copy.deepcopy(base)
+        tampered["expect"]["resident_layers"] = 12
+        # no recipe: ANY count delta is refused; a changed count without a binding recipe never passes
+        self.assertFalse(qc.plan_structural_equal_except_artifact_path(base, tampered))
+        corpus = copy.deepcopy(base)
+        corpus["primary"]["contexts"][0]["id"] = "other"
+        self.assertFalse(qc.plan_structural_equal_except_artifact_path(base, corpus))
+        # with recipe: ONLY artifact.path plus the recipe-bound expect.resident_layers passes.
+        # The expected set lives ONLY in recipe.expect.resident_layer_set (strict Expect has no
+        # set field; no new plan field introduced, native deny_unknown_fields untouched).
+        recipe = fake_recipe(expect={"resident_layers": 12, "resident_layer_set": list(range(12)),
+                                     "placement": "slowlink-profile"})
+        bound = copy.deepcopy(base)
+        bound["artifact"]["path"] = "/staged/model.mq4"
+        bound["expect"]["resident_layers"] = 12
+        self.assertTrue(qc.plan_structural_equal_except_artifact_path(base, bound, recipe))
+        wrong_count = copy.deepcopy(bound)
+        wrong_count["expect"]["resident_layers"] = 13
+        self.assertFalse(qc.plan_structural_equal_except_artifact_path(base, wrong_count, recipe))
+        other_drift = copy.deepcopy(bound)
+        other_drift["expect"]["s1_tile_rows"] = 1536
+        self.assertFalse(qc.plan_structural_equal_except_artifact_path(base, other_drift, recipe))
+        set_in_plan = copy.deepcopy(bound)
+        set_in_plan["expect"]["resident_layer_set"] = list(range(12))
+        self.assertFalse(qc.plan_structural_equal_except_artifact_path(base, set_in_plan, recipe))
+
+    def test_device_pack_cache_count_refused(self):
+        camp = fake_camp()
+        camp["execution_recipe"] = fake_recipe()
+        camp["device"] = dict(camp["execution_recipe"]["device"])
+        self.assertEqual(qc.camp_arch(camp), "gfx1201")
+        self.assertEqual(qc.device_state(FakeHost({"/sys/bus/pci/devices/0000:c3:00.0/vendor": "0x1002\n",
+                                                   "/sys/bus/pci/devices/0000:c3:00.0/device": "0x744c\n"}),
+                                         camp["device"])[0], True)
+        self.assertFalse(qc.device_state(FakeHost({}), camp["device"])[0])
+        self.assertEqual(qc.pack_dir_of("/x/bin/q", "gfx1201"), "/x/bin/kernels/compiled/gfx1201")
+        with self.assertRaises(qc.Refusal):
+            qc.pack_rel_for("gfx900")
+        m = qc.native_manifest(camp, "off", "s1a")
+        self.assertEqual(m["source"]["execution_recipe"]["device"]["uuid"], "GPU-05f92432f2312a0e")
+        self.assertEqual(m["launch"]["device"]["arch"], "gfx1201")
+        self.assertEqual(m["launch"]["env"]["set"]["HIPFIRE_HOME"], "/real/.hipfire")
+        self.assertEqual(m["launch"]["env"]["set"]["HOME"], m["launch"]["env"]["set"]["HOME"])
+        self.assertTrue(m["launch"]["env"]["set"]["HOME"].endswith("/home"))
+        self.assertEqual(m["launch"]["env"]["set"]["HIPFIRE_DEVICES"], "GPU-05f92432f2312a0e")
+
+    def test_wrong_arch_pack_rejected_and_cache_verified(self):
+        self.assertEqual(qc.pack_dir_of("/x/bin/q", "gfx1100"), "/x/bin/kernels/compiled/gfx1100")
+        self.assertNotEqual(qc.pack_dir_of("/x/bin/q", "gfx1201"), qc.pack_dir_of("/x/bin/q", "gfx1100"))
+        with tempfile.TemporaryDirectory() as d:
+            member = os.path.join(d, "model.mq4")
+            with open(member, "wb") as f:
+                f.write(b"x" * 10)
+            st = os.stat(member)
+            vc = os.path.join(d, "verified-artifacts.json")
+            with open(vc, "wb") as f:
+                f.write(b"{}")
+            r = fake_recipe(verified_cache={"home": d, "path": vc, "sha256": qc.sha256_bytes(b"{}"),
+                                            "entries": [{"path": member, "sha256": "9" * 64, "dev": st.st_dev,
+                                                         "ino": st.st_ino, "size": st.st_size,
+                                                         "mtime_ns": st.st_mtime_ns}]})
+            self.assertEqual(qc.verify_verified_cache(r), [])
+            bad = copy.deepcopy(r)
+            bad["verified_cache"]["sha256"] = "0" * 64
+            self.assertTrue(qc.verify_verified_cache(bad))
+            stale = copy.deepcopy(r)
+            stale["verified_cache"]["entries"][0]["size"] += 1
+            self.assertTrue(qc.verify_verified_cache(stale))
+
+    def test_recipe_counts_parameterized_not_hardcoded(self):
+        camp = fake_camp()
+        camp["execution_recipe"] = fake_recipe(expect={"resident_layers": 12,
+                                                       "resident_layer_set": list(range(12)),
+                                                       "placement": "slowlink-profile"})
+        camp["device"] = dict(camp["execution_recipe"]["device"])
+        ev = qc.route_evidence("off", cells(), LOAD_FRONT.replace("resident layers=9", "resident layers=12"),
+                               [], camp=camp)
+        self.assertFalse(ev["ok"])  # helper cells still carry N9 receipts: genuine mismatch must fail
+        p = base_plan()
+        p["expect"]["resident_layers"] = 12
+        ap = qc.arm_plan(p, "off", camp["execution_recipe"])
+        self.assertEqual(ap["expect"]["resident_layers"], 12)
+        with self.assertRaises(qc.Refusal):
+            qc.arm_plan(p, "off")  # no-recipe replay keeps the original N9 gate
+
 class HistoricalCampaign(unittest.TestCase):
     def test_source_binding_and_report_only_override(self):
         with tempfile.TemporaryDirectory() as root:
