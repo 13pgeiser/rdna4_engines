@@ -174,6 +174,7 @@ typedef struct RadBuildCtx {
      * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
     int      kv_quant;
 
+    /* ---- appended in ABI 26 (control vectors) */
     /* A control vector loaded from a GGUF `controlvector` file found for this model, or null.
      *
      * The engine loads and validates it once, at bringup, and the plugin only reads it: the
