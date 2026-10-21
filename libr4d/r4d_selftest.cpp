@@ -15235,7 +15235,8 @@ static void mx_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, int64_
             const int64_t pbm = pwide || (K > 256 && Tr >= 12288) ? 64 : 32;
             const bool p64 =
                 glm && Tr >= (P.srt ? 5760 : 769) && (Tr + pbm - 1) / pbm + E <= 65535;
-            const bool small = glm && Tr <= (P.srt ? 32 : 384);
+            const bool small = (glm && Tr <= (P.srt ? 32 : 384)) ||
+                               (f8 && E == 288 && top_k == 8 && !P.srt && Tr <= 384);
             const bool expert = !p64 && !small && (f8 || Tr <= (glm ? (P.srt ? 6143 : 768) : 511));
             const bool pipe = !p64 && !small && !expert && glm;
             const int64_t jr = p64 ? pbm : pipe ? 32 : 16;
