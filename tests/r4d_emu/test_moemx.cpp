@@ -7,7 +7,8 @@
  * slice the P64 form with streamed A. Runs of 0, 1, 15, 16, 17, 63, 64, 65 and 130 rows, dropped
  * slots inside runs and past the routed rows, columns an odd expert does not have, a shorter K for
  * odd experts, E8M0 codes 0 and 255, parts 2, token and sorted rows, stacked planes and pointer
- * tables. The table decode is also held to the arithmetic one over every code. */
+ * tables. At GLM's TP8 slices below P64 the small-M form, with runs longer than one tile. The
+ * table decode is also held to the arithmetic one over every code. */
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "r4d_plugin.h"
@@ -201,6 +202,45 @@ int main() {
           glm_runs({ 200, 33, 300, 31, 200 }),
           20,
           "(moe_mxfp4_p64_kernel<32, 64, 256, 1, false>)" },
+        { "GLM TP8 gate_up, small-M form, four tokens",
+          512,
+          4096,
+          512,
+          4096,
+          2,
+          8,
+          false,
+          true,
+          false,
+          glm_runs({ 1, 2, 1, 3, 1, 6, 1, 2, 9, 1 }),
+          5,
+          "(moe_mxfp4_small_kernel<512, 1>)" },
+        { "GLM TP8 gate_up, small-M form, runs past one tile",
+          512,
+          4096,
+          512,
+          4096,
+          2,
+          8,
+          false,
+          true,
+          true,
+          glm_runs({ 12, 1, 16, 17, 3, 0, 5, 9, 2, 33 }),
+          2,
+          "(moe_mxfp4_small_kernel<512, 1>)" },
+        { "GLM TP8 down, small-M form, a run past one tile",
+          4096,
+          256,
+          4096,
+          256,
+          1,
+          8,
+          true,
+          true,
+          true,
+          glm_runs({ 3, 1, 17, 2, 1, 1, 1 }),
+          5,
+          "(moe_mxfp4_small_kernel<256, 4>)" },
         { "GLM TP8 down, P64 BM32 BN64 K128 x4, A resident",
           4096,
           256,

@@ -15007,8 +15007,8 @@ static void mx_experts_check(const Plugin& pl, int M, int parts, bool pooled, co
  *
  * The form is the launcher's rule, mirrored here only to name it and count the expert slices it
  * streams: a (job, expert) pair reads the whole slice across the column blocks, so row groups
- * re-read an expert once per group its run spans, the expert-major decode form once per 16 of its
- * rows, and the P64 and GLM prefill forms once per job. */
+ * re-read an expert once per group its run spans, the expert-major and small-M forms once per 16
+ * of its rows, and the P64 and GLM prefill forms once per job. */
 static void mx_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, int64_t top_k,
                     bool f8 = false, const char* skew = nullptr) {
     if (iters <= 0) iters = 100;
@@ -15235,11 +15235,12 @@ static void mx_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, int64_
             const int64_t pbm = pwide || (K > 256 && Tr >= 12288) ? 64 : 32;
             const bool p64 =
                 glm && Tr >= (P.srt ? 5760 : 769) && (Tr + pbm - 1) / pbm + E <= 65535;
-            const bool expert = !p64 && (f8 || Tr <= (glm ? (P.srt ? 6143 : 768) : 511));
-            const bool pipe = !p64 && !expert && glm;
+            const bool small = glm && Tr <= (P.srt ? 32 : 384);
+            const bool expert = !p64 && !small && (f8 || Tr <= (glm ? (P.srt ? 6143 : 768) : 511));
+            const bool pipe = !p64 && !small && !expert && glm;
             const int64_t jr = p64 ? pbm : pipe ? 32 : 16;
             int64_t streams = 0;
-            if (p64 || pipe || expert)
+            if (p64 || pipe || expert || small)
                 for (int64_t e = 0; e < E; ++e)
                     streams += (off[(size_t)(e + 1)] - off[(size_t)e] + jr - 1) / jr;
             else
@@ -15249,6 +15250,7 @@ static void mx_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, int64_
                 p64 ? fmt("P64 BM%lld BN%d K%d", (long long)pbm, pwide ? 128 : 64,
                           K > 256 && !pwide ? 256 : 128) +
                           (K <= 256 ? " x4, A resident" : "") + (pwide ? ", LDS out" : "")
+                : small  ? fmt("small-M K%d x%d tiles", K <= 256 ? 256 : 512, K <= 256 ? 4 : 1)
                 : expert ? fmt("expert-major K%d x%d tiles", K <= 256 ? 128 : 256,
                                K <= 256 || (f8 && Tr < 128) ? 4 : 1)
                 : pipe   ? std::string("GLM prefill form, jobs of 32 rows")
@@ -26495,6 +26497,12 @@ static void device_phase(const Plugin& pl) {
                 mx_experts_check(pl, m, shape % 2 ? 2 : 1, false, shape == 2 ? "sorted" : "token",
                                  shape, true, 288, 8);
             }
+        // At GLM's TP8 slices the small-M form for gate_up to 384 routed rows and down to 32,
+        // the expert-major form for down above, with dropped slots.
+        for (int m : { 1, 3, 4, 6, 8, 12, 48 }) {
+            mx_experts_check(pl, m, 2, m % 2 == 0, "token", 3, false, 288, 8, true);
+            mx_experts_check(pl, m, 1, m % 2 != 0, "sorted", 4, m == 3, 288, 8, true);
+        }
         // At GLM's TP8 slices the expert-major form to its bound (gate_up 768 rows, down below
         // P64's 5760), then P64 by its rule: gate_up BM32 BN64 K256 from 769 rows, BM64 BN64 K256
         // from 12288 and BM64 BN128 K128 with the LDS output from 24576; down BM32 BN64 K128 x4
