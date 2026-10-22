@@ -1731,13 +1731,26 @@ pub(crate) fn activation(
     if is_slab(p) {
         return slab_activation(gpu, p);
     }
-    let live = total_slots
-        .checked_mul(p.mi)
+    let wide_exact =
+        p.recipe.bf16_round_trip() && super::layer_ops::wide_exact_rows(gpu, p.batch_size);
+    // The F16 WMMA and symmetric IU4 downs rotate the grouped rows themselves
+    // (see `down`); the F32 unscatter may already have rotated.
+    let path2_done = !wide_exact
+        && use_path2
+        && (sym_iu4(gpu, p, use_path2) || down_wmma(gpu, p) || unscatter_rotates(gpu, p));
+    // The batch views are owed only when this stage runs a kernel over them.
+    // The symmetric IU4 route's compact scratch holds no gate/up/rot rows
+    // beyond the fallback cap, so viewing `batch_size * k_top * mi` eagerly
+    // would index past that allocation on a prefill chunk.
+    let live = activation_batch_extent(path2_done, total_slots, p.mi)
         .ok_or_else(|| DispatchError::Hip("routed activation extent overflows".into()))?;
+    if live == 0 {
+        return Ok(());
+    }
     let gate = f32_view(p.gate_batch, 0, live);
     let up = f32_view(p.up_batch, 0, live);
     let rotated = f32_view(p.rot_batch, 0, live);
-    if p.recipe.bf16_round_trip() && super::layer_ops::wide_exact_rows(gpu, p.batch_size) {
+    if wide_exact {
         return hip(gpu.silu_mul_bf16_rt_rotate_x_mq_128_v2_shared(
             &gate,
             &up,
@@ -1754,12 +1767,18 @@ pub(crate) fn activation(
             hip(gpu.bf16_round_trip_f32(&rotated))?;
         }
     }
-    // The F16 WMMA and symmetric IU4 downs rotate the grouped rows themselves
-    // (see `down`); the F32 unscatter may already have rotated.
-    if use_path2 && (sym_iu4(gpu, p, use_path2) || down_wmma(gpu, p) || unscatter_rotates(gpu, p)) {
-        return Ok(());
-    }
     hip(gpu.rotate_x_mq_128_v2(&rotated, &rotated, p.mi, total_slots))
+}
+
+/// F32 elements of the gate/up/rot batch buffers the non-slab activation stage
+/// runs a kernel over: `0` when path 2's down or unscatter already consumed
+/// the rotation (`path2_done`), else the live `total_slots * mi` rows. Pure;
+/// the caller views the buffers only for a non-zero extent. `None` on overflow.
+fn activation_batch_extent(path2_done: bool, total_slots: usize, mi: usize) -> Option<usize> {
+    if path2_done {
+        return Some(0);
+    }
+    total_slots.checked_mul(mi)
 }
 
 /// A few-row forward (speculative verify) on grouped path 2 without the WMMA
@@ -3710,6 +3729,35 @@ mod scratch_tests {
             .unwrap()
             .require_within(&compact_scratch(4096))
             .is_err());
+    }
+
+    #[test]
+    fn full_prefill_chunk_activation_owes_no_view_into_the_compact_batch_buffers() {
+        // pp16384 on the symmetric IU4 route: compact scratch holds gate/up/rot
+        // rows for `min(n, 512)` chunk rows only (13_107_200 B each), while a
+        // view over the chunk's `rows * k_top * mi` would be 419_430_400 B.
+        let rows = 16_384;
+        let held = compact_scratch(rows);
+        assert_eq!(held.gate_batch, 13_107_200);
+        let slots = rows * K_TOP;
+        assert_eq!(slots * MI * 4, 419_430_400);
+        assert!(slots * MI * 4 > held.gate_batch);
+        let need = sym().requirement(&dims(rows)).unwrap();
+        assert_eq!((need.gate_batch, need.up_batch, need.rot_batch), (0, 0, 0));
+        need.require_within(&held).unwrap();
+        // Path 2's down consumed the rotation: the stage views nothing.
+        assert_eq!(activation_batch_extent(true, slots, MI), Some(0));
+        // Every row count the compact fallback arms admit views what they hold.
+        for rows in [1, 8, 9, 64, 511, 512] {
+            let held = compact_scratch(rows.max(512));
+            let slots = rows * K_TOP;
+            let live = activation_batch_extent(false, slots, MI).unwrap();
+            assert_eq!(live, slots * MI);
+            for bytes in [held.gate_batch, held.up_batch, held.rot_batch] {
+                assert!(live * 4 <= bytes, "rows={rows}");
+            }
+        }
+        assert_eq!(activation_batch_extent(false, usize::MAX, 2), None);
     }
 
     #[test]
