@@ -12668,7 +12668,10 @@ mod tests {
         assert!(!ok("gfx1201", true, true, 320, 2568, 4096, false, false));
         assert!(!ok("gfx1201", true, true, 320, 0, 4096, false, false));
         for arch in ["gfx1151", "gfx1200", "gfx1100", "gfx1030", "gfx1201x", ""] {
-            assert!(!ok(arch, true, true, 320, 2560, 4096, false, false), "{arch}");
+            assert!(
+                !ok(arch, true, true, 320, 2560, 4096, false, false),
+                "{arch}"
+            );
         }
         assert_eq!(hc_up_v2_groups(0), 1);
         assert_eq!(hc_up_v2_groups(1), 1);
@@ -12700,8 +12703,12 @@ mod tests {
             state ^= state << 17;
             state
         };
-        const BF16_SPECIAL: [u16; 8] = [0x7fc0, 0xff80, 0x7f80, 0x0000, 0x8000, 0x0001, 0x807f, 0x7f7f];
-        const F16_SPECIAL: [u16; 8] = [0x7e00, 0xfc00, 0x7c00, 0x0000, 0x8000, 0x0001, 0x03ff, 0xfbff];
+        const BF16_SPECIAL: [u16; 8] = [
+            0x7fc0, 0xff80, 0x7f80, 0x0000, 0x8000, 0x0001, 0x807f, 0x7f7f,
+        ];
+        const F16_SPECIAL: [u16; 8] = [
+            0x7e00, 0xfc00, 0x7c00, 0x0000, 0x8000, 0x0001, 0x03ff, 0xfbff,
+        ];
         let bf16 = |next: &mut dyn FnMut() -> u64, special: bool| -> u16 {
             let r = next();
             if special && r % 97 == 0 {
@@ -12728,10 +12735,14 @@ mod tests {
             t
         };
         for special in [false, true] {
-            let w: Vec<u16> = (0..wide * low_rank).map(|_| bf16(&mut next, special)).collect();
+            let w: Vec<u16> = (0..wide * low_rank)
+                .map(|_| bf16(&mut next, special))
+                .collect();
             let up_weight = upload(&gpu, &w, DType::BF16);
             for rows in [1usize, 16, 129, 4099] {
-                let l: Vec<u16> = (0..rows * low_rank).map(|_| bf16(&mut next, special)).collect();
+                let l: Vec<u16> = (0..rows * low_rank)
+                    .map(|_| bf16(&mut next, special))
+                    .collect();
                 let n: Vec<u16> = (0..rows * wide).map(|_| f16(&mut next, special)).collect();
                 let low = upload(&gpu, &l, DType::BF16);
                 let normalized = upload(&gpu, &n, DType::F16);
