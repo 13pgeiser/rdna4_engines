@@ -95,11 +95,26 @@ struct Case {
 }
 
 const FINITE_SPECIAL: [u32; 12] = [
-    0x0000_0000, 0x8000_0000, 0x0000_0001, 0x8000_0001, 0x007f_ffff, 0x807f_ffff, 0x3f80_8000,
-    0x3f80_7fff, 0x3f80_8001, 0xbf81_8000, 0x7f7f_ffff, 0xff7f_ffff,
+    0x0000_0000,
+    0x8000_0000,
+    0x0000_0001,
+    0x8000_0001,
+    0x007f_ffff,
+    0x807f_ffff,
+    0x3f80_8000,
+    0x3f80_7fff,
+    0x3f80_8001,
+    0xbf81_8000,
+    0x7f7f_ffff,
+    0xff7f_ffff,
 ];
 const NONFINITE_SPECIAL: [u32; 6] = [
-    0x7fc0_0000, 0xffc0_0001, 0x7f80_0000, 0xff80_0000, 0x7f80_0001, 0x7fff_ffff,
+    0x7fc0_0000,
+    0xffc0_0001,
+    0x7f80_0000,
+    0xff80_0000,
+    0x7f80_0001,
+    0x7fff_ffff,
 ];
 
 fn gen_case(rows: usize, seed: u64, mode: Mode) -> Case {
@@ -207,12 +222,14 @@ fn operands(gpu: &mut Gpu, c: &Case, bf16_input: bool) -> Operands {
     let a = gpu.upload_f32(&c.a, &[n * HV]).expect("a");
     let b = gpu.upload_f32(&c.b, &[n * HV]).expect("b");
     let a_log = typed(
-        gpu.upload_raw(&bytes_u16(&c.a_log), &[HV * 2]).expect("a_log"),
+        gpu.upload_raw(&bytes_u16(&c.a_log), &[HV * 2])
+            .expect("a_log"),
         DType::BF16,
         vec![HV],
     );
     let dt_bias = typed(
-        gpu.upload_raw(&bytes_u16(&c.dt_bias), &[HV * 2]).expect("dt"),
+        gpu.upload_raw(&bytes_u16(&c.dt_bias), &[HV * 2])
+            .expect("dt"),
         DType::BF16,
         vec![HV],
     );
@@ -345,7 +362,12 @@ fn compare(what: &str, rows: usize, a: &Outputs, b: &Outputs) -> usize {
                         if e < n64 * w {
                             eprintln!(
                                 "  {plane} row {} col {}: ref {:02x}{:02x} got {:02x}{:02x}",
-                                e / w, e % w, p[1], p[0], q[1], q[0]
+                                e / w,
+                                e % w,
+                                p[1],
+                                p[0],
+                                q[1],
+                                q[0]
                             );
                             break;
                         }
@@ -417,7 +439,6 @@ fn chain_fuse_is_bytewise_todays_chain() {
     }
 }
 
-
 // ---- exhaustive check of the producer's SiLU fast path ----------------------------------
 
 /// Test kernel appended to the production module source, so it calls the very device
@@ -470,12 +491,24 @@ fn silu_fast_path_is_exact_over_all_f32() {
     let obj = dir.join("silu.hsaco");
     std::fs::write(
         &src,
-        format!("{}\n{}", rdna_compute::kernels::FN_GDN_DENSE_SRC, SILU_EXHAUSTIVE),
+        format!(
+            "{}\n{}",
+            rdna_compute::kernels::FN_GDN_DENSE_SRC,
+            SILU_EXHAUSTIVE
+        ),
     )
     .unwrap();
     // The recipe of `core_hipcc_flags` (the module's own compile flags).
     let status = std::process::Command::new("hipcc")
-        .args(["--genco", "--offload-arch=gfx1201", "-O3", "--no-offload-compress", "-fuse-cuid=none", "-mcode-object-version=6", "-o"])
+        .args([
+            "--genco",
+            "--offload-arch=gfx1201",
+            "-O3",
+            "--no-offload-compress",
+            "-fuse-cuid=none",
+            "-mcode-object-version=6",
+            "-o",
+        ])
         .arg(&obj)
         .arg(&src)
         .status()
@@ -502,7 +535,14 @@ fn silu_fast_path_is_exact_over_all_f32() {
         // (unsigned*, unsigned).
         unsafe {
             gpu.hip
-                .launch_kernel(&func, [CHUNK_BLOCKS, 1, 1], [256, 1, 1], 0, None, &mut params)
+                .launch_kernel(
+                    &func,
+                    [CHUNK_BLOCKS, 1, 1],
+                    [256, 1, 1],
+                    0,
+                    None,
+                    &mut params,
+                )
                 .expect("launch");
         }
         gpu.hip.device_synchronize().unwrap();
@@ -513,9 +553,17 @@ fn silu_fast_path_is_exact_over_all_f32() {
         "silu exhaustive over 2^32 F32 inputs: mismatches(production vs exact)={} fast-accepted-wrong={} accepted={} in-domain={} first-bad-bits={:#010x} max|y_fast-y_exact|={} ulp",
         w(0), w(1), w(2), w(3), w(4), w(5)
     );
-    assert_eq!(w(0), 0, "production SiLU differs from the exact chain (first at {:#010x})", w(4));
+    assert_eq!(
+        w(0),
+        0,
+        "production SiLU differs from the exact chain (first at {:#010x})",
+        w(4)
+    );
     assert_eq!(w(1), 0);
-    assert!(w(2) as f64 > 0.99 * w(3) as f64 * 0.0 + 1.0, "fast path never accepted");
+    assert!(
+        w(2) as f64 > 0.99 * w(3) as f64 * 0.0 + 1.0,
+        "fast path never accepted"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -551,7 +599,10 @@ fn i8_gemm_bf16_entry_is_rne_of_f32_entry() {
     let (m, k) = (CH, 2048);
     for (n, big) in [false, true].into_iter().enumerate() {
         let w = gpu
-            .upload_raw(&gen_weights(m, k, 0x77 + n as u64, big), &[m * (k / 256) * GROUP_BYTES])
+            .upload_raw(
+                &gen_weights(m, k, 0x77 + n as u64, big),
+                &[m * (k / 256) * GROUP_BYTES],
+            )
             .expect("w");
         for rows in [1usize, 16, 777, 4096, 16384] {
             let mut r = Rng(0xabcd + rows as u64);
@@ -559,7 +610,11 @@ fn i8_gemm_bf16_entry_is_rne_of_f32_entry() {
                 .map(|i| {
                     let v = r.unit() * 3.0;
                     // A few outlier rows keep every A8 scale regime alive.
-                    if (i / k) % 53 == 7 { v * 40.0 } else { v }
+                    if (i / k) % 53 == 7 {
+                        v * 40.0
+                    } else {
+                        v
+                    }
                 })
                 .collect();
             let xt = gpu.upload_f32(&x, &[rows * k]).expect("x");
@@ -581,8 +636,14 @@ fn i8_gemm_bf16_entry_is_rne_of_f32_entry() {
                 nonzero += (v != 0.0) as usize;
                 bad += (want != got) as usize;
             }
-            assert_eq!(bad, 0, "rows {rows} big={big}: {bad} BF16 words differ from RNE(F32)");
-            assert!(nonzero > rows * m / 2, "rows {rows}: GEMM output mostly zero");
+            assert_eq!(
+                bad, 0,
+                "rows {rows} big={big}: {bad} BF16 words differ from RNE(F32)"
+            );
+            assert!(
+                nonzero > rows * m / 2,
+                "rows {rows}: GEMM output mostly zero"
+            );
             eprintln!(
                 "rows {rows:>5} M={m} K={k} big={big}: {} BF16 words == RNE(F32 entry)",
                 rows * m
@@ -649,7 +710,10 @@ fn microbench_qkv_gemm_entries() {
     };
     let (m, k) = (CH, 2048);
     let w = gpu
-        .upload_raw(&gen_weights(m, k, 0x77, false), &[m * (k / 256) * GROUP_BYTES])
+        .upload_raw(
+            &gen_weights(m, k, 0x77, false),
+            &[m * (k / 256) * GROUP_BYTES],
+        )
         .expect("w");
     for rows in [4096usize, 16384] {
         let mut r = Rng(0xabcd + rows as u64);
@@ -659,10 +723,12 @@ fn microbench_qkv_gemm_entries() {
         let y16 = gpu.zeros(&[rows * m], DType::BF16).expect("y16");
         let xq = gpu.mq6_i8_prepare_x(&xt, k, rows).expect("prepare");
         let t32 = median_us(&mut gpu, 20, |g| {
-            g.gemm_mq6g256v2_i8_prequant(&w, xq, &y32, m, k, rows).unwrap();
+            g.gemm_mq6g256v2_i8_prequant(&w, xq, &y32, m, k, rows)
+                .unwrap();
         });
         let t16 = median_us(&mut gpu, 20, |g| {
-            g.gemm_mq6g256v2_i8_prequant(&w, xq, &y16, m, k, rows).unwrap();
+            g.gemm_mq6g256v2_i8_prequant(&w, xq, &y16, m, k, rows)
+                .unwrap();
         });
         println!("MICROBENCH rows={rows} qkv GEMM f32 out={t32:.1}us bf16 out={t16:.1}us");
         for t in [xt, y32, y16] {

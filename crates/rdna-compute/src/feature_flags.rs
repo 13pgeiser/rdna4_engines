@@ -83,12 +83,18 @@ pub struct FeatureFlags {
     /// pair. Exact gfx1201 only, where it defaults on; `0` is the kill switch.
     pub qwen4_gdn_i8_fuse: bool,
     /// Qwen4 gfx1201 FN prefill (`HIPFIRE_QWEN4_GDN_CHAIN_FUSE`): the dense-GDN chain
-    /// reads the qkv projection as BF16 bits (the exact-INT8 MQ6 GEMM stores BF16 where
-    /// the producer only ever consumes its BF16 rounding) and runs the load-batched
-    /// `fn_gdn_dense_producer_v2_{f32,bf16}` entries. Bytes identical to the F32
-    /// projection and the v1 producer. Exact gfx1201 only, where it defaults on; `0` is
-    /// the kill switch.
+    /// runs the load-batched `fn_gdn_dense_producer_v2_{f32,bf16}` entries (and, with
+    /// `HIPFIRE_QWEN4_GDN_QKV_BF16`, reads a BF16 qkv projection). Bytes identical to the
+    /// v1 producer on the F32 projection. Exact gfx1201 only, where it defaults on; `0` is
+    /// the kill switch restoring today's chain exactly.
     pub qwen4_gdn_chain_fuse: bool,
+    /// Qwen4 gfx1201 FN prefill (`HIPFIRE_QWEN4_GDN_QKV_BF16`, opt-in, default off): with
+    /// [`Self::qwen4_gdn_chain_fuse_enabled`], the dense route's qkv GEMM stores BF16 bits
+    /// (halving the GEMM write and the producer read; byte-identical). Off by default because
+    /// the PeaceMaker INT8 GEMM's BF16 entry is currently slower than its F32 entry at the qkv
+    /// shape (M = 10240, K = 2048, 16384 rows: 5.53 vs 4.96 ms), which outweighs the 0.39 ms the
+    /// producer gains.
+    pub qwen4_gdn_qkv_bf16: bool,
     /// Qwen4 HC read/write fusion level (`HIPFIRE_QWEN4_HC_FUSE`: 0 off, 1
     /// read side, 2 + attention epilogue, 3 + shared-down epilogue). Default
     /// 3 on gfx1151, 1 on gfx1201, 0 elsewhere; see [`Self::qwen4_hc_fuse_level`].
@@ -945,6 +951,7 @@ impl FeatureFlags {
             qwen4_gdn_q8_inline: parse_bool("HIPFIRE_QWEN4_GDN_Q8_INLINE").unwrap_or(false),
             qwen4_gdn_i8_fuse: parse_bool("HIPFIRE_QWEN4_GDN_I8_FUSE").unwrap_or(is_gfx1201),
             qwen4_gdn_chain_fuse: parse_bool("HIPFIRE_QWEN4_GDN_CHAIN_FUSE").unwrap_or(is_gfx1201),
+            qwen4_gdn_qkv_bf16: parse_bool("HIPFIRE_QWEN4_GDN_QKV_BF16").unwrap_or(false),
             qwen4_hc_fuse: value("HIPFIRE_QWEN4_HC_FUSE")
                 .ok()
                 .and_then(|v| v.trim().parse::<u8>().ok())
@@ -1450,9 +1457,14 @@ impl FeatureFlags {
         self.qwen4_gdn_i8_fuse && self.arch == "gfx1201"
     }
 
-    /// Dense-GDN chain: BF16 qkv projection + load-batched producer. Exact gfx1201 only.
+    /// Dense-GDN chain: the load-batched producer. Exact gfx1201 only.
     pub fn qwen4_gdn_chain_fuse_enabled(&self) -> bool {
         self.qwen4_gdn_chain_fuse && self.arch == "gfx1201"
+    }
+
+    /// Dense-GDN chain with the BF16 qkv projection (opt-in; needs the chain fusion on).
+    pub fn qwen4_gdn_qkv_bf16_enabled(&self) -> bool {
+        self.qwen4_gdn_qkv_bf16 && self.qwen4_gdn_chain_fuse_enabled()
     }
 
     /// Flash-Next lane step: the gfx1151 PeaceMaker multi-column row kernels
@@ -1708,6 +1720,7 @@ impl FeatureFlags {
             qwen4_gdn_q8_inline: false,
             qwen4_gdn_i8_fuse: false,
             qwen4_gdn_chain_fuse: false,
+            qwen4_gdn_qkv_bf16: false,
             qwen4_hc_fuse: 0,
             qwen4_hc_up_tile: false,
             qwen4_moe_combine_zinit: false,
@@ -2727,6 +2740,30 @@ mod tests {
             assert_eq!(one.qwen4_gdn_chain_fuse_enabled(), exact, "{arch}: 1");
         }
         assert!(!FeatureFlags::for_test("gfx1201").qwen4_gdn_chain_fuse_enabled());
+    }
+
+    /// The BF16 qkv store is opt-in and needs the chain fusion: never on by default, never
+    /// with `HIPFIRE_QWEN4_GDN_CHAIN_FUSE=0`, never off gfx1201.
+    #[test]
+    fn qwen4_gdn_qkv_bf16_is_opt_in_behind_the_chain_fusion() {
+        let with = |chain: Option<&'static str>, qkv: Option<&'static str>| {
+            move |name: &str| -> std::result::Result<String, ()> {
+                match (name, chain, qkv) {
+                    ("HIPFIRE_QWEN4_GDN_CHAIN_FUSE", Some(v), _) => Ok(v.into()),
+                    ("HIPFIRE_QWEN4_GDN_QKV_BF16", _, Some(v)) => Ok(v.into()),
+                    _ => Err(()),
+                }
+            }
+        };
+        let on = |arch: &str, chain, qkv| {
+            FeatureFlags::from_lookup(arch, with(chain, qkv)).qwen4_gdn_qkv_bf16_enabled()
+        };
+        assert!(!on("gfx1201", None, None));
+        assert!(on("gfx1201", None, Some("1")));
+        assert!(!on("gfx1201", Some("0"), Some("1")));
+        assert!(!on("gfx1201", None, Some("0")));
+        assert!(!on("gfx1151", None, Some("1")));
+        assert!(!FeatureFlags::for_test("gfx1201").qwen4_gdn_qkv_bf16_enabled());
     }
 
     #[test]
