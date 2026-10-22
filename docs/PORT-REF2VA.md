@@ -1251,3 +1251,31 @@ T2VA request (seed 1234) dumped all seven files (rows 3212 = 1560 text + 244 aud
 driver log `E dit_dbg: dumped step 0 -- rows 3212 h0 176160768 temb 8192 mod 51609600 vel 39481344`).
 #62 = `prep_dump.py` → `run_reference.py --td 8 --temb-presilu` (CPU, ~3 min/block) → `compare_vel.py`;
 harness gains `--td` (8 = curve). Verdict appended when the replay lands.
+
+### cont.24 — #62 VERDICT: the whole DiT (blocks + norm_out + head) is faithful; the fried look moves to the VAE DECODER
+Two fixes first: the per-block window shadow had been capturing `b_ao` (the MLP **delta**), not the
+residual stream — block *l*'s delta only folds into `b_h` at the NEXT iteration's `op_mq1` (rms_mod
+gated=1), so the capture moved to *after* `op_mq1` (slots 0..48) and after `op_nout` (slot 49); the
+first #62 table was measuring deltas. With valid windows (ditdump_prep2): **blocks 0-19 cos 0.980→0.775
+smooth decay** (W8A8-int8-scores + fp8-PV vs bf16 noise floor), block 20 cascade point (cos −0.458),
+then chaotic decorrelation. No per-block structural bug.
+That left the 7.6× step-0 vel-std gap (dev 3.03 vs harness 0.4002) pointing at the FinalLayer, so the
+dump grew two head-isolation shadows (`9ce44b6`): `dit_hn.f32` = norm_out's modulated stream, first
+256 video rows, f32; `dit_nout.f32` = lane/step's b_nout table row (true pitch `ng*2D` = 32256 for a
+plain request, NOT the declared `kMaxSegs*2D`; at lane 0/step 0 the dump starts at offset 0 so the
+video cell = cols 21504..32256 = shift|scale). `compare_head.py` verdict, all three checks:
+**A** the dumped video cell == `t8 @ norm_out.linear + bias` at the bf16 floor (relFro 1.5e-3, cos
+0.999999; NO silu — curve form bakes it, `a_temb.x = b_temb` alias); **B** the checkpoint head
+reproduces `dit_vel` from `dit_hn` EXACTLY (row cos 1.000000, affine 1.0000·x+0.0); **C** rms(hn)=0.15
+consistent with `rms(wn·(1+scale))=0.35` under trained-direction correlation.
+The vel-std "gap" is also not a device magnitude bug: with the verified vectors, a random-direction
+prediction `rms(wn·(1+scale))·sqrt(D)·rms(W_v)` = 2.05 sits BETWEEN the two (0.40 / 3.03) — the std is
+dominated by heavy-tailed alignment of each stream's direction with the head, so neither number is a
+bug signal. The attention scale was double-checked too (`1/sqrt(hd)` in both dense and VSA decls).
+**So the denoiser is exonerated end-to-end** (op-level; modulo quantization chaos). The decisive
+counter-evidence was always visual and independent: a **pinned frame-0 whose latent is ~= the keyframe's
+own VAE latent renders fried** — the sampler barely touched that latent, so what changed its look is the
+**video VAE decoder**, the one stage with NO parity harness (only encoders were ever checked — and the
+video ENCODER itself hid two real bugs: the norm1/norm3 swap and the shortcut-after-norm1 ordering).
+Next: **video VAE decoder value parity** (new build: R4D_DEC_SEL shadows + AST-extracted comfy decoder
+forward, mirroring `tests/data/ref2va/ref_venc_parity.py`).
