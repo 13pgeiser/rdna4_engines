@@ -35,7 +35,7 @@ use hipfire_dispatch::pipeline::gated_mlp::{
 };
 use hipfire_dispatch::pipeline::hybrid::{
     AttentionKv, AttentionRow, AttentionTap, DeltaNetMixerOp, GatedAttentionOp, GdnState,
-    HybridDims, MropeRope,
+    HybridDims, MixerOutput, MropeRope,
 };
 use hipfire_dispatch::pipeline::Step;
 use hipfire_runtime::llama::WeightTensor;
@@ -126,7 +126,8 @@ pub(crate) struct DecodeBinding<'a> {
 impl<'a> DecodeBinding<'a> {
     /// The mixer step of `layer`. `delta_layer` indexes DeltaNet state;
     /// `prerotated_input` marks that the previous layer's MoE combine already
-    /// produced this layer's normalized, rotated input in `x_rot`.
+    /// produced this layer's normalized, rotated input in `x_rot`; `output`
+    /// is `Residual` on one device, `Write` of a tensor-parallel partial.
     pub fn mixer(
         &self,
         layer: &'a LayerWeights,
@@ -134,6 +135,7 @@ impl<'a> DecodeBinding<'a> {
         delta_layer: usize,
         prerotated_input: bool,
         tap: Option<AttentionTap<'a>>,
+        output: MixerOutput<'a>,
     ) -> Step<'a> {
         let s = self.s;
         match layer {
@@ -195,6 +197,7 @@ impl<'a> DecodeBinding<'a> {
                     k: &s.dn_k,
                     recurrent_out: &s.dn_attn_out,
                     normed: &s.dn_normed,
+                    output,
                 })
             }
             LayerWeights::FullAttn(_) | LayerWeights::FullAttnMoe(_) => {
@@ -236,6 +239,7 @@ impl<'a> DecodeBinding<'a> {
                     x_rot: &s.x_rot,
                     q_gate: &s.fa_q_full,
                     tap,
+                    output,
                     mrope: self.mrope_section.map(|section| MropeRope {
                         positions: &s.pos_buf3,
                         section,

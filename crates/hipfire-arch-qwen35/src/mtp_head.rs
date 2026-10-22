@@ -2445,6 +2445,7 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
         q_gate: &scratch.q_full,
         tap: None,
         mrope: None,
+        output: hipfire_dispatch::pipeline::hybrid::MixerOutput::Residual,
     };
     execute_steps(gpu, &ctx, &[Step::GatedAttention(attention)]).map_err(HipError::from)?;
 

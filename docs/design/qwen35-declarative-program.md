@@ -241,8 +241,8 @@ across requests). Their handlers delegate to the hybrid stages.
   K/V rotation, the exact PM GEMM). Its callers are the prompt fill
   (`kv_only=true`) and `mtp_compose.rs` (`kv_only=false`).
 - The PP decode loop (`ep_batch::forward_scratch_layers_multi`, multi-GPU pp
-  migration #58) and the dense TP decode partials (`dense_tp_attention_partial`,
-  `dense_tp_deltanet_partial`, `dense_tp_ffn_partial`).
+  migration #58). Dense TP decode mixer and FFN partials run through the
+  dispatch `MixerOutput::Write` and `GatedMlp` `Write` arms.
 - The gfx1201 exact-VMM row twins (`forward_slots/vmm/exact.rs`), which must
   change in lockstep with `DeltaNetMixerOp::prepare` and
   `GatedAttentionOp::attend`.
@@ -309,16 +309,53 @@ head may now take, covered only by the parity tests) and qt53 MTP heads.
 
 ## Dense tensor parallelism on the generic engine (#927 item 4, HIPF-142)
 
-`qwen35::mesh_tp` declares one step program for prefill and decode: per layer
-the mixer (replicated, `Opaque`), `GatedMlp` (`SplitRule::GatedMlp`, `Product`
-ladder, gate/up `ColumnShard { axis: 0 }`, down `RowShard { axis: 1 }` in
-whole G256 groups) writing `ffn_out`, and the residual `Accumulate`
-(`OpKind::ResidualAdd`). On a pure TP mesh the splitter turns each
-`Accumulate` into one rank-ordered `AllReduceAdd` into `x`, so a rank runs
-`[embed, mixer, ffn] AllReduceAdd [mixer, ffn] AllReduceAdd … [head]`. A
-decode epoch binds it to the decode scratch; a prefill epoch to the rank's
-batch scratch (batched mixers, `Product` rows with the TP `Partial`
-epilogue, last-row logits). Each rank holds every attention and DeltaNet head
-and its even block of the FFN intermediate (`ffn_rank_layout`).
-`Qwen35TpBindings` is tied to the plan of exactly those shards and refuses a
-prefill past the batch scratch, sessions, checkpoints and prefix repair.
+`qwen35::mesh_tp` declares one step program for prefill and decode. Per
+layer: the mixer (`SplitRule::HeadMixer`, declared input projections
+`HeadSharded`, output projection `RowShard { axis: 1 }`) writing `mix_out`,
+a residual `Accumulate`, `GatedMlp` (`SplitRule::GatedMlp`, `Product` ladder,
+gate/up `ColumnShard { axis: 0 }`, down `RowShard { axis: 1 }`) writing
+`ffn_out`, and a second `Accumulate`. On a pure TP mesh the splitter turns
+each `Accumulate` into one rank-ordered `AllReduceAdd` into `x`, so a rank
+runs `[embed, mixer] AllReduceAdd [ffn] AllReduceAdd [mixer] … [head]` —
+the hand dense-TP route's two reductions per layer.
+
+Each rank holds an even contiguous block of the query, KV, DeltaNet key and
+value heads and of the FFN intermediate (`tp_rank_layouts`:
+`dense_tp_rank_layouts` admitted only for even splits, loaded through
+`load_weights_dense_tp_rank`). A decode epoch binds the decode scratch and
+runs the mixers' `MixerOutput::Write` arm; a prefill epoch binds the rank's
+batch scratch and runs the batched mixers and `Product` rows with the
+`Partial` epilogue (last-row logits). `Qwen35TpBindings` is tied to the plan
+of exactly those shards and refuses a prefill past the batch scratch,
+sessions, checkpoints and prefix repair.
+
+### Why one compound mixer rule
+
+`SplitRule::HeadMixer` mirrors `GatedMlp`: whole input, head-split input
+projections and state, row-split output projection, Partial output reduced
+by its consumer. The alternative, `HeadLocal` plus a separate row-split
+`Project` for the output projection, needs the mixer's attention output as a
+graph resource between two ops. The hybrid mixers fuse that boundary
+(fused gate + MQ-rotate attention epilogue feeding a prerotated GEMV,
+gated norm + MQ rotate in DeltaNet), and `HeadLocal` has no partial output.
+Qwen4's attention and GDN blocks are the intended second consumer; they are
+still `Opaque` today.
+
+### The `MixerOutput::Write` arm
+
+`DeltaNetMixerOp` and `GatedAttentionOp` take `output: MixerOutput`.
+`Residual` is the fused single-device body. `Write(out)` is the former hand
+`dense_tp_{deltanet,attention}_partial` body, moved verbatim: the plain
+chain (normed projection, unfused prep, plain recurrence or attention,
+GEMV into `out`), with compacted KV and a prerotated input refused. The hand
+dense-TP route now runs its decode mixers through this arm.
+
+### What stays on the hand route
+
+The product dense-TP route (`EpArch::Qwen35DenseTp` serve, bench, MTP and
+DFlash dense TP) stays on `forward_{scratch,prefill}_dense_tp*` until the
+generic engine has what it uses: per-segment hipGraph capture and replay of
+decode, the uneven TP3/TP5 layouts (Q-group splits and replicated KV heads),
+the peer-rooted reduction route, and the verify captures (hidden-state ring,
+GDN tape, row capture and state rollback) that MTP and DFlash need. Each is
+an executor capability, not a Qwen3.5 one.
