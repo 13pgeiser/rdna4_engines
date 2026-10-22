@@ -5805,10 +5805,10 @@ mod tests {
             "v2i_t Qfr[16]",
             "constexpr int TK = 48",
             "LDS + 49920",
-            "const uint32_t* p32 = (const uint32_t*)p",
-            "kg * 8 + j, seq_len - 1",
-            "dc * 16 + (ml & ~3)",
-            "word >> (8 * (ml & 3))",
+            "const uint32_t* p = (const uint32_t*)(k_cache",
+            "min(kb + r, seq_len - 1)",
+            "vp + (unsigned long long)key * QR_KV_STRIDE",
+            "__builtin_amdgcn_perm(w1, w0, 0x05010400u)",
         ] {
             assert!(
                 body.contains(contract),
