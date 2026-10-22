@@ -512,10 +512,10 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
     // The shipped bundle carries every epilogue symbol: keep the launched one.
     bextra.insert(
         "cost_lint".into(),
-        base_lint
-            .get(&base.launch_symbol)
-            .cloned()
-            .unwrap_or(base_lint),
+        match base_lint.get(&base.launch_symbol) {
+            Some(loops) => json!({ base.launch_symbol.clone(): loops }),
+            None => base_lint,
+        },
     );
     rec["baseline"] = object_json(&base, base_res, bextra);
 
