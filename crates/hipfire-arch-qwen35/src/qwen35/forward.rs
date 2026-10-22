@@ -3156,6 +3156,7 @@ fn qkvza_via_execute_steps(
                 k: wqkv.k,
                 eps,
                 rotation: RotationPlan::None,
+                rows: 1,
             },
             Step::Gemv {
                 w: &wr_qkv,
@@ -3241,6 +3242,7 @@ fn qkvza_via_execute_steps(
                 k: wqkv.k,
                 eps,
                 rotation,
+                rows: 1,
             },
             Step::Gemv {
                 w: &wr_qkv,
@@ -3335,6 +3337,7 @@ fn qkv_via_execute_steps(
                 k: wq.k,
                 eps,
                 rotation: RotationPlan::None,
+                rows: 1,
             },
             Step::Gemv {
                 w: &wrq,
@@ -3400,6 +3403,7 @@ fn qkv_via_execute_steps(
                 k: wq.k,
                 eps,
                 rotation,
+                rows: 1,
             },
             Step::Gemv {
                 w: &wrq,
@@ -3473,6 +3477,7 @@ fn gate_up_via_execute_steps(
                 k: w_gate.k,
                 eps,
                 rotation: RotationPlan::None,
+                rows: 1,
             },
             Step::Gemv {
                 w: &wrg,
@@ -3521,6 +3526,7 @@ fn gate_up_via_execute_steps(
                 k: w_gate.k,
                 eps,
                 rotation,
+                rows: 1,
             },
             Step::Gemv {
                 w: &wrg,
