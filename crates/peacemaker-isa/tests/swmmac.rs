@@ -146,7 +146,10 @@ fn effects_read_the_destination_accumulator_in_place() {
             .uses
             .iter()
             .any(|u| u.kind == peacemaker_ir::reg::Kind::V && u.base == 0 && u.len == d.len);
-        assert!(reads_dst, "{kind:?}: table effects must read the accumulator");
+        assert!(
+            reads_dst,
+            "{kind:?}: table effects must read the accumulator"
+        );
     }
 }
 

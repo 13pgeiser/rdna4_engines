@@ -807,17 +807,38 @@ fn swmmac_refusals_carry_the_rust_error_text() {
         ))
     };
     refuses(
-        &call("F32F16", "vr(0, 8)", "vr(8, 3)", "vr(16, 8)", "v(24)", SWMMAC_NO_MODS),
+        &call(
+            "F32F16",
+            "vr(0, 8)",
+            "vr(8, 3)",
+            "vr(16, 8)",
+            "v(24)",
+            SWMMAC_NO_MODS,
+        ),
         Arch::Gfx1201,
         "v_swmmac_f32_16x16x32_f16: A requires 4 VGPRs, found v[8:10]",
     );
     refuses(
-        &call("F16F16", "vr(0, 8)", "vr(8, 4)", "vr(16, 8)", "v(24)", SWMMAC_NO_MODS),
+        &call(
+            "F16F16",
+            "vr(0, 8)",
+            "vr(8, 4)",
+            "vr(16, 8)",
+            "v(24)",
+            SWMMAC_NO_MODS,
+        ),
         Arch::Gfx1201,
         "v_swmmac_f16_16x16x32_f16: D requires 4 VGPRs, found v[0:7]",
     );
     refuses(
-        &call("F32F16", "vr(0, 8)", "vr(8, 4)", "vr(16, 8)", "vr(24, 2)", SWMMAC_NO_MODS),
+        &call(
+            "F32F16",
+            "vr(0, 8)",
+            "vr(8, 4)",
+            "vr(16, 8)",
+            "vr(24, 2)",
+            SWMMAC_NO_MODS,
+        ),
         Arch::Gfx1201,
         "WMMA operand requires 1 VGPRs, found v[24:25]",
     );

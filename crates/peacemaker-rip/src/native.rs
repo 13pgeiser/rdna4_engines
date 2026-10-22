@@ -484,8 +484,7 @@ fn swmmac_kind_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<Swmmac> {
 }
 
 fn swmmac_mods_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<SwmmacMods> {
-    const SHAPE: &str =
-        "Wmma::swmmac requires SwmmacMods { index_key, neg_lo, neg_hi, clamp }";
+    const SHAPE: &str = "Wmma::swmmac requires SwmmacMods { index_key, neg_lo, neg_hi, clamp }";
     let Value::Struct(ty, fields) = it.deref(v.clone()) else {
         return Err(SHAPE.into());
     };

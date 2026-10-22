@@ -375,9 +375,7 @@ impl Wmma {
             return Err(format!("{name}: index_key must be 0 or 1"));
         }
         if mods.neg_lo > 3 || mods.neg_hi > 3 {
-            return Err(format!(
-                "{name}: neg_lo/neg_hi bit 2 (C) is not encodable"
-            ));
+            return Err(format!("{name}: neg_lo/neg_hi bit 2 (C) is not encodable"));
         }
         if class == SwmmacClass::Fp8 && mods.neg_lo != 0 {
             return Err(format!("{name} does not accept neg_lo"));

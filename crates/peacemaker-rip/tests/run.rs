@@ -543,7 +543,10 @@ fn swmmac_recipe_is_refused_on_gfx1151() {
         )
         .err()
         .unwrap_or_else(|| panic!("{variant}: gfx1151 must refuse SWMMAC"));
-        assert!(error.contains("SWMMAC requires gfx12"), "{variant}: {error}");
+        assert!(
+            error.contains("SWMMAC requires gfx12"),
+            "{variant}: {error}"
+        );
     }
 }
 
@@ -563,7 +566,10 @@ fn f16_bits(v: f64) -> Option<u16> {
 
 fn f16_value(bits: u16) -> f64 {
     let (e, m) = ((bits >> 10) & 31, f64::from(bits & 1023));
-    assert!((1..31).contains(&e), "f16 {bits:#06x} is not a normal number");
+    assert!(
+        (1..31).contains(&e),
+        "f16 {bits:#06x} is not a normal number"
+    );
     let v = (1.0 + m / 1024.0) * 2f64.powi(i32::from(e) - 15);
     if bits >> 15 == 1 {
         -v
@@ -626,10 +632,16 @@ fn check_sparse24_case(case_file: &str, dtype: &str, decode: impl Fn(f64) -> f64
     let bt: Vec<f64> = numbers(bt, "values").into_iter().map(&decode).collect();
     let idx: Vec<u32> = numbers(idx, "values").iter().map(|&w| w as u32).collect();
     let expect = numbers(d, "expect");
-    assert_eq!((a.len(), bt.len(), idx.len(), expect.len()), (256, 512, 32, 256));
+    assert_eq!(
+        (a.len(), bt.len(), idx.len(), expect.len()),
+        (256, 512, 32, 256)
+    );
     let allowed = [0.5, 1.0, 1.5, 2.0, 3.0];
     for v in a.iter().chain(&bt) {
-        assert!(allowed.contains(&v.abs()), "{case_file}: {v} is not in the value set");
+        assert!(
+            allowed.contains(&v.abs()),
+            "{case_file}: {v} is not in the value set"
+        );
     }
 
     // Lane L = 16*h + r: bits 2i..2i+1 of its word select slot 8*h + i of row r.
@@ -637,13 +649,20 @@ fn check_sparse24_case(case_file: &str, dtype: &str, decode: impl Fn(f64) -> f64
     let mut patterns = std::collections::HashSet::new();
     for (lane, &word) in idx.iter().enumerate() {
         let (r, h) = (lane & 15, lane >> 4);
-        assert_eq!(word >> 16, 0, "{case_file}: lane {lane} uses only index_key 0");
+        assert_eq!(
+            word >> 16,
+            0,
+            "{case_file}: lane {lane} uses only index_key 0"
+        );
         let mut pattern = Vec::new();
         for i in 0..8 {
             let sel = ((word >> (2 * i)) & 3) as usize;
             let slot = 8 * h + i;
             let k = 4 * (slot >> 1) + sel;
-            assert!(dense[r][k].is_none(), "{case_file}: row {r} K {k} claimed twice");
+            assert!(
+                dense[r][k].is_none(),
+                "{case_file}: row {r} K {k} claimed twice"
+            );
             dense[r][k] = Some(a[16 * r + slot]);
             pattern.push(sel);
         }
@@ -653,7 +672,10 @@ fn check_sparse24_case(case_file: &str, dtype: &str, decode: impl Fn(f64) -> f64
         }
         patterns.insert(word);
     }
-    assert!(patterns.len() >= 16, "{case_file}: selector patterns are too uniform");
+    assert!(
+        patterns.len() >= 16,
+        "{case_file}: selector patterns are too uniform"
+    );
     let mut magnitudes = std::collections::HashSet::new();
     for r in 0..16 {
         for c in 0..16 {
@@ -665,11 +687,17 @@ fn check_sparse24_case(case_file: &str, dtype: &str, decode: impl Fn(f64) -> f64
             }
             let want = expect[16 * r + c];
             assert_eq!(sum, want, "{case_file}: D[{r}][{c}]");
-            assert!(want != 0.0 && want.abs() <= 64.0, "{case_file}: D[{r}][{c}] = {want}");
+            assert!(
+                want != 0.0 && want.abs() <= 64.0,
+                "{case_file}: D[{r}][{c}] = {want}"
+            );
             magnitudes.insert(want.to_bits());
         }
     }
-    assert!(magnitudes.len() >= 32, "{case_file}: expected values are too uniform");
+    assert!(
+        magnitudes.len() >= 32,
+        "{case_file}: expected values are too uniform"
+    );
 }
 
 #[test]
