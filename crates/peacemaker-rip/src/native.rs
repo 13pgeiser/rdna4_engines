@@ -30,10 +30,10 @@ mod native_fp8;
 mod native_gen;
 #[path = "native_mq6.rs"]
 mod native_mq6;
-#[path = "native_qmoe.rs"]
-mod native_qmoe;
 #[path = "native_prod.rs"]
 mod native_prod;
+#[path = "native_qmoe.rs"]
+mod native_qmoe;
 
 #[derive(Clone)]
 pub struct Chain {
