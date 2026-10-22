@@ -41,6 +41,8 @@ pub mod batched_attention;
 pub mod batched_deltanet;
 pub mod gated_mlp;
 #[cfg(feature = "deltanet")]
+pub mod batched_moe;
+#[cfg(feature = "deltanet")]
 pub mod hybrid;
 pub(crate) mod layer_ops;
 pub mod sandwich;
