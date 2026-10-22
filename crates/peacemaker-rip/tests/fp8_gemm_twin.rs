@@ -249,20 +249,16 @@ fn publishing_an_unwritten_slot_is_refused() {
     assert!(e.contains("invalid LDS transition Ready(4)"), "{e}");
 }
 
-/// The split barrier's ring state: dropping the retire of A1 leaves the slot Published at the
-/// loop's back edge, which the builder's loop fixpoint refuses.
+/// The split barrier's ring state: dropping the retire of A1 leaves the slot Published, so the next
+/// block's publish into A1 is refused by the slot machine (`A1 cannot be stored while Reading`).
 #[test]
-fn a_loop_that_leaves_a_slot_published_is_refused() {
+fn dropping_the_retire_of_a_slot_is_refused_at_its_next_store() {
     let src = edit(
         "        let mut b2 = vec![retire(1), retire(2 + p), ready(0)];",
         "        let mut b2 = vec![retire(2 + p), ready(0)];",
     );
     let e = build(&src, ROW_SET).expect_err("A1 stays published");
-    eprintln!("loop refusal: {e}");
-    assert!(
-        e.contains("A1") || e.contains("LDS") || e.contains("loop"),
-        "{e}"
-    );
+    assert!(e.contains("A1 cannot be stored while Reading"), "{e}");
 }
 
 #[test]

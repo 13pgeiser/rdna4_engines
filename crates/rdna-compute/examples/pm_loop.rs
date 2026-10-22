@@ -6,10 +6,10 @@
 //! kernel (gfx1201). Prints ONE JSON object (schema 1) on stdout.
 //!
 //! ```text
-//! pm_loop --kernel iu4_gemm|mq6_i8_gemm|qwen4_moe_sym --shape <S> [kernel knobs]
+//! pm_loop --kernel iu4_gemm|mq6_i8_gemm|fp8_gemm|qwen4_moe_sym --shape <S> [kernel knobs]
 //!         [--base-<knob> V ...] [--rip FILE.rip] [--time N] [--rounds R]
 //!         [--max-rounds R] [--time-budget-s S] [--emu] [--out DIR]
-//!         (--rip: iu4_gemm, mq6_i8_gemm)
+//!         (--rip: iu4_gemm, mq6_i8_gemm, fp8_gemm)
 //! ```
 //!
 //! Pipeline (every step lands in the JSON record):
@@ -61,8 +61,8 @@
 //! error); 2 usage error.
 //!
 //! Kernel knobs and shape grammar: see the doc comment of `pm_loop/iu4.rs`
-//! (`--kernel iu4_gemm`), `pm_loop/mq6.rs` (`--kernel mq6_i8_gemm`) and `pm_loop/moe.rs`
-//! (`--kernel qwen4_moe_sym`).
+//! (`--kernel iu4_gemm`), `pm_loop/mq6.rs` (`--kernel mq6_i8_gemm`), `pm_loop/fp8.rs`
+//! (`--kernel fp8_gemm`) and `pm_loop/moe.rs` (`--kernel qwen4_moe_sym`).
 //!
 //! Use (build once, then take a gfx1201 card through the fabric; check
 //! `fabric-run.sh --status` first and pick an idle hiptrx card A/B/C/E):
@@ -84,6 +84,8 @@
 
 #[path = "support/abba.rs"]
 mod abba;
+#[path = "pm_loop/fp8.rs"]
+mod fp8;
 #[path = "pm_loop/iu4.rs"]
 mod iu4;
 #[path = "pm_loop/moe.rs"]
@@ -197,9 +199,9 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
     if o.kernel.is_empty() {
         return Err(format!("missing --kernel (usage: {DRIVER_FLAGS})"));
     }
-    if o.rip.is_some() && !matches!(o.kernel.as_str(), "iu4_gemm" | "mq6_i8_gemm") {
+    if o.rip.is_some() && !matches!(o.kernel.as_str(), "iu4_gemm" | "mq6_i8_gemm" | "fp8_gemm") {
         return Err(format!(
-            "--rip is only supported with --kernel iu4_gemm or mq6_i8_gemm: only iu4_gemm and mq6_i8_gemm blocks are exposed to .rip so far (got --kernel {})",
+            "--rip is only supported with --kernel iu4_gemm, mq6_i8_gemm or fp8_gemm: only iu4_gemm, mq6_i8_gemm and fp8_gemm blocks are exposed to .rip so far (got --kernel {})",
             o.kernel
         ));
     }
@@ -219,10 +221,11 @@ fn build_workload(o: &mut Opts) -> Result<Box<dyn Workload>> {
     let w = match o.kernel.as_str() {
         "iu4_gemm" => iu4::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
         "mq6_i8_gemm" => mq6::new(&shape, &mut knobs, o.rip.as_deref())?,
+        "fp8_gemm" => fp8::new(&shape, &mut knobs, o.rip.as_deref())?,
         "qwen4_moe_sym" => moe::new(&shape, &mut knobs)?,
         other => {
             return Err(format!(
-                "unknown --kernel {other} (iu4_gemm|mq6_i8_gemm|qwen4_moe_sym)"
+                "unknown --kernel {other} (iu4_gemm|mq6_i8_gemm|fp8_gemm|qwen4_moe_sym)"
             ))
         }
     };
