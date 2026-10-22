@@ -287,8 +287,9 @@ fn qwen4_scoped_verify_rows(
 /// `FnSymGfx1201` is the proven-route plan of a gfx1201 Flash-Next artifact
 /// whose routed headers are all symmetric: the MoE buffers are sized for the
 /// symmetric IU4 prefill route plus a [`QWEN4_COMPACT_FALLBACK_ROWS`]-row F32
-/// fallback, and eight phase-disjoint fields borrow their storage from an
-/// owner (see [`Qwen4GpuForwardScratch::plan`]).  Both modes run identical
+/// fallback, and the step-local fields of the GDN, QSA, HC, PLE, MoE and
+/// embedding steps share one phase arena (see
+/// [`Qwen4GpuForwardScratch::plan`]).  Both modes run identical
 /// arithmetic; the mode only changes where intermediates live, so it must be
 /// decided before expert placement and frozen for the forward's lifetime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5806,6 +5807,9 @@ pub(crate) struct ScratchSlot {
     pub dtype: DType,
     pub owner: Option<ScratchField>,
     pub pitch: Option<usize>,
+    /// Elements into the owner's allocation where this view starts; zero for
+    /// owners and every `Full`-mode slot.
+    pub offset: usize,
 }
 
 impl ScratchSlot {
@@ -5819,6 +5823,98 @@ impl ScratchSlot {
 fn scratch_mul(a: usize, b: usize) -> Result<usize, Qwen4GpuForwardError> {
     a.checked_mul(b)
         .ok_or_else(|| invalid("scratch size arithmetic overflows"))
+}
+
+/// Elements (256 bytes of F32) every phase-arena field start is rounded up to.
+const COMPACT_ARENA_ALIGN: usize = 64;
+
+fn round_up_arena(elements: usize) -> Result<usize, Qwen4GpuForwardError> {
+    elements
+        .checked_add(COMPACT_ARENA_ALIGN - 1)
+        .map(|sum| sum / COMPACT_ARENA_ALIGN * COMPACT_ARENA_ALIGN)
+        .ok_or_else(|| invalid("compact scratch arena overflows"))
+}
+
+/// The step-local field groups of the `FnSymGfx1201` phase arena, each as
+/// `(field, elements, pitch)` in layout order: GDN, QSA, HC, PLE, MoE,
+/// embedding.  Groups never run at once, so each lays out from element 0 of
+/// the shared allocation.  `slots` supplies the MoE element counts, which the
+/// plan sizes for the symmetric IU4 route.  The first GDN entry,
+/// `Projection`, is the arena owner.
+pub(crate) fn compact_arena_groups(
+    config: &Qwen4Config,
+    max_chunk: usize,
+    slots: &[ScratchSlot],
+) -> Result<Vec<Vec<(ScratchField, usize, Option<usize>)>>, Qwen4GpuForwardError> {
+    use ScratchField as F;
+    let layout = Qwen4ScratchLayout::for_rows(program_dims(config), max_chunk)
+        .map_err(|error| invalid(error.to_string()))?;
+    let n = max_chunk;
+    let heads = config.linear_num_value_heads;
+    let kv_width = scratch_mul(config.num_key_value_heads, config.head_dim)?;
+    let mut groups = Vec::with_capacity(6);
+    let sized = |fields: &[(F, usize)]| -> Result<_, Qwen4GpuForwardError> {
+        fields
+            .iter()
+            .map(|&(field, width)| Ok((field, scratch_mul(n, width)?, Some(width))))
+            .collect::<Result<Vec<_>, Qwen4GpuForwardError>>()
+    };
+    groups.push(sized(&[
+        (F::Projection, layout.gdn_qkv),
+        (F::Projection2, layout.gdn_qkv),
+        (F::GdnRecurrentOutput, layout.gdn_value),
+        (F::GdnZ, layout.gdn_value),
+        (F::GdnOutput, layout.gdn_value),
+        (F::GdnA, heads),
+        (F::GdnB, heads),
+        (F::GdnGate, heads),
+        (F::GdnBeta, heads),
+    ])?);
+    groups.push(sized(&[
+        (F::QsaQgate, 2 * layout.q_width),
+        (F::QsaOutput, layout.q_width),
+        (F::QsaIndex, layout.index_width),
+        (F::QsaK, kv_width),
+        (F::QsaV, kv_width),
+    ])?);
+    groups.push(sized(&[
+        (F::HcNormalized, layout.wide),
+        (F::HcLow, config.hc_lowrank),
+        (F::HcUp, layout.wide),
+    ])?);
+    groups.push(sized(&[
+        (F::PleQuery, layout.wide),
+        (F::PleKey, layout.wide),
+        (F::PleOutput, layout.wide),
+        (F::PleValue, layout.hidden),
+    ])?);
+    groups.push(
+        [
+            F::MoeYDownGrouped,
+            F::MoeYGateUpGrouped,
+            F::MoeDownExpanded,
+            F::MoeXRot,
+            F::MoeSharedOutput,
+            F::MoeGateUp,
+            F::MoeGate,
+            F::MoeUp,
+            F::MoeHidden,
+            F::MoeScalar,
+            F::MoeGateBatch,
+            F::MoeUpBatch,
+            F::MoeRotBatch,
+        ]
+        .iter()
+        .map(|&field| (field, slots[field as usize].elements, None))
+        .collect(),
+    );
+    groups.push(
+        [F::Embeddings, F::EmbeddingRot]
+            .iter()
+            .map(|&field| (field, slots[field as usize].elements, None))
+            .collect(),
+    );
+    Ok(groups)
 }
 
 /// `(offset, len)` in elements of lane segment `[begin, begin + rows)` of an
@@ -5857,9 +5953,10 @@ pub(crate) fn owner_pitch_extent(
 /// Device buffers shared by one forward object.  All allocations happen in
 /// `new`/`new_npu_bank`; token/chunk execution only creates borrowed subviews.
 ///
-/// In [`Qwen4ForwardScratchMode::FnSymGfx1201`] eight fields are borrowed
-/// views of another field's allocation (see [`Self::plan`]); only owners are
-/// allocated, charged by [`Self::device_bytes`] and freed.
+/// In [`Qwen4ForwardScratchMode::FnSymGfx1201`] the step-local fields of the
+/// GDN, QSA, HC, PLE, MoE and embedding steps are views of the `Projection`
+/// arena (see [`Self::plan`]) and `PleGated` views `Rotation`; only owners
+/// are allocated, charged by [`Self::device_bytes`] and freed.
 pub struct Qwen4GpuForwardScratch {
     pub max_chunk: usize,
     pub mode: Qwen4ForwardScratchMode,
@@ -5968,10 +6065,11 @@ impl Qwen4GpuForwardScratch {
     ///   down `max(G(c)*hidden*4, G(n)*hidden*2)` bytes, kept as F32-typed
     ///   facades of `bytes / 4` elements (the IU4 kernels read the pointers as
     ///   BF16 storage);
-    /// - phase aliases: `hc_normalized`, `ple_query` -> `projection`;
-    ///   `hc_up`, `ple_key` -> `projection2`; `ple_gated` -> `rotation`;
-    ///   `ple_output` -> `moe_y_down_grouped`; `ple_value` ->
-    ///   `moe_shared_output`; `gdn_recurrent_output` -> `qsa_qgate`.
+    /// - phase arena: `projection` owns one allocation; the step-local fields
+    ///   of the GDN, QSA, HC, PLE, MoE and embedding steps (see
+    ///   [`compact_arena_groups`]) are views of it, each group laid out from
+    ///   element 0 with every field start rounded up to 256 bytes, and the
+    ///   arena is the largest group.  `ple_gated` -> `rotation`.
     ///   `ple_normed` stays dedicated: partial verify rollback reads it after
     ///   the forward.
     fn plan_scoped(
@@ -6012,12 +6110,6 @@ impl Qwen4GpuForwardScratch {
             has(LayerType::LinearAttention),
             has(LayerType::FullAttention),
         );
-        if mode == Qwen4ForwardScratchMode::FnSymGfx1201 && has_gdn && !has_qsa {
-            return Err(invalid(
-                "compact forward scratch aliases the GDN output onto QSA scratch, which a band \
-                 without QSA layers does not own",
-            ));
-        }
         let max_projection = wide
             .max(hidden)
             .max(if has_qsa { qsa_qgate } else { 0 })
@@ -6105,6 +6197,7 @@ impl Qwen4GpuForwardScratch {
                 dtype,
                 owner: None,
                 pitch: None,
+                offset: 0,
             });
             Ok(())
         };
@@ -6262,84 +6355,96 @@ impl Qwen4GpuForwardScratch {
             let down_bf16 = scratch_mul(grouped_bound, scratch_mul(hidden, bf16_bytes)?)?;
             slots[F::MoeYDownGrouped as usize].elements = facade(down_f32.max(down_bf16));
 
-            // `owner_pitch`: row pitch of the owner's lane segments (`None`
-            // for a pure-capacity owner); `view_pitch`: the views' pitch.
-            let mut bind = |owner: F,
-                            owner_pitch: Option<usize>,
-                            view_pitch: usize,
-                            views: &[F]|
-             -> Result<(), Qwen4GpuForwardError> {
-                if !present(owner) {
-                    return Ok(());
-                }
-                let owner_slot = slots[owner as usize];
-                if owner_slot.owner.is_some() {
-                    return Err(invalid(format!(
-                        "scratch alias owner {owner:?} is itself a view"
-                    )));
-                }
-                if let Some(pitch) = owner_pitch {
-                    if owner_slot.elements < scratch_mul(max_chunk, pitch)? {
-                        return Err(invalid(format!(
-                            "scratch alias owner {owner:?} is smaller than {max_chunk} rows of pitch {pitch}"
-                        )));
-                    }
-                    slots[owner as usize].pitch = Some(pitch);
-                }
-                for &view in views {
-                    if !present(view) {
+            // Phase arena: `Projection` owns one allocation; every field of
+            // a step-local group is a view of it at a 64-element-aligned
+            // offset.  Groups never run at once, so they overlap.
+            let groups = compact_arena_groups(config, max_chunk, &slots)?;
+            let mut arena = 0usize;
+            let mut placed: Vec<(F, usize, Option<usize>)> = Vec::new();
+            for group in &groups {
+                let mut cursor = 0usize;
+                for &(field, elements, pitch) in group {
+                    if slots[field as usize].elements == 0 || (field == F::Projection && !has_gdn) {
                         continue;
                     }
-                    let slot = slots[view as usize];
-                    if slot.owner.is_some() || slot.dtype != owner_slot.dtype {
-                        return Err(invalid(format!(
-                            "scratch field {view:?} cannot alias {owner:?}"
-                        )));
+                    let offset = round_up_arena(cursor)?;
+                    let extent = elements.max(match pitch {
+                        Some(pitch) => scratch_mul(max_chunk, pitch)?,
+                        None => 0,
+                    });
+                    cursor = offset
+                        .checked_add(extent)
+                        .ok_or_else(|| invalid("compact scratch arena overflows"))?;
+                    placed.push((field, offset, pitch));
+                    if field != F::Projection {
+                        slots[field as usize].elements = elements;
                     }
-                    if slot.elements > owner_slot.elements {
-                        return Err(invalid(format!(
-                            "scratch field {view:?} ({} elements) exceeds its owner {owner:?} ({} elements)",
-                            slot.elements, owner_slot.elements
-                        )));
-                    }
-                    if slot.elements > scratch_mul(max_chunk, view_pitch)? {
-                        return Err(invalid(format!(
-                            "scratch field {view:?} is wider than its owner pitch {view_pitch}"
-                        )));
-                    }
-                    slots[view as usize].owner = Some(owner);
-                    slots[view as usize].pitch = Some(view_pitch);
                 }
-                Ok(())
-            };
-            // The grouped GDN producers write `rows * gdn_qkv` packed values
-            // while the per-lane cores address `begin * pitch`, so the owner
-            // pitch must equal the actual qkv width.  Only the equal-width
-            // geometry is bound (capacity stays `max_projection`); any other
-            // leaves both sets dedicated.
-            if gdn_qkv == wide {
-                bind(
-                    F::Projection,
-                    Some(wide),
-                    wide,
-                    &[F::HcNormalized, F::PleQuery],
-                )?;
-                bind(F::Projection2, Some(wide), wide, &[F::HcUp, F::PleKey])?;
+                arena = arena.max(round_up_arena(cursor)?);
             }
-            bind(
-                F::Rotation,
-                Some(max_rotation),
-                max_rotation,
-                &[F::PleGated],
-            )?;
-            bind(F::MoeYDownGrouped, None, ple_channels, &[F::PleOutput])?;
-            bind(F::MoeSharedOutput, Some(hidden), hidden, &[F::PleValue])?;
-            bind(
-                F::QsaQgate,
-                Some(qsa_qgate),
-                qsa_qgate,
-                &[F::GdnRecurrentOutput],
-            )?;
+            let owner_elements = arena.max(1);
+            for &(field, offset, pitch) in &placed {
+                if field == F::Projection {
+                    continue;
+                }
+                let slot = &mut slots[field as usize];
+                if slot.dtype != DType::F32 {
+                    return Err(invalid(format!(
+                        "scratch field {field:?} cannot alias {:?}",
+                        F::Projection
+                    )));
+                }
+                if offset % COMPACT_ARENA_ALIGN != 0 {
+                    return Err(invalid(format!(
+                        "scratch field {field:?} offset {offset} is not 256-byte aligned"
+                    )));
+                }
+                if offset
+                    .checked_add(slot.elements)
+                    .is_none_or(|end| end > owner_elements)
+                {
+                    return Err(invalid(format!(
+                        "scratch field {field:?} ({} elements at {offset}) exceeds the \
+                         {owner_elements}-element arena",
+                        slot.elements
+                    )));
+                }
+                if let Some(pitch) = pitch {
+                    let reserved = scratch_mul(max_chunk, pitch)?;
+                    if slot.elements > reserved
+                        || offset
+                            .checked_add(reserved)
+                            .is_none_or(|end| end > owner_elements)
+                    {
+                        return Err(invalid(format!(
+                            "scratch field {field:?} is wider than its pitch {pitch} or leaves \
+                             the arena"
+                        )));
+                    }
+                }
+                slot.owner = Some(F::Projection);
+                slot.offset = offset;
+                slot.pitch = pitch;
+            }
+            if present(F::Projection) {
+                slots[F::Projection as usize].elements = owner_elements;
+                slots[F::Projection as usize].pitch = has_gdn.then_some(gdn_qkv);
+            }
+            // `PleGated` stays a view of `Rotation`.
+            if present(F::PleGated) {
+                let owner_slot = slots[F::Rotation as usize];
+                let slot = &mut slots[F::PleGated as usize];
+                if slot.dtype != owner_slot.dtype
+                    || slot.elements > owner_slot.elements
+                    || slot.elements > scratch_mul(max_chunk, max_rotation)?
+                    || owner_slot.elements < scratch_mul(max_chunk, max_rotation)?
+                {
+                    return Err(invalid("scratch field PleGated cannot alias Rotation"));
+                }
+                slot.owner = Some(F::Rotation);
+                slot.pitch = Some(max_rotation);
+                slots[F::Rotation as usize].pitch = Some(max_rotation);
+            }
         }
         Ok((slots, max_ple_bytes))
     }
@@ -6352,6 +6457,23 @@ impl Qwen4GpuForwardScratch {
         mode: Qwen4ForwardScratchMode,
     ) -> Result<u64, Qwen4GpuForwardError> {
         Self::device_bytes_scoped(config, max_chunk, mode, &Qwen4BandScope::single(config))
+    }
+
+    /// Elements of the `FnSymGfx1201` phase arena (the `Projection` owner) a
+    /// band of `scope` plans for `max_chunk` rows; an error is a geometry the
+    /// compact plan refuses.
+    pub(crate) fn compact_arena_elements(
+        config: &Qwen4Config,
+        max_chunk: usize,
+        scope: &Qwen4BandScope,
+    ) -> Result<usize, Qwen4GpuForwardError> {
+        let (slots, _) = Self::plan_scoped(
+            config,
+            max_chunk,
+            Qwen4ForwardScratchMode::FnSymGfx1201,
+            scope,
+        )?;
+        Ok(slots[ScratchField::Projection as usize].elements)
     }
 
     /// [`Self::device_bytes`] for one band: only the fields it plans.
@@ -6503,7 +6625,7 @@ impl Qwen4GpuForwardScratch {
                 let view = tensors[owner as usize]
                     .as_ref()
                     .expect("plan validated that a view's owner owns its allocation")
-                    .sub_offset(0, slot.elements);
+                    .sub_offset(slot.offset, slot.elements);
                 tensors[index] = Some(view);
             }
         }
@@ -6700,7 +6822,10 @@ impl Qwen4GpuForwardScratch {
                 // The pitched reservation is bounded by the allocation that
                 // actually holds it: a borrowed view's own logical element
                 // count can be narrower than `rows * pitch`.
-                let storage = self.field_tensor(slot.owner.unwrap_or(field));
+                let region = scratch_mul(self.max_chunk, pitch)?;
+                let storage = self
+                    .field_tensor(slot.owner.unwrap_or(field))
+                    .sub_offset(slot.offset, region);
                 let (offset, len) =
                     owner_pitch_extent(pitch, storage.numel(), begin, rows, logical_width)?;
                 Ok(storage.sub_offset(offset, len))
@@ -13456,8 +13581,8 @@ mod tests {
     }
 
     use super::{
-        owner_pitch_extent, qwen4_forward_device_bytes, qwen4_spec_logit_rows,
-        slab_codec_tag_bytes, uploaded_ids_range, CompactScratchTerms,
+        compact_arena_groups, owner_pitch_extent, qwen4_forward_device_bytes,
+        qwen4_spec_logit_rows, slab_codec_tag_bytes, uploaded_ids_range, CompactScratchTerms,
         Qwen4ForwardScratchMode as Mode, Qwen4GpuForwardScratch as Scratch, ScratchField as F,
         ScratchSlot, QWEN4_COMPACT_FALLBACK_ROWS,
     };
@@ -13657,21 +13782,24 @@ mod tests {
     fn fn_scratch_bytes_are_pinned() {
         assert_eq!(scratch_bytes(4096, Mode::Full), 4_538_503_044);
         assert_eq!(scratch_bytes(8192, Mode::Full), 8_957_998_980);
-        assert_eq!(scratch_bytes(4096, Mode::FnSymGfx1201), 2_314_473_348);
-        assert_eq!(scratch_bytes(8192, Mode::FnSymGfx1201), 4_511_905_668);
+        assert_eq!(scratch_bytes(256, Mode::FnSymGfx1201), 259_303_940);
+        assert_eq!(scratch_bytes(512, Mode::FnSymGfx1201), 399_600_772);
+        assert_eq!(scratch_bytes(4096, Mode::FnSymGfx1201), 1_376_522_116);
+        assert_eq!(scratch_bytes(8192, Mode::FnSymGfx1201), 2_752_001_924);
+        assert_eq!(scratch_bytes(16384, Mode::FnSymGfx1201), 5_502_961_540);
         assert_eq!(
             scratch_bytes(4096, Mode::Full) - scratch_bytes(4096, Mode::FnSymGfx1201),
-            2_224_029_696
+            3_161_980_928
         );
         assert_eq!(
             scratch_bytes(8192, Mode::Full) - scratch_bytes(8192, Mode::FnSymGfx1201),
-            4_446_093_312
+            6_205_997_056
         );
-        // The 8192-row compact scratch is smaller than today's 4096-row one.
+        // The 8192-row compact scratch is smaller than the 4096-row full one.
         assert!(scratch_bytes(8192, Mode::FnSymGfx1201) <= scratch_bytes(4096, Mode::Full));
         assert_eq!(
             scratch_bytes(4096, Mode::Full) - scratch_bytes(8192, Mode::FnSymGfx1201),
-            26_597_376
+            1_786_501_120
         );
         // The estimator adds the same 64-row speculative logits to either plan.
         let config = fn_config();
@@ -13815,64 +13943,112 @@ mod tests {
         assert_eq!(field_bytes(&full, F::MoeYDownGrouped), 917_504_000);
     }
 
+    /// Every field of every arena group lies inside the `Projection` arena at
+    /// a 256-byte aligned offset, and the regions of one group are disjoint.
+    fn assert_arena_groups_disjoint(config: &Qwen4Config, rows: usize, slots: &[ScratchSlot]) {
+        let arena = slots[F::Projection as usize].elements;
+        let groups = compact_arena_groups(config, rows, slots).unwrap();
+        for group in &groups {
+            let mut regions: Vec<(usize, usize, F)> = Vec::new();
+            for &(field, elements, pitch) in group {
+                let slot = slots[field as usize];
+                if slot.elements == 0 {
+                    continue;
+                }
+                if field != F::Projection {
+                    assert_eq!(slot.owner, Some(F::Projection), "{field:?} at {rows}");
+                    assert_eq!(slot.pitch, pitch, "{field:?} at {rows}");
+                }
+                assert_eq!(slot.offset % 64, 0, "{field:?} at {rows}");
+                let extent = elements.max(pitch.map_or(0, |pitch| rows * pitch));
+                assert!(slot.offset + extent <= arena, "{field:?} at {rows}");
+                regions.push((slot.offset, slot.offset + extent, field));
+            }
+            regions.sort_by_key(|region| (region.0, region.1));
+            for pair in regions.windows(2) {
+                assert!(
+                    pair[0].1 <= pair[1].0,
+                    "{:?} overlaps {:?} at {rows}",
+                    pair[0].2,
+                    pair[1].2
+                );
+            }
+        }
+    }
+
     #[test]
-    fn compact_aliases_borrow_one_owner_each_and_ple_normed_stays_dedicated() {
+    fn compact_arena_groups_are_disjoint_and_everything_else_owns_its_allocation() {
+        let config = fn_config();
         let full = plan(8192, Mode::Full);
         assert_eq!(full.len(), F::COUNT);
         assert!(full
             .iter()
-            .all(|slot| slot.owner.is_none() && slot.pitch.is_none()));
-        let compact = plan(8192, Mode::FnSymGfx1201);
-        let owner = |field: F| compact[field as usize].owner;
-        assert_eq!(owner(F::HcNormalized), Some(F::Projection));
-        assert_eq!(owner(F::PleQuery), Some(F::Projection));
-        assert_eq!(owner(F::HcUp), Some(F::Projection2));
-        assert_eq!(owner(F::PleKey), Some(F::Projection2));
-        assert_eq!(owner(F::PleGated), Some(F::Rotation));
-        assert_eq!(owner(F::PleOutput), Some(F::MoeYDownGrouped));
-        assert_eq!(owner(F::PleValue), Some(F::MoeSharedOutput));
-        assert_eq!(owner(F::GdnRecurrentOutput), Some(F::QsaQgate));
-        assert_eq!(owner(F::PleNormed), None);
-        assert_eq!(
-            compact.iter().filter(|slot| slot.owner.is_some()).count(),
-            8
-        );
-        // Only owners are charged; no view's owner is itself a view and every
-        // view fits inside its owner.
-        assert_eq!(
-            owned_bytes(&compact),
-            scratch_bytes(8192, Mode::FnSymGfx1201)
-        );
+            .all(|slot| slot.owner.is_none() && slot.pitch.is_none() && slot.offset == 0));
+        for rows in [1usize, 7, 256, 512, 4096, 16384] {
+            let compact = plan(rows, Mode::FnSymGfx1201);
+            assert_arena_groups_disjoint(&config, rows, &compact);
+            let grouped: Vec<F> = compact_arena_groups(&config, rows, &compact)
+                .unwrap()
+                .into_iter()
+                .flatten()
+                .map(|(field, _, _)| field)
+                .collect();
+            for (index, slot) in compact.iter().enumerate() {
+                let field = F::ALL[index];
+                match field {
+                    F::PleGated => assert_eq!(slot.owner, Some(F::Rotation)),
+                    _ if grouped.contains(&field) && field != F::Projection => {
+                        assert_eq!(slot.owner, Some(F::Projection), "{field:?} at {rows}");
+                    }
+                    _ => {
+                        assert_eq!(slot.owner, None, "{field:?} at {rows}");
+                        assert_eq!(slot.offset, 0, "{field:?} at {rows}");
+                    }
+                }
+            }
+            for field in [
+                F::Streams,
+                F::HcMixed,
+                F::HcGates,
+                F::AttentionOutput,
+                F::FfnOutput,
+                F::Rotation,
+                F::PleRows,
+                F::PleStaged,
+                F::PleNormed,
+                F::TokenIds,
+                F::Logits,
+                F::GdnBf16,
+                F::QsaSelected,
+                F::MoeTopkIndices,
+                F::MoeTopkWeights,
+                F::MoeExpertTokenCounts,
+                F::MoeExpertOffsets,
+                F::MoeExpertTileIds,
+                F::MoeSortedSlotIndex,
+                F::MoeInversePerm,
+                F::RouterLogits,
+            ] {
+                assert!(!grouped.contains(&field), "{field:?}");
+                assert_eq!(compact[field as usize].owner, None, "{field:?} at {rows}");
+            }
+            assert_eq!(
+                owned_bytes(&compact),
+                scratch_bytes(rows, Mode::FnSymGfx1201)
+            );
+            for slot in compact.iter().filter(|slot| slot.owner.is_some()) {
+                let owner = compact[slot.owner.unwrap() as usize];
+                assert!(owner.owner.is_none());
+                assert_eq!(owner.dtype, slot.dtype);
+                assert!(slot.offset + slot.elements <= owner.elements);
+            }
+        }
         assert_eq!(owned_bytes(&full), scratch_bytes(8192, Mode::Full));
-        for slot in compact.iter().filter(|slot| slot.owner.is_some()) {
-            let owner = compact[slot.owner.unwrap() as usize];
-            assert!(owner.owner.is_none());
-            assert_eq!(owner.dtype, slot.dtype);
-            assert!(slot.elements <= owner.elements);
-        }
-        // Alias-set members share the owner's row pitch.
-        let pitch = |field: F| compact[field as usize].pitch;
-        for field in [
-            F::Projection,
-            F::HcNormalized,
-            F::PleQuery,
-            F::Projection2,
-            F::HcUp,
-            F::PleKey,
-        ] {
-            assert_eq!(pitch(field), Some(10_240), "{field:?}");
-        }
-        for field in [F::QsaQgate, F::GdnRecurrentOutput] {
-            assert_eq!(pitch(field), Some(12_288), "{field:?}");
-        }
-        for field in [F::Rotation, F::PleGated, F::PleOutput] {
-            assert_eq!(pitch(field), Some(10_240), "{field:?}");
-        }
-        for field in [F::MoeSharedOutput, F::PleValue] {
-            assert_eq!(pitch(field), Some(2_560), "{field:?}");
-        }
-        assert_eq!(pitch(F::MoeYDownGrouped), None);
-        assert_eq!(pitch(F::PleNormed), None);
+        let compact = plan(8192, Mode::FnSymGfx1201);
+        assert_eq!(compact[F::Rotation as usize].pitch, Some(10_240));
+        assert_eq!(compact[F::PleGated as usize].pitch, Some(10_240));
+        assert_eq!(compact[F::Projection as usize].pitch, Some(10_240));
+        assert_eq!(compact[F::PleNormed as usize].owner, None);
     }
 
     /// One grouped-GDN invocation set, host-simulated: the grouped producers
@@ -13931,29 +14107,22 @@ mod tests {
         let wide = config.hidden_size * config.hc_count;
         assert_eq!(qkv, wide);
         let compact = plan(32, Mode::FnSymGfx1201);
-        for (owner, views) in [
-            (F::Projection, [F::HcNormalized, F::PleQuery]),
-            (F::Projection2, [F::HcUp, F::PleKey]),
-        ] {
-            let pitch = compact[owner as usize].pitch.expect("owner pitch");
+        for field in [F::Projection, F::Projection2] {
+            let pitch = compact[field as usize].pitch.expect("owner pitch");
             assert_eq!(pitch, qkv);
-            for view in views {
-                assert_eq!(compact[view as usize].owner, Some(owner));
-                assert_eq!(compact[view as usize].pitch, Some(pitch));
-            }
             for group in 1..=8usize {
                 for begin in [0usize, 1, 3, 9] {
                     assert_eq!(
                         simulate_grouped_gdn_rows(pitch, qkv, wide, begin, group),
                         Ok(()),
-                        "{owner:?} group {group} begin {begin}"
+                        "{field:?} group {group} begin {begin}"
                     );
                 }
             }
         }
-        // Negative control: the retired owner pitch (the capacity's maximum
-        // width, 12288) strands every row after the first of a group, so the
-        // odd group row is the first the lane fails to find.
+        // Negative control: a pitch wider than the actual qkv width (12288)
+        // strands every row after the first of a group, so the odd group row
+        // is the first the lane fails to find.
         for group in 1..=8usize {
             for begin in [0usize, 1, 3, 9] {
                 let result = simulate_grouped_gdn_rows(12_288, qkv, wide, begin, group);
@@ -13967,70 +14136,30 @@ mod tests {
     }
 
     #[test]
-    fn unequal_gdn_width_leaves_the_projection_alias_sets_dedicated() {
+    fn unequal_gdn_width_keeps_the_arena_at_the_qkv_pitch() {
         let mut config = fn_config();
         config.linear_num_key_heads = 12;
         let qkv = 2 * config.linear_num_key_heads * config.linear_key_head_dim
             + config.linear_num_value_heads * config.linear_value_head_dim;
         assert_ne!(qkv, config.hidden_size * config.hc_count);
         let rows = 32usize;
-        let full = Scratch::plan(&config, rows, Mode::Full).unwrap().0;
         let compact = Scratch::plan(&config, rows, Mode::FnSymGfx1201).unwrap().0;
-        for field in [
-            F::Projection,
-            F::HcNormalized,
-            F::PleQuery,
-            F::Projection2,
-            F::HcUp,
-            F::PleKey,
-        ] {
-            let slot = compact[field as usize];
-            assert_eq!(slot.owner, None, "{field:?}");
-            assert_eq!(slot.pitch, None, "{field:?}");
-            assert_eq!(slot.elements, full[field as usize].elements, "{field:?}");
+        for field in [F::Projection, F::Projection2] {
+            assert_eq!(compact[field as usize].pitch, Some(qkv), "{field:?}");
         }
-        // The other compact alias sets are unchanged.
-        let pitch = |field: F| compact[field as usize].pitch;
-        let owner = |field: F| compact[field as usize].owner;
-        assert_eq!(owner(F::PleGated), Some(F::Rotation));
-        assert_eq!(owner(F::PleOutput), Some(F::MoeYDownGrouped));
-        assert_eq!(owner(F::PleValue), Some(F::MoeSharedOutput));
-        assert_eq!(owner(F::GdnRecurrentOutput), Some(F::QsaQgate));
-        for field in [F::QsaQgate, F::GdnRecurrentOutput] {
-            assert_eq!(pitch(field), Some(12_288), "{field:?}");
-        }
-        for field in [F::Rotation, F::PleGated, F::PleOutput] {
-            assert_eq!(pitch(field), Some(10_240), "{field:?}");
-        }
-        for field in [F::MoeSharedOutput, F::PleValue] {
-            assert_eq!(pitch(field), Some(2_560), "{field:?}");
-        }
-        assert_eq!(pitch(F::MoeYDownGrouped), None);
-        assert_eq!(
-            compact.iter().filter(|slot| slot.owner.is_some()).count(),
-            4
-        );
-        // Accounting: only owners are charged, every view still fits inside
-        // its owner, and the estimator agrees with the plan.
-        for slot in compact.iter().filter(|slot| slot.owner.is_some()) {
-            let owner = compact[slot.owner.unwrap() as usize];
-            assert!(owner.owner.is_none());
-            assert_eq!(owner.dtype, slot.dtype);
-            assert!(slot.elements <= owner.elements);
-        }
+        assert_eq!(compact[F::Projection2 as usize].owner, Some(F::Projection));
+        assert_eq!(compact[F::HcNormalized as usize].owner, Some(F::Projection));
         assert_eq!(
             owned_bytes(&compact),
             Scratch::device_bytes(&config, rows, Mode::FnSymGfx1201).unwrap()
         );
-        assert!(owned_bytes(&compact) < owned_bytes(&full));
+        assert_arena_groups_disjoint(&config, rows, &compact);
     }
 
     #[test]
-    fn pitched_segments_are_bounded_by_the_actual_owner_allocation() {
-        // `segment_view` resolves a view's storage to its owner: a view whose
-        // logical element count is narrower than `rows * pitch` (the 6144-wide
-        // GDN recurrent output at pitch 12288) still fits whole and at its
-        // last lane inside the owner's allocation.
+    fn pitched_segments_are_bounded_by_the_arena_region_of_the_field() {
+        // `segment_view` bounds a pitched field by its own `max_chunk * pitch`
+        // region of the owner's allocation, which sits at the field's offset.
         let rows = 8usize;
         let config = fn_config();
         let qkv = 2 * config.linear_num_key_heads * config.linear_key_head_dim
@@ -14041,28 +14170,24 @@ mod tests {
             let Some(pitch) = slot.pitch else { continue };
             let storage = slot.owner.map_or(*slot, |owner| compact[owner as usize]);
             assert!(storage.owner.is_none(), "field {index}");
-            assert!(storage.elements >= rows * pitch, "field {index}");
-            // The live row width: the Projection owners are allocated at the
-            // `max_projection` capacity (12288) but carry GDN qkv rows; every
-            // other field's capacity is its logical width.
+            assert!(
+                slot.offset + rows * pitch <= storage.elements,
+                "field {index}"
+            );
             let width = match F::ALL[index] {
                 F::Projection | F::Projection2 => qkv,
                 _ => slot.elements / rows,
             };
             assert!(width <= pitch, "field {index}");
-            let whole = owner_pitch_extent(pitch, storage.elements, 0, rows, width).unwrap();
+            let region = rows * pitch;
+            let whole = owner_pitch_extent(pitch, region, 0, rows, width).unwrap();
             assert_eq!(whole, (0, rows * pitch), "field {index}");
-            let last = owner_pitch_extent(pitch, storage.elements, rows - 1, 1, width).unwrap();
+            let last = owner_pitch_extent(pitch, region, rows - 1, 1, width).unwrap();
             assert_eq!(last, ((rows - 1) * pitch, pitch), "field {index}");
+            assert!(owner_pitch_extent(pitch, region - 1, 0, rows, width).is_err());
             checked += 1;
         }
-        assert!(checked >= 8);
-        // Negative control: bounding by the 6144-wide view's own allocation
-        // refuses the whole reservation that the owner holds.
-        let recurrent = compact[F::GdnRecurrentOutput as usize];
-        assert_eq!(recurrent.owner, Some(F::QsaQgate));
-        assert!(recurrent.elements < rows * 12_288);
-        assert!(owner_pitch_extent(12_288, recurrent.elements, 0, rows, 6_144).is_err());
+        assert!(checked >= 20);
     }
 
     #[test]
