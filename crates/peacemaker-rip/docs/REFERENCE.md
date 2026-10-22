@@ -693,3 +693,25 @@ The script declares the LDS slots (`b.lds_slot`, from `g.lds_slots()`: `k_plane`
 | `fa::preconvert(b, g)?` | the whole preconvert body through `s_endpgm` |
 
 The Q8_0 tile is `tile_setup`, `fill`, label `FILL_DONE`, `[ready(0), ready(1)]`, label `QK`, `skip_if_helper(TURN)`, `qk`, four `softmax_sub`, label `TURN`, `[retire(0), retire(1)]`, `next_tile`. The fp8 tile reuses one 32-KiB stage sequentially: `fill_k`, `[ready(0)]`, `qk` (helper skips to `QK_DONE`), `[retire(0)]`, `fill_v`, `[ready(0)]`, four `softmax_sub` (helper skips to `TURN`), `[retire(0)]`, `next_tile`. `fa_prefill::emit` is written over the same blocks and is pinned to the digests recorded before they existed for both modules, every export and the three shape contracts (`peacemaker-isa/tests/fa_prefill_digests.rs`); the twins re-emit the bytes and the proof of every export (`tests/fa_prefill_twin.rs`). `pm_loop --kernel fa_prefill --rip fa_prefill.rip` times them ([cookbook 15](cookbook/15-fa-prefill-blocks.md)).
+
+## 18. The PM producers: `C8Gen`, `RotGen`, `GdnGen`
+
+`iu4_c8_producer_pm` (four exports), `moe_rotate_i4_pm` (flat-slot and grouped-position) and `gdn_chunk_prep_pm` are untyped-`Builder` kernels, so their twins are too: `Builder::new(g.kernel_spec(), g.plan()?)`, `b.enable_delay_alu()`, no `Workgroup`. A generator is an opaque handle; the natives are the public `blocks` of `iu4_c8_producer`, `moe_rotate_i4_pm` and `gdn_chunk_prep`, each emitting straight into the builder `b` passed first. The committed twins are [`iu4_c8_producer.rip`](../../peacemaker-isa/src/kernels/iu4_c8_producer.rip), [`moe_rotate_i4_pm.rip`](../../peacemaker-isa/src/kernels/moe_rotate_i4_pm.rip) and [`gdn_chunk_prep.rip`](../../peacemaker-isa/src/kernels/gdn_chunk_prep.rip); `tests/producers_twin.rs` requires `s_text` and proof identity with the Rust emit of every export and the module text assembled from the twin's exports, and `peacemaker-isa/tests/producers_pinned.rs` pins the Rust side (every export and module) to the digests recorded before the blocks were split. `pm_loop --kernel iu4_c8_producer_pm|moe_rotate_i4_pm|gdn_chunk_prep_pm --rip FILE.rip` compiles the twin's variant, ABI-checks it against the Rust emit of the same entry and times it.
+
+| call | meaning |
+|---|---|
+| `C8Gen::new(arch, tag)?` | one c8 export (`rotate`, `norm`, `sigmoid_rotate`, `norm_out`); `g.plan()?`, `g.kernel_spec()`, `g.tag()`, `g.lds_bytes()` |
+| `RotGen::new(arch, gp)?` | `moe_rotate_i4_pm` (`gp`: the grouped-position twin, record `g * P + row`); `g.plan()?`, `g.kernel_spec()`, `g.gp()` |
+| `GdnGen::new(arch)?` | `gdn_chunk_prep_pm` (the A3B geometry); `g.plan()?`, `g.kernel_spec()` |
+| `prod::label(b, name)?`, `prod::wait_all(b)?` | place a label; drain every counter |
+| `c8::prologue(b, g)?`, `c8::rotate_front(b)?`, `c8::sigmoid_rotate_front(b)?` | arguments, ids and exits, pointers, lane offsets; the rotate's `x * signs1` (AWQ divide first); the sigmoid gate in front of it |
+| `c8::norm_row_loads(b)?`, `c8::norm_prefetch(b)?`, `c8::norm_sumsq(b)?` | the norm's row dwords; the next phase's loads; the per-thread `fma` chain |
+| `c8::norm_reduce_pre(b, g)?`, `c8::norm_store_insn()`, `c8::norm_reduce_addr(b, g)?`, `c8::norm_load_insns()`, `c8::norm_reduce_post(b, g)?` | the reduction in five pieces: up to the LDS store; the store `Instruction` (for `b.ds_store(0, ..)`); the load address; the two `ds_load_b128` `Instruction`s (for `b.ds_load(0, ..)`); the eight-root tree (and for `norm_out` the in-wave levels). The barrier between is the script's `b.barrier_with_scope([ready(0)], "lds_only")` |
+| `c8::norm_rms(b)?`, `c8::norm_apply(b, g)?` | `rsqrt(eps + mean)` with the denormal guard; `y = (x * w) * rms`, the norm-out store, the AWQ divide and signs1 |
+| `c8::fwht_scale_store(b)?`, `c8::quantize(b)?`, `c8::store_record(b, g)?` | FWHT, scale and the rotated store; the C8 quantizer; the record store, the export's exit label and `s_endpgm` |
+| `rot::prologue(b, g)?`, `rot::rotate(b)?`, `rot::quantize(b, e)?`, `rot::store(b)?` | the prologue; the FWHT128 (returns the four registers the quantizer reads); the `{5,7}` quantizer; the record store |
+| `gdn::label(name)?` | `end`, `gate_loop`, `gate_done`, `k_start`, `v_start`, `epi`, `q_loop`, `k_loop`, `v_loop` |
+| `gdn::prologue(b)?`, `gdn::gate_guard(b)?`, `gdn::gate_setup(b)?`, `gdn::gate_body(b)?` | arguments and ids; only `by == 0` blocks run the gates; the gate set-up; one trip of the gate loop (back branch included: use it as the body of `b.loop_(gdn::label("gate_loop")?, \|b\| ..)`) |
+| `gdn::conv_setup(b)?`, `gdn::conv_to_v(b)?`, `gdn::conv_to_k(b)?`, `gdn::region_setup(b, "q" \| "k" \| "v")?`, `gdn::row_body(b, region, head)?`, `gdn::to_epi(b)?`, `gdn::epilogue(b)?` | the conv unit: set-up, the unit dispatch, a region's pointers, one trip of a region's row loop, `s_branch epi`, the chunk-0 conv_state advance |
+
+Variants: `rotate`, `norm`, `sigmoid_rotate`, `norm_out` (c8), `rows`, `gp` (rotate), `chunk_prep` (gdn). gfx1201 only.

@@ -9,7 +9,8 @@
 //! pm_loop --kernel iu4_gemm|mq6_i8_gemm|fp8_gemm|fa_prefill|qwen4_moe_sym --shape <S> [kernel knobs]
 //!         [--base-<knob> V ...] [--rip FILE.rip] [--time N] [--rounds R]
 //!         [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--out DIR]
-//!         (--rip: iu4_gemm, mq6_i8_gemm, fp8_gemm, fa_prefill, qwen4_moe_sym)
+//!         (--rip: iu4_gemm, mq6_i8_gemm, fp8_gemm, fa_prefill, qwen4_moe_sym and the PM producers
+//!          iu4_c8_producer_pm / moe_rotate_i4_pm / gdn_chunk_prep_pm)
 //! ```
 //!
 //! Pipeline (every step lands in the JSON record):
@@ -234,11 +235,18 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
     if o.rip.is_some()
         && !matches!(
             o.kernel.as_str(),
-            "iu4_gemm" | "mq6_i8_gemm" | "fp8_gemm" | "fa_prefill" | "qwen4_moe_sym"
+            "iu4_gemm"
+                | "mq6_i8_gemm"
+                | "fp8_gemm"
+                | "fa_prefill"
+                | "qwen4_moe_sym"
+                | "iu4_c8_producer_pm"
+                | "moe_rotate_i4_pm"
+                | "gdn_chunk_prep_pm"
         )
     {
         return Err(format!(
-            "--rip is only supported with --kernel iu4_gemm, mq6_i8_gemm, fp8_gemm, fa_prefill or qwen4_moe_sym: only iu4_gemm, mq6_i8_gemm, fp8_gemm, fa_prefill and qwen4_moe_sym are exposed to .rip so far (got --kernel {})",
+            "--rip is only supported with --kernel iu4_gemm, mq6_i8_gemm, fp8_gemm, fa_prefill, qwen4_moe_sym, iu4_c8_producer_pm, moe_rotate_i4_pm or gdn_chunk_prep_pm: only those generators are exposed to .rip so far (got --kernel {})",
             o.kernel
         ));
     }
@@ -261,9 +269,9 @@ fn build_workload(o: &mut Opts) -> Result<Box<dyn Workload>> {
         "fp8_gemm" => fp8::new(&shape, &mut knobs, o.rip.as_deref())?,
         "fa_prefill" => fa::new(&shape, &mut knobs, o.rip.as_deref())?,
         "qwen4_moe_sym" => moe::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
-        "iu4_c8_producer_pm" => c8::new(&shape, &mut knobs)?,
-        "moe_rotate_i4_pm" => rotate::new(&shape, &mut knobs)?,
-        "gdn_chunk_prep_pm" => gdn::new(&shape, &mut knobs)?,
+        "iu4_c8_producer_pm" => c8::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
+        "moe_rotate_i4_pm" => rotate::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
+        "gdn_chunk_prep_pm" => gdn::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
         other => {
             return Err(format!(
                 "unknown --kernel {other} (iu4_gemm|mq6_i8_gemm|fp8_gemm|fa_prefill|qwen4_moe_sym|iu4_c8_producer_pm|moe_rotate_i4_pm|gdn_chunk_prep_pm)"
@@ -907,7 +915,7 @@ mod tests {
         assert_eq!(o.knobs.0.len(), 1, "--rip is not a knob");
         assert!(parse_args(args("--kernel iu4_gemm")).unwrap().rip.is_none());
         let e = parse_args(args("--kernel nope --rip /tmp/a.rip")).unwrap_err();
-        assert!(e.contains("only iu4_gemm"), "{e}");
+        assert!(e.contains("--rip is only supported with --kernel"), "{e}");
         // qwen4_moe_sym takes --rip (every MQ4 entry; the entry check is the workload's).
         let o = parse_args(args(
             "--kernel qwen4_moe_sym --rip /tmp/a.rip --epi down_gp_nt4",
@@ -915,6 +923,15 @@ mod tests {
         .unwrap();
         assert_eq!(o.rip, Some(PathBuf::from("/tmp/a.rip")));
         assert!(parse_args(args("--kernel iu4_gemm --rip")).is_err());
+        // The PM producers take --rip (the twin of the selected export / variant).
+        for k in [
+            "iu4_c8_producer_pm",
+            "moe_rotate_i4_pm",
+            "gdn_chunk_prep_pm",
+        ] {
+            let o = parse_args(args(&format!("--kernel {k} --rip /tmp/a.rip"))).unwrap();
+            assert_eq!(o.rip, Some(PathBuf::from("/tmp/a.rip")), "{k}");
+        }
     }
 
     #[test]

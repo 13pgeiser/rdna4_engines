@@ -32,6 +32,8 @@ mod native_gen;
 mod native_mq6;
 #[path = "native_qmoe.rs"]
 mod native_qmoe;
+#[path = "native_prod.rs"]
+mod native_prod;
 
 #[derive(Clone)]
 pub struct Chain {
@@ -88,6 +90,8 @@ pub enum Nat {
     MoeNt1Gen(Rc<peacemaker_isa::kernels::qwen4_moe_sym::nt1_blocks::Gen>),
     /// A `fa_prefill` generator (`FaGen::new(arch, spec)`): the validated spec every `fa::*` block reads.
     FaGen(Rc<peacemaker_isa::kernels::fa_prefill::blocks::Gen>),
+    /// A PM producer generator (`C8Gen::new`, `RotGen::new`, `GdnGen::new`).
+    ProdGen(Rc<native_prod::ProdGen>),
 }
 
 impl Nat {
@@ -125,6 +129,7 @@ impl Nat {
             Nat::MoeNtGen(_) => "MoeNtGen",
             Nat::MoeNt1Gen(_) => "MoeNt1Gen",
             Nat::FaGen(_) => "FaGen",
+            Nat::ProdGen(_) => "ProdGen",
         }
     }
     pub fn equals(&self, o: &Nat) -> bool {
@@ -264,6 +269,7 @@ pub fn is_fn(name: &str) -> bool {
         || native_fp8::is_fn(name)
         || native_qmoe::is_fn(name)
         || native_fa::is_fn(name)
+        || native_prod::is_fn(name)
     {
         return true;
     }
@@ -304,6 +310,7 @@ pub fn is_type(n: &str) -> bool {
         || native_fp8::is_type(n)
         || native_qmoe::is_type(n)
         || native_fa::is_type(n)
+        || native_prod::is_type(n)
 }
 
 pub fn is_struct(n: &str) -> bool {
@@ -1173,6 +1180,9 @@ pub fn call_fn<'a>(it: &Interp<'a>, name: &str, args: Vec<Value<'a>>, cx: &mut C
             if let Some(r) = native_fa::call_fn(it, n, a, cx) {
                 return r;
             }
+            if let Some(r) = native_prod::call_fn(it, n, a, cx) {
+                return r;
+            }
             if let Some((t, f)) = n.split_once("::") {
                 if let Some(ty) = IntTy::parse(t) {
                     need(1)?;
@@ -1292,6 +1302,7 @@ pub fn method<'a>(
         Nat::MoeNtGen(g) => native_qmoe::nt_method(it, g, name, a)?,
         Nat::MoeNt1Gen(g) => native_qmoe::nt1_method(it, g, name, a)?,
         Nat::FaGen(g) => native_fa::method(it, g, name, a)?,
+        Nat::ProdGen(g) => native_prod::method(it, g, name, a)?,
         Nat::Arch(arch) => match name {
             "gfx12" => Some(Value::Bool(arch.gfx12())),
             "name" => Some(Value::str(arch.name())),

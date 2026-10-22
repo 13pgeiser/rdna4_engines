@@ -135,6 +135,9 @@ const WIN_DONE: &str = ".Lgdcp_win_done";
 const K_START: &str = ".Lgdcp_k_start";
 const V_START: &str = ".Lgdcp_v_start";
 const EPI: &str = ".Lgdcp_epi";
+const Q_LOOP: &str = ".Lgdcp_q";
+const K_LOOP: &str = ".Lgdcp_k";
+const V_LOOP: &str = ".Lgdcp_v";
 
 // ------------------------------------------------------------------ VGPR map
 const TID: u8 = 0;
@@ -1132,9 +1135,14 @@ fn gate_body(b: &mut Builder) -> R {
 }
 
 /// Only `by == 0` blocks run the gates.
-fn gate(b: &mut Builder) -> R {
+/// Only the `by == 0` blocks run the gates: any other block branches to `GATE_DONE`.
+fn gate_guard(b: &mut Builder) -> R {
     op(b, "s_cmp_lg_u32 ttmp7, 0", &[], &[])?;
-    op(b, format!("s_cbranch_scc1 {GATE_DONE}"), &[], &[])?;
+    op(b, format!("s_cbranch_scc1 {GATE_DONE}"), &[], &[])
+}
+
+fn gate(b: &mut Builder) -> R {
+    gate_guard(b)?;
     gate_setup(b)?;
     b.wait_all()?;
     b.loop_(GATE_LOOP, gate_body)?;
@@ -1144,7 +1152,7 @@ fn gate(b: &mut Builder) -> R {
 
 // ------------------------------------------------------------------ conv
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Region {
+pub enum Region {
     Q,
     K,
     V,
@@ -1581,27 +1589,42 @@ fn row_body(b: &mut Builder, region: Region, head: &str) -> R {
 }
 
 /// The three region loops behind a uniform dispatch; each falls to (or jumps to) the epilogue.
-fn conv(b: &mut Builder) -> R {
-    conv_setup(b)?;
+/// Unit dispatch: units `>= 2 * HK` (v heads) branch to `V_START`.
+fn conv_to_v(b: &mut Builder) -> R {
     sop(
         b,
         format!("s_cmp_ge_u32 s{S_UNIT}, {}", 2 * HK),
         &[],
         &[S_UNIT],
     )?;
-    op(b, format!("s_cbranch_scc1 {V_START}"), &[], &[])?;
+    op(b, format!("s_cbranch_scc1 {V_START}"), &[], &[])
+}
+
+/// Unit dispatch: units `>= HK` (k heads) branch to `K_START`.
+fn conv_to_k(b: &mut Builder) -> R {
     sop(b, format!("s_cmp_ge_u32 s{S_UNIT}, {HK}"), &[], &[S_UNIT])?;
-    op(b, format!("s_cbranch_scc1 {K_START}"), &[], &[])?;
+    op(b, format!("s_cbranch_scc1 {K_START}"), &[], &[])
+}
+
+/// End of a region: `s_branch EPI`.
+fn to_epi(b: &mut Builder) -> R {
+    op(b, format!("s_branch {EPI}"), &[], &[])
+}
+
+fn conv(b: &mut Builder) -> R {
+    conv_setup(b)?;
+    conv_to_v(b)?;
+    conv_to_k(b)?;
     region_setup(b, Region::Q)?;
-    b.loop_(".Lgdcp_q", |b| row_body(b, Region::Q, ".Lgdcp_q"))?;
-    op(b, format!("s_branch {EPI}"), &[], &[])?;
+    b.loop_(Q_LOOP, |b| row_body(b, Region::Q, Q_LOOP))?;
+    to_epi(b)?;
     b.label(K_START)?;
     region_setup(b, Region::K)?;
-    b.loop_(".Lgdcp_k", |b| row_body(b, Region::K, ".Lgdcp_k"))?;
-    op(b, format!("s_branch {EPI}"), &[], &[])?;
+    b.loop_(K_LOOP, |b| row_body(b, Region::K, K_LOOP))?;
+    to_epi(b)?;
     b.label(V_START)?;
     region_setup(b, Region::V)?;
-    b.loop_(".Lgdcp_v", |b| row_body(b, Region::V, ".Lgdcp_v"))
+    b.loop_(V_LOOP, |b| row_body(b, Region::V, V_LOOP))
 }
 
 /// Chunk-0 blocks advance their channels' three-deep conv_state ring after consuming the old values.
@@ -1695,46 +1718,143 @@ fn epilogue(b: &mut Builder) -> R {
 
 /// The chunk-prep entry `gdn_chunk_prep_pm_gfx1201`.
 pub fn emit(arch: Arch, spec: &GdnChunkPrepSpec) -> Result<Emitted, String> {
-    admit(arch, spec)?;
-    let kernargs = KernargLayout::new(KERNARG_BYTES)
-        .pointer_access("x", 0, Access::ReadOnly)
-        .pointer_access("conv_w", 8, Access::ReadOnly)
-        .pointer_access("conv_state", 16, Access::ReadWrite)
-        .pointer_access("a", 24, Access::ReadWrite)
-        .pointer_access("b", 32, Access::ReadWrite)
-        .pointer_access("dt_bias", 40, Access::ReadOnly)
-        .pointer_access("a_log", 48, Access::ReadOnly)
-        .pointer_access("q", 56, Access::WriteOnly)
-        .pointer_access("k", 64, Access::WriteOnly)
-        .pointer_access("v", 72, Access::WriteOnly)
-        .hidden("T", 80, 4, "by_value")
-        .hidden("q_scale", 84, 4, "by_value")
-        .hidden("eps", 88, 4, "by_value")
-        .hidden("hk", 92, 4, "by_value")
-        .hidden("hv", 96, 4, "by_value");
-    let kspec = KernelSpec {
-        kernel_id: KERNEL_ID.into(),
-        variant: "chunk_prep".into(),
-        arch,
-        symbol: SYMBOL.into(),
-        kernargs,
-        user_sgpr_count: 2,
-        system_sgpr_workgroup_id_y: true,
-        workgroup_size: BLOCK as u16,
-        group_segment_fixed_size: 0,
-        wave32: true,
-        cu_mode: false,
-    };
-    let mut b = Builder::new(kspec, plan()?);
+    let g = blocks::Gen::new(arch, spec)?;
+    let mut b = Builder::new(g.kernel_spec(), g.plan()?);
     b.enable_delay_alu();
-    prologue(&mut b)?;
+    blocks::prologue(&mut b)?;
     gate(&mut b)?;
     conv(&mut b)?;
-    epilogue(&mut b)?;
+    blocks::epilogue(&mut b)?;
     b.wait_all()?;
     b.label(END)?;
     b.control(Sop::End.encode(Arch::Gfx1201)?)?;
     b.finish()
+}
+
+/// The emit's phases as public blocks: [`emit`] with `gate` and `conv` (the sequences below) is the composition
+/// the `.rip` twin (`gdn_chunk_prep.rip`) writes, statement for statement, over the `gdn::*` natives. Every block
+/// emits straight into the builder; the two gate and three conv loops are the script's `b.loop_` statements
+/// over `gate_body` / `row_body`.
+pub mod blocks {
+    use super::*;
+
+    /// The one geometry's launch contract and register plan.
+    pub struct Gen {
+        arch: Arch,
+    }
+
+    impl Gen {
+        pub fn new(arch: Arch, spec: &GdnChunkPrepSpec) -> Result<Gen, String> {
+            admit(arch, spec)?;
+            Ok(Gen { arch })
+        }
+        pub fn plan(&self) -> Result<RegPlan, String> {
+            super::plan()
+        }
+        pub fn kernel_spec(&self) -> KernelSpec {
+            let kernargs = KernargLayout::new(KERNARG_BYTES)
+                .pointer_access("x", 0, Access::ReadOnly)
+                .pointer_access("conv_w", 8, Access::ReadOnly)
+                .pointer_access("conv_state", 16, Access::ReadWrite)
+                .pointer_access("a", 24, Access::ReadWrite)
+                .pointer_access("b", 32, Access::ReadWrite)
+                .pointer_access("dt_bias", 40, Access::ReadOnly)
+                .pointer_access("a_log", 48, Access::ReadOnly)
+                .pointer_access("q", 56, Access::WriteOnly)
+                .pointer_access("k", 64, Access::WriteOnly)
+                .pointer_access("v", 72, Access::WriteOnly)
+                .hidden("T", 80, 4, "by_value")
+                .hidden("q_scale", 84, 4, "by_value")
+                .hidden("eps", 88, 4, "by_value")
+                .hidden("hk", 92, 4, "by_value")
+                .hidden("hv", 96, 4, "by_value");
+            KernelSpec {
+                kernel_id: KERNEL_ID.into(),
+                variant: "chunk_prep".into(),
+                arch: self.arch,
+                symbol: SYMBOL.into(),
+                kernargs,
+                user_sgpr_count: 2,
+                system_sgpr_workgroup_id_y: true,
+                workgroup_size: BLOCK as u16,
+                group_segment_fixed_size: 0,
+                wave32: true,
+                cu_mode: false,
+            }
+        }
+    }
+
+    /// A label of the kernel: `end`, `gate_loop`, `gate_done`, `k_start`, `v_start`, `epi`, or a conv loop head
+    /// `q_loop` / `k_loop` / `v_loop`.
+    pub fn label(name: &str) -> Result<&'static str, String> {
+        Ok(match name {
+            "end" => END,
+            "gate_loop" => GATE_LOOP,
+            "gate_done" => GATE_DONE,
+            "k_start" => K_START,
+            "v_start" => V_START,
+            "epi" => EPI,
+            "q_loop" => Q_LOOP,
+            "k_loop" => K_LOOP,
+            "v_loop" => V_LOOP,
+            o => return Err(format!("gdn label `{o}`: expected end, gate_loop, gate_done, k_start, v_start, epi, q_loop, k_loop or v_loop")),
+        })
+    }
+
+    /// One of the three conv regions by name (`q`, `k`, `v`).
+    pub fn region(name: &str) -> Result<Region, String> {
+        match name {
+            "q" => Ok(Region::Q),
+            "k" => Ok(Region::K),
+            "v" => Ok(Region::V),
+            o => Err(format!("gdn region `{o}`: expected q, k or v")),
+        }
+    }
+
+    /// Kernel arguments, ids, bounds exits and the launch constants.
+    pub fn prologue(b: &mut Builder) -> R {
+        super::prologue(b)
+    }
+    /// The gate unit's set-up (heads, parameters, first rows).
+    pub fn gate_setup(b: &mut Builder) -> R {
+        super::gate_setup(b)
+    }
+    /// One trip of the gate loop: two rows per lane, softplus, beta, the prefix; includes the back branch.
+    pub fn gate_body(b: &mut Builder) -> R {
+        super::gate_body(b)
+    }
+    /// Unit pointers, per-lane offsets, the conv weights, row 0 and the three-row window.
+    pub fn conv_setup(b: &mut Builder) -> R {
+        super::conv_setup(b)
+    }
+    /// A region's output pointers and constants.
+    pub fn region_setup(b: &mut Builder, region: Region) -> R {
+        super::region_setup(b, region)
+    }
+    /// One trip of a region's row loop (`head` is its loop label); includes the back branch.
+    pub fn row_body(b: &mut Builder, region: Region, head: &str) -> R {
+        super::row_body(b, region, head)
+    }
+    /// `s_cmp_lg_u32 ttmp7, 0; s_cbranch_scc1 gate_done`: only the `by == 0` blocks run the gates.
+    pub fn gate_guard(b: &mut Builder) -> R {
+        super::gate_guard(b)
+    }
+    /// Unit dispatch: v-head units branch to `v_start`.
+    pub fn conv_to_v(b: &mut Builder) -> R {
+        super::conv_to_v(b)
+    }
+    /// Unit dispatch: k-head units branch to `k_start`.
+    pub fn conv_to_k(b: &mut Builder) -> R {
+        super::conv_to_k(b)
+    }
+    /// `s_branch epi`.
+    pub fn to_epi(b: &mut Builder) -> R {
+        super::to_epi(b)
+    }
+    /// The chunk-0 blocks' conv_state ring advance (and the `epi` label).
+    pub fn epilogue(b: &mut Builder) -> R {
+        super::epilogue(b)
+    }
 }
 
 /// The single export as one code object (`gdn_chunk_prep_pm_gfx1201`).
