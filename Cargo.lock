@@ -1304,6 +1304,7 @@ dependencies = [
  "saddle-core",
  "serde",
  "serde_json",
+ "smallvec",
 ]
 
 [[package]]
@@ -1554,6 +1555,7 @@ dependencies = [
  "hipfire-client",
  "hipfire-config",
  "hipfire-dispatch",
+ "hipfire-loader",
  "hipfire-registry",
  "hipfire-runtime",
  "http-body-util",
