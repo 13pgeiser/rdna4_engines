@@ -6154,6 +6154,27 @@ void lint_qwen35_fp8_family(Fn declare, StepFn step, const RadModelMeta* meta, i
 
 }  /* namespace */
 
+/* The GDN state cache's width is a deployment's choice: f32 by default, f16 with
+ * RADIANCE_GDN_STATE_F16=1 (libr4d's kernels read the width off the cache), anything else f32. */
+TEST(qwen35_fp8_gdn_state_is_f32_unless_the_deployment_asks_f16) {
+    MetaKV mk = q35fp8_meta();
+    for (const char* v : { (const char*)nullptr, "1", "0", "yes" }) {
+        if (v) setenv("RADIANCE_GDN_STATE_F16", v, 1);
+        RadBuilder b;
+        RadBuildCtx ctx = build_ctx();
+        const int rc = stderr_of_rc([&] { return qwen35_fp8::declare(&b, mk.meta(), &ctx); });
+        unsetenv("RADIANCE_GDN_STATE_F16");
+        REQUIRE_EQ(rc, RAD_OK);
+        int n = 0;
+        for (const RecKV& g : b.kv_groups)
+            if (g.name == "kv_gdn_state") {
+                ++n;
+                CHECK_EQ(g.d.dtype, (v && std::string(v) == "1") ? RAD_F16 : RAD_F32);
+            }
+        CHECK_EQ(n, 1);
+    }
+}
+
 /* The fp8 sibling of qwen35_bf16: the same layers with every large linear a block-fp8 gemm_nt_q
  * read at fp8a8, one quantiser per activation, and the attention's output gate, multiply and
  * quantiser fused into gate_quant_fp8 (the sigmoid/mul pair is the bf16-linear form only). The

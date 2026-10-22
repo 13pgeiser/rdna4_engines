@@ -922,6 +922,36 @@ the pool that holds context; compare M with the sessions you expect to keep live
 wht6`, a decode step above the row count startup names is all-reduced lossily like a prefill chunk;
 at 8 sequences and depth 3, Flash-Next's decode steps are above it.
 
+**The delta-net state at f16** (`RADIANCE_GDN_STATE_F16=1`). The `qwen35` plugins (`qwen35_fp8`,
+and `qwen35moe_fp8` and `qwen35_w8a8`, built from it) declare the recurrent state cache f32. With the
+variable set to exactly `1` they declare it f16, and the declare log says so (`GDN state cache f16
+(RADIANCE_GDN_STATE_F16=1)`); any other value, `0` and `yes` included, keeps f32. **It is lossy**: the
+state is rounded wherever it is stored, so the generated text changes. It halves the state pool and
+its host checkpoints, and the state's traffic, which grows with the number of decoding sequences.
+Measured on `qwen35_fp8` only, Qwen3.8-27B MXFP4 at `--tp 2` on two R9700s (PCIe Gen5 x8, 265 W),
+against the bf16 model:
+
+| state | mean KL, 2048 chunk | mean KL, 64 chunk | top-1, 64 chunk |
+|---|---|---|---|
+| f32, `k6_v4` KV | 0.040238 | 0.039607 | 94.07% |
+| f16, `k6_v4` KV | 0.040005 | 0.040468 (+2.2%) | 94.00% |
+| f32, `fp8` KV | 0.039171 | 0.039327 | |
+| f16, `fp8` KV | 0.039600 (+1.1%) | 0.039690 (+0.9%) | |
+
+A 64-token chunk stores the state, and rounds it, every 64 tokens. Decode, greedy, three rounds
+(medians, tok/s):
+
+| streams | f32, no speculation | f16 | f32, speculation 7 | f16 |
+|---|---|---|---|---|
+| 1 | 67.1 | 67.5 (+0.6%) | 222.2 | 215.1 (-3.2%) |
+| 4 | 246.8 | 253.3 (+2.6%) | 636.9 | 621.0 (-2.5%) |
+| 16 | 708.0 | 779.5 (+10.1%) | 1223.8 | 1276.7 (+4.3%) |
+
+Without speculation the rounds agree to a tenth and the gain grows with the streams. With
+speculation f16 also changes which drafts the greedy text accepts, so one and four streams moved
+down; whether that is the text or the step was not separated. Use it for many concurrent sequences
+where the KL above is acceptable, and measure your own load.
+
 ### 4.5 Prefill chunk size
 
 A long prompt is prefilled in chunks of at most `--max-num-batched-tokens`. On a mixture-of-experts
@@ -3280,6 +3310,7 @@ reductions running on fewer blocks: Qwen3.8-27B's 41k-token prefill 9.5 s uncapp
 | `RADIANCE_CALIB_TOKENS` | with `RADIANCE_CALIB_DIR`, the tokens the calibration tap accumulates before it writes and switches itself off (default 65536) |
 | `RADIANCE_G3_CALIB_LAYERS` | `lo:hi`: `arch/gemma3`'s calibration tap over layers lo to hi - 1 only, to take a large model's Grams in passes (docs/ARCHITECTURES.md) |
 | `RADIANCE_PROFILE_EVERY` | with `--profile-ops`, dump the per-op table every N steps (default 32) |
+| `RADIANCE_GDN_STATE_F16` | `1` exactly: the `qwen35` plugins declare the delta-net state cache f16 instead of f32. Lossy (the text changes); halves the state pool, faster with many decoding sequences (§4.4) |
 | `RADIANCE_LOG_STEPS` | log one line per step: its phase, sequences, and each one's token count and context (§4.5) |
 
 Engine development has its own instruments: `RADIANCE_DEBUG_*` (residual probes, routing and issue

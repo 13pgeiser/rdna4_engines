@@ -583,17 +583,28 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                     "and head instead of %lld", kvq_name, kvq == RAD_KVQ_V4 ? "E4M3" : "int6",
                  (long long)(g.head_dim * row16 / 16), (long long)(2 * g.head_dim));
 
-    /* The SSM state cache is f32.
+    /* The SSM state cache is f32 unless RADIANCE_GDN_STATE_F16=1 declares it f16.
      *
      * State reads and writes dominate the two GDN kernels: one [128,128] state is 64 KiB at f32,
-     * and a speculative step writes one per candidate token per head, since the surviving
-     * candidate is unknown until after the layer. At depth 7 that is hundreds of MB per rank per
-     * step; f16 would halve it. libr4d compiles both widths (`SDT`) and the f16 round-trip error is
-     * ~5e-4 relative (elements are O(0.1)); vLLM's `--mamba-ssm-cache-dtype` is commonly float16.
-     * It stays f32 because f16 changes the generated text. */
+     * and a step reads a sequence's state and writes it back (under the anchor form once, whatever
+     * the draft depth). libr4d compiles both widths (`SDT`, from the cache's dtype) and the f16
+     * round-trip error is ~5e-4 relative (elements are O(0.1)); vLLM's `--mamba-ssm-cache-dtype`
+     * is commonly float16. f16 changes the generated text, so it is a deployment's choice, not the
+     * default. Measured on Qwen3.8-27B (MXFP4, k6_v4, TP2), KL against the bf16 reference: at
+     * chunk 2048 0.040238 -> 0.040005, at chunk 64 (the state rounded every 64 tokens) 0.039607 ->
+     * 0.040468, top-1 94.07 -> 94.00 %; with an fp8 KV cache 0.039171 -> 0.039600 and 0.039327 ->
+     * 0.039690. Decode on two R9700s (three rounds, medians), greedy: without speculation one
+     * stream 67.1 -> 67.5 t/s, four 246.8 -> 253.3, sixteen 708.0 -> 779.5 (the state traffic grows
+     * with the sequences); at speculation 7 one stream 222.2 -> 215.1, four 636.9 -> 621.0, sixteen
+     * 1223.8 -> 1276.7, where f16 also changes the greedy text and so the drafts accepted. It
+     * halves the state pool and its host checkpoints. */
     RadKVGroupDecl sd{};
     sd.kind         = RAD_KV_LINEAR;
-    sd.dtype        = RAD_F32;
+    {
+        const char* e = std::getenv("RADIANCE_GDN_STATE_F16");
+        sd.dtype = e && e[0] == '1' && e[1] == '\0' ? RAD_F16 : RAD_F32;
+        if (sd.dtype == RAD_F16) rad_note(b, "GDN state cache f16 (RADIANCE_GDN_STATE_F16=1)");
+    }
     sd.n_head_kv    = gc.n_head_v;
     sd.state_dim[0] = gc.head_v;
     sd.state_dim[1] = gc.head_k;

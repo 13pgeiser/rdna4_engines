@@ -228,7 +228,9 @@ Three groups, which is why hybrid KV groups are first-class:
 across the 48 linear layers, and it is what the prefix-cache checkpoint of `spec.md` §7.3
 snapshots. Its reads and writes dominate the two GDN kernels. libr4d also compiles an f16 form
 (elements are O(0.1); the f16 round trip is about 5e-4 relative) that would halve that traffic,
-but the plugins declare f32 because f16 changes the generated text. How a speculative step keeps a
+but the plugins declare f32 because f16 changes the generated text; `RADIANCE_GDN_STATE_F16=1`
+declares f16 for a deployment that accepts the loss (GUIDE §4.4: on Qwen3.8-27B MXFP4, mean KL
++0.9..+2.2 %, decode +10 % at sixteen streams without speculation). How a speculative step keeps a
 state it can roll back is `docs/OPS.md`'s `state_form`.
 
 ## FP8
