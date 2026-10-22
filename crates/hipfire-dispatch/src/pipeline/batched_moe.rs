@@ -139,6 +139,48 @@ fn try_gfx12_rotate_exact_prepared_no_epilogue(
     Ok(Some(prep))
 }
 
+/// L4: the FA output gate of the MoE finish (`sigmoid_mul_f32(attn, gate)`) folded into the exact C8 PM
+/// rotate that consumes it (`HIPFIRE_PREFILL_IU4_C8_PM` nested under the F3 producer fusion). The
+/// gated activation is formed per element in registers (the exact `sigmoid_mul_f32` expression), then
+/// the identical AWQ / rotate / C8 path runs: the f32 rotated side output, the sidecar and the
+/// capture / receipt notes are those of [`try_gfx12_rotate_exact_prepared_no_epilogue`] after the
+/// standalone gate. `attn` is not written; nothing after this helper reads the gated f32 attention
+/// buffer on the admitted route (the residual GEMM consumes the prepared sidecar, and the rotated
+/// f32 side output is still written for every other reader). `None` (nothing launched, the
+/// scratch untouched) keeps the unfused chain: the standalone gate, then the legacy / exact
+/// rotate producers.
+fn try_gfx12_sigmoid_rotate_exact_prepared_no_epilogue(
+    gpu: &mut Gpu,
+    wo: &WeightRef<'_>,
+    attn: &GpuTensor,
+    gate: &GpuTensor,
+    x_rot: &GpuTensor,
+    k: usize,
+    n: usize,
+) -> HipResult<Option<rdna_compute::Int4MmqPrepared>> {
+    // The unfused chain would take the legacy prepared rotate (`try_iu4_rotate_prepared_no_epilogue`)
+    // before the exact one: not this route.
+    if wo.dtype == DType::MQ4G256V2 && gpu.iu4_producer_sidecar_active(n, k) {
+        return Ok(None);
+    }
+    if !prefill_iu4_producer_fused_admitted(
+        prefill_iu4_producer_fused_explicit(),
+        &gpu.arch,
+        wo.dtype == DType::MQ4G256V2,
+        gpu.mq4g256v2_shared_iu4_supported(k, n) && gpu.iu4_producer_quant_fused_active(n, k),
+    ) {
+        return Ok(None);
+    }
+    if !gpu.iu4_c8_pm_sigmoid_rotate_admitted(attn, gate, wo.awq_scale, x_rot, k, n) {
+        return Ok(None);
+    }
+    let res = gpu.reserve_int4_mmq(k, n)?;
+    let prep = gpu.mq_sigmoid_rotate_x_i4_c8_pm(attn, gate, wo.awq_scale, Some(x_rot), res, k, n)?;
+    gpu.maybe_capture_activation(wo.buf, x_rot, n, k);
+    gpu.iu4_verify_note_f16();
+    Ok(Some(prep))
+}
+
 /// Qualified (`HIPFIRE_PREFILL_IU4_PRODUCER_FUSED`, unset on at exact gfx1201) RMSNorm/FWHT +
 /// `block_i4_128` producer for the MoE LA qkvza / FA qkv input. The caller
 /// passes whether every consumer weight is MQ4G256V2 and the fused key
@@ -2039,7 +2081,19 @@ pub fn attention_moe_finish_batched(
             false,
         )?;
     }
-    gpu.sigmoid_mul_f32(pbs.fa_attn_out_batch, pbs.fa_gate_batch)?;
+    // L4: the C8 PM route folds the gate into the wo rotate producer below; otherwise the standalone gate.
+    let folded_wo_prep = try_gfx12_sigmoid_rotate_exact_prepared_no_epilogue(
+        gpu,
+        &layer.wo,
+        pbs.fa_attn_out_batch,
+        pbs.fa_gate_batch,
+        pbs.fa_attn_out_rot_batch,
+        layer.wo.k,
+        n,
+    )?;
+    if folded_wo_prep.is_none() {
+        gpu.sigmoid_mul_f32(pbs.fa_attn_out_batch, pbs.fa_gate_batch)?;
+    }
     // wo + residual. Mirrors the dense FA wo dispatch at
     // qwen35.rs:5591-5623 — Q8 wo skips rotation (un-rotated
     // input expected); MQ4/MQ6 wo apply FWHT(awq_scale-adjusted).
@@ -2061,8 +2115,16 @@ pub fn attention_moe_finish_batched(
     // scratch, then add into x_batch.
     let fa_wo_is_paro = matches!(layer.wo.dtype, DType::ParoQ4G128);
     // T-B: fused rotate+quantize (always-Residual here — no epilogue param).
-    let mut iu4_wo_prep =
-        try_iu4_rotate_prepared_no_epilogue(gpu, &layer.wo, pbs.fa_attn_out_batch, layer.wo.k, n)?;
+    let mut iu4_wo_prep = match folded_wo_prep {
+        Some(prep) => Some(prep),
+        None => try_iu4_rotate_prepared_no_epilogue(
+            gpu,
+            &layer.wo,
+            pbs.fa_attn_out_batch,
+            layer.wo.k,
+            n,
+        )?,
+    };
     if iu4_wo_prep.is_none() {
         iu4_wo_prep = try_gfx12_rotate_exact_prepared_no_epilogue(
             gpu,
