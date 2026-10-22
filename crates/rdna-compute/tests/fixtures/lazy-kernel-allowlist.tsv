@@ -563,7 +563,6 @@ module	gemm_mq4g256v2_moe_grouped_top10_simt	codec-outside-core-rungs	Non-slab M
 module	gemm_mq4g256v2_residual_iu4_v2c_gfx11	developer-opt-in	Non-default developer override: HIPFIRE_GFX1100_PM_GEMM; rdna-compute/src/gemm.rs:956-967
 module	gemm_mq4g256v2_residual_mmq_i8_gfx11	config-opt-in	Non-default configuration: kernel.gfx; rdna-compute/src/gemm.rs:1650-1680
 module	gemm_mq4g256v2_residual_mmq_i8_gfx11_t256	config-opt-in	Non-default configuration: kernel.gfx; rdna-compute/src/gemm.rs:1650-1680
-module	gemm_mq4g256v2_residual_mmq_i8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_A8_PREFILL / HIPFIRE_A8_APF_K32; rdna-compute/src/gemm.rs:1646-1648
 module	gemm_mq4g256v2_residual_mmq_i8_gfx12_apf0	config-opt-in	Non-default configuration: kernel.gfx; rdna-compute/src/gemm.rs:1650-1680
 module	gemm_mq4g256v2_residual_mmq_iu4_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_G12_RASTER / HIPFIRE_IU4_SYMFOLD; rdna-compute/src/gemm.rs:21648-21700
 module	gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold	developer-opt-in	Non-default developer override: HIPFIRE_G12_IU4_ISA / HIPFIRE_G12_RASTER; rdna-compute/src/gemm.rs:21636-21660
@@ -589,6 +588,16 @@ module	gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds	developer-opt-in	Non-defa
 module	gemm_mq4g256v2_residual_wmma_gfx1100_mw_lds	no-caller	Unreachable launcher branch: its N>=416 selection sits after the gfx1100 batch>=64 IU4/A8/Q8_1 MMQ return under the same non-capture, non-replay conditions, so no default or opt-in config reaches it; rdna-compute/src/gemm.rs:37906-37916
 module	gemm_mq4v2_packed_gfx1100	developer-opt-in	Non-default developer override: HIPFIRE_GFX1100_PACKED_MQ4_PREFILL; rdna-compute/src/packed_mq4.rs:4
 module	gemm_mq5g256v2_residual_wmma	codec-outside-core-rungs	Non-slab MQ5G256V2 layout absent from core XTS artifact rungs; rdna-compute/src/gemm.rs:41418-42059
+module	gemm_mq6g256v2_mmq_i8_gfx11	developer-opt-in	gfx1151 opt-in only, measured slower: HIPFIRE_MQ6_I8=1 (exact-INT8 MQ6 prefill, 128-token build); rdna-compute/src/gemm_mq6_i8.rs:64-94
+module	gemm_mq6g256v2_mmq_i8_gfx11_t256	developer-opt-in	gfx1151 opt-in only, measured slower: HIPFIRE_MQ6_I8=1 (exact-INT8 MQ6 prefill, 256-token build); rdna-compute/src/gemm_mq6_i8.rs:64-94
+module	gemm_mq6g256v2_wmma_fp8_round_bf16_db_gfx1201	developer-opt-in	Non-default developer override: HIPFIRE_GFX12_MQ6_FP8_ARM=round + HIPFIRE_GFX12_MQ6_FP8_DB=1 with BF16 output; rdna-compute/src/gemm_mq6_fp8.rs:253
+module	gemm_mq6g256v2_wmma_fp8_round_bf16_gfx1201	developer-opt-in	Non-default developer override: HIPFIRE_GFX12_MQ6_FP8_ARM=round with BF16 output; rdna-compute/src/gemm_mq6_fp8.rs:253
+module	gemm_mq6g256v2_wmma_fp8_round_db_gfx1201	developer-opt-in	Non-default developer override: HIPFIRE_GFX12_MQ6_FP8_ARM=round + HIPFIRE_GFX12_MQ6_FP8_DB=1; rdna-compute/src/gemm_mq6_fp8.rs:253
+module	gemm_mq6g256v2_wmma_fp8_round_gfx1201	developer-opt-in	Non-default developer override: HIPFIRE_GFX12_MQ6_FP8_ARM=round; rdna-compute/src/gemm_mq6_fp8.rs:253
+module	gemm_mq6g256v2_wmma_fp8_split_bf16_db_gfx1201	developer-opt-in	Non-default developer override: HIPFIRE_GFX12_MQ6_FP8_DB=1 with BF16 output (not yet admitted by default dispatch); rdna-compute/src/gemm_mq6_fp8.rs:253
+module	gemm_mq6g256v2_wmma_fp8_split_bf16_gfx1201	developer-opt-in	Non-default developer override: HIPFIRE_GFX12_MQ6_FP8 route with BF16 output (not yet admitted by default dispatch); rdna-compute/src/gemm_mq6_fp8.rs:253
+module	gemm_mq6g256v2_wmma_fp8_split_db_gfx1201	developer-opt-in	Non-default developer override: HIPFIRE_GFX12_MQ6_FP8_DB=1 (not yet admitted by default dispatch); rdna-compute/src/gemm_mq6_fp8.rs:253
+module	gemm_mq6g256v2_wmma_fp8_split_gfx1201	developer-opt-in	Non-default developer override: HIPFIRE_GFX12_MQ6_FP8 (not yet admitted by default dispatch); rdna-compute/src/gemm_mq6_fp8.rs:253
 module	gemm_paro_q4g128_moe_grouped_mmq_gfx1151	codec-outside-core-rungs	PARO codec/layout route absent from admitted core artifact rungs; hipfire-dispatch/src/pipeline/mod.rs:2706-2733
 module	gemm_paro_q4g128_moe_grouped_mmq_k8_gfx1151	codec-outside-core-rungs	PARO codec/layout route absent from admitted core artifact rungs; hipfire-dispatch/src/pipeline/mod.rs:2706-2733
 module	gemm_paro_q4g128_moe_grouped_wmma_k2	codec-outside-core-rungs	PARO route absent from admitted core artifact rungs; hipfire-dispatch/src/pipeline/mod.rs:2710-2737

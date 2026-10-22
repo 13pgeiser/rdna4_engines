@@ -136,6 +136,33 @@ Manual VGPR granule padding is **not required by RegPlan or the emitter**: the e
 
 `Chain::new(dst:u8,width:u8,kind:str) -> Chain` describes a WMMA accumulator; width must be 8 and kind `"f16"` or `"bf16"`. Example `let c = Chain::new(0,8,"f16");`. `c.step(b,a:u8,aw:u8,b:u8,bw:u8) -> Result<(),String>` emits the kind's `v_wmma_f32_16x16x16_*` using and redefining its accumulator; example `c.step(wg.isa(),8,8,16,8)?;` on gfx11. Operand widths must match the architecture (eight on gfx11, four on gfx12); initialize the accumulator before its first step. The item keyword `chain` merely defines a function and is unrelated to this native Chain value.
 
+`Wmma::swmmac(arch, kind: Swmmac, dst, a, b, index: RegRef, mods: SwmmacMods) -> Result<Instruction,String>` builds a gfx12 sparse (2:4) WMMA; push it with `wg.isa().push(..)?`. `kind` is `Swmmac::<Kind>`; `dst`, `a` and `b` are `vr(..)` ranges of exactly the kind's width (table below); `index` is one VGPR (`v(n)`); `mods` is the struct literal `SwmmacMods { index_key, neg_lo, neg_hi, clamp }` with all four fields written (`u8, u8, u8, bool`). SWMMAC has no C operand: `dst` is read in place as the accumulator, so the instruction declares defs `[dst]` and uses `[a, b, index, dst]`, and the accumulator must be initialized first. Example: `wg.isa().push(Wmma::swmmac(arch, Swmmac::F32F16, vr(24,8), vr(8,4), vr(12,8), v(20), SwmmacMods { index_key: 0, neg_lo: 0, neg_hi: 0, clamp: false })?)?;` emits `v_swmmac_f32_16x16x32_f16 v[24:31], v[8:11], v[12:19], v20`. Refusals carry the Rust error text: `SWMMAC requires gfx12` (gfx1100/gfx1151), `<mnemonic>: A requires 4 VGPRs, found v[8:10]` (width), and the modifier errors below. A hand-written `op` with the same text must declare `dst` in its uses as well. Worked example: `docs/cookbook/10-swmmac.md`.
+
+| `Swmmac::` kind | mnemonic | D | A | B | modifiers |
+|---|---|---|---|---|---|
+| `F32F16` | v_swmmac_f32_16x16x32_f16 | 8 | 4 | 8 | float |
+| `F32Bf16` | v_swmmac_f32_16x16x32_bf16 | 8 | 4 | 8 | float |
+| `F16F16` | v_swmmac_f16_16x16x32_f16 | 4 | 4 | 8 | float |
+| `Bf16Bf16` | v_swmmac_bf16_16x16x32_bf16 | 4 | 4 | 8 | float |
+| `I32Iu8` | v_swmmac_i32_16x16x32_iu8 | 8 | 2 | 4 | int |
+| `I32Iu4` | v_swmmac_i32_16x16x32_iu4 | 8 | 1 | 2 | int |
+| `I32Iu4X64` | v_swmmac_i32_16x16x64_iu4 | 8 | 2 | 4 | int, no `index_key` |
+| `F32Fp8Fp8` | v_swmmac_f32_16x16x32_fp8_fp8 | 8 | 2 | 4 | fp8 |
+| `F32Fp8Bf8` | v_swmmac_f32_16x16x32_fp8_bf8 | 8 | 2 | 4 | fp8 |
+| `F32Bf8Fp8` | v_swmmac_f32_16x16x32_bf8_fp8 | 8 | 2 | 4 | fp8 |
+| `F32Bf8Bf8` | v_swmmac_f32_16x16x32_bf8_bf8 | 8 | 2 | 4 | fp8 |
+
+Counts are VGPRs (dwords); the index is always one VGPR. Legal modifier sets (as accepted by `llvm-mc -mcpu=gfx1201`; anything else is refused as `<mnemonic> does not accept <modifier>`, `<mnemonic> has no index_key` or `<mnemonic>: neg_lo/neg_hi bit 2 (C) is not encodable`):
+
+| class | `index_key` | `neg_lo` | `neg_hi` | `clamp` |
+|---|---|---|---|---|
+| float (`F32F16` `F32Bf16` `F16F16` `Bf16Bf16`) | 0 or 1 | bits 0-1 (A, B) | bits 0-1 | no |
+| int (`I32Iu8` `I32Iu4`) | 0 or 1 | bits 0-1 | no | yes |
+| `I32Iu4X64` | no (must be 0) | bits 0-1 | no | yes |
+| fp8 (`F32Fp8Fp8` `F32Fp8Bf8` `F32Bf8Fp8` `F32Bf8Bf8`) | 0 or 1 | no | no | no |
+
+`neg_lo`/`neg_hi` bit 0 negates A and bit 1 negates B; bit 2 (C) never encodes. Text order is `index_key:1 neg_lo:[a,b,0] neg_hi:[a,b,0] clamp`; `index_key:1` is OP_SEL bit 0 (`index_key:0` is the default and is not printed). In instruction text `index_key:N` is accepted only on `v_swmmac_*` rows other than `v_swmmac_i32_16x16x64_iu4`.
+
 ## 8. Workgroup driver
 
 ### Scope and complete skeleton
@@ -305,7 +332,7 @@ The tables are the supported PeaceMaker vocabulary, not a complete silicon ISA c
 
 Inline integer constants are -16..64. A larger integer is a literal, spelled canonically with `lit`, not a decimal inline constant. There is one literal word per instruction (reusing the same literal is different from requesting two distinct literal words). VOP2 `_e32` has VGPR-only src1: use `_e64` when that source must be scalar or constant, or commute operands if valid. Not every opcode has both encodings in the tables. DPP controls are instruction modifiers, not standalone cross-lane instructions. `row_shr` is not a supported substitute for `row_shl`.
 
-The following checks prove representative spellings and intentional rejections. F16 WMMA widths are in dwords, not element counts.
+The following checks prove representative spellings and intentional rejections. F16 WMMA and SWMMAC widths are in dwords, not element counts.
 
 ```mnemonics
 gfx1151: s_add_u32 s12, s12, s13
@@ -357,6 +384,12 @@ gfx1201: v_add_nc_u32_e64 v1, v2, 0x80
 !gfx1201: v_add_nc_u32 v1, v2, v3
 gfx1151: v_wmma_f32_16x16x16_f16 v[0:7], v[8:15], v[16:23], v[0:7]
 gfx1201: v_wmma_f32_16x16x16_f16 v[0:7], v[8:11], v[16:19], v[0:7]
+gfx1201: v_swmmac_f32_16x16x32_f16 v[0:7], v[8:11], v[12:19], v20
+gfx1201: v_swmmac_f32_16x16x32_f16 v[0:7], v[8:11], v[12:19], v20 index_key:1 neg_lo:[1,1,0] neg_hi:[1,1,0]
+gfx1201: v_swmmac_i32_16x16x32_iu8 v[0:7], v[8:9], v[10:13], v14 index_key:1 neg_lo:[1,1,0] clamp
+gfx1201: v_swmmac_f32_16x16x32_fp8_fp8 v[0:7], v[8:9], v[10:13], v14 index_key:1
+!gfx1201: v_swmmac_i32_16x16x64_iu4 v[0:7], v[8:9], v[10:13], v14 index_key:1
+!gfx1151: v_swmmac_f32_16x16x32_f16 v[0:7], v[8:11], v[12:19], v20
 gfx1151: s_waitcnt vmcnt(0)
 gfx1151: s_waitcnt lgkmcnt(0)
 gfx1151: s_waitcnt_vscnt null, 0

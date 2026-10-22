@@ -32082,7 +32082,7 @@ impl Gpu {
     /// CU count for tile selection. Falls back to 16 (the smallest RDNA3 iGPU
     /// config) when the device property is unavailable, which biases the
     /// selector toward the wide tile rather than toward the narrow one.
-    fn cu_count_or_default(&self) -> usize {
+    pub(crate) fn cu_count_or_default(&self) -> usize {
         self.hip
             .get_device_attribute(
                 crate::profiler::HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,

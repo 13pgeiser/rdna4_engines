@@ -254,7 +254,7 @@ fn gfx942_rotate_live_validation_enabled() -> bool {
 
 /// In-register fp8 producers (no `x_rot` round trip). Default on after
 /// byte-identical H2 KLD and +1.8% pp8192; `HIPFIRE_FP8_PROD_INREG=0` opts out.
-fn fp8_prod_inreg(k: usize) -> bool {
+pub(crate) fn fp8_prod_inreg(k: usize) -> bool {
     k <= 17408 && hipfire_config::developer_bool("HIPFIRE_FP8_PROD_INREG", true)
 }
 /// Phase-1a-batched fp8 SHORT RMSNorm: up to 8 row loads in flight per wave

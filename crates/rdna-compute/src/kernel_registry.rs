@@ -2859,6 +2859,27 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::GEMM_MQ6G256V2_RESIDUAL_WMMA_GFX12_SRC,
             ["gemm_mq6g256v2_residual_wmma_gfx12"]
         );
+        // Exact-INT8 MQ6G256V2 prefill (default on gfx1201 in the Qwen4 forward,
+        // `gemm_mq6_i8.rs`): the GEMM module and the A8 `block_i8_128` quantizer
+        // (`Gpu::ensure_int8_mmq_x`) it consumes.
+        add!(
+            "gemm_mq6g256v2_mmq_i8_gfx12",
+            kernels::GEMM_MQ6G256V2_MMQ_I8_GFX12_SRC,
+            [
+                "gemm_mq6g256v2_mmq_i8_set_bf16_gfx12",
+                "gemm_mq6g256v2_mmq_i8_set_gfx12"
+            ]
+        );
+        add!(
+            "gemm_mq4g256v2_residual_mmq_i8_gfx12",
+            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_SRC,
+            [
+                "gemm_mq4g256v2_gate_up_silu_mmq_i8",
+                "gemm_mq4g256v2_residual_mmq_i8_full_add",
+                "gemm_mq4g256v2_residual_mmq_i8_full_set",
+                "quantize_int8_mmq_ds128"
+            ]
+        );
         add!(
             "qwen4_gemm_mq6g256v2_wmma_gfx12_x4",
             kernels::QWEN4_GEMM_MQ6G256V2_WMMA_GFX12_X4_SRC,
@@ -3907,6 +3928,21 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         "fused_qkvza_q8_0",
         kernels::FUSED_QKVZA_Q8_0_SRC,
         ["fused_qkvza_q8_0"]
+    );
+    // ParoQ4G64 scalar projections and its group-sized out-of-place rotation;
+    // these launchers have no architecture gate.
+    add!("gemm_hfq4g64", kernels::GEMM_HFQ4G64_SRC, ["gemm_hfq4g64"]);
+    add!("gemv_hfq4g64", kernels::GEMV_HFQ4G64_SRC, ["gemv_hfq4g64"]);
+    add!(
+        "givens_rotate_to_g64_f32",
+        kernels::GIVENS_ROTATE_TO_G64_SRC,
+        ["givens_rotate_to_g64_f32"]
+    );
+    // DFlash2's HC-state mean capture uses the same scalar source on all arches.
+    add!(
+        "hc_mean_capture",
+        crate::tensor_ops::HC_MEAN_CAPTURE_SRC,
+        ["hc_mean_capture_f32"]
     );
     // Coverage batch A (no arch gate in the launchers, embedding.rs /
     // gemm.rs `fused_gate_up_q8_0`): default resident-codec embeddings
@@ -8975,13 +9011,52 @@ mod tests {
         // tape/lane copies, the storage-boundary round trip and 116 discovery
         // and static-coverage modules. Keep the later beta cohorts above.
         const FIRST_REQUEST_JIT_ADDED_MODULES: usize = 119;
+        // The exact-INT8 MQ6 prefill default adds its GEMM module and the A8
+        // `block_i8_128` quantizer module it consumes.
+        const MQ6_I8_ADDED_MODULES: [&str; 2] = [
+            "gemm_mq6g256v2_mmq_i8_gfx12",
+            "gemm_mq4g256v2_residual_mmq_i8_gfx12",
+        ];
+        for module in MQ6_I8_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing MQ6 i8 module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
+        // Later ParoQ4G64 and DFlash2 launchers add their own modules, not P0 rows.
+        const G64_AND_HC_CAPTURE_ADDED_MODULES: [&str; 4] = [
+            "gemm_hfq4g64",
+            "gemv_hfq4g64",
+            "givens_rotate_to_g64_f32",
+            "hc_mean_capture",
+        ];
+        for module in G64_AND_HC_CAPTURE_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing G64/HC capture module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
                 + PRE_S1_ADDED_SINCE_P0
                 + S1_ADDED_MODULES.len()
                 + NATIVE_A3B_ADDED_MODULES.len()
-                + FIRST_REQUEST_JIT_ADDED_MODULES,
+                + FIRST_REQUEST_JIT_ADDED_MODULES
+                + MQ6_I8_ADDED_MODULES.len()
+                + G64_AND_HC_CAPTURE_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name
