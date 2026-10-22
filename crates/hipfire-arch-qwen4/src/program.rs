@@ -255,7 +255,7 @@ pub struct Qwen4LayerDescription<'a> {
 }
 
 /// Dense FFN projections, source-bound once by the family and consumed by
-/// `Step::DenseFfn`.
+/// `Step::GatedMlp` on the trunk ladder.
 #[derive(Clone, Copy)]
 pub struct Qwen4DenseBinding<'a> {
     pub gate: WeightRef<'a>,
@@ -1379,7 +1379,7 @@ pub fn qwen4_step_graph_with_output(
             );
         } else {
             op(
-                OpKind::DenseFfn,
+                OpKind::GatedMlp,
                 layer,
                 SplitRule::Opaque,
                 &[mixed],
@@ -1471,7 +1471,7 @@ mod step_graph_tests {
                 out.push((OpKind::Clear, layer));
                 out.push((OpKind::Moe, layer));
             } else {
-                out.push((OpKind::DenseFfn, layer));
+                out.push((OpKind::GatedMlp, layer));
             }
             out.push((OpKind::HyperWrite, layer));
         }
