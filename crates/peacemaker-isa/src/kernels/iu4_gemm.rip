@@ -20,7 +20,7 @@
 //     TILE  128x128x8 | 256x128x16            (rows x tokens x waves)
 //     CACC  cacc1 | cacc2                     (int32 accumulator sets; only cacc1 builds)
 //     slab  optional: the slab activation layout (default: token layout)
-//     EPI   set | add | silu | silu-bf16 | qkvzagdn
+//     EPI   set | add | addsigmoid | silu | silu-bf16 | qkvzagdn
 //
 // e.g. `k128-128x128x8-cacc1-set`, `k128-128x128x8-cacc1-slab-silu-bf16`,
 // `k128-256x128x16-cacc1-add`. A combination without a generator is refused by
@@ -38,6 +38,7 @@ const VARIANTS: &[&str] = &[
     "k128-128x128x8-cacc1-slab-set",
     "k128-128x128x8-cacc1-add",
     "k128-128x128x8-cacc1-slab-add",
+    "k128-128x128x8-cacc1-addsigmoid",
     "k128-128x128x8-cacc1-silu",
     "k128-128x128x8-cacc1-slab-silu",
     "k128-128x128x8-cacc1-silu-bf16",
@@ -89,10 +90,11 @@ fn iu4_spec(variant: &str, arch: Arch) -> Result<Iu4Spec, String> {
     let epi = match name.as_str() {
         "set" => Epi::Set,
         "add" => Epi::Add,
+        "addsigmoid" => Epi::AddSigmoid,
         "silu" => Epi::GateUpSilu,
         "silu-bf16" => Epi::GateUpSiluBf16,
         "qkvzagdn" => Epi::QkvzaGdn,
-        e => return Err(format!("variant `{variant}`: unknown epilogue `{e}` (set, add, silu, silu-bf16, qkvzagdn)")),
+        e => return Err(format!("variant `{variant}`: unknown epilogue `{e}` (set, add, addsigmoid, silu, silu-bf16, qkvzagdn)")),
     };
     Ok(Iu4Spec { fold: fold, tile: tile, cacc: cacc, epi: epi, act: act, arch: arch })
 }

@@ -93,7 +93,14 @@ const ENUMS: &[(&str, &[&str])] = &[
     ("Cacc", &["One", "Two"]),
     (
         "Epi",
-        &["Set", "Add", "GateUpSilu", "GateUpSiluBf16", "QkvzaGdn"],
+        &[
+            "Set",
+            "Add",
+            "AddSigmoid",
+            "GateUpSilu",
+            "GateUpSiluBf16",
+            "QkvzaGdn",
+        ],
     ),
     ("ALayout", &["Token", "Slab"]),
     ("MoeKind", &["GateUp", "Down"]),
@@ -159,6 +166,7 @@ fn epi_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<Epi> {
     match variant_of(it, v, "Epi")?.as_str() {
         "Set" => Ok(Epi::Set),
         "Add" => Ok(Epi::Add),
+        "AddSigmoid" => Ok(Epi::AddSigmoid),
         "GateUpSilu" => Ok(Epi::GateUpSilu),
         "GateUpSiluBf16" => Ok(Epi::GateUpSiluBf16),
         "QkvzaGdn" => Ok(Epi::QkvzaGdn),

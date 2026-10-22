@@ -4,7 +4,8 @@
 
 //! Every valid `iu4_gemm::Spec` re-emits the bytes recorded before the
 //! building blocks (`iu4_gemm::blocks`) were factored out of `emit`: the
-//! sha256 of `emit(spec).s_text` per spec. A change to any digest is a change
+//! sha256 of `emit(spec).s_text` per spec, computed from origin/beta's unrefactored
+//! `iu4_gemm::emit` (a scratch worktree of origin/beta, this file copied in). A change to any digest is a change
 //! to a production kernel and must be intentional.
 
 use peacemaker_isa::kernels::iu4_gemm::{emit, ALayout, Cacc, Epi, Fold, Spec, Tile};
@@ -28,6 +29,10 @@ const PINNED: &[(&str, &str)] = &[
     (
         "k128-128x128x8-cacc1-slab-add",
         "dff9618681be419f4df102f9e75e1ebf19779ff4408449f749520366413fb45e",
+    ),
+    (
+        "k128-128x128x8-cacc1-addsigmoid",
+        "4af41d09171edbc9065b613c54a0d0c35a085e19bc0333072f2bb018ed37bfd0",
     ),
     (
         "k128-128x128x8-cacc1-silu",
@@ -75,6 +80,7 @@ fn digests() -> Vec<(String, String)> {
                 for epi in [
                     Epi::Set,
                     Epi::Add,
+                    Epi::AddSigmoid,
                     Epi::GateUpSilu,
                     Epi::GateUpSiluBf16,
                     Epi::QkvzaGdn,

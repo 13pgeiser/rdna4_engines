@@ -192,9 +192,10 @@ impl Gen {
     /// meta_ds meta_sz ds_voff sz_voff sc_addr d_addr`, `a_pf<i> w_pf<i>
     /// st_w<i>`, SGPRs `karg srd_w srd_z srd_a0 srd_a1 srd_y step2 goff trips
     /// rs bs wave gpr136 mm1 hs tmp epi_s a_slab1` and kernel arguments
-    /// `arg_a arg_u arg_xq arg_y arg_m arg_k arg_n arg_bcx arg_bcy`. `None`
+    /// `arg_a arg_u arg_gate arg_xq arg_y arg_m arg_k arg_n arg_bcx arg_bcy`. `None`
     /// for an unknown name and for an absent optional register (`arg_u`
-    /// outside gate/up, `a_slab1` outside the slab layout).
+    /// outside gate/up, `arg_gate` outside the sigmoid ADD, `a_slab1` outside
+    /// the slab layout).
     pub fn reg(&self, name: &str) -> Option<u8> {
         let a = &self.args;
         let indexed = |base: &str, v: &[u8]| -> Option<u8> {
@@ -242,6 +243,7 @@ impl Gen {
             "a_slab1" => return self.a_slab1,
             "arg_a" => a.a,
             "arg_u" => return a.u,
+            "arg_gate" => return a.gate,
             "arg_xq" => a.xq,
             "arg_y" => a.y,
             "arg_m" => a.m,

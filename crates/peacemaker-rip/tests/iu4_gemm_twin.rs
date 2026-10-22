@@ -22,6 +22,7 @@ fn every_spec() -> Vec<Spec> {
                 for epi in [
                     Epi::Set,
                     Epi::Add,
+                    Epi::AddSigmoid,
                     Epi::GateUpSilu,
                     Epi::GateUpSiluBf16,
                     Epi::QkvzaGdn,
@@ -90,7 +91,7 @@ fn iu4_gemm_twin_matches_the_rust_emit() {
         );
     }
     assert_eq!(
-        valid, 13,
+        valid, 14,
         "the number of valid specs changed: update VARIANTS"
     );
 }
@@ -194,12 +195,11 @@ fn module() -> (Vec<Emitted>, String, String) {
 }
 fn emit(spec: Spec) -> Result<Emitted, String> {
     let (all, text, proof) = Iu4Gemm::emit_module(Fold::K128, Tile::T128x128x8, Cacc::One, ALayout::Token, spec.arch)?;
-    // Epi::{Set, Add, GateUpSilu, GateUpSiluBf16, QkvzaGdn}
-    assert_eq!(all.len(), 5);
     assert!(text.contains(".amdgpu_metadata"));
     assert!(proof.contains("s_text_sha256"));
     Ok(all[0])
 }
+fn count() -> usize { let (a, _t, _p) = module(); a.len() }
 fn text() -> String { let (_a, t, _p) = module(); t }
 fn proof() -> String { let (_a, _t, p) = module(); p }
 "#;
@@ -216,6 +216,10 @@ fn iu4_gemm_emit_module_returns_the_rust_module() {
     .unwrap();
     let got = peacemaker_rip::compile(MODULE, Arch::Gfx1201, "default").unwrap();
     assert_eq!(emitted[0].s_text, got.s_text);
+    assert_eq!(
+        peacemaker_rip::eval(MODULE, "count").unwrap(),
+        emitted.len().to_string()
+    );
     // The module text and its proof (as JSON) come back unchanged.
     assert_eq!(
         peacemaker_rip::eval(MODULE, "text").unwrap(),
