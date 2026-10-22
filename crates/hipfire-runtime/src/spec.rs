@@ -414,6 +414,18 @@ pub trait SpecTarget {
         Err("target does not expose lm_head over hidden".into())
     }
 
+    /// [`lm_head_logits`](Self::lm_head_logits) left on the device: a
+    /// non-owning `[n, vocab]` F32 view of the target's logit scratch, valid
+    /// until the target's next forward or head call. Returns `Err` by default.
+    fn lm_head_logits_device(
+        &mut self,
+        _gpu: &mut Gpu,
+        _hidden_rows: &GpuTensor,
+        _n: usize,
+    ) -> Result<GpuTensor, String> {
+        Err("target does not expose a device lm_head over hidden".into())
+    }
+
     /// Like [`verify_block`](Self::verify_block), but returns the FULL per-position
     /// target logits (`block.len() × vocab`, row-major) instead of the per-position
     /// argmax. The caller uses the full logits to draw from the target distribution
@@ -538,6 +550,24 @@ pub trait SpecTarget {
     /// stays `None`).
     fn set_dflash_extract_layers(&mut self, _layers: Vec<usize>) {}
 
+    /// The drafter reads only the last `rows` rows of the `hidden_out` sink
+    /// of [`spec_advance`](Self::spec_advance): the target may drop leading
+    /// rows of the sink while it appends, keeping at least `rows` (the drafter
+    /// re-derives its base from the end position). Default: keep every row.
+    fn set_dflash_feature_window(&mut self, _rows: usize) {}
+
+    /// Roll back a verify whose window will not reach
+    /// [`commit_prefix`](Self::commit_prefix) (the drafter failed after the
+    /// verify ran): restore whatever the verify snapshotted into `scratch`.
+    /// A no-op when no verify is outstanding. Default: nothing to restore.
+    fn abandon_verify(
+        &mut self,
+        _gpu: &mut Gpu,
+        _scratch: &mut dyn SpecScratch,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Capture the target's residual hidden states at `layers` for a freshly-
     /// committed `seed` token at absolute `position`, returning the concatenated
     /// `[layers.len() * hidden]` F32 vector (the DSpark `main_hidden`).
@@ -611,6 +641,10 @@ pub trait SpecScratch {
     /// `DeviceBuffer` have no `Drop` in this codebase — a bare `drop` of the box
     /// would orphan device memory. Called from the speculator's `free`.
     fn free(self: Box<Self>, gpu: &mut Gpu);
+
+    /// Forget per-window state that names target state a reset discarded
+    /// (an outstanding verify ticket). Default: nothing to forget.
+    fn clear(&mut self) {}
 }
 
 /// Outcome of [`SpecTarget::spec_advance`].
