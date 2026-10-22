@@ -21,11 +21,15 @@ use peacemaker_isa::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan}
 use std::cell::RefCell;
 use std::rc::Rc;
 
+#[path = "native_fp8.rs"]
+mod native_fp8;
 /// The production generators (`iu4_gemm`, `qwen4_moe_sym`) as natives.
 #[path = "native_gen.rs"]
 mod native_gen;
 #[path = "native_mq6.rs"]
 mod native_mq6;
+#[path = "native_qdown.rs"]
+mod native_qdown;
 
 #[derive(Clone)]
 pub struct Chain {
@@ -74,6 +78,10 @@ pub enum Nat {
     Iu4Gen(Rc<peacemaker_isa::kernels::iu4_gemm::Gen>),
     /// An `mq6_i8_gemm` generator (`Mq6Gen::new(spec)`): register assignment and geometry.
     Mq6Gen(Rc<peacemaker_isa::kernels::mq6_i8_gemm::Gen>),
+    /// An `fp8_gemm` generator (`Fp8Gen::new(spec)`): the validated spec every `fp8::*` block reads.
+    Fp8Gen(Rc<peacemaker_isa::kernels::fp8_gemm::blocks::Gen>),
+    /// A `qwen4_moe_sym` down-entry generator (`QDownGen::new(nt, gp, arch)`): registers, labels, launch contract.
+    QDownGen(Rc<peacemaker_isa::kernels::qwen4_moe_sym::down_blocks::Gen>),
 }
 
 impl Nat {
@@ -107,6 +115,8 @@ impl Nat {
             Nat::Swmmac(_) => "Swmmac",
             Nat::Iu4Gen(_) => "Iu4Gen",
             Nat::Mq6Gen(_) => "Mq6Gen",
+            Nat::Fp8Gen(_) => "Fp8Gen",
+            Nat::QDownGen(_) => "QDownGen",
         }
     }
     pub fn equals(&self, o: &Nat) -> bool {
@@ -243,6 +253,8 @@ pub fn is_fn(name: &str) -> bool {
         || ASSOC_FNS.contains(&name)
         || native_gen::is_fn(name)
         || native_mq6::is_fn(name)
+        || native_fp8::is_fn(name)
+        || native_qdown::is_fn(name)
     {
         return true;
     }
@@ -280,13 +292,15 @@ pub fn is_type(n: &str) -> bool {
     ) || IntTy::parse(n).is_some()
         || native_gen::is_type(n)
         || native_mq6::is_type(n)
+        || native_fp8::is_type(n)
+        || native_qdown::is_type(n)
 }
 
 pub fn is_struct(n: &str) -> bool {
     matches!(n, "KernelSpec" | "GatherTemps" | "VopdOp" | "SwmmacMods")
         || native_gen::is_struct(n)
         || native_mq6::is_struct(n)
-        || native_mq6::is_struct(n)
+        || native_fp8::is_struct(n)
 }
 
 pub fn global_const<'a>(n: &str) -> Option<Value<'a>> {
@@ -303,6 +317,9 @@ pub fn assoc_const<'a>(ty: &str, item: &str) -> Option<Value<'a>> {
         return Some(v);
     }
     if let Some(v) = native_mq6::assoc_const(ty, item) {
+        return Some(v);
+    }
+    if let Some(v) = native_fp8::assoc_const(ty, item) {
         return Some(v);
     }
     let nat = |n: Nat| Some(Value::Nat(n));
@@ -1133,6 +1150,12 @@ pub fn call_fn<'a>(it: &Interp<'a>, name: &str, args: Vec<Value<'a>>, cx: &mut C
             if let Some(r) = native_mq6::call_fn(it, n, a, cx) {
                 return r;
             }
+            if let Some(r) = native_fp8::call_fn(it, n, a, cx) {
+                return r;
+            }
+            if let Some(r) = native_qdown::call_fn(it, n, a, cx) {
+                return r;
+            }
             if let Some((t, f)) = n.split_once("::") {
                 if let Some(ty) = IntTy::parse(t) {
                     need(1)?;
@@ -1248,6 +1271,8 @@ pub fn method<'a>(
     Ok(match n {
         Nat::Iu4Gen(g) => native_gen::method(it, g, name, a)?,
         Nat::Mq6Gen(g) => native_mq6::method(it, g, name, a)?,
+        Nat::Fp8Gen(g) => native_fp8::method(it, g, name, a)?,
+        Nat::QDownGen(g) => native_qdown::method(it, g, name, a)?,
         Nat::Arch(arch) => match name {
             "gfx12" => Some(Value::Bool(arch.gfx12())),
             "name" => Some(Value::str(arch.name())),

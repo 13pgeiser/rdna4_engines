@@ -6,10 +6,10 @@
 //! kernel (gfx1201). Prints ONE JSON object (schema 1) on stdout.
 //!
 //! ```text
-//! pm_loop --kernel iu4_gemm|mq6_i8_gemm|qwen4_moe_sym --shape <S> [kernel knobs]
+//! pm_loop --kernel iu4_gemm|mq6_i8_gemm|fp8_gemm|qwen4_moe_sym --shape <S> [kernel knobs]
 //!         [--base-<knob> V ...] [--rip FILE.rip] [--time N] [--rounds R]
-//!         [--max-rounds R] [--time-budget-s S] [--emu] [--out DIR]
-//!         (--rip: iu4_gemm, mq6_i8_gemm)
+//!         [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--out DIR]
+//!         (--rip: iu4_gemm, mq6_i8_gemm, fp8_gemm, qwen4_moe_sym down entries)
 //! ```
 //!
 //! Pipeline (every step lands in the JSON record):
@@ -53,16 +53,21 @@
 //!    vetoes it) stay in the record. Not separable: ABBA rounds keep being added
 //!    (doubling) until `separable`, `--max-rounds` (default 256) or
 //!    `--time-budget-s` (default 240, under the fabric's timing cap) is reached;
-//!    `rounds_run`, `extended` and `stop` report it. Sampling is
-//!    refused when the candidate fails correctness.
+//!    `rounds_run`, `extended` and `stop` report it. The sign test also
+//!    detects real but immaterial placement and order effects (two arms with
+//!    byte-identical code objects came out separable at 0.2-0.3%), so
+//!    `material` = `separable` AND `|block_ratio - 1| >= --min-effect`
+//!    (default 0.005); the human verdict says `faster/slower (material)` or
+//!    `separable but below min-effect`. Sampling is refused when the
+//!    candidate fails correctness.
 //!
 //! Exit status: 0 ok; 1 correctness failure (record still printed); 3 the
 //! candidate could not be emitted/certified/launched (record printed with the
 //! error); 2 usage error.
 //!
 //! Kernel knobs and shape grammar: see the doc comment of `pm_loop/iu4.rs`
-//! (`--kernel iu4_gemm`), `pm_loop/mq6.rs` (`--kernel mq6_i8_gemm`) and `pm_loop/moe.rs`
-//! (`--kernel qwen4_moe_sym`).
+//! (`--kernel iu4_gemm`), `pm_loop/mq6.rs` (`--kernel mq6_i8_gemm`), `pm_loop/fp8.rs`
+//! (`--kernel fp8_gemm`) and `pm_loop/moe.rs` (`--kernel qwen4_moe_sym`).
 //!
 //! Use (build once, then take a gfx1201 card through the fabric; check
 //! `fabric-run.sh --status` first and pick an idle hiptrx card A/B/C/E):
@@ -84,12 +89,24 @@
 
 #[path = "support/abba.rs"]
 mod abba;
+#[path = "pm_loop/c8.rs"]
+mod c8;
+#[path = "pm_loop/common.rs"]
+mod common;
+#[path = "pm_loop/fp8.rs"]
+mod fp8;
+#[path = "pm_loop/gdn.rs"]
+mod gdn;
 #[path = "pm_loop/iu4.rs"]
 mod iu4;
 #[path = "pm_loop/moe.rs"]
 mod moe;
 #[path = "pm_loop/mq6.rs"]
 mod mq6;
+#[path = "pm_loop/prod.rs"]
+mod prod;
+#[path = "pm_loop/rotate.rs"]
+mod rotate;
 #[path = "pm_loop/workload.rs"]
 mod workload;
 
@@ -107,6 +124,10 @@ const DEFAULT_ROUNDS: usize = 6;
 const DEFAULT_MAX_ROUNDS: usize = 256;
 /// Below the fabric timing cap (1800 s) and the usual `--max-secs 900`.
 const DEFAULT_TIME_BUDGET_S: f64 = 240.0;
+/// Smallest |block_ratio - 1| that counts as a material difference (0.5%): the paired
+/// sign test also detects real but immaterial placement/order effects (two arms with
+/// byte-identical code objects came out "separable" at 0.2-0.3%).
+const DEFAULT_MIN_EFFECT: f64 = 0.005;
 
 fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
@@ -132,6 +153,8 @@ struct Opts {
     max_rounds: usize,
     /// Wall-clock budget of the sampling phase, seconds.
     time_budget_s: f64,
+    /// `--min-effect`: `material` needs `|block_ratio - 1| >=` this.
+    min_effect: f64,
     emu: bool,
     out: Option<PathBuf>,
     /// `--rip FILE`: candidate compiled from a `.rip` source (iu4_gemm only).
@@ -140,7 +163,7 @@ struct Opts {
 }
 
 const DRIVER_FLAGS: &str =
-    "--kernel K --shape S [--time N] [--rounds R] [--max-rounds R] [--time-budget-s S] [--emu] [--out DIR] [--rip FILE.rip] [--<knob> V]... [--base-<knob> V]...";
+    "--kernel K --shape S [--time N] [--rounds R] [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--out DIR] [--rip FILE.rip] [--<knob> V]... [--base-<knob> V]...";
 
 fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
     let mut o = Opts {
@@ -150,6 +173,7 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
         rounds: DEFAULT_ROUNDS,
         max_rounds: DEFAULT_MAX_ROUNDS,
         time_budget_s: DEFAULT_TIME_BUDGET_S,
+        min_effect: DEFAULT_MIN_EFFECT,
         emu: false,
         out: None,
         rip: None,
@@ -185,6 +209,13 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
                     .filter(|v| v.is_finite() && *v > 0.0)
                     .ok_or_else(|| format!("--time-budget-s {value}: expected seconds > 0"))?
             }
+            "min-effect" => {
+                o.min_effect = value
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                    .ok_or_else(|| format!("--min-effect {value}: expected a fraction >= 0"))?
+            }
             "out" => o.out = Some(PathBuf::from(value)),
             "rip" => o.rip = Some(PathBuf::from(value)),
             _ => {
@@ -197,9 +228,14 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
     if o.kernel.is_empty() {
         return Err(format!("missing --kernel (usage: {DRIVER_FLAGS})"));
     }
-    if o.rip.is_some() && !matches!(o.kernel.as_str(), "iu4_gemm" | "mq6_i8_gemm") {
+    if o.rip.is_some()
+        && !matches!(
+            o.kernel.as_str(),
+            "iu4_gemm" | "mq6_i8_gemm" | "fp8_gemm" | "qwen4_moe_sym"
+        )
+    {
         return Err(format!(
-            "--rip is only supported with --kernel iu4_gemm or mq6_i8_gemm: only iu4_gemm and mq6_i8_gemm blocks are exposed to .rip so far (got --kernel {})",
+            "--rip is only supported with --kernel iu4_gemm, mq6_i8_gemm, fp8_gemm or qwen4_moe_sym (down entries): only iu4_gemm, mq6_i8_gemm, fp8_gemm and the qwen4_moe_sym down blocks are exposed to .rip so far (got --kernel {})",
             o.kernel
         ));
     }
@@ -219,10 +255,14 @@ fn build_workload(o: &mut Opts) -> Result<Box<dyn Workload>> {
     let w = match o.kernel.as_str() {
         "iu4_gemm" => iu4::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
         "mq6_i8_gemm" => mq6::new(&shape, &mut knobs, o.rip.as_deref())?,
-        "qwen4_moe_sym" => moe::new(&shape, &mut knobs)?,
+        "fp8_gemm" => fp8::new(&shape, &mut knobs, o.rip.as_deref())?,
+        "qwen4_moe_sym" => moe::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
+        "iu4_c8_producer_pm" => c8::new(&shape, &mut knobs)?,
+        "moe_rotate_i4_pm" => rotate::new(&shape, &mut knobs)?,
+        "gdn_chunk_prep_pm" => gdn::new(&shape, &mut knobs)?,
         other => {
             return Err(format!(
-                "unknown --kernel {other} (iu4_gemm|mq6_i8_gemm|qwen4_moe_sym)"
+                "unknown --kernel {other} (iu4_gemm|mq6_i8_gemm|fp8_gemm|qwen4_moe_sym|iu4_c8_producer_pm|moe_rotate_i4_pm|gdn_chunk_prep_pm)"
             ))
         }
     };
@@ -396,7 +436,9 @@ fn arm_json(s: &TimingStats) -> Value {
 
 const RULE: &str = "separable = exact two-sided sign test over the per-round paired ratios \
     (each ABBA round: mean of the candidate's two block medians over the mean of the baseline's \
-    two, same round) has p <= 1e-3, ties counting against; direction = majority sign. \
+    two, same round) has p <= 1e-3, ties counting against; direction = majority sign; \
+    material = separable AND |block_ratio - 1| >= min_effect (the sign test also detects real \
+    but immaterial placement/order effects). \
     separable_block_disjoint = every candidate block median is below every baseline block \
     median, or every one above. separable_full_range = the pm_decode_twins rule: |median delta| \
     > larger full spread AND ranges disjoint";
@@ -412,6 +454,7 @@ fn timing_record(
     rounds: usize,
     stop: abba::ExtendStop,
     sampling_s: f64,
+    min_effect: f64,
 ) -> Result<Value> {
     let a = timing_stats(&s.base_ns)?;
     let b = timing_stats(&s.cand_ns)?;
@@ -431,6 +474,8 @@ fn timing_record(
         "stop": stop.as_str(), "sampling_s": sampling_s, "calls_per_arm": a.count,
         "baseline_us": arm_json(&a), "candidate_us": arm_json(&b),
         "ratio": ratio, "separable": r.separable, "direction": r.direction,
+        "material": r.separable && (r.block_ratio - 1.0).abs() >= min_effect,
+        "min_effect": min_effect,
         "sign_p": r.sign_p, "p_max": abba::PAIRED_P_MAX,
         "rounds_faster": r.rounds_faster, "rounds_slower": r.rounds_slower,
         "rounds_tied": r.rounds_tied,
@@ -745,13 +790,15 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
             && w.output(&gpu, Arm::Candidate)? == cand_out)
     })();
     match (sampled, post) {
-        (Ok((s, stop, secs)), Ok(true)) => match timing_record(&s, o.time, o.rounds, stop, secs) {
-            Ok(mut t) => {
-                t["post_outputs_unchanged"] = json!(true);
-                rec["timing"] = t;
+        (Ok((s, stop, secs)), Ok(true)) => {
+            match timing_record(&s, o.time, o.rounds, stop, secs, o.min_effect) {
+                Ok(mut t) => {
+                    t["post_outputs_unchanged"] = json!(true);
+                    rec["timing"] = t;
+                }
+                Err(e) => return fail(rec, "timing", e),
             }
-            Err(e) => return fail(rec, "timing", e),
-        },
+        }
         (Ok(_), Ok(false)) => {
             rec["timing"] =
                 json!({"status": "post-sampling outputs changed; no performance claim"});
@@ -761,6 +808,40 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
     }
     rec["device_after"] = device_json(&gpu);
     (rec, Outcome::Ok)
+}
+
+/// The human verdict line of a timing record.
+fn verdict(ts: &Value) -> String {
+    let f = |k: &str| ts[k].as_f64().unwrap_or(f64::NAN);
+    if ts["separable"] == true {
+        let (dir, ratio) = (ts["direction"].as_str().unwrap_or("?"), f("block_ratio"));
+        if ts["material"] == true {
+            format!(
+                "{dir} (material): block ratio {ratio:.6} after {} rounds, sign p {:.3e}",
+                ts["rounds_run"],
+                f("sign_p")
+            )
+        } else {
+            format!(
+                "separable but below min-effect ({:.3}%): {dir} by {:.3}% (block ratio {ratio:.6}), sign p {:.3e}, {} rounds",
+                f("min_effect") * 100.0,
+                (ratio - 1.0).abs() * 100.0,
+                f("sign_p"),
+                ts["rounds_run"]
+            )
+        }
+    } else {
+        format!(
+            "not separable after {} rounds ({}); {}/{}/{} rounds faster/slower/tied, sign p {:.3e}, block ratio {:.6}",
+            ts["rounds_run"],
+            ts["stop"],
+            ts["rounds_faster"],
+            ts["rounds_slower"],
+            ts["rounds_tied"],
+            f("sign_p"),
+            f("block_ratio")
+        )
+    }
 }
 
 fn main() {
@@ -777,26 +858,7 @@ fn main() {
         serde_json::to_string(&rec).expect("record serializes")
     );
     if let Some(ts) = rec.get("timing").filter(|t| t["ratio"].is_number()) {
-        let verdict = if ts["separable"] == true {
-            format!(
-                "separable after {} rounds: candidate {} than baseline, sign p {:.3e}, block ratio {:.6}",
-                ts["rounds_run"],
-                ts["direction"].as_str().unwrap_or("?"),
-                ts["sign_p"].as_f64().unwrap_or(f64::NAN),
-                ts["block_ratio"].as_f64().unwrap_or(f64::NAN)
-            )
-        } else {
-            format!(
-                "not separable after {} rounds ({}); {}/{}/{} rounds faster/slower/tied, sign p {:.3e}, block ratio {:.6}",
-                ts["rounds_run"],
-                ts["stop"],
-                ts["rounds_faster"],
-                ts["rounds_slower"],
-                ts["rounds_tied"],
-                ts["sign_p"].as_f64().unwrap_or(f64::NAN),
-                ts["block_ratio"].as_f64().unwrap_or(f64::NAN)
-            )
-        };
+        let verdict = verdict(ts);
         eprintln!("pm_loop: {verdict}");
     }
     std::process::exit(match outcome {
@@ -840,8 +902,14 @@ mod tests {
         assert_eq!(o.rip, Some(PathBuf::from("/tmp/a.rip")));
         assert_eq!(o.knobs.0.len(), 1, "--rip is not a knob");
         assert!(parse_args(args("--kernel iu4_gemm")).unwrap().rip.is_none());
-        let e = parse_args(args("--kernel qwen4_moe_sym --rip /tmp/a.rip")).unwrap_err();
+        let e = parse_args(args("--kernel nope --rip /tmp/a.rip")).unwrap_err();
         assert!(e.contains("only iu4_gemm"), "{e}");
+        // qwen4_moe_sym takes --rip (down entries; the entry check is the workload's).
+        let o = parse_args(args(
+            "--kernel qwen4_moe_sym --rip /tmp/a.rip --epi down_gp_nt4",
+        ))
+        .unwrap();
+        assert_eq!(o.rip, Some(PathBuf::from("/tmp/a.rip")));
         assert!(parse_args(args("--kernel iu4_gemm --rip")).is_err());
     }
 
@@ -929,7 +997,15 @@ mod tests {
     #[test]
     fn timing_record_units_ratio_and_separability() {
         use abba::ExtendStop::{MaxRounds, Separable};
-        let t = timing_record(&flat(2, 12, 100_000.0, 200_000.0), 2, 6, Separable, 1.5).unwrap();
+        let t = timing_record(
+            &flat(2, 12, 100_000.0, 200_000.0),
+            2,
+            6,
+            Separable,
+            1.5,
+            0.005,
+        )
+        .unwrap();
         assert_eq!(t["separable"], true);
         assert_eq!(t["direction"], "slower");
         assert_eq!(t["separable_block_disjoint"], true);
@@ -952,7 +1028,7 @@ mod tests {
         assert_eq!(t["round_ratio_min"], 2.0);
         assert_eq!(t["candidate_block_median_us"]["max"], 200.0);
         // Equal arms: every round ties, never separable.
-        let same = timing_record(&flat(2, 12, 7.0, 7.0), 2, 12, MaxRounds, 1.0).unwrap();
+        let same = timing_record(&flat(2, 12, 7.0, 7.0), 2, 12, MaxRounds, 1.0, 0.005).unwrap();
         assert_eq!(same["separable"], false);
         assert_eq!(
             (same["direction"].as_str(), same["rounds_tied"].as_u64()),
@@ -962,7 +1038,7 @@ mod tests {
             (same["ratio"].clone(), same["sign_p"].clone()),
             (json!(1.0), json!(1.0))
         );
-        assert!(timing_record(&samples(&[], &[1.0; 8]), 1, 1, Separable, 0.0).is_err());
+        assert!(timing_record(&samples(&[], &[1.0; 8]), 1, 1, Separable, 0.0, 0.005).is_err());
         // The rule text names all three rules.
         let rule = t["rule"].as_str().unwrap();
         assert!(
@@ -978,7 +1054,7 @@ mod tests {
     fn one_hiccup_vetoes_only_the_full_range_rule() {
         let mut s = flat(2, 12, 330_000.0, 320_000.0);
         s.base_ns[3] = 7_003_000.0;
-        let t = timing_record(&s, 2, 6, abba::ExtendStop::Separable, 1.0).unwrap();
+        let t = timing_record(&s, 2, 6, abba::ExtendStop::Separable, 1.0, 0.005).unwrap();
         assert_eq!(t["separable"], true);
         assert_eq!(t["direction"], "faster");
         assert_eq!(t["separable_full_range"], false);
@@ -1037,6 +1113,73 @@ mod tests {
             "{secs} {}",
             s.base_ns.len()
         );
+    }
+
+    /// Two byte-identical arms that a placement effect makes 0.25% slower every
+    /// round: statistically separable, but not material at the default gate.
+    #[test]
+    fn immaterial_separable_difference_is_not_material() {
+        use abba::ExtendStop::Separable;
+        let s = flat(2, 40, 300_000.0, 300_750.0);
+        let t = timing_record(&s, 2, 6, Separable, 1.0, DEFAULT_MIN_EFFECT).unwrap();
+        assert_eq!(t["separable"], true);
+        assert_eq!(t["direction"], "slower");
+        assert_eq!(t["material"], false);
+        assert_eq!(t["min_effect"], 0.005);
+        let v = verdict(&t);
+        assert!(v.starts_with("separable but below min-effect"), "{v}");
+        // The same data is material once the gate is below the effect, and a real 2% win is material.
+        assert_eq!(
+            timing_record(&s, 2, 6, Separable, 1.0, 0.001).unwrap()["material"],
+            true
+        );
+        let win = timing_record(
+            &flat(2, 40, 300_000.0, 294_000.0),
+            2,
+            6,
+            Separable,
+            1.0,
+            DEFAULT_MIN_EFFECT,
+        )
+        .unwrap();
+        assert_eq!(
+            (win["material"].clone(), win["direction"].clone()),
+            (json!(true), json!("faster"))
+        );
+        assert!(
+            verdict(&win).starts_with("faster (material)"),
+            "{}",
+            verdict(&win)
+        );
+        // Not separable is never material.
+        let tie = timing_record(
+            &flat(2, 12, 7.0, 7.0),
+            2,
+            12,
+            abba::ExtendStop::MaxRounds,
+            1.0,
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(tie["material"], false);
+        assert!(verdict(&tie).starts_with("not separable"));
+    }
+
+    #[test]
+    fn min_effect_flag_parses() {
+        assert_eq!(
+            parse_args(args("--kernel iu4_gemm")).unwrap().min_effect,
+            0.005
+        );
+        let o = parse_args(args("--kernel iu4_gemm --min-effect 0.02")).unwrap();
+        assert_eq!(o.min_effect, 0.02);
+        assert!(o.knobs.0.is_empty());
+        for bad in ["--min-effect -1", "--min-effect x", "--min-effect nan"] {
+            assert!(
+                parse_args(args(&format!("--kernel k {bad}"))).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

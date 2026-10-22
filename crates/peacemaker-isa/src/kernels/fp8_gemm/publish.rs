@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-use super::{ds_store, vload, vo, ActScale, Builder, Spec};
+use super::{ds_load_insn, ds_store_insn, vload, vo, ActScale, Builder, Instruction, Spec};
 use crate::kernels::common::{op, s, sop, v};
 
 /// Address and prefetch every fragment byte of one A slot. All four b64
@@ -32,16 +32,22 @@ pub(super) fn fetch_a(b: &mut Builder, kb_offset: u32, slab: u32) -> Result<(), 
         Ok(())
     })
 }
+/// The four LDS stores of the prefetched A payload into slot `slot` (0 or 1).
+pub(super) fn publish_a_insns(slot: usize) -> Result<Vec<Instruction>, String> {
+    (0..4u8)
+        .map(|j| {
+            ds_store_insn(
+                168 + 2 * j,
+                2,
+                178,
+                (slot as u32) * 8192 + u32::from(j / 2) * 2048 + u32::from(j % 2) * 128,
+            )
+        })
+        .collect()
+}
 pub(super) fn publish_a(b: &mut Builder, slot: usize) -> Result<(), String> {
-    for j in 0..4 {
-        ds_store(
-            b,
-            slot,
-            168 + 2 * j,
-            2,
-            178,
-            (slot as u32) * 8192 + u32::from(j / 2) * 2048 + u32::from(j % 2) * 128,
-        )?;
+    for insn in publish_a_insns(slot)? {
+        b.ds_store(slot, insn)?;
     }
     Ok(())
 }
@@ -61,33 +67,51 @@ pub(super) fn fetch_next_ratio(b: &mut Builder, next_kb: u32) -> Result<(), Stri
     sop(b, "s_lshl_b32 s92, s92, 10", &[92], &[92])?;
     vload(b, 184, 1, 182, 40, Some(92), 0)
 }
+/// The row-ratio store of plane `plane` (into `R<plane>`, slot `2 + plane`).
+pub(super) fn ratio_store_insn(plane: usize) -> Result<Instruction, String> {
+    ds_store_insn(184, 1, 182, 16384 + plane as u32 * 1024)
+}
+/// K128 only: the next block's per-token D ratio, from its loads to the exec
+/// mask (`tid < 128`) that its single producer per word needs. The caller
+/// issues [`d_store_insn`] to slot `4 + plane` and then [`d_restore`].
+pub(super) fn d_prepare(b: &mut Builder, next_kb: u32) -> Result<(), String> {
+    sop(b, "s_add_co_i32 s93, s85, 0", &[93], &[85])?;
+    sop(b, "s_lshl_b32 s93, s93, 2", &[93], &[93])?;
+    vload(b, 168, 1, 183, 48, Some(93), 0)?;
+    vload(b, 169, 1, 183, 48, Some(93), 4 * next_kb)?;
+    // Positive powers of two: floating exponents are affine. The bit
+    // subtraction produces the exactly represented d[b]/d[b+1].
+    vo(
+        b,
+        "v_sub_nc_u32_e32 v170, v168, v169",
+        &[170],
+        &[168, 169],
+        &[],
+    )?;
+    vo(b, "v_add_nc_u32_e32 v170, 1.0, v170", &[170], &[170], &[])?;
+    op(b, "v_cmp_gt_u32_e64 s72, 0x80, v187", &[s(72)], &[v(187)])?;
+    op(b, "s_mov_b32 s74, exec_lo", &[s(74)], &[])?;
+    op(b, "s_mov_b32 exec_lo, s72", &[], &[s(72)])
+}
+/// The D-ratio store of plane `plane` (into `D<plane>`, slot `4 + plane`).
+pub(super) fn d_store_insn(plane: usize) -> Result<Instruction, String> {
+    ds_store_insn(170, 1, 182, 18432 + plane as u32 * 512)
+}
+/// Restore the exec mask [`d_prepare`] narrowed.
+pub(super) fn d_restore(b: &mut Builder) -> Result<(), String> {
+    op(b, "s_mov_b32 exec_lo, s74", &[], &[s(74)])
+}
 pub(super) fn publish_next_ratios(
     b: &mut Builder,
     spec: Spec,
     next_kb: u32,
     plane: usize,
 ) -> Result<(), String> {
-    ds_store(b, 2 + plane, 184, 1, 182, 16384 + plane as u32 * 1024)?;
+    b.ds_store(2 + plane, ratio_store_insn(plane)?)?;
     if spec.act_scale == ActScale::K128 {
-        sop(b, "s_add_co_i32 s93, s85, 0", &[93], &[85])?;
-        sop(b, "s_lshl_b32 s93, s93, 2", &[93], &[93])?;
-        vload(b, 168, 1, 183, 48, Some(93), 0)?;
-        vload(b, 169, 1, 183, 48, Some(93), 4 * next_kb)?;
-        // Positive powers of two: floating exponents are affine. The bit
-        // subtraction produces the exactly represented d[b]/d[b+1].
-        vo(
-            b,
-            "v_sub_nc_u32_e32 v170, v168, v169",
-            &[170],
-            &[168, 169],
-            &[],
-        )?;
-        vo(b, "v_add_nc_u32_e32 v170, 1.0, v170", &[170], &[170], &[])?;
-        op(b, "v_cmp_gt_u32_e64 s72, 0x80, v187", &[s(72)], &[v(187)])?;
-        op(b, "s_mov_b32 s74, exec_lo", &[s(74)], &[])?;
-        op(b, "s_mov_b32 exec_lo, s72", &[], &[s(72)])?;
-        ds_store(b, 4 + plane, 170, 1, 182, 18432 + plane as u32 * 512)?;
-        op(b, "s_mov_b32 exec_lo, s74", &[], &[s(74)])?;
+        d_prepare(b, next_kb)?;
+        b.ds_store(4 + plane, d_store_insn(plane)?)?;
+        d_restore(b)?;
     }
     Ok(())
 }
@@ -117,19 +141,24 @@ pub(super) fn fetch_w(b: &mut Builder, unit: usize) -> Result<(), String> {
     })
 }
 
-/// Four conflict-free A fragments from the current slot, one per 16-column
-/// tile. No A fragment destination aliases the next slab's prefetch bank.
+/// The four conflict-free A fragment loads from slot `slot`, one per
+/// 16-column tile. No A fragment destination aliases the next slab's
+/// prefetch bank.
+pub(super) fn fragment_insns(slot: usize, step: usize) -> Result<Vec<Instruction>, String> {
+    (0..4u8)
+        .map(|tt| {
+            ds_load_insn(
+                160 + 2 * tt,
+                2,
+                179,
+                (slot * 8192 + step * 2048 + usize::from(tt) * 256) as u32,
+            )
+        })
+        .collect()
+}
 pub(super) fn fragments(b: &mut Builder, slot: usize, step: usize) -> Result<(), String> {
-    for tt in 0..4 {
-        ds_load(
-            b,
-            slot,
-            160 + 2 * tt,
-            2,
-            179,
-            (slot * 8192 + step * 2048 + usize::from(tt) * 256) as u32,
-        )?;
+    for insn in fragment_insns(slot, step)? {
+        b.ds_load(slot, insn)?;
     }
     Ok(())
 }
-use super::ds_load;

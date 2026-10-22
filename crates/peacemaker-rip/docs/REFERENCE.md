@@ -568,3 +568,70 @@ Geometry (128 rows x 128 tokens x 8 waves), the LDS layout, the register map and
 | `mq6::epilogue(wg, g)?` | everything after the `mq6::EPI` label (the script places it with `wg.label`): output descriptor, lane masks, masked stores |
 
 The committed twin [`mq6_i8_gemm.rip`](../../peacemaker-isa/src/kernels/mq6_i8_gemm.rip) writes the whole composition: ring declaration, the prologue's staging of block 0, the K-loop (`wg_skip_if` + `loop_carried` + `block` + trip end, then the peeled pair) and the block body (queued decode / store / fetch work interleaved between WMMAs, B1 and B2 split barriers, the fold), then the epilogue. Its variants are the shipped variant names (`128x128x8-set`, `256x128x16-set_bf16-linear`, ...: `TILE-EPI[-linear]`, twelve of them; the grammar is in the file header). `tests/mq6_i8_gemm_twin.rs` requires its `s_text` and proof to be identical to `mq6_i8_gemm::emit` for every valid spec, and `peacemaker-isa/tests/mq6_i8_gemm_digests.rs` pins `emit` itself to the digests recorded before the blocks were factored out. [Cookbook 12](cookbook/12-mq6-blocks.md) shows what to move.
+
+## 15. Production generator on the raw `Builder`: `fp8_gemm`
+
+The MQ4V2 x E4M3 ratio-fold prefill GEMM (`peacemaker_isa::kernels::fp8_gemm`, gfx1201, `v_wmma_f32_16x16x16_fp8_fp8`) is composable from `.rip`, but it is a different kind of kernel from §13 and §14: the shipped generator is an untyped-`Builder` kernel (raw `barrier_with_scope`, `loop_`, `control` branches, a jump-network epilogue), not a typed-core one. Its twin is therefore written on the raw `Builder` surface that `.rip` already exposes (`Builder::new`, `lds_slot`, `ds_store`, `ds_load`, `barrier_with_scope`, `barrier_signal`, `barrier_wait`, `loop_`, `control`, `wait`, `ready` / `retire`), not on `Workgroup`. That is a deliberate boundary: there is no typestate and no sealed ring here, and every checked rule is the Builder's (the LDS slot machine, the wait ledger, the hazard guards, the loop fixpoint). Nothing is an escape hatch: a store into a slot that is Reading, a read of a slot that is not Published, a barrier over an undrained store, a loop whose back edge differs from its entry are all refusals (`tests/fp8_gemm_twin.rs`).
+
+- **LDS operations are script statements.** The script declares the six slots with `b.lds_slot` and issues every `b.ds_store(slot, insn)` / `b.ds_load(slot, insn)` and every barrier.
+- **Natives that touch LDS return `Instruction`s** (`fp8::publish_a_insns`, `fp8::fragment_insns`, `fp8::ratio_store_insn`, `fp8::d_store_insn`, the `fp8::fold_*_load_insns`).
+- **Every other native emits into the builder passed as its first argument** (`b`, from `Builder::new`): fetches, address set-up, the WMMAs, the fold arithmetic, the loop bookkeeping.
+- **`fp8::epilogue` is one coarse native.** The epilogue is a jump network, and the GDN-fused QKVZA epilogue carries its own LDS ring and loops; both are composed in Rust and the script places them after the K-loop.
+
+Geometry (256 rows x 128 tokens x 8 waves), the six LDS slots (`A0 A1 R0 R1 D0 D1`), and the register map are fixed by the Rust generator; changing them needs a rebuild.
+
+### Coarse natives and the generator
+
+| call | meaning |
+|---|---|
+| `Fp8Gemm::emit(Fp8Spec { arch, scale, epi })?` | what `fp8_gemm::emit` returns (`Emitted`); `Spec::validate` stays the gate (gfx1201 only; `silu-bf16` and `qkvzagdn` are row-scaled only) |
+| `Fp8Gemm::emit_module(arch, scale, [epis])?` | `(Vec<Emitted>, text, proof_json)` of the module `emit --kernel fp8_gemm --scale S --epi ...` writes |
+| `Fp8Scale::{Row, K128}`, `Fp8Epi::{Set, Add, GateUpSilu, GateUpSiluBf16, Qkv, Qkvza, QkvzaGdn}` | the spec enums (script enum values) |
+| `Fp8Spec { arch, scale, epi }` | the struct literal (the Rust `act_scale` is `scale` in script) |
+| `Fp8Gen::new(Fp8Spec { .. })?` | the generator of one valid spec: an opaque value |
+| `g.plan()?`, `g.kernel_spec()`, `g.spec()` | the `RegPlan`, the `KernelSpec`, the `Fp8Spec` |
+| `g.slot("A0")` | `Option<(base, bytes)>` of an LDS slot: `A0 A1 R0 R1 D0 D1` (`D*` are K128 only) |
+| `fp8::BEGIN LOOP LOOP_END EPILOGUE END` | the label constants (strings) |
+| `fp8::label(b, name)?` | place a label |
+
+### Blocks
+
+`b` is the `Builder` of `Builder::new(g.kernel_spec(), g.plan()?)`; `g` an `Fp8Gen`. Indices are checked: an out-of-range slot, unit, step, plane or WMMA index is a refusal naming the native, and the K128-only natives refuse a row spec (`only the K128-scaled kernel has a D ratio`).
+
+| call | what it does |
+|---|---|
+| `fp8::prologue_front(b, g)?` | kernel arguments and the banded CTA raster; leaves the tile-outside compare for the script's `b.control` branch to `fp8::END` |
+| `fp8::prologue_lanes(b, g)?` | buffer descriptors and the hoisted lane addresses |
+| `fp8::fetch_a(b, g, kb_offset, slab)?` | the four raw `buffer_load_b64` of A slab `slab` of the block `kb_offset` K128 blocks ahead |
+| `fp8::publish_a_insns(g, slot)?` | `Vec<Instruction>`: the LDS stores that publish the fetched slab into slot `slot`; issue with `b.ds_store(slot, insn)` |
+| `fp8::weight_base(b, g)?`, `fp8::fetch_w(b, g, unit)?` | the weight base and the unit's four `buffer_load_b128`s (no W is staged in LDS) |
+| `fp8::fetch_next_ratio(b, g, kb)?` | the next block's row-ratio loads |
+| `fp8::ratio_store_insn(g, plane)?` | `Instruction`: the ratio store into plane `plane` (slot `2 + plane`) |
+| `fp8::d_prepare(b, g, kb)?`, `fp8::d_store_insn(g, plane)?`, `fp8::d_restore(b, g)?` | K128 only: the next block's per-token D ratio, its store into slot `4 + plane`, the exec-mask restore |
+| `fp8::fragment_insns(g, slot, step)?` | `Vec<Instruction>`: the four A fragment `ds_load_b128`s of K16 step `step` (0..4) from slot `slot`; issue with `b.ds_load(slot, insn)` |
+| `fp8::mma(b, g, unit, step, first, i)?`, `fp8::mma_insn(...)` | the `i`-th (0..16) WMMA of K16 step `step` of unit `unit` (0..4); `first` starts the accumulators from the WMMA's inline zero. `mma_insn` returns the `Instruction` |
+| `fp8::fold_row_group_load_insns(g, plane, i)?`, `fp8::fold_row_group_scale(b, g, i)?` | Row fold: the two `ds_load_b128` ratio loads of group `i`, then its 16 packets |
+| `fp8::fold_k128_token_load_insns(g, plane)?`, `fp8::fold_k128_pair_load_insns(g, plane, i, e)?`, `fp8::fold_k128_pair_scale(b, g, i, e)?` | K128 fold: the four per-token D loads, a pair's two ratio loads, its four token chains |
+| `fp8::advance_block(b, g)?`, `fp8::trips_setup(b, g)?`, `fp8::trip_end(b, g)?` | block offset advance; trip count; the loop's counter advance |
+| `fp8::wait_all(b)?` | the builder's ledger-wide wait |
+| `fp8::epilogue(b, g)?` | everything after the `fp8::EPILOGUE` label: the output jump network (and the GDN preparation for `qkvzagdn`) |
+
+The committed twin [`fp8_gemm.rip`](../../peacemaker-isa/src/kernels/fp8_gemm.rip) writes the whole composition, down to the barrier lists: `declare_lds`, `prologue`, `kloop` (first block, loop of two blocks per trip, peeled last block), `block` (A1 fetched before slab 0, a uniform B1 barrier that retires A0 and publishes the next ratio planes, the next A0 payload, the fold, a split B2 barrier), `fold`, then `fp8::epilogue`. `fp8_gemm::emit` is written over the same blocks and is pinned to the digests recorded before they existed (`peacemaker-isa/tests/fp8_gemm_digests.rs`). It re-emits the bytes and the proof of every one of the twelve valid specs (`tests/fp8_gemm_twin.rs`). `pm_loop --kernel fp8_gemm --rip fp8_gemm.rip` times it ([cookbook 13](cookbook/13-fp8-blocks.md)).
+
+## 16. `qwen4_moe_sym` down entries: `QDownGen` and `qdown::*`
+
+The gfx1201 MQ4 down NT4/NT8 entries of `qwen4_moe_sym`, flat-slot (`down_ntN`) and grouped-position (`down_gp_ntN`), as phase blocks over `qwen4_moe_sym::down_blocks`. The committed twin is `peacemaker-isa/src/kernels/qwen4_moe_down_gp.rip`; `tests/qwen4_moe_down_twin.rs` requires `s_text` and proof identity with `qwen4_moe_sym::emit` / `emit_down_gp` for all four variants. `MoeSym::emit(..)` (section 13) is the coarse native.
+
+The down entries have no LDS and no ring, so there is nothing to lend: the blocks that need the typed core run in one `Driver::typed` call each (like `iu4::*`); the others emit straight into `wg.isa()`. The script owns the exit, the K-loop's trip structure, the order of weight loads and epoch folds in a trip, the descriptor step, the trip counter and prefetch distance (which descriptor each fold re-issues its activations through). The prologue, a fold, the tail and the store epilogue are single blocks (each interleaves emission with per-tile or wave-scope branches, which a typed block cannot sit under). Tile width `nt` is a spec axis (`QDownGen::new(nt, gp, arch)`, `nt` 4 or 8).
+
+| call | meaning |
+|---|---|
+| `QDownGen::new(nt, gp, arch)?` | the generator of one valid entry (the Rust `emit` refusals). `gen.plan()?`, `gen.kernel_spec()`, `gen.nt()`, `gen.gp()`, `gen.label(name)`, `gen.exit_label()` |
+| `qdown::prologue(wg, g, end)?` | kernel arguments, tile ids, descriptors, lane offsets, the first epoch's loads (typed) |
+| `qdown::trips_cmp(wg, "s_cmp_eq_u32" \| "s_cmp_lg_u32")?` | the trip counter against zero, a workgroup-uniform `WgCond` (typed) |
+| `qdown::trips_dec(wg)?` | one trip done |
+| `qdown::load_w(wg, g, p)?` | issue the weight loads of epoch parity `p` |
+| `qdown::compute(wg, g, p, site)?`, `qdown::compute_reload(wg, g, p, site, srd)?` | fold epoch parity `p`; the second form re-issues each tile's next-epoch activations through descriptor `srd` (`qdown::srd_x(0 \| 1)?`) right after its fold (typed) |
+| `qdown::advance(wg)?` | step the weight and activation descriptors one trip on |
+| `qdown::tail(wg, g)?` | the tail after the trips: one pair (even K/128) or one epoch (odd), one block |
+| `qdown::epilogue(wg, g, end)?` | the epilogue label and the tile stores; the script places the exit with `wg.end(end)` |

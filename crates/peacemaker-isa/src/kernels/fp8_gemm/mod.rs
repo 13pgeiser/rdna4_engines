@@ -4,6 +4,7 @@
 
 //! gfx1201 MQ4V2 E4M3 fragment GEMM, emitted with the checked ISA builder.
 //! The 96-byte ABI and all fragment offsets are frozen by fp8-4k5 §11.4–11.5.
+pub mod blocks;
 mod epilogue;
 mod fold;
 mod gdn_epilogue;
@@ -17,17 +18,17 @@ use crate::kernels::common::{mem, op, s, sr, v, vr};
 use crate::{
     insn::{Instruction, MemoryClass},
     reg::Live,
-    Arch, Builder, BuilderProof, Emitted, KernelSpec, RegPlan,
+    Arch, Builder, BuilderProof, Emitted, RegPlan,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 pub use spec::{ActScale, Epi, Spec};
 
-const BEGIN: &str = ".Lfp8_begin";
-const LOOP: &str = ".Lfp8_loop";
-const LOOP_END: &str = ".Lfp8_loop_end";
-const EPILOGUE: &str = ".Lfp8_epilogue";
-const END: &str = ".Lfp8_end";
+pub const BEGIN: &str = ".Lfp8_begin";
+pub const LOOP: &str = ".Lfp8_loop";
+pub const LOOP_END: &str = ".Lfp8_loop_end";
+pub const EPILOGUE: &str = ".Lfp8_epilogue";
+pub const END: &str = ".Lfp8_end";
 
 fn vo(
     b: &mut Builder,
@@ -84,14 +85,13 @@ fn vload(
         MemoryClass::VmemLoad,
     )
 }
-fn ds_store(
-    b: &mut Builder,
-    slot: usize,
+/// `ds_store_b{32,64}` of `data` (`width` VGPRs) at byte `offset` from the address VGPR `addr`.
+pub(crate) fn ds_store_insn(
     data: u8,
     width: u8,
     addr: u8,
     offset: u32,
-) -> Result<(), String> {
+) -> Result<Instruction, String> {
     let name = match width {
         1 => "ds_store_b32",
         2 => "ds_store_b64",
@@ -102,24 +102,20 @@ fn ds_store(
     } else {
         format!(" offset:{offset}")
     };
-    b.ds_store(
-        slot,
-        Instruction::new(
-            format!("{name} v{addr}, {}{off}", vr(data, width)),
-            vec![],
-            vec![v(addr), vr(data, width)],
-        )
-        .memory(MemoryClass::DsStore),
+    Ok(Instruction::new(
+        format!("{name} v{addr}, {}{off}", vr(data, width)),
+        vec![],
+        vec![v(addr), vr(data, width)],
     )
+    .memory(MemoryClass::DsStore))
 }
-fn ds_load(
-    b: &mut Builder,
-    slot: usize,
+/// `ds_load_b{32,64,128}` into `data` (`width` VGPRs) from the address VGPR `addr` plus `offset`.
+pub(crate) fn ds_load_insn(
     data: u8,
     width: u8,
     addr: u8,
     offset: u32,
-) -> Result<(), String> {
+) -> Result<Instruction, String> {
     let name = match width {
         1 => "ds_load_b32",
         2 => "ds_load_b64",
@@ -131,15 +127,12 @@ fn ds_load(
     } else {
         format!(" offset:{offset}")
     };
-    b.ds_load(
-        slot,
-        Instruction::new(
-            format!("{name} {}, v{addr}{off}", vr(data, width)),
-            vec![vr(data, width)],
-            vec![v(addr)],
-        )
-        .memory(MemoryClass::DsLoad),
+    Ok(Instruction::new(
+        format!("{name} {}, v{addr}{off}", vr(data, width)),
+        vec![vr(data, width)],
+        vec![v(addr)],
     )
+    .memory(MemoryClass::DsLoad))
 }
 
 // v0:127 accumulator, v128:159 alternating K32 weight units, v160:167
@@ -194,17 +187,7 @@ fn plan() -> Result<RegPlan, String> {
     Ok(p)
 }
 fn declare_lds(b: &mut Builder) -> Result<(), String> {
-    for (id, (name, base, len)) in [
-        ("A0", 0, 8192),
-        ("A1", 8192, 8192),
-        ("R0", 16384, 1024),
-        ("R1", 17408, 1024),
-        ("D0", 18432, 512),
-        ("D1", 18944, 512),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    for (id, (name, base, len)) in blocks::LDS_SLOTS.into_iter().enumerate() {
         if b.lds_slot(name, base, len)? != id {
             return Err("LDS slot order".into());
         }
@@ -212,25 +195,8 @@ fn declare_lds(b: &mut Builder) -> Result<(), String> {
     Ok(())
 }
 pub fn emit(spec: Spec) -> Result<Emitted, String> {
-    spec.validate()?;
-    let kernel = KernelSpec {
-        kernel_id: "fp8_gemm".into(),
-        variant: spec.variant(),
-        arch: spec.arch,
-        symbol: spec.symbol(),
-        kernargs: spec.kernargs(),
-        user_sgpr_count: 2,
-        system_sgpr_workgroup_id_y: true,
-        workgroup_size: 256,
-        group_segment_fixed_size: if spec.epi == Epi::QkvzaGdn {
-            gdn_epilogue::FIXED_LDS
-        } else {
-            0
-        },
-        wave32: true,
-        cu_mode: false,
-    };
-    let mut b = Builder::new(kernel, plan()?);
+    let g = blocks::Gen::new(spec)?;
+    let mut b = Builder::new(g.kernel_spec(), g.plan()?);
     b.enable_delay_alu();
     declare_lds(&mut b)?;
     prologue::emit(&mut b, spec)?;
