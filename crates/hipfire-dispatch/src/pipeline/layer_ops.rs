@@ -1530,6 +1530,94 @@ pub fn execute_hyper_write_pregated(
     execute_hyper_write_inner(gpu, op, true)
 }
 
+/// Whether the pregated HC write `write` and the HC read `read` right after it (whose
+/// own paired write is `next_write`) run as the gfx1201 mixer-tail row fold
+/// (`HIPFIRE_QWEN4_HC_ROW_FOLD`): exactly the BF16-stream write `hyper_write` gives
+/// `hyper_write_bf16x8_gfx1201` (see [`Gpu::hc_row_fold_gfx1201_applies`]) and a read
+/// that takes [`execute_hyper_read_prenormed`] ([`hyper_read_prenorm_applies`]).
+pub fn hyper_write_read_fold_applies(
+    gpu: &Gpu,
+    write: &HyperWriteOp<'_>,
+    read: &HyperReadOp<'_>,
+    next_write: &HyperWriteOp<'_>,
+) -> bool {
+    let Some(wide) = write.branches.checked_mul(write.hidden) else {
+        return false;
+    };
+    let Some(streams_len) = write.rows.checked_mul(wide) else {
+        return false;
+    };
+    gpu.flags.qwen4_hc_row_fold_mixer_gfx1201_enabled()
+        && write.state_bf16
+        && write.branches == 4
+        && write.input.buf.as_ptr() == write.output.buf.as_ptr()
+        && read.input.buf.as_ptr() == write.output.buf.as_ptr()
+        && read.rows == write.rows
+        && read.hidden == write.hidden
+        && write.input.dtype == DType::F32
+        && write.input.numel() >= streams_len
+        && write.mixed.dtype == DType::F32
+        && write.mixed.numel() >= write.rows * write.hidden
+        && write.gates.dtype == DType::F32
+        && write.gates.numel() >= write.rows * write.branches
+        && gpu.hc_row_fold_gfx1201_applies(write.rows, write.hidden, write.input, write.mixed)
+        && hyper_read_prenorm_applies(gpu, read, next_write)
+        && hc_row_fold_next_gfx1201_ok(read, next_write)
+}
+
+/// The operand shapes the gfx1201 row folds need of the next HC read and its paired
+/// write (the launch's own checks), so a mismatch plans no fold instead of failing the
+/// launch.
+pub fn hc_row_fold_next_gfx1201_ok(read: &HyperReadOp<'_>, next_write: &HyperWriteOp<'_>) -> bool {
+    let Some(wide) = read.branches.checked_mul(read.hidden) else {
+        return false;
+    };
+    read.norm_weight.dtype == DType::BF16
+        && read.norm_weight.numel() == wide
+        && next_write.block_inject.buf.dtype == DType::BF16
+        && next_write.block_inject.buf.numel() >= 4 * wide
+        && next_write.gates.dtype == DType::F32
+        && next_write.gates.numel() >= read.rows * 4
+}
+
+/// [`execute_hyper_write_pregated`] of `write` followed by the norm + gate projection
+/// of `read`'s [`execute_hyper_read_prenormed`] input, in one launch (the gfx1201
+/// mixer-tail row fold; bytewise `hyper_write_bf16x8_gfx1201` then
+/// `hyper_norm_gate_outputs`).  The read must then run
+/// [`execute_hyper_read_prenormed`].  Requires [`hyper_write_read_fold_applies`].
+pub fn execute_hyper_write_read_fold(
+    gpu: &mut Gpu,
+    write: &HyperWriteOp<'_>,
+    read: &HyperReadOp<'_>,
+    next_write: &HyperWriteOp<'_>,
+) -> Result<(), DispatchError> {
+    if !hyper_write_read_fold_applies(gpu, write, read, next_write) {
+        return Err(DispatchError::Hip(
+            "hyper write: the gfx1201 row fold was planned but its route no longer applies".into(),
+        ));
+    }
+    let wide = checked_mul(write.branches, write.hidden, "hyper write wide")?;
+    let streams = view(write.input, 0, write.rows * wide);
+    let mixed = view(write.mixed, 0, write.rows * write.hidden);
+    let gates = view(write.gates, 0, write.rows * write.branches);
+    let next_gates = view(next_write.gates, 0, read.rows * next_write.branches);
+    // The read's F16 row lives in the shared F16 scratch it takes it from.
+    let x16 = hip(gpu.qwen4_f16_x_scratch(read.rows * wide))?;
+    hip(
+        gpu.hc_row_write_norm_gate_gfx1201(&rdna_compute::hc_row_fold::HcRowWriteNormGateGfx1201 {
+            mixed: &mixed,
+            streams: &streams,
+            gates: &gates,
+            norm_weight: read.norm_weight,
+            gate_weight: next_write.block_inject.buf,
+            next_gates: &next_gates,
+            normalized_f16: &x16,
+            rows: write.rows,
+            hidden: write.hidden,
+        }),
+    )
+}
+
 /// H4 attention epilogue (`HIPFIRE_QWEN4_HC_FUSE` >= 2): an MQ6G256V2 (or, on the
 /// gfx1151 PM module, MQ4G256V2) output
 /// projection that applies the paired HC write `write` in its GEMM epilogue.
