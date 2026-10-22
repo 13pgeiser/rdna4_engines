@@ -165,7 +165,7 @@ fn load_inner(
             crate::slowlink_admission::window_route_of(&receipt.manifest.weights),
         ))
     .then(|| {
-        crate::artifact::routed_headers_symmetric(&hfq, &receipt.manifest)
+        crate::artifact::routed_headers_symmetric_verdict(&hfq, &receipt.manifest)
             .map_err(|error| error.to_string())
     });
     let unified = gpu.is_uma();
