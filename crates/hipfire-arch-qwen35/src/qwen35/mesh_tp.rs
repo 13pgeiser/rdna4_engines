@@ -590,6 +590,7 @@ impl<'a> Qwen35TpBindings<'a> {
                     kv_cache: &rank.kv,
                     dn_state: &rank.dn,
                     position: start,
+                    mrope_section: None,
                 };
                 let step = binding.mixer(&rank.weights.layers[layer], layer, index, false, None);
                 execute_steps(gpu, &ctx, &[step]).map_err(dispatch)
