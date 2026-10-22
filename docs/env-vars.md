@@ -822,7 +822,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1688
+**Count:** 1684
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1113,7 +1113,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DEEPSEEK4_WO_Q8_WMMA` | crates/rdna-compute/src/gemv.rs | developer |
 | `HIPFIRE_DEFAULT_CHATML` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_DEMOTE_MQ6` | crates/hipfire-runtime/examples/hfq_splice_attn.rs | harness |
-| `HIPFIRE_DENSE_FIXTURE` | crates/hipfire-generate/tests/dense_rollback_gpu.rs, scripts/device_mesh_matrix.py | harness |
+| `HIPFIRE_DENSE_FIXTURE` | crates/hipfire-arch-muse-glimmer/tests/kv_cap_gpu.rs, crates/hipfire-generate/tests/dense_rollback_gpu.rs | harness |
 | `HIPFIRE_DENSE_TP` | crates/hipfire-arch-qwen35/examples/qwen_dense_tp2_parity.rs | harness |
 | `HIPFIRE_DETECTED_ARCH` | scripts/_detect-gpu.sh, scripts/test-kernels.sh | harness |
 | `HIPFIRE_DETECTED_NAME` | scripts/_detect-gpu.sh | harness |
@@ -1296,7 +1296,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_FLASH_PREFILL_BC` | crates/hipfire-dispatch/src/families/attention.rs | developer |
 | `HIPFIRE_FLASH_PREFILL_BR` | crates/hipfire-dispatch/src/families/attention.rs, crates/rdna-compute/src/kernel_registry.rs | developer |
 | `HIPFIRE_FLASH_PREFILL_FIXED_HD` | crates/rdna-compute/examples/bench_glimmer_verify_attention.rs, crates/rdna-compute/examples/fa_a3b_screen.rs | developer |
-| `HIPFIRE_FLASH_PREFILL_KERNEL` | crates/hipfire-arch-muse-glimmer/src/forward.rs, crates/hipfire-arch-qwen35/src/forward_slots.rs | developer |
+| `HIPFIRE_FLASH_PREFILL_KERNEL` | crates/hipfire-arch-qwen35/src/forward_slots.rs, crates/hipfire-arch-qwen35/src/qwen35/prefill.rs | developer |
 | `HIPFIRE_FLASH_PREFILL_MIN_CTX` | crates/hipfire-dispatch/src/families/attention.rs | developer |
 | `HIPFIRE_FLASH_PREFILL_PREFETCH_V` | crates/rdna-compute/examples/bench_glimmer_verify_attention.rs, crates/rdna-compute/examples/fa_a3b_screen.rs | developer |
 | `HIPFIRE_FLASH_PREFILL_SPLITQ` | crates/rdna-compute/examples/bench_glimmer_verify_attention.rs, crates/rdna-compute/examples/fa_a3b_screen.rs | developer |
@@ -1580,26 +1580,22 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_GLIMMER_CTX_CAP` | crates/hipfire-arch-muse-glimmer/src/drafter.rs, crates/hipfire-generate/src/dense.rs | developer |
 | `HIPFIRE_GLIMMER_DEVICE_CAPTURE` | crates/hipfire-loader/src/carriers.rs, crates/hipfire-runtime/examples/dflash_spec_demo.rs | developer |
 | `HIPFIRE_GLIMMER_DEVICE_CAPTURE_AUDIT` | crates/hipfire-arch-muse-glimmer/src/glimmer.rs, crates/hipfire-generate/src/dense.rs | developer |
-| `HIPFIRE_GLIMMER_FLASH_FULL` | crates/hipfire-arch-muse-glimmer/src/forward.rs | developer |
 | `HIPFIRE_GLIMMER_FUSED_SILU_ROTATE` | crates/hipfire-arch-muse-glimmer/src/forward.rs | developer |
 | `HIPFIRE_GLIMMER_GATE_UP_K6656` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_GLIMMER_GPU_SAMPLE` | crates/hipfire-generate/src/dense.rs | developer |
 | `HIPFIRE_GLIMMER_KV_VMM` | crates/hipfire-arch-muse-glimmer/src/glimmer.rs, crates/hipfire-runtime/examples/build_kld_ref_native_glimmer.rs | developer |
-| `HIPFIRE_GLIMMER_MUSE_GEMM` | crates/hipfire-arch-muse-glimmer/src/forward.rs | developer |
 | `HIPFIRE_GLIMMER_NO_CENTERED_NORM` | crates/hipfire-arch-muse-glimmer/src/glimmer.rs | developer |
-| `HIPFIRE_GLIMMER_NO_FLASH` | crates/hipfire-arch-muse-glimmer/src/forward.rs | developer |
-| `HIPFIRE_GLIMMER_O_RESIDUAL` | crates/hipfire-arch-muse-glimmer/src/forward.rs | developer |
 | `HIPFIRE_GLIMMER_PREFILL_CHUNK` | crates/hipfire-arch-muse-glimmer/src/forward.rs | developer |
 | `HIPFIRE_GLIMMER_PROMPT_CACHE` | crates/hipfire-generate/src/dense.rs | developer |
 | `HIPFIRE_GLIMMER_QKVG_K6656` | crates/rdna-compute/src/kernels.rs | developer |
-| `HIPFIRE_GLIMMER_SHARED_ROT` | crates/hipfire-arch-muse-glimmer/src/drafter.rs, crates/hipfire-arch-muse-glimmer/src/forward.rs | developer |
+| `HIPFIRE_GLIMMER_SHARED_ROT` | crates/hipfire-arch-muse-glimmer/src/forward.rs | developer |
 | `HIPFIRE_GLIMMER_SPEC_DIAG` | crates/hipfire-generate/src/dense.rs, crates/hipfire-runtime/examples/dflash_spec_demo.rs | developer |
 | `HIPFIRE_GLIMMER_SPEC_FALLBACK` | crates/hipfire-generate/src/dense.rs | developer |
 | `HIPFIRE_GLIMMER_SPEC_PERTURB` | crates/hipfire-generate/src/dense.rs | developer |
-| `HIPFIRE_GLIMMER_SPEC_PROFIT_GUARD` | crates/hipfire-generate/src/dense.rs | developer |
+| `HIPFIRE_GLIMMER_SPEC_PROFIT_GUARD` | crates/hipfire-generate/src/dense.rs, crates/hipfire-generate/tests/dense_rollback_gpu.rs | developer |
 | `HIPFIRE_GLIMMER_SWA_PREFETCH_V` | crates/rdna-compute/examples/bench_glimmer_verify_attention.rs, crates/rdna-compute/src/attention.rs | developer |
 | `HIPFIRE_GLIMMER_TAP_LAYERS` | crates/hipfire-generate/src/dense.rs | developer |
-| `HIPFIRE_GLIMMER_TIMING` | crates/hipfire-arch-muse-glimmer/src/drafter.rs, crates/hipfire-arch-muse-glimmer/src/forward.rs | developer |
+| `HIPFIRE_GLIMMER_TIMING` | crates/hipfire-arch-muse-glimmer/src/drafter.rs, crates/hipfire-generate/src/dense.rs | developer |
 | `HIPFIRE_GLIMMER_WMMA_FULL` | crates/hipfire-arch-muse-glimmer/src/forward.rs | developer |
 | `HIPFIRE_GPTQ_BLOCK` | crates/hipfire-quantize/src/gptq.rs | developer |
 | `HIPFIRE_GPTQ_DAMPING` | crates/hipfire-quantize/src/quant_mq.rs | developer |

@@ -805,7 +805,9 @@ pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchE
             Step::ParallelMoeMlp(op) => op.mlp.validate_for_gpu(gpu)?,
             // One row keeps the single-row route's contract (`x` may be a wider
             // buffer whose shape the kernel reads); a batch must hold its rows.
-            Step::RmsnormAutomatic { x, out, k, rows, .. } if *rows != 1 => {
+            Step::RmsnormAutomatic {
+                x, out, k, rows, ..
+            } if *rows != 1 => {
                 let need = rows * k;
                 if *rows == 0 || x.numel() < need || out.numel() < need {
                     return Err(DispatchError::Hip(format!(
