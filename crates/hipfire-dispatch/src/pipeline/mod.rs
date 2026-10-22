@@ -6164,8 +6164,14 @@ fn decode_down_stage(
             }
             return Ok(());
         }
-        #[cfg(feature = "lab")]
-        bind_g1_window(gpu, p.routed_experts, p.n_exp)?;
+        #[cfg(feature = "test-utils")]
+        bind_g1_window(
+            gpu,
+            p.routed_experts,
+            p.n_exp,
+            p.topk_weights,
+            p.recipe.bf16_round_trip(),
+        )?;
         hip!(gpu.gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded(
             p.expert_down_ptrs,
             p.topk_indices,
