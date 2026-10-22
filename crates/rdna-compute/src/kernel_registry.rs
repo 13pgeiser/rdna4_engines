@@ -2761,6 +2761,27 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::GEMM_MQ6G256V2_RESIDUAL_WMMA_GFX12_SRC,
             ["gemm_mq6g256v2_residual_wmma_gfx12"]
         );
+        // Exact-INT8 MQ6G256V2 prefill (default on gfx1201 in the Qwen4 forward,
+        // `gemm_mq6_i8.rs`): the GEMM module and the A8 `block_i8_128` quantizer
+        // (`Gpu::ensure_int8_mmq_x`) it consumes.
+        add!(
+            "gemm_mq6g256v2_mmq_i8_gfx12",
+            kernels::GEMM_MQ6G256V2_MMQ_I8_GFX12_SRC,
+            [
+                "gemm_mq6g256v2_mmq_i8_set_bf16_gfx12",
+                "gemm_mq6g256v2_mmq_i8_set_gfx12"
+            ]
+        );
+        add!(
+            "gemm_mq4g256v2_residual_mmq_i8_gfx12",
+            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_SRC,
+            [
+                "gemm_mq4g256v2_gate_up_silu_mmq_i8",
+                "gemm_mq4g256v2_residual_mmq_i8_full_add",
+                "gemm_mq4g256v2_residual_mmq_i8_full_set",
+                "quantize_int8_mmq_ds128"
+            ]
+        );
         add!(
             "qwen4_gemm_mq6g256v2_wmma_gfx12_x4",
             kernels::QWEN4_GEMM_MQ6G256V2_WMMA_GFX12_X4_SRC,
@@ -8859,13 +8880,32 @@ mod tests {
         // tape/lane copies, the storage-boundary round trip and 116 discovery
         // and static-coverage modules. Keep the later beta cohorts above.
         const FIRST_REQUEST_JIT_ADDED_MODULES: usize = 119;
+        // The exact-INT8 MQ6 prefill default adds its GEMM module and the A8
+        // `block_i8_128` quantizer module it consumes.
+        const MQ6_I8_ADDED_MODULES: [&str; 2] = [
+            "gemm_mq6g256v2_mmq_i8_gfx12",
+            "gemm_mq4g256v2_residual_mmq_i8_gfx12",
+        ];
+        for module in MQ6_I8_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing MQ6 i8 module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
                 + PRE_S1_ADDED_SINCE_P0
                 + S1_ADDED_MODULES.len()
                 + NATIVE_A3B_ADDED_MODULES.len()
-                + FIRST_REQUEST_JIT_ADDED_MODULES,
+                + FIRST_REQUEST_JIT_ADDED_MODULES
+                + MQ6_I8_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name

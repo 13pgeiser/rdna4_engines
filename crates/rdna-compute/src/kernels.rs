@@ -5294,6 +5294,14 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_i8.gfx12.hip")
 );
+/// gfx1201 exact-INT8 MQ6G256V2 prefill GEMM (`gemm_mq6g256v2_mmq_i8_set{,_bf16}_gfx12`; dynamic
+/// LDS `MQ6_I8_GFX12_LDS_BYTES` = 36864): the `block_i8_128` prelude without its standalone
+/// quantizer, then the kernel.
+pub const GEMM_MQ6G256V2_MMQ_I8_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/gemm_mq6g256v2_mmq_i8.gfx12.hip")
+);
 /// Full-slab A-prefetch variant (191 VGPR, 0 spills) for end-to-end screening.
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_APF0_SRC: &str = concat!(
     "#define I8_APF_K32 0\n",
@@ -5314,6 +5322,22 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX11_T256_SRC: &str = concat!(
     "#define I8_TILE 256\n",
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_i8.gfx11.hip")
+);
+/// gfx1100/gfx1151 exact-INT8 MQ6G256V2 prefill GEMM (`gemm_mq6g256v2_mmq_i8_set{,_bf16}_gfx11`,
+/// 128x128 tile, 512 threads; dynamic LDS `MQ6_I8_GFX11_LDS_BYTES` = 32768): the `block_i8_128`
+/// prelude without its standalone quantizer, then the kernel.
+pub const GEMM_MQ6G256V2_MMQ_I8_GFX11_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/gemm_mq6g256v2_mmq_i8.gfx11.hip")
+);
+/// The 256x256-tile build of [`GEMM_MQ6G256V2_MMQ_I8_GFX11_SRC`] (entries suffixed `_t256`, 1024
+/// threads, dynamic LDS 65536).
+pub const GEMM_MQ6G256V2_MMQ_I8_GFX11_T256_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
+    "#define I8_TILE 256\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/gemm_mq6g256v2_mmq_i8.gfx11.hip")
 );
 // gfx12 (RDNA4) i8-WMMA MMQ port (single-wave 16-row tile, [32,1,1], LDS 0).
 // RDNA3's #if guard excludes gfx12, so RDNA4 needs this separate source.

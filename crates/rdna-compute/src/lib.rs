@@ -42,6 +42,7 @@ mod gdn_q8ef_reference;
 pub mod gemm;
 mod gemm_fp8_verify;
 mod gemm_mq6_fp8;
+mod gemm_mq6_i8;
 mod gemm_vt;
 mod gemma4_ext;
 mod gemma4_ops;

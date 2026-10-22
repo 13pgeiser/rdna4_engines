@@ -70,6 +70,10 @@ name = "pm_mtp_gemm_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "mq6_fp8_gemm_bench"
+required-features = ["lab"]
+
+[[example]]
 name = "pm_aco_oracle"
 required-features = ["lab"]
 

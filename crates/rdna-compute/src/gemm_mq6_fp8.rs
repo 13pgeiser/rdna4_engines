@@ -47,6 +47,33 @@ fn mq6_fp8_scope_admits(flag: Option<bool>) -> bool {
 }
 
 impl Gpu {
+    /// Move the shared MQ6 F32 rotation scratch (grown to at least `elems`
+    /// values, captured graphs invalidated first when it will grow) out of the
+    /// scratch state: the FP8 producer and the INT8 route
+    /// ([`Gpu::mq6_i8_prepare_x`]) take `&mut self` while they use it. Hand it
+    /// back with [`Gpu::put_mq6_x_rot`] whatever the outcome.
+    pub(crate) fn take_mq6_x_rot(&mut self, elems: usize) -> HipResult<GpuTensor> {
+        if self
+            .scratch
+            .mq6_fp8_x_rot
+            .as_ref()
+            .map_or(true, |t| t.buf.size() < elems * 4)
+        {
+            self.invalidate_for_scratch_growth();
+        }
+        self.scratch
+            .ensure_mq6_fp8_x_rot(&self.hip, self.device_id, elems)?;
+        self.scratch
+            .mq6_fp8_x_rot
+            .take()
+            .ok_or_else(|| HipError::new(0, "mq6 x_rot scratch missing"))
+    }
+
+    /// Return the scratch taken by [`Gpu::take_mq6_x_rot`].
+    pub(crate) fn put_mq6_x_rot(&mut self, x_rot: GpuTensor) {
+        self.scratch.mq6_fp8_x_rot = Some(x_rot);
+    }
+
     /// Whether the MQ6 FP8 route admits one launch of `m` weight rows, `k` and
     /// `batch_size` tokens: exact gfx1201, eager (no replay recording / graph
     /// capture), `k % 256 == 0`, non-empty dims, and the opt-in
@@ -101,26 +128,9 @@ impl Gpu {
         if crate::gemv::fp8_prod_inreg(k) {
             return self.rotate_x_mq_fp8_gfx12_batched(x, None, None, x, k, batch_size);
         }
-        let needed_bytes = elems * 4;
-        if self
-            .scratch
-            .mq6_fp8_x_rot
-            .as_ref()
-            .map_or(true, |t| t.buf.size() < needed_bytes)
-        {
-            self.invalidate_for_scratch_growth();
-        }
-        self.scratch
-            .ensure_mq6_fp8_x_rot(&self.hip, self.device_id, elems)?;
-        // The producer takes `&mut self`: move the scratch tensor out for the
-        // call and put it back whatever the outcome.
-        let x_out = self
-            .scratch
-            .mq6_fp8_x_rot
-            .take()
-            .ok_or_else(|| HipError::new(0, "mq6_fp8_prepare_x: x_out scratch missing"))?;
+        let x_out = self.take_mq6_x_rot(elems)?;
         let prepared = self.rotate_x_mq_fp8_gfx12_batched(x, None, None, &x_out, k, batch_size);
-        self.scratch.mq6_fp8_x_rot = Some(x_out);
+        self.put_mq6_x_rot(x_out);
         prepared
     }
 
@@ -341,12 +351,7 @@ mod tests {
     #[test]
     fn kernel_source_pins_the_table_literals_and_symbols() {
         let src = include_str!("../../../kernels/src/gemm_mq6g256v2_wmma_fp8.gfx1201.hip");
-        for (name, v) in [
-            ("CL0", CL0),
-            ("CL1", CL1),
-            ("CH0", CH0),
-            ("CH1", CH1),
-        ] {
+        for (name, v) in [("CL0", CL0), ("CL1", CL1), ("CH0", CH0), ("CH1", CH1)] {
             let line = format!("#define HIPFIRE_MQ6_FP8_{name} 0x{v:08X}u");
             assert!(src.contains(&line), "kernel source lacks `{line}`");
         }
@@ -413,7 +418,10 @@ mod tests {
                 true,
             ),
         ] {
-            assert!(konst.contains(src), "{sym}: source must embed the kernel file");
+            assert!(
+                konst.contains(src),
+                "{sym}: source must embed the kernel file"
+            );
             // The macro prefix prepended to the kernel file selects the variant;
             // only the DB consts define HIPFIRE_MQ6_FP8_DB (the file defaults it to 0).
             let prefix = konst.strip_suffix(src).expect("prefix + kernel file");

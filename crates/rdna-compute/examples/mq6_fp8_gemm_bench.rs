@@ -2,42 +2,61 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! MQ6G256V2 native-FP8 prefill GEMM microbench + correctness gate (exact
-//! gfx1201; developer example).
+//! MQ6G256V2 prefill GEMM microbench + correctness gate: the exact-INT8 route
+//! (gfx1201 and gfx1151) and the native-FP8 route (exact gfx1201 only);
+//! developer example.
 //!
 //! Per (shape, N) the timed arms are
-//!   * `inc_prep`  `Gpu::rotate_x_mq_batched_f16` (shared F16 rotation),
-//!   * `inc_gemm`  `Gpu::gemm_mq6g256v2_xf16` (the incumbent PM/X-LDS route;
-//!     `n/a` when `gemm_mq6g256v2_xf16_applies` is false),
-//!   * `fp8_prep`  `Gpu::mq6_fp8_prepare_x` (rotation into E4M3 planes),
-//!   * `fp8_gemm_<arm>` `Gpu::gemm_mq6g256v2_fp8_prepared`.
+//!   * `inc`   `Gpu::rotate_x_mq_batched_f16` (shared F16 rotation) then
+//!     `Gpu::gemm_mq6g256v2_xf16` (the incumbent PM/X-LDS route of the Qwen4
+//!     forward on either arch; `n/a` when `gemm_mq6g256v2_xf16_applies` is
+//!     false; the launched kernel name is recorded in `--json`),
+//!   * `i8`    `Gpu::mq6_i8_prepare_x` (FWHT into F32 scratch + A8
+//!     `block_i8_128` quantization) then `Gpu::gemm_mq6g256v2_i8_prequant`,
+//!   * `fp8_<arm>[_db]` `Gpu::mq6_fp8_prepare_x` then
+//!     `Gpu::gemm_mq6g256v2_fp8_prepared` (gfx1201 only).
 //! Times are GPU event times of one launch (median of `--iters`, after
-//! `--warmup` launches); TFLOP/s = 2*M*K*N / time.
+//! `--warmup` launches); TFLOP/s = 2*M*K*N / time. Achieved GB/s = bytes / time
+//! with GEMM bytes = weights `m*(k/256)*200` + activations (inc `n*k*2`; i8
+//! `n*(k/128)*136`; fp8 `n*k + n*(k/128)*4 + n*4`) + output `n*m*4`; prep GB/s:
+//! inc read `n*k*4` + write `n*k*2`; i8 rotate read/write `n*k*8` + quantizer
+//! read `n*k*4` + write blocks; fp8 read `n*k*4` + write planes. `vs_inc` is
+//! the incumbent prep+gemm time over the arm's.
 //!
 //! The incumbent is admitted like the Qwen4 forward does: `Gpu::qwen4_scope` is
 //! set and `HIPFIRE_QWEN4_MQ6_X4_GFX1201` defaults to `1` for this process (set
-//! it to `0` to see the memset+residual route skipped as `n/a`).
+//! it to `0` to see the memset+residual route skipped as `n/a` on gfx1201).
 //!
 //! Correctness (unless `--no-check`), for N in {512, 4000} and every shape
-//! (M = 48 and the non-multiple-of-128 N exercise the OOB paths): the E4M3
-//! bytes and per-row scales the producer emitted are read back, weights are
-//! decoded exactly on the CPU (f64), and 32 sampled tokens (first 8, last 8,
-//! 16 seeded random) x all M rows are checked:
-//!   * SPLIT passes iff every element has
+//! (M = 48 and the non-multiple-of-128 N exercise the OOB paths); 32 sampled
+//! tokens (first 8, last 8, 16 seeded random) x all M rows are checked against
+//! an f64 CPU reference with exactly decoded weights; the output is
+//! NaN-prefilled (an unwritten element fails):
+//!   * i8: the `block_i8_128` blocks the producer emitted are read back
+//!     (`d * qs`, nibble-pair order undone); passes iff every element has
+//!     `|y - ref| <= 1e-4 * sum_k |w_k d qx_k| + 1e-30` and the whole output is
+//!     finite, and the BF16 entry equals bf16_rne(0.0 + F32 entry) bit for bit
+//!     over the whole output; rel-L2(incumbent F32, i8) is reported;
+//!   * fp8: the E4M3 bytes and per-row scales the producer emitted are read
+//!     back; SPLIT passes iff every element has
 //!     `|y - ref| <= 1e-4 * a_t * sum_k |w_k x8_k| + 1e-30` (the weight side is
 //!     bit-exact, so only f32 summation noise remains) and the whole output is
-//!     finite (the output is NaN-prefilled: an unwritten element fails);
-//!   * ROUND reports rel-L2 vs the exact reference (no pass bar);
-//!   * rel-L2(incumbent F32, SPLIT) on the same tokens (expected ~1e-2: E4M3
-//!     activations vs F16);
-//!   * on (10240, 2560) the SPLIT BF16 variant must equal bf16_rne(0.0 + SPLIT
-//!     F32) bit for bit.
-//! Exit status 1 on any SPLIT or BF16 failure.
+//!     finite; ROUND reports rel-L2 vs the exact reference (no pass bar);
+//!     rel-L2(incumbent F32, SPLIT) is reported (expected ~1e-2: E4M3
+//!     activations vs F16); on (10240, 2560) the SPLIT BF16 variant must equal
+//!     bf16_rne(0.0 + SPLIT F32) bit for bit.
+//! Exit status 1 on any i8, SPLIT or BF16 failure.
+//!
+//! Run: `cargo run --release -p rdna-compute --features lab --example
+//! mq6_fp8_gemm_bench` (gated behind `lab`, like the other developer probes,
+//! so the default build does not pay for it).
 //!
 //! CLI: `[--shapes fn] [--shape M,K]...` (a `--shape` replaces the FN list)
-//! `[--n 64,128,...] [--iters 20] [--warmup 3] [--arm split|round|both]`
-//! `[--db 0|1|both]` (default both: every (arm, db) combination is timed as
-//! `fp8_gemm_<arm>` / `fp8_gemm_<arm>_db`, and the SPLIT exactness + BF16
+//! `[--n 64,128,...] [--iters 20] [--warmup 3] [--arm i8|split|round|both|all]`
+//! (default: `i8` plus `split` and `round` on gfx1201; `both` = split+round,
+//! `all` = i8+split+round; FP8 arms are refused on gfx1151)
+//! `[--db 0|1|both]` (default both: every FP8 (arm, db) combination is timed as
+//! `fp8_<arm>` / `fp8_<arm>_db`, and the SPLIT exactness + BF16
 //! checks run for the DB variant too) `[--json PATH] [--no-check] [--seed N]`.
 
 use half::f16;
@@ -324,15 +343,15 @@ fn check_case(
         .collect();
 
     // Sampled tokens: first 8, last 8, 16 seeded random.
-    let mut toks: BTreeSet<usize> = (0..n.min(8)).chain(n.saturating_sub(8)..n).collect();
-    let mut r = Rng(seed ^ 0x7467_6b00 ^ n as u64);
-    for _ in 0..16 {
-        toks.insert(r.below(n as u64) as usize);
-    }
-    let toks: Vec<usize> = toks.into_iter().collect();
+    let toks = sample_tokens(n, seed);
     let x8: Vec<Vec<f64>> = toks
         .iter()
-        .map(|&t| x8_bytes[t * k..(t + 1) * k].iter().map(|&b| dec_e4m3(b)).collect())
+        .map(|&t| {
+            x8_bytes[t * k..(t + 1) * k]
+                .iter()
+                .map(|&b| dec_e4m3(b))
+                .collect()
+        })
         .collect();
     let a: Vec<f64> = toks.iter().map(|&t| scales[t]).collect();
     let (refv, magv) = reference(wbytes, m, k, &x8, &a);
@@ -448,14 +467,205 @@ fn check_case(
     Ok(out)
 }
 
+// ---------------------------------------------------------- bytes / reporting
+
+/// One timed new-route arm of a (shape, N) point.
+struct ArmRow {
+    name: String,
+    prep: Vec<f64>,
+    prep_bytes: usize,
+    gemm: Vec<f64>,
+    /// Activation bytes the GEMM reads.
+    act_bytes: usize,
+    kernel: Option<String>,
+}
+
+/// GEMM traffic: weights `m*(k/256)*200` + activations + output `n*m*4`.
+fn gemm_bytes(m: usize, k: usize, act_bytes: usize, n: usize) -> usize {
+    m * (k / 256) * GROUP_BYTES + act_bytes + n * m * 4
+}
+/// Incumbent GEMM activations: F16 `n*k*2`.
+fn inc_act_bytes(n: usize, k: usize) -> usize {
+    n * k * 2
+}
+/// i8 GEMM activations: `block_i8_128` (136 B per 128 K) per token.
+fn i8_act_bytes(n: usize, k: usize) -> usize {
+    n * (k / 128) * 136
+}
+/// FP8 GEMM activations: E4M3 bytes + per-half sums + per-row scale.
+fn fp8_act_bytes(n: usize, k: usize) -> usize {
+    n * k + n * (k / 128) * 4 + n * 4
+}
+/// Incumbent prep: read F32 `n*k*4`, write F16 `n*k*2`.
+fn inc_prep_bytes(n: usize, k: usize) -> usize {
+    n * k * 4 + n * k * 2
+}
+/// i8 prep: FWHT rotate read + write F32 (`n*k*8`), quantizer read `n*k*4`, write blocks.
+fn i8_prep_bytes(n: usize, k: usize) -> usize {
+    n * k * 8 + n * k * 4 + i8_act_bytes(n, k)
+}
+/// FP8 prep: read F32 `n*k*4`, write the E4M3 planes (in-register producer).
+fn fp8_prep_bytes(n: usize, k: usize) -> usize {
+    n * k * 4 + fp8_act_bytes(n, k)
+}
+fn gbps(bytes: usize, ms: f64) -> f64 {
+    bytes as f64 / (ms * 1e-3) / 1e9
+}
+
+/// First 8, last 8 and 16 seeded random tokens of `n`.
+fn sample_tokens(n: usize, seed: u64) -> Vec<usize> {
+    let mut toks: BTreeSet<usize> = (0..n.min(8)).chain(n.saturating_sub(8)..n).collect();
+    let mut r = Rng(seed ^ 0x7467_6b00 ^ n as u64);
+    for _ in 0..16 {
+        toks.insert(r.below(n as u64) as usize);
+    }
+    toks.into_iter().collect()
+}
+
+/// Undo the A8 nibble-pair order: per 8-element group `g`, `qs[8g+0..3] =
+/// q[8g+0,2,4,6]` and `qs[8g+4..7] = q[8g+1,3,5,7]`.
+fn unpack_a8_qs(qs: &[u8], out: &mut [i32; 128]) {
+    for g in 0..16 {
+        for j in 0..4 {
+            out[8 * g + 2 * j] = qs[8 * g + j] as i8 as i32;
+            out[8 * g + 2 * j + 1] = qs[8 * g + 4 + j] as i8 as i32;
+        }
+    }
+}
+
+struct I8Check {
+    pass: bool,
+    bad: usize,
+    nonfinite: usize,
+    max_ratio: f64,
+    inc_rel_l2: Option<f64>,
+    /// F32-vs-BF16 entry mismatches over the whole output.
+    bf16_bad: usize,
+    tokens: usize,
+}
+
+/// Exactness gate of the i8 route: the `block_i8_128` blocks the producer
+/// emitted are read back (`d * qs`), weights are decoded exactly on the CPU
+/// (f64), and 32 sampled tokens x all M rows must satisfy
+/// `|y - ref| <= 1e-4 * sum|w * d * qx| + 1e-30` (the integer core and the
+/// fold are exact, so only f32 fold rounding remains); the NaN-prefilled output
+/// must be fully finite, and the BF16 entry must equal bf16_rne(0.0 + F32
+/// entry) bit for bit over the whole output.
+#[allow(clippy::too_many_arguments)]
+fn check_i8_case(
+    gpu: &mut Gpu,
+    w: &GpuTensor,
+    wbytes: &[u8],
+    xf: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    seed: u64,
+) -> Res<I8Check> {
+    let xt = gpu.upload_f32(&xf[..n * k], &[n * k])?;
+    let xq = gpu.mq6_i8_prepare_x(&xt, k, n)?;
+    let blocks = dtoh(gpu, xq, (k / 128) * n * 136)?;
+    let toks = sample_tokens(n, seed);
+    let t_n = toks.len();
+    let xv: Vec<Vec<f64>> = toks
+        .iter()
+        .map(|&t| {
+            let mut v = vec![0.0f64; k];
+            let mut q = [0i32; 128];
+            for kb in 0..k / 128 {
+                let b = &blocks[(kb * n + t) * 136..(kb * n + t + 1) * 136];
+                let d = f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64;
+                unpack_a8_qs(&b[8..136], &mut q);
+                for i in 0..128 {
+                    v[kb * 128 + i] = d * q[i] as f64;
+                }
+            }
+            v
+        })
+        .collect();
+    let (refv, magv) = reference(wbytes, m, k, &xv, &vec![1.0; t_n]);
+    let sample = |y: &[f32]| -> Vec<f64> {
+        let mut s = Vec::with_capacity(m * t_n);
+        for r in 0..m {
+            for &t in &toks {
+                s.push(y[t * m + r] as f64);
+            }
+        }
+        s
+    };
+
+    let y = nan_filled(gpu, n * m, DType::F32)?;
+    gpu.gemm_mq6g256v2_i8_prequant(w, xq, &y, m, k, n)?;
+    let yh = gpu.download_f32(&y)?;
+    gpu.free_tensor(y)?;
+    let ys = sample(&yh);
+    let (mut bad, mut max_ratio) = (0usize, 0.0f64);
+    for i in 0..ys.len() {
+        let err = (ys[i] - refv[i]).abs();
+        let tol = 1e-4 * magv[i] + 1e-30;
+        max_ratio = max_ratio.max(err / tol);
+        // `!(<=)` also fails NaN.
+        if !(err <= tol) {
+            bad += 1;
+        }
+    }
+    let nonfinite = yh.iter().filter(|v| !v.is_finite()).count();
+
+    let y16 = nan_filled(gpu, n * m, DType::BF16)?;
+    gpu.gemm_mq6g256v2_i8_prequant(w, xq, &y16, m, k, n)?;
+    let raw = gpu.download_raw_bytes(&y16)?;
+    gpu.free_tensor(y16)?;
+    let mut bf16_bad = 0usize;
+    for (i, c) in raw.chunks_exact(2).enumerate().take(n * m) {
+        let got = u16::from_le_bytes([c[0], c[1]]);
+        let v = 0.0f32 + yh[i];
+        let want = if v.is_finite() {
+            bf16_rne(v)
+        } else {
+            (v.to_bits() >> 16) as u16
+        };
+        if got != want {
+            bf16_bad += 1;
+        }
+    }
+
+    let inc_rel_l2 = if gpu.gemm_mq6g256v2_xf16_applies(k, n) {
+        let x16 = gpu.rotate_x_mq_batched_f16(&xt, k, n)?;
+        let yi = nan_filled(gpu, n * m, DType::F32)?;
+        gpu.gemm_mq6g256v2_xf16(w, &x16, &yi, m, k, n)?;
+        let ih = gpu.download_f32(&yi)?;
+        gpu.free_tensor(yi)?;
+        Some(rel_l2(&sample(&ih), &ys))
+    } else {
+        None
+    };
+    gpu.free_tensor(xt)?;
+    Ok(I8Check {
+        pass: bad == 0 && nonfinite == 0,
+        bad,
+        nonfinite,
+        max_ratio,
+        inc_rel_l2,
+        bf16_bad,
+        tokens: t_n,
+    })
+}
+
 // ---------------------------------------------------------------------- cli
+
+/// Arms selected by `--arm`: the exact-INT8 route and/or the FP8 weight-plane arms.
+struct ArmSel {
+    i8: bool,
+    fp8: Vec<Mq6Fp8Arm>,
+}
 
 struct Args {
     shapes: Vec<(usize, usize)>,
     ns: Vec<usize>,
     iters: usize,
     warmup: usize,
-    arms: Vec<Mq6Fp8Arm>,
+    /// `None` = the arch default: `i8`, plus `split` and `round` on gfx1201.
+    arms: Option<ArmSel>,
     dbs: Vec<bool>,
     json: Option<String>,
     check: bool,
@@ -463,10 +673,22 @@ struct Args {
 }
 
 impl Args {
-    /// Every (arm, db) combination to time and check, arm-major.
-    fn vars(&self) -> Vec<Var> {
-        self.arms
-            .iter()
+    /// `(run the i8 arm, FP8 weight-plane arms)` for `arch`; FP8 arms exist on
+    /// gfx1201 only.
+    fn resolve_arms(&self, arch: &str) -> Res<(bool, Vec<Mq6Fp8Arm>)> {
+        match &self.arms {
+            None if arch == "gfx1201" => Ok((true, vec![Mq6Fp8Arm::Split, Mq6Fp8Arm::Round])),
+            None => Ok((true, vec![])),
+            Some(sel) if arch != "gfx1201" && !sel.fp8.is_empty() => {
+                Err(format!("FP8 arms need exact gfx1201, device is {arch}").into())
+            }
+            Some(sel) => Ok((sel.i8, sel.fp8.clone())),
+        }
+    }
+
+    /// Every (arm, db) FP8 combination to time and check, arm-major.
+    fn vars(&self, fp8: &[Mq6Fp8Arm]) -> Vec<Var> {
+        fp8.iter()
             .flat_map(|&a| self.dbs.iter().map(move |&d| (a, d)))
             .collect()
     }
@@ -478,7 +700,7 @@ fn parse_args() -> Res<Args> {
         ns: DEFAULT_NS.to_vec(),
         iters: 20,
         warmup: 3,
-        arms: vec![Mq6Fp8Arm::Split, Mq6Fp8Arm::Round],
+        arms: None,
         dbs: vec![false, true],
         json: None,
         check: true,
@@ -509,12 +731,29 @@ fn parse_args() -> Res<Args> {
             "--iters" => a.iters = val("--iters")?.parse()?,
             "--warmup" => a.warmup = val("--warmup")?.parse()?,
             "--arm" => {
-                a.arms = match val("--arm")?.as_str() {
-                    "split" => vec![Mq6Fp8Arm::Split],
-                    "round" => vec![Mq6Fp8Arm::Round],
-                    "both" => vec![Mq6Fp8Arm::Split, Mq6Fp8Arm::Round],
+                a.arms = Some(match val("--arm")?.as_str() {
+                    "i8" => ArmSel {
+                        i8: true,
+                        fp8: vec![],
+                    },
+                    "split" => ArmSel {
+                        i8: false,
+                        fp8: vec![Mq6Fp8Arm::Split],
+                    },
+                    "round" => ArmSel {
+                        i8: false,
+                        fp8: vec![Mq6Fp8Arm::Round],
+                    },
+                    "both" => ArmSel {
+                        i8: false,
+                        fp8: vec![Mq6Fp8Arm::Split, Mq6Fp8Arm::Round],
+                    },
+                    "all" => ArmSel {
+                        i8: true,
+                        fp8: vec![Mq6Fp8Arm::Split, Mq6Fp8Arm::Round],
+                    },
                     other => return Err(format!("unknown --arm {other}").into()),
-                }
+                })
             }
             "--db" => {
                 a.dbs = match val("--db")?.as_str() {
@@ -561,10 +800,16 @@ fn main() -> Res<()> {
         std::env::set_var("HIPFIRE_QWEN4_MQ6_X4_GFX1201", "1");
     }
     let mut gpu = Gpu::init()?;
-    if gpu.arch != "gfx1201" {
-        return Err(format!("mq6_fp8_gemm_bench needs exact gfx1201, device is {}", gpu.arch).into());
+    if !matches!(gpu.arch.as_str(), "gfx1201" | "gfx1151") {
+        return Err(format!(
+            "mq6_fp8_gemm_bench needs exact gfx1201 or gfx1151, device is {}",
+            gpu.arch
+        )
+        .into());
     }
     gpu.qwen4_scope = true;
+    let (run_i8, fp8_arms) = args.resolve_arms(&gpu.arch)?;
+    let fp8_on = !fp8_arms.is_empty();
 
     // Largest N needed per K (activations are generated once, prefixes reused).
     let mut kmax: HashMap<usize, usize> = HashMap::new();
@@ -577,18 +822,33 @@ fn main() -> Res<()> {
     }
     let mut xcache: HashMap<usize, Vec<f32>> = HashMap::new();
 
-    let vars = args.vars();
+    let vars = args.vars(&fp8_arms);
+    let arm_names: Vec<String> = run_i8
+        .then(|| "i8".to_owned())
+        .into_iter()
+        .chain(vars.iter().map(|v| format!("fp8_{}", var_name(*v))))
+        .collect();
     println!(
-        "mq6_fp8_gemm_bench arch={} rev={} iters={} warmup={} variants={:?}",
+        "mq6_fp8_gemm_bench arch={} rev={} iters={} warmup={} arms={:?}",
         gpu.arch,
         git_rev(),
         args.iters,
         args.warmup,
-        vars.iter().map(|v| var_name(*v)).collect::<Vec<_>>()
+        arm_names
     );
     println!(
-        "{:>6}x{:<5} {:>5} | {:>9} {:>9} {:>7} | {:>9} {:>9} {:>7} | {:>7}",
-        "M", "K", "N", "inc_prep", "inc_gemm", "TF/s", "fp8_prep", "fp8_gemm", "TF/s", "speedup"
+        "{:>6}x{:<5} {:>5} | {:<16} | {:>9} {:>8} | {:>9} {:>7} {:>8} | {:>9} {:>7}",
+        "M",
+        "K",
+        "N",
+        "arm",
+        "prep_ms",
+        "prepGB/s",
+        "gemm_ms",
+        "TF/s",
+        "GB/s",
+        "total_ms",
+        "vs_inc"
     );
 
     let mut runs: Vec<Value> = Vec::new();
@@ -605,7 +865,7 @@ fn main() -> Res<()> {
         for &n in &args.ns {
             let xt = gpu.upload_f32(&xfull[..n * k], &[n * k])?;
             let y_inc = gpu.zeros(&[n * m], DType::F32)?;
-            let y_fp8 = gpu.zeros(&[n * m], DType::F32)?;
+            let y_new = gpu.zeros(&[n * m], DType::F32)?;
 
             let inc_prep = time_ms(&mut gpu, args.warmup, args.iters, |g| {
                 g.rotate_x_mq_batched_f16(&xt, k, n)?;
@@ -624,121 +884,195 @@ fn main() -> Res<()> {
             } else {
                 None
             };
+            let inc_prep_ms = median(&inc_prep);
+            let inc_total = inc_gemm.as_ref().map(|s| inc_prep_ms + median(s));
 
-            let fp8_prep = time_ms(&mut gpu, args.warmup, args.iters, |g| {
-                g.mq6_fp8_prepare_x(&xt, k, n)?;
-                Ok(())
-            })?;
-            let prepared = gpu.mq6_fp8_prepare_x(&xt, k, n)?;
-            let mut fp8_gemm: Vec<(Var, Vec<f64>)> = Vec::new();
-            for &v in &vars {
-                set_var(&mut gpu, v);
-                let s = time_ms(&mut gpu, args.warmup, args.iters, |g| {
-                    g.gemm_mq6g256v2_fp8_prepared(&w, &prepared, &y_fp8, m, k, n)?;
+            // (name, prep samples, prep bytes, gemm samples, act bytes, kernel)
+            let mut rows_out: Vec<ArmRow> = Vec::new();
+            if run_i8 {
+                let prep = time_ms(&mut gpu, args.warmup, args.iters, |g| {
+                    g.mq6_i8_prepare_x(&xt, k, n)?;
                     Ok(())
                 })?;
-                fp8_gemm.push((v, s));
+                let xq = gpu.mq6_i8_prepare_x(&xt, k, n)?;
+                let s = time_ms(&mut gpu, args.warmup, args.iters, |g| {
+                    g.gemm_mq6g256v2_i8_prequant(&w, xq, &y_new, m, k, n)?;
+                    Ok(())
+                })?;
+                rows_out.push(ArmRow {
+                    name: "i8".into(),
+                    prep,
+                    prep_bytes: i8_prep_bytes(n, k),
+                    gemm: s,
+                    act_bytes: i8_act_bytes(n, k),
+                    kernel: gpu.last_launched_kernel().map(str::to_owned),
+                });
+            }
+            if fp8_on {
+                let prep = time_ms(&mut gpu, args.warmup, args.iters, |g| {
+                    g.mq6_fp8_prepare_x(&xt, k, n)?;
+                    Ok(())
+                })?;
+                let prepared = gpu.mq6_fp8_prepare_x(&xt, k, n)?;
+                for &v in &vars {
+                    set_var(&mut gpu, v);
+                    let s = time_ms(&mut gpu, args.warmup, args.iters, |g| {
+                        g.gemm_mq6g256v2_fp8_prepared(&w, &prepared, &y_new, m, k, n)?;
+                        Ok(())
+                    })?;
+                    rows_out.push(ArmRow {
+                        name: format!("fp8_{}", var_name(v)),
+                        prep: prep.clone(),
+                        prep_bytes: fp8_prep_bytes(n, k),
+                        gemm: s,
+                        act_bytes: fp8_act_bytes(n, k),
+                        kernel: gpu.last_launched_kernel().map(str::to_owned),
+                    });
+                }
             }
 
-            let inc_prep_ms = median(&inc_prep);
-            let fp8_prep_ms = median(&fp8_prep);
-            let inc_ms = inc_gemm.as_ref().map(|s| median(s));
-            let first = fp8_gemm.first().map(|(_, s)| median(s));
             let fmt_ms = |v: Option<f64>| v.map_or("n/a".to_owned(), |v| format!("{v:.3}"));
-            let speedup = match (inc_ms, first) {
-                (Some(i), Some(f)) => format!("{:.2}x", (inc_prep_ms + i) / (fp8_prep_ms + f)),
-                _ => "n/a".into(),
-            };
+            let inc_gemm_ms = inc_gemm.as_ref().map(|s| median(s));
             println!(
-                "{:>6}x{:<5} {:>5} | {:>9.3} {:>9} {:>7} | {:>9.3} {:>9} {:>7} | {:>7}",
+                "{:>6}x{:<5} {:>5} | {:<16} | {:>9.3} {:>8.1} | {:>9} {:>7} {:>8} | {:>9} {:>7}",
                 m,
                 k,
                 n,
+                "inc",
                 inc_prep_ms,
-                fmt_ms(inc_ms),
-                inc_ms.map_or("n/a".to_owned(), |v| format!("{:.1}", tflops(m, k, n, v))),
-                fp8_prep_ms,
-                fmt_ms(first),
-                first.map_or("n/a".to_owned(), |v| format!("{:.1}", tflops(m, k, n, v))),
-                speedup
+                gbps(inc_prep_bytes(n, k), inc_prep_ms),
+                fmt_ms(inc_gemm_ms),
+                inc_gemm_ms.map_or("n/a".to_owned(), |v| format!("{:.1}", tflops(m, k, n, v))),
+                inc_gemm_ms.map_or("n/a".to_owned(), |v| format!(
+                    "{:.0}",
+                    gbps(gemm_bytes(m, k, inc_act_bytes(n, k), n), v)
+                )),
+                fmt_ms(inc_total),
+                "1.00x"
             );
-            for (v, s) in &fp8_gemm {
-                let ms = median(s);
+            for r in &rows_out {
+                let (pm, gm) = (median(&r.prep), median(&r.gemm));
                 println!(
-                    "{:>6}  {:<5} {:>5} |   fp8_gemm_{:<8} {:.3} ms  {:.1} TF/s",
-                    "", "", "", var_name(*v), ms, tflops(m, k, n, ms)
+                    "{:>6} {:<5} {:>5} | {:<16} | {:>9.3} {:>8.1} | {:>9.3} {:>7.1} {:>8.0} | {:>9.3} {:>7}",
+                    "",
+                    "",
+                    "",
+                    r.name,
+                    pm,
+                    gbps(r.prep_bytes, pm),
+                    gm,
+                    tflops(m, k, n, gm),
+                    gbps(gemm_bytes(m, k, r.act_bytes, n), gm),
+                    pm + gm,
+                    inc_total.map_or("n/a".to_owned(), |t| format!("{:.2}x", t / (pm + gm)))
                 );
             }
 
             let mut arms_json = serde_json::Map::new();
             arms_json.insert(
                 "inc_prep".into(),
-                json!({"median_ms": inc_prep_ms, "samples_ms": inc_prep}),
+                json!({
+                    "median_ms": inc_prep_ms, "samples_ms": inc_prep,
+                    "gbps": gbps(inc_prep_bytes(n, k), inc_prep_ms),
+                }),
             );
             arms_json.insert(
                 "inc_gemm".into(),
                 match &inc_gemm {
                     Some(s) => json!({
                         "median_ms": median(s), "tflops": tflops(m, k, n, median(s)),
+                        "gbps": gbps(gemm_bytes(m, k, inc_act_bytes(n, k), n), median(s)),
                         "samples_ms": s, "kernel": inc_kernel,
                     }),
                     None => json!("n/a"),
                 },
             );
-            arms_json.insert(
-                "fp8_prep".into(),
-                json!({"median_ms": fp8_prep_ms, "samples_ms": fp8_prep}),
-            );
-            for (v, s) in &fp8_gemm {
+            for r in &rows_out {
+                let (pm, gm) = (median(&r.prep), median(&r.gemm));
                 arms_json.insert(
-                    format!("fp8_gemm_{}", var_name(*v)),
+                    format!("{}_prep", r.name),
                     json!({
-                        "median_ms": median(s), "tflops": tflops(m, k, n, median(s)),
-                        "samples_ms": s,
+                        "median_ms": pm, "samples_ms": r.prep,
+                        "gbps": gbps(r.prep_bytes, pm),
+                    }),
+                );
+                arms_json.insert(
+                    format!("{}_gemm", r.name),
+                    json!({
+                        "median_ms": gm, "tflops": tflops(m, k, n, gm),
+                        "gbps": gbps(gemm_bytes(m, k, r.act_bytes, n), gm),
+                        "samples_ms": r.gemm, "kernel": r.kernel,
+                        "vs_inc": inc_total.map(|t| t / (pm + gm)),
                     }),
                 );
             }
             runs.push(json!({"m": m, "k": k, "n": n, "arms": Value::Object(arms_json)}));
 
             gpu.free_tensor(y_inc)?;
-            gpu.free_tensor(y_fp8)?;
+            gpu.free_tensor(y_new)?;
             gpu.free_tensor(xt)?;
         }
 
         if args.check {
             for &n in &CHECK_NS {
-                let c = check_case(&mut gpu, &w, &wbytes, xfull, m, k, n, args.seed, &vars)?;
-                let bf16_ok = c.bf16.map_or(true, |(ok, _)| ok);
-                println!(
-                    "check M={m} K={k} N={n} tokens={} split={} (bad={} nonfinite={} max_err/tol={:.3}) round_rel_l2={:.3e} inc_vs_split_rel_l2={} bf16={}",
-                    c.tokens,
-                    if c.split_pass { "PASS" } else { "FAIL" },
-                    c.split_bad,
-                    c.split_nonfinite,
-                    c.split_max_ratio,
-                    c.round_rel_l2,
-                    c.inc_vs_split_rel_l2
-                        .map_or("n/a".to_owned(), |v| format!("{v:.3e}")),
-                    c.bf16.map_or("n/a".to_owned(), |(ok, bad)| {
-                        if ok { "PASS".to_owned() } else { format!("FAIL({bad})") }
-                    }),
-                );
-                // A SPLIT pass is only meaningful when SPLIT ran.
-                let split_ran = vars.iter().any(|(a, _)| *a == Mq6Fp8Arm::Split);
-                if (split_ran && !c.split_pass) || !bf16_ok {
-                    failed = true;
+                if run_i8 {
+                    let c = check_i8_case(&mut gpu, &w, &wbytes, xfull, m, k, n, args.seed)?;
+                    let bf16_ok = c.bf16_bad == 0;
+                    println!(
+                        "check i8 M={m} K={k} N={n} tokens={} i8={} (bad={} nonfinite={} max_err/tol={:.3}) inc_vs_i8_rel_l2={} bf16={}",
+                        c.tokens,
+                        if c.pass { "PASS" } else { "FAIL" },
+                        c.bad,
+                        c.nonfinite,
+                        c.max_ratio,
+                        c.inc_rel_l2.map_or("n/a".to_owned(), |v| format!("{v:.3e}")),
+                        if bf16_ok { "PASS".to_owned() } else { format!("FAIL({})", c.bf16_bad) },
+                    );
+                    if !c.pass || !bf16_ok {
+                        failed = true;
+                    }
+                    checks.push(json!({
+                        "arm": "i8", "m": m, "k": k, "n": n, "tokens": c.tokens,
+                        "pass": c.pass, "bad": c.bad, "nonfinite": c.nonfinite,
+                        "max_err_over_tol": c.max_ratio,
+                        "inc_vs_i8_rel_l2": c.inc_rel_l2,
+                        "bf16_pass": bf16_ok, "bf16_mismatches": c.bf16_bad,
+                    }));
                 }
-                checks.push(json!({
-                    "m": m, "k": k, "n": n, "tokens": c.tokens,
-                    "split_ran": split_ran,
-                    "split_pass": c.split_pass, "split_bad": c.split_bad,
-                    "split_nonfinite": c.split_nonfinite,
-                    "split_max_err_over_tol": c.split_max_ratio,
-                    "round_rel_l2": c.round_rel_l2,
-                    "inc_vs_split_rel_l2": c.inc_vs_split_rel_l2,
-                    "bf16_pass": c.bf16.map(|(ok, _)| ok),
-                    "bf16_mismatches": c.bf16.map(|(_, b)| b),
-                }));
+                if fp8_on {
+                    let c = check_case(&mut gpu, &w, &wbytes, xfull, m, k, n, args.seed, &vars)?;
+                    let bf16_ok = c.bf16.map_or(true, |(ok, _)| ok);
+                    println!(
+                        "check M={m} K={k} N={n} tokens={} split={} (bad={} nonfinite={} max_err/tol={:.3}) round_rel_l2={:.3e} inc_vs_split_rel_l2={} bf16={}",
+                        c.tokens,
+                        if c.split_pass { "PASS" } else { "FAIL" },
+                        c.split_bad,
+                        c.split_nonfinite,
+                        c.split_max_ratio,
+                        c.round_rel_l2,
+                        c.inc_vs_split_rel_l2
+                            .map_or("n/a".to_owned(), |v| format!("{v:.3e}")),
+                        c.bf16.map_or("n/a".to_owned(), |(ok, bad)| {
+                            if ok { "PASS".to_owned() } else { format!("FAIL({bad})") }
+                        }),
+                    );
+                    // A SPLIT pass is only meaningful when SPLIT ran.
+                    let split_ran = vars.iter().any(|(a, _)| *a == Mq6Fp8Arm::Split);
+                    if (split_ran && !c.split_pass) || !bf16_ok {
+                        failed = true;
+                    }
+                    checks.push(json!({
+                        "arm": "fp8", "m": m, "k": k, "n": n, "tokens": c.tokens,
+                        "split_ran": split_ran,
+                        "split_pass": c.split_pass, "split_bad": c.split_bad,
+                        "split_nonfinite": c.split_nonfinite,
+                        "split_max_err_over_tol": c.split_max_ratio,
+                        "round_rel_l2": c.round_rel_l2,
+                        "inc_vs_split_rel_l2": c.inc_vs_split_rel_l2,
+                        "bf16_pass": c.bf16.map(|(ok, _)| ok),
+                        "bf16_mismatches": c.bf16.map(|(_, b)| b),
+                    }));
+                }
             }
         }
         gpu.free_tensor(w)?;
@@ -751,7 +1085,7 @@ fn main() -> Res<()> {
             "iters": args.iters,
             "warmup": args.warmup,
             "seed": args.seed,
-            "arms": args.arms.iter().map(|a| arm_name(*a)).collect::<Vec<_>>(),
+            "arms": arm_names,
             "variants": vars.iter().map(|v| var_name(*v)).collect::<Vec<_>>(),
             "runs": runs,
             "checks": checks,

@@ -450,6 +450,7 @@ refused at load under PP; Single and EP session behavior is unchanged.
 | `HIPFIRE_GFX12_MQ6_FP8` | Exact-gfx1201 native-FP8 MQ6G256V2 prefill GEMM (`kernels/src/gemm_mq6g256v2_wmma_fp8.gfx1201.hip`, `Gpu::gemm_mq6g256v2_fp8_prepared`): the 6-bit codes are decoded in-register into E4M3 WMMA operands (no weight conversion pass, no resident FP8 weight copy); activations come from the MQ4v2 FP8 producer. Eager-only, `K % 256 == 0`. Opt-in research route: `1` runs every eligible MQ6G256V2 prefill projection on it (any scope); unset or any other value keeps the F16 incumbent. On Flash-Next gfx1201 pp16384 it lost (exact `split` -6.5%, lossy `round` +2.7% but over the KLD bar), so it is off by default. |
 | `HIPFIRE_GFX12_MQ6_FP8_ARM` | Weight-plane arm of the MQ6 FP8 GEMM: `split` (default, exact: `q-32 = 8*hi + lo` as two E4M3 planes, two WMMAs per tile, weight side bit-exact) or `round` (one lossy `E4M3_RNE(q-32)` plane, one WMMA per tile) |
 | `HIPFIRE_GFX12_MQ6_FP8_DB` | Developer: `1` selects the double-buffered continuous-pipeline variant of the MQ6 FP8 GEMM (`_db_` symbols; A/W/S/SZ double-buffered in LDS, raw prefetch of the next K64 slab, one barrier per slab, 1 block/CU); anything else (default) keeps the single-buffer kernel until measured |
+| `HIPFIRE_MQ6_I8` | Exact-INT8 MQ6G256V2 prefill GEMM (`kernels/src/gemm_mq6g256v2_mmq_i8.gfx12.hip` / `.gfx11.hip`, `Gpu::gemm_mq6g256v2_i8_prequant`): the 6-bit codes enter `v_wmma_i32_16x16x16_iu8` raw and unsigned and the activations are the existing A8 `block_i8_128` blocks (one FWHT + A8 quantization per K shared by every MQ6 member of a projection group), centered through the accumulator seed so the integer core is exact; output F32 or BF16 (RNE). Eager-only, `K % 256 == 0`, never inside few-row / verify forwards. **Default ON on exact gfx1201 inside the Qwen4 (Flash-Next) forward at `route_rows >= 512` (the F16 PM route's own threshold)**: on Flash-Next pp16384 (R9700) it measured +1.1% (4680 → 4734 tok/s, 3 fresh processes) with the KLD pair inside the bar (WT2 +0.0006, code24 −0.0025). `0` opts out (the F16 PM route runs, byte for byte); `1` runs every eligible MQ6G256V2 prefill projection on it for any scope and any arch (exact gfx1201 / gfx1151). gfx1151 is opt-in only: there the iu8 rate equals F16 and the route measured slower than the incumbent. |
 | `HIPFIRE_GFX12_GDN_PRE_FUSED` | gfx1201 batched-prefill GDN preamble fusion (sigmoid+conv+qknorm 3→1, byte-exact) — default ON on exact gfx1201 (`kernel.gfx12_gdn_pre_fused`); `=0` restores the 3-launch sequence |
 | `HIPFIRE_GFX1151_GDN_SCAN` | Exact-gfx1151 twin of the GDN chunk scan (`gdn_chunk_scan_gfx1151`: pipelined chunk loop, K staged transposed, one value half per 256-thread workgroup; byte-identical `out` and state) — default ON; `=0` restores `gdn_chunk_scan` |
 | `HIPFIRE_V2B_A4_EPI` | Developer A4-fusion arm of the exact-gfx1151 V2B gate/up SiLU launch (eager prefill only; admitted only where the certified V2B tile is: `gate_m == up_m`, `gate_m % 256 == 0`, `batch % 128 == 0`, `k % 256 == 0`; graph capture and Redline recording keep the unfused path). Unset, `1` and any other value (default ON on exact gfx1151): the fused kernel `gemm_mq4g256v2_gate_up_silu_a4_iu4_pm_v2b_gfx1151` also writes the w_down A4 sidecar (72-byte `block_i4_128` records) into a dedicated scratch slot, so `h` is not written and the hin producer is skipped; byte-identical. `0`: opt-out, the V2B SiLU + `fused_silu_hin_rotate_mq_i4_batched` path. `retile`: the stage-1 m512 twin replaces the V2B SiLU launch (same `h`, same downstream producer). Read on every call, so one process can switch arms. `HIPFIRE_V2B_PM=0` and `HIPFIRE_F1LITE=0` also disable it; other arches are unaffected |
@@ -846,7 +847,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1707
+**Count:** 1714
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1890,6 +1891,11 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_MQ6G256V2_XBATCH_MAX` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_MQ6V2_DOWN_TIGHT_GRID` | crates/rdna-compute/src/gemv.rs | developer |
 | `HIPFIRE_MQ6V2_GATE_UP_TIGHT_GRID` | crates/rdna-compute/src/gemv.rs | developer |
+| `HIPFIRE_MQ6_FP8_DB` | crates/rdna-compute/src/gemm_mq6_fp8.rs, crates/rdna-compute/src/kernels.rs | developer |
+| `HIPFIRE_MQ6_FP8_KERNEL` | crates/rdna-compute/src/gemm_mq6_fp8.rs, crates/rdna-compute/src/kernels.rs | developer |
+| `HIPFIRE_MQ6_FP8_OUT_BF16` | crates/rdna-compute/src/gemm_mq6_fp8.rs, crates/rdna-compute/src/kernels.rs | developer |
+| `HIPFIRE_MQ6_FP8_SPLIT` | crates/rdna-compute/src/gemm_mq6_fp8.rs, crates/rdna-compute/src/kernels.rs | developer |
+| `HIPFIRE_MQ6_I8` | crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_MQV2_BT_SCREEN_BITS3` | crates/rdna-compute/examples/test_mqv2_bt_gfx11.rs | harness |
 | `HIPFIRE_MQV2_GFX11_SCREEN` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_MQV2_GFX11_WMMA` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-runtime/src/llama.rs | developer |

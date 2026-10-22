@@ -212,6 +212,12 @@ pub struct FeatureFlags {
     /// (A/W/S/SZ double-buffered in LDS, one barrier per K64 slab); anything
     /// else (default) keeps the single-buffer kernel until measured.
     pub gfx12_mq6_fp8_db: bool,
+    /// Exact-INT8 MQ6G256V2 prefill GEMM on gfx1201 / gfx1151
+    /// (`HIPFIRE_MQ6_I8`, developer): `Some(true)` (`1`) on for any scope,
+    /// `Some(false)` (`0`) off, unset = the per-arch default
+    /// (`crate::gemm_mq6_i8::MQ6_I8_DEFAULT_ARCHS`, qwen4 scope)
+    /// (`Gpu::gemm_mq6g256v2_i8_applies`).
+    pub mq6_i8: Option<bool>,
     /// Calibration-only override keeping native-BF16 teachers in BF16
     /// (`HIPFIRE_CALIB_BF16=1`). Mirrors the `calib_force_bf16` snapshot
     /// read so fresh `Gpu` code can take the flag from `self.flags`
@@ -1020,6 +1026,7 @@ impl FeatureFlags {
                 _ => crate::gemm_mq6_fp8::Mq6Fp8Arm::Split,
             },
             gfx12_mq6_fp8_db: value("HIPFIRE_GFX12_MQ6_FP8_DB").as_deref() == Ok("1"),
+            mq6_i8: parse_bool("HIPFIRE_MQ6_I8"),
             calib_force_bf16: value("HIPFIRE_CALIB_BF16").as_deref() == Ok("1"),
 
             // MMQ screening
@@ -1668,6 +1675,7 @@ impl FeatureFlags {
             gfx12_mq6_fp8: None,
             gfx12_mq6_fp8_arm: crate::gemm_mq6_fp8::Mq6Fp8Arm::Split,
             gfx12_mq6_fp8_db: false,
+            mq6_i8: None,
             calib_force_bf16: false,
             mmq_screen: false,
             mmq_screen_threshold: if is_gfx906 { 0.50 } else { 0.10 },
@@ -2629,10 +2637,22 @@ mod tests {
         assert_eq!(flags(Some("0"), None).gfx12_mq6_fp8, Some(false));
         assert_eq!(flags(Some("auto"), None).gfx12_mq6_fp8, None);
         assert_eq!(flags(None, None).gfx12_mq6_fp8_arm, Mq6Fp8Arm::Split);
-        assert_eq!(flags(None, Some("split")).gfx12_mq6_fp8_arm, Mq6Fp8Arm::Split);
-        assert_eq!(flags(None, Some("round")).gfx12_mq6_fp8_arm, Mq6Fp8Arm::Round);
-        assert_eq!(flags(None, Some("ROUND")).gfx12_mq6_fp8_arm, Mq6Fp8Arm::Round);
-        assert_eq!(flags(None, Some("bogus")).gfx12_mq6_fp8_arm, Mq6Fp8Arm::Split);
+        assert_eq!(
+            flags(None, Some("split")).gfx12_mq6_fp8_arm,
+            Mq6Fp8Arm::Split
+        );
+        assert_eq!(
+            flags(None, Some("round")).gfx12_mq6_fp8_arm,
+            Mq6Fp8Arm::Round
+        );
+        assert_eq!(
+            flags(None, Some("ROUND")).gfx12_mq6_fp8_arm,
+            Mq6Fp8Arm::Round
+        );
+        assert_eq!(
+            flags(None, Some("bogus")).gfx12_mq6_fp8_arm,
+            Mq6Fp8Arm::Split
+        );
         // Arch-independent parse; the unit-test constructor stays auto + split.
         let t = FeatureFlags::for_test("gfx1201");
         assert_eq!(t.gfx12_mq6_fp8, None);
@@ -2650,6 +2670,23 @@ mod tests {
         assert!(!db(Some("0")));
         assert!(!db(Some("bogus")));
         assert!(!t.gfx12_mq6_fp8_db);
+    }
+
+    #[test]
+    fn mq6_i8_is_tri_state() {
+        let flag = |v: Option<&str>| {
+            FeatureFlags::from_lookup("gfx1201", |name| match (name, v) {
+                ("HIPFIRE_MQ6_I8", Some(v)) => Ok(v.to_owned()),
+                _ => Err(()),
+            })
+            .mq6_i8
+        };
+        assert_eq!(flag(None), None);
+        assert_eq!(flag(Some("1")), Some(true));
+        assert_eq!(flag(Some("0")), Some(false));
+        assert_eq!(flag(Some("auto")), None);
+        assert_eq!(FeatureFlags::for_test("gfx1201").mq6_i8, None);
+        assert_eq!(FeatureFlags::for_test("gfx1151").mq6_i8, None);
     }
 
     #[test]
