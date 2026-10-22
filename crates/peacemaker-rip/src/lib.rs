@@ -50,11 +50,21 @@
 //! `let mut wg = Workgroup::new(&mut b, arch)?;` opens the sealed driver
 //! over the builder `b` for the rest of its block, up to the first
 //! statement that mentions `b` again (typically `b.finish()`).
+//!
+//! # Offline features
+//!
+//! [`features::collect`] and `peacemaker-rip features FILE [--json]` report
+//! shared [`check`] resources, linked-object schedule costs, and instruction-by-
+//! instruction emulator coverage without a GPU. Source and assembly SHA256
+//! receipts identify the inputs. Optional `--routes FILE` supplies the original
+//! cost-lint routes JSON; unavailable route-dependent facts remain null, and
+//! compile, link, lift, or routes errors are structured per-target failures.
 
 pub mod builtin;
 pub mod diag;
 pub mod driver;
 pub mod expand;
+pub mod features;
 pub mod fmt;
 pub mod interp;
 pub mod native;
@@ -230,6 +240,15 @@ pub struct Checked {
 fn descriptor_int(text: &str, key: &str) -> Option<u32> {
     text.lines()
         .find_map(|l| l.trim().strip_prefix(key)?.trim().parse().ok())
+}
+
+/// Wave size declared by the emitted kernel, never inferred from its architecture.
+pub(crate) fn wave_size_of(e: &Emitted) -> Option<u32> {
+    match descriptor_int(&e.s_text, ".amdhsa_wavefront_size32 ")? {
+        0 => Some(64),
+        1 => Some(32),
+        _ => None,
+    }
 }
 
 fn resources_of(e: &Emitted) -> Option<Resources> {
