@@ -496,8 +496,8 @@ mod tests {
         assert!(plan(0, usize::MAX, 128).is_err());
     }
 
-    fn try_gpu() -> Option<Gpu> {
-        let gpu = Gpu::init().ok()?;
+    fn try_gpu() -> Option<crate::gpu_test::TestGpu> {
+        let gpu = crate::gpu_test::init().ok()?;
         if gpu.arch_caps.is_gfx1151() {
             Some(gpu)
         } else {

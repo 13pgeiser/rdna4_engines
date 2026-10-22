@@ -4369,7 +4369,7 @@ mod owner_map_tests {
     #[test]
     #[ignore = "requires a gfx1201 GPU and working HIP toolchain"]
     fn kernel_matches_the_host_reference() {
-        let mut gpu = match Gpu::init() {
+        let mut gpu = match crate::gpu_test::init() {
             Ok(gpu) if qwen4_ep_owner_assign_pm_arch(&gpu.arch) => gpu,
             _ => {
                 eprintln!("skip: the balanced-ownership kernel is gfx1201 only");
@@ -4482,7 +4482,7 @@ mod tests {
         const K: usize = 640;
         const GROUPED: usize = 330;
         const SLOTS: usize = 400;
-        let mut gpu = match Gpu::init() {
+        let mut gpu = match crate::gpu_test::init() {
             Ok(gpu) if gpu.arch_caps.has_gfx11_plus_simt() => gpu,
             _ => {
                 eprintln!("skip: needs a gfx11/gfx12 GPU");
@@ -4582,7 +4582,7 @@ mod tests {
     /// sequence bit for bit, with padding slots interleaved in the groups.
     #[test]
     fn unscatter_silu_matches_unfused_sequence() {
-        let mut gpu = match Gpu::init() {
+        let mut gpu = match crate::gpu_test::init() {
             Ok(gpu) => gpu,
             Err(_) => {
                 eprintln!("skip: no GPU");
@@ -4638,7 +4638,7 @@ mod tests {
     /// bitwise as its own `gemv_q8_0_staged_rows` launch does.
     #[test]
     fn q8_k2560_staged_rows_x2_is_bitwise_two_launches() {
-        let Ok(mut gpu) = Gpu::init() else {
+        let Ok(mut gpu) = crate::gpu_test::init() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -4703,7 +4703,7 @@ mod tests {
     /// accumulates into, with dead (-1) and duplicate routes and ragged tokens.
     #[test]
     fn combine_bf16in_zero_init_is_bytewise_the_zero_filled_accumulate() {
-        let Ok(mut gpu) = Gpu::init() else {
+        let Ok(mut gpu) = crate::gpu_test::init() else {
             eprintln!("skip: no GPU");
             return;
         };
@@ -4874,7 +4874,7 @@ mod tests {
     /// chunked run.
     #[test]
     fn unscatter_silu_clamp_k8_small_and_past_65535_slots() {
-        let mut gpu = match Gpu::init() {
+        let mut gpu = match crate::gpu_test::init() {
             Ok(gpu) => gpu,
             Err(_) => {
                 eprintln!("skip: no GPU");
@@ -4950,7 +4950,7 @@ mod tests {
     /// the old grid.y limit) for both k8 combine launchers.
     #[test]
     fn moe_down_combine_k8_small_and_past_65535_tokens() {
-        let mut gpu = match Gpu::init() {
+        let mut gpu = match crate::gpu_test::init() {
             Ok(gpu) => gpu,
             Err(_) => {
                 eprintln!("skip: no GPU");
@@ -4972,7 +4972,7 @@ mod tests {
     #[ignore = "requires a gfx1151/gfx1201 GPU and working HIP toolchain"]
     fn router_fast_is_bit_identical_to_incumbent() {
         const TOKENS: usize = 37;
-        let mut gpu = match Gpu::init() {
+        let mut gpu = match crate::gpu_test::init() {
             Ok(gpu) if matches!(gpu.arch.as_str(), "gfx1151" | "gfx1201") => gpu,
             _ => {
                 eprintln!("skip: needs a gfx1151/gfx1201 GPU");
@@ -5200,7 +5200,7 @@ mod ep_tile_tests {
     #[test]
     #[ignore = "requires a gfx1100/gfx1201 GPU and working HIP toolchain"]
     fn mask_and_pull_match_the_host_reference() {
-        let mut gpu = match Gpu::init() {
+        let mut gpu = match crate::gpu_test::init() {
             Ok(gpu) if ep_tile_pm_arch(&gpu.arch) => gpu,
             _ => {
                 eprintln!("skip: the tile kernels are gfx1100/gfx1201 only");

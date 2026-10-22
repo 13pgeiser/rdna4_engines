@@ -10286,23 +10286,11 @@ mod tests {
         );
     }
 
-    /// One device is shared by every GPU test in this module, and several assert on
-    /// allocator/VRAM bookkeeping. `upload_raw_copy_failure_hip_frees_owner` demands
-    /// byte-exact `hipMemGetInfo` free across its window, which a sibling test
-    /// allocating or freeing VRAM in that window breaks — observed as a failure on
-    /// roughly one `cargo test -p rdna-compute --lib` run in three with no source
-    /// change. Holding this lock for each GPU test's duration makes the suite
-    /// deterministic without weakening any assertion. Poisoning is ignored: a panic
-    /// in one test must not fail the rest.
-    static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Serialized GPU handle for a test. The guard must be *bound* for the test's
     /// duration — `let Some((mut gpu, _guard)) = try_gpu() else { … }` — because
     /// dropping it immediately would release the lock.
     fn try_gpu() -> Option<(super::Gpu, std::sync::MutexGuard<'static, ()>)> {
-        let guard = GPU_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = crate::gpu_test::lock();
         match super::Gpu::init() {
             Ok(gpu) => Some((gpu, guard)),
             Err(_) => None,
@@ -10871,9 +10859,7 @@ mod tests {
     #[ignore = "needs a HIP device with VMM granule support"]
     fn vmm_prefix_capture_fork_hw() {
         use hip_bridge::DeviceBuffer;
-        let _guard = GPU_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::gpu_test::lock();
         let mut gpu = Gpu::init().expect("vmm_prefix_capture_fork_hw requires a HIP device");
         hip_bridge::clear_vmm_faults();
         let access = [gpu.device_id];
@@ -11858,9 +11844,7 @@ mod tests {
         use std::os::fd::{AsFd, AsRawFd};
         use std::os::unix::process::CommandExt;
 
-        let _guard = GPU_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::gpu_test::lock();
         let mut gpu = super::Gpu::init().expect("GPU initialization must succeed");
         assert_eq!(gpu.arch, "gfx1201", "test is gated to gfx1201");
         if std::env::var("WH_S2_IMPORT_FD").is_ok() {

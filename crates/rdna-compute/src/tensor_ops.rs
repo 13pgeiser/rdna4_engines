@@ -11338,8 +11338,8 @@ mod tests {
         assert_eq!(moved.get(), 0);
     }
 
-    fn try_gpu() -> Option<Gpu> {
-        Gpu::init().ok()
+    fn try_gpu() -> Option<crate::gpu_test::TestGpu> {
+        crate::gpu_test::init().ok()
     }
 
     /// The batched gated RMSNorm (with its folded BF16 recurrent rounding)
@@ -13308,6 +13308,8 @@ mod tests {
             eprintln!("skip: no GPU");
             return;
         };
+        // Field-disjoint borrows (gpu.graphs / gpu.hip) need the plain `&mut Gpu`.
+        let gpu = &mut *gpu;
         for format in [GdnStateFormat::Q8, GdnStateFormat::F32] {
             for (key_heads, value_heads) in [(2usize, 6usize), (16, 16), (16, 48)] {
                 let dim = 128usize;
@@ -13346,7 +13348,7 @@ mod tests {
                     let slot0 = gpu.zeros(&[slot_units], format.dtype()).expect("slot");
                     if format == GdnStateFormat::Q8 {
                         gdn_state_from_f32(
-                            &mut gpu,
+                            gpu,
                             format,
                             state0_gpu.buf.as_ptr(),
                             slot0.buf.as_ptr(),
@@ -13365,7 +13367,7 @@ mod tests {
                         gpu.hip.memcpy_dtoh(&mut out, &t.buf).expect("download");
                         out
                     };
-                    let seed_bytes = bytes(&gpu, &slot0);
+                    let seed_bytes = bytes(&*gpu, &slot0);
                     assert!(seed_bytes.iter().any(|b| *b != 0), "seed state is zero");
                     let fresh_slot = |gpu: &mut Gpu| -> GpuTensor {
                         let slot = gpu.zeros(&[slot_units], format.dtype()).expect("slot");
@@ -13377,9 +13379,9 @@ mod tests {
                     // Every mismatch is collected, then asserted, so one run reports
                     // exactly which rows and prefixes leave the sequential oracle.
                     let mut failures: Vec<String> = Vec::new();
-                    let oracle_slot = fresh_slot(&mut gpu);
+                    let oracle_slot = fresh_slot(gpu);
                     let (seq_out, seq_states) = gdn_sequential(
-                        &mut gpu,
+                        gpu,
                         &proj_gpu,
                         &gate_gpu,
                         &beta_gpu,
@@ -13393,7 +13395,7 @@ mod tests {
                     for graph in [false, true] {
                         for base in [0usize, max_rows] {
                             for n in 1..=max_rows {
-                                let live = fresh_slot(&mut gpu);
+                                let live = fresh_slot(gpu);
                                 let out = gpu.zeros(&[n * value], DType::F32).expect("output");
                                 // Two capture halves plus an immutable pre-window source slot.
                                 let source = 2 * max_rows;
@@ -13494,7 +13496,7 @@ mod tests {
                                         .begin_graph_capture(&gpu.hip, gpu.device_id, &stream)
                                         .expect("begin capture");
                                     gpu.active_stream = Some(stream);
-                                    launch(&mut gpu);
+                                    launch(gpu);
                                     let stream = gpu.active_stream.take().expect("stream");
                                     gpu.graphs
                                         .end_graph_capture(&gpu.hip, gpu.device_id, &stream)
@@ -13506,7 +13508,7 @@ mod tests {
                                     gpu.hip.device_synchronize().expect("sync");
                                     gpu.graphs.drop_captured_graph(&gpu.hip, gpu.device_id);
                                 } else {
-                                    launch(&mut gpu);
+                                    launch(gpu);
                                 }
 
                                 let tag = format!("{format:?} kh={key_heads} vh={value_heads} p={start} base={base} graph={graph} n={n}");
@@ -13540,7 +13542,7 @@ mod tests {
                                     a.iter().zip(b).filter(|(p, q)| p != q).count()
                                 };
                                 let captured = bytes(
-                                    &gpu,
+                                    &*gpu,
                                     &ring.sub_offset((base + n - 1) * slot_units, slot_units),
                                 );
                                 let d = slot_diff(&captured, &seq_states[n - 1]);
@@ -13549,10 +13551,10 @@ mod tests {
                                         "{tag}: captured slot differs from AR in {d} bytes"
                                     ));
                                 }
-                                if bytes(&gpu, &live) != seed_bytes {
+                                if bytes(&*gpu, &live) != seed_bytes {
                                     failures.push(format!("{tag}: capture wrote the live state"));
                                 }
-                                if bytes(&gpu, &ring.sub_offset(source * slot_units, slot_units))
+                                if bytes(&*gpu, &ring.sub_offset(source * slot_units, slot_units))
                                     != seed_bytes
                                 {
                                     failures.push(format!("{tag}: rollback wrote its source slot"));
@@ -13560,7 +13562,7 @@ mod tests {
                                 let rollback_out = gpu.download_f32(&discard).expect("download");
                                 for keep in 1..=n {
                                     let kept = bytes(
-                                        &gpu,
+                                        &*gpu,
                                         &ring.sub_offset(
                                             (repair_base + keep - 1) * slot_units,
                                             slot_units,
@@ -15484,6 +15486,8 @@ mod tests {
             eprintln!("skip: no GPU");
             return;
         };
+        // Field-disjoint borrows (gpu.replay / gpu.device_id) need the plain `&mut Gpu`.
+        let gpu = &mut *gpu;
         if gpu.arch != "gfx1201" {
             eprintln!("skip: needs gfx1201, found {}", gpu.arch);
             return;
@@ -15544,9 +15548,9 @@ mod tests {
             unsafe { gpu.alloc_vmm_tensor(&[reserved_rows * DIM], DType::F32, gran, &[device]) }
                 .unwrap_or_else(|error| panic!("{label} VMM tensor: {error}"))
         };
-        let raw_keys = vmm_tensor(&mut gpu, "raw index keys");
-        let full_keys = vmm_tensor(&mut gpu, "full keys");
-        let full_values = vmm_tensor(&mut gpu, "full values");
+        let raw_keys = vmm_tensor(gpu, "raw index keys");
+        let full_keys = vmm_tensor(gpu, "full keys");
+        let full_values = vmm_tensor(gpu, "full values");
         assert_eq!(gpu.vmm_allocation_count(), baseline_vmm + 3);
         for tensor in [&raw_keys, &full_keys, &full_values] {
             assert_eq!(gpu.vmm_granularity(tensor), Some(gran));
@@ -15622,7 +15626,7 @@ mod tests {
         gpu.replay = ReplayController::new_manual_pm4();
         assert!(gpu.replay.uses_pm4_transport());
         gpu.replay.begin_capture().expect("open recording window");
-        run_qsa(&mut gpu, &t, p0);
+        run_qsa(gpu, &t, p0);
         gpu.hip.device_synchronize().expect("sync capture");
         gpu.replay.finish_capture().expect("close recording window");
         let launches = gpu.replay.recorded_launches().len();
@@ -15643,8 +15647,8 @@ mod tests {
         assert!(gpu.replay.uses_pm4_transport());
 
         // Control inside the mapped granule, before any growth.
-        let replayed_p0 = observe(&mut gpu, &t, p0, true);
-        let reference_p0 = observe(&mut gpu, &t, p0, false);
+        let replayed_p0 = observe(gpu, &t, p0, true);
+        let reference_p0 = observe(gpu, &t, p0, false);
         assert_same("pre-growth p0", &replayed_p0, &reference_p0);
         assert_eq!(replayed_p0.raw_row, index_row_bytes);
 
@@ -15698,8 +15702,8 @@ mod tests {
         for position in [p1, p2] {
             let blocks = (position + 1) / COMPRESS;
             let tail_start = (blocks * COMPRESS) as i32;
-            let tape = observe(&mut gpu, &t, position, true);
-            let reference = observe(&mut gpu, &t, position, false);
+            let tape = observe(gpu, &t, position, true);
+            let reference = observe(gpu, &t, position, false);
             let label = format!("grown position {position}");
             assert_same(&label, &tape, &reference);
 
