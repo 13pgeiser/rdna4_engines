@@ -17,8 +17,8 @@
 //! `K@40, P@44, L@48`. The incumbent's first 52 argument bytes are the same layout; only the grid
 //! differs (the incumbent folds the row and group into grid x).
 //!
-//! Selection ([`Gpu::qwen4_moe_rotate128_i4`]): the typed flag (explicit `1` only; the route has
-//! no qualification row) AND exact-gfx1201 raw inventory AND the requested symmetric IU4 route
+//! Selection ([`Gpu::qwen4_moe_rotate128_i4`]): the typed flag (unset follows the exact-gfx1201
+//! qualification, `0` kills) AND exact-gfx1201 raw inventory AND the requested symmetric IU4 route
 //! AND the frozen C2 producer candidate set AND a supported shape. Any miss keeps the incumbent,
 //! which stays reachable as [`Gpu::qwen4_moe_rotate128_i4_incumbent`] (the oracle's control).
 //! The explicit lab entry [`Gpu::qwen4_moe_rotate128_i4_pm`] never consults the flag and errors on
@@ -129,7 +129,8 @@ pub fn moe_rotate_i4_pm_shape_supported(k: usize, grouped_rows: usize, total_slo
     validate_moe_rotate_i4_pm(k, grouped_rows, total_slots).is_ok()
 }
 
-/// Pure selection of the rotate twin: the resolved typed flag (explicit `1`; unset is off), the
+/// Pure selection of the rotate twin: the resolved typed flag (unset follows the exact-gfx1201
+/// qualification, `0` kills), the
 /// exact-gfx1201 raw inventory, the requested symmetric IU4 route, the exact C2 producer
 /// candidate set and a supported shape. Any miss keeps the incumbent.
 pub fn moe_rotate_i4_pm_selection(

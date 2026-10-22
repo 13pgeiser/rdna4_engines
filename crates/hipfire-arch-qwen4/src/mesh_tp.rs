@@ -329,6 +329,11 @@ impl MeshStepBindings for Qwen4TpBindings<'_> {
         rank.bundle.reset(gpu).map_err(|error| error.to_string())
     }
 
+    /// Refused before the first callback, so the mesh stays healthy.
+    fn admits_prefix_repair(&self) -> bool {
+        false
+    }
+
     fn repair_prefix_rank(
         &mut self,
         _owner: usize,
