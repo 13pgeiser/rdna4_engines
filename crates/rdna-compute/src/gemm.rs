@@ -21650,8 +21650,10 @@ impl Gpu {
                     &format!("slab A4 activations need the gfx1201 _b1s GEMM (m={m} k={k} n={batch_size})"),
                 ));
             }
-            // The sigmoid-gated residual epilogue exists only in the hipcc V3
-            // module's ADD entry (`add_val` 2 plus the trailing gate pointer).
+            // The sigmoid-gated residual epilogue lives in the hipcc V3 module's ADD
+            // entry (`add_val` 2 plus the trailing gate pointer) and in the `_b1`
+            // bundle's `full_add_sigmoid` entry (same kernarg layout, byte-identical
+            // output; the old control bundle lacks it and keeps V3).
             let epi = shared_gate.is_some();
             if epi && !(add && v3 && !slab) {
                 return Err(hip_bridge::HipError::new(
@@ -21661,7 +21663,7 @@ impl Gpu {
                     ),
                 ));
             }
-            let isa = isa && !epi;
+            let isa = isa && !(epi && *G12_IU4_B1_CONTROL);
             let (module, source, kernel_name) = if slab {
                 (
                     "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
@@ -21676,7 +21678,9 @@ impl Gpu {
                 (
                     "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1",
                     "",
-                    if add {
+                    if epi {
+                        "gemm_mq4g256v2_residual_mmq_iu4_full_add_sigmoid_b1"
+                    } else if add {
                         "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1"
                     } else {
                         "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1"
@@ -21744,8 +21748,9 @@ impl Gpu {
             let mut n_val = batch_size as i32;
             let mut add_val = if epi { 2 } else { i32::from(add) };
             // The V3 ADD entry carries a trailing gate pointer at kernarg offset 40
-            // (NULL unless the gated epilogue is selected); no other module does.
-            let v3_add = !slab && !isa && v3 && add;
+            // (NULL unless the gated epilogue is selected), as does the `_b1`
+            // sigmoid entry; no other module does.
+            let v3_add = !slab && add && if isa { epi } else { v3 };
             let mut gate_ptr: *mut c_void = shared_gate.unwrap_or(std::ptr::null_mut());
             let mut params: Vec<*mut c_void> = vec![
                 &mut a_ptr as *mut _ as *mut c_void,

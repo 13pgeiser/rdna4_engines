@@ -95,6 +95,40 @@ fn assemble(text: &str) -> Result<(), String> {
     }
 }
 
+/// The sigmoid residual ADD shares the ADD K-loop instruction for instruction
+/// (only the epilogue differs) and exists for the token-layout production tile.
+#[test]
+fn sigmoid_add_shares_the_add_hot_loop() {
+    let emit = |epi, act| {
+        iu4_gemm::emit(Spec {
+            fold: Fold::K128,
+            tile: Tile::T128x128x8,
+            cacc: Cacc::One,
+            epi,
+            act,
+            arch: Arch::Gfx1201,
+        })
+    };
+    let add = emit(Epi::Add, ALayout::Token).unwrap();
+    let sig = emit(Epi::AddSigmoid, ALayout::Token).unwrap();
+    assert_eq!(
+        iu4_gemm::hot_loop_census(&sig.s_text),
+        iu4_gemm::hot_loop_census(&add.s_text)
+    );
+    assert!(emit(Epi::AddSigmoid, ALayout::Slab).is_err());
+    assert!(iu4_gemm::emit(Spec {
+        tile: Tile::T256x128x16,
+        ..Spec::control(Epi::AddSigmoid)
+    })
+    .is_err());
+    // The epilogue region: one exp + one IEEE division per column block.
+    let count = |m: &str| sig.s_text.matches(m).count();
+    assert_eq!(count("v_exp_f32"), 4);
+    assert_eq!(count("v_div_scale_f32"), 8);
+    assert_eq!(count("v_div_fmas_f32"), 4);
+    assert_eq!(count("v_div_fixup_f32"), 4);
+}
+
 #[test]
 fn hot_loop_meets_shape_contract_for_every_product_symbol() {
     for (tile, act, name) in POINTS {
