@@ -5668,6 +5668,49 @@ pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_V2_B128X128_SRC: &str = concat!
     "#define HIPFIRE_FP8_V2_TILE 1\n#define HIPFIRE_FP8_V2_BM 128\n#define HIPFIRE_FP8_V2_BN 128\n#define HIPFIRE_FP8_V2_BK 64\n#define HIPFIRE_FP8_V2_WAVES 8\n#define HIPFIRE_FP8_RESIDUAL 1\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_mq4g256v2_residual_wmma_fp8_v2_b128x128_gfx1201\n",
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
 );
+/// MQ6G256V2 native-FP8 WMMA prefill GEMM (exact gfx1201), SPLIT arm (exact hi/lo E4M3
+/// planes), F32 overwrite. See `gemm_mq6_fp8.rs`.
+pub const GEMM_MQ6G256V2_WMMA_FP8_SPLIT_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_MQ6_FP8_SPLIT 1\n#define HIPFIRE_MQ6_FP8_OUT_BF16 0\n#define HIPFIRE_MQ6_FP8_KERNEL gemm_mq6g256v2_wmma_fp8_split_gfx1201\n",
+    include_str!("../../../kernels/src/gemm_mq6g256v2_wmma_fp8.gfx1201.hip")
+);
+/// [`GEMM_MQ6G256V2_WMMA_FP8_SPLIT_GFX1201_SRC`] with BF16 (RNE) output bits.
+pub const GEMM_MQ6G256V2_WMMA_FP8_SPLIT_BF16_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_MQ6_FP8_SPLIT 1\n#define HIPFIRE_MQ6_FP8_OUT_BF16 1\n#define HIPFIRE_MQ6_FP8_KERNEL gemm_mq6g256v2_wmma_fp8_split_bf16_gfx1201\n",
+    include_str!("../../../kernels/src/gemm_mq6g256v2_wmma_fp8.gfx1201.hip")
+);
+/// MQ6G256V2 native-FP8 WMMA prefill GEMM, ROUND arm (single lossy E4M3_RNE(q-32) plane),
+/// F32 overwrite.
+pub const GEMM_MQ6G256V2_WMMA_FP8_ROUND_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_MQ6_FP8_SPLIT 0\n#define HIPFIRE_MQ6_FP8_OUT_BF16 0\n#define HIPFIRE_MQ6_FP8_KERNEL gemm_mq6g256v2_wmma_fp8_round_gfx1201\n",
+    include_str!("../../../kernels/src/gemm_mq6g256v2_wmma_fp8.gfx1201.hip")
+);
+/// [`GEMM_MQ6G256V2_WMMA_FP8_ROUND_GFX1201_SRC`] with BF16 (RNE) output bits.
+pub const GEMM_MQ6G256V2_WMMA_FP8_ROUND_BF16_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_MQ6_FP8_SPLIT 0\n#define HIPFIRE_MQ6_FP8_OUT_BF16 1\n#define HIPFIRE_MQ6_FP8_KERNEL gemm_mq6g256v2_wmma_fp8_round_bf16_gfx1201\n",
+    include_str!("../../../kernels/src/gemm_mq6g256v2_wmma_fp8.gfx1201.hip")
+);
+/// [`GEMM_MQ6G256V2_WMMA_FP8_SPLIT_GFX1201_SRC`] as the double-buffered continuous-pipeline
+/// variant (`HIPFIRE_MQ6_FP8_DB 1`).
+pub const GEMM_MQ6G256V2_WMMA_FP8_SPLIT_DB_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_MQ6_FP8_SPLIT 1\n#define HIPFIRE_MQ6_FP8_OUT_BF16 0\n#define HIPFIRE_MQ6_FP8_DB 1\n#define HIPFIRE_MQ6_FP8_KERNEL gemm_mq6g256v2_wmma_fp8_split_db_gfx1201\n",
+    include_str!("../../../kernels/src/gemm_mq6g256v2_wmma_fp8.gfx1201.hip")
+);
+/// [`GEMM_MQ6G256V2_WMMA_FP8_SPLIT_BF16_GFX1201_SRC`] as the double-buffered variant.
+pub const GEMM_MQ6G256V2_WMMA_FP8_SPLIT_BF16_DB_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_MQ6_FP8_SPLIT 1\n#define HIPFIRE_MQ6_FP8_OUT_BF16 1\n#define HIPFIRE_MQ6_FP8_DB 1\n#define HIPFIRE_MQ6_FP8_KERNEL gemm_mq6g256v2_wmma_fp8_split_bf16_db_gfx1201\n",
+    include_str!("../../../kernels/src/gemm_mq6g256v2_wmma_fp8.gfx1201.hip")
+);
+/// [`GEMM_MQ6G256V2_WMMA_FP8_ROUND_GFX1201_SRC`] as the double-buffered variant.
+pub const GEMM_MQ6G256V2_WMMA_FP8_ROUND_DB_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_MQ6_FP8_SPLIT 0\n#define HIPFIRE_MQ6_FP8_OUT_BF16 0\n#define HIPFIRE_MQ6_FP8_DB 1\n#define HIPFIRE_MQ6_FP8_KERNEL gemm_mq6g256v2_wmma_fp8_round_db_gfx1201\n",
+    include_str!("../../../kernels/src/gemm_mq6g256v2_wmma_fp8.gfx1201.hip")
+);
+/// [`GEMM_MQ6G256V2_WMMA_FP8_ROUND_BF16_GFX1201_SRC`] as the double-buffered variant.
+pub const GEMM_MQ6G256V2_WMMA_FP8_ROUND_BF16_DB_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_MQ6_FP8_SPLIT 0\n#define HIPFIRE_MQ6_FP8_OUT_BF16 1\n#define HIPFIRE_MQ6_FP8_DB 1\n#define HIPFIRE_MQ6_FP8_KERNEL gemm_mq6g256v2_wmma_fp8_round_bf16_db_gfx1201\n",
+    include_str!("../../../kernels/src/gemm_mq6g256v2_wmma_fp8.gfx1201.hip")
+);
 pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_V2_B64X256_SRC: &str = concat!(
     "#define HIPFIRE_FP8_V2_TILE 1\n#define HIPFIRE_FP8_V2_BM 64\n#define HIPFIRE_FP8_V2_BN 256\n#define HIPFIRE_FP8_V2_BK 64\n#define HIPFIRE_FP8_V2_WAVES 8\n#define HIPFIRE_FP8_RESIDUAL 1\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_mq4g256v2_residual_wmma_fp8_v2_b64x256_gfx1201\n",
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")

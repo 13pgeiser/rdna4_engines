@@ -339,6 +339,10 @@ pub struct ScratchState {
     /// Dedicated F32 temporary for the unfused GEMV-residual alias fallback.
     /// Lazily allocated and grown on demand; no other scratch path uses it.
     pub gemv_residual_tmp: Option<GpuTensor>,
+    /// Dedicated F32 `x_out` operand for `Gpu::mq6_fp8_prepare_x` (the MQ4v2 FP8
+    /// producer's rotated-row output, `[batch * k]`; the in-register producer
+    /// never writes it). Lazily allocated, grown on demand, never shrunk.
+    pub mq6_fp8_x_rot: Option<GpuTensor>,
     pub paro_x_scratch: Option<GpuTensor>,
     /// Rotation scratch buffers for PARO fused-kernel dispatch. 4 × [k] F32
     /// buffers, lazily allocated and grown on demand. Used by
@@ -1924,6 +1928,35 @@ impl ScratchState {
             });
         }
         Ok(self.gemv_residual_tmp.as_ref().unwrap())
+    }
+
+    /// Ensure the MQ6 FP8 producer `x_out` scratch holds at least `min_elems` F32
+    /// values (same grow-on-demand contract as [`Self::ensure_gemv_residual_tmp`]:
+    /// the `Gpu` caller invalidated captured graphs first when it will grow).
+    pub fn ensure_mq6_fp8_x_rot(
+        &mut self,
+        hip: &HipRuntime,
+        device_id: i32,
+        min_elems: usize,
+    ) -> HipResult<()> {
+        crate::graph::bind_thread(hip, device_id)?;
+        let needed_bytes = min_elems * 4;
+        let needs_grow = self
+            .mq6_fp8_x_rot
+            .as_ref()
+            .map_or(true, |t| t.buf.size() < needed_bytes);
+        if needs_grow {
+            if let Some(old) = self.mq6_fp8_x_rot.take() {
+                hip.device_synchronize()?;
+                let _ = hip.free(old.buf);
+            }
+            self.mq6_fp8_x_rot = Some(GpuTensor {
+                buf: hip.malloc(needed_bytes)?,
+                shape: vec![min_elems],
+                dtype: DType::F32,
+            });
+        }
+        Ok(())
     }
 
     /// Lazily initialize MagnumQuant FWHT sign tables (256 floats each, seeds 42 and 1042).

@@ -183,6 +183,18 @@ pub fn project_weights(
     )
 }
 
+/// Whether `weight`'s prefill GEMM of `rows` runs the gfx1201 native-FP8 MQ6
+/// route ([`Gpu::gemm_mq6g256v2_fp8_applies`]) on an F32 activation: an MQ6G256V2
+/// weight outside few-row and verify forwards (`route_rows <= few_row_limit`,
+/// the row-exact wide verify included), which keep their decode-twin launches.
+/// Producers of the projection's input ([`GatedDeltaNetOp`]'s gate output) read
+/// it to keep the activation F32 rather than BF16, which the FP8 pack cannot read.
+fn mq6_fp8_route(gpu: &Gpu, weight: &WeightRef<'_>, rows: usize) -> bool {
+    weight.dtype == DType::MQ6G256V2
+        && gpu.route_rows(rows) > gpu.few_row_limit()
+        && gpu.gemm_mq6g256v2_fp8_applies(weight.m, weight.k, rows)
+}
+
 /// [`project_weights`] with the MQ6 a/b/z row-region fold (three F32 outputs
 /// of shared-rotation MQ6 siblings, one launch) enabled for exactly the
 /// projections `region_members` flags (parallel to `projections`) instead of
@@ -217,6 +229,31 @@ fn project_weights_inner(
     // Shared-rotation weights first, grouped by K: other projections reuse
     // the same F16 scratch and would overwrite the rotated copy.
     let mut done = vec![false; projections.len()];
+    // gfx1201 qwen4 prefill: MQ6G256V2 members of one K share one FWHT + FP8
+    // activation pack (`mq6_fp8_prepare_x`) and each runs the native-FP8 GEMM
+    // (BF16 or F32 output, as the caller allocated it).  Before every other
+    // route: the packed planes live in shared FP8 scratch, so all MQ6 members
+    // launch before anything can repack it.  Verify and few-row forwards
+    // (`route <= few_row_limit`, incl. the row-exact wide verify) never take
+    // it; MQ4 members left in the group keep the shared F16 rotation below.
+    if input.dtype == DType::F32 {
+        for i in 0..projections.len() {
+            let (weight, _) = projections[i];
+            if done[i] || !mq6_fp8_route(gpu, weight, rows) {
+                continue;
+            }
+            let prepared = hip(gpu.mq6_fp8_prepare_x(input, weight.k, rows))?;
+            for j in i..projections.len() {
+                let (w, out) = projections[j];
+                if !done[j] && w.k == weight.k && mq6_fp8_route(gpu, w, rows) {
+                    hip(gpu.gemm_mq6g256v2_fp8_prepared(
+                        w.buf, &prepared, out, w.m, w.k, rows,
+                    ))?;
+                    done[j] = true;
+                }
+            }
+        }
+    }
     for i in 0..projections.len() {
         let (weight, _) = projections[i];
         if done[i] || !shared(weight, gpu) {
@@ -2515,6 +2552,14 @@ fn execute_gated_delta_net_hc_impl(
                 _ => false,
             }
     };
+    // The output projection reads `gdn_output`: stored as BF16 only when the
+    // projection rotates it straight to F16.  The native-FP8 MQ6 route packs an
+    // F32 activation, so where it takes the projection the gate output stays F32
+    // (the same BF16-rounded values, twice the bytes).
+    let bf16_input_store = |gpu: &Gpu| {
+        bf16_store(&op.output, TrunkFamily::GdnOut.bit(), gpu)
+            && !mq6_fp8_route(gpu, &op.output, op.rows)
+    };
     if arenas.is_some_and(|a| a.qkv.is_some())
         || bf16_store(&op.qkv, TrunkFamily::GdnQkv.bit(), gpu)
     {
@@ -2570,7 +2615,7 @@ fn execute_gated_delta_net_hc_impl(
     if phase == MixerPhase::OutProj {
         // The core ran in an earlier call; only the dtype decision it made for
         // its output is owed here.
-        if persistent_batch && bf16_store(&op.output, TrunkFamily::GdnOut.bit(), gpu) {
+        if persistent_batch && bf16_input_store(gpu) {
             gdn_output.dtype = DType::BF16;
         }
     } else if persistent_batch {
@@ -2664,7 +2709,7 @@ fn execute_gated_delta_net_hc_impl(
         }
         // The chunked route's output is BF16-rounded: stored as BF16 when the
         // output projection rotates it straight to F16 (half the bytes).
-        if bf16_store(&op.output, TrunkFamily::GdnOut.bit(), gpu) {
+        if bf16_input_store(gpu) {
             gdn_output.dtype = DType::BF16;
         }
         if window.is_some() {
