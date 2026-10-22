@@ -1110,6 +1110,40 @@ binary without `HIPFIRE_EMULATE_GPUS`: every visible device is one rank.
 Record per arm the `TP<n> oracle` lines (FNV-64 digests of `x` and `n`), the
 binary MD5, `HIP_VISIBLE_DEVICES` and the ROCm version.
 
+### Dense FFN tensor parallelism: `GatedMlp` split (developer)
+
+`SplitRule::GatedMlp` splits a dense gated MLP along its intermediate: gate
+and up `ColumnShard { axis: 0 }`, down `RowShard { axis: 1 }`. Every rank
+runs the op's kernel ladder unchanged on its `intermediate / parts` slice
+with the input whole (the pre-norm needs complete rows), and the output is a
+partial sum that its consumer reduces: an `Accumulate` fuses one
+`AllReduceAdd`, any other whole reader takes an `AllReduce`. All-`Replicate`
+weights, or a single TP part (a PP stage), keep the op whole and local.
+Admission refuses, without allocating, a mixed policy, gate/up/down that do
+not share one intermediate, `intermediate % (parts * group)` on the down
+weight, and a ladder with no shard-safe form (`SandwichWide`: its post-norm
+epilogue cannot take a partial sum).
+
+The first end-to-end use is the Qwen4 dense developer profile: each rank
+holds the whole model with only its BF16 FFN slice
+(`Qwen4Weights::shard_dense_ffn`, which records `(rank, parts)`),
+`qwen4_tp_plan` reduces each layer's FFN output before its `HyperWrite`
+(and refuses a packed FFN), and `Qwen4TpBindings` runs a rank's program in
+one segment per collective after checking the plan is that of exactly its
+shards. A rank's FFN hands its F32 partial to the reduction
+(`MlpStorage::Bf16SourcePartial`); the HC write rounds the sum once, as the
+unsharded FFN output is rounded once. Everything except the FFN is
+replicated. Sessions, checkpoints and prefix repair are not admitted on TP
+yet, and the loader has no Qwen4 TP route. Oracle (tokens and logits
+byte-identical to a single-device run of the same rank shards that sums the
+FFN partials in rank order, and reported against the plain single card):
+
+```sh
+cargo test --release -p hipfire-arch-qwen4 --features qwen4-dev-profiles --lib --no-run
+for n in 2 4; do HIPFIRE_EMULATE_GPUS=$n HIPFIRE_QWEN4_DEV_ARTIFACT=<tiny-dense-dev .hfq> \
+  <binary> mesh_tp::hw_tests --ignored --nocapture --test-threads=1; done
+```
+
 ### Architectural limits (current)
 
 - Homogeneous **exact arch string** by default (`ALLOW_MIXED_ARCH` is opt-in).

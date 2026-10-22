@@ -44,6 +44,12 @@ pub enum MlpStorage {
     /// BF16 storage after the gate projection, the up projection, the
     /// activation, the product and the down projection.
     Bf16Source,
+    /// [`Self::Bf16Source`] for a tensor-parallel rank whose output is a
+    /// partial sum: every boundary but the down projection. The rank hands
+    /// its F32 partial to the reduction, so the sum is rounded once (by its
+    /// consumer), as the unsharded down projection is; rounding each partial
+    /// would round twice. Set only by a TP rank's sharded FFN.
+    Bf16SourcePartial,
 }
 
 /// RMS pre-norm of `x` into `normed` (F32 `[rows, hidden]`).
@@ -82,6 +88,21 @@ pub enum MlpLadder {
     /// rows, fused post-norm residual on one row; greedy-EAGLE strict kernels
     /// inside. Gemma 4.
     SandwichWide,
+}
+
+impl MlpLadder {
+    /// Whether the ladder runs unchanged on an intermediate shard of its
+    /// weights (gate/up rows, down columns) and writes a partial sum. `Trunk`
+    /// admits only the `Write` output, which its consumer reduces; the split
+    /// rule does not record the output form, so this is safe only because
+    /// the op refuses every other output on that ladder. `SandwichWide` is
+    /// refused: its standalone use (Gemma 4 dense layers) is the `PostNorm`
+    /// epilogue, which norms the output before the residual add, so a partial
+    /// sum cannot pass it (its `Write` form is refused too, conservatively).
+    /// A new ladder is refused until it opts in here.
+    pub fn tp_shardable(self) -> bool {
+        matches!(self, Self::Trunk)
+    }
 }
 
 /// Fixed scratch of one op.
@@ -130,7 +151,10 @@ impl GatedMlpOp<'_> {
             MlpLadder::Trunk => {
                 self.pre_norm.is_none()
                     && self.activation == Activation::Silu
-                    && self.storage == MlpStorage::Bf16Source
+                    && matches!(
+                        self.storage,
+                        MlpStorage::Bf16Source | MlpStorage::Bf16SourcePartial
+                    )
                     && matches!(self.output, MlpOutput::Write(_))
             }
             MlpLadder::SandwichWide => {
@@ -239,7 +263,8 @@ pub fn execute_gated_mlp(
 /// 2. BF16 round trip of gate, then of up;
 /// 3. `act = silu(gate)`, BF16 round trip;
 /// 4. `act = act * up`, BF16 round trip;
-/// 5. down projection of `act` into `out`, BF16 round trip.
+/// 5. down projection of `act` into `out`, BF16 round trip (none for
+///    `Bf16SourcePartial`: the F32 partial is reduced first).
 ///
 /// The element-wise kernels read each element before writing it, so `act`
 /// may alias `gate`.
@@ -266,6 +291,9 @@ fn trunk(gpu: &mut Gpu, op: &GatedMlpOp<'_>, out: &GpuTensor) -> Result<(), Disp
     gpu.mul_f32(&act, &up, &act).map_err(hip)?;
     gpu.bf16_round_trip_f32(&act).map_err(hip)?;
     project_weight(gpu, &op.down, &act, &out, op.rows, rotation)?;
+    if op.storage == MlpStorage::Bf16SourcePartial {
+        return Ok(());
+    }
     gpu.bf16_round_trip_f32(&out).map_err(hip)
 }
 

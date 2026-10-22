@@ -13,6 +13,7 @@
 //! allocation) so unrelated libtest threads cannot perturb the count; the
 //! tally itself is a process-global `AtomicUsize`.
 
+use hipfire_dispatch::pipeline::gated_mlp::MlpLadder;
 use hipfire_dispatch::pipeline::step_graph::{
     OpDecl, OpKind, ResourceClass, ResourceDecl, ResourceId, SplitRule, StepGraph, StepGraphError,
 };
@@ -334,6 +335,96 @@ fn split_program_refuses_without_allocating() {
             1,
             "refused alias must not be recorded"
         );
+    }
+
+    // 6. GatedMlp admission refusals: geometry (`intermediate % (parts *
+    //    group)`, 384 % (2 * 256) != 0 while 384 % 2 == 0 plans), a down
+    //    weight that does not split the intermediate with gate/up, and a
+    //    ladder with no shard-safe form.
+    {
+        const HIDDEN: usize = 256;
+        const INTER: usize = 384;
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 2)]).unwrap();
+        let split = [
+            ShardPolicy::ColumnShard { axis: 0 },
+            ShardPolicy::ColumnShard { axis: 0 },
+            ShardPolicy::RowShard { axis: 1 },
+        ];
+        let mut mixed = split.clone();
+        mixed[2] = ShardPolicy::Replicate;
+        for (case, policies, ladder) in [
+            ("gated mlp geometry", &split, MlpLadder::Trunk),
+            ("gated mlp mixed policy", &mixed, MlpLadder::Trunk),
+            ("gated mlp ladder", &split, MlpLadder::SandwichWide),
+        ] {
+            let shapes = [[INTER, HIDDEN], [INTER, HIDDEN], [HIDDEN, INTER]];
+            let names = ["gate", "up", "down"];
+            let entries: Vec<WeightEntry> = (0..3)
+                .map(|i| {
+                    WeightEntry::layer(
+                        names[i],
+                        0,
+                        shapes[i].to_vec(),
+                        DType::F16,
+                        policies[i].clone(),
+                    )
+                })
+                .collect();
+            let plan = expect_plan(&entries, &mesh, 1);
+            let mut graph = StepGraph::new();
+            let mut add = |class, shape: &[usize]| {
+                graph
+                    .add_resource(ResourceDecl {
+                        class,
+                        shape: shape.to_vec(),
+                        alias: None,
+                    })
+                    .unwrap()
+            };
+            let input = add(ResourceClass::Activation, &[HIDDEN]);
+            let output = add(ResourceClass::Activation, &[HIDDEN]);
+            let [gate, up, down] = [0, 1, 2].map(|i| {
+                add(
+                    ResourceClass::Weight {
+                        name: names[i].to_string(),
+                        layer: Some(0),
+                        // Packed groups along the down weight's split axis.
+                        group: if i == 2 { 256 } else { 1 },
+                    },
+                    &shapes[i],
+                )
+            });
+            let op = graph
+                .add_op(OpDecl {
+                    kind: OpKind::GatedMlp,
+                    layer: Some(0),
+                    rule: SplitRule::GatedMlp {
+                        input,
+                        gate,
+                        up,
+                        down,
+                        output,
+                        ladder,
+                    },
+                    reads: vec![input, gate, up, down],
+                    writes: vec![output],
+                })
+                .unwrap();
+            let expected = match case {
+                "gated mlp geometry" => SplitError::Geometry {
+                    resource: down,
+                    extent: INTER,
+                    parts: 2,
+                    align: 256,
+                },
+                "gated mlp mixed policy" => SplitError::UnsupportedPolicy { op, resource: down },
+                _ => SplitError::UnshardableOp {
+                    op,
+                    kind: OpKind::GatedMlp,
+                },
+            };
+            assert_eq!(refusal(case, &graph, &plan, &mesh), expected, "{case}");
+        }
     }
 
     // Keep the success type referenced so a future signature drift fails here.

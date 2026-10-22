@@ -66,6 +66,11 @@ pub const GEMV_PARO4G128_SRC: &str = include_str!("../../../kernels/src/gemv_par
 /// HFQ4-G128 batched GEMM: same tiled approach as G256 but 72 bytes/group, 4 weights/thread.
 pub const GEMM_HFQ4G128_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g128.hip");
 
+/// HFQ4-G64 GEMV / batched GEMM (ParoQ4G64): 40 bytes per 64 weights,
+/// [f32 scale][f32 zero][32B nibbles].
+pub const GEMV_HFQ4G64_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g64.hip");
+pub const GEMM_HFQ4G64_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g64.hip");
+
 /// HFQ4-G128 i8 WMMA MMQ (non-grouped) for gfx1151. Mirror of the routed
 /// grouped k8 kernel minus expert scatter — same i8 WMMA pattern, same
 /// 16×16 tile, same 8-WMMA-per-group K-pipeline. Activation must be
@@ -3759,6 +3764,14 @@ pub const FUSED_SILU_MUL_GIVENS_ROTATE_SRC: &str =
 /// fewer inter-node dependency for the hipGraph dependency analyzer).
 pub const GIVENS_ROTATE_TO_SRC: &str = include_str!("../../../kernels/src/givens_rotate_to.hip");
 
+/// `givens_rotate_to_f32` over 64-channel rotation blocks (ParoQ4G64).
+pub const GIVENS_ROTATE_TO_G64_SRC: &str = concat!(
+    "#define GROUP_SIZE 64\n",
+    "#define HALF_GROUP 32\n",
+    "#define GIVENS_ROTATE_TO_KERNEL givens_rotate_to_g64_f32\n",
+    include_str!("../../../kernels/src/givens_rotate_to.hip")
+);
+
 /// Index-aware MoE gate_up GEMV for HFQ6G256-layout routed experts. Used
 /// by mixed-kmap MoE models where some layers are promoted from MQ4 → MQ6
 /// (post-PR-199 alternating-kmap default). Without this kernel, those
@@ -4180,6 +4193,10 @@ pub const GEMM_Q8_0_WMMA_GFX12_SRC: &str =
 /// Selected by `gemm_q8_0_wmma` dispatch when the runtime arch is
 /// not gfx12.
 pub const GEMM_Q8_0_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_q8_0_wmma.hip");
+/// Exact-gfx1151 1..=16-row sibling of `gemm_q8_0_wmma` (same ABI, byte-identical
+/// outputs): 4 waves x 16 rows per block, X slab staged in LDS, b128 weight loads.
+pub const GEMM_Q8_0_WMMA_GFX1151_XLDS_SRC: &str =
+    include_str!("../../../kernels/src/gemm_q8_0_wmma_gfx1151_xlds.hip");
 
 /// Path 2 unscatter combine for gate_up: fans Y_grouped[m_total × 2*mi]
 /// back into per-token gate_batch[N × K_TOP × mi] + up_batch[N × K_TOP
