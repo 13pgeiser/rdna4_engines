@@ -1123,6 +1123,38 @@ behind the packet processor's barrier bit, which saves most of the launch gap be
 kernels. The bytes are the same. Plain decode measured slower with them, so they stay off there
 and on every other model; the startup report's `chained launches` row says which and why.
 
+**A shorter block under load: `--draft-short-from N`.** A block drafter's block is paid for by
+every drafting sequence, whatever each one verifies. At one sequence a long block pays; at many, its
+drafter rows and its weaker first positions cost more than the extra drafts bring. A drafter that also
+serves a shorter block declares it (PLUGIN.md §11); DFlash2 declares a block of 4 (3 drafts) wherever its
+own is longer, on `qwen35_fp8` and `gemma3`. With `--draft-short-from N` the engine runs that short block
+once N sequences decoded in the step just run, and the drafter's own block again only once the count
+falls two below N, so a load wavering at N does not change the pass shape every step. `0`, the default,
+never switches. Startup names what it will run:
+
+```
+speculation: from 16 decoding sequences on, 'dflash2' runs its short block of 4 row(s), 3 token(s)
+```
+
+or warns that the drafter declares no shorter block, or is a serial head. Qwen3.8-27B MXFP4 + DFlash2
+on two R9700s, `--num-speculative-tokens 7` at the fixed window, greedy, tok/s:
+
+| streams | unset | `--draft-short-from 8` |
+|---|---|---|
+| 1 | 188.3 | 184.2 |
+| 4 | 573.2 | 572.3 |
+| 8 | 823.6 | 784.3 |
+| 16 | 922.2 | 1089.1 |
+| 32 | 1191.5 | 1252.7 |
+| 64 | 1255.8 | 1541.0 |
+
+The block driver runs the short block on the card as it runs the drafter's own: the query pass is
+the shorter batch, each row's proposals are the front of the drafter's proposal row, and the step
+issued ahead verifies that many. Leave it unset for one to eight streams; for a server that
+regularly decodes 16 or more sequences, set it around 16 and measure 8..32 for your load. The
+drafts are verified as any others; as with `--num-speculative-tokens`, a different block is a
+different verify shape, so greedy text can differ at a near-tie.
+
 ### 4.7 Multiple cards
 
 ```sh
@@ -1708,6 +1740,7 @@ by 0.002-0.003 nats.
 |---|---|---|
 | `--num-speculative-tokens N` | auto | speculative window; 0 disables. The ceiling under `--draft-window adaptive` |
 | `--draft-window MODE` | fixed | `fixed` drafts N every step; `adaptive` follows each sequence's acceptance and the measured step cost, serial draft heads only (§4.6) |
+| `--draft-short-from N` | 0 | a block drafter that declares a shorter block runs it from N decoding sequences on, its own block again two below; 0 never (§4.6) |
 | `--draft-model PATH` | | not implemented: merge the drafter at convert time |
 
 **Server**

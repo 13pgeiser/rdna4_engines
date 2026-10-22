@@ -361,6 +361,16 @@ says so with `RAD_ARCH_SERVES_IMPORTS(0)` (`qwen35_w8a8` does), and imports keep
   (`rad_op_resolved`) and is an error only if issued. The in-tree blocks do this for
   `qk_norm_rope_gate`.
 - **Read §8** if the model has a linear or recurrent block.
+- **A block drafter may serve a shorter block.** `rad_drafter_short_block(b, block)`, called once
+  after `rad_declare_drafter`, says the plugin declared its query pass at `block` rows a sequence as
+  well as at `RadDrafterDecl::block`, with the same anchor convention, so the core may stage a step
+  at either; the short block proposes `block - (RadDrafterDecl::block - depth)` tokens. The builder
+  refuses it without a block drafter, at or above the drafter's own block, and where it would
+  propose nothing. The engine runs it under `--draft-short-from` (GUIDE §4.6) and reads row `s` of
+  the proposals at `s * proposal_pitch`; a block drafter's `proposal_pitch` now defaults to its
+  depth (a row holds the whole block's proposals and a short block fills its front) and is refused
+  below it. The pass's block is `n_tok / n_seq`; a block the plugin has no ops for should fail the
+  step (`rad_block_dflash2.h` does). Additive export; `RAD_ABI_VERSION` does not move.
 - **Media preprocessing is the core's** (`core/mm`): resizing, patching, placeholder-token
   expansion and positions, in five processor families (Qwen-VL, Gemma 4, LFM2-VL, Unlimited-OCR,
   GLM-5.3) chosen by the container's `vision_config.model_type` (Unlimited-OCR's by its
