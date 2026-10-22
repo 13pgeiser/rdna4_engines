@@ -11,7 +11,7 @@ use crate::value::*;
 use peacemaker_author::runtime::{
     Arrived, Cond, Exit, Phase, Place, RegionId, RingId, Transition, WgCond,
 };
-use peacemaker_isa::insn::{Instruction, MemoryClass, Wmma};
+use peacemaker_isa::insn::{Instruction, MemoryClass, Swmmac, SwmmacMods, Wmma};
 use peacemaker_isa::kernels::common;
 use peacemaker_isa::ledger::Counter;
 use peacemaker_isa::plan::{Access, MemoryScope};
@@ -61,6 +61,8 @@ pub enum Nat {
     Exit(Exit),
     Arrived(Arrived),
     Phase(Phase),
+    /// A `Swmmac::…` SWMMAC kind.
+    Swmmac(Swmmac),
 }
 
 impl Nat {
@@ -91,6 +93,7 @@ impl Nat {
             Nat::Exit(_) => "Exit",
             Nat::Arrived(_) => "Arrived",
             Nat::Phase(_) => "Phase",
+            Nat::Swmmac(_) => "Swmmac",
         }
     }
     pub fn equals(&self, o: &Nat) -> bool {
@@ -103,6 +106,7 @@ impl Nat {
             (Nat::Region(a), Nat::Region(b)) => a == b,
             (Nat::Ring(a), Nat::Ring(b)) => a == b,
             (Nat::Phase(a), Nat::Phase(b)) => a == b,
+            (Nat::Swmmac(a), Nat::Swmmac(b)) => a == b,
             (Nat::Wg, Nat::Wg) | (Nat::Isa, Nat::Isa) => true,
             _ => false,
         }
@@ -124,6 +128,7 @@ impl Nat {
             Nat::Live(l) => format!("{l:?}"),
             Nat::Region(r) => format!("{r:?}"),
             Nat::Ring(r) => format!("{r:?}"),
+            Nat::Swmmac(k) => format!("{k:?}"),
             other => other.type_name().to_string(),
         }
     }
@@ -177,6 +182,7 @@ pub(crate) const ASSOC_FNS: &[&str] = &[
     "mem::swap",
     "Wmma::iu4",
     "Wmma::fp8",
+    "Wmma::swmmac",
 ];
 /// Method names `wg_method` implements on `Workgroup` / `Wave`.
 pub(crate) const WORKGROUP_METHODS: &[&str] = &[
@@ -241,6 +247,7 @@ pub fn is_type(n: &str) -> bool {
             | "Chain"
             | "Wmma"
             | "VopdOp"
+            | "Swmmac"
             | "Ring"
             | "Workgroup"
             | "Option"
@@ -257,7 +264,7 @@ pub fn is_type(n: &str) -> bool {
 }
 
 pub fn is_struct(n: &str) -> bool {
-    matches!(n, "KernelSpec" | "GatherTemps" | "VopdOp")
+    matches!(n, "KernelSpec" | "GatherTemps" | "VopdOp" | "SwmmacMods")
 }
 
 pub fn global_const<'a>(n: &str) -> Option<Value<'a>> {
@@ -293,6 +300,10 @@ pub fn assoc_const<'a>(ty: &str, item: &str) -> Option<Value<'a>> {
         ("Phase", "Free") => nat(Nat::Phase(Phase::RtFree)),
         ("Phase", "Writing") => nat(Nat::Phase(Phase::RtWriting)),
         ("Phase", "Published") => nat(Nat::Phase(Phase::RtPublished)),
+        ("Swmmac", kind) => Swmmac::ALL
+            .iter()
+            .find(|k| format!("{k:?}") == kind)
+            .map(|k| Value::Nat(Nat::Swmmac(*k))),
         (t, "MAX") if IntTy::parse(t).is_some() => {
             IntTy::parse(t).map(|t| Value::Int(t.max(), Some(t)))
         }
@@ -465,6 +476,46 @@ fn vopd_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<VopdOp> {
         src1: u8_of(it, &get("src1")?, "VopdOp.src1")?,
     })
 }
+fn swmmac_kind_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<Swmmac> {
+    match nat_of(it, v) {
+        Some(Nat::Swmmac(k)) => Ok(k),
+        _ => Err("Wmma::swmmac: the kind is a Swmmac, e.g. Swmmac::F32F16".into()),
+    }
+}
+
+fn swmmac_mods_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<SwmmacMods> {
+    const SHAPE: &str =
+        "Wmma::swmmac requires SwmmacMods { index_key, neg_lo, neg_hi, clamp }";
+    let Value::Struct(ty, fields) = it.deref(v.clone()) else {
+        return Err(SHAPE.into());
+    };
+    if &*ty != "SwmmacMods" {
+        return Err(SHAPE.into());
+    }
+    let get = |name: &str| {
+        fields
+            .iter()
+            .find(|(n, _)| &**n == name)
+            .map(|(_, v)| v.clone())
+            .ok_or_else(|| format!("SwmmacMods is missing `{name}`"))
+    };
+    let clamp = match it.deref(get("clamp")?) {
+        Value::Bool(b) => b,
+        o => {
+            return Err(format!(
+                "SwmmacMods.clamp: expected a bool, found {}",
+                o.type_name()
+            ))
+        }
+    };
+    Ok(SwmmacMods {
+        index_key: u8_of(it, &get("index_key")?, "SwmmacMods.index_key")?,
+        neg_lo: u8_of(it, &get("neg_lo")?, "SwmmacMods.neg_lo")?,
+        neg_hi: u8_of(it, &get("neg_hi")?, "SwmmacMods.neg_hi")?,
+        clamp,
+    })
+}
+
 /// An `Instruction` consumed by the active driver, validated against the
 /// driver's arch before the driver sees it.
 fn checked_insn<'a>(it: &Interp<'a>, v: &Value<'a>, cx: &mut Cx<'_>) -> R<'a, Instruction> {
@@ -951,6 +1002,17 @@ pub fn call_fn<'a>(it: &Interp<'a>, name: &str, args: Vec<Value<'a>>, cx: &mut C
             } else {
                 Ok(done_with(Wmma::fp8(arch, dst, x, vgpr_of(it, &a[3])?, wmma_acc_of(it, &a[4])?), insn))
             }
+        }
+        "Wmma::swmmac" => {
+            need(7)?;
+            let arch = arch_of(it, &a[0])?;
+            let kind = swmmac_kind_of(it, &a[1])?;
+            let dst = reg_of(it, &a[2], "Wmma::swmmac D")?;
+            let x = reg_of(it, &a[3], "Wmma::swmmac A")?;
+            let y = reg_of(it, &a[4], "Wmma::swmmac B")?;
+            let index = vgpr_of::<1>(it, &a[5])?;
+            let mods = swmmac_mods_of(it, &a[6])?;
+            Ok(done_with(Wmma::swmmac(arch, kind, dst, x, y, index, mods), |i| nat(Nat::Insn(Rc::new(i)))))
         }
         "KernargLayout::new" => {
             need(1)?;

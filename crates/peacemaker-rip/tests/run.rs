@@ -492,3 +492,194 @@ fn human_output_names_buffers_and_verdict() {
     assert!(stdout.contains("out"), "{stdout}");
     assert!(stdout.contains("ok") || stdout.contains("pass"), "{stdout}");
 }
+
+// ---------------------------------------------------------------- 10-swmmac.md
+//
+// SWMMAC exists on gfx12 only, so the recipe is not part of the both-arch
+// `COOKBOOK` table: it runs on gfx1201 and is refused on gfx1151.
+
+const SWMMAC_RECIPE: &str = "10-swmmac.md";
+const SWMMAC_F16: (&str, &str) = ("sparse_f16", "10_swmmac_f16_sparse24.json");
+const SWMMAC_FP8: (&str, &str) = ("sparse_fp8", "10_swmmac_fp8_sparse24.json");
+
+fn run_swmmac_case(variant: &str, case_file: &str) {
+    let dir = scratch("swmmac");
+    let (rip, case, _declared) = stage(&dir, SWMMAC_RECIPE, case_file, None);
+    let (output, report) = run_one(&rip, &case, "gfx1201", variant, &[]);
+    assert!(
+        output.status.success(),
+        "{SWMMAC_RECIPE} gfx1201 {variant}: {}",
+        text(&output.stderr)
+    );
+    ok_report(&report, "gfx1201", variant);
+    let d = &report["buffers"]["d"];
+    assert_eq!(d["kind"], "output", "{report}");
+    assert_eq!(d["guard_ok"], true, "{report}");
+    assert!(d.get("first_mismatch").is_none(), "{report}");
+    for name in ["a", "idx", "bt"] {
+        assert_eq!(report["buffers"][name]["changed"], false, "{report}");
+    }
+}
+
+#[test]
+fn swmmac_sparse_f16_runs_exactly_on_gfx1201() {
+    run_swmmac_case(SWMMAC_F16.0, SWMMAC_F16.1);
+}
+
+#[test]
+fn swmmac_sparse_fp8_runs_exactly_on_gfx1201() {
+    run_swmmac_case(SWMMAC_FP8.0, SWMMAC_FP8.1);
+}
+
+#[test]
+fn swmmac_recipe_is_refused_on_gfx1151() {
+    let (source, _) = recipe(SWMMAC_RECIPE);
+    for variant in [SWMMAC_F16.0, SWMMAC_FP8.0] {
+        let error = peacemaker_rip::compile_named(
+            &source,
+            "10-swmmac.rip",
+            peacemaker_isa::Arch::Gfx1151,
+            variant,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("{variant}: gfx1151 must refuse SWMMAC"));
+        assert!(error.contains("SWMMAC requires gfx12"), "{variant}: {error}");
+    }
+}
+
+/// An f16 value's bits, exactly (normal numbers only); `None` if `v` is not f16.
+fn f16_bits(v: f64) -> Option<u16> {
+    if v == 0.0 || !v.is_finite() {
+        return None;
+    }
+    let exp = v.abs().log2().floor() as i32;
+    let mant = v.abs() / 2f64.powi(exp) - 1.0;
+    let m = mant * 1024.0;
+    if m.fract() != 0.0 || !(-14..=15).contains(&exp) {
+        return None;
+    }
+    Some(u16::from(v < 0.0) << 15 | ((exp + 15) as u16) << 10 | m as u16)
+}
+
+fn f16_value(bits: u16) -> f64 {
+    let (e, m) = ((bits >> 10) & 31, f64::from(bits & 1023));
+    assert!((1..31).contains(&e), "f16 {bits:#06x} is not a normal number");
+    let v = (1.0 + m / 1024.0) * 2f64.powi(i32::from(e) - 15);
+    if bits >> 15 == 1 {
+        -v
+    } else {
+        v
+    }
+}
+
+/// OCP E4M3 (bias 7): normal encodings only; zero, denormals and NaN are refused.
+fn e4m3_value(byte: u8) -> f64 {
+    let (e, m) = ((byte >> 3) & 15, f64::from(byte & 7));
+    assert!(
+        (1..15).contains(&e),
+        "E4M3 {byte:#04x} is not a normal number"
+    );
+    let v = (1.0 + m / 8.0) * 2f64.powi(i32::from(e) - 7);
+    if byte >> 7 == 1 {
+        -v
+    } else {
+        v
+    }
+}
+
+fn buffer<'a>(case: &'a Value, name: &str) -> &'a Value {
+    case["buffers"]
+        .as_array()
+        .expect("buffers")
+        .iter()
+        .find(|b| b["name"] == name)
+        .unwrap_or_else(|| panic!("case has no buffer `{name}`"))
+}
+
+fn numbers(buf: &Value, key: &str) -> Vec<f64> {
+    buf[key]
+        .as_array()
+        .unwrap_or_else(|| panic!("buffer {} has no `{key}`", buf["name"]))
+        .iter()
+        .map(|v| v.as_f64().expect("number"))
+        .collect()
+}
+
+/// Rebuild dense A (16 x 32) from the compressed slots and the lane-order index
+/// words, check the 2:4 property, multiply by B (from `bt`) in f64 and compare
+/// with `expect` exactly. `decode` maps the stored element to its value.
+fn check_sparse24_case(case_file: &str, dtype: &str, decode: impl Fn(f64) -> f64) {
+    let case: Value = serde_json::from_str(&case_source(case_file)).expect("parse case");
+    assert_eq!(case["block"], serde_json::json!([32, 1, 1]), "{case_file}");
+    let (a, idx, bt, d) = (
+        buffer(&case, "a"),
+        buffer(&case, "idx"),
+        buffer(&case, "bt"),
+        buffer(&case, "d"),
+    );
+    assert_eq!(a["dtype"], dtype, "{case_file}");
+    assert_eq!(bt["dtype"], dtype, "{case_file}");
+    assert_eq!(idx["dtype"], "u32", "{case_file}");
+    assert_eq!(d["dtype"], "f32", "{case_file}");
+    assert_eq!(d["tolerance"].as_f64(), Some(0.0), "{case_file}");
+    let a: Vec<f64> = numbers(a, "values").into_iter().map(&decode).collect();
+    let bt: Vec<f64> = numbers(bt, "values").into_iter().map(&decode).collect();
+    let idx: Vec<u32> = numbers(idx, "values").iter().map(|&w| w as u32).collect();
+    let expect = numbers(d, "expect");
+    assert_eq!((a.len(), bt.len(), idx.len(), expect.len()), (256, 512, 32, 256));
+    let allowed = [0.5, 1.0, 1.5, 2.0, 3.0];
+    for v in a.iter().chain(&bt) {
+        assert!(allowed.contains(&v.abs()), "{case_file}: {v} is not in the value set");
+    }
+
+    // Lane L = 16*h + r: bits 2i..2i+1 of its word select slot 8*h + i of row r.
+    let mut dense = vec![[None::<f64>; 32]; 16];
+    let mut patterns = std::collections::HashSet::new();
+    for (lane, &word) in idx.iter().enumerate() {
+        let (r, h) = (lane & 15, lane >> 4);
+        assert_eq!(word >> 16, 0, "{case_file}: lane {lane} uses only index_key 0");
+        let mut pattern = Vec::new();
+        for i in 0..8 {
+            let sel = ((word >> (2 * i)) & 3) as usize;
+            let slot = 8 * h + i;
+            let k = 4 * (slot >> 1) + sel;
+            assert!(dense[r][k].is_none(), "{case_file}: row {r} K {k} claimed twice");
+            dense[r][k] = Some(a[16 * r + slot]);
+            pattern.push(sel);
+        }
+        // 2:4: the two slots of every K-group pick different positions.
+        for pair in pattern.chunks(2) {
+            assert_ne!(pair[0], pair[1], "{case_file}: lane {lane} is not 2:4");
+        }
+        patterns.insert(word);
+    }
+    assert!(patterns.len() >= 16, "{case_file}: selector patterns are too uniform");
+    let mut magnitudes = std::collections::HashSet::new();
+    for r in 0..16 {
+        for c in 0..16 {
+            let mut sum = 0.0f64;
+            for k in 0..32 {
+                if let Some(x) = dense[r][k] {
+                    sum += x * bt[c * 32 + k];
+                }
+            }
+            let want = expect[16 * r + c];
+            assert_eq!(sum, want, "{case_file}: D[{r}][{c}]");
+            assert!(want != 0.0 && want.abs() <= 64.0, "{case_file}: D[{r}][{c}] = {want}");
+            magnitudes.insert(want.to_bits());
+        }
+    }
+    assert!(magnitudes.len() >= 32, "{case_file}: expected values are too uniform");
+}
+
+#[test]
+fn swmmac_case_data_is_true_2_4_and_matches_an_independent_dense_reference() {
+    check_sparse24_case(SWMMAC_F16.1, "f16", |v| {
+        let bits = f16_bits(v).unwrap_or_else(|| panic!("{v} is not an f16 value"));
+        f16_value(bits)
+    });
+    check_sparse24_case(SWMMAC_FP8.1, "u8", |byte| {
+        assert!((0.0..256.0).contains(&byte) && byte.fract() == 0.0);
+        e4m3_value(byte as u8)
+    });
+}
