@@ -41,6 +41,9 @@ required-features = ["lab"]
 [[example]]
 name = "npu_trunk_consumers_check"
 required-features = ["lab"]
+[[example]]
+name = "qwen4_moe_front_oracle"
+required-features = ["lab"]
 
 [[example]]
 name = "pm_moe_cn_tiled_numeric_oracle"
