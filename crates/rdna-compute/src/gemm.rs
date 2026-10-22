@@ -516,6 +516,31 @@ pub(crate) fn hc_down_tile_selected(
         }
 }
 
+/// Smallest route-row count the fused HC-down + activation kernel takes; below it the
+/// three-launch chain wins.
+pub const HC_DOWN_FUSED_MIN_ROWS: usize = 1536;
+
+/// gfx1201 HC-down (320 x 10240) + activation fused into one launch
+/// (`HIPFIRE_QWEN4_HC_DOWN_FUSED`, default on, `0` keeps the chain).
+pub(crate) fn hc_down_fused_selected(
+    arch: &str,
+    enabled: bool,
+    m: usize,
+    k: usize,
+    rows: usize,
+    recording: bool,
+    capturing: bool,
+) -> bool {
+    enabled
+        && arch == "gfx1201"
+        && m == 320
+        && k == 10240
+        && rows >= HC_DOWN_FUSED_MIN_ROWS
+        && rows.checked_mul(k * 2).is_some_and(|b| b < (1usize << 32))
+        && !recording
+        && !capturing
+}
+
 /// gfx1201's symmetric MoE uses the native image even when the gfx1151
 /// native-image kill switch is off.
 pub(crate) fn qwen4_moe_sym_native_selected(arch: &str, enabled: bool) -> bool {
@@ -526,6 +551,10 @@ pub(crate) fn qwen4_moe_sym_native_selected(arch: &str, enabled: bool) -> bool {
 /// of the 64 x 128 / k64 split-K tile.
 static QWEN4_HC_DOWN_TILE: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_DOWN_TILE", true));
+/// Fused HC-down + activation (gfx1201), default on, `0` restores the three-launch chain.
+static QWEN4_HC_DOWN_FUSED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_DOWN_FUSED", true)
+});
 /// Tokens from which the F16 WMMA arms are used (measured on gfx1151; the MoE gate/up
 /// arm is slower below ~450; the others break even or win).
 pub const QWEN4_F16_WMMA_MIN_TOKENS: usize = 512;
@@ -29694,6 +29723,97 @@ impl Gpu {
         })
     }
 
+    /// Whether [`Gpu::gemm_bf16_xf16_hc_down_fused`] replaces the HC-down GEMM +
+    /// activation chain for this shape (see [`hc_down_fused_selected`]).
+    pub fn qwen4_hc_down_fused_applies(&self, m: usize, k: usize, rows: usize) -> bool {
+        hc_down_fused_selected(
+            self.arch.as_str(),
+            *QWEN4_HC_DOWN_FUSED,
+            m,
+            k,
+            self.route_rows(rows),
+            self.replay.is_recording(),
+            self.graphs.capture_mode,
+        )
+    }
+
+    /// gfx1201 HC-down (BF16 `weight` [m, k] on its F16 shadow, F16 `x_f16` [rows, k]) fused with
+    /// `hc_activation_fused_f32`: writes only the packed BF16 activation `low_bf16` [rows, m],
+    /// byte-identical to `gemm_bf16_xf16_f16_wmma` + `hc_activation_fused_f32(bf16_out)`.
+    /// Callers gate on [`Gpu::qwen4_hc_down_fused_applies`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_bf16_xf16_hc_down_fused(
+        &mut self,
+        weight: &GpuTensor,
+        x_f16: &GpuTensor,
+        low_bf16: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        scale: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            self.arch == "gfx1201" && m == 320 && k == 10240,
+            "gemm_bf16_xf16_hc_down_fused: gfx1201 M=320 K=10240 only (arch {}, m {m}, k {k})",
+            self.arch
+        );
+        assert!(
+            weight.dtype == DType::BF16
+                && x_f16.dtype == DType::F16
+                && low_bf16.dtype == DType::BF16,
+            "gemm_bf16_xf16_hc_down_fused: dtypes must be BF16 weight, F16 x, BF16 out"
+        );
+        assert!(
+            weight.numel() >= m * k
+                && x_f16.numel() >= batch_size * k
+                && low_bf16.numel() >= batch_size * m
+                && batch_size * k * 2 < (1usize << 32),
+            "gemm_bf16_xf16_hc_down_fused: operands too small or too large for [{m} x {k}] x {batch_size}"
+        );
+        if batch_size == 0 {
+            return Ok(());
+        }
+        let w16 = self.ensure_bf16_f16_shadow(weight, m, k)?;
+        let xp = x_f16.buf.as_ptr();
+        let op = low_bf16.buf.as_ptr();
+        assert!(
+            (w16 as usize) % 16 == 0 && (xp as usize) % 16 == 0 && (op as usize) % 16 == 0,
+            "gemm_bf16_xf16_hc_down_fused: operands must be 16-byte aligned"
+        );
+        const MODULE: &str = "qwen4_hc_down_fused";
+        const ENTRY: &str = "qwen4_hc_down_fused_b64_k32";
+        self.ensure_kernel(MODULE, kernels::QWEN4_HC_DOWN_FUSED_SRC, ENTRY)?;
+        let ap = w16;
+        let ki = k as i32;
+        let bi = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &ki as *const _ as *mut c_void,
+            &bi as *const _ as *mut c_void,
+            &scale as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            ENTRY,
+            [batch_size.div_ceil(64) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap);
+                b.push_ptr(xp);
+                b.push_ptr(op);
+                b.push_i32(ki);
+                b.push_i32(bi);
+                b.push_f32(scale);
+                b
+            },
+        )
+    }
+
     /// `Y[b, m] = Σ_k W[m, k]·X[b, k]` for a BF16 weight through a
     /// model-lifetime F16 shadow and the LDS-staged F16 WMMA GEMM, X already
     /// F16.  2.5-5x the BF16 multirow kernel on gfx1151, 4-30x on gfx1201.
@@ -52040,6 +52160,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hc_down_fused_predicate_covers_arch_shape_flags_and_boundaries() {
+        let ok =
+            |arch, en, m, k, rows, rec, cap| hc_down_fused_selected(arch, en, m, k, rows, rec, cap);
+        let min = HC_DOWN_FUSED_MIN_ROWS;
+        assert!(ok("gfx1201", true, 320, 10240, min, false, false));
+        assert!(ok("gfx1201", true, 320, 10240, 4096, false, false));
+        assert!(!ok("gfx1201", true, 320, 10240, min - 1, false, false));
+        assert!(!ok("gfx1201", true, 320, 10240, 0, false, false));
+        assert!(!ok("gfx1201", false, 320, 10240, 4096, false, false));
+        assert!(!ok("gfx1201", true, 320, 10240, 4096, true, false));
+        assert!(!ok("gfx1201", true, 320, 10240, 4096, false, true));
+        assert!(!ok("gfx1201", true, 320, 10240, 4096, true, true));
+        assert!(!ok("gfx1201", true, 319, 10240, 4096, false, false));
+        assert!(!ok("gfx1201", true, 321, 10240, 4096, false, false));
+        assert!(!ok("gfx1201", true, 320, 10239, 4096, false, false));
+        assert!(!ok("gfx1201", true, 320, 10496, 4096, false, false));
+        for arch in ["gfx1151", "gfx1200", "gfx1100", "gfx1030", "gfx1201x", ""] {
+            assert!(!ok(arch, true, 320, 10240, 4096, false, false), "{arch}");
+        }
+        // rows * k * 2 < 2^32: 209715 rows * 20480 B = 4_294_963_200 (< 2^32), 209716 is over.
+        assert!(ok("gfx1201", true, 320, 10240, 209_715, false, false));
+        assert!(!ok("gfx1201", true, 320, 10240, 209_716, false, false));
+        assert!(!ok("gfx1201", true, 320, 10240, usize::MAX, false, false));
+    }
+
+    #[test]
     fn q8_verify_fallthrough_scope_covers_every_admitted_width() {
         for admitted in 1..=64 {
             for rows in 0..=65 {
@@ -53641,6 +53787,96 @@ mod tests {
             gpu.free_tensor(x).expect("free x");
             gpu.free_tensor(a).expect("free a");
         }
+    }
+
+    /// The fused HC-down + activation launch (`HIPFIRE_QWEN4_HC_DOWN_FUSED`) must write the
+    /// chain's packed BF16 bytes: the production split-K GEMM + reducer followed by
+    /// `hc_activation_fused_f32` with `bf16_out`, on the real 320 x 10240 shape, with a ragged
+    /// last 64-row block, NaN/inf/zero/subnormal-F16 operands and a guard region past the output.
+    #[test]
+    #[ignore = "requires a gfx1201 GPU and working HIP toolchain"]
+    fn hc_down_fused_matches_chain_bytes() {
+        let mut gpu = match Gpu::init() {
+            Ok(gpu) if gpu.arch.as_str() == "gfx1201" => gpu,
+            _ => {
+                eprintln!("skip: needs exact gfx1201");
+                return;
+            }
+        };
+        let (m, k) = (320usize, 10240usize);
+        let bytes = |v: &[u16]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        // BF16 weights |w| in [2^-9, 2^-6) and F16 inputs |x| in [0.25, 1), mixed signs;
+        // some rows carry NaN / inf / +-0 / F16 subnormal inputs.
+        let w_bits: Vec<u16> = (0..m * k)
+            .map(|i| 0x3b00 | ((i * 7919 + 5) % 0x300) as u16 | if i % 3 == 0 { 0x8000 } else { 0 })
+            .collect();
+        let mut weight = gpu
+            .upload_raw(&bytes(&w_bits), &[m * k])
+            .expect("weight upload");
+        weight.dtype = DType::BF16;
+        let specials = [0x7e00u16, 0xfc00, 0x7c00, 0x0000, 0x8000, 0x0001, 0x83ff];
+        for rows in [HC_DOWN_FUSED_MIN_ROWS, 4099usize] {
+            let x_bits: Vec<u16> = (0..rows * k)
+                .map(|i| {
+                    let row = i / k;
+                    if row % 37 == 5 && (i % k) % 101 == (row % 7) {
+                        specials[(i / 3) % specials.len()]
+                    } else {
+                        0x3400
+                            | ((i * 104729 + 11) % 0x0b00) as u16
+                            | if i % 5 < 2 { 0x8000 } else { 0 }
+                    }
+                })
+                .collect();
+            let mut x = gpu
+                .upload_raw(&bytes(&x_bits), &[rows * k])
+                .expect("x upload");
+            x.dtype = DType::F16;
+            let n = rows * m;
+            let fill = vec![0xABu8; (n + 4096) * 2];
+            let mut want_t = gpu
+                .upload_raw(&fill, &[n + 4096])
+                .expect("chain out upload");
+            want_t.dtype = DType::BF16;
+            let mut got_t = gpu
+                .upload_raw(&fill, &[n + 4096])
+                .expect("fused out upload");
+            got_t.dtype = DType::BF16;
+            let y = gpu.zeros(&[n], DType::F32).expect("y alloc");
+            gpu.gemm_bf16_xf16_f16_wmma(&weight, &x, &y, m, k, rows)
+                .expect("chain GEMM");
+            crate::tensor_ops::hc_activation_fused_f32(
+                &mut gpu,
+                &crate::tensor_ops::HcActivationFused {
+                    values: &y,
+                    scale: 0.25,
+                    bf16_out: Some(&want_t),
+                },
+            )
+            .expect("chain activation");
+            assert!(gpu.qwen4_hc_down_fused_applies(m, k, rows));
+            gpu.gemm_bf16_xf16_hc_down_fused(&weight, &x, &got_t, m, k, rows, 0.25)
+                .expect("fused launch");
+            let want = gpu.download_raw_bytes(&want_t).expect("download chain");
+            let got = gpu.download_raw_bytes(&got_t).expect("download fused");
+            let differing = want[..n * 2]
+                .iter()
+                .zip(&got[..n * 2])
+                .filter(|(a, b)| a != b)
+                .count();
+            assert_eq!(
+                differing, 0,
+                "fused HC-down differs in {differing} bytes at rows={rows}"
+            );
+            assert!(
+                got[n * 2..].iter().all(|&b| b == 0xAB),
+                "fused HC-down wrote past its output at rows={rows}"
+            );
+            for t in [x, y, want_t, got_t] {
+                gpu.free_tensor(t).expect("free");
+            }
+        }
+        gpu.free_tensor(weight).expect("free weight");
     }
     #[test]
     fn moe_route_launch_census_default_and_since() {

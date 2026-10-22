@@ -1276,6 +1276,13 @@ fn execute_hyper_read_inner(
     let wmma_read = f16 && op.low_rank % 16 == 0 && op.low_rank <= 504 && op.hidden % 16 == 0;
     let mut normalized_f16 = None;
     let mut activated = false;
+    // The WMMA read takes `low` as packed BF16, staged in `up` (which that
+    // route does not otherwise use).
+    let low_bf16 = wmma_read.then(|| {
+        let mut packed = view(op.up, 0, op.rows * op.low_rank);
+        packed.dtype = DType::BF16;
+        packed
+    });
     if f16 {
         if prenormed && !(wmma_read && paired.is_some()) {
             return Err(DispatchError::Hip(
@@ -1309,14 +1316,39 @@ fn execute_hyper_read_inner(
             }
             None => hip(hyper_norm_f16(gpu, &norm, &x16, !wmma_read))?,
         }
-        hip(gpu.gemm_bf16_xf16_f16_wmma(
-            op.input_mix_down.buf,
-            &x16,
-            &low,
-            op.input_mix_down.m,
-            op.input_mix_down.k,
-            op.rows,
-        ))?;
+        // gfx1201 HC-down + activation as one launch (byte-identical to the
+        // F16 WMMA GEMM + `hc_activation_fused_f32` chain): the packed BF16
+        // `low_bf16` is the only output the WMMA read consumes.
+        match low_bf16.as_ref().filter(|_| {
+            wmma_read
+                && op.low_rank == op.input_mix_down.m
+                && gpu.qwen4_hc_down_fused_applies(
+                    op.input_mix_down.m,
+                    op.input_mix_down.k,
+                    op.rows,
+                )
+        }) {
+            Some(packed) => {
+                hip(gpu.gemm_bf16_xf16_hc_down_fused(
+                    op.input_mix_down.buf,
+                    &x16,
+                    packed,
+                    op.input_mix_down.m,
+                    op.input_mix_down.k,
+                    op.rows,
+                    1.0 / op.branches as f32,
+                ))?;
+                activated = true;
+            }
+            None => hip(gpu.gemm_bf16_xf16_f16_wmma(
+                op.input_mix_down.buf,
+                &x16,
+                &low,
+                op.input_mix_down.m,
+                op.input_mix_down.k,
+                op.rows,
+            ))?,
+        }
         normalized_f16 = Some(x16);
     } else if gpu.arch_caps.has_gfx11_plus_simt()
         && hc_decode_partitions(
@@ -1354,13 +1386,6 @@ fn execute_hyper_read_inner(
             Some(op.rotation),
         )?;
     }
-    // The WMMA read takes `low` as packed BF16, staged in `up` (which that
-    // route does not otherwise use).
-    let low_bf16 = wmma_read.then(|| {
-        let mut packed = view(op.up, 0, op.rows * op.low_rank);
-        packed.dtype = DType::BF16;
-        packed
-    });
     // `activated` implies the gfx11+ route: the down GEMV already applied it.
     if gpu.arch_caps.has_gfx11_plus_simt() {
         if !activated {
