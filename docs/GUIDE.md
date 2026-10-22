@@ -1042,6 +1042,12 @@ does not support spans; there the flag only plans every step but a lone prefill 
 budget, and startup warns. Window snapshots are written at `--checkpoint-interval` boundaries
 as well as just before the prompt's end. The intermediate snapshots let an edited prompt resume
 below its first changed token; `--checkpoint-policy` bounds the snapshots kept.
+For a window-only checkpoint model, `--checkpoint-policy tip-only` also skips
+creating the intermediate snapshots and splitting chunks at their intervals, not
+just retaining the tip afterward. This restores tail-only snapshot scheduling and
+avoids the extra copies, at the cost of full re-prefill if an edit precedes the tip.
+Recurrent-state models still checkpoint at intervals under `tip-only`; their
+existing scheduling is unchanged.
 
 **Sharing a step** (`--busy-prefill-chunk`, default `auto`). When other work is pending, a prefill
 chunk leaves room for one row plus the draft window per decode row behind it, and a share of the

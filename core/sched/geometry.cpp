@@ -153,9 +153,11 @@ int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry
 
     /* Log the effective chunk length. `plan_chunk` splits at the checkpoint interval first, so
      * when the interval is below --max-num-batched-tokens, raising the budget does not change the
-     * chunk; the log line makes that visible. */
+     * chunk; the log line makes that visible. tip-only window snapshots do not
+     * split at the interval, so their chunk is bounded by the token budget. */
     const int64_t span_tok = g.checkpoint_interval * g.span;
-    const int64_t eff = (g.checkpoint_interval > 0 && span_tok < cfg.max_tok)
+    const bool periodic = !g.window_ckpt || cfg.checkpoint_policy != "tip-only";
+    const int64_t eff = (g.checkpoint_interval > 0 && periodic && span_tok < cfg.max_tok)
                       ? span_tok : cfg.max_tok;
     RAD_INFO("chunk geometry: quantum %lld (attn block %lld, state chunk %lld), checkpoint "
              "interval %lld, max_tok %lld -> prefill chunks of at most %lld%s",

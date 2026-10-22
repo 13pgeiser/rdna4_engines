@@ -347,40 +347,92 @@ TEST(chunk_geometry_refuses_a_budget_it_cannot_serve) {
  * cannot serve a request whose last few hundred tokens changed: it is past the
  * divergence. Keep periodic snapshots as well, so lookup can resume below it. */
 TEST(window_prefill_writes_interval_snapshots_before_the_tail) {
+    for (const char* policy : { "geometric-backoff", "keep-all" }) {
+        Fixture f;
+        f.build(4096, 64, 512, 4096, /*windowed=*/true);
+        f.prog.kv_groups.erase(f.prog.kv_groups.begin() + 1, f.prog.kv_groups.begin() + 3);
+        f.prog.ops.resize(1);             /* remove the recurrent scan and its chunk constraint */
+        f.prog.buffers.resize(1);         /* its derived conv/state indices do not apply either */
+        f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+        f.pc.groups = { 0 };
+        f.cfg.checkpoint_policy = policy;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK(f.sch.geometry().window_ckpt);
+
+        int64_t pos = 0;
+        std::vector<int64_t> snapshots;
+        while (pos < 1100) {
+            int64_t ckpt = -1;
+            const int64_t n = f.sch.plan_chunk(pos, 1100, 512, &ckpt);
+            REQUIRE(n > 0);
+            pos += n;
+            if (ckpt > 0) {
+                CHECK_EQ(ckpt, pos);
+                snapshots.push_back(ckpt);
+            }
+        }
+        const std::vector<int64_t> expected = { 256, 512, 768, 1024, 1072 };
+        CHECK(snapshots == expected);
+
+        /* An aligned prompt must still snapshot before its last block: that block's
+         * generation marker changes when the client replays the assistant reply. */
+        int64_t ckpt = -1;
+        CHECK_EQ(f.sch.plan_chunk(768, 1024, 512, &ckpt), 240ll);
+        CHECK_EQ(ckpt, 1008ll);
+        /* A shared step may end before the boundary; the next chunk must reach it. */
+        CHECK_EQ(f.sch.plan_chunk(0, 1100, 160, &ckpt), 160ll);
+        CHECK_EQ(ckpt, -1ll);
+        CHECK_EQ(f.sch.plan_chunk(160, 1100, 160, &ckpt), 96ll);
+        CHECK_EQ(ckpt, 256ll);
+    }
+}
+
+/* tip-only is a window snapshot opt-out, not just retention after paying for
+ * copies which will be discarded. Match the original unsplit prefill schedule. */
+TEST(tip_only_window_prefill_writes_only_the_tail_snapshot) {
     Fixture f;
     f.build(4096, 64, 512, 4096, /*windowed=*/true);
     f.prog.kv_groups.erase(f.prog.kv_groups.begin() + 1, f.prog.kv_groups.begin() + 3);
-    f.prog.ops.resize(1);             /* remove the recurrent scan and its chunk constraint */
-    f.prog.buffers.resize(1);         /* its derived conv/state indices do not apply either */
+    f.prog.ops.resize(1);
+    f.prog.buffers.resize(1);
     f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
     f.pc.groups = { 0 };
+    f.cfg.checkpoint_policy = "tip-only";
     REQUIRE_EQ(f.start(), RAD_OK);
     CHECK(f.sch.geometry().window_ckpt);
 
-    int64_t pos = 0;
-    std::vector<int64_t> snapshots;
-    while (pos < 1100) {
-        int64_t ckpt = -1;
-        const int64_t n = f.sch.plan_chunk(pos, 1100, 512, &ckpt);
-        REQUIRE(n > 0);
-        pos += n;
-        if (ckpt > 0) {
-            CHECK_EQ(ckpt, pos);
-            snapshots.push_back(ckpt);
-        }
-    }
-    const std::vector<int64_t> expected = { 256, 512, 768, 1024, 1072 };
-    CHECK(snapshots == expected);
-
-    /* An aligned prompt must still snapshot before its last block: that block's
-     * generation marker changes when the client replays the assistant reply. */
     int64_t ckpt = -1;
+    CHECK_EQ(f.sch.plan_chunk(0, 1100, 512, &ckpt), 512ll);
+    CHECK_EQ(ckpt, -1ll);
+    CHECK_EQ(f.sch.plan_chunk(512, 1100, 512, &ckpt), 512ll);
+    CHECK_EQ(ckpt, -1ll);
+    CHECK_EQ(f.sch.plan_chunk(1024, 1100, 512, &ckpt), 48ll);
+    CHECK_EQ(ckpt, 1072ll);
+    CHECK_EQ(f.sch.plan_chunk(1072, 1100, 512, &ckpt), 28ll);
+    CHECK_EQ(ckpt, -1ll);
+
     CHECK_EQ(f.sch.plan_chunk(768, 1024, 512, &ckpt), 240ll);
     CHECK_EQ(ckpt, 1008ll);
-    /* A shared step may end before the boundary; the next chunk must reach it. */
-    CHECK_EQ(f.sch.plan_chunk(0, 1100, 160, &ckpt), 160ll);
+    CHECK_EQ(f.sch.plan_chunk(0, 256, 512, &ckpt), 256ll);
     CHECK_EQ(ckpt, -1ll);
-    CHECK_EQ(f.sch.plan_chunk(160, 1100, 160, &ckpt), 96ll);
+    /* Explicit request checkpoints must still be honored. */
+    CHECK_EQ(f.sch.plan_chunk(0, 1100, 512, &ckpt, 256), 256ll);
+    CHECK_EQ(ckpt, 256ll);
+
+    f.submit(1100, 1);
+    for (int i = 0; i < 8 && f.sch.step(); ++i) f.commit_plain();
+    CHECK_EQ(f.pc.reserved, 1);
+    CHECK_EQ(f.sch.metrics().checkpoints_written, 1ll);
+}
+
+TEST(tip_only_does_not_disable_recurrent_interval_checkpoints) {
+    Fixture f;
+    f.build();
+    f.cfg.checkpoint_policy = "tip-only";
+    REQUIRE_EQ(f.start(), RAD_OK);
+    CHECK(!f.sch.geometry().window_ckpt);
+    int64_t ckpt = -1;
+    CHECK_EQ(f.sch.plan_chunk(0, 1100, 512, &ckpt), 256ll);
     CHECK_EQ(ckpt, 256ll);
 }
 
