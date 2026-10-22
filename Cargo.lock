@@ -3244,6 +3244,7 @@ dependencies = [
  "peacemaker-isa",
  "peacemaker-lift",
  "peacemaker-npu",
+ "peacemaker-rip",
  "radiowave",
  "railgun",
  "railgun-corpus",

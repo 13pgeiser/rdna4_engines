@@ -102,11 +102,13 @@ struct Opts {
     rounds: usize,
     emu: bool,
     out: Option<PathBuf>,
+    /// `--rip FILE`: candidate compiled from a `.rip` source (iu4_gemm only).
+    rip: Option<PathBuf>,
     knobs: Knobs,
 }
 
 const DRIVER_FLAGS: &str =
-    "--kernel K --shape S [--time N] [--rounds R] [--emu] [--out DIR] [--<knob> V]... [--base-<knob> V]...";
+    "--kernel K --shape S [--time N] [--rounds R] [--emu] [--out DIR] [--rip FILE.rip] [--<knob> V]... [--base-<knob> V]...";
 
 fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
     let mut o = Opts {
@@ -116,6 +118,7 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
         rounds: DEFAULT_ROUNDS,
         emu: false,
         out: None,
+        rip: None,
         knobs: Knobs::default(),
     };
     while let Some(arg) = a.next() {
@@ -138,6 +141,7 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
                 o.rounds = abba::positive_count(&value).map_err(|e| format!("--rounds: {e}"))?
             }
             "out" => o.out = Some(PathBuf::from(value)),
+            "rip" => o.rip = Some(PathBuf::from(value)),
             _ => {
                 if o.knobs.0.insert(key.clone(), value).is_some() {
                     return Err(format!("--{key} given twice"));
@@ -148,6 +152,12 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
     if o.kernel.is_empty() {
         return Err(format!("missing --kernel (usage: {DRIVER_FLAGS})"));
     }
+    if o.rip.is_some() && o.kernel != "iu4_gemm" {
+        return Err(format!(
+            "--rip is only supported with --kernel iu4_gemm: only iu4_gemm blocks are exposed to .rip so far (got --kernel {})",
+            o.kernel
+        ));
+    }
     abba::timing_counts(o.time, o.rounds)?;
     Ok(o)
 }
@@ -156,7 +166,7 @@ fn build_workload(o: &mut Opts) -> Result<Box<dyn Workload>> {
     let shape = o.shape.clone().unwrap_or_default();
     let mut knobs = std::mem::take(&mut o.knobs);
     let w = match o.kernel.as_str() {
-        "iu4_gemm" => iu4::new(&shape, &mut knobs)?,
+        "iu4_gemm" => iu4::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
         "qwen4_moe_sym" => moe::new(&shape, &mut knobs)?,
         other => return Err(format!("unknown --kernel {other} (iu4_gemm|qwen4_moe_sym)")),
     };
@@ -455,7 +465,7 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
     // 1. emit + link
     let cand = match w.candidate() {
         Ok(c) => c,
-        Err(e) => return fail(rec, "emit", e),
+        Err(e) => return fail(rec, if o.rip.is_some() { "rip" } else { "emit" }, e),
     };
     let base = match w.baseline() {
         Ok(b) => b,
@@ -671,6 +681,17 @@ mod tests {
             Some("128x128x8")
         );
         assert_eq!(o.knobs.0.len(), 2, "driver flags are not knobs");
+    }
+
+    #[test]
+    fn rip_flag_parses_and_is_iu4_only() {
+        let o = parse_args(args("--kernel iu4_gemm --rip /tmp/a.rip --fold k128")).unwrap();
+        assert_eq!(o.rip, Some(PathBuf::from("/tmp/a.rip")));
+        assert_eq!(o.knobs.0.len(), 1, "--rip is not a knob");
+        assert!(parse_args(args("--kernel iu4_gemm")).unwrap().rip.is_none());
+        let e = parse_args(args("--kernel qwen4_moe_sym --rip /tmp/a.rip")).unwrap_err();
+        assert!(e.contains("only iu4_gemm"), "{e}");
+        assert!(parse_args(args("--kernel iu4_gemm --rip")).is_err());
     }
 
     #[test]

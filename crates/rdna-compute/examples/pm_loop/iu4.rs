@@ -47,6 +47,7 @@ use rdna_compute::Gpu;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::cell::OnceCell;
+use std::path::Path;
 
 const GROUP_BYTES: usize = 136;
 const REC: usize = 72;
@@ -390,13 +391,102 @@ pub struct Iu4 {
     host: Option<Host>,
     dev: Option<Dev>,
     reference: OnceCell<Vec<f32>>,
+    /// `--rip`: the candidate arm is this source, not `iu4_gemm::emit`.
+    rip: Option<RipSource>,
+}
+
+struct RipSource {
+    path: String,
+    text: String,
+}
+
+/// ABI of a kernel in an assembled object: everything the launcher and the
+/// kernarg packer depend on (symbol, kernarg layout, workgroup size, LDS,
+/// wave mode). Code, VGPR/SGPR counts and the like may differ.
+fn abi_signature(elf: &[u8], symbol: &str) -> Result<String> {
+    use peacemaker_ir::inst::Abi;
+    let program = peacemaker_lift::lift_object(
+        elf,
+        peacemaker_lift::Options {
+            frontend: peacemaker_ir::inst::Frontend::Builder,
+        },
+    )
+    .map_err(dev_err)?
+    .program;
+    let kernel = program
+        .kernels
+        .iter()
+        .find(|k| k.symbol.0 == symbol)
+        .ok_or_else(|| format!("object has no kernel {symbol}"))?;
+    let Abi::Hsa {
+        descriptor,
+        metadata,
+    } = &kernel.abi
+    else {
+        return Err(format!("{symbol}: not an HSA kernel"));
+    };
+    let m = &metadata.parsed;
+    Ok(format!(
+        "symbol={} args={:?} kernarg_bytes={} kernarg_align={} lds_bytes={} max_flat_workgroup_size={} wavefront_size={} workgroup_processor_mode={}",
+        m.symbol,
+        m.args,
+        descriptor.kernarg_size,
+        m.kernarg_segment_align,
+        descriptor.group_segment_fixed_size,
+        m.max_flat_workgroup_size,
+        m.wavefront_size,
+        m.workgroup_processor_mode,
+    ))
+}
+
+/// Compile `.rip` source for `spec`, refuse unless its ABI equals that of
+/// `iu4_gemm::emit(spec)`, and return the linked ELF, the symbol and the
+/// `candidate.rip` record fields (`variant`, `sha256`, `identical_to_generator`).
+fn compile_rip(source: &str, spec: Spec) -> Result<(Vec<u8>, String, Value)> {
+    let variant = spec.variant_name();
+    let compiled = peacemaker_rip::compile(source, spec.arch, &variant)?;
+    let generator = iu4_gemm::emit(spec)?;
+    let symbol = spec.symbol();
+    let elf = peacemaker_isa::native::assemble(&compiled.s_text, spec.arch)?;
+    let gen_elf = peacemaker_isa::native::assemble(&generator.s_text, spec.arch)?;
+    let got = abi_signature(&elf, &symbol)
+        .map_err(|e| format!("compiled kernel does not expose {symbol}: {e}"))?;
+    let want = abi_signature(&gen_elf, &symbol)?;
+    if got != want {
+        return Err(format!(
+            "ABI mismatch with iu4_gemm::emit({variant}):\n  .rip:      {got}\n  generator: {want}"
+        ));
+    }
+    let info = json!({
+        "sha256": sha256_hex(source.as_bytes()),
+        "variant": variant,
+        "identical_to_generator": compiled.s_text == generator.s_text,
+    });
+    Ok((elf, symbol, info))
 }
 
 fn dev_err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
+#[cfg(test)]
 pub fn new(shape: &str, knobs: &mut Knobs) -> Result<Box<dyn Workload>> {
+    new_with_rip(shape, knobs, None)
+}
+
+/// [`new`] with the candidate compiled from a `.rip` file (`--rip`).
+pub fn new_with_rip(
+    shape: &str,
+    knobs: &mut Knobs,
+    rip: Option<&Path>,
+) -> Result<Box<dyn Workload>> {
+    let rip = match rip {
+        Some(p) => Some(RipSource {
+            path: p.display().to_string(),
+            text: std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?,
+        }),
+        None => None,
+    };
     let (m, n, k) = parse_shape(shape)?;
     if m == 0 || n == 0 || k == 0 || k % 256 != 0 || m % 4 != 0 {
         return Err(format!(
@@ -485,6 +575,7 @@ pub fn new(shape: &str, knobs: &mut Knobs) -> Result<Box<dyn Workload>> {
         host: None,
         dev: None,
         reference: OnceCell::new(),
+        rip,
     }))
 }
 
@@ -512,6 +603,22 @@ impl Iu4 {
             } else {
                 4
             }
+    }
+
+    fn rip_object(&self, rip: &RipSource) -> Result<Object> {
+        let (elf, symbol, mut info) = compile_rip(&rip.text, self.cand)?;
+        info["path"] = json!(rip.path);
+        Ok(Object {
+            source: json!({
+                "source": format!("peacemaker_rip::compile({}) + native::assemble", rip.path),
+                "variant": self.cand.variant_name(),
+                "sha256": sha256_hex(&elf),
+            }),
+            desc: json!({"knobs": self.cand_strs.json(), "rip": info}),
+            exports: vec![symbol.clone()],
+            launch_symbol: symbol,
+            bytes: elf,
+        })
     }
 
     fn emit_object(&self, spec: Spec, knobs: Value) -> Result<Object> {
@@ -689,6 +796,9 @@ impl Workload for Iu4 {
     }
 
     fn candidate(&self) -> Result<Object> {
+        if let Some(rip) = &self.rip {
+            return self.rip_object(rip);
+        }
         self.emit_object(self.cand, self.cand_strs.json())
     }
 
@@ -876,6 +986,47 @@ mod tests {
         assert!(new("M=6,N=1,K=256", &mut knobs(&[])).is_err());
         assert!(new("M=64,N=1,K=256", &mut knobs(&[("epi", "silu")])).is_err());
         assert!(new("M=128,N=1,K=256", &mut knobs(&[("epi", "qkvzagdn")])).is_err());
+    }
+
+    const TWIN: &str = include_str!("../../../peacemaker-isa/src/kernels/iu4_gemm.rip");
+
+    fn default_spec() -> Spec {
+        Spec::from_knobs("k128", "128x128x8", "1", "set", "token", Arch::Gfx1201).unwrap()
+    }
+
+    #[test]
+    fn rip_twin_is_identical_to_generator() {
+        let (_, symbol, info) = compile_rip(TWIN, default_spec()).unwrap();
+        assert_eq!(symbol, default_spec().symbol());
+        assert_eq!(info["identical_to_generator"], true);
+        assert_eq!(info["variant"], default_spec().variant_name());
+        assert_eq!(info["sha256"], sha256_hex(TWIN.as_bytes()));
+    }
+
+    #[test]
+    fn rip_edit_passes_abi_and_reports_difference() {
+        let edited = TWIN.replacen(
+            "    op(wg.isa(), \"s_setprio 1\", vec![], vec![])?;\n",
+            "",
+            1,
+        );
+        assert_ne!(edited, TWIN, "the s_setprio 1 line must exist in the twin");
+        let (_, _, info) = compile_rip(&edited, default_spec()).unwrap();
+        assert_eq!(info["identical_to_generator"], false);
+    }
+
+    #[test]
+    fn rip_symbol_change_is_refused() {
+        // The twin derives the kernel (and so the symbol) from the variant it
+        // parses: make `set` build the `add` kernel.
+        let renamed = TWIN.replacen("\"set\" => Epi::Set,", "\"set\" => Epi::Add,", 1);
+        assert_ne!(renamed, TWIN, "the epilogue arm must exist in the twin");
+        let spec = default_spec();
+        let e = compile_rip(&renamed, spec).unwrap_err();
+        assert!(
+            e.contains("does not expose") || e.contains("ABI mismatch"),
+            "{e}"
+        );
     }
 
     #[test]

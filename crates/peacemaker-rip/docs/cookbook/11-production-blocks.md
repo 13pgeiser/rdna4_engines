@@ -83,7 +83,7 @@ Results are unchanged; only scheduling moves.
 
 ## Timing a variation
 
-`pm_loop --rip FILE --variant V` is the intended loop: it compiles `FILE` with the same `Spec` as the shipped variant `V`, certifies and checks the result (`peacemaker-rip build --certify` and the production checks), times it next to the shipped variant, and reports the difference. Iterating on generator logic is: edit the `.rip`, rerun. The variant names are the shipped ones (`k128-128x128x8-cacc1-slab-silu-bf16`; the grammar is in the twin's header). `peacemaker-rip check FILE --variant V --arch gfx1201` already runs the front-end checks on its own.
+`pm_loop --kernel iu4_gemm --rip FILE.rip [knobs...]` is the loop (build once with `cargo build --release -p rdna-compute --features lab --example pm_loop`, run on a gfx1201 card through `fabric-run.sh --class timing`). The knobs pick the `Spec` (tile, fold, epilogue, layout: the launch geometry and kernarg layout); `FILE` is compiled for that `Spec`'s variant name, refused (exit 3, stage `rip`) unless its symbol, kernarg layout, workgroup size and LDS equal those of `iu4_gemm::emit`, then linked with the native writer, certified (M7), checked against the CPU reference and the shipped object, and ABBA-timed. The record carries `candidate.rip = {path, sha256, variant, identical_to_generator}`. Iterating on generator logic is: edit the `.rip`, rerun; no Rust rebuild. Only `iu4_gemm` blocks are exposed to `.rip` so far (`--kernel qwen4_moe_sym --rip` is a usage error). The variant names are the shipped ones (`k128-128x128x8-cacc1-slab-silu-bf16`; the grammar is in the twin's header). `peacemaker-rip check FILE --variant V --arch gfx1201` already runs the front-end checks on its own.
 
 ## Why
 
