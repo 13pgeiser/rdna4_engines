@@ -3021,6 +3021,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ]
         );
         add!(
+            "qwen4_hc_down_fused",
+            kernels::QWEN4_HC_DOWN_FUSED_SRC,
+            ["qwen4_hc_down_fused_b64_k32"]
+        );
+        add!(
             "hyper_read_up_wmma_gfx1201",
             crate::tensor_ops::HYPER_READ_UP_WMMA_GFX1201_SRC,
             [
@@ -9783,6 +9788,20 @@ mod tests {
             "gemm_mq4g256v2_residual_mmq_i8_gfx12",
             "mq_rotate_x_i8_gfx12",
         ];
+        // The fused HC-down + activation kernel (`Gpu::gemm_bf16_xf16_hc_down_fused`).
+        const HC_DOWN_FUSED_ADDED_MODULES: [&str; 1] = ["qwen4_hc_down_fused"];
+        for module in HC_DOWN_FUSED_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing HC-down fused module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         for module in MQ6_I8_ADDED_MODULES {
             assert!(
                 by_name.contains_key(module),
@@ -9822,6 +9841,7 @@ mod tests {
                 + NATIVE_A3B_ADDED_MODULES.len()
                 + FIRST_REQUEST_JIT_ADDED_MODULES
                 + MQ6_I8_ADDED_MODULES.len()
+                + HC_DOWN_FUSED_ADDED_MODULES.len()
                 + G64_AND_HC_CAPTURE_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );

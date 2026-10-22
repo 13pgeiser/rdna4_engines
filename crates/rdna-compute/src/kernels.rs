@@ -10643,6 +10643,13 @@ pub const GEMM_F16_X_F16_WMMA_GFX12_SRC: &str =
 pub const GEMM_F16_X_F16_WMMA_LDS_SPLITK_SRC: &str =
     include_str!("../../../kernels/src/gemm_f16_x_f16_wmma_lds_splitk.hip");
 
+/// gfx1201 Qwen4 HC input_mix_down (BF16 weight on its F16 shadow, M = 320,
+/// K = 10240) + `hc_activation_fused_f32` in one launch: the split-K=4 160 x 80
+/// / k32 WMMA tile, its reduction and the BF16-bit activation, byte-identical
+/// to that chain (`Gpu::gemm_bf16_xf16_hc_down_fused`). Exact-arch gfx1201.
+pub const QWEN4_HC_DOWN_FUSED_SRC: &str =
+    include_str!("../../../kernels/src/qwen4_hc_down_fused.hip");
+
 /// LDS-staged 128×128 macro-tile sibling of `GEMM_F16_X_F16_WMMA_SRC`, with
 /// the bias fused into the epilogue. Raises arithmetic intensity from
 /// 8 to 64 FLOP/byte for the dense FLUX MMDiT linears. Requires K % 64 == 0.
