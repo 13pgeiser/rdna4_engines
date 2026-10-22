@@ -57,12 +57,12 @@ pub(super) fn hip<T>(result: Result<T, hip_bridge::HipError>) -> Result<T, Dispa
 }
 
 #[inline]
-fn checked_mul(a: usize, b: usize, label: &'static str) -> Result<usize, DispatchError> {
+pub(super) fn checked_mul(a: usize, b: usize, label: &'static str) -> Result<usize, DispatchError> {
     a.checked_mul(b)
         .ok_or_else(|| DispatchError::Hip(format!("{label} extent overflows")))
 }
 
-fn require_tensor(
+pub(super) fn require_tensor(
     tensor: &GpuTensor,
     elements: usize,
     dtype: DType,
@@ -96,7 +96,7 @@ fn projection_weight_dtype(dtype: DType) -> bool {
     )
 }
 
-fn require_weight(
+pub(super) fn require_weight(
     weight: &WeightRef<'_>,
     m: usize,
     k: usize,
@@ -122,7 +122,7 @@ fn require_weight(
 }
 
 #[inline]
-fn view(source: &GpuTensor, offset: usize, len: usize) -> GpuTensor {
+pub(super) fn view(source: &GpuTensor, offset: usize, len: usize) -> GpuTensor {
     source.sub_offset(offset, len)
 }
 
@@ -664,12 +664,12 @@ fn project_trunk_masked(
 /// one (MQ4G256V2, MQ6G256V2, MFP4G32E8SOA) or MQ4G128V2's row-local 128-wide
 /// one. `None` for payloads that read the natural activation.
 #[derive(PartialEq)]
-enum RotationBasis {
+pub(super) enum RotationBasis {
     Aligned256,
     RowLocal128,
 }
 
-fn rotation_basis(dtype: DType) -> Option<RotationBasis> {
+pub(super) fn rotation_basis(dtype: DType) -> Option<RotationBasis> {
     match dtype {
         DType::MQ4G256V2
         | DType::MQ6G256V2
@@ -4459,117 +4459,6 @@ pub fn execute_project(gpu: &mut Gpu, op: &ProjectOp<'_>) -> Result<(), Dispatch
     project_weight(gpu, &op.weight, op.input, op.output, op.rows, op.rotation)
 }
 
-/// Dense feed-forward recipe: which source equation and storage boundaries
-/// [`execute_dense_ffn`] runs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DenseFfnRecipe {
-    /// `down(silu(gate(x)) * up(x))` with BF16 storage after the gate
-    /// projection, the up projection, the SiLU, the product and the down
-    /// projection.
-    SiluBf16Source,
-}
-
-/// Dense gated FFN over `rows` row-major rows of `hidden`: gate and up
-/// projections of `input` (`m = intermediate`, `k = hidden`), the recipe's
-/// activation, and the down projection (`m = hidden`, `k = intermediate`) into
-/// `output`.  `gate_scratch` and `up_scratch` must be distinct tensors; the
-/// op writes both and `output`, and reads `input` only before it writes
-/// `output`.
-pub struct DenseFfnOp<'a> {
-    pub recipe: DenseFfnRecipe,
-    pub gate: WeightRef<'a>,
-    pub up: WeightRef<'a>,
-    pub down: WeightRef<'a>,
-    /// F32, at least `rows * hidden`.
-    pub input: &'a GpuTensor,
-    /// F32, at least `rows * intermediate`.
-    pub gate_scratch: &'a GpuTensor,
-    /// F32, at least `rows * intermediate`.
-    pub up_scratch: &'a GpuTensor,
-    /// F32, at least `rows * hidden`.
-    pub output: &'a GpuTensor,
-    /// FWHT basis scratch, at least `rows * max(hidden, intermediate)`; read
-    /// only for payloads that carry an FWHT basis.
-    pub rotation: &'a GpuTensor,
-    pub rows: usize,
-    pub hidden: usize,
-    pub intermediate: usize,
-}
-
-impl DenseFfnOp<'_> {
-    pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
-        self.validate_layout()
-    }
-
-    fn validate_layout(&self) -> Result<(), DispatchError> {
-        if self.rows == 0 || self.hidden == 0 || self.intermediate == 0 {
-            return Err(DispatchError::Hip("dense FFN has empty geometry".into()));
-        }
-        require_weight(&self.gate, self.intermediate, self.hidden, "dense FFN gate")?;
-        require_weight(&self.up, self.intermediate, self.hidden, "dense FFN up")?;
-        require_weight(&self.down, self.hidden, self.intermediate, "dense FFN down")?;
-        let wide = checked_mul(self.rows, self.hidden, "dense FFN hidden rows")?;
-        let inner = checked_mul(self.rows, self.intermediate, "dense FFN intermediate rows")?;
-        require_tensor(self.input, wide, DType::F32, "dense FFN input")?;
-        require_tensor(
-            self.gate_scratch,
-            inner,
-            DType::F32,
-            "dense FFN gate scratch",
-        )?;
-        require_tensor(self.up_scratch, inner, DType::F32, "dense FFN up scratch")?;
-        require_tensor(self.output, wide, DType::F32, "dense FFN output")?;
-        if [&self.gate, &self.up, &self.down]
-            .iter()
-            .any(|weight| rotation_basis(weight.dtype).is_some())
-        {
-            let rotated = checked_mul(
-                self.rows,
-                self.hidden.max(self.intermediate),
-                "dense FFN rotation",
-            )?;
-            require_tensor(self.rotation, rotated, DType::F32, "dense FFN rotation")?;
-        }
-        Ok(())
-    }
-}
-
-/// Run a [`DenseFfnOp`].  `SiluBf16Source` order, each step on exact-length
-/// views, no allocation:
-///
-/// 1. gate and up projections of `input` (`project_weights`);
-/// 2. BF16 round trip of gate, then of up (storage after each projection);
-/// 3. `gate = silu(gate)`, BF16 round trip (storage after the activation);
-/// 4. `gate = gate * up`, BF16 round trip (storage after the product);
-/// 5. down projection of the product into `output`;
-/// 6. BF16 round trip of `output` (storage after the down projection).
-///
-/// The element-wise kernels read each element before writing it, so the
-/// in-place SiLU and product are safe.
-pub fn execute_dense_ffn(gpu: &mut Gpu, op: &DenseFfnOp<'_>) -> Result<(), DispatchError> {
-    let DenseFfnRecipe::SiluBf16Source = op.recipe;
-    let wide = checked_mul(op.rows, op.hidden, "dense FFN hidden rows")?;
-    let inner = checked_mul(op.rows, op.intermediate, "dense FFN intermediate rows")?;
-    let gate = view(op.gate_scratch, 0, inner);
-    let up = view(op.up_scratch, 0, inner);
-    let output = view(op.output, 0, wide);
-    project_weights(
-        gpu,
-        op.input,
-        op.rows,
-        Some(op.rotation),
-        &[(&op.gate, &gate), (&op.up, &up)],
-    )?;
-    hip(gpu.bf16_round_trip_f32(&gate))?;
-    hip(gpu.bf16_round_trip_f32(&up))?;
-    hip(gpu.silu_f32(&gate, &gate))?;
-    hip(gpu.bf16_round_trip_f32(&gate))?;
-    hip(gpu.mul_f32(&gate, &up, &gate))?;
-    hip(gpu.bf16_round_trip_f32(&gate))?;
-    project_weight(gpu, &op.down, &gate, &output, op.rows, Some(op.rotation))?;
-    hip(gpu.bf16_round_trip_f32(&output))
-}
-
 /// Largest causal window the gated short-convolution kernel holds per thread.
 pub const GATED_SHORT_CONV_MAX_KERNEL: usize = 8;
 
@@ -5370,124 +5259,6 @@ mod tests {
             lloyd_lut_f16: None,
             lloyd_lut_c16: None,
         }
-    }
-
-    fn dense_ffn_fixture(rows: usize, hidden: usize, intermediate: usize) -> [GpuTensor; 7] {
-        [
-            tensor(hidden * intermediate, DType::BF16),
-            tensor(hidden * intermediate, DType::BF16),
-            tensor(hidden * intermediate, DType::BF16),
-            tensor(rows * hidden, DType::F32),
-            tensor(rows * intermediate, DType::F32),
-            tensor(rows * intermediate, DType::F32),
-            tensor(rows * hidden, DType::F32),
-        ]
-    }
-
-    fn dense_ffn_op<'a>(
-        t: &'a [GpuTensor; 7],
-        rotation: &'a GpuTensor,
-        rows: usize,
-        hidden: usize,
-        intermediate: usize,
-    ) -> DenseFfnOp<'a> {
-        DenseFfnOp {
-            recipe: DenseFfnRecipe::SiluBf16Source,
-            gate: plain_weight(&t[0], DType::BF16, intermediate, hidden),
-            up: plain_weight(&t[1], DType::BF16, intermediate, hidden),
-            down: plain_weight(&t[2], DType::BF16, hidden, intermediate),
-            input: &t[3],
-            gate_scratch: &t[4],
-            up_scratch: &t[5],
-            output: &t[6],
-            rotation,
-            rows,
-            hidden,
-            intermediate,
-        }
-    }
-
-    /// Message of the refusal `op` must produce.
-    fn dense_ffn_refusal(op: &DenseFfnOp<'_>) -> String {
-        op.validate_layout()
-            .expect_err("dense FFN op must be refused")
-            .to_string()
-    }
-
-    #[test]
-    fn dense_ffn_geometry_validation() {
-        let (rows, hidden, intermediate) = (3, 16, 8);
-        let t = dense_ffn_fixture(rows, hidden, intermediate);
-        let rotation = tensor(1, DType::F32);
-        let op = || dense_ffn_op(&t, &rotation, rows, hidden, intermediate);
-        assert!(op().validate_layout().is_ok());
-
-        let mut bad = op();
-        bad.rows = 0;
-        assert!(dense_ffn_refusal(&bad).contains("empty geometry"));
-        let mut bad = op();
-        bad.hidden = 0;
-        assert!(dense_ffn_refusal(&bad).contains("empty geometry"));
-        let mut bad = op();
-        bad.intermediate = 0;
-        assert!(dense_ffn_refusal(&bad).contains("empty geometry"));
-
-        // Transposed or mis-sized projection geometry.
-        let mut bad = op();
-        bad.gate = plain_weight(&t[0], DType::BF16, hidden, intermediate);
-        assert!(dense_ffn_refusal(&bad).contains("dense FFN gate"));
-        let mut bad = op();
-        bad.up = plain_weight(&t[1], DType::BF16, intermediate, intermediate);
-        assert!(dense_ffn_refusal(&bad).contains("dense FFN up"));
-        let mut bad = op();
-        bad.down = plain_weight(&t[2], DType::BF16, intermediate, hidden);
-        assert!(dense_ffn_refusal(&bad).contains("dense FFN down"));
-
-        // A weight buffer smaller than its geometry, and an unprojectable dtype.
-        let short = tensor(hidden * intermediate - 1, DType::BF16);
-        let mut bad = op();
-        bad.down = plain_weight(&short, DType::BF16, hidden, intermediate);
-        assert!(dense_ffn_refusal(&bad).contains("dense FFN down"));
-        let mut bad = op();
-        bad.gate = plain_weight(&t[0], DType::F32, intermediate, hidden);
-        assert!(dense_ffn_refusal(&bad).contains("dense FFN gate"));
-    }
-
-    #[test]
-    fn dense_ffn_scratch_validation() {
-        let (rows, hidden, intermediate) = (3, 16, 8);
-        let rotation = tensor(1, DType::F32);
-        let small_wide = tensor(rows * hidden - 1, DType::F32);
-        let small_inner = tensor(rows * intermediate - 1, DType::F32);
-        let wrong_dtype = tensor(rows * hidden, DType::BF16);
-        let t = dense_ffn_fixture(rows, hidden, intermediate);
-        let op = || dense_ffn_op(&t, &rotation, rows, hidden, intermediate);
-
-        let mut bad = op();
-        bad.input = &small_wide;
-        assert!(dense_ffn_refusal(&bad).contains("dense FFN input"));
-        let mut bad = op();
-        bad.input = &wrong_dtype;
-        assert!(dense_ffn_refusal(&bad).contains("dense FFN input"));
-        let mut bad = op();
-        bad.gate_scratch = &small_inner;
-        assert!(dense_ffn_refusal(&bad).contains("gate scratch"));
-        let mut bad = op();
-        bad.up_scratch = &small_inner;
-        assert!(dense_ffn_refusal(&bad).contains("up scratch"));
-        let mut bad = op();
-        bad.output = &small_wide;
-        assert!(dense_ffn_refusal(&bad).contains("dense FFN output"));
-
-        // Rotation scratch is owed only to FWHT payloads, and then at
-        // rows * max(hidden, intermediate).
-        let mut bad = op();
-        bad.down = plain_weight(&t[2], DType::MQ4G256V2, hidden, intermediate);
-        assert!(dense_ffn_refusal(&bad).contains("dense FFN rotation"));
-        let enough = tensor(rows * hidden, DType::F32);
-        let mut fwht = dense_ffn_op(&t, &enough, rows, hidden, intermediate);
-        fwht.down = plain_weight(&t[2], DType::MQ4G256V2, hidden, intermediate);
-        assert!(fwht.validate_layout().is_ok());
     }
 
     #[test]

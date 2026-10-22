@@ -46,16 +46,19 @@ use hipfire_dispatch::families::moe::{
     MoeSharedDtypes, MoeSharedWeights, MoeStageTables, MoeTileExchange, MoeTileExchangeParams,
     RoutedExpertWeights, MOE_GROUPED_BLOCK_M,
 };
+use hipfire_dispatch::pipeline::gated_mlp::{
+    Activation, GatedMlpOp, GatedMlpScratch, MlpLadder, MlpOutput, MlpStorage,
+};
 use hipfire_dispatch::pipeline::sealed_moe::{
     retained_body_action, specialized_sealed_moe_retained_admission, RetainedBodyAction,
     SealedMoeCall,
 };
 use hipfire_dispatch::pipeline::{
     execute_embedding, execute_validated_steps, execute_validated_steps_with_moe_hooks,
-    seal_decode, validate_steps, BoundMoeExperts, ClearOp, DenseFfnOp, DenseFfnRecipe, EmbeddingOp,
-    ExpertBindingCache, ExpertMetadata, ExpertResource, ExpertResources, ExpertTable,
-    GatedDeltaNetOp, GroupedDepthwiseOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode,
-    IndexedAttentionOp, IndexedAttentionState, MixerPhase, MoeStepHooks, Step,
+    seal_decode, validate_steps, BoundMoeExperts, ClearOp, EmbeddingOp, ExpertBindingCache,
+    ExpertMetadata, ExpertResource, ExpertResources, ExpertTable, GatedDeltaNetOp,
+    GroupedDepthwiseOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp,
+    IndexedAttentionState, MixerPhase, MoeStepHooks, Step,
 };
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_dispatch::types::DispatchError;
@@ -5786,7 +5789,7 @@ impl Qwen4GpuForwardScratch {
             alloc(F::MoeSharedOutput, rows(hidden)?, DType::F32)?;
             // Batched gate/up rows: routed slots * routed intermediate for a
             // MoE profile, rows * intermediate for a dense FFN (exactly one of
-            // the two extents is nonzero); `Step::DenseFfn` borrows both.
+            // the two extents is nonzero); `Step::GatedMlp` borrows both.
             alloc(F::MoeGateBatch, ffn_batch_rows, DType::F32)?;
             alloc(F::MoeUpBatch, ffn_batch_rows, DType::F32)?;
             alloc(F::MoeRotBatch, rows(routed_width)?, DType::F32)?;
@@ -6860,19 +6863,25 @@ impl<'a> LayerPhaseEnv<'a> {
     /// `scratch.ffn_output`.
     pub(crate) fn dense_step(&self, dense: &Qwen4DenseBinding<'a>) -> Step<'a> {
         let scratch = self.scratch;
-        Step::DenseFfn(DenseFfnOp {
-            recipe: DenseFfnRecipe::SiluBf16Source,
-            gate: dense.gate,
-            up: dense.up,
-            down: dense.down,
-            input: &scratch.hc_mixed,
-            gate_scratch: &scratch.moe_gate_batch,
-            up_scratch: &scratch.moe_up_batch,
-            output: &scratch.ffn_output,
-            rotation: &scratch.rotation,
+        Step::GatedMlp(GatedMlpOp {
             rows: self.rows,
             hidden: self.bundle.config.hidden_size,
             intermediate: dense.intermediate,
+            x: &scratch.hc_mixed,
+            pre_norm: None,
+            gate: dense.gate,
+            up: dense.up,
+            down: dense.down,
+            activation: Activation::Silu,
+            storage: MlpStorage::Bf16Source,
+            output: MlpOutput::Write(&scratch.ffn_output),
+            ladder: MlpLadder::Trunk,
+            scratch: GatedMlpScratch {
+                gate: &scratch.moe_gate_batch,
+                up: &scratch.moe_up_batch,
+                act: &scratch.moe_gate_batch,
+                x_rot: &scratch.rotation,
+            },
         })
     }
 
