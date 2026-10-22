@@ -818,9 +818,16 @@ impl Qwen4Bundle {
             (Some(inputs), Some(ple_config)) => {
                 // One prefill chunk prefetches `rows * head_count` n-gram rows
                 // in a single row-store request, so staging holds the
-                // requested chunk.
-                let staging_rows =
-                    qwen4_prefill_chunk_requested(gpu, max_seq_len) * ple_config.head_count;
+                // requested chunk. The scratch mode is not known at assembly:
+                // the largest-default mode (`FnSymGfx1201`, 16384 rows on
+                // gfx1201) bounds every mode's chunk, so staging always
+                // covers the chunk the forward later picks. An explicit
+                // `HIPFIRE_PREFILL_CHUNK_ROWS` stays authoritative.
+                let staging_rows = qwen4_prefill_chunk_requested(
+                    gpu,
+                    max_seq_len,
+                    Qwen4ForwardScratchMode::FnSymGfx1201,
+                ) * ple_config.head_count;
                 match build_ple_row_store(
                     &inputs.source,
                     &transaction,
@@ -1428,7 +1435,7 @@ impl Qwen4Bundle {
         let s1_tile = self.slowlink.profile.map(|profile| profile.tile_rows);
         let requested =
             session_pair::attach_chunk_request(s1_tile, max_chunk, ple_rows_cap, || {
-                qwen4_prefill_chunk_requested(gpu, max_chunk)
+                qwen4_prefill_chunk_requested(gpu, max_chunk, mode)
             })
             .map_err(BundleError::Forward)?;
         if requested == 0 {

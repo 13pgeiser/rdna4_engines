@@ -2684,8 +2684,11 @@ pub fn qwen4_ep_vram_layers(
                 .map(|(_, bytes)| bytes.len() as u64)
         })
     };
-    let chunk_rows =
-        hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(gpu, shared.max_seq);
+    let chunk_rows = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(
+        gpu,
+        shared.max_seq,
+        scratch_mode,
+    );
     let (non_expert, layer_experts, reserve, ..) = qwen4_placement_inputs(
         gpu,
         &config,
@@ -2818,17 +2821,34 @@ pub fn qwen4_preload_resource_plan(
     };
     // Conservative supported scratch-mode union without the payload scan:
     // `Full` always; the compact route only where its device/flag/profile
-    // terms already allow it. The selected route stays unknown here.
-    let chunk_rows = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(gpu, max_seq);
+    // terms already allow it. The selected route stays unknown here, so the
+    // chunk the census, PLE staging and pool workspace are sized from is the
+    // largest default among the possible modes (`chunk_rows`); each mode's
+    // own scratch bytes are taken at its own default chunk.
+    use hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode;
+    let compact_possible =
+        hipfire_arch_qwen4::gpu_forward::qwen4_compact_scratch_possible(gpu, &config);
+    let full_chunk = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(
+        gpu,
+        max_seq,
+        Qwen4ForwardScratchMode::Full,
+    );
+    let compact_chunk = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(
+        gpu,
+        max_seq,
+        Qwen4ForwardScratchMode::FnSymGfx1201,
+    );
+    let chunk_rows = if compact_possible {
+        full_chunk.max(compact_chunk)
+    } else {
+        full_chunk
+    };
     if chunk_rows == 0 {
         return Err("qwen4 preload plan: requested prefill chunk is zero".into());
     }
-    let compact_possible =
-        hipfire_arch_qwen4::gpu_forward::qwen4_compact_scratch_possible(gpu, &config);
-    use hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode;
     let full_scratch = hipfire_arch_qwen4::gpu_forward::qwen4_forward_device_bytes(
         &config,
-        chunk_rows,
+        full_chunk,
         Qwen4ForwardScratchMode::Full,
     )
     .ok_or("qwen4 preload plan: full scratch has no checked byte authority")?;
@@ -2836,7 +2856,7 @@ pub fn qwen4_preload_resource_plan(
         Some(
             hipfire_arch_qwen4::gpu_forward::qwen4_forward_device_bytes(
                 &config,
-                chunk_rows,
+                compact_chunk,
                 Qwen4ForwardScratchMode::FnSymGfx1201,
             )
             .ok_or("qwen4 preload plan: compact scratch has no checked byte authority")?,
@@ -4428,9 +4448,14 @@ fn load_qwen4_rank_scoped(
     // default measures the host link once (cached per device; a unified
     // device is classified without a copy) and is 8192 only on a narrow
     // discrete link, so the placement cedes resident layers for the wider
-    // chunk there. Every other arch and any explicit value never probes.
-    let placement_chunk =
-        hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&*ctx.gpu, ctx.max_seq);
+    // chunk there. On gfx1201 the default follows the load's scratch plan
+    // (16384 rows under the compact plan, 4096 under `Full`). Every other
+    // arch and any explicit value never probes.
+    let placement_chunk = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(
+        &*ctx.gpu,
+        ctx.max_seq,
+        scratch_mode,
+    );
     // Freeze the original capacity inputs before placement, materialization or
     // capture growth. Pool readings are separate instants, not a free-memory
     // delta and not evidence of an old model's original preload basis.
@@ -6944,7 +6969,8 @@ fn load_qwen4_pp_bundle(
         let scratch_mode =
             q4::artifact::source_forward_scratch_mode(daemon, hfq, &config, &receipt.manifest)
                 .map_err(|error| error.to_string())?;
-        let chunk_rows = q4::gpu_forward::qwen4_prefill_chunk_requested(daemon, shared.max_seq);
+        let chunk_rows =
+            q4::gpu_forward::qwen4_prefill_chunk_requested(daemon, shared.max_seq, scratch_mode);
         let context = q4::Qwen4ContextCommit::new(
             shared.backend,
             shared.max_seq,

@@ -530,22 +530,28 @@ pub struct RouteChoice {
 /// [`crate::gpu_forward::expert_stage_min_rows_from`]) and the same developer
 /// overrides (`HIPFIRE_QWEN4_EXPERT_STAGE`, `HIPFIRE_PREFILL_CHUNK_ROWS`,
 /// `HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS`). The chunk is reported before the
-/// model's `max_seq` cap, which is only known at load.
+/// model's `max_seq` cap, which is only known at load, and for the compact
+/// forward scratch plan the shipped Flash-Next artifacts take on gfx1201
+/// (`Qwen4ForwardScratchMode::FnSymGfx1201`, 16384 rows); a load that keeps
+/// the `Full` plan (`HIPFIRE_QWEN4_COMPACT_SCRATCH=0`) defaults to 4096 rows.
 pub fn link_route_choices(arch: &str, link: HostLink) -> Vec<RouteChoice> {
     let env = |name: &str| hipfire_config::developer_var(name).ok();
     link_route_choices_from(
         arch,
         link,
+        crate::gpu_forward::Qwen4ForwardScratchMode::FnSymGfx1201,
         env(crate::gpu_forward::QWEN4_EXPERT_STAGE_ENV).as_deref(),
         env(crate::gpu_forward::QWEN4_PREFILL_CHUNK_ROWS_ENV).as_deref(),
         env(crate::gpu_forward::QWEN4_EXPERT_STAGE_MIN_ROWS_ENV).as_deref(),
     )
 }
 
-/// [`link_route_choices`] with the three developer-override values supplied.
+/// [`link_route_choices`] with the scratch `mode` and the three
+/// developer-override values supplied.
 fn link_route_choices_from(
     arch: &str,
     link: HostLink,
+    mode: crate::gpu_forward::Qwen4ForwardScratchMode,
     stage_env: Option<&str>,
     chunk_env: Option<&str>,
     min_rows_env: Option<&str>,
@@ -567,8 +573,8 @@ fn link_route_choices_from(
         format!("follows the link: {note}")
     };
 
-    let chunk = prefill_chunk_requested_from(arch, chunk_env, usize::MAX, || link);
-    let baseline = qwen4_prefill_chunk_baseline_default(arch);
+    let chunk = prefill_chunk_requested_from(arch, chunk_env, usize::MAX, mode, || link);
+    let baseline = qwen4_prefill_chunk_baseline_default(arch, mode);
     let chunk_why = if explicit_prefill_chunk_rows(chunk_env).is_some() {
         format!("{QWEN4_PREFILL_CHUNK_ROWS_ENV} override (whole 256-row tiles)")
     } else if chunk != baseline {
@@ -632,6 +638,7 @@ fn link_note(link: HostLink) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gpu_forward::Qwen4ForwardScratchMode;
 
     #[test]
     fn classification_is_fail_closed() {
@@ -870,7 +877,9 @@ mod tests {
         let calibrated = link_from_calibration(&fresh(false, Some(7.115_572_651_289_664)))
             .expect("a fresh discrete record states its link");
         let probed = HostLink::classify(false, Some(7.1));
-        let chunk = |link: HostLink| qwen4_prefill_chunk_default("gfx1100", || link);
+        let chunk = |link: HostLink| {
+            qwen4_prefill_chunk_default("gfx1100", Qwen4ForwardScratchMode::Full, || link)
+        };
         assert_eq!(chunk(calibrated), 8192);
         assert_eq!(chunk(calibrated), chunk(probed));
         let layers = |free_mib: u64| {
@@ -892,7 +901,14 @@ mod tests {
     }
 
     fn routes(arch: &str, link: HostLink) -> [String; 3] {
-        let choices = link_route_choices_from(arch, link, None, None, None);
+        let choices = link_route_choices_from(
+            arch,
+            link,
+            Qwen4ForwardScratchMode::FnSymGfx1201,
+            None,
+            None,
+            None,
+        );
         [
             route(&choices, "expert_stage").value.clone(),
             route(&choices, "prefill_chunk_rows").value.clone(),
@@ -922,14 +938,31 @@ mod tests {
             HostLink::Unmeasured,
             HostLink::Unified,
         ] {
-            assert_eq!(routes("gfx1201", link), ["on", "4096", "2048"], "{link:?}");
+            assert_eq!(routes("gfx1201", link), ["on", "16384", "2048"], "{link:?}");
+            // The Full plan keeps the 4096-row chunk.
+            let full = link_route_choices_from(
+                "gfx1201",
+                link,
+                Qwen4ForwardScratchMode::Full,
+                None,
+                None,
+                None,
+            );
+            assert_eq!(route(&full, "prefill_chunk_rows").value, "4096", "{link:?}");
         }
     }
 
     #[test]
     fn route_reasons_name_what_decided() {
         let narrow = HostLink::Discrete { gbps: 7.1 };
-        let choices = link_route_choices_from("gfx1100", narrow, None, None, None);
+        let choices = link_route_choices_from(
+            "gfx1100",
+            narrow,
+            Qwen4ForwardScratchMode::Full,
+            None,
+            None,
+            None,
+        );
         assert!(route(&choices, "expert_stage").why.contains("narrow"));
         assert!(route(&choices, "prefill_chunk_rows")
             .why
@@ -939,6 +972,7 @@ mod tests {
         let off = link_route_choices_from(
             "gfx1100",
             HostLink::Discrete { gbps: 27.0 },
+            Qwen4ForwardScratchMode::Full,
             None,
             None,
             None,
@@ -947,7 +981,14 @@ mod tests {
             .why
             .ends_with("unused while staging is off"));
 
-        let arch_on = link_route_choices_from("gfx1201", HostLink::Unmeasured, None, None, None);
+        let arch_on = link_route_choices_from(
+            "gfx1201",
+            HostLink::Unmeasured,
+            Qwen4ForwardScratchMode::FnSymGfx1201,
+            None,
+            None,
+            None,
+        );
         assert!(route(&arch_on, "expert_stage")
             .why
             .starts_with("arch default"));
@@ -956,8 +997,14 @@ mod tests {
     #[test]
     fn developer_overrides_win_in_the_report_as_in_the_engine() {
         let narrow = HostLink::Discrete { gbps: 7.1 };
-        let choices =
-            link_route_choices_from("gfx1100", narrow, Some("0"), Some("2048"), Some("512"));
+        let choices = link_route_choices_from(
+            "gfx1100",
+            narrow,
+            Qwen4ForwardScratchMode::Full,
+            Some("0"),
+            Some("2048"),
+            Some("512"),
+        );
         let stage = route(&choices, "expert_stage");
         assert_eq!(stage.value, "off");
         assert!(stage.why.contains("HIPFIRE_QWEN4_EXPERT_STAGE=0"));
@@ -968,10 +1015,24 @@ mod tests {
         assert_eq!(rows.value, "512");
         assert!(rows.why.contains("HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS"));
         // Anything but the strict `1`/`0` is unset, as in the engine.
-        let loose = link_route_choices_from("gfx1100", narrow, Some("on"), None, None);
+        let loose = link_route_choices_from(
+            "gfx1100",
+            narrow,
+            Qwen4ForwardScratchMode::Full,
+            Some("on"),
+            None,
+            None,
+        );
         assert_eq!(route(&loose, "expert_stage").value, "on");
         assert!(route(&loose, "expert_stage").why.contains("narrow"));
-        let forced = link_route_choices_from("gfx1100", HostLink::Unified, Some("1"), None, None);
+        let forced = link_route_choices_from(
+            "gfx1100",
+            HostLink::Unified,
+            Qwen4ForwardScratchMode::Full,
+            Some("1"),
+            None,
+            None,
+        );
         assert_eq!(route(&forced, "expert_stage").value, "on");
     }
 }

@@ -2514,7 +2514,11 @@ pub fn single_device_facts_with_arenas<'a>(
     pre_init_free_bytes: Option<u64>,
 ) -> Result<LoadFacts<'a>, String> {
     // Beta's single incumbent helper (probes the host link once, cached).
-    let placement_chunk = crate::gpu_forward::qwen4_prefill_chunk_requested(load.gpu, load.max_seq);
+    let placement_chunk = crate::gpu_forward::qwen4_prefill_chunk_requested(
+        load.gpu,
+        load.max_seq,
+        load.scratch_mode,
+    );
     // The tile reserve once: its census total sizes the placement and its
     // runtime charge is the credit the S1 runtime budget supplements.
     let tile_reserve = single_device_reserve(load, purpose_tile_rows(load.purpose))?;

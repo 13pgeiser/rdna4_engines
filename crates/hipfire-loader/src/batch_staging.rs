@@ -629,7 +629,12 @@ fn stage_qwen4_lanes(
     // helper (`Qwen4Carrier` reserves them before splitting the experts).
     let row_budget = ep_lane_row_budget(req.row_budget, requested);
     if topology == "single" {
-        let chunk = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(gpu, max_seq);
+        // The chunk the attached forward's scratch plan defaults to.
+        let mode = bundle
+            .forward_scratch_mode()
+            .unwrap_or(hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode::Full);
+        let chunk =
+            hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(gpu, max_seq, mode);
         let Some(need) = ep_lane_store_device_bytes(
             &bundle.config,
             bundle.state_format(),

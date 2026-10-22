@@ -2036,7 +2036,11 @@ fn stage_rank_lanes(
         .ep_placement()
         .map_or(0, |placement| placement.rank);
     let max_seq = bundle.state.max_seq_len;
-    let chunk = crate::gpu_forward::qwen4_prefill_chunk_requested(gpu, max_seq);
+    // The rank's attached forward plan; an EP load always keeps `Full`.
+    let mode = bundle
+        .forward_scratch_mode()
+        .unwrap_or(crate::gpu_forward::Qwen4ForwardScratchMode::Full);
+    let chunk = crate::gpu_forward::qwen4_prefill_chunk_requested(gpu, max_seq, mode);
     let need = ep_lane_store_device_bytes(
         &bundle.config,
         bundle.state_format(),

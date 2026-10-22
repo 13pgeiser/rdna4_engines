@@ -94,11 +94,19 @@ pub(crate) const QWEN4_PREFILL_CHUNK_ROWS_ENV: &str = "HIPFIRE_PREFILL_CHUNK_ROW
 /// expert weights, so pp throughput rises with the chunk until another
 /// kernel's shape envelope ends.  Measured against the earlier 1536-row
 /// chunk: gfx1151 pp8192 +10.2% at 8192 rows (resident experts).  On
-/// gfx1201 under `auto` expert placement the larger chunk costs VRAM expert
-/// layers, so the rung is the fastest pp8192 within 3% of the 2048-row
-/// rung's tg64: 4096 rows (14 layers at max_seq 66,560) measured pp8192
-/// +14.1% over 2048 rows (16 layers) at -2.9% tg64; 8192 rows (11 layers)
-/// measured +22.6% at -6.9% tg64.
+/// gfx1201 the default depends on the forward scratch plan `mode`: with the
+/// compact phase-arena scratch ([`Qwen4ForwardScratchMode::FnSymGfx1201`])
+/// the chunk is 16384 rows (pp16384 +12% over 4096 rows measured on the
+/// R9700, fn-chunk-ab-001; the scratch costs 4776 MiB at 16384 rows against
+/// 4328 MiB for 4096 rows under the Full plan).  Fewer routed experts stay
+/// resident than with a 4096-row compact chunk, so decode is slower; an
+/// explicit `HIPFIRE_PREFILL_CHUNK_ROWS=4096` keeps the smaller chunk for
+/// decode-heavy use.  Under the Full plan the
+/// larger chunk costs VRAM expert layers under `auto` expert placement, so
+/// the rung is the fastest pp8192 within 3% of the 2048-row rung's tg64:
+/// 4096 rows (14 layers at max_seq 66,560) measured pp8192 +14.1% over 2048
+/// rows (16 layers) at -2.9% tg64; 8192 rows (11 layers) measured +22.6% at
+/// -6.9% tg64.
 ///
 /// gfx1100 takes 8192 only on a measured narrow discrete host link
 /// ([`crate::host_link::HostLink::is_narrow_discrete`], measured below
@@ -113,20 +121,24 @@ pub(crate) const QWEN4_PREFILL_CHUNK_ROWS_ENV: &str = "HIPFIRE_PREFILL_CHUNK_ROW
 /// probe here. Other architectures keep the measured 1536.
 pub fn qwen4_prefill_chunk_default(
     arch: &str,
+    mode: Qwen4ForwardScratchMode,
     link: impl FnOnce() -> crate::host_link::HostLink,
 ) -> usize {
     match rdna_compute::expert_capabilities::narrow_link_prefill_chunk_rows(arch) {
         Some(rows) if link().is_narrow_discrete() => rows,
-        _ => qwen4_prefill_chunk_baseline_default(arch),
+        _ => qwen4_prefill_chunk_baseline_default(arch, mode),
     }
 }
 
-/// The default chunk before any link policy: gfx1151 8192, gfx1201 4096,
-/// gfx942 and every other arch 1536. Never reads the host link; gfx1100 uses
-/// it unless [`qwen4_prefill_chunk_default`] sees a narrow discrete link.
-pub fn qwen4_prefill_chunk_baseline_default(arch: &str) -> usize {
+/// The default chunk before any link policy: gfx1151 8192, gfx1201 16384
+/// under the compact [`Qwen4ForwardScratchMode::FnSymGfx1201`] scratch and
+/// 4096 under `Full`, gfx942 and every other arch 1536. Never reads the host
+/// link; gfx1100 uses it unless [`qwen4_prefill_chunk_default`] sees a narrow
+/// discrete link.
+pub fn qwen4_prefill_chunk_baseline_default(arch: &str, mode: Qwen4ForwardScratchMode) -> usize {
     match arch {
         "gfx1151" => 8192,
+        "gfx1201" if mode == Qwen4ForwardScratchMode::FnSymGfx1201 => 16384,
         "gfx1201" => 4096,
         "gfx942" => GFX942_PREFILL_CHUNK_ROWS,
         _ => 1536,
@@ -135,23 +147,29 @@ pub fn qwen4_prefill_chunk_baseline_default(arch: &str) -> usize {
 
 /// Requested prefill chunk: `prefill.chunk_rows`
 /// (`HIPFIRE_PREFILL_CHUNK_ROWS`) rounded down to whole 256-row GEMM tiles,
-/// else [`qwen4_prefill_chunk_default`] for `gpu` (its host link is measured
-/// once per device, see [`crate::host_link`], and only on gfx1100); never
-/// above `max_seq`. An explicit value never probes. Load-time admission
-/// ([`qwen4_prefill_chunk_rungs`]) may still pick a smaller rung.
+/// else [`qwen4_prefill_chunk_default`] for `gpu` under scratch `mode` (its
+/// host link is measured once per device, see [`crate::host_link`], and only
+/// on gfx1100); never above `max_seq`. An explicit value never probes.
+/// Load-time admission ([`qwen4_prefill_chunk_rungs`]) may still pick a
+/// smaller rung.
 ///
 /// This is also the chunk the loader sizes the expert placement reserve,
 /// forward census and pool workspace from, so on a measured narrow discrete
 /// gfx1100 link the default 8192 rows are charged to the placement (ceding
 /// resident expert layers), and an explicit `HIPFIRE_PREFILL_CHUNK_ROWS`
 /// stays authoritative for placement and chunk alike.
-pub fn qwen4_prefill_chunk_requested(gpu: &Gpu, max_seq: usize) -> usize {
+pub fn qwen4_prefill_chunk_requested(
+    gpu: &Gpu,
+    max_seq: usize,
+    mode: Qwen4ForwardScratchMode,
+) -> usize {
     prefill_chunk_requested_from(
         &gpu.arch,
         hipfire_config::developer_var(QWEN4_PREFILL_CHUNK_ROWS_ENV)
             .ok()
             .as_deref(),
         max_seq,
+        mode,
         || crate::host_link::host_link(gpu),
     )
 }
@@ -170,18 +188,20 @@ pub(crate) fn prefill_chunk_requested_from(
     arch: &str,
     env: Option<&str>,
     max_seq: usize,
+    mode: Qwen4ForwardScratchMode,
     link: impl FnOnce() -> crate::host_link::HostLink,
 ) -> usize {
     explicit_prefill_chunk_rows(env)
-        .unwrap_or_else(|| qwen4_prefill_chunk_default(arch, link))
+        .unwrap_or_else(|| qwen4_prefill_chunk_default(arch, mode, link))
         .min(max_seq)
 }
 
 /// Chunk rungs admission tries, largest first: `requested`, then each
-/// smaller default rung down to 1536 (or `requested` itself when smaller).
+/// smaller default rung (8192, 4096, 2048) down to 1536 (or `requested`
+/// itself when smaller).
 pub(crate) fn qwen4_prefill_chunk_rungs(requested: usize) -> impl Iterator<Item = usize> {
     std::iter::once(requested).chain(
-        [4096, 2048, 1536]
+        [8192, 4096, 2048, 1536]
             .into_iter()
             .filter(move |&rows| rows < requested),
     )
@@ -432,7 +452,7 @@ pub fn qwen4_compact_scratch_possible(gpu: &Gpu, config: &Qwen4Config) -> bool {
 /// (every routed trunk layer is a slab arena; default on, `0` opts out);
 /// `source_symmetric` is the proof from the artifact's actual routed payload
 /// headers ([`crate::artifact::routed_headers_symmetric`]), not metadata, and
-/// still needs the knob at `1` plus the IU4 route requested;
+/// also needs the IU4 route requested (default on, `0` opts out);
 /// `ple_key_value_bf16` states that the PLE key/value projections are BF16.
 /// Cheap arch/flag checks come first so a caller may skip its header scan
 /// when this would be `Full` regardless.  [`Qwen4GpuForward::new`] still
@@ -13215,27 +13235,79 @@ mod tests {
             );
             assert!(!super::trunk_prefill_invariant_scope(true, "gfx1201", knob));
         }
+        use super::Qwen4ForwardScratchMode::{FnSymGfx1201, Full};
         let unmeasured = || crate::host_link::HostLink::Unmeasured;
         assert_eq!(
-            super::qwen4_prefill_chunk_default("gfx942", unmeasured),
+            super::qwen4_prefill_chunk_default("gfx942", Full, unmeasured),
             1536
         );
         assert_eq!(
-            super::qwen4_prefill_chunk_default("gfx1151", unmeasured),
+            super::qwen4_prefill_chunk_default("gfx1151", Full, unmeasured),
             8192
         );
         assert_eq!(
-            super::qwen4_prefill_chunk_default("gfx1201", unmeasured),
+            super::qwen4_prefill_chunk_default("gfx1201", Full, unmeasured),
             4096
+        );
+        assert_eq!(
+            super::qwen4_prefill_chunk_default("gfx1201", FnSymGfx1201, unmeasured),
+            16384
+        );
+    }
+
+    #[test]
+    fn gfx1201_chunk_follows_the_scratch_mode_and_explicit_env_wins() {
+        use super::Qwen4ForwardScratchMode::{FnSymGfx1201, Full};
+        use super::{prefill_chunk_requested_from as chunk, qwen4_prefill_chunk_rungs};
+        let probe = || unreachable!("probed");
+        // The compact phase-arena scratch takes 16384 rows, the Full plan 4096.
+        assert_eq!(chunk("gfx1201", None, usize::MAX, Full, probe), 4096);
+        assert_eq!(
+            chunk("gfx1201", None, usize::MAX, FnSymGfx1201, probe),
+            16384
+        );
+        // An explicit value is authoritative under both plans.
+        for mode in [Full, FnSymGfx1201] {
+            assert_eq!(
+                chunk("gfx1201", Some("8192"), usize::MAX, mode, probe),
+                8192
+            );
+            assert_eq!(
+                chunk("gfx1201", Some("2048"), usize::MAX, mode, probe),
+                2048
+            );
+            assert_eq!(
+                chunk("gfx1201", Some("16384"), usize::MAX, mode, probe),
+                16384
+            );
+            assert_eq!(chunk("gfx1201", Some("16384"), 4096, mode, probe), 4096);
+        }
+        // Never above max_seq.
+        assert_eq!(chunk("gfx1201", None, 6144, FnSymGfx1201, probe), 6144);
+        assert_eq!(chunk("gfx1201", None, 1024, Full, probe), 1024);
+        // The scratch mode can only raise a gfx1201 default, never lower it,
+        // so a bound taken with `FnSymGfx1201` covers every mode.
+        for arch in ["gfx1100", "gfx1151", "gfx942", "gfx1030", "gfx1201"] {
+            assert!(
+                super::qwen4_prefill_chunk_baseline_default(arch, FnSymGfx1201)
+                    >= super::qwen4_prefill_chunk_baseline_default(arch, Full),
+                "{arch}"
+            );
+        }
+        // A 16384 request that does not fit tries 8192 first.
+        assert_eq!(
+            qwen4_prefill_chunk_rungs(16384).collect::<Vec<_>>(),
+            [16384, 8192, 4096, 2048, 1536]
         );
     }
 
     #[test]
     fn gfx1100_chunk_is_8192_only_on_a_measured_narrow_discrete_link() {
         use super::prefill_chunk_requested_from;
+        use super::Qwen4ForwardScratchMode::{FnSymGfx1201, Full};
         use crate::host_link::HostLink::{self, Discrete, Unified, Unmeasured};
         let chunk = |arch: &str, link: HostLink| {
-            prefill_chunk_requested_from(arch, None, usize::MAX, move || link)
+            prefill_chunk_requested_from(arch, None, usize::MAX, Full, move || link)
         };
         // Narrow discrete link: the larger admitted rung.
         assert_eq!(chunk("gfx1100", Discrete { gbps: 12.0 }), 8192);
@@ -13245,8 +13317,8 @@ mod tests {
         assert_eq!(chunk("gfx1100", Discrete { gbps: 26.0 }), 1536);
         assert_eq!(chunk("gfx1100", Unmeasured), 1536);
         assert_eq!(chunk("gfx1100", Unified), 1536);
-        // No other arch changes: gfx1201 stays 4096 on any link (Gen5 x16
-        // R9700 included), gfx1151 stays 8192, the rest 1536.
+        // No other arch changes: gfx1201 Full stays 4096 on any link (Gen5
+        // x16 R9700 included), gfx1151 stays 8192, the rest 1536.
         for link in [
             Discrete { gbps: 4.0 },
             Discrete { gbps: 27.3 },
@@ -13260,27 +13332,30 @@ mod tests {
         }
         // Only gfx1100 evaluates the link (so the other arches never probe),
         // and an explicit chunk request never does.
-        for (arch, rows) in [
-            ("gfx1201", 4096),
-            ("gfx1151", 8192),
-            ("gfx942", 1536),
-            ("gfx1030", 1536),
+        for (arch, mode, rows) in [
+            ("gfx1201", Full, 4096),
+            ("gfx1201", FnSymGfx1201, 16384),
+            ("gfx1151", Full, 8192),
+            ("gfx942", Full, 1536),
+            ("gfx1030", Full, 1536),
         ] {
             assert_eq!(
-                prefill_chunk_requested_from(arch, None, usize::MAX, || unreachable!("probed")),
+                prefill_chunk_requested_from(arch, None, usize::MAX, mode, || unreachable!(
+                    "probed"
+                )),
                 rows,
                 "{arch}"
             );
         }
         assert_eq!(
-            prefill_chunk_requested_from("gfx1100", Some("2048"), usize::MAX, || {
+            prefill_chunk_requested_from("gfx1100", Some("2048"), usize::MAX, Full, || {
                 unreachable!("probed")
             }),
             2048
         );
         // max_seq still caps it, and the attach-time rung search can step down.
         assert_eq!(
-            prefill_chunk_requested_from("gfx1100", None, 4096, || Discrete { gbps: 8.0 }),
+            prefill_chunk_requested_from("gfx1100", None, 4096, Full, || Discrete { gbps: 8.0 }),
             4096
         );
         assert_eq!(
@@ -13291,8 +13366,18 @@ mod tests {
 
     #[test]
     fn placement_chunk_is_the_requested_chunk_and_only_gfx1100_reads_the_link() {
-        use super::prefill_chunk_requested_from as chunk;
+        use super::prefill_chunk_requested_from;
+        use super::Qwen4ForwardScratchMode as Mode;
         use crate::host_link::HostLink::{Discrete, Unified, Unmeasured};
+        // gfx1100's chunk does not depend on the scratch mode.
+        fn chunk(
+            arch: &str,
+            env: Option<&str>,
+            max_seq: usize,
+            link: impl FnOnce() -> crate::host_link::HostLink,
+        ) -> usize {
+            prefill_chunk_requested_from(arch, env, max_seq, Mode::Full, link)
+        }
         // The expert placement reserve is sized from the requested chunk, so
         // a measured narrow discrete gfx1100 link is the one default that
         // places for 8192 rows (ceding resident layers); every other link
@@ -13315,17 +13400,23 @@ mod tests {
         }
         // Every other arch keeps its baseline and never evaluates the link
         // (gfx1201, gfx1151 and the rest never probe).
-        for (arch, rows) in [
-            ("gfx1151", 8192),
-            ("gfx1201", 4096),
-            ("gfx942", 1536),
-            ("gfx1030", 1536),
+        for (arch, mode, rows) in [
+            ("gfx1151", Mode::Full, 8192),
+            ("gfx1201", Mode::Full, 4096),
+            ("gfx1201", Mode::FnSymGfx1201, 16384),
+            ("gfx942", Mode::Full, 1536),
+            ("gfx1030", Mode::Full, 1536),
         ] {
-            assert_eq!(super::qwen4_prefill_chunk_baseline_default(arch), rows);
             assert_eq!(
-                chunk(arch, None, usize::MAX, || unreachable!("probed")),
+                super::qwen4_prefill_chunk_baseline_default(arch, mode),
+                rows
+            );
+            assert_eq!(
+                prefill_chunk_requested_from(arch, None, usize::MAX, mode, || unreachable!(
+                    "probed"
+                )),
                 rows,
-                "{arch}"
+                "{arch} {mode:?}"
             );
         }
         // An explicit value is authoritative on every arch and link and never
@@ -13364,7 +13455,13 @@ mod tests {
         };
         use crate::host_link::HostLink::{Discrete, Unmeasured};
         let chunk = |arch: &str, env: Option<&str>| {
-            prefill_chunk_requested_from(arch, env, usize::MAX, || Unmeasured)
+            prefill_chunk_requested_from(
+                arch,
+                env,
+                usize::MAX,
+                super::Qwen4ForwardScratchMode::Full,
+                || Unmeasured,
+            )
         };
         // gfx1100 on a fast/unmeasured link: the 1536-row chunk is the
         // threshold, so a full chunk stages.
@@ -13659,7 +13756,11 @@ mod tests {
         let link = Discrete { gbps: 12.0 };
         let narrow = link.is_narrow_discrete();
         assert!(narrow);
-        let chunk = super::qwen4_prefill_chunk_default("gfx1100", || link);
+        let chunk = super::qwen4_prefill_chunk_default(
+            "gfx1100",
+            super::Qwen4ForwardScratchMode::Full,
+            || link,
+        );
         assert_eq!(chunk, 8192, "the narrow-link 8192-row prefill chunk");
         let (min_rows, _) = super::resolve_expert_stage_min_rows("gfx1100", chunk, narrow, None);
         assert_eq!(min_rows, 768);
@@ -14538,6 +14639,15 @@ mod tests {
                 ..sym
             },
             CompactScratchTerms {
+                sym_iu4_requested: false,
+                ..sym
+            },
+            CompactScratchTerms {
+                knob: None,
+                source_symmetric: false,
+                ..sym
+            },
+            CompactScratchTerms {
                 source_symmetric: false,
                 ..sym
             },
@@ -14545,10 +14655,11 @@ mod tests {
         for terms in sym_off {
             assert_eq!(terms.mode(), Mode::Full, "{terms:?}");
         }
-        // Neither route: a packed (non-slab, non-symmetric) artifact.
+        // `0` opts the symmetric route out even with every other term true.
         assert_eq!(
             CompactScratchTerms {
-                source_symmetric: false,
+                knob: Some(false),
+                source_slab: true,
                 ..sym
             }
             .mode(),
@@ -14562,6 +14673,7 @@ mod tests {
                 ..slab
             },
             sym,
+            CompactScratchTerms { knob: None, ..sym },
         ] {
             let off = [
                 CompactScratchTerms {

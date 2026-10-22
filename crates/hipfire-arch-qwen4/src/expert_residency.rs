@@ -2159,7 +2159,7 @@ pub fn incumbent_auto_resident_layers(
         state_format,
         scratch_mode,
         ranks: 1,
-        chunk_rows: crate::gpu_forward::qwen4_prefill_chunk_requested(gpu, max_seq),
+        chunk_rows: crate::gpu_forward::qwen4_prefill_chunk_requested(gpu, max_seq, scratch_mode),
     })?;
     let (free, _) = gpu
         .device_mem_info()
@@ -3978,6 +3978,7 @@ mod tests {
         // forward scratch.
         let reserve = reserve(crate::gpu_forward::qwen4_prefill_chunk_default(
             "gfx1201",
+            Full,
             || crate::host_link::HostLink::Unmeasured,
         ));
         assert!(reserve > measured_chunk);
@@ -4128,7 +4129,7 @@ mod tests {
         census_at(
             config,
             max_seq,
-            crate::gpu_forward::qwen4_prefill_chunk_default("gfx1201", || {
+            crate::gpu_forward::qwen4_prefill_chunk_default("gfx1201", Full, || {
                 crate::host_link::HostLink::Unmeasured
             }),
             Full,
@@ -7254,8 +7255,13 @@ mod tests {
             (XTX_NON_EXPERT, XTX_GATE_UP + XTX_DOWN)
         );
         // Placement: the requested chunk, the placement stage switch.
-        let placement_rows =
-            crate::gpu_forward::prefill_chunk_requested_from(arch, chunk_env, XTX_MAX_SEQ, || link);
+        let placement_rows = crate::gpu_forward::prefill_chunk_requested_from(
+            arch,
+            chunk_env,
+            XTX_MAX_SEQ,
+            Full,
+            || link,
+        );
         let charges = PlacementCharges::new(
             layer,
             dedicated_slab_stage(expert_stage_placement_switch(arch, stage_env), slab, false),
@@ -7472,9 +7478,13 @@ mod tests {
         // defaults, and the link is never evaluated for them.
         for (arch, rows) in [("gfx1151", 8192), ("gfx1201", 4096), ("gfx942", 1536)] {
             assert_eq!(
-                crate::gpu_forward::prefill_chunk_requested_from(arch, None, usize::MAX, || {
-                    unreachable!("probed")
-                }),
+                crate::gpu_forward::prefill_chunk_requested_from(
+                    arch,
+                    None,
+                    usize::MAX,
+                    Full,
+                    || { unreachable!("probed") }
+                ),
                 rows
             );
         }
@@ -7529,10 +7539,13 @@ mod tests {
         let mut weights = mq2_xts_manifest();
         let (non_expert, layer) = resident_split(&weights, mq2_xts_bytes).unwrap();
         assert_eq!(non_expert, XTX_NON_EXPERT);
-        let rows =
-            crate::gpu_forward::prefill_chunk_requested_from("gfx1100", None, XTX_MAX_SEQ, || {
-                narrow
-            });
+        let rows = crate::gpu_forward::prefill_chunk_requested_from(
+            "gfx1100",
+            None,
+            XTX_MAX_SEQ,
+            Full,
+            || narrow,
+        );
         assert_eq!(rows, 8192, "the shipped narrow-link default chunk");
         let charges = PlacementCharges::new(
             layer,

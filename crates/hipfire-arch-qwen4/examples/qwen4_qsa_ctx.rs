@@ -1279,8 +1279,11 @@ fn main() -> Result<()> {
                         .map(|(_, bytes)| bytes.len() as u64)
                 })
                 .map_err(err)?;
-                let chunk =
-                    hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&gpu, n_ctx);
+                let chunk = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(
+                    &gpu,
+                    n_ctx,
+                    scratch_mode,
+                );
                 let context = hipfire_arch_qwen4::Qwen4ContextCommit::new(
                     backend,
                     n_ctx,

@@ -931,7 +931,11 @@ fn load_with_max_seq(model: &Path, max_seq: usize) -> Result<Loaded, String> {
         let experts = residency::routed_expert_bytes(&weights, bytes_of)?;
         let (free, _) = gpu.hip.get_vram_info().map_err(|e| e.to_string())?;
         let free = free as u64;
-        let chunk = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&gpu, max_seq);
+        let chunk = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(
+            &gpu,
+            max_seq,
+            scratch_mode,
+        );
         let context = hipfire_arch_qwen4::Qwen4ContextCommit::for_expert_reserve(
             backend,
             gpu.is_uma(),
